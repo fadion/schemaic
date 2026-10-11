@@ -2470,10 +2470,10 @@ fn word_under(ed: &Editor, p: Point) -> Option<(usize, usize)> {
 }
 
 /// The document offset under `p` (in `editor_area` coords), and whether `p`
-/// is inside the text rather than past a line's end — `None` over the gutter.
-/// The inverse of the overlays' placement: the code column, the editor's border
-/// and top padding ([`EDITOR_TEXT_TOP`]) and the scroll undone. Reads nothing
-/// document-sized, as a pointer move asks it.
+/// is inside the text rather than past a line's end or below the last line —
+/// `None` over the gutter. The inverse of the overlays' placement: the code
+/// column, the editor's border and top padding ([`EDITOR_TEXT_TOP`]) and the
+/// scroll undone. Reads nothing document-sized, as a pointer move asks it.
 fn pointer_offset(ed: &Editor, p: Point) -> Option<(usize, bool)> {
     let cx = content_x(ed);
     let vp = ed.viewport.get_untracked();
@@ -2481,7 +2481,12 @@ fn pointer_offset(ed: &Editor, p: Point) -> Option<(usize, bool)> {
     if doc.x < 0.0 {
         return None;
     }
-    Some(ed.offset_of_point(floem::views::editor::core::mode::Mode::Insert, doc))
+    let (off, inside) = ed.offset_of_point(floem::views::editor::core::mode::Mode::Insert, doc);
+    // floem clamps a point below the last line onto that line, and its
+    // `inside` asks only about the line's end — so the blank space under a
+    // query read as the words above it.
+    let (_, bottom) = ed.points_of_offset(off, CursorAffinity::Backward);
+    Some((off, inside && doc.y < bottom.y))
 }
 
 /// The quick-info for the name starting at `at` in `sql`, against the
@@ -10758,5 +10763,65 @@ mod diagnostics_catalog_gate {
             "the Ctrl+click branch opens a name without asking whether the click \
              was on the text:\n{branch}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pointer_offset_tests {
+    use super::*;
+    use floem::kurbo::Size;
+    use floem::reactive::Scope;
+    use floem::views::editor::text::SimpleStyling;
+    use floem::views::editor::text_document::TextDocument;
+
+    /// A headless editor over `text`, scrolled to the top, as floem's own
+    /// movement tests build one.
+    fn editor(text: &str) -> Editor {
+        let cx = Scope::new();
+        let doc = Rc::new(TextDocument::new(cx, text));
+        let ed = Editor::new(cx, doc, Rc::new(SimpleStyling::new()), false);
+        ed.viewport
+            .set(Rect::ZERO.with_size(Size::new(10_000.0, 10_000.0)));
+        ed
+    }
+
+    /// The `editor_area` point at the middle of the glyph at `off`, `dy`
+    /// below it — the inverse of `pointer_offset`'s own transform.
+    fn point_at(ed: &Editor, off: usize, dy: f64) -> Point {
+        let (top, bot) = ed.points_of_offset(off, CursorAffinity::Forward);
+        Point::new(
+            content_x(ed) + top.x + 2.0,
+            (top.y + bot.y) / 2.0 + EDITOR_TEXT_TOP + dy,
+        )
+    }
+
+    #[test]
+    fn a_word_on_the_only_line_is_under_the_pointer() {
+        let sql = "SELECT staff_id FROM staff";
+        let ed = editor(sql);
+        let at = sql.find("staff_id").unwrap();
+        assert_eq!(word_under(&ed, point_at(&ed, at, 0.0)), Some((at, at + 8)));
+    }
+
+    /// The reported bug: below a one-line query, in the column of a name, the
+    /// pointer counted as on it — floem clamps a point past the last line onto
+    /// that line — so the Ctrl+hover underline, its arrow and the quick-info
+    /// tip all appeared over blank space.
+    #[test]
+    fn below_the_last_line_is_off_the_text() {
+        let sql = "SELECT staff_id FROM staff";
+        let ed = editor(sql);
+        let at = sql.find("staff_id").unwrap();
+        assert_eq!(word_under(&ed, point_at(&ed, at, 80.0)), None);
+        assert!(pointer_offset(&ed, point_at(&ed, at, 80.0)).is_some_and(|(_, inside)| !inside));
+    }
+
+    #[test]
+    fn below_the_last_of_several_lines_is_off_the_text() {
+        let sql = "SELECT staff_id\nFROM staff";
+        let ed = editor(sql);
+        let at = sql.rfind("staff").unwrap(); // the table, on line 2
+        assert_eq!(word_under(&ed, point_at(&ed, at, 0.0)), Some((at, at + 5)));
+        assert_eq!(word_under(&ed, point_at(&ed, at, 80.0)), None);
     }
 }

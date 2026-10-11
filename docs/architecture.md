@@ -26020,8 +26020,9 @@ existing prose was left alone.
     or view through `open_table`, a column through `open_table_col` (which scrolls to it), a routine
     through `object_editor::open_for_object` with the loaded `RoutineInfo`, the doors the schema
     tree and Find Anywhere use. Alt+click is left to floem and still adds a caret; a Ctrl+click on
-    nothing resolvable just places the caret. **Nor does one past a line's end**: floem puts the
-    caret just after the line's last word there, which `name_at` accepts, so the branch first asks
+    nothing resolvable just places the caret. **Nor does one past a line's end, or below the last
+    line**: floem puts the caret just after the line's last word there, and clamps a point under
+    the last line onto it, both of which `name_at` accepts, so the branch first asks
     `pointer_offset`'s `inside` of the last point the `editor_area` PointerMove saw
     (`last_pointer` — the click arrives in the editor view's coords, which `pointer_offset` does
     not take) and opens nothing outside the text, as the hover shows nothing there
@@ -26069,7 +26070,10 @@ existing prose was left alone.
     and `ctrl_link_view` is click-through, so it cannot wear a cursor of its own.
     **Alt+Shift+drag is a box selection** (`text_ops::box_regions`). `name_box_at`'s way back from
     a pointer to the document is factored out as `pointer_offset` — the offset under the pointer and
-    whether it is inside the text, `None` over the gutter — which the drag shares. The same outer
+    whether it is inside the text, `None` over the gutter — which the drag shares. *Inside* is
+    floem's own past-the-line's-end answer **and** a `y` above the bottom of the line it landed on:
+    floem's alone let the blank space under a one-line query underline, tip and arrow the word
+    above it (`pointer_offset_tests`, on a headless `Editor` built as floem's own tests build one). The same outer
     `PointerDown`, again after floem's own click (which with Shift+Alt would extend the selection or
     add a caret instead), sets `box_anchor` at the pointer and puts a lone caret there on the
     primary button with Alt and Shift; any other press clears it, as does a `PointerUp`. **That
