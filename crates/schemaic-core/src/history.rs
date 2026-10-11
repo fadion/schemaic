@@ -331,6 +331,19 @@ impl RunResult {
     }
 }
 
+/// How long a run takes before its end is worth calling the user back for.
+/// Ten seconds: long enough that they may have switched away, short enough
+/// that they have not yet forgotten what they ran.
+pub const ATTENTION_AFTER_MS: u64 = 10_000;
+
+/// Should a run that just reached a verdict after `took_ms` ask for the
+/// window's attention — the taskbar flash, the dock bounce? Only a long one,
+/// and only while the window is not focused: in front, the result is already
+/// where the user is looking.
+pub fn wants_attention(took_ms: u64, window_focused: bool) -> bool {
+    !window_focused && took_ms >= ATTENTION_AFTER_MS
+}
+
 /// Record how a run turned out, onto the entry [`push`] wrote when it launched.
 /// Returns whether one was found.
 ///
@@ -681,6 +694,23 @@ pub fn relative_time(ts: u64, now: u64) -> String {
 mod tests {
     use super::push as push_with;
     use super::*;
+
+    /// **A run long enough to have been walked away from** asks for the
+    /// window's attention when it ends — only while the window is not the one
+    /// in front, where the result is already on screen.
+    #[test]
+    fn a_long_run_finishing_in_the_background_asks_for_attention() {
+        assert!(wants_attention(ATTENTION_AFTER_MS, false));
+        assert!(wants_attention(ATTENTION_AFTER_MS * 6, false));
+        assert!(
+            !wants_attention(ATTENTION_AFTER_MS - 1, false),
+            "a quick run"
+        );
+        assert!(
+            !wants_attention(ATTENTION_AFTER_MS * 6, true),
+            "the user is watching"
+        );
+    }
 
     /// `ts` doubles as the run id — every entry in a test gets its own, which is
     /// what the caller's counter guarantees in the app.

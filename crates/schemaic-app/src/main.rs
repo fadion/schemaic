@@ -2902,6 +2902,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // The tabs whose open transaction holds DDL a reload is owed for
     // (`settle_schema`).
     let ddl_owed: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
+    // **A long run that ends behind another window calls the user back** — the
+    // taskbar flash on Windows and Linux, the dock bounce on macOS — through
+    // `history::wants_attention`. `Informational`, which stops on its own once
+    // the window is focused; both run paths ask it, after their supersede
+    // checks, so only the run a tab still shows does.
+    let call_back_after = move |took_ms: u64| {
+        if schemaic_core::history::wants_attention(took_ms, window_focused.get_untracked()) {
+            floem::WindowIdExt::request_attention(&window, floem::Urgency::Informational);
+        }
+    };
     let run_query_core: Rc<dyn Fn(String, bool)> = {
         let refresh_after_run = refresh_after_run.clone();
         let ddl_owed = ddl_owed.clone();
@@ -3068,6 +3078,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         return;
                     }
                     tokens_done.borrow_mut().remove(&id);
+                    if run_result(&state, took).is_some() {
+                        call_back_after(took);
+                    }
                     if is_view {
                         // Cleared for every arm, and **after** the supersede check
                         // above rather than before it: a run that has been replaced
@@ -3627,6 +3640,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         return;
                     }
                     tokens_done.borrow_mut().remove(&id);
+                    // The batch's whole run, statement times summed — a long
+                    // script of quick statements is as much a walk-away as one
+                    // slow one. Asked only of a batch that reached a verdict.
+                    if !runs.is_empty() {
+                        call_back_after(took.iter().sum());
+                    }
                     // By id, statement for statement: the strip may have been
                     // pinned, reordered or partly closed while the batch ran, and
                     // a positional write would then land a statement's result on
