@@ -516,6 +516,11 @@ pub fn view_icon() -> Color {
 pub fn grid_col_sel() -> Color {
     ui().grid_col_sel
 }
+/// Results grid: the rule down the right edge of the frozen columns — the faint
+/// text colour, so it stands out from the hairlines in either theme.
+pub fn grid_frozen_edge() -> Color {
+    text_faint().multiply_alpha(0.6)
+}
 pub fn grid_edit_staged() -> Color {
     ui().grid_edit_staged
 }

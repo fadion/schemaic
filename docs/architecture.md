@@ -37441,12 +37441,28 @@ this bundle's.
   which is the user's choice to make rather than the grid's to refuse. What it must not cost is the
   horizontal wheel: the frozen pane forwards both axes to the data pane (the scroll-sync rule
   below), so a pane frozen wide still pans the columns behind it.
-  **A frozen column's header wears a dim 2px rail down each inner edge** (`header_cell`'s
-  `frozen_rail`, `text_faint` at 0.45, `FROZEN_RAIL_W`) — the one cue that it is frozen, since the
-  cell has no room for another icon and a background tint already means *formatted*. The rails
-  are absolute, `pointer_events(false)` and stacked under `col_resize_handle`: painted rather than
-  bordered, because a border would take width from the header that its column's values do not
-  lose, and the label would stop lining up over them.
+  **A frozen column's header is hatched** — faint 45° `/` lines over the whole cell (`header_cell`'s
+  `Hatch`, `text_faint` at 0.22, `FROZEN_HATCH_STEP` apart), the one cue that it is frozen, since the
+  cell has no room for another icon and a background tint already means *formatted*. `Hatch` is a
+  custom painted view because floem 0.2 has no pattern fill; it clips to its own rect, reads its
+  colour at paint time so a theme switch repaints it, and is absolute, `pointer_events(false)`,
+  hidden unless the column is frozen, and stacked under the label and `col_resize_handle`. Painted
+  rather than bordered, because a border would take width from the header that its column's values
+  do not lose, and the label would stop lining up over them. The line geometry is the pure
+  `hatch_lines(w, h, step)` (`hatch_tests`: 45°, a step apart, no stripe-free corner).
+  **The frozen block ends in one rule, however many columns are frozen** — `FROZEN_EDGE_W` (2px) in
+  `theme::grid_frozen_edge()` (`text_faint` at 0.6), laid **over** the last frozen header's own 1px
+  hairline rather than beside it, so the two never read as a 3px pair: a 1px right border on the
+  frozen header strip (`frozen_header`) and on a `stack` wrapping `frozen_body`, plus
+  `frozen_edge_inner`, an absolute, click-through 1px line just inside that border — over the
+  hairline in the header, over the last frozen cell's right edge in the body (body cells draw no
+  vertical rule). None when nothing is frozen, the gutter's own hairline being the edge then. Both
+  panes widen by the 1px border, so the data header and the data body move right by the same pixel
+  and stay aligned — **the edge must be on both or on neither**. The body needs the wrapper because
+  floem 0.2 has one border colour per view and the frozen body's own top border is the grid's
+  hairline colour. This replaced a dim rail down each
+  frozen header's inner edges, which did not read well: a rail per header marked each column, where
+  the thing to show is where the frozen block ends.
   The list used to be an inline `(0..ncols).filter(!= frozen)` — the second spelling `core::edit`
   warns about — and is now the same core list scroll-into-view sums over.
   The resulting **draw order** — frozen first, then the rest in index order — is

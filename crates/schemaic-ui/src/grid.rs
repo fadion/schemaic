@@ -15,13 +15,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use floem::AnyView;
+use floem::context::PaintCx;
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
-use floem::kurbo::{Point, Rect};
+use floem::kurbo::{BezPath, Point, Rect, Stroke};
 use floem::prelude::*;
 use floem::reactive::{Memo, create_effect, create_memo};
 use floem::style::CursorStyle;
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector};
+use floem::{View, ViewId};
+use floem_renderer::Renderer;
 
 use floem::action::save_as;
 use floem::file::{FileDialogOptions, FileSpec};
@@ -5063,6 +5066,17 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     (vscroll.get_untracked() + pan.y).clamp(0.0, max_y),
                 )));
             });
+            // **The frozen block ends in one rule**, `FROZEN_EDGE_W` wide, however
+            // many columns are frozen, laid over the last frozen header's own
+            // hairline rather than beside it: a 1px right border on the frozen
+            // header strip and on the frozen body — both widen by it, so the data
+            // pane moves right by the same amount above and below — plus a 1px
+            // line just inside it (`frozen_edge_inner`), over that hairline in the
+            // header and over the last frozen cell's edge in the body. None with
+            // nothing frozen — the gutter's own hairline is the edge then.
+            let frozen_any = !frozen_cols.is_empty();
+            let edge_w = if frozen_any { FROZEN_EDGE_W - 1.0 } else { 0.0 };
+            fhead.push(frozen_edge_inner(frozen_any).into_any());
             let fw = forward_wheel.clone();
             let frozen_header = h_stack_from_iter(fhead)
                 .on_event(EventListener::PointerWheel, move |e| {
@@ -5071,10 +5085,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     }
                     EventPropagation::Stop
                 })
-                .style(|s| {
+                .style(move |s| {
                     s.flex_row()
                         .flex_shrink(0.0_f32)
                         .background(theme::bg_header_row())
+                        .border_right(edge_w)
+                        .border_color(theme::grid_frozen_edge())
                 });
             let km = key_map.get_untracked();
             let hdr_cols = data_cols.clone();
@@ -5179,6 +5195,15 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     .min_height(0.0)
                     .border_top(1.0)
                     .border_color(theme::border())
+            });
+            // The edge on a wrapper: floem 0.2 has one border colour per view,
+            // and the body's top border is the grid's hairline colour.
+            let frozen_body = stack((frozen_body, frozen_edge_inner(frozen_any))).style(move |s| {
+                s.flex_row()
+                    .flex_shrink(0.0_f32)
+                    .min_height(0.0)
+                    .border_right(edge_w)
+                    .border_color(theme::grid_frozen_edge())
             });
 
             let order_d = order.clone();
@@ -10313,203 +10338,305 @@ fn header_cell(
             .into_any()
     };
 
-    // **A frozen column's header wears a dim rail down each inner edge**, the
+    // **A frozen column's header is hatched** with faint diagonal lines, the
     // cue that it is frozen — the cell has no room for another icon, and a
-    // tint is already "this column is formatted". Painted, not bordered: a
-    // border would take width from the header that its column's values below
-    // do not lose, and the label would stop lining up over them. Drawn before
-    // the resize handle so the handle stays on top of the right-hand rail.
-    let frozen_rail = move |left: bool| {
-        empty()
-            .style(move |s| {
-                let s = s
-                    .absolute()
-                    .inset_top(0.0)
-                    .inset_bottom(0.0)
-                    .width(FROZEN_RAIL_W);
-                let s = if left {
-                    s.inset_left(0.0)
-                } else {
-                    s.inset_right(0.0)
-                };
-                if gs.frozen.with(|f| f.contains(&ci)) {
-                    s.background(theme::text_faint().multiply_alpha(0.45))
-                } else {
-                    s.hide()
-                }
-            })
-            .pointer_events(|| false)
-    };
-    stack((
-        content,
-        frozen_rail(true),
-        frozen_rail(false),
-        col_resize_handle(gs, ci, key.is_some()),
-    ))
-    .on_click_stop(move |_| {
-        gs.dismiss_overlays();
-        // Eligible results sort server-side (full-table ORDER BY re-run); others
-        // fall back to today's in-memory sort of the loaded page.
-        if gs.filterable() {
-            gs.cycle_server_sort(ci);
-        } else {
-            cycle_sort(sort, ci);
-        }
-    })
-    // Right-click → Freeze this column (pin left) · Copy its name or values.
-    .on_secondary_click_stop(move |_| {
-        gs.dismiss_overlays();
-        // Each column freezes on its own and joins the ones already
-        // frozen; they are drawn first, in index order (`ColLayout`).
-        let freeze_item = if gs.frozen.with_untracked(|f| f.contains(&ci)) {
-            MenuEntry::action("Unfreeze", move || {
-                gs.frozen.update(|f| {
-                    f.remove(&ci);
-                })
-            })
-        } else {
-            MenuEntry::action("Freeze", move || {
-                gs.frozen.update(|f| {
-                    f.insert(ci);
-                })
-            })
-        };
-        // "AI summary" for the whole column: what is this field *for*? The
-        // prompt carries a sample of the loaded values, which usually settles
-        // it where the name alone wouldn't. Sampled from what's on screen —
-        // no query, so the menu stays instant.
-        let sum = gs.summarize.get_untracked();
-        let rs = gs.rs.get_untracked();
-        let (column, type_name) = rs
-            .columns
-            .get(ci)
-            .map(|c| (c.name.clone(), c.type_name.clone()))
-            .unwrap_or_default();
-        let msg = summary::column_prompt(
-            source_table(gs, Some(ci)).as_deref(),
-            &column,
-            &type_name,
-            &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
-        );
-        // `database.schema.table.column` — the shape the schema tree's
-        // column entry copies — for a column read from a real table. An
-        // expression has no such name, so it gets none; an aliased column
-        // keeps its origin, and copies the base column's real name, which
-        // is what a qualified reference to it is.
-        let qualified = rs.columns.get(ci).and_then(|c| c.origin.as_ref()).map(|o| {
-            format!(
-                "{}.{}.{}",
-                o.database,
-                schemaic_core::schema::display_name(o.schema.as_deref(), &o.table),
-                o.column
-            )
-        });
-        gs.popup_anchor.set(None); // right-click → open at the cursor
-        let name = column.clone();
-        let layout = gs.layout_untracked();
-        let mut entries = vec![freeze_item];
-        // Hide this column; bring back the ones already hidden. The last drawn
-        // column cannot go — see `ColLayout::may_hide`.
-        entries.push(
-            MenuEntry::action("Hide column", move || hide_column(gs, ci))
-                .disabled(!layout.may_hide(ci, rs.col_count())),
-        );
-        let n_hidden = layout.hidden_in(rs.col_count());
-        if n_hidden > 0 {
-            entries.push(MenuEntry::sub(
-                format!("Show hidden columns ({n_hidden})"),
-                show_columns_submenu(gs, &layout),
-            ));
-        }
-        entries.extend([
-            MenuEntry::sub("Format as", format_submenu(gs, ci)),
-            MenuEntry::Separator,
-            // The name as the header shows it — an alias where the query
-            // gave one, since that is what the next query will refer to.
-            MenuEntry::action("Copy name", move || {
-                let _ = floem::Clipboard::set_contents(name.clone());
-            }),
-        ]);
-        if let Some(q) = qualified {
-            entries.push(MenuEntry::action("Copy qualified name", move || {
-                let _ = floem::Clipboard::set_contents(q.clone());
-            }));
-        }
-        entries.push(MenuEntry::sub(
-            "Copy values",
-            vec![
-                MenuEntry::action("CSV", move || {
-                    let _ = floem::Clipboard::set_contents(export_column_csv(gs, ci));
-                }),
-                MenuEntry::action("JSON", move || {
-                    let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
-                }),
-                // Empty when every value is NULL — `IN ()` is no list.
-                MenuEntry::action("SQL IN list", move || {
-                    let text = export_column_in_list(gs, ci);
-                    if !text.is_empty() {
-                        let _ = floem::Clipboard::set_contents(text);
-                    }
-                }),
-            ],
-        ));
-        // The column summary's prompt carries a sample of the values, so it
-        // is a data path like the cell one and is absent on a schema-only
-        // connection. (Copy is not: the clipboard is the user's own machine.)
-        if ai_offered(gs) {
-            entries.push(MenuEntry::Separator);
-            entries.push(MenuEntry::action_icon(
-                "AI summary",
-                (icons::SPARKLES, theme::key_foreign),
-                move || {
-                    // Asked again at the launch, not only at the build.
-                    // `msg` was captured with real cell values in it, and a
-                    // menu can outlive the level that permitted it — the
-                    // connection's data access is changed from a settings
-                    // panel that does not close an open menu.
-                    if !ai_offered(gs) {
-                        return;
-                    }
-                    if let Some(s) = &sum {
-                        (s)(msg.clone());
-                    }
-                },
-            ));
-        }
-        gs.open_menu(entries);
-    })
+    // tint is already "this column is formatted". Under the label, so the
+    // text reads over it; the frozen block's right edge is the panes' border
+    // (`FROZEN_EDGE_W`), not the cell's.
+    let hatch = Hatch {
+        id: ViewId::new(),
+        color: || theme::text_faint().multiply_alpha(0.22),
+    }
     .style(move |s| {
-        // `with`, not `get`: `get` clones the whole widths `Vec` to read one
-        // slot, and this closure re-runs for every visible header on any
-        // selection change.
-        let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
-        // Highlight the header when its column is within the cell selection.
-        let col_sel = matches!(gs.bounds(), Some((_, c0, _, c1)) if ci >= c0 && ci <= c1);
-        let formatted = gs
-            .formats
-            .with(|f| f.get(ci).map(|x| *x != ColumnFormat::None).unwrap_or(false));
-        let s = s.width(w).height(grid_header_h()).flex_shrink(0.0_f32);
-        let s = if col_sel {
-            s.background(theme::grid_col_sel())
-        } else if formatted {
-            // At-a-glance cue this column shows a formatted (not raw) value.
-            s.background(theme::dropdown_active())
-                .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
+        let s = s.absolute().inset(0.0);
+        if gs.frozen.with(|f| f.contains(&ci)) {
+            s
         } else {
-            // Opaque header background (not transparent over the header row) so
-            // a live resize where header cells briefly overlap occludes cleanly.
-            s.background(theme::bg_header_row())
-                .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
-        };
-        // Border on every column, last included, so a narrow table still shows
-        // where the final column ends.
-        s.border_right(1.0).border_color(theme::border())
+            s.hide()
+        }
     })
+    .pointer_events(|| false);
+    stack((hatch, content, col_resize_handle(gs, ci, key.is_some())))
+        .on_click_stop(move |_| {
+            gs.dismiss_overlays();
+            // Eligible results sort server-side (full-table ORDER BY re-run); others
+            // fall back to today's in-memory sort of the loaded page.
+            if gs.filterable() {
+                gs.cycle_server_sort(ci);
+            } else {
+                cycle_sort(sort, ci);
+            }
+        })
+        // Right-click → Freeze this column (pin left) · Copy its name or values.
+        .on_secondary_click_stop(move |_| {
+            gs.dismiss_overlays();
+            // Each column freezes on its own and joins the ones already
+            // frozen; they are drawn first, in index order (`ColLayout`).
+            let freeze_item = if gs.frozen.with_untracked(|f| f.contains(&ci)) {
+                MenuEntry::action("Unfreeze", move || {
+                    gs.frozen.update(|f| {
+                        f.remove(&ci);
+                    })
+                })
+            } else {
+                MenuEntry::action("Freeze", move || {
+                    gs.frozen.update(|f| {
+                        f.insert(ci);
+                    })
+                })
+            };
+            // "AI summary" for the whole column: what is this field *for*? The
+            // prompt carries a sample of the loaded values, which usually settles
+            // it where the name alone wouldn't. Sampled from what's on screen —
+            // no query, so the menu stays instant.
+            let sum = gs.summarize.get_untracked();
+            let rs = gs.rs.get_untracked();
+            let (column, type_name) = rs
+                .columns
+                .get(ci)
+                .map(|c| (c.name.clone(), c.type_name.clone()))
+                .unwrap_or_default();
+            let msg = summary::column_prompt(
+                source_table(gs, Some(ci)).as_deref(),
+                &column,
+                &type_name,
+                &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
+            );
+            // `database.schema.table.column` — the shape the schema tree's
+            // column entry copies — for a column read from a real table. An
+            // expression has no such name, so it gets none; an aliased column
+            // keeps its origin, and copies the base column's real name, which
+            // is what a qualified reference to it is.
+            let qualified = rs.columns.get(ci).and_then(|c| c.origin.as_ref()).map(|o| {
+                format!(
+                    "{}.{}.{}",
+                    o.database,
+                    schemaic_core::schema::display_name(o.schema.as_deref(), &o.table),
+                    o.column
+                )
+            });
+            gs.popup_anchor.set(None); // right-click → open at the cursor
+            let name = column.clone();
+            let layout = gs.layout_untracked();
+            let mut entries = vec![freeze_item];
+            // Hide this column; bring back the ones already hidden. The last drawn
+            // column cannot go — see `ColLayout::may_hide`.
+            entries.push(
+                MenuEntry::action("Hide column", move || hide_column(gs, ci))
+                    .disabled(!layout.may_hide(ci, rs.col_count())),
+            );
+            let n_hidden = layout.hidden_in(rs.col_count());
+            if n_hidden > 0 {
+                entries.push(MenuEntry::sub(
+                    format!("Show hidden columns ({n_hidden})"),
+                    show_columns_submenu(gs, &layout),
+                ));
+            }
+            entries.extend([
+                MenuEntry::sub("Format as", format_submenu(gs, ci)),
+                MenuEntry::Separator,
+                // The name as the header shows it — an alias where the query
+                // gave one, since that is what the next query will refer to.
+                MenuEntry::action("Copy name", move || {
+                    let _ = floem::Clipboard::set_contents(name.clone());
+                }),
+            ]);
+            if let Some(q) = qualified {
+                entries.push(MenuEntry::action("Copy qualified name", move || {
+                    let _ = floem::Clipboard::set_contents(q.clone());
+                }));
+            }
+            entries.push(MenuEntry::sub(
+                "Copy values",
+                vec![
+                    MenuEntry::action("CSV", move || {
+                        let _ = floem::Clipboard::set_contents(export_column_csv(gs, ci));
+                    }),
+                    MenuEntry::action("JSON", move || {
+                        let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
+                    }),
+                    // Empty when every value is NULL — `IN ()` is no list.
+                    MenuEntry::action("SQL IN list", move || {
+                        let text = export_column_in_list(gs, ci);
+                        if !text.is_empty() {
+                            let _ = floem::Clipboard::set_contents(text);
+                        }
+                    }),
+                ],
+            ));
+            // The column summary's prompt carries a sample of the values, so it
+            // is a data path like the cell one and is absent on a schema-only
+            // connection. (Copy is not: the clipboard is the user's own machine.)
+            if ai_offered(gs) {
+                entries.push(MenuEntry::Separator);
+                entries.push(MenuEntry::action_icon(
+                    "AI summary",
+                    (icons::SPARKLES, theme::key_foreign),
+                    move || {
+                        // Asked again at the launch, not only at the build.
+                        // `msg` was captured with real cell values in it, and a
+                        // menu can outlive the level that permitted it — the
+                        // connection's data access is changed from a settings
+                        // panel that does not close an open menu.
+                        if !ai_offered(gs) {
+                            return;
+                        }
+                        if let Some(s) = &sum {
+                            (s)(msg.clone());
+                        }
+                    },
+                ));
+            }
+            gs.open_menu(entries);
+        })
+        .style(move |s| {
+            // `with`, not `get`: `get` clones the whole widths `Vec` to read one
+            // slot, and this closure re-runs for every visible header on any
+            // selection change.
+            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
+            // Highlight the header when its column is within the cell selection.
+            let col_sel = matches!(gs.bounds(), Some((_, c0, _, c1)) if ci >= c0 && ci <= c1);
+            let formatted = gs
+                .formats
+                .with(|f| f.get(ci).map(|x| *x != ColumnFormat::None).unwrap_or(false));
+            let s = s.width(w).height(grid_header_h()).flex_shrink(0.0_f32);
+            let s = if col_sel {
+                s.background(theme::grid_col_sel())
+            } else if formatted {
+                // At-a-glance cue this column shows a formatted (not raw) value.
+                s.background(theme::dropdown_active())
+                    .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
+            } else {
+                // Opaque header background (not transparent over the header row) so
+                // a live resize where header cells briefly overlap occludes cleanly.
+                s.background(theme::bg_header_row())
+                    .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
+            };
+            // Border on every column, last included, so a narrow table still shows
+            // where the final column ends.
+            s.border_right(1.0).border_color(theme::border())
+        })
 }
 
-/// The width of [`header_cell`]'s frozen rails — a hairline's neighbour, so it
-/// reads as a mark at every scale rather than growing with the type.
-const FROZEN_RAIL_W: f64 = 2.0;
+/// The gap between [`header_cell`]'s frozen hatch lines, along the header's
+/// width.
+const FROZEN_HATCH_STEP: f64 = 14.0;
+
+/// The width of the rule down the right edge of the frozen block — the frozen
+/// header strip and the frozen body both wear it, as a border one pixel short
+/// of it plus [`frozen_edge_inner`]'s pixel over the last frozen header's own
+/// hairline, so the data pane starts that much less one further right in both
+/// and stays aligned.
+const FROZEN_EDGE_W: f64 = 2.0;
+
+/// The inner 1px of the frozen block's edge: a line down the right of its
+/// parent's content box, just inside the 1px border that is the rest of it —
+/// over the last frozen header's own hairline, so the two read as one rule.
+/// Absolute and click-through, so it takes no room and leaves the resize
+/// handle under it working. Hidden with nothing frozen.
+fn frozen_edge_inner(shown: bool) -> impl IntoView {
+    empty()
+        .style(move |s| {
+            let s = s
+                .absolute()
+                .inset_top(0.0)
+                .inset_bottom(0.0)
+                .inset_right(0.0)
+                .width(1.0)
+                .background(theme::grid_frozen_edge());
+            if shown { s } else { s.hide() }
+        })
+        .pointer_events(|| false)
+}
+
+/// The 45° lines `/` that hatch a `w` × `h` rect, `step` apart along its width,
+/// as `(bottom, top)` end points: the first starts far enough left that its top
+/// end is the rect's corner or before it, the last before the right edge, so the
+/// whole rect is covered — the caller clips the overhang. Empty for an empty
+/// rect or a step that is not positive.
+fn hatch_lines(w: f64, h: f64, step: f64) -> Vec<(Point, Point)> {
+    if w <= 0.0 || h <= 0.0 || step <= 0.0 {
+        return Vec::new();
+    }
+    // Indexed by the top end, from the top-left corner; a line is drawn while
+    // its bottom end is still left of the right edge.
+    (0..)
+        .map(|k| k as f64 * step)
+        .take_while(|top| top - h < w)
+        .map(|top| (Point::new(top - h, h), Point::new(top, 0.0)))
+        .collect()
+}
+
+/// A frozen column header's diagonal hatching, painted — floem 0.2 has no
+/// pattern fill. Over the whole of its rect, clipped to it, in `color`, read at
+/// paint time so a theme switch repaints it in the new one.
+struct Hatch {
+    id: ViewId,
+    color: fn() -> floem::peniko::Color,
+}
+
+impl View for Hatch {
+    fn id(&self) -> ViewId {
+        self.id
+    }
+
+    fn paint(&mut self, cx: &mut PaintCx) {
+        let size = self.id.get_size().unwrap_or_default();
+        let lines = hatch_lines(size.width, size.height, theme::scaled(FROZEN_HATCH_STEP));
+        if lines.is_empty() {
+            return;
+        }
+        let mut path = BezPath::new();
+        for (a, b) in lines {
+            path.move_to(a);
+            path.line_to(b);
+        }
+        cx.save();
+        cx.clip(&size.to_rect());
+        cx.stroke(&path, (self.color)(), &Stroke::new(1.0));
+        cx.restore();
+    }
+}
+
+#[cfg(test)]
+mod hatch_tests {
+    use super::*;
+
+    #[test]
+    fn every_line_rises_at_45_degrees_across_the_full_height() {
+        for (a, b) in hatch_lines(100.0, 40.0, 6.0) {
+            assert_eq!((a.y, b.y), (40.0, 0.0));
+            assert_eq!(b.x - a.x, 40.0);
+        }
+    }
+
+    #[test]
+    fn the_lines_are_a_step_apart() {
+        let xs: Vec<f64> = hatch_lines(100.0, 40.0, 6.0)
+            .iter()
+            .map(|l| l.0.x)
+            .collect();
+        assert!(xs.windows(2).all(|p| p[1] - p[0] == 6.0), "{xs:?}");
+    }
+
+    /// No stripe-free corner: the first line's top end reaches the left edge
+    /// (so the top-left is hatched) and the last starts within a step of the
+    /// right edge (so the bottom-right is).
+    #[test]
+    fn the_lines_cover_the_whole_rect() {
+        let lines = hatch_lines(100.0, 40.0, 6.0);
+        let (first, last) = (lines[0], lines[lines.len() - 1]);
+        assert!(first.1.x <= 0.0 && first.1.x > -6.0, "{first:?}");
+        assert!(last.0.x < 100.0 && last.0.x >= 94.0, "{last:?}");
+    }
+
+    #[test]
+    fn an_empty_rect_or_step_draws_nothing() {
+        assert!(hatch_lines(0.0, 40.0, 6.0).is_empty());
+        assert!(hatch_lines(100.0, 0.0, 6.0).is_empty());
+        assert!(hatch_lines(100.0, 40.0, 0.0).is_empty());
+    }
+}
 
 /// Stage the inline editor's buffer into the cell it is open on and close it —
 /// **Enter's contract**, called by the type-aware controls, which have no text to
