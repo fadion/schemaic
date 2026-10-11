@@ -1161,7 +1161,6 @@ pub(crate) fn ai_settings_overlay(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>
                                         } else {
                                             theme::text_muted()
                                         })
-                                        .cursor(floem::style::CursorStyle::Pointer)
                                         .hover(|s| s.color(theme::accent_hover()))
                                 })
                         }))

@@ -1519,6 +1519,45 @@ mod tests {
         );
     }
 
+    /// **No pointer cursor outside a hyperlink.** `docs/architecture.md`'s UI
+    /// conventions keep the arrow on every button, tab and icon — a pointer
+    /// reads as a web page — and allow `Pointer` only on a genuine link. The
+    /// rule held by `grep` alone, and six sites slipped past it: the Server
+    /// Activity and Server Variables tabs, the reload-from-disk offer, the
+    /// settings model chips, the grid's figure copy and its hidden-columns
+    /// corner.
+    ///
+    /// The one allowed site is the terminal's hyperlink run, recognised by the
+    /// `is_link` it branches on just above the call.
+    #[test]
+    fn no_pointer_cursor_outside_a_hyperlink() {
+        let needle = "CursorStyle::Pointer";
+        let mut links = 0usize;
+        let mut offenders = Vec::new();
+        for (name, code) in &crate_sources() {
+            let code = super::production_code(code);
+            for (at, _) in code.match_indices(needle) {
+                let before = &code[at.saturating_sub(120)..at];
+                if before.contains("if is_link") {
+                    links += 1;
+                    continue;
+                }
+                let line = 1 + code[..at].bytes().filter(|c| *c == b'\n').count();
+                offenders.push(format!("{name}:{line}"));
+            }
+        }
+        assert_eq!(
+            links, 1,
+            "the terminal hyperlink's pointer is no longer where this gate looks \
+             for it — a gate that recognises nothing reports success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a pointer cursor outside a hyperlink; native controls keep the arrow:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// **A deferred hand-back to the SQL editor either claims the keyboard or
     /// stands down.**
     ///

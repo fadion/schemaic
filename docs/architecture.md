@@ -22640,6 +22640,7 @@ existing prose was left alone.
     invariants*, with the empty allowlist it should keep), an unscaled `const` length in
     `consts.rs` that says nowhere why (`consts::unscaled_const_gate`), a menu label ending in an
     ellipsis (`no_menu_label_ends_in_an_ellipsis`, whose subject is under *UI conventions*), a
+    pointer cursor outside a hyperlink (`no_pointer_cursor_outside_a_hyperlink`, likewise), a
     connection form that decides its own trimming instead of going through `Connection::trimmed` (`lib.rs`'s
     `the_connection_form_trims_through_core`, which is a gate because `to_connection` reads a couple
     of dozen signals and needs a Floem scope) — and an engine comparison with no capability behind it,
@@ -34372,9 +34373,14 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **No pointer cursor on buttons/icons** — native apps keep the arrow cursor; a pointer feels
   web-like. Use the default; reserve `CursorStyle::Text` for text inputs (a genuine hyperlink may
   keep `Pointer`). The account browser's rows shipped with `CursorStyle::Pointer` and are named here
-  because a rule with no instance reads as a preference: after that one was removed the only
-  `CursorStyle::Pointer` left in `schemaic-ui` is the terminal's hyperlink run in `lib.rs`, which is
-  the exception the bracket allows. One `grep` is the whole check.
+  because a rule with no instance reads as a preference. **It is a source gate**, because a `grep`
+  nobody ran was not a check: this bullet called one sufficient while six sites had slipped back in
+  — the Server Activity and Server Variables tabs, the reload-from-disk offer's buttons, the
+  settings model chips, and the grid's figure copy and hidden-columns corner.
+  `source_gate::tests::no_pointer_cursor_outside_a_hyperlink` scans `crate_sources`' production code
+  and fails on any `CursorStyle::Pointer` without an `if is_link` in the 120 bytes before it. That
+  one exception is the terminal's hyperlink run in `lib.rs`, and the gate asserts exactly one such
+  site, so a rewording that stops it matching fails rather than reporting success.
 - **A selection outline is painted in both states; only its colour changes.** Taffy sizes the
   **border box**, so a 1px rule added only while a control is picked grows it 2px: a button sized by
   its own padding jumped a pixel each way the moment it was chosen and the row re-flowed around it,

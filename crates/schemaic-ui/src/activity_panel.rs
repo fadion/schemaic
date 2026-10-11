@@ -144,7 +144,6 @@ pub(crate) fn activity_panel(
                     s.font_size(font_label())
                         .padding_vert(theme::scaled(3.0))
                         .margin_right(theme::scaled(14.0))
-                        .cursor(floem::style::CursorStyle::Pointer)
                         .border_bottom(2.0)
                         .border_color(if on {
                             theme::accent()

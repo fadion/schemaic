@@ -4465,10 +4465,7 @@ pub(crate) fn grid_selection_bar(
                                 }
                             });
                         })
-                        .style(|s| {
-                            s.cursor(floem::style::CursorStyle::Pointer)
-                                .hover(|s| s.color(theme::text()))
-                        })
+                        .style(|s| s.hover(|s| s.color(theme::text())))
                         .into_any(),
                     );
                     if i + 1 < n {
@@ -5001,7 +4998,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                             .color(theme::text_faint())
                     }),
                 ))
-                .style(|s| s.items_center().cursor(floem::style::CursorStyle::Pointer))
+                .style(|s| s.items_center())
                 .on_click_stop(move |_| gs.hidden.set(Default::default()))
                 .tooltip(move || {
                     text(format!(

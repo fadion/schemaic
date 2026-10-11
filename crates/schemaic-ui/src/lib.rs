@@ -9418,7 +9418,6 @@ fn center(ui: Ui) -> impl IntoView {
                 let act = |label: &'static str, on: Rc<dyn Fn()>| {
                     text(label).on_click_stop(move |_| on()).style(|s| {
                         s.color(theme::status_warn())
-                            .cursor(floem::style::CursorStyle::Pointer)
                             .margin_left(theme::scaled(12.0))
                             .hover(|s| s.color(theme::status_warn_hover()))
                     })
