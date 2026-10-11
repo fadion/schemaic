@@ -113,7 +113,9 @@ substitute for the statement, and none of these is a style preference.
   re-fetch, and `cli::exec::ExecRequest::approved` for `schemaic exec` — minted against
   `run_verdict` itself, whose `--yes` answers a `Confirm` and cannot answer a `Block`.
   `read_only_reason` has no request: it is enforced inside `cli::query::read_only_query`, the one
-  headless read path, which both front ends call. That shape is the invariant, not a detail of
+  headless read path, which both front ends call — and inside its plan sibling
+  `read_only_explain`, behind the MCP server's `explain`, whose plain `EXPLAIN` also runs on a
+  read-only session, since planning can run a function that writes. That shape is the invariant, not a detail of
   it: the guard being a
   *step* the launcher had to remember is how one `return` came to be all that stood between a
   read-only connection and a file, and how three of the four re-run affordances came to rest on

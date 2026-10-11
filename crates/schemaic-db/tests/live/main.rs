@@ -127,6 +127,7 @@ live_suite!(
         a_session_pinned_to_the_gates_lexer_still_writes,
         a_read_only_pinned_session_refuses_a_write_a_select_hides,
         a_read_only_explain_analyze_refuses_a_write_a_select_hides,
+        a_read_only_plan_refuses_a_write_its_planner_makes,
         a_read_only_stream_refuses_a_write_a_select_hides,
         a_read_only_batch_refuses_a_write_a_select_hides,
     ],

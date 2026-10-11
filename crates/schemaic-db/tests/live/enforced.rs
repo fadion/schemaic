@@ -186,6 +186,72 @@ pub async fn a_read_only_explain_analyze_refuses_a_write_a_select_hides(target: 
     scratch.teardown().await;
 }
 
+/// **A plan is not inert, so a read-only one runs on a read-only session.**
+/// The plain `EXPLAIN` executes nothing *of the statement* — but MySQL and
+/// MariaDB run a stored function to materialise a derived table or fold a
+/// constant while planning, and PostgreSQL evaluates an `IMMUTABLE` function at
+/// plan time, which may call a volatile one. Each emptied the table through a
+/// plain `EXPLAIN` on an ordinary session, read-only connection or not, and the
+/// MCP server's `explain` tool asks exactly this with nobody at the keyboard.
+pub async fn a_read_only_plan_refuses_a_write_its_planner_makes(target: &'static Target) {
+    let (scratch, t) = seeded(target, "enforce_plan").await;
+    let sql = match scratch.db.engine() {
+        schemaic_db::Engine::Postgres => {
+            scratch
+                .exec(
+                    "CREATE FUNCTION fold_purge() RETURNS int IMMUTABLE LANGUAGE plpgsql AS \
+                     $$ BEGIN PERFORM purge_all(); RETURN 1; END $$",
+                )
+                .await;
+            "SELECT fold_purge()"
+        }
+        _ => "SELECT * FROM (SELECT purge_all() AS x) d",
+    };
+    let got = scratch
+        .db
+        .explain(
+            Some(&scratch.database),
+            sql,
+            false,
+            true,
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        rows_left(&scratch, &t).await,
+        "3",
+        "{}: a read-only plan let its planner delete ({got:?})",
+        target.name
+    );
+    assert!(got.is_err(), "{}: the write was not refused", target.name);
+    // A plan of a write: PostgreSQL plans it in a read-only transaction
+    // (`EXPLAIN` alone never reaches the executor's read-only check); MySQL and
+    // MariaDB refuse to, and the refusal says so in Schemaic's words rather
+    // than as "Cannot execute statement".
+    let write = scratch
+        .db
+        .explain(
+            Some(&scratch.database),
+            &format!("DELETE FROM {t}"),
+            false,
+            true,
+            CancellationToken::new(),
+        )
+        .await;
+    match scratch.db.engine() {
+        schemaic_db::Engine::Postgres => {
+            write.unwrap_or_else(|e| panic!("{}: a read-only plan of a DELETE: {e}", target.name));
+        }
+        _ => assert!(
+            matches!(&write, Err(schemaic_db::DbError::Refused(m)) if m.contains("read-only")),
+            "{}: {write:?}",
+            target.name
+        ),
+    }
+    assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
+    scratch.teardown().await;
+}
+
 /// The *All rows* export re-runs the tab's statement, so on a read-only
 /// connection its stream is refused the hidden write the run was.
 pub async fn a_read_only_stream_refuses_a_write_a_select_hides(target: &'static Target) {

@@ -4,7 +4,8 @@
 //! and the MCP server's `run_query` tool. They had every reason to drift apart:
 //! same gate, same timeout, same normalisation, two copies, and only one of
 //! them getting a fix. What differs between them is what they do with the rows,
-//! which is the caller's business and stays there.
+//! which is the caller's business and stays there. A plan — the MCP server's
+//! `explain` — is a read too, and [`read_only_explain`] takes the same gate.
 //!
 //! The gate is [`schemaic_core::sql::read_only_reason`], and it is **strictly
 //! stronger than the editor's** `run_verdict`: an allowlist of read-only
@@ -150,6 +151,37 @@ pub async fn read_only_query(
     .await
     {
         Some(r) => r.map_err(|e| NoRows::Failed(e.to_string())),
+        None => Err(NoRows::TimedOut(timeout)),
+    }
+}
+
+/// The plan of a **read**, or why not — the MCP server's `explain` tool.
+///
+/// **Behind the same gate as [`read_only_query`]**, although a plan executes
+/// nothing: the planner is not inert. PostgreSQL folds an `IMMUTABLE`
+/// function's call at plan time — and nothing stops such a function writing —
+/// and a statement this path would plan is one `run_query` would refuse to run,
+/// so a model has no reason to ask for it. Only ever the plain form: `analyze`
+/// is `false`, so the statement is never run to be measured, and `read_only`
+/// is `true` for whatever the engine does with it regardless.
+pub async fn read_only_explain(
+    db: &Db,
+    database: Option<&str>,
+    sql: &str,
+    timeout: Duration,
+) -> Result<schemaic_core::plan::QueryPlan, NoRows> {
+    let stmt = gate(sql, db.engine().dialect())?;
+    let token = CancellationToken::new();
+    match crate::deadline::with_deadline(
+        db.explain(database, stmt, false, true, token.clone()),
+        token,
+        timeout,
+    )
+    .await
+    {
+        Some(r) => r
+            .map(|rs| schemaic_core::plan::QueryPlan::from_result(&rs))
+            .map_err(|e| NoRows::Failed(e.to_string())),
         None => Err(NoRows::TimedOut(timeout)),
     }
 }

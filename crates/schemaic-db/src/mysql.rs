@@ -5324,10 +5324,27 @@ pub(crate) async fn explain(
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     let (primary, fallback) = explain_commands(sql, analyze);
+    // **The plain form is not inert either**: to plan, the server runs a stored
+    // function that materialises a derived table or folds into a constant, and
+    // a plain `EXPLAIN` emptied a table that way. So a read-only plan runs on a
+    // read-only session too.
     if !analyze {
-        return db
-            .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel)
-            .await;
+        return match read_only {
+            true => db
+                .fetch_query_enforced(
+                    database,
+                    &primary,
+                    EXPLAIN_ROW_CAP,
+                    cancel,
+                    crate::Enforce::ReadOnly,
+                )
+                .await
+                .map_err(read_only_plan_refusal),
+            false => {
+                db.fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel)
+                    .await
+            }
+        };
     }
     match (
         explain_in_rolled_back_tx(db, database, &primary, read_only, cancel.clone()).await,
@@ -5338,6 +5355,24 @@ pub(crate) async fn explain(
             explain_in_rolled_back_tx(db, database, &fb, read_only, cancel).await
         }
         (other, _) => other,
+    }
+}
+
+/// A read-only plan's failure, said as what it is when the server refused to
+/// plan a write at all. MySQL and MariaDB answer `EXPLAIN DELETE …` inside a
+/// read-only transaction with error 1792, "Cannot execute statement in a READ
+/// ONLY transaction" — true of no statement the user ran. The transaction
+/// cannot be dropped for a write's plan: `EXPLAIN DELETE … WHERE id = f()`
+/// runs `f` while planning as readily as a `SELECT` does.
+fn read_only_plan_refusal(e: DbError) -> DbError {
+    match e {
+        DbError::Query(m) if m.contains("1792") => DbError::Refused(
+            "This connection is read-only, and MySQL and MariaDB will not plan a write inside \
+             the read-only transaction that stops a plan from writing. Plan the statement's \
+             SELECT form instead."
+                .to_string(),
+        ),
+        other => other,
     }
 }
 
@@ -5688,6 +5723,24 @@ mod explain_tests {
     fn explain_commands_strips_trailing_semicolon_and_space() {
         let (primary, _) = explain_commands("  SELECT 1 ;  ", false);
         assert_eq!(primary, "EXPLAIN SELECT 1");
+    }
+
+    #[test]
+    fn a_refused_plan_of_a_write_says_why_and_other_failures_pass_through() {
+        let refused = super::read_only_plan_refusal(DbError::Query(
+            "Server error: `ERROR 1792 (25006): Cannot execute statement in a READ ONLY \
+             transaction'"
+                .to_string(),
+        ));
+        assert!(
+            matches!(&refused, DbError::Refused(m) if m.contains("read-only")),
+            "{refused:?}"
+        );
+        let other = DbError::Query("ERROR 1146: Table 'x' doesn't exist".to_string());
+        assert!(matches!(
+            super::read_only_plan_refusal(other),
+            DbError::Query(m) if m.contains("1146")
+        ));
     }
 }
 /// What a cancelled import reports, given what its `ROLLBACK` achieved.

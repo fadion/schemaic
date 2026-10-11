@@ -3346,7 +3346,8 @@ fn render_ai_context(
              describe_table tools (search_objects finds tables and columns by part of their \
              name; describe_table gives one table's DDL, foreign keys, and sample rows) and run \
              read-only queries (a single SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statement) with the \
-             run_query tool. Use them when they help you answer."
+             run_query tool; the explain tool shows a query's plan and its likely performance \
+             problems without running it. Use them when they help you answer."
         }
         AiData::OnRequest => {
             "You can inspect the live schema with the list_schema, search_objects and \

@@ -12291,7 +12291,8 @@ existing prose was left alone.
     date beside today's time, a stamp a day in the past from the one control whose whole job is the
     current instant. A caller that wants only the day still wants `Date::today`.
   - `plan.rs` — `QueryPlan::from_result` parses an `EXPLAIN` result into a table + heuristic
-    warnings (full scan / filesort / temp table); `to_prompt_text` for the AI.
+    warnings (full scan / filesort / temp table); `to_prompt_text` for the AI — the plan modal's
+    hand-off and the MCP server's `explain` reply.
     **SQL Server's plan is not a table but an XML document per statement**, and it is read into
     the same tabular `QueryPlan` rather than a second shape the modal would have to learn: a result
     whose one column is `SHOWPLAN_COLUMN` (`Microsoft SQL Server 2005 XML Showplan`, the name
@@ -15739,8 +15740,27 @@ existing prose was left alone.
   not the guarantee it looks like: it undoes an InnoDB write but not a MyISAM or Aria one, and on
   PostgreSQL `setval`/`nextval` are never rolled back, so a measured `SELECT setval(…)` moved the
   sequence for good. With the flag, `mysql::explain_in_rolled_back_tx` opens `START TRANSACTION READ
-  ONLY` and `pg::explain` opens `BEGIN READ ONLY`, which refuse both; plain `EXPLAIN` only plans and
-  is untouched, and SQLite's `explain` never executes, so the flag is moot there. SQL Server has
+  ONLY` and `pg::explain` opens `BEGIN READ ONLY`, which refuse both. **Plain `EXPLAIN` takes the
+  flag too, because planning is not inert**, and this entry used to say it was untouched: MySQL and
+  MariaDB run a stored function to materialise a derived table or fold a constant while planning,
+  and PostgreSQL evaluates an `IMMUTABLE` function's call at plan time, which may call a volatile
+  one. Measured live: on PostgreSQL `EXPLAIN SELECT fold()`, `fold` an `IMMUTABLE` plpgsql function
+  that `PERFORM`s a deleting one, emptied a table; on MariaDB `EXPLAIN SELECT 1 FROM other WHERE id =
+  purge_all()` and `EXPLAIN SELECT * FROM (SELECT purge_all() AS x) d` both ran the `DETERMINISTIC`
+  function and emptied it — so the GUI's Plan on a read-only connection was a write path, and the
+  MCP server's `explain` would have been one with nobody at the keyboard. So with the flag
+  `pg::explain` runs the plain form through `fetch_query` with `Enforce::ReadOnly`, and
+  `mysql::explain` through `fetch_query_enforced(…, Enforce::ReadOnly)`. **That costs the MySQL
+  family the plan of a write on a read-only connection**: both refuse to plan `EXPLAIN DELETE …`
+  inside a read-only transaction (error 1792, "Cannot execute statement in a READ ONLY
+  transaction", true of nothing the user ran), and the transaction cannot be dropped for a write's
+  plan, since `EXPLAIN DELETE … WHERE id = f()` runs `f` while planning as readily as a `SELECT`
+  does. `mysql::read_only_plan_refusal` turns 1792 into a `DbError::Refused` that says so and points
+  at the statement's `SELECT` form, and passes every other failure through
+  (`a_refused_plan_of_a_write_says_why_and_other_failures_pass_through`). PostgreSQL still plans a
+  write in a read-only transaction, `EXPLAIN` alone never reaching the executor's read-only check.
+  SQLite's `EXPLAIN QUERY PLAN` takes `Enforce::ReadOnly` as well, for uniformity rather than
+  need — nothing executes there. SQL Server has
   no read-only transaction to open, so `mssql::explain_setup` keeps the guarantee the other way
   round: the measured plan runs inside a `BEGIN TRANSACTION` that is never committed, and with the
   flag the statement must first pass `sql::read_only_reason` — `DbError::Refused` otherwise —
@@ -18747,7 +18767,15 @@ existing prose was left alone.
   `a_read_only_batch_refuses_a_write_a_select_hides` (`run_batch_enforced`, with a read ahead of the
   hidden write, so the batch must answer read-then-refused). Each runs an unenforced control that
   must succeed, so the refusal is the session's and not a function that fails anyway — and the
-  stream and batch controls assert the table then *is* empty. SQLite's batch leg is pure, in
+  stream and batch controls assert the table then *is* empty.
+  `a_read_only_plan_refuses_a_write_its_planner_makes` is the plain `EXPLAIN`'s case, for the
+  editor's Plan and the MCP server's `explain` at once, and its statement is the planner's rather
+  than the executor's: an `IMMUTABLE` plpgsql function that `PERFORM`s `purge_all()` on
+  PostgreSQL, `SELECT * FROM (SELECT purge_all() AS x) d` on the MySQL family. It was red on
+  MariaDB and PostgreSQL before `Db::explain`'s plain form honoured `read_only` — the rows deleted —
+  and green on all three legs after. It has no unenforced control; it asserts the refusal and the
+  three rows, and then that a read-only plan of `DELETE FROM t` answers on PostgreSQL and is a
+  `DbError::Refused` naming "read-only" on MySQL/MariaDB. SQLite's batch leg is pure, in
   `sqlite.rs` (`a_read_only_batch_refuses_a_write_and_still_reads`). **The `sql_mode` pin has no
   case here**: no leg sets a mode that moves a quote, so the smuggle `AsJudged` closes on the MySQL
   family was measured once, by hand, on a throwaway MariaDB 11.8, and what holds it now is
@@ -22413,6 +22441,12 @@ existing prose was left alone.
     `read_only_query`'s `Enforce::ReadOnly` to `Enforce::None` passed the whole suite, since
     in-memory SQLite has no statement that passes its text gate and writes. The editor's twin is
     `every_editor_sql_path_runs_on_a_session_enforcing_read_only`.
+    `a_headless_plan_never_executes_the_statement` sits beside it for the MCP server's `explain`:
+    every `.explain(` in the same two files must pass the literals `false, true` as its third and
+    fourth top-level arguments — `analyze`, which would execute the statement, and `read_only` — and
+    a floor of one call across both files fails a needle that stops matching. A source gate for the
+    same reason: SQLite, the one engine the suite reaches, ignores `analyze`, so no behavioural test
+    could tell. Seen red with `analyze` flipped to `true`.
   - `stored.rs` — `Stored<T>`, **a persisted store the UI can read freely and write only by
     saving**. `formats`, `db_colors`, `table_colors` and `db_favorites` used to sit on `Ui` as public
     `RwSignal`s beside three public save closures (`save_formats`, `save_db_colors`,
@@ -22610,7 +22644,9 @@ existing prose was left alone.
     `width: 100%` *plus* a 12px margin, which is 24px too wide because margins sit outside the
     width — column-flex stretch subtracts them and a percentage does not.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
-    via `TabsActions::run_plan` → `Db::explain`. SQL Server's plan needed no change here: it
+    via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
+    read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
+    `mysql::read_only_plan_refusal`'s sentence, rather than drawn (`schemaic-db`'s entry). SQL Server's plan needed no change here: it
     arrives as the same tabular `QueryPlan` (under `core::plan`), and the two warning kinds only
     it produces, `MissingIndex` and `ServerWarning`, take the warning colour through the `_ =>`
     arm that keeps `theme::error` for `FullScan` alone.
@@ -24719,7 +24755,7 @@ existing prose was left alone.
     *overview* asks `mcp::listed_databases` (so the assistant's tools agree with its prompt about
     what this session can see), and so does `search_objects` without a `database`, which searches
     that same overview, while `list_schema {"database": …}`, `search_objects {"database": …}`,
-    `describe_table` and `run_query` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
+    `describe_table`, `run_query` and `explain` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
     walks through anyway would be theatre. The MCP subprocess is handed a **blob, not a signal**
     (`hidden` on the endpoint JSON, absent in older blobs → nothing hidden), so hiding a database
     mid-session takes effect on the next one, exactly as the system prompt beside it does. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the
@@ -30661,7 +30697,7 @@ existing prose was left alone.
     same reason. `listed` is what `list` prints; `list --all` is what shows the rest, with their
     status, so a human can see *why* an expected connection is unreachable.
   - `cli/query.rs` — **the one headless read path, and both non-GUI front ends are on it**:
-    `schemaic query` and the MCP server's `run_query` — and `tables` and `describe`, whose canned SQL
+    `schemaic query` and the MCP server's `run_query` and `explain` — and `tables` and `describe`, whose canned SQL
     (`catalog.rs`) is a query the user did not type. Written twice they would have had every
     reason to drift — same gate, same timeout, same normalisation, and only one of them getting the
     next fix. The gate is
@@ -30711,6 +30747,22 @@ existing prose was left alone.
     what is returned, and `ResultSet::truncated` is the front end's to pass on — a caller silently
     told a capped result was the whole answer has been given a wrong answer by a command that
     succeeded.
+    **`read_only_explain` is the plan of a read, behind the same `gate`**, then `Db::explain` under
+    `deadline::with_deadline`, parsed by `core::plan::QueryPlan::from_result` — the MCP server's
+    `explain` tool. Gated although a plan executes nothing, because the planner is not inert —
+    PostgreSQL folds an `IMMUTABLE` function's call at plan time, and nothing stops such a function
+    writing — and because a statement `run_query` would refuse to run has no reason to be planned.
+    **Only ever the plain form**: `analyze` is `false`, since the analysing form executes the
+    statement to measure it, inside a rollback a MyISAM table or a DDL statement does not honour
+    (`Db::explain`'s doc). **`read_only` is `true`, and on the plain form it is a read-only
+    session**, as `read_only_query`'s `Enforce::ReadOnly` is: the text gate does not see into a
+    view's body (above), or into what a function the planner calls goes on to call, and a plain
+    `EXPLAIN` emptied a table that way on PostgreSQL and on MariaDB (`schemaic-db`'s entry has the
+    probes, and `a_read_only_plan_refuses_a_write_its_planner_makes`). The plan of a write is
+    therefore refused outright on MySQL/MariaDB — which the gate refuses first anyway — and SQL
+    Server's `SHOWPLAN_XML` executes nothing and needs no session. Both `bool`s are positional, which is what a later edit
+    flips without anything failing (SQLite, the one engine the suite can reach, ignores `analyze`),
+    so `a_headless_plan_never_executes_the_statement` pins them in source (`ui/source_gate.rs`).
   - `cli/catalog.rs` — the canned SQL behind `schemaic tables` and `schemaic describe <table>`: two
     pure builders, `tables_sql(dialect, database)` and `describe_sql(dialect, database, table)`, and
     `DESCRIBE_COLUMNS`. **Text run through `query::read_only_query`, not a `Db` method of its
@@ -31123,11 +31175,11 @@ existing prose was left alone.
     `relation does not exist` for a table `list_schema` just showed it
     (`the_mcp_notice_says_when_there_is_no_default_database`). `connect` is handed a `ConnArgs` with
     `password_stdin: false`, `mcp` having no such flag.
-  - `cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and five
+  - `cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and six
     tools, none of which writes anything. It was `app/mcp.rs` until `schemaic mcp` needed it, and it
     lives here so that the second way in is the same server rather than a copy of its gates —
-    `schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The five (`run_query`,
-    `list_schema`, `describe_table`, `search_objects`, `propose_table_change`) are described
+    `schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The six (`run_query`,
+    `explain`, `list_schema`, `describe_table`, `search_objects`, `propose_table_change`) are described
     for **this** connection's engine and listed for **this** connection's access levels and **this** host:
     `tools_list(engine, reads_data, schema, host)` builds
     `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
@@ -31187,7 +31239,7 @@ existing prose was left alone.
     (`run_query_takes_a_database_and_uses_it`). The panel lists the same tools, so it has the
     argument too, which the SCHEMA eye's rule already allows for: `run_query` answers in full, a
     hidden database included.
-    **The five are a type — `McpTool` — and that is what makes the advertised array and the gates one
+    **The six are a type — `McpTool` — and that is what makes the advertised array and the gates one
     set.** They used to be written out independently in five places the compiler related to nothing:
     the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
     `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
@@ -31275,6 +31327,25 @@ existing prose was left alone.
     matched arm by arm into this server's own sentences, because `NoRows::message` points a refused
     write at `schemaic exec` and the assistant's route to a write is `propose_table_change` — in the
     panel; standalone it has none. Same refusal, right advice for whoever is reading it.
+    **`explain` is `run_query`'s twin for a plan, and it stands exactly where `run_query` does.**
+    Same inputs — `sql`, required, and the optional `database` through `tool_database` — and the
+    same gate, through `query::read_only_explain`; the reply is `core::plan`'s `to_prompt_text`,
+    the server's own rows and then the warnings its heuristics found, or "(the server returned no
+    plan)". Never the analysing form, which executes the statement (`query.rs`'s entry).
+    **It reads row data, and `reads_row_data` says so**: a plan is not free of the data, because
+    MySQL's `EXPLAIN` reads a `const` table to plan it and answers "Impossible WHERE noticed after
+    reading const tables" exactly when no row has that key — an existence oracle over values, one
+    key per call. So below `AiData::Full` it is withheld and refused with `NO_DATA_ACCESS`, whose
+    two wordings now name both tools (`only_the_query_and_plan_tools_count_as_reading_rows`).
+    `reads_schema` answers `false`, as `run_query`'s does: the plan names the tables and indexes of
+    a statement the model wrote, which is what `run_query` on the same text would tell it. Its
+    refusals and failures are `run_query`'s sentences, through the shared `no_rows_reply`, since it
+    is `run_query`'s gate that refused it. `explain_is_gated_as_run_query_is` holds `offered` equal
+    for the two at every level and host, refuses a call at the data level through `call`, and has
+    the gate turn away `DELETE FROM t` and an empty statement — those two by calling the tool
+    function directly rather than through the serve loop, because the gate's parse there overflows
+    a debug test thread's 2 MiB stack (`run_query`'s does too), where the real server runs on
+    `run::block_on_own_stack`.
     **The statement deadline is a property of the server, not of one tool.** `QUERY_TIMEOUT` (30 s)
     existed, its doc named the reason — "a backstop against `SLEEP()` / heavy scans holding the
     connection open" — and it was wired to exactly one of the **four** database reads this server
@@ -31383,8 +31454,9 @@ existing prose was left alone.
     (`the_answer_is_the_newest_version_the_client_can_know`). The loop keeps what was agreed, and
     `tools/list` goes through `annotated`: from `2025-03-26` on — the revision that introduced
     them — every tool carries `annotations: {readOnlyHint}` from `McpTool::read_only`, an
-    exhaustive match that answers `true` for all five (`run_query` runs on a read-only session,
-    `search_objects` reads only the catalogue, `propose_table_change` runs nothing). A `2024-11-05` session, or a `tools/list` sent before the
+    exhaustive match that answers `true` for all six (`run_query` runs on a read-only session,
+    `explain` plans without the analysing form that would run the statement, `search_objects`
+    reads only the catalogue, `propose_table_change` runs nothing). A `2024-11-05` session, or a `tools/list` sent before the
     handshake, gets the list as it always was
     (`a_2025_session_is_told_every_tool_is_read_only`).
     **`search_objects` is Find-Anywhere's question asked over this server's two reads, not a third
@@ -31668,7 +31740,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic mcp` is a second way into that same server rather than a new path: its `run_query` is
   the same call, the connection it serves has passed `cli/select.rs`'s `cli_access` gate like every
   subcommand's, and the one tool that could lead toward a write, `propose_table_change`, is not
-  offered there at all.
+  offered there at all. The server's `explain` tool is the same gate again — `query::gate`, inside
+  `read_only_explain` — and **the same session half**: it passes `Db::explain` `read_only = true`,
+  which puts even the plain `EXPLAIN` on a read-only session, since planning ran a writing function
+  on PostgreSQL and MariaDB (`schemaic-db`'s entry). It never asks for the analysing form, and
+  `a_headless_plan_never_executes_the_statement` pins both literals in source.
   **A head is a spelling, not a read, and this paragraph called the gate read-only while it was
   not.** `SELECT setval('s', 1000)`, `SELECT lo_unlink(…)`, PostgreSQL's `SELECT 1 INTO newtable` and
   a `SELECT` of a function whose body `DELETE`s all passed it and wrote through both front ends —
@@ -31765,7 +31841,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   span and asserts both halves, because either alone is the bug: the launch has to refuse, and the
   refusal has to be about the connection being launched.
 - **A row reaches the model only where `AiData` says it may, and the level is the connection's.**
-  Every path that can put a cell value in a prompt — `run_query`, `describe_table`'s samples, the
+  Every path that can put a cell value in a prompt — `run_query`, the `explain` tool (whose MySQL
+  plan says whether a key exists, `cli/mcp.rs`'s entry), `describe_table`'s samples, the
   grid's attach-to-chat, AI Summary, AI Fill, AI Seed — is gated on
   `connection::AiData::{may_query, may_attach}`, resolved from **the connection the data came
   from** — `grid::ai_data_of` keys on `GridState::conn_at_load`, the id snapshotted when the rows

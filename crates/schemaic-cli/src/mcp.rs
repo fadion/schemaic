@@ -383,6 +383,7 @@ const INVALID_REQUEST: i64 = -32600;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpTool {
     RunQuery,
+    Explain,
     ListSchema,
     DescribeTable,
     SearchObjects,
@@ -391,8 +392,9 @@ pub enum McpTool {
 
 impl McpTool {
     /// Every tool, in the order `tools/list` advertises them.
-    pub const ALL: [McpTool; 5] = [
+    pub const ALL: [McpTool; 6] = [
         McpTool::RunQuery,
+        McpTool::Explain,
         McpTool::ListSchema,
         McpTool::DescribeTable,
         McpTool::SearchObjects,
@@ -403,6 +405,7 @@ impl McpTool {
     pub fn name(self) -> &'static str {
         match self {
             McpTool::RunQuery => "run_query",
+            McpTool::Explain => "explain",
             McpTool::ListSchema => "list_schema",
             McpTool::DescribeTable => "describe_table",
             McpTool::SearchObjects => "search_objects",
@@ -416,6 +419,7 @@ impl McpTool {
     pub fn ai_name(self) -> &'static str {
         match self {
             McpTool::RunQuery => "mcp__schemaic__run_query",
+            McpTool::Explain => "mcp__schemaic__explain",
             McpTool::ListSchema => "mcp__schemaic__list_schema",
             McpTool::DescribeTable => "mcp__schemaic__describe_table",
             McpTool::SearchObjects => "mcp__schemaic__search_objects",
@@ -436,7 +440,12 @@ impl McpTool {
     /// advertised by one rule and denied by another.
     pub fn reads_row_data(self) -> bool {
         match self {
-            McpTool::RunQuery => true,
+            // **A plan is not free of the data.** MySQL's `EXPLAIN` reads a
+            // `const` table to plan it, and answers "Impossible WHERE noticed
+            // after reading const tables" exactly when no row has that key —
+            // an existence oracle over values, one key per call. So `explain`
+            // stands wherever `run_query` does and nowhere else.
+            McpTool::RunQuery | McpTool::Explain => true,
             McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
@@ -464,7 +473,9 @@ impl McpTool {
     /// this path — it reaches only `listed_databases`.
     pub fn reads_schema(self) -> bool {
         match self {
-            McpTool::RunQuery => false,
+            // A plan names the tables and indexes of a statement the model
+            // wrote — what `run_query` on the same text would tell it.
+            McpTool::RunQuery | McpTool::Explain => false,
             // A name search is the existence oracle `propose_table_change`'s
             // note above describes, asked on purpose.
             McpTool::ListSchema
@@ -479,12 +490,14 @@ impl McpTool {
     ///
     /// All of them do, and that is the server's whole shape rather than a
     /// coincidence: `run_query` goes through `read_only_query` on a read-only
-    /// session, `search_objects` reads only the catalogue, and
+    /// session, `explain` plans without the analysing form that would run the
+    /// statement, `search_objects` reads only the catalogue, and
     /// `propose_table_change` runs nothing — its DDL goes to the user's
     /// preview. Asked per tool all the same, so a new one has to answer.
     pub fn read_only(self) -> bool {
         match self {
             McpTool::RunQuery
+            | McpTool::Explain
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
@@ -505,6 +518,7 @@ impl McpTool {
         match self {
             McpTool::ProposeTableChange => true,
             McpTool::RunQuery
+            | McpTool::Explain
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects => false,
@@ -534,7 +548,7 @@ const NO_SCHEMA_ACCESS: &str = "Refused: the user's Schema context setting is No
 /// setting, because the model's next move should be to ask the user for the
 /// values (or to change the level) rather than to retry the same call.
 const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set so the assistant \
-     reads no rows on its own, so run_query is unavailable. Ask the user for the values you need \
+     reads no rows on its own, so run_query and explain are unavailable. Ask the user for the values you need \
      — they can attach rows from a result grid, or raise the connection's AI data access \
      setting.";
 
@@ -543,7 +557,8 @@ const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set s
 /// model passing it on would send the user looking for a grid that is not
 /// there.
 const NO_DATA_ACCESS_STANDALONE: &str = "Refused: this connection's AI data access, set in \
-     Schemaic, lets no assistant read rows on its own, so run_query is unavailable. Ask the user \
+     Schemaic, lets no assistant read rows on its own, so run_query and explain are unavailable. Ask the \
+     user \
      for the values you need — or ask them to set the connection's AI data access to \"Let it \
      read data\" in Schemaic's connection settings and restart this server.";
 
@@ -618,6 +633,32 @@ pub fn tools_list(
                         "type": "string",
                         "description": "The database to run in, as list_schema names it. Defaults \
                                         to the connection's active database."
+                    }
+                },
+                "required": ["sql"]
+            }
+        },
+        {
+            "name": "explain",
+            "description": format!(
+                "Show the query plan for ONE read-only query (a SELECT, or WITH … SELECT) — which \
+                 indexes it uses, where it scans, sorts or spills — followed by the likely \
+                 performance problems. The statement is planned, never executed, so the plan \
+                 carries the optimiser's estimates rather than measured times. The connection \
+                 is {}, so write it in that dialect.",
+                dialect.engine_label(),
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "The statement to plan, without EXPLAIN in front."
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "The database to plan in, as list_schema names it. \
+                                        Defaults to the connection's active database."
                     }
                 },
                 "required": ["sql"]
@@ -800,12 +841,16 @@ async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
             .filter(|s| !s.is_empty())
     };
     // Exhaustive, with no catch-all: the unknown name was refused above, so a
-    // fifth variant fails to compile here rather than falling into an arm
+    // new variant fails to compile here rather than falling into an arm
     // written for something else.
     let (text, is_error) = match tool {
         McpTool::RunQuery => {
             let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
             run_query(db, tool_database(args, database), sql).await
+        }
+        McpTool::Explain => {
+            let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
+            explain(db, tool_database(args, database), sql).await
         }
         McpTool::ListSchema => list_schema(db, arg("database"), database, hidden, reads_data).await,
         McpTool::DescribeTable => match arg("table") {
@@ -932,17 +977,36 @@ where
 /// assistant's route to a write is `propose_table_change`. Same refusal, right
 /// advice for whoever is reading it.
 async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
-    use crate::query::NoRows;
     match crate::query::read_only_query(db, database, sql, MCP_ROW_CAP, QUERY_TIMEOUT).await {
         Ok(rs) => (format_table(&rs), false),
-        Err(NoRows::Empty) => ("Empty query.".to_string(), true),
-        Err(NoRows::NotARead(reason) | NoRows::NotPermitted(reason)) => {
+        Err(e) => no_rows_reply(e),
+    }
+}
+
+/// The `explain` tool: [`crate::query::read_only_explain`]'s plan, as
+/// `core::plan` writes it for a model — the server's own rows, then the
+/// warnings its heuristics found. Refused in `run_query`'s words, since it is
+/// `run_query`'s gate that refused it.
+async fn explain(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
+    match crate::query::read_only_explain(db, database, sql, QUERY_TIMEOUT).await {
+        Ok(plan) if plan.rows.is_empty() => ("(the server returned no plan)".to_string(), false),
+        Ok(plan) => (plan.to_prompt_text(), false),
+        Err(e) => no_rows_reply(e),
+    }
+}
+
+/// A headless read's refusal or failure, in the words a model is given.
+fn no_rows_reply(e: crate::query::NoRows) -> (String, bool) {
+    use crate::query::NoRows;
+    match e {
+        NoRows::Empty => ("Empty query.".to_string(), true),
+        NoRows::NotARead(reason) | NoRows::NotPermitted(reason) => {
             (format!("Rejected: {reason}."), true)
         }
-        Err(NoRows::Failed(e)) => (format!("Query error: {e}"), true),
+        NoRows::Failed(e) => (format!("Query error: {e}"), true),
         // A read never reports `Indeterminate` — that is a write's timeout —
         // but a read-only session makes the two the same event here anyway.
-        Err(NoRows::TimedOut(d) | NoRows::Indeterminate(d)) => (
+        NoRows::TimedOut(d) | NoRows::Indeterminate(d) => (
             format!("Query timed out ({}s) and was cancelled.", d.as_secs()),
             true,
         ),
@@ -1757,8 +1821,9 @@ mod tests {
     /// One predicate decides both halves, so a tool can never be listed by one
     /// rule and refused by another.
     #[test]
-    fn only_the_query_tool_counts_as_reading_rows() {
+    fn only_the_query_and_plan_tools_count_as_reading_rows() {
         assert!(McpTool::RunQuery.reads_row_data());
+        assert!(McpTool::Explain.reads_row_data());
         for schema_tool in [
             McpTool::ListSchema,
             McpTool::DescribeTable,
@@ -1907,6 +1972,7 @@ mod tests {
                 names,
                 [
                     "run_query",
+                    "explain",
                     "list_schema",
                     "describe_table",
                     "search_objects"
@@ -2129,6 +2195,43 @@ mod tests {
         assert_eq!(
             call(&ep, "run_query", r#"{"sql":"SELECT 1"}"#).await,
             (super::NO_DATA_ACCESS.to_string(), true)
+        );
+    }
+
+    /// **`explain` stands wherever `run_query` does, and behind its gate.** A
+    /// plan reads the data (MySQL's const-table "Impossible WHERE" answers
+    /// whether a key exists), so the data level withholds it; and the statement
+    /// it plans is refused by `run_query`'s own read-only gate before anything
+    /// is dialled — the endpoint here reaches nothing, so getting past the gate
+    /// would read as a connection failure rather than a rejection.
+    #[tokio::test]
+    async fn explain_is_gated_as_run_query_is() {
+        for host in [super::Host::Panel, super::Host::Standalone] {
+            for reads in [false, true] {
+                for schema in [false, true] {
+                    assert_eq!(
+                        McpTool::Explain.offered(reads, schema, host),
+                        McpTool::RunQuery.offered(reads, schema, host),
+                        "{host:?} rows={reads} schema={schema}"
+                    );
+                }
+            }
+        }
+        let ep = unreachable(false, true, super::Host::Standalone);
+        assert_eq!(
+            call(&ep, "explain", r#"{"sql":"SELECT 1"}"#).await,
+            (super::NO_DATA_ACCESS_STANDALONE.to_string(), true)
+        );
+        let ep = unreachable(true, true, super::Host::Standalone);
+        // Straight to the tool rather than through `call`: the gate's parse
+        // under the serve loop overflows a debug test thread's 2 MiB stack —
+        // `run_query`'s too — where the real server runs on its own
+        // (`run::block_on_own_stack`).
+        let (text, err) = super::explain(&ep.db, None, "DELETE FROM t").await;
+        assert!(err && text.starts_with("Rejected: "), "{text}");
+        assert_eq!(
+            super::explain(&ep.db, None, " ; ").await,
+            ("Empty query.".to_string(), true)
         );
     }
 

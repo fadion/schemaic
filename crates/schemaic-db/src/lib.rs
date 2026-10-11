@@ -1175,6 +1175,14 @@ impl Db {
     /// safe even for `UPDATE`/`DELETE`. `analyze` is different: it **executes** the
     /// statement to measure it, so callers must gate it to read-only statements.
     ///
+    /// **But planning is not inert.** MySQL and MariaDB run a stored function to
+    /// materialise a derived table or fold a constant, and PostgreSQL evaluates
+    /// an `IMMUTABLE` function's call, which may call a volatile one — each
+    /// emptied a table through a plain `EXPLAIN`. So `read_only` reaches the
+    /// plain form too, as an [`Enforce::ReadOnly`] session
+    /// (`a_read_only_plan_refuses_a_write_its_planner_makes`). SQL Server's
+    /// `SHOWPLAN_XML` compiles without running anything.
+    ///
     /// MariaDB spells the analyzing form `ANALYZE <stmt>`, not `EXPLAIN ANALYZE`
     /// (which it rejects as a syntax error *before* running anything), so when the
     /// `EXPLAIN ANALYZE` attempt fails we retry with `ANALYZE`. On MySQL the reverse
@@ -1221,9 +1229,24 @@ impl Db {
                 // the toggle on the statement being read-only.
                 let stmt = sql.trim().trim_end_matches(';').trim_end();
                 let plan = format!("EXPLAIN QUERY PLAN {stmt}");
-                return self
-                    .fetch_query(database, &plan, EXPLAIN_ROW_CAP, cancel)
-                    .await;
+                // Nothing here executes, but `read_only` is honoured as on the
+                // other engines rather than reasoned away.
+                match read_only {
+                    true => {
+                        self.fetch_query_enforced(
+                            database,
+                            &plan,
+                            EXPLAIN_ROW_CAP,
+                            cancel,
+                            Enforce::ReadOnly,
+                        )
+                        .await
+                    }
+                    false => {
+                        self.fetch_query(database, &plan, EXPLAIN_ROW_CAP, cancel)
+                            .await
+                    }
+                }
             }
             Engine::MySql => mysql::explain(self, database, sql, analyze, read_only, cancel).await,
             Engine::MsSql => mssql::explain(self, database, sql, analyze, read_only, cancel).await,

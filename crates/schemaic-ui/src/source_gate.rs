@@ -695,6 +695,57 @@ mod headless_read_session_gate {
             );
         }
     }
+
+    /// **A headless plan never runs the statement.** `Db::explain`'s
+    /// `analyze` executes it to measure it, inside a rollback that a MyISAM
+    /// table or DDL does not honour, so the headless path — `query::read_only_explain`,
+    /// behind the MCP server's `explain` — passes `analyze = false`, and
+    /// `read_only = true` besides. Positional `bool`s are exactly what a later
+    /// edit flips without anything failing: no in-memory SQLite statement
+    /// could tell, since SQLite ignores `analyze` altogether.
+    #[test]
+    fn a_headless_plan_never_executes_the_statement() {
+        let mut calls = 0usize;
+        for file in ["schemaic-cli/query.rs", "schemaic-cli/mcp.rs"] {
+            let body = super::workspace_source(file);
+            let mut from = 0usize;
+            while let Some(rel) = body[from..].find(".explain(") {
+                let open = from + rel + ".explain".len();
+                // The top-level arguments, to the matching `)`.
+                let (mut depth, mut start, mut args) = (0usize, open + 1, Vec::new());
+                for (k, c) in body[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                args.push(body[start..open + k].trim().to_string());
+                                from = open + k;
+                                break;
+                            }
+                        }
+                        ',' if depth == 1 => {
+                            args.push(body[start..open + k].trim().to_string());
+                            start = open + k + 1;
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    args.get(2).map(String::as_str) == Some("false")
+                        && args.get(3).map(String::as_str) == Some("true"),
+                    "{file}: a headless `explain` must pass `analyze = false, read_only = \
+                     true` as literals — ANALYZE runs the statement: {args:?}"
+                );
+                calls += 1;
+            }
+        }
+        assert!(
+            calls >= 1,
+            "the needle stopped matching: no `.explain(` in the headless read path — a \
+             gate that scans nothing reports success"
+        );
+    }
 }
 
 /// The MCP server's deadline gates — over `schemaic-cli/mcp.rs`, whose own

@@ -709,6 +709,10 @@ pub(crate) async fn explain(
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     let stmt = sql.trim().trim_end_matches(';').trim_end();
+    // **The plain form is not inert either**: the planner evaluates an
+    // `IMMUTABLE` function's call, and such a function may `PERFORM` a volatile
+    // one that writes — a plain `EXPLAIN` emptied a table that way. So a
+    // read-only plan runs in a read-only transaction too.
     if !analyze {
         return fetch_query(
             db,
@@ -716,7 +720,7 @@ pub(crate) async fn explain(
             &format!("EXPLAIN {stmt}"),
             &mut crate::RowDest::Capped(10_000),
             cancel,
-            None,
+            read_only.then_some(crate::Enforce::ReadOnly),
         )
         .await;
     }
