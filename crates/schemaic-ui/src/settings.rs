@@ -1795,6 +1795,7 @@ pub(crate) fn theme_settings_overlay(
     let comma_style = layout.comma_style;
     let statement_gap = layout.statement_gap;
     let join_on_own_line = layout.join_on_own_line;
+    let river = layout.river;
     let table_aliases = layout.table_aliases;
     let show_whitespace = layout.show_whitespace;
     let indent_guides = layout.indent_guides;
@@ -1949,6 +1950,14 @@ pub(crate) fn theme_settings_overlay(
                 ),
             ))
             .style(ctrl);
+            let river_row = focusable_toggle_row(
+                "Right-align clause keywords",
+                "Line SELECT, FROM, WHERE and the rest up on their right edge, each \
+                 clause's body beside its keyword, instead of a keyword on a line of its own.",
+                river,
+                ring.clone(),
+                185,
+            );
             let join_on_row = focusable_toggle_row(
                 "Join condition on its own line",
                 "Put a join's ON, and the AND and OR of its condition, on a line of \
@@ -1973,6 +1982,7 @@ pub(crate) fn theme_settings_overlay(
                 case_section,
                 commas_section,
                 gap_section,
+                river_row,
                 join_on_row,
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));

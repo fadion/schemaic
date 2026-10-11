@@ -85,6 +85,7 @@ fn format_sql_under(
     f.leading_commas = style.commas == CommaStyle::Leading;
     f.gap = style.gap;
     f.join_on_own_line = style.join_on_own_line;
+    f.river = style.river;
     f.run(&toks);
     let out = f.out.trim_end();
     if sql.ends_with('\n') {
@@ -218,6 +219,9 @@ pub struct FormatStyle {
     pub gap: StatementGap,
     /// A join's `ON` opens a line of its own, one in from the join.
     pub join_on_own_line: bool,
+    /// Clause keywords right-aligned on one edge, each body on its keyword's
+    /// line — the "river" layout — in place of a keyword on a line of its own.
+    pub river: bool,
 }
 
 impl From<KeywordCase> for FormatStyle {
@@ -1463,7 +1467,21 @@ struct Fmt<'a> {
     /// Inside a join condition laid out on its own line: its `AND`/`OR`
     /// break to the `ON`'s indent rather than the join's.
     in_on: bool,
+    /// The river layout ([`FormatStyle::river`]).
+    river: bool,
+    /// A subquery's `(` was just written under the river: its first clause
+    /// keyword stays on the paren's line rather than breaking.
+    river_inline_head: bool,
+    /// Where the current line's text starts in `out`, past its indent — what
+    /// [`Fmt::line_cols`] counts from.
+    line_body_start: usize,
 }
+
+/// The width the river's keywords right-align to: `SELECT`'s, and that of
+/// every other head of a query's first line (`DELETE`, `UPDATE`, `INSERT`,
+/// `VALUES`). A longer keyword (`RETURNING`) stands at the edge and runs past
+/// it.
+const RIVER: usize = 6;
 
 /// One open `CASE`: the indent of the line it opened on, the paren depth it
 /// opened at (its `WHEN`/`ELSE`/`END` are the ones at that depth), and whether
@@ -1509,6 +1527,9 @@ impl<'a> Fmt<'a> {
             join_on_own_line: false,
             joined: false,
             in_on: false,
+            river: false,
+            river_inline_head: false,
+            line_body_start: 0,
         }
     }
 
@@ -1648,6 +1669,7 @@ impl<'a> Fmt<'a> {
             for _ in 0..level.col {
                 self.out.push(' ');
             }
+            self.line_body_start = self.out.len();
             self.line_indent = level;
             self.line_has_content = false;
         } else if self.line_has_content
@@ -1657,9 +1679,33 @@ impl<'a> Fmt<'a> {
             self.out.push(' ');
         }
         self.tight_next = false;
+        self.river_inline_head = false;
         self.out.push_str(text);
         self.line_has_content = true;
         self.prev = Some((kind, text.to_string()));
+    }
+
+    /// How many characters the current line holds past its indent.
+    fn line_cols(&self) -> usize {
+        self.out[self.line_body_start..].chars().count()
+    }
+
+    /// The indent of the column the current line has reached — where the
+    /// next character would go, less one for the space before it.
+    fn here(&self) -> Ind {
+        Ind {
+            col: self.line_indent.col + self.line_cols(),
+            ..self.line_indent
+        }
+    }
+
+    /// The river's line for a keyword `word` long: `base`, padded so the
+    /// word ends on the river's edge.
+    fn river_at(&self, word: &str) -> Ind {
+        Ind {
+            col: self.base.col + RIVER.saturating_sub(word.chars().count()),
+            ..self.base
+        }
     }
 
     /// Would writing `text` with no space in front of it butt two characters
@@ -1935,8 +1981,15 @@ impl<'a> Fmt<'a> {
                     let deferred = if trailing { self.pending.take() } else { None };
                     self.emit(kind, text, false);
                     // A line comment runs to EOL; whatever follows must be on a
-                    // new line at the current structural indent.
-                    self.break_to(deferred.unwrap_or(self.line_indent));
+                    // new line at the current structural indent — under the
+                    // river, the body's column, since a head's line is the
+                    // edge's and not its body's.
+                    let fallback = if self.river {
+                        self.content
+                    } else {
+                        self.line_indent
+                    };
+                    self.break_to(deferred.unwrap_or(fallback));
                 }
                 Kind::BlockComment => {
                     self.emit(kind, text, false);
@@ -2125,9 +2178,18 @@ impl<'a> Fmt<'a> {
                         self.emit(Kind::Word, text, false);
                     } else if up == "CASE" && self.prev_word_upper().as_deref() != Some("END") {
                         // Opens a frame; `END CASE`'s word closes one instead.
+                        // Under the river its branches hang from the `CASE`
+                        // itself, which is where its line's body starts.
                         self.emit(Kind::Word, text, false);
+                        let indent = if self.river {
+                            let mut at = self.here();
+                            at.col -= text.chars().count();
+                            at
+                        } else {
+                            self.line_indent
+                        };
                         self.cases.push(CaseFrame {
-                            indent: self.line_indent,
+                            indent,
                             depth: self.parens.len(),
                             laid_out: !in_expr,
                         });
@@ -2186,7 +2248,18 @@ impl<'a> Fmt<'a> {
                             || output_head)
                     {
                         self.limit_depth = (up == "LIMIT").then_some(self.parens.len());
-                        self.break_to(self.base);
+                        // The river right-aligns the keyword on its edge — save
+                        // where a statement starts, and a subquery's first
+                        // keyword, which stays on its paren's line.
+                        let inline = self.river && self.river_inline_head;
+                        if !inline {
+                            let at = if self.river && self.prev.is_some() {
+                                self.river_at(text)
+                            } else {
+                                self.base
+                            };
+                            self.break_to(at);
+                        }
                         self.emit(Kind::Word, text, false);
                         // Attach any followers on the same line.
                         let folls = head_followers(&up);
@@ -2197,20 +2270,40 @@ impl<'a> Fmt<'a> {
                             self.emit(Kind::Word, toks[k + 1].1, false);
                             k += 1;
                         }
-                        self.content = self.base + 1;
-                        self.break_to(self.content);
+                        if self.river {
+                            // The body goes on, and a list continues under its
+                            // first item.
+                            self.content = Ind {
+                                col: self.here().col + 1,
+                                ..self.line_indent
+                            };
+                        } else {
+                            self.content = self.base + 1;
+                            self.break_to(self.content);
+                        }
                         self.joined = false;
                         self.in_on = false;
                     } else if !in_expr && self.is_join_break(&up) {
                         // A join keyword (JOIN/LEFT/…) breaks to the content
-                        // indent before emitting.
-                        self.break_to(self.content);
+                        // indent before emitting — on the river's edge, under
+                        // the river.
+                        let to = if self.river {
+                            self.river_at(text)
+                        } else {
+                            self.content
+                        };
+                        self.break_to(to);
                         self.emit(Kind::Word, text, false);
                         self.joined = true;
                         self.in_on = false;
                     } else if up == "ON" && self.join_on_own_line && self.joined && !in_expr {
                         // The join's condition, one in from the join.
-                        self.break_to(self.content + 1);
+                        let to = if self.river {
+                            self.river_at(text)
+                        } else {
+                            self.content + 1
+                        };
+                        self.break_to(to);
                         self.emit(Kind::Word, text, false);
                         self.in_on = true;
                     } else if !in_expr
@@ -2218,8 +2311,11 @@ impl<'a> Fmt<'a> {
                         && !(up == "AND" && self.suppress_and)
                     {
                         // A boolean AND/OR breaks to the content indent — or to
-                        // the `ON`'s, inside a join condition on its own line.
-                        let to = if self.in_on {
+                        // the `ON`'s, inside a join condition on its own line;
+                        // under the river, to its edge either way.
+                        let to = if self.river {
+                            self.river_at(text)
+                        } else if self.in_on {
                             self.content + 1
                         } else {
                             self.content
@@ -2253,7 +2349,23 @@ impl<'a> Fmt<'a> {
                             saved_joined: self.joined,
                             saved_on: self.in_on,
                         });
-                        if sub {
+                        if sub && self.river {
+                            // On the paren's line, with a river of its own:
+                            // its edge falls where its first keyword ends.
+                            self.joined = false;
+                            self.in_on = false;
+                            let first = toks[k + 1..]
+                                .iter()
+                                .find(|(kind, _)| *kind == Kind::Word)
+                                .map_or("", |(_, w)| *w);
+                            let here = self.here();
+                            self.base = Ind {
+                                col: here.col.saturating_sub(RIVER.saturating_sub(first.len())),
+                                ..here
+                            };
+                            self.content = self.base;
+                            self.river_inline_head = true;
+                        } else if sub {
                             self.joined = false;
                             self.in_on = false;
                             self.base = self.line_indent + 1;
@@ -2272,8 +2384,11 @@ impl<'a> Fmt<'a> {
                                 self.base = p.saved_base;
                                 self.content = p.saved_content;
                             } else if p.subquery {
-                                let close = self.base.up();
-                                self.break_to(close);
+                                // The river closes it on its last line.
+                                if !self.river {
+                                    let close = self.base.up();
+                                    self.break_to(close);
+                                }
                                 self.emit(Kind::Punct, ")", true);
                                 self.base = p.saved_base;
                                 self.content = p.saved_content;
@@ -2822,6 +2937,145 @@ mod tests {
         assert!(out.contains("join b\n"), "{out}");
         assert!(out.contains(") x\n"), "the outer ON moves too:\n{out}");
         assert!(out.contains("on x.id = t.id"), "{out}");
+    }
+
+    fn river() -> FormatStyle {
+        FormatStyle {
+            river: true,
+            ..FormatStyle::default()
+        }
+    }
+
+    /// `styled` under `style`, asserting a second format moves nothing.
+    fn settled(sql: &str, style: FormatStyle) -> String {
+        let once = styled(sql, style);
+        assert_eq!(styled(&once, style), once, "a second format moved:\n{once}");
+        once
+    }
+
+    /// The river: each clause keyword right-aligned on the end of `SELECT`,
+    /// its body on the same line, so every body starts in one column; a
+    /// join's and a condition's keywords join the same edge.
+    #[test]
+    fn the_river_right_aligns_the_clause_keywords() {
+        assert_eq!(
+            settled(
+                "select a, b from t join u on u.id = t.u_id left join v using (id) \
+                 where x = 1 and y = 2 order by a",
+                river()
+            ),
+            "select a,\n       b\n  from t\n  join u on u.id = t.u_id\n  left join v using (id)\n \
+             where x = 1\n   and y = 2\n order by a"
+        );
+        // A list continues under its first item, wherever the head ends.
+        assert_eq!(
+            settled(
+                "select a, count(*) from t group by a, b having count(*) > 1 limit 10",
+                river()
+            ),
+            "select a,\n       count(*)\n  from t\n group by a,\n          b\nhaving count(*) > 1\n \
+             limit 10"
+        );
+    }
+
+    #[test]
+    fn the_river_lays_out_writes() {
+        assert_eq!(
+            settled("update t set a = 1, b = 2 where id = 3", river()),
+            "update t\n   set a = 1,\n       b = 2\n where id = 3"
+        );
+        assert_eq!(
+            settled("insert into t (a, b) values (1, 2), (3, 4)", river()),
+            // `t(a, b)` tight, as the block layout writes it too.
+            "insert into t(a, b)\nvalues (1, 2),\n       (3, 4)"
+        );
+        assert_eq!(
+            settled("delete from t where id = 1", river()),
+            "delete from t\n where id = 1"
+        );
+    }
+
+    /// A subquery starts on its paren's line and keeps a river of its own,
+    /// aligned under its first keyword; its `)` closes on its last line.
+    #[test]
+    fn a_subquery_keeps_its_own_river() {
+        assert_eq!(
+            settled(
+                "select a from t where id in (select id from u where z = 1) and b = 2",
+                river()
+            ),
+            "select a\n  from t\n where id in (select id\n                from u\n               \
+             where z = 1)\n   and b = 2"
+        );
+        assert_eq!(
+            settled("with x as (select 1 as a) select a from x", river()),
+            "with x as (select 1 as a)\nselect a\n  from x"
+        );
+        assert_eq!(
+            settled("select a from t union all select b from u", river()),
+            "select a\n  from t\n union all\nselect b\n  from u"
+        );
+    }
+
+    /// A `CASE`'s branches indent from the `CASE` itself, not from the line
+    /// it happens to start on.
+    #[test]
+    fn a_case_in_the_river_hangs_from_its_case() {
+        assert_eq!(
+            settled(
+                "select case when a then 1 else 2 end as x, b from t",
+                river()
+            ),
+            "select case\n         when a then 1\n         else 2\n       end as x,\n       b\n  \
+             from t"
+        );
+    }
+
+    /// The join's own line under the river: `ON` and its `AND`s join the
+    /// edge too.
+    #[test]
+    fn a_joins_on_in_the_river_joins_the_edge() {
+        let style = FormatStyle {
+            river: true,
+            join_on_own_line: true,
+            ..FormatStyle::default()
+        };
+        assert_eq!(
+            settled(
+                "select * from t left join u on u.id = t.id and u.x = 1",
+                style
+            ),
+            "select *\n  from t\n  left join u\n    on u.id = t.id\n   and u.x = 1"
+        );
+    }
+
+    /// A body's statements keep their indent unit, and the river is spaces
+    /// after it — a tab can indent, never align.
+    #[test]
+    fn the_river_aligns_with_spaces_after_the_indent() {
+        assert_eq!(
+            settled("create procedure p() begin select a from t; end", river()),
+            "create procedure p()\nbegin\n  select a\n    from t;\nend"
+        );
+        let sql = "create procedure p() begin select a from t where b = 1; end";
+        assert_eq!(
+            format_range(sql, 0, sql.len(), "\t", SqlDialect::MySql, river()),
+            "create procedure p()\nbegin\n\tselect a\n\t  from t\n\t where b = 1;\nend"
+        );
+    }
+
+    /// Only whitespace moves: the river's output is the same tokens as the
+    /// block layout's.
+    #[test]
+    fn the_river_moves_only_whitespace() {
+        let sql = "select a, (select max(b) from u where u.id = t.id) as m from t \
+                   join u on u.id = t.id where a in (1, 2) and not exists (select 1 from v) \
+                   group by a order by a desc limit 5";
+        let squash = |s: String| s.split_whitespace().collect::<String>();
+        assert_eq!(
+            squash(settled(sql, river())),
+            squash(styled(sql, FormatStyle::default()))
+        );
     }
 
     // These tests predate the dialect parameter and assert MySQL formatting; a thin

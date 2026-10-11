@@ -13251,7 +13251,8 @@ existing prose was left alone.
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
     A line's indent is an `Ind { lv, col }` — `lv` indent units, then `col` spaces of alignment, two
     parts because a unit may be a tab and an alignment never can be; the block layout moves only
-    `lv` (`ind + 1` adds a level, `up()` steps one out, never below the margin). `Fmt::run` is a loop
+    `lv` (`ind + 1` adds a level, `up()` steps one out, never below the margin), and `col` is the
+    river's (`FormatStyle::river`, below). `Fmt::run` is a loop
     over `Fmt::step(toks, k)`, which lays out one token — and any follower it takes with it, a
     head's `BY`, a `BEGIN`'s `TRY` — and answers the next index, so a layout can be tried and taken
     back; the per-token arms below are `step`'s.
@@ -13290,7 +13291,7 @@ existing prose was left alone.
     `CommaStyle` is `Trailing` (the default, *End of line*: the formatter as it always was) or
     `Leading` (*Start of line*), serialised and read leniently exactly as `KeywordCase` is, an
     unknown word being `Trailing` (`comma_style_defaults_to_end_of_line_and_reads_leniently`). The
-    settings travel as a `FormatStyle { case, commas, gap, join_on_own_line }`, and `format_range`/`format_statement`
+    settings travel as a `FormatStyle { case, commas, gap, join_on_own_line, river }`, and `format_range`/`format_statement`
     take `impl Into<FormatStyle>`, with `From<KeywordCase>` putting every other setting at its
     default — so a caller or test that passes a bare `KeywordCase` says nothing about the rest and
     is unchanged. `format_sql` stays at the defaults. `format_sql_under` takes the whole
@@ -13339,6 +13340,33 @@ existing prose was left alone.
     `) x` each answer for their own join. What was one branch for a join keyword and `AND`/`OR`
     together is three — the join break, the `ON`, the `AND`/`OR` — since the last now asks which
     indent it breaks to.
+    **The river is the fifth**, a `bool` too — `FormatStyle::river`, off by default. On, each clause
+    keyword is right-aligned on one edge and its body goes on the keyword's own line, so the bodies
+    share a column: `select a,⏎       b⏎  from t⏎ where x = 1⏎   and y = 2`. The edge is
+    `const RIVER: usize = 6`, `SELECT`'s width and that of every head of a query's first line; a
+    longer head such as `RETURNING` takes no pad and runs past the edge. All of
+    it is in `Fmt::step`. A head breaks to `Fmt::river_at(word)` — `base`, padded in `Ind::col` so
+    the word ends on the edge — save at a statement's start (`prev` is `None`, so no pad) and at a
+    subquery's first head, which stays on its paren's line (`Fmt::river_inline_head`, **cleared by
+    every `emit`**, so it answers only for the token straight after the `(`). There is no break
+    after the head: `content` becomes the column just past the head and its followers
+    (`Fmt::here()`, whose `line_cols()` counts from `Fmt::line_body_start`, set where `emit` writes
+    a line's indent), so a list continues under its first item wherever the head ended —
+    `group by a,⏎          b`. A head with a follower aligns its *first* word, and the `BY` runs
+    past the edge. Join keywords, a join's own-line `ON` and `AND`/`OR` break to `river_at` of their
+    own word, so a `left join` puts `left` on the edge (`a_joins_on_in_the_river_joins_the_edge`).
+    **A subquery's `(` does not break**: its `base` is the paren's column less the pad its first
+    keyword will have, so the subquery's own river lines up under that keyword, and its `)` closes
+    on its last line instead of on a line of its own (`a_subquery_keeps_its_own_river`). Two
+    things the block layout took from `line_indent` read differently here, because under the river a
+    line's indent is its keyword's pad, not where its body starts: a laid-out `CASE`'s frame indent
+    is the `CASE` word's own column (`here()` less the word), so `WHEN`/`ELSE` hang one unit in from
+    it and `END` returns to it (`a_case_in_the_river_hangs_from_its_case`); and a line comment's
+    fallback break is `content`, the body's column, where it is `line_indent` otherwise. With a tab
+    unit the levels are tabs and the river's alignment is spaces after them
+    (`the_river_aligns_with_spaces_after_the_indent`). Only whitespace moves, held against the
+    default layout's tokens (`the_river_moves_only_whitespace`); every river test also formats its
+    output again through a `settled` helper that asserts nothing moves.
     **`formattable_range` is what decides how much of the document a Format may touch**, and it is
     here rather than at the call site because `format_sql` lexes what it is handed **from byte 0**
     and takes that for a real token boundary. True of a whole document and of a selection whose ends
@@ -13484,7 +13512,15 @@ existing prose was left alone.
     that joins two strings where `newline_continues_strings`, kept as a token of its own. The
     *Format statement* of each statement alone, spliced back, and `single_line` wherever it does
     not refuse are held to the same (`the_corpus_formats_idempotently_on_every_engine`,
-    under `intel`'s tests for where the corpus lives). It compared non-blank characters until
+    under `intel`'s tests for where the corpus lives). **Each layout setting is a second layout and
+    is held to the same two properties** over the same corpus and engines —
+    `the_corpus_formats_idempotently_under_every_layout_setting`, for a list `styles` of non-default
+    `FormatStyle`s (the river; the river with `join_on_own_line`, `StatementGap::Keep` and leading
+    commas; `join_on_own_line` with `StatementGap::None`) — never a keyword case, which changes a
+    token's text by design — where a second format must move nothing and
+    `what_it_says` must not change. The formatter's own tests pin a setting a shape at a time, and
+    this is where a shape none of them thought of shows up. **A new layout setting joins
+    `styles`**; a setting left off it is held to neither property here. It compared non-blank characters until
     then, which is blind to every split and fusion this formatter can make — `END//` and
     `END / /`, `between .1` and `between.1`, `- ~5` and `-~ 5` have the same ink — and a census
     taken with `sqlfmt::tokenize` itself agrees with itself about a token it mis-splits, so the
@@ -27891,12 +27927,14 @@ existing prose was left alone.
     **Between statements** after that (*One blank line* by default, focus order 180 —
     `UiState::format_statement_gap`, pinned by
     `format_statement_gap_defaults_to_one_and_keeps_a_choice`; `LayoutUi::statement_gap`), then
-    the section's one switch, **Join condition on its own line** (a `focusable_toggle_row`, off by
-    default, focus order 190 — `UiState::format_join_on_own_line`, pinned by
+    the section's two switches, each a `focusable_toggle_row` off by default: **Right-align clause
+    keywords** (focus order 185 — `UiState::format_river`, pinned by
+    `format_river_defaults_off_and_keeps_an_on`; `LayoutUi::river`), and **Join condition on its
+    own line** (focus order 190 — `UiState::format_join_on_own_line`, pinned by
     `format_join_on_own_line_defaults_off_and_keeps_an_on`; `LayoutUi::join_on_own_line`). What
     each does to the text is the `core/sqlfmt.rs` entry's. **They reach the formatter as one
     value**: the theme state holds a single `format_style: RwSignal<FormatStyle>`, and the app
-    composes it in one `create_effect` beside the other editor-setting effects, from the four
+    composes it in one `create_effect` beside the other editor-setting effects, from the five
     signals Settings edits one at a time, into `theme::set_format_style` — which replaced a setter
     per setting. `theme::format_style()` reads it **untracked** and the setter bumps no
     `editor_gen`, because nothing is drawn from it: Format Code (`format_editor`'s `format_range`)

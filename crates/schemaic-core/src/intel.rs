@@ -27786,6 +27786,57 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     }
 
+    /// **Every layout setting holds the same two properties** over the same
+    /// corpus: a second Format Code moves nothing, and nothing the statement
+    /// says changes. A setting is a second layout, and the formatter's own
+    /// tests pin each one a shape at a time — this is where a shape none of
+    /// them thought of shows up. A new layout setting joins `styles`.
+    #[test]
+    fn the_corpus_formats_idempotently_under_every_layout_setting() {
+        use crate::sqlfmt::{FormatStyle, StatementGap};
+        let styles = [
+            FormatStyle {
+                river: true,
+                ..FormatStyle::default()
+            },
+            FormatStyle {
+                river: true,
+                join_on_own_line: true,
+                gap: StatementGap::Keep,
+                commas: crate::sqlfmt::CommaStyle::Leading,
+                ..FormatStyle::default()
+            },
+            FormatStyle {
+                join_on_own_line: true,
+                gap: StatementGap::None,
+                ..FormatStyle::default()
+            },
+        ];
+        let mut failures = Vec::new();
+        let cases = SqlDialect::ALL
+            .iter()
+            .flat_map(|&d| valid_corpus().iter().map(move |&sql| (d, sql)))
+            .chain(format_corpus().iter().copied());
+        for (d, sql) in cases {
+            let said = what_it_says(sql, d);
+            for style in styles {
+                let fmt = |s: &str| crate::sqlfmt::format_range(s, 0, s.len(), "  ", d, style);
+                let once = fmt(sql);
+                let twice = fmt(&once);
+                if twice != once {
+                    failures.push(format!(
+                        "[{d:?} {style:?}] not idempotent: {sql}\n{once}\n--\n{twice}"
+                    ));
+                } else if what_it_says(&once, d) != said {
+                    failures.push(format!(
+                        "[{d:?} {style:?}] changed what it says: {sql}\n{once}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
     #[test]
     fn corpus_valid_queries_produce_no_diagnostics() {
         let valid = valid_corpus();

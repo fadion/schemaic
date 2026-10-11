@@ -6170,6 +6170,9 @@ pub struct LayoutUi {
     /// Format Code puts a join's `ON` on its own line; one part of
     /// `theme::set_format_style`. Persisted.
     pub join_on_own_line: RwSignal<bool>,
+    /// Format Code's river layout; one part of `theme::set_format_style`.
+    /// Persisted.
+    pub river: RwSignal<bool>,
     /// Write an alias after a table completion inserts; drives
     /// `theme::set_completion_table_aliases`. Persisted.
     pub table_aliases: RwSignal<bool>,

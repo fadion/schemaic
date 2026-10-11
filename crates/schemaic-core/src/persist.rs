@@ -348,6 +348,10 @@ pub struct UiState {
     /// Format Code puts a join's `ON` on a line of its own. Default: off.
     #[serde(default)]
     pub format_join_on_own_line: bool,
+    /// Format Code right-aligns clause keywords on one edge, the river
+    /// layout. Default: off, a keyword on a line of its own.
+    #[serde(default)]
+    pub format_river: bool,
     /// Completion writes an alias after a table it inserts into a `FROM` or
     /// `JOIN` (`orders o`). Default: on.
     #[serde(default = "default_true")]
@@ -484,6 +488,7 @@ impl Default for UiState {
             format_comma_style: crate::sqlfmt::CommaStyle::Trailing,
             format_statement_gap: crate::sqlfmt::StatementGap::One,
             format_join_on_own_line: false,
+            format_river: false,
             completion_table_aliases: true,
             editor_show_whitespace: false,
             editor_indent_guides: false,
@@ -1959,6 +1964,22 @@ mod tests {
         let back: UiState =
             serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("parses");
         assert!(back.format_join_on_own_line);
+    }
+
+    /// The block layout for a new install and a file written before the
+    /// river existed, and an on stays on.
+    #[test]
+    fn format_river_defaults_off_and_keeps_an_on() {
+        assert!(!UiState::default().format_river);
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert!(!old.format_river);
+        let on = UiState {
+            format_river: true,
+            ..UiState::default()
+        };
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&on).expect("serialises")).expect("parses");
+        assert!(back.format_river);
     }
 
     /// Completion writes table aliases for a new install and a file written
