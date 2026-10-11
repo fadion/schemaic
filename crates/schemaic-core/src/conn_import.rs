@@ -74,6 +74,8 @@ pub enum ImportSource {
     Pgpass,
     /// `~/.pg_service.conf` — libpq's named-service file.
     PgService,
+    /// Schemaic's own export ([`export_connections`]).
+    Schemaic,
 }
 
 impl ImportSource {
@@ -86,6 +88,7 @@ impl ImportSource {
             ImportSource::MyCnf => ".my.cnf",
             ImportSource::Pgpass => ".pgpass",
             ImportSource::PgService => ".pg_service.conf",
+            ImportSource::Schemaic => "Schemaic",
         }
     }
 }
@@ -868,6 +871,7 @@ pub fn scan(files: &[SourceFile], existing: &[Connection]) -> ImportScan {
             ImportSource::MyCnf => parse_my_cnf(&f.text),
             ImportSource::Pgpass => parse_pgpass(&f.text),
             ImportSource::PgService => parse_pg_service(&f.text),
+            ImportSource::Schemaic => parse_schemaic(&f.text),
         };
         for imp in &mut one.found {
             imp.origin = f.path.clone();
@@ -1988,6 +1992,94 @@ fn percent_decode(s: &str) -> String {
 fn looks_like_drive_path(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+// ---------------------------------------------------------------------------
+// Schemaic's own export
+// ---------------------------------------------------------------------------
+
+/// The end of an export's file name — `team.schemaic-connections.json` — and
+/// what the app's picker recognises one by, since `.json` alone is DBeaver's
+/// too.
+pub const EXPORT_FILE_SUFFIX: &str = "schemaic-connections.json";
+
+/// The export's envelope: a version, so a later shape can be told from this
+/// one, and the connections.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExportFile {
+    schemaic_connections: u32,
+    connections: Vec<Connection>,
+}
+
+/// *Export connections*: `conns` as a file to hand to someone else — or to
+/// this app on another machine, through the import ([`parse_schemaic`]).
+///
+/// **Without secrets, and without consent.** The database password, the SSH
+/// password and the SSH key's passphrase are blanked in the copy — built from
+/// the in-memory list, which holds them hydrated from the keyring, so blanking
+/// is this function's job and not the save path's. The two per-machine grants
+/// go back to their defaults: CLI access (off) and the AI data level (unset),
+/// since letting a tool or an assistant read a database on one machine is no
+/// grant on another. The id is dropped too; the import assigns a fresh one.
+/// What stays is everything another person needs to connect, paths included —
+/// a key or certificate path is no secret, and may well be the same for a team.
+pub fn export_connections(conns: &[Connection]) -> String {
+    serde_json::to_string_pretty(&ExportFile {
+        schemaic_connections: EXPORT_VERSION,
+        connections: conns.iter().cloned().map(shareable).collect(),
+    })
+    .unwrap_or_default()
+}
+
+/// The export's version — what [`parse_schemaic`] refuses to read past.
+const EXPORT_VERSION: u32 = 1;
+
+/// `c` as it may leave this machine, or arrive from another: no id, no
+/// secret, no grant. One function for both directions, so the export and the
+/// import cannot come to disagree about what a shared file may carry.
+fn shareable(mut c: Connection) -> Connection {
+    c.id = 0;
+    c.password.clear();
+    c.ssh.password.clear();
+    c.ssh.key_passphrase.clear();
+    c.cli_access = false;
+    c.ai_data = None;
+    c
+}
+
+/// Read an export ([`export_connections`]) back as rows to offer. Each comes
+/// as written — it is Schemaic's own shape — but through [`shareable`] again,
+/// so a hand-edited file can slip in neither a grant nor a password (which
+/// the next save would hand to the keyring), and the scan notes the missing
+/// passwords as for any source. A file from a newer Schemaic is refused,
+/// rather than half-read as this version.
+pub fn parse_schemaic(json: &str) -> ImportScan {
+    let mut out = ImportScan::default();
+    let file: ExportFile = match serde_json::from_str(strip_bom(json)) {
+        Ok(f) => f,
+        Err(e) => {
+            out.skip(
+                "",
+                SkipReason::Unreadable(format!("not a Schemaic connections export: {e}")),
+            );
+            return out;
+        }
+    };
+    if file.schemaic_connections > EXPORT_VERSION {
+        out.skip(
+            "",
+            SkipReason::Unreadable(format!(
+                "exported by a newer Schemaic (version {}) — update to import it",
+                file.schemaic_connections
+            )),
+        );
+        return out;
+    }
+    for c in file.connections {
+        out.found
+            .push(imported(shareable(c), ImportSource::Schemaic));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -6527,5 +6619,119 @@ mod tests {
             s.contains("still imported"),
             "a cap nobody is told about is the bug, not the fix: {s}"
         );
+    }
+
+    /// **An export carries no secret and no consent.** The three secrets are
+    /// blank in the file — not merely absent from a field — and the two
+    /// per-machine grants (CLI access, the AI data level) go back to their
+    /// defaults, since a grant on one machine is not one on another. What it
+    /// keeps comes back through the import as it was, offered rather than
+    /// written, with the missing password noted.
+    #[test]
+    fn an_export_round_trips_through_the_import_without_its_secrets() {
+        let mut c = blank(POSTGRES);
+        c.id = 7;
+        c.name = "Prod".into();
+        c.host = "db.internal".into();
+        c.user = "app".into();
+        c.password = "s3cret-db".into();
+        c.database = "shop".into();
+        c.folder = "Work".into();
+        c.read_only = true;
+        c.cli_access = true;
+        c.ai_data = Some(crate::connection::AiData::Full);
+        c.ssh = SshTunnel {
+            enabled: true,
+            host: "bastion".into(),
+            port: 22,
+            user: "me".into(),
+            password: "s3cret-ssh".into(),
+            key_passphrase: "s3cret-key".into(),
+            ..SshTunnel::default()
+        };
+        let file = export_connections(std::slice::from_ref(&c));
+        for secret in ["s3cret-db", "s3cret-ssh", "s3cret-key"] {
+            assert!(!file.contains(secret), "{secret} in the export:\n{file}");
+        }
+        let scan = scan(
+            &[SourceFile {
+                source: ImportSource::Schemaic,
+                path: "team.schemaic-connections.json".into(),
+                text: file,
+                local: None,
+            }],
+            &[],
+        );
+        assert!(scan.skipped.is_empty(), "{:?}", scan.skipped);
+        let [row] = scan.found.as_slice() else {
+            panic!("one row: {:?}", scan.found);
+        };
+        let got = &row.connection;
+        assert_eq!(
+            (got.id, got.name.as_str(), got.host.as_str()),
+            (0, "Prod", "db.internal")
+        );
+        assert_eq!(
+            (got.database.as_str(), got.folder.as_str()),
+            ("shop", "Work")
+        );
+        assert!(got.read_only && got.ssh.enabled && got.ssh.host == "bastion");
+        assert!(got.password.is_empty() && got.ssh.password.is_empty());
+        assert!(got.ssh.key_passphrase.is_empty());
+        assert!(
+            !got.cli_access && got.ai_data.is_none(),
+            "grants are not carried"
+        );
+        assert!(row.has(ImportNote::NoPassword));
+        assert_eq!(row.source.label(), "Schemaic");
+    }
+
+    /// **A hand-edited export is held to the export's rules**: a password or a
+    /// grant typed into the file does not reach the keyring or the connection
+    /// — a file somebody handed over is no channel for either — and a file
+    /// from a newer Schemaic is refused rather than half-read as this one.
+    #[test]
+    fn a_hand_edited_export_is_stripped_and_a_newer_one_refused() {
+        let mut c = blank(MYSQL);
+        c.name = "x".into();
+        c.host = "h".into();
+        let mut file: serde_json::Value =
+            serde_json::from_str(&export_connections(std::slice::from_ref(&c))).unwrap();
+        let row = &mut file["connections"][0];
+        row["password"] = "typed".into();
+        row["ssh"]["key_passphrase"] = "typed".into();
+        row["cli_access"] = true.into();
+        let s = parse_schemaic(&file.to_string());
+        let got = &s.found[0].connection;
+        assert!(got.password.is_empty() && got.ssh.key_passphrase.is_empty());
+        assert!(!got.cli_access);
+        file["schemaic_connections"] = 2.into();
+        let s = parse_schemaic(&file.to_string());
+        assert!(s.found.is_empty());
+        assert!(
+            matches!(s.skipped.as_slice(), [Skipped { reason: SkipReason::Unreadable(m), .. }] if m.contains("newer")),
+            "{:?}",
+            s.skipped
+        );
+    }
+
+    /// A file that is not an export is said to be one, not read as empty.
+    #[test]
+    fn a_file_that_is_not_an_export_is_unreadable() {
+        for text in ["{", r#"{"connections": {}}"#] {
+            let s = parse_schemaic(text);
+            assert!(s.found.is_empty());
+            assert!(
+                matches!(
+                    s.skipped.as_slice(),
+                    [Skipped {
+                        reason: SkipReason::Unreadable(_),
+                        ..
+                    }]
+                ),
+                "{text}: {:?}",
+                s.skipped
+            );
+        }
     }
 }

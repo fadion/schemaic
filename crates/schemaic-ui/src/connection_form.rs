@@ -654,6 +654,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
     let select_conn = actions.select_conn.clone();
     let new_conn = actions.new_conn.clone();
     let open_import = actions.open_import.clone();
+    let export_connections = actions.export_connections.clone();
     let save_conn = actions.save_conn.clone();
     let duplicate_conn = actions.duplicate_conn.clone();
     let delete_conn = actions.delete_conn.clone();
@@ -982,8 +983,35 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 0.0,
                 move || (import_c)(),
             );
+            // Beside it, the other direction: every connection to a file to
+            // share, without its secrets — the file Import reads back.
+            let export_c = export_connections.clone();
+            let export = in_ring_button(
+                container(
+                    h_stack((
+                        icons::icon(icons::UPLOAD, 15.0),
+                        text("Export connections").style(|s| s.font_size(theme::font_label())),
+                    ))
+                    .style(|s| {
+                        s.flex_row()
+                            .items_center()
+                            .gap(theme::scaled(8.0))
+                            .color(theme::text_dim())
+                    }),
+                )
+                .on_click_stop({
+                    let export_c = export_c.clone();
+                    move |_| (export_c)()
+                })
+                .style(menu_item_style),
+                ring.clone(),
+                NAV_TAB + 3,
+                true,
+                0.0,
+                move || (export_c)(),
+            );
 
-            let left = v_stack((list, add, import)).style(|s| {
+            let left = v_stack((list, add, import, export)).style(|s| {
                 s.width(theme::scaled(210.0))
                     .flex_shrink(0.0_f32)
                     .height_full()

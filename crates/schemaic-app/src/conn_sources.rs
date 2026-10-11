@@ -225,6 +225,8 @@ pub fn source_for_path(path: &Path) -> ImportSource {
         ".my.cnf" | "my.cnf" | "my.ini" => ImportSource::MyCnf,
         ".pgpass" | "pgpass.conf" => ImportSource::Pgpass,
         ".pg_service.conf" | "pg_service.conf" => ImportSource::PgService,
+        // Schemaic's own export, by the suffix it is always saved with.
+        n if n.ends_with(schemaic_core::conn_import::EXPORT_FILE_SUFFIX) => ImportSource::Schemaic,
         _ => ImportSource::Url,
     }
 }
@@ -475,6 +477,9 @@ mod tests {
                 ImportSource::Pgpass,
             ),
             ("/home/me/.pg_service.conf", ImportSource::PgService),
+            // Schemaic's own export, by its suffix whatever comes before it.
+            ("/x/schemaic-connections.json", ImportSource::Schemaic),
+            ("/x/Team.Schemaic-Connections.json", ImportSource::Schemaic),
         ];
         for (path, want) in cases {
             assert_eq!(source_for_path(Path::new(path)), want, "{path}");

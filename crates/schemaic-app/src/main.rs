@@ -10252,6 +10252,79 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         add_import_result(import_ui, scan);
     });
 
+    // *Export connections*: every saved connection to a file to share, without
+    // its secrets or this machine's grants (`conn_import::export_connections`,
+    // which blanks them in a copy of the hydrated in-memory list — never the
+    // on-disk `connections.json`, which holds a password in the clear wherever
+    // the keyring is unavailable). Saved under `EXPORT_FILE_SUFFIX`, the name
+    // Import's picker recognises it by; the write is atomic and off the UI
+    // thread, and a failure reaches the error modal as a file error does.
+    let export_connections: Rc<dyn Fn()> = {
+        let handle = handle.clone();
+        let file_error = file_error.clone();
+        Rc::new(move || {
+            use floem::file::{FileDialogOptions, FileSpec};
+            let opts = FileDialogOptions::new()
+                .title("Export connections")
+                .default_name(conn_import::EXPORT_FILE_SUFFIX)
+                .allowed_types(vec![FileSpec {
+                    name: "Schemaic connections",
+                    extensions: &["json"],
+                }]);
+            let handle = handle.clone();
+            let file_error = file_error.clone();
+            floem::action::save_as(opts, move |file| {
+                let Some(picked) = file.and_then(|f| f.path.first().cloned()) else {
+                    return; // cancelled
+                };
+                // The suffix is what the import keys on, so a name typed
+                // without it gets it back.
+                let name = picked
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let path = if name
+                    .to_ascii_lowercase()
+                    .ends_with(conn_import::EXPORT_FILE_SUFFIX)
+                {
+                    picked
+                } else {
+                    // The name as typed, less a `.json` of its own.
+                    // Compared as bytes: `cut` may fall inside a multi-byte
+                    // character (`日本`), and a `str` slice there panics. A
+                    // match puts it on the ASCII `.`, a char boundary.
+                    let stem = match name.len().checked_sub(5) {
+                        Some(cut) if name.as_bytes()[cut..].eq_ignore_ascii_case(b".json") => {
+                            &name[..cut]
+                        }
+                        _ => name.as_str(),
+                    };
+                    picked.with_file_name(format!("{stem}.{}", conn_import::EXPORT_FILE_SUFFIX))
+                };
+                // Not a *New connection* nobody has saved yet (`unsaved_new`):
+                // a 127.0.0.1 placeholder is nothing to share.
+                let draft = unsaved_new.get_untracked();
+                let text = connections.with_untracked(|cs| {
+                    let saved: Vec<Connection> =
+                        cs.iter().filter(|c| Some(c.id) != draft).cloned().collect();
+                    conn_import::export_connections(&saved)
+                });
+                let file_error = file_error.clone();
+                let report = create_ext_action(cx, move |res: Result<(), String>| {
+                    if let Err(e) = res {
+                        (file_error)(e);
+                    }
+                });
+                handle.spawn_blocking(move || {
+                    report(
+                        schemaic_core::persist::write_file_atomic(&path, text.as_bytes())
+                            .map_err(|e| format!("Couldn't write {}: {e}", path.display())),
+                    );
+                });
+            });
+        })
+    };
+
     // Read a source file the user pointed at, for a layout `conn_sources`
     // doesn't search — a project's own `.idea/dataSources.xml`, an export, a
     // `.env`. Which parser to use is decided from the file's name.
@@ -10344,17 +10417,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let reset_activity = reset_activity.clone();
         let switch_conn = switch_conn.clone();
         Rc::new(move || {
-            let picked: Vec<Connection> = import_ui.rows.with_untracked(|rows| {
-                import_ui.chosen.with_untracked(|chosen| {
-                    let mut idx: Vec<usize> = chosen.iter().copied().collect();
-                    // The set has no order; import in the order the list showed.
-                    idx.sort_unstable();
-                    idx.iter()
-                        .filter_map(|i| rows.get(*i))
-                        .map(|r| r.connection.clone())
-                        .collect()
-                })
-            });
+            // With whether any came from another tool — a Schemaic export
+            // carries read-only and the environment badge, so the notice below
+            // that says they were dropped is about the other sources only.
+            let (picked, any_foreign): (Vec<Connection>, bool) =
+                import_ui.rows.with_untracked(|rows| {
+                    import_ui.chosen.with_untracked(|chosen| {
+                        let mut idx: Vec<usize> = chosen.iter().copied().collect();
+                        // The set has no order; import in the order the list showed.
+                        idx.sort_unstable();
+                        let rows: Vec<&conn_import::Imported> =
+                            idx.iter().filter_map(|i| rows.get(*i)).collect();
+                        (
+                            rows.iter().map(|r| r.connection.clone()).collect(),
+                            rows.iter()
+                                .any(|r| r.source != conn_import::ImportSource::Schemaic),
+                        )
+                    })
+                });
             if picked.is_empty() {
                 return;
             }
@@ -10437,14 +10517,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Said once, here, rather than as a note on every row: it is true
             // of all of them, and a badge repeated twelve times is read zero
             // times.
-            import_ui.done.set(Some(format!(
-                "{} Read-only and the environment badge are not carried over — set them \
-                 in Manage connections for anything that matters.",
-                match added {
-                    1 => "Added 1 connection.".to_string(),
-                    n => format!("Added {n} connections."),
-                }
-            )));
+            let added_line = match added {
+                1 => "Added 1 connection.".to_string(),
+                n => format!("Added {n} connections."),
+            };
+            import_ui.done.set(Some(if any_foreign {
+                format!(
+                    "{added_line} Read-only and the environment badge are not carried over \
+                     from another client — set them in Manage connections for anything that \
+                     matters."
+                )
+            } else {
+                added_line
+            }));
         })
     };
 
@@ -12874,6 +12959,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             test_conn,
             recheck_conn: check_conn.clone(),
             open_import,
+            export_connections,
             scan_installed_clients,
             add_pasted_url,
             choose_import_file,

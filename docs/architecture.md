@@ -10211,9 +10211,10 @@ existing prose was left alone.
     caller's bug this must not hide. Both over-cap refusals use it — the binary panel's column cap
     and the app's `LOAD_CAP`.
   - `conn_import.rs` — reading connections **out of other tools**: a pasted URL/DSN, DBeaver's
-    `data-sources.json`, DataGrip's (or any JetBrains IDE's) `dataSources.xml`, and the three
+    `data-sources.json`, DataGrip's (or any JetBrains IDE's) `dataSources.xml`, the three
     plain-text files the command-line clients read — `~/.my.cnf`, `~/.pgpass`,
-    `~/.pg_service.conf`. Pure over *text*: `conn_sources` in the app finds and reads the files,
+    `~/.pg_service.conf` — and **Schemaic's own export**, the one source this module also writes
+    (`export_connections`, at the end of this entry). Pure over *text*: `conn_sources` in the app finds and reads the files,
     this decides what they mean, which is what makes the whole surface unit-testable. Every parser
     answers with `Imported` values carrying **`id: 0`** and a *suggested* name — an import is a
     proposal, and the app assigns the real id and uniquifies the name only when the user accepts a
@@ -10613,6 +10614,38 @@ existing prose was left alone.
     client group inherits, so a `[client_prod]` is read *layered on it* (what
     `--defaults-group-suffix` does); `[mysqld]` is the server's own configuration and is not a
     client at all.
+    **Schemaic's own export is the other direction, and it carries no secret and no consent.**
+    `export_connections` turns a list of connections into a pretty-printed `ExportFile` — a
+    `schemaic_connections` version (1) and the connections in this app's own shape — from a copy in
+    which the database password, the SSH password and the SSH key's passphrase are blanked, the id
+    is 0 as every parser's is, and the two per-machine grants are back at their defaults:
+    `cli_access` off and `ai_data` unset, because letting a tool or an assistant read a database on
+    one machine is no grant on another. Everything else stays, the key, certificate and SQLite
+    paths included — a path is not a secret, and a team may well share it. **It is built from the
+    hydrated in-memory list, never from the on-disk `connections.json`**, and that is load-bearing:
+    the disk copy is the one that holds every secret in the clear wherever the keyring is
+    unavailable (`core/secrets.rs`), so serialising it would export exactly what this function
+    exists to leave out — the blanking is this function's own job, not the save path's
+    `sanitize_file` (`an_export_round_trips_through_the_import_without_its_secrets`). `parse_schemaic`
+    reads it back as `ImportSource::Schemaic` rows through the ordinary `scan`, so dedupe,
+    `mark_existing` and the `NoPassword` note apply as to any source. **Both directions go through
+    one `shareable`** — id 0, the three secrets blank, both grants at their defaults — so a
+    hand-edited file can slip in neither a grant nor a password the next save would hand to the
+    keyring, and the export and the import cannot come to disagree about what a shared file may
+    carry (`a_hand_edited_export_is_stripped_and_a_newer_one_refused`). A version past
+    `EXPORT_VERSION` is refused as *exported by a newer Schemaic* rather than half-read. A file
+    that does not parse as the envelope — bad JSON, no `schemaic_connections` key — is one
+    `SkipReason::Unreadable` saying it is *not a Schemaic connections export*, not an empty scan
+    (`a_file_that_is_not_an_export_is_unreadable`). Unlike every other source, the row arrives as
+    written rather than through `blank`, so read-only, the environment and the folder come across —
+    Schemaic's own guard rails, which the reason other sources blank them (guessing another tool's
+    is worse) does not reach — and `import_chosen`'s closing notice that they were *not carried
+    over* is said only when a row from another client was among those added. The import still
+    re-picks the colour and uniquifies the name, as it does for any row.
+    `EXPORT_FILE_SUFFIX` (`schemaic-connections.json`) is the end of an export's file name and the
+    only way the app's picker tells one from DBeaver's `.json` (`conn_sources::source_for_path`);
+    the save dialog puts it back on a name typed without it, so a file renamed to plain `.json`
+    afterwards is read as a list of URLs.
   - `connection.rs` — the saved-connection model. A `Connection` is a database **server**, not one
     database — the sidebar lists all of its databases. **SQLite is the exception to that whole
     sentence**: there is no server, so `Connection::file` is the entire target and
@@ -12190,7 +12223,11 @@ existing prose was left alone.
     removing the `SecretKind` arm alone would have stranded that entry in the keyring, unread and
     undeletable through the app. The real keyring-backed store lives in `schemaic-conn`'s
     `secrets` module (the heavy `keyring`/D-Bus dep stays out of core); pure + unit-tested via an
-    in-memory fake.
+    in-memory fake. **The connections export is a separate scrub, by design, not this one**:
+    `sanitize_file` keeps plaintext on disk when the store is unavailable, which is the right
+    answer for a save and the wrong one for a file handed to someone else, so
+    `conn_import::export_connections` blanks the secrets itself in a copy of the hydrated list and
+    never reads the file this module writes.
     **Both directions of a store failure now come back as a sentence, because the machine where the
     keyring rule is quietly untrue is exactly the machine whose user needs to hear it.**
     `SecretStore::delete` returns a `bool` — *definitely gone*, which covers a delete that succeeded
@@ -22068,7 +22105,18 @@ existing prose was left alone.
     presses twice), and painted *directly above* that modal in `modals.rs` — the question is about
     the list behind it, so closing returns to it. Its own term in `modal_backdrop_up`, like
     `manage_open`'s, because it is a loose child of the layer and can outlive the modal that raised
-    it.
+    it. **"Export connections" sits under that row and is not part of this modal**: the same dim
+    `in_ring_button` (`icons::UPLOAD` beside Import's `DOWNLOAD`, ring index `NAV_TAB + 3`), calling
+    `ConnActions::export_connections`, which goes straight to a save dialog — the app's closure,
+    titled *Export connections*, defaulting to `schemaic-connections.json`. A typed name without
+    `conn_import::EXPORT_FILE_SUFFIX` gets it appended, after any `.json` of its own and in the
+    user's casing, because the suffix is the only thing *Choose a file…* recognises an export by —
+    the `.json` is compared as bytes, since a name like `日本` puts the cut inside a character, where
+    a `str` slice panics in the dialog's callback (found reviewing it, before it shipped). A *New
+    connection* nobody has saved yet (`unsaved_new`) is left out: a 127.0.0.1 placeholder is nothing
+    to share. The file is written with `persist::write_file_atomic` on `handle.spawn_blocking`; a failure
+    reaches the error modal through `file_error`, and a success says nothing. What goes in the file
+    is `core::conn_import`'s decision, under that entry.
     **Three ways in, and the modal opens empty.** A pasted *Connection URL* at the top, then
     *Choose a file…* and *Scan installed clients* beneath it, then — only once one of them has
     produced something — the review list. The URL field holds its *Add* inside it
@@ -29870,7 +29918,10 @@ existing prose was left alone.
     because libpq reads them first. Reads are capped at 4 MiB and a file that fails is silently
     skipped — this runs over paths the user never named — *except* one they picked by hand, which
     goes through `open_source` — `read_source` is that call with the error dropped — and is
-    reported by the modal.
+    reported by the modal. `source_for_path` chooses that file's parser by the name its tool gives
+    it, and Schemaic's own export by a case-insensitive `conn_import::EXPORT_FILE_SUFFIX` on the
+    end of the name, since `.json` alone is DBeaver's too
+    (`a_tools_own_file_name_picks_its_parser`).
     `password_sources` is the narrow half of that walk — today just `~/.pgpass` — for the one path
     that reads a single file: a hand-picked DataGrip export would otherwise arrive with twelve
     blank passwords that libpq's file, on the same machine, holds every one of, and whether a row

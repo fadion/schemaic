@@ -5843,6 +5843,10 @@ pub struct ConnActions {
     /// touches the filesystem, so it is the one the user asks for rather than
     /// the one that happens because a dialog opened.
     pub open_import: Rc<dyn Fn()>,
+    /// Save every connection to a file to share, without its secrets or this
+    /// machine's grants (`core::conn_import::export_connections`) — the file
+    /// the import reads back.
+    pub export_connections: Rc<dyn Fn()>,
     /// Search this machine for the files DBeaver, the JetBrains IDEs and the
     /// command-line clients keep their connections in.
     pub scan_installed_clients: Rc<dyn Fn()>,
