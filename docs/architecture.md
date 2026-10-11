@@ -37366,6 +37366,12 @@ this bundle's.
   which is the user's choice to make rather than the grid's to refuse. What it must not cost is the
   horizontal wheel: the frozen pane forwards both axes to the data pane (the scroll-sync rule
   below), so a pane frozen wide still pans the columns behind it.
+  **A frozen column's header wears a dim 2px rail down each inner edge** (`header_cell`'s
+  `frozen_rail`, `text_faint` at 0.45, `FROZEN_RAIL_W`) — the one cue that it is frozen, since the
+  cell has no room for another icon and a background tint already means *formatted*. The rails
+  are absolute, `pointer_events(false)` and stacked under `col_resize_handle`: painted rather than
+  bordered, because a border would take width from the header that its column's values do not
+  lose, and the label would stop lining up over them.
   The list used to be an inline `(0..ncols).filter(!= frozen)` — the second spelling `core::edit`
   warns about — and is now the same core list scroll-into-view sums over.
   The resulting **draw order** — frozen first, then the rest in index order — is

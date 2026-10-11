@@ -10313,167 +10313,203 @@ fn header_cell(
             .into_any()
     };
 
-    stack((content, col_resize_handle(gs, ci, key.is_some())))
-        .on_click_stop(move |_| {
-            gs.dismiss_overlays();
-            // Eligible results sort server-side (full-table ORDER BY re-run); others
-            // fall back to today's in-memory sort of the loaded page.
-            if gs.filterable() {
-                gs.cycle_server_sort(ci);
-            } else {
-                cycle_sort(sort, ci);
-            }
-        })
-        // Right-click → Freeze this column (pin left) · Copy its name or values.
-        .on_secondary_click_stop(move |_| {
-            gs.dismiss_overlays();
-            // Each column freezes on its own and joins the ones already
-            // frozen; they are drawn first, in index order (`ColLayout`).
-            let freeze_item = if gs.frozen.with_untracked(|f| f.contains(&ci)) {
-                MenuEntry::action("Unfreeze", move || {
-                    gs.frozen.update(|f| {
-                        f.remove(&ci);
-                    })
+    // **A frozen column's header wears a dim rail down each inner edge**, the
+    // cue that it is frozen — the cell has no room for another icon, and a
+    // tint is already "this column is formatted". Painted, not bordered: a
+    // border would take width from the header that its column's values below
+    // do not lose, and the label would stop lining up over them. Drawn before
+    // the resize handle so the handle stays on top of the right-hand rail.
+    let frozen_rail = move |left: bool| {
+        empty()
+            .style(move |s| {
+                let s = s
+                    .absolute()
+                    .inset_top(0.0)
+                    .inset_bottom(0.0)
+                    .width(FROZEN_RAIL_W);
+                let s = if left {
+                    s.inset_left(0.0)
+                } else {
+                    s.inset_right(0.0)
+                };
+                if gs.frozen.with(|f| f.contains(&ci)) {
+                    s.background(theme::text_faint().multiply_alpha(0.45))
+                } else {
+                    s.hide()
+                }
+            })
+            .pointer_events(|| false)
+    };
+    stack((
+        content,
+        frozen_rail(true),
+        frozen_rail(false),
+        col_resize_handle(gs, ci, key.is_some()),
+    ))
+    .on_click_stop(move |_| {
+        gs.dismiss_overlays();
+        // Eligible results sort server-side (full-table ORDER BY re-run); others
+        // fall back to today's in-memory sort of the loaded page.
+        if gs.filterable() {
+            gs.cycle_server_sort(ci);
+        } else {
+            cycle_sort(sort, ci);
+        }
+    })
+    // Right-click → Freeze this column (pin left) · Copy its name or values.
+    .on_secondary_click_stop(move |_| {
+        gs.dismiss_overlays();
+        // Each column freezes on its own and joins the ones already
+        // frozen; they are drawn first, in index order (`ColLayout`).
+        let freeze_item = if gs.frozen.with_untracked(|f| f.contains(&ci)) {
+            MenuEntry::action("Unfreeze", move || {
+                gs.frozen.update(|f| {
+                    f.remove(&ci);
                 })
-            } else {
-                MenuEntry::action("Freeze", move || {
-                    gs.frozen.update(|f| {
-                        f.insert(ci);
-                    })
+            })
+        } else {
+            MenuEntry::action("Freeze", move || {
+                gs.frozen.update(|f| {
+                    f.insert(ci);
                 })
-            };
-            // "AI summary" for the whole column: what is this field *for*? The
-            // prompt carries a sample of the loaded values, which usually settles
-            // it where the name alone wouldn't. Sampled from what's on screen —
-            // no query, so the menu stays instant.
-            let sum = gs.summarize.get_untracked();
-            let rs = gs.rs.get_untracked();
-            let (column, type_name) = rs
-                .columns
-                .get(ci)
-                .map(|c| (c.name.clone(), c.type_name.clone()))
-                .unwrap_or_default();
-            let msg = summary::column_prompt(
-                source_table(gs, Some(ci)).as_deref(),
-                &column,
-                &type_name,
-                &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
-            );
-            // `database.schema.table.column` — the shape the schema tree's
-            // column entry copies — for a column read from a real table. An
-            // expression has no such name, so it gets none; an aliased column
-            // keeps its origin, and copies the base column's real name, which
-            // is what a qualified reference to it is.
-            let qualified = rs.columns.get(ci).and_then(|c| c.origin.as_ref()).map(|o| {
-                format!(
-                    "{}.{}.{}",
-                    o.database,
-                    schemaic_core::schema::display_name(o.schema.as_deref(), &o.table),
-                    o.column
-                )
-            });
-            gs.popup_anchor.set(None); // right-click → open at the cursor
-            let name = column.clone();
-            let layout = gs.layout_untracked();
-            let mut entries = vec![freeze_item];
-            // Hide this column; bring back the ones already hidden. The last drawn
-            // column cannot go — see `ColLayout::may_hide`.
-            entries.push(
-                MenuEntry::action("Hide column", move || hide_column(gs, ci))
-                    .disabled(!layout.may_hide(ci, rs.col_count())),
-            );
-            let n_hidden = layout.hidden_in(rs.col_count());
-            if n_hidden > 0 {
-                entries.push(MenuEntry::sub(
-                    format!("Show hidden columns ({n_hidden})"),
-                    show_columns_submenu(gs, &layout),
-                ));
-            }
-            entries.extend([
-                MenuEntry::sub("Format as", format_submenu(gs, ci)),
-                MenuEntry::Separator,
-                // The name as the header shows it — an alias where the query
-                // gave one, since that is what the next query will refer to.
-                MenuEntry::action("Copy name", move || {
-                    let _ = floem::Clipboard::set_contents(name.clone());
-                }),
-            ]);
-            if let Some(q) = qualified {
-                entries.push(MenuEntry::action("Copy qualified name", move || {
-                    let _ = floem::Clipboard::set_contents(q.clone());
-                }));
-            }
+            })
+        };
+        // "AI summary" for the whole column: what is this field *for*? The
+        // prompt carries a sample of the loaded values, which usually settles
+        // it where the name alone wouldn't. Sampled from what's on screen —
+        // no query, so the menu stays instant.
+        let sum = gs.summarize.get_untracked();
+        let rs = gs.rs.get_untracked();
+        let (column, type_name) = rs
+            .columns
+            .get(ci)
+            .map(|c| (c.name.clone(), c.type_name.clone()))
+            .unwrap_or_default();
+        let msg = summary::column_prompt(
+            source_table(gs, Some(ci)).as_deref(),
+            &column,
+            &type_name,
+            &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
+        );
+        // `database.schema.table.column` — the shape the schema tree's
+        // column entry copies — for a column read from a real table. An
+        // expression has no such name, so it gets none; an aliased column
+        // keeps its origin, and copies the base column's real name, which
+        // is what a qualified reference to it is.
+        let qualified = rs.columns.get(ci).and_then(|c| c.origin.as_ref()).map(|o| {
+            format!(
+                "{}.{}.{}",
+                o.database,
+                schemaic_core::schema::display_name(o.schema.as_deref(), &o.table),
+                o.column
+            )
+        });
+        gs.popup_anchor.set(None); // right-click → open at the cursor
+        let name = column.clone();
+        let layout = gs.layout_untracked();
+        let mut entries = vec![freeze_item];
+        // Hide this column; bring back the ones already hidden. The last drawn
+        // column cannot go — see `ColLayout::may_hide`.
+        entries.push(
+            MenuEntry::action("Hide column", move || hide_column(gs, ci))
+                .disabled(!layout.may_hide(ci, rs.col_count())),
+        );
+        let n_hidden = layout.hidden_in(rs.col_count());
+        if n_hidden > 0 {
             entries.push(MenuEntry::sub(
-                "Copy values",
-                vec![
-                    MenuEntry::action("CSV", move || {
-                        let _ = floem::Clipboard::set_contents(export_column_csv(gs, ci));
-                    }),
-                    MenuEntry::action("JSON", move || {
-                        let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
-                    }),
-                    // Empty when every value is NULL — `IN ()` is no list.
-                    MenuEntry::action("SQL IN list", move || {
-                        let text = export_column_in_list(gs, ci);
-                        if !text.is_empty() {
-                            let _ = floem::Clipboard::set_contents(text);
-                        }
-                    }),
-                ],
+                format!("Show hidden columns ({n_hidden})"),
+                show_columns_submenu(gs, &layout),
             ));
-            // The column summary's prompt carries a sample of the values, so it
-            // is a data path like the cell one and is absent on a schema-only
-            // connection. (Copy is not: the clipboard is the user's own machine.)
-            if ai_offered(gs) {
-                entries.push(MenuEntry::Separator);
-                entries.push(MenuEntry::action_icon(
-                    "AI summary",
-                    (icons::SPARKLES, theme::key_foreign),
-                    move || {
-                        // Asked again at the launch, not only at the build.
-                        // `msg` was captured with real cell values in it, and a
-                        // menu can outlive the level that permitted it — the
-                        // connection's data access is changed from a settings
-                        // panel that does not close an open menu.
-                        if !ai_offered(gs) {
-                            return;
-                        }
-                        if let Some(s) = &sum {
-                            (s)(msg.clone());
-                        }
-                    },
-                ));
-            }
-            gs.open_menu(entries);
-        })
-        .style(move |s| {
-            // `with`, not `get`: `get` clones the whole widths `Vec` to read one
-            // slot, and this closure re-runs for every visible header on any
-            // selection change.
-            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
-            // Highlight the header when its column is within the cell selection.
-            let col_sel = matches!(gs.bounds(), Some((_, c0, _, c1)) if ci >= c0 && ci <= c1);
-            let formatted = gs
-                .formats
-                .with(|f| f.get(ci).map(|x| *x != ColumnFormat::None).unwrap_or(false));
-            let s = s.width(w).height(grid_header_h()).flex_shrink(0.0_f32);
-            let s = if col_sel {
-                s.background(theme::grid_col_sel())
-            } else if formatted {
-                // At-a-glance cue this column shows a formatted (not raw) value.
-                s.background(theme::dropdown_active())
-                    .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
-            } else {
-                // Opaque header background (not transparent over the header row) so
-                // a live resize where header cells briefly overlap occludes cleanly.
-                s.background(theme::bg_header_row())
-                    .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
-            };
-            // Border on every column, last included, so a narrow table still shows
-            // where the final column ends.
-            s.border_right(1.0).border_color(theme::border())
-        })
+        }
+        entries.extend([
+            MenuEntry::sub("Format as", format_submenu(gs, ci)),
+            MenuEntry::Separator,
+            // The name as the header shows it — an alias where the query
+            // gave one, since that is what the next query will refer to.
+            MenuEntry::action("Copy name", move || {
+                let _ = floem::Clipboard::set_contents(name.clone());
+            }),
+        ]);
+        if let Some(q) = qualified {
+            entries.push(MenuEntry::action("Copy qualified name", move || {
+                let _ = floem::Clipboard::set_contents(q.clone());
+            }));
+        }
+        entries.push(MenuEntry::sub(
+            "Copy values",
+            vec![
+                MenuEntry::action("CSV", move || {
+                    let _ = floem::Clipboard::set_contents(export_column_csv(gs, ci));
+                }),
+                MenuEntry::action("JSON", move || {
+                    let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
+                }),
+                // Empty when every value is NULL — `IN ()` is no list.
+                MenuEntry::action("SQL IN list", move || {
+                    let text = export_column_in_list(gs, ci);
+                    if !text.is_empty() {
+                        let _ = floem::Clipboard::set_contents(text);
+                    }
+                }),
+            ],
+        ));
+        // The column summary's prompt carries a sample of the values, so it
+        // is a data path like the cell one and is absent on a schema-only
+        // connection. (Copy is not: the clipboard is the user's own machine.)
+        if ai_offered(gs) {
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::action_icon(
+                "AI summary",
+                (icons::SPARKLES, theme::key_foreign),
+                move || {
+                    // Asked again at the launch, not only at the build.
+                    // `msg` was captured with real cell values in it, and a
+                    // menu can outlive the level that permitted it — the
+                    // connection's data access is changed from a settings
+                    // panel that does not close an open menu.
+                    if !ai_offered(gs) {
+                        return;
+                    }
+                    if let Some(s) = &sum {
+                        (s)(msg.clone());
+                    }
+                },
+            ));
+        }
+        gs.open_menu(entries);
+    })
+    .style(move |s| {
+        // `with`, not `get`: `get` clones the whole widths `Vec` to read one
+        // slot, and this closure re-runs for every visible header on any
+        // selection change.
+        let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
+        // Highlight the header when its column is within the cell selection.
+        let col_sel = matches!(gs.bounds(), Some((_, c0, _, c1)) if ci >= c0 && ci <= c1);
+        let formatted = gs
+            .formats
+            .with(|f| f.get(ci).map(|x| *x != ColumnFormat::None).unwrap_or(false));
+        let s = s.width(w).height(grid_header_h()).flex_shrink(0.0_f32);
+        let s = if col_sel {
+            s.background(theme::grid_col_sel())
+        } else if formatted {
+            // At-a-glance cue this column shows a formatted (not raw) value.
+            s.background(theme::dropdown_active())
+                .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
+        } else {
+            // Opaque header background (not transparent over the header row) so
+            // a live resize where header cells briefly overlap occludes cleanly.
+            s.background(theme::bg_header_row())
+                .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
+        };
+        // Border on every column, last included, so a narrow table still shows
+        // where the final column ends.
+        s.border_right(1.0).border_color(theme::border())
+    })
 }
+
+/// The width of [`header_cell`]'s frozen rails — a hairline's neighbour, so it
+/// reads as a mark at every scale rather than growing with the type.
+const FROZEN_RAIL_W: f64 = 2.0;
 
 /// Stage the inline editor's buffer into the cell it is open on and close it —
 /// **Enter's contract**, called by the type-aware controls, which have no text to
