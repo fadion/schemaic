@@ -13833,10 +13833,19 @@ fn repair_tsql_dependents(
     for ix in &current.indexes {
         // An included column holds the index to the column as a key one does:
         // T-SQL refuses the `ALTER COLUMN` naming it either way (Msg 5074).
-        if !ix
-            .column_names()
-            .chain(ix.include.iter().map(String::as_str))
-            .any(|c| disturbs(c, TsqlDependent::Index))
+        // So does a filter's, and a filter holds it against a **rename** too —
+        // `sp_rename` refuses a column a filtered index's condition names
+        // (Msg 5074, where a key column it renames under the index).
+        let filter_names_a_rename = ix.predicate.as_deref().is_some_and(|p| {
+            altered
+                .iter()
+                .any(|(f, t)| f.name != t.name && reads(p, &f.name))
+        });
+        if !filter_names_a_rename
+            && !ix
+                .column_names()
+                .chain(ix.include.iter().map(String::as_str))
+                .any(|c| disturbs(c, TsqlDependent::Index))
         {
             continue;
         }
@@ -17008,6 +17017,17 @@ fn remake_index(
 ) -> [Change; 2] {
     changes.retain(|c| !matches!(c, Change::RenameIndex { from, .. } if *from == ix.name));
     let mut again = rename_index(ix, renamed);
+    // A filter is text naming the columns as they were; created again after
+    // the renames, it names them as they are. Here and not in `rename_index`,
+    // which `diff` also compares the draft through — and the draft keeps the
+    // condition as it was read.
+    if let Some(p) = again.predicate.as_mut() {
+        for (from, to) in renamed {
+            if let Some(e) = repoint_check_column(p, from, to, SqlDialect::MsSql) {
+                *p = e;
+            }
+        }
+    }
     let now = index_name_after(&ix.name, ix_renamed);
     if now != ix.name {
         again.constraint = again
@@ -22423,6 +22443,47 @@ mod tests {
         t.indexes
             .push(crate::schema::IndexInfo::plain("ix_x", vec!["x"], false));
         t
+    }
+
+    /// **SQL Server will not rename a column a filtered index's condition
+    /// names** — `sp_rename` fails with Msg 5074 "The index 'ix_live' is
+    /// dependent on column 'n'" (measured on 2022). The index has to come off
+    /// before the rename and go back after, its condition naming the new
+    /// column.
+    #[test]
+    fn sql_server_remakes_a_filtered_index_around_a_rename_its_condition_names() {
+        let t = TableInfo {
+            name: "t".into(),
+            schema: Some("dbo".into()),
+            columns: vec![
+                ms_col("id", "int"),
+                ms_col("n", "int"),
+                ms_col("title", "varchar(50)"),
+            ],
+            indexes: vec![IndexInfo {
+                predicate: Some("[n] IS NOT NULL".into()),
+                ..IndexInfo::plain("ix_live", vec!["title"], false)
+            }],
+            ..Default::default()
+        };
+        let mut d = TableDraft::from_table(&t);
+        d.rename_column(1, "cnt");
+        let cs = diff(&t, &d, MsSql);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let stmts = cs.emit();
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in {stmts:#?}"))
+        };
+        assert!(at("DROP INDEX [ix_live]") < at("N'COLUMN';"), "{stmts:#?}");
+        assert!(
+            at("N'COLUMN';") < at("CREATE INDEX [ix_live]"),
+            "{stmts:#?}"
+        );
+        let create = &stmts[at("CREATE INDEX [ix_live]")];
+        assert!(create.contains("WHERE [cnt] IS NOT NULL"), "{create}");
     }
 
     /// **SQL Server will not rename or alter a column a computed column reads**

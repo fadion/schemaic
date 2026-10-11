@@ -6639,6 +6639,15 @@ existing prose was left alone.
     them, not its order, because an `ALTER COLUMN` on a column an ordered clustered columnstore
     sorts by is allowed with the index in place (measured on 2025) — and a nonclustered one's order
     names only columns it stores, which the key check already asks.
+    **A filtered index's condition holds its columns against a rename, where its key does not**:
+    `sp_rename` renames a key column under its index, but refuses one a filter names (Msg 5074
+    "The index 'ix_live' is dependent on column 'n'", measured on 2022). So the repair also takes
+    an index off and puts it back when its `predicate` reads a column the plan renames, and
+    `remake_index` repoints that predicate across the renames with `repoint_check_column` — there
+    and not in `rename_index`, which `diff_indexes` compares the draft through, and the draft keeps
+    the condition as it was read (`sql_server_remakes_a_filtered_index_around_a_rename_its_condition_names`;
+    live, `a_column_a_filtered_index_names_is_renamed`, red with Msg 5074 before and green on 2022
+    and 2025 after).
     **An XML or spatial index is written as one too, and also only on SQL Server**
     (`supports_xml_and_spatial_indexes`, the same exhaustive shape): `create_index_sql` writes
     `CREATE {method} INDEX ix ON t (col)` — `PRIMARY XML`, `SELECTIVE XML`, `XML` or `SPATIAL` —

@@ -3634,6 +3634,40 @@ async fn a_column_under_a_computed_one_is_renamed_and_retyped() {
     assert!(again.changes.is_empty(), "{:?}", again.changes);
 }
 
+/// **A column a filtered index's condition names is renamed.** `sp_rename`
+/// refuses it while the index stands (Msg 5074), so the plan takes the index
+/// off first and puts it back after, its condition naming the new column —
+/// read back filtered on it, and round-tripping to nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_a_filtered_index_names_is_renamed() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_filtered").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, n int NULL, title varchar(50) NULL); \
+         CREATE INDEX ix_live ON dbo.t (title) WHERE n IS NOT NULL",
+    )
+    .await;
+    let t = read_table(&s, "t").await;
+    let mut d = schemaic_core::ddl::TableDraft::from_table(&t);
+    let col = d.columns.iter_mut().find(|c| c.info.name == "n").unwrap();
+    col.info.name = "cnt".into();
+    let stmts = apply_draft(&s, &t, &d).await;
+    let t2 = read_table(&s, "t").await;
+    let ix = t2
+        .indexes
+        .iter()
+        .find(|i| i.name == "ix_live")
+        .unwrap_or_else(|| panic!("the index came back: {stmts:#?}"));
+    assert!(
+        ix.predicate.as_deref().is_some_and(|p| p.contains("[cnt]")),
+        "{ix:?}\n{stmts:#?}"
+    );
+    let again = schemaic_core::ddl::diff(&t2, &schemaic_core::ddl::TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+}
+
 /// **A view is altered in place and renamed by re-creating it.** A
 /// schema-bound view with a column list and a grant: `CREATE OR ALTER`
 /// changes its body keeping all three — T-SQL's `ALTER VIEW` would drop the
