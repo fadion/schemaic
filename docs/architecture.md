@@ -25320,11 +25320,14 @@ existing prose was left alone.
     a fix, and writes the answer over that diagnostic's range through `edit_untyped`: one undo step,
     refused under the Ctrl+K freeze, the caret left after the replacement. **The key is spent even
     with nothing to fix**, so a stray Alt+Enter never falls through to a newline. The tip says what
-    the key would do: `diag_hits` appends a line `Alt+Enter: <fix>` (the keycap through
-    `shortcuts::keys_label`) to a diagnostic that has one. The two do not pick alike — the tip
-    shows `diag_under`'s strongest diagnostic, fix or none, and the key `fix_at`'s strongest *with*
-    one — so where a server error covers a fixable offline warning, the tip names the error and
-    Alt+Enter still applies the warning's fix.
+    the key would do: `diag_hits` builds each message through `tip_message`, which appends a line
+    `Alt+Enter: <fix>` (the keycap through `shortcuts::keys_label`) holding **`fix_at`'s answer at
+    the squiggle's start**, over the same offline list — never the hovered diagnostic's own `fix`.
+    The two pick differently: the tip shows `diag_under`'s strongest diagnostic of every source, the
+    key `fix_at`'s strongest *fixable* offline one, so a server error over a fixable offline warning
+    once showed the error alone while Alt+Enter still applied the warning's fix. Now the error's tip
+    names that fix (`a_server_error_over_a_fixable_token_still_names_the_fix`,
+    `the_tip_shows_the_fix_the_key_would_pick_not_its_own`).
     **The same tip is a name's quick-info**, and Ctrl+click opens what the name names — both over
     `core::quickinfo`. `DiagHit` carries `name_at: Option<usize>`: where `diag_under` finds no
     squiggle, `hover_diag` asks `name_box_at`, which undoes `content_x`, `EDITOR_TEXT_TOP` and the

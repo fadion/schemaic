@@ -2540,6 +2540,29 @@ fn diag_under(hits: &[DiagHit], p: Point) -> Option<&DiagHit> {
         })
 }
 
+/// The hover text for `d`: its message, and on a second line the fix Alt+Enter
+/// would make with the caret at the squiggle's start — `intel::fix_at` over the
+/// offline diagnostics, the very call the key makes.
+///
+/// Not `d`'s own fix: the tip shows the strongest diagnostic of every source
+/// (`diag_under`), the key applies the strongest *fixable offline* one, and the
+/// two differ wherever a server error, which carries no fix, sits on a token the
+/// offline pass can correct. Reading `d.fix` showed the server's message alone
+/// over an edit the key would still make.
+fn tip_message(
+    d: &schemaic_core::intel::Diagnostic,
+    offline: &[schemaic_core::intel::Diagnostic],
+) -> String {
+    match schemaic_core::intel::fix_at(offline, d.range.0).map(|(_, _, fix)| fix) {
+        Some(fix) => format!(
+            "{}\n{}: {fix}",
+            d.message,
+            crate::shortcuts::keys_label("Alt+Enter")
+        ),
+        None => d.message.clone(),
+    }
+}
+
 /// Where a diagnostic's hover tip sits.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TipAt {
@@ -6965,7 +6988,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let diag_hits = {
         let ed = ed_syntax;
         create_memo(move |_| {
-            let mut diags = syntax.get();
+            let offline = syntax.get();
+            let mut diags = offline.clone();
             diags.extend(db_diag.get());
             diags.extend(run_diag.get());
             let vp = ed.viewport.get();
@@ -7000,14 +7024,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         bottom,
                         severity: d.severity,
                         // The fix the key would make, said where the problem is.
-                        message: match &d.fix {
-                            Some(fix) => format!(
-                                "{}\n{}: {fix}",
-                                d.message,
-                                crate::shortcuts::keys_label("Alt+Enter")
-                            ),
-                            None => d.message.clone(),
-                        },
+                        message: tip_message(d, &offline),
                         name_at: None,
                     })
                 })
@@ -8958,6 +8975,53 @@ mod geometry_tests {
         ] {
             assert_eq!(diag_under(&hits, p), None, "{p:?}");
         }
+    }
+
+    fn diag(range: (usize, usize), severity: Severity, msg: &str, fix: Option<&str>) -> Diagnostic {
+        Diagnostic {
+            range,
+            severity,
+            message: msg.to_string(),
+            fix: fix.map(str::to_string),
+        }
+    }
+
+    /// **The tip names what the key does.** The server's error outranks the
+    /// offline warning on the same token, so it is the one hovered — and it
+    /// carries no fix, while Alt+Enter applies the offline one. The tip once
+    /// showed the server's message alone, and the key then made an edit
+    /// nothing on screen had offered.
+    #[test]
+    fn a_server_error_over_a_fixable_token_still_names_the_fix() {
+        let offline = [diag(
+            (14, 20),
+            Severity::Warning,
+            "did you mean salary",
+            Some("salary"),
+        )];
+        let server = diag((14, 20), Severity::Error, "Unknown column 'salery'", None);
+        let tip = tip_message(&server, &offline);
+        assert!(tip.starts_with("Unknown column 'salery'\n"), "{tip}");
+        assert!(tip.ends_with(": salary"), "{tip}");
+    }
+
+    /// The hovered diagnostic's own fix gives way to the one the key would
+    /// pick at that spot — `intel::fix_at`'s stronger, narrower choice.
+    #[test]
+    fn the_tip_shows_the_fix_the_key_would_pick_not_its_own() {
+        let offline = [
+            diag((10, 30), Severity::Warning, "wide", Some("WIDE")),
+            diag((10, 15), Severity::Error, "narrow", Some("narrow_fix")),
+        ];
+        let tip = tip_message(&offline[0], &offline);
+        assert!(tip.ends_with(": narrow_fix"), "{tip}");
+    }
+
+    #[test]
+    fn nothing_fixable_at_the_squiggle_leaves_the_message_alone() {
+        let offline = [diag((40, 45), Severity::Warning, "elsewhere", Some("x"))];
+        let server = diag((14, 20), Severity::Error, "Unknown column", None);
+        assert_eq!(tip_message(&server, &offline), "Unknown column");
     }
 
     #[test]
