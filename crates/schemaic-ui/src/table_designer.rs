@@ -529,20 +529,7 @@ fn tab_strip(d: DdlUi, ring: FocusRing) -> impl IntoView {
                     d.rev.update(|r| *r += 1);
                 }
             })
-            .style(move |s| {
-                let s = s
-                    .font_size(theme::font_body())
-                    .padding_horiz(theme::scaled(12.0))
-                    .padding_vert(theme::scaled(7.0))
-                    .border_radius(6.0);
-                if d.tab.get() == t {
-                    s.background(theme::pill_active_bg())
-                        .color(theme::pill_active_text())
-                } else {
-                    s.color(theme::text_dim())
-                        .hover(|s| s.background(theme::pill_hover_bg()).color(theme::text()))
-                }
-            })
+            .style(move |s| crate::widgets::pill_tab_style(s, d.tab.get() == t))
     }))
     .style(|s| {
         s.flex_row()

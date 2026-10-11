@@ -21417,6 +21417,13 @@ existing prose was left alone.
     with lines, and the colour sets a heading off with nothing added. The margin is load-bearing:
     Settings' version caption copies it so the air under the caption matches the air under
     `General` (under `settings.rs`).
+    **`pill_tab_style(s, on)` is a modal's section-tab look**, lifted out of
+    `table_designer::tab_strip`: body size, `scaled(12)`/`scaled(7)` padding, radius 6, filled in
+    `pill_active_bg`/`pill_active_text` when `on`, `text_dim` with a `pill_hover_bg` hover when not.
+    The designer's *Table | Columns | Indexes …* strip and Server Variables' *Variables | Status*
+    switch both call it, so the two cannot drift apart again — the switch wore Server Activity's
+    underlined labels until the user asked for it to match the designer's tabs. Server Activity's
+    own *Sessions | Locks* switch still draws those underlined labels and does not use it.
     **There is no `footer_button` any more.** Every modal with a footer bar wears the filled
     `action_button`, and the text-only button that sat beside it at a smaller padding left with the
     last of those footers. The rest of that family went with GitHub #25: `dialog_button` (over a
@@ -23455,8 +23462,8 @@ existing prose was left alone.
     write. `VarsState::Loaded` holds an `Rc<Vec<ServerVar>>` because the list is rebuilt per
     keystroke.
     The modal is titled *Server variables — <connection name>*; the *Variables | Status* switch
-    (Server Activity's underlined-label style) is built only where `supports_status`, then the
-    search `edit_field` (clearable, ring stop 10), then the scrolled list — name in mono, the value
+    (the table designer's pill tabs, `widgets::pill_tab_style`, `scaled(4)` apart) is built only
+    where `supports_status`, then the search `edit_field` (clearable, ring stop 10), then the scrolled list — name in mono, the value
     beside it, the engine's description dim beneath where there is one. The list is keyed on
     `(state, filter)` and draws `server_vars::render_slice`'s first `RENDER_CAP` rows with an
     *N more settings match — narrow the search* line under them; the other states are *Loading…*,

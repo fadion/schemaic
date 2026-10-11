@@ -1658,6 +1658,26 @@ pub(crate) fn form_section_gap() -> f64 {
     theme::scaled(36.0)
 }
 
+/// One tab of a modal's section strip, drawn as a pill: filled with
+/// `pill_active_bg` when `on`, dim text with a hover fill when not. The table
+/// designer's *Table | Columns | Indexes …* strip and Server Variables'
+/// *Variables | Status* switch share it so the two cannot drift apart again —
+/// the switch once wore Server Activity's underlined labels instead.
+pub(crate) fn pill_tab_style(s: floem::style::Style, on: bool) -> floem::style::Style {
+    let s = s
+        .font_size(theme::font_body())
+        .padding_horiz(theme::scaled(12.0))
+        .padding_vert(theme::scaled(7.0))
+        .border_radius(6.0);
+    if on {
+        s.background(theme::pill_active_bg())
+            .color(theme::pill_active_text())
+    } else {
+        s.color(theme::text_dim())
+            .hover(|s| s.background(theme::pill_hover_bg()).color(theme::text()))
+    }
+}
+
 /// A labelled control: caption above, control below.
 pub(crate) fn form_setting(label: &'static str, control: impl IntoView + 'static) -> impl IntoView {
     form_setting_owned(label.to_string(), control)

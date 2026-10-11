@@ -36,7 +36,7 @@ use schemaic_core::server_vars::{self, ServerVar, VarKind};
 use schemaic_core::text::plural;
 
 use crate::consts::MONO_FAMILY;
-use crate::theme::{font_body, font_hint, font_label};
+use crate::theme::{font_body, font_hint};
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, dismiss_layer,
     focus_root_with_ring, modal_footer_split, modal_pad_h, modal_title_owned, modal_w, panel_style,
@@ -232,8 +232,9 @@ pub(crate) fn server_vars_overlay(ctx: VarsCtx) -> impl IntoView {
     })
 }
 
-/// *Variables | Status* — Server Activity's *Sessions | Locks* switch, the
-/// same underlined labels. A switch is a fetch, which the modal's effect makes.
+/// *Variables | Status* — the table designer's pill tabs
+/// ([`crate::widgets::pill_tab_style`]). A switch is a fetch, which the modal's
+/// effect makes.
 fn kind_switch(kind: RwSignal<VarKind>) -> impl IntoView {
     let tab = move |label: &'static str, which: VarKind| {
         text(label)
@@ -242,26 +243,13 @@ fn kind_switch(kind: RwSignal<VarKind>) -> impl IntoView {
                     kind.set(which);
                 }
             })
-            .style(move |s| {
-                let on = kind.get() == which;
-                s.font_size(font_label())
-                    .padding_vert(theme::scaled(3.0))
-                    .margin_right(theme::scaled(14.0))
-                    .border_bottom(2.0)
-                    .border_color(if on {
-                        theme::accent()
-                    } else {
-                        floem::peniko::Color::TRANSPARENT
-                    })
-                    .color(if on { theme::text() } else { theme::text_dim() })
-                    .hover(|s| s.color(theme::text()))
-            })
+            .style(move |s| crate::widgets::pill_tab_style(s, kind.get() == which))
     };
     h_stack((
         tab("Variables", VarKind::Variables),
         tab("Status", VarKind::Status),
     ))
-    .style(|s| s.items_center())
+    .style(|s| s.items_center().gap(theme::scaled(4.0)))
 }
 
 /// The list, rebuilt on a new answer and on every keystroke of the search —
@@ -344,7 +332,7 @@ fn var_row(v: &ServerVar) -> AnyView {
                 .flex_row()
                 .items_start()
                 .padding_horiz(modal_pad_h())
-                .padding_vert(theme::scaled(4.0))
+                .padding_vert(theme::scaled(6.0))
                 .border_bottom(1.0)
                 .border_color(theme::border())
         })
