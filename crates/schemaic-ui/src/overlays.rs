@@ -3563,6 +3563,95 @@ fn search_result_item(
     }
 }
 
+/// Build one **body** hit's row ([`BodyFindHit`]): the object, and on the
+/// secondary line what it is and the line the term was found on.
+///
+/// Activation is borrowed whole from the row builder that already opens that
+/// kind of object — a view from [`search_result_item`], a routine or event
+/// from [`object_result_item`] — so a body hit records the same history entry
+/// and opens the same thing its name row would. A trigger has no row of its
+/// own anywhere in the palette, so it opens, and is remembered as, the table
+/// it fires on.
+///
+/// No `match_term`: the bold highlight is drawn on the primary line, and the
+/// name there is precisely what did not match.
+#[allow(clippy::too_many_arguments)]
+fn body_result_item(
+    b: BodyFindHit,
+    active_conn: RwSignal<u64>,
+    search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
+    open_table: Rc<dyn Fn(TableSource)>,
+    open_table_col: Rc<dyn Fn(TableSource, String)>,
+    open_object: Rc<dyn Fn(String, schemaic_core::schema::ObjectItem)>,
+    close: Rc<dyn Fn()>,
+) -> PaletteItem {
+    use schemaic_core::body_search::BodyOwner;
+    use schemaic_core::schema::ObjectItem;
+    let BodyFindHit {
+        database,
+        hit,
+        icon,
+    } = b;
+    let db = database.clone();
+    let table_row = |source: TableSource| {
+        search_result_item(
+            source,
+            None,
+            Some(icon),
+            false,
+            None,
+            active_conn,
+            search_history,
+            open_table.clone(),
+            open_table_col.clone(),
+            close.clone(),
+        )
+    };
+    let object_row = |item: ObjectItem| {
+        object_result_item(
+            database.clone(),
+            item,
+            false,
+            None,
+            active_conn,
+            search_history,
+            open_object.clone(),
+            close.clone(),
+        )
+    };
+    let (mut row, what) = match hit.owner {
+        BodyOwner::View { schema, name } => (
+            table_row(TableSource::new(database.clone(), schema, name)),
+            "view body".to_string(),
+        ),
+        BodyOwner::Routine(r) => {
+            let item = ObjectItem::Routine(r);
+            let what = format!("{} body", item.kind().label());
+            (object_row(item), what)
+        }
+        BodyOwner::Event(e) => {
+            let item = ObjectItem::Event(e);
+            let what = format!("{} body", item.kind().label());
+            (object_row(item), what)
+        }
+        BodyOwner::Trigger {
+            schema,
+            table,
+            name,
+        } => {
+            let source = TableSource::new(database.clone(), schema, table);
+            let what = format!("trigger on {}", source.display());
+            let mut row = table_row(source);
+            row.primary = name.clone();
+            row.complete = Some(name);
+            (row, what)
+        }
+    };
+    row.secondary = format!("{db} · {what} · {}", hit.snippet);
+    row.icon = Some(icon);
+    row
+}
+
 /// Render `primary` with the first case-insensitive occurrence of `term` bolded +
 /// tinted (`match_highlight`). Plain text when there's no term / no match.
 /// How far a row that cannot be activated is faded.
@@ -4447,8 +4536,8 @@ struct SnippetSearch {
     insert: Rc<dyn Fn(schemaic_core::snippet::Snippet)>,
 }
 
-/// Snippet rows for the palette — the **fourth** category, after names, objects
-/// and columns, and deliberately last: the palette is a way to reach the
+/// Snippet rows for the palette — the **fifth** category, after names, objects,
+/// columns and bodies, and deliberately last: the palette is a way to reach the
 /// database, and a saved query is a thing you wrote about it.
 ///
 /// Activating one inserts it at the caret, exactly as clicking its library row
@@ -4574,8 +4663,25 @@ fn build_items(
                     })
                     .collect();
             }
-            find_matches(db_nodes, hidden, &q, 80)
-                .into_iter()
+            let (hits, bodies) = find_matches(
+                db_nodes,
+                hidden,
+                &q,
+                80,
+                schemaic_core::body_search::BODY_HIT_CAP,
+            );
+            let bodies = bodies.into_iter().map(|b| {
+                body_result_item(
+                    b,
+                    active_conn,
+                    search_history,
+                    open_table.clone(),
+                    open_table_col.clone(),
+                    open_object.clone(),
+                    close.clone(),
+                )
+            });
+            hits.into_iter()
                 .map(|hit| match hit.target {
                     FindTarget::Table { source, column } => search_result_item(
                         source,
@@ -4600,6 +4706,7 @@ fn build_items(
                         close.clone(),
                     ),
                 })
+                .chain(bodies)
                 .chain(snippet_items(snippets, &q, close))
                 .collect()
         }
@@ -5747,7 +5854,8 @@ fn find_matches(
     hidden: Memo<HashSet<String>>,
     q: &str,
     limit: usize,
-) -> Vec<FindHit> {
+    body_limit: usize,
+) -> (Vec<FindHit>, Vec<BodyFindHit>) {
     // `with_untracked`, not `get_untracked`: this runs on **every keystroke**
     // (the palette is deliberately undebounced, unlike the schema tree's filter
     // box), and `get` is documented as "try to *clone* and return" — so the two
@@ -5775,10 +5883,12 @@ fn find_matches(
             }
         })
     });
-    matches_across(
-        loaded.iter().map(|(db, s)| (db.as_str(), s.as_ref())),
-        q,
-        limit,
+    let dbs = || loaded.iter().map(|(db, s)| (db.as_str(), s.as_ref()));
+    // The same visible, loaded databases for both lists: a body hit in a
+    // hidden database would be the leak `db_visible` above exists to close.
+    (
+        matches_across(dbs(), q, limit),
+        body_matches_across(dbs(), q, body_limit),
     )
 }
 
@@ -5867,6 +5977,74 @@ fn matches_across<'a>(
         }
     }
     buckets.retain(|b| !b.is_empty());
+    let want: Vec<usize> = buckets.iter().map(Vec::len).collect();
+    let take = db_shares(limit, &want);
+    let mut out = Vec::with_capacity(take.iter().sum());
+    for (bucket, n) in buckets.into_iter().zip(take) {
+        out.extend(bucket.into_iter().take(n));
+    }
+    out
+}
+
+/// One Find-Anywhere **body** hit — the fourth tier, below names, objects and
+/// columns: an object whose stored definition contains the term
+/// ([`schemaic_core::body_search`]).
+///
+/// Its own type rather than a [`FindTarget`] arm because it is its own list,
+/// with its own cap, appended after [`matches_across`]' merged one — a body
+/// match is the least precise answer the palette has, so it never takes a
+/// share of the rows the name tiers fill.
+#[derive(Clone)]
+struct BodyFindHit {
+    database: String,
+    hit: schemaic_core::body_search::BodyHit,
+    icon: ResultIcon,
+}
+
+/// Every visible database's body hits, at most `limit` in all, merged under
+/// [`db_shares`] — the round-robin the name tiers use across databases, for
+/// the reason that function gives: catalogue order is an accident, not a
+/// policy.
+///
+/// A routine or event the palette may not open ([`is_palette_target`]) is
+/// dropped here, as the object pass drops it. A trigger's icon is the one its
+/// table wears, since the table is what activating the row opens.
+fn body_matches_across<'a>(
+    dbs: impl IntoIterator<Item = (&'a str, &'a schemaic_core::schema::DbSchema)>,
+    q: &str,
+    limit: usize,
+) -> Vec<BodyFindHit> {
+    use schemaic_core::body_search::{BodyOwner, body_hits};
+    use schemaic_core::schema::ObjectItem;
+    let mut buckets: Vec<Vec<BodyFindHit>> = Vec::new();
+    for (database, schema) in dbs {
+        let bucket: Vec<BodyFindHit> = body_hits(schema, q, limit)
+            .into_iter()
+            .filter_map(|hit| {
+                let object = |item: ObjectItem| {
+                    is_palette_target(&item).then(|| ResultIcon::Object(item.kind()))
+                };
+                let icon = match &hit.owner {
+                    BodyOwner::View { .. } => ResultIcon::View,
+                    BodyOwner::Routine(r) => object(ObjectItem::Routine(r.clone()))?,
+                    BodyOwner::Event(e) => object(ObjectItem::Event(e.clone()))?,
+                    BodyOwner::Trigger {
+                        schema: ns, table, ..
+                    } => schema
+                        .find_table(ns.as_deref(), table)
+                        .map_or(ResultIcon::Table, table_result_icon),
+                };
+                Some(BodyFindHit {
+                    database: database.to_string(),
+                    hit,
+                    icon,
+                })
+            })
+            .collect();
+        if !bucket.is_empty() {
+            buckets.push(bucket);
+        }
+    }
     let want: Vec<usize> = buckets.iter().map(Vec::len).collect();
     let take = db_shares(limit, &want);
     let mut out = Vec::with_capacity(take.iter().sum());
@@ -6856,6 +7034,47 @@ mod find_tests {
         );
         // And no database at all is not a panic.
         assert!(super::matches_across([], "orders", 80).is_empty());
+    }
+
+    /// The body tier as the palette composes it: core's hits per database,
+    /// the editor gate applied to each routine, and the databases sharing the
+    /// cap rather than the first in catalogue order taking all of it.
+    #[test]
+    fn body_hits_share_the_cap_and_skip_what_cannot_be_opened() {
+        use schemaic_core::body_search::BodyOwner;
+        use schemaic_core::schema::RoutineInfo;
+        use std::sync::Arc;
+        let routine = |name: &str, language: &str| {
+            Arc::new(RoutineInfo {
+                name: name.into(),
+                language: language.into(),
+                body: "UPDATE ledger SET n = n + 1".into(),
+                ..Default::default()
+            })
+        };
+        let flood = DbSchema {
+            routines: (0..60).map(|i| routine(&format!("f{i}"), "sql")).collect(),
+            ..Default::default()
+        };
+        let small = DbSchema {
+            routines: vec![routine("post", "plpgsql"), routine("linked", "c")],
+            ..Default::default()
+        };
+        let hits = super::body_matches_across([("big", &flood), ("shop", &small)], "ledger", 50);
+        assert_eq!(hits.len(), 50, "the cap holds across databases");
+        let names: Vec<String> = hits
+            .iter()
+            .map(|b| match &b.hit.owner {
+                BodyOwner::Routine(r) => format!("{}.{}", b.database, r.name),
+                _ => unreachable!("only routines here"),
+            })
+            .collect();
+        assert!(names.contains(&"shop.post".to_string()), "{names:?}");
+        // A C function's body is a link symbol and its editor refuses to open,
+        // so its row would go nowhere.
+        assert!(!names.contains(&"shop.linked".to_string()), "{names:?}");
+        // Too short a term searches no body at all.
+        assert!(super::body_matches_across([("shop", &small)], "le", 50).is_empty());
     }
 
     /// Each pass is guaranteed its third if it can use it; a pass with nothing to

@@ -159,7 +159,8 @@ substitute for the statement, and none of these is a style preference.
   caller cannot skip.
 - **Every schema-search surface matches through one predicate** (`schema::object_name_matches`,
   which the ER diagram's find bar calls too), and Find-Anywhere searches names → objects → columns
-  in that order, undebounced.
+  → bodies in that order, undebounced — the body tier (`core::body_search`) matches definition
+  text, a different question from a name, so it is no second name predicate.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** — `sql::is_word_byte`/`is_word_start`
   are the only definitions, and where a name *ends* per dialect (T-SQL's `#`/`@`/`$`) is
   `sql::continues_name`.

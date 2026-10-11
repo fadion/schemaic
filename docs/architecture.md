@@ -13104,6 +13104,38 @@ existing prose was left alone.
     own line starts — back from the upper end to its line's start, forward to the lower end — where
     a table of the whole document's lines was a full pass of the text per move, 6.8 ms at 16 MiB
     against microseconds now. The pane's drag is under `editor_pane.rs`.
+  - `body_search.rs` — Find Anywhere's **fourth tier**: the objects whose stored *body* contains the
+    term, for the palette (`ui/overlays.rs`) to list below its three name tiers. `body_hits` walks
+    one `DbSchema` — a view's `TableInfo::view_definition`, a trigger's `TriggerAction::Body`, then
+    `RoutineInfo::body` and `EventInfo::body`, in that order and catalogue order within each — and
+    stops at the caller's `limit`; each `BodyHit` is its `BodyOwner` (`View`, `Routine`, `Event`, or
+    `Trigger` with the table it fires on) and a snippet. **Everything it reads is already in the
+    loaded `DbSchema`**, so the tier costs no round trip — and so a MySQL routine is searched in
+    `information_schema`'s escape-resolved `body`, not the `RoutineSource` its editor reads lazily
+    (the one field `DbSchema`'s own doc warns is not trustworthy for an edit). A PostgreSQL trigger is
+    `TriggerAction::Function` and has no body of its own; its function's body is found as a routine
+    (`a_postgres_trigger_has_no_body_of_its_own`).
+    **It is a different question from the name tiers, and so it does not go through
+    `schema::object_name_matches`**: "does this definition contain the term", not "does this name".
+    The invariant that every schema-search surface matches *names* through the one predicate is
+    untouched, because nothing here answers for a name. The predicate is asked only to **skip an
+    object a name tier already lists** — a view, routine or event whose own name matches — so the
+    object appears once, in the more precise tier. A trigger is never skipped: no name tier lists
+    triggers, so its body is the only way the palette reaches one
+    (`an_object_a_name_tier_lists_is_skipped`, `a_trigger_body_is_a_hit_even_when_its_name_matches`).
+    The match is a plain case-insensitive substring over the body **as stored**, comments and string
+    literals included — deliberately: a body search is how you find the routine that mentions a
+    table in a comment, and a lexer-aware search would hide exactly that. It folds case by
+    `text_ops::matches_at`'s rule, the editor find bar's, non-ASCII letters included
+    (`the_match_ignores_case_on_both_sides`). **The cost is a scan of every body on every
+    keystroke**, the palette being undebounced, which is why `searches_bodies` waits for
+    `MIN_TERM_CHARS` (3) — one or two letters match nearly every body in a database — counted in
+    characters rather than bytes, so three Cyrillic letters qualify as three ASCII ones do
+    (`a_term_shorter_than_three_characters_searches_no_body`). `BODY_HIT_CAP` (50) is the palette's
+    cap on the tier. `body_snippet` is the row's text: the matching line, trimmed, its whitespace
+    runs collapsed to one space, and when longer than `SNIPPET_CHARS` (60) cut to a window keeping 20
+    characters ahead of the match, an `…` on each side that was cut — on character boundaries, so a
+    multibyte line is never split (`a_multibyte_line_is_cut_on_character_boundaries`).
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -33653,7 +33685,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   palette — a tree row is context, sitting under the table that owns it, while a palette row is a
   destination, and this one's activation is an editor that refuses to open. That withholding is
   `overlays::is_palette_target`, which **delegates to `object_editor::is_editable_object`** rather
-  than re-spelling it, and **both** producers ask it — the live search *and* `lookup_object` on the
+  than re-spelling it, and **both** producers ask it — the live search (its object pass, and the
+  body tier's routines and events in `body_matches_across`) *and* `lookup_object` on the
   search-history path. A `serial`'s sequence is an ordinary object and a legitimate result, so it
   can be remembered; migrating its column to an identity column makes that same sequence internal,
   and only the second gate stops the remembered row from opening an editor the server would refuse.
@@ -33662,6 +33695,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   the tree's filter found them and the palette did not, through the one delegation rather than a
   second exclusion; and when the form landed, removing that one term ended the divergence on
   both producers at once, the remembered row included. Every path to `open_for_object` is gated (the tree's two, and this one) — don't add an ungated one.
+  **The palette's body tier (`core::body_search`) is neither a fifth caller nor an exception.** It
+  asks whether an object's *definition* contains the term, not whether its name does, so it does
+  not go through `object_name_matches` for its match and this rule does not reach it; the one
+  thing it asks the predicate is whether a name tier already lists the object, so as to skip it.
+  A clause added to the predicate therefore moves which objects the body tier *skips*, never what
+  counts as a body hit.
 - **A Find-Anywhere database is searched in three passes: table/view *names*, then objects, then
   columns** (`overlays::schema_hits`), and the object pass sits in the middle **deliberately**.
   Columns are the category that floods — one `user_id` foreign key across a hundred tables is a
@@ -33695,7 +33734,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   `one_database_still_fills_the_list` (the share must not cap a lone database at a fraction of
   `limit`) and `the_share_holds_for_any_number_of_buckets`, the last because the bucket count is now
   however many databases are loaded rather than always three.
-  **Snippets are a fourth category, appended after all three** (`overlays::snippet_items`), with the
+  **Bodies are a fourth tier, below all three — names → objects → columns → bodies — and outside
+  their share.** `find_matches` returns two lists from the same visible, loaded databases, so a
+  hidden database leaks no body hit: the 80-row merge above, and `overlays::body_matches_across`,
+  which asks each database's `body_search::body_hits` for up to `BODY_HIT_CAP` (50), drops a
+  routine or event `is_palette_target` refuses (a C-language function), and merges the databases
+  with `db_shares`, the name tiers' round-robin across databases, under that cap of its own. The
+  body rows are appended after the merged 80 and take none of their rows: `BodyFindHit` is its own
+  type rather than a `FindTarget` arm because it is its own list: a body match is the least precise
+  answer the palette has, so it never takes a share of the rows the name tiers fill.
+  `overlays::body_result_item` **borrows each row whole** from the builder that already opens that
+  kind of object — `search_result_item` for a view, `object_result_item` for a routine or event —
+  so a body hit opens, and is recorded in the search history as, exactly what its name row would.
+  A trigger has no row of its own anywhere in the palette, so its row opens, and is remembered as,
+  the table it fires on, with the trigger's name as the primary line. The secondary line is
+  `{db} · {kind} body · {snippet}` (`{db} · trigger on {table} · {snippet}` for a trigger), and the
+  primary carries no match highlight, since the name there is precisely what did not match.
+  **Snippets are a fifth category, appended after the body tier** (`overlays::snippet_items`), with the
   bookmark glyph the panel toggle wears — in the **accent**, the only row colour in the list, because
   a snippet is the one result that is the user's rather than the server's (the completion popup tints
   its snippet rows for the same reason). They
@@ -33711,7 +33766,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   over every loaded database. So anything it calls per-database is on a per-character path: that is
   why the object arm goes through `DbSchema::objects_matching` (clones only the hits) rather than
   `objects_all` (clones the database's every enum, domain and sequence, an enum's whole value list
-  included, to answer a substring test). Same rule as `SignalGet::with` over `get`.
+  included, to answer a substring test). Same rule as `SignalGet::with` over `get`. The body tier is
+  on the same path and is the widest scan on it — every view, trigger, routine and event body of
+  every loaded database — which is why `body_search::searches_bodies` holds it back until the term
+  has three characters and `body_hits` stops at the cap it is given.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** so Unicode identifiers tokenize whole.
   `sql::is_word_byte` (continues a word) and `sql::is_word_start` (begins one — `alphabetic`, since a
   digit can't start a name) are the **only** definitions, next to `skip_noncode` because they answer
