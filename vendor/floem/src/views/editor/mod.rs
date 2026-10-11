@@ -168,6 +168,9 @@ pub struct Editor {
     pub editor_view_focused: Trigger,
     pub editor_view_focus_lost: Trigger,
     pub editor_view_id: RwSignal<Option<crate::id::ViewId>>,
+    /// The pointer's cursor over the text — `Text` (the I-beam) unless the
+    /// owner says otherwise. schemaic patch (PATCHES.md)
+    pub pointer_cursor: RwSignal<crate::style::CursorStyle>,
 
     /// The current scroll position.
     pub scroll_delta: RwSignal<Vec2>,
@@ -283,6 +286,8 @@ impl Editor {
             editor_view_focused: cx.create_trigger(),
             editor_view_focus_lost: cx.create_trigger(),
             editor_view_id: cx.create_rw_signal(None),
+            // schemaic patch (PATCHES.md)
+            pointer_cursor: cx.create_rw_signal(crate::style::CursorStyle::Text),
             lines,
             screen_lines,
             register: cx.create_rw_signal(Register::default()),

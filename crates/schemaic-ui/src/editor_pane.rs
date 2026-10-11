@@ -7372,6 +7372,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .background(theme::accent()),
         })
         .pointer_events(|| false);
+    // Over an underlined word the pointer is an arrow, not the I-beam: the
+    // click there opens something rather than placing a caret. The editor's
+    // own view wears the cursor (vendored floem's `pointer_cursor`), and the
+    // overlay above is click-through, so it cannot.
+    let pointer_cursor = ed_qi.with_untracked(|ed| ed.pointer_cursor);
+    create_effect(move |_| {
+        let cursor = if ctrl_link.with(Option::is_some) {
+            CursorStyle::Default
+        } else {
+            CursorStyle::Text
+        };
+        if pointer_cursor.get_untracked() != cursor {
+            pointer_cursor.set(cursor);
+        }
+    });
 
     // Run button: a Lucide play overlay pinned to the editor's bottom-right
     // (7px insets). The whole pill is clickable (not just the glyph); hover

@@ -26061,6 +26061,12 @@ existing prose was left alone.
     when it goes true and clears the line when it goes false. A release while the window is
     unfocused never arrives, so a pointer move that sees no modifier writes it back to `false`
     (`shortcuts::note_primary_up`) — otherwise the next press would change nothing and draw nothing.
+    **Over the underlined word the pointer is an arrow**, not the I-beam, since the click there
+    opens something rather than placing a caret: an effect beside `ctrl_link_view` writes the
+    editor's `pointer_cursor` — `CursorStyle::Default` while `ctrl_link` is `Some`, `Text`
+    otherwise. That signal is vendored floem's seventh patch (*Floem 0.2 gotchas*), because
+    `editor_content` set the I-beam in the text view's own style, which no ancestor class outranks,
+    and `ctrl_link_view` is click-through, so it cannot wear a cursor of its own.
     **Alt+Shift+drag is a box selection** (`text_ops::box_regions`). `name_box_at`'s way back from
     a pointer to the document is factored out as `pointer_offset` — the offset under the pointer and
     whether it is inside the text, `None` over the gutter — which the drag shares. The same outer
@@ -34779,7 +34785,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   behind it the modal's Escape listener never heard the key (GitHub #15). The window root now
   forwards such an Escape to the innermost focus root's listeners, and running a view's listeners
   for an event is exactly what `apply_event` does — see *A key event goes to the focused view*,
-  below. **Three measures
+  below. The seventh makes the editor's pointer cursor a signal, `Editor::pointer_cursor`
+  (`CursorStyle::Text` by default), which `editor_content`'s style reads in place of the constant
+  `.cursor(CursorStyle::Text)` it set in the text view's own style — a style no ancestor class
+  outranks, so nothing outside could change it; the query editor wears an arrow over a Ctrl+hover
+  underline (`editor_pane.rs`). It also has `StyleCx::style_view` hand a hovered view's new cursor
+  over at restyle time when its old one is the cursor showing — for any view, not only the
+  editor's. Floem resolves the cursor only on a pointer move, so without it a Ctrl pressed with
+  the mouse still kept the I-beam until the mouse moved. No test covers it. **Three measures
   keep upstream's code out of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
   manifest, since a path dependency inside the workspace directory would otherwise join it as a
   member; `vendor/floem/rustfmt.toml` with `disable_all_formatting = true`, since `cargo fmt --all`

@@ -574,6 +574,8 @@ impl<'a> StyleCx<'a> {
         let mut view_interact_state = self.get_interact_state(&view_id);
         view_interact_state.is_disabled |= self.disabled;
         self.disabled = view_interact_state.is_disabled;
+        // schemaic patch (PATCHES.md)
+        let old_cursor = view_state.borrow().combined_style.builtin().cursor();
         let mut new_frame = self.app_state.compute_style(
             view_id,
             view_style,
@@ -583,6 +585,16 @@ impl<'a> StyleCx<'a> {
         );
 
         let style = view_state.borrow().combined_style.clone();
+        // schemaic patch (PATCHES.md): the hovered view whose cursor is the one
+        // showing changed it with the pointer still — show the new one now
+        // rather than on the next move, the only time the cursor is resolved.
+        let new_cursor = style.builtin().cursor();
+        if new_cursor != old_cursor
+            && self.app_state.cursor == old_cursor
+            && self.app_state.hovered.contains(&view_id)
+        {
+            self.app_state.cursor = new_cursor;
+        }
         self.direct = style;
         Style::apply_only_inherited(&mut self.current, &self.direct);
         CaptureState::capture_style(view_id, self);

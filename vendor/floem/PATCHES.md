@@ -124,3 +124,25 @@ listeners, and running a view's listeners for an event is exactly what
 `ViewId::apply_event` does — but it was `pub(crate)`.
 
 **What.** `src/id.rs`: `apply_event` is `pub`. Its body is unchanged.
+
+### 7. The editor's pointer cursor is a signal, and follows it without a move
+
+**Why.** `editor_content` styled the text view `.cursor(CursorStyle::Text)`, a
+constant in the view's own style, which outranks any class an ancestor could
+apply — so nothing outside could change it. Schemaic shows an arrow over a word
+Ctrl+click would open. And Floem resolves the cursor only on a pointer move
+(`WindowHandle::event` clears it, `EventCx` refills it from the hovered views),
+so a cursor that changes with the pointer still — Ctrl pressed over a word —
+kept the old one until the mouse twitched.
+
+**What.**
+
+- `src/views/editor/mod.rs`: a `pub pointer_cursor: RwSignal<CursorStyle>`
+  field on `Editor`, `CursorStyle::Text` in `new_direct`'s literal.
+- `src/views/editor/view.rs`, `editor_content`: the text view's style reads
+  `pointer_cursor.get()` instead of the constant (and the now-unused
+  `CursorStyle` import goes).
+- `src/context.rs`, `StyleCx::style_view`: when a restyle changes the view's
+  cursor, the view is hovered and its old cursor is the one showing
+  (`app_state.cursor`), the new one replaces it; `set_cursor` at the end of
+  the update then applies it.

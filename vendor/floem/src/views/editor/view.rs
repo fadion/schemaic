@@ -9,7 +9,7 @@ use crate::{
     kurbo::{BezPath, Line, Point, Rect, Size, Vec2},
     peniko::Color,
     reactive::{batch, create_effect, create_memo, create_rw_signal, Memo, RwSignal, Scope},
-    style::{CursorStyle, Style},
+    style::Style,
     style_class,
     taffy::tree::NodeId,
     text::{Attrs, AttrsList, TextLayout},
@@ -1132,10 +1132,11 @@ fn editor_content(
     let scroll_to = ed.scroll_to;
     let window_origin = ed.window_origin;
     let viewport = ed.viewport;
+    let pointer_cursor = ed.pointer_cursor; // schemaic patch (PATCHES.md)
 
     scroll({
-        let editor_content_view =
-            editor_view(editor, is_active).style(move |s| s.absolute().cursor(CursorStyle::Text));
+        let editor_content_view = editor_view(editor, is_active)
+            .style(move |s| s.absolute().cursor(pointer_cursor.get()));
 
         let id = editor_content_view.id();
         ed.editor_view_id.set(Some(id));
