@@ -23123,7 +23123,10 @@ existing prose was left alone.
     **A Sessions | Locks switch sits under the title** (`ActivityUi::view`, an `ActivityView`,
     drawn by `widgets::segmented_tabs` at `scaled(12)` side padding and `scaled(4)` from the title,
     a `scaled(10)` spacer above the search box), and the app polls only the list on show, so a
-    switch is a fetch of the other and nothing else. The Locks view paints `LocksState` — `ActivityState`'s shape
+    switch is a fetch of the other and nothing else. The one search box filters whichever list is
+    shown, so its placeholder says which — *Search sessions…* / *Search locks…*, through
+    `FieldCfg::placeholder_of`, a placeholder read in its own reactive label so the switch relabels
+    the box without rebuilding the field. The Locks view paints `LocksState` — `ActivityState`'s shape
     for the other list, `Idle`/`Loaded(Rc<LockList>)`/`Failed` — in three functions. `locks_header`
     is the tally, from the whole snapshot as the sessions' counts are: `N locks`, then `M waiting`
     in the error colour and left out at zero, both wearing the `+` on a capped list, then

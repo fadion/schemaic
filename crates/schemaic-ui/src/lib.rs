@@ -10924,6 +10924,12 @@ impl floem::views::editor::text::Styling for FieldStyling {
 /// Config for [`edit_field`], the app's shared editor-backed input.
 pub(crate) struct FieldCfg {
     pub placeholder: &'static str,
+    /// A placeholder that follows the signals it reads, in place of
+    /// [`Self::placeholder`] — for one box that searches whichever list is shown
+    /// (Server Activity's *Search sessions…* / *Search locks…*). Read in the
+    /// placeholder's own reactive label, so a switch relabels the box without
+    /// rebuilding the field.
+    pub placeholder_of: Option<Rc<dyn Fn() -> &'static str>>,
     /// Box background. A fn (not a `Color`) so it's re-read inside the field's
     /// reactive style — the surface then follows a live theme switch instead of
     /// freezing the colour captured when the field was first built.
@@ -11139,6 +11145,7 @@ impl Default for FieldCfg {
     fn default() -> Self {
         FieldCfg {
             placeholder: "",
+            placeholder_of: None,
             background: theme::bg_deepest,
             multiline: false,
             clearable: false,
@@ -11332,6 +11339,7 @@ fn single_line_sync(current: &str, doc: &str, multiline: bool) -> Option<String>
 pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl IntoView {
     let FieldCfg {
         placeholder,
+        placeholder_of,
         background,
         multiline,
         clearable,
@@ -12162,7 +12170,8 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         move || text_sig.with(|t| t.is_empty()) && !focused.get(),
         move |show| {
             if show {
-                text(placeholder)
+                let placeholder_of = placeholder_of.clone();
+                label(move || placeholder_of.as_ref().map_or(placeholder, |f| f()))
                     .style(move |s| {
                         s.font_size(font_size())
                             .font_family("IBM Plex Sans".to_string())

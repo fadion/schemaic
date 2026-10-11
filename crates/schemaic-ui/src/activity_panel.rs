@@ -300,7 +300,11 @@ pub(crate) fn activity_panel(
         edit_field(
             search_input,
             FieldCfg {
-                placeholder: "Search…",
+                // The box searches the list shown, so it says which.
+                placeholder_of: Some(Rc::new(move || match view.get() {
+                    crate::ActivityView::Sessions => "Search sessions…",
+                    crate::ActivityView::Locks => "Search locks…",
+                })),
                 background: theme::bg_chrome,
                 clearable: true,
                 ..Default::default()
