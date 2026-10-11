@@ -28974,8 +28974,13 @@ existing prose was left alone.
   (`a_run_walked_away_from_after_a_second_asks_for_attention`). Both run paths ask it after their
   supersede checks, so only a run the tab still shows does, and only one that reached a verdict:
   the single run with its `took`, Run Everything with its statements' times summed, since a long
-  script of quick statements is as much a walk-away as one slow statement. A `.sql` file run and
-  an export do not ask yet.
+  script of quick statements is as much a walk-away as one slow statement. A `.sql` file run
+  (`script_run`), both of `export_file`'s paths, a dump (`dump_run`) and a folder export
+  (`files_run`) ask it too, timed by an `Instant` taken as each claims its cancel slot — and **not
+  on a cancelled outcome**: the user pressed Stop in this window, and a cancel can still land after
+  they have switched away, where a flash would call them back to something they ended. The fetched
+  export's two ext actions over one `done` share an `asked` cell, so only the report that lands
+  first asks — the same one `ExportTarget::run` keeps.
   **A file changed by another program is offered back when the window regains focus**, not by a
   filesystem watcher: the edit that matters was made elsewhere, and coming back is when the user
   would act on a stale copy. A second `create_effect` on `window_focused`, beside the connection

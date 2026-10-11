@@ -2914,7 +2914,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // taskbar flash on Windows and Linux, the dock bounce on macOS — through
     // `history::wants_attention`. `Informational`, which stops on its own once
     // the window is focused; both run paths ask it, after their supersede
-    // checks, so only the run a tab still shows does.
+    // checks, so only the run a tab still shows does. A `.sql` file run, an
+    // export, a dump and a folder export ask it too, timed from their launch,
+    // unless the user stopped them.
     let call_back_after = move |took_ms: u64| {
         if schemaic_core::history::wants_attention(took_ms, window_focused.get_untracked()) {
             floem::WindowIdExt::request_attention(&window, floem::Urgency::Informational);
@@ -4262,10 +4264,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             let export_token = export_token.clone();
                             let stoppable = req.stoppable;
                             let done = done.clone();
+                            // The window is asked for once, by whichever
+                            // report lands first — the one the modal keeps.
+                            let (started, asked) = (Instant::now(), Rc::new(Cell::new(false)));
                             move || {
                                 let export_token = export_token.clone();
                                 let done = done.clone();
+                                let asked = asked.clone();
                                 create_ext_action(cx, move |o: ExportOutcome| {
+                                    if !asked.replace(true)
+                                        && !matches!(o, ExportOutcome::Cancelled)
+                                    {
+                                        call_back_after(started.elapsed().as_millis() as u64);
+                                    }
                                     // **Only a run that took the slot may clear
                                     // it**, or an unstoppable log export
                                     // finishing would release the slot out from
@@ -4498,10 +4509,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                         let token = CancellationToken::new();
                         *export_token.borrow_mut() = Some(token.clone());
+                        let started = Instant::now();
                         let report = {
                             let export_token = export_token.clone();
                             create_ext_action(cx, move |o: ExportOutcome| {
                                 *export_token.borrow_mut() = None;
+                                if !matches!(o, ExportOutcome::Cancelled) {
+                                    call_back_after(started.elapsed().as_millis() as u64);
+                                }
                                 (done)(o)
                             })
                         };
@@ -4768,10 +4783,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 let token = CancellationToken::new();
                 *dump_token.borrow_mut() = Some(token.clone());
+                let started = Instant::now();
                 let report = {
                     let dump_token = dump_token.clone();
                     create_ext_action(cx, move |o: DumpOutcome| {
                         *dump_token.borrow_mut() = None;
+                        if !matches!(o, DumpOutcome::Cancelled { .. }) {
+                            call_back_after(started.elapsed().as_millis() as u64);
+                        }
                         (done)(o);
                     })
                 };
@@ -4817,10 +4836,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 let token = CancellationToken::new();
                 *dump_token.borrow_mut() = Some(token.clone());
+                let started = Instant::now();
                 let report = {
                     let dump_token = dump_token.clone();
                     create_ext_action(cx, move |o: FilesOutcome| {
                         *dump_token.borrow_mut() = None;
+                        if !matches!(o, FilesOutcome::Cancelled { .. }) {
+                            call_back_after(started.elapsed().as_millis() as u64);
+                        }
                         (done)(o);
                     })
                 };
@@ -4917,10 +4940,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 let token = CancellationToken::new();
                 *script_token.borrow_mut() = Some(token.clone());
+                let started = Instant::now();
                 let report = {
                     let script_token = script_token.clone();
                     create_ext_action(cx, move |o: RunOutcome| {
                         *script_token.borrow_mut() = None;
+                        if !matches!(o, RunOutcome::Cancelled { .. }) {
+                            call_back_after(started.elapsed().as_millis() as u64);
+                        }
                         (done)(o);
                     })
                 };
