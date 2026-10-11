@@ -1737,7 +1737,6 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         return empty_hint("No index selected. The primary key lives on the columns.").into_any();
     };
     let dialect = target.dialect;
-    let pg = dialect == SqlDialect::Postgres;
     // **Unique, Columns and Include are built only for a kind that keeps
     // them** (`IndexStorage::takes_*`, which agree with what `apply` clears):
     // a columnstore, XML or spatial index offered a toggle and lists the
@@ -1759,52 +1758,54 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         "Comma-separated, in key order. Add DESC for a descending column."
     };
 
-    // PostgreSQL-only, and built only there: a `hide()`n field is still in the
-    // modal's Tab order.
-    let pg_only: AnyView = if pg {
-        v_stack((
-            form_setting(
-                "Method",
-                field_with_hint(
-                    bound_field(
-                        d.draft,
-                        ix.method.clone().unwrap_or_default(),
-                        word_field_w,
-                        "btree",
-                        ring.clone(),
-                        40,
-                        move |d, v| {
-                            if let Some(x) = d.indexes.get_mut(i) {
-                                x.info.method =
-                                    Some(v.trim().to_string()).filter(|s| !s.is_empty());
-                            }
-                        },
-                    ),
-                    "Leave empty for the default (btree).",
+    // Each built only where the engine has it: a `hide()`n field is still in
+    // the modal's Tab order.
+    let method_field: AnyView = if ddl::supports_index_method(dialect) {
+        form_setting(
+            "Method",
+            field_with_hint(
+                bound_field(
+                    d.draft,
+                    ix.method.clone().unwrap_or_default(),
+                    word_field_w,
+                    "btree",
+                    ring.clone(),
+                    40,
+                    move |d, v| {
+                        if let Some(x) = d.indexes.get_mut(i) {
+                            x.info.method = Some(v.trim().to_string()).filter(|s| !s.is_empty());
+                        }
+                    },
                 ),
+                "Leave empty for the default (btree).",
             ),
-            form_setting(
-                "Only rows where",
-                field_with_hint(
-                    bound_field(
-                        d.draft,
-                        ix.predicate.clone().unwrap_or_default(),
-                        list_field_w,
-                        "",
-                        ring.clone(),
-                        50,
-                        move |d, v| {
-                            if let Some(x) = d.indexes.get_mut(i) {
-                                x.info.predicate =
-                                    Some(v.trim().to_string()).filter(|s| !s.is_empty());
-                            }
-                        },
-                    ),
-                    "A partial index's condition, without the WHERE.",
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
+    // A partial index is PostgreSQL's, SQLite's and SQL Server's — on SQL
+    // Server only for a kind that can be filtered, which `apply` agrees with.
+    let filter_field: AnyView = if ddl::supports_partial_index(dialect) && kind.takes_filter() {
+        form_setting(
+            "Only rows where",
+            field_with_hint(
+                bound_field(
+                    d.draft,
+                    ix.predicate.clone().unwrap_or_default(),
+                    list_field_w,
+                    "",
+                    ring.clone(),
+                    50,
+                    move |d, v| {
+                        if let Some(x) = d.indexes.get_mut(i) {
+                            x.info.predicate = Some(v.trim().to_string()).filter(|s| !s.is_empty());
+                        }
+                    },
                 ),
+                "A partial index's condition, without the WHERE.",
             ),
-        ))
-        .style(|s| s.flex_col().gap(form_gap()).width_full())
+        )
         .into_any()
     } else {
         crate::widgets::nothing()
@@ -1812,7 +1813,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
     // SQL Server's index kinds — rowstore, columnstore, the clustered
     // columnstore that is the table's own storage, XML and spatial — built only
-    // where the engine offers more than a rowstore, for `pg_only`'s reason, and
+    // where the engine offers more than a rowstore, for `method_field`'s reason, and
     // each kind only where its capability says (`IndexStorage::offered`). The
     // mapping is core's, which also clears what the choice cannot carry.
     let kinds: Vec<ddl::IndexStorage> = ddl::IndexStorage::ALL
@@ -1922,7 +1923,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     };
 
-    // Built only where the engine has `INCLUDE`, for `pg_only`'s reason, the
+    // Built only where the engine has `INCLUDE`, for `method_field`'s reason, the
     // kind keeps one, and the index can: not a SQL Server unique constraint
     // (no `INCLUDE` there, and the re-add dropped the list) nor a clustered
     // index (Msg 10601) — `ddl::index_takes_include`, which `validate` asks.
@@ -2018,7 +2019,8 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         using,
         order,
         unique,
-        pg_only,
+        method_field,
+        filter_field,
     ))
     .style(|s| {
         s.flex_col()

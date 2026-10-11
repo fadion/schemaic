@@ -5515,7 +5515,14 @@ existing prose was left alone.
     hint, naming the keyword `definition_sql` writes — it read *Auto-increment (AUTO_INCREMENT)* on
     SQL Server. `supports_index_prefix(dialect)` is MySQL's alone, and the index key hint names the
     `bio(20)` prefix syntax only there; it named it on every engine but PostgreSQL.
-    `supports_index_include(dialect)` sits beside it, true on SQL Server and PostgreSQL and false on
+    `supports_partial_index(dialect)` is true on PostgreSQL, SQLite and SQL Server — each a partial
+    (or filtered) index whose `WHERE` `create_index_sql` writes and whose introspection reads the
+    condition back — and false on MySQL, which has none; the index form's *Only rows where* field
+    asks it. `supports_index_method(dialect)` is PostgreSQL's alone, where the access method is a free
+    choice among installed ones, and the *Method* field asks it. The two were one PostgreSQL-only
+    block until the condition field was split off for the engines it serves
+    (`a_partial_index_is_offered_where_the_emitter_writes_its_where`).
+    `supports_index_include(dialect)` sits beside `supports_index_prefix`, true on SQL Server and PostgreSQL and false on
     MySQL and SQLite, which have no `INCLUDE` clause: the index form builds its *Include* field only
     where it is true, and `IndexInfo::include_sql` writes nothing where it is false (below, and
     under `schema.rs`). It is necessary, not sufficient: the field asks `index_takes_include(ix,
@@ -5925,7 +5932,16 @@ existing prose was left alone.
     the index it replaces) and replaying `TableInfo::dependent_ddl`. Each index goes back the way
     `ddl::sqlite_index_replay` says: emitted from the model, which is the only form that follows a
     renamed column into its index, or — for one the pragmas read `lossy` and this plan leaves alone
-    — replayed verbatim from `IndexInfo::create_sql`. The copy is what makes a rename
+    — replayed verbatim from `IndexInfo::create_sql`. **A partial index is its own arm**
+    (`partial_index_replay`), since its predicate is read back now and is free SQL naming columns:
+    refused when the condition names a column the plan drops — nothing to repoint it to, and SQLite
+    would refuse the `CREATE INDEX` with the whole rebuild rolled back — replayed verbatim when it is
+    untouched and no column moved, and otherwise emitted with the predicate repointed across each
+    renamed column by `repoint_check_column`, as the checks are. Before the predicate was read, a
+    rename anywhere under a partial index refused the plan; emitting it naively instead fails with
+    `no such column` in the re-emitted `CREATE INDEX`
+    (`renaming_a_column_a_partial_index_names_carries_its_condition`,
+    `dropping_a_column_a_partial_index_names_is_refused`, both red before the arm). The copy is what makes a rename
     a rename rather than a drop-and-add: each new column is mapped to the one it came from, a column
     the user added is in neither list so its default applies, and a generated column is in neither
     because it cannot be inserted into. It is `INSERT … SELECT` and not `CREATE TABLE … AS SELECT`,
@@ -6118,14 +6134,17 @@ existing prose was left alone.
     present it withholds nothing except an index flagged `IndexInfo::lossy` that cannot be put back
     as it was**: the rebuild drops the table, so every index has to be created again, and one
     re-emitted from a partial reading is not the index that was there — a partial index comes back
-    covering every row, an expression index missing its key. The way through is the one a trigger
+    covering every row, an expression index missing its key. (A partial index is no longer one of
+    these: `sqlite::index_predicate_of` reads its condition back, and it is `lossy` only where its
+    text yields none; its own refusal — a condition naming a dropped column — is under the
+    twelve-step rebuild above.) The way through is the one a trigger
     takes: `ddl::sqlite_index_replay` replays the index's **own** `CREATE` text
     (`IndexInfo::create_sql`) verbatim, which cannot lose what the pragmas never read. That leaves
     three narrow cases where no faithful statement exists, and only those are withheld — the index
     was **edited** (the stored text is the old one, and the model can't describe the new one), the
     index has no stored text of its own, or the plan **renames or drops a column**
-    (`ddl::column_moved`). The last is not caution: the unread part is exactly where a partial
-    index's predicate and an expression key live, so which columns the index uses is a question the
+    (`ddl::column_moved`). The last is not caution: the unread part is exactly where an expression
+    key lives (and a partial index's predicate, where it could not be cut), so which columns the index uses is a question the
     model cannot answer, and it is asked of the whole table instead. A withheld index is not a
     warning to read past; the plan is refused until the user drops it or undoes the edit.
     **SQL Server rebuilds too, through `tsql_rebuild_sql(current, draft)`**, for the three edits
@@ -16482,9 +16501,10 @@ existing prose was left alone.
   the sort that only show up against a real database: `table_xinfo` rather than `table_info`,
   because only the former reports a **generated** column and a write path that can't see one offers
   to insert into it; a non-`INTEGER` `PRIMARY KEY` is reported **nullable**, because SQLite
-  documents that it really is; and an index whose predicate or expression key the pragmas don't
-  return is marked `lossy`, since an index edit is a drop-and-create and would otherwise silently
-  widen it. That last one is also why every index carries `IndexInfo::create_sql`, the statement
+  documents that it really is; and an index whose expression key the pragmas don't return is
+  marked `lossy`, since an index edit is a drop-and-create and would otherwise silently change it —
+  as is a partial index whose predicate `index_predicate_of` (below) cannot cut from its text, which
+  would otherwise come back widened to every row. That last one is also why every index carries `IndexInfo::create_sql`, the statement
   that declared it — `sqlite::index_sql` is one `sqlite_master` query behind two consumers, Copy
   DDL's appended `CREATE INDEX` block and the per-index text a rebuild replays instead of
   re-emitting a `lossy` index from the model. It is `None` for an index SQLite wrote itself to back
@@ -16523,6 +16543,21 @@ existing prose was left alone.
   read alike, because SQLite makes no distinction once the table exists and a rebuild restates both
   as table constraints; a constraint written without `CONSTRAINT <name>` keeps an **empty** name,
   which is the honest answer rather than a gap (`sqlite::check_text_tests`/`check_schema_tests`).
+  **A partial index's predicate has no pragma either**, and `index_predicate_of` cuts it from the
+  index's own `CREATE INDEX` text (`index_sql`) with the same tools. The key list is the first `(`
+  in code, closed by `balanced_paren_span`; past any comments the next word must be `WHERE`, since
+  SQLite's `CREATE INDEX` has no other clause there; and the predicate runs to the last code byte
+  before the statement's `;` — **the stored text carries one**, which was found when a test read
+  back `deleted_at IS NULL;`. A comment *after* the condition is dropped, because restated in front
+  of a `;` a trailing `-- note` would comment the terminator out; one *inside* it is text and kept
+  (`index_predicate_tests`). `table_indexes` sets `predicate` from it and is `lossy` only for a
+  partial index whose text yields none, or an expression key. Until it did, every partial index
+  was `predicate: None` and `lossy` — so a rebuild refused any column rename under one, and the
+  index was invisible to the questions that read the field: `indexes_equal`, `ddl::index_hints`
+  (it counted as a plain index, so as redundant or as a foreign key's cover), and compare, which
+  flagged it uncertain. `a_partial_unique_index_is_not_offered_as_a_write_key` now asserts the
+  predicate is read and the index not lossy; `identifies_a_row` still refuses it on the predicate
+  itself rather than on `lossy`.
   **One catalogue read of the trigger text feeds two consumers** — `trigger_sql` is the query, and
   the two things made from it are not redundant (see `TableInfo::dependent_ddl` above).
   `trigger_statements` re-terminates each one into `dependent_ddl`, because SQLite stores a
@@ -23333,11 +23368,14 @@ existing prose was left alone.
     and a check's *Enforced* toggle `supports_unenforced_check(dialect, flavour)`, which is MySQL's
     *server's* rather than its dialect's: MariaDB answers `NOT ENFORCED` with `ERROR 1064`
     (measured live), and an `Unknown` flavour is withheld it rather than offered a clause the server
-    may reject (`the_designers_mysql_fields_are_asked_as_capabilities`). The one comparison left is
-    the index form's PostgreSQL-only *Method* and partial-index predicate block, kept because
-    splitting it honestly widens the form: a partial index is SQLite's and SQL Server's too, but
-    SQLite's introspection reads no predicate back (the index is replayed verbatim), so the field
-    would open empty over one. The index form's *Include* field, after
+    may reject (`the_designers_mysql_fields_are_asked_as_capabilities`). **The last comparison took
+    it 1 → 0**: the index form's PostgreSQL-only *Method* and partial-index predicate block, which
+    is two fields now — *Method* built where `ddl::supports_index_method` holds (PostgreSQL alone),
+    *Only rows where* where `ddl::supports_partial_index` holds (PostgreSQL, SQLite and SQL Server)
+    and the kind `IndexStorage::takes_filter`. It was kept whole for as long as SQLite's
+    introspection read no predicate back, since the field would have opened empty over a partial
+    index that was replayed verbatim; `sqlite::index_predicate_of` reading it is what made the split
+    honest (under `sqlite.rs`). The index form's *Include* field, after
     *Columns*, is built only where `ddl::index_takes_include` answers yes — an engine with `INCLUDE`
     (`supports_index_include`, SQL Server and PostgreSQL), a kind that keeps a list, and neither a
     SQL Server unique constraint nor a clustered index, on either of which the server refuses one
@@ -23356,7 +23394,9 @@ existing prose was left alone.
     only for a kind that keeps them** — `takes_unique` and `takes_include` for a rowstore index
     alone, `takes_columns` for every kind but the clustered columnstore, which stores every column
     — so a columnstore, XML or spatial index no longer offers a toggle and lists its Storage choice
-    has just emptied. Each is pinned to what `apply` leaves, not listed beside it
+    has just emptied. *Only rows where* follows the same rule through `takes_filter`, true for a
+    rowstore and a nonclustered columnstore index and false for the clustered columnstore, XML and
+    spatial kinds — exactly where `apply` clears `predicate`. Each is pinned to what `apply` leaves, not listed beside it
     (`each_kind_takes_exactly_the_fields_its_apply_keeps`). The *Columns* hint follows the kind
     too: the one column an XML or spatial index is over, the columns a nonclustered columnstore
     stores. A *Using* field (tab 28) follows the Storage dropdown, built only when the kind has a
@@ -23432,7 +23472,9 @@ existing prose was left alone.
     rebuilds a table carrying an index `IndexInfo::lossy` marked **and cannot replay it** — it was
     edited, it has no `CREATE` text of its own, or the plan moves a column that text may name — so
     the block names it and Apply refuses until the user drops the index or undoes the edit. An
-    untouched one is simply replayed and never reaches this block. Entry
+    untouched one is simply replayed and never reaches this block. A partial index whose condition
+    names a column the plan drops reaches it the same way without being `lossy`
+    (`ddl::partial_index_replay`, under `ddl.rs`). Entry
     points:
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
@@ -32111,7 +32153,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `supports_column_comments` and `supports_on_update_current_timestamp` — the first paid off since
   as `ddl::supports_comments`, asked of the table's comment field too, when SQL Server's Create
   table needed both hidden; `ON UPDATE` as `ddl::supports_column_on_update`, with the storage row
-  and the check's *Enforced* toggle beside it, taking the file 4 → 1. Giving the predicates a
+  and the check's *Enforced* toggle beside it, taking the file 4 → 1; its last, the index form's
+  PostgreSQL-only *Method*-and-predicate block, split into `ddl::supports_index_method` and
+  `supports_partial_index` once SQLite read a partial index's predicate back, taking it off the
+  list. What the view crates still have admitted is one site each in `account_editor.rs`,
+  `lib.rs`, `trigger_editor.rs` and `schemaic-app/ai.rs`. Giving the predicates a
   named home outside `ddl.rs` — which is legitimately per-dialect throughout, and long enough that
   a view author looking for one does not find it — is the half the gate does not do, and is open.
   `export::qualified_table` was the same sitting's other half: its per-engine `match` spells the

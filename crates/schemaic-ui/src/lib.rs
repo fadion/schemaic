@@ -4360,25 +4360,6 @@ mod engine_comparison_gate {
              prompt says `(none)` beside it.",
         ),
         (
-            "table_designer.rs",
-            1,
-            "PostgreSQL's index method and partial-index fields, built as one \
-             block. Not split into capabilities yet because the honest ones \
-             widen the form: a partial index is SQLite's and SQL Server's too, \
-             but SQLite's introspection reads no predicate back (the index is \
-             replayed verbatim), so the field would open empty over one. \
-             4 → 1: the storage row asks `ddl::takes_table_options`, the \
-             column's On update `supports_column_on_update`, and `NOT \
-             ENFORCED` `supports_unenforced_check(dialect, flavour)`. 9 → 8: a new column's \
-             placeholder type is `ddl::default_new_column_type`. 8 → 5, with \
-             SQL Server's Create table: both comment fields ask \
-             `ddl::supports_comments`, the identity toggle \
-             `ddl::identity_wording`, and the index key hint \
-             `ddl::supports_index_prefix`. 5 → 4: the namespace a new table \
-             defaults to is `schema::default_namespace`, which was the \
-             comparison sending SQL Server's into the login's schema.",
-        ),
-        (
             "trigger_editor.rs",
             1,
             "A trigger function's name is qualified as PostgreSQL's, because \

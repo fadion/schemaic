@@ -9775,6 +9775,30 @@ pub fn supports_index_prefix(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Can an index be **partial** — `CREATE INDEX … WHERE <condition>` — on
+/// `dialect`? PostgreSQL's partial index, SQLite's, and SQL Server's filtered
+/// one; [`create_index_sql`] writes the `WHERE` for each, and each engine's
+/// introspection reads the condition back (SQLite's from the index's own
+/// text). MySQL and MariaDB have none. The designer's *Only rows where* field.
+pub fn supports_partial_index(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::MySql => false,
+    }
+}
+
+/// Does the designer offer an index's **access method** (`USING gin`) on
+/// `dialect`? PostgreSQL's alone, where it is a free choice among installed
+/// methods. MySQL's `BTREE`/`HASH` is the storage engine's to honour or ignore
+/// and its spatial index is a kind, SQL Server's choice is the *Storage* row,
+/// and SQLite has one method.
+pub fn supports_index_method(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
 /// What kind of index a SQL Server index is — the designer's *Storage*
 /// choice, mapped onto [`IndexInfo::method`], [`IndexInfo::clustered`] and
 /// [`IndexInfo::using`] here so the form only shows it.
@@ -9901,6 +9925,16 @@ impl IndexStorage {
         self == IndexStorage::Rowstore
     }
 
+    /// Can this kind be **filtered** ([`IndexInfo::predicate`])? A rowstore
+    /// or nonclustered columnstore index can; a clustered columnstore one
+    /// stores every row, and an XML or spatial one takes no filter — exactly
+    /// where [`IndexStorage::apply`] clears it. The designer builds its
+    /// condition field only where this holds, and where the engine has a
+    /// partial index at all ([`supports_partial_index`]).
+    pub fn takes_filter(self) -> bool {
+        matches!(self, IndexStorage::Rowstore | IndexStorage::Columnstore)
+    }
+
     /// [`IndexStorage::of`] as `dialect`'s designer reads it: a kind the
     /// engine does not offer is a rowstore index there. MySQL's `SPATIAL`
     /// index carries the `method` SQL Server's does, and read as SQL
@@ -9954,9 +9988,9 @@ impl IndexStorage {
                 ix.unique = false;
                 ix.include.clear();
                 // A columnstore column has no direction (Msg 35302), and a
-                // clustered one takes no filter (Msg 102) — a filter the
-                // designer shows on PostgreSQL alone, so left here it could
-                // not be cleared (S3.1-L1-02).
+                // clustered one takes no filter (Msg 102) — and the designer
+                // builds no condition field for this kind (`takes_filter`), so
+                // left here it could not be cleared (S3.1-L1-02).
                 for c in &mut ix.columns {
                     c.descending = false;
                 }
@@ -13450,15 +13484,16 @@ fn is_sqlite_constraint_index(ix: &IndexInfo) -> bool {
 
 /// How this draft index gets back onto the rebuilt table.
 ///
-/// Only an [`IndexInfo::lossy`] index can be anything but [`IndexReplay::Emit`],
-/// and for one of those the verbatim text is a **snapshot**: it describes the
-/// index as it was, against the table as it was. Each condition below is a way
-/// that snapshot has stopped being true, and the part that makes them necessary
-/// rather than cautious is the same part that makes the index lossy — the
-/// predicate of a partial index, the expression of an expression key. Those name
-/// columns the model never read, so "does this edit touch a column the index
-/// uses?" is a question that cannot be answered from the model at all. It is
-/// asked of the whole table instead.
+/// An index the model holds whole goes to [`partial_index_replay`] — emitted,
+/// unless it is partial and its condition needs saying. For an
+/// [`IndexInfo::lossy`] one the verbatim text is a **snapshot**: it describes
+/// the index as it was, against the table as it was. Each condition below is a
+/// way that snapshot has stopped being true, and the part that makes them
+/// necessary rather than cautious is the same part that makes the index lossy —
+/// the expression of an expression key, or a partial index's predicate where
+/// its text could not be cut. Those name columns the model never read, so "does
+/// this edit touch a column the index uses?" is a question that cannot be
+/// answered from the model at all. It is asked of the whole table instead.
 fn sqlite_index_replay<'a>(
     current: &'a TableInfo,
     draft: &TableDraft,
@@ -13472,7 +13507,7 @@ fn sqlite_index_replay<'a>(
         return IndexReplay::Skip;
     }
     if !ix.info.lossy {
-        return IndexReplay::Emit;
+        return partial_index_replay(current, draft, ix);
     }
     let name = &ix.info.name;
     let partly_read = format!(
@@ -13513,6 +13548,52 @@ fn sqlite_index_replay<'a>(
              recreating it would change what it indexes. Drop the index to go on \
              without it."
         )),
+    }
+}
+
+/// [`sqlite_index_replay`] for an index the model holds whole — which, once
+/// SQLite's introspection reads a partial index's predicate back, includes a
+/// partial one, and the predicate is free SQL naming columns.
+///
+/// - **No predicate**: [`IndexReplay::Emit`], as ever.
+/// - **A predicate naming a column the plan drops**: refused — there is
+///   nothing to repoint it to, and SQLite would refuse the `CREATE INDEX` with
+///   the whole rebuild rolled back.
+/// - **Untouched, with no column moved**: its own text verbatim, so a rebuild
+///   that was about something else leaves the index exactly as written.
+/// - **Otherwise** emitted from the model, where [`sqlite_rebuild_sql`]
+///   repoints the predicate across renamed columns as it does the checks.
+fn partial_index_replay<'a>(
+    current: &'a TableInfo,
+    draft: &TableDraft,
+    ix: &IndexDraft,
+) -> IndexReplay<'a> {
+    let Some(pred) = ix.info.predicate.as_deref() else {
+        return IndexReplay::Emit;
+    };
+    let kept: HashSet<&str> = draft
+        .columns
+        .iter()
+        .filter_map(|c| c.original.as_deref())
+        .collect();
+    if let Some(gone) = current.columns.iter().find(|c| {
+        !kept.contains(c.name.as_str())
+            && repoint_check_column(pred, &c.name, &c.name, SqlDialect::Sqlite).is_some()
+    }) {
+        return IndexReplay::Refuse(format!(
+            "Index {}'s condition names {}, which this plan drops. Edit the condition \
+             or drop the index first.",
+            ix.info.name, gone.name
+        ));
+    }
+    let untouched = ix
+        .original
+        .as_deref()
+        .and_then(|o| current.indexes.iter().find(|c| c.name == o))
+        .filter(|cur| indexes_equal(cur, &ix.info) && column_moved(current, draft).is_none());
+    match untouched.and_then(|cur| cur.create_sql.as_deref()) {
+        Some(sql) => IndexReplay::Verbatim(sql),
+        None => IndexReplay::Emit,
     }
 }
 
@@ -14230,16 +14311,6 @@ struct MovedColumn {
     phrase: String,
 }
 
-/// Every column this plan renames or drops, each named the way a message wants
-/// it — empty when every column of `current` is still there under its own name.
-///
-/// Only these two edits invalidate SQL that refers to a column: a retype, a
-/// default, a new column or a constraint all leave every existing name pointing
-/// at the same thing.
-///
-/// All of them rather than the first, because a caller asking *"does this other
-/// statement name one"* has to ask about each: the first moved column is not
-/// necessarily the one a given trigger spells.
 /// A generated column whose expression names a column this plan moves, or
 /// `None`.
 ///
@@ -14291,6 +14362,16 @@ fn rebuild_strands_a_generated_column(current: &TableInfo, draft: &TableDraft) -
     None
 }
 
+/// Every column this plan renames or drops, each named the way a message wants
+/// it — empty when every column of `current` is still there under its own name.
+///
+/// Only these two edits invalidate SQL that refers to a column: a retype, a
+/// default, a new column or a constraint all leave every existing name pointing
+/// at the same thing.
+///
+/// All of them rather than the first, because a caller asking *"does this other
+/// statement name one"* has to ask about each: the first moved column is not
+/// necessarily the one a given trigger spells.
 fn moved_columns(current: &TableInfo, draft: &TableDraft) -> Vec<MovedColumn> {
     let mut out: Vec<MovedColumn> = Vec::new();
     for c in &draft.columns {
@@ -14529,6 +14610,23 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
     out.push("PRAGMA legacy_alter_table = OFF;".to_string());
     for ix in &draft.indexes {
         match sqlite_index_replay(current, draft, ix) {
+            // A partial index's condition follows a renamed column the way the
+            // checks above do: it is text SQLite stored, naming columns as they
+            // were, and the table it now goes on has them as they *will be*.
+            IndexReplay::Emit if ix.info.predicate.is_some() => {
+                let mut info = ix.info.clone();
+                for c in &draft.columns {
+                    let Some(was) = c.original.as_deref().filter(|o| **o != c.info.name) else {
+                        continue;
+                    };
+                    if let Some(p) = info.predicate.as_deref()
+                        && let Some(e) = repoint_check_column(p, was, &c.info.name, d)
+                    {
+                        info.predicate = Some(e);
+                    }
+                }
+                out.push(create_index_sql(&info, &original, d));
+            }
             IndexReplay::Emit => out.push(create_index_sql(&ix.info, &original, d)),
             IndexReplay::Verbatim(sql) => out.push(sql.to_string()),
             // Already in the table body, as a `UNIQUE (…)` constraint line.
@@ -19916,6 +20014,29 @@ mod tests {
         }
     }
 
+    /// **A partial index is three engines', not PostgreSQL's**, and the
+    /// emitter writes its `WHERE` on each: the designer's *Only rows where*
+    /// field follows that rather than the one engine it was first built for.
+    /// MySQL has no partial index, so the field there would take a condition
+    /// the server rejects. The access method is PostgreSQL's alone to choose.
+    #[test]
+    fn a_partial_index_is_offered_where_the_emitter_writes_its_where() {
+        for d in [Postgres, Sqlite, MsSql] {
+            assert!(supports_partial_index(d), "{d:?}");
+            let ix = IndexInfo {
+                predicate: Some("qty > 0".into()),
+                ..IndexInfo::plain("ix", vec!["qty"], false)
+            };
+            let sql = create_index_sql(&ix, "t", d);
+            assert!(sql.contains("WHERE qty > 0"), "{d:?}: {sql}");
+        }
+        assert!(!supports_partial_index(MySql));
+        assert!(supports_index_method(Postgres));
+        for d in [MySql, Sqlite, MsSql] {
+            assert!(!supports_index_method(d), "{d:?}");
+        }
+    }
+
     /// **The preview's line for an added index says what the statement
     /// does.** A clustered columnstore index names no columns, so it read
     /// *"Add index ix_cs on ()"*; an expression key was skipped, so a
@@ -20013,12 +20134,14 @@ mod tests {
         for s in IndexStorage::ALL {
             let mut ix = IndexInfo {
                 include: vec!["code".into()],
+                predicate: Some("qty > 0".into()),
                 ..IndexInfo::plain("ix", vec!["qty", "code"], true)
             };
             s.apply(&mut ix);
             assert_eq!(s.takes_unique(), ix.unique, "{s:?}");
             assert_eq!(s.takes_columns(), !ix.columns.is_empty(), "{s:?}");
             assert_eq!(s.takes_include(), !ix.include.is_empty(), "{s:?}");
+            assert_eq!(s.takes_filter(), ix.predicate.is_some(), "{s:?}");
         }
         assert!(IndexStorage::Columnstore.takes_columns());
         assert!(!IndexStorage::ClusteredColumnstore.takes_columns());

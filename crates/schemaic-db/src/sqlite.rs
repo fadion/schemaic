@@ -3125,6 +3125,76 @@ fn as_expression(sql: &str, at: usize) -> Option<String> {
     None
 }
 
+/// A partial index's predicate, without the `WHERE`, cut from the index's own
+/// `CREATE INDEX` text — **no pragma reports it**, the position
+/// [`checks_of`] is in, answered with the same tools.
+///
+/// The key list is the statement's first `(` in code, so a parenthesis inside
+/// a quoted index or table name is not it, and [`balanced_paren_span`] closes
+/// it over an expression key's own parens and a literal's. What follows is
+/// either nothing or `WHERE <predicate>`: SQLite's `CREATE INDEX` has no other
+/// clause there. The predicate runs to the last code byte before the
+/// statement's `;` (the stored text carries one), so a comment
+/// *after* it is left behind — restated in front of a `;`, a trailing
+/// `-- note` would comment the terminator out — while one inside it is text
+/// and kept.
+///
+/// [`balanced_paren_span`]: schemaic_core::sql::balanced_paren_span
+fn index_predicate_of(create_sql: &str) -> Option<String> {
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::sql::{balanced_paren_span, is_word_byte, skip_noncode};
+
+    let d = SqlDialect::Sqlite;
+    let b = create_sql.as_bytes();
+    let is_comment = |i: usize| b[i..].starts_with(b"--") || b[i..].starts_with(b"/*");
+    // The key list's `(`, in code.
+    let mut i = 0usize;
+    while i < b.len() && b[i] != b'(' {
+        i = skip_noncode(b, i, d).unwrap_or(i + 1).max(i + 1);
+    }
+    let mut i = balanced_paren_span(b, i, d)? + 1;
+    // Past whitespace and comments, to the next code byte.
+    while i < b.len() {
+        match skip_noncode(b, i, d) {
+            Some(j) if is_comment(i) => i = j.max(i + 1),
+            _ if b[i].is_ascii_whitespace() => i += 1,
+            _ => break,
+        }
+    }
+    let word_end = i + 5;
+    if b.len() < word_end
+        || !create_sql[i..word_end].eq_ignore_ascii_case("WHERE")
+        || b.get(word_end).is_some_and(|&c| is_word_byte(c))
+    {
+        return None;
+    }
+    // The predicate: from the first code byte after `WHERE` to the end of the
+    // last one, strings and quoted names counting as code.
+    let (mut start, mut end) = (None, word_end);
+    let mut i = word_end;
+    while i < b.len() {
+        let next = match skip_noncode(b, i, d) {
+            Some(j) if is_comment(i) => {
+                i = j.max(i + 1);
+                continue;
+            }
+            Some(j) => j.max(i + 1),
+            None if b[i].is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            // The statement's own terminator, which the stored text carries.
+            None if b[i] == b';' => break,
+            None => i + 1,
+        };
+        start.get_or_insert(i);
+        end = next;
+        i = next;
+    }
+    let p = create_sql[start?..end].trim();
+    (!p.is_empty()).then(|| p.to_string())
+}
+
 /// One table's indexes, from `PRAGMA index_list` + `PRAGMA index_xinfo`.
 ///
 /// `index_xinfo` rather than `index_info` because it reports the sort order and
@@ -3163,6 +3233,13 @@ fn table_indexes(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<IndexIn
     for (name, unique, origin, partial) in rows {
         let (columns, dropped_expression) = index_columns(conn, db, &name, &column_collations)?;
         let is_pk = origin == "pk";
+        // A partial index's predicate isn't in any pragma — only in the index's
+        // own `CREATE` text, and read from there. A partial index whose text
+        // will not yield one is still `lossy` below, rather than recreated
+        // widened to every row.
+        let predicate = partial
+            .then(|| declared.get(&name).and_then(|s| index_predicate_of(s)))
+            .flatten();
         out.push(IndexInfo {
             name: if is_pk {
                 "PRIMARY".to_string()
@@ -3177,17 +3254,13 @@ fn table_indexes(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<IndexIn
             unique,
             foreign: false,
             method: None,
-            // A partial index's predicate isn't in any pragma — only in the
-            // index's own `CREATE` text — so it is left unread rather than
-            // guessed, and `lossy` below is what stops a recreate silently
-            // widening the index to every row.
-            predicate: None,
             constraint: (origin != "c").then(|| name.clone()),
-            // Two things SQLite's pragmas don't give back, and each would be
-            // destroyed by the drop-and-create an index edit is: the predicate of
-            // a partial index, and an expression key column, which `index_xinfo`
-            // reports with a NULL name and nothing else.
-            lossy: partial || dropped_expression,
+            // What SQLite's pragmas don't give back, each destroyed by the
+            // drop-and-create an index edit is: an expression key column, which
+            // `index_xinfo` reports with a NULL name and nothing else, and a
+            // partial index's predicate when its text could not be cut.
+            lossy: (partial && predicate.is_none()) || dropped_expression,
+            predicate,
             // Keyed on the catalogue name, not the `PRIMARY` this may have been
             // renamed to — and absent for exactly the indexes SQLite declares
             // itself, which have no statement of their own to keep.
@@ -6024,11 +6097,9 @@ mod tests {
     /// in the order the app does, because the bug was never in the predicate. It
     /// was in the two resolvers that never asked it.
     ///
-    /// SQLite is also the engine that makes the case sharpest: `db::sqlite`
-    /// leaves a partial index's `WHERE` unread on purpose and reports `lossy`
-    /// instead, so `predicate` is `None` here and `lossy` is the *only* thing
-    /// saying the index does not mean what `columns` says. A resolver reading
-    /// `predicate` alone would still get this wrong.
+    /// `db::sqlite` once left a partial index's `WHERE` unread and reported
+    /// `lossy` instead; it reads the predicate back from the index's own text
+    /// now (`index_predicate_of`), and the introspector half below pins that.
     ///
     /// The rows prove the index really is not a key: two live rows share an
     /// email, which the engine accepts, so `WHERE email = ?` would have matched
@@ -6061,10 +6132,12 @@ mod tests {
             .find(|ix| ix.name == "ux")
             .expect("the index was introspected");
         assert!(ux.unique, "not read as unique, so this proves nothing");
-        assert!(
-            ux.lossy && ux.predicate.is_none(),
-            "SQLite reports a partial index as lossy with no predicate: {ux:?}"
+        assert_eq!(
+            ux.predicate.as_deref(),
+            Some("deleted_at IS NULL"),
+            "the partial index's predicate is read from its text: {ux:?}"
         );
+        assert!(!ux.lossy, "a predicate read back is not lossy: {ux:?}");
 
         // `SELECT email, deleted_at` — no rowid, so the *only* candidate key is
         // the index. If it is accepted, the table is editable; it must not be.
@@ -7969,6 +8042,84 @@ mod check_text_tests {
     }
 }
 
+/// [`index_predicate_of`] over the statement text alone.
+#[cfg(test)]
+mod index_predicate_tests {
+    use super::index_predicate_of as pred;
+
+    #[test]
+    fn the_predicate_is_everything_after_the_key_lists_where() {
+        assert_eq!(
+            pred("CREATE INDEX ix ON t(a, b DESC) WHERE a IS NOT NULL AND b > 0").as_deref(),
+            Some("a IS NOT NULL AND b > 0")
+        );
+        assert_eq!(
+            pred("CREATE UNIQUE INDEX ux ON t (email COLLATE NOCASE)\n  where deleted_at is null")
+                .as_deref(),
+            Some("deleted_at is null")
+        );
+    }
+
+    #[test]
+    fn an_index_with_no_where_has_no_predicate() {
+        assert_eq!(pred("CREATE INDEX ix ON t(a)"), None);
+        assert_eq!(pred(""), None);
+        assert_eq!(pred("CREATE INDEX ix ON t(a) WHERE "), None);
+    }
+
+    /// Names and literals are not the key list, nor the keyword: a `(` or a
+    /// `WHERE` inside a quoted name or a string is text.
+    #[test]
+    fn quoted_names_and_literals_cannot_fake_the_shape() {
+        assert_eq!(
+            pred(r#"CREATE INDEX "ix(where" ON "t WHERE (" ("a)") WHERE "a)" <> ')' "#).as_deref(),
+            Some(r#""a)" <> ')'"#)
+        );
+        assert_eq!(
+            pred("CREATE INDEX ix ON t(a) WHERE a IN (1, 2) AND b = 'x WHERE y'").as_deref(),
+            Some("a IN (1, 2) AND b = 'x WHERE y'")
+        );
+    }
+
+    /// **A trailing comment is not the predicate.** Restated before the
+    /// statement's `;`, a `-- note` would comment the terminator out.
+    #[test]
+    fn a_comment_after_the_predicate_is_left_behind() {
+        assert_eq!(
+            pred("CREATE INDEX ix ON t(a) WHERE a > 0 -- live rows").as_deref(),
+            Some("a > 0")
+        );
+        assert_eq!(
+            pred("CREATE INDEX ix ON t(a) /* k */ WHERE /* p */ a > 0 /* end */").as_deref(),
+            Some("a > 0")
+        );
+        // The terminator `index_sql` hands the statement over with is not
+        // part of the predicate either.
+        assert_eq!(
+            pred("CREATE INDEX ix ON t(a) WHERE a > 0; -- live").as_deref(),
+            Some("a > 0")
+        );
+        assert_eq!(
+            pred("CREATE INDEX ix ON t(a) WHERE a <> ';';").as_deref(),
+            Some("a <> ';'")
+        );
+        // Inside the predicate a comment is kept: it is part of the text.
+        assert_eq!(
+            pred("CREATE INDEX ix ON t(a) WHERE a > 0 /* x */ AND b").as_deref(),
+            Some("a > 0 /* x */ AND b")
+        );
+    }
+
+    /// An expression key's parens are nesting inside the key list.
+    #[test]
+    fn an_expression_key_does_not_end_the_key_list() {
+        assert_eq!(
+            pred("CREATE INDEX ix ON t(lower(name), (a + b)) WHERE length(name) > 2").as_deref(),
+            Some("length(name) > 2")
+        );
+    }
+}
+
 /// Introspection carrying the checks it reads — the wiring behind
 /// [`check_text_tests`], over a real database.
 #[cfg(test)]
@@ -8025,7 +8176,8 @@ mod check_schema_tests {
 mod rebuild_roundtrip_tests {
     use super::tests::shared_memory;
     use super::*;
-    use schemaic_core::ddl::{TableDraft, sqlite_rebuild_sql};
+    use schemaic_core::ddl::{TableDraft, diff, sqlite_rebuild_sql};
+    use schemaic_core::intel::SqlDialect;
     use tokio_util::sync::CancellationToken;
 
     async fn table_of(db: &Db, name: &str) -> TableInfo {
@@ -8178,13 +8330,15 @@ mod rebuild_roundtrip_tests {
 
         let before = table_of(&db, "t").await;
         // Introspection is what supplies the text, so this covers the wiring too.
+        // The expression index is lossy; the partial one's predicate is read
+        // back, and an untouched one still replays its own text verbatim.
         for name in ["ix_lower", "ix_live"] {
             let ix = before
                 .indexes
                 .iter()
                 .find(|i| i.name == name)
                 .unwrap_or_else(|| panic!("{name}"));
-            assert!(ix.lossy, "{name} must read lossy: {ix:?}");
+            assert_eq!(ix.lossy, name == "ix_lower", "{name}: {ix:?}");
             assert!(ix.create_sql.is_some(), "{name} keeps its own text");
         }
 
@@ -8232,21 +8386,120 @@ mod rebuild_roundtrip_tests {
         keeper
             .execute_batch(
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, title TEXT);
+                 CREATE INDEX ix_lower ON t (lower(title));",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "TEXT".into();
+        // `title` appears only in the expression key, which no pragma reports —
+        // so the model cannot see that this rename breaks the index at all.
+        draft.rename_column(2, "heading");
+        let withheld =
+            schemaic_core::ddl::diff(&before, &draft, schemaic_core::intel::SqlDialect::Sqlite)
+                .unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains("ix_lower"), "{withheld:?}");
+        assert!(withheld[0].contains("title"), "{withheld:?}");
+    }
+
+    /// **A partial index's condition follows a renamed column through a
+    /// rebuild**, as a `CHECK` does. The predicate is read back now, so the
+    /// rebuild re-emits the index from the model with the condition repointed —
+    /// where it used to refuse the whole plan, and before that the replayed text
+    /// named a column the new table no longer had.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renaming_a_column_a_partial_index_names_carries_its_condition() {
+        let (keeper, db) = shared_memory("rebuild_partial_rename");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, title TEXT);
+                 CREATE INDEX ix_live ON t (title) WHERE n IS NOT NULL;
+                 INSERT INTO t VALUES (1, 5, 'A'), (2, NULL, 'B');",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[2].info.type_name = "BLOB".into();
+        draft.rename_column(1, "count");
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("rebuild");
+
+        let after = table_of(&db, "t").await;
+        let ix = after
+            .indexes
+            .iter()
+            .find(|i| i.name == "ix_live")
+            .expect("the index came back");
+        let p = ix.predicate.as_deref().unwrap_or_default();
+        assert!(
+            p.contains("count") && !p.contains(" n "),
+            "the condition names the new column: {ix:?}"
+        );
+        let used: i64 = keeper
+            .query_row(
+                "SELECT count(*) FROM t INDEXED BY ix_live WHERE count IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the index serves the condition it was written for");
+        assert_eq!(used, 1);
+    }
+
+    /// A dropped column the condition names has nothing to be repointed to, so
+    /// the plan is refused and says which index and which column.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_column_a_partial_index_names_is_refused() {
+        let (keeper, db) = shared_memory("rebuild_partial_drop");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, title TEXT);
                  CREATE INDEX ix_live ON t (title) WHERE n IS NOT NULL;",
             )
             .unwrap();
         let before = table_of(&db, "t").await;
         let mut draft = TableDraft::from_table(&before);
         draft.columns[2].info.type_name = "BLOB".into();
-        // `n` appears only in the predicate, which no pragma reports — so the
-        // model cannot see that this rename breaks the index at all.
-        draft.rename_column(1, "count");
-        let withheld =
-            schemaic_core::ddl::diff(&before, &draft, schemaic_core::intel::SqlDialect::Sqlite)
-                .unsupported();
-        assert_eq!(withheld.len(), 1, "{withheld:?}");
-        assert!(withheld[0].contains("ix_live"), "{withheld:?}");
-        assert!(withheld[0].contains('n'), "{withheld:?}");
+        draft.remove_column(1, SqlDialect::Sqlite);
+        let withheld = diff(&before, &draft, SqlDialect::Sqlite).unsupported();
+        assert!(
+            withheld
+                .iter()
+                .any(|w| w.contains("ix_live") && w.contains('n')),
+            "{withheld:?}"
+        );
+    }
+
+    /// The edit the read predicate makes possible: change the condition, and
+    /// the index is recreated with the new one rather than withheld as lossy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_indexs_condition_can_be_edited() {
+        let (keeper, db) = shared_memory("partial_edit");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, title TEXT);
+                 CREATE INDEX ix_live ON t (title) WHERE n IS NOT NULL;",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        let ix = draft
+            .indexes
+            .iter_mut()
+            .find(|i| i.info.name == "ix_live")
+            .expect("the draft carries the index");
+        ix.info.predicate = Some("n > 10".into());
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("the edit applies");
+        let after = table_of(&db, "t").await;
+        let ix = after.indexes.iter().find(|i| i.name == "ix_live").unwrap();
+        assert_eq!(ix.predicate.as_deref(), Some("n > 10"), "{ix:?}");
     }
 }
 

@@ -204,7 +204,10 @@ pub struct IndexInfo {
     /// The access method (`btree`, `hash`, `gin`…), when the server names one.
     /// Left `None` for the engine's default so generated DDL stays plain.
     pub method: Option<String>,
-    /// A partial index's predicate, without the `WHERE` (PostgreSQL only).
+    /// A partial index's predicate, without the `WHERE` — PostgreSQL's partial
+    /// index, SQL Server's filtered one, and SQLite's, cut from the index's own
+    /// `CREATE` text since no pragma reports it. `None` on MySQL, which has
+    /// none ([`crate::ddl::supports_partial_index`]).
     pub predicate: Option<String>,
     /// The constraint this index *is*, when it backs one — a PostgreSQL
     /// `PRIMARY KEY` or `UNIQUE` constraint. `None` for a plain index (and always
@@ -251,8 +254,10 @@ pub struct IndexInfo {
     /// created again — and an index re-emitted from a partial reading is a
     /// *different* index. Replaying this text puts back exactly what was there,
     /// the same fidelity argument [`TableInfo::dependent_ddl`] makes for
-    /// triggers, and it is what lets a table with a partial or expression index
-    /// be edited at all (`ddl::sqlite_rebuild_sql`).
+    /// triggers, and it is what lets a table with an expression index be
+    /// edited at all (`ddl::sqlite_rebuild_sql`). A partial index whose
+    /// predicate was read back replays it too while untouched, so a rebuild
+    /// about something else leaves its text exactly as written.
     ///
     /// **On PostgreSQL it is what stops a structure dump rewriting an index
     /// nobody edited.** [`TableInfo::create_ddl`] emits from the model, and the
