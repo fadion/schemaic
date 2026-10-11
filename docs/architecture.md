@@ -21423,7 +21423,17 @@ existing prose was left alone.
     The designer's *Table | Columns | Indexes …* strip and Server Variables' *Variables | Status*
     switch both call it, so the two cannot drift apart again — the switch wore Server Activity's
     underlined labels until the user asked for it to match the designer's tabs. Server Activity's
-    own *Sessions | Locks* switch still draws those underlined labels and does not use it.
+    own *Sessions | Locks* switch does not use it either: it is a switch between views of one
+    panel, not a modal's sections, and takes `segmented_tabs` below.
+    **`segmented_tabs(tabs, current)` is a tab bar** — the tabs in equal shares of one bar
+    (`flex_grow(1)`, basis 0), labels centred at body size, a click setting the `RwSignal<T>`. The
+    bar wears a text field's surface and outline (`bg_chrome`, a 1px `field_border`, radius 6,
+    `scaled(3)` padding and gap), so it reads as a control of the same family as the search box it
+    sits above. The active tab is filled in `btn_primary` (radius 4) with a `text` label and answers
+    no hover — it is already where a click would go; the others are `text_dim` and a hover only
+    brightens them to `text`. Server Activity's *Sessions | Locks* is its one caller, replacing the
+    row of accent-underlined labels it drew before; `pill_tab_style`'s loose pills stay the look of
+    a modal's section strip.
     **There is no `footer_button` any more.** Every modal with a footer bar wears the filled
     `action_button`, and the text-only button that sat beside it at a smaller padding left with the
     last of those footers. The rest of that family went with GitHub #25: `dialog_button` (over a
@@ -23110,9 +23120,10 @@ existing prose was left alone.
     The lock-wait card is the same lesson in the other direction: it lost its right border to
     `width: 100%` *plus* a 12px margin, which is 24px too wide because margins sit outside the
     width — column-flex stretch subtracts them and a percentage does not.
-    **A Sessions | Locks switch sits under the title** (`ActivityUi::view`, an `ActivityView`, the
-    active one underlined in the accent), and the app polls only the list on show, so a switch is a
-    fetch of the other and nothing else. The Locks view paints `LocksState` — `ActivityState`'s shape
+    **A Sessions | Locks switch sits under the title** (`ActivityUi::view`, an `ActivityView`,
+    drawn by `widgets::segmented_tabs` at `scaled(12)` side padding and `scaled(4)` from the title,
+    a `scaled(10)` spacer above the search box), and the app polls only the list on show, so a
+    switch is a fetch of the other and nothing else. The Locks view paints `LocksState` — `ActivityState`'s shape
     for the other list, `Idle`/`Loaded(Rc<LockList>)`/`Failed` — in three functions. `locks_header`
     is the tally, from the whole snapshot as the sessions' counts are: `N locks`, then `M waiting`
     in the error colour and left out at zero, both wearing the `+` on a capped list, then

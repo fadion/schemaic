@@ -131,40 +131,18 @@ pub(crate) fn activity_panel(
     // the list shown (`ActivityUi::view`), so a switch is a fetch of the other.
     let view = activity.view;
     let locks = activity.locks;
-    let view_switch = {
-        let tab = move |label: &'static str, which: crate::ActivityView| {
-            text(label)
-                .on_click_stop(move |_| {
-                    if view.get_untracked() != which {
-                        view.set(which);
-                    }
-                })
-                .style(move |s| {
-                    let on = view.get() == which;
-                    s.font_size(font_label())
-                        .padding_vert(theme::scaled(3.0))
-                        .margin_right(theme::scaled(14.0))
-                        .border_bottom(2.0)
-                        .border_color(if on {
-                            theme::accent()
-                        } else {
-                            floem::peniko::Color::TRANSPARENT
-                        })
-                        .color(if on { theme::text() } else { theme::text_dim() })
-                        .hover(|s| s.color(theme::text()))
-                })
-        };
-        h_stack((
-            tab("Sessions", crate::ActivityView::Sessions),
-            tab("Locks", crate::ActivityView::Locks),
-        ))
-        .style(|s| {
-            s.items_center()
-                .padding_horiz(theme::scaled(12.0))
-                .padding_top(theme::scaled(4.0))
-                .flex_shrink(0.0_f32)
-        })
-    };
+    let view_switch = container(crate::widgets::segmented_tabs(
+        vec![
+            ("Sessions", crate::ActivityView::Sessions),
+            ("Locks", crate::ActivityView::Locks),
+        ],
+        view,
+    ))
+    .style(|s| {
+        s.padding_horiz(theme::scaled(12.0))
+            .padding_top(theme::scaled(4.0))
+            .flex_shrink(0.0_f32)
+    });
 
     // Counts + the lock-wait banner, both derived from the *whole* snapshot rather
     // than the filtered view: they are facts about the server, and narrowing the
@@ -314,11 +292,11 @@ pub(crate) fn activity_panel(
     v_stack((
         title_row,
         view_switch,
-        // The same 5px above / 10px below the search box as the schema and
-        // history panels; spacers rather than margins so the flex-grow scroll's
-        // height stays exact (a sibling's vertical margin isn't subtracted → the
-        // list overflows the panel).
-        empty().style(|s| s.height(theme::scaled(5.0)).flex_shrink(0.0_f32)),
+        // 10px between the tab bar and the search box, and 10px below the box
+        // as the schema and history panels space theirs; spacers rather than
+        // margins so the flex-grow scroll's height stays exact (a sibling's
+        // vertical margin isn't subtracted → the list overflows the panel).
+        empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
         edit_field(
             search_input,
             FieldCfg {

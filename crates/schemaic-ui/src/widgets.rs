@@ -1678,6 +1678,57 @@ pub(crate) fn pill_tab_style(s: floem::style::Style, on: bool) -> floem::style::
     }
 }
 
+/// A **tab bar**: `tabs` side by side in equal shares of one bar, the one equal
+/// to `current` filled in the primary colour, and a click on another setting
+/// `current`. For a switch between views of one panel — Server Activity's
+/// *Sessions | Locks* — where [`pill_tab_style`]'s loose pills head a modal's
+/// sections.
+///
+/// The bar wears a text field's surface and outline (`bg_chrome`,
+/// `field_border`), so it sits beside the panel's search box as a control of
+/// the same family. Only the inactive tabs answer a hover, and only by
+/// brightening their text: the active one is already where a click would go.
+pub(crate) fn segmented_tabs<T: Copy + PartialEq + 'static>(
+    tabs: Vec<(&'static str, T)>,
+    current: RwSignal<T>,
+) -> impl IntoView {
+    h_stack_from_iter(tabs.into_iter().map(|(label, which)| {
+        container(text(label))
+            .on_click_stop(move |_| {
+                if current.get_untracked() != which {
+                    current.set(which);
+                }
+            })
+            .style(move |s| {
+                let s = s
+                    .flex_grow(1.0_f32)
+                    .flex_basis(0.0)
+                    .min_width(0.0)
+                    .justify_center()
+                    .items_center()
+                    .font_size(theme::font_body())
+                    .padding_vert(theme::scaled(5.0))
+                    .border_radius(4.0);
+                if current.get() == which {
+                    s.background(theme::btn_primary()).color(theme::text())
+                } else {
+                    s.color(theme::text_dim()).hover(|s| s.color(theme::text()))
+                }
+            })
+    }))
+    .style(|s| {
+        s.flex_row()
+            .width_full()
+            .flex_shrink(0.0_f32)
+            .padding(theme::scaled(3.0))
+            .gap(theme::scaled(3.0))
+            .background(theme::bg_chrome())
+            .border(1.0)
+            .border_color(theme::field_border())
+            .border_radius(6.0)
+    })
+}
+
 /// A labelled control: caption above, control below.
 pub(crate) fn form_setting(label: &'static str, control: impl IntoView + 'static) -> impl IntoView {
     form_setting_owned(label.to_string(), control)
