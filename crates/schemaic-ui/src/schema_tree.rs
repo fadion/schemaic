@@ -910,7 +910,7 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
 /// below the last database, and the whole panel on a connection with nothing in
 /// it.
 ///
-/// **Three entries, and every one of them is about the panel rather than about
+/// **Four entries, and every one of them is about the panel rather than about
 /// anything in it**, because nothing in it was clicked. `Refresh` leads: it is
 /// the same whole-tree refresh the gear offers, it is here because a connection
 /// showing nothing is exactly when you want it and has no row to right-click,
@@ -922,10 +922,11 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
 /// `Users and privileges` is here for the same reason and is the gear's
 /// neighbour there too.
 ///
-/// Empty on SQLite, which has neither a database to create nor an account to
-/// browse — and then the handler raises nothing at all, rather than a menu whose
-/// only entry would be `Refresh`. A one-item menu on a blank area reads as a
-/// misfire, which is why the test is whether this engine has *anything* here
+/// `Server variables` sits beside it, for the same reason. On SQLite, which has
+/// neither a database to create nor an account to browse, that entry and
+/// `Refresh` are the whole menu; with nothing beyond `Refresh` the handler would
+/// raise nothing at all, since a one-item menu on a blank area reads as a
+/// misfire — which is why the test is whether this engine has *anything* here
 /// beyond `Refresh` rather than whether it has databases.
 ///
 /// `Create database` is **dimmed** on a read-only connection rather than absent,
@@ -965,6 +966,9 @@ fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
                 ui.conn.active_conn.get_untracked(),
                 ui.tabs_ui.active_db.get_untracked().as_deref(),
             ),
+            BlankKind::ServerVariables => {
+                crate::server_vars_view::open_for_active(ui.conn, ui.overlay)
+            }
         })
         .disabled(e.disabled)
     })
@@ -983,6 +987,7 @@ pub(crate) enum BlankKind {
     CreateDatabase,
     Refresh,
     Users,
+    ServerVariables,
 }
 
 /// One blank-space entry as data: its label, what it does, and whether it is
@@ -999,10 +1004,11 @@ pub(crate) struct BlankEntry {
 /// has, and for the same reason: `Create database` opens an editor that ends at
 /// a live `run_ddl`, so both gates on it are worth a test rather than a comment.
 ///
-/// **Empty means no menu at all**, not a menu with one row: on SQLite there is
-/// no database to create, and a lone `Refresh` popping up on blank space reads
-/// as a misfire rather than an offer. The gear menu still carries Refresh, which
-/// is where someone looking for it goes.
+/// **Empty means no menu at all**, not a menu with one row: a lone `Refresh`
+/// popping up on blank space reads as a misfire rather than an offer, and the
+/// gear menu still carries Refresh, which is where someone looking for it goes.
+/// SQLite has no database to create and no accounts, but it has its settings,
+/// so it gets `Refresh` and `Server variables`.
 ///
 /// **And empty when there is no saved connection at all.** With none,
 /// `edit_ctx` falls back to `SqlDialect::default()` — MySQL — and
@@ -1032,12 +1038,14 @@ pub(crate) fn blank_space_entries(
 ) -> Vec<BlankEntry> {
     let databases = schemaic_core::ddl::supports_database_editing(dialect);
     let users = schemaic_core::users::supports_users(dialect);
+    let settings = schemaic_core::server_vars::supports_server_vars(dialect);
     // **Empty means no menu at all**, and the test is now whether this engine has
     // *anything* here beyond Refresh — not whether it has databases. SQLite has
-    // neither a database to create nor an account to browse, so it still raises
-    // nothing; asking only the first question would have left a lone Refresh the
-    // moment a second entry arrived.
-    if !connection_exists || (!databases && !users) {
+    // neither a database to create nor an account to browse, and raised nothing
+    // until its settings (its PRAGMAs) gave it a second real entry; asking only
+    // the first question would have left a lone Refresh the moment a second
+    // entry arrived.
+    if !connection_exists || (!databases && !users && !settings) {
         return Vec::new();
     }
     // **Skeleton order: read (group 2) before write (group 4).** This shipped
@@ -1072,6 +1080,15 @@ pub(crate) fn blank_space_entries(
         out.push(BlankEntry {
             label: "Users and privileges",
             kind: BlankKind::Users,
+            disabled: down,
+        });
+    }
+    if settings {
+        // Group 2 beside the browser, and gated as it is: a read, so a down
+        // connection dims it and a read-only one does not.
+        out.push(BlankEntry {
+            label: "Server variables",
+            kind: BlankKind::ServerVariables,
             disabled: down,
         });
     }
@@ -4566,7 +4583,7 @@ mod tests {
             .collect()
     }
 
-    /// Three entries, and all three about the panel rather than about anything
+    /// Four entries, and all four about the panel rather than about anything
     /// in it — nothing in it was clicked.
     ///
     /// **The kinds are asserted beside the labels**, because the menu builder
@@ -4574,11 +4591,16 @@ mod tests {
     /// render one thing and do another, and a labels-only assertion is exactly
     /// what would not notice.
     #[test]
-    fn blank_space_offers_refresh_accounts_and_create() {
+    fn blank_space_offers_refresh_accounts_settings_and_create() {
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert_eq!(
                 blank_labels(d, false),
-                ["Refresh", "Users and privileges", "Create database"],
+                [
+                    "Refresh",
+                    "Users and privileges",
+                    "Server variables",
+                    "Create database"
+                ],
                 "{d:?}"
             );
             let kinds: Vec<BlankKind> = blank_space_entries(d, false, true, false)
@@ -4590,6 +4612,7 @@ mod tests {
                 [
                     BlankKind::Refresh,
                     BlankKind::Users,
+                    BlankKind::ServerVariables,
                     BlankKind::CreateDatabase
                 ],
                 "{d:?}"
@@ -4597,14 +4620,18 @@ mod tests {
         }
     }
 
-    /// **No menu at all on SQLite, rather than a menu holding only Refresh.**
-    /// There is no database to create there — a database is a file — and a
-    /// one-row menu popping up on blank space reads as a misfire. The gear still
-    /// carries Refresh, which is where someone looking for it goes.
+    /// **SQLite's menu is Refresh and its settings, and nothing that is not
+    /// there.** It has no database to create — a database is a file — and no
+    /// accounts, so for a long time it raised no menu at all, a lone Refresh
+    /// reading as a misfire. Its PRAGMAs are a second, real entry, so the menu
+    /// now earns its place by the rule it was always held to.
     #[test]
-    fn blank_space_raises_nothing_where_there_is_no_database_to_create() {
-        assert!(blank_space_entries(SqlDialect::Sqlite, false, true, false).is_empty());
-        assert!(blank_space_entries(SqlDialect::Sqlite, true, true, false).is_empty());
+    fn blank_space_on_sqlite_offers_only_what_sqlite_has() {
+        for read_only in [false, true] {
+            let entries = blank_space_entries(SqlDialect::Sqlite, read_only, true, false);
+            assert_eq!(labels(&entries), ["Refresh", "Server variables"]);
+            assert!(!disabled(&entries, "Server variables"), "a read");
+        }
     }
 
     /// **And no menu at all with no saved connection.** `edit_ctx` falls back
@@ -4630,7 +4657,12 @@ mod tests {
         // connection that is down, which this cannot see and must not punish.
         assert_eq!(
             labels(&blank_space_entries(SqlDialect::MySql, false, true, false)),
-            vec!["Refresh", "Users and privileges", "Create database"]
+            vec![
+                "Refresh",
+                "Users and privileges",
+                "Server variables",
+                "Create database"
+            ]
         );
     }
 
@@ -4650,6 +4682,10 @@ mod tests {
         assert!(
             !disabled(&entries, "Users and privileges"),
             "browsing accounts writes nothing"
+        );
+        assert!(
+            !disabled(&entries, "Server variables"),
+            "reading settings writes nothing"
         );
     }
 
@@ -4681,6 +4717,10 @@ mod tests {
         assert!(
             disabled(&entries, "Users and privileges"),
             "a down connection has no accounts to read"
+        );
+        assert!(
+            disabled(&entries, "Server variables"),
+            "a down connection has no settings to read"
         );
 
         // Down *and* read-only is still one dimmed entry, not a contradiction.
@@ -4722,13 +4762,13 @@ mod tests {
         // The skeleton groups these two labels sit in — the numbers in
         // `overlays::menu_order_gate::group`, which this must not disagree with.
         let group = |label: &str| match label {
-            "Refresh" | "Users and privileges" => 2,
+            "Refresh" | "Users and privileges" | "Server variables" => 2,
             "Create database" => 4,
             other => panic!(
                 "`{other}` has no place in the menu skeleton — put it in a group in                  `overlays::menu_order_gate::group` first, and mirror the number here"
             ),
         };
-        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+        for d in SqlDialect::ALL {
             for read_only in [false, true] {
                 let groups: Vec<u8> = blank_space_entries(d, read_only, true, false)
                     .iter()

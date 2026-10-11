@@ -9531,6 +9531,35 @@ existing prose was left alone.
     `matches` twice per keystroke — once to build the rows and once for the footer's count — each
     call re-`format!`ing every account's `display()`, which at the ~1,000 accounts a shared server
     has was measured at ≥13 ms of a 16.7 ms frame, behind a query with no `LIMIT`.
+  - `server_vars.rs` — the **Server variables** viewer's model: a server's settings as the engine
+    reports them, over an already-fetched list. No DB, no UI — `activity.rs`'s and `users.rs`'s
+    shape again, the fetch being one query per engine in `schemaic-db` (`Db::fetch_server_vars`,
+    below) because each engine publishes its settings somewhere else, while what every answer has
+    in common is a `ServerVar` — `name`, `value` (PostgreSQL's with its unit appended) and an
+    optional `detail` for the engines that describe a setting (PostgreSQL's `short_desc`, SQL
+    Server's `description`; MySQL publishes none). `VarKind` is `Variables` — the default, what the
+    server was configured to do — or `Status`, its counters since start.
+    **Both capabilities are exhaustive `match`es, and the first answers `true` for all four
+    engines.** `supports_server_vars` includes SQLite, though it is a library and not a server:
+    what it has instead of server variables is its PRAGMAs, and those are the settings a user of a
+    SQLite file asks after. It is asked anyway — by both menus, by the app's fetch and by
+    `Db::fetch_server_vars` — so a fifth engine has to answer it rather than inherit a menu row. `supports_status` is MySQL's
+    alone — PostgreSQL spreads its counters over a dozen `pg_stat_*` views with no single
+    name/value shape, SQL Server over its DMVs, and SQLite has no server to count — so the viewer's
+    *Variables | Status* switch is offered there and nowhere else, rather than opening onto an
+    empty list. **`SQLITE_PRAGMAS` is a fixed list, and every entry is read without an
+    assignment** — `PRAGMA journal_mode`, never `PRAGMA journal_mode = …`, since a PRAGMA given a
+    value *changes* the setting. They are named here rather than discovered because `pragma_list`
+    names every PRAGMA, the ones that act (`optimize`, `integrity_check`, `wal_checkpoint`)
+    included, so a viewer reading that list would be a way to run them;
+    `the_sqlite_pragmas_are_bare_names_and_unique` pins that each is a bare lower-case name, with
+    no `=` or `(` to be an assignment. `var_matches` is the search: a case-insensitive substring
+    over name, value *and* detail, so *utf8* finds every setting whose value is a UTF-8 character
+    set and *parallel* finds SQL Server's settings by their description; an empty query matches
+    everything. `render_slice` is `activity::render_slice`'s rule — the first `RENDER_CAP` (300)
+    matches as references, plus a *count* of the rest rather than a silent cut — because a MariaDB
+    server reports some six hundred variables and the list is rebuilt on every keystroke of the
+    search.
   - `scram.rs` — PostgreSQL's **SCRAM-SHA-256 password verifier**, computed here so a role's
     password never reaches the server as text. `ALTER ROLE "x" PASSWORD 'hunter2'` is logged
     verbatim under `log_statement = 'ddl'`, pgaudit or any `log_min_duration_statement` the
@@ -15224,11 +15253,12 @@ existing prose was left alone.
   Around the dispatch and not inside each arm, for `Db::fetch_databases`' reason: PostgreSQL's
   `connect_maintenance` tries three candidate databases in turn, so a per-attempt bound is three
   times the deadline it claims. `every_reachability_path_is_bounded_by_a_timeout` is a source gate
-  over `ping`/`fetch_databases`/`fetch_sessions`/`fetch_locks`/`kill_session` **and
-  `fetch_table`**, because the failure is a host that never answers and no unit test can stage
+  over `ping`/`fetch_databases`/`fetch_sessions`/`fetch_locks`/`fetch_server_vars`/`kill_session`
+  **and `fetch_table`**, because the failure is a host that never answers and no unit test can stage
   one — a closed port is *refused*, instantly, and only a packet filter reproduces the hang. **Its table names a file per method,
   because the bound is not always where the public method is.** Two shapes exist and both are
-  right: `fetch_sessions`, `fetch_locks`, `kill_session` and `fetch_table` wrap the whole dispatch
+  right: `fetch_sessions`, `fetch_locks`, `fetch_server_vars`, `kill_session` and `fetch_table`
+  wrap the whole dispatch
   in `lib.rs`, so the bound belongs to the public method, while `ping` and `fetch_databases` are
   bounded per engine — `pg::ping` takes the deadline as a parameter, and SQLite's wraps an `open` that can block on a
   dead network share. Writing the file down per method is what stops the gate reading a file its
@@ -15245,7 +15275,12 @@ existing prose was left alone.
   could not have kept up with anyway, and saying so beats a silent stale snapshot. The list the gate
   reads is *the set of methods a timer calls*, so a method joining that set belongs in it.
   `fetch_locks` is the newest to join: the Locks view polls on the sessions list's timer, so it
-  takes the same `PING_TIMEOUT` around the same dispatch.
+  takes the same `PING_TIMEOUT` around the same dispatch. `fetch_server_vars` is on the list
+  **without** a timer — the Server variables modal reads once per opening, per switch and per
+  Refresh — and that is a widening of the rule above, stated rather than slipped in: it is admitted,
+  as `kill_session` is, for being the call made when somebody is looking at a server, which is
+  when a dark one is likeliest, and a modal sitting on *Loading…* for the OS connect timeout is
+  the failure the deadline exists to bound.
   **`Db::fetch_locks` is Server Activity's *Locks* view**, gated on `supports_activity` like
   `fetch_sessions` and one query per engine. Each engine asks for `MAX_LOCKS + 1` rows ordered
   waits first, so the server's own cut keeps the waits, and each leaves out its own session; the
@@ -15283,6 +15318,30 @@ existing prose was left alone.
   most of the list. What the live tests saw (below): MariaDB `db.imp (PRIMARY) 1`, `RECORD` `X`;
   MySQL `RECORD` `X,REC_NOT_GAP` beside a `TABLE` `IX`; PostgreSQL the waiter on `transaction N`,
   `transactionid` `ShareLock`, with relation and tuple locks on `imp` and `imp_pkey`.
+  **`Db::fetch_server_vars(kind)` is the Server variables viewer's backend**, beside the two above
+  and on their terms: it asks `server_vars::supports_server_vars` and, for `VarKind::Status`,
+  `supports_status` **before** the engine `match`, and a status list asked of an engine without one
+  is a `DbError::Query` saying so rather than an empty list, which would read as "no counters".
+  One read per engine, all reshaped to `core::server_vars::ServerVar`. MySQL/MariaDB
+  (`mysql::fetch_server_vars`) run `SHOW GLOBAL VARIABLES` or `SHOW GLOBAL STATUS` — **`GLOBAL`,
+  not the session's**, because the session is this operation's fresh connection: its values are
+  the server's defaults plus whatever the driver set on connect, which is not what anyone opening a
+  server's settings is asking. The rows are read as bytes and decoded leniently, so one value that
+  is not UTF-8 cannot lose the rest of the list; there is no description to show. PostgreSQL
+  (`pg::fetch_server_vars`) reads `pg_settings` with the unit appended to the value and
+  `short_desc` as the detail, on `connect_maintenance` for the sessions list's reason — these are
+  the cluster's settings, not one database's. SQL Server (`mssql::fetch_server_vars`) reads
+  `sys.configurations` — the `sp_configure` options — taking `value_in_use` rather than a `value`
+  still awaiting `RECONFIGURE`, and casting it and `description` to `nvarchar` so the read never
+  depends on how the driver decodes a `sql_variant`. SQLite (`sqlite::fetch_server_vars`) asks
+  `sqlite_version()` and then each of `server_vars::SQLITE_PRAGMAS` on one `with_conn`
+  connection; a PRAGMA this build of SQLite does not know answers no row and is left out rather
+  than shown blank. The pins are `sqlite::tests::server_vars_lists_the_version_and_the_pragmas`
+  (in-memory, shared-cache) and two live tests: `suite::server_variables_list_the_servers_settings`
+  in `live_suite!`'s `suite` group (`max_connections` on every leg, `Uptime` in the status list
+  where `supports_status`, an error elsewhere) and
+  `mssql::server_variables_read_the_servers_configuration` (`max degree of parallelism` with a
+  description; the status list an error).
   **`Db::fetch_principals`/`Db::fetch_grants`** are the Users and privileges browser's backend, and
   they gate on `users::supports_users` before the engine `match` for the same reason those two do,
   with `NO_USERS_MSG` as the one sentence both raise. The MySQL half is `collect_my_users`: **five
@@ -21456,8 +21515,10 @@ existing prose was left alone.
     full-window box sitting on top of the form, swallowing every click meant for it: the same
     always-full-window failure as above, arrived at through a member that is open but invisible
     rather than through a group that is closed. `users_view::users_overlay` asks the identical three
-    signals, and the two must not be able to disagree.
-    **Schema compare, the group's sixth member, takes the same `preview_open` clause — and there for
+    signals, and the two must not be able to disagree. **The Server variables viewer, mounted
+    directly after the browser, is the contrast**: it raises nothing, so `vars_open` is a plain term
+    and counts whenever the viewer is open.
+    **Schema compare, the group's seventh member, takes the same `preview_open` clause — and there for
     the rule rather than for a case.** It raises the DDL preview too, painted in the earlier DDL
     group, so a wrapper that went on filling the layer would sit on top of it exactly as above. What
     is different is that `compare_view::open_plan_preview` closes the comparison on its way to the
@@ -23022,7 +23083,8 @@ existing prose was left alone.
     right-click. In the gear it sits **above** `Create database` — a read entry before a write one,
     skeleton group 2 before group 4. It shipped below it, which is the cross-group inversion
     `menu_order_gate` exists to catch and cannot see in this menu, so the gear now reads Refresh ·
-    Collapse all · Users and privileges · Create database · Show table sizes. The entry
+    Collapse all · Users and privileges · Server variables · Create database · Show table sizes. The
+    entry
     is **absent** where the engine has no accounts at all (`users::supports_users` — SQLite) and with
     no saved connection (`ctx.exists`), and **dimmed on a down connection but not on a read-only
     one**: browsing accounts writes nothing, so the read-only refusal that guards `Create database`
@@ -23171,6 +23233,51 @@ existing prose was left alone.
       second click while one is in flight would otherwise land the wrong account's privileges in the
       pane. Nothing is persisted — the browser opts out of `SavedTab` by construction, as every
       other modal does.
+  - `server_vars_view.rs` — the **Server variables** viewer (`server_vars_overlay`), over
+    `core::server_vars`: the connection's settings as the engine reports them, in a read-only list
+    with a search box. **Read-only by design, and nothing here writes**: a `SET GLOBAL` or an
+    `ALTER SYSTEM` is a statement the user can type in the editor, through the write guard, and a
+    value field here would be a second path to the server with no guard on it. Server-level like
+    the Users browser beside it, so the modal takes no object. Mounted in the workspace group
+    directly after `users_overlay`, counted by `workspace_modals_up` whenever it is open (it raises
+    nothing, so the browser's preview clause has no counterpart here), and on
+    `modal_backdrop_gate::PAINTS_A_BACKDROP`.
+    **Three entry points, one door.** `GearKind::ServerVariables` in the SCHEMA gear and
+    `BlankKind::ServerVariables` in the tree's blank-space menu, each directly after `Users and
+    privileges` — skeleton group 2, a read of the server — **present** wherever a connection exists
+    and `supports_server_vars` says so (every engine today), and dimmed on a **down** connection but
+    not on a read-only one, the browser's gating for the browser's reason. The third is the
+    palette's *Server Variables*, an `instant` command **omitted** when there is no saved
+    connection, because a row that closes the palette and does nothing reads as broken; it asks no
+    capability and is not dimmed on a down connection, leaving both to the fetch. All three
+    call `open_for_active(conn, overlay)`, which resolves the active connection's name and dialect
+    (a no-op with none) and calls `open_for_server(overlay, conn_id, name, dialect)`; that resets
+    the kind to Variables, the state to `Loading` and the filter on the way in rather than on
+    close — `users_view::open_for_server`'s rule, so a second opening cannot flash the previous
+    server's list — and sets the `VarsTarget`, captured at open like `UsersTarget` so the list
+    describes the server it was opened on whatever the switcher does next. `VarsCtx` holds
+    `OverlayUi` and the one fetch, `SchemaActions::server_vars`, and is built at its call site in
+    `modals.rs`.
+    **The fetch effect keys on `(target, kind)` and lives above the `dyn_container`**, the
+    browser's rule: an effect created inside the child runs again on every rebuild of it. It
+    compares against its previous value because `create_effect` has no equality check of its own,
+    and switching *Variables | Status* is a fetch it makes. The app's `server_vars_fetch` (beside
+    `principals` in `main.rs`) asks `supports_server_vars` and, for Status, `supports_status`
+    **before** the round trip and reports `VarsState::Unsupported` — distinct from an empty
+    `Loaded`, which would read as "no settings" — then claims `overlay.server_vars_generation`
+    and checks it on landing alongside the target and the kind, `users_generation`'s guard: Variables
+    → Status → Variables on a slow server is three fetches on one target, and only the last may
+    write. `VarsState::Loaded` holds an `Rc<Vec<ServerVar>>` because the list is rebuilt per
+    keystroke.
+    The modal is titled *Server variables — <connection name>*; the *Variables | Status* switch
+    (Server Activity's underlined-label style) is built only where `supports_status`, then the
+    search `edit_field` (clearable, ring stop 10), then the scrolled list — name in mono, the value
+    beside it, the engine's description dim beneath where there is one. The list is keyed on
+    `(state, filter)` and draws `server_vars::render_slice`'s first `RENDER_CAP` rows with an
+    *N more settings match — narrow the search* line under them; the other states are *Loading…*,
+    the unsupported sentence, the failure in the error colour, and *No matching settings.* The
+    footer counts *N settings*, or *x of N settings* while the search is narrowing them, beside
+    Refresh and Close; Escape and the dismiss layer close it too.
   - `import_view.rs` — the file-import modal (schema context menu → **Import**), over
     `core::import`. Two steps (Source → Mapping) in one panel driven by the `ImportUi` bundle;
     `SchemaActions::import_probe`/`import_run` do the file + DB work off the UI thread, reached
@@ -24276,8 +24383,8 @@ existing prose was left alone.
     right-click, which is exactly the connection on which a new database is worth making.
     `create_children`, `schema_tree::blank_space_entries` and `overlays::gear_entries` are the
     three places that decide which entries exist, each with its own test. The gear's list got
-    that treatment last and had most to gain from it: two of its five entries are conditional and
-    two of those are conditionally dimmed, and it stayed a 130-line inline builder in a file whose
+    that treatment last and had most to gain from it: two of its then five entries were conditional
+    and two of those were conditionally dimmed, and it stayed a 130-line inline builder in a file whose
     test module could not reach it, while its sibling had already been split out after an ordering
     inversion no test could see. `GearEntry` carries a `GearKind` discriminant rather than a bare
     label, for `BlankKind`'s reason: routing on the string with a catch-all arm makes a sixth entry
@@ -24296,7 +24403,8 @@ existing prose was left alone.
     The two menus deliberately **do not agree entry for entry**
     — the gear also carries `Collapse all` and the size toggle, which are about the panel rather
     than the server — so it is a second list and not a call to the first; what they must agree on is
-    the *gating*, which is why both ask `users::supports_users` and `ddl::supports_database_editing`. **The read-only refusal is inside
+    the *gating*, which is why both ask `users::supports_users`, `server_vars::supports_server_vars`
+    and `ddl::supports_database_editing`. **The read-only refusal is inside
     `open_for_new` itself**, not at the four launch sites: the invariant is that a launch guards
     itself in the same step that launches it, and written per site that is four copies of one
     `if` — of which `create_submenu`'s arm had already been left out, relying on
@@ -24857,8 +24965,8 @@ existing prose was left alone.
     text and this styles the box the dots live in, so a helper would have to return a view either
     way.
     **A right-click on the tree's empty space raises its own menu** — `Refresh`,
-    `Users and privileges` and `Create database`, all three about the *panel* rather than about
-    anything in it,
+    `Users and privileges`, `Server variables` and `Create database`, all four about the *panel*
+    (or the server behind it) rather than about anything in it,
     because nothing in it was clicked. It hangs off the tree's own box with no hit test of its own:
     every row raises its
     menu with `on_secondary_click_stop`, so what reaches this handler is exactly a click that
@@ -24871,9 +24979,12 @@ existing prose was left alone.
     with a catch-all arm a third entry falls into whichever branch was written last and renders as
     a live row that does nothing.
     **The early return now asks whether the engine has anything here beyond `Refresh`** —
-    `databases || users`, where it used to ask `supports_database_editing` alone. SQLite still
-    raises **nothing at all**, having neither a database to create nor an account to browse, which
-    is the original point: a one-row menu on blank space reads as a misfire, and the gear still
+    `databases || users || settings`, where it first asked `supports_database_editing` alone. **That
+    is the rule SQLite's menu is held to, and it now passes it**: having neither a database to
+    create nor an account to browse, SQLite raised **nothing at all** until
+    `server_vars::supports_server_vars` gave it a real second entry — its PRAGMAs — and it now
+    raises `Refresh` and `Server variables` (`blank_space_on_sqlite_offers_only_what_sqlite_has`).
+    The original point stands: a one-row menu on blank space reads as a misfire, and the gear still
     carries Refresh for anyone looking for it. Left asking only the first question, that lone
     `Refresh` would have appeared the moment a second entry arrived.
     `Users and privileges` is skeleton group 2 and sits **after** `Refresh` rather than before it,
@@ -24884,8 +24995,11 @@ existing prose was left alone.
     `Refresh` is both what this menu is opened for most often and the only entry in it that costs
     nothing. It is dimmed on a **down** connection and **not** on a read-only one —
     browsing accounts writes nothing, and the write actions inside the browser gate themselves —
-    where `Create database` is dimmed on either. `blank_space_is_a_subsequence_of_the_skeleton` is
-    this menu's own half of `overlays::menu_order_gate`, which cannot see a menu built in this file;
+    where `Create database` is dimmed on either. `Server variables` follows it inside group 2 and is
+    gated the same way, being a read of the server too.
+    `blank_space_is_a_subsequence_of_the_skeleton` is
+    this menu's own half of `overlays::menu_order_gate`, which cannot see a menu built in this file,
+    and walks every dialect in `SqlDialect::ALL`, SQLite's menu included;
     see that gate for what it does and does not reach. The tests look entries up **by label**
     (`labels`/`disabled`, the second panicking when the row is absent) rather than by index, so a
     fourth entry cannot silently shift what an older assertion checks, and an assertion about a row
@@ -36245,11 +36359,14 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   menus in the app are outside it, both of which then shipped the inversion it was written to catch.
   The SCHEMA gear put `Create database` (group 4) *above* `Users and privileges` (group 2), and the
   tree's blank-space menu did the same; the gear now runs Refresh · Collapse all · Users and
-  privileges · Create database · Show table sizes, and the blank-space menu carries its own half of
+  privileges · Server variables · Create database · Show table sizes, and the blank-space menu
+  carries its own half of
   the gate in `schema_tree::blank_space_is_a_subsequence_of_the_skeleton`, asserted over the entry
-  **values** rather than over the source, since unlike the context menus those entries are data. It
+  **values** rather than over the source, since unlike the context menus those entries are data,
+  and walked for every dialect in `SqlDialect::ALL`. It
   mirrors the group number for each of its labels from `group` here by hand, which is why
-  `Users and privileges` is in this table at all: it is **not a context-menu row today**, but an
+  `Users and privileges` and `Server variables` (group 2 both, the second a read of the server
+  like the first) are in this table at all: neither is **a context-menu row today**, but an
   unknown label fails, so a second menu cannot place an entry this one has never heard of. The
   vacuity guard (`arms.len() == 7`) counts arms of the builder the gate already reads, so it cannot
   notice a third source either.

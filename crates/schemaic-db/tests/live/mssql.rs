@@ -470,6 +470,31 @@ async fn a_ping_and_the_database_list_reach_the_server() {
     }
 }
 
+/// **The server's settings are `sys.configurations`**, each with the value in
+/// use and its description — and SQL Server has no status list, which is an
+/// error that says so rather than an empty one.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_variables_read_the_servers_configuration() {
+    use schemaic_core::server_vars::VarKind;
+    if !enabled() {
+        return;
+    }
+    let vars = base_db()
+        .fetch_server_vars(VarKind::Variables)
+        .await
+        .expect("the settings read");
+    let maxdop = vars
+        .iter()
+        .find(|v| v.name == "max degree of parallelism")
+        .unwrap_or_else(|| panic!("no max degree of parallelism in {} settings", vars.len()));
+    assert!(maxdop.value.parse::<i64>().is_ok(), "{maxdop:?}");
+    assert!(
+        maxdop.detail.as_deref().is_some_and(|d| !d.is_empty()),
+        "{maxdop:?}"
+    );
+    assert!(base_db().fetch_server_vars(VarKind::Status).await.is_err());
+}
+
 /// **A database in maintenance is still listed for a login that may open
 /// it.** The listing left out every `RESTRICTED_USER` database and every
 /// `SINGLE_USER` one, so the database an administrator had just put in

@@ -3455,6 +3455,34 @@ pub(crate) async fn fetch_locks(db: &Db) -> Result<schemaic_core::activity::Lock
     })
 }
 
+/// The SQL Server half of [`crate::Db::fetch_server_vars`]:
+/// `sys.configurations`, the `sp_configure` options, each with the value in
+/// use (not a `value` set but awaiting `RECONFIGURE`) and its description.
+/// Both are `sql_variant`/`nvarchar` underneath and cast to text here, so the
+/// read never depends on how the driver decodes a variant.
+pub(crate) async fn fetch_server_vars(
+    db: &Db,
+) -> Result<Vec<schemaic_core::server_vars::ServerVar>, DbError> {
+    let mut client = connect(db, None).await?;
+    let rows = query_rows(
+        &mut client,
+        "SELECT name, CAST(value_in_use AS nvarchar(4000)), \
+         CAST(description AS nvarchar(4000)) \
+         FROM sys.configurations ORDER BY name",
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(schemaic_core::server_vars::ServerVar {
+                name: r.first().cloned().flatten()?,
+                value: cell(&r, 1),
+                detail: r.get(2).cloned().flatten().filter(|d| !d.is_empty()),
+            })
+        })
+        .collect())
+}
+
 /// [`fetch_locks`]' query, its first `limit` rows, waits first.
 fn locks_sql(limit: usize) -> String {
     format!(

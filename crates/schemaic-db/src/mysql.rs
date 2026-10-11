@@ -497,6 +497,44 @@ pub(crate) async fn fetch_locks(db: &Db) -> Result<activity::LockList, DbError> 
     out
 }
 
+/// The MySQL/MariaDB half of [`crate::Db::fetch_server_vars`]:
+/// `SHOW GLOBAL VARIABLES` or `SHOW GLOBAL STATUS`, a name and a value each.
+///
+/// **`GLOBAL`, not the session's own**, because the session is this fresh
+/// connection and nobody else's: its values are the server's defaults plus
+/// whatever this driver set on connect, which is not what anyone opening a
+/// server's settings is asking. The engine publishes no descriptions, so
+/// `detail` stays empty. Read as bytes and decoded leniently, so one setting
+/// whose value is not UTF-8 (a path, on a misconfigured host) cannot lose the
+/// rest of the list.
+pub(crate) async fn fetch_server_vars(
+    db: &Db,
+    kind: schemaic_core::server_vars::VarKind,
+) -> Result<Vec<schemaic_core::server_vars::ServerVar>, DbError> {
+    use schemaic_core::server_vars::{ServerVar, VarKind};
+    let sql = match kind {
+        VarKind::Variables => "SHOW GLOBAL VARIABLES",
+        VarKind::Status => "SHOW GLOBAL STATUS",
+    };
+    type Row = (Vec<u8>, Option<Vec<u8>>);
+    let mut conn = db.open(None, false).await?;
+    let rows: Result<Vec<Row>, DbError> = conn
+        .query(sql)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()));
+    let _ = conn.disconnect().await;
+    Ok(rows?
+        .into_iter()
+        .map(|(name, value)| ServerVar {
+            name: String::from_utf8_lossy(&name).into_owned(),
+            value: value
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                .unwrap_or_default(),
+            detail: None,
+        })
+        .collect())
+}
+
 async fn collect_locks(conn: &mut Conn) -> Result<activity::LockList, DbError> {
     let version: Option<String> = conn
         .query_first("SELECT @@version")
@@ -3244,6 +3282,9 @@ mod schema_tests {
             ("lib.rs", "fetch_sessions", "PING_TIMEOUT"),
             // The Locks view polls on the same timer as the sessions list.
             ("lib.rs", "fetch_locks", "PING_TIMEOUT"),
+            // The Server variables modal: one read, but opened to look at a
+            // server, which is when a dark one is likeliest.
+            ("lib.rs", "fetch_server_vars", "PING_TIMEOUT"),
             ("lib.rs", "kill_session", "CANCEL_TIMEOUT"),
             // **The second forever-timer, which the doc above said did not
             // exist.** The Live Monitor re-arms `fetch_table` every two seconds

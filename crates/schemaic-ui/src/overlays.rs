@@ -1275,6 +1275,7 @@ pub(crate) enum GearKind {
     Refresh,
     CollapseAll,
     Users,
+    ServerVariables,
     CreateDatabase,
     ShowTableSizes,
 }
@@ -1306,6 +1307,9 @@ impl GearKind {
             // nothing, so the read-only refusal that guards `Create database`
             // would answer a question this action does not ask.
             GearKind::Users => down,
+            // The same question as the browser above it: a read, of a server
+            // that has to be reachable to answer.
+            GearKind::ServerVariables => down,
             GearKind::CreateDatabase => read_only || down,
         }
     }
@@ -1323,10 +1327,11 @@ pub(crate) struct GearEntry {
 /// Which entries the SCHEMA gear's menu has, and which are inert.
 ///
 /// **Split out for the reason its sibling was.** The gear and the tree's
-/// blank space are two homes for the same three actions, and
+/// blank space are two homes for the same four actions, and
 /// `schema_tree::blank_space_entries` got this treatment after an ordering
 /// inversion that no test could see — while this menu, which has *more* gates
-/// (two of the five are conditional and two of those are conditionally dimmed),
+/// (two of its then five entries were conditional and two of those
+/// conditionally dimmed),
 /// stayed a 130-line inline builder in a file whose test module could not reach
 /// it. The gates are the part worth asserting: `Create database` ends at a live
 /// `run_ddl`, and `Users and privileges` opens a browser on a connection that
@@ -1366,6 +1371,17 @@ pub(crate) fn gear_entries(
             label: "Users and privileges",
             kind: GearKind::Users,
             disabled: GearKind::Users.disabled_when(read_only, down),
+        });
+    }
+    // Beside the browser, and gated the same way: a read of the server, so a
+    // down connection dims it and a read-only one does not. Every engine has
+    // settings to show — SQLite's are its PRAGMAs — but the capability is
+    // asked anyway, so a fifth engine answers it rather than inheriting a row.
+    if connection_exists && schemaic_core::server_vars::supports_server_vars(dialect) {
+        out.push(GearEntry {
+            label: "Server variables",
+            kind: GearKind::ServerVariables,
+            disabled: GearKind::ServerVariables.disabled_when(read_only, down),
         });
     }
     // Dimmed on read-only *and* on down, for the reason
@@ -1523,6 +1539,9 @@ pub(crate) fn schema_settings_overlay(
                                     conn.active_conn.get_untracked(),
                                     database.as_deref(),
                                 );
+                            }
+                            GearKind::ServerVariables => {
+                                crate::server_vars_view::open_for_active(conn, overlay);
                             }
                             // The read-only refusal is inside `open_for_new`,
                             // so every home of this action is guarded by
@@ -4334,7 +4353,31 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 },
             },
         },
+        // The SCHEMA gear's entry, from the keyboard — the same door.
+        Command {
+            name: "server variables",
+            label: "Server Variables",
+            hint: "the active connection's settings",
+            arg: instant(
+                Rc::new({
+                    let conn = ui.conn;
+                    let overlay = ui.overlay;
+                    move || crate::server_vars_view::open_for_active(conn, overlay)
+                }),
+                &close,
+            ),
+        },
     ];
+    // **No "Server Variables" without a connection to read them from**, for
+    // the gear's reason: the door would do nothing, and a palette row that
+    // closes the palette and does nothing reads as broken.
+    let has_conn = {
+        let id = active_conn.get_untracked();
+        connections.with_untracked(|cs| schemaic_core::connection::by_id(cs, id).is_some())
+    };
+    if !has_conn {
+        cmds.retain(|c| c.name != "server variables");
+    }
     // **No "Ask AI" while the assistant is off** — omitted, as the Activity
     // panel is on an engine without sessions. The registry is built per open,
     // so turning the assistant on brings it back at the next.
@@ -7068,6 +7111,7 @@ mod tests {
                     "Refresh",
                     "Collapse all",
                     "Users and privileges",
+                    "Server variables",
                     "Create database",
                     "Show table sizes",
                 ],
@@ -7079,6 +7123,7 @@ mod tests {
                     GearKind::Refresh,
                     GearKind::CollapseAll,
                     GearKind::Users,
+                    GearKind::ServerVariables,
                     GearKind::CreateDatabase,
                     GearKind::ShowTableSizes,
                 ],
@@ -7089,13 +7134,18 @@ mod tests {
 
     /// **Absent means "not on this engine"; dimmed means "not here".** SQLite
     /// has no accounts, no `CREATE DATABASE` and no per-table sizes, so the gear
-    /// keeps exactly the two entries that need no server at all — rather than
-    /// showing three dead rows a user would hunt for the setting to enable.
+    /// keeps the two entries that need no server at all, and its settings —
+    /// its PRAGMAs, which it does have — rather than showing three dead rows a
+    /// user would hunt for the setting to enable.
     #[test]
     fn the_gear_omits_what_the_engine_has_not_got() {
         assert_eq!(
             gear_kinds(SqlDialect::Sqlite, true, false, false),
-            [GearKind::Refresh, GearKind::CollapseAll]
+            [
+                GearKind::Refresh,
+                GearKind::CollapseAll,
+                GearKind::ServerVariables
+            ]
         );
         // And with no saved connection: `edit_ctx` falls back to MySQL, so
         // without this gate a fresh install offered `Create database`, opened
@@ -7129,10 +7179,12 @@ mod tests {
 
         let ro = disabled(true, false);
         assert!(!of(&ro, GearKind::Users), "read-only must not dim a read");
+        assert!(!of(&ro, GearKind::ServerVariables), "nor this one");
         assert!(of(&ro, GearKind::CreateDatabase));
 
         let down = disabled(false, true);
         assert!(of(&down, GearKind::Users));
+        assert!(of(&down, GearKind::ServerVariables));
         assert!(of(&down, GearKind::CreateDatabase));
 
         // Refresh is never dimmed — a down connection is the one most worth
@@ -7658,6 +7710,9 @@ fn ",
             // that is what the table is for: a label with no group fails, so a
             // second menu cannot place an entry this one has never heard of.
             | "Users and privileges"
+            // Raised from the same two places as the browser, for the same
+            // reason, and a read of the server like it.
+            | "Server variables"
             | "Refresh"
             | "Collapse all" => 2,
             // 3. Tree state — the row, not the object.

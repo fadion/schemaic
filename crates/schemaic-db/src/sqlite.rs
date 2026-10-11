@@ -94,6 +94,7 @@ use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
     TriggerInfo, ViewOptions,
 };
+use schemaic_core::server_vars::{self, ServerVar};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Db, DbError, ident_sqlite};
@@ -1998,6 +1999,47 @@ pub(crate) async fn prepare_check(db: &Db, sql: &str) -> Result<(), DbError> {
     let sql = sql.to_string();
     with_conn(db, move |conn| {
         conn.prepare(&sql).map(|_| ()).map_err(query_err)
+    })
+    .await
+}
+
+/// The SQLite half of [`crate::Db::fetch_server_vars`]: the library's version,
+/// then each of [`server_vars::SQLITE_PRAGMAS`] read on one connection.
+///
+/// **Read, never assigned** — `PRAGMA journal_mode`, not `PRAGMA journal_mode =
+/// …`; the list is fixed in core so no PRAGMA that acts can be reached from
+/// here. A PRAGMA this build of SQLite does not know answers no row, and is left
+/// out rather than shown blank.
+pub(crate) async fn fetch_server_vars(db: &Db) -> Result<Vec<ServerVar>, DbError> {
+    with_conn(db, |conn| {
+        let mut out = Vec::with_capacity(server_vars::SQLITE_PRAGMAS.len() + 1);
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+            .map_err(query_err)?;
+        out.push(ServerVar {
+            name: "sqlite_version".to_string(),
+            value: version,
+            detail: None,
+        });
+        for name in server_vars::SQLITE_PRAGMAS {
+            let mut stmt = conn.prepare(&format!("PRAGMA {name}")).map_err(query_err)?;
+            let mut rows = stmt.query([]).map_err(query_err)?;
+            if let Some(row) = rows.next().map_err(query_err)? {
+                let value = match row.get_ref(0).map_err(query_err)? {
+                    ValueRef::Null => String::new(),
+                    ValueRef::Integer(i) => i.to_string(),
+                    ValueRef::Real(f) => f.to_string(),
+                    ValueRef::Text(b) => String::from_utf8_lossy(b).into_owned(),
+                    ValueRef::Blob(b) => binary_display(b.len()),
+                };
+                out.push(ServerVar {
+                    name: (*name).to_string(),
+                    value,
+                    detail: None,
+                });
+            }
+        }
+        Ok(out)
     })
     .await
 }
@@ -4814,6 +4856,31 @@ mod tests {
         assert_eq!(n, 1, "the refused write left a row behind");
         let rs = fetch("SELECT id FROM t").await.expect("a read runs");
         assert_eq!(rs.row_count(), 1);
+    }
+
+    /// **A SQLite connection's settings are its version and its PRAGMAs**, read
+    /// through `Db` and so through the capability gate as well as this module.
+    /// `foreign_keys` is the one a user most often asks after, and it reads as
+    /// the value this connection was opened with rather than being left out.
+    #[tokio::test]
+    async fn server_vars_lists_the_version_and_the_pragmas() {
+        let (_keeper, db) = shared_memory("server_vars");
+        let vars = db
+            .fetch_server_vars(schemaic_core::server_vars::VarKind::Variables)
+            .await
+            .expect("the settings read");
+        let names: Vec<&str> = vars.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names.first(), Some(&"sqlite_version"), "{names:?}");
+        assert!(names.contains(&"foreign_keys"), "{names:?}");
+        assert!(names.contains(&"journal_mode"), "{names:?}");
+        let version = &vars[0].value;
+        assert!(version.starts_with("3."), "{version}");
+        // SQLite has no status list, and says so rather than answering empty.
+        assert!(
+            db.fetch_server_vars(schemaic_core::server_vars::VarKind::Status)
+                .await
+                .is_err()
+        );
     }
 
     /// **Run All on a read-only connection is refused the write too** — its

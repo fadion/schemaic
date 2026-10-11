@@ -2662,6 +2662,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let users_grants: RwSignal<schemaic_ui::GrantsState> =
         RwSignal::new(schemaic_ui::GrantsState::Idle);
     let users_generation: RwSignal<u64> = RwSignal::new(0);
+    // Server variables viewer — `server_vars` is the open flag and the server
+    // being described, `users`' shape.
+    let server_vars: RwSignal<Option<schemaic_ui::VarsTarget>> = RwSignal::new(None);
+    let server_vars_kind: RwSignal<schemaic_core::server_vars::VarKind> =
+        RwSignal::new(schemaic_core::server_vars::VarKind::Variables);
+    let server_vars_state: RwSignal<schemaic_ui::VarsState> =
+        RwSignal::new(schemaic_ui::VarsState::Loading);
+    let server_vars_generation: RwSignal<u64> = RwSignal::new(0);
     // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
     let table_sizes = RwSignal::new(ui_state.show_table_sizes);
     // The schema tree's filter text, as it was left (see `UiState::schema_filter`).
@@ -9512,6 +9520,59 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         )
     };
 
+    // The Server variables viewer's list — `principals`' shape: the capability
+    // asked before the round trip, a generation claimed before it and compared
+    // when it lands, and the target compared too.
+    let server_vars_fetch: Rc<
+        dyn Fn(schemaic_ui::VarsTarget, schemaic_core::server_vars::VarKind),
+    > = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |target: schemaic_ui::VarsTarget, kind: schemaic_core::server_vars::VarKind| {
+                use schemaic_core::server_vars::{VarKind, supports_server_vars, supports_status};
+                let db = match db_for(target.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        server_vars_state.set(schemaic_ui::VarsState::Failed(e));
+                        return;
+                    }
+                };
+                let dialect = db.engine().dialect();
+                if !supports_server_vars(dialect)
+                    || (kind == VarKind::Status && !supports_status(dialect))
+                {
+                    server_vars_state.set(schemaic_ui::VarsState::Unsupported);
+                    return;
+                }
+                let want = target.clone();
+                // Switching Variables → Status → Variables on a slow server is
+                // three fetches on one target; only the last may write.
+                let generation = server_vars_generation.get_untracked() + 1;
+                server_vars_generation.set(generation);
+                let report = create_ext_action(
+                    cx,
+                    move |res: Result<Vec<schemaic_core::server_vars::ServerVar>, String>| {
+                        if server_vars.with_untracked(|t| t.as_ref() != Some(&want))
+                            || server_vars_kind.get_untracked() != kind
+                            || server_vars_generation.get_untracked() != generation
+                        {
+                            return;
+                        }
+                        server_vars_state.set(match res {
+                            Ok(list) => schemaic_ui::VarsState::Loaded(Rc::new(list)),
+                            Err(e) => schemaic_ui::VarsState::Failed(e),
+                        });
+                    },
+                );
+                handle.spawn(async move {
+                    let res = db.fetch_server_vars(kind).await.map_err(|e| e.to_string());
+                    report(res);
+                });
+            },
+        )
+    };
+
     let toggle_table_sizes: Rc<dyn Fn()> = Rc::new(move || table_sizes.update(|on| *on = !*on));
 
     // Fetch one database's table statistics into its node's slot, once.
@@ -12827,6 +12888,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             users_selected,
             users_grants,
             users_generation,
+            server_vars,
+            server_vars_kind,
+            server_vars_state,
+            server_vars_filter: RwSignal::new(String::new()),
+            server_vars_generation,
             run_guard,
             snippet_edit: snippet_edit_open,
             alias_rename: alias_rename_open,
@@ -12884,6 +12950,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             count_cancel,
             principals,
             grants,
+            server_vars: server_vars_fetch,
             toggle_table_sizes,
             db_stats,
         }),

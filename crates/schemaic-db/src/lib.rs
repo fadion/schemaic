@@ -94,6 +94,7 @@ use schemaic_core::model::{
 use schemaic_core::schema::{
     ColumnInfo, DbSchema, EventSource, ForeignKeyInfo, IndexInfo, TableInfo, TriggerSource,
 };
+use schemaic_core::server_vars;
 use schemaic_core::stats::{SchemaStats, count_rows_sql};
 use schemaic_core::users::{self, Grants, Principal};
 use tokio_util::sync::CancellationToken;
@@ -419,6 +420,9 @@ pub(crate) const ENGINE_ENTRY_POINTS: &[&str] = &[
     "run_batch",
     "prepare_check",
     "ping",
+    // The Server variables viewer's list: every engine has settings to show,
+    // SQLite's being its PRAGMAs, so all three modules answer it.
+    "fetch_server_vars",
 ];
 
 /// Which database engine a [`Db`] speaks. Selected from the saved connection's
@@ -1857,6 +1861,53 @@ impl Db {
             .map_err(|_| DbError::Connect("timed out".to_string()))??;
         list.truncated |= activity::prepare_locks(&mut list.locks);
         Ok(list)
+    }
+
+    /// The server's settings — the Server variables viewer's list — or, where
+    /// the engine publishes one, its status counters ([`VarKind::Status`]).
+    ///
+    /// One query per engine, over what each publishes: `SHOW GLOBAL
+    /// VARIABLES`/`STATUS` on MySQL/MariaDB, `pg_settings` on PostgreSQL,
+    /// `sys.configurations` on SQL Server, and on SQLite its version and the
+    /// fixed, read-only list of PRAGMAs in
+    /// [`server_vars::SQLITE_PRAGMAS`].
+    ///
+    /// Gated on [`server_vars::supports_server_vars`] and, for a status list, on
+    /// [`server_vars::supports_status`] — asked as capabilities, for
+    /// [`Db::fetch_sessions`]' reason; a status list asked of an engine without
+    /// one is an error that says so rather than an empty list that would read
+    /// as "no counters". **Bounded by [`PING_TIMEOUT`] around the dispatch**,
+    /// beside its two siblings: a modal opened to look at a server that has
+    /// stopped answering should say so in five seconds, not the OS connect
+    /// timeout.
+    ///
+    /// [`VarKind::Status`]: schemaic_core::server_vars::VarKind::Status
+    pub async fn fetch_server_vars(
+        &self,
+        kind: server_vars::VarKind,
+    ) -> Result<Vec<server_vars::ServerVar>, DbError> {
+        let dialect = self.engine.dialect();
+        if !server_vars::supports_server_vars(dialect) {
+            return Err(DbError::Query(
+                "This engine has no server settings to show.".to_string(),
+            ));
+        }
+        if kind == server_vars::VarKind::Status && !server_vars::supports_status(dialect) {
+            return Err(DbError::Query(
+                "This engine publishes no status list — only its variables.".to_string(),
+            ));
+        }
+        let fetch = async {
+            match self.engine {
+                Engine::MySql => mysql::fetch_server_vars(self, kind).await,
+                Engine::Postgres => pg::fetch_server_vars(self).await,
+                Engine::MsSql => mssql::fetch_server_vars(self).await,
+                Engine::Sqlite => sqlite::fetch_server_vars(self).await,
+            }
+        };
+        tokio::time::timeout(PING_TIMEOUT, fetch)
+            .await
+            .map_err(|_| DbError::Connect("timed out".to_string()))?
     }
 
     /// Cancel a statement, or terminate a session outright, by server id.

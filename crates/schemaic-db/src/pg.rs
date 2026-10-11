@@ -1836,6 +1836,32 @@ pub(crate) async fn fetch_locks(db: &Db) -> Result<activity::LockList, DbError> 
     })
 }
 
+/// The PostgreSQL half of [`Db::fetch_server_vars`]: `pg_settings`, each
+/// value with its unit (`128 8kB`, `4 MB`'s raw form) and its `short_desc` as
+/// the detail. On the maintenance connection, for [`fetch_sessions`]' reason:
+/// these are the server's settings, not one database's.
+pub(crate) async fn fetch_server_vars(
+    db: &Db,
+) -> Result<Vec<schemaic_core::server_vars::ServerVar>, DbError> {
+    let client = connect_maintenance(db).await?;
+    let rows = query_all(
+        &client,
+        "SELECT name, setting || COALESCE(' ' || unit, ''), short_desc \
+         FROM pg_settings ORDER BY name",
+    )
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some(schemaic_core::server_vars::ServerVar {
+                name: opt(r, 0)?,
+                value: opt(r, 1).unwrap_or_default(),
+                detail: opt(r, 2).filter(|d| !d.is_empty()),
+            })
+        })
+        .collect())
+}
+
 /// `pg_locks` as [`activity::LockInfo`]'s columns, waits first, ending in
 /// `LIMIT ` for the caller's bound. A granted `virtualxid` is every
 /// transaction's lock on itself and says nothing; a waited-for one is the

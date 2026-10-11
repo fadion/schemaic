@@ -52,6 +52,52 @@ pub async fn a_ping_reaches_the_server(target: &'static Target) {
         });
 }
 
+/// The server's settings read back, with a setting all three servers share by
+/// name; and where the engine publishes a status list
+/// ([`supports_status`](schemaic_core::server_vars::supports_status) — asked,
+/// not inferred from the engine), its counters, with `Uptime` among them.
+pub async fn server_variables_list_the_servers_settings(target: &'static Target) {
+    use schemaic_core::server_vars::{VarKind, supports_status};
+    let db = target.base_db();
+    let vars = db
+        .fetch_server_vars(VarKind::Variables)
+        .await
+        .unwrap_or_else(|e| panic!("{}: the settings did not read: {e}", target.name));
+    let max = vars
+        .iter()
+        .find(|v| v.name.eq_ignore_ascii_case("max_connections"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: no max_connections in {} settings",
+                target.name,
+                vars.len()
+            )
+        });
+    assert!(
+        max.value.trim().parse::<u64>().is_ok_and(|n| n > 0),
+        "{}: max_connections reads {:?}",
+        target.name,
+        max.value
+    );
+    let status = db.fetch_server_vars(VarKind::Status).await;
+    if supports_status(target.engine.dialect()) {
+        let status =
+            status.unwrap_or_else(|e| panic!("{}: the status did not read: {e}", target.name));
+        assert!(
+            status.iter().any(|v| v.name == "Uptime"),
+            "{}: no Uptime in {} status rows",
+            target.name,
+            status.len()
+        );
+    } else {
+        assert!(
+            status.is_err(),
+            "{}: a status list where the engine has none",
+            target.name
+        );
+    }
+}
+
 /// Rows written through one connection come back through another as the text the
 /// grid renders — including the distinction between NULL and the empty string,
 /// which every engine has its own way of losing.

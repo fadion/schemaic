@@ -43,6 +43,7 @@ mod properties;
 mod routine_editor;
 mod schema_tree;
 mod script_view;
+mod server_vars_view;
 /// The tree-node key builders, and the two predicates that read a key back.
 /// Public because the persisted expanded-node set is the app's to edit —
 /// collapsing a database drops every key `key_under` claims, the size column
@@ -5393,6 +5394,10 @@ pub struct SchemaActions {
     /// second round trip, per selection, and a failure to read one account's
     /// grants must not take the list of accounts down with it.
     pub grants: Rc<dyn Fn(UsersTarget, schemaic_core::users::Principal)>,
+    /// Fetch the server's settings (or status counters) for the Server
+    /// variables viewer, into `overlay.server_vars_state`. Asked by the
+    /// viewer on opening and on every Variables | Status switch.
+    pub server_vars: Rc<dyn Fn(VarsTarget, schemaic_core::server_vars::VarKind)>,
     /// Toggle the schema tree's size column, persisting the choice. Switching it
     /// on is what makes the app fetch statistics for the expanded databases.
     pub toggle_table_sizes: Rc<dyn Fn()>,
@@ -5710,6 +5715,38 @@ pub enum GrantsState {
     Idle,
     Loading,
     Loaded(schemaic_core::users::Grants),
+    Failed(String),
+}
+
+/// What the **Server variables** viewer is open on.
+///
+/// Server-level, like [`UsersTarget`], and captured at open for the same
+/// reason: the list describes the server it was opened on even if the
+/// switcher has since moved. `name` is the connection's name for the title,
+/// and `dialect` decides whether the Variables | Status switch is offered
+/// ([`schemaic_core::server_vars::supports_status`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VarsTarget {
+    pub conn_id: u64,
+    pub name: String,
+    pub dialect: SqlDialect,
+}
+
+/// The viewer's list, in its four states.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum VarsState {
+    /// The fetch is in flight (the state the viewer opens in).
+    #[default]
+    Loading,
+    /// The settings, shared rather than cloned: the list is rebuilt per
+    /// keystroke of the search, and a MySQL server has several hundred.
+    Loaded(Rc<Vec<schemaic_core::server_vars::ServerVar>>),
+    /// The engine has no list of this kind
+    /// ([`schemaic_core::server_vars::supports_server_vars`] /
+    /// [`supports_status`](schemaic_core::server_vars::supports_status)).
+    /// Distinct from an empty `Loaded`, which would read as "no settings".
+    Unsupported,
+    /// The fetch failed (message shown in the viewer's body).
     Failed(String),
 }
 
@@ -6407,6 +6444,20 @@ pub struct OverlayUi {
     /// worse, one just dropped listed again with a live Drop beside it. The
     /// browser has no other way back to the truth than closing and reopening.
     pub users_generation: RwSignal<u64>,
+    /// Server variables viewer: `Some(target)` opens it for that server, and
+    /// the fetch it kicks off lands in `server_vars_state`.
+    pub server_vars: RwSignal<Option<VarsTarget>>,
+    /// Which list is showing — the settings, or (where the engine has one)
+    /// its status counters. Reset to Variables on every opening.
+    pub server_vars_kind: RwSignal<schemaic_core::server_vars::VarKind>,
+    pub server_vars_state: RwSignal<VarsState>,
+    /// The search box's text. Not persisted, for `users_filter`'s reason.
+    pub server_vars_filter: RwSignal<String>,
+    /// Bumped by every fetch and compared when its answer lands —
+    /// `users_generation`'s guard: switching Variables → Status → Variables
+    /// faster than a slow server answers must not leave the list showing
+    /// whichever answer happened to land last.
+    pub server_vars_generation: RwSignal<u64>,
     /// The snippet whose body is being edited, or `None`. One at a time, like
     /// every other editor here.
     pub snippet_edit: RwSignal<Option<u64>>,

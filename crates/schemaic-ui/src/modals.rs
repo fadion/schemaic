@@ -286,6 +286,13 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 ui.overlay,
                 &ui.schema_actions,
             )),
+            // Server variables: a server-level reading, like the Users browser
+            // above it, raised from the same gear — but it raises nothing, so
+            // it counts in `workspace_modals_up` whenever it is open.
+            crate::server_vars_view::server_vars_overlay(crate::server_vars_view::VarsCtx::new(
+                ui.overlay,
+                &ui.schema_actions,
+            )),
             // The binary-cell panel joins this group on the merits: like the
             // properties modal beside it, it is a question asked *about the
             // result on screen* rather than about the schema tree, and it is
@@ -512,7 +519,7 @@ pub(crate) fn ddl_editors_up(d: DdlUi) -> impl Fn() -> bool + Copy + 'static {
 }
 
 /// The workspace group's modals — Live Monitor, the ER diagram, Properties, the
-/// binary-cell panel, and the two that are not simply open or closed: the Users
+/// Server variables viewer, the binary-cell panel, and the two that are not simply open or closed: the Users
 /// and privileges browser, and schema compare. Both of those raise something
 /// painted in an earlier group and so stop counting while it is up. See the
 /// note in the body.
@@ -525,6 +532,7 @@ fn workspace_modals_up(
     let erd_open = overlay.erd;
     let props_open = overlay.properties;
     let users_open = overlay.users;
+    let vars_open = overlay.server_vars;
     let blob_open = blob.target;
     let compare_open = overlay.compare;
     // **The browser counts only while it is the thing on screen.** It renders
@@ -539,6 +547,7 @@ fn workspace_modals_up(
         mon_open.get()
             || erd_open.get().is_some()
             || props_open.get().is_some()
+            || vars_open.with(Option::is_some)
             || blob_open.get().is_some()
             || (users_open.get().is_some()
                 && account_open.get().is_none()
@@ -695,6 +704,9 @@ mod modal_backdrop_gate {
         // stack is at floem's 16-arity limit and the two never open together),
         // raised by `ddl_modals_up`'s `script_open.get().is_some()` arm.
         "script_view.rs",
+        // In the layer's workspace group, beside `users_view.rs`, raised by
+        // `workspace_modals_up`'s `vars_open.get().is_some()` arm.
+        "server_vars_view.rs",
         "settings.rs",
         // In the layer's DDL group, raised by `ddl_modals_up`'s
         // `snippet_edit.get().is_some()` arm.

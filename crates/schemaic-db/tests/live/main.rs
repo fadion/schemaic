@@ -96,6 +96,7 @@ live_suite!(
     ],
     suite: [
         a_ping_reaches_the_server,
+        server_variables_list_the_servers_settings,
         a_seeded_table_round_trips_through_a_query,
         introspection_finds_the_seeded_table,
         a_scratch_database_is_gone_once_torn_down,
