@@ -8969,6 +8969,24 @@ existing prose was left alone.
     `set_interval` on the way in, so the picker can never be left with nothing marked; a choice
     equal to the default is still stored, or moving `DEFAULT_POLL_SECS` would silently move every
     connection someone had deliberately set to the old one.
+    **The *Locks* view's model is here too, and is deliberately thinner.** `LockInfo`
+    (`session`/`object`/`kind`/`mode`/`granted`/`blocked_by`) is engine-neutral in its shape, as
+    `SessionInfo` is, but `kind` and `mode` are the engine's own words — MySQL's `RECORD` and
+    `X,REC_NOT_GAP`, PostgreSQL's `transactionid` and `ShareLock`, SQL Server's `KEY` and `U` —
+    shown and never interpreted; `object` is whatever the engine can name the lock on, a table with
+    its index and key where there are ones, a transaction, a database. `LockList` carries the locks,
+    the truncation verdict and `contended_only` (MariaDB's, under `schemaic-db` below).
+    `prepare_locks` is `prepare`'s counterpart: every **waiting** lock first — what is stuck is what
+    the view is opened for — then by object, session and mode so the order is total; `blocked_by`
+    deduplicated for the reason the sessions graph is, the engines answering one row per lock pair;
+    and a cut at `MAX_LOCKS` whose `bool` is said rather than hidden. The cap matters more here than
+    for sessions, since an `UPDATE` of a million rows holds a record lock on each on MySQL.
+    `lock_matches` searches what the row shows — session, object, kind and mode — and the word
+    `waiting` for a lock not yet granted. `parse_id_list` is `parse_pid_array` under the name a lock
+    caller asks for, reading both PostgreSQL's array literal (`{5,9}`) and MySQL's `GROUP_CONCAT`
+    (`5,9`). The pins are `waiting_locks_lead_and_their_blockers_are_distinct` and
+    `a_lock_is_found_by_what_its_row_says`; they arrived with the functions they test, so there was
+    no unfixed tree for them to be watched failing against.
   - `users.rs` — the **Users and privileges** browser's model: which accounts a server knows, and
     what each of them is allowed to do, over an already-fetched snapshot. No DB, no UI, no engine,
     and deliberately the same shape as `activity.rs` — the fetch is one query set per engine in
@@ -15206,13 +15224,13 @@ existing prose was left alone.
   Around the dispatch and not inside each arm, for `Db::fetch_databases`' reason: PostgreSQL's
   `connect_maintenance` tries three candidate databases in turn, so a per-attempt bound is three
   times the deadline it claims. `every_reachability_path_is_bounded_by_a_timeout` is a source gate
-  over `ping`/`fetch_databases`/`fetch_sessions`/`kill_session` **and `fetch_table`**, because the
-  failure is a host that never answers and no unit test can stage one — a closed port is *refused*,
-  instantly, and only a packet filter reproduces the hang. **Its table names a file per method,
+  over `ping`/`fetch_databases`/`fetch_sessions`/`fetch_locks`/`kill_session` **and
+  `fetch_table`**, because the failure is a host that never answers and no unit test can stage
+  one — a closed port is *refused*, instantly, and only a packet filter reproduces the hang. **Its table names a file per method,
   because the bound is not always where the public method is.** Two shapes exist and both are
-  right: `fetch_sessions`, `kill_session` and `fetch_table` wrap the whole dispatch in `lib.rs`, so
-  the bound belongs to the public method, while `ping` and `fetch_databases` are bounded per engine
-  — `pg::ping` takes the deadline as a parameter, and SQLite's wraps an `open` that can block on a
+  right: `fetch_sessions`, `fetch_locks`, `kill_session` and `fetch_table` wrap the whole dispatch
+  in `lib.rs`, so the bound belongs to the public method, while `ping` and `fetch_databases` are
+  bounded per engine — `pg::ping` takes the deadline as a parameter, and SQLite's wraps an `open` that can block on a
   dead network share. Writing the file down per method is what stops the gate reading a file its
   subject has left, which is how a source gate stops testing anything without failing.
   **`fetch_table` is the app's second forever-timer, and this gate's own doc used to say in so many
@@ -15226,6 +15244,45 @@ existing prose was left alone.
   trade is worth naming: a poll that cannot finish inside it is one the monitor's two-second cadence
   could not have kept up with anyway, and saying so beats a silent stale snapshot. The list the gate
   reads is *the set of methods a timer calls*, so a method joining that set belongs in it.
+  `fetch_locks` is the newest to join: the Locks view polls on the sessions list's timer, so it
+  takes the same `PING_TIMEOUT` around the same dispatch.
+  **`Db::fetch_locks` is Server Activity's *Locks* view**, gated on `supports_activity` like
+  `fetch_sessions` and one query per engine. Each engine asks for `MAX_LOCKS + 1` rows ordered
+  waits first, so the server's own cut keeps the waits, and each leaves out its own session; the
+  dispatch then runs `activity::prepare_locks` and ORs its verdict into the engine's `truncated`.
+  PostgreSQL (`PG_LOCKS_SQL`) reads `pg_locks` LEFT JOIN `pg_database`, with an ungranted row's
+  blockers from `pg_blocking_pids` — the function the sessions list already trusts over a
+  hand-written join. **It connects to the connection's own database where `db.database()` names
+  one**, and to the maintenance database only otherwise, unlike the sessions list: `pg_locks` is
+  cluster-wide, but a relation's oid is a name only inside its own database, so `::regclass` can say
+  `public.orders` there and nowhere else. A relation in another database is written
+  `db: relation <oid>` and **never cast**, since the same oid here may be some other table.
+  `transactionid`, `virtualxid` and `advisory` locks get labels of their own; a *granted*
+  `virtualxid` — every transaction's lock on itself — is dropped, while a waited-for one, the
+  `CREATE INDEX CONCURRENTLY` kind of wait, stays. MySQL and MariaDB keep their locks in tables
+  neither has of the other's — MySQL 8 removed `INNODB_LOCKS`, MariaDB never had
+  `performance_schema.data_locks` — so `mysql::fetch_locks` **asks `SELECT @@version` once and
+  decides the flavour through `ServerFlavour::parse_version`** rather than trying one spelling and
+  falling back, which is the shape that cost MariaDB a failed query on every sessions poll (above)
+  until `wait_graph_is_worth_fetching` learned to skip it. Its first draft decided the flavour with
+  a hand-rolled `contains("mariadb")`, and `only_one_function_decides_which_mysql_family_server_this_is`
+  caught it. MySQL 8 (`MY_LOCKS_PS_SQL`) reads `data_locks` and `data_lock_waits` through
+  `performance_schema.threads`, because both name a *performance-schema* thread rather than the
+  processlist id a session is known by everywhere else; the object is
+  `schema.table (INDEX) LOCK_DATA`. MariaDB (`MY_LOCKS_IS_SQL`) reads `INNODB_LOCKS` joined to
+  `INNODB_TRX`: a lock is waiting when it is its transaction's `trx_requested_lock_id`, its blockers
+  come through `INNODB_LOCK_WAITS`, and `lock_table` arrives backticked and is shown without them.
+  **MariaDB answers `contended_only = true`**, because `INNODB_LOCKS` lists a lock only while it is
+  waited for or holds up a wait — a quiet list there is not a lock-free server, and the panel says
+  so. SQL Server (`mssql::locks_sql`) reads `sys.dm_tran_locks`. An `OBJECT` lock is named across
+  databases, `OBJECT_SCHEMA_NAME`/`OBJECT_NAME` taking the database id; a `KEY`, `PAGE`, `RID` or
+  `HOBT` lock names a heap or index that `sys.partitions` resolves only in the database this
+  connection is in, so elsewhere it shows the database and the engine's own `resource_description`.
+  Blockers come from `sys.dm_os_waiting_tasks` on `lock_owner_address`, and besides `@@SPID` it
+  leaves out every session's granted shared `DATABASE` lock, which is held by existing and would be
+  most of the list. What the live tests saw (below): MariaDB `db.imp (PRIMARY) 1`, `RECORD` `X`;
+  MySQL `RECORD` `X,REC_NOT_GAP` beside a `TABLE` `IX`; PostgreSQL the waiter on `transaction N`,
+  `transactionid` `ShareLock`, with relation and tuple locks on `imp` and `imp_pkey`.
   **`Db::fetch_principals`/`Db::fetch_grants`** are the Users and privileges browser's backend, and
   they gate on `users::supports_users` before the engine `match` for the same reason those two do,
   with `NO_USERS_MSG` as the one sentence both raise. The MySQL half is `collect_my_users`: **five
@@ -18370,7 +18427,11 @@ existing prose was left alone.
   nothing, a script split at `GO`, introspection, a table's generated DDL rebuilding the table it
   was read from (`a_tables_ddl_rebuilds_the_table_it_was_read_from`), a cancel (of a running
   statement, and of one still compiling behind another session's lock), activity (the poll's own
-  session absent from it), the grid's write-back (seven tests, from
+  session absent from it, and `a_lock_wait_lists_the_waiter_and_its_holder`: a holder batch
+  `BEGIN TRAN; UPDATE; WAITFOR` four seconds, `ROLLBACK` blocks a second `UPDATE`, and the waiting
+  lock must lead, its blocker's granted lock must be on `.dbo.t`, and `contended_only` must be
+  false — the blocker read off the wait rather than compared with a known id, there being no
+  pinned session in it; passing on 2022 and 2025), the grid's write-back (seven tests, from
   `a_staged_edit_lands_on_its_row_and_reads_back` to `a_stopped_commit_is_undone`, under
   `mssql.rs` above), `run_ddl` and the designer's plans (from a designed table and a
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
@@ -18698,6 +18759,11 @@ existing prose was left alone.
   table in one statement and reading it in the next: under a connection per statement the second
   fails, and so would a dump's opening `SET FOREIGN_KEY_CHECKS = 0`. That a `Session`'s transaction
   is real is asserted from a *second* connection, which must not see the uncommitted row.
+  The same pinned `Session` is what gives `a_lock_wait_lists_the_waiter_and_its_holder` a lock to
+  see: it holds a row in an open transaction, a spawned autocommit `UPDATE` of that row blocks, and
+  `Db::fetch_locks` — polled until the wait shows, up to fifty times at 100 ms — must list a waiting
+  lock blocked by the holder's `server_id`, the holder's own granted lock, and a wait at the head of
+  the list. It runs on MariaDB, MySQL and PostgreSQL; SQL Server has its own, under `mssql.rs`.
   **A Stop inside that transaction is where the last two of those paths meet**, and
   `a_stop_inside_a_manual_transaction_leaves_the_connection_usable` asserts the **agreement** rather
   than the outcome: stage a row, cancel a long statement on the same pinned connection, commit, and
@@ -22789,6 +22855,27 @@ existing prose was left alone.
     The lock-wait card is the same lesson in the other direction: it lost its right border to
     `width: 100%` *plus* a 12px margin, which is 24px too wide because margins sit outside the
     width — column-flex stretch subtracts them and a percentage does not.
+    **A Sessions | Locks switch sits under the title** (`ActivityUi::view`, an `ActivityView`, the
+    active one underlined in the accent), and the app polls only the list on show, so a switch is a
+    fetch of the other and nothing else. The Locks view paints `LocksState` — `ActivityState`'s shape
+    for the other list, `Idle`/`Loaded(Rc<LockList>)`/`Failed` — in three functions. `locks_header`
+    is the tally, from the whole snapshot as the sessions' counts are: `N locks`, then `M waiting`
+    in the error colour and left out at zero, both wearing the `+` on a capped list, then
+    "list capped" — and on `contended_only` a line saying the server lists only locks waited for or
+    holding up a wait, so MariaDB's short list does not read as a lock-free server. `locks_list`
+    filters by `lock_matches`, draws `render_slice`'s front for the sessions list's reason and counts
+    the rest, and says which kind of empty it is: no match, no lock waits (where only contended
+    locks are listed), or no other session holding a lock. A connection that could not be reached
+    at all is reported on the *sessions* state (`refresh_activity` fails before asking for either
+    list), so the Locks branch reads `ActivityState::Failed` too while its own state is still `Idle`
+    — read as `Idle` alone it said "Loading…" forever with auto-refresh off (found documenting it,
+    before it shipped). `lock_row` is a dot, red while waiting;
+    the session id, "holds" or "waits for", and the engine's kind and mode; the object in mono; and
+    "held by …" for a wait. **Lock rows offer no kill, on purpose.** The app's kill handler names
+    the session it is about to confirm from the *sessions* snapshot — `kill_confirm` takes its
+    `SessionInfo` — and returns silently when the id is not in it, which a session seen only in the
+    Locks list need not be; a Kill there would be a button that sometimes does nothing. The Sessions
+    view's lock-wait banner remains the way to end a blocker.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
     read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
@@ -28317,9 +28404,9 @@ existing prose was left alone.
   on `Running` for ever.
   **The Server Activity poll is generation-guarded, and only runs while the panel is open *and the
   window has focus*.** One effect watches `(right_panel, active_conn, activity_interval,
-  window_focused)`; it bumps `activity_gen`, clears the snapshot when the *connection* changed, then
-  arms `activity_poll` — refreshing immediately only when the connection changed or the panel just
-  became visible. Focus is in the rule because every tick is a full connect + authenticate against
+  window_focused, activity_view)`; it bumps `activity_gen`, clears the snapshot when the
+  *connection* changed, then arms `activity_poll` — refreshing immediately only when the connection
+  changed, the panel just became visible, or the view switched between Sessions and Locks. Focus is in the rule because every tick is a full connect + authenticate against
   the server being watched (one connection per operation, §7), so a panel left open behind another
   window was opening and tearing down a connection every couple of seconds, indefinitely, for
   nobody — the same reason the health poll pauses unfocused. Refreshing on an *interval* change was
@@ -28334,6 +28421,12 @@ existing prose was left alone.
   the generation too and is **dropped** on arrival if it no longer matches: a reply describing the
   previous server, landing under the new one's heading, is a list of session ids the user might kill.
   Clearing the snapshot on a connection change is the same rule stated once more.
+  **The Locks view rides the same loop rather than a second one.** `refresh_activity` fetches
+  `Db::fetch_locks` instead of the sessions when `activity_view` is Locks, under the same generation
+  and in-flight guard, and reports into `activity_locks`. A switch of view re-arms, and the re-arm
+  bumps the generation, so a poll of the other list still in flight can neither hold the new fetch
+  off through the in-flight guard nor land when it returns. A connection change and
+  `reset_activity` put `activity_locks` back to `Idle` beside the sessions snapshot.
   **A switch is not the only way the server under the panel changes, and `reset_activity` is the
   other way in.** The effect keys on `active_conn`, which is an *id*, and editing a connection in
   place does not move it — so repointing the active connection from host X to host Y with the panel

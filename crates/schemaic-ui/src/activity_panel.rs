@@ -124,12 +124,56 @@ pub(crate) fn activity_panel(
             .style(|s| s.width_full().flex_row().items_start().justify_between())
     };
 
+    // **Sessions or Locks**: the switch under the title. The app polls only
+    // the list shown (`ActivityUi::view`), so a switch is a fetch of the other.
+    let view = activity.view;
+    let locks = activity.locks;
+    let view_switch = {
+        let tab = move |label: &'static str, which: crate::ActivityView| {
+            text(label)
+                .on_click_stop(move |_| {
+                    if view.get_untracked() != which {
+                        view.set(which);
+                    }
+                })
+                .style(move |s| {
+                    let on = view.get() == which;
+                    s.font_size(font_label())
+                        .padding_vert(theme::scaled(3.0))
+                        .margin_right(theme::scaled(14.0))
+                        .cursor(floem::style::CursorStyle::Pointer)
+                        .border_bottom(2.0)
+                        .border_color(if on {
+                            theme::accent()
+                        } else {
+                            floem::peniko::Color::TRANSPARENT
+                        })
+                        .color(if on { theme::text() } else { theme::text_dim() })
+                        .hover(|s| s.color(theme::text()))
+                })
+        };
+        h_stack((
+            tab("Sessions", crate::ActivityView::Sessions),
+            tab("Locks", crate::ActivityView::Locks),
+        ))
+        .style(|s| {
+            s.items_center()
+                .padding_horiz(theme::scaled(12.0))
+                .padding_top(theme::scaled(4.0))
+                .flex_shrink(0.0_f32)
+        })
+    };
+
     // Counts + the lock-wait banner, both derived from the *whole* snapshot rather
     // than the filtered view: they are facts about the server, and narrowing the
     // list on screen must not make a blocked session disappear from the tally.
-    let header = dyn_container(move || state.get(), {
+    let header = dyn_container(move || (view.get(), state.get(), locks.get()), {
         let kill = kill.clone();
-        move |st| match st {
+        move |(v, st, lk)| match st {
+            _ if v == crate::ActivityView::Locks => match lk {
+                crate::LocksState::Loaded(list) => locks_header(&list),
+                _ => empty().into_any(),
+            },
             ActivityState::Loaded {
                 sessions,
                 truncated,
@@ -162,12 +206,29 @@ pub(crate) fn activity_panel(
     .style(|s| s.width_full().flex_shrink(0.0_f32));
 
     let list = dyn_container(
-        move || (state.get(), search.get()),
-        move |(st, q)| {
+        move || (view.get(), state.get(), locks.get(), search.get()),
+        move |(v, st, lk, q)| {
             let term = {
                 let t = q.trim();
                 (!t.is_empty()).then(|| t.to_string())
             };
+            if v == crate::ActivityView::Locks {
+                return match (&st, lk) {
+                    (ActivityState::Unsupported, _) => {
+                        list_message(SQLITE_HAS_NO_SESSIONS, theme::text_muted)
+                    }
+                    (_, crate::LocksState::Loaded(list)) => locks_list(&list, &q),
+                    (_, crate::LocksState::Failed(e)) => list_message(e, theme::error),
+                    // The connection could not be reached at all — the refresh
+                    // says so on the sessions state, before it asks for either
+                    // list. Left to `Idle` below, that read "Loading…" forever
+                    // with auto-refresh off.
+                    (ActivityState::Failed(e), crate::LocksState::Idle) => {
+                        list_message(e.clone(), theme::error)
+                    }
+                    (_, crate::LocksState::Idle) => list_message("Loading…", theme::text_muted),
+                };
+            }
             let sessions = match &st {
                 ActivityState::Loaded { sessions, .. } => sessions,
                 // No snapshot: say which kind of nothing this is.
@@ -248,6 +309,7 @@ pub(crate) fn activity_panel(
 
     v_stack((
         title_row,
+        view_switch,
         // The same 5px above / 10px below the search box as the schema and
         // history panels; spacers rather than margins so the flex-grow scroll's
         // height stays exact (a sibling's vertical margin isn't subtracted → the
@@ -771,6 +833,164 @@ fn session_row(
                     dialect.get_untracked(),
                 )));
         })
+        .style(|s| {
+            s.flex_col()
+                .width_full()
+                .gap(theme::scaled(4.0))
+                .padding_horiz(theme::scaled(12.0))
+                .padding_vert(theme::scaled(9.0))
+                .border_bottom(1.0)
+                .border_color(theme::border())
+                .hover(|s| s.background(theme::row_hover_soft()))
+        })
+        .into_any()
+}
+
+/// The *Locks* view's tally, from the whole snapshot as the sessions' is: how
+/// many, how many waiting (in the blocked colour, left out at zero), the cap
+/// as a caveat — and, where the engine shows only contended locks, that a
+/// short list is not a lock-free server.
+fn locks_header(list: &activity::LockList) -> floem::AnyView {
+    let n = list.locks.len();
+    let waiting = list.locks.iter().filter(|l| !l.granted).count();
+    let more = if list.truncated { "+" } else { "" };
+    let mut parts: Vec<floem::AnyView> = vec![
+        text(format!("{n}{more} {}", plural(n, "lock", "locks")))
+            .style(|s| s.font_size(font_label()).color(theme::text_muted()))
+            .into_any(),
+    ];
+    if waiting > 0 {
+        parts.push(
+            text(format!("{waiting}{more} waiting"))
+                .style(|s| s.font_size(font_label()).color(theme::error()))
+                .into_any(),
+        );
+    }
+    if list.truncated {
+        parts.push(
+            text("list capped")
+                .style(|s| s.font_size(font_label()).color(theme::text_faint()))
+                .into_any(),
+        );
+    }
+    let tally = floem::views::stack_from_iter(parts).style(|s| {
+        s.flex_row()
+            .items_center()
+            .width_full()
+            .gap(theme::scaled(12.0))
+    });
+    let note = list.contended_only.then(|| {
+        text(
+            "This server lists only locks that are waited for, or that hold up a wait — \
+             not every lock a session has.",
+        )
+        .style(|s| {
+            s.font_size(font_label())
+                .color(theme::text_faint())
+                .width_full()
+        })
+        .into_any()
+    });
+    let mut rows = vec![tally.into_any()];
+    rows.extend(note);
+    floem::views::stack_from_iter(rows)
+        .style(|s| {
+            s.flex_col()
+                .width_full()
+                .gap(theme::scaled(4.0))
+                .padding_horiz(theme::scaled(12.0))
+                .padding_bottom(theme::scaled(9.0))
+        })
+        .into_any()
+}
+
+/// The *Locks* list: the locks [`activity::lock_matches`] the search, the
+/// front [`activity::RENDER_CAP`] of them as rows for the sessions list's
+/// reason, the rest counted.
+fn locks_list(list: &activity::LockList, q: &str) -> floem::AnyView {
+    let matched: Vec<&activity::LockInfo> = list
+        .locks
+        .iter()
+        .filter(|l| activity::lock_matches(l, q))
+        .collect();
+    if matched.is_empty() {
+        return list_message(
+            if !q.trim().is_empty() {
+                "No matching locks."
+            } else if list.contended_only {
+                "No lock waits on this server."
+            } else {
+                "No other session holds a lock."
+            },
+            theme::text_muted,
+        );
+    }
+    let (rows, undrawn) = activity::render_slice(&matched);
+    let mut items: Vec<floem::AnyView> = rows.iter().map(|l| lock_row(l)).collect();
+    if undrawn > 0 {
+        items.push(list_message(
+            format!(
+                "{undrawn} more {} — narrow the search to see {}.",
+                plural(undrawn, "lock matches", "locks match"),
+                plural(undrawn, "it", "them")
+            ),
+            theme::text_faint,
+        ));
+    }
+    v_stack_from_iter(items)
+        .style(|s| s.flex_col().width_full())
+        .into_any()
+}
+
+/// One lock: the session (dotted red while it waits), whether it holds or
+/// waits, the engine's own kind and mode, what it is on, and for a wait who
+/// holds it up.
+fn lock_row(l: &activity::LockInfo) -> floem::AnyView {
+    let color: fn() -> floem::peniko::Color = if l.granted {
+        theme::text_muted
+    } else {
+        theme::error
+    };
+    let heading = h_stack((
+        icons::icon(icons::DOT, 6.0).style(move |s| {
+            s.color(color())
+                .flex_shrink(0.0_f32)
+                .margin_right(theme::scaled(7.0))
+        }),
+        text(l.session.to_string()).style(|s| {
+            s.font_size(font_body())
+                .font_family(MONO_FAMILY.to_string())
+                .color(theme::text_dim())
+                .flex_shrink(0.0_f32)
+                .margin_right(theme::scaled(7.0))
+        }),
+        text(if l.granted { "holds" } else { "waits for" })
+            .style(move |s| s.font_size(font_label()).color(color()))
+            .style(|s| s.margin_right(theme::scaled(7.0)).flex_shrink(0.0_f32)),
+        text(format!("{} {}", l.kind, l.mode)).style(|s| {
+            s.font_size(font_label())
+                .color(theme::text_muted())
+                .min_width(0.0)
+                .text_ellipsis()
+        }),
+    ))
+    .style(|s| s.items_center().width_full());
+    let object = text(l.object.clone()).style(|s| {
+        s.font_size(font_body())
+            .font_family(MONO_FAMILY.to_string())
+            .color(theme::text())
+            .width_full()
+    });
+    let mut rows = vec![heading.into_any(), object.into_any()];
+    if !l.granted && !l.blocked_by.is_empty() {
+        let ids: Vec<String> = l.blocked_by.iter().map(i64::to_string).collect();
+        rows.push(
+            text(format!("held by {}", ids.join(", ")))
+                .style(|s| s.font_size(font_label()).color(theme::text_muted()))
+                .into_any(),
+        );
+    }
+    floem::views::stack_from_iter(rows)
         .style(|s| {
             s.flex_col()
                 .width_full()

@@ -1533,3 +1533,95 @@ pub async fn a_refused_write_says_which_value_the_server_refused(target: &'stati
 
     scratch.teardown().await;
 }
+
+/// **Server Activity's Locks view sees a real wait**, on every server: one
+/// session holds a row in an open transaction, a second's `UPDATE` of it
+/// blocks, and `Db::fetch_locks` lists the second's lock as waiting, blocked
+/// by the first — whose own held lock is listed beside it.
+pub async fn a_lock_wait_lists_the_waiter_and_its_holder(target: &'static Target) {
+    let scratch = Scratch::create(target, "locks_wait").await;
+    seed_import_table(&scratch).await;
+    let t = scratch.qualified("imp");
+    scratch
+        .exec(&format!("INSERT INTO {t} (id, name) VALUES (1, 'a')"))
+        .await;
+
+    let holder = OpenSession(Some(
+        Session::open(&scratch.db, Some(&scratch.database))
+            .await
+            .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.name)),
+    ));
+    holder
+        .ensure_tx()
+        .await
+        .unwrap_or_else(|e| panic!("{}: could not begin: {e}", target.name));
+    holder
+        .fetch_query(
+            &format!("UPDATE {t} SET name = 'held' WHERE id = 1"),
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .result
+        .unwrap_or_else(|e| panic!("{}: the holder's update failed: {e}", target.name));
+    let holder_id = holder
+        .server_id()
+        .unwrap_or_else(|| panic!("{}: the session has no server id", target.name));
+
+    let waiter = {
+        let (db, database) = (scratch.db.clone(), scratch.database.clone());
+        let sql = format!("UPDATE {t} SET name = 'waited' WHERE id = 1");
+        tokio::spawn(async move {
+            db.fetch_query(Some(&database), &sql, 1, CancellationToken::new())
+                .await
+        })
+    };
+
+    let mut seen = None;
+    for _ in 0..50 {
+        let list = scratch
+            .db
+            .fetch_locks()
+            .await
+            .unwrap_or_else(|e| panic!("{}: fetch_locks: {e}", target.name));
+        if list
+            .locks
+            .iter()
+            .any(|l| !l.granted && l.blocked_by.contains(&holder_id))
+        {
+            seen = Some(list);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let list = seen.unwrap_or_else(|| {
+        panic!(
+            "{}: no waiting lock blocked by {holder_id} appeared",
+            target.name
+        )
+    });
+    assert!(
+        list.locks
+            .iter()
+            .any(|l| l.granted && l.session == holder_id),
+        "{}: the holder's own lock is not listed: {:?}",
+        target.name,
+        list.locks
+    );
+    assert!(
+        !list.locks[0].granted,
+        "{}: the waits lead the list",
+        target.name
+    );
+
+    holder
+        .rollback()
+        .await
+        .unwrap_or_else(|e| panic!("{}: rollback: {e}", target.name));
+    waiter
+        .await
+        .expect("the waiter's task")
+        .unwrap_or_else(|e| panic!("{}: the waiter's update failed: {e}", target.name));
+    drop(holder);
+    scratch.teardown().await;
+}

@@ -1148,6 +1148,88 @@ pub fn parse_pid_array(s: &str) -> Vec<i64> {
         .collect()
 }
 
+/// A list of session ids as the lock queries return one — PostgreSQL's array
+/// literal (`{5,9}`) or MySQL's `GROUP_CONCAT` (`5,9`). [`parse_pid_array`]
+/// reads both, and is this under the name a lock caller asks for.
+pub fn parse_id_list(s: &str) -> Vec<i64> {
+    parse_pid_array(s)
+}
+
+/// One lock a session holds or waits for — the *Locks* view's row, engine-
+/// neutral as [`SessionInfo`] is.
+///
+/// What the engines call a lock differs, so the fields are their own words:
+/// `kind` is MySQL's `RECORD`/`TABLE`, PostgreSQL's `relation`/`tuple`/
+/// `transactionid`, SQL Server's `OBJECT`/`KEY`/`PAGE`; `mode` is `X`, `IX`,
+/// `RowExclusiveLock`, `U`… — shown, never interpreted. `object` is what the
+/// lock is on, as the engine can name it: a table with its index and key where
+/// there are ones, a transaction, a database.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockInfo {
+    pub session: i64,
+    pub object: String,
+    pub kind: String,
+    pub mode: String,
+    /// Held (`true`) or waited for.
+    pub granted: bool,
+    /// For a waited-for lock, the sessions holding what it waits on.
+    pub blocked_by: Vec<i64>,
+}
+
+/// What one *Locks* poll found ([`LockInfo`], ordered and capped by
+/// [`prepare_locks`]).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct LockList {
+    pub locks: Vec<LockInfo>,
+    /// The cap cut it.
+    pub truncated: bool,
+    /// The engine shows only **contended** locks — MariaDB's
+    /// `INNODB_LOCKS` lists a lock only while one is waited on or blocks a
+    /// wait — so a quiet list is not a lock-free server, and the view says so.
+    pub contended_only: bool,
+}
+
+/// How many locks the view keeps — the same bound [`MAX_SESSIONS`] is, for the
+/// same reason, and a lock list is the one that can run away: an `UPDATE` of a
+/// million rows holds a record lock on each on MySQL.
+pub const MAX_LOCKS: usize = 500;
+
+/// Order a fetched lock list and bound it: every **waiting** lock first —
+/// what is stuck is what the view is opened for — then the held ones, each
+/// by object and session. Blockers are deduplicated (one row per lock pair is
+/// the engines' unit, as for [`prepare`]). Returns whether the cap cut it.
+pub fn prepare_locks(locks: &mut Vec<LockInfo>) -> bool {
+    for l in locks.iter_mut() {
+        l.blocked_by.sort_unstable();
+        l.blocked_by.dedup();
+    }
+    locks.sort_by(|a, b| {
+        a.granted
+            .cmp(&b.granted)
+            .then_with(|| a.object.cmp(&b.object))
+            .then_with(|| a.session.cmp(&b.session))
+            .then_with(|| a.mode.cmp(&b.mode))
+    });
+    let truncated = locks.len() > MAX_LOCKS;
+    if truncated {
+        locks.truncate(MAX_LOCKS);
+    }
+    truncated
+}
+
+/// Does the view's search find this lock? By what the row shows — the
+/// session, the object, the kind and the mode — and `waiting` for a lock not
+/// yet granted.
+pub fn lock_matches(l: &LockInfo, query: &str) -> bool {
+    let q = query.trim();
+    q.is_empty()
+        || contains_ignore_ascii_case(&l.session.to_string(), q)
+        || contains_ignore_ascii_case(&l.object, q)
+        || contains_ignore_ascii_case(&l.kind, q)
+        || contains_ignore_ascii_case(&l.mode, q)
+        || (!l.granted && contains_ignore_ascii_case("waiting", q))
+}
+
 /// Which of the two things "kill" can mean.
 ///
 /// Both engines offer both, and the difference is the whole reason this is an
@@ -2691,5 +2773,54 @@ mod tests {
         }
         assert_eq!(sane_interval(7), DEFAULT_POLL_SECS, "not on the menu");
         assert_eq!(sane_interval(u64::MAX), DEFAULT_POLL_SECS);
+    }
+
+    fn lock(session: i64, object: &str, granted: bool, blocked_by: &[i64]) -> LockInfo {
+        LockInfo {
+            session,
+            object: object.to_string(),
+            kind: "RECORD".to_string(),
+            mode: "X".to_string(),
+            granted,
+            blocked_by: blocked_by.to_vec(),
+        }
+    }
+
+    /// **The waits first**, longest-standing question first: a lock list is
+    /// read for what is stuck, so every waiting lock leads, then the held
+    /// ones, each by object and session. Blockers dedupe as the sessions'
+    /// edges do — one row per lock pair is the engines' unit, not the user's.
+    #[test]
+    fn waiting_locks_lead_and_their_blockers_are_distinct() {
+        let mut locks = vec![
+            lock(5, "shop.orders", true, &[]),
+            lock(9, "shop.orders", false, &[5, 5]),
+            lock(3, "shop.items", true, &[]),
+            lock(7, "shop.items", false, &[3]),
+        ];
+        assert!(!prepare_locks(&mut locks));
+        let order: Vec<(i64, bool)> = locks.iter().map(|l| (l.session, l.granted)).collect();
+        assert_eq!(order, [(7, false), (9, false), (3, true), (5, true)]);
+        assert_eq!(locks[1].blocked_by, [5]);
+        let mut many: Vec<LockInfo> = (0..MAX_LOCKS as i64 + 3)
+            .map(|i| lock(i, "t", true, &[]))
+            .collect();
+        assert!(prepare_locks(&mut many), "past the cap is said, not hidden");
+        assert_eq!(many.len(), MAX_LOCKS);
+    }
+
+    /// The search reads what the row shows: the session, the object, the
+    /// lock's kind and mode, and whether it waits.
+    #[test]
+    fn a_lock_is_found_by_what_its_row_says() {
+        let l = lock(42, "shop.orders (PRIMARY) 7", false, &[5]);
+        for q in ["42", "ORDERS", "primary", "record", "x", "waiting", ""] {
+            assert!(lock_matches(&l, q), "{q}");
+        }
+        assert!(!lock_matches(&l, "items"));
+        assert!(!lock_matches(&lock(1, "t", true, &[]), "waiting"));
+        assert_eq!(parse_id_list("5,9, 12"), [5, 9, 12]);
+        assert_eq!(parse_id_list("{5,9}"), [5, 9]);
+        assert!(parse_id_list("").is_empty());
     }
 }

@@ -5708,6 +5708,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // showing another server's session ids for even one frame is an invitation to
     // kill the wrong thing.
     let activity_state: RwSignal<ActivityState> = RwSignal::new(ActivityState::Idle);
+    let activity_view = RwSignal::new(schemaic_ui::ActivityView::Sessions);
+    let activity_locks = RwSignal::new(schemaic_ui::LocksState::Idle);
     // The interval is **per connection** — how hard you are willing to lean on a
     // particular server, not a taste. One number would carry a laptop's two
     // seconds straight onto a production replica on the next switch.
@@ -5805,6 +5807,31 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // A refused kill is news about one click, not a standing condition —
             // the next look at the server retires it.
             activity_kill_error.set(None);
+            // **The Locks view polls the locks instead**, under the same
+            // generation guard: a reply for the other view, or an old server,
+            // lands nowhere.
+            if activity_view.get_untracked() == schemaic_ui::ActivityView::Locks {
+                let report = create_ext_action(
+                    cx,
+                    move |res: Result<schemaic_core::activity::LockList, String>| {
+                        if activity_inflight.get_untracked() == Some(generation) {
+                            activity_inflight.set(None);
+                            activity_busy.set(false);
+                        }
+                        if activity_gen.try_get_untracked() != Some(generation) {
+                            return;
+                        }
+                        activity_locks.set(match res {
+                            Ok(list) => schemaic_ui::LocksState::Loaded(Rc::new(list)),
+                            Err(e) => schemaic_ui::LocksState::Failed(e),
+                        });
+                    },
+                );
+                handle.spawn(async move {
+                    report(db.fetch_locks().await.map_err(|e| e.to_string()));
+                });
+                return;
+            }
             let report = create_ext_action(
                 cx,
                 move |res: Result<Vec<schemaic_core::activity::SessionInfo>, String>| {
@@ -6097,31 +6124,39 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // `true`. `activity_polling` is now defined above all three.
     {
         let refresh = refresh_activity.clone();
-        create_effect(move |prev: Option<(u64, bool, u64)>| {
-            let open = activity_polling();
-            let conn = active_conn.get();
-            let secs = activity_interval.get();
-            let conn_changed = prev.is_none_or(|(c, _, _)| c != conn);
-            // An interval change re-arms the timer and nothing else. Refreshing on
-            // it too meant moving a struggling server from 2s to 30s — done
-            // precisely to lean on it less — fired an immediate extra fetch, and
-            // because the generation had just been bumped the in-flight guard
-            // couldn't suppress it: two `PROCESSLIST` queries at once, on the
-            // server that prompted the change.
-            let woke = prev.is_none_or(|(_, was_open, _)| !was_open);
-            // Bumping first is what strands every timer and every in-flight fetch
-            // armed under the old state — and the re-arm rides with it, so the
-            // panel cannot be left bumped-but-unarmed.
-            rearm_activity(activity_gen, activity_interval, refresh.clone(), open);
-            if conn_changed {
-                activity_state.set(ActivityState::Idle);
-                activity_kill_error.set(None);
-            }
-            if open && (conn_changed || woke) {
-                (refresh)();
-            }
-            (conn, open, secs)
-        });
+        create_effect(
+            move |prev: Option<(u64, bool, u64, schemaic_ui::ActivityView)>| {
+                let open = activity_polling();
+                let conn = active_conn.get();
+                let secs = activity_interval.get();
+                // A switch between Sessions and Locks fetches the list now shown:
+                // the re-arm below bumps the generation, so a poll of the other
+                // list still in flight cannot hold this one off.
+                let view = activity_view.get();
+                let view_changed = prev.is_some_and(|(_, _, _, v)| v != view);
+                let conn_changed = prev.is_none_or(|(c, _, _, _)| c != conn);
+                // An interval change re-arms the timer and nothing else. Refreshing on
+                // it too meant moving a struggling server from 2s to 30s — done
+                // precisely to lean on it less — fired an immediate extra fetch, and
+                // because the generation had just been bumped the in-flight guard
+                // couldn't suppress it: two `PROCESSLIST` queries at once, on the
+                // server that prompted the change.
+                let woke = prev.is_none_or(|(_, was_open, _, _)| !was_open);
+                // Bumping first is what strands every timer and every in-flight fetch
+                // armed under the old state — and the re-arm rides with it, so the
+                // panel cannot be left bumped-but-unarmed.
+                rearm_activity(activity_gen, activity_interval, refresh.clone(), open);
+                if conn_changed {
+                    activity_state.set(ActivityState::Idle);
+                    activity_locks.set(schemaic_ui::LocksState::Idle);
+                    activity_kill_error.set(None);
+                }
+                if open && (conn_changed || woke || view_changed) {
+                    (refresh)();
+                }
+                (conn, open, secs, view)
+            },
+        );
     }
 
     // Throw the Server Activity snapshot away and start again — what the effect
@@ -6170,6 +6205,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // every view reading them for a value that did not move.
             if !matches!(activity_state.get_untracked(), ActivityState::Idle) {
                 activity_state.set(ActivityState::Idle);
+            }
+            if !matches!(
+                activity_locks.get_untracked(),
+                schemaic_ui::LocksState::Idle
+            ) {
+                activity_locks.set(schemaic_ui::LocksState::Idle);
             }
             if activity_kill_error.get_untracked().is_some() {
                 activity_kill_error.set(None);
@@ -13056,6 +13097,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         }),
         activity: ActivityUi {
             state: activity_state,
+            view: activity_view,
+            locks: activity_locks,
             interval: activity_interval,
             busy: activity_busy,
             kill_error: activity_kill_error,

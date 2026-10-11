@@ -168,6 +168,7 @@ live_suite!(
         a_rolled_back_manual_transaction_leaves_nothing,
         a_typo_in_a_manual_transaction_names_what_the_server_refused,
         a_cancelled_query_stops_at_the_server,
+        a_lock_wait_lists_the_waiter_and_its_holder,
         a_cancelled_script_stops_at_the_server_and_reports_what_ran,
         a_cancelled_import_rolls_back_and_says_so,
         a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain,

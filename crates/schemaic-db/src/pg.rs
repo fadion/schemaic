@@ -1793,6 +1793,71 @@ pub(crate) async fn fetch_sessions(db: &Db) -> Result<Vec<SessionInfo>, DbError>
     Ok(activity::from_pg_rows(&rows))
 }
 
+/// The PostgreSQL half of [`Db::fetch_locks`]: `pg_locks`, with a waiting
+/// lock's blockers from `pg_blocking_pids` — the function the sessions view
+/// already trusts over a hand-written join.
+///
+/// **On the connection's own database where it names one**, unlike the
+/// sessions list: `pg_locks` is cluster-wide, but a relation's oid is a name
+/// only inside its own database, so `::regclass` can say `public.orders` there
+/// and nowhere else. A lock in another database is named by that database and
+/// its oid instead — never cast, since the same oid here may be some other
+/// table.
+pub(crate) async fn fetch_locks(db: &Db) -> Result<activity::LockList, DbError> {
+    let client = match db.database() {
+        Some(d) => connect_to(db, d).await?,
+        None => connect_maintenance(db).await?,
+    };
+    let rows = query_all(
+        &client,
+        &format!("{PG_LOCKS_SQL}{}", activity::MAX_LOCKS + 1),
+    )
+    .await?;
+    let truncated = rows.len() > activity::MAX_LOCKS;
+    let locks = rows
+        .iter()
+        .filter_map(|r| {
+            Some(activity::LockInfo {
+                session: opt(r, 0)?.parse().ok()?,
+                object: opt(r, 1).unwrap_or_default(),
+                kind: opt(r, 2).unwrap_or_default(),
+                mode: opt(r, 3).unwrap_or_default(),
+                granted: opt(r, 4).as_deref() == Some("t"),
+                blocked_by: opt(r, 5)
+                    .map(|s| activity::parse_id_list(&s))
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(activity::LockList {
+        locks,
+        truncated,
+        contended_only: false,
+    })
+}
+
+/// `pg_locks` as [`activity::LockInfo`]'s columns, waits first, ending in
+/// `LIMIT ` for the caller's bound. A granted `virtualxid` is every
+/// transaction's lock on itself and says nothing; a waited-for one is the
+/// `CREATE INDEX CONCURRENTLY` kind of wait and stays.
+const PG_LOCKS_SQL: &str = "SELECT l.pid::text, \
+     CASE \
+       WHEN l.relation IS NOT NULL AND l.database = \
+            (SELECT oid FROM pg_database WHERE datname = current_database()) \
+         THEN l.relation::regclass::text \
+       WHEN l.relation IS NOT NULL \
+         THEN COALESCE(d.datname, '?') || ': relation ' || l.relation::text \
+       WHEN l.locktype = 'transactionid' THEN 'transaction ' || l.transactionid::text \
+       WHEN l.locktype = 'virtualxid' THEN 'virtual transaction ' || l.virtualxid \
+       WHEN l.locktype = 'advisory' THEN 'advisory ' || l.classid::text || ':' || l.objid::text \
+       ELSE l.locktype END, \
+     l.locktype, l.mode, l.granted, \
+     CASE WHEN NOT l.granted THEN pg_blocking_pids(l.pid)::text END \
+     FROM pg_locks l LEFT JOIN pg_database d ON d.oid = l.database \
+     WHERE l.pid IS NOT NULL AND l.pid <> pg_backend_pid() \
+       AND NOT (l.locktype = 'virtualxid' AND l.granted) \
+     ORDER BY l.granted, l.pid LIMIT ";
+
 /// The activity query, projecting [`activity::PG_ACTIVITY_COLUMNS`] in order.
 fn pg_activity_sql(limit: usize) -> String {
     let projection: Vec<String> = activity::PG_ACTIVITY_COLUMNS

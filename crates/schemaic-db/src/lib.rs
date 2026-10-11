@@ -1828,6 +1828,37 @@ impl Db {
             .map_err(|_| DbError::Connect("timed out".to_string()))?
     }
 
+    /// The locks this server's sessions hold and wait for — Server Activity's
+    /// *Locks* view, beside [`Db::fetch_sessions`] and bounded the same way,
+    /// for the same reason.
+    ///
+    /// One query per engine, over what each engine publishes: MySQL 8's
+    /// `performance_schema.data_locks`, MariaDB's `INNODB_LOCKS` (contended
+    /// locks only — [`activity::LockList::contended_only`]), PostgreSQL's
+    /// `pg_locks` and SQL Server's `sys.dm_tran_locks`. Each leaves out its
+    /// own session and the locks every session holds just by existing (a
+    /// PostgreSQL transaction's own virtual xid, a SQL Server session's shared
+    /// lock on its database), which would bury the rest.
+    pub async fn fetch_locks(&self) -> Result<activity::LockList, DbError> {
+        if !activity::supports_activity(self.engine.dialect()) {
+            return Err(DbError::Query(NO_SESSIONS_MSG.to_string()));
+        }
+        let poll = async {
+            match self.engine {
+                Engine::Postgres => pg::fetch_locks(self).await,
+                Engine::MySql => mysql::fetch_locks(self).await,
+                Engine::MsSql => mssql::fetch_locks(self).await,
+                // Unreachable — `supports_activity` above is the gate.
+                Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
+            }
+        };
+        let mut list = tokio::time::timeout(PING_TIMEOUT, poll)
+            .await
+            .map_err(|_| DbError::Connect("timed out".to_string()))??;
+        list.truncated |= activity::prepare_locks(&mut list.locks);
+        Ok(list)
+    }
+
     /// Cancel a statement, or terminate a session outright, by server id.
     ///
     /// **A fresh connection, always.** The session being killed may be the one

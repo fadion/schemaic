@@ -483,6 +483,109 @@ pub(crate) async fn fetch_sessions(db: &Db) -> Result<Vec<SessionInfo>, DbError>
     out
 }
 
+/// The MySQL/MariaDB half of [`crate::Db::fetch_locks`].
+///
+/// **The flavour is asked, not discovered by failing.** The two servers
+/// publish locks in tables neither has of the other's — MySQL 8 removed
+/// `INNODB_LOCKS`, MariaDB never had `performance_schema.data_locks` — and
+/// the sessions list's try-one-then-the-other cost MariaDB a failed query on
+/// every poll until it learned to skip it. `@@version` is one cheap row.
+pub(crate) async fn fetch_locks(db: &Db) -> Result<activity::LockList, DbError> {
+    let mut conn = db.open(None, false).await?;
+    let out = collect_locks(&mut conn).await;
+    let _ = conn.disconnect().await;
+    out
+}
+
+async fn collect_locks(conn: &mut Conn) -> Result<activity::LockList, DbError> {
+    let version: Option<String> = conn
+        .query_first("SELECT @@version")
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    // The one decider of which server this is (see
+    // `only_one_function_decides_which_mysql_family_server_this_is`).
+    let mariadb = version
+        .as_deref()
+        .is_some_and(|v| schemaic_core::schema::ServerFlavour::parse_version(v).is_mariadb());
+    let sql = format!(
+        "{}{}",
+        if mariadb {
+            MY_LOCKS_IS_SQL
+        } else {
+            MY_LOCKS_PS_SQL
+        },
+        activity::MAX_LOCKS + 1
+    );
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = conn
+        .query(sql)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let truncated = rows.len() > activity::MAX_LOCKS;
+    let locks = rows
+        .into_iter()
+        .filter_map(|(id, object, kind, mode, granted, blockers)| {
+            Some(activity::LockInfo {
+                session: id?.parse().ok()?,
+                object: object.unwrap_or_default(),
+                kind: kind.unwrap_or_default(),
+                mode: mode.unwrap_or_default(),
+                granted: granted.as_deref() == Some("1"),
+                blocked_by: blockers
+                    .map(|s| activity::parse_id_list(&s))
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(activity::LockList {
+        locks,
+        truncated,
+        contended_only: mariadb,
+    })
+}
+
+/// MySQL 8's every-lock table, in [`activity::LockInfo`]'s columns, ending in
+/// `LIMIT `. `data_locks` names a *performance-schema* thread, not the
+/// processlist id a session is known by everywhere else, so both it and the
+/// waits' blocking thread go through `threads`.
+const MY_LOCKS_PS_SQL: &str = "SELECT CAST(t.PROCESSLIST_ID AS CHAR), \
+     CONCAT(l.OBJECT_SCHEMA, '.', l.OBJECT_NAME, \
+            IFNULL(CONCAT(' (', l.INDEX_NAME, ')'), ''), IFNULL(CONCAT(' ', l.LOCK_DATA), '')), \
+     l.LOCK_TYPE, l.LOCK_MODE, IF(l.LOCK_STATUS = 'GRANTED', '1', '0'), \
+     (SELECT GROUP_CONCAT(DISTINCT CAST(bt.PROCESSLIST_ID AS CHAR)) \
+        FROM performance_schema.data_lock_waits w \
+        JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID \
+       WHERE w.REQUESTING_ENGINE_LOCK_ID = l.ENGINE_LOCK_ID) \
+     FROM performance_schema.data_locks l \
+     JOIN performance_schema.threads t ON t.THREAD_ID = l.THREAD_ID \
+     WHERE t.PROCESSLIST_ID IS NOT NULL AND t.PROCESSLIST_ID <> CONNECTION_ID() \
+     ORDER BY l.LOCK_STATUS = 'GRANTED', t.PROCESSLIST_ID LIMIT ";
+
+/// MariaDB's: `INNODB_LOCKS`, which holds only the locks that are waited for
+/// or block a wait. A lock is waiting when it is its transaction's
+/// `trx_requested_lock_id`; its blockers are `INNODB_LOCK_WAITS`' holders,
+/// named by their transactions' threads. `lock_table` arrives quoted
+/// (`` `shop`.`orders` ``), and is shown without the backticks.
+const MY_LOCKS_IS_SQL: &str = "SELECT CAST(t.trx_mysql_thread_id AS CHAR), \
+     CONCAT(REPLACE(l.lock_table, '`', ''), \
+            IFNULL(CONCAT(' (', l.lock_index, ')'), ''), IFNULL(CONCAT(' ', l.lock_data), '')), \
+     l.lock_type, l.lock_mode, IF(t.trx_requested_lock_id <=> l.lock_id, '0', '1'), \
+     (SELECT GROUP_CONCAT(DISTINCT CAST(bt.trx_mysql_thread_id AS CHAR)) \
+        FROM information_schema.INNODB_LOCK_WAITS w \
+        JOIN information_schema.INNODB_TRX bt ON bt.trx_id = w.blocking_trx_id \
+       WHERE w.requested_lock_id = l.lock_id) \
+     FROM information_schema.INNODB_LOCKS l \
+     JOIN information_schema.INNODB_TRX t ON t.trx_id = l.lock_trx_id \
+     WHERE t.trx_mysql_thread_id <> CONNECTION_ID() \
+     ORDER BY 5, 1 LIMIT ";
+
 /// Cancel a statement, or terminate a session outright, by server id.
 ///
 /// **A fresh connection, always** — the session being killed may be the one
@@ -3139,6 +3242,8 @@ mod schema_tests {
             ("mysql.rs", "ping", "timeout"),
             ("mysql.rs", "fetch_databases", "crate::PING_TIMEOUT"),
             ("lib.rs", "fetch_sessions", "PING_TIMEOUT"),
+            // The Locks view polls on the same timer as the sessions list.
+            ("lib.rs", "fetch_locks", "PING_TIMEOUT"),
             ("lib.rs", "kill_session", "CANCEL_TIMEOUT"),
             // **The second forever-timer, which the doc above said did not
             // exist.** The Live Monitor re-arms `fetch_table` every two seconds

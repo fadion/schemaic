@@ -5968,10 +5968,34 @@ pub enum ActivityState {
     Unsupported,
 }
 
+/// Which of Server Activity's two lists is shown: the sessions, or the locks
+/// they hold and wait for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ActivityView {
+    #[default]
+    Sessions,
+    Locks,
+}
+
+/// What the *Locks* view has to show — [`ActivityState`]'s shape, for the
+/// other list. A poll that lands on `Loaded` replaces it in place.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LocksState {
+    Idle,
+    /// Ordered and capped by [`schemaic_core::activity::prepare_locks`].
+    Loaded(Rc<schemaic_core::activity::LockList>),
+    Failed(String),
+}
+
 /// Server-activity signals (Copy bundle).
 #[derive(Clone, Copy)]
 pub struct ActivityUi {
     pub state: RwSignal<ActivityState>,
+    /// The list on show. The app's poll fetches only this one, so a switch is
+    /// a fetch of the other and nothing else.
+    pub view: RwSignal<ActivityView>,
+    /// The *Locks* view's snapshot.
+    pub locks: RwSignal<LocksState>,
     /// The **active connection's** auto-refresh interval in seconds; `0` is off.
     /// Derived, not settable — the store it comes from is keyed by `conn_id`
     /// ([`schemaic_core::activity::IntervalRule`]), so the panel reads this and

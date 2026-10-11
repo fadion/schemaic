@@ -3420,6 +3420,73 @@ pub(crate) async fn fetch_sessions(
     Ok(activity::from_mssql_rows(&rows))
 }
 
+/// The SQL Server half of [`crate::Db::fetch_locks`]: `sys.dm_tran_locks`, a
+/// waiting lock's blocker from `sys.dm_os_waiting_tasks`.
+///
+/// An `OBJECT` lock is named across databases (`OBJECT_SCHEMA_NAME` and
+/// `OBJECT_NAME` take the database id); a `KEY`, `PAGE` or `RID` lock names a
+/// heap or index (`hobt_id`), which `sys.partitions` resolves only in the
+/// database this connection is in, so elsewhere it is the database and the
+/// engine's own resource description. Every session's shared lock on its
+/// database is left out: it is held by existing, and would be most of the
+/// list.
+pub(crate) async fn fetch_locks(db: &Db) -> Result<schemaic_core::activity::LockList, DbError> {
+    use schemaic_core::activity;
+    let mut client = connect(db, None).await?;
+    let rows = query_rows(&mut client, &locks_sql(activity::MAX_LOCKS + 1)).await?;
+    let truncated = rows.len() > activity::MAX_LOCKS;
+    let locks = rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(activity::LockInfo {
+                session: cell(&r, 0).parse().ok()?,
+                object: cell(&r, 1),
+                kind: cell(&r, 2),
+                mode: cell(&r, 3),
+                granted: cell(&r, 4) == "1",
+                blocked_by: activity::parse_id_list(&cell(&r, 5)),
+            })
+        })
+        .collect();
+    Ok(activity::LockList {
+        locks,
+        truncated,
+        contended_only: false,
+    })
+}
+
+/// [`fetch_locks`]' query, its first `limit` rows, waits first.
+fn locks_sql(limit: usize) -> String {
+    format!(
+        "SELECT TOP ({limit}) CAST(l.request_session_id AS varchar(20)), \
+           CASE \
+             WHEN l.resource_type = 'OBJECT' THEN DB_NAME(l.resource_database_id) + '.' \
+               + OBJECT_SCHEMA_NAME(l.resource_associated_entity_id, l.resource_database_id) \
+               + '.' + OBJECT_NAME(l.resource_associated_entity_id, l.resource_database_id) \
+             WHEN l.resource_type = 'DATABASE' THEN DB_NAME(l.resource_database_id) \
+             WHEN p.object_id IS NOT NULL THEN DB_NAME(l.resource_database_id) + '.' \
+               + OBJECT_SCHEMA_NAME(p.object_id) + '.' + OBJECT_NAME(p.object_id) \
+               + ISNULL(' ' + NULLIF(RTRIM(l.resource_description), ''), '') \
+             ELSE ISNULL(DB_NAME(l.resource_database_id), '') \
+               + ISNULL(' ' + NULLIF(RTRIM(l.resource_description), ''), '') \
+           END, \
+           l.resource_type, l.request_mode, \
+           CASE WHEN l.request_status = 'GRANT' THEN '1' ELSE '0' END, \
+           CAST(w.blocking_session_id AS varchar(20)) \
+         FROM sys.dm_tran_locks l \
+         LEFT JOIN sys.partitions p ON p.hobt_id = l.resource_associated_entity_id \
+           AND l.resource_database_id = DB_ID() \
+           AND l.resource_type IN ('KEY', 'PAGE', 'RID', 'HOBT') \
+         LEFT JOIN sys.dm_os_waiting_tasks w ON w.resource_address = l.lock_owner_address \
+           AND w.blocking_session_id IS NOT NULL \
+         WHERE l.request_session_id > 0 AND l.request_session_id <> @@SPID \
+           AND NOT (l.resource_type = 'DATABASE' AND l.request_mode = 'S' \
+                    AND l.request_status = 'GRANT') \
+         ORDER BY CASE WHEN l.request_status = 'GRANT' THEN 1 ELSE 0 END, \
+                  l.request_session_id"
+    )
+}
+
 /// `KILL <session>`, from a fresh connection. There is no statement that
 /// cancels another session's request and leaves the session standing, so a
 /// *Cancel query* is refused rather than performed as a `KILL` — see

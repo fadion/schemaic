@@ -8321,6 +8321,73 @@ async fn a_query_waiting_to_compile_stops_when_asked() {
     let _ = holder.await;
 }
 
+/// **The Locks view sees a real wait on SQL Server**: one session holds a row
+/// in an open transaction, another's `UPDATE` of it blocks, and
+/// `Db::fetch_locks` lists the second's lock as waiting, blocked by a session
+/// whose own held lock is on the same table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_wait_lists_the_waiter_and_its_holder() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("locks_wait").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v int); INSERT dbo.t VALUES (1, 0)")
+        .await;
+    let holder = {
+        let (db, name) = (s.db.clone(), s.name.clone());
+        tokio::spawn(async move {
+            db.fetch_query(
+                Some(&name),
+                "BEGIN TRANSACTION; UPDATE dbo.t SET v = 1 WHERE id = 1; \
+                 WAITFOR DELAY '00:00:04'; ROLLBACK",
+                1,
+                CancellationToken::new(),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let waiter = {
+        let (db, name) = (s.db.clone(), s.name.clone());
+        tokio::spawn(async move {
+            db.fetch_query(
+                Some(&name),
+                "UPDATE dbo.t SET v = 2 WHERE id = 1",
+                1,
+                CancellationToken::new(),
+            )
+            .await
+        })
+    };
+    let mut seen = None;
+    for _ in 0..30 {
+        let list = s.db.fetch_locks().await.expect("fetch_locks");
+        if list
+            .locks
+            .iter()
+            .any(|l| !l.granted && !l.blocked_by.is_empty())
+        {
+            seen = Some(list);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let list = seen.expect("a waiting lock with its blocker");
+    let waiting = &list.locks[0];
+    assert!(!waiting.granted, "the waits lead: {:?}", list.locks);
+    let blocker = waiting.blocked_by[0];
+    assert!(
+        list.locks
+            .iter()
+            .any(|l| l.granted && l.session == blocker && l.object.contains(".dbo.t")),
+        "the holder's lock on the table: {:?}",
+        list.locks
+    );
+    assert!(!list.contended_only);
+    let _ = holder.await;
+    let _ = waiter.await;
+}
+
 /// The activity panel sees the server's other sessions — not the one
 /// polling, as on the other engines — and will end one but not cancel its
 /// statement: SQL Server has no statement for that.
