@@ -63,15 +63,14 @@ reads, so silent drift from the code is the most damaging kind of bug there —
 that has quietly become false. Write it as part of the change that made it stale, never in a
 later pass.
 
-**`TODO.md` is the user's scratchpad — a plain list of things to be done, and the place to park an
-idea for a future release.** It is gitignored, so it is also the one file here with no git history
-to recover from: back it up before a large rewrite, and never edit it with a script. Entries are
-short and imperative; delete them as they land rather than checking them off. **It is not a
-decision board.** The moment an entry starts explaining *why* something was chosen or rejected, that
-paragraph belongs in `docs/architecture.md` (or the commit that supersedes it) and the entry here
-shrinks back to the work that is left. Keep the three disjoint: a fact about the system goes in
-`docs/architecture.md`, an instruction about how to work goes in this file, an open piece of work
-goes in `TODO.md`.
+**`docs/roadmap.md` is the planned work** — the larger features not started yet, each with the
+decisions already taken, its non-goals, its phases and the traps worth knowing before starting.
+Read a feature's entry before working on it, and follow what it has decided rather than
+re-deciding it; a decision that turns out wrong is changed there, with the user, not worked around
+in the code. When a phase lands, its facts move into `docs/architecture.md` in the same change and
+the phase is deleted from the roadmap rather than ticked off. Keep the three disjoint: a fact about
+the system goes in `docs/architecture.md`, an instruction about how to work goes in this file,
+planned work goes in `docs/roadmap.md`.
 
 ## Delegate the reading
 
