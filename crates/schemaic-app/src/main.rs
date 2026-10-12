@@ -3230,7 +3230,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // killed one has spent it — and nothing else on screen says so.
                 // `None` (no session) can't have had a transaction to spend.
                 let note = |m: String| match stmt {
-                    Some(o) => tx::run_failed_message(&m, o, tx_before),
+                    Some(o) => tx::run_failed_message(&m, o, tx_before, engine, &sql),
                     None => m,
                 };
                 let state = match res {
@@ -3265,16 +3265,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // everything already in it permanent — and the arm above,
                     // which discloses exactly that, is reached only when the
                     // *clock* stopped the run. See `tx::cancelled_message`.
-                    Err(DbError::Cancelled) => match tx::run_cancelled_message(stmt, tx_before) {
-                        Some(m) => {
-                            tracing::info!("query cancelled after an implicit commit");
-                            QueryState::Failed(ModalError::app(m))
+                    Err(DbError::Cancelled) => {
+                        match tx::run_cancelled_message(stmt, tx_before, engine, &sql) {
+                            Some(m) => {
+                                tracing::info!("query cancelled after an implicit commit");
+                                QueryState::Failed(ModalError::app(m))
+                            }
+                            None => {
+                                tracing::info!("query cancelled");
+                                QueryState::Cancelled
+                            }
                         }
-                        None => {
-                            tracing::info!("query cancelled");
-                            QueryState::Cancelled
-                        }
-                    },
+                    }
                     Err(e) => {
                         tracing::error!("query failed: {e}");
                         // A rejected statement or a refused connection — the
@@ -3797,13 +3799,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                         &timeout_message(timeout_secs),
                                         out.stmt,
                                         before,
+                                        engine,
+                                        sql,
                                     )))
                                 }
                                 // The same pair as `run_query_core`'s, and the
                                 // same hole: see `tx::cancelled_message`.
                                 Err(DbError::Cancelled) => {
                                     stopped = true;
-                                    match tx::run_cancelled_message(Some(out.stmt), before) {
+                                    match tx::run_cancelled_message(
+                                        Some(out.stmt),
+                                        before,
+                                        engine,
+                                        sql,
+                                    ) {
                                         Some(m) => QueryState::Failed(ModalError::app(m)),
                                         None => QueryState::Cancelled,
                                     }
@@ -3811,7 +3820,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Err(e) => {
                                     stopped = true;
                                     QueryState::Failed(ModalError::new(
-                                        tx::run_failed_message(&e.to_string(), out.stmt, before),
+                                        tx::run_failed_message(
+                                            &e.to_string(),
+                                            out.stmt,
+                                            before,
+                                            engine,
+                                            sql,
+                                        ),
                                         tx::run_error_source(e.modal_source(), Some(out.stmt)),
                                     ))
                                 }

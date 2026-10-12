@@ -10222,7 +10222,16 @@ existing prose was left alone.
     `on_statement` as it goes and hands each statement the state it found. Every other pair is
     `failed_message`'s (`a_lost_connection_says_the_open_transaction_and_its_statements_are_gone`,
     `a_run_failure_without_a_lost_transaction_is_failed_messages`). Both paths' timeout arms go
-    through it too. **`run_cancelled_message` is the same for a Stop**: a `DbError::Cancelled`
+    through it too. **It is also given the engine and the statement lost, because "undone" is not
+    always what the engine delivered**: a connection lost on a `COMMIT` (or PostgreSQL's `END`, or
+    on SQL Server a `COMMIT` anywhere in the batch, `text_commits`) may have committed first, so the
+    outcome is said to be *unknown*; one lost under a MySQL statement `implicit_commit` names says the
+    earlier statements were most likely committed before it began; and on MySQL "undone" carries
+    the caveat that a write to a non-transactional table (MyISAM, MEMORY) stays. The first two end
+    in *Check the data before running any of it again* — the plain "undone" had a user re-run two
+    credits that had landed (`a_connection_lost_on_a_commit_does_not_claim_the_transaction_was_undone`,
+    `a_connection_lost_on_mysql_ddl_says_the_earlier_statements_were_committed`,
+    `a_connection_lost_on_mysql_names_what_a_rollback_cannot_undo`). **`run_cancelled_message` is the same for a Stop**: a `DbError::Cancelled`
     carrying `ConnectionLost` over an open transaction — SQL Server replacing a connection a Stop
     left out of step, under `db::mssql` — is `run_failed_message` of "The statement was cancelled.",
     where `cancelled_message`, which has no arm for it, answered the bare *Cancelled*; anything else

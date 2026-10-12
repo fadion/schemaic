@@ -950,21 +950,83 @@ pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
 /// its connection ends — on every engine here — so every statement run in it
 /// since it began is undone, and this says so with the number, which only
 /// `before` still knows. Every other outcome is `failed_message`'s.
-pub fn run_failed_message(message: &str, stmt: StmtOutcome, before: TxState) -> String {
+///
+/// **Unless the statement lost was the one that ends it.** `sql` is the
+/// statement the connection died under, and the report never claims more than
+/// the engine delivered:
+///
+/// - **A `COMMIT`** (or PostgreSQL's `END`; on SQL Server, one anywhere in the
+///   batch — [`text_commits`]) may have committed before the socket died, so
+///   the outcome is *unknown*, and saying "undone" invited a second run of work
+///   that had landed.
+/// - **MySQL's implicitly committing statements** ([`implicit_commit`]): the
+///   server commits the open transaction before it starts one, so the earlier
+///   statements were most likely made permanent.
+/// - **Anything else on MySQL** is undone only where the table is
+///   transactional — a write to a MyISAM or MEMORY table stays, which no
+///   rollback reverses (as `Rollback::note` says of an explicit one).
+pub fn run_failed_message(
+    message: &str,
+    stmt: StmtOutcome,
+    before: TxState,
+    engine: TxEngine,
+    sql: &str,
+) -> String {
     if stmt != StmtOutcome::ConnectionLost || !before.is_open() {
         return failed_message(message, stmt);
     }
-    let what = match before.stmts() {
-        0 => "nothing had run in it yet".to_string(),
-        n => format!(
-            "the {n} {} run in it since it began {} undone",
+    let n = before.stmts();
+    let them = match n {
+        0 => None,
+        n => Some(format!(
+            "the {n} {} run in it since it began",
             crate::text::plural(n as usize, "statement", "statements"),
-            if n == 1 { "is" } else { "are" }
-        ),
+        )),
+    };
+    let head = "The connection was lost with a transaction open.";
+    let check = "Check the data before running any of it again.";
+    let kw = crate::sql::leading_keyword(sql, crate::intel::SqlDialect::MySql);
+    let commits = matches!(kw.as_deref(), Some("COMMIT" | "END")) || text_commits(engine, sql);
+    if commits {
+        let was = if n > 1 { "were" } else { "was" };
+        let what = them.unwrap_or_else(|| "the transaction".to_string());
+        return format!(
+            "{message}\n\n{head} It was lost on a COMMIT, so whether {what} {was} committed \
+             or rolled back is unknown: the server may have committed before the connection \
+             dropped. {check}"
+        );
+    }
+    if implicit_commit(engine, sql) {
+        let what = them.map_or_else(
+            || "nothing had run in it yet, so there was nothing to commit".to_string(),
+            |t| {
+                let (were, are) = if n == 1 {
+                    ("was", "is")
+                } else {
+                    ("were", "are")
+                };
+                format!("{t} {were} most likely committed then, and {are} permanent")
+            },
+        );
+        return format!(
+            "{message}\n\n{head} MySQL commits an open transaction before it runs this \
+             statement, so {what}. {check}"
+        );
+    }
+    let what = match &them {
+        None => "nothing had run in it yet".to_string(),
+        Some(t) => format!("{t} {} undone", if n == 1 { "is" } else { "are" }),
+    };
+    let caveat = match (engine, &them) {
+        (TxEngine::MySql, Some(_)) => {
+            " — except a write to a table that does not support transactions \
+             (MyISAM, MEMORY), which no rollback undoes"
+        }
+        _ => "",
     };
     format!(
-        "{message}\n\nThe connection was lost with a transaction open. The server rolls an \
-         unfinished transaction back when its connection ends, so {what}."
+        "{message}\n\n{head} The server rolls an unfinished transaction back when its \
+         connection ends, so {what}{caveat}."
     )
 }
 
@@ -972,12 +1034,19 @@ pub fn run_failed_message(message: &str, stmt: StmtOutcome, before: TxState) -> 
 /// `failed_message` given it: a Stop that cost the connection — SQL Server
 /// replaces one a Stop left out of step, which reports `ConnectionLost` under
 /// a `Cancelled` — over an open transaction says what went with it.
-pub fn run_cancelled_message(stmt: Option<StmtOutcome>, before: TxState) -> Option<String> {
+pub fn run_cancelled_message(
+    stmt: Option<StmtOutcome>,
+    before: TxState,
+    engine: TxEngine,
+    sql: &str,
+) -> Option<String> {
     match stmt {
         Some(StmtOutcome::ConnectionLost) if before.is_open() => Some(run_failed_message(
             "The statement was cancelled.",
             StmtOutcome::ConnectionLost,
             before,
+            engine,
+            sql,
         )),
         _ => cancelled_message(stmt),
     }
@@ -1479,20 +1548,99 @@ mod tests {
     #[test]
     fn a_lost_connection_says_the_open_transaction_and_its_statements_are_gone() {
         let lost = StmtOutcome::ConnectionLost;
+        let pg = TxEngine::Postgres;
+        let upd = "UPDATE t SET a = 1";
         let m = run_failed_message(
             "Lost connection to server",
             lost,
             TxState::Open { stmts: 3 },
+            pg,
+            upd,
         );
         assert!(m.starts_with("Lost connection to server\n\n"), "{m}");
         assert!(
             m.contains("the 3 statements run in it since it began"),
             "{m}"
         );
-        let one = run_failed_message("x", lost, TxState::Poisoned { stmts: 1 });
+        let one = run_failed_message("x", lost, TxState::Poisoned { stmts: 1 }, pg, upd);
         assert!(one.contains("the 1 statement run in it"), "{one}");
-        let none = run_failed_message("x", lost, TxState::Open { stmts: 0 });
+        let none = run_failed_message("x", lost, TxState::Open { stmts: 0 }, pg, upd);
         assert!(none.contains("nothing had run in it yet"), "{none}");
+    }
+
+    /// **A connection lost on a `COMMIT` has an unknown outcome**, not an
+    /// undone one: the server may have committed before the socket died.
+    /// "Undone" invited the user to run it all again — twice over, if it had
+    /// landed. Every engine, and on SQL Server a `COMMIT` inside the batch.
+    #[test]
+    fn a_connection_lost_on_a_commit_does_not_claim_the_transaction_was_undone() {
+        let lost = StmtOutcome::ConnectionLost;
+        let open = TxState::Open { stmts: 2 };
+        for (engine, sql) in [
+            (TxEngine::Postgres, "COMMIT"),
+            (TxEngine::Postgres, "/* done */ END"),
+            (TxEngine::MySql, "commit"),
+            (TxEngine::MsSql, "UPDATE t SET a = 1; COMMIT TRANSACTION"),
+        ] {
+            let m = run_failed_message("Lost connection", lost, open, engine, sql);
+            assert!(!m.contains("undone"), "{engine:?} {sql}: {m}");
+            assert!(m.contains("Check the data"), "{engine:?} {sql}: {m}");
+            let c = run_cancelled_message(Some(lost), open, engine, sql).expect("disclosed");
+            assert!(!c.contains("undone"), "cancelled, {engine:?} {sql}: {c}");
+        }
+        // A ROLLBACK lost on the way is undone whichever way it went.
+        let r = run_failed_message("x", lost, open, TxEngine::Postgres, "ROLLBACK");
+        assert!(r.contains("undone"), "{r}");
+    }
+
+    /// **MySQL commits before it runs DDL**, so a connection lost under an
+    /// `ALTER` has most likely already made the earlier statements
+    /// permanent — and "undone" made the user re-run two credits.
+    #[test]
+    fn a_connection_lost_on_mysql_ddl_says_the_earlier_statements_were_committed() {
+        let m = run_failed_message(
+            "Lost connection",
+            StmtOutcome::ConnectionLost,
+            TxState::Open { stmts: 2 },
+            TxEngine::MySql,
+            "ALTER TABLE big ADD COLUMN x int",
+        );
+        assert!(!m.contains("undone"), "{m}");
+        assert!(m.contains("committed"), "{m}");
+        assert!(m.contains("Check the data"), "{m}");
+        // PostgreSQL's DDL is transactional: undone, as for any statement.
+        let pg = run_failed_message(
+            "x",
+            StmtOutcome::ConnectionLost,
+            TxState::Open { stmts: 2 },
+            TxEngine::Postgres,
+            "ALTER TABLE big ADD COLUMN x int",
+        );
+        assert!(pg.contains("undone"), "{pg}");
+    }
+
+    /// **On MySQL a rollback undoes only what was transactional**: a write
+    /// to a MyISAM or MEMORY table stays, which "every statement … undone"
+    /// denied.
+    #[test]
+    fn a_connection_lost_on_mysql_names_what_a_rollback_cannot_undo() {
+        let m = run_failed_message(
+            "x",
+            StmtOutcome::ConnectionLost,
+            TxState::Open { stmts: 2 },
+            TxEngine::MySql,
+            "UPDATE acct SET bal = bal + 10",
+        );
+        assert!(m.contains("undone"), "{m}");
+        assert!(m.contains("MyISAM"), "{m}");
+        let pg = run_failed_message(
+            "x",
+            StmtOutcome::ConnectionLost,
+            TxState::Open { stmts: 2 },
+            TxEngine::Postgres,
+            "UPDATE acct SET bal = bal + 10",
+        );
+        assert!(!pg.contains("MyISAM"), "{pg}");
     }
 
     /// **A Stop that cost the connection says so too.** SQL Server answers a
@@ -1502,13 +1650,15 @@ mod tests {
     #[test]
     fn a_stop_that_lost_the_connection_says_the_transaction_went_with_it() {
         let lost = Some(StmtOutcome::ConnectionLost);
-        let m = run_cancelled_message(lost, TxState::Open { stmts: 2 }).expect("disclosed");
+        let (ms, sql) = (TxEngine::MsSql, "UPDATE t SET a = 1");
+        let m =
+            run_cancelled_message(lost, TxState::Open { stmts: 2 }, ms, sql).expect("disclosed");
         assert!(m.starts_with("The statement was cancelled."), "{m}");
         assert!(m.contains("the 2 statements run in it"), "{m}");
-        assert_eq!(run_cancelled_message(lost, TxState::Idle), None);
+        assert_eq!(run_cancelled_message(lost, TxState::Idle, ms, sql), None);
         let committed = Some(StmtOutcome::FailedAndCommitted);
         assert_eq!(
-            run_cancelled_message(committed, TxState::Open { stmts: 2 }),
+            run_cancelled_message(committed, TxState::Open { stmts: 2 }, ms, sql),
             cancelled_message(committed)
         );
     }
@@ -1518,15 +1668,16 @@ mod tests {
     #[test]
     fn a_run_failure_without_a_lost_transaction_is_failed_messages() {
         let lost = StmtOutcome::ConnectionLost;
-        assert_eq!(run_failed_message("x", lost, TxState::Idle), "x");
-        assert_eq!(run_failed_message("x", lost, TxState::Lost), "x");
+        let (my, sql) = (TxEngine::MySql, "COMMIT");
+        assert_eq!(run_failed_message("x", lost, TxState::Idle, my, sql), "x");
+        assert_eq!(run_failed_message("x", lost, TxState::Lost, my, sql), "x");
         for stmt in [
             StmtOutcome::FailedAndCommitted,
             StmtOutcome::FailedAndRolledBack,
             StmtOutcome::Ok,
         ] {
             assert_eq!(
-                run_failed_message("x", stmt, TxState::Open { stmts: 2 }),
+                run_failed_message("x", stmt, TxState::Open { stmts: 2 }, my, sql),
                 failed_message("x", stmt),
                 "{stmt:?}"
             );
