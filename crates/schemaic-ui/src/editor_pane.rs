@@ -6963,10 +6963,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // run — the two boxes' closures re-run on every scroll frame — and in a
         // memo rather than the builder, so a zoom (the font size `content_x`
         // reads) moves the boxes with the text. The rope's line count, never a
-        // copy of the text.
+        // copy of the text — read untracked, so `query` is tracked for it: a
+        // line count gaining a digit widens the gutter.
         let code_x = {
             let ed = ed.clone();
-            create_memo(move |_| content_x(&ed))
+            create_memo(move |_| {
+                query.track();
+                content_x(&ed)
+            })
         };
         dyn_container(
             move || bracket_match.get(),
@@ -7020,10 +7024,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // scroll frame — N occurrences meant N full scans per frame — and the
         // rope's line count costs no copy. A memo beside the `dyn_container`,
         // not a `let` in its untracked builder, so a zoom moves the boxes with
-        // the text instead of leaving them where they were (issue #20).
+        // the text instead of leaving them where they were (issue #20). And
+        // `query` tracked, since the rope's line count is read untracked and a
+        // line count gaining a digit widens the gutter. The f64 dedups, so the
+        // boxes restyle only when the column really moves.
         let code_x = {
             let ed = ed.clone();
-            create_memo(move |_| content_x(&ed))
+            create_memo(move |_| {
+                query.track();
+                content_x(&ed)
+            })
         };
         dyn_container(
             move || ident_occurrences.get(),
@@ -10154,6 +10164,55 @@ mod geometry_tests {
                 );
             }
         }
+    }
+
+    /// **And a memo of the code column tracks the document.** `content_x`
+    /// widens the gutter by a digit per digit of the line count, but the rope
+    /// it counts is read untracked (`Editor::rope_text` → `doc()` →
+    /// `get_untracked`), so a memo of it alone re-ran on a zoom and never on an
+    /// edit: once a query gained a digit of lines (9→10), every occurrence and
+    /// bracket box sat a digit-width left of its text until the next zoom. The
+    /// squiggle memo beside them tracks `query` for exactly this reason.
+    #[test]
+    fn every_code_column_memo_follows_the_line_count() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("editor_pane.rs"),
+        )
+        .expect("editor_pane.rs");
+        let body = crate::source_gate::production_code(&src);
+        let mut seen = 0usize;
+        for (at, _) in body.match_indices("create_memo(") {
+            // The memo's closure: to the parenthesis that closes the call.
+            let open = at + "create_memo".len();
+            let mut depth = 0usize;
+            let mut end = open;
+            for (i, c) in body[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let memo = &body[at..end];
+            if !memo.contains("content_x(") {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                memo.contains("query.track()"),
+                "a memo of the code column does not track the document, so a \
+                 line-count digit leaves it behind:\n{memo}"
+            );
+        }
+        assert!(seen >= 2, "the bracket and occurrence memos are gone ({seen})");
     }
 
     /// Hoisted is not enough when the builder itself rebuilds per keystroke —

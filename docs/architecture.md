@@ -26876,6 +26876,14 @@ existing prose was left alone.
     every scroll frame while it is up. `no_overlay_freezes_its_geometry_in_an_untracked_builder`
     refuses a `content_x(` or `statement_line_boxes(` after the builder's `move |` in those three
     blocks, and only those three — it names them, so a fourth overlay is not covered.
+    **A memo of the code column also tracks `query`**: the font size is a tracked read, but the line
+    count `content_x` widens by is the rope's, read untracked (`Editor::rope_text` → `doc()` →
+    `get_untracked`), so a memo of `content_x` alone re-ran on a zoom and never on an edit — once a
+    query gained a digit of lines (9→10) every bracket and occurrence box sat a digit-width left of
+    its text until the next zoom. The squiggle memo already tracked it for that reason;
+    `every_code_column_memo_follows_the_line_count` refuses a `create_memo` reading `content_x(`
+    without `query.track()`, file-wide. The f64 dedups, so the boxes restyle only when the column
+    really moves.
     `the_code_column_follows_the_code_font_s_digit_width` and
     `the_code_column_widens_with_the_line_number_digit_count` pin the sum; `content_x_of` survives
     only under `#[cfg(test)]`, the geometry tests' fixed origin at a nominal 8px digit, and
