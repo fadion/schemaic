@@ -355,6 +355,19 @@ pub(crate) enum DesignerFocus<'a> {
     },
 }
 
+/// Is `info` something the table designer edits — an ordinary table, and not
+/// a view, a MariaDB sequence or a PostgreSQL foreign table, whose edits the
+/// server refuses in part or whole (`overlays::object_entries` gives none of
+/// them an Edit table entry)? The question every door asks: the menus by
+/// shape, [`open_for_table`] as its own lock, and the Properties panel.
+pub(crate) fn designable(info: &schemaic_core::schema::TableInfo) -> bool {
+    use schemaic_core::schema::TableShape;
+    match info.shape() {
+        TableShape::Table => true,
+        TableShape::View | TableShape::Sequence | TableShape::ForeignTable => false,
+    }
+}
+
 /// Open the designer on an existing table, landing on whatever `focus` names —
 /// the schema tree's column and key right-clicks put you on the row you clicked
 /// rather than on the table summary.
@@ -380,8 +393,10 @@ pub(crate) fn open_for_table(
     // `field_entries`, `key_entries`); this is the second lock, because the
     // failure it prevents is a full Columns / Indexes / Foreign keys form for an
     // object whose every edit the server refuses — and on SQLite one whose
-    // rebuild would emit `DROP TABLE` on a view.
-    if info.is_view {
+    // rebuild would emit `DROP TABLE` on a view. Nor is a MariaDB sequence or a
+    // PostgreSQL foreign table, which the menus withhold the designer from too
+    // (`designable`); the Properties panel's Edit reached here with both.
+    if !designable(&info) {
         return;
     }
     let ctx = edit_ctx(conn);
@@ -2743,7 +2758,32 @@ fn preview_from(target: &DesignerTarget, draft: &TableDraft, cs: &ddl::ChangeSet
 
 #[cfg(test)]
 mod tests {
-    use super::{swap_target, unique_name};
+    use super::{designable, swap_target, unique_name};
+    use schemaic_core::schema::TableInfo;
+
+    /// Only an ordinary table is designed: the Properties panel's Edit asked
+    /// `is_view` alone, and opened the designer on a foreign table and a
+    /// MariaDB sequence that every menu withholds it from.
+    #[test]
+    fn only_an_ordinary_table_is_designable() {
+        assert!(designable(&TableInfo::default()));
+        for t in [
+            TableInfo {
+                is_view: true,
+                ..Default::default()
+            },
+            TableInfo {
+                is_sequence: true,
+                ..Default::default()
+            },
+            TableInfo {
+                is_foreign: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!designable(&t), "{:?}", t.shape());
+        }
+    }
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

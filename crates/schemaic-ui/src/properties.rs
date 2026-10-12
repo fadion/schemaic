@@ -828,7 +828,9 @@ fn footer(
             if target.is_view {
                 editable_view
             } else {
-                !i.columns.is_empty()
+                // Not a sequence or a foreign table, which no menu offers the
+                // designer either.
+                !i.columns.is_empty() && crate::table_designer::designable(i)
             }
         });
     let is_view = target.is_view;

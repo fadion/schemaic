@@ -33845,7 +33845,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   about**: `field_entries` and `key_entries` take `is_view` because the tree renders a column row
   under a view exactly as under a table, and a constant `true` there offered Edit column and a red
   Drop for something that has neither — opening the *table* designer on a view, whose every edit all
-  three engines refuse. `table_designer::open_for_table` refuses a view outright as the second lock.
+  three engines refuse. `table_designer::open_for_table` refuses outright, as the second lock,
+  anything `table_designer::designable` calls no ordinary table — a view, a MariaDB sequence, a
+  PostgreSQL foreign table — and the Properties panel's Edit asks the same, where it once asked
+  `is_view` alone and opened the designer on the other two (`only_an_ordinary_table_is_designable`).
   Gate the menu entry on the right
   one rather than leaving the refusal to `Db::run_ddl`, which sees only strings. A
   new engine is a `SqlDialect` arm in `ddl.rs`'s emitter, not a parallel emitter. The
