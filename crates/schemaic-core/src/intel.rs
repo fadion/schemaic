@@ -14250,8 +14250,11 @@ fn friendly_syntax_message(msg: &str) -> String {
 ///
 /// **One sweep after the sort.** Every diagnostic kept so far starts at or
 /// before the one in hand, so it is covered exactly when some kept one reaches
-/// at least as far — among the errors for an error, among all of them for a
-/// warning — and the two furthest reaches are all that needs remembering. It
+/// at least as far — among the errors for an error, among the errors and
+/// warnings for a warning, among all of them for a hint — and the three
+/// furthest reaches are all that needs remembering. (A hint covering a warning
+/// was the same bug one severity lower: the cartesian check became a hint and
+/// hid a `= NULL` warning inside the derived table it spans.) It
 /// compared each diagnostic with every one kept before it, O(d²) on the flood
 /// a long routine can raise (`diagnostics_work_grows_linearly_with_a_long_range`).
 fn dedup_diagnostics(mut v: Vec<Diagnostic>) -> Vec<Diagnostic> {
@@ -14263,22 +14266,28 @@ fn dedup_diagnostics(mut v: Vec<Diagnostic>) -> Vec<Diagnostic> {
             .cmp(&b.range.0)
             .then(a.severity.rank().cmp(&b.severity.rank()))
     });
-    // How far the kept errors, and the kept diagnostics of any severity,
-    // reach. A hint is covered as a warning is.
-    let (mut error_reach, mut any_reach) = (None::<usize>, None::<usize>);
+    // How far the kept errors, the kept errors and warnings, and the kept
+    // diagnostics of any severity reach. Each severity is covered only by a
+    // claim at least as strong: a hint by anything, a warning never by a hint.
+    let (mut error_reach, mut warn_reach, mut any_reach) =
+        (None::<usize>, None::<usize>, None::<usize>);
     let mut out: Vec<Diagnostic> = Vec::new();
     for d in v {
         #[cfg(test)]
         work::tick(&work::DEDUP);
         let reach = match d.severity {
             Severity::Error => error_reach,
-            Severity::Warning | Severity::Hint => any_reach,
+            Severity::Warning => warn_reach,
+            Severity::Hint => any_reach,
         };
         if reach.is_some_and(|r| d.range.1 <= r) {
             continue;
         }
         if d.severity == Severity::Error {
             error_reach = error_reach.max(Some(d.range.1));
+        }
+        if d.severity != Severity::Hint {
+            warn_reach = warn_reach.max(Some(d.range.1));
         }
         any_reach = any_reach.max(Some(d.range.1));
         out.push(d);
@@ -32062,7 +32071,26 @@ mod tests {
         );
     }
 
-    /// The function itself, over the four combinations — which is what says the
+    /// The same cover, one severity lower: the unconstrained join became a
+    /// Hint, and a hint spanning the derived table hid the `= NULL` warning
+    /// inside it — a statement that can never match a row got only the quietest
+    /// squiggle.
+    #[test]
+    fn a_hint_does_not_swallow_the_warning_inside_it() {
+        let sql = "SELECT * FROM employees e JOIN (SELECT id FROM departments WHERE id = NULL) d";
+        let d = diag(sql);
+        assert!(
+            d.iter()
+                .any(|x| x.severity == Severity::Warning && x.message.contains("NULL")),
+            "the NULL comparison was swallowed: {d:?}"
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("ON/USING")),
+            "and the hint must still be reported: {d:?}"
+        );
+    }
+
+    /// The function itself, over the severity combinations — which is what says the
     /// fix is about severity and not about that one statement.
     #[test]
     fn dedup_keeps_a_covered_diagnostic_only_when_the_cover_is_no_weaker() {
@@ -32111,6 +32139,40 @@ mod tests {
             ])),
             ["outer warning"]
         );
+        // A hint is the weakest claim: it hides only a hint inside it, never a
+        // warning or an error — the cartesian check's hint spans a whole derived
+        // table, and a `= NULL` inside one lost its warning to it.
+        let outer_hint = d(0, 100, Severity::Hint, "outer hint");
+        let inner_hint = d(10, 20, Severity::Hint, "inner hint");
+        assert_eq!(
+            msgs(dedup_diagnostics(vec![
+                outer_hint.clone(),
+                inner_warn.clone()
+            ])),
+            ["outer hint", "inner warning"]
+        );
+        assert_eq!(
+            msgs(dedup_diagnostics(vec![
+                outer_hint.clone(),
+                inner_err.clone()
+            ])),
+            ["outer hint", "inner error"]
+        );
+        assert_eq!(
+            msgs(dedup_diagnostics(vec![
+                outer_hint.clone(),
+                inner_hint.clone()
+            ])),
+            ["outer hint"]
+        );
+        // And the stronger claims still hide a hint inside them.
+        for outer in [outer_warn.clone(), outer_err.clone()] {
+            let kept = outer.message.clone();
+            assert_eq!(
+                msgs(dedup_diagnostics(vec![outer, inner_hint.clone()])),
+                [kept]
+            );
+        }
         // Same span, both severities: the error is the one kept, whichever order
         // it arrives in. That is what the sort is for.
         for v in [

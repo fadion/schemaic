@@ -2108,14 +2108,17 @@ existing prose was left alone.
     severity half was only in the sort, and only at an equal start offset, so the coverage test read
     no severity at all and a Warning that happened to start earlier swallowed a real Error inside it.
     Not hypothetical: `cartesian_check` squiggles the whole derived table, so the unconstrained-join
-    warning hid the unknown column inside the subquery — the user was told the join was
-    unconstrained and not told the statement would fail.
-    `a_warning_does_not_swallow_the_error_inside_it` pins the composition and
-    `dedup_keeps_a_covered_diagnostic_only_when_the_cover_is_no_weaker` the four severity
-    combinations, which is what says the fix is about severity rather than about that one statement.
+    diagnostic (then a warning, now a hint) hid the unknown column inside the subquery — the user was
+    told the join was unconstrained and not told the statement would fail. Making that check a hint
+    repeated the bug one severity lower, while the sweep still let any kept diagnostic cover a
+    warning: a `= NULL` inside the derived table lost its warning to the hint.
+    `a_warning_does_not_swallow_the_error_inside_it` and `a_hint_does_not_swallow_the_warning_inside_it`
+    pin the composition and `dedup_keeps_a_covered_diagnostic_only_when_the_cover_is_no_weaker` the
+    severity combinations, hints included, which is what says the fix is about severity rather than
+    about one statement.
     It is **one sweep after the sort**: everything kept starts no later than the diagnostic in hand,
-    so that one is covered exactly when a kept error (for an error) or any kept diagnostic (for a
-    warning or a hint) reaches as far, and two running maxima answer it. The sort's tie-break at an
+    so that one is covered exactly when a kept error (for an error), a kept error or warning (for a
+    warning) or any kept diagnostic (for a hint) reaches as far, and three running maxima answer it. The sort's tie-break at an
     equal start is `Severity::rank` (error, warning, hint), the same order the editor's hover
     `diag_under` settles an overlap by — the two have to agree, which is why it is one method. It compared each diagnostic with
     every one kept before it, O(d²) on the flood a long routine could raise.
