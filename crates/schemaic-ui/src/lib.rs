@@ -53,6 +53,7 @@ pub use schema_tree::{
 };
 mod alias_rename;
 mod settings;
+pub use settings::SettingsSection;
 mod shortcuts;
 mod snippet_edit;
 mod snippet_panel;
@@ -6137,6 +6138,9 @@ pub struct LayoutUi {
     pub editor_collapsed: RwSignal<bool>,
     /// Whether the theme settings modal is open.
     pub theme_settings_open: RwSignal<bool>,
+    /// The Settings modal's showing section — kept while it is closed, so it
+    /// reopens where it was left. Not persisted.
+    pub settings_section: RwSignal<SettingsSection>,
     /// Whether the keyboard-shortcuts modal is open.
     pub help_open: RwSignal<bool>,
     /// Active interface (chrome) theme; drives `theme::set_ui`.

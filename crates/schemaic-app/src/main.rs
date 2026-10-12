@@ -2359,6 +2359,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // theme registry from the persisted choice *before* any view builds, then
     // mirror the signals into it whenever the picker mutates them (live switch).
     let theme_settings_open = RwSignal::new(false);
+    let settings_section = RwSignal::new(schemaic_ui::SettingsSection::default());
     let help_open = RwSignal::new(false);
     let ui_theme = RwSignal::new(UiThemeKind::from_key(&ui_state.ui_theme));
     let editor_theme = RwSignal::new(EditorThemeKind::from_key(&ui_state.editor_theme));
@@ -13336,6 +13337,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             editor_h,
             editor_collapsed,
             theme_settings_open,
+            settings_section,
             help_open,
             ui_theme,
             editor_theme,

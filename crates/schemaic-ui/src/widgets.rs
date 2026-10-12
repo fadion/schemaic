@@ -1633,12 +1633,11 @@ pub(crate) fn form_hint(hint: impl Into<String>) -> impl IntoView {
 }
 
 /// A long form's section heading over a group of fields: [`form_section`] in
-/// `theme::form_heading`'s blue, with 2px under it. Settings and the connection
-/// form both draw theirs with this, and both set their sections
-/// [`form_section_gap`] apart: space, never a rule, separates them (GitHub
-/// #16). Import and Export draw their sections' headings with it too, at their
-/// own spacing. The margin is what Settings' version caption copies, so the air
-/// under the caption matches the air under `General`.
+/// `theme::form_heading`'s blue, with 2px under it. The connection form draws
+/// its sections' headings with this and sets them [`form_section_gap`] apart:
+/// space, never a rule, separates them (GitHub #16). Settings heads each of its
+/// pages with it, one section to a page; Import and Export draw their sections'
+/// headings with it too, at their own spacing.
 ///
 /// **Not a replacement for [`form_section`].** This heads a *section* of a long
 /// form; the object editors, the DDL preview, Run script and the fact panels

@@ -21589,8 +21589,8 @@ existing prose was left alone.
     (`items_center().justify_center()`) — nothing at its natural size, and what keeps the label
     mid-box once a field has stretched it.
     **A long form's sections are `form_section_header` over its group, `form_section_gap()`
-    (`scaled(36)`) apart, and no rule between them** — Settings and Manage Connections, today
-    (GitHub #16). The gap is wider than any
+    (`scaled(36)`) apart, and no rule between them** — Manage Connections, today; Settings was the
+    other until each of its sections became a page of its own (GitHub #16). The gap is wider than any
     gap inside a section (16 in Settings, 20 in the connection form), which is the whole of what
     sets the sections apart. `form_section_header` is `form_section` in `theme::form_heading`
     (the palette's `accent_hover` — the lighter blue on dark, the deeper one on light) with a
@@ -21600,9 +21600,9 @@ existing prose was left alone.
     Run script and the fact panels head a few lines each, where a heading is a label rather than
     a divider, and the blue was judged to be noise there. A point more size
     and a rule under each heading were tried first and dropped: a long form ended up striped
-    with lines, and the colour sets a heading off with nothing added. The margin is load-bearing:
-    Settings' version caption copies it so the air under the caption matches the air under
-    `General` (under `settings.rs`).
+    with lines, and the colour sets a heading off with nothing added. Settings' version caption
+    used to copy the margin, so the air under it matched the air under `General`; it moved to the
+    foot of the section list and copies nothing now (under `settings.rs`).
     **`pill_tab_style(s, on)` is a modal's section-tab look**, lifted out of
     `table_designer::tab_strip`: body size, `scaled(12)`/`scaled(7)` padding, radius 6, filled in
     `pill_active_bg`/`pill_active_text` when `on`, `text_dim` with a `pill_hover_bg` hover when not.
@@ -21967,7 +21967,7 @@ existing prose was left alone.
     would execute the block in whatever tab is in front, which is the connection the insert had just
     declined to open on. The `bool` exists for that one question; the refusal itself is reported by
     the action.
-  - `settings.rs` — the three settings modals (the main one's groups are General / Editor / Code formatting /
+  - `settings.rs` — the three settings modals (the main one's sections are General / Editor / Code formatting /
     Query / **Appearance**, the last holding the two theme pickers and the **interface scale**) **and the
     four shared controls every modal's form is
     built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
@@ -22002,7 +22002,39 @@ existing prose was left alone.
     open_config_dir, CliCommand)`, the last two General's two trips outside the app —
     and `help_overlay(LayoutUi)`, which reads a single signal. The
     module names no `Ui` anywhere now, prose included.
-    **The body opens with a version caption, and the string it shows is composed in `schemaic-core`.**
+    **The main modal is Manage connections' two panes, not one long column.** It had been five
+    headed groups in a single scroll; it is now a section list on the left (`section_list`, a
+    `SECTION_LIST_W` 170 column with a `border_right` and `padding_vert` 6) and the chosen
+    section's page on the right, `SECTION_PAGE_W` 420 wide — the single-column modal's width, which
+    every hint in it was written to wrap within. The panel is `modal_w(SECTION_LIST_W +
+    SECTION_PAGE_W)` at a **fixed** `height(modal_h(560))`, so switching sections never resizes it;
+    the old `max_height(modal_body_h(560))` cap went with the column. The sections are
+    `SettingsSection` (re-exported as `schemaic_ui::SettingsSection`): `General` by default, `ALL`
+    in list order, and `label()` naming both the row and its page's heading — *Code formatting* for
+    `Formatting`. Which one is showing is `LayoutUi::settings_section`, created by the app and not
+    persisted, so the modal reopens on the section it was left on and a fresh start opens on General.
+    `the_settings_sections_are_listed_once_and_named_apart` pins the default first and no two rows
+    sharing a name; its exhaustive `match` makes a new variant fail to compile there, which is a
+    prompt to add it to `ALL` rather than proof that it was — `ALL` is a fixed-length array, and the
+    test's length check would still read 5. The rows wear Manage connections' list colours
+    (`theme::conn_list_text`/`conn_list_sel_text`/`conn_list_sel_bg`, a hover brightening the text
+    only) at its 5px row gap, padded 12×11, and the whole list is **one** ring stop at
+    `widgets::NAV_TAB`, ahead of every control: a `nav_group` on `NavAxis::Vertical` — the second
+    after Manage connections' list — whose Up/Down clamps through `list_step` while the ring around
+    it wraps.
+    **Only the showing page is built, and only its controls are in the ring.** The page is a
+    `dyn_container` keyed on the section whose child builds that section alone —
+    `general_section`, `editor_section`, `formatting_section`, `query_section`,
+    `appearance_section`, each an `AnyView` from `section_page` (the heading over its settings at a
+    group's 16) with `ctrl` stacking a caption over its control — inside its own
+    `autohide(scroll(..))` at padding 14, so a page scrolls on its own and opens at the top each
+    time it is shown, while the list beside it stays put. A ring control registers when it is
+    built and unregisters in its cleanup, so a page a switch tears down takes its controls out of
+    the ring with it, and Tab never walks into a page nobody can see — the AI modal's reason for
+    tearing down what is off rather than hiding it. Each page keeps the block of tab numbers it had
+    in the single form; only one block is ever in the ring, but they still never collide.
+    **The section list ends in a version caption, and the string it shows is composed in
+    `schemaic-core`.**
     `settings_version_line` renders `core::app_version_label()` — `Schemaic v0.24.0`, built from
     `APP_NAME` and `APP_VERSION` (`env!("CARGO_PKG_VERSION")`, which inherits
     `[workspace.package].version`). It is the only place the version is on screen anywhere in the
@@ -22017,20 +22049,19 @@ existing prose was left alone.
     it was written would take a source gate over `app_version_label`'s body: the kind of test that
     reading the repository's own files is exempt for (the `ui::source_gate` family, `APP_ID`'s
     packager test), which nobody has judged worth writing for a one-line function.
-    It is a **caption, not a fifth heading**: `theme::text_dim()` at `theme::font_body()`, unbold,
-    deliberately not `widgets::form_section_header`'s styling, so it identifies the panel instead of
-    competing with `General`. **Its spacing is derived from the section header's, not chosen**, and
-    that is the part a tidy-up would break: the caption carries the same
-    `margin_bottom(theme::scaled(2.0))` a header carries, and is wrapped with `general_group` in an
-    `intro` `v_stack` at a group's own `gap(theme::scaled(16.0))`, so the air under the caption is
-    exactly the air under `General` and both follow the same two constants. Left in the body's own
-    stack it would have spent the `widgets::form_section_gap()` that separates *sections* and
-    floated above the form instead.
-    **That outer gap is `form_section_gap()` (`scaled(36)`), and it was a literal 28** until the
-    sections ran together once Settings had grown, and the user asked for a little more (GitHub
-    #16). The heading moved out of this module with it — it was a private `settings_section_header`
-    — so the connection form could draw its own sections with the same two calls; the 16 inside a
-    group did not change.
+    It is a **caption, not a sixth row**: `theme::text_dim()` at `theme::font_hint()`, unbold, so it
+    identifies the panel instead of competing with the sections. It sits at the list's **foot**,
+    pushed there by a growing spacer and inset by the rows' own 12 so its text starts where theirs
+    do — which is what puts it in front of every section. It used to open the single column above
+    `General`, at `font_body()`, carrying a section header's `margin_bottom(scaled(2))` inside an
+    `intro` stack at a group's 16 so the air under it matched the air under the heading; that
+    pairing went with the column, and nothing about the caption is derived from the header now.
+    **The gap between sections was `form_section_gap()` (`scaled(36)`), and it was a literal 28**
+    until the sections ran together once Settings had grown, and the user asked for a little more
+    (GitHub #16). The heading moved out of this module with it — it was a private
+    `settings_section_header` — so the connection form could draw its own sections with the same
+    two calls; the 16 inside a group did not change. Settings no longer spends the gap, each page
+    being one section, so the connection form is its one caller.
     `log_row` is the General section's one non-toggle: it names the log's **full path** (`log_hint`,
     which is the pure half and is tested) and reveals the folder holding it through
     `Ui::open_config_dir`. The log had been written and rotated since `logging.rs` landed, and
@@ -22073,7 +22104,7 @@ existing prose was left alone.
     `max_width(scaled(460))` is a wrap hint which relies on `modal_footer_split` to shrink it, and
     in the Settings modal's `modal_w(420)` nothing did, so a long error was laid out past the
     modal's edge and clipped. `outcome_line` is `width_full().min_width(0)`, so it wraps at the
-    modal's width. All of it arrives as one
+    page's width (`SECTION_PAGE_W`, the 420 the modal then was). All of it arrives as one
     `Ui::cli_command: CliCommand { install, remove, state, installed, status }` — two actions, the
     one `RwSignal<InstallState>` they share, the `RwSignal<bool>` behind Remove and the
     `RwSignal<RowStatus>` behind the hint and Install, which the app owns: a registry write or a
@@ -22273,12 +22304,14 @@ existing prose was left alone.
     `C:\Users\…\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe`). Bounded to the panel,
     cosmic-text's default `Wrap::WordOrGlyph` falls back to glyph-level breaks, which is what a path
     wants anyway.
-    **All three modal bodies scroll the same way, and the AI one joined them last.** Each body is
-    `autohide(scroll(body))` under `max_height(widgets::modal_body_h(560.0))`. The AI modal's eight
-    groups at 25px apart had outgrown the window, and a modal taller than the screen loses its
+    **The AI and Shortcuts modal bodies scroll the same way, and the AI one joined last.** Each body
+    is `autohide(scroll(body))` under `max_height(widgets::modal_body_h(560.0))`. The AI modal's
+    eight groups at 25px apart had outgrown the window, and a modal taller than the screen loses its
     *bottom* groups with no affordance saying they exist — which is the failure the General Settings
     and Shortcuts modals were already wrapped against. The cap is a `modal_body_h` rather than a
     constant precisely so it shrinks with a small window instead of being right at one size only.
+    The main Settings modal was the third until it became two panes: its panel is a fixed
+    `modal_h(560)` and each page scrolls inside it on its own (above).
   - `shortcuts.rs` — the app's keyboard shortcuts as **one table** (`SHORTCUTS`), which
     `settings::help_overlay` renders straight from — plus the tests that keep it honest. This list
     is the app's *only* keyboard documentation and for Ctrl+H / Ctrl+G the only affordance of any
@@ -22408,7 +22441,8 @@ existing prose was left alone.
     (Environment, Type, then `engine_block` — Host/Port, Database, Authentication and User/Password
     for a server, the Database file for SQLite) and **Network** (the SSH tunnel and its fields, SSL /
     TLS). Each opens with `widgets::form_section_header` and they stand `widgets::form_section_gap()`
-    apart with no divider, as Settings' do; inside a section the fields keep the form's 20. It had
+    apart with no divider, as Settings' did while it was one column; inside a section the fields
+    keep the form's 20. It had
     been a single 20px-gap column. For Network to be a section of its own, the tunnel and
     `tls_fields` came out of `server_fields` into **`network_fields`**, which `conn_form` builds in
     a `network_block` `dyn_container` keyed on `DbKind::is_networked()` — the heading inside it, so
@@ -36624,7 +36658,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   face's own style and the wrapper, so the two cannot drift; icon buttons pass `0.0`, their faces
   being genuinely square.
 - **A group of like things is *one* Tab stop, and arrows move within it.** Manage Connections'
-  colour swatches (`connection_form::color_picker`) and connection list, the designer's section
+  colour swatches (`connection_form::color_picker`) and connection list, Settings' section list
+  (`settings::section_list`), the designer's section
   strip, and the designer/trigger item list (`table_designer::list_pane`) each take a single ring
   slot: Tab reaches the group, Left/Right or Up/Down move inside it, Tab leaves. `widgets::nav_group`
   is the shared one (the swatches and `list_pane` predate it and carry their own scrolling and

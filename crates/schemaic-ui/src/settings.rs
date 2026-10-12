@@ -11,9 +11,9 @@ use floem::prelude::*;
 
 use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::widgets::{
-    ActionKind, MenuEntry, action_button, action_button_dyn, action_gap, autohide,
-    focus_root_with_ring, form_hint, form_hint_style, form_label_style, form_section_gap,
-    form_section_header, modal_title, nothing, panel_style,
+    ActionKind, FocusRing, MenuEntry, action_button, action_button_dyn, action_gap, autohide,
+    focus_root_with_ring, form_hint, form_hint_style, form_label_style, form_section_header,
+    modal_title, nothing, panel_style,
 };
 use crate::{
     AiActions, AiEffort, AiUi, ConnUi, FieldCfg, LayoutUi, SchemaScope, TermActions, TermCursor,
@@ -1764,26 +1764,70 @@ fn cli_row(
     .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
 }
 
-/// `Schemaic v0.24.0`, above the first section.
+/// `Schemaic v0.24.0`, at the foot of the section list.
 ///
 /// Dimmed and unbold on purpose: it is a caption identifying the panel, not a
-/// fifth section heading competing with `General`. The string comes from
+/// section competing with the list above it — and at the list's foot rather
+/// than atop one page, so every section shows it. The string comes from
 /// [`schemaic_core::app_version_label`] so a release bump reaches it with no
 /// edit here — see the tests beside that function for what that does and does
-/// not guarantee.
-///
-/// The trailing `margin_bottom` is the one [`form_section_header`] carries,
-/// for the same reason: paired with a group's 16 gap it puts exactly as much air
-/// under this line as sits under `General`, so the caption and the heading below
-/// it read as one balanced block. Both spacings then move together if either
-/// constant changes.
+/// not guarantee. Inset as the rows are, so its text starts where theirs do.
 fn settings_version_line() -> impl IntoView {
     text(schemaic_core::app_version_label()).style(|s| {
-        s.font_size(theme::font_body())
+        s.font_size(theme::font_hint())
             .color(theme::text_dim())
-            .margin_bottom(theme::scaled(2.0))
+            .padding_horiz(theme::scaled(12.0))
+            .padding_vert(theme::scaled(8.0))
     })
 }
+
+/// The Settings modal's sections, in the order its list shows them — each a
+/// page of its own on the right, the way Manage connections shows one
+/// connection beside its list.
+///
+/// **Which one is showing outlives the modal** ([`LayoutUi::settings_section`]):
+/// reopening lands where the user left, which is what changing a setting,
+/// trying it and coming back to change it again wants. It is not persisted —
+/// a fresh start opens on General.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsSection {
+    #[default]
+    General,
+    Editor,
+    Formatting,
+    Query,
+    Appearance,
+}
+
+impl SettingsSection {
+    /// Every section, in the order the list shows them.
+    pub const ALL: [SettingsSection; 5] = [
+        SettingsSection::General,
+        SettingsSection::Editor,
+        SettingsSection::Formatting,
+        SettingsSection::Query,
+        SettingsSection::Appearance,
+    ];
+
+    /// The section's name, in its list and as its page's heading.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsSection::General => "General",
+            SettingsSection::Editor => "Editor",
+            SettingsSection::Formatting => "Code formatting",
+            SettingsSection::Query => "Query",
+            SettingsSection::Appearance => "Appearance",
+        }
+    }
+}
+
+/// The section list's width, added to the page's: the page keeps the width
+/// the single-column modal had.
+const SECTION_LIST_W: f64 = 170.0;
+
+/// The page's width — the single-column modal's, which every setting's hint
+/// was written to wrap within.
+const SECTION_PAGE_W: f64 = 420.0;
 
 pub(crate) fn theme_settings_overlay(
     layout: LayoutUi,
@@ -1791,32 +1835,7 @@ pub(crate) fn theme_settings_overlay(
     cli_command: crate::CliCommand,
 ) -> impl IntoView {
     let open = layout.theme_settings_open;
-    let ui_theme = layout.ui_theme;
-    let editor_theme = layout.editor_theme;
-    let ui_scale = layout.ui_scale;
-    let editor_font = layout.editor_font;
-    let row_limit = layout.row_limit;
-    let statement_timeout = layout.statement_timeout;
-    let confirm_writes = layout.confirm_writes;
-    let live_validate = layout.live_validate;
-    let notify_finished = layout.notify_finished;
-    let editor_predictions = layout.editor_predictions;
-    let editor_remembered_predictions = layout.editor_remembered_predictions;
-    let rainbow_brackets = layout.rainbow_brackets;
-    let keyword_case = layout.keyword_case;
-    let comma_style = layout.comma_style;
-    let statement_gap = layout.statement_gap;
-    let join_on_own_line = layout.join_on_own_line;
-    let river = layout.river;
-    let align = layout.align;
-    let wrap_width = layout.wrap_width;
-    let function_case = layout.function_case;
-    let type_case = layout.type_case;
-    let table_aliases = layout.table_aliases;
-    let show_whitespace = layout.show_whitespace;
-    let indent_guides = layout.indent_guides;
-    let restore_tabs = layout.restore_tabs;
-    let open_config_dir = open_config_dir.clone();
+    let section = layout.settings_section;
 
     dyn_container(
         move || open.get(),
@@ -1826,371 +1845,56 @@ pub(crate) fn theme_settings_overlay(
             }
             let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
 
-            let ctrl = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
-
-            // The modal's Tab order: one group per section, spaced by 10 within
-            // it and by 100 between them — see `FocusRing`.
-            //
-            // **The number follows the layout, not the order the control was
-            // added.** A control appended by number rather than inserted at its
-            // place walks the user backwards through the form: the statement
-            // timeout was written last and numbered 230 while sitting *second*
-            // in its group, so Tab went row limit → confirm → validate → back up
-            // to timeout.
+            // The modal's Tab order — see `FocusRing`. The section list is one
+            // stop at `NAV_TAB`, ahead of every control, with ↑/↓ moving
+            // between sections. Only the showing page's controls are in the
+            // ring: a page is built when its section is picked, and each
+            // control leaves the ring as its page is torn down.
             let ring = crate::widgets::FocusRing::new();
 
-            // General group.
-            let restore_row = focusable_toggle_row(
-                "Restore tabs on startup",
-                "Reopen the query tabs from your last session when the app starts.",
-                restore_tabs,
-                ring.clone(),
-                10,
-            );
-            let general_group = v_stack((
-                form_section_header("General"),
-                restore_row,
-                log_row(open_config_dir.clone(), ring.clone(), 20),
-                cli_row(cli_command.clone(), ring.clone(), 30),
-            ))
-            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
+            let page = {
+                let ring = ring.clone();
+                let open_config_dir = open_config_dir.clone();
+                let cli_command = cli_command.clone();
+                dyn_container(
+                    move || section.get(),
+                    move |s| {
+                        let body = match s {
+                            SettingsSection::General => general_section(
+                                layout,
+                                ring.clone(),
+                                open_config_dir.clone(),
+                                cli_command.clone(),
+                            ),
+                            SettingsSection::Editor => editor_section(layout, ring.clone()),
+                            SettingsSection::Formatting => formatting_section(layout, ring.clone()),
+                            SettingsSection::Query => query_section(layout, ring.clone()),
+                            SettingsSection::Appearance => appearance_section(layout, ring.clone()),
+                        };
+                        // A page of its own scrolls on its own, from the top
+                        // each time it is shown; the list beside it stays put.
+                        autohide(scroll(
+                            body.style(|s| s.width_full().padding(theme::scaled(14.0))),
+                        ))
+                        .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0))
+                        .into_any()
+                    },
+                )
+                .style(|s| s.flex_grow(1.0_f32).flex_col().min_width(0.0).height_full())
+            };
+            let body = h_stack((section_list(section, ring.clone()), page))
+                .style(|s| s.width_full().flex_grow(1.0_f32).flex_row().min_height(0.0));
 
-            // Editor group. (Tab width, spaces-vs-tabs, and word wrap live in the
-            // status bar.)
-            let font_dd = focusable_dropdown(
-                editor_font,
-                EDITOR_FONT_SIZES,
-                editor_font_label,
-                ring.clone(),
-                100,
-            );
-            let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(ctrl);
-            let predictions_row = focusable_toggle_row(
-                "Inline predictions",
-                "Show the likely next words after the caret — the partner of a keyword, a \
-                 join's foreign key, the columns to group by or insert. Tab, or → at the end of \
-                 a line, takes them whole, Ctrl+→ (⌘→ on macOS) a word at a time, and Escape \
-                 turns them down.",
-                editor_predictions,
-                ring.clone(),
-                110,
-            );
-            // Greyed out while inline predictions are off: it refines them, and
-            // means nothing without them.
-            let remembered_row = focusable_toggle_row_when(
-                "Predictions from past statements",
-                "Also offer the rest of a line from a statement you ran, wrote in another \
-                 tab or saved as a snippet. Switch off to keep past statements off the \
-                 screen.",
-                editor_remembered_predictions,
-                editor_predictions,
-                ring.clone(),
-                120,
-            );
-            let aliases_row = focusable_toggle_row(
-                "Table aliases",
-                "When completion writes a table after FROM or JOIN, follow it with a short \
-                 alias made of its initials — orders o, order_items oi — and use the alias \
-                 in a join's ON condition.",
-                table_aliases,
-                ring.clone(),
-                125,
-            );
-            let rainbow_row = focusable_toggle_row(
-                "Rainbow brackets",
-                "Colour each pair of brackets by how deeply it is nested, so a closing \
-                 bracket can be matched to its opening one at a glance.",
-                rainbow_brackets,
-                ring.clone(),
-                130,
-            );
-            let whitespace_row = focusable_toggle_row(
-                "Show whitespace",
-                "Draw spaces and tabs as faint marks, so a tab can be told from spaces.",
-                show_whitespace,
-                ring.clone(),
-                140,
-            );
-            let guides_row = focusable_toggle_row(
-                "Indent guides",
-                "Draw a faint vertical line at each indent level.",
-                indent_guides,
-                ring.clone(),
-                150,
-            );
-            let case_dd = focusable_dropdown(
-                keyword_case,
-                schemaic_core::sqlfmt::KeywordCase::ALL,
-                schemaic_core::sqlfmt::KeywordCase::label,
-                ring.clone(),
-                160,
-            );
-            let case_section = v_stack((
-                settings_group_label("Keyword case"),
-                case_dd,
-                form_hint(
-                    "How Format Code writes keywords such as SELECT and FROM. Names, \
-                     strings and comments keep their case.",
-                ),
-            ))
-            .style(ctrl);
-            let function_case_dd = focusable_dropdown(
-                function_case,
-                schemaic_core::sqlfmt::KeywordCase::ALL,
-                schemaic_core::sqlfmt::KeywordCase::label,
-                ring.clone(),
-                163,
-            );
-            let function_case_section = v_stack((
-                settings_group_label("Function case"),
-                function_case_dd,
-                form_hint(
-                    "How Format Code writes the engine's own functions, such as COUNT and \
-                     COALESCE, where they are called. Your own functions keep their case.",
-                ),
-            ))
-            .style(ctrl);
-            let type_case_dd = focusable_dropdown(
-                type_case,
-                schemaic_core::sqlfmt::KeywordCase::ALL,
-                schemaic_core::sqlfmt::KeywordCase::label,
-                ring.clone(),
-                166,
-            );
-            let type_case_section = v_stack((
-                settings_group_label("Type case"),
-                type_case_dd,
-                form_hint(
-                    "How Format Code writes the engine's own data types, such as INT and \
-                     VARCHAR. Types you created keep their case.",
-                ),
-            ))
-            .style(ctrl);
-            let commas_dd = focusable_dropdown(
-                comma_style,
-                schemaic_core::sqlfmt::CommaStyle::ALL,
-                schemaic_core::sqlfmt::CommaStyle::label,
-                ring.clone(),
-                170,
-            );
-            let commas_section = v_stack((
-                settings_group_label("Commas"),
-                commas_dd,
-                form_hint(
-                    "Where Format Code puts the comma of a list it breaks across lines. \
-                     Lists kept on one line, like a function's arguments, are left alone \
-                     unless the wrap width breaks them.",
-                ),
-            ))
-            .style(ctrl);
-            let gap_dd = focusable_dropdown(
-                statement_gap,
-                schemaic_core::sqlfmt::StatementGap::ALL,
-                schemaic_core::sqlfmt::StatementGap::label,
-                ring.clone(),
-                180,
-            );
-            let gap_section = v_stack((
-                settings_group_label("Between statements"),
-                gap_dd,
-                form_hint(
-                    "The blank lines Format Code leaves between two statements. As typed \
-                     keeps a blank line wherever there was one.",
-                ),
-            ))
-            .style(ctrl);
-            let wrap_dd =
-                focusable_dropdown(wrap_width, WRAP_WIDTHS, wrap_width_label, ring.clone(), 183);
-            let wrap_section = v_stack((
-                settings_group_label("Wrap width"),
-                wrap_dd,
-                form_hint(
-                    "A list Format Code keeps on one line, like a function's arguments, \
-                     goes one item a line once its line would run past this width.",
-                ),
-            ))
-            .style(ctrl);
-            let river_row = focusable_toggle_row(
-                "Right-align clause keywords",
-                "Line SELECT, FROM, WHERE and the rest up on their right edge, each \
-                 clause's body beside its keyword, instead of a keyword on a line of its own.",
-                river,
-                ring.clone(),
-                185,
-            );
-            let align_row = focusable_toggle_row(
-                "Align columns",
-                "Line up the AS of a select list's aliases, the = of an UPDATE's \
-                 assignments and the types of a table's columns.",
-                align,
-                ring.clone(),
-                188,
-            );
-            let join_on_row = focusable_toggle_row(
-                "Join condition on its own line",
-                "Put a join's ON, and the AND and OR of its condition, on a line of \
-                 their own under the join.",
-                join_on_own_line,
-                ring.clone(),
-                190,
-            );
-            let editor_group = v_stack((
-                form_section_header("Editor"),
-                font_section,
-                predictions_row,
-                remembered_row,
-                aliases_row,
-                rainbow_row,
-                whitespace_row,
-                guides_row,
-            ))
-            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
-            let formatting_group = v_stack((
-                form_section_header("Code formatting"),
-                case_section,
-                function_case_section,
-                type_case_section,
-                commas_section,
-                gap_section,
-                wrap_section,
-                river_row,
-                align_row,
-                join_on_row,
-            ))
-            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
-
-            // Query group.
-            let row_dd =
-                focusable_dropdown(row_limit, ROW_LIMITS, row_limit_label, ring.clone(), 200);
-            let row_section =
-                v_stack((settings_group_label("Default row limit"), row_dd)).style(ctrl);
-            // 210, because `timeout_section` is the row *below* the row limit in
-            // the group below — the two toggles come after it.
-            let timeout_dd = focusable_dropdown(
-                statement_timeout,
-                STATEMENT_TIMEOUTS,
-                statement_timeout_label,
-                ring.clone(),
-                210,
-            );
-            let confirm_row = focusable_toggle_row(
-                "Confirm before running writes",
-                "Ask before executing any statement that modifies data or schema.",
-                confirm_writes,
-                ring.clone(),
-                220,
-            );
-            let validate_row = focusable_toggle_row(
-                "Live database validation",
-                "Check the statement under the cursor against the database as you type \
-                 (a non-executing PREPARE) to surface exact errors. Adds a DB round-trip \
-                 on each pause.",
-                live_validate,
-                ring.clone(),
-                230,
-            );
-            let notify_row = focusable_toggle_row(
-                "Notify when a run finishes in the background",
-                "Show a desktop notification when a query, script, export or dump that \
-                 took a second or more ends while Schemaic is not the active window. The \
-                 taskbar button is highlighted either way. The notification never \
-                 includes the SQL.",
-                notify_finished,
-                ring.clone(),
-                240,
-            );
-            let timeout_section = v_stack((
-                settings_group_label("Statement timeout"),
-                timeout_dd,
-                form_hint(
-                    "Cancel a statement that runs longer than this. Off by default — \
-                     an import or a report can legitimately take a while.",
-                ),
-            ))
-            .style(ctrl);
-            let query_group = v_stack((
-                form_section_header("Query"),
-                row_section,
-                timeout_section,
-                confirm_row,
-                validate_row,
-                notify_row,
-            ))
-            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
-
-            // Theme group.
-            let ui_dd = focusable_dropdown(
-                ui_theme,
-                theme::UiThemeKind::ALL,
-                theme::UiThemeKind::label,
-                ring.clone(),
-                300,
-            );
-            let editor_dd = focusable_dropdown(
-                editor_theme,
-                theme::EditorThemeKind::ALL,
-                theme::EditorThemeKind::label,
-                ring.clone(),
-                310,
-            );
-            let scale_dd = scale_picker(ui_scale, ring.clone(), 320);
-            // Kept for the root, which answers Tab by entering the ring.
-            let root_ring = ring;
-            let ui_section = v_stack((settings_group_label("Interface theme"), ui_dd)).style(ctrl);
-            let editor_section =
-                v_stack((settings_group_label("Editor theme"), editor_dd)).style(ctrl);
-            // No hint under this one, unlike the settings that carry a
-            // consequence: four segments named by their percentage, applying the
-            // instant they are pressed, explain themselves better than a line of
-            // prose restating them.
-            let scale_section =
-                v_stack((settings_group_label("Interface scale"), scale_dd)).style(ctrl);
-            let theme_group = v_stack((
-                form_section_header("Appearance"),
-                ui_section,
-                editor_section,
-                scale_section,
-            ))
-            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
-
-            // The version caption pairs with the first section instead of
-            // standing as a group of its own: the outer gap is the one that
-            // separates *sections*, and spending it here would leave the caption
-            // floating above the form. Inside this wrapper it gets a group's own
-            // 16 — which, with the 2 margin the caption carries, is exactly the
-            // air under `General`.
-            let intro = v_stack((settings_version_line(), general_group))
-                .style(|s| s.flex_col().gap(theme::scaled(16.0)));
-
-            let body = v_stack((
-                intro,
-                editor_group,
-                formatting_group,
-                query_group,
-                theme_group,
-            ))
-            .style(|s| {
-                s.flex_col()
-                    .gap(form_section_gap())
-                    .padding(theme::scaled(14.0))
-                    .width_full()
-            });
-            // Scroll so the taller grouped modal never overflows the window.
-            let body = autohide(scroll(body)).style(|s| {
-                s.width_full()
-                    .max_height(crate::widgets::modal_body_h(560.0))
-            });
-
-            let panel = v_stack((
-                modal_title("Settings", close.clone(), root_ring.clone()),
-                body,
-            ))
-            .on_click_stop(|_| {})
-            .style(|s| {
-                panel_style(s)
-                    .background(theme::bg_panel())
-                    .width(crate::widgets::modal_w(420.0))
-            });
+            // One height for every section, so switching never resizes the
+            // modal; a long page scrolls inside it.
+            let panel = v_stack((modal_title("Settings", close.clone(), ring.clone()), body))
+                .on_click_stop(|_| {})
+                .style(|s| {
+                    panel_style(s)
+                        .background(theme::bg_panel())
+                        .width(crate::widgets::modal_w(SECTION_LIST_W + SECTION_PAGE_W))
+                        .height(crate::widgets::modal_h(560.0))
+                });
 
             let esc = close.clone();
             // Click-to-dismiss on a sibling behind the panel, never on the focus
@@ -2198,7 +1902,7 @@ pub(crate) fn theme_settings_overlay(
             // `widgets::dismiss_layer`.
             focus_root_with_ring(
                 stack((crate::widgets::dismiss_layer(move || close()), panel)),
-                root_ring,
+                ring,
             )
             .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
             .style(|s| {
@@ -2217,6 +1921,435 @@ pub(crate) fn theme_settings_overlay(
             s
         }
     })
+}
+
+/// The Settings modal's list of sections: one Tab stop, ↑/↓ between them,
+/// the showing one in Manage connections' selected-row colours. The app's
+/// version sits at its foot, where every section can see it.
+fn section_list(section: RwSignal<SettingsSection>, ring: FocusRing) -> impl IntoView {
+    let rows = v_stack_from_iter(SettingsSection::ALL.into_iter().map(move |s| {
+        text(s.label())
+            .on_click_stop(move |_| {
+                if section.get_untracked() != s {
+                    section.set(s);
+                }
+            })
+            .style(move |st| {
+                let st = st
+                    .width_full()
+                    .font_size(theme::font_body())
+                    .padding_horiz(theme::scaled(12.0))
+                    .padding_vert(theme::scaled(11.0));
+                if section.get() == s {
+                    st.color(theme::conn_list_sel_text())
+                        .background(theme::conn_list_sel_bg())
+                } else {
+                    st.color(theme::conn_list_text())
+                        .hover(|st| st.color(theme::conn_list_sel_text()))
+                }
+            })
+    }))
+    .style(|s| s.flex_col().width_full().gap(theme::scaled(5.0)));
+    // Clamped, as Manage connections' list is: the ring around it is what
+    // wraps.
+    let list = crate::widgets::nav_group(
+        rows,
+        ring,
+        crate::widgets::NAV_TAB,
+        crate::widgets::NavAxis::Vertical,
+        move |delta| {
+            let all = SettingsSection::ALL;
+            let cur = all
+                .iter()
+                .position(|s| *s == section.get_untracked())
+                .unwrap_or(0);
+            if let Some(next) = crate::widgets::list_step(all.len(), cur, delta) {
+                section.set(all[next]);
+            }
+        },
+    );
+    v_stack((
+        list,
+        empty().style(|s| s.flex_grow(1.0_f32)),
+        settings_version_line(),
+    ))
+    .style(|s| {
+        s.width(theme::scaled(SECTION_LIST_W))
+            .flex_shrink(0.0_f32)
+            .height_full()
+            .flex_col()
+            .border_right(1.0)
+            .border_color(theme::border())
+            .padding_vert(theme::scaled(6.0))
+    })
+}
+
+/// A settings page: its section's heading, then its settings, a group's gap
+/// apart.
+fn section_page<V: ViewTuple + 'static>(children: V) -> AnyView {
+    v_stack(children)
+        .style(|s| s.flex_col().gap(theme::scaled(16.0)))
+        .into_any()
+}
+
+/// A setting's caption and control stacked, the way every dropdown sits.
+fn ctrl(s: floem::style::Style) -> floem::style::Style {
+    s.flex_col().gap(theme::scaled(6.0))
+}
+
+/// The General section: the session, the log, the command-line tool.
+///
+/// **A section's Tab numbers follow its layout, not the order a control was
+/// added**, spaced by 10 so one can be inserted between two — a control
+/// appended by number rather than inserted at its place walks the user
+/// backwards through the page: the statement timeout was written last and
+/// numbered 230 while sitting *second* in its group, so Tab went row limit →
+/// confirm → validate → back up to timeout. Each section keeps the block of
+/// numbers it had in the single long form; they never collide, though only
+/// one page is in the ring at a time.
+fn general_section(
+    layout: LayoutUi,
+    ring: FocusRing,
+    open_config_dir: Rc<dyn Fn()>,
+    cli_command: crate::CliCommand,
+) -> AnyView {
+    let restore_tabs = layout.restore_tabs;
+    let restore_row = focusable_toggle_row(
+        "Restore tabs on startup",
+        "Reopen the query tabs from your last session when the app starts.",
+        restore_tabs,
+        ring.clone(),
+        10,
+    );
+    section_page((
+        form_section_header(SettingsSection::General.label()),
+        restore_row,
+        log_row(open_config_dir, ring.clone(), 20),
+        cli_row(cli_command, ring, 30),
+    ))
+}
+
+/// The Editor section. (Tab width, spaces-vs-tabs, and word wrap live in the
+/// status bar.)
+fn editor_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
+    let editor_font = layout.editor_font;
+    let editor_predictions = layout.editor_predictions;
+    let editor_remembered_predictions = layout.editor_remembered_predictions;
+    let table_aliases = layout.table_aliases;
+    let rainbow_brackets = layout.rainbow_brackets;
+    let show_whitespace = layout.show_whitespace;
+    let indent_guides = layout.indent_guides;
+    let font_dd = focusable_dropdown(
+        editor_font,
+        EDITOR_FONT_SIZES,
+        editor_font_label,
+        ring.clone(),
+        100,
+    );
+    let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(ctrl);
+    let predictions_row = focusable_toggle_row(
+        "Inline predictions",
+        "Show the likely next words after the caret — the partner of a keyword, a \
+                 join's foreign key, the columns to group by or insert. Tab, or → at the end of \
+                 a line, takes them whole, Ctrl+→ (⌘→ on macOS) a word at a time, and Escape \
+                 turns them down.",
+        editor_predictions,
+        ring.clone(),
+        110,
+    );
+    // Greyed out while inline predictions are off: it refines them, and
+    // means nothing without them.
+    let remembered_row = focusable_toggle_row_when(
+        "Predictions from past statements",
+        "Also offer the rest of a line from a statement you ran, wrote in another \
+                 tab or saved as a snippet. Switch off to keep past statements off the \
+                 screen.",
+        editor_remembered_predictions,
+        editor_predictions,
+        ring.clone(),
+        120,
+    );
+    let aliases_row = focusable_toggle_row(
+        "Table aliases",
+        "When completion writes a table after FROM or JOIN, follow it with a short \
+                 alias made of its initials — orders o, order_items oi — and use the alias \
+                 in a join's ON condition.",
+        table_aliases,
+        ring.clone(),
+        125,
+    );
+    let rainbow_row = focusable_toggle_row(
+        "Rainbow brackets",
+        "Colour each pair of brackets by how deeply it is nested, so a closing \
+                 bracket can be matched to its opening one at a glance.",
+        rainbow_brackets,
+        ring.clone(),
+        130,
+    );
+    let whitespace_row = focusable_toggle_row(
+        "Show whitespace",
+        "Draw spaces and tabs as faint marks, so a tab can be told from spaces.",
+        show_whitespace,
+        ring.clone(),
+        140,
+    );
+    let guides_row = focusable_toggle_row(
+        "Indent guides",
+        "Draw a faint vertical line at each indent level.",
+        indent_guides,
+        ring.clone(),
+        150,
+    );
+    section_page((
+        form_section_header(SettingsSection::Editor.label()),
+        font_section,
+        predictions_row,
+        remembered_row,
+        aliases_row,
+        rainbow_row,
+        whitespace_row,
+        guides_row,
+    ))
+}
+
+/// The Code formatting section — what Format Code does, `FormatStyle` field
+/// by field.
+fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
+    let keyword_case = layout.keyword_case;
+    let function_case = layout.function_case;
+    let type_case = layout.type_case;
+    let comma_style = layout.comma_style;
+    let statement_gap = layout.statement_gap;
+    let wrap_width = layout.wrap_width;
+    let river = layout.river;
+    let align = layout.align;
+    let join_on_own_line = layout.join_on_own_line;
+    let case_dd = focusable_dropdown(
+        keyword_case,
+        schemaic_core::sqlfmt::KeywordCase::ALL,
+        schemaic_core::sqlfmt::KeywordCase::label,
+        ring.clone(),
+        160,
+    );
+    let case_section = v_stack((
+        settings_group_label("Keyword case"),
+        case_dd,
+        form_hint(
+            "How Format Code writes keywords such as SELECT and FROM. Names, \
+                     strings and comments keep their case.",
+        ),
+    ))
+    .style(ctrl);
+    let function_case_dd = focusable_dropdown(
+        function_case,
+        schemaic_core::sqlfmt::KeywordCase::ALL,
+        schemaic_core::sqlfmt::KeywordCase::label,
+        ring.clone(),
+        163,
+    );
+    let function_case_section = v_stack((
+        settings_group_label("Function case"),
+        function_case_dd,
+        form_hint(
+            "How Format Code writes the engine's own functions, such as COUNT and \
+                     COALESCE, where they are called. Your own functions keep their case.",
+        ),
+    ))
+    .style(ctrl);
+    let type_case_dd = focusable_dropdown(
+        type_case,
+        schemaic_core::sqlfmt::KeywordCase::ALL,
+        schemaic_core::sqlfmt::KeywordCase::label,
+        ring.clone(),
+        166,
+    );
+    let type_case_section = v_stack((
+        settings_group_label("Type case"),
+        type_case_dd,
+        form_hint(
+            "How Format Code writes the engine's own data types, such as INT and \
+                     VARCHAR. Types you created keep their case.",
+        ),
+    ))
+    .style(ctrl);
+    let commas_dd = focusable_dropdown(
+        comma_style,
+        schemaic_core::sqlfmt::CommaStyle::ALL,
+        schemaic_core::sqlfmt::CommaStyle::label,
+        ring.clone(),
+        170,
+    );
+    let commas_section = v_stack((
+        settings_group_label("Commas"),
+        commas_dd,
+        form_hint(
+            "Where Format Code puts the comma of a list it breaks across lines. \
+                     Lists kept on one line, like a function's arguments, are left alone \
+                     unless the wrap width breaks them.",
+        ),
+    ))
+    .style(ctrl);
+    let gap_dd = focusable_dropdown(
+        statement_gap,
+        schemaic_core::sqlfmt::StatementGap::ALL,
+        schemaic_core::sqlfmt::StatementGap::label,
+        ring.clone(),
+        180,
+    );
+    let gap_section = v_stack((
+        settings_group_label("Between statements"),
+        gap_dd,
+        form_hint(
+            "The blank lines Format Code leaves between two statements. As typed \
+                     keeps a blank line wherever there was one.",
+        ),
+    ))
+    .style(ctrl);
+    let wrap_dd = focusable_dropdown(wrap_width, WRAP_WIDTHS, wrap_width_label, ring.clone(), 183);
+    let wrap_section = v_stack((
+        settings_group_label("Wrap width"),
+        wrap_dd,
+        form_hint(
+            "A list Format Code keeps on one line, like a function's arguments, \
+                     goes one item a line once its line would run past this width.",
+        ),
+    ))
+    .style(ctrl);
+    let river_row = focusable_toggle_row(
+        "Right-align clause keywords",
+        "Line SELECT, FROM, WHERE and the rest up on their right edge, each \
+                 clause's body beside its keyword, instead of a keyword on a line of its own.",
+        river,
+        ring.clone(),
+        185,
+    );
+    let align_row = focusable_toggle_row(
+        "Align columns",
+        "Line up the AS of a select list's aliases, the = of an UPDATE's \
+                 assignments and the types of a table's columns.",
+        align,
+        ring.clone(),
+        188,
+    );
+    let join_on_row = focusable_toggle_row(
+        "Join condition on its own line",
+        "Put a join's ON, and the AND and OR of its condition, on a line of \
+                 their own under the join.",
+        join_on_own_line,
+        ring.clone(),
+        190,
+    );
+    section_page((
+        form_section_header(SettingsSection::Formatting.label()),
+        case_section,
+        function_case_section,
+        type_case_section,
+        commas_section,
+        gap_section,
+        wrap_section,
+        river_row,
+        align_row,
+        join_on_row,
+    ))
+}
+
+/// The Query section: what a run fetches, how long it may take, and what it
+/// asks first.
+fn query_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
+    let row_limit = layout.row_limit;
+    let statement_timeout = layout.statement_timeout;
+    let confirm_writes = layout.confirm_writes;
+    let live_validate = layout.live_validate;
+    let notify_finished = layout.notify_finished;
+    let row_dd = focusable_dropdown(row_limit, ROW_LIMITS, row_limit_label, ring.clone(), 200);
+    let row_section = v_stack((settings_group_label("Default row limit"), row_dd)).style(ctrl);
+    // 210, because `timeout_section` is the row *below* the row limit in
+    // the group below — the two toggles come after it.
+    let timeout_dd = focusable_dropdown(
+        statement_timeout,
+        STATEMENT_TIMEOUTS,
+        statement_timeout_label,
+        ring.clone(),
+        210,
+    );
+    let confirm_row = focusable_toggle_row(
+        "Confirm before running writes",
+        "Ask before executing any statement that modifies data or schema.",
+        confirm_writes,
+        ring.clone(),
+        220,
+    );
+    let validate_row = focusable_toggle_row(
+        "Live database validation",
+        "Check the statement under the cursor against the database as you type \
+                 (a non-executing PREPARE) to surface exact errors. Adds a DB round-trip \
+                 on each pause.",
+        live_validate,
+        ring.clone(),
+        230,
+    );
+    let notify_row = focusable_toggle_row(
+        "Notify when a run finishes in the background",
+        "Show a desktop notification when a query, script, export or dump that \
+                 took a second or more ends while Schemaic is not the active window. The \
+                 taskbar button is highlighted either way. The notification never \
+                 includes the SQL.",
+        notify_finished,
+        ring.clone(),
+        240,
+    );
+    let timeout_section = v_stack((
+        settings_group_label("Statement timeout"),
+        timeout_dd,
+        form_hint(
+            "Cancel a statement that runs longer than this. Off by default — \
+                     an import or a report can legitimately take a while.",
+        ),
+    ))
+    .style(ctrl);
+    section_page((
+        form_section_header(SettingsSection::Query.label()),
+        row_section,
+        timeout_section,
+        confirm_row,
+        validate_row,
+        notify_row,
+    ))
+}
+
+/// The Appearance section: the two themes and the interface scale.
+fn appearance_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
+    let ui_theme = layout.ui_theme;
+    let editor_theme = layout.editor_theme;
+    let ui_scale = layout.ui_scale;
+    let ui_dd = focusable_dropdown(
+        ui_theme,
+        theme::UiThemeKind::ALL,
+        theme::UiThemeKind::label,
+        ring.clone(),
+        300,
+    );
+    let editor_dd = focusable_dropdown(
+        editor_theme,
+        theme::EditorThemeKind::ALL,
+        theme::EditorThemeKind::label,
+        ring.clone(),
+        310,
+    );
+    let scale_dd = scale_picker(ui_scale, ring, 320);
+    let ui_section = v_stack((settings_group_label("Interface theme"), ui_dd)).style(ctrl);
+    let editor_section = v_stack((settings_group_label("Editor theme"), editor_dd)).style(ctrl);
+    // No hint under this one, unlike the settings that carry a
+    // consequence: four segments named by their percentage, applying the
+    // instant they are pressed, explain themselves better than a line of
+    // prose restating them.
+    let scale_section = v_stack((settings_group_label("Interface scale"), scale_dd)).style(ctrl);
+    section_page((
+        form_section_header(SettingsSection::Appearance.label()),
+        ui_section,
+        editor_section,
+        scale_section,
+    ))
 }
 
 // ── Shortcuts: keyboard-reference modal ──────────────────────────────────────
@@ -2435,6 +2568,35 @@ mod tests {
         assert_eq!(row_limit_label(50_000), "50,000");
         assert_ne!(row_limit_label(50_000), row_limit_label(200_000));
         assert_eq!(wrap_width_label(90), "90 characters");
+    }
+
+    /// Every section is listed once, the list opens on the default, and no two
+    /// share a name — the name is the page's heading and the row's only text.
+    #[test]
+    fn the_settings_sections_are_listed_once_and_named_apart() {
+        use super::SettingsSection;
+        let all = SettingsSection::ALL;
+        assert_eq!(all[0], SettingsSection::default());
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+                assert_ne!(a.label(), b.label());
+            }
+        }
+        // Exhaustive, so a section added to the enum stops this compiling —
+        // the prompt to add it to `ALL` and to the count below as well. It
+        // cannot prove `ALL` holds it: that is the count's job, and the
+        // count is only as right as whoever edits it.
+        for s in all {
+            match s {
+                SettingsSection::General
+                | SettingsSection::Editor
+                | SettingsSection::Formatting
+                | SettingsSection::Query
+                | SettingsSection::Appearance => {}
+            }
+        }
+        assert_eq!(all.len(), 5);
     }
 
     /// The wrap width's list leads with off, the default, and labels it so;
