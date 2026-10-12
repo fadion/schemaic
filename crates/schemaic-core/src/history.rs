@@ -343,8 +343,15 @@ pub const ATTENTION_AFTER_MS: u64 = 1_000;
 /// window's attention — the taskbar flash, the dock bounce? Only a long one,
 /// and only while the window is not focused: in front, the result is already
 /// where the user is looking.
-pub fn wants_attention(took_ms: u64, window_focused: bool) -> bool {
-    !window_focused && took_ms >= ATTENTION_AFTER_MS
+///
+/// **Never one the user stopped** (`stopped_by_user`: cancelled, and not by
+/// the statement timeout): they pressed Stop in this window, and the cancel
+/// can land after they have switched away. Asked here rather than left to each
+/// caller to filter, because a stop does not always reach the caller as a
+/// `Cancelled` state — a batch keeps the statements that finished before it,
+/// and a single run stopped before it was sent is built as `Failed`.
+pub fn wants_attention(took_ms: u64, window_focused: bool, stopped_by_user: bool) -> bool {
+    !stopped_by_user && !window_focused && took_ms >= ATTENTION_AFTER_MS
 }
 
 /// What ended, for [`finished_note`].
@@ -737,14 +744,14 @@ mod tests {
     /// in front, where the result is already on screen.
     #[test]
     fn a_long_run_finishing_in_the_background_asks_for_attention() {
-        assert!(wants_attention(ATTENTION_AFTER_MS, false));
-        assert!(wants_attention(ATTENTION_AFTER_MS * 6, false));
+        assert!(wants_attention(ATTENTION_AFTER_MS, false, false));
+        assert!(wants_attention(ATTENTION_AFTER_MS * 6, false, false));
         assert!(
-            !wants_attention(ATTENTION_AFTER_MS - 1, false),
+            !wants_attention(ATTENTION_AFTER_MS - 1, false, false),
             "a quick run"
         );
         assert!(
-            !wants_attention(ATTENTION_AFTER_MS * 6, true),
+            !wants_attention(ATTENTION_AFTER_MS * 6, true, false),
             "the user is watching"
         );
     }
@@ -755,8 +762,22 @@ mod tests {
     /// bar only has to keep an instant run from asking.
     #[test]
     fn a_run_walked_away_from_after_a_second_asks_for_attention() {
-        assert!(wants_attention(1_200, false));
-        assert!(!wants_attention(300, false), "over before anyone left");
+        assert!(wants_attention(1_200, false, false));
+        assert!(
+            !wants_attention(300, false, false),
+            "over before anyone left"
+        );
+    }
+
+    /// **A run the user stopped never calls them back**, however long it ran
+    /// and wherever the window is: they pressed Stop in this window, and the
+    /// cancel can land after they have switched away. Run Everything stopped
+    /// after its first statement read as "Query finished", and a single run
+    /// stopped before it was sent as "Query failed".
+    #[test]
+    fn a_run_the_user_stopped_does_not_ask_for_attention() {
+        assert!(!wants_attention(5_000, false, true));
+        assert!(!wants_attention(ATTENTION_AFTER_MS * 60, false, true));
     }
 
     /// The notification says what ended and how, and how long it took —

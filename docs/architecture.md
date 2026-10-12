@@ -9959,7 +9959,8 @@ existing prose was left alone.
     (`database_names_compare_by_the_engines_case_rule`). The SQL Server arm is the *default*
     collation's answer; nothing consults the server's own, so on one installed case-sensitive
     the rule errs towards offering.
-    `wants_attention` (with `ATTENTION_AFTER_MS`) is the taskbar call-back's question, and
+    `wants_attention` (with `ATTENTION_AFTER_MS`; never for a run the user stopped) is the taskbar
+    call-back's question, and
     `finished_note(Finished, failed, took_ms)` the wording of the desktop notification that can
     follow it — *Query finished* / *Script failed* and so on over `Took 12.3s.` through
     `format_duration` (`a_finished_note_names_what_ended_and_how_long_it_took`). **It never
@@ -29495,9 +29496,16 @@ existing prose was left alone.
   **A long run that ends behind another window calls the user back**: the taskbar flash on Windows
   and Linux, the dock bounce on macOS (`WindowIdExt::request_attention` with
   `Urgency::Informational`, which stops on its own once the window is focused). `call_back_after`
-  asks `history::wants_attention(took, window_focused)` — at least `ATTENTION_AFTER_MS`, one
-  second, and the window not in front, where the result is already on screen
-  (`a_long_run_finishing_in_the_background_asks_for_attention`). **The bar is low on purpose**: a
+  asks `history::wants_attention(took, window_focused, stopped)` — at least `ATTENTION_AFTER_MS`,
+  one second, the window not in front, where the result is already on screen
+  (`a_long_run_finishing_in_the_background_asks_for_attention`), and **not a run the user
+  stopped** (`a_run_the_user_stopped_does_not_ask_for_attention`). The two editor run paths pass
+  that flag because a Stop does not always reach them as `Cancelled`: Run Everything keeps the
+  statements that finished before it, so `runs` stayed non-empty and a stopped batch read *Query
+  finished*, and the single run builds a Stop before the statement was sent, or after a MySQL
+  DDL's implicit commit, as `Failed`, which read *Query failed*. The single run's flag is
+  `Err(Cancelled)` without the watchdog having fired; Run Everything's is the token cancelled with
+  no statement's watchdog fired (the timeout cancels the same token). **The bar is low on purpose**: a
   window not in front when the run ends is already the evidence the user walked away, so the bar
   only keeps a run that was over before anyone could leave from asking. It was ten seconds, and a
   1.2 s query switched away from the moment it was run never flashed
@@ -29507,12 +29515,13 @@ existing prose was left alone.
   script of quick statements is as much a walk-away as one slow statement. A `.sql` file run
   (`script_run`), both of `export_file`'s paths, a dump (`dump_run`) and a folder export
   (`files_run`) ask it too, timed by an `Instant` taken as each claims its cancel slot — and **not
-  on a cancelled outcome**: the user pressed Stop in this window, and a cancel can still land after
-  they have switched away, where a flash would call them back to something they ended. The fetched
+  on a cancelled outcome**, which each filters itself and so passes `stopped` as `false`: the user
+  pressed Stop in this window, and a cancel can still land after they have switched away, where a
+  flash would call them back to something they ended. The fetched
   export's two ext actions over one `done` share an `asked` cell, so only the report that lands
   first asks — the same one `ExportTarget::run` keeps.
   **The same moment can also show a desktop notification, and only if the user asked for one.**
-  `call_back_after` takes `(Finished, failed, took_ms)` rather than the time alone, and when
+  `call_back_after` takes `(Finished, failed, took_ms, stopped)` rather than the time alone, and when
   `wants_attention` says yes and the `notify_finished` signal is on (Settings → Query, *Notify
   when a run finishes in the background*; `persist::UiState::notify_finished`, `serde`-defaulted
   off and autosaved as `live_validate` is) it hands `history::finished_note`'s title and body to

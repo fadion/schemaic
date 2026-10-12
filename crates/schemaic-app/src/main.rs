@@ -2938,13 +2938,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // taskbar flash on Windows and Linux, the dock bounce on macOS — through
     // `history::wants_attention`. `Informational`, which stops on its own once
     // the window is focused; both run paths ask it, after their supersede
-    // checks, so only the run a tab still shows does. A `.sql` file run, an
-    // export, a dump and a folder export ask it too, timed from their launch,
-    // unless the user stopped them. With *Notify when a run finishes in the
+    // checks, so only the run a tab still shows does, and each says whether the
+    // user stopped it (`stopped`), which `wants_attention` refuses. A `.sql`
+    // file run, an export, a dump and a folder export ask it too, timed from
+    // their launch; they skip a stopped run themselves and pass `false`. With
+    // *Notify when a run finishes in the
     // background* on, the same moment also shows a desktop notification
     // (`notify::show`, worded by `history::finished_note`).
-    let call_back_after = move |what: Finished, failed: bool, took_ms: u64| {
-        if schemaic_core::history::wants_attention(took_ms, window_focused.get_untracked()) {
+    let call_back_after = move |what: Finished, failed: bool, took_ms: u64, stopped: bool| {
+        if schemaic_core::history::wants_attention(took_ms, window_focused.get_untracked(), stopped)
+        {
             floem::WindowIdExt::request_attention(&window, floem::Urgency::Informational);
             if notify_finished.get_untracked() {
                 let (title, body) = schemaic_core::history::finished_note(what, failed, took_ms);
@@ -3071,7 +3074,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let ddl_owed = ddl_owed.clone();
             let send = create_ext_action(
                 cx,
-                move |(state, stmt, took): (QueryState, Option<StmtOutcome>, u64)| {
+                move |(state, stmt, took, stopped): (
+                    QueryState,
+                    Option<StmtOutcome>,
+                    u64,
+                    bool,
+                )| {
                     // Fold the transaction state first, and unconditionally: it
                     // tracks the *connection*, so it stays true even when a newer run
                     // has superseded this one for display purposes.
@@ -3118,8 +3126,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         return;
                     }
                     tokens_done.borrow_mut().remove(&id);
+                    // `stopped`: a Stop can arrive as `Failed` (not sent yet,
+                    // or a MySQL DDL's implicit commit), which `run_result`
+                    // counts as a verdict.
                     if let Some(r) = run_result(&state, took) {
-                        call_back_after(Finished::Query, !r.ok, took);
+                        call_back_after(Finished::Query, !r.ok, took, stopped);
                     }
                     if is_view {
                         // Cleared for every arm, and **after** the supersede check
@@ -3225,6 +3236,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 let timed_out = watchdog.fired();
                 drop(watchdog);
+                // The user pressed Stop, as opposed to the statement timeout —
+                // which arrives as the same error.
+                let stopped = matches!(res, Err(DbError::Cancelled)) && !timed_out;
                 // What the error text cannot say: on MySQL a DDL statement
                 // commits the open transaction before it runs, so a rejected or
                 // killed one has spent it — and nothing else on screen says so.
@@ -3292,7 +3306,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         )
                     }
                 };
-                send((state, stmt, started.elapsed().as_millis() as u64));
+                send((state, stmt, started.elapsed().as_millis() as u64, stopped));
             });
         })
     };
@@ -3629,10 +3643,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let ddl_owed = ddl_owed.clone();
             let send = create_ext_action(
                 cx,
-                move |(states, outcomes, took): (
+                move |(states, outcomes, took, stopped): (
                     Vec<QueryState>,
                     Vec<Option<StmtOutcome>>,
                     Vec<u64>,
+                    bool,
                 )| {
                     for (sql, stmt) in tx_stmts.iter().zip(&outcomes) {
                         if let Some(stmt) = stmt {
@@ -3684,10 +3699,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     tokens_done.borrow_mut().remove(&id);
                     // The batch's whole run, statement times summed — a long
                     // script of quick statements is as much a walk-away as one
-                    // slow one. Asked only of a batch that reached a verdict.
+                    // slow one. Asked only of a batch that reached a verdict —
+                    // and `stopped` says the user ended it: the statements that
+                    // finished before the Stop keep `runs` non-empty, so a
+                    // stopped batch read as a finished one.
                     if !runs.is_empty() {
                         let failed = runs.iter().any(|(_, r)| !r.ok);
-                        call_back_after(Finished::Query, failed, took.iter().sum());
+                        call_back_after(Finished::Query, failed, took.iter().sum(), stopped);
                     }
                     // By id, statement for statement: the strip may have been
                     // pinned, reordered or partly closed while the batch ran, and
@@ -3719,6 +3737,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // one, so the number is never shown.
                 let mut took: Vec<u64> = vec![0; n];
                 let mut clock = std::time::Instant::now();
+                // Whether a statement timeout fired: it cancels the same token
+                // a Stop does, and only a Stop is "stopped by the user".
+                let mut clock_stopped = false;
                 match &session {
                     Some(s) => {
                         // See `run_query_core`: the session owns the decision, and
@@ -3732,7 +3753,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 e.modal_source(),
                             ));
                             took[0] = clock.elapsed().as_millis() as u64;
-                            send((states, outcomes, took));
+                            send((states, outcomes, took, token.is_cancelled()));
                             return;
                         }
                         // The session runs statements one at a time on the pinned
@@ -3771,6 +3792,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             let out = s.fetch_query(sql, cap, token.clone()).await;
                             let timed_out = watchdog.fired();
                             drop(watchdog);
+                            clock_stopped |= timed_out;
                             took[i] = clock.elapsed().as_millis() as u64;
                             clock = std::time::Instant::now();
                             outcomes[i] = Some(out.stmt);
@@ -3849,6 +3871,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             token.clone(),
                             |i, res| {
                                 let timed_out = watchdog.fired();
+                                clock_stopped |= timed_out;
                                 watchdog = RunTimeout::arm(&token, timeout_secs);
                                 took[i] = clock.elapsed().as_millis() as u64;
                                 clock = std::time::Instant::now();
@@ -3869,7 +3892,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         .await;
                     }
                 }
-                send((states, outcomes, took));
+                let stopped = token.is_cancelled() && !clock_stopped;
+                send((states, outcomes, took, stopped));
             });
         })
     };
@@ -4321,10 +4345,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     if !asked.replace(true)
                                         && !matches!(o, ExportOutcome::Cancelled)
                                     {
+                                        // A stop is `Cancelled`, filtered above.
                                         call_back_after(
                                             Finished::Export,
                                             matches!(o, ExportOutcome::Failed { .. }),
                                             started.elapsed().as_millis() as u64,
+                                            false,
                                         );
                                     }
                                     // **Only a run that took the slot may clear
@@ -4569,6 +4595,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                         Finished::Export,
                                         matches!(o, ExportOutcome::Failed { .. }),
                                         started.elapsed().as_millis() as u64,
+                                        false,
                                     );
                                 }
                                 (done)(o)
@@ -4847,6 +4874,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Finished::Dump,
                                 matches!(o, DumpOutcome::Failed { .. }),
                                 started.elapsed().as_millis() as u64,
+                                false,
                             );
                         }
                         (done)(o);
@@ -4904,6 +4932,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Finished::Export,
                                 matches!(o, FilesOutcome::Failed { .. }),
                                 started.elapsed().as_millis() as u64,
+                                false,
                             );
                         }
                         (done)(o);
@@ -5012,6 +5041,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Finished::Script,
                                 matches!(o, RunOutcome::Failed { .. }),
                                 started.elapsed().as_millis() as u64,
+                                false,
                             );
                         }
                         (done)(o);
