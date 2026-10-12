@@ -430,6 +430,24 @@ pub fn disk_change(disk: Option<&str>, now: std::io::Result<Vec<u8>>) -> Option<
     changed_on_disk(&now, disk?).then(|| decode(&now).text)
 }
 
+/// Does a window-focus check's report still describe the tab? Only while the
+/// tab is bound to the `read_path` it read, holding the `read_disk` it compared
+/// against — `bound_path` and `bound_disk` are the tab's binding now.
+///
+/// **The path too, not the text alone.** A clean tab's Save As writes the text
+/// it already held, so after one to `b.sql` the on-disk text is unchanged and a
+/// report read from `a.sql` before it passed, raising "“b.sql” changed on disk"
+/// with another file's contents. Compared exactly: a report dropped over a
+/// path spelled differently costs nothing, the next focus asks again.
+pub fn report_is_current(
+    bound_path: Option<&Path>,
+    bound_disk: Option<&str>,
+    read_path: &Path,
+    read_disk: Option<&str>,
+) -> bool {
+    bound_path == Some(read_path) && bound_disk == read_disk
+}
+
 /// [`same_file`]'s rule with the platform's answer passed in, so both sides of it
 /// are testable on either platform.
 ///
@@ -1027,6 +1045,27 @@ mod tests {
         assert_eq!(disk_change(None, Ok(b"SELECT 2;\n".to_vec())), None);
         let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(disk_change(Some("SELECT 1;\n"), Err(gone)), None);
+    }
+
+    /// **A focus check's report is the tab's only while the tab is bound as it
+    /// was when the read began** — the same file, the same on-disk text. Keyed
+    /// on the text alone, a read of `a.sql` from before a Save As to `b.sql`
+    /// passed (a clean tab saves the text it already held) and raised
+    /// "“b.sql” changed on disk" with `a.sql`'s contents.
+    #[test]
+    fn a_focus_report_is_dropped_once_the_tab_is_bound_otherwise() {
+        let (a, b) = (Path::new("C:/q/a.sql"), Path::new("C:/q/b.sql"));
+        let text = Some("SELECT 1;\n");
+        assert!(report_is_current(Some(a), text, a, text));
+        assert!(
+            !report_is_current(Some(b), text, a, text),
+            "saved as another file since"
+        );
+        assert!(
+            !report_is_current(Some(a), Some("SELECT 2;\n"), a, text),
+            "saved or reloaded since"
+        );
+        assert!(!report_is_current(None, text, a, text), "closed or unbound");
     }
 
     /// **A Save As names somebody else's file**, and the user has already

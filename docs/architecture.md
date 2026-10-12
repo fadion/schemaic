@@ -14256,6 +14256,8 @@ existing prose was left alone.
     block is never offered back. It answers `None` with no `disk` (a tab restored with unsaved edits
     holds none, so there is nothing to compare against) and for a file gone or unreadable, which a
     reload could not load either (`a_file_changed_under_its_tab_is_offered_back`).
+    `report_is_current(bound_path, bound_disk, read_path, read_disk)` is whether that answer, landing
+    later, still describes the tab: the same path, compared exactly, and the same on-disk text.
     **Size is asked before the bytes are.** `open_verdict` confirms past 8 MiB and refuses past 64
     MB, and the reason is the editor rather than the read: `fs::read` and `decode` are cheap even at
     256 MB, while the editor works on the document for as long as it is open. The confirm stood at
@@ -29592,9 +29594,13 @@ existing prose was left alone.
   re-check and with the same false → true test (the effect's own first run is a mount, so a launch
   is not a focus gain), collects every tab holding both a `path` and a `Some` `disk_sql`, and for
   each reads the file on `handle.spawn_blocking` and asks `sqlfile::disk_change`; the answer comes
-  back through `create_ext_action` into `Tab::disk_changed`. **The report is dropped when the tab's
-  `disk_sql` is no longer the one it was compared against** — a tab closed, saved or reloaded
-  while the read was in flight — and it writes the signal only when the value differs, so a file
+  back through `create_ext_action` into `Tab::disk_changed`. **The report is dropped when the tab
+  is no longer bound as it was when the read began** (`sqlfile::report_is_current`): its `path`
+  not the file read, or its `disk_sql` not the text compared against — a tab closed, saved, saved
+  as or reloaded while the read was in flight. The path is asked too because a clean tab's Save As
+  writes the text it already held, and a report from the old file passed the text check and raised
+  "“b.sql” changed on disk" with `a.sql`'s contents
+  (`a_focus_report_is_dropped_once_the_tab_is_bound_otherwise`). It writes the signal only when the value differs, so a file
   changed *back* clears the bar. `write_tab_to`'s and `reload_sql_file`'s success branches clear it
   too, since either makes the file the tab's again. What it does not cover, stated rather than
   implied: a tab restored with unsaved edits (`disk_sql` `None`) is never checked until a save or

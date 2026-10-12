@@ -12378,11 +12378,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         continue;
                     }
                     let expected = disk.clone();
+                    let read_path = path.clone();
                     let report = create_ext_action(cx, move |changed: Option<String>| {
                         // Closed while the read was in flight, or settled since
-                        // by a save or reload: the comparison was against a
-                        // `disk_sql` the tab no longer holds.
-                        if tab.disk_sql.try_get_untracked().flatten() != disk {
+                        // by a save, a Save As or a reload: the comparison was
+                        // against a file or a `disk_sql` the tab no longer holds.
+                        let bound = tab.path.try_get_untracked().flatten();
+                        let bound_disk = tab.disk_sql.try_get_untracked().flatten();
+                        if !schemaic_core::sqlfile::report_is_current(
+                            bound.as_deref(),
+                            bound_disk.as_deref(),
+                            &read_path,
+                            disk.as_deref(),
+                        ) {
                             return;
                         }
                         if tab.disk_changed.try_get_untracked().flatten() != changed {
