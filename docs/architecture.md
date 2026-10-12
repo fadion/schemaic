@@ -22591,11 +22591,16 @@ existing prose was left alone.
     **The modifier going down or up on its own is a key, not a state**: `is_primary_key` (Control;
     Meta only where `PRIMARY_IS_CMD`, through the testable `primary_key_from`) asks about the key,
     since a lone Ctrl's own key-down does not reliably carry Ctrl in its modifiers yet.
-    `primary_key_down()` is the window-wide answer — an `RwSignal<bool>` in a detached-scope
-    `thread_local`, the `widgets::window_size` shape — written by `note_primary_key` only on a
-    change, because a held key repeats its key-down. It exists for the editor's Ctrl+hover
-    underline (`editor_pane.rs`), and is a signal of its own because floem never hands a key to an
-    ancestor of the focused view (*Floem 0.2 gotchas*). `primary_key_tests` pin both platforms.
+    `modifier_keys()` is the window-wide answer — an `RwSignal<HeldModifiers>` (the primary
+    modifier, Shift, Alt) in a detached-scope `thread_local`, the `widgets::window_size` shape —
+    written by `note_modifier_key` only on a change, because a held key repeats its key-down, and
+    corrected by `note_pointer_modifiers` from a pointer's modifiers. It exists for the editor's
+    Ctrl+hover underline (`editor_pane.rs`), and is a signal of its own because floem never hands a
+    key to an ancestor of the focused view (*Floem 0.2 gotchas*). **`opens_link(primary, shift,
+    alt)` is the one Ctrl+click rule** — the primary modifier alone — which the click, the pointer
+    move's underline and the key-driven underline all ask: the last asked Ctrl's own key alone, so
+    Shift-then-Ctrl (how Ctrl+Shift+F starts) drew the link line on a word a Ctrl+Shift click does
+    not open (`shift_or_alt_then_ctrl_opens_no_link`). `primary_key_tests` pin both platforms.
   - `connection_form.rs` — Manage Connections modal + password-mask (+ tests). The form is built
     **once per open** while the list on its left keeps loading a different connection into the same
     `DraftSignals` — so every control the form owns a *separate* signal for has to be synced back
@@ -26475,12 +26480,15 @@ existing prose was left alone.
     nothing beneath. **Pressing or releasing the modifier with
     the pointer still has to move the line too, and no listener on `editor_area` can hear that**:
     floem gives a key to the focused view and then the root, never the ancestors between, and the
-    editor consumes a lone Ctrl. So `shortcuts::primary_key_down` is noted where the key does
+    editor consumes a lone Ctrl. So `shortcuts::modifier_keys` is noted where the key does
     arrive — the editor's own key handler, the root's `KeyDown` (focus elsewhere) and a root
     `KeyUp` (the editor takes no key-ups) — and an effect in each pane re-asks at `link_pointer`
-    when it goes true and clears the line when it goes false. A release while the window is
-    unfocused never arrives, so a pointer move that sees no modifier writes it back to `false`
-    (`shortcuts::note_primary_up`) — otherwise the next press would change nothing and draw nothing.
+    when `opens_link` goes true and clears the line when it goes false, so Shift or Alt held with
+    Ctrl, before or after it, draws nothing. The effect reads a memo of `(primary, opens_link)`,
+    not the signal, so a bare Shift while typing does not re-run it and re-arm a retired tip. A
+    release while the window is unfocused never arrives, so a pointer move corrects it
+    (`shortcuts::note_pointer_modifiers`: Shift and Alt as the pointer reports them, the primary
+    modifier only ever cleared) — otherwise the next press would change nothing and draw nothing.
     **Over the underlined word the pointer is an arrow**, not the I-beam, since the click there
     opens something rather than placing a caret: an effect beside `ctrl_link_view` writes the
     editor's `pointer_cursor` — `CursorStyle::Default` while `ctrl_link` is `Some`, `Text`
@@ -26489,7 +26497,7 @@ existing prose was left alone.
     and `ctrl_link_view` is click-through, so it cannot wear a cursor of its own. **And no hover
     tip while Ctrl is held** — the pointer is hunting for something to open, and a box over the
     text only hides it: the `editor_area` move asks `hover_diag` for nothing while the modifier is
-    down, the effect that follows `primary_key_down` retires a shown or pending tip on the press
+    down, the effect that follows `modifier_keys` retires a shown or pending tip on the press
     and re-arms the delay for the word under the pointer on the release — that call untracked, as
     its word lookup reads `screen_lines` and a scroll re-running it would bring back a tip the
     scroll had just retired.
@@ -36385,7 +36393,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   exactly such a container: the editor `on_event_stop`s every `KeyDown`, a lone Ctrl included, and
   takes no `KeyUp`, which therefore reaches the root alone. A view that has to follow a key it is
   not focused for reads a window-wide signal noted where the key does arrive —
-  `shortcuts::primary_key_down`, written from the editor's key handler and the root's `KeyDown`
+  `shortcuts::modifier_keys`, written from the editor's key handler and the root's `KeyDown`
   and `KeyUp` (see `editor_pane.rs` under *Crates*). `editor_area`'s own `KeyDown` listener, which
   retires the diagnostic tip, is the instance that was already in the tree under a comment
   claiming otherwise.

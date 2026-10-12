@@ -3407,10 +3407,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             KeyInput::Keyboard(key, _) => types_a_character(key, primary_held(mods), mods.alt()),
             _ => false,
         });
-        // A lone Ctrl is consumed here, so the Ctrl+hover underline hears its
-        // press only through this note (`shortcuts::primary_key_down`).
+        // A lone Ctrl (or Shift, or Alt) is consumed here, so the Ctrl+hover
+        // underline hears its press only through this note
+        // (`shortcuts::modifier_keys`).
         if let KeyInput::Keyboard(key, _) = &kp.key {
-            crate::shortcuts::note_primary_key(key, true);
+            crate::shortcuts::note_modifier_key(key, true);
         }
         // Any keypress dismisses the unsafe-run notice (and doesn't execute). The
         // Ctrl+Enter branch below may re-raise it if the run is still unsafe.
@@ -5929,9 +5930,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // definition. floem's own click, which runs first, has put
                 // the caret there already.
                 if pe.button.is_primary()
-                    && primary_held(pe.modifiers)
-                    && !pe.modifiers.alt()
-                    && !pe.modifiers.shift()
+                    && crate::shortcuts::opens_link(
+                        primary_held(pe.modifiers),
+                        pe.modifiers.shift(),
+                        pe.modifiers.alt(),
+                    )
                 {
                     let off = ed_menu.cursor.get_untracked().offset();
                     // A click past the line's end landed on nothing, though
@@ -8171,15 +8174,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 hover_diag((!covered && !held).then_some(pe.pos));
                 link_pointer_move.set((!covered).then_some(pe.pos));
                 // A release the window never heard (it lost focus first) is
-                // corrected by the next move that sees no modifier.
-                if !held {
-                    crate::shortcuts::note_primary_up();
-                }
+                // corrected by the next move.
+                crate::shortcuts::note_pointer_modifiers(pe.modifiers);
                 // The click's own modifier rule: Ctrl+Shift or Ctrl+Alt opens
                 // nothing, so it underlines nothing either.
                 update_ctrl_link(
                     (!covered).then_some(pe.pos),
-                    held && !pe.modifiers.alt() && !pe.modifiers.shift(),
+                    crate::shortcuts::opens_link(held, pe.modifiers.shift(), pe.modifiers.alt()),
                 );
                 // A box selection being dragged: every line between the anchor
                 // and the pointer, across the same columns. After floem's own
@@ -8271,16 +8272,31 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // letting go takes the line away. Not a key listener on `editor_area`:
     // floem hands a key to the focused view and then the root, never to the
     // ancestors between, so a listener here hears nothing —
-    // `shortcuts::primary_key_down` is noted where the key does arrive.
+    // `shortcuts::modifier_keys` is noted where the key does arrive.
+    //
+    // Through a memo of the two answers it acts on: Shift and Alt are in that
+    // signal too, and a bare Shift pressed while typing must not re-run this
+    // and re-arm the hover tip the key-down just retired.
+    let link_keys = create_memo(move |_| {
+        let held = crate::shortcuts::modifier_keys().get();
+        (held.primary, held.opens_link())
+    });
     create_effect(move |_| {
         // The hover tip follows it the other way: Ctrl takes a shown tip away
         // (and cancels a pending one), and letting go starts the delay afresh
         // for whatever is under the pointer — untracked: its word lookup reads
         // `screen_lines`, and a scroll re-running this would re-arm the tip
         // the scroll just retired.
-        if crate::shortcuts::primary_key_down().get() {
+        let (primary, opens) = link_keys.get();
+        if primary {
             hover_diag(None);
-            update_ctrl_link(link_pointer.get(), true);
+            // The click's rule, not Ctrl alone: Shift or Alt held with it
+            // opens nothing, so it underlines nothing.
+            if opens {
+                update_ctrl_link(link_pointer.get(), true);
+            } else {
+                update_ctrl_link(None, false);
+            }
         } else {
             let p = link_pointer.get();
             floem::reactive::untrack(|| hover_diag(p));

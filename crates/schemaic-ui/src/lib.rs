@@ -7455,7 +7455,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             if let Event::KeyDown(ke) = e {
                 let m = ke.modifiers;
                 // Focus outside the SQL editor: its Ctrl press lands here.
-                shortcuts::note_primary_key(&ke.key.logical_key, true);
+                shortcuts::note_modifier_key(&ke.key.logical_key, true);
                 // Escape closing a control's popup has to be answered here, and
                 // only here: the popup takes the keyboard itself, so neither the
                 // control that owns it nor the modal around it is the focused
@@ -7614,10 +7614,10 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         })
         // A key-up nothing focused answers lands here — the SQL editor does not
         // take key-ups — so this is where the editor's Ctrl+hover underline
-        // hears Ctrl let go (`shortcuts::primary_key_down`).
+        // hears Ctrl, Shift or Alt let go (`shortcuts::modifier_keys`).
         .on_event_cont(EventListener::KeyUp, |e| {
             if let Event::KeyUp(ke) = e {
-                shortcuts::note_primary_key(&ke.key.logical_key, false);
+                shortcuts::note_modifier_key(&ke.key.logical_key, false);
             }
         })
         .style(|s| s.size_full())

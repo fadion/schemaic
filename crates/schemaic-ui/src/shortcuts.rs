@@ -321,13 +321,65 @@ fn primary_key_from(key: &floem::keyboard::Key, primary_is_cmd: bool) -> bool {
 }
 
 thread_local! {
-    static PRIMARY_DOWN: std::cell::RefCell<
-        Option<(floem::reactive::RwSignal<bool>, floem::reactive::Scope)>,
+    static HELD_KEYS: std::cell::RefCell<
+        Option<(floem::reactive::RwSignal<HeldModifiers>, floem::reactive::Scope)>,
     > = const { std::cell::RefCell::new(None) };
 }
 
-/// Whether the primary modifier is down, as its own key events last said —
-/// window-wide, in a detached scope like `widgets::window_size`.
+/// Does a press with these modifiers open what the name under the pointer
+/// names? The primary modifier alone: Ctrl+Shift and Ctrl+Alt are other
+/// shortcuts' chords. **The one rule** the Ctrl+click, the pointer-move
+/// underline and the key-driven underline all ask, so the line is never drawn
+/// on a word a click with the same keys would not open.
+pub(crate) fn opens_link(primary: bool, shift: bool, alt: bool) -> bool {
+    primary && !shift && !alt
+}
+
+/// The modifier keys held, as their own key events last said.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeldModifiers {
+    pub primary: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+impl HeldModifiers {
+    /// [`opens_link`] over what is held.
+    pub(crate) fn opens_link(self) -> bool {
+        opens_link(self.primary, self.shift, self.alt)
+    }
+
+    /// After `key` went `down` (or up): the primary modifier, Shift or Alt
+    /// recorded, any other key left alone.
+    fn noted(self, key: &floem::keyboard::Key, down: bool) -> Self {
+        use floem::keyboard::{Key, NamedKey};
+        let mut next = self;
+        if is_primary_key(key) {
+            next.primary = down;
+        }
+        match key {
+            Key::Named(NamedKey::Shift) => next.shift = down,
+            Key::Named(NamedKey::Alt | NamedKey::AltGraph) => next.alt = down,
+            _ => {}
+        }
+        next
+    }
+
+    /// Corrected by a pointer event's modifiers — the repair for a key-up that
+    /// went to another window. The primary modifier is only ever cleared here
+    /// (a lone Ctrl's state is the key events'); Shift and Alt are taken as the
+    /// pointer reports them.
+    fn seen_by_pointer(self, mods: Modifiers) -> Self {
+        HeldModifiers {
+            primary: self.primary && primary_held(mods),
+            shift: mods.shift(),
+            alt: mods.alt(),
+        }
+    }
+}
+
+/// The modifier keys held, as their own key events last said — window-wide, in
+/// a detached scope like `widgets::window_size`.
 ///
 /// **Its own signal because floem delivers a key only to the focused view and
 /// then to the root view's listeners**, never to the ancestors between: a
@@ -335,46 +387,109 @@ thread_local! {
 /// consumes it), and its release, which nothing focused answers, reaches only
 /// the root. The editor's Ctrl+hover underline has to hear both, so the three
 /// places a key arrives — the editor's key handler, the root's `KeyDown` and its
-/// `KeyUp` — note it here ([`note_primary_key`]) and each pane reads it. A
-/// release while the window is not focused never arrives; a pointer move that
-/// sees no modifier corrects it ([`note_primary_up`]).
-pub(crate) fn primary_key_down() -> floem::reactive::RwSignal<bool> {
-    PRIMARY_DOWN.with(|cell| {
+/// `KeyUp` — note it here ([`note_modifier_key`]) and each pane reads it. A
+/// release while the window is not focused never arrives; a pointer move
+/// corrects it ([`note_pointer_modifiers`]).
+///
+/// **Shift and Alt are held here too**, not only the primary modifier: the
+/// key-driven underline drew on Ctrl's own press, and Shift-then-Ctrl — how
+/// Ctrl+Shift+F starts — underlined a word a Ctrl+Shift click does not open.
+pub(crate) fn modifier_keys() -> floem::reactive::RwSignal<HeldModifiers> {
+    HELD_KEYS.with(|cell| {
         if cell.borrow().is_none() {
             let scope = floem::reactive::Scope::new();
-            let sig = scope.create_rw_signal(false);
+            let sig = scope.create_rw_signal(HeldModifiers::default());
             *cell.borrow_mut() = Some((sig, scope));
         }
         cell.borrow().as_ref().unwrap().0
     })
 }
 
-/// Record a key event in [`primary_key_down`] if `key` is the primary
-/// modifier. A held key repeats its key-down, so only a change is written.
-pub(crate) fn note_primary_key(key: &floem::keyboard::Key, down: bool) {
+/// Record a key event in [`modifier_keys`] if `key` is the primary modifier,
+/// Shift or Alt. A held key repeats its key-down, so only a change is written.
+pub(crate) fn note_modifier_key(key: &floem::keyboard::Key, down: bool) {
     use floem::reactive::{SignalGet, SignalUpdate};
-    if is_primary_key(key) {
-        let sig = primary_key_down();
-        if sig.get_untracked() != down {
-            sig.set(down);
-        }
+    let sig = modifier_keys();
+    let now = sig.get_untracked();
+    let next = now.noted(key, down);
+    if next != now {
+        sig.set(next);
     }
 }
 
-/// Record that the primary modifier is up, from a pointer event whose
-/// modifiers say so — the repair for a key-up that went to another window.
-pub(crate) fn note_primary_up() {
+/// Correct [`modifier_keys`] from a pointer event's modifiers
+/// ([`HeldModifiers::seen_by_pointer`]).
+pub(crate) fn note_pointer_modifiers(mods: Modifiers) {
     use floem::reactive::{SignalGet, SignalUpdate};
-    let sig = primary_key_down();
-    if sig.get_untracked() {
-        sig.set(false);
+    let sig = modifier_keys();
+    let now = sig.get_untracked();
+    let next = now.seen_by_pointer(mods);
+    if next != now {
+        sig.set(next);
     }
 }
 
 #[cfg(test)]
 mod primary_key_tests {
-    use super::primary_key_from;
-    use floem::keyboard::{Key, NamedKey};
+    use super::{HeldModifiers, opens_link, primary_key_from};
+    use floem::keyboard::{Key, NamedKey, Modifiers};
+
+    /// The keys noted in order, from nothing held.
+    fn after(keys: &[(NamedKey, bool)]) -> HeldModifiers {
+        keys.iter().fold(HeldModifiers::default(), |h, (k, down)| {
+            h.noted(&Key::Named(*k), *down)
+        })
+    }
+
+    /// **Shift (or Alt) then Ctrl underlines nothing**, as a click with those
+    /// keys opens nothing — the key-driven underline asked the primary key
+    /// alone, so starting Ctrl+Shift+F over a name drew the link line on it.
+    #[test]
+    fn shift_or_alt_then_ctrl_opens_no_link() {
+        assert!(after(&[(NamedKey::Control, true)]).opens_link());
+        assert!(!after(&[(NamedKey::Shift, true), (NamedKey::Control, true)]).opens_link());
+        assert!(!after(&[(NamedKey::Alt, true), (NamedKey::Control, true)]).opens_link());
+        // Shift added after Ctrl takes the line away, and letting it go
+        // brings it back.
+        assert!(!after(&[(NamedKey::Control, true), (NamedKey::Shift, true)]).opens_link());
+        assert!(
+            after(&[
+                (NamedKey::Control, true),
+                (NamedKey::Shift, true),
+                (NamedKey::Shift, false),
+            ])
+            .opens_link()
+        );
+        assert!(!after(&[(NamedKey::Control, true), (NamedKey::Control, false)]).opens_link());
+        // The rule itself, as the click asks it.
+        assert!(opens_link(true, false, false));
+        assert!(!opens_link(true, true, false));
+        assert!(!opens_link(true, false, true));
+        assert!(!opens_link(false, false, false));
+    }
+
+    /// A pointer move repairs a key-up the window never heard: Shift and Alt
+    /// as it reports them, the primary key only ever cleared.
+    #[test]
+    fn a_pointer_move_corrects_a_missed_release() {
+        let stuck = after(&[(NamedKey::Control, true), (NamedKey::Shift, true)]);
+        let seen = stuck.seen_by_pointer(Modifiers::CONTROL);
+        assert_eq!(
+            seen,
+            HeldModifiers {
+                primary: true,
+                shift: false,
+                alt: false
+            }
+        );
+        assert!(!seen.seen_by_pointer(Modifiers::empty()).primary);
+        assert!(
+            !HeldModifiers::default()
+                .seen_by_pointer(Modifiers::CONTROL)
+                .primary,
+            "a pointer never sets the primary key"
+        );
+    }
 
     #[test]
     fn control_is_the_primary_key_everywhere() {
