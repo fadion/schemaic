@@ -37660,19 +37660,28 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   when *Rename alias* opened its dialog both were queued in one pass and fired in floem's arbitrary
   timer order: when the restore won, the dialog's field never had the keyboard and what was typed
   into it — Backspace, `i`, Enter, seen in the window — edited the query behind the modal.
-  **The stand-down is `menu_return`'s, and it compares roots rather than asking whether one is
-  mounted.** `menu_return` notes `innermost_focus_root()` when the return is *built* — as the menu
-  is armed, before its own panel's root registers — and the timer restores only if the same root
-  is innermost when it lands (`widgets::restore_stands`, pinned by `restore_stands_tests`). A modal
-  an entry opened is on top by then, so the return stands down whichever timer runs first; a menu
-  opened *inside* a modal — the settings pickers' — was armed under that modal and closes under it,
-  so it still restores to the control it came from. The editor used to carry the check itself, as
+  **The stand-down is `menu_return`'s, and it asks whether a root newer than the return is
+  mounted.** Every `focus_root` registers under a rising sequence number (`FOCUS_SEQ`);
+  `menu_return` notes the last one handed out when the return is *built* (`focus_root_mark`), and
+  the timer restores only if no root mounted when it lands is numbered past that mark
+  (`widgets::restore_stands` over `newest_root_seq`, pinned by `restore_stands_tests`, which drive
+  the registry rather than hand-picked values). A modal an entry opened is newer, so the return
+  stands down whichever timer runs first; a menu opened *inside* a modal — the settings pickers' —
+  closes with only that older modal up, so it still restores to the control it came from. **It
+  compared ids once, and that was a regression**: it noted the innermost root's id at arming and
+  restored only if the same id was innermost at landing. A root leaves the list only in its
+  cleanup, which a `dyn_container` runs on a queued update, so a menu panel closed in the handler
+  that armed a return was still innermost then. *Rename alias* / *Rename CTE* build their `back`
+  inside the entry's action, before the menu closes, and a second right-click arms while the first
+  panel is still registered — in both, the captured id was the since-closed panel's, nothing ever
+  matched it, and the editor never got the keyboard back
+  (`a_return_armed_under_a_since_closed_menu_restores`). The editor used to carry the check itself, as
   `innermost_focus_root().is_none()`, and kept it out of `menu_return` on purpose, because that
   question would have stranded the settings pickers. Kept local, it covered the one menu that had
   been seen to race: the schema tree's return had no guard, and it took the keyboard back from
   every modal its entries open — the Trigger editor, Edit table, Live monitor, ER diagram, Export,
   Import — leaving each deaf to Escape until it was clicked (GitHub #15). The grid toolbar's
-  keyboard-only returns were exposed the same way. Comparing against the armed-under root answers
+  keyboard-only returns were exposed the same way. Asking for a root newer than the arming answers
   both cases, so the editor's guard is gone, subsumed.
   Standing down leaves the editor with nothing to come back to once the dialog closes — its root's
   own hand-back finds no other root — so the dialog carries its own return

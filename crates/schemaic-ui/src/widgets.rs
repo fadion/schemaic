@@ -41,8 +41,14 @@ use crate::{icons, theme};
 // the designer), and `retain` rather than `pop` because they don't always unmount
 // innermost-first.
 thread_local! {
-    static FOCUS_ROOTS: std::cell::RefCell<Vec<(floem::ViewId, Option<FocusRing>)>> =
+    /// Each mounted root with its ring and its registration's sequence number
+    /// (see [`FOCUS_SEQ`]).
+    static FOCUS_ROOTS: std::cell::RefCell<Vec<(floem::ViewId, Option<FocusRing>, u64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// How many [`focus_root`]s have ever registered — the sequence number the
+    /// next one takes. What [`menu_return`] arms by: a root numbered past the
+    /// mark it took is one an entry opened.
+    static FOCUS_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Where the keyboard goes when a focused control disappears and there is **no
     /// overlay above it** — see [`set_keyboard_home`].
     static KEYBOARD_HOME: std::cell::RefCell<Option<Rc<dyn Fn()>>> =
@@ -328,12 +334,12 @@ pub(crate) fn focus_root<V: IntoView + 'static>(view: V) -> V::V {
 fn focus_root_inner<V: IntoView + 'static>(view: V, ring: Option<FocusRing>) -> V::V {
     let view = view.into_view();
     let id = view.id();
-    FOCUS_ROOTS.with_borrow_mut(|s| s.push((id, ring)));
+    register_root_entry(id, ring);
     let view = takes_pointer_focus(view);
     view.keyboard_navigable()
         .request_focus(|| {})
         .on_cleanup(move || {
-            FOCUS_ROOTS.with_borrow_mut(|s| s.retain(|(x, _)| *x != id));
+            unregister_root_entry(id);
             // A root has no place in a ring, so there is nothing to remember —
             // the ring it *carried* went with it.
             //
@@ -408,7 +414,30 @@ pub(crate) fn dismiss_layer(dismiss: impl Fn() + 'static) -> impl IntoView {
 /// The innermost mounted [`focus_root`], or `None` when no overlay is open (a
 /// field in the main workspace then simply drops focus on Escape).
 pub(crate) fn innermost_focus_root() -> Option<floem::ViewId> {
-    FOCUS_ROOTS.with_borrow(|s| s.last().map(|(id, _)| *id))
+    FOCUS_ROOTS.with_borrow(|s| s.last().map(|(id, ..)| *id))
+}
+
+/// Put `id` on the mounted-roots list under the next sequence number.
+fn register_root_entry(id: floem::ViewId, ring: Option<FocusRing>) {
+    let seq = FOCUS_SEQ.get() + 1;
+    FOCUS_SEQ.set(seq);
+    FOCUS_ROOTS.with_borrow_mut(|s| s.push((id, ring, seq)));
+}
+
+/// Take `id` off the mounted-roots list, wherever it sits in it.
+fn unregister_root_entry(id: floem::ViewId) {
+    FOCUS_ROOTS.with_borrow_mut(|s| s.retain(|(x, ..)| *x != id));
+}
+
+/// The mark [`menu_return`] arms by: the sequence number of the last root to
+/// register, mounted or not.
+fn focus_root_mark() -> u64 {
+    FOCUS_SEQ.get()
+}
+
+/// The highest sequence number among the roots mounted now, `None` with none.
+fn newest_root_seq() -> Option<u64> {
+    FOCUS_ROOTS.with_borrow(|s| s.iter().map(|(.., seq)| *seq).max())
 }
 
 /// The innermost mounted overlay that **has** a [`FocusRing`], as
@@ -430,7 +459,7 @@ pub(crate) fn innermost_ring_root() -> Option<(floem::ViewId, FocusRing)> {
     FOCUS_ROOTS.with_borrow(|s| {
         s.iter()
             .rev()
-            .find_map(|(id, r)| r.clone().map(|r| (*id, r)))
+            .find_map(|(id, r, _)| r.clone().map(|r| (*id, r)))
     })
 }
 
@@ -4529,21 +4558,31 @@ pub(crate) fn reclaim_focus_at(ring: &FocusRing, tabindex: u32) {
 /// property `claim_keyboard`'s own doc describes — "the race is settled either
 /// way round" — applied at the sites that had not applied it.
 ///
-/// **And it stands down if an entry opened a modal.** The innermost focus root
-/// is noted when the return is built — as the menu is armed, before its own
-/// panel registers — and the restore runs only if the same root is innermost
-/// when it lands ([`restore_stands`]). An entry that opened a modal (the schema
-/// tree's Triggers, Edit table, Live monitor, ER diagram, Export, Import) has
-/// put a root on top by then, and taking the keyboard back to the tree left the
-/// modal mounted with no focus, so its Escape never fired until something in it
-/// was clicked (issue #15). A menu opened inside a modal closes under the same
-/// root it was armed under, so its return still runs.
+/// **And it stands down if an entry opened a modal.** Every root registers
+/// under a rising sequence number; the return notes the last one handed out
+/// when it is built, and the restore runs only if no root registered **since**
+/// is still mounted when it lands ([`restore_stands`]). An entry that opened a
+/// modal (the schema tree's Triggers, Edit table, Live monitor, ER diagram,
+/// Export, Import) has put a newer root up by then, and taking the keyboard
+/// back to the tree left the modal mounted with no focus, so its Escape never
+/// fired until something in it was clicked (issue #15). A menu opened inside a
+/// modal closes with only older roots up, so its return still runs.
+///
+/// **Newer, not different.** It compared the innermost root's *id* at arming
+/// with the innermost at landing, and a root leaves the list only in its
+/// cleanup, which a `dyn_container` runs on a queued update — so a menu panel
+/// closed in the very handler that armed a return was still the innermost
+/// root then, and its id was captured. The editor's *Rename alias* / *Rename
+/// CTE* build their return inside the entry's action, before the menu closes;
+/// a second right-click arms one while the first panel is still registered.
+/// By landing that panel is gone, the ids never matched, and the editor never
+/// got the keyboard back — the failure b3f8a94d had fixed.
 pub(crate) fn menu_return(restore: impl Fn() + Clone + 'static) -> Rc<dyn Fn()> {
-    let armed_under = innermost_focus_root();
+    let armed = focus_root_mark();
     Rc::new(move || {
         let restore = restore.clone();
         floem::action::exec_after(std::time::Duration::ZERO, move |_| {
-            if !restore_stands(armed_under, innermost_focus_root()) {
+            if !restore_stands(armed, newest_root_seq()) {
                 return;
             }
             claim_keyboard();
@@ -4552,12 +4591,12 @@ pub(crate) fn menu_return(restore: impl Fn() + Clone + 'static) -> Rc<dyn Fn()> 
     })
 }
 
-/// Does a menu's focus return still apply when it lands? Only when the
-/// innermost focus root is the one the menu was armed under (`armed_under`);
-/// another on top means an entry opened a modal, which owns the keyboard now.
-/// See [`menu_return`].
-fn restore_stands<T: PartialEq>(armed_under: Option<T>, now: Option<T>) -> bool {
-    armed_under == now
+/// Does a menu's focus return still apply when it lands? Only when no root
+/// mounted now (`newest`, the highest mounted sequence number) registered after
+/// the return was armed at mark `armed`; a newer one means an entry opened a
+/// modal, which owns the keyboard now. See [`menu_return`].
+fn restore_stands(armed: u64, newest: Option<u64>) -> bool {
+    newest.is_none_or(|seq| seq <= armed)
 }
 
 fn take_menu_return() -> Option<Rc<dyn Fn()>> {
@@ -6976,33 +7015,106 @@ mod cap_below_tests {
 /// another focus root on top (issue #15).
 #[cfg(test)]
 mod restore_stands_tests {
-    use super::restore_stands;
+    use super::{
+        focus_root_mark, newest_root_seq, register_root_entry, restore_stands,
+        unregister_root_entry,
+    };
 
-    /// A menu in the main workspace (no root) closes with no root mounted:
-    /// focus goes back where it was.
+    /// Mount a root as `focus_root` does, without a view.
+    fn mount() -> floem::ViewId {
+        let id = floem::ViewId::new();
+        register_root_entry(id, None);
+        id
+    }
+
+    /// Whether a return armed at `armed` would restore now, as it lands.
+    fn lands(armed: u64) -> bool {
+        restore_stands(armed, newest_root_seq())
+    }
+
+    /// A menu in the main workspace closes with nothing opened: focus goes
+    /// back where it was. Its own panel registers after the arming.
     #[test]
     fn a_workspace_menu_that_opened_nothing_restores() {
-        assert!(restore_stands::<u32>(None, None));
+        let armed = focus_root_mark();
+        let panel = mount();
+        unregister_root_entry(panel);
+        assert!(lands(armed));
     }
 
     /// **The issue #15 case.** The schema tree's menu, armed with no modal up,
     /// lands after an entry mounted one: the modal keeps the keyboard.
     #[test]
     fn a_workspace_menu_that_opened_a_modal_stands_down() {
-        assert!(!restore_stands(None, Some(7_u32)));
+        let armed = focus_root_mark();
+        let panel = mount();
+        let modal = mount();
+        unregister_root_entry(panel);
+        assert!(!lands(armed));
+        unregister_root_entry(modal);
     }
 
     /// A settings picker's menu, armed inside the settings modal, closes under
     /// that same modal: its return still runs.
     #[test]
     fn a_menu_inside_a_modal_restores_within_it() {
-        assert!(restore_stands(Some(3_u32), Some(3)));
+        let settings = mount();
+        let armed = focus_root_mark();
+        let panel = mount();
+        unregister_root_entry(panel);
+        assert!(lands(armed));
+        unregister_root_entry(settings);
     }
 
     /// An entry of a menu inside a modal that opened a second modal over it.
     #[test]
     fn a_menu_inside_a_modal_that_opened_another_stands_down() {
-        assert!(!restore_stands(Some(3_u32), Some(9)));
+        let settings = mount();
+        let armed = focus_root_mark();
+        let panel = mount();
+        let second = mount();
+        unregister_root_entry(panel);
+        assert!(!lands(armed));
+        unregister_root_entry(second);
+        unregister_root_entry(settings);
+    }
+
+    /// **Armed while the menu's own panel was still registered** — *Rename
+    /// alias* builds its return inside the entry's action, before the menu
+    /// closes, and a second right-click arms while the first panel is still
+    /// up. The panel is gone by landing and nothing newer is mounted, so the
+    /// editor gets the keyboard back. Comparing the innermost root's id at
+    /// arming (the panel) with the one at landing (none) stood down here.
+    #[test]
+    fn a_return_armed_under_a_since_closed_menu_restores() {
+        let panel = mount();
+        let armed = focus_root_mark();
+        unregister_root_entry(panel);
+        assert!(lands(armed));
+        // The rename dialog it opened, closed again before the return lands.
+        let panel = mount();
+        let armed = focus_root_mark();
+        let dialog = mount();
+        unregister_root_entry(panel);
+        unregister_root_entry(dialog);
+        assert!(lands(armed));
+        // The second right-click: armed over the old panel, under the new one.
+        let old = mount();
+        let armed = focus_root_mark();
+        let new = mount();
+        unregister_root_entry(old);
+        unregister_root_entry(new);
+        assert!(lands(armed));
+    }
+
+    /// The rule itself, for the record: only a root numbered past the mark
+    /// stands the return down.
+    #[test]
+    fn only_a_newer_root_stands_a_return_down() {
+        assert!(restore_stands(5, None));
+        assert!(restore_stands(5, Some(5)));
+        assert!(restore_stands(5, Some(2)));
+        assert!(!restore_stands(5, Some(6)));
     }
 }
 
