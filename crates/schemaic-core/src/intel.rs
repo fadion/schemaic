@@ -12764,8 +12764,7 @@ pub fn definition_at(sql: &str, caret: usize, dialect: SqlDialect) -> Option<(us
     // is found and shadows an outer one; the leading `WITH`'s token walk
     // below where it does not.
     if let Some(ast) = ast {
-        return alias_refs::cte_definition(stmt, lo, ast, name, toks[at].quoted, caret)
-            .filter(|&def| !on(def));
+        return alias_refs::cte_definition(stmt, lo, ast, caret).filter(|&def| !on(def));
     }
     let def = cte_name_tokens(&toks).into_iter().find(|d| match &d.kind {
         TkKind::Word(w) if d.quoted || toks[at].quoted => w == name,
@@ -12959,7 +12958,7 @@ mod alias_refs {
     use sqlparser::ast::{
         AssignmentTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
         Query, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement,
-        TableFactor, Visit, Visitor,
+        TableFactor, TableObject, Visit, Visitor,
     };
 
     use super::colres::to_range;
@@ -13236,24 +13235,31 @@ mod alias_refs {
         Some(all.into_iter().map(|r| unquoted(stmt, lo, r)).collect())
     }
 
-    /// [`super::definition_at`]'s CTE half over the tree: the CTE called
-    /// `name` that a reference at `caret` binds to ([`Ctes::bound`]) — the
-    /// innermost declaring query, so one declared inside a subquery is found
-    /// and shadows an outer one there, and a later sibling is out of an
-    /// earlier one's reach. The same walk *Rename CTE* binds by, so the jump
-    /// and the rename cannot disagree about what a name names. Its name's
-    /// range, quotes off.
+    /// [`super::definition_at`]'s CTE half over the tree: the CTE a table
+    /// reference at `caret` binds to ([`Ctes::bound`]) — the innermost
+    /// declaring query, so one declared inside a subquery is found and shadows
+    /// an outer one there, and a later sibling is out of an earlier one's
+    /// reach — or, for a qualifier, the one [`cte_spans`] binds it to. The same
+    /// walk *Rename CTE* binds by, so the jump and the rename cannot disagree
+    /// about what a name names: a bare word that is no table reference (a
+    /// column sharing the CTE's name) is not the CTE. Its name's range, quotes
+    /// off.
     pub(super) fn cte_definition(
         stmt: &str,
         lo: usize,
         ast: &Statement,
-        name: &str,
-        quoted: bool,
         caret: usize,
     ) -> Option<(usize, usize)> {
         let c = Ctes::of(stmt, lo, ast);
-        let d = c.bound(name, quoted, (caret, caret))?;
-        Some(unquoted(stmt, lo, c.decls[d].at))
+        let on = |r: &Span| r.0 <= caret && caret <= r.1;
+        if let Some(r) = c.refs.iter().find(|r| on(&r.at)) {
+            let d = r.single.then(|| c.bound(&r.name, r.quoted, r.at)).flatten()?;
+            return Some(unquoted(stmt, lo, c.decls[d].at));
+        }
+        let (def, all) = cte_spans(stmt, lo, ast, caret)?;
+        all.iter()
+            .any(on)
+            .then(|| unquoted(stmt, lo, def))
     }
 
     /// Do two names name the same thing? A quoted one on either side is that
@@ -13297,12 +13303,55 @@ mod alias_refs {
         lo: usize,
         decls: Vec<CteDecl>,
         refs: Vec<CteRef>,
+        /// One-part names that may be a CTE and are no table factor — an
+        /// `INSERT`'s target (T-SQL inserts through a CTE; PostgreSQL's names
+        /// a real table), a `TABLE c` — folded, with where they stand (the
+        /// enclosing query's range for `TABLE`, which carries no span). The
+        /// walk cannot bind them, so *Rename CTE* refuses a CTE one may name
+        /// rather than leave it under the old name.
+        blind: Vec<(String, Span)>,
     }
 
     impl Visitor for Ctes<'_> {
         type Break = ();
 
+        fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
+            if let Statement::Insert(ins) = s
+                && let TableObject::TableName(name) = &ins.table
+                && let [part] = name.0.as_slice()
+                && let Some(id) = part.as_ident()
+            {
+                self.blind.push((
+                    id.value.to_ascii_lowercase(),
+                    to_range(self.stmt, self.lo, id.span),
+                ));
+            }
+            ControlFlow::Continue(())
+        }
+
         fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            // `TABLE c` anywhere in this query's own set operation; a nested
+            // query is visited on its own.
+            fn tables(e: &SetExpr, out: &mut Vec<String>) {
+                match e {
+                    SetExpr::Table(t) if t.schema_name.is_none() => {
+                        if let Some(n) = &t.table_name {
+                            out.push(n.trim_matches(['"', '`', '[', ']']).to_ascii_lowercase());
+                        }
+                    }
+                    SetExpr::SetOperation { left, right, .. } => {
+                        tables(left, out);
+                        tables(right, out);
+                    }
+                    _ => {}
+                }
+            }
+            let mut named = Vec::new();
+            tables(&q.body, &mut named);
+            if !named.is_empty() {
+                let at = to_range(self.stmt, self.lo, q.span());
+                self.blind.extend(named.into_iter().map(|n| (n, at)));
+            }
             if let Some(with) = &q.with {
                 let mut scope = to_range(self.stmt, self.lo, q.span());
                 let first = self.decls.len();
@@ -13351,6 +13400,7 @@ mod alias_refs {
                 lo,
                 decls: Vec::new(),
                 refs: Vec::new(),
+                blind: Vec::new(),
             };
             let _ = ast.visit(&mut c);
             c
@@ -13447,6 +13497,7 @@ mod alias_refs {
         }) || w
             .bare
             .iter()
+            .chain(&c.blind)
             .any(|(n, r)| *n == folded && d.scope.0 <= r.0 && r.1 <= d.scope.1)
         {
             return None;
@@ -28651,11 +28702,80 @@ mod tests {
         );
     }
 
+    /// **A name the walk cannot see as a reference refuses the rename** rather
+    /// than half-applying it: a T-SQL `INSERT INTO cte` and a `TABLE cte` are
+    /// no table factor, so the walk missed them before and after the rename
+    /// alike, and the re-binding check could not notice — `INSERT INTO d` was
+    /// left naming the old CTE, or a real table `d`.
+    #[test]
+    fn a_cte_rename_refuses_a_reference_it_cannot_see() {
+        assert_eq!(
+            cte_renamed(
+                "WITH d| AS (SELECT id FROM employees) INSERT INTO d (id) VALUES (1)",
+                "dd",
+                SqlDialect::MsSql
+            ),
+            Err(AliasRenameRefusal::NoAlias)
+        );
+        assert_eq!(
+            cte_renamed(
+                "WITH c| AS (SELECT 1 AS n) SELECT * FROM c UNION TABLE c",
+                "dd",
+                SqlDialect::Postgres
+            ),
+            Err(AliasRenameRefusal::NoAlias)
+        );
+        // An insert into another name, and a `TABLE` of another, still rename.
+        assert_eq!(
+            cte_renamed(
+                "WITH d| AS (SELECT id FROM employees) INSERT INTO t (id) SELECT id FROM d",
+                "dd",
+                SqlDialect::MsSql
+            )
+            .unwrap(),
+            "WITH dd| AS (SELECT id FROM employees) INSERT INTO t (id) SELECT id FROM dd"
+        );
+        assert!(
+            cte_renamed(
+                "WITH c| AS (SELECT 1 AS n) SELECT * FROM c UNION TABLE t",
+                "dd",
+                SqlDialect::Postgres
+            )
+            .is_ok()
+        );
+    }
+
     /// Ctrl+click's jump: the text a `|`-marked reference's definition spans.
     fn defined(sql: &str) -> Option<String> {
         let caret = sql.find('|').unwrap();
         let sql = sql.replace('|', "");
         definition_at(&sql, caret, SqlDialect::MySql).map(|(a, b)| format!("{}@{a}", &sql[a..b]))
+    }
+
+    /// **A bare column sharing a CTE's name is not the CTE.** The jump bound
+    /// any word by name and scope, so a select-list `name` — `employees.name`
+    /// here — jumped to the CTE `name`, the one ambiguity *Rename CTE* refuses
+    /// for exactly that reason. Only a table reference, or a qualifier through
+    /// the CTE, leads to it.
+    #[test]
+    fn a_bare_column_named_like_a_cte_does_not_jump_to_it() {
+        let sql = "WITH name AS (SELECT 1 AS x) \
+                   SELECT e.id, na|me FROM employees e WHERE e.id IN (SELECT x FROM name)";
+        assert_eq!(defined(sql), None);
+        assert_eq!(
+            defined("WITH n AS (SELECT 1 AS n) SELECT n| FROM n"),
+            None,
+            "the column `n`"
+        );
+        // The table reference and a qualifier still lead to it.
+        assert_eq!(
+            defined("WITH n AS (SELECT 1 AS n) SELECT n FROM n|").as_deref(),
+            Some("n@5")
+        );
+        assert_eq!(
+            defined("WITH c AS (SELECT 1 AS k) SELECT c|.k FROM c").as_deref(),
+            Some("c@5")
+        );
     }
 
     /// A table alias, a derived table's and a CTE's reference each lead to

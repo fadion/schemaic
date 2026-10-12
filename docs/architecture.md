@@ -2829,8 +2829,12 @@ existing prose was left alone.
     `alias_name_at` reads — so a derived table's alias is found as a table's is, and a subquery's
     shadowing `o` is the one a click inside it reaches. Where that walk finds no alias, a CTE is
     looked up **by scope** where the statement parses — `alias_refs::cte_definition`, which is
-    *Rename CTE*'s `Ctes::bound` (below) at the caret: the innermost query holding it that declares
-    the name, where the CTE is visible — so a CTE a subquery declares is
+    *Rename CTE*'s `Ctes::bound` (below) at a one-part table reference under the caret, and
+    `cte_spans`' answer at a qualifier: the innermost query holding it that declares
+    the name, where the CTE is visible. **A bare word that is no table reference is never the CTE** —
+    a select-list `name` sharing a CTE's name is a column, the ambiguity *Rename CTE* refuses; the
+    jump once bound any word by name and scope and led there
+    (`a_bare_column_named_like_a_cte_does_not_jump_to_it`). So a CTE a subquery declares is
     found, and shadows an outer one of the same name inside it while the outer one still answers
     outside (`a_cte_declared_inside_a_subquery_is_found_by_scope`; only the leading `WITH` was read
     before, so a nested one led nowhere and a shadowing one led to the outer). Where the statement
@@ -2857,7 +2861,11 @@ existing prose was left alone.
     query exposing an unaliased table of that name exposes a one-part reference bound to it. It is
     `None` — not offered — on anything not bound to a CTE, where the CTE's own `WITH` declares the
     name twice, and where a bare identifier of its name stands in its scope: a column or
-    PostgreSQL's whole row, which, as with an alias, no walk tells apart. **The capture check is a
+    PostgreSQL's whole row, which, as with an alias, no walk tells apart. **So is a name the walk
+    cannot bind** (`Ctes::blind`): a one-part `INSERT` target — T-SQL inserts through a CTE,
+    PostgreSQL's target is a real table — and a `TABLE c`, neither a table factor. Missed before and
+    after the rename alike, the re-binding below could not notice them, and `INSERT INTO d` was left
+    under the old name (`a_cte_rename_refuses_a_reference_it_cannot_see`). **The capture check is a
     re-binding, not a list of cases**: `cte_rename` writes the renamed statement, parses it, runs
     `cte_spans` again at the moved declaration, and stands only if exactly the moved ranges come
     back. A name that is a table the statement reads, a sibling CTE, an alias a qualifier would bind
@@ -2866,7 +2874,7 @@ existing prose was left alone.
     `a_cte_rename_refuses_a_capturing_name` — neither could fail first, the functions not existing).
     The refusals' `message`s are worded for either rename: `NoAlias` says *There is nothing here to
     rename any more.*, `Empty` *Give it a name.* **Ctrl+click binds through the same `Ctes`**:
-    `cte_definition` is `Ctes::bound` at the caret, so the jump and the rename cannot disagree
+    `cte_definition` is `Ctes::bound` at a reference and `cte_spans` at a qualifier, so the jump and the rename cannot disagree
     about what a name names. Names compare by `same_name` — a quoted one on either side exactly, a
     bare pair ASCII-case-insensitively — so on PostgreSQL, where `WITH "C"` and `FROM c` name two
     things, the rename takes only the first; it once lowercased every name in a second visitor,
