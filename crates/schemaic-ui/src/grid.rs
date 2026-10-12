@@ -3784,19 +3784,14 @@ fn build_referenced_by(
 
 /// Open `spec`'s table filtered to the rows that reference data row
 /// `data_idx` — `schema::referencing_target`, through the same request and the
-/// same `follow_fk` hand-off as [`follow_relation`].
+/// same `follow_fk` hand-off as [`follow_relation`]. Nothing for a row
+/// `schema::referenced_values` refuses (a NULL, or bytes) — and the menu
+/// leaves such a row's entry off.
 fn open_referencing(gs: GridState, data_idx: usize, spec: &RefBySpec) {
     let rs = gs.rs.get_untracked();
-    let values: Vec<Value> = spec
-        .value_cols
-        .iter()
-        .map(|&vc| {
-            rs.cell(data_idx, vc)
-                .map(|c| c.to_value())
-                .unwrap_or(Value::Null)
-        })
-        .collect();
-    if let Some(ft) = schemaic_core::schema::referencing_target(
+    if let Some(values) =
+        schemaic_core::schema::referenced_values(&rs, data_idx, &spec.value_cols)
+        && let Some(ft) = schemaic_core::schema::referencing_target(
         &spec.child,
         &values,
         &spec.database,
@@ -11551,21 +11546,31 @@ fn data_cell(
             }
             // "Referenced by" — the other way: the tables whose keys point at
             // this row's table, each opened filtered to the rows that point at
-            // this row. Real rows only, for Follow's reason.
-            let referencing = gs.referenced_by.get_untracked();
-            if pending.is_none() && !referencing.is_empty() {
-                entries.push(MenuEntry::sub(
-                    "Referenced by",
-                    referencing
-                        .iter()
-                        .map(|spec| {
-                            let spec = spec.clone();
-                            MenuEntry::action(spec.label(), move || {
-                                open_referencing(gs, data_idx, &spec)
-                            })
+            // this row. Real rows only, for Follow's reason — and only the keys
+            // this row's values can name: a NULL references nothing, and a
+            // byte column's placeholder is no value to filter on
+            // (`schema::referenced_values`).
+            let referencing: Vec<MenuEntry> = if pending.is_none() {
+                let rs = gs.rs.get_untracked();
+                gs.referenced_by
+                    .get_untracked()
+                    .iter()
+                    .filter(|spec| {
+                        schemaic_core::schema::referenced_values(&rs, data_idx, &spec.value_cols)
+                            .is_some()
+                    })
+                    .map(|spec| {
+                        let spec = spec.clone();
+                        MenuEntry::action(spec.label(), move || {
+                            open_referencing(gs, data_idx, &spec)
                         })
-                        .collect(),
-                ));
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !referencing.is_empty() {
+                entries.push(MenuEntry::sub("Referenced by", referencing));
             }
             if nullable && !deleted {
                 entries.push(MenuEntry::action("Set to NULL", move || match pending {

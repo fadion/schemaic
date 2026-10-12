@@ -176,11 +176,12 @@ pub struct Aggregates {
     pub truncated: bool,
     /// How many different non-NULL values the selection holds — compared as
     /// numbers in a numeric column (`1.0` and `1.00` are one), as written
-    /// otherwise. `None` past [`KEPT_VALUE_BUDGET`], or when truncated.
+    /// otherwise. `None` past [`KEPT_VALUE_BUDGET`], when truncated, or over
+    /// bytes — a binary cell is its `<n bytes>` size, not its value.
     pub distinct: Option<usize>,
     /// The shortest and longest non-NULL value of a **non-numeric** column, in
-    /// characters. `None` for a numeric column, an all-NULL selection, or a
-    /// truncated one.
+    /// characters. `None` for a numeric column, an all-NULL selection, a
+    /// truncated one, or one over bytes.
     pub length: Option<(usize, usize)>,
 }
 
@@ -275,6 +276,10 @@ pub fn aggregate_capped<S: AsRef<str>>(
     // fits `KEPT_VALUE_BUDGET` and dropped the moment it doesn't.
     let mut kept = Some(Kept::default());
     let mut length: Option<(usize, usize)> = None;
+    // **A binary cell is its size, not its value**: every engine renders one
+    // as `<n bytes>`, so its distinct count and length are the placeholder's.
+    // Known by the type, or — SQLite, whose type names nothing — by the cell.
+    let mut bytes = column.is_binary();
     for cell in cells {
         if agg.rows >= budget {
             // One past the budget: something is there, so the counts are a
@@ -293,6 +298,10 @@ pub fn aggregate_capped<S: AsRef<str>>(
         let text = text.as_ref();
         agg.non_null += 1;
         if !numeric_column {
+            bytes = bytes || crate::model::is_binary_display(text);
+            if bytes {
+                continue;
+            }
             if let Some(k) = kept.as_mut() {
                 k.distinct.insert(text.to_string());
             }
@@ -330,6 +339,9 @@ pub fn aggregate_capped<S: AsRef<str>>(
         n.median = kept.as_ref().and_then(|k| median(&k.values));
         n
     });
+    if bytes {
+        return agg;
+    }
     agg.distinct = kept.map(|k| k.distinct.len());
     agg.length = length;
     agg
@@ -530,7 +542,9 @@ impl Aggregates {
             |label: &str, v: &Fixed| fig(format!("{label} {}", grouped(&v.text())), v.text());
         // `N+` when the scan stopped at its budget — the same `+` the find
         // bar's count uses for the same reason, rather than a number that
-        // reads exact and is not.
+        // reads exact and is not. Copied with it too: a bare `100000` on the
+        // clipboard is not the selection's size, and the NULL count stopped
+        // at the same budget.
         let more = if self.truncated { "+" } else { "" };
         let mut parts = vec![fig(
             format!(
@@ -538,11 +552,11 @@ impl Aggregates {
                 self.rows,
                 crate::text::plural(self.rows, "row", "rows")
             ),
-            self.rows.to_string(),
+            format!("{}{more}", self.rows),
         )];
         let nulls = self.rows - self.non_null;
         if nulls > 0 {
-            parts.push(fig(format!("{nulls} null"), nulls.to_string()));
+            parts.push(fig(format!("{nulls}{more} null"), format!("{nulls}{more}")));
         }
         // One value is its own distinct count and its own median, so neither
         // is printed until there are two.
@@ -564,9 +578,18 @@ impl Aggregates {
             parts.push(exact("Min", &n.min));
             parts.push(exact("Max", &n.max));
         }
+        // **In characters, and labelled so**: that is what MySQL and
+        // PostgreSQL count a `VARCHAR(n)` in, but SQL Server's `nvarchar(n)`
+        // counts UTF-16 units and a UTF-8 `varchar(n)` bytes, so a bare
+        // "Length" read as the column's own unit sized it too small there.
         match self.length {
-            Some((lo, hi)) if lo == hi => parts.push(fig(format!("Length {lo}"), lo.to_string())),
-            Some((lo, hi)) => parts.push(fig(format!("Length {lo}–{hi}"), format!("{lo}–{hi}"))),
+            Some((lo, hi)) if lo == hi => parts.push(fig(
+                format!("Length {lo} {}", crate::text::plural(lo, "char", "chars")),
+                lo.to_string(),
+            )),
+            Some((lo, hi)) => {
+                parts.push(fig(format!("Length {lo}–{hi} chars"), format!("{lo}–{hi}")))
+            }
             None => {}
         }
         parts
@@ -628,6 +651,44 @@ mod tests {
         assert_eq!(agg.non_null, 10);
         assert_eq!(agg.numeric, None, "a partial sum is not a sum");
         assert!(agg.summary().starts_with("10+ rows"), "{}", agg.summary());
+    }
+
+    /// **A floor copies as a floor.** The `+` is the whole of what tells
+    /// `100000+ rows` from an exact count, and clicking the figure put a bare
+    /// `100000` on the clipboard — a number that is not the selection's size.
+    /// The NULL count stopped at the same budget, so it is a floor as well.
+    #[test]
+    fn a_truncated_count_shows_and_copies_as_a_floor() {
+        let c = col("int");
+        let cells = (0..50).map(|i| (i % 2 == 0).then(|| i.to_string()));
+        let agg = aggregate_capped(&c, cells, 10);
+        let figs = agg.figures();
+        assert_eq!(
+            (figs[0].shown.as_str(), figs[0].copy.as_str()),
+            ("10+ rows", "10+")
+        );
+        assert_eq!(
+            (figs[1].shown.as_str(), figs[1].copy.as_str()),
+            ("5+ null", "5+")
+        );
+    }
+
+    /// **A binary cell is its size, not its value.** Every engine renders one
+    /// as `<n bytes>`, so a thousand different `BINARY(16)` ids read
+    /// "1 distinct · Length 10" — the placeholder's figures. Neither is given
+    /// for a column that holds bytes, by its type or (SQLite, whose type names
+    /// nothing) by the placeholder itself.
+    #[test]
+    fn a_binary_selection_has_no_distinct_count_or_length() {
+        let ids = [
+            Value::Str(crate::model::binary_display(16)),
+            Value::Str(crate::model::binary_display(16)),
+        ];
+        let a = agg_of("binary(16)", &ids);
+        assert_eq!((a.distinct, a.length), (None, None));
+        assert_eq!(a.summary(), "2 rows");
+        let untyped = agg_of("", &ids);
+        assert_eq!((untyped.distinct, untyped.length), (None, None));
     }
 
     /// Exactly the budget is **not** truncated: the scan saw everything there
@@ -796,7 +857,10 @@ mod tests {
         );
         assert_eq!((a.rows, a.non_null), (3, 2));
         assert!(a.numeric.is_none());
-        assert_eq!(a.summary(), "3 rows · 1 null · 2 distinct · Length 3–5");
+        assert_eq!(
+            a.summary(),
+            "3 rows · 1 null · 2 distinct · Length 3–5 chars"
+        );
     }
 
     /// A numeric column whose cell isn't a number is counted as present and left
@@ -1025,7 +1089,7 @@ mod tests {
         let len = text.figures().into_iter().last().unwrap();
         assert_eq!(
             (len.shown.as_str(), len.copy.as_str()),
-            ("Length 2–4", "2–4")
+            ("Length 2–4 chars", "2–4")
         );
     }
 
@@ -1077,8 +1141,11 @@ mod tests {
         assert_eq!(med("int", &["-2", "-1"]).as_deref(), Some("-1.5"));
     }
 
-    /// A text column reports the shortest and longest value, in characters —
-    /// what a `VARCHAR(n)` limit is counted in — rather than bytes.
+    /// A text column reports the shortest and longest value **in characters,
+    /// and says so**. Not "what a `VARCHAR(n)` limit is counted in", which this
+    /// claimed: SQL Server's `nvarchar(n)` counts UTF-16 units (an emoji is
+    /// two) and a UTF-8 `varchar(n)` counts bytes, so a bare "Length" sized a
+    /// column too small there. The unit is the label's, on every engine.
     #[test]
     fn a_text_column_reports_its_length_range_in_characters() {
         let a = agg_of(
@@ -1090,7 +1157,17 @@ mod tests {
             ],
         );
         assert_eq!(a.length, Some((2, 4)));
-        assert_eq!(a.summary(), "3 rows · 1 null · 2 distinct · Length 2–4");
+        assert_eq!(
+            a.summary(),
+            "3 rows · 1 null · 2 distinct · Length 2–4 chars"
+        );
+        let one = agg_of("nvarchar(9)", &[Value::Str("é".into())]);
+        assert_eq!(one.summary(), "1 row · Length 1 char");
+        assert_eq!(
+            agg_of("nvarchar(9)", &[Value::Str("😀".into())]).length,
+            Some((1, 1)),
+            "a character, though SQL Server's nvarchar spends two units on it"
+        );
         assert_eq!(
             agg_of("int", &[Value::Str("12".into())]).length,
             None,

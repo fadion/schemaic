@@ -6141,15 +6141,18 @@ pub fn incoming_keys(
 /// The rows of `child`'s table that reference a parent row whose referenced
 /// columns (`child.key.ref_columns`, in order) hold `values` — **Follow
 /// relation** run backwards. It *is* [`follow_target`], over the key turned
-/// round, so the quoting, the `IS NULL` and the qualification are that
-/// function's and cannot drift from it.
+/// round, so the quoting and the qualification are that function's and cannot
+/// drift from it. **Except a NULL, which it refuses**: `follow_target`'s
+/// `IS NULL` is harmless forwards (`parent.id IS NULL` matches nothing) and
+/// wrong backwards, where it listed every child whose key references no row
+/// as this row's children — see [`referenced_values`].
 pub fn referencing_target(
     child: &InboundForeignKey,
     values: &[Value],
     database: &str,
     dialect: crate::intel::SqlDialect,
 ) -> Option<FollowTarget> {
-    if child.key.columns.len() != child.key.ref_columns.len() {
+    if child.key.columns.len() != child.key.ref_columns.len() || values.iter().any(Value::is_null) {
         return None;
     }
     let reversed = ForeignKeyInfo {
@@ -6166,6 +6169,35 @@ pub fn referencing_target(
         ..ForeignKeyInfo::default()
     };
     follow_target(&reversed, values, database, dialect)
+}
+
+/// Data row `data_idx`'s values in result columns `cols`, as *Referenced by*
+/// filters its children on — or `None` when the row can name no children.
+///
+/// **A NULL references nothing**: a foreign key with a NULL in it is not
+/// checked against any parent (MATCH SIMPLE on all four engines), so
+/// [`referencing_target`] refuses one rather than writing `IS NULL` and
+/// listing every orphan as this row's children. **Nor can a column that holds
+/// bytes**: its cell is the grid's `<n bytes>` placeholder, which no literal
+/// can carry back — `WHERE id = '<16 bytes>'` matched nothing on MySQL and
+/// PostgreSQL and was a conversion error on SQL Server. The edit model
+/// refuses a byte key for writes for the same reason (`edit::holds_bytes`).
+/// The grid leaves the entry off the menu for such a row, so it is not an
+/// entry that silently does nothing.
+pub fn referenced_values(
+    rs: &crate::model::ResultSet,
+    data_idx: usize,
+    cols: &[usize],
+) -> Option<Vec<Value>> {
+    cols.iter()
+        .map(|&ci| {
+            if crate::edit::holds_bytes(rs, ci) {
+                return None;
+            }
+            let v = rs.cell(data_idx, ci)?.to_value();
+            (!v.is_null()).then_some(v)
+        })
+        .collect()
 }
 
 /// Look one object up by `(namespace, name)` — the rule every `find_*` on
@@ -12413,14 +12445,98 @@ mod tests {
             ["notes"]
         );
         let sales = incoming_keys(&schema, Some("sales"), "customers", "db", Postgres);
-        let t =
-            referencing_target(&sales[0], &[Value::Int(1), Value::Null], "db", Postgres).unwrap();
+        let t = referencing_target(
+            &sales[0],
+            &[Value::Int(1), Value::Str("eu".into())],
+            "db",
+            Postgres,
+        )
+        .unwrap();
         assert_eq!(t.schema.as_deref(), Some("sales"));
         assert_eq!(
             t.sql,
-            "SELECT * FROM \"sales\".\"orders\" WHERE \"cust\" = 1 AND \"region\" IS NULL"
+            "SELECT * FROM \"sales\".\"orders\" WHERE \"cust\" = 1 AND \"region\" = 'eu'"
         );
         assert!(referencing_target(&sales[0], &[Value::Int(1)], "db", Postgres).is_none());
+    }
+
+    /// **No row references a NULL.** A foreign key with a NULL in it is not
+    /// checked against any parent (MATCH SIMPLE, on all four engines), so
+    /// `WHERE fk IS NULL` lists every orphan as this row's children — Follow
+    /// relation's `IS NULL` arm is harmless forwards and wrong backwards. A
+    /// composite key with one NULL part is the same.
+    #[test]
+    fn nothing_references_a_null_key() {
+        use crate::intel::SqlDialect::MySql;
+        let schema = DbSchema {
+            tables: vec![
+                fk_table(None, "users", vec![]),
+                fk_table(
+                    None,
+                    "invites",
+                    vec![fk(
+                        &["inviter_email", "team"],
+                        None,
+                        "users",
+                        &["email", "team"],
+                    )],
+                ),
+            ],
+            ..Default::default()
+        };
+        let keys = incoming_keys(&schema, None, "users", "shop", MySql);
+        assert!(referencing_target(&keys[0], &[Value::Null, Value::Null], "shop", MySql).is_none());
+        assert!(
+            referencing_target(
+                &keys[0],
+                &[Value::Str("a@b".into()), Value::Null],
+                "shop",
+                MySql
+            )
+            .is_none()
+        );
+    }
+
+    /// The row's referenced values as *Referenced by* filters on them — `None`
+    /// for a NULL, and for a column that holds bytes, whose cell is the
+    /// `<16 bytes>` placeholder: `WHERE id = '<16 bytes>'` matches nothing on
+    /// MySQL and PostgreSQL and is a conversion error on SQL Server.
+    #[test]
+    fn referenced_values_refuse_a_null_or_a_byte_column() {
+        use crate::model::{Column, ResultSet};
+        let column = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            origin: None,
+        };
+        let rs = ResultSet::from_rows(
+            vec![
+                column("id", "INT"),
+                column("uid", "BINARY"),
+                column("email", "VARCHAR"),
+            ],
+            vec![
+                vec![
+                    Value::Int(7),
+                    Value::Str(crate::model::binary_display(16)),
+                    Value::Str("a@b".into()),
+                ],
+                vec![Value::Int(8), Value::Null, Value::Null],
+            ],
+        );
+        assert_eq!(
+            referenced_values(&rs, 0, &[0, 2]),
+            Some(vec![Value::Int(7), Value::Str("a@b".into())])
+        );
+        assert_eq!(referenced_values(&rs, 1, &[2]), None, "a NULL");
+        assert_eq!(referenced_values(&rs, 0, &[1]), None, "bytes");
+        let mut rs = rs;
+        rs.binary_columns = vec![2];
+        assert_eq!(
+            referenced_values(&rs, 0, &[2]),
+            None,
+            "a column known to hold bytes"
+        );
     }
 
     // ── Standalone objects ──────────────────────────────────────────────────

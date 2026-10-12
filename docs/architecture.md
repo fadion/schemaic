@@ -330,11 +330,20 @@ existing prose was left alone.
     the rest: the middle value, or the mean of the two middles, which is at most a half-unit off
     the shared scale, so an odd pair takes one more decimal place (units × 5 at scale + 1) rather
     than rounding (`the_median_is_the_exact_middle`). `length` is the shortest and longest value of
-    a non-numeric column in `char`s, not bytes. Distinct and median need every value kept, which is
+    a non-numeric column in `char`s, not bytes, and **the readout says `chars`**: that is a
+    `VARCHAR(n)`'s unit on MySQL and PostgreSQL, but SQL Server's `nvarchar(n)` counts UTF-16
+    units and a UTF-8 `varchar(n)` bytes, so a bare "Length" sized a column too small there
+    (`a_text_column_reports_its_length_range_in_characters`). **Neither distinct nor length is
+    given over bytes** — a binary cell is its `<n bytes>` size, so a thousand different
+    `BINARY(16)` ids read "1 distinct · Length 10"; the column is known by `Column::is_binary`, or
+    (SQLite, whose type names nothing) by a cell that is `is_binary_display`
+    (`a_binary_selection_has_no_distinct_count_or_length`). Distinct and median need every value kept, which is
     exactly what the fold below refuses to do, so they stop at their own `KEPT_VALUE_BUDGET`
     (10,000 *cells*, NULLs included — ten times under the scan's cap) and are then omitted while
     Sum, Min and Max still cover the whole selection (`distinct_and_median_stop_at_their_own_budget`);
-    a truncated scan reports none of the three. `summary` prints distinct and median only once
+    a truncated scan reports none of the three, and its row and NULL counts show **and copy** with
+    the `+` (`100000+`), since a bare number on the clipboard reads exact and is not
+    (`a_truncated_count_shows_and_copies_as_a_floor`). `summary` prints distinct and median only once
     there are two non-NULL values — one value is its own of each, and `1 row · Sum 7` stays
     unpadded (`a_single_value_is_not_padded_with_distinct_or_median`).
     **There are four overflow sites and they do not degrade alike**, which is how three different
@@ -11505,9 +11514,16 @@ existing prose was left alone.
     `referencing_target(child, values, database, dialect)` builds the query, and it **is**
     `follow_target` (Follow relation's) over the key turned round — `columns` and `ref_columns`
     swapped, the child as `ref_table`, `ref_schema` `None` on MySQL and the child's namespace
-    elsewhere — so the quoting, the `IS NULL` and the qualification are that function's and cannot
-    drift from it (`referenced_by_finds_the_keys_pointing_at_a_table_and_filters_their_rows`,
-    `referenced_by_matches_namespaces_as_the_engine_resolves_them`).
+    elsewhere — so the quoting and the qualification are that function's and cannot drift from it
+    (`referenced_by_finds_the_keys_pointing_at_a_table_and_filters_their_rows`,
+    `referenced_by_matches_namespaces_as_the_engine_resolves_them`). **Except a NULL, which it
+    refuses**: `follow_target`'s `IS NULL` is harmless forwards and wrong backwards, where a
+    foreign key with a NULL in it references nothing (MATCH SIMPLE, on all four engines) and
+    `WHERE fk IS NULL` listed every orphan as this row's children (`nothing_references_a_null_key`).
+    `referenced_values(rs, data_idx, cols)` is the row's side of the same question — `None` for a
+    NULL and for a column that holds bytes (`edit::holds_bytes`), whose `<16 bytes>` placeholder
+    filtered nothing on MySQL and PostgreSQL and was a conversion error on SQL Server
+    (`referenced_values_refuse_a_null_or_a_byte_column`).
     **The tree's Generate DDL entries are two `DbSchema` methods, one per altitude.**
     `create_ddl_script(schema, dialect)` emits one namespace in **dependency order** — the
     standalone types, then base tables, then views, then the sequences that stand on their own —
@@ -38198,7 +38214,10 @@ this bundle's.
   names. *Referenced by* is it run backwards: a submenu after it on any cell, one entry per key in
   the source table's database pointing at that table, labelled `[ns.]table (cols)`
   (`RefBySpec::label`), each opening the child table filtered to the rows that point at this one
-  (`open_referencing` → `schema::referencing_target`). `build_referenced_by` asks
+  (`open_referencing` → `schema::referencing_target`). An entry is offered only for a row whose
+  referenced values `schema::referenced_values` can name — not a NULL, not bytes — so the menu
+  holds no entry that would silently do nothing, and the submenu is left off when none remain.
+  `build_referenced_by` asks
   `schema::incoming_keys` and keeps a key only where every column it references is in the result
   by provenance (`rs.origin_columns`), as `build_follow_specs` does for Follow's, since otherwise
   the row has no value to filter by. Both lists are rebuilt into `GridState` (`follow`,
