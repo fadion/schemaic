@@ -670,6 +670,30 @@ fn fold_char(c: char) -> char {
     }
 }
 
+/// `s` with every character replaced by its [`fold_char`] where that is as
+/// wide in UTF-8, and kept where it is not — **so every byte offset in the
+/// result is the same character's offset in `s`.**
+///
+/// A plain substring search of one folded string in another then finds what
+/// [`matches_at`]'s case-insensitive rule finds, at the same offsets: that
+/// rule pairs two characters when they are equal, or as wide as each other
+/// and fold alike, and folding only where the width holds keeps exactly those
+/// pairs equal. What it buys is the search: a folded haystack built once can
+/// be scanned with `str::find` rather than by asking [`matches_at`] at every
+/// character, which is what made Find Anywhere's body tier ten times slower
+/// on a term that starts with a non-ASCII letter (`core::body_search`).
+pub fn fold_for_search(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    s.chars()
+        .map(|c| {
+            let f = fold_char(c);
+            if f.len_utf8() == c.len_utf8() { f } else { c }
+        })
+        .collect()
+}
+
 /// [`matches_at`] with the needle's ASCII-ness worked out once by the caller,
 /// since [`find_matches`] asks it at every byte of the document.
 fn folded_match_at(hay: &str, off: usize, needle: &str, ascii: bool) -> bool {

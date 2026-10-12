@@ -13110,6 +13110,11 @@ existing prose was left alone.
     offsets would not be the document's. An ASCII needle keeps the byte-wise path, which matches
     exactly what the char walk would, no other character being as narrow as an ASCII one
     (`find_folds_the_case_of_non_ascii_letters`, `a_folded_match_never_changes_the_hits_byte_length`).
+    `fold_for_search` is that fold applied to a whole string, each character replaced only where
+    its fold is as wide — so the copy keeps every offset, and a `str::find` of one folded string in
+    another finds what `matches_at` finds, where it finds it. Find Anywhere's body tier searches
+    bodies folded this way once per schema (`body_search`'s entry); the find bar still walks the
+    document, which changes under it.
     **The find bar's Match case and Whole word are `FindOptions`**, taken by `find_matches_in`,
     `matches_at_in` and `replace_all_in`; the three names without the suffix are those with the
     default (both off), unchanged in behaviour, so the highlight callers above never see the
@@ -13342,10 +13347,12 @@ existing prose was left alone.
     a table of the whole document's lines was a full pass of the text per move, 6.8 ms at 16 MiB
     against microseconds now. The pane's drag is under `editor_pane.rs`.
   - `body_search.rs` — Find Anywhere's **fourth tier**: the objects whose stored *body* contains the
-    term, for the palette (`ui/overlays.rs`) to list below its three name tiers. `body_hits` walks
-    one `DbSchema` — a view's `TableInfo::view_definition`, a trigger's `TriggerAction::Body`, then
+    term, for the palette (`ui/overlays.rs`) to list below its three name tiers. `body_hits_where`
+    walks one `DbSchema` — a view's `TableInfo::view_definition`, a trigger's `TriggerAction::Body`, then
     `RoutineInfo::body` and `EventInfo::body`, in that order and catalogue order within each — and
-    stops at the caller's `limit`; each `BodyHit` is its `BodyOwner` (`View`, `Routine`, `Event`, or
+    stops at the caller's `limit`, **counting only the hits its `keep` predicate accepts**, so the
+    rows a caller would drop cannot spend the cap (`hits_a_caller_drops_do_not_spend_the_limit`);
+    `body_hits` is it keeping everything. Each `BodyHit` is its `BodyOwner` (`View`, `Routine`, `Event`, or
     `Trigger` with the table it fires on) and a snippet. **Everything it reads is already in the
     loaded `DbSchema`**, so the tier costs no round trip — and so a MySQL routine is searched in
     `information_schema`'s escape-resolved `body`, not the `RoutineSource` its editor reads lazily
@@ -13364,15 +13371,31 @@ existing prose was left alone.
     literals included — deliberately: a body search is how you find the routine that mentions a
     table in a comment, and a lexer-aware search would hide exactly that. It folds case by
     `text_ops::matches_at`'s rule, the editor find bar's, non-ASCII letters included
-    (`the_match_ignores_case_on_both_sides`). **The cost is a scan of every body on every
-    keystroke**, the palette being undebounced, which is why `searches_bodies` waits for
+    (`the_match_ignores_case_on_both_sides`), **on the term as typed** — the caller must not
+    lowercase it first: `İ` lowercases to two characters and `ẞ` to a narrower one, and the rule
+    pairs characters of equal width, so a lowered `İstanbul` found no body spelling it as typed
+    (`a_term_is_matched_as_typed`; the skip below lowercases a copy for `object_name_matches`).
+    **The cost is a scan of every body on every
+    keystroke**, the palette being undebounced, and **that scan is over a copy folded once per
+    schema** — `BodyIndex`, built on a schema's first body search and kept in
+    `DbSchema::body_index` (a `BodyIndexCache` whose clone starts empty, since a schema is cloned
+    to be changed: `a_cloned_schema_does_not_search_its_sources_bodies`). Each body is folded by
+    `text_ops::fold_for_search`, which keeps every byte offset, and searched with `str::find`.
+    Asking `matches_at` at every character instead cost, in release over 10,000 routines of 4 KB,
+    17–30 ms a keystroke for an ASCII term and 166–204 ms for one starting with a non-ASCII letter;
+    the index takes about 20 ms to build once and then 4–8 ms a keystroke for either. That the two
+    searches agree is `the_folded_search_finds_what_the_find_bar_rule_finds`, over Turkish, German,
+    Cyrillic, Greek, titlecase digraphs, the Kelvin and Ohm signs, ligatures and CJK. Even so,
+    `searches_bodies` waits for
     `MIN_TERM_CHARS` (3) — one or two letters match nearly every body in a database — counted in
     characters rather than bytes, so three Cyrillic letters qualify as three ASCII ones do
     (`a_term_shorter_than_three_characters_searches_no_body`). `BODY_HIT_CAP` (50) is the palette's
     cap on the tier. `body_snippet` is the row's text: the matching line, trimmed, its whitespace
     runs collapsed to one space, and when longer than `SNIPPET_CHARS` (60) cut to a window keeping 20
     characters ahead of the match, an `…` on each side that was cut — on character boundaries, so a
-    multibyte line is never split (`a_multibyte_line_is_cut_on_character_boundaries`).
+    multibyte line is never split (`a_multibyte_line_is_cut_on_character_boundaries`). The window
+    is counted out of the line rather than collected: a MySQL view's definition is one line, and
+    gathering it into a `Vec<char>` cost four bytes a character of the whole definition per hit.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -34646,9 +34669,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   **Bodies are a fourth tier, below all three — names → objects → columns → bodies — and outside
   their share.** `find_matches` returns two lists from the same visible, loaded databases, so a
   hidden database leaks no body hit: the 80-row merge above, and `overlays::body_matches_across`,
-  which asks each database's `body_search::body_hits` for up to `BODY_HIT_CAP` (50), drops a
-  routine or event `is_palette_target` refuses (a C-language function), and merges the databases
-  with `db_shares`, the name tiers' round-robin across databases, under that cap of its own. The
+  which asks each database's `body_search::body_hits_where` for up to `BODY_HIT_CAP` (50) that
+  `is_palette_target` accepts — a C-language function or a `verbatim` T-SQL routine is refused
+  **inside** the search, before it counts: dropped afterwards, a legacy PostGIS install's C
+  functions, whose link symbols match `geography`, spent the whole cap and left the user's own
+  routine unlisted (`routines_that_cannot_be_opened_do_not_spend_the_body_cap`) — and merges the databases
+  with `db_shares`, the name tiers' round-robin across databases, under that cap of its own. It is
+  handed the query **as typed** while the name tiers get it lowercased — `overlays::FindNeedles`
+  carries both (`a_body_is_found_by_a_capital_that_lowercases_wider_or_narrower`). The
   body rows are appended after the merged 80 and take none of their rows: `BodyFindHit` is its own
   type rather than a `FindTarget` arm because it is its own list: a body match is the least precise
   answer the palette has, so it never takes a share of the rows the name tiers fill.
@@ -34677,8 +34705,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   `objects_all` (clones the database's every enum, domain and sequence, an enum's whole value list
   included, to answer a substring test). Same rule as `SignalGet::with` over `get`. The body tier is
   on the same path and is the widest scan on it — every view, trigger, routine and event body of
-  every loaded database — which is why `body_search::searches_bodies` holds it back until the term
-  has three characters and `body_hits` stops at the cap it is given.
+  every loaded database — which is why it searches a copy of the bodies folded once per schema
+  (`body_search::BodyIndex`) rather than folding per keystroke, `body_search::searches_bodies`
+  holds it back until the term has three characters, and `body_hits_where` stops at the cap it is
+  given.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** so Unicode identifiers tokenize whole.
   `sql::is_word_byte` (continues a word) and `sql::is_word_start` (begins one — `alphabetic`, since a
   digit can't start a name) are the **only** definitions, next to `skip_noncode` because they answer

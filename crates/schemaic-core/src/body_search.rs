@@ -14,14 +14,25 @@
 //! the palette is undebounced — which is why it waits for
 //! [`MIN_TERM_CHARS`] characters and stops at the caller's `limit`.
 //!
+//! **The scan is over bodies folded once per schema load**, not per keystroke
+//! ([`BodyIndex`], cached on the schema). Asking the find bar's rule at every
+//! character of every body cost, in a release build over 10,000 routines of
+//! 4 KB, about 17–30 ms a keystroke for an ASCII term and **166–204 ms** for one
+//! starting with a non-ASCII letter (`заказ`, `éte`) — on the UI thread, for the
+//! precise searches the tier exists for, since only a term matching little
+//! scans everything. A folded copy is searched with `str::find` instead, and
+//! [`crate::text_ops::fold_for_search`] keeps it offset-for-offset with the
+//! body, so the hit is read back out of the body as stored.
+//!
 //! The match is a plain case-insensitive substring over the body **as stored**,
 //! comments and string literals included: a body search is how you find the
 //! routine that mentions a table in a comment, and a lexer-aware search would
 //! hide exactly that.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::schema::{DbSchema, EventInfo, RoutineInfo, TriggerAction, object_name_matches};
+use crate::text_ops::fold_for_search;
 
 /// How many characters the term must have before bodies are searched. One or
 /// two letters match nearly every body in a database, so the tier would be
@@ -76,7 +87,26 @@ pub fn searches_bodies(needle: &str) -> bool {
 }
 
 /// The objects in `schema` whose body contains `needle`, at most `limit` of
-/// them, each with a snippet of the matching line.
+/// them, each with a snippet of the matching line — [`body_hits_where`] keeping
+/// every hit.
+pub fn body_hits(schema: &DbSchema, needle: &str, limit: usize) -> Vec<BodyHit> {
+    body_hits_where(schema, needle, limit, |_| true)
+}
+
+/// The objects in `schema` whose body contains `needle` and that `keep`
+/// accepts, at most `limit` of them, each with a snippet of the matching line.
+///
+/// **`needle` is the term as typed, not lowercased** — the match folds case
+/// itself, character for character and width for width, and a lowercased term
+/// no longer lines up with the text it was typed from: `İ` lowercases to two
+/// characters and `ẞ` to the narrower `ß`, so `İstanbul` and `STRAẞE` found no
+/// body that spelled them exactly as typed.
+///
+/// **`keep` is asked before a hit counts against `limit`.** The palette drops
+/// what it cannot open — a C function, whose `prosrc` is a link symbol that
+/// matches a term like `geography`, a `verbatim` T-SQL routine — and dropping
+/// them after the cap was spent let fifty such rows crowd out the user's own
+/// routine that mentions the term, and show nothing at all.
 ///
 /// **An object a name tier already lists is skipped** — a view, routine or
 /// event whose own name matches through [`object_name_matches`], which is the
@@ -86,65 +116,170 @@ pub fn searches_bodies(needle: &str) -> bool {
 /// Order: views, then triggers (by their table), then routines, then events —
 /// catalogue order within each. Nothing is returned for a term shorter than
 /// [`MIN_TERM_CHARS`].
-pub fn body_hits(schema: &DbSchema, needle: &str, limit: usize) -> Vec<BodyHit> {
+pub fn body_hits_where(
+    schema: &DbSchema,
+    needle: &str,
+    limit: usize,
+    mut keep: impl FnMut(&BodyOwner) -> bool,
+) -> Vec<BodyHit> {
     let mut out = Vec::new();
     if limit == 0 || !searches_bodies(needle) {
         return out;
     }
-    let mut push = |owner: BodyOwner, body: &str| -> bool {
-        if let Some(snippet) = body_snippet(body, needle) {
-            out.push(BodyHit { owner, snippet });
-        }
-        out.len() >= limit
-    };
-    for t in schema.tables.iter().filter(|t| t.is_view) {
-        let Some(def) = t.view_definition.as_deref() else {
+    let folded_needle = fold_for_search(needle);
+    let name_needle = needle.to_lowercase();
+    for entry in &schema.body_index.get(schema).entries {
+        let Some((owner, body)) = entry.source.resolve(schema) else {
             continue;
         };
-        if object_name_matches(&t.name, needle) {
-            continue;
-        }
-        let owner = BodyOwner::View {
-            schema: t.schema.clone(),
-            name: t.name.clone(),
+        let name = match &owner {
+            BodyOwner::View { name, .. } => Some(name.as_str()),
+            BodyOwner::Routine(r) => Some(r.name.as_str()),
+            BodyOwner::Event(e) => Some(e.name.as_str()),
+            BodyOwner::Trigger { .. } => None,
         };
-        if push(owner, def) {
-            return out;
-        }
-    }
-    for t in &schema.tables {
-        for tr in &t.triggers {
-            let TriggerAction::Body(body) = &tr.action else {
-                // PostgreSQL's: the body is the function's, found as a routine.
-                continue;
-            };
-            let owner = BodyOwner::Trigger {
-                schema: t.schema.clone(),
-                table: t.name.clone(),
-                name: tr.name.clone(),
-            };
-            if push(owner, body) {
-                return out;
-            }
-        }
-    }
-    for r in &schema.routines {
-        if object_name_matches(&r.name, needle) {
+        if name.is_some_and(|n| object_name_matches(n, &name_needle)) {
             continue;
         }
-        if push(BodyOwner::Routine(r.clone()), &r.body) {
-            return out;
-        }
-    }
-    for e in &schema.events {
-        if object_name_matches(&e.name, needle) {
+        let Some(at) = entry.folded.find(&folded_needle) else {
+            continue;
+        };
+        if !keep(&owner) {
             continue;
         }
-        if push(BodyOwner::Event(e.clone()), &e.body) {
-            return out;
+        out.push(BodyHit {
+            snippet: snippet_at(body, at),
+            owner,
+        });
+        if out.len() >= limit {
+            break;
         }
     }
     out
+}
+
+/// Every body in a schema, folded once ([`fold_for_search`]) and in the order
+/// [`body_hits_where`] reports them. Built on a schema's first body search and
+/// kept on it ([`BodyIndexCache`]), so each keystroke after that is a
+/// `str::find` per body rather than the find bar's rule asked at every
+/// character.
+#[derive(Debug, Default)]
+pub struct BodyIndex {
+    entries: Vec<BodyEntry>,
+}
+
+#[derive(Debug)]
+struct BodyEntry {
+    source: BodySource,
+    /// The body, folded: every byte offset is the same character's offset in
+    /// the body as stored.
+    folded: String,
+}
+
+/// Where in the schema a [`BodyEntry`]'s body lives — positions, not copies,
+/// since the index lives on that very schema.
+#[derive(Clone, Copy, Debug)]
+enum BodySource {
+    View(usize),
+    Trigger(usize, usize),
+    Routine(usize),
+    Event(usize),
+}
+
+impl BodySource {
+    fn resolve(self, schema: &DbSchema) -> Option<(BodyOwner, &str)> {
+        Some(match self {
+            BodySource::View(t) => {
+                let t = schema.tables.get(t)?;
+                (
+                    BodyOwner::View {
+                        schema: t.schema.clone(),
+                        name: t.name.clone(),
+                    },
+                    t.view_definition.as_deref()?,
+                )
+            }
+            BodySource::Trigger(t, i) => {
+                let t = schema.tables.get(t)?;
+                let tr = t.triggers.get(i)?;
+                let TriggerAction::Body(body) = &tr.action else {
+                    return None;
+                };
+                (
+                    BodyOwner::Trigger {
+                        schema: t.schema.clone(),
+                        table: t.name.clone(),
+                        name: tr.name.clone(),
+                    },
+                    body.as_str(),
+                )
+            }
+            BodySource::Routine(i) => {
+                let r = schema.routines.get(i)?;
+                (BodyOwner::Routine(r.clone()), r.body.as_str())
+            }
+            BodySource::Event(i) => {
+                let e = schema.events.get(i)?;
+                (BodyOwner::Event(e.clone()), e.body.as_str())
+            }
+        })
+    }
+}
+
+impl BodyIndex {
+    fn build(schema: &DbSchema) -> BodyIndex {
+        let mut entries = Vec::new();
+        let mut add = |source: BodySource, body: &str| {
+            if !body.is_empty() {
+                entries.push(BodyEntry {
+                    source,
+                    folded: fold_for_search(body),
+                });
+            }
+        };
+        for (i, t) in schema.tables.iter().enumerate().filter(|(_, t)| t.is_view) {
+            if let Some(def) = t.view_definition.as_deref() {
+                add(BodySource::View(i), def);
+            }
+        }
+        for (i, t) in schema.tables.iter().enumerate() {
+            for (j, tr) in t.triggers.iter().enumerate() {
+                // PostgreSQL's has no body of its own: it is the function's,
+                // found as a routine.
+                if let TriggerAction::Body(body) = &tr.action {
+                    add(BodySource::Trigger(i, j), body);
+                }
+            }
+        }
+        for (i, r) in schema.routines.iter().enumerate() {
+            add(BodySource::Routine(i), &r.body);
+        }
+        for (i, e) in schema.events.iter().enumerate() {
+            add(BodySource::Event(i), &e.body);
+        }
+        BodyIndex { entries }
+    }
+}
+
+/// A schema's [`BodyIndex`], built on its first body search.
+///
+/// **A clone starts empty.** A `DbSchema` is cloned to be changed — a
+/// comparison strips definers, a test builds one variant from another — and a
+/// clone that carried its source's index would search bodies it no longer
+/// has.
+#[derive(Debug, Default)]
+pub struct BodyIndexCache(OnceLock<BodyIndex>);
+
+impl Clone for BodyIndexCache {
+    fn clone(&self) -> Self {
+        BodyIndexCache::default()
+    }
+}
+
+impl BodyIndexCache {
+    fn get(&self, schema: &DbSchema) -> &BodyIndex {
+        self.0.get_or_init(|| BodyIndex::build(schema))
+    }
 }
 
 /// The first case-insensitive occurrence of `needle` in `hay`, by the rule
@@ -177,7 +312,16 @@ fn first_match(hay: &str, needle: &str) -> Option<usize> {
 ///
 /// `None` when the body does not contain the term (or the term is empty).
 pub fn body_snippet(body: &str, needle: &str) -> Option<String> {
-    let at = first_match(body, needle)?;
+    Some(snippet_at(body, first_match(body, needle)?))
+}
+
+/// [`body_snippet`]'s row text for a match at byte `at` of `body`.
+///
+/// **Counted, not collected.** A MySQL view's definition is one line however
+/// long it is, and gathering the line into a `Vec<char>` to cut sixty
+/// characters out of it allocated four bytes per character of the whole
+/// definition, per hit, per keystroke.
+fn snippet_at(body: &str, at: usize) -> String {
     let line_start = body[..at].rfind('\n').map_or(0, |i| i + 1);
     let line_end = body[at..].find('\n').map_or(body.len(), |i| at + i);
     let line = &body[line_start..line_end];
@@ -186,13 +330,13 @@ pub fn body_snippet(body: &str, needle: &str) -> Option<String> {
     let lead_ws = line.len() - line.trim_start().len();
     let line = line.trim();
     let at = (at - line_start).saturating_sub(lead_ws).min(line.len());
-    let chars: Vec<char> = line.chars().collect();
+    let len = line.chars().count();
     let at_char = line[..at].chars().count();
-    let (start, end) = if chars.len() <= SNIPPET_CHARS {
-        (0, chars.len())
+    let (start, end) = if len <= SNIPPET_CHARS {
+        (0, len)
     } else {
         let start = at_char.saturating_sub(SNIPPET_LEAD);
-        let end = (start + SNIPPET_CHARS).min(chars.len());
+        let end = (start + SNIPPET_CHARS).min(len);
         (end.saturating_sub(SNIPPET_CHARS), end)
     };
     let mut out = String::new();
@@ -200,7 +344,7 @@ pub fn body_snippet(body: &str, needle: &str) -> Option<String> {
         out.push('…');
     }
     let mut in_space = false;
-    for &c in &chars[start..end] {
+    for c in line.chars().skip(start).take(end - start) {
         if c.is_whitespace() {
             if !in_space {
                 out.push(' ');
@@ -211,10 +355,10 @@ pub fn body_snippet(body: &str, needle: &str) -> Option<String> {
             in_space = false;
         }
     }
-    if end < chars.len() {
+    if end < len {
         out.push('…');
     }
-    Some(out)
+    out
 }
 
 #[cfg(test)]
@@ -380,6 +524,118 @@ mod tests {
         };
         assert_eq!(names(&body_hits(&s, "Customers", 50)), ["routine:a"]);
         assert_eq!(names(&body_hits(&s, "ärger", 50)), ["routine:b"]);
+    }
+
+    /// **The folded index finds what the find bar's rule finds, where it
+    /// finds it.** The tier searches a copy folded once per schema rather than
+    /// asking `matches_at` at every character, and that is only sound while
+    /// the two agree — over every script and width the fold distinguishes.
+    #[test]
+    fn the_folded_search_finds_what_the_find_bar_rule_finds() {
+        let bodies = [
+            "SELECT * FROM Orders WHERE city = 'İstanbul' AND street = 'STRAẞE'",
+            "UPDATE заказы SET статус = 'Готов' -- ÉTÉ été Été",
+            "SELECT 'ΣΊΣΥΦΟΣ', 'σίσυφος', 'ǅ', 'Kelvin K', 'Ω Ohm Ω'",
+            "naïve façade Ärger ärger ÄRGER 東京 東京都 ﬁle FILE",
+            "",
+        ];
+        let needles = [
+            "orders",
+            "ORDERS",
+            "İstanbul",
+            "istanbul",
+            "straẞe",
+            "STRASSE",
+            "заказ",
+            "ЗАКАЗЫ",
+            "статус",
+            "été",
+            "ÉTÉ",
+            "σίσυφος",
+            "ΣΊΣΥΦΟΣ",
+            "ǆ",
+            "ǅ",
+            "kelvin k",
+            "k",
+            "ω",
+            "ärger",
+            "東京",
+            "ﬁle",
+            "file",
+            "zzq",
+        ];
+        for body in bodies {
+            let folded = fold_for_search(body);
+            assert_eq!(folded.len(), body.len(), "the fold keeps every offset");
+            for needle in needles {
+                assert_eq!(
+                    folded.find(&fold_for_search(needle)),
+                    first_match(body, needle),
+                    "{needle:?} in {body:?}"
+                );
+            }
+        }
+    }
+
+    /// A term typed with a capital that lowercases wider (`İ`) or narrower
+    /// (`ẞ`) finds the body that spells it as typed, and its lowercase still
+    /// finds an ordinary capital.
+    #[test]
+    fn a_term_is_matched_as_typed() {
+        let s = DbSchema {
+            routines: vec![
+                routine("a", "WHERE city = 'İstanbul'"),
+                routine("b", "WHERE street = 'HAUPTSTRAẞE'"),
+                routine("c", "WHERE name = 'Ärger'"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(names(&body_hits(&s, "İstanbul", 50)), ["routine:a"]);
+        assert_eq!(names(&body_hits(&s, "STRAẞE", 50)), ["routine:b"]);
+        assert_eq!(names(&body_hits(&s, "ärger", 50)), ["routine:c"]);
+        // The name tiers' skip still reads the lowercase of what was typed.
+        let named = DbSchema {
+            routines: vec![routine("Orders_Total", "SELECT 1 FROM Orders")],
+            ..Default::default()
+        };
+        assert!(body_hits(&named, "ORDERS", 50).is_empty());
+    }
+
+    /// `keep` is asked before a hit spends the limit, so the rows a caller will
+    /// drop cannot crowd out the ones it will show.
+    #[test]
+    fn hits_a_caller_drops_do_not_spend_the_limit() {
+        let mut routines: Vec<_> = (0..10)
+            .map(|i| routine(&format!("c{i}"), "geography_distance"))
+            .collect();
+        routines.push(routine("mine", "SELECT b::geography"));
+        let s = DbSchema {
+            routines,
+            ..Default::default()
+        };
+        let hits = body_hits_where(
+            &s,
+            "geography",
+            3,
+            |o| matches!(o, BodyOwner::Routine(r) if r.name == "mine"),
+        );
+        assert_eq!(names(&hits), ["routine:mine"]);
+    }
+
+    /// **A clone searches its own bodies.** The index is built on a schema's
+    /// first body search and kept on it; a clone is made to be changed, and
+    /// one carrying its source's index would search bodies it no longer has.
+    #[test]
+    fn a_cloned_schema_does_not_search_its_sources_bodies() {
+        let s = DbSchema {
+            routines: vec![routine("f", "SELECT * FROM ledger")],
+            ..Default::default()
+        };
+        assert_eq!(names(&body_hits(&s, "ledger", 50)), ["routine:f"]);
+        let mut changed = s.clone();
+        changed.routines = vec![routine("f", "SELECT * FROM journal")];
+        assert!(body_hits(&changed, "ledger", 50).is_empty());
+        assert_eq!(names(&body_hits(&changed, "journal", 50)), ["routine:f"]);
     }
 
     #[test]

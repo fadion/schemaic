@@ -6374,6 +6374,11 @@ pub struct DbSchema {
     /// **PostgreSQL's installed extensions** (`pg_extension`) — empty on every
     /// other engine, none of which has the object. See [`ExtensionInfo`].
     pub extensions: Vec<ExtensionInfo>,
+    /// The bodies above, folded once for Find Anywhere's body tier
+    /// ([`crate::body_search::BodyIndex`]) — built on the first body search,
+    /// and empty again in a clone, which is made to be changed. Not part of
+    /// the schema; leave it to `Default`.
+    pub body_index: crate::body_search::BodyIndexCache,
 }
 
 /// One installed PostgreSQL extension (`pg_extension` joined to

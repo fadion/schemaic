@@ -4668,7 +4668,8 @@ fn build_items(
         // query we instead show this connection's recent activations (search history),
         // each marked with a trailing rotate-ccw-clock — they vanish once you type.
         Parsed::Search(q) => {
-            let q = q.trim().to_lowercase();
+            let needles = FindNeedles::of(&q);
+            let q = needles.name.clone();
             if q.is_empty() {
                 let conn = active_conn.get_untracked();
                 // `recent_visible`, not `recent`: a hidden database is gone
@@ -4728,7 +4729,7 @@ fn build_items(
             let (hits, bodies) = find_matches(
                 db_nodes,
                 hidden,
-                &q,
+                &needles,
                 80,
                 schemaic_core::body_search::BODY_HIT_CAP,
             );
@@ -5921,10 +5922,30 @@ struct FindHit {
     icon: ResultIcon,
 }
 
+/// The two forms of one Find-Anywhere query: lowercased for the name tiers,
+/// whose predicate takes a lowered needle, and as typed for the body tier,
+/// whose match folds case itself — `İ` lowercases to two characters and `ẞ`
+/// to a narrower one, so a lowered term no longer lines up with text spelled
+/// as typed (`body_search::body_hits_where`). Both trimmed.
+struct FindNeedles {
+    name: String,
+    body: String,
+}
+
+impl FindNeedles {
+    fn of(typed: &str) -> FindNeedles {
+        let body = typed.trim().to_string();
+        FindNeedles {
+            name: body.to_lowercase(),
+            body,
+        }
+    }
+}
+
 fn find_matches(
     db_nodes: RwSignal<Vec<ConnNode>>,
     hidden: Memo<HashSet<String>>,
-    q: &str,
+    needles: &FindNeedles,
     limit: usize,
     body_limit: usize,
 ) -> (Vec<FindHit>, Vec<BodyFindHit>) {
@@ -5959,8 +5980,8 @@ fn find_matches(
     // The same visible, loaded databases for both lists: a body hit in a
     // hidden database would be the leak `db_visible` above exists to close.
     (
-        matches_across(dbs(), q, limit),
-        body_matches_across(dbs(), q, body_limit),
+        matches_across(dbs(), &needles.name, limit),
+        body_matches_across(dbs(), &needles.body, body_limit),
     )
 }
 
@@ -6079,29 +6100,38 @@ struct BodyFindHit {
 /// policy.
 ///
 /// A routine or event the palette may not open ([`is_palette_target`]) is
-/// dropped here, as the object pass drops it. A trigger's icon is the one its
-/// table wears, since the table is what activating the row opens.
+/// dropped here, as the object pass drops it — **inside** `body_hits_where`,
+/// before a hit counts against the cap, so a schema full of C functions whose
+/// link symbols match cannot spend it all on rows that are then thrown away.
+/// A trigger's icon is the one its table wears, since the table is what
+/// activating the row opens.
+///
+/// `q` is the term **as typed** (`FindNeedles::body`), not lowercased.
 fn body_matches_across<'a>(
     dbs: impl IntoIterator<Item = (&'a str, &'a schemaic_core::schema::DbSchema)>,
     q: &str,
     limit: usize,
 ) -> Vec<BodyFindHit> {
-    use schemaic_core::body_search::{BodyOwner, body_hits};
+    use schemaic_core::body_search::{BodyOwner, body_hits_where};
     use schemaic_core::schema::ObjectItem;
+    let opens = |owner: &BodyOwner| match owner {
+        BodyOwner::Routine(r) => is_palette_target(&ObjectItem::Routine(r.clone())),
+        BodyOwner::Event(e) => is_palette_target(&ObjectItem::Event(e.clone())),
+        BodyOwner::View { .. } | BodyOwner::Trigger { .. } => true,
+    };
     let mut buckets: Vec<Vec<BodyFindHit>> = Vec::new();
     for (database, schema) in dbs {
-        let bucket: Vec<BodyFindHit> = body_hits(schema, q, limit)
+        let bucket: Vec<BodyFindHit> = body_hits_where(schema, q, limit, opens)
             .into_iter()
-            .filter_map(|hit| {
-                let object = |item: ObjectItem| {
-                    is_palette_target(&item).then(|| ResultIcon::Object(item.kind()))
-                };
+            .map(|hit| {
                 let icon = match &hit.owner {
                     BodyOwner::View { .. } => {
                         ResultIcon::Relation(schemaic_core::schema::TableShape::View)
                     }
-                    BodyOwner::Routine(r) => object(ObjectItem::Routine(r.clone()))?,
-                    BodyOwner::Event(e) => object(ObjectItem::Event(e.clone()))?,
+                    BodyOwner::Routine(r) => {
+                        ResultIcon::Object(ObjectItem::Routine(r.clone()).kind())
+                    }
+                    BodyOwner::Event(e) => ResultIcon::Object(ObjectItem::Event(e.clone()).kind()),
                     BodyOwner::Trigger {
                         schema: ns, table, ..
                     } => schema.find_table(ns.as_deref(), table).map_or(
@@ -6109,11 +6139,11 @@ fn body_matches_across<'a>(
                         table_result_icon,
                     ),
                 };
-                Some(BodyFindHit {
+                BodyFindHit {
                     database: database.to_string(),
                     hit,
                     icon,
-                })
+                }
             })
             .collect();
         if !bucket.is_empty() {
@@ -7186,6 +7216,76 @@ mod find_tests {
         assert!(!names.contains(&"shop.linked".to_string()), "{names:?}");
         // Too short a term searches no body at all.
         assert!(super::body_matches_across([("shop", &small)], "le", 50).is_empty());
+    }
+
+    /// **Routines the palette cannot open do not spend the cap.** A legacy
+    /// PostGIS install puts hundreds of C functions in `public`, each `prosrc`
+    /// a link symbol like `geography_distance`, and the fifty they filled were
+    /// all dropped afterwards — leaving the user's own routine that mentions
+    /// `geography`, sorted after them, unlisted and the tier empty.
+    #[test]
+    fn routines_that_cannot_be_opened_do_not_spend_the_body_cap() {
+        use schemaic_core::schema::RoutineInfo;
+        use std::sync::Arc;
+        let mut routines: Vec<Arc<RoutineInfo>> = (0..60)
+            .map(|i| {
+                Arc::new(RoutineInfo {
+                    name: format!("st_f{i:02}"),
+                    language: "c".into(),
+                    body: "geography_distance".into(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        routines.push(Arc::new(RoutineInfo {
+            name: "zz_nearest_shop".into(),
+            language: "plpgsql".into(),
+            body: "BEGIN RETURN ST_Distance(a::geography, b); END".into(),
+            ..Default::default()
+        }));
+        let gis = DbSchema {
+            routines,
+            ..Default::default()
+        };
+        let hits = super::body_matches_across([("gis", &gis)], "geography", 50);
+        assert_eq!(hits.len(), 1, "only the routine that opens");
+        assert!(super::body_matches_across([("gis", &gis)], "geography", 0).is_empty());
+    }
+
+    /// **The body tier gets the term as typed.** The palette lowercases its
+    /// query for the name predicate, and `İ` lowercases to two characters and
+    /// `ẞ` to a narrower one — so the lowered term matched nothing a body
+    /// spells exactly as typed.
+    #[test]
+    fn a_body_is_found_by_a_capital_that_lowercases_wider_or_narrower() {
+        use schemaic_core::schema::RoutineInfo;
+        use std::sync::Arc;
+        let s = DbSchema {
+            routines: vec![
+                Arc::new(RoutineInfo {
+                    name: "by_city".into(),
+                    language: "plpgsql".into(),
+                    body: "SELECT * FROM shops WHERE city = 'İstanbul'".into(),
+                    ..Default::default()
+                }),
+                Arc::new(RoutineInfo {
+                    name: "by_street".into(),
+                    language: "plpgsql".into(),
+                    body: "SELECT * FROM shops WHERE street = 'HAUPTSTRAẞE'".into(),
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        };
+        for typed in ["İstanbul", "  STRAẞE "] {
+            // What `build_items` hands the body tier, from what was typed.
+            let needles = super::FindNeedles::of(typed);
+            assert_eq!(
+                super::body_matches_across([("shop", &s)], &needles.body, 50).len(),
+                1,
+                "{typed}"
+            );
+        }
     }
 
     /// Each pass is guaranteed its third if it can use it; a pass with nothing to
