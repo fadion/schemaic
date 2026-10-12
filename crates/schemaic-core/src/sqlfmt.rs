@@ -2189,6 +2189,10 @@ struct Fmt<'a> {
     /// and a slice's `:` sit tight: `ARRAY[1,2]` came out `array [ 1,⏎  2 ]`.
     brackets: usize,
     prev: Option<(Kind, String)>,
+    /// The last token that is no comment, since the statement began — what
+    /// "is this the statement's first word?" asks, so that a comment above a
+    /// statement neither hides its verb nor pushes its head onto the river.
+    prev_code: Option<(Kind, String)>,
     /// Inside `BETWEEN … AND …`: the next `AND` stays inline.
     suppress_and: bool,
     /// Previous token was a unary sign → the next token is tight against it.
@@ -2313,6 +2317,7 @@ impl<'a> Fmt<'a> {
             parens: Vec::new(),
             brackets: 0,
             prev: None,
+            prev_code: None,
             suppress_and: false,
             tight_next: false,
             limit_depth: None,
@@ -2353,13 +2358,14 @@ impl<'a> Fmt<'a> {
         self.base = Ind::lv(self.blocks.len());
         self.content = self.base;
         self.prev = None;
+        self.prev_code = None;
         self.break_to(self.base);
     }
 
     /// Is the next token one where a statement starts — after a `;`, a body's
-    /// opening word, or a label's `:`?
+    /// opening word, or a label's `:`, comments between aside?
     fn at_statement_start(&self) -> bool {
-        match &self.prev {
+        match &self.prev_code {
             None => true,
             Some((Kind::Punct, p)) => p == ":",
             Some(_) => false,
@@ -2493,7 +2499,11 @@ impl<'a> Fmt<'a> {
         }
         self.tight_next = false;
         self.river_inline_head = false;
-        if std::mem::take(&mut self.item.fresh) {
+        // A comment is no part of a list's item: one trailing the last item's
+        // comma would otherwise open the next item on the comma's line, which
+        // then never lined up.
+        let comment = matches!(kind, Kind::LineComment | Kind::BlockComment);
+        if !comment && std::mem::take(&mut self.item.fresh) {
             self.item = Item {
                 line: self.line_body_start,
                 first: text.to_ascii_uppercase(),
@@ -2507,7 +2517,10 @@ impl<'a> Fmt<'a> {
             self.marks.push((self.group, self.out.len()));
             self.item.marked = true;
         }
-        self.item.tokens += 1;
+        if !comment {
+            self.item.tokens += 1;
+            self.prev_code = Some((kind, text.to_string()));
+        }
         self.out.push_str(text);
         self.line_has_content = true;
         self.prev = Some((kind, text.to_string()));
@@ -2553,7 +2566,13 @@ impl<'a> Fmt<'a> {
         self.out = out;
         self.marks = marks;
         let (out_len, marks_len) = (self.out.len(), self.marks.len());
-        let line_start = self.out.rfind('\n').map_or(0, |n| n + 1);
+        // From the line the `(` lands on: where a break is pending it opens a
+        // line of its own, and the line above it is none of its width.
+        let line_start = if self.pending.is_some() && !self.glue_next {
+            out_len
+        } else {
+            self.out.rfind('\n').map_or(0, |n| n + 1)
+        };
         self.measuring = true;
         let mut j = k;
         while j <= close {
@@ -2904,11 +2923,16 @@ impl<'a> Fmt<'a> {
                 && self.item.tokens == 1
                 && !TABLE_ITEM_WORDS.contains(&self.item.first.as_str());
             // After a statement under `Keep`: the blank line is the input's,
-            // read at the first token on a new line — a comment trailing the
-            // terminator is still the statement's line.
-            if self.gap_pending && (kind != Kind::LineComment || gap.contains('\n')) {
-                self.gap_pending = false;
-                self.blank = gap.matches('\n').count() >= 2;
+            // read before each token on a new line up to the next statement's
+            // first — a comment trailing the terminator is still the
+            // statement's line, and a blank after a comment between the two
+            // is kept where it was.
+            if self.gap_pending {
+                let comment = matches!(kind, Kind::LineComment | Kind::BlockComment);
+                if !comment || gap.contains('\n') {
+                    self.blank = gap.matches('\n').count() >= 2;
+                }
+                self.gap_pending = comment;
             }
             match kind {
                 Kind::LineComment => {
@@ -2961,6 +2985,7 @@ impl<'a> Fmt<'a> {
                     self.parens.clear();
                     self.suppress_and = false;
                     self.prev = None;
+                    self.prev_code = None;
                     self.blank = true;
                     self.break_to(Ind::default());
                 }
@@ -2974,7 +2999,7 @@ impl<'a> Fmt<'a> {
                 Kind::Word => {
                     let up = text.to_ascii_uppercase();
                     let in_expr = self.in_expr_paren();
-                    if self.prev.is_none() {
+                    if self.prev_code.is_none() {
                         self.verb = Some(up.clone());
                     }
                     // A write's `OUTPUT inserted.id`, not a parameter's
@@ -3202,7 +3227,7 @@ impl<'a> Fmt<'a> {
                         // keyword, which stays on its paren's line.
                         let inline = self.river && self.river_inline_head;
                         if !inline {
-                            let at = if self.river && self.prev.is_some() {
+                            let at = if self.river && self.prev_code.is_some() {
                                 self.river_at(text)
                             } else {
                                 self.base
@@ -3246,8 +3271,16 @@ impl<'a> Fmt<'a> {
                         self.emit(Kind::Word, text, false);
                         self.joined = true;
                         self.in_on = false;
-                    } else if up == "ON" && self.join_on_own_line && self.joined && !in_expr {
-                        // The join's condition, one in from the join.
+                    } else if up == "ON"
+                        && self.join_on_own_line
+                        && self.joined
+                        && !in_expr
+                        && !word_is(toks, k + 1, "DUPLICATE")
+                        && !word_is(toks, k + 1, "CONFLICT")
+                    {
+                        // The join's condition, one in from the join. One
+                        // join owns one `ON`: a later one — an upsert's
+                        // `ON DUPLICATE KEY`/`ON CONFLICT` — is no condition.
                         let to = if self.river {
                             self.river_at(text)
                         } else {
@@ -3255,6 +3288,7 @@ impl<'a> Fmt<'a> {
                         };
                         self.break_to(to);
                         self.emit(Kind::Word, text, false);
+                        self.joined = false;
                         self.in_on = true;
                     } else if !in_expr
                         && (up == "AND" || up == "OR")
@@ -3473,6 +3507,7 @@ impl<'a> Fmt<'a> {
         self.joined = false;
         self.in_on = false;
         self.prev = None;
+        self.prev_code = None;
         self.blank = level.lv == 0 && self.gap == StatementGap::One;
         self.gap_pending = self.gap == StatementGap::Keep;
         self.break_to(level);
@@ -3861,6 +3896,26 @@ mod tests {
             ),
             "create procedure p()\nbegin\n  select\n    1;\n\n  select\n    2;\n  select\n    3;\nend"
         );
+        // A blank after a comment between two statements is kept where it
+        // was — after a comment on its own line, after a block comment
+        // trailing the terminator, after a run of comments.
+        assert_eq!(
+            styled("select 1;\n-- end of part one\n\nselect 2;", keep),
+            "select\n  1;\n-- end of part one\n\nselect\n  2;"
+        );
+        assert_eq!(
+            styled("select 1;\n\n-- part two\nselect 2;", keep),
+            "select\n  1;\n\n-- part two\nselect\n  2;"
+        );
+        assert!(
+            styled("select 1; /* done */\n\nselect 2;", keep).contains("/* done */\n\nselect"),
+            "{}",
+            styled("select 1; /* done */\n\nselect 2;", keep)
+        );
+        assert_eq!(
+            styled("select 1; -- c1\n-- c2\n\nselect 2;", keep),
+            "select\n  1; -- c1\n-- c2\n\nselect\n  2;"
+        );
     }
 
     #[test]
@@ -3917,6 +3972,10 @@ mod tests {
             "alter table t add constraint fk foreign key (a) references b (id) on delete cascade",
             "create trigger tr after insert on t for each row set @a = 1",
             "merge into t using s on t.id = s.id when matched then update set a = 1",
+            // An upsert after a join: its `ON` is no join condition.
+            "insert into t (a, b) select x.a, y.b from x join y using (id) \
+             on duplicate key update b = values(b)",
+            "insert into t (a) select x.a from x join y using (id) on conflict (a) do nothing",
         ] {
             assert_eq!(
                 styled(sql, on_own_line()),
@@ -3924,6 +3983,14 @@ mod tests {
                 "{sql}"
             );
         }
+        // Nor a second one, after the join's own.
+        let out = styled(
+            "insert into t (a, b) select x.a, y.b from x join y on y.id = x.id and y.z = 1 \
+             on duplicate key update b = values(b)",
+            on_own_line(),
+        );
+        assert!(out.contains("    on y.id = x.id\n"), "{out}");
+        assert!(out.contains("and y.z = 1 on duplicate key"), "{out}");
         let nested =
             "select * from t join (select * from a join b on b.id = a.id) x on x.id = t.id";
         let out = styled(nested, on_own_line());
@@ -3944,6 +4011,58 @@ mod tests {
         let once = styled(sql, style);
         assert_eq!(styled(&once, style), once, "a second format moved:\n{once}");
         once
+    }
+
+    /// A comment above a statement is no part of its layout: the statement
+    /// under it starts at the margin under the river, and its verb still
+    /// decides what its parens and clauses are — a `CREATE TABLE`'s body,
+    /// T-SQL's `OUTPUT`.
+    #[test]
+    fn a_comment_before_a_statement_changes_nothing_after_it() {
+        for sql in ["with x as (select 1 as a) select a from x", "set @a = 1"] {
+            assert_eq!(
+                settled(&format!("-- c\n{sql}"), river()),
+                format!("-- c\n{}", styled(sql, river())),
+                "{sql}"
+            );
+        }
+        // In a body as well: a commented statement starts at the body's
+        // margin, as its neighbours do.
+        let body = "create procedure p as begin -- setup\nset nocount on;\n-- the rows\n\
+                    with c as (select 1 as a) select a from c; end";
+        let out = format_range(body, 0, body.len(), IND, SqlDialect::MsSql, river());
+        assert!(out.contains("\n  set nocount on;"), "{out}");
+        assert!(out.contains("\n  with c as"), "{out}");
+        let table = "create table t (a int, b int)";
+        assert_eq!(
+            styled(&format!("-- t\n{table}"), FormatStyle::default()),
+            format!("-- t\n{}", styled(table, FormatStyle::default()))
+        );
+        assert_eq!(
+            styled(&format!("/* t */ {table}"), FormatStyle::default()),
+            format!("/* t */ {}", styled(table, FormatStyle::default()))
+        );
+        let ms = |sql: &str| {
+            format_range(
+                sql,
+                0,
+                sql.len(),
+                IND,
+                SqlDialect::MsSql,
+                FormatStyle::default(),
+            )
+        };
+        let update = "update t set a = 1 output inserted.a where id = 1";
+        assert_eq!(
+            ms(&format!("-- c\n{update}")),
+            format!("-- c\n{}", ms(update))
+        );
+        // MySQL's compound statements too: an `IF` after a comment in a body
+        // still opens one.
+        let my = |sql: &str| styled(sql, FormatStyle::default());
+        let plain = my("create procedure p() begin if a then select 1; end if; end");
+        let commented = my("create procedure p() begin\n-- c\nif a then select 1; end if; end");
+        assert_eq!(commented.replacen("  -- c\n", "", 1), plain, "{commented}");
     }
 
     /// The river: each clause keyword right-aligned on the end of `SELECT`,
@@ -4157,6 +4276,41 @@ mod tests {
         );
     }
 
+    /// A trailing comment is no item: the column after a commented one
+    /// still lines up, in a table body, a select list and a `SET`.
+    #[test]
+    fn a_trailing_comment_does_not_take_the_next_items_place() {
+        let out = settled(
+            "create table t (id int, -- the key\n name varchar(10), -- the name\n \
+             created_at datetime, flag bit)",
+            aligned(),
+        );
+        let cols: Vec<usize> = ["int", "varchar", "datetime", "bit"]
+            .iter()
+            .map(|ty| {
+                let line = out
+                    .lines()
+                    .find(|l| l.contains(&format!(" {ty}")))
+                    .unwrap_or_else(|| panic!("no {ty}:\n{out}"));
+                line.find(&format!(" {ty}")).unwrap()
+            })
+            .collect();
+        assert!(cols.iter().all(|&c| c == cols[0]), "{cols:?}\n{out}");
+        let out = settled(
+            "select t.id as id, -- key\n t.name as name, t.created_at as created from t",
+            aligned(),
+        );
+        assert!(out.contains("  t.name       as name,\n"), "{out}");
+        let out = settled(
+            "update t set a = 1, -- one\n longer_name = 2, bb = 3",
+            aligned(),
+        );
+        assert!(
+            out.contains("  longer_name = 2,\n  bb          = 3"),
+            "{out}"
+        );
+    }
+
     /// Off, nothing lines up: the formatter as it always was.
     #[test]
     fn alignment_is_off_by_default() {
@@ -4218,6 +4372,25 @@ mod tests {
             settled(no_list, wrapped(20)),
             styled(no_list, FormatStyle::default())
         );
+    }
+
+    /// A list that opens its own line is measured from that line, not from
+    /// the long one above it: a short `VALUES` row under a long comment, a
+    /// row constructor under a long select item, stay whole.
+    #[test]
+    fn a_list_on_its_own_line_is_measured_on_it() {
+        let out = settled(
+            "insert into t (a, b) values\n(1, 'x'), -- the first row, which is the one we \
+             always seed for the demo account\n(2, 'y'), -- short\n(3, 'z')",
+            wrapped(80),
+        );
+        assert!(out.contains("(2, 'y'),"), "{out}");
+        let out = settled(
+            "select a_column_with_a_rather_long_name_number_one_that_goes_on_and_on_and_on_forever, \
+             (1, 2) as pair from t",
+            wrapped(80),
+        );
+        assert!(out.contains("(1, 2) as pair"), "{out}");
     }
 
     /// Under the river the list hangs from the body's column.

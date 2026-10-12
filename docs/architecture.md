@@ -13373,13 +13373,15 @@ existing prose was left alone.
     writes one blank line wherever the input had one or more and none where it had none, **at any
     depth**, so a body's statements may be parted too, which the other two never do. Both live in
     `end_statement`: `One` sets `blank` only at level 0, and `Keep` sets `Fmt::gap_pending`
-    instead, which the next token settles by counting the newlines the input had before it. **It
-    is read at the first token that starts a new line, not the first token** — a line comment with
-    no newline before it trailed the terminator and is still the statement's line, so
-    `select 1; -- one⏎⏎select 2;` keeps its gap after the comment rather than losing it to the
-    comment's own blank-free run-up (`as_typed_keeps_the_blank_lines_the_input_had`, which holds
-    both that and a procedure body). Several blank lines become one; the setting does not keep
-    counts. A `GO` line is outside it: the batch after one starts after a blank line under all
+    instead, which stays open across the comments between the two statements and is settled at
+    the next one's first code token. **Each token on a new line up to there sets `blank` from the
+    newlines the input had before it** — a comment, line or block, with no newline before it
+    trailed the terminator and is still the statement's line, so `select 1; -- one⏎⏎select 2;` and
+    `select 1; /* done */⏎⏎select 2;` keep their gap after the comment, and a blank after a
+    comment on its own line (`select 1;⏎-- part one⏎⏎select 2;`) stays after it rather than being
+    lost to the comment's own blank-free run-up (`as_typed_keeps_the_blank_lines_the_input_had`,
+    which holds those, a run of comments and a procedure body). Several blank lines become one;
+    the setting does not keep counts. A `GO` line is outside it: the batch after one starts after a blank line under all
     three, as it always did.
     **A join's condition on its own line is the fourth**, and the first that is a plain `bool` —
     `FormatStyle::join_on_own_line`, off by default, which is the formatter as it always was:
@@ -13389,10 +13391,12 @@ existing prose was left alone.
     (`a_joins_on_can_take_its_own_line`). **Only a join's `ON` moves, and that is the state's whole
     job**: `ON` is also an index's `ON t`, a trigger's `ON t`, a key's `ON DELETE` and a `MERGE`'s
     `ON`, none of which is a join condition. So `Fmt::joined` is set only where a join keyword
-    breaks (`is_join_break`) and cleared by a clause head and in `end_statement`, and the `ON` arm
-    asks for it — a test of the word alone would break every one of those
+    breaks (`is_join_break`) and cleared by a clause head, in `end_statement` **and by the `ON` it
+    takes — one join owns one `ON`** — and the `ON` arm asks for it, and refuses an `ON` before
+    `DUPLICATE` or `CONFLICT`. A test of the word alone would break every one of those
     (`an_on_that_is_no_joins_keeps_its_line`, which holds all four — a `MERGE`'s keeps its line
-    because no join keyword precedes its `ON`). **A subquery
+    because no join keyword precedes its `ON` — and an upsert's `ON DUPLICATE KEY`/`ON CONFLICT`
+    after an `INSERT … SELECT`'s join, which no head separates from it). **A subquery
     has joins of its own**: a subquery `(` saves both flags in `Paren::saved_joined`/`saved_on`
     and clears them, and its `)` restores them, so the inner join's `ON` and the outer one's after
     `) x` each answer for their own join. What was one branch for a join keyword and `AND`/`OR`
@@ -13404,7 +13408,9 @@ existing prose was left alone.
     `const RIVER: usize = 6`, `SELECT`'s width and that of every head of a query's first line; a
     longer head such as `RETURNING` takes no pad and runs past the edge. All of
     it is in `Fmt::step`. A head breaks to `Fmt::river_at(word)` — `base`, padded in `Ind::col` so
-    the word ends on the edge — save at a statement's start (`prev` is `None`, so no pad) and at a
+    the word ends on the edge — save at a statement's start (`Fmt::prev_code` is `None`, so no
+    pad: the last token that is no comment, so a comment above `WITH` or `SET` does not push it
+    onto the edge, `a_comment_before_a_statement_changes_nothing_after_it`) and at a
     subquery's first head, which stays on its paren's line (`Fmt::river_inline_head`, **cleared by
     every `emit`**, so it answers only for the token straight after the `(`). There is no break
     after the head: `content` becomes the column just past the head and its followers
@@ -13442,7 +13448,11 @@ existing prose was left alone.
     on an item's later line lines up with nothing, and `) as sub` after a subquery laid out over
     several lines would otherwise be padded out to the aliases above it. `Item::fresh` is set by
     `Fmt::new_list` and after every breakable comma, under either comma style, and the next `emit`
-    starts the item — its line, and its first word upper-cased. **Each list is a group of its
+    **of code** starts the item — its line, and its first word upper-cased. A comment neither
+    starts an item nor counts among its tokens: the `-- the key` trailing `id int,` is written on
+    the comma's line, and taken as the next item's first token it put that item's line a line too
+    early, so the column after every commented one never lined up
+    (`a_trailing_comment_does_not_take_the_next_items_place`). **Each list is a group of its
     own**: `new_list(clause)` hands out a new one at every clause head (the clause being the head
     word) and when a subquery's or a table body's paren opens (no clause), and
     `Paren::saved_align` keeps the outer `(group, clause, item)` for its `)` to restore — so a
@@ -13470,7 +13480,10 @@ existing prose was left alone.
     doing**, which is what the `step` seam is for: it takes `out` and `marks` aside, clones the
     `Fmt` and puts them back — so the clone is the layout state, not the text written so far —
     sets `Fmt::measuring`, steps from the `(` to its `)`, and asks whether any line from the `(`'s
-    line on is wider than `wrap`, a tab counted as `tab_width`; then it truncates `out` and
+    line on is wider than `wrap`, a tab counted as `tab_width` — the line it *lands* on: where a
+    break is pending the `(` opens a new line, and measuring from the last `\n` written took in the
+    long line above it, so a short `VALUES` row under a long comment went one item a line
+    (`a_list_on_its_own_line_is_measured_on_it`); then it truncates `out` and
     `marks` to where they were and restores the clone. So the width it measures is the one it
     would write, spacing and case frames and all, rather than an estimate of it. While `measuring`
     is set `overflows` answers `false`, so the lists inside stay on one line for the measure; each
@@ -13665,9 +13678,12 @@ existing prose was left alone.
     (`recursive_window_and_limit_lay_out_as_clauses`). T-SQL's `TOP (n)` keeps its space (`TOP`
     is in `is_keyword`, so its paren is a clause's, not a call's), and a write's `OUTPUT` is a head
     — only where `has_output_clause` (SQL Server), only in an `INSERT`/`UPDATE`/`DELETE`/`MERGE`
-    (`Fmt::verb`, the statement's first word), and only with a name after it, since a procedure
-    parameter's `@x int OUTPUT` takes no parens and a column may be called `output`
-    (`top_keeps_its_space_and_output_is_a_clause`). **A `BEGIN … END` body is indented**
+    (`Fmt::verb`, the statement's first *code* word — read where `Fmt::prev_code` is `None`, so a
+    comment above the statement no longer hides it, and with it a `CREATE TABLE`'s body, which
+    went unlisted, `a_comment_before_a_statement_changes_nothing_after_it`; that also covers
+    `at_statement_start`, which opens MySQL's compound statements), and only with a name after
+    it, since a procedure parameter's `@x int OUTPUT` takes no parens and a column may be called
+    `output` (`top_keeps_its_space_and_output_is_a_clause`). **A `BEGIN … END` body is indented**
     (`Fmt::blocks`, a stack of the word that opened each open body): `end_statement` returns a
     body's `;` to the body's level, not the margin, and with no blank line between its statements
     unless `StatementGap::Keep` finds one in the input;
