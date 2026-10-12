@@ -6972,9 +6972,13 @@ existing prose was left alone.
     Redundant indexes come first, in list order, then unindexed foreign keys; each carries its own
     sentence (`IndexHint::message`). **Only a plain index is offered as redundant**: not unique —
     it enforces what its cover may not — with no predicate, no `INCLUDE`, and not columnstore, XML
-    or spatial. Its key columns must lead the cover's, compared ASCII-case-insensitively as
-    `validate` compares names, with the same prefix length, sort order and expression flag, and
-    under the same `method`. The primary key is no row of `draft.indexes` (`from_table` filters it
+    or spatial — and not `lossy`, which is neither advised against nor taken as a cover: it is how
+    introspection records what the model could not read (PostgreSQL's operator class, MySQL's
+    invisible index, SQLite's unread condition), and `text_pattern_ops` serves `LIKE 'a%'` where the
+    plain cover cannot. Its key columns must lead the cover's, compared ASCII-case-insensitively as
+    `validate` compares names, with the same prefix length, sort order, expression flag and per-key
+    collation (SQLite's `name COLLATE NOCASE` serves what `name` does not), and
+    under the same `method` (`a_lossy_or_differently_collated_index_is_no_basis_for_advice`). The primary key is no row of `draft.indexes` (`from_table` filters it
     out — `find_key` below), so it is asked separately and first, and covers only a default-method
     index. An identical pair flags only the **later** index, so taking the advice leaves one rather
     than dropping both. A foreign key is covered by the primary key or any non-partial index whose

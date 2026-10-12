@@ -1222,11 +1222,20 @@ pub fn index_hints(draft: &TableDraft, dialect: SqlDialect) -> Vec<IndexHint> {
             && a.prefix == b.prefix
             && a.descending == b.descending
             && a.expression == b.expression
+            // `name COLLATE NOCASE` serves lookups the plain key cannot.
+            && match (&a.collation, &b.collation) {
+                (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+                (x, y) => x.is_none() && y.is_none(),
+            }
     };
     // A plain B-tree-shaped index, the only kind that serves another's
-    // lookups and the only kind offered as redundant.
+    // lookups and the only kind offered as redundant — and one the model read
+    // whole: a `lossy` index carries what it could not read (an operator
+    // class, MySQL's invisible flag, an unread condition), so it is neither
+    // advised against nor taken as a cover.
     let plain = |ix: &IndexInfo| {
-        ix.predicate.is_none()
+        !ix.lossy
+            && ix.predicate.is_none()
             && ix.include.is_empty()
             && !ix.is_columnstore()
             && !ix.is_tsql_xml_or_spatial()
@@ -24391,6 +24400,50 @@ mod tests {
         d.indexes[3].info.method = Some("hash".into());
         d.indexes[4].info.columns[0].descending = true;
         assert_eq!(index_hints(&d, Postgres), Vec::new());
+    }
+
+    /// **What the model could not read is no basis for advice.** A `lossy`
+    /// index — PostgreSQL's non-default operator class, MySQL's invisible
+    /// index, SQLite's unread partial condition — is neither offered as
+    /// redundant nor taken as a cover: `text_pattern_ops` serves `LIKE 'a%'`
+    /// where the plain index cannot, and an invisible cover is one the
+    /// optimiser ignores. Nor is a key with its own collation the same key as
+    /// one without: only SQLite's `COLLATE NOCASE` index serves a NOCASE match.
+    #[test]
+    fn a_lossy_or_differently_collated_index_is_no_basis_for_advice() {
+        // The opclass index, beside a plain cover.
+        let mut d = hinted(
+            &[],
+            &[
+                ("ix_pattern", &["name"], false),
+                ("ix_nb", &["name", "b"], false),
+            ],
+            &[],
+        );
+        d.indexes[0].info.lossy = true;
+        assert_eq!(index_hints(&d, Postgres), Vec::new());
+        // The invisible cover, beside a plain index.
+        let mut d = hinted(
+            &[],
+            &[("ix_a", &["name"], false), ("ix_ab", &["name", "b"], false)],
+            &[],
+        );
+        d.indexes[1].info.lossy = true;
+        assert_eq!(index_hints(&d, MySql), Vec::new());
+        // The NOCASE index, beside a plain cover.
+        let mut d = hinted(
+            &[],
+            &[
+                ("ix_nocase", &["name"], false),
+                ("ix_nb", &["name", "b"], false),
+            ],
+            &[],
+        );
+        d.indexes[0].info.columns[0].collation = Some("NOCASE".into());
+        assert_eq!(index_hints(&d, Sqlite), Vec::new());
+        // The same collation, spelled in another case, is the same key.
+        d.indexes[1].info.columns[0].collation = Some("nocase".into());
+        assert_eq!(index_hints(&d, Sqlite).len(), 1);
     }
 
     /// A foreign key with no index leading with its columns — in any order —
