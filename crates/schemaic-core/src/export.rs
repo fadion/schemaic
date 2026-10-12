@@ -2501,6 +2501,37 @@ pub fn qualified_table(
     }
 }
 
+/// How SQL aimed at **one row by its key** addresses its table — the grid's
+/// write-back and the copies that render it (`edit::staged_sql`, Copy as ▸
+/// SQL UPDATE).
+///
+/// [`qualified_table`] everywhere but SQL Server, where it is three-part
+/// whenever the database is known: `[db].[schema].[table]`, or `[db]..[table]`
+/// with no schema, which T-SQL reads as the default one. `qualified_table`
+/// leaves the database out there on purpose, so an export can be retargeted;
+/// a statement that names a row by key must not be. A tab in database A that
+/// edited `B.dbo.t` wrote the same-named `dbo.t` in A, and a pasted copy has
+/// not even the 1-row net to notice. PostgreSQL needs nothing more — its
+/// connection is bound to the database — and MySQL already qualifies with it.
+pub fn qualified_row_target(
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    dialect: SqlDialect,
+) -> String {
+    match dialect {
+        SqlDialect::MsSql if !database.is_empty() => format!(
+            "{}.{}.{}",
+            ident_sql(database, dialect),
+            schema.map(|s| ident_sql(s, dialect)).unwrap_or_default(),
+            ident_sql(table, dialect)
+        ),
+        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            qualified_table(database, schema, table, dialect)
+        }
+    }
+}
+
 /// Columns whose exported cells stand in for bytes this result never carried.
 ///
 /// A raw-bytes cell renders as [`crate::model::binary_display`]'s `<n bytes>`,
@@ -4312,6 +4343,28 @@ mod tests {
     fn a_sql_server_table_is_qualified_by_its_schema_only() {
         assert_eq!(qualified_table("app", Some("dbo"), "t", MsSql), "[dbo].[t]");
         assert_eq!(qualified_table("app", None, "t", MsSql), "[t]");
+    }
+
+    /// A row aimed at by key names the database on SQL Server — three parts,
+    /// `..` for the default schema — and nothing changes for the other three,
+    /// or for an empty database, which means "don't qualify".
+    #[test]
+    fn a_row_target_names_the_database_on_sql_server() {
+        assert_eq!(
+            qualified_row_target("app", Some("dbo"), "t", MsSql),
+            "[app].[dbo].[t]"
+        );
+        assert_eq!(qualified_row_target("app", None, "t", MsSql), "[app]..[t]");
+        assert_eq!(
+            qualified_row_target("", Some("dbo"), "t", MsSql),
+            "[dbo].[t]"
+        );
+        assert_eq!(qualified_row_target("shop", None, "o", MySql), "`shop`.`o`");
+        assert_eq!(
+            qualified_row_target("shop", Some("s"), "o", Postgres),
+            "\"s\".\"o\""
+        );
+        assert_eq!(qualified_row_target("main", None, "o", Sqlite), "\"o\"");
     }
 
     /// **`None` is a claim about the connection, not about the engine**, and

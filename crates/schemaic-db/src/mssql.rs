@@ -3929,18 +3929,12 @@ fn qname(schema: Option<&str>, table: &str) -> String {
 /// identity, so nothing else could catch it. T-SQL takes a three-part name in
 /// every statement here (`SET IDENTITY_INSERT` included), and inside the
 /// pinned transaction.
+///
+/// The rule itself is `export::qualified_row_target`, which the grid's copies
+/// of these statements (Copy staged changes as SQL, Copy as ▸ SQL UPDATE) take
+/// too, so a pasted copy names the object Commit wrote.
 fn qname3(database: &str, schema: Option<&str>, table: &str) -> String {
-    if database.is_empty() {
-        return qname(schema, table);
-    }
-    // A three-part name needs its schema part; `db..t` would take the
-    // default schema, which is what a missing one means anyway.
-    format!(
-        "{}.{}.{}",
-        ident(database),
-        schema.map(ident).unwrap_or_default(),
-        ident(table)
-    )
+    schemaic_core::export::qualified_row_target(database, schema, table, MS)
 }
 
 /// A statement and the values its `@P1`, `@P2`… placeholders stand for, in

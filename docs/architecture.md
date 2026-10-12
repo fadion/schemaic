@@ -3727,7 +3727,13 @@ existing prose was left alone.
     the grid shows, staged edits included — through `export::script_literal` and named by
     `origin_column` through `export::ident_sql`; so a staged change to a key column is in neither
     half of the copy. A pending row has no key yet and is skipped (`saved_rows`)
-    (`copy_as_update_sets_the_staged_value_and_keys_by_the_original`). `where_in_at` writes
+    (`copy_as_update_sets_the_staged_value_and_keys_by_the_original`). **A column past the
+    result's arena ceiling (`ResultSet::capped_columns`) is left out of the `SET` list**: its
+    later cells read blank while holding real text, so `SET body = ''` erased every value it was
+    run over (`copy_as_update_leaves_out_a_column_the_arena_blanked`); a key or confirming column
+    there refuses both copies (`key_aimable`), since `WHERE k = ''` names another row or none.
+    **The `UPDATE`'s table is `export::qualified_row_target`**, the name Commit writes to — three
+    parts on SQL Server (`copy_as_update_on_sql_server_names_the_database`). `where_in_at` writes
     `WHERE k IN (…)` for one key column and `OR`ed, parenthesised matches for a composite one — SQL
     Server has no tuple `IN` — each row once, in display order
     (`copy_as_where_in_ors_a_composite_key`); it refuses an implicit key (non-empty `confirm_cols`,
@@ -3784,8 +3790,10 @@ existing prose was left alone.
     string `NULL` — which is the paste round-trip's reading of the same cell. The **unset** cell
     of a pending row is the other distinction: it will take a server default, so a column whose
     source is one plans nothing at all rather than writing NULLs over the rows below it. A column
-    `editable` refuses is skipped in place, as a paste's is; a selection of one row, after the
-    rows are clipped to the real ones plus the pending ones, plans nothing
+    `editable` refuses is skipped in place, as a paste's is, and so is a column past the arena
+    ceiling, whose blank cells hold text the result never carried — filling with their `''` is
+    what Commit would then write (`fill_skips_a_column_the_arena_blanked`); a selection of one
+    row, after the rows are clipped to the real ones plus the pending ones, plans nothing
     (`fill_down_copies_each_columns_top_cell_into_the_rows_below`,
     `fill_up_copies_the_bottom_cell_as_the_grid_shows_it`,
     `fill_skips_what_it_cannot_write_or_has_no_value_for`).
@@ -3799,7 +3807,14 @@ existing prose was left alone.
     `IS NULL`, `key_match`'s spelling. A literal's type is its result column's, found by matching
     provenance because the plan names columns rather than indexing them — which is what gives SQL
     Server its `N'…'` (`staged_sql_speaks_each_engines_dialect`); names go through
-    `export::ident_sql` and the table through `export::qualified_table`. An `INSERT` that sets no
+    `export::ident_sql` and the table through **`export::qualified_row_target`, the rule
+    `db::mssql::qname3` delegates to** — so on SQL Server the copy is three-part, as Commit is. It
+    was `qualified_table`, which leaves the database out there for an export's sake, and a copy of
+    an edit to `B.dbo.t` pasted back into a tab in A wrote A's same-named table
+    (`staged_sql_on_sql_server_names_the_edits_database`). An insert that sets an IDENTITY column
+    is bracketed by `SET IDENTITY_INSERT … ON/OFF` on SQL Server, as Commit runs it — the identity
+    read off the result column's `flags.auto_increment`
+    (`staged_sql_brackets_an_identity_insert_on_sql_server`). An `INSERT` that sets no
     column is `() VALUES ()` on MySQL and `DEFAULT VALUES` elsewhere. **A staged blob is withheld,
     not written**: no literal here carries bytes, so its value is the grid's `<n bytes>`
     placeholder *unquoted* and a `-- NOTE:` line heads the text — the statement fails loudly if run,
@@ -17630,7 +17645,8 @@ existing prose was left alone.
   for the statement**: a trigger's statements report theirs first, in the same batch
   (`a_trigger_does_not_trip_the_one_row_guard`). The statements are `statement_for`,
   `refetch_statement` and `blob_statement`, pure and pinned in `write_tests`: every name through
-  `export::ident_sql`, qualified **`[database].[schema].[table]`** (`qname3`) whenever the
+  `export::ident_sql`, qualified **`[database].[schema].[table]`** (`qname3`, which is
+  `export::qualified_row_target` — the grid's copies of these statements take it too) whenever the
   database is known — `db..t` without a schema, two-part without a database — and the column facts
   read from that database's own `sys.columns`. **The database is part of the name because a pinned
   session's connection is in the session's database, not the edit's**: a Manual tab pinned to A
@@ -34224,7 +34240,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   no backslash escape, so doubling one would corrupt the value. **SQL Server is where brackets do
   have an escape**, so it emits them: `ident_sql` writes `[name]` with a `]` doubled, and
   `qualified_table` names `schema.table`, never the database, since a two-part name there is
-  schema-first. Its literals double only the quote and are **`N`-prefixed** — an unprefixed one is
+  schema-first — so an export can be retargeted. A statement that names **one row by key** must
+  not be, and takes `export::qualified_row_target` instead, three-part on SQL Server and
+  `qualified_table` elsewhere: the write-back (`qname3`) and the grid's copies of it. Its literals double only the quote and are **`N`-prefixed** — an unprefixed one is
   `varchar`, converted to the database's code page on the way in, so `'Ωμέγα'` can arrive as
   `'?????'` (`a_sql_server_string_literal_is_national_and_doubles_only_the_quote`). That is the
   literal's half only: `N'…'` carries the text as far as the column, and a `varchar` column still

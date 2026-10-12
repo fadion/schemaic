@@ -642,6 +642,24 @@ fn key_match(rs: &ResultSet, tbl: &EditTable, di: usize, dialect: SqlDialect) ->
         .join(" AND ")
 }
 
+/// `Err` when a column [`key_match`] would name a row by sits past the
+/// result's arena ceiling ([`ResultSet::capped_columns`]): its later cells read
+/// blank, and `WHERE k = ''` aims at another row or none.
+fn key_aimable(rs: &ResultSet, tbl: &EditTable) -> Result<(), &'static str> {
+    let blanked = tbl
+        .key_cols
+        .iter()
+        .chain(tbl.confirm_cols.iter())
+        .any(|ci| rs.capped_columns.contains(ci));
+    if blanked {
+        return Err(
+            "Nothing to copy as SQL: the key was too large for this result to hold whole, so some \
+             rows cannot be named by it.",
+        );
+    }
+    Ok(())
+}
+
 /// The staged changes as the SQL **Commit would run** — [`GridWrite::plan`]'s
 /// statements in its own order (deletes, updates, inserts), one a line, for the
 /// user to read or copy before committing.
@@ -655,24 +673,33 @@ fn key_match(rs: &ResultSet, tbl: &EditTable, di: usize, dialect: SqlDialect) ->
 /// grid's own `<n bytes>`, unquoted, and the copy fails loudly if it is run
 /// rather than storing the placeholder; a `-- NOTE` heads the text to say so.
 ///
+/// **It names the object Commit writes** — `export::qualified_row_target`,
+/// the rule `mssql::qname3` is, so on SQL Server the database is in the name
+/// and a paste into a tab in another database cannot land on a same-named
+/// table there — and on SQL Server an insert that sets an IDENTITY column is
+/// bracketed by `SET IDENTITY_INSERT … ON/OFF`, as Commit runs it.
+///
 /// [`GridWrite::plan`]: crate::model::GridWrite::plan
 pub fn staged_sql(write: &crate::model::GridWrite, rs: &ResultSet, dialect: SqlDialect) -> String {
-    use crate::export::{ident_sql, qualified_table, script_literal};
+    use crate::export::{ident_sql, qualified_row_target, script_literal};
     use crate::model::WriteStep;
-    // The type a written column has in the result, matched on its provenance —
-    // the statements name columns, and the literal needs the type.
-    let type_of = |database: &str, schema: Option<&str>, table: &str, column: &str| {
-        rs.columns
-            .iter()
-            .find(|c| {
-                c.origin.as_ref().is_some_and(|o| {
-                    o.database == database
-                        && o.schema.as_deref() == schema
-                        && o.table == table
-                        && o.column == column
-                })
+    // The result column a written column is, matched on its provenance — the
+    // statements name columns, and the literal needs the type.
+    let column_of = |database: &str, schema: Option<&str>, table: &str, column: &str| {
+        rs.columns.iter().find(|c| {
+            c.origin.as_ref().is_some_and(|o| {
+                o.database == database
+                    && o.schema.as_deref() == schema
+                    && o.table == table
+                    && o.column == column
             })
-            .map_or(String::new(), |c| c.type_name.clone())
+        })
+    };
+    let type_of = |database: &str, schema: Option<&str>, table: &str, column: &str| {
+        column_of(database, schema, table, column).map_or(String::new(), |c| c.type_name.clone())
+    };
+    let origin_of = |database: &str, schema: Option<&str>, table: &str, column: &str| {
+        column_of(database, schema, table, column).and_then(|c| c.origin.as_ref())
     };
     let mut bytes = false;
     let mut cell = |e: &CellEdit, ty: &str| match e {
@@ -702,8 +729,23 @@ pub fn staged_sql(write: &crate::model::GridWrite, rs: &ResultSet, dialect: SqlD
             WriteStep::Update(u) => (&u.database, u.schema.as_deref(), &u.table),
             WriteStep::Insert(i) => (&i.database, i.schema.as_deref(), &i.table),
         };
-        let target = qualified_table(database, schema, table, dialect);
+        let target = qualified_row_target(database, schema, table, dialect);
         let ty = |column: &str| type_of(database, schema, table, column);
+        // Commit runs an insert that sets an IDENTITY column between
+        // `SET IDENTITY_INSERT … ON` and `OFF`, and the server refuses it bare.
+        // T-SQL's own statement, so a grammar question rather than a capability.
+        let identity = match (step, dialect) {
+            (WriteStep::Insert(i), SqlDialect::MsSql) => i.cols.iter().any(|(c, _)| {
+                origin_of(database, schema, table, c).is_some_and(|o| o.flags.auto_increment)
+            }),
+            (
+                _,
+                SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite,
+            ) => false,
+        };
+        if identity {
+            lines.push(format!("SET IDENTITY_INSERT {target} ON;"));
+        }
         lines.push(match step {
             WriteStep::Delete(d) => format!("DELETE FROM {target} WHERE {};", key(&d.key, &ty)),
             WriteStep::Update(u) => {
@@ -739,6 +781,9 @@ pub fn staged_sql(write: &crate::model::GridWrite, rs: &ResultSet, dialect: SqlD
                 format!("INSERT INTO {target} ({names}) VALUES ({values});")
             }
         });
+        if identity {
+            lines.push(format!("SET IDENTITY_INSERT {target} OFF;"));
+        }
     }
     let mut out = String::new();
     if bytes {
@@ -1676,6 +1721,12 @@ impl GridCells<'_> {
     /// and never a `SET`; a column that is not text-writable (an expression, a
     /// blob shown as `<n bytes>`) is left out; a pending row has no key yet and
     /// is skipped. `Err` is the sentence the grid shows instead of copying.
+    ///
+    /// **A column past the result's arena ceiling ([`ResultSet::capped_columns`])
+    /// is left out too**: its later cells read blank while holding real text,
+    /// so `SET body = ''` would erase what it was run over. A key column there
+    /// refuses the copy — [`key_aimable`]. The target is
+    /// `export::qualified_row_target`, the name Commit writes to.
     pub fn updates_at(
         &self,
         model: &EditModel,
@@ -1685,17 +1736,24 @@ impl GridCells<'_> {
         dialect: SqlDialect,
     ) -> Result<String, &'static str> {
         let tbl = model.insert_target().ok_or(COPY_NEEDS_ONE_KEYED_TABLE)?;
+        key_aimable(self.rs, tbl)?;
         let (rows, cols) = self.gesture_at(selection, pos, &layout.into());
         let (out, order) = self.exported();
         let saved = self.saved_rows(&order, rows)?;
-        let sets: Vec<usize> = cols
+        let (sets, blanked): (Vec<usize>, Vec<usize>) = cols
             .into_iter()
             .filter(|&ci| model.text_editable(ci) && !tbl.key_cols.contains(&ci))
-            .collect();
+            .partition(|ci| !self.rs.capped_columns.contains(ci));
+        if sets.is_empty() && !blanked.is_empty() {
+            return Err(
+                "Nothing to copy as UPDATE: the selected columns were too large for this result to \
+                 hold whole, and some of their cells show blank.",
+            );
+        }
         if sets.is_empty() {
             return Err("Nothing to copy as UPDATE: none of the selected columns can be written.");
         }
-        let target = crate::export::qualified_table(
+        let target = crate::export::qualified_row_target(
             &tbl.database,
             tbl.schema.as_deref(),
             &tbl.table,
@@ -1742,6 +1800,7 @@ impl GridCells<'_> {
         dialect: SqlDialect,
     ) -> Result<String, &'static str> {
         let tbl = model.insert_target().ok_or(COPY_NEEDS_ONE_KEYED_TABLE)?;
+        key_aimable(self.rs, tbl)?;
         if !tbl.confirm_cols.is_empty() {
             return Err(
                 "Nothing to copy as WHERE IN: this table has no primary or unique key to name its \
@@ -1808,7 +1867,10 @@ impl GridCells<'_> {
     /// Columns are the **drawn** ones of the selection (`selected_cols`, hidden
     /// ones out), and one `editable` refuses is skipped in place. A pending
     /// row's **unset** cell is not a NULL — it will take the server's default —
-    /// so a column whose source is one fills nothing rather than NULLs.
+    /// so a column whose source is one fills nothing rather than NULLs. Nor
+    /// does a column past the arena ceiling ([`ResultSet::capped_columns`]):
+    /// its blank cells hold text the result never carried, and filling with
+    /// their `''` is what Commit would then write.
     pub fn fill_plan(
         &self,
         (r0, c0, r1, c1): (usize, usize, usize, usize),
@@ -1836,7 +1898,7 @@ impl GridCells<'_> {
         let ncols = self.rs.col_count();
         let mut plan = Vec::new();
         for ci in selected_cols((c0, c1), ncols, &layout.into()) {
-            if ci >= ncols || !editable(ci) || unset(ci) {
+            if ci >= ncols || !editable(ci) || unset(ci) || self.rs.capped_columns.contains(&ci) {
                 continue;
             }
             let value = self.summary_text(source, ci).map(|v| v.into_owned());
@@ -4861,7 +4923,51 @@ mod tests {
         );
         let mssql = staged_sql(&staged_write(), &r, SqlDialect::MsSql);
         assert!(mssql.contains("SET [name] = N'o''neil'"), "{mssql}");
-        assert!(mssql.contains("DELETE FROM [t] WHERE [id] = 3;"), "{mssql}");
+    }
+
+    /// **On SQL Server the copy names the database, as Commit does.** A tab in
+    /// database A that edited `B.dbo.t` commits to `[B].[dbo].[t]`
+    /// (`mssql::qname3`); a copy that said `[dbo].[t]` and was pasted back into
+    /// that tab wrote A's same-named table instead.
+    #[test]
+    fn staged_sql_on_sql_server_names_the_edits_database() {
+        let (r, _) = keyed_people();
+        let mssql = staged_sql(&staged_write(), &r, SqlDialect::MsSql);
+        assert!(
+            mssql.contains("DELETE FROM [db]..[t] WHERE [id] = 3;"),
+            "{mssql}"
+        );
+        let mut w = staged_write();
+        w.updates[0].schema = Some("dbo".into());
+        let mssql = staged_sql(&w, &r, SqlDialect::MsSql);
+        assert!(mssql.contains("UPDATE [db].[dbo].[t] SET"), "{mssql}");
+    }
+
+    /// A staged insert that sets an IDENTITY column runs under
+    /// `SET IDENTITY_INSERT … ON/OFF` in Commit, and the server refuses it bare —
+    /// so the copy brackets it too, and only it.
+    #[test]
+    fn staged_sql_brackets_an_identity_insert_on_sql_server() {
+        let (mut r, _) = keyed_people();
+        if let Some(o) = r.columns[0].origin.as_mut() {
+            o.flags.auto_increment = true;
+        }
+        let mut w = staged_write();
+        w.inserts[0]
+            .cols
+            .insert(0, ("id".into(), CellEdit::Text("9".into())));
+        let mssql = staged_sql(&w, &r, SqlDialect::MsSql);
+        assert!(
+            mssql.contains(
+                "SET IDENTITY_INSERT [db]..[t] ON;\n\
+                 INSERT INTO [db]..[t] ([id], [name]) VALUES (N'9', N'new');\n\
+                 SET IDENTITY_INSERT [db]..[t] OFF;\n"
+            ),
+            "{mssql}"
+        );
+        assert_eq!(mssql.matches("IDENTITY_INSERT").count(), 2, "{mssql}");
+        let mysql = staged_sql(&w, &r, SqlDialect::MySql);
+        assert!(!mysql.contains("IDENTITY_INSERT"), "{mysql}");
     }
 
     /// A NULL key is matched with `IS NULL` — `=` never matches one — and a
@@ -4972,6 +5078,74 @@ mod tests {
             c.updates_at(&no_model, None, 0, None, SqlDialect::MySql)
                 .is_err()
         );
+    }
+
+    /// Copy as ▸ SQL UPDATE aims at the same object Commit writes: three-part on
+    /// SQL Server, where a two-part name resolves in whatever database the
+    /// paste runs in.
+    #[test]
+    fn copy_as_update_on_sql_server_names_the_database() {
+        let (r, m) = keyed_people();
+        let (order, formats, dirty, new) = (vec![0, 1, 2], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let sql = c
+            .updates_at(&m, Some((0, 1, 0, 1)), 0, None, SqlDialect::MsSql)
+            .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE [db]..[t] SET [name] = N'ann' WHERE [id] = 1;\n"
+        );
+    }
+
+    /// **A column past the result's arena ceiling reads blank, not empty.**
+    /// Copying it as `SET note = ''` would erase every real value it was run
+    /// over, so it is left out of the `SET` list — and a selection of nothing
+    /// else says why.
+    #[test]
+    fn copy_as_update_leaves_out_a_column_the_arena_blanked() {
+        let (mut r, m) = keyed_people();
+        r.capped_columns = vec![2];
+        let (order, formats, dirty, new) = (vec![0, 1, 2], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let sql = c
+            .updates_at(&m, Some((0, 1, 0, 2)), 0, None, SqlDialect::MySql)
+            .unwrap();
+        assert_eq!(sql, "UPDATE `db`.`t` SET `name` = 'ann' WHERE `id` = 1;\n");
+        let only = c
+            .updates_at(&m, Some((0, 2, 0, 2)), 0, None, SqlDialect::MySql)
+            .unwrap_err();
+        assert!(only.contains("too large"), "{only}");
+    }
+
+    /// A key column blanked by the arena ceiling cannot name its rows: a
+    /// `WHERE k = ''` aims at a different row or none.
+    #[test]
+    fn copy_as_sql_refuses_a_key_the_arena_blanked() {
+        let (mut r, m) = keyed_people();
+        r.capped_columns = vec![0];
+        let (order, formats, dirty, new) = (vec![0, 1, 2], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        assert!(
+            c.updates_at(&m, Some((0, 1, 0, 1)), 0, None, SqlDialect::MySql)
+                .is_err()
+        );
+        assert!(
+            c.where_in_at(&m, Some((0, 1, 0, 1)), 0, None, SqlDialect::MySql)
+                .is_err()
+        );
+    }
+
+    /// Fill copies what the grid shows, and a blanked cell shows nothing it
+    /// holds: staging its `''` into the rows below is what Commit then writes.
+    #[test]
+    fn fill_skips_a_column_the_arena_blanked() {
+        let (mut r, m) = keyed_people();
+        r.capped_columns = vec![1];
+        let (order, formats, dirty, new) = (vec![0, 1, 2], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let plan = c.fill_plan((0, 1, 2, 2), None, |ci| m.text_editable(ci), Fill::Down);
+        assert!(plan.iter().all(|&(_, ci, _)| ci != 1), "{plan:?}");
+        assert!(plan.iter().any(|&(_, ci, _)| ci == 2), "{plan:?}");
     }
 
     /// `WHERE key IN (…)` names the selected rows by their keys, once each.
