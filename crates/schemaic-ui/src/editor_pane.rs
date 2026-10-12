@@ -7500,7 +7500,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let find_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
         let ed = ed_find.clone();
         create_effect(move |prev: Option<(String, FindOptions)>| {
-            let opts = find_opts.get();
+            // Whole word ends a word where the tab's dialect ends a name.
+            let opts = FindOptions {
+                dialect: dialect.get(),
+                ..find_opts.get()
+            };
             // Closed, it forgets the query it ran for: reopening — seeded with
             // the needle it last had, say — is a new query, not an edit.
             if !find_open.get() {
@@ -7652,7 +7656,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let text_now = ed.doc().text().to_string();
             // Under the options the hits were found with, or a hit that whole
             // word refused would pass the revalidation as a fold-equal span.
-            let opts = find_opts.get_untracked();
+            let opts = FindOptions {
+                dialect: dialect.get_untracked(),
+                ..find_opts.get_untracked()
+            };
             let off = if matches_at_in(&text_now, hits[idx], &q, opts) {
                 hits[idx]
             } else {
@@ -7703,7 +7710,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
             let repl = find_replace.get_untracked();
             let text = ed.doc().text().to_string();
-            let opts = find_opts.get_untracked();
+            let opts = FindOptions {
+                dialect: dialect.get_untracked(),
+                ..find_opts.get_untracked()
+            };
             let (new_text, n) = replace_all_in(&text, &q, &repl, opts);
             if n == 0 {
                 return;

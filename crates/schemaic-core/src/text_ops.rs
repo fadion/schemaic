@@ -621,11 +621,15 @@ pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FindOptions {
     pub match_case: bool,
-    /// No word byte either side of the hit, by [`crate::sql::is_word_byte`] —
-    /// the one definition, so `_` and a non-ASCII letter continue a word as
-    /// they do an identifier. Asked only on a side where the needle's own edge
-    /// is a word byte: `f(` has a boundary to want on its left alone.
+    /// No name byte either side of the hit, by [`crate::sql::continues_name`]
+    /// on [`Self::dialect`] — the one definition, so `_`, `$` and a non-ASCII
+    /// letter continue a word as they do an identifier, and `@`/`#` do on SQL
+    /// Server. Asked only on a side where the needle's own edge is such a
+    /// byte: `f(` has a boundary to want on its left alone.
     pub whole_word: bool,
+    /// The tab's dialect, which is where a name ends for
+    /// [`Self::whole_word`]; nothing else reads it.
+    pub dialect: SqlDialect,
 }
 
 /// [`find_matches`] under `opts`.
@@ -650,7 +654,15 @@ pub fn find_matches_in(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize>
 
 /// A character's lowercase, when it is a single character; the character
 /// itself otherwise (`İ` lowercases to two). [`find_matches`]' folding.
+///
+/// The word-final sigma `ς` folds to `σ`: both have the capital `Σ`, and a
+/// per-character lowercase cannot tell which one `Σ` stands for, so without
+/// it every Greek word ending in sigma was found only in its typed case. Both
+/// are two bytes, so a hit's width is unchanged.
 fn fold_char(c: char) -> char {
+    if c == 'ς' {
+        return 'σ';
+    }
     let mut lower = c.to_lowercase();
     match (lower.next(), lower.next()) {
         (Some(l), None) => l,
@@ -733,10 +745,10 @@ fn hit_at(hay: &str, off: usize, needle: &str, ascii: bool, opts: FindOptions) -
     if !spelled || !opts.whole_word {
         return spelled;
     }
-    use crate::sql::is_word_byte;
+    let name = |b: u8| crate::sql::continues_name(b, opts.dialect);
     let (hb, nb) = (hay.as_bytes(), needle.as_bytes());
-    let open_left = !is_word_byte(nb[0]) || off == 0 || !is_word_byte(hb[off - 1]);
-    let open_right = !is_word_byte(nb[nb.len() - 1]) || end == hb.len() || !is_word_byte(hb[end]);
+    let open_left = !name(nb[0]) || off == 0 || !name(hb[off - 1]);
+    let open_right = !name(nb[nb.len() - 1]) || end == hb.len() || !name(hb[end]);
     open_left && open_right
 }
 
@@ -2751,6 +2763,45 @@ mod tests {
         assert!(matches_at_in("(id)", 1, "id", word));
     }
 
+    /// **Where a word ends is the tab's dialect's**, by `sql::continues_name`:
+    /// `$` continues a name on every engine, and `@`/`#` on SQL Server. Whole
+    /// word asked `is_word_byte` alone, so `b` was a hit inside the column
+    /// `a$b` and Replace All rewrote it, and `id` inside `@id`.
+    #[test]
+    fn whole_word_ends_a_word_where_the_dialect_ends_a_name() {
+        let on = |dialect| FindOptions {
+            whole_word: true,
+            dialect,
+            ..FindOptions::default()
+        };
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert_eq!(
+                find_matches_in("SELECT a$b FROM t", "b", on(d)),
+                Vec::<usize>::new(),
+                "{d:?}"
+            );
+            assert_eq!(
+                replace_all_in("SELECT a$b, b FROM t", "b", "c", on(d)),
+                ("SELECT a$b, c FROM t".to_string(), 1),
+                "{d:?}"
+            );
+        }
+        let ms = on(SqlDialect::MsSql);
+        assert_eq!(find_matches_in("SELECT @id, #id, id", "id", ms), vec![17]);
+        // `@` is no name byte elsewhere: a PostgreSQL operator stays a boundary.
+        assert_eq!(
+            find_matches_in("SELECT a @ id", "id", on(SqlDialect::Postgres)),
+            vec![11]
+        );
+        // The needle's own prefix is still found whole.
+        assert_eq!(find_matches_in("SELECT @id, @idx", "@id", ms), vec![7]);
+    }
+
     /// found whichever case it was typed in, as an ASCII one always was.
     #[test]
     fn find_folds_the_case_of_non_ascii_letters() {
@@ -2758,6 +2809,10 @@ mod tests {
         assert_eq!(find_matches("Привет ПРИВЕТ", "привет"), vec![0, 13]);
         assert_eq!(find_matches("Größe GRÖSSE größe", "GRÖßE"), vec![0, 16]);
         assert_eq!(find_matches("ΣΟΦΊΑ σοφία", "σοφία"), vec![0, 11]);
+        // A word-final sigma: `ς` and `σ` share the capital `Σ`, and a
+        // per-character lowercase leaves `ς` alone.
+        assert_eq!(find_matches("ΟΔΌΣ οδός", "οδός"), vec![0, 9]);
+        assert_eq!(find_matches("οδός ΟΔΌΣ", "ΟΔΌΣ"), vec![0, 9]);
         assert!(matches_at("Élan", 0, "élan"));
         assert_eq!(
             replace_all("Ärger ärger", "ärger", "x"),

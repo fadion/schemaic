@@ -13074,7 +13074,9 @@ existing prose was left alone.
     `Ö`/`ö`, Cyrillic, Greek — where they used to fold ASCII only; `contains_ignore_ascii_case`
     (called from `grid`, `history`, `snippet`, `users` and `activity`) still folds ASCII only, as
     its name says. The fold is per character, a char's lowercase when that is one char
-    (`fold_char`), and **two chars are equal only if they are as wide in UTF-8 as well**. That is
+    (`fold_char`) — and the word-final sigma `ς` as `σ`, since both have the capital `Σ` and a
+    per-character lowercase cannot know which one `Σ` stands for, so every Greek word ending in
+    sigma was found only in its typed case — and **two chars are equal only if they are as wide in UTF-8 as well**. That is
     load-bearing: every hit spans exactly `needle.len()` bytes, because that is what the editor's
     find bar selects, highlights and replaces by, and what the match highlights in `overlays.rs`
     and `widgets.rs` span with `t.len()`. So the few pairs whose cases differ in width — the
@@ -13088,9 +13090,12 @@ existing prose was left alone.
     default (both off), unchanged in behaviour, so the highlight callers above never see the
     options. Every entry point asks one private `hit_at`, so the count, the step and Replace All
     cannot disagree about what a hit is. Match case compares the span byte for byte instead of
-    folding; whole word then refuses a hit with a word byte beside it, by `sql::is_word_byte` — the
-    one definition, so `_` and a non-ASCII letter continue a word as they do an identifier — asked
-    only on a side where the needle's own edge is a word byte, so `f(` wants a boundary on its left
+    folding; whole word then refuses a hit with a name byte beside it, by `sql::continues_name` on
+    `FindOptions::dialect` (the tab's) — the one definition, so `_`, `$` and a non-ASCII letter
+    continue a word as they do an identifier, and `@`/`#` do on SQL Server; asking
+    `is_word_byte` alone found `b` inside the column `a$b` and Replace All rewrote it
+    (`whole_word_ends_a_word_where_the_dialect_ends_a_name`) — asked
+    only on a side where the needle's own edge is such a byte, so `f(` wants a boundary on its left
     alone. Both options keep every hit exactly `needle.len()` bytes, one by comparing the same span
     more strictly and the other by only refusing, and that invariant is **why regex is not among
     them**: a pattern's match has its own length, and the bar selects, reveals and replaces by the
@@ -26974,7 +26979,8 @@ existing prose was left alone.
     arm still calls `query.track()`, or typing a needle after clearing one would read a document the
     effect had stopped following.
     **Match case and Whole word are part of the query, not a filter on its hits.** They are a
-    per-pane `find_opts: RwSignal<FindOptions>` (`text_ops`, above), held for the pane's life like
+    per-pane `find_opts: RwSignal<FindOptions>` (`text_ops`, above), its `dialect` filled from the
+    pane's at every read rather than stored, held for the pane's life like
     the needle beside them and not persisted, and the effect's previous value is `(query, opts)`
     rather than the query alone — so flipping one is a new query, rescanned and revealed at once,
     not an edit left to the debounce. **A new query bumps `find_gen` too**: it was bumped by the
