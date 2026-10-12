@@ -1581,6 +1581,11 @@ fn diagnostics_with(
 /// UI thread — only if `g` is still the pane's latest generation, so a pass
 /// overtaken by typing never paints over a newer one, and only while the tab
 /// lives. Passes queue on the cache's lock, in order.
+///
+/// `syntax_text` is set to `sql` beside it: the text those diagnostics
+/// describe, which Alt+Enter compares with the buffer before applying a fix
+/// (`intel::current_fix_at`) — a pass lands a debounce and a parse after the
+/// keystroke, and its ranges are the older text's until the next one does.
 #[allow(clippy::too_many_arguments)]
 fn diagnose_in_background(
     syntax: RwSignal<Vec<Diagnostic>>,
@@ -1591,13 +1596,16 @@ fn diagnose_in_background(
     db_nodes: RwSignal<Vec<ConnNode>>,
     active_db: Option<&str>,
     dialect: SqlDialect,
+    syntax_text: RwSignal<String>,
 ) {
     let catalog = crate::completion::build_catalog(db_nodes, active_db);
+    let diagnosed = sql.clone();
     let deliver = floem::ext_event::create_ext_action(
         floem::reactive::Scope::current(),
         move |diags: Vec<Diagnostic>| {
             if dgen.get() == g && syntax.try_get_untracked().is_some() {
                 syntax.set(diags);
+                syntax_text.set(diagnosed);
             }
         },
     );
@@ -3287,6 +3295,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let diag_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
     // The pane's statement cache, which the worker passes share.
     let diag_cache = std::sync::Arc::new(std::sync::Mutex::new(intel::DiagnosticsCache::default()));
+    // The text this pane's last delivered pass described — empty until one
+    // lands, so a tab's diagnostics kept from before the pane mounted fix
+    // nothing until they are this pane's own.
+    let syntax_text: RwSignal<String> = RwSignal::new(String::new());
     // Seed the tab's diagnostics from the text this pane opens on, and re-run when
     // the *catalog* moves under them — unknown-table/unknown-column errors depend
     // on it, so a set computed before introspection landed is stale. Tracks
@@ -3316,7 +3328,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let Some(q) = query.try_get_untracked() else {
                     return;
                 };
-                diagnose_in_background(syntax, dgen, g, cache, q, db_nodes, adb.as_deref(), dia);
+                diagnose_in_background(
+                    syntax,
+                    dgen,
+                    g,
+                    cache,
+                    q,
+                    db_nodes,
+                    adb.as_deref(),
+                    dia,
+                    syntax_text,
+                );
             });
         });
     }
@@ -4093,7 +4115,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Alt+Enter applies the quick fix of the diagnostic under the caret
         // (`intel::fix_at`) — the nearest keyword for a typo, `x IS NULL` for
         // `x = NULL` — as one undoable edit over exactly that diagnostic's
-        // range. Nothing to fix there is no edit, and the key is still spent.
+        // range. Nothing to fix there is no edit, and the key is still spent —
+        // and so is a fix for text the buffer has moved on from: the pass
+        // lands a debounce and a parse after the keystroke
+        // (`intel::current_fix_at`).
         if mods.alt()
             && !primary_held(mods)
             && !mods.shift()
@@ -4101,8 +4126,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         {
             editor_sig.with_untracked(|e| {
                 let caret = e.cursor.get_untracked().offset();
+                let text = e.doc().text().to_string();
                 let fix = syntax.with_untracked(|d| {
-                    schemaic_core::intel::fix_at(d, caret).map(|(a, b, t)| (a, b, t.to_string()))
+                    syntax_text.with_untracked(|diagnosed| {
+                        schemaic_core::intel::current_fix_at(d, diagnosed, &text, caret)
+                            .map(|(a, b, t)| (a, b, t.to_string()))
+                    })
                 });
                 if let Some((a, b, text)) = fix
                     && edit_untyped(e, comp, Selection::region(a, b), &text, EditType::Other)
@@ -5733,6 +5762,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         db_nodes,
                         active_db.get_untracked().as_deref(),
                         dialect.get_untracked(),
+                        syntax_text,
                     );
                 });
             }
@@ -10744,9 +10774,14 @@ mod diagnostics_catalog_gate {
         let src =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/editor_pane.rs"))
                 .expect("this file");
-        let body = production_code(&src);
+        // Blanks folded to one space, so the call reads the same however
+        // rustfmt wraps it.
+        let body = production_code(&src)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let at = body
-            .find("diagnose_in_background(syntax, dgen, g, cache, q, db_nodes")
+            .find("diagnose_in_background( syntax, dgen, g, cache, q, db_nodes")
             .expect("the catalog-driven diagnostics pass");
         let effect = &body[body[..at].rfind("create_effect(").expect("in an effect")..at];
         assert!(

@@ -16544,6 +16544,22 @@ pub fn fix_at(diags: &[Diagnostic], caret: usize) -> Option<(usize, usize, &str)
         .map(|(d, f)| (d.range.0, d.range.1, f))
 }
 
+/// [`fix_at`], but only while `text` — the buffer now — is the `diagnosed`
+/// text `diags` were computed on. A fix's range and replacement describe that
+/// text: the editor's pass lands a debounce and a parse after the keystroke,
+/// so applying an older one splices at offsets an edit has since moved.
+pub fn current_fix_at<'a>(
+    diags: &'a [Diagnostic],
+    diagnosed: &str,
+    text: &str,
+    caret: usize,
+) -> Option<(usize, usize, &'a str)> {
+    if diagnosed != text {
+        return None;
+    }
+    fix_at(diags, caret)
+}
+
 /// The messages of every diagnostic touching `sql[lo..hi]`, in the order they
 /// appear, without repeats — what an AI fix for that range is being asked about.
 ///
@@ -27170,6 +27186,22 @@ mod tests {
                 "{cond}: {got:?}"
             );
         }
+    }
+
+    /// **A fix is applied only to the text it was computed on.** The editor's
+    /// diagnostics land a debounce and a parse after the keystroke, and
+    /// nothing shifted them in between: typing `e` into `selct` and pressing
+    /// Alt+Enter at once replaced `selec` by `select` — `selectt`.
+    #[test]
+    fn a_fix_for_older_text_is_not_offered() {
+        let old = "selct * from employees";
+        let d = diag(old);
+        assert_eq!(current_fix_at(&d, old, old, 4), Some((0, 5, "select")));
+        assert_eq!(
+            current_fix_at(&d, old, "select * from employees", 4),
+            None,
+            "the buffer moved on since"
+        );
     }
 
     /// Alt+Enter finds the fix under the caret, the caret just past the word

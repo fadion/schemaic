@@ -26405,7 +26405,13 @@ existing prose was left alone.
     key handler's arm — Alt, neither the primary modifier nor Shift — asks `intel::fix_at` over the
     pane's `syntax` diagnostics alone, the offline pass's, since nothing the server reports carries
     a fix, and writes the answer over that diagnostic's range through `edit_untyped`: one undo step,
-    refused under the Ctrl+K freeze, the caret left after the replacement. **The key is spent even
+    refused under the Ctrl+K freeze, the caret left after the replacement. **Only on the text the
+    pass described** (`intel::current_fix_at`): `diagnose_in_background` sets the pane's
+    `syntax_text` to the text beside `syntax`, and the key compares it with the buffer. A pass lands
+    a debounce and a parse after the keystroke and nothing shifts its ranges meanwhile, so typing
+    `e` into `selct` and pressing Alt+Enter at once spliced `select` over `selec` — `selectt`
+    (`a_fix_for_older_text_is_not_offered`). `syntax_text` starts empty, so a tab's diagnostics
+    kept from before the pane mounted fix nothing until the pane's own pass lands. **The key is spent even
     with nothing to fix**, so a stray Alt+Enter never falls through to a newline. The tip says what
     the key would do: `diag_hits` builds each message through `tip_message`, which appends a line
     `Alt+Enter: <fix>` (the keycap through `shortcuts::keys_label`) holding **`fix_at`'s answer at
