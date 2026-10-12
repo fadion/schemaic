@@ -37835,7 +37835,11 @@ this bundle's.
   cap on it, deliberately**: freeze enough wide columns and the data pane is left little or no room,
   which is the user's choice to make rather than the grid's to refuse. What it must not cost is the
   horizontal wheel: the frozen pane forwards both axes to the data pane (the scroll-sync rule
-  below), so a pane frozen wide still pans the columns behind it.
+  below), so a pane frozen wide still pans the columns behind it. **Nor the keyboard's vertical
+  scroll**: a data pane left no room lays out to width 0, and `scroll_active_into_view` guarded
+  both axes on the width, so Arrow-Down past the last visible row, PageDown, Go to row and
+  find-next moved the cursor off screen. `scroll_target` asks each axis its own extent — the rows
+  the viewport's height, the columns its width (`a_zero_width_viewport_still_scrolls_rows`).
   **A frozen column's header is hatched** — faint 45° `/` lines over the whole cell (`header_cell`'s
   `Hatch`, `text_faint` at 0.22, `FROZEN_HATCH_STEP` apart), the one cue that it is frozen, since the
   cell has no room for another icon and a background tint already means *formatted*. `Hatch` is a
@@ -38294,10 +38298,18 @@ this bundle's.
   the bar). *SQL UPDATE* and *SQL WHERE IN* close it — `copy_keyed_sql` →
   `edit::GridCells::updates_at`/`where_in_at`, keyed by the write-back's own `row_key` (`core::edit`'s
   entry has the statement shapes and the refusals) — behind `row_gestures_are_safe`, as Delete and
-  Duplicate row are, and a refusal goes on `commit_note` with the clipboard left as it was. The
-  submenu is `copy_as_menu`, and **the cell menu carries it too**, after *Copy* / *Copy formatted*,
-  with the cell's display row as `pos`: the gesture is the highlighted block when the cell is
-  inside it, else that cell's whole row. The gutter menu's row
+  Duplicate row are, and a refusal goes on `commit_note` with the clipboard left as it was. On a
+  read-only connection or a pinned result the two keyed copies refuse with **that** reason
+  (`edit::withheld_model_reason`, held in `GridState::model_withheld` by the edit-model effect):
+  the model is emptied there on purpose, and its own refusal blamed a keyed table for having no
+  key. The submenu is `copy_as_menu(gs, pos, sel)`, and **the cell menu carries it too**, after
+  *Copy* / *Copy formatted*, with the cell's display row as `pos`: the gesture is the highlighted
+  block when the cell is inside one of more than one cell, else that cell's whole row. **`sel` is
+  taken when the menu is built** — the gutter's selection, and for the cell menu
+  `edit::toolbar_copy_block` of it — because the cell's right-click has already collapsed an
+  outside selection onto the clicked cell, and the live one-cell selection resolved every format
+  to that one column (`the_cell_menus_copy_as_takes_the_row_of_a_lone_cell`; the source gate in
+  `no_export_path_renders_the_unresolved_result` pins the call). The gutter menu's row
   actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
   `clone_rows`) and count them in the label: the same menu naming five rows in one entry and acting
   on one in the next is how four deletions go missing unnoticed. **`set_rows_deleted` batches, and
@@ -38623,12 +38635,20 @@ this bundle's.
   `WHERE` would read as text; `each_figure_copies_as_its_bare_value`) — rather than the one
   flattened line, and `Aggregates::summary` is now those figures joined, so the summary's tests
   guard both. A clicked figure reads *Copied* for `FIGURE_COPIED_FOR`, behind a generation so a
-  second click is not cut short by the first one's reset. The bar was `.pointer_events(|| false)`
+  second click is not cut short by the first one's reset, and **it is withdrawn when the readout
+  is rebuilt**: keyed by position and outliving the chip, it landed on whatever figure the next
+  selection put in that place, a value nobody copied. The click then hands the keyboard back
+  (`widgets::hand_keyboard_back`, which reaches the grid as the keyboard home): floem clears the
+  focus on every pointer-down and returns it only to a focusable view, so the arrows and Ctrl+C
+  reached nothing after a copy. The bar was `.pointer_events(|| false)`
   while it was one line of text — as the last child of the results stack it swallowed every click
   on the cells it covered — and **the flag had to go rather than be undone per figure**: the
   opt-out is not inheritable (above), so a flagged container hides its children from the hit walk.
   What it takes now is the chip's own shrink-wrapped box, and nothing while hidden (the absolute
   placement applies only while there is a readout); `grid_error_bar` keeps its events as before.
+  **A wheel over the chip scrolls the grid**: floem hands a pointer event to the first hit child
+  only, and the grid is the chip's sibling, so `grid_view` publishes its `forward_wheel` in
+  `GridCtx::sel_wheel` with each body it builds and the chip calls it while it has a readout.
   **Every panel-level bar is cleared when the result stops being `Loaded`**, in one
   effect in `results_section`: their only writer lives inside `grid_view`, so a failed re-run left
   the previous total and a live-looking Go-to-row popup pinned to a panel saying "Query failed."

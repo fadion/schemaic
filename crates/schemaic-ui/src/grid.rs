@@ -116,6 +116,10 @@ impl VirtualVector<usize> for RowRange {
 /// original (query) order.
 type SortState = Option<(usize, bool)>;
 
+/// A selection `(r0, c0, r1, c1)`, or none — what a gesture's rows and columns
+/// are resolved against (`edit::GridCells::exported_rows_at` and siblings).
+type Block = Option<(usize, usize, usize, usize)>;
+
 /// Cycle a column's sort: unsorted/other → ASC → DESC → unsorted.
 fn cycle_sort(sort: RwSignal<SortState>, ci: usize) {
     sort.update(|s| {
@@ -252,6 +256,8 @@ type FollowFn = Rc<dyn Fn(TableSource, crate::RerunRequest)>;
 /// Re-run the active tab with a rewritten (filtered/sorted) statement — the
 /// server-side filter/sort callback (`TabsActions::apply_view`).
 type ApplyViewFn = Rc<dyn Fn(crate::RerunRequest)>;
+/// A wheel pan handed to the mounted grid's body — `GridCtx::sel_wheel`.
+pub(crate) type WheelFn = Rc<dyn Fn(floem::kurbo::Vec2)>;
 
 /// Per-result interactive grid state. `Copy` (every field is an `RwSignal`, which
 /// is `Copy`) so it threads freely into the many cell/handler closures. Created
@@ -318,6 +324,10 @@ struct GridState {
     /// Which columns are editable + each base table's WHERE key (from the
     /// result's per-column provenance). Computed once per result set.
     edit_model: RwSignal<Arc<EditModel>>,
+    /// Why [`GridState::edit_model`] is empty on purpose — a read-only
+    /// connection or a pinned result — for a surface that would otherwise
+    /// blame the result's shape (`edit::withheld_model_reason`).
+    model_withheld: RwSignal<Option<&'static str>>,
     /// Which **control** each result column's values are edited with — a boolean
     /// track, an enum menu, a `SET`'s chips, a calendar, or plain text. Resolved
     /// from the column's *declared* type (see `column_editors`) and kept in a
@@ -731,6 +741,7 @@ impl GridState {
             selecting: RwSignal::new(false),
             row_selecting: RwSignal::new(false),
             edit_model: RwSignal::new(Arc::new(EditModel::default())),
+            model_withheld: RwSignal::new(None),
             // Text everywhere until `grid_view`'s effect resolves the columns.
             editors: RwSignal::new(Rc::new(Vec::new())),
             commit_busy: RwSignal::new(false),
@@ -2162,17 +2173,7 @@ fn col_spacer(w: f64, h: fn() -> f64) -> impl IntoView {
 /// Nudge the body scroll so `(i, ci)` is visible (keyboard nav).
 fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
     let vp = gs.vp.get_untracked();
-    if vp.width() <= 0.0 {
-        return;
-    }
     let rh = row_h();
-    let (mut nx, mut ny) = (vp.x0, vp.y0);
-    let y0 = i as f64 * rh;
-    if y0 < vp.y0 {
-        ny = y0;
-    } else if y0 + rh > vp.y0 + vp.height() {
-        ny = y0 + rh - vp.height();
-    }
     // Horizontal scroll applies only to data-pane columns; the frozen column lives
     // in its own always-visible pane. Compute the target x in *data-pane* space —
     // widths summed over the scrolling pane's columns before this one, the list
@@ -2180,20 +2181,46 @@ fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
     // correctly under a freeze and past a hidden column alike.
     let widths = gs.widths.get_untracked();
     let pane = gs.layout_untracked().scrolling(widths.len());
-    if pane.contains(&ci) {
+    let span = pane.contains(&ci).then(|| {
         let x0: f64 = pane
             .iter()
             .take_while(|&&j| j != ci)
             .map(|&j| widths.get(j).copied().unwrap_or(0.0))
             .sum();
-        let x1 = x0 + widths.get(ci).copied().unwrap_or(0.0);
+        (x0, x0 + widths.get(ci).copied().unwrap_or(0.0))
+    });
+    if let Some(to) = scroll_target(vp, i as f64 * rh, rh, span) {
+        gs.scroll_to.set(Some(to));
+    }
+}
+
+/// Where the body scroll must move so row `[y0, y0 + rh)` — and, when it is in
+/// the scrolling pane, column span `span` — is in viewport `vp`; `None` before
+/// the body has been laid out.
+///
+/// **Each axis asks only its own extent.** A frozen block wider than the panel
+/// lays the data pane out to width 0, and the guard used to be `width <= 0`
+/// for both: Arrow-Down past the last visible row, PageDown, Ctrl+End, Go to
+/// row and find-next then moved the cursor off screen without scrolling. The
+/// rows still have a height to scroll in; only the columns have no width.
+fn scroll_target(vp: Rect, y0: f64, rh: f64, span: Option<(f64, f64)>) -> Option<Point> {
+    if vp.height() <= 0.0 {
+        return None;
+    }
+    let (mut nx, mut ny) = (vp.x0, vp.y0);
+    if y0 < vp.y0 {
+        ny = y0;
+    } else if y0 + rh > vp.y0 + vp.height() {
+        ny = y0 + rh - vp.height();
+    }
+    if let Some((x0, x1)) = span.filter(|_| vp.width() > 0.0) {
         if x0 < vp.x0 {
             nx = x0;
         } else if x1 > vp.x0 + vp.width() {
             nx = x1 - vp.width();
         }
     }
-    gs.scroll_to.set(Some(Point::new(nx.max(0.0), ny.max(0.0))));
+    Some(Point::new(nx.max(0.0), ny.max(0.0)))
 }
 
 /// Copy the current selection to the clipboard as TSV (a lone cell → raw value).
@@ -2818,12 +2845,12 @@ fn exported_row_count(gs: GridState) -> usize {
 /// [`schemaic_core::edit::GridCells::exported_rows_at`]. The whole selection
 /// rectangle and the freeze go down, so the columns are the block's, drawn
 /// order, as Copy and Attach beside it take them.
-fn exported_rows_at(gs: GridState, pos: usize) -> (ResultSet, Vec<usize>) {
+fn exported_rows_at(gs: GridState, pos: usize, sel: Block) -> (ResultSet, Vec<usize>) {
     let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
     let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
     let formats = gs.formats.get_untracked();
     grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported_rows_at(
-        gs.bounds_untracked(),
+        sel,
         pos,
         gs.layout_untracked(),
     )
@@ -2832,12 +2859,12 @@ fn exported_rows_at(gs: GridState, pos: usize) -> (ResultSet, Vec<usize>) {
 /// The same gesture as [`exported_rows_at`], as the blocks an `INSERT` export
 /// takes — a pending row's unset cells left out rather than written `NULL`.
 /// See [`schemaic_core::edit::GridCells::insert_blocks_at`].
-fn insert_blocks_at(gs: GridState, pos: usize) -> Vec<(ResultSet, Vec<usize>)> {
+fn insert_blocks_at(gs: GridState, pos: usize, sel: Block) -> Vec<(ResultSet, Vec<usize>)> {
     let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
     let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
     let formats = gs.formats.get_untracked();
     grid_cells(&rs, &order, &formats, &dirty, &new_rows).insert_blocks_at(
-        gs.bounds_untracked(),
+        sel,
         pos,
         gs.layout_untracked(),
     )
@@ -2855,9 +2882,9 @@ fn insert_blocks_all(gs: GridState) -> Vec<(ResultSet, Vec<usize>)> {
 /// there is one of more than one cell (`edit::toolbar_copy_block`), else the
 /// whole result. It copied every row whatever was selected.
 fn render_export(gs: GridState, format: ExportFormat) -> String {
-    if let Some((r0, ..)) = schemaic_core::edit::toolbar_copy_block(gs.bounds_untracked()) {
+    if let Some(block @ (r0, ..)) = schemaic_core::edit::toolbar_copy_block(gs.bounds_untracked()) {
         // `r0` is inside the block, so the gesture resolves to the block.
-        return render_rows_at(gs, r0, format);
+        return render_rows_at(gs, r0, Some(block), format);
     }
     if format == ExportFormat::Sql {
         return render_inserts(gs, insert_blocks_all(gs));
@@ -2866,13 +2893,14 @@ fn render_export(gs: GridState, format: ExportFormat) -> String {
     render_order(gs, &rs, &order, format)
 }
 
-/// Render the rows the gutter menu was opened on in `format` — the row menu's
-/// *Copy as*, through the same renderer as the whole-result copy.
-fn render_rows_at(gs: GridState, pos: usize, format: ExportFormat) -> String {
+/// Render the rows a menu was opened on in `format` — *Copy as*, through the
+/// same renderer as the whole-result copy. `sel` is the block the gesture
+/// means, or `None` for row `pos` whole — see [`copy_as_menu`].
+fn render_rows_at(gs: GridState, pos: usize, sel: Block, format: ExportFormat) -> String {
     if format == ExportFormat::Sql {
-        return render_inserts(gs, insert_blocks_at(gs, pos));
+        return render_inserts(gs, insert_blocks_at(gs, pos, sel));
     }
-    let (rs, order) = exported_rows_at(gs, pos);
+    let (rs, order) = exported_rows_at(gs, pos, sel);
     render_order(gs, &rs, &order, format)
 }
 
@@ -2956,8 +2984,8 @@ fn export_column_in_list(gs: GridState, ci: usize) -> String {
 
 /// The rows the gutter menu was opened on as `VALUES` tuples — the rows
 /// [`render_rows_at`] resolves for every other *Copy as* entry.
-fn export_values_at(gs: GridState, pos: usize) -> String {
-    let (rs, order) = exported_rows_at(gs, pos);
+fn export_values_at(gs: GridState, pos: usize, sel: Block) -> String {
+    let (rs, order) = exported_rows_at(gs, pos, sel);
     sql_copy_text(
         gs,
         schemaic_core::export::export_values(&rs, order.as_slice(), gs.dialect),
@@ -2980,14 +3008,22 @@ enum KeyedCopy {
 /// copy text rather than write, but the text is a statement aimed at one table
 /// by key, and a join that projects one table's columns (`insert_target`'s
 /// blind spot) would aim it at rows the display row only partly stands for.
-fn copy_keyed_sql(gs: GridState, pos: usize, what: KeyedCopy) -> String {
-    let result = if gs.row_gestures_are_safe() {
+///
+/// **A read-only connection or a pinned result says so**, rather than the
+/// model's "the rows need to come from one table with a key": the model is
+/// emptied there on purpose (`model_withheld`), and a keyed table read as one
+/// without a key. The copies stay off there — the model split that would let
+/// them through has to stay clear of every write gate, and is not this.
+fn copy_keyed_sql(gs: GridState, pos: usize, sel: Block, what: KeyedCopy) -> String {
+    let result = if let Some(why) = gs.model_withheld.get_untracked() {
+        Err(why)
+    } else if gs.row_gestures_are_safe() {
         let model = gs.edit_model.get_untracked();
         let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
         let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
         let formats = gs.formats.get_untracked();
         let cells = grid_cells(&rs, &order, &formats, &dirty, &new_rows);
-        let (sel, layout) = (gs.bounds_untracked(), gs.layout_untracked());
+        let layout = gs.layout_untracked();
         match what {
             KeyedCopy::Update => cells.updates_at(&model, sel, pos, layout, gs.dialect),
             KeyedCopy::WhereIn => cells.where_in_at(&model, sel, pos, layout, gs.dialect),
@@ -3003,7 +3039,14 @@ fn copy_keyed_sql(gs: GridState, pos: usize, what: KeyedCopy) -> String {
 
 /// The *Copy as* submenu, shared by the gutter's menu and the cell's: the
 /// text formats, then the SQL fragments — `VALUES`, and the two keyed ones.
-fn copy_as_menu(gs: GridState, pos: usize) -> MenuEntry {
+///
+/// `sel` is the selection the gesture means, taken when the menu is built:
+/// the gutter's own, and for the cell menu `edit::toolbar_copy_block` of it —
+/// a block of more than one cell when the right-click landed inside one, else
+/// `None`, which is row `pos` whole. The cell menu read the live selection,
+/// which its right-click had already collapsed onto the clicked cell, so every
+/// format copied that one column and "this cell's row" was unreachable.
+fn copy_as_menu(gs: GridState, pos: usize, sel: Block) -> MenuEntry {
     let copy = |text: String| {
         // Empty is said on the bar by the renderer, not copied.
         if !text.is_empty() {
@@ -3013,16 +3056,16 @@ fn copy_as_menu(gs: GridState, pos: usize) -> MenuEntry {
     MenuEntry::sub(
         "Copy as",
         ExportFormat::clipboard_formats()
-            .map(|f| MenuEntry::action(f.label(), move || copy(render_rows_at(gs, pos, f))))
+            .map(|f| MenuEntry::action(f.label(), move || copy(render_rows_at(gs, pos, sel, f))))
             // The rows without the `INSERT` around them, for a `VALUES` the
             // user is writing.
             .chain([
-                MenuEntry::action("SQL VALUES", move || copy(export_values_at(gs, pos))),
+                MenuEntry::action("SQL VALUES", move || copy(export_values_at(gs, pos, sel))),
                 MenuEntry::action("SQL UPDATE", move || {
-                    copy(copy_keyed_sql(gs, pos, KeyedCopy::Update))
+                    copy(copy_keyed_sql(gs, pos, sel, KeyedCopy::Update))
                 }),
                 MenuEntry::action("SQL WHERE IN", move || {
-                    copy(copy_keyed_sql(gs, pos, KeyedCopy::WhereIn))
+                    copy(copy_keyed_sql(gs, pos, sel, KeyedCopy::WhereIn))
                 }),
             ])
             .collect(),
@@ -3995,6 +4038,13 @@ pub(crate) struct GridCtx {
     /// `results_multi` is a tab strip keyed on `active_result`, not several grids
     /// side by side.
     pub(crate) sel_summary: RwSignal<Option<SelReadout>>,
+    /// The mounted grid's wheel forwarder (`forward_wheel`), for the selection
+    /// readout: the chip sits over the cells as the panel's sibling, and floem
+    /// hands a pointer event to the first hit child only, so a wheel over it
+    /// scrolled nothing. Written by `grid_view` with each body it builds; the
+    /// chip calls it only while it has a readout, which the grid's own disposal
+    /// clears.
+    pub(crate) sel_wheel: RwSignal<Option<WheelFn>>,
     /// Last commit error (grid write-back), shown in a bottom error bar at the
     /// panel level (like the find bar at the top). Cleared by the next edit/commit.
     pub(crate) commit_err: RwSignal<Option<ModalError>>,
@@ -4426,6 +4476,7 @@ const FIGURE_COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(
 
 pub(crate) fn grid_selection_bar(
     sel_summary: RwSignal<Option<SelReadout>>,
+    sel_wheel: RwSignal<Option<WheelFn>>,
     error_shown: impl Fn() -> bool + 'static + Copy,
 ) -> impl IntoView {
     // The figure last clicked, by position, and a generation so a second click
@@ -4433,62 +4484,17 @@ pub(crate) fn grid_selection_bar(
     let copied: RwSignal<Option<(usize, u64)>> = RwSignal::new(None);
     dyn_container(
         move || sel_summary.get(),
-        move |readout| match readout {
-            None => empty().into_any(),
-            Some(r) => {
-                let sep = || text("·").style(|s| s.padding_horiz(theme::scaled(5.0)));
-                let mut parts: Vec<AnyView> = Vec::new();
-                if let Some(column) = r.column {
-                    parts.push(text(column).into_any());
-                    parts.push(sep().into_any());
-                }
-                let n = r.figures.len();
-                for (i, f) in r.figures.into_iter().enumerate() {
-                    let shown = f.shown;
-                    let copy = f.copy;
-                    parts.push(
-                        label(move || match copied.get() {
-                            Some((at, _)) if at == i => "Copied".to_string(),
-                            _ => shown.clone(),
-                        })
-                        .on_click_stop(move |_| {
-                            let _ = floem::Clipboard::set_contents(copy.clone());
-                            let generation = copied.get_untracked().map_or(0, |(_, g)| g + 1);
-                            copied.set(Some((i, generation)));
-                            floem::action::exec_after(FIGURE_COPIED_FOR, move |_| {
-                                if copied.try_get_untracked().flatten().map(|(_, g)| g)
-                                    == Some(generation)
-                                {
-                                    copied.set(None);
-                                }
-                            });
-                        })
-                        .style(|s| s.hover(|s| s.color(theme::text())))
-                        .into_any(),
-                    );
-                    if i + 1 < n {
-                        parts.push(sep().into_any());
-                    }
-                }
-                h_stack_from_iter(parts)
-                    .style(|s| {
-                        // `bg_deepest`, the footer's surface — darker than the
-                        // panel it floats over, which is what makes the readout
-                        // legible against the grid behind it. `text_dim` on it,
-                        // and `text` for a hovered figure, are both gated
-                        // pairings (`contrast.rs` names this bar beside each).
-                        s.items_center()
-                            .color(theme::text_dim())
-                            .font_size(theme::font_label())
-                            .padding_horiz(theme::scaled(10.0))
-                            .padding_vert(theme::scaled(4.0))
-                            .background(theme::bg_deepest())
-                            .border(1.0)
-                            .border_color(theme::border())
-                            .border_radius(6.0)
-                    })
-                    .into_any()
+        move |readout| {
+            // **"Copied" belongs to the readout it was clicked on.** Keyed by
+            // position alone and outliving the rebuild, it landed on whatever
+            // figure the next selection put second — a value nobody copied.
+            // Withdrawn with the surface that showed it, as the Floem gotchas
+            // ask of a transient confirmation; the reset's generation check
+            // then finds nothing to clear.
+            if copied.get_untracked().is_some() {
+                copied.set(None);
             }
+            selection_readout(readout, copied)
         },
     )
     // **No click-through, and no need for one.** It was `pointer_events(false)`
@@ -4499,6 +4505,18 @@ pub(crate) fn grid_selection_bar(
     // — so the flag is gone. What it takes is the chip's own shrink-wrapped
     // box, and nothing at all while hidden: the absolute placement below is
     // applied only while there is a readout, and an `empty()` has no size.
+    // **What it covers it hands on**: a wheel over it scrolls the grid
+    // (`GridCtx::sel_wheel`), since floem gives a pointer event to the first
+    // hit child only and the grid is a sibling, not an ancestor.
+    .on_event(EventListener::PointerWheel, move |e| {
+        if let Event::PointerWheel(pe) = e
+            && sel_summary.with_untracked(Option::is_some)
+            && let Some(fw) = sel_wheel.get_untracked()
+        {
+            fw(wheel_pan(pe.delta, pe.modifiers.shift()));
+        }
+        EventPropagation::Stop
+    })
     .style(move |s| {
         if sel_summary.with(Option::is_some) {
             // Above `grid_error_bar` when that one is up, at the edge otherwise —
@@ -4511,6 +4529,77 @@ pub(crate) fn grid_selection_bar(
             s
         }
     })
+}
+
+/// [`grid_selection_bar`]'s chip for one readout: the column, then each figure,
+/// clickable to copy its bare value.
+fn selection_readout(
+    readout: Option<SelReadout>,
+    copied: RwSignal<Option<(usize, u64)>>,
+) -> AnyView {
+    match readout {
+        None => empty().into_any(),
+        Some(r) => {
+            let sep = || text("·").style(|s| s.padding_horiz(theme::scaled(5.0)));
+            let mut parts: Vec<AnyView> = Vec::new();
+            if let Some(column) = r.column {
+                parts.push(text(column).into_any());
+                parts.push(sep().into_any());
+            }
+            let n = r.figures.len();
+            for (i, f) in r.figures.into_iter().enumerate() {
+                let shown = f.shown;
+                let copy = f.copy;
+                parts.push(
+                    label(move || match copied.get() {
+                        Some((at, _)) if at == i => "Copied".to_string(),
+                        _ => shown.clone(),
+                    })
+                    .on_click_stop(move |_| {
+                        let _ = floem::Clipboard::set_contents(copy.clone());
+                        let generation = copied.get_untracked().map_or(0, |(_, g)| g + 1);
+                        copied.set(Some((i, generation)));
+                        floem::action::exec_after(FIGURE_COPIED_FOR, move |_| {
+                            if copied.try_get_untracked().flatten().map(|(_, g)| g)
+                                == Some(generation)
+                            {
+                                copied.set(None);
+                            }
+                        });
+                        // floem cleared the focus on the pointer-down and
+                        // gives it back only to a focusable view, which a
+                        // label is not — so the arrows, Shift+arrows and
+                        // Ctrl+C reached nothing until a cell was clicked.
+                        // No overlay is up here, so this is the grid.
+                        crate::widgets::hand_keyboard_back(None);
+                    })
+                    .style(|s| s.hover(|s| s.color(theme::text())))
+                    .into_any(),
+                );
+                if i + 1 < n {
+                    parts.push(sep().into_any());
+                }
+            }
+            h_stack_from_iter(parts)
+                .style(|s| {
+                    // `bg_deepest`, the footer's surface — darker than the
+                    // panel it floats over, which is what makes the readout
+                    // legible against the grid behind it. `text_dim` on it,
+                    // and `text` for a hovered figure, are both gated
+                    // pairings (`contrast.rs` names this bar beside each).
+                    s.items_center()
+                        .color(theme::text_dim())
+                        .font_size(theme::font_label())
+                        .padding_horiz(theme::scaled(10.0))
+                        .padding_vert(theme::scaled(4.0))
+                        .background(theme::bg_deepest())
+                        .border(1.0)
+                        .border_color(theme::border())
+                        .border_radius(6.0)
+                })
+                .into_any()
+        }
+    }
 }
 
 /// The grid's **go to row** popup (Ctrl+G) — the editor's go-to-line popup, for
@@ -4684,7 +4773,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         // write keyed on them would be aimed at whatever the row holds now.
         // **Tracked**, like `read_only` beside it: pinning doesn't rebuild the
         // grid, so a flag read once here left the pinned result editable.
-        let model = if read_only.get() || frozen_panel.get() {
+        let (read_only, pinned) = (read_only.get(), frozen_panel.get());
+        gs.model_withheld
+            .set(schemaic_core::edit::withheld_model_reason(
+                read_only, pinned,
+            ));
+        let model = if read_only || pinned {
             EditModel::default()
         } else {
             analyze_edit(&rs_model, model_dialect, |db, ns, table| {
@@ -4926,6 +5020,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // The body rebuilds on every sort/layout/new-row change, so the ring is cloned
     // per build rather than captured once.
     let strip_for_body = strip.clone();
+    let sel_wheel = gctx.sel_wheel;
     let body_key = body_rebuild_key(sort, gs.frozen, gs.hidden, gs.new_rows, key_gen);
     let grid = dyn_container(
         // Rebuild on sort / layout change, and when the number of pending new rows
@@ -5061,6 +5156,10 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     (vscroll.get_untracked() + pan.y).clamp(0.0, max_y),
                 )));
             });
+            // The selection readout floats over the cells as the panel's
+            // sibling, where no wheel reaches this body — so it forwards here.
+            let fw = forward_wheel.clone();
+            sel_wheel.set(Some(Rc::new(move |pan| fw(pan))));
             // **The frozen block ends in one rule**, `FROZEN_EDGE_W` wide, however
             // many columns are frozen, laid over the last frozen header's own
             // hairline rather than beside it: a 1px right border on the frozen
@@ -9973,7 +10072,7 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
         // The rows as the toolbar's Copy renders the whole result — an
         // `INSERT`, a JSON array, a Markdown table — for just these rows, plus
         // the SQL fragments only a row gesture can mean (`copy_as_menu`).
-        copy_as_menu(gs, pos),
+        copy_as_menu(gs, pos, gs.bounds_untracked()),
     ];
     // Row actions, on the same terms the cell menu offers them: real (already
     // committed) rows of a single writable table.
@@ -11495,8 +11594,15 @@ fn data_cell(
                 }));
             }
             // The gutter's *Copy as*, over the same gesture: the selected block
-            // when this cell is inside it, else this cell's row.
-            entries.push(copy_as_menu(gs, i));
+            // when this cell is inside one of more than one cell, else this
+            // cell's row. Asked of the selection as the right-click left it —
+            // collapsed onto this cell when it landed outside the block, which
+            // is a lone cell and so the row (`copy_as_menu`).
+            entries.push(copy_as_menu(
+                gs,
+                i,
+                schemaic_core::edit::toolbar_copy_block(gs.bounds_untracked()),
+            ));
             // Beside Copy, and gated the same way Edit Field is: a paste is a
             // batch of edits, so a result nothing can be typed into has nothing
             // to paste into either. The action still lands on the *selection*,
@@ -11912,6 +12018,42 @@ mod preview_walk_tests {
 }
 
 #[cfg(test)]
+mod scroll_target_tests {
+    use super::*;
+
+    /// **A frozen block wider than the panel still lets rows scroll.** The
+    /// data pane then lays out to width 0, and a guard on the width for both
+    /// axes left the cursor moving off screen under Arrow-Down, PageDown, Go
+    /// to row and find-next. The row axis asks the height alone.
+    #[test]
+    fn a_zero_width_viewport_still_scrolls_rows() {
+        let vp = Rect::new(0.0, 0.0, 0.0, 100.0);
+        let to = scroll_target(vp, 400.0, 20.0, Some((50.0, 80.0)));
+        assert_eq!(
+            to,
+            Some(Point::new(0.0, 320.0)),
+            "down to the row, not across"
+        );
+    }
+
+    /// Both axes as before when the pane has a width; nothing before layout.
+    #[test]
+    fn a_laid_out_viewport_scrolls_both_axes_and_an_unlaid_one_neither() {
+        let vp = Rect::new(100.0, 200.0, 300.0, 300.0);
+        assert_eq!(
+            scroll_target(vp, 40.0, 20.0, Some((350.0, 420.0))),
+            Some(Point::new(220.0, 40.0))
+        );
+        assert_eq!(
+            scroll_target(vp, 220.0, 20.0, None),
+            Some(Point::new(100.0, 200.0)),
+            "already visible, and a frozen column scrolls nothing across"
+        );
+        assert_eq!(scroll_target(Rect::ZERO, 400.0, 20.0, None), None);
+    }
+}
+
+#[cfg(test)]
 mod fill_target_tests {
     use super::*;
     use floem::reactive::Scope;
@@ -12236,7 +12378,10 @@ mod cell_preview_tests {
         let at = body.find("fn render_rows_at(").expect("render_rows_at");
         let end = body[at..].find("\n}").expect("no end");
         let f = &body[at..at + end];
-        for needle in ["exported_rows_at(gs, pos)", "insert_blocks_at(gs, pos)"] {
+        for needle in [
+            "exported_rows_at(gs, pos, sel)",
+            "insert_blocks_at(gs, pos, sel)",
+        ] {
             assert!(
                 f.contains(needle),
                 "`render_rows_at` no longer renders the rows the gesture named \
@@ -12252,7 +12397,7 @@ mod cell_preview_tests {
         let end = body[at..].find("\n}").expect("no end");
         let f = &body[at..at + end];
         assert!(
-            f.contains("exported_rows_at(gs, pos)") && !f.contains("exported_rows(gs)"),
+            f.contains("exported_rows_at(gs, pos, sel)") && !f.contains("exported_rows(gs)"),
             "`export_values_at` no longer copies just the rows the gesture named:\n{f}"
         );
         // And its *SQL UPDATE* / *SQL WHERE IN*, which resolve inside
@@ -12265,9 +12410,8 @@ mod cell_preview_tests {
         let f = &body[at..at + end];
         for needle in [
             "grid_cells(",
-            ".updates_at(",
-            ".where_in_at(",
-            "gs.bounds_untracked()",
+            ".updates_at(&model, sel,",
+            ".where_in_at(&model, sel,",
         ] {
             assert!(
                 f.contains(needle),
@@ -12275,6 +12419,19 @@ mod cell_preview_tests {
                  `GridCells` (`{needle}` is gone):\n{f}"
             );
         }
+        // **The cell menu's gesture is its block, else the row.** Its
+        // right-click has already collapsed an outside selection onto the
+        // clicked cell, so handing *Copy as* the live selection copied one
+        // column every time; `toolbar_copy_block` of it is no block for a lone
+        // cell (`the_cell_menus_copy_as_takes_the_row_of_a_lone_cell`).
+        let at = body
+            .find("entries.push(copy_as_menu(")
+            .expect("the cell menu's Copy as");
+        let call = &body[at..at + body[at..].find(";").expect("no end")];
+        assert!(
+            call.contains("toolbar_copy_block(gs.bounds_untracked())"),
+            "the cell menu's *Copy as* is handed the collapsed selection:\n{call}"
+        );
         // **The file's `INSERT`s are the clipboard's blocks.** `exported_rows`
         // satisfies the resolution check above and still has a pending ＋Row's
         // unset cells as `NULL`, so Save .sql wrote them — overriding the

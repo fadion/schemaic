@@ -9324,6 +9324,7 @@ fn center(ui: Ui) -> impl IntoView {
                     goto_step: RwSignal::new(0u64),
                     // Selection aggregates, written by the mounted grid.
                     sel_summary: RwSignal::new(None),
+                    sel_wheel: RwSignal::new(None),
                     // Commit-status bar (bottom) — its own per-tab-render signals;
                     // "View" opens the shared workspace error modal with its text.
                     commit_err: RwSignal::new(None),
@@ -9526,7 +9527,7 @@ fn results_section(
     let (find_open, find_query, find_step) = (gctx.find_open, gctx.find_query, gctx.find_step);
     let (find_total, find_pos, find_more) = (gctx.find_total, gctx.find_pos, gctx.find_more);
     let (goto_open, goto_query, goto_step) = (gctx.goto_open, gctx.goto_query, gctx.goto_step);
-    let sel_summary = gctx.sel_summary;
+    let (sel_summary, sel_wheel) = (gctx.sel_summary, gctx.sel_wheel);
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
     let commit_note = gctx.commit_note;
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
@@ -9700,7 +9701,7 @@ fn results_section(
         // second copy of the same four-way `is_some`, which the note surface
         // would have had to be added to twice; the two disagreeing is the pair
         // of them drawn on top of each other.
-        grid_selection_bar(sel_summary, move || bars.any_up()),
+        grid_selection_bar(sel_summary, sel_wheel, move || bars.any_up()),
     ))
     .style(|s| {
         s.width_full()

@@ -1188,6 +1188,25 @@ pub fn toolbar_copy_block(
     selection.filter(|&(r0, c0, r1, c1)| r0 != r1 || c0 != c1)
 }
 
+/// Why the grid's [`EditModel`] is left empty on purpose, or `None` when it is
+/// computed: a **read-only connection**, or a **pinned** result, whose rows are
+/// a snapshot a keyed statement would aim at whatever the row holds now.
+///
+/// A surface that needs the model's key — Copy as ▸ SQL UPDATE / WHERE IN —
+/// says this rather than [`EditModel::insert_target`]'s refusal, which blamed
+/// the result for having no keyed table when the table had one. A pinned
+/// result's reason wins, being the stronger: unpinning would not help a
+/// read-only connection, but neither would it be the first thing to try.
+pub fn withheld_model_reason(read_only: bool, pinned: bool) -> Option<&'static str> {
+    if pinned {
+        Some("Nothing to copy as SQL: this result is pinned, so its rows are a snapshot.")
+    } else if read_only {
+        Some("Nothing to copy as SQL: this connection is read-only.")
+    } else {
+        None
+    }
+}
+
 /// The literal a staged SQL NULL reads as, everywhere a surface reads the grid.
 /// The cell paints it, so the clipboard and an attachment say it too.
 const STAGED_NULL: &str = "NULL";
@@ -4745,6 +4764,48 @@ mod tests {
 
         assert_eq!(CopyScope::Cell.label(), "Copy value");
         assert_eq!(CopyScope::Selection.label(), "Copy");
+    }
+
+    /// **The cell menu's Copy as copies the clicked cell's row**, unless the
+    /// click landed in a block of more than one cell. Its right-click has
+    /// already collapsed an outside selection onto the clicked cell, and the
+    /// live one-cell selection resolved to that one column — so the menu asks
+    /// `toolbar_copy_block` of it, which is no block for a lone cell.
+    #[test]
+    fn the_cell_menus_copy_as_takes_the_row_of_a_lone_cell() {
+        let (r, _) = keyed_people();
+        let (order, formats, dirty, new) = (vec![0, 1, 2], vec![], HashMap::new(), vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        // After the right-click on (1, 2): the selection is that cell.
+        let (rs, rows) = c.exported_rows_at(toolbar_copy_block(Some((1, 2, 1, 2))), 1, None);
+        assert_eq!(rows, vec![1]);
+        assert_eq!(rs.col_count(), 3, "every column of the row");
+        // Inside a block: the block.
+        let (rs, rows) = c.exported_rows_at(toolbar_copy_block(Some((0, 1, 1, 2))), 1, None);
+        assert_eq!((rows, rs.col_count()), (vec![0, 1], 2));
+    }
+
+    /// A read-only connection and a pinned result empty the edit model on
+    /// purpose, and a copy that needs its key says which — not that the rows
+    /// have no keyed table, which they had.
+    #[test]
+    fn a_withheld_model_says_why() {
+        assert_eq!(withheld_model_reason(false, false), None);
+        assert!(
+            withheld_model_reason(true, false)
+                .unwrap()
+                .contains("read-only")
+        );
+        assert!(
+            withheld_model_reason(false, true)
+                .unwrap()
+                .contains("pinned")
+        );
+        assert!(
+            withheld_model_reason(true, true)
+                .unwrap()
+                .contains("pinned")
+        );
     }
 
     // ── what the surfaces that *read* the grid see ───────────────────────────
