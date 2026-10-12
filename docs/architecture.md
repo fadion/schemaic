@@ -22126,7 +22126,11 @@ existing prose was left alone.
     section's page on the right, `SECTION_PAGE_W` 420 wide — the single-column modal's width, which
     every hint in it was written to wrap within. The panel is `modal_w(SECTION_LIST_W +
     SECTION_PAGE_W)` at a **fixed** `height(modal_h(560))`, so switching sections never resizes it;
-    the old `max_height(modal_body_h(560))` cap went with the column. The sections are
+    the old `max_height(modal_body_h(560))` cap went with the column. **Both panes scroll**: the
+    page in its own `autohide(scroll)`, and the list's rows in theirs (`flex_grow`, `min_height(0)`)
+    with `settings_version_line` pinned beneath — `modal_h` caps the panel to the window, and an
+    unscrolled list of seven rows drew its last rows and the version below the panel's bottom edge
+    on a short window at a large interface scale. The sections are
     `SettingsSection` (re-exported as `schemaic_ui::SettingsSection`): `General` by default, `ALL`
     in list order, and `label()` naming both the row and its page's heading — *Code formatting* for
     `Formatting`. Which one is showing is `LayoutUi::settings_section`, created by the app and not

@@ -1898,12 +1898,15 @@ fn section_list(section: RwSignal<SettingsSection>, ring: FocusRing) -> impl Int
             }
         },
     );
-    v_stack((
-        list,
-        empty().style(|s| s.flex_grow(1.0_f32)),
-        settings_version_line(),
-    ))
-    .style(|s| {
+    // **The rows scroll, as the page does**, with the version pinned beneath
+    // them: the panel's height is fixed and capped to the window, and an
+    // unscrolled list of seven rows painted its last ones and the version
+    // below the panel's bottom edge on a short window. `flex_grow` takes the
+    // room the spacer used to, so on a tall one the version still sits at the
+    // foot.
+    let list = autohide(scroll(container(list).style(|s| s.width_full())))
+        .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
+    v_stack((list, settings_version_line())).style(|s| {
         s.width(theme::scaled(SECTION_LIST_W))
             .flex_shrink(0.0_f32)
             .height_full()
