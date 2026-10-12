@@ -327,12 +327,16 @@ fn apply_name_case_under(
         out.replace_range(at..at + text.len(), &recased);
     };
     let mut verb: Option<String> = None;
+    // Inside a `DECLARE`, or a procedure's or function's header before its
+    // `AS` — where an `@name` is followed by its type ([`declares_variables`]).
+    let mut declares = false;
     let mut frames: Vec<NameFrame> = Vec::new();
     for i in 0..code.len() {
         let (kind, text) = code[i];
         match (kind, text) {
             (Kind::Terminator | Kind::Directive, _) | (Kind::Punct, ";") => {
                 verb = None;
+                declares = false;
                 frames.clear();
                 continue;
             }
@@ -352,11 +356,15 @@ fn apply_name_case_under(
         if verb.is_none() && kind == Kind::Word {
             verb = Some(text.to_ascii_uppercase());
         }
+        if kind == Kind::Word && frames.is_empty() {
+            declares = declares_variables(&code, i, declares, verb.as_deref());
+        }
         if kind == Kind::Word {
             let dot =
                 |j: Option<usize>| matches!(j.and_then(|j| code.get(j)), Some((Kind::Punct, ".")));
             let dotted = dot(i.checked_sub(1)) || dot(Some(i + 1));
-            let typed = !dotted && type_position(&code, i, frames.last(), verb.as_deref(), dialect);
+            let typed = !dotted
+                && type_position(&code, i, frames.last(), verb.as_deref(), declares, dialect);
             if typed && is_builtin_type(text, dialect) {
                 recase(text, types);
                 // The rest of a type spelled in several words.
@@ -397,7 +405,7 @@ fn apply_name_case_under(
             } else if !typed
                 && !dotted
                 && matches!(code.get(i + 1), Some((Kind::Punct, "(")))
-                && is_call(&code, i, verb.as_deref())
+                && is_call(&code, i, verb.as_deref(), dialect)
                 && crate::intel::is_builtin_function(text, dialect)
             {
                 recase(text, functions);
@@ -447,14 +455,46 @@ fn paren_holds(code: &[(Kind, &str)], i: usize, verb: Option<&str>) -> ParenHold
 /// name a paren follows: a table's (`into year(a)`, `table date(…)`,
 /// `from json_table(…)`, an index's `on t(a)`), a routine's being created, a
 /// clause keyword's own parens (`VALUES (`, `IN (`)?
-fn is_call(code: &[(Kind, &str)], i: usize, verb: Option<&str>) -> bool {
+///
+/// A name also stands where no single keyword before it announces one: past
+/// `IF NOT EXISTS`, after an `INSERT`/`REPLACE` that leaves out its `INTO`
+/// (and its `IGNORE`, `TOP (n)`), as a CTE's name before its column list
+/// (`log(a) AS (`), as a derived table's column aliases (`AS log(a)`), as a
+/// MySQL key's name (`UNIQUE log (`), and before a T-SQL table hint
+/// (`log (nolock)`). Each was once recased, and each fails on a server whose
+/// names are case-sensitive.
+fn is_call(code: &[(Kind, &str)], i: usize, verb: Option<&str>, dialect: SqlDialect) -> bool {
     let w = code[i].1;
     if is_keyword(w) && !is_called_keyword(w) {
+        return false;
+    }
+    // A CTE's name: its column list is followed by `AS (` (or `AS
+    // [NOT] MATERIALIZED (`), which no call is.
+    if let Some(close) = close_of(code, i + 1)
+        && word_is(code, close + 1, "AS")
+        && (matches!(code.get(close + 2), Some((Kind::Punct, "(")))
+            || word_is(code, close + 2, "MATERIALIZED")
+            || word_is(code, close + 2, "NOT"))
+    {
+        return false;
+    }
+    if is_table_hint(code, i + 1, dialect) {
         return false;
     }
     let Some(prev) = i.checked_sub(1) else {
         return true;
     };
+    // `… IF NOT EXISTS log (` names what it creates.
+    if word_is(code, prev, "EXISTS")
+        && prev >= 2
+        && word_is(code, prev - 1, "NOT")
+        && word_is(code, prev - 2, "IF")
+    {
+        return false;
+    }
+    if inserts_into(code, prev) {
+        return false;
+    }
     let names = [
         "INTO",
         "TABLE",
@@ -469,6 +509,10 @@ fn is_call(code: &[(Kind, &str)], i: usize, verb: Option<&str>) -> bool {
         "KEY",
         "TRIGGER",
         "TYPE",
+        "AS",
+        "UNIQUE",
+        "FULLTEXT",
+        "SPATIAL",
     ];
     if names.iter().any(|n| word_is(code, prev, n)) {
         return false;
@@ -476,28 +520,136 @@ fn is_call(code: &[(Kind, &str)], i: usize, verb: Option<&str>) -> bool {
     !(verb == Some("CREATE") && word_is(code, prev, "ON"))
 }
 
+/// Where the paren opened at `code[open]` closes, or `None` when `code[open]`
+/// is no `(` or it never closes.
+fn close_of(code: &[(Kind, &str)], open: usize) -> Option<usize> {
+    if !matches!(code.get(open), Some((Kind::Punct, "("))) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (j, t) in code.iter().enumerate().skip(open) {
+        match t {
+            (Kind::Punct, "(") => depth += 1,
+            (Kind::Punct, ")") => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where the paren that closes at `code[close]` opened — [`close_of`] read
+/// backwards.
+fn open_of(code: &[(Kind, &str)], close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for j in (0..=close).rev() {
+        match code[j] {
+            (Kind::Punct, ")") => depth += 1,
+            (Kind::Punct, "(") => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Is `code[last]` the end of an `INSERT`/`REPLACE` head that leaves out its
+/// `INTO` — `INSERT log`, `INSERT IGNORE`, `INSERT TOP (5)` — so that the word
+/// after it is the table?
+fn inserts_into(code: &[(Kind, &str)], last: usize) -> bool {
+    const MODS: &[&str] = &[
+        "IGNORE",
+        "LOW_PRIORITY",
+        "HIGH_PRIORITY",
+        "DELAYED",
+        "PERCENT",
+    ];
+    let mut j = Some(last);
+    while let Some(at) = j {
+        if word_is(code, at, "INSERT") || word_is(code, at, "REPLACE") {
+            return true;
+        }
+        if MODS.iter().any(|m| word_is(code, at, m)) {
+            j = at.checked_sub(1);
+            continue;
+        }
+        // T-SQL's `TOP (n)`.
+        if matches!(code[at], (Kind::Punct, ")"))
+            && let Some(open) = open_of(code, at)
+            && open >= 1
+            && word_is(code, open - 1, "TOP")
+        {
+            j = (open - 1).checked_sub(1);
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+/// Does the paren at `code[open]` hold a legacy T-SQL table hint —
+/// `FROM a, log (nolock)` — making the word before it a table?
+fn is_table_hint(code: &[(Kind, &str)], open: usize, dialect: SqlDialect) -> bool {
+    const HINTS: &[&str] = &[
+        "NOLOCK",
+        "READUNCOMMITTED",
+        "READCOMMITTED",
+        "REPEATABLEREAD",
+        "SERIALIZABLE",
+        "HOLDLOCK",
+        "UPDLOCK",
+        "XLOCK",
+        "ROWLOCK",
+        "PAGLOCK",
+        "TABLOCK",
+        "TABLOCKX",
+        "NOWAIT",
+        "READPAST",
+    ];
+    match dialect {
+        SqlDialect::MsSql => {}
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => return false,
+    }
+    close_of(code, open) == Some(open + 2) && HINTS.iter().any(|h| word_is(code, open + 1, h))
+}
+
 /// Does the word at `code[i]` stand where a type goes?
 ///
 /// After a cast's `::`; after the `AS` of a `CAST(`; a table body's item's
 /// second token, where the first is a column's name; a routine parameter's
 /// type, after its name and any `IN`/`OUT`; after `RETURNS`; on SQL Server
-/// after a variable or parameter (`@x int`, `@x AS int`); and in an
-/// `ALTER TABLE`, after `ADD [COLUMN] c`, `MODIFY [COLUMN] c`,
-/// `ALTER COLUMN c`, `CHANGE [COLUMN] old new` and `TYPE`. The type list
-/// still has to agree ([`is_builtin_type`]), so a position read too widely
-/// costs nothing but a name it already would not touch.
+/// after a variable or parameter being declared (`DECLARE @x int`, a
+/// procedure's `@x AS int` — `declares`), never after one in a select list,
+/// where `@x date` is an alias; and in an `ALTER TABLE`, after
+/// `ADD [COLUMN] c`, `MODIFY [COLUMN] c`, T-SQL's `ALTER COLUMN c`,
+/// `CHANGE [COLUMN] old new` and `TYPE`. `COLUMN` is never the column's
+/// name. The type list still has to agree ([`is_builtin_type`]), so a
+/// position read too widely costs nothing but a name it already would not
+/// touch.
 fn type_position(
     code: &[(Kind, &str)],
     i: usize,
     frame: Option<&NameFrame>,
     verb: Option<&str>,
+    declares: bool,
     dialect: SqlDialect,
 ) -> bool {
     let word = |j: Option<usize>, w: &str| j.is_some_and(|j| word_is(code, j, w));
     let back = |n: usize| i.checked_sub(n);
     let name_at = |j: Option<usize>| {
-        j.and_then(|j| code.get(j))
-            .is_some_and(|(k, _)| matches!(k, Kind::Word | Kind::Quoted))
+        j.and_then(|j| code.get(j)).is_some_and(|(k, t)| match k {
+            Kind::Quoted => true,
+            Kind::Word => !t.eq_ignore_ascii_case("COLUMN"),
+            _ => false,
+        })
     };
     if matches!(back(1).map(|j| code[j]), Some((Kind::Punct, "::"))) || word(back(1), "RETURNS") {
         return true;
@@ -516,7 +668,8 @@ fn type_position(
         }
     }
     let variable = |j: Option<usize>| matches!(j.map(|j| code[j]), Some((Kind::Word, w)) if w.starts_with('@') && !w.starts_with("@@"));
-    if variables_are_typed_by_name(dialect)
+    if declares
+        && variables_are_typed_by_name(dialect)
         && (variable(back(1)) || (word(back(1), "AS") && variable(back(2))))
     {
         return true;
@@ -533,10 +686,57 @@ fn type_position(
     let prev = code[i - 1].1.to_ascii_uppercase();
     word(back(2), "MODIFY")
         || (word(back(2), "COLUMN")
-            && (word(back(3), "ADD") || word(back(3), "MODIFY") || word(back(3), "ALTER")))
+            && (word(back(3), "ADD")
+                || word(back(3), "MODIFY")
+                || (word(back(3), "ALTER") && alter_column_takes_a_type(dialect))))
         || (word(back(2), "ADD") && prev != "COLUMN" && !TABLE_ITEM_WORDS.contains(&prev.as_str()))
         || (name_at(back(2))
             && (word(back(3), "CHANGE") || (word(back(3), "COLUMN") && word(back(4), "CHANGE"))))
+}
+
+/// Is the word after `ALTER COLUMN c` its new type — T-SQL's
+/// `ALTER COLUMN c int` — rather than an action (`SET DEFAULT`, `DROP NOT
+/// NULL`, PostgreSQL's `TYPE`, which [`type_position`] reads on its own)?
+/// MySQL's `SET` is a type too, so `alter column c set default 1` must not
+/// be read as one. An exhaustive `match`, for the reason [`ops`] gives.
+fn alter_column_takes_a_type(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Whether `@name`s are being declared at the depth-0 word `code[i]`, given
+/// whether they were before it ([`apply_name_case`]'s `declares`): a
+/// `DECLARE` opens a declaration, as a `PROCEDURE`/`FUNCTION` name in a
+/// `CREATE`/`ALTER` opens a header of parameters; the header's own `AS` and
+/// any statement's first word close it. Outside one, `@x date` is a column
+/// and its alias.
+fn declares_variables(code: &[(Kind, &str)], i: usize, was: bool, verb: Option<&str>) -> bool {
+    const ENDS: &[&str] = &[
+        "SELECT", "SET", "INSERT", "UPDATE", "DELETE", "MERGE", "IF", "WHILE", "RETURN", "EXEC",
+        "EXECUTE", "BEGIN", "PRINT", "WITH",
+    ];
+    let w = code[i].1;
+    if w.eq_ignore_ascii_case("DECLARE") {
+        return true;
+    }
+    if matches!(verb, Some("CREATE" | "ALTER"))
+        && ["PROCEDURE", "PROC", "FUNCTION"]
+            .iter()
+            .any(|r| w.eq_ignore_ascii_case(r))
+    {
+        return true;
+    }
+    if !was {
+        return false;
+    }
+    if w.eq_ignore_ascii_case("AS") {
+        // `@x AS int` is still the declaration; the header's `AS` is not.
+        let after_variable = matches!(i.checked_sub(1).map(|j| code[j]), Some((Kind::Word, v)) if v.starts_with('@'));
+        return after_variable;
+    }
+    !ENDS.iter().any(|e| w.eq_ignore_ascii_case(e))
 }
 
 /// Does a type follow an `@name` here — `DECLARE @x int`, a procedure's
@@ -4100,7 +4300,7 @@ mod tests {
     #[test]
     fn function_case_leaves_a_name_before_a_paren() {
         use KeywordCase::*;
-        use SqlDialect::MySql;
+        use SqlDialect::{MsSql, MySql};
         for sql in [
             "insert into year(a) values (1)",
             "create table date(a int)",
@@ -4118,6 +4318,53 @@ mod tests {
                 }
             }
         }
+        // The forms a name stands in that no keyword straight before it
+        // announces: past `IF NOT EXISTS`, an `INSERT` without its `INTO`, a
+        // CTE's and a derived table's column list, a key's name, a table
+        // hint's table. Each was recased, and each fails on a server whose
+        // names are case-sensitive.
+        for (d, sql) in [
+            (MySql, "create table if not exists log (id int, msg text)"),
+            (MySql, "create temporary table if not exists point (a int)"),
+            (MySql, "insert log (msg) values ('x')"),
+            (MySql, "insert ignore year (a) values (1)"),
+            (MySql, "insert low_priority ignore year (a) values (1)"),
+            (MySql, "replace log (a) values (1)"),
+            (MsSql, "insert log (msg) values ('x')"),
+            (MsSql, "insert top (5) log (msg) select a from t"),
+            (MySql, "with log(a) as (select 1) select * from log"),
+            (
+                MySql,
+                "with x as (select 1), log(a) as (select 2) select * from log",
+            ),
+            (
+                MySql,
+                "with recursive log(a) as (select 1) select * from log",
+            ),
+            (MySql, "select log.a from (select 1) as log(a)"),
+            (MySql, "alter table t add unique year (b)"),
+            (MsSql, "select * from a, log (nolock)"),
+        ] {
+            assert_eq!(apply_name_case(sql, d, Upper, Keep), sql, "{d:?}");
+        }
+        // Still a call where an expression stands.
+        assert_eq!(
+            apply_name_case("insert into t values (log(2))", MySql, Upper, Keep),
+            "insert into t values (LOG(2))"
+        );
+        assert_eq!(
+            apply_name_case("select a as x, log(b) from t", MySql, Upper, Keep),
+            "select a as x, LOG(b) from t"
+        );
+        assert_eq!(
+            apply_name_case(
+                "with c as (select log(a) from t) select 1",
+                MySql,
+                Upper,
+                Keep
+            ),
+            "with c as (select LOG(a) from t) select 1"
+        );
     }
 
     /// A built-in type is recased where it stands as a type — a column's,
@@ -4174,6 +4421,42 @@ mod tests {
         assert_eq!(
             apply_name_case("CREATE TABLE t (ID INT)", MySql, Keep, Lower),
             "CREATE TABLE t (ID int)"
+        );
+        // `COLUMN` is a keyword, not the column: the name after it is the
+        // name, and only the word after *that* is the type. Recasing `date`
+        // here renames the column (MariaDB keeps the case it is given).
+        assert_eq!(
+            up(
+                "alter table t modify column date int, change column a year int, \
+                 add column time int, alter column date set default 1",
+                MySql
+            ),
+            "alter table t modify column date INT, change column a year INT, \
+             add column time INT, alter column date set default 1"
+        );
+        // A variable in a select list is followed by its alias, not a type:
+        // only a declaration or a routine's header types an `@name`.
+        for sql in [
+            "select @d as date, @d time",
+            "set @x = 1; select @x as date",
+            "declare @d mytype select @d as date",
+            "create procedure q as begin select @a as date end",
+        ] {
+            assert_eq!(apply_name_case(sql, MsSql, Keep, Upper), sql, "{sql}");
+        }
+        assert_eq!(
+            up(
+                "create procedure p @a int, @b as nvarchar(10) as select @a as date",
+                MsSql
+            ),
+            "create procedure p @a INT, @b as NVARCHAR(10) as select @a as date"
+        );
+        assert_eq!(
+            up(
+                "alter function f(@a date) returns int as begin declare @d date; return 1 end",
+                MsSql
+            ),
+            "alter function f(@a DATE) returns INT as begin declare @d DATE; return 1 end"
         );
     }
 

@@ -13303,17 +13303,28 @@ existing prose was left alone.
     where it is that?* A function only unqualified, straight before its `(`, and where `is_call`
     says it is called: not a layout keyword whose parens are a clause's (`VALUES (`, `IN (`) unless
     `is_called_keyword`, not after `INTO`/`TABLE`/`FROM`/`JOIN`/`UPDATE`/`REFERENCES`/`FUNCTION`/
-    `PROCEDURE`/`VIEW`/`INDEX`/`KEY`/`TRIGGER`/`TYPE`, nor after an index's `ON` in a `CREATE` —
-    `insert into year(a)` names a table, not `YEAR()`, and a MySQL table's name may be
-    case-sensitive (`function_case_recases_built_in_calls`,
+    `PROCEDURE`/`VIEW`/`INDEX`/`KEY`/`TRIGGER`/`TYPE`/`AS`/`UNIQUE`/`FULLTEXT`/`SPATIAL`, nor after
+    an index's `ON` in a `CREATE` — `insert into year(a)` names a table, not `YEAR()`, and a MySQL
+    table's name may be case-sensitive. Nor where a name stands with no one keyword before it: past
+    `IF NOT EXISTS`, after an `INSERT`/`REPLACE` that leaves out its `INTO` (over `IGNORE`,
+    `LOW_PRIORITY`, `TOP (n)` — `inserts_into`), a CTE's name, read off its column list's closing
+    paren being followed by `AS (` or `AS [NOT] MATERIALIZED`, and on SQL Server a table before a
+    legacy hint, `log (nolock)` (`is_table_hint`). Each of those was recased once, and each failed
+    on a server whose names are case-sensitive — measured on MariaDB, MySQL 8.4 and a `CS_AS` SQL
+    Server database (`function_case_recases_built_in_calls`,
     `function_case_leaves_a_name_before_a_paren`). That is conservative on purpose, and `from
-    json_table(…)` is missed with it, deliberately: the word before the paren is all the rule reads.
+    json_table(…)` is missed with it, deliberately.
     A type only where `type_position` puts one: after `::`; after the `AS` inside a `CAST`/
     `TRY_CAST`/`SAFE_CAST` paren; a table body item's second token unless its first is one of
     `TABLE_ITEM_WORDS`; a routine parameter's, after its name and any `IN`/`OUT`/`INOUT`/
-    `VARIADIC`; after `RETURNS`; on SQL Server after an `@var` or `@var AS`; and in an `ALTER TABLE`
-    after `ADD [COLUMN] c`, `MODIFY [COLUMN] c`, `ALTER COLUMN c`, `CHANGE [COLUMN] old new` and
-    `TYPE`. A type's tail words go with it, past a size's parens — `TYPE_TAILS` (`PRECISION`,
+    `VARIADIC`; after `RETURNS`; on SQL Server after an `@var` or `@var AS` **being declared** — in a
+    `DECLARE`, or a procedure's or function's header before its `AS` (`declares_variables`), never
+    in a select list, where `@d date` is a column and its alias; and in an `ALTER TABLE` after
+    `ADD [COLUMN] c`, `MODIFY [COLUMN] c`, T-SQL's `ALTER COLUMN c` (`alter_column_takes_a_type` —
+    elsewhere `ALTER COLUMN c SET …` is an action, and MySQL's `SET` is also a type), `CHANGE
+    [COLUMN] old new` and `TYPE`. `COLUMN` itself is never read as the column's name, so `modify
+    column date int` recases `INT` and not the column. A type's tail words go with it, past a
+    size's parens — `TYPE_TAILS` (`PRECISION`,
     `VARYING`, `UNSIGNED`, `SIGNED`, `ZEROFILL`), and `WITH`/`WITHOUT TIME ZONE` after `TIME` or
     `TIMESTAMP` (`type_case_recases_built_in_types_where_they_are_types`). What each open paren
     holds is a stack of `NameFrame { holds: ParenHolds, n, first }` — `Table`, `Params`, `Cast` or
