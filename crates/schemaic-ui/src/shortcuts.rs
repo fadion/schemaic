@@ -432,7 +432,7 @@ pub(crate) fn note_pointer_modifiers(mods: Modifiers) {
 #[cfg(test)]
 mod primary_key_tests {
     use super::{HeldModifiers, opens_link, primary_key_from};
-    use floem::keyboard::{Key, NamedKey, Modifiers};
+    use floem::keyboard::{Key, Modifiers, NamedKey};
 
     /// The keys noted in order, from nothing held.
     fn after(keys: &[(NamedKey, bool)]) -> HeldModifiers {

@@ -10228,7 +10228,10 @@ mod geometry_tests {
                  line-count digit leaves it behind:\n{memo}"
             );
         }
-        assert!(seen >= 2, "the bracket and occurrence memos are gone ({seen})");
+        assert!(
+            seen >= 2,
+            "the bracket and occurrence memos are gone ({seen})"
+        );
     }
 
     /// Hoisted is not enough when the builder itself rebuilds per keystroke —

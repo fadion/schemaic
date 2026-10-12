@@ -13253,13 +13253,14 @@ mod alias_refs {
         let c = Ctes::of(stmt, lo, ast);
         let on = |r: &Span| r.0 <= caret && caret <= r.1;
         if let Some(r) = c.refs.iter().find(|r| on(&r.at)) {
-            let d = r.single.then(|| c.bound(&r.name, r.quoted, r.at)).flatten()?;
+            let d = r
+                .single
+                .then(|| c.bound(&r.name, r.quoted, r.at))
+                .flatten()?;
             return Some(unquoted(stmt, lo, c.decls[d].at));
         }
         let (def, all) = cte_spans(stmt, lo, ast, caret)?;
-        all.iter()
-            .any(on)
-            .then(|| unquoted(stmt, lo, def))
+        all.iter().any(on).then(|| unquoted(stmt, lo, def))
     }
 
     /// Do two names name the same thing? A quoted one on either side is that
@@ -27172,7 +27173,10 @@ mod tests {
             Some(format!("{w}name::text IS NULL"))
         );
         assert_eq!(
-            null_fixed(&format!("{w}CAST(name AS varchar(9)) = NULL"), SqlDialect::MsSql),
+            null_fixed(
+                &format!("{w}CAST(name AS varchar(9)) = NULL"),
+                SqlDialect::MsSql
+            ),
             Some(format!("{w}CAST(name AS varchar(9)) IS NULL"))
         );
         // NULL on the left of an operand its span cuts short: either the right
