@@ -2150,8 +2150,11 @@ existing prose was left alone.
     an edit moves the statement, and a second span would have to be shifted everywhere the first
     is. The not-found checks fill it with their own "did you mean" — an unknown table (its range is
     the name token alone, so a qualifier stays) and an unknown column, qualified or bare, in the
-    per-scope resolver and the flat qualified check alike — quoted by `export::ident_if_needed` as
-    the message quotes it. Three more checks fill it, and every other construction site states
+    per-scope resolver and the flat qualified check alike — quoted by `export::ident_if_needed`. A
+    column is written in **the catalogue's own case** (`Src::spelled`), not the folded key the
+    resolver matches by: quoting by case is only right once the case is the column's, and on
+    PostgreSQL `m."Ix"` was fixed to `m.id`, which names no column
+    (`a_column_fix_keeps_the_catalogues_case`). Three more checks fill it, and every other construction site states
     `None`: `null_comparisons`
     writes `x IS NULL` for `x = NULL` (`IS NOT NULL` for `<>`/`!=`) — nothing for `NULL = NULL`.
     **It never rebuilds the operand from its AST span** (`null_fix`): sqlparser's spans leave out a

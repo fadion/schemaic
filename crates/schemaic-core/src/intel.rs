@@ -11369,6 +11369,11 @@ mod colres {
         /// `SELECT * FROM (SELECT nope FROM departments) d` was silent, which
         /// is the most common place for a wrong column name to be.
         defines: Option<(usize, usize)>,
+        /// The catalogue's own spelling of each column, keyed by the folded name
+        /// `cols` holds — what a "did you mean" fix writes, so PostgreSQL's
+        /// `"Id"` is not suggested as `id`, which names no column. Empty for a
+        /// source whose columns are not the catalogue's; the key stands in.
+        spelled: HashMap<String, String>,
     }
 
     /// A resolution scope: the byte range it spans, its FROM sources, and the output
@@ -11582,6 +11587,7 @@ mod colres {
                                 table: None,
                                 shadowed: None,
                                 defines: None,
+                                spelled: HashMap::new(),
                             }],
                             proj_aliases: HashSet::new(),
                             alias_blind: Vec::new(),
@@ -11914,12 +11920,16 @@ mod colres {
                                             ),
                                         ),
                                     );
-                                    // The message's "did you mean", as the fix.
+                                    // The message's "did you mean", as the fix —
+                                    // in the catalogue's case, not the key's.
                                     d.fix = super::nearest_name(
                                         &r.col,
                                         cols.iter().map(String::as_str),
                                     )
-                                    .map(|n| crate::export::ident_if_needed(n, dialect));
+                                    .map(|n| {
+                                        let n = src.spelled.get(n).map_or(n, String::as_str);
+                                        crate::export::ident_if_needed(n, dialect)
+                                    });
                                     Some(d)
                                 }
                             };
@@ -12024,7 +12034,15 @@ mod colres {
                     .map(|n| format!(" — did you mean `{n}`?"))
                     .unwrap_or_default();
                 let mut d = err(r, &format!("Column `{}` not found{where_tbl}{hint}", r.col));
-                d.fix = suggestion.map(|n| crate::export::ident_if_needed(n, dialect));
+                d.fix = suggestion.map(|n| {
+                    let n = chain[0]
+                        .sources
+                        .iter()
+                        .filter(visible)
+                        .find_map(|src| src.spelled.get(n))
+                        .map_or(n, String::as_str);
+                    crate::export::ident_if_needed(n, dialect)
+                });
                 Some(d)
             }
         }
@@ -12381,6 +12399,7 @@ mod colres {
                 table: None,
                 shadowed,
                 defines: *body,
+                spelled: HashMap::new(),
             });
         }
         let tref = TableRef {
@@ -12392,6 +12411,7 @@ mod colres {
             None => Some(tref),
             Some(d) => catalog.in_database(d, &tref),
         };
+        let mut spelled = HashMap::new();
         let cols = match resolved.as_ref().map(|r| (catalog.table_status(r), r)) {
             // The engine's undeclared columns join the introspected ones, so
             // `rowid` on SQLite resolves through the same scope walk as a real
@@ -12400,6 +12420,10 @@ mod colres {
             Some((TableStatus::Found, tref)) => catalog
                 .columns_of(tref)
                 .map(|c| {
+                    spelled = c
+                        .iter()
+                        .map(|s| (s.to_ascii_lowercase(), s.to_string()))
+                        .collect();
                     Cols::Known(
                         c.iter()
                             .map(|s| s.to_ascii_lowercase())
@@ -12416,6 +12440,7 @@ mod colres {
             table: Some(tname),
             shadowed,
             defines: None,
+            spelled,
         })
     }
 
@@ -12515,6 +12540,7 @@ mod colres {
                     table: None,
                     shadowed: None,
                     defines: Some(to_range(stmt, lo, subquery.span())),
+                    spelled: HashMap::new(),
                 });
             }
             TableFactor::NestedJoin {
@@ -12606,6 +12632,7 @@ mod colres {
             table: None,
             shadowed: None,
             defines: None,
+            spelled: HashMap::new(),
         }
     }
 
@@ -26984,6 +27011,40 @@ mod tests {
             fix_for("SELECT * FROM employes", "employes").as_deref(),
             Some("employees")
         );
+        assert_eq!(
+            fix_for("SELECT e.salery FROM employees e", "salery").as_deref(),
+            Some("salary")
+        );
+    }
+
+    /// **A column's "did you mean" fix is spelled as the catalogue spells it.**
+    /// The resolver keys columns lowercased, and the fix was quoted from that
+    /// key: on PostgreSQL `m."Ix"` became `m.id`, which names no column — one
+    /// error swapped for another. Quoting by case is only right once the case
+    /// is the column's own.
+    #[test]
+    fn a_column_fix_keeps_the_catalogues_case() {
+        let schema = DbSchema {
+            tables: vec![tbl("MixedCase", &["Id", "Label"])],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("public", &schema)], Some("public"));
+        let pg = SqlDialect::Postgres;
+        let fix_of = |sql: &str, at: &str| {
+            diagnostics(sql, &cat, pg)
+                .into_iter()
+                .find(|d| &sql[d.range.0..d.range.1] == at)
+                .and_then(|d| d.fix)
+        };
+        assert_eq!(
+            fix_of(r#"SELECT m."Ix" FROM "MixedCase" m"#, r#""Ix""#).as_deref(),
+            Some(r#""Id""#)
+        );
+        assert_eq!(
+            fix_of(r#"SELECT "Labl" FROM "MixedCase""#, r#""Labl""#).as_deref(),
+            Some(r#""Label""#)
+        );
+        // A lower-case column stays bare, as before.
         assert_eq!(
             fix_for("SELECT e.salery FROM employees e", "salery").as_deref(),
             Some("salary")
