@@ -12677,8 +12677,11 @@ existing prose was left alone.
     date beside today's time, a stamp a day in the past from the one control whose whole job is the
     current instant. A caller that wants only the day still wants `Date::today`.
   - `plan.rs` — `QueryPlan::from_result` parses an `EXPLAIN` result into a table + heuristic
-    warnings (full scan / filesort / temp table); `to_prompt_text` for the AI — the plan modal's
-    hand-off and the MCP server's `explain` reply.
+    warnings (full scan / filesort / temp table), and carries the fetch's `truncated` — a plan
+    of a table partitioned by day runs two rows a partition and can reach the 10,000-row cap, and
+    one cut there must not read as whole (`a_capped_plan_carries_its_cut`); `to_prompt_text` for
+    the AI — the plan modal's hand-off. The MCP server's `explain` reply is its own, capped
+    `format_plan` (`schemaic-cli`'s `mcp.rs`).
     **SQL Server's plan is not a table but an XML document per statement**, and it is read into
     the same tabular `QueryPlan` rather than a second shape the modal would have to learn: a result
     whose one column is `SHOWPLAN_COLUMN` (`Microsoft SQL Server 2005 XML Showplan`, the name
@@ -16518,12 +16521,21 @@ existing prose was left alone.
   inside a read-only transaction (error 1792, "Cannot execute statement in a READ ONLY
   transaction", true of nothing the user ran), and the transaction cannot be dropped for a write's
   plan, since `EXPLAIN DELETE … WHERE id = f()` runs `f` while planning as readily as a `SELECT`
-  does. `mysql::read_only_plan_refusal` turns 1792 into a `DbError::Refused` that says so and points
-  at the statement's `SELECT` form, and passes every other failure through
-  (`a_refused_plan_of_a_write_says_why_and_other_failures_pass_through`). PostgreSQL still plans a
+  does. `mysql::read_only_plan_refusal` turns 1792 into a `DbError::Refused` that says so, and
+  passes every other failure through
+  (`a_refused_plan_of_a_write_says_why_and_other_failures_pass_through`). **It reads the error's
+  code, not its text** — `server_error_code`, the first `ERROR <code> (` the driver writes ahead of
+  the server's own text. It matched "1792" anywhere, so `SELECT * FROM t1792` (no such table)
+  through the MCP `explain` came back as this refusal with its 1146 gone. **And it is worded to be
+  true from both callers**: the MCP server plans read-only on any connection, so the sentence says
+  plans *here* run in a read-only transaction rather than that the connection is read-only, and it
+  points at the `SELECT` form only for a statement `sql::contains_write` calls a write — a `SELECT`
+  refused here is one whose function writes, and is told so (the live
+  `a_read_only_plan_refuses_a_write_its_planner_makes` asserts both sentences). PostgreSQL still plans a
   write in a read-only transaction, `EXPLAIN` alone never reaching the executor's read-only check.
   SQLite's `EXPLAIN QUERY PLAN` takes `Enforce::ReadOnly` as well, for uniformity rather than
-  need — nothing executes there. SQL Server has
+  need — nothing executes there; `a_read_only_plan_runs_on_a_query_only_connection` holds that the
+  plan still comes back, and in `id|parent|notused|detail`. SQL Server has
   no read-only transaction to open, so `mssql::explain_setup` keeps the guarantee the other way
   round: the measured plan runs inside a `BEGIN TRANSACTION` that is never committed, and with the
   flag the statement must first pass `sql::read_only_reason` — `DbError::Refused` otherwise —
@@ -32656,9 +32668,14 @@ existing prose was left alone.
     panel; standalone it has none. Same refusal, right advice for whoever is reading it.
     **`explain` is `run_query`'s twin for a plan, and it stands exactly where `run_query` does.**
     Same inputs — `sql`, required, and the optional `database` through `tool_database` — and the
-    same gate, through `query::read_only_explain`; the reply is `core::plan`'s `to_prompt_text`,
-    the server's own rows and then the warnings its heuristics found, or "(the server returned no
-    plan)". Never the analysing form, which executes the statement (`query.rs`'s entry).
+    same gate, through `query::read_only_explain`; the reply is `format_plan`, the server's own
+    rows and then the warnings its heuristics found, or "(the server returned no plan)". **It is
+    held to `run_query`'s caps** — `MCP_ROW_CAP` rows through the shared `pipe_table` at
+    `MCP_CELL_CHARS` — where it used to be `to_prompt_text`'s whole plan at full width, up to the
+    fetch's 10,000 rows of a partitioned table's plan on every turn; and it says `(N+ plan rows,
+    capped)` when this cap or the fetch's (`QueryPlan::truncated`) cut it, counting the warnings
+    about rows not shown (`a_long_plan_stops_at_the_cap_and_says_so`,
+    `a_sqlite_plan_reaches_the_model_whole`). Never the analysing form, which executes the statement (`query.rs`'s entry).
     **It reads row data, and `reads_row_data` says so**: a plan is not free of the data, because
     MySQL's `EXPLAIN` reads a `const` table to plan it and answers "Impossible WHERE noticed after
     reading const tables" exactly when no row has that key — an existence oracle over values, one

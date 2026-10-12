@@ -37,6 +37,10 @@ pub struct QueryPlan {
     pub rows: Vec<Vec<String>>,
     /// Heuristic performance flags, each tied to a row index.
     pub warnings: Vec<PlanWarning>,
+    /// The fetch's row cap cut the plan (`ResultSet::truncated`), so `rows`
+    /// is its head — and the warnings cover only that head. A partitioned
+    /// table's plan runs two rows a partition and can reach the cap.
+    pub truncated: bool,
 }
 
 /// The kind of a heuristic plan warning (drives the icon/colour in the UI).
@@ -91,7 +95,10 @@ impl QueryPlan {
                         .unwrap_or_default()
                 })
                 .collect();
-            return showplan(&docs);
+            return QueryPlan {
+                truncated: rs.truncated,
+                ..showplan(&docs)
+            };
         }
         let ncols = rs.col_count();
         let rows: Vec<Vec<String>> = (0..rs.row_count())
@@ -110,6 +117,7 @@ impl QueryPlan {
             columns,
             rows,
             warnings,
+            truncated: rs.truncated,
         }
     }
 
@@ -310,7 +318,7 @@ fn showplan(docs: &[String]) -> QueryPlan {
                 return QueryPlan {
                     columns: vec!["Plan".to_string()],
                     rows,
-                    warnings: Vec::new(),
+                    ..Default::default()
                 };
             }
         }
@@ -320,7 +328,7 @@ fn showplan(docs: &[String]) -> QueryPlan {
         return QueryPlan {
             columns: vec!["Plan".to_string()],
             rows: vec![vec!["No statement in this batch has a plan.".to_string()]],
-            warnings: Vec::new(),
+            ..Default::default()
         };
     }
     let measured = statements
@@ -408,6 +416,7 @@ fn showplan(docs: &[String]) -> QueryPlan {
         columns,
         rows,
         warnings,
+        truncated: false,
     }
 }
 
@@ -777,6 +786,15 @@ mod tests {
                 .map(|r| r.iter().map(|c| Value::Str(c.to_string())).collect())
                 .collect(),
         )
+    }
+
+    /// A plan the fetch's row cap cut says so, rather than reading as whole.
+    #[test]
+    fn a_capped_plan_carries_its_cut() {
+        let mut capped = rs(&["QUERY PLAN"], &[&["Seq Scan on p_1"]]);
+        capped.truncated = true;
+        assert!(QueryPlan::from_result(&capped).truncated);
+        assert!(!QueryPlan::from_result(&rs(&["QUERY PLAN"], &[&["Seq Scan on a"]])).truncated);
     }
 
     const HEADERS: &[&str] = &[

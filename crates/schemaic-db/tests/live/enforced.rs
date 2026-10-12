@@ -242,11 +242,22 @@ pub async fn a_read_only_plan_refuses_a_write_its_planner_makes(target: &'static
         schemaic_db::Engine::Postgres => {
             write.unwrap_or_else(|e| panic!("{}: a read-only plan of a DELETE: {e}", target.name));
         }
-        _ => assert!(
-            matches!(&write, Err(schemaic_db::DbError::Refused(m)) if m.contains("read-only")),
-            "{}: {write:?}",
-            target.name
-        ),
+        _ => {
+            assert!(
+                matches!(&write, Err(schemaic_db::DbError::Refused(m))
+                    if m.contains("read-only") && m.contains("SELECT form")),
+                "{}: {write:?}",
+                target.name
+            );
+            // The SELECT was refused for its function, and is told so rather
+            // than to plan the SELECT form it already is.
+            assert!(
+                matches!(&got, Err(schemaic_db::DbError::Refused(m))
+                    if !m.contains("SELECT form") && m.contains("function")),
+                "{}: {got:?}",
+                target.name
+            );
+        }
     }
     assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
     scratch.teardown().await;

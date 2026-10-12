@@ -990,9 +990,46 @@ async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool)
 async fn explain(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
     match crate::query::read_only_explain(db, database, sql, QUERY_TIMEOUT).await {
         Ok(plan) if plan.rows.is_empty() => ("(the server returned no plan)".to_string(), false),
-        Ok(plan) => (plan.to_prompt_text(), false),
+        Ok(plan) => (format_plan(&plan), false),
         Err(e) => no_rows_reply(e),
     }
+}
+
+/// A plan as a tool result: [`format_table`]'s shape and caps, not
+/// `QueryPlan::to_prompt_text`'s whole plan at full width.
+///
+/// **Held to the row cap and the cell width a query is**, because a tool
+/// result rides along on every turn: a plan over a table partitioned by day
+/// runs two rows a partition, up to the fetch's 10,000, which is hundreds of
+/// KB a call. **And it says when it was cut** — by this cap, or by the fetch's
+/// own (`QueryPlan::truncated`) — since a cut plan handed over as whole is a
+/// wrong answer. The heuristics' warnings follow for the rows shown; those
+/// about rows cut away are counted rather than listed.
+fn format_plan(plan: &schemaic_core::plan::QueryPlan) -> String {
+    let shown = plan.rows.len().min(MCP_ROW_CAP);
+    let mut out =
+        schemaic_core::prompt::pipe_table(&plan.columns, &plan.rows[..shown], MCP_CELL_CHARS);
+    if plan.truncated || shown < plan.rows.len() {
+        out.push_str(&format!("\n({shown}+ plan rows, capped)"));
+    } else {
+        let rows = if shown == 1 { "row" } else { "rows" };
+        out.push_str(&format!("\n({shown} plan {rows})"));
+    }
+    let (listed, unlisted): (Vec<_>, Vec<_>) = plan.warnings.iter().partition(|w| w.row < shown);
+    if !listed.is_empty() || !unlisted.is_empty() {
+        out.push_str("\n\nPotential issues:");
+        for w in &listed {
+            out.push_str("\n- ");
+            out.push_str(&w.message);
+        }
+        if !unlisted.is_empty() {
+            out.push_str(&format!(
+                "\n- …and {} more in the plan rows not shown.",
+                unlisted.len()
+            ));
+        }
+    }
+    out
 }
 
 /// A headless read's refusal or failure, in the words a model is given.
@@ -2233,6 +2270,79 @@ mod tests {
             super::explain(&ep.db, None, " ; ").await,
             ("Empty query.".to_string(), true)
         );
+    }
+
+    /// **A server's plan reaches the model as the tool writes it**: SQLite's
+    /// `EXPLAIN QUERY PLAN` columns, as `Db::explain` returns them (its own
+    /// test, `a_read_only_plan_runs_on_a_query_only_connection`, runs them on
+    /// an in-memory database — a `file:` URI this crate cannot open, since the
+    /// boundary refuses one outside `schemaic-db`'s own tests), read by
+    /// `QueryPlan::from_result` and laid out by `format_plan`.
+    #[test]
+    fn a_sqlite_plan_reaches_the_model_whole() {
+        use schemaic_core::model::{Column, ResultSet, Value};
+        let col = |n: &str| Column {
+            name: n.to_string(),
+            type_name: String::new(),
+            origin: None,
+        };
+        let rs = ResultSet::from_rows(
+            vec![col("id"), col("parent"), col("notused"), col("detail")],
+            vec![vec![
+                Value::Str("2".into()),
+                Value::Str("0".into()),
+                Value::Str("216".into()),
+                Value::Str("SCAN t".into()),
+            ]],
+        );
+        let out = super::format_plan(&schemaic_core::plan::QueryPlan::from_result(&rs));
+        assert!(out.contains("| detail |"), "{out}");
+        assert!(out.contains("SCAN t"), "{out}");
+        assert!(out.ends_with("(1 plan row)"), "{out}");
+    }
+
+    /// **A plan is held to the row cap a query is**, and says when it was cut:
+    /// a partitioned table's plan has two lines per partition, and a capped
+    /// plan handed over as whole is a wrong answer.
+    #[test]
+    fn a_long_plan_stops_at_the_cap_and_says_so() {
+        let plan = schemaic_core::plan::QueryPlan {
+            columns: vec!["QUERY PLAN".to_string()],
+            rows: (0..MCP_ROW_CAP + 5)
+                .map(|i| vec![format!("Seq Scan on p_{i} {}", "x".repeat(200))])
+                .collect(),
+            ..Default::default()
+        };
+        let out = super::format_plan(&plan);
+        assert_eq!(out.matches("Seq Scan on p_").count(), MCP_ROW_CAP, "{out}");
+        assert!(
+            out.contains(&format!("({MCP_ROW_CAP}+ plan rows, capped)")),
+            "{out}"
+        );
+        assert!(
+            out.lines()
+                .all(|l| l.chars().count() < super::MCP_CELL_CHARS + 20),
+            "cells trimmed as run_query's are"
+        );
+        // Cut by the server's own cap: the rows that came are all there, and
+        // the note still says it is not the whole plan.
+        let server_cut = schemaic_core::plan::QueryPlan {
+            columns: vec!["QUERY PLAN".to_string()],
+            rows: vec![vec!["Seq Scan on a".to_string()]],
+            truncated: true,
+            ..Default::default()
+        };
+        assert!(
+            super::format_plan(&server_cut).contains("(1+ plan rows, capped)"),
+            "{}",
+            super::format_plan(&server_cut)
+        );
+        let whole = schemaic_core::plan::QueryPlan {
+            columns: vec!["QUERY PLAN".to_string()],
+            rows: vec![vec!["Seq Scan on a".to_string()]],
+            ..Default::default()
+        };
+        assert!(!super::format_plan(&whole).contains("capped"));
     }
 
     /// **A line that is not UTF-8 is skipped, not the end of the session.**

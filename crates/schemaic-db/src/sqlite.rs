@@ -4860,6 +4860,42 @@ mod tests {
         assert_eq!(rs.row_count(), 1);
     }
 
+    /// **A read-only plan still plans**: `Db::explain`'s SQLite arm sets
+    /// `PRAGMA query_only` before `EXPLAIN QUERY PLAN` when asked read-only —
+    /// the MCP server's `explain` always is — and nothing ran it. A change to
+    /// how the session refuses writes that also refused the plan, or a reshaped
+    /// `id|parent|notused|detail`, would have passed the suite.
+    #[tokio::test]
+    async fn a_read_only_plan_runs_on_a_query_only_connection() {
+        let (keeper, db) = shared_memory("explain_read_only");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .expect("seed");
+        for read_only in [true, false] {
+            let rs = db
+                .explain(
+                    None,
+                    "SELECT * FROM t WHERE name = 'x'",
+                    false,
+                    read_only,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("read_only={read_only}: {e}"));
+            let plan = schemaic_core::plan::QueryPlan::from_result(&rs);
+            assert!(
+                plan.columns.iter().any(|c| c == "detail"),
+                "{:?}",
+                plan.columns
+            );
+            assert!(
+                plan.rows.iter().flatten().any(|c| c == "SCAN t"),
+                "read_only={read_only}: {:?}",
+                plan.rows
+            );
+        }
+    }
+
     /// **A SQLite connection's settings are its version and its PRAGMAs**, read
     /// through `Db` and so through the capability gate as well as this module.
     /// `foreign_keys` is the one a user most often asks after, and it reads as

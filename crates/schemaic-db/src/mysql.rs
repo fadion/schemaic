@@ -5503,7 +5503,7 @@ pub(crate) async fn explain(
                     crate::Enforce::ReadOnly,
                 )
                 .await
-                .map_err(read_only_plan_refusal),
+                .map_err(|e| read_only_plan_refusal(e, sql)),
             false => {
                 db.fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel)
                     .await
@@ -5528,16 +5528,41 @@ pub(crate) async fn explain(
 /// ONLY transaction" — true of no statement the user ran. The transaction
 /// cannot be dropped for a write's plan: `EXPLAIN DELETE … WHERE id = f()`
 /// runs `f` while planning as readily as a `SELECT` does.
-fn read_only_plan_refusal(e: DbError) -> DbError {
+///
+/// **Matched on the error's code, not on its text.** The driver renders a
+/// server error as `ERROR <code> (<state>): <text>`, and the text carries the
+/// user's own names and values: `SELECT * FROM t1792` (no such table) came
+/// back as this refusal, its 1146 gone. **And worded to be true from both
+/// callers** — a read-only connection's plan, and the MCP server's, which
+/// plans read-only on any connection — so it says the plan ran read-only, not
+/// that the connection is, and advises the `SELECT` form only for a statement
+/// that is a write; a `SELECT` refused here is one whose function writes.
+fn read_only_plan_refusal(e: DbError, sql: &str) -> DbError {
     match e {
-        DbError::Query(m) if m.contains("1792") => DbError::Refused(
-            "This connection is read-only, and MySQL and MariaDB will not plan a write inside \
-             the read-only transaction that stops a plan from writing. Plan the statement's \
-             SELECT form instead."
-                .to_string(),
-        ),
+        DbError::Query(m) if server_error_code(&m) == Some(1792) => {
+            let advice = if schemaic_core::sql::contains_write(sql, SqlDialect::MySql) {
+                "Plan the statement's SELECT form instead."
+            } else {
+                "A function it calls writes, which a plan here is not allowed to do."
+            };
+            DbError::Refused(format!(
+                "Plans here run in a read-only transaction, and MySQL and MariaDB will not plan \
+                 a statement that writes inside one. {advice}"
+            ))
+        }
         other => other,
     }
+}
+
+/// The code of a server error as the driver renders it — the first
+/// `ERROR <code> (` in the message, which comes before the server's own text.
+fn server_error_code(message: &str) -> Option<u16> {
+    let rest = &message[message.find("ERROR ")? + "ERROR ".len()..];
+    let digits: &str = &rest[..rest.find(|c: char| !c.is_ascii_digit())?];
+    if !rest[digits.len()..].starts_with(" (") {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Run one analyzing-EXPLAIN command on a single connection, wrapped in a
@@ -5891,20 +5916,52 @@ mod explain_tests {
 
     #[test]
     fn a_refused_plan_of_a_write_says_why_and_other_failures_pass_through() {
-        let refused = super::read_only_plan_refusal(DbError::Query(
-            "Server error: `ERROR 1792 (25006): Cannot execute statement in a READ ONLY \
-             transaction'"
-                .to_string(),
-        ));
+        let e1792 = || {
+            DbError::Query(
+                "Server error: `ERROR 1792 (25006): Cannot execute statement in a READ ONLY \
+                 transaction.'"
+                    .to_string(),
+            )
+        };
+        let refused = super::read_only_plan_refusal(e1792(), "DELETE FROM t WHERE id = 1");
         assert!(
-            matches!(&refused, DbError::Refused(m) if m.contains("read-only")),
+            matches!(&refused, DbError::Refused(m) if m.contains("read-only")
+                && m.contains("SELECT form")),
             "{refused:?}"
         );
+        // The statement is already a SELECT: a function it calls writes, and
+        // "plan the SELECT form" would be advice it has already taken. Nor is
+        // the *connection* said to be read-only — through the MCP server every
+        // plan runs read-only, whatever the connection is.
+        let refused = super::read_only_plan_refusal(e1792(), "SELECT * FROM (SELECT purge() x) d");
+        let DbError::Refused(m) = &refused else {
+            panic!("{refused:?}")
+        };
+        assert!(!m.contains("SELECT form"), "{m}");
+        assert!(!m.contains("connection is read-only"), "{m}");
+        assert!(m.contains("function"), "{m}");
+
         let other = DbError::Query("ERROR 1146: Table 'x' doesn't exist".to_string());
         assert!(matches!(
-            super::read_only_plan_refusal(other),
+            super::read_only_plan_refusal(other, "SELECT * FROM x"),
             DbError::Query(m) if m.contains("1146")
         ));
+        // **A 1792 inside the server's text is not the code.** A table, a
+        // column or a SIGNAL text carrying the digits came back as "this
+        // connection is read-only" with the real error gone.
+        for text in [
+            "Server error: `ERROR 1146 (42S02): Table 'db.t1792' doesn't exist'",
+            "Server error: `ERROR 1054 (42S22): Unknown column 'c1792' in 'field list''",
+            "Server error: `ERROR 1644 (45000): ERROR 1792 (25006) is what I say'",
+        ] {
+            assert!(
+                matches!(
+                    super::read_only_plan_refusal(DbError::Query(text.into()), "SELECT 1"),
+                    DbError::Query(m) if m == text
+                ),
+                "{text}"
+            );
+        }
     }
 }
 /// What a cancelled import reports, given what its `ROLLBACK` achieved.
