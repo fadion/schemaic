@@ -3943,9 +3943,7 @@ pub struct TermUi {
     pub screen: RwSignal<schemaic_term::Screen>,
     /// Whether the terminal panel has keyboard focus (drives the cursor).
     pub focused: RwSignal<bool>,
-    /// Whether the terminal settings modal is open.
-    pub settings_open: RwSignal<bool>,
-    /// Available shells + selected default (for the settings modal).
+    /// Available shells + selected default (for Settings' Terminal section).
     pub shells: RwSignal<Vec<schemaic_term::ShellProfile>>,
     pub shell_selected: RwSignal<usize>,
     /// The engine label when the terminal is holding a **DB CLI** session
@@ -3995,8 +3993,6 @@ pub struct AiUi {
     pub messages: RwSignal<Vec<ChatMessage>>,
     pub input: RwSignal<String>,
     pub busy: RwSignal<bool>,
-    /// Whether the AI settings modal is open.
-    pub settings_open: RwSignal<bool>,
     /// Which agent CLI drives the panel.
     ///
     /// The other AI settings are read *through* it: `cli_path` points at this
@@ -8660,6 +8656,7 @@ fn body(
             RightPanel::Terminal => terminal_panel(
                 ui_right.term,
                 ui_right.conn,
+                ui_right.layout,
                 ui_right.term_actions.clone(),
                 ui_right.tab_actions.open_db_cli.clone(),
             )
@@ -10415,10 +10412,12 @@ fn terminal_grid(scr: Screen, font: u16, open_link: Rc<dyn Fn(String)>) -> impl 
 /// Takes `TermActions` whole rather than its twelve closures one by one — the
 /// `schema_settings_overlay` case, several times over. `ConnUi` is here for the
 /// read-only memo below, and `open_db_cli` is the one action this panel reaches
-/// outside its own domain, so it is named.
+/// outside its own domain, so it is named. `LayoutUi` is the gear's: it opens
+/// Settings on its Terminal section (`settings::open_settings_at`).
 fn terminal_panel(
     term: TermUi,
     conn: ConnUi,
+    layout: LayoutUi,
     actions: Rc<TermActions>,
     open_cli: Rc<dyn Fn(Option<String>)>,
 ) -> impl IntoView {
@@ -10427,7 +10426,6 @@ fn terminal_panel(
     let input = actions.input.clone();
     let resize = actions.resize.clone();
     let scroll = actions.scroll.clone();
-    let settings_open = term.settings_open;
     let sel_start = actions.sel_start.clone();
     let sel_update = actions.sel_update.clone();
     let sel_clear = actions.sel_clear.clone();
@@ -10494,9 +10492,9 @@ fn terminal_panel(
         5.0,
         7.0,
         || true,
-        move || settings_open.set(true),
+        move || settings::open_settings_at(layout, SettingsSection::Terminal),
     )
-    .tooltip(|| text("Terminal settings…").style(widgets::tooltip_style));
+    .tooltip(|| text("Terminal settings").style(widgets::tooltip_style));
     let icons_group = h_stack((db_cli_btn, restart_btn, gear))
         .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     // The engine, but only while this is a DB CLI session — see `TermUi::db_label`.
@@ -16225,7 +16223,8 @@ mod whole_ui_gate {
         // 5 → 2: the three **group predicates** take the bundles they read —
         // `ddl_modals_up(OverlayUi, ImportUi, DumpUi, ScriptUi, DdlUi)`,
         // `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and
-        // `settings_modals_up(TermUi, AiUi, LayoutUi)`. Each was already a list
+        // `settings_modals_up(LayoutUi)` — `TermUi` and `AiUi` left it when
+        // their settings became sections of the one modal. Each was already a list
         // of `Copy` flags read at the top and never touched again; only the
         // signature had not said so.
         //
@@ -16382,13 +16381,14 @@ mod whole_ui_gate {
         // some other path would have stayed.
         // `settings.rs` is **off the list** — 4 to zero, and like
         // `connection_import.rs` it was narrow already and only had to say so:
-        // each of the four settings modals owns one domain and reads nothing
-        // else. `term_settings_overlay(TermUi, Rc<TermActions>)`,
-        // `ai_settings_overlay(AiUi, ConnUi, Rc<AiActions>)` — the `ConnUi` is
-        // the active connection's data-access level, which the AI pane reports
-        // — `theme_settings_overlay(LayoutUi, open_config_dir, CliCommand)`, the
-        // last two General's trips outside the app — and
-        // `help_overlay(LayoutUi)`, which reads a single signal.
+        // it reads only the domains its sections edit. `settings_overlay`
+        // takes a `SettingsCtx` naming them — `LayoutUi`, the terminal's
+        // `TermUi` and `Rc<TermActions>`, the assistant's `AiUi`,
+        // `Rc<AiActions>` and `ConnUi` (the active connection's data-access
+        // level, which the AI section reports), and General's two trips
+        // outside the app — and `help_overlay(LayoutUi)` reads a single
+        // signal. (Those were four modals each owning one domain until the
+        // terminal's and the assistant's became sections of the one.)
         //
         // The module names no `Ui` at all now — **not a first**, and the claim
         // this comment used to make is worth leaving as a warning. It read

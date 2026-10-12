@@ -83,7 +83,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let cancel = ui.ai_actions.cancel.clone();
     let new_chat_cb = ui.ai_actions.new_chat.clone();
     let regenerate = ui.ai_actions.regenerate.clone();
-    let settings_open = ui.ai.settings_open;
+    let layout = ui.layout;
     let gutter = ui.ai.gutter;
     let cli_path = ui.ai.cli_path;
     let cli_ok = ui.ai_actions.cli_ok.clone();
@@ -685,9 +685,9 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         5.0,
         7.0,
         || true,
-        move || settings_open.set(true),
+        move || crate::settings::open_settings_at(layout, crate::SettingsSection::Ai),
     )
-    .tooltip(|| text("AI settings…").style(crate::widgets::tooltip_style));
+    .tooltip(|| text("AI settings").style(crate::widgets::tooltip_style));
     let icons_group =
         h_stack((new_chat, gear)).style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     let title_row = h_stack((section_title("AI ASSISTANT"), icons_group))

@@ -21907,9 +21907,11 @@ existing prose was left alone.
     itself first.
     **`whole_ui_gate` 5 → 2, and the two left are the layer and the union.** The three group
     predicates take the bundles they read — `ddl_modals_up(OverlayUi, ImportUi, DumpUi, ScriptUi,
-    DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and `settings_modals_up(TermUi, AiUi,
-    LayoutUi)` — each having already been a list of `Copy` flags read at the top and never touched
-    again, with only the signature not saying so. Neither of the other two is a candidate:
+    DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and `settings_modals_up(LayoutUi)` —
+    each having already been a list of `Copy` flags read at the top and never touched again, with
+    only the signature not saying so. The last took `TermUi` and `AiUi` too until the terminal's and
+    the assistant's settings modals became sections of Settings: its group holds two overlays now,
+    `settings_overlay` and `help_overlay`, and both open flags are `LayoutUi`'s. Neither of the other two is a candidate:
     `modal_layer` reaches **twenty-one** `Ui` fields and hands the bundle to every modal constructor
     in the app, which makes it the widest of everything this gate's entries name — `center`'s
     eighteen included, where this sentence used to put the two the other way round on a stale
@@ -21967,8 +21969,9 @@ existing prose was left alone.
     would execute the block in whatever tab is in front, which is the connection the insert had just
     declined to open on. The `bool` exists for that one question; the refusal itself is reported by
     the action.
-  - `settings.rs` — the three settings modals (the main one's sections are General / Editor / Code formatting /
-    Query / **Appearance**, the last holding the two theme pickers and the **interface scale**) **and the
+  - `settings.rs` — the Settings modal (its sections are General / Editor / Code formatting /
+    Query / **Terminal** / **AI assistant** / **Appearance**, the last holding the two theme pickers
+    and the **interface scale**) and the Shortcuts reference, **and the
     four shared controls every modal's form is
     built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
     floem's), `focusable_dropdown` and the picker-agnostic **`in_ring_picker`** under it — the box
@@ -21994,14 +21997,24 @@ existing prose was left alone.
     cannot Tab to. `focusable_toggle_row` and the greyed row share `toggle_row_layout`. Which branch
     is built is one `enabled.get()` in the view, and nothing tests it.
     **Off `whole_ui_gate`'s list, 4 to zero, and it is `connection_import.rs`'s sweep a second
-    time** — the module was narrow already and only had to say so, each of its four modals (the
-    three settings ones and Shortcuts) owning one domain and reading nothing else:
+    time** — the module was narrow already and only had to say so, each of the four modals it then
+    had (three settings ones and Shortcuts) owning one domain and reading nothing else:
     `term_settings_overlay(TermUi, Rc<TermActions>)`,
     `ai_settings_overlay(AiUi, ConnUi, Rc<AiActions>)` — the `ConnUi` is the active connection's
     data-access level, which the AI pane reports — `theme_settings_overlay(LayoutUi,
     open_config_dir, CliCommand)`, the last two General's two trips outside the app —
     and `help_overlay(LayoutUi)`, which reads a single signal. The
-    module names no `Ui` anywhere now, prose included.
+    module names no `Ui` anywhere now, prose included, bar `SettingsCtx`'s doc saying it holds none.
+    **Four became two when the terminal's and the assistant's modals joined Settings as sections**,
+    and their signatures moved down a level unchanged but for the ring they now share:
+    `terminal_section(TermUi, Rc<TermActions>, FocusRing)` and `ai_section(AiUi, ConnUi,
+    Rc<AiActions>, FocusRing)`, each an `AnyView` like its four neighbours. The modal holding them is
+    `settings_overlay(SettingsCtx)` — `theme_settings_overlay` renamed, since it is no longer the
+    theme's — and the ctx is there for clippy rather than for the gate: `SettingsCtx { layout, term,
+    term_actions, ai, conn, ai_actions, open_config_dir, cli_command }` is eight parameters named
+    one by one, past `too_many_arguments`' seven. It holds no `Ui`, for `CompareCtx`'s reason, and is
+    built by naming the reads at its one call site in `modals.rs`, so what the modal touches stays
+    written down there.
     **The main modal is Manage connections' two panes, not one long column.** It had been five
     headed groups in a single scroll; it is now a section list on the left (`section_list`, a
     `SECTION_LIST_W` 170 column with a `border_right` and `padding_vert` 6) and the chosen
@@ -22016,7 +22029,7 @@ existing prose was left alone.
     `the_settings_sections_are_listed_once_and_named_apart` pins the default first and no two rows
     sharing a name; its exhaustive `match` makes a new variant fail to compile there, which is a
     prompt to add it to `ALL` rather than proof that it was — `ALL` is a fixed-length array, and the
-    test's length check would still read 5. The rows wear Manage connections' list colours
+    test's length check would still read 7. The rows wear Manage connections' list colours
     (`theme::conn_list_text`/`conn_list_sel_text`/`conn_list_sel_bg`, a hover brightening the text
     only) at its 5px row gap, padded 12×11, and the whole list is **one** ring stop at
     `widgets::NAV_TAB`, ahead of every control: a `nav_group` on `NavAxis::Vertical` — the second
@@ -22025,14 +22038,26 @@ existing prose was left alone.
     **Only the showing page is built, and only its controls are in the ring.** The page is a
     `dyn_container` keyed on the section whose child builds that section alone —
     `general_section`, `editor_section`, `formatting_section`, `query_section`,
-    `appearance_section`, each an `AnyView` from `section_page` (the heading over its settings at a
-    group's 16) with `ctrl` stacking a caption over its control — inside its own
-    `autohide(scroll(..))` at padding 14, so a page scrolls on its own and opens at the top each
-    time it is shown, while the list beside it stays put. A ring control registers when it is
-    built and unregisters in its cleanup, so a page a switch tears down takes its controls out of
-    the ring with it, and Tab never walks into a page nobody can see — the AI modal's reason for
-    tearing down what is off rather than hiding it. Each page keeps the block of tab numbers it had
-    in the single form; only one block is ever in the ring, but they still never collide.
+    `terminal_section`, `ai_section`, `appearance_section`, each an `AnyView` from `section_page`
+    (the heading over its settings at a group's 16) with `ctrl` stacking a caption over its control
+    — inside its own `autohide(scroll(..))` at padding 14, so a page scrolls on its own and opens at
+    the top each time it is shown, while the list beside it stays put. A ring control registers
+    when it is built and unregisters in its cleanup, so a page a switch tears down takes its
+    controls out of the ring with it, and Tab never walks into a page nobody can see — the AI
+    page's reason for tearing down what is off rather than hiding it. The five that were the single
+    form keep the block of tab numbers each had there, and those never collide; Terminal and AI
+    assistant brought their own modals' numbering (10–50 and 5–60), which does overlap General's,
+    and is harmless only because one page at a time is ever in the ring.
+    **`section_page` sets `width_full`, and the AI page is why.** A page is usually the very child
+    the scroll pads, but the AI page sits one container in — its teardown hook needs a view of its
+    own (below) — and without the width it took its longest line's width and ran off the panel's
+    right edge; seen in a sandboxed window, fixed, re-checked. The terminal and AI pages also
+    took the page's 16 between groups with them, where their modals had spaced groups 25 apart.
+    **Two gears open Settings on their own section**, through `open_settings_at(LayoutUi,
+    SettingsSection)`, which sets the section and then the open flag: the terminal pane's
+    (`terminal_panel` takes `LayoutUi` for it) lands on Terminal, the AI panel's on AI assistant.
+    Each had opened its own modal until the two joined; their tooltips, *Terminal settings* and
+    *AI settings*, lost their ellipsis on the way.
     **The section list ends in a version caption, and the string it shows is composed in
     `schemaic-core`.**
     `settings_version_line` renders `core::app_version_label()` — `Schemaic v0.24.0`, built from
@@ -22111,7 +22136,9 @@ existing prose was left alone.
     symlink is the app boundary's job for `open_config_dir`'s reason.
     **Both buttons stay enabled while either runs**, and the guard against a click on either is
     `main.rs`'s, beside the launch — the labels only say so.
-    **The AI modal is where the harness is chosen, and half its controls follow that choice.** The
+    **The AI assistant page is where the harness is chosen, and half its controls follow that
+    choice.** It was a modal of its own until it joined Settings, which is the history several
+    paragraphs below still speak in. The
     *Agent CLI* dropdown is `focusable_dropdown(agent, Agent::ALL, Agent::label, …)` over the
     workspace's **one** `Agent` — `schemaic-ui` depends on `schemaic-ai` for it, deliberately, and
     the Cargo.toml comment carries the reason: a UI-side mirror converted at the app boundary is two
@@ -22128,9 +22155,21 @@ existing prose was left alone.
     every control after it is made by a `build_rest` closure inside a `dyn_container` keyed on
     `enabled`, whose off arm is `widgets::nothing()` — torn down rather than hidden, because a hidden
     field stays in the ring (the `.hide()` entry under *Floem 0.2 gotchas*), and Tab would walk an off
-    modal through a CLI path, a model and the rest of a form nobody can see. Each control binds
+    page through a CLI path, a model and the rest of a form nobody can see. Each control binds
     straight to an `AiUi` signal, so the rebuild on turning it on loses nothing. The grade notice's
     memo answers `None` while off: there is no CLI to grade, and the app does not probe one.
+    **The page commits as it goes away.** Its controls write `AiUi` live, but a changed model, path
+    or harness reaches the agent only through `AiActions::apply` (the app's `ai_apply`), which the
+    modal's close used to call. A section's page is torn down at exactly the two moments that close
+    stood for — a switch to another section, or Settings closing — so the page is wrapped in a
+    `container` whose `on_cleanup` calls `apply`, **deferred one tick** (`exec_after(ZERO, …)`)
+    because the page's scope is mid-dispose when its cleanup runs: the scope rule under *Architecture
+    invariants*. Committing on every leave is safe because `ai_apply` respawns only where
+    `ai::needs_respawn` says a session-affecting setting changed, and otherwise only persists. That
+    wrapper is the extra container `section_page`'s `width_full` exists for, so the two go
+    together. Checked in a sandboxed window: picking Claude Code and then switching to Terminal
+    rewrote the sandbox's `ui_state.json` with `ai_harness` `"claude"`, which nothing had saved
+    before the switch.
     **The grade notice under it is hidden, not merely empty, when there is nothing to say.**
     `Constraint::notice` is `None` on `Sealed`, and a `dyn_container` rendering `empty()` is still a
     flex child, so it collected the group's 6px gap on *both* sides — which meant Claude Code, the
@@ -22245,8 +22284,8 @@ existing prose was left alone.
     path — so clearing lands on the one value
     every harness is guaranteed to take.
     **A clear with no way back was the other half of the bug, and `HarnessFields` is the memory
-    that answers it.** The modal's ✕, its backdrop and Escape all commit, so there is no cancel,
-    and the clearing fired on any `prev != now` in *both* directions — a user who opened the
+    that answers it.** The modal's ✕, its backdrop and Escape all committed — as leaving the page
+    or closing Settings does now — so there is no cancel, and the clearing fired on any `prev != now` in *both* directions — a user who opened the
     dropdown to see what was there and picked their own harness again came back to three empty
     fields, permanently, with the modal's own header still promising "Changes commit when the modal
     closes". `harness_switch(prev, now, …, remembered)` restores what a harness held the last time
@@ -22301,17 +22340,17 @@ existing prose was left alone.
     floem label sets its own taffy node width to the measured text, so the green *"Auto-detected:
     `<path>`"* line and both red ones overflowed the 460px panel rather than stretching to it — and
     an auto-detected path is long and has no spaces (Codex resolves to
-    `C:\Users\…\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe`). Bounded to the panel,
-    cosmic-text's default `Wrap::WordOrGlyph` falls back to glyph-level breaks, which is what a path
+    `C:\Users\…\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe`). Bounded to the panel — the
+    page's `SECTION_PAGE_W` now, through `section_page`'s own `width_full` — cosmic-text's default `Wrap::WordOrGlyph` falls back to glyph-level breaks, which is what a path
     wants anyway.
-    **The AI and Shortcuts modal bodies scroll the same way, and the AI one joined last.** Each body
-    is `autohide(scroll(body))` under `max_height(widgets::modal_body_h(560.0))`. The AI modal's
-    eight groups at 25px apart had outgrown the window, and a modal taller than the screen loses its
-    *bottom* groups with no affordance saying they exist — which is the failure the General Settings
-    and Shortcuts modals were already wrapped against. The cap is a `modal_body_h` rather than a
-    constant precisely so it shrinks with a small window instead of being right at one size only.
-    The main Settings modal was the third until it became two panes: its panel is a fixed
-    `modal_h(560)` and each page scrolls inside it on its own (above).
+    **The Shortcuts modal's body scrolls under a cap, and it is the last of the three that did.** It
+    is `autohide(scroll(body))` under `max_height(widgets::modal_body_h(560.0))`, against a modal
+    taller than the screen losing its *bottom* rows with no affordance saying they exist. The cap is
+    a `modal_body_h` rather than a constant precisely so it shrinks with a small window instead of
+    being right at one size only. The AI modal joined that shape last — its eight groups at 25px
+    apart had outgrown the window — and the main Settings modal had it first; both left it when the
+    one became two panes and the other a section of it. Settings' panel is a fixed `modal_h(560)`
+    and each page, the AI assistant's included, scrolls inside it on its own (above).
   - `shortcuts.rs` — the app's keyboard shortcuts as **one table** (`SHORTCUTS`), which
     `settings::help_overlay` renders straight from — plus the tests that keep it honest. This list
     is the app's *only* keyboard documentation and for Ctrl+H / Ctrl+G the only affordance of any
@@ -25271,8 +25310,8 @@ existing prose was left alone.
     missing CLI is not why the box is dead, and naming either sends the user to fix something that
     is not the reason (`an_assistant_switched_off_says_so_whatever_else_is_wrong`; the other three
     keep their old order). It is one memo over all three inputs, for the reason the pair memo it
-    replaced was one: two memos would be two keys. **The gear stays live** — it is the only way into
-    the settings, and so the only way back on — and the panel toggle and Ctrl+Shift+A stay too, so
+    replaced was one: two memos would be two keys. **The gear stays live** — the panel's own way into
+    its settings, and so back on, beside Settings' *AI assistant* section — and the panel toggle and Ctrl+Shift+A stay too, so
     the panel is there to say that it is off. The transcript stays on screen, but the last reply's
     Regenerate icon does not: it has nothing to send to (the off rule under *Architecture
     invariants*).
@@ -28524,7 +28563,9 @@ existing prose was left alone.
     being `tab_actions.open_db_cli`, named because it is the one action the panel reaches outside
     its own domain, while `TermActions` goes in whole because the panel reads twelve closures off it
     and naming twelve is the `schema_settings_overlay` case several times over; the `ConnUi` is
-    there for a read-only memo. **Four of the five are wide by nature** — `workspace` reaches eleven
+    there for a read-only memo. It has since gained a `LayoutUi`, after `ConnUi`, so its gear can
+    open Settings on the Terminal section (`settings::open_settings_at`). **Four of the five are
+    wide by nature** — `workspace` reaches eleven
     `Ui` fields, `center` **eighteen** and is the widest function in this file, `footer` seven,
     `header` **nine** — so naming any of them lands at or past clippy's seven-argument limit, which is
     the lint agreeing with the gate, except that here there is no single child bundle to take
@@ -28541,7 +28582,9 @@ existing prose was left alone.
     Rc<AiActions>)` — the `ConnUi` being the data-access level the AI pane reports —
     `theme_settings_overlay(LayoutUi, open_config_dir, CliCommand)` and
     `help_overlay(LayoutUi)`, which reads a
-    single signal. `properties.rs` went 5 to zero the other way, on a `PropertiesCtx`, and the
+    single signal. The first two have since become Settings sections and the third
+    `settings_overlay(SettingsCtx)`, eight fields being past clippy's seven — the module's entry has
+    the current shape. `properties.rs` went 5 to zero the other way, on a `PropertiesCtx`, and the
     footer is why: **Edit** routes to the table designer or the view editor, so the panel wants what
     those two doors want on top of the four arguments `footer` already carries, which named one by
     one is nine parameters — past clippy's seven, so the lint and *take the child bundle* agree and
@@ -28555,7 +28598,8 @@ existing prose was left alone.
     three group predicates take the bundles they read — `ddl_modals_up(OverlayUi, ImportUi, DumpUi,
     ScriptUi, DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and
     `settings_modals_up(TermUi, AiUi, LayoutUi)` — each already a list of `Copy` flags read at the
-    top and never touched again. `modal_layer` reaches **twenty-one** `Ui` fields and hands the
+    top and never touched again; the last is `settings_modals_up(LayoutUi)` now, the terminal's and
+    the assistant's modals having become Settings sections. `modal_layer` reaches **twenty-one** `Ui` fields and hands the
     bundle to every modal constructor in the app — the widest of everything this gate's entries
     name, ahead of `center`'s eighteen and `overlays::context_menu_overlay`'s seventeen — and
     `modal_backdrop_up` calls all three predicates and adds seven terms of its own, so what it needs
@@ -29464,7 +29508,7 @@ existing prose was left alone.
   therefore keeps the live conversation instead of trading it for a binary nothing can spawn — and
   **that gate is why the pending bubble cannot stamp the selected harness**, which is
   `ai::turn_harness`'s job and is in `core::transcript`'s entry. The
-  AI settings modal is where the user finds out it is unreachable — its `cli_ok` reads the
+  AI assistant section of Settings is where the user finds out it is unreachable — its `cli_ok` reads the
   harness *signal* rather than closing over a value, so the hint follows the selection rather than
   validating against whichever CLI was chosen when the closure was built. Two corollaries, both
   easy to get wrong in
@@ -29473,8 +29517,8 @@ existing prose was left alone.
   licence to ignore the rest, the gate sitting on the `cli_path`/`harness` comparisons alone. The
   filesystem
   question belongs to the caller because the function is pure — the reason it lives in `ai.rs` at
-  all. Both call sites ask it: `ai_send` before a turn, and `ai_apply` when the settings modal
-  closes. `ai_apply` used to compare the whole `AiSettings` with `!=` instead, which is a second
+  all. Both call sites ask it: `ai_send` before a turn, and `ai_apply` when the AI assistant
+  section's page goes away — a switch to another section, or Settings closing. `ai_apply` used to compare the whole `AiSettings` with `!=` instead, which is a second
   rule for one question and had already drifted — `!=` counts `cli_path` unconditionally, so typing
   a path that resolves to nothing (the state the field's own red hint is for) threw the live
   conversation away.
@@ -29678,7 +29722,7 @@ existing prose was left alone.
   the flag is cleared. It is confined to "no session live" — if a *different* one is, `ai_busy`
   belongs to that turn, and clearing it would strand the new turn exactly as this stranded the old
   (`a_terminal_snapshot_with_no_live_session_still_settles_the_panel`). **The two takers reachable
-  mid-stream settle it themselves as well** — the AI settings modal's apply, and editing the active
+  mid-stream settle it themselves as well** — the AI settings page's apply, and editing the active
   connection in place — because nothing guarantees a snapshot arrives after the drop at all: the drop
   closes `stdin_tx`, the task breaks to `child.kill()`, and whether the reader got one more line out
   first is a race. `every_taker_of_the_ai_session_answers_for_ai_busy` is the source gate over
@@ -32968,7 +33012,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   is consumed and opens nothing, so it cannot fall through to an editor binding. But
   **hiding is the courtesy, not the guard**, for the write guard's reason: a control the hiding
   missed, or a menu built a moment before the switch, must still send nothing. **Switching off ends
-  what is running**, at the pick rather than when the modal closes: an effect on `ai_enabled` going
+  what is running**, at the pick rather than when the settings page goes away: an effect on `ai_enabled` going
   false drops the live session, which kills its CLI, aborts an in-flight inline task, whose child is
   `kill_on_drop`, resets a Busy inline state, and settles a streaming turn with `mark_stopped`, since
   the gear is live mid-turn. **The grid's AI fills and seeds stop with it** — before, they ran on
@@ -36446,7 +36490,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   conditionally**: import's CSV and Excel settings, the designer's MySQL-only engine/collation and
   `ON UPDATE` and PostgreSQL-only index method/predicate, the view editor's MySQL options, PG
   recreate toggle and SQLite-only column list, the trigger form's `Fires`/`When` and SQLite-only
-  `Of columns`. The AI settings modal applies it to a setting rather than an engine: with the
+  `Of columns`. Settings' AI assistant section applies it to a setting rather than an engine: with the
   assistant off, nothing below the *Agent CLI* choice is built (`settings.rs`).
   Nothing is lost by rebuilding — each of those binds
   straight to a draft or a persisted signal — and a control an engine can't express shouldn't be

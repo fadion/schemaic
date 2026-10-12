@@ -22,13 +22,11 @@ use crate::erd_view::erd_overlay;
 use crate::monitor_view::monitor_overlay;
 use crate::overlays::{confirm_overlay, error_modal_overlay, find_overlay, tx_prompt_overlay};
 use crate::plan_view::plan_overlay;
-use crate::settings::{
-    ai_settings_overlay, help_overlay, term_settings_overlay, theme_settings_overlay,
-};
+use crate::settings::{help_overlay, settings_overlay};
 use crate::{
-    AiUi, BlobUi, DdlUi, DumpUi, ImportUi, LayoutUi, OverlayUi, ScriptUi, TermUi, Ui,
-    account_editor, database_editor, ddl_preview, event_editor, import_view, object_editor,
-    properties, routine_editor, table_designer, theme, trigger_editor, users_view, view_editor,
+    BlobUi, DdlUi, DumpUi, ImportUi, LayoutUi, OverlayUi, ScriptUi, Ui, account_editor,
+    database_editor, ddl_preview, event_editor, import_view, object_editor, properties,
+    routine_editor, table_designer, theme, trigger_editor, users_view, view_editor,
 };
 
 /// **Every modal, in one layer that starts below the title bar.**
@@ -73,7 +71,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
     // would eat every click in the app beneath it.
     let ddl_modals_up = ddl_modals_up(ui.overlay, ui.import, ui.dump, ui.script, ui.ddl);
     let workspace_modals_up = workspace_modals_up(ui.overlay, ui.blob, ui.ddl);
-    let settings_modals_up = settings_modals_up(ui.term, ui.ai, ui.layout);
+    let settings_modals_up = settings_modals_up(ui.layout);
     let confirm_up = ui.overlay.confirm;
     stack((
         // First, so it keeps the place it had in the root stack: under every
@@ -317,20 +315,23 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 s
             }
         }),
-        // The four settings/help modals share one tuple element — this stack is
+        // The two settings/help modals share one tuple element — this stack is
         // at Floem's 16-arity `ViewTuple` limit, the same squeeze the trigger and
         // function editors are under above. They are mutually exclusive (each is
         // reached from a different chrome control, and each takes the window with
         // its own backdrop), and the wrapper fills only while one is open, or an
         // always-full-window box would eat every click in the app.
         stack((
-            term_settings_overlay(ui.term, ui.term_actions.clone()),
-            ai_settings_overlay(ui.ai, ui.conn, ui.ai_actions.clone()),
-            theme_settings_overlay(
-                ui.layout,
-                ui.open_config_dir.clone(),
-                ui.cli_command.clone(),
-            ),
+            settings_overlay(crate::settings::SettingsCtx {
+                layout: ui.layout,
+                term: ui.term,
+                term_actions: ui.term_actions.clone(),
+                ai: ui.ai,
+                conn: ui.conn,
+                ai_actions: ui.ai_actions.clone(),
+                open_config_dir: ui.open_config_dir.clone(),
+                cli_command: ui.cli_command.clone(),
+            }),
             help_overlay(ui.layout),
         ))
         .style(move |s| {
@@ -563,17 +564,12 @@ fn workspace_modals_up(
     }
 }
 
-/// The settings/help group's modals.
-fn settings_modals_up(
-    term: TermUi,
-    ai: AiUi,
-    layout: LayoutUi,
-) -> impl Fn() -> bool + Copy + 'static {
-    let term_open = term.settings_open;
-    let ai_open = ai.settings_open;
-    let theme_open = layout.theme_settings_open;
+/// The settings/help group's modals: Settings — the terminal's and the
+/// assistant's settings among its sections now — and Shortcuts.
+fn settings_modals_up(layout: LayoutUi) -> impl Fn() -> bool + Copy + 'static {
+    let settings_open = layout.theme_settings_open;
     let help_open = layout.help_open;
-    move || term_open.get() || ai_open.get() || theme_open.get() || help_open.get()
+    move || settings_open.get() || help_open.get()
 }
 
 /// Is a **full-window modal backdrop** on screen?
@@ -622,7 +618,7 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let error_modal_open = ui.overlay.error_modal_open;
     let ddl = ddl_modals_up(ui.overlay, ui.import, ui.dump, ui.script, ui.ddl);
     let workspace = workspace_modals_up(ui.overlay, ui.blob, ui.ddl);
-    let settings = settings_modals_up(ui.term, ui.ai, ui.layout);
+    let settings = settings_modals_up(ui.layout);
     move || {
         find_open.get()
             || manage_open.get()

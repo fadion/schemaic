@@ -93,8 +93,9 @@ pub(crate) struct AiSession {
     /// database password, the MCP config that holds it, the working directory
     /// the child ran in. Removed when the session ends.
     pub(crate) private: SessionPrivate,
-    /// The AI settings this session was spawned with, so closing the settings
-    /// modal only respawns `claude` when one actually changed (review §7.4).
+    /// The AI settings this session was spawned with, so leaving Settings' AI
+    /// assistant page only respawns `claude` when one actually changed
+    /// (review §7.4).
     pub(crate) settings: AiSettings,
     /// The live context (active database / schema outline / editor contents) as
     /// the assistant last saw it — seeded from the system prompt at spawn, then

@@ -2283,8 +2283,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // expanded. `editor_h` is the restore height; collapsing sets the editor height
     // to 0 (instant).
     let editor_collapsed: RwSignal<bool> = RwSignal::new(false);
-    // AI Assistant settings (gear → modal), restored from disk.
-    let ai_settings_open = RwSignal::new(false);
+    // AI Assistant settings (gear → Settings' AI section), restored from disk.
     // Which agent CLI drives the panel, or none. An unrecognised persisted key
     // falls back to **off** *and says so* — `Agent::from_key` refuses to guess
     // precisely so this decision is made where there is a UI to report it.
@@ -11751,7 +11750,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
-    // Commit AI settings (called when the settings modal closes): drop the live
+    // Commit AI settings (called as Settings' AI assistant page goes away — a
+    // switch to another section, or Settings closing): drop the live
     // session so the next message respawns `claude` with the new model / effort /
     // CLI path, and persist the choices.
     let ai_apply: Rc<dyn Fn()> = {
@@ -12324,7 +12324,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let term_screen: RwSignal<schemaic_term::Screen> =
         RwSignal::new(schemaic_term::Screen::default());
     let term_focused = RwSignal::new(false);
-    let term_settings_open = RwSignal::new(false);
     let detected_shells = schemaic_term::shell::detect_shells();
     let term_shells = RwSignal::new(detected_shells.clone());
     let term_dims = Rc::new(Cell::new((80u16, 24u16)));
@@ -13203,7 +13202,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             messages: ai_messages,
             input: ai_input,
             busy: ai_busy,
-            settings_open: ai_settings_open,
             harness: ai_harness,
             enabled: ai_enabled,
             unknown_key: ai_harness_unknown,
@@ -13306,7 +13304,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         term: TermUi {
             screen: term_screen,
             focused: term_focused,
-            settings_open: term_settings_open,
             shells: term_shells,
             shell_selected: term_shell_selected,
             db_label: term_db_label,

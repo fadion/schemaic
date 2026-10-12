@@ -1478,9 +1478,9 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
 /// A title bar for a modal panel, with a close (×) button.
 ///
 /// `ring` is **required**, and that is the point of the parameter: this ✕ was
-/// the one button in every modal that never joined one — and in the four
-/// footer-less modals (Settings, Terminal settings, AI settings, Shortcuts) it
-/// is the *only* button, so "every modal button goes through `in_ring_button`"
+/// the one button in every modal that never joined one — and in the
+/// footer-less modals (Settings, Shortcuts; Terminal and AI settings too,
+/// while they were modals) it is the *only* button, so "every modal button goes through `in_ring_button`"
 /// was false in the chrome every modal wears. (The shared error modal is a
 /// fifth when it shows one of Schemaic's own notices, which offers no action.)
 pub(crate) fn modal_title(

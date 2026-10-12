@@ -1,4 +1,4 @@
-//! The settings modals (Terminal / AI Assistant / Appearance) + the keyboard
+//! The Settings modal — every setting, a section to a page — and the keyboard
 //! `Shortcuts` reference modal, plus their shared controls: a labelled toggle
 //! row, a generic dropdown, and the themed switch. Each control binds straight to
 //! its persisted signal.
@@ -22,12 +22,11 @@ use crate::{
 use schemaic_ai::harness::Agent;
 use schemaic_core::cli_install::InstallState;
 
-// ===== moved from lib.rs (settings modals) =====
-// The Terminal settings pane: shell + font size + cursor style dropdowns, and
-// copy-on-select / blink toggles. Every control binds straight to its persisted
-// signal — picking a shell respawns the terminal; the rest apply live.
-pub(crate) fn term_settings_overlay(term: TermUi, actions: Rc<TermActions>) -> impl IntoView {
-    let open = term.settings_open;
+/// The Terminal section: shell + font size + cursor style dropdowns, and
+/// copy-on-select / blink toggles. Every control binds straight to its
+/// persisted signal — picking a shell respawns the terminal; the rest apply
+/// live.
+fn terminal_section(term: TermUi, actions: Rc<TermActions>, ring: FocusRing) -> AnyView {
     let shells = term.shells;
     let selected = term.shell_selected;
     let apply = actions.apply_shell.clone();
@@ -35,107 +34,48 @@ pub(crate) fn term_settings_overlay(term: TermUi, actions: Rc<TermActions>) -> i
     let copy_on_select = term.copy_on_select;
     let cursor_style = term.cursor_style;
     let cursor_blink = term.cursor_blink;
+    let shell_dd = shell_dropdown(shells, selected, apply.clone(), ring.clone(), 10);
+    let font_dd = focusable_dropdown(
+        font_size,
+        TERM_FONT_SIZES,
+        term_font_label,
+        ring.clone(),
+        20,
+    );
+    let cursor_dd = focusable_dropdown(
+        cursor_style,
+        TermCursor::ALL,
+        TermCursor::label,
+        ring.clone(),
+        30,
+    );
 
-    dyn_container(
-        move || open.get(),
-        move |is_open| {
-            if !is_open {
-                return empty().into_any();
-            }
-            let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
-
-            // The modal's Tab order. Indices are spaced by 10 so a control can be
-            // inserted between two without renumbering — see `FocusRing`.
-            let ring = crate::widgets::FocusRing::new();
-
-            let shell_dd = shell_dropdown(shells, selected, apply.clone(), ring.clone(), 10);
-            let font_dd = focusable_dropdown(
-                font_size,
-                TERM_FONT_SIZES,
-                term_font_label,
-                ring.clone(),
-                20,
-            );
-            let cursor_dd = focusable_dropdown(
-                cursor_style,
-                TermCursor::ALL,
-                TermCursor::label,
-                ring.clone(),
-                30,
-            );
-
-            let group = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
-            let shell_section = v_stack((settings_group_label("Shell"), shell_dd)).style(group);
-            let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(group);
-            let cursor_section =
-                v_stack((settings_group_label("Cursor style"), cursor_dd)).style(group);
-            let copy_row = focusable_toggle_row(
-                "Copy on selection",
-                "Copy selected text to the clipboard the moment a selection ends.",
-                copy_on_select,
-                ring.clone(),
-                40,
-            );
-            let blink_row = focusable_toggle_row(
-                "Blink cursor",
-                "Blink the cursor while the terminal is focused.",
-                cursor_blink,
-                ring.clone(),
-                50,
-            );
-            // Kept for the root, which answers Tab by entering the ring.
-            let root_ring = ring;
-
-            let body = v_stack((
-                shell_section,
-                font_section,
-                cursor_section,
-                copy_row,
-                blink_row,
-            ))
-            .style(|s| {
-                s.flex_col()
-                    .gap(theme::scaled(25.0))
-                    .padding(theme::scaled(14.0))
-                    .width_full()
-            });
-
-            let panel = v_stack((
-                modal_title("Terminal", close.clone(), root_ring.clone()),
-                body,
-            ))
-            .on_click_stop(|_| {})
-            .style(|s| {
-                panel_style(s)
-                    .background(theme::bg_panel())
-                    .width(crate::widgets::modal_w(420.0))
-            });
-
-            let esc = close.clone();
-            // Click-to-dismiss on a sibling behind the panel, never on the focus
-            // root — floem fires `Click` there for Space. See
-            // `widgets::dismiss_layer`.
-            focus_root_with_ring(
-                stack((crate::widgets::dismiss_layer(move || close()), panel)),
-                root_ring,
-            )
-            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
-            .style(|s| {
-                s.size_full()
-                    .items_center()
-                    .justify_center()
-                    .background(theme::modal_backdrop())
-            })
-            .into_any()
-        },
-    )
-    .style(move |s| {
-        if open.get() {
-            s.absolute().inset(0.0)
-        } else {
-            s
-        }
-    })
+    let group = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
+    let shell_section = v_stack((settings_group_label("Shell"), shell_dd)).style(group);
+    let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(group);
+    let cursor_section = v_stack((settings_group_label("Cursor style"), cursor_dd)).style(group);
+    let copy_row = focusable_toggle_row(
+        "Copy on selection",
+        "Copy selected text to the clipboard the moment a selection ends.",
+        copy_on_select,
+        ring.clone(),
+        40,
+    );
+    let blink_row = focusable_toggle_row(
+        "Blink cursor",
+        "Blink the cursor while the terminal is focused.",
+        cursor_blink,
+        ring,
+        50,
+    );
+    section_page((
+        form_section_header(SettingsSection::Terminal.label()),
+        shell_section,
+        font_section,
+        cursor_section,
+        copy_row,
+        blink_row,
+    ))
 }
 
 /// Font-size dropdown label — computed from the value, so it can't name a
@@ -308,7 +248,7 @@ pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style 
         .focus_visible(|s| s.outline(0.0))
 }
 
-// A small dim group heading inside the AI settings modal.
+// A small dim group heading over a setting's control, on any Settings page.
 fn settings_group_label(t: &'static str) -> impl IntoView {
     text(t).style(form_label_style)
 }
@@ -837,11 +777,17 @@ pub(crate) fn in_ring_picker(
     })
 }
 
-// AI Assistant settings: harness + CLI path override + model + effort. Changes
-// commit when the modal closes (the `ai_apply` callback restarts the session and
-// persists).
-pub(crate) fn ai_settings_overlay(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>) -> impl IntoView {
-    let open = ai.settings_open;
+/// The AI assistant section: harness + CLI path override + model + effort and
+/// the rest.
+///
+/// **Changes commit as the page goes away** — a switch to another section, or
+/// Settings closing — through `AiActions::apply`, which restarts the session
+/// only where a session-affecting setting really changed and persists. As the
+/// AI modal's own close did while it was a modal; a section's page is torn
+/// down at exactly the two moments that close stood for. Deferred a tick, as
+/// any write from a disposal is ([`crate::widgets`]'s scope rule): the page's
+/// scope is mid-dispose when its cleanup runs.
+fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -> AnyView {
     let harness = ai.harness;
     let enabled = ai.enabled;
     let unknown_key = ai.unknown_key;
@@ -874,563 +820,494 @@ pub(crate) fn ai_settings_overlay(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>
     let constraint_notice = actions.constraint_notice.clone();
     let cli_ok = actions.cli_ok.clone();
 
-    dyn_container(
-        move || open.get(),
-        move |is_open| {
-            if !is_open {
-                return empty().into_any();
-            }
-            let close: Rc<dyn Fn()> = {
-                let apply = apply.clone();
-                Rc::new(move || {
-                    open.set(false);
-                    (apply)();
-                })
-            };
-
-            // The modal's Tab order; indices spaced by 10 — see `FocusRing`.
-            let ring = crate::widgets::FocusRing::new();
-
-            // **The choice is an `Agent`; the app holds it as two signals** —
-            // `enabled`, and the `harness` an assistant that is on drives — so
-            // everything below that takes a `Harness` goes on taking one. This
-            // signal is the dropdown's view of the pair (`Agent::of`), written
-            // back on a pick. What a pick writes is `Agent::apply`'s answer,
-            // pure and tested in `schemaic-ai` — the decision used to live
-            // here and in an app effect, and the bug sat between the two.
-            let agent = RwSignal::new(Agent::of(enabled.get_untracked(), harness.get_untracked()));
-            floem::reactive::create_effect(move |prev: Option<()>| {
-                let picked = agent.get();
-                if prev.is_none() {
-                    return;
-                }
-                let pick = picked.apply(enabled.get_untracked(), harness.get_untracked());
-                if pick.drop_unknown_key {
-                    unknown_key.set(None);
-                }
-                if let Some(h) = pick.harness {
-                    harness.set(h);
-                }
-                enabled.set(pick.enabled);
-            });
-            // `Agent` is `Copy` and `Agent::label` is a plain
-            // `fn(Agent) -> &'static str`, so it satisfies this widget's bounds
-            // directly — no wrapper, and one `Agent` shared with the rest of
-            // the workspace rather than a UI-side mirror of it.
-            let agent_dd = focusable_dropdown(agent, Agent::ALL, Agent::label, ring.clone(), 5);
-            // Each group is a label + its controls (6px gap); groups are spaced
-            // 25px apart.
-            let group = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
-            // **What this harness actually gives you, where the choice is made.**
-            // `Constraint::notice` returns `None` on the strongest grade, so the
-            // Claude case shows nothing and the two that matter — a session whose
-            // built-in tools can still read the machine, or one we could not
-            // establish any restriction for — say so here rather than nowhere.
-            // Keyed on the harness *and* the path, because both change which
-            // binary was probed.
-            let constraint_notice = constraint_notice.clone();
-            let notice_ok = cli_ok.clone();
-            // Held as a memo rather than computed inside the container, because
-            // the *style* has to ask the same question the child does — see
-            // below.
-            //
-            // **A path that is not yet a file is not probed.** `constraint_notice`
-            // resolved the binary and ran `--help` on it, synchronously, on this
-            // thread — and this memo tracks the *live* field, so typing a path
-            // asked a different question on every keystroke, one per prefix,
-            // each an unresolvable path and each a spawn. The comment on the
-            // app's closure said the per-(harness, path) cache made this cheap;
-            // the path being part of the key is exactly what made every
-            // keystroke a miss. There is nothing to say about a binary that is
-            // not there anyway — the red "File doesn't exist." hint below is the
-            // whole answer — so the half-typed states ask nothing at all, and
-            // the two that resolve (empty → auto-detect, or a complete path) are
-            // the stable keys the cache was built for. The rule is
-            // `should_ask_for_a_notice`; this closure only applies it.
-            //
-            // The closure reads the *cache* now and never fills it, so a cold
-            // key costs nothing on this thread either — see the app's
-            // `constraint_notice`. **Nothing while the assistant is off**: there
-            // is no CLI to grade, and the app does not probe one.
-            let notice = floem::reactive::create_memo(move |_| {
-                let _ = harness.get();
-                let path = cli_path.get();
-                if !enabled.get() {
-                    return None;
-                }
-                // The rule is `should_ask_for_a_notice`, not this closure: a
-                // predicate with a recorded failure history and no test is one
-                // nothing can hold to it. See that function.
-                if !should_ask_for_a_notice(&path, |p| notice_ok(p)) {
-                    return None;
-                }
-                (constraint_notice)()
-            });
-            // **Hidden, not merely empty, on the silent grade.** A container
-            // rendering `empty()` is still a flex child, so it collects the
-            // group's gap on both sides — which is why Claude, the one harness
-            // with nothing to say here, showed the widest gap between the
-            // dropdown and the path field below it. Taffy drops a `Display::None`
-            // child before the gaps are distributed, so this costs nothing.
-            let harness_notice = dyn_container(
-                move || notice.get(),
-                move |why| match why {
-                    None => empty().into_any(),
-                    Some(why) => text(why)
-                        .style(|s| {
-                            s.width_full()
-                                .font_size(theme::font_hint())
-                                .color(theme::plan_warn())
-                        })
-                        .into_any(),
-                },
-            )
-            .style(move |s| match notice.with(|n| n.is_some()) {
-                true => s,
-                false => s.display(floem::style::Display::None),
-            });
-            // What off means, under the choice that made it — text, not a
-            // control, so hiding it is safe for the ring (§ Floem: a `.hide()`n
-            // control is still in the Tab order).
-            let off_hint = text(
-                "Nothing is sent to any agent, no agent CLI is started, and no AI action is \
-                 offered. Pick a CLI to turn the assistant on.",
-            )
-            .style(move |s| {
-                let s = s
-                    .width_full()
-                    .font_size(theme::font_hint())
-                    .color(theme::text_muted());
-                if enabled.get() {
-                    s.display(floem::style::Display::None)
-                } else {
-                    s
-                }
-            });
-            let harness_section = v_stack((
-                settings_group_label("Agent CLI"),
-                agent_dd,
-                harness_notice,
-                off_hint,
-            ))
-            .style(group);
-
-            // **Everything below the choice is built only while the assistant is
-            // on**, and torn down when it goes off — not hidden: a hidden field
-            // is still in the ring, and Tab would walk an off modal through a
-            // CLI path, a model and four more controls nobody can see. Each binds
-            // straight to an `AiUi` signal, so rebuilding loses nothing. Called
-            // once per turn-on by the container at the foot of the body.
-            let detect_path = detect_path.clone();
-            let cli_ok = cli_ok.clone();
-            let rest_ring = ring.clone();
-            let build_rest = move || -> AnyView {
-                let ring = rest_ring.clone();
-                let detect_path = detect_path.clone();
-                let cli_ok = cli_ok.clone();
-
-                let path_field = edit_field(
-                    cli_path,
-                    FieldCfg {
-                        placeholder: "Leave empty to auto-detect",
-                        clearable: true,
-                        focus: Some((ring.clone(), 10)),
-                        ..Default::default()
-                    },
-                )
-                .style(|s| s.width_full());
-                // Hint below the field, reacting to the path's value:
-                //  • empty + detected → green "Auto-detected: <path>"
-                //  • empty + not detected → red "Auto-detect failed…"
-                //  • manual path that resolves → hidden
-                //  • manual path that doesn't → red "File doesn't exist."
-                // **`width_full` is what makes these wrap.** A label sets its own
-                // taffy width to the measured text, so it overflows the panel rather
-                // than stretching to it — and an auto-detected path is long, has no
-                // spaces, and is the one line here that reliably exceeds 460px. At
-                // 100% the line is bounded and cosmic-text falls back to glyph-level
-                // breaks, which is what a path wants anyway.
-                let red = |s: floem::style::Style| {
+    // **The choice is an `Agent`; the app holds it as two signals** —
+    // `enabled`, and the `harness` an assistant that is on drives — so
+    // everything below that takes a `Harness` goes on taking one. This
+    // signal is the dropdown's view of the pair (`Agent::of`), written
+    // back on a pick. What a pick writes is `Agent::apply`'s answer,
+    // pure and tested in `schemaic-ai` — the decision used to live
+    // here and in an app effect, and the bug sat between the two.
+    let agent = RwSignal::new(Agent::of(enabled.get_untracked(), harness.get_untracked()));
+    floem::reactive::create_effect(move |prev: Option<()>| {
+        let picked = agent.get();
+        if prev.is_none() {
+            return;
+        }
+        let pick = picked.apply(enabled.get_untracked(), harness.get_untracked());
+        if pick.drop_unknown_key {
+            unknown_key.set(None);
+        }
+        if let Some(h) = pick.harness {
+            harness.set(h);
+        }
+        enabled.set(pick.enabled);
+    });
+    // `Agent` is `Copy` and `Agent::label` is a plain
+    // `fn(Agent) -> &'static str`, so it satisfies this widget's bounds
+    // directly — no wrapper, and one `Agent` shared with the rest of
+    // the workspace rather than a UI-side mirror of it.
+    let agent_dd = focusable_dropdown(agent, Agent::ALL, Agent::label, ring.clone(), 5);
+    // Each group is a label + its controls (6px gap); groups are spaced
+    // a page's 16 apart, as every other section's are.
+    let group = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
+    // **What this harness actually gives you, where the choice is made.**
+    // `Constraint::notice` returns `None` on the strongest grade, so the
+    // Claude case shows nothing and the two that matter — a session whose
+    // built-in tools can still read the machine, or one we could not
+    // establish any restriction for — say so here rather than nowhere.
+    // Keyed on the harness *and* the path, because both change which
+    // binary was probed.
+    let constraint_notice = constraint_notice.clone();
+    let notice_ok = cli_ok.clone();
+    // Held as a memo rather than computed inside the container, because
+    // the *style* has to ask the same question the child does — see
+    // below.
+    //
+    // **A path that is not yet a file is not probed.** `constraint_notice`
+    // resolved the binary and ran `--help` on it, synchronously, on this
+    // thread — and this memo tracks the *live* field, so typing a path
+    // asked a different question on every keystroke, one per prefix,
+    // each an unresolvable path and each a spawn. The comment on the
+    // app's closure said the per-(harness, path) cache made this cheap;
+    // the path being part of the key is exactly what made every
+    // keystroke a miss. There is nothing to say about a binary that is
+    // not there anyway — the red "File doesn't exist." hint below is the
+    // whole answer — so the half-typed states ask nothing at all, and
+    // the two that resolve (empty → auto-detect, or a complete path) are
+    // the stable keys the cache was built for. The rule is
+    // `should_ask_for_a_notice`; this closure only applies it.
+    //
+    // The closure reads the *cache* now and never fills it, so a cold
+    // key costs nothing on this thread either — see the app's
+    // `constraint_notice`. **Nothing while the assistant is off**: there
+    // is no CLI to grade, and the app does not probe one.
+    let notice = floem::reactive::create_memo(move |_| {
+        let _ = harness.get();
+        let path = cli_path.get();
+        if !enabled.get() {
+            return None;
+        }
+        // The rule is `should_ask_for_a_notice`, not this closure: a
+        // predicate with a recorded failure history and no test is one
+        // nothing can hold to it. See that function.
+        if !should_ask_for_a_notice(&path, |p| notice_ok(p)) {
+            return None;
+        }
+        (constraint_notice)()
+    });
+    // **Hidden, not merely empty, on the silent grade.** A container
+    // rendering `empty()` is still a flex child, so it collects the
+    // group's gap on both sides — which is why Claude, the one harness
+    // with nothing to say here, showed the widest gap between the
+    // dropdown and the path field below it. Taffy drops a `Display::None`
+    // child before the gaps are distributed, so this costs nothing.
+    let harness_notice = dyn_container(
+        move || notice.get(),
+        move |why| match why {
+            None => empty().into_any(),
+            Some(why) => text(why)
+                .style(|s| {
                     s.width_full()
-                        .font_size(theme::font_label())
-                        .color(theme::reject_bg())
-                };
-                // **Keyed on the harness as well as the path.** Both halves of this
-                // hint are per-harness: detection resolves *that* CLI's binary, and
-                // the failure line has to name it. Keyed on the path alone, it kept
-                // reporting the previous harness's binary — and "Claude CLI not
-                // found" — under a field the caption above had already relabelled.
-                let hint = dyn_container(
-                    move || (cli_path.get(), harness.get()),
-                    move |(path, h)| {
-                        if path.trim().is_empty() {
-                            match detect_path() {
-                                Some(p) => text(format!("Auto-detected: {}", p)).style(|s| {
-                                    s.width_full()
-                                        .font_size(theme::font_label())
-                                        .color(theme::conn_ok())
-                                }),
-                                None => text(format!(
-                                    "Auto-detect failed. {} not found — give it a path above.",
-                                    h.label()
-                                ))
-                                .style(red),
-                            }
-                            .into_any()
-                        } else if cli_ok(path) {
-                            empty().into_any()
-                        } else {
-                            text("File doesn't exist.").style(red).into_any()
-                        }
-                    },
-                );
-
-                // **A field, not a dropdown.** Any id the CLI accepts is valid —
-                // a dated snapshot, an alias newer than this build — so the control
-                // has to take text. The suggestions sit under it as one-click
-                // buttons rather than in a combo popup, which keeps the common case
-                // to a single click without pretending the list is exhaustive.
-                let model_field = edit_field(
-                    model,
-                    FieldCfg {
-                        placeholder: "Leave empty for the harness's default",
-                        clearable: true,
-                        focus: Some((ring.clone(), 20)),
-                        ..Default::default()
-                    },
-                )
-                .style(|s| s.width_full());
-                let scope_dd = focusable_dropdown(
-                    scope,
-                    SchemaScope::ALL,
-                    SchemaScope::label,
-                    ring.clone(),
-                    50,
-                );
-
-                let instr_field = edit_field(
-                    instructions,
-                    FieldCfg {
-                        placeholder: "Dialect, conventions, house rules…",
-                        multiline: true,
-                        focus: Some((ring.clone(), 40)),
-                        ..Default::default()
-                    },
-                )
-                .style(|s| s.width_full());
-
-                // The label follows the harness: the field points at *that* CLI's
-                // binary, and a box captioned "Claude Code CLI path" over a Codex
-                // session is the kind of stale caption a user reasonably acts on.
-                let cli_section = v_stack((
-                    label(move || format!("{} path", harness.get().label()))
-                        .style(form_label_style),
-                    path_field,
-                    hint,
-                ))
-                .style(group);
-                // Suggestions follow the harness, and an empty list renders nothing
-                // — Antigravity's model names were never measured, and inventing a
-                // menu for it would be guessing in the user's settings.
-                let suggestions = dyn_container(
-                    move || harness.get(),
-                    move |h| {
-                        let picks = h.suggested_models();
-                        if picks.is_empty() {
-                            return empty().into_any();
-                        }
-                        h_stack_from_iter(picks.iter().map(|m| {
-                            let m = m.to_string();
-                            let set = m.clone();
-                            // Tinted when it is the value in effect — the same
-                            // vocabulary the dropdowns use for "you are holding
-                            // this one".
-                            let is_cur = m.clone();
-                            text(m)
-                                .on_click_stop(move |_| model.set(set.clone()))
-                                .style(move |s| {
-                                    let active = model.get() == is_cur;
-                                    s.padding_horiz(theme::scaled(8.0))
-                                        .padding_vert(theme::scaled(3.0))
-                                        .border(1.0)
-                                        .border_color(theme::field_border())
-                                        .border_radius(theme::scaled(4.0))
-                                        .font_size(theme::font_hint())
-                                        .color(if active {
-                                            theme::chip_active()
-                                        } else {
-                                            theme::text_muted()
-                                        })
-                                        .hover(|s| s.color(theme::accent_hover()))
-                                })
-                        }))
-                        .style(|s| {
-                            s.flex_row()
-                                .flex_wrap(floem::style::FlexWrap::Wrap)
-                                .width_full()
-                                .gap(theme::scaled(6.0))
-                        })
-                        .into_any()
-                    },
-                )
-                // Hidden the same way the harness notice and the Effort row are: an
-                // empty chip row is still a flex child, so it kept its 6px gap and
-                // pushed the hint below it away from the field.
-                .style(move |s| {
-                    match harness.get().suggested_models().is_empty() {
-                        false => s,
-                        true => s.display(floem::style::Display::None),
-                    }
-                });
-                let model_section = v_stack((
-                    settings_group_label("Model"),
-                    model_field,
-                    suggestions,
-                    // **The second sentence is about the chips, so it goes when they
-                    // do.** Under Antigravity, which suggests nothing, "the buttons
-                    // are shortcuts, not the whole list" pointed at buttons that
-                    // were not on screen — a hint that describes an absent control
-                    // reads as a bug in the modal rather than a note about the
-                    // field.
-                    label(move || {
-                        let base = "Any id this CLI accepts — an alias, or a dated snapshot to pin \
-                                one across upgrades.";
-                        match harness.get().suggested_models().is_empty() {
-                            true => base.to_string(),
-                            false => {
-                                format!("{base} The buttons are shortcuts, not the whole list.")
-                            }
-                        }
-                    })
-                    .style(|s| {
-                        s.width_full()
-                            .font_size(theme::font_hint())
-                            .color(theme::text_muted())
-                    }),
-                ))
-                .style(group);
-                // **Hidden, not disabled, where the harness has no such flag.**
-                // Effort is Claude's `--effort` and Antigravity's; Codex takes no
-                // equivalent, and a greyed control still says "this exists
-                // for you and is off", which is a different and false claim. Asked
-                // as a capability so a harness that grows the flag needs no edit
-                // here.
-                //
-                // The dropdown is built *inside* the container because a floem view
-                // is not `Clone` — it has to be constructed on each keyed rebuild.
-                let effort_ring = ring.clone();
-                // **Keyed on the levels, not on `supports_effort()`.** The child
-                // reads `levels` from the value it is handed, so the key has to
-                // carry everything the child reads: a `bool` that is true for both
-                // Claude and Antigravity cannot tell the dropdown that the list
-                // behind it changed, and it went on offering `xhigh` under a harness
-                // whose flag does not take it.
-                //
-                // **Not because the key dedups — it does not.** The comment here
-                // used to say the child "was never rebuilt", which is the belief
-                // `docs/architecture.md`'s Floem gotcha exists to correct and the
-                // one that cost the DDL editors their caret: `dyn_container` runs
-                // `create_updater` and there is no equality check on that path
-                // (`floem-0.2.0/src/views/dyn_container.rs`,
-                // `floem_reactive-0.2.0/src/effect.rs`). The key is a *value handed
-                // to the child*, not a change detector, and stating it as one here
-                // — where it reads as the tidiest explanation in the file — teaches
-                // the wrong contract to whoever copies it next.
-                let effort_section = dyn_container(
-                    move || harness.get().effort_levels(),
-                    move |levels| {
-                        if levels.is_empty() {
-                            return empty().into_any();
-                        }
-                        // Only the levels this harness's own flag takes — Claude has
-                        // a fourth (`xhigh`) that Antigravity does not advertise.
-                        // The rule lives in `AiEffort::offered_by` rather than here,
-                        // because a decision inside a view closure is one no test
-                        // can reach: the test that guarded this re-performed the
-                        // filter in its own body and stayed green whatever this
-                        // line did.
-                        let offered = AiEffort::offered_by(levels);
-                        v_stack((
-                            settings_group_label("Effort"),
-                            focusable_dropdown(
-                                effort,
-                                offered,
-                                AiEffort::label,
-                                effort_ring.clone(),
-                                30,
-                            ),
-                        ))
-                        .style(group)
-                        .into_any()
-                    },
-                )
-                // Hidden the same way the harness notice is, and for the same
-                // reason: an empty container between two 25px section gaps reads as
-                // one 50px hole, which is what Codex showed between Model and Custom
-                // instructions.
-                .style(move |s| match harness.get().supports_effort() {
-                    true => s,
-                    false => s.display(floem::style::Display::None),
-                });
-                let instr_section =
-                    v_stack((settings_group_label("Custom instructions"), instr_field))
-                        .style(group);
-                // **What this setting is, said out loud.** It reads as a context
-                // budget — how much structure is worth spending the model's window
-                // on — and *Data access*, below and per-connection, is the consent
-                // control. But a budget of zero that one tool call walks around is
-                // neither, so `None` withholds `list_schema` and `describe_table`
-                // too; the hint says so, because a setting whose reach a user has to
-                // infer is one they will infer wrongly in the safe direction or the
-                // unsafe one.
-                let scope_section = v_stack((
-                    settings_group_label("Schema context"),
-                    scope_dd,
-                    text(
-                        "How much database structure rides in every message. None also withholds \
-                     the schema tools, so the assistant asks you for names instead of reading \
-                     the catalogue itself.",
-                    )
-                    .style(|s| {
-                        s.width_full()
-                            .font_size(theme::font_hint())
-                            .color(theme::text_muted())
-                    }),
-                ))
-                .style(group);
-                // Data access is *not* settable here: it belongs to the connection,
-                // because a scratch database and a client's production server are
-                // not the same risk and one global answer forces the careless
-                // setting on one of them. This section states what the connection in
-                // front of the user says, and where to change it — a modal that
-                // silently omitted the subject would read as "there is no such
-                // setting".
-                let data_section = v_stack((
-                    settings_group_label("Data access"),
-                    label(move || {
-                        let (name, lvl) = active_ai_data.get();
-                        if name.is_empty() {
-                            format!("{} — {}", lvl.label(), lvl.hint())
-                        } else {
-                            format!("{name}: {} — {}", lvl.label(), lvl.hint())
-                        }
-                    })
-                    .style(|s| {
-                        s.width_full()
-                            .font_size(theme::font_hint())
-                            .color(theme::text_muted())
-                    }),
-                    text("Set per connection, in the connection's settings.").style(|s| {
-                        s.width_full()
-                            .font_size(theme::font_hint())
-                            .color(theme::text_muted())
-                    }),
-                ))
-                .style(group);
-                // Presentation, and the only setting here that is: it changes
-                // nothing about what is sent or how a turn runs, so it does not
-                // enter `ai_settings_now()` and closing the modal after flipping it
-                // leaves the live conversation alone.
-                let gutter_row = focusable_toggle_row(
-                    "Accent rule on replies",
-                    // Not "Claude's" — the panel is driven by whichever CLI the user
-                    // picked, and this setting is about replies rather than about
-                    // any one vendor's.
-                    "Mark the assistant's replies with a coloured rule down their right edge. Off \
-                 gives them the same margin on both sides.",
-                    gutter,
-                    ring.clone(),
-                    60,
-                );
-                v_stack((
-                    cli_section,
-                    model_section,
-                    effort_section,
-                    instr_section,
-                    scope_section,
-                    data_section,
-                    gutter_row,
-                ))
-                .style(|s| s.flex_col().gap(theme::scaled(25.0)).width_full())
-                .into_any()
-            };
-            // The off arm is `nothing()`, whose `display:none` keeps the body's
-            // gap from opening a hole under the choice (§ Floem, the `.hide()`
-            // entry's else-arm).
-            let rest = dyn_container(
-                move || enabled.get(),
-                move |on| {
-                    if on {
-                        build_rest()
-                    } else {
-                        crate::widgets::nothing().into_any()
-                    }
-                },
-            )
-            .style(move |s| {
-                let s = s.width_full();
-                if enabled.get() {
-                    s
-                } else {
-                    s.display(floem::style::Display::None)
-                }
-            });
-            // Kept for the root, which answers Tab by entering the ring.
-            let root_ring = ring;
-
-            let body = v_stack((harness_section, rest)).style(|s| {
-                s.flex_col()
-                    .gap(theme::scaled(25.0))
-                    .padding(theme::scaled(14.0))
-                    .width_full()
-            });
-            // Scroll, exactly as the General Settings modal does and for the same
-            // reason: eight groups at 25px apart outgrew the window, and a modal
-            // taller than the screen loses its *bottom* groups with no
-            // affordance saying they exist. The cap is a `modal_body_h` so it
-            // shrinks with a small window rather than being a constant that is
-            // only right at one size.
-            let body = autohide(scroll(body)).style(|s| {
-                s.width_full()
-                    .max_height(crate::widgets::modal_body_h(560.0))
-            });
-
-            let panel = v_stack((
-                modal_title("AI Assistant — Settings", close.clone(), root_ring.clone()),
-                body,
-            ))
-            .on_click_stop(|_| {})
-            .style(|s| {
-                panel_style(s)
-                    .background(theme::bg_panel())
-                    .width(crate::widgets::modal_w(460.0))
-            });
-
-            let esc = close.clone();
-            // Click-to-dismiss on a sibling behind the panel, never on the focus
-            // root — floem fires `Click` there for Space. See
-            // `widgets::dismiss_layer`.
-            focus_root_with_ring(
-                stack((crate::widgets::dismiss_layer(move || close()), panel)),
-                root_ring,
-            )
-            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
-            .style(|s| {
-                s.size_full()
-                    .items_center()
-                    .justify_center()
-                    .background(theme::modal_backdrop())
-            })
-            .into_any()
+                        .font_size(theme::font_hint())
+                        .color(theme::plan_warn())
+                })
+                .into_any(),
         },
     )
+    .style(move |s| match notice.with(|n| n.is_some()) {
+        true => s,
+        false => s.display(floem::style::Display::None),
+    });
+    // What off means, under the choice that made it — text, not a
+    // control, so hiding it is safe for the ring (§ Floem: a `.hide()`n
+    // control is still in the Tab order).
+    let off_hint = text(
+        "Nothing is sent to any agent, no agent CLI is started, and no AI action is \
+                 offered. Pick a CLI to turn the assistant on.",
+    )
     .style(move |s| {
-        if open.get() {
-            s.absolute().inset(0.0)
+        let s = s
+            .width_full()
+            .font_size(theme::font_hint())
+            .color(theme::text_muted());
+        if enabled.get() {
+            s.display(floem::style::Display::None)
         } else {
             s
         }
+    });
+    let harness_section = v_stack((
+        settings_group_label("Agent CLI"),
+        agent_dd,
+        harness_notice,
+        off_hint,
+    ))
+    .style(group);
+
+    // **Everything below the choice is built only while the assistant is
+    // on**, and torn down when it goes off — not hidden: a hidden field
+    // is still in the ring, and Tab would walk an off modal through a
+    // CLI path, a model and four more controls nobody can see. Each binds
+    // straight to an `AiUi` signal, so rebuilding loses nothing. Called
+    // once per turn-on by the container at the foot of the body.
+    let detect_path = detect_path.clone();
+    let cli_ok = cli_ok.clone();
+    let rest_ring = ring.clone();
+    let build_rest = move || -> AnyView {
+        let ring = rest_ring.clone();
+        let detect_path = detect_path.clone();
+        let cli_ok = cli_ok.clone();
+
+        let path_field = edit_field(
+            cli_path,
+            FieldCfg {
+                placeholder: "Leave empty to auto-detect",
+                clearable: true,
+                focus: Some((ring.clone(), 10)),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width_full());
+        // Hint below the field, reacting to the path's value:
+        //  • empty + detected → green "Auto-detected: <path>"
+        //  • empty + not detected → red "Auto-detect failed…"
+        //  • manual path that resolves → hidden
+        //  • manual path that doesn't → red "File doesn't exist."
+        // **`width_full` is what makes these wrap.** A label sets its own
+        // taffy width to the measured text, so it overflows the panel rather
+        // than stretching to it — and an auto-detected path is long, has no
+        // spaces, and is the one line here that reliably exceeds 460px. At
+        // 100% the line is bounded and cosmic-text falls back to glyph-level
+        // breaks, which is what a path wants anyway.
+        let red = |s: floem::style::Style| {
+            s.width_full()
+                .font_size(theme::font_label())
+                .color(theme::reject_bg())
+        };
+        // **Keyed on the harness as well as the path.** Both halves of this
+        // hint are per-harness: detection resolves *that* CLI's binary, and
+        // the failure line has to name it. Keyed on the path alone, it kept
+        // reporting the previous harness's binary — and "Claude CLI not
+        // found" — under a field the caption above had already relabelled.
+        let hint = dyn_container(
+            move || (cli_path.get(), harness.get()),
+            move |(path, h)| {
+                if path.trim().is_empty() {
+                    match detect_path() {
+                        Some(p) => text(format!("Auto-detected: {}", p)).style(|s| {
+                            s.width_full()
+                                .font_size(theme::font_label())
+                                .color(theme::conn_ok())
+                        }),
+                        None => text(format!(
+                            "Auto-detect failed. {} not found — give it a path above.",
+                            h.label()
+                        ))
+                        .style(red),
+                    }
+                    .into_any()
+                } else if cli_ok(path) {
+                    empty().into_any()
+                } else {
+                    text("File doesn't exist.").style(red).into_any()
+                }
+            },
+        );
+
+        // **A field, not a dropdown.** Any id the CLI accepts is valid —
+        // a dated snapshot, an alias newer than this build — so the control
+        // has to take text. The suggestions sit under it as one-click
+        // buttons rather than in a combo popup, which keeps the common case
+        // to a single click without pretending the list is exhaustive.
+        let model_field = edit_field(
+            model,
+            FieldCfg {
+                placeholder: "Leave empty for the harness's default",
+                clearable: true,
+                focus: Some((ring.clone(), 20)),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width_full());
+        let scope_dd = focusable_dropdown(
+            scope,
+            SchemaScope::ALL,
+            SchemaScope::label,
+            ring.clone(),
+            50,
+        );
+
+        let instr_field = edit_field(
+            instructions,
+            FieldCfg {
+                placeholder: "Dialect, conventions, house rules…",
+                multiline: true,
+                focus: Some((ring.clone(), 40)),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width_full());
+
+        // The label follows the harness: the field points at *that* CLI's
+        // binary, and a box captioned "Claude Code CLI path" over a Codex
+        // session is the kind of stale caption a user reasonably acts on.
+        let cli_section = v_stack((
+            label(move || format!("{} path", harness.get().label())).style(form_label_style),
+            path_field,
+            hint,
+        ))
+        .style(group);
+        // Suggestions follow the harness, and an empty list renders nothing
+        // — Antigravity's model names were never measured, and inventing a
+        // menu for it would be guessing in the user's settings.
+        let suggestions = dyn_container(
+            move || harness.get(),
+            move |h| {
+                let picks = h.suggested_models();
+                if picks.is_empty() {
+                    return empty().into_any();
+                }
+                h_stack_from_iter(picks.iter().map(|m| {
+                    let m = m.to_string();
+                    let set = m.clone();
+                    // Tinted when it is the value in effect — the same
+                    // vocabulary the dropdowns use for "you are holding
+                    // this one".
+                    let is_cur = m.clone();
+                    text(m)
+                        .on_click_stop(move |_| model.set(set.clone()))
+                        .style(move |s| {
+                            let active = model.get() == is_cur;
+                            s.padding_horiz(theme::scaled(8.0))
+                                .padding_vert(theme::scaled(3.0))
+                                .border(1.0)
+                                .border_color(theme::field_border())
+                                .border_radius(theme::scaled(4.0))
+                                .font_size(theme::font_hint())
+                                .color(if active {
+                                    theme::chip_active()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .hover(|s| s.color(theme::accent_hover()))
+                        })
+                }))
+                .style(|s| {
+                    s.flex_row()
+                        .flex_wrap(floem::style::FlexWrap::Wrap)
+                        .width_full()
+                        .gap(theme::scaled(6.0))
+                })
+                .into_any()
+            },
+        )
+        // Hidden the same way the harness notice and the Effort row are: an
+        // empty chip row is still a flex child, so it kept its 6px gap and
+        // pushed the hint below it away from the field.
+        .style(move |s| match harness.get().suggested_models().is_empty() {
+            false => s,
+            true => s.display(floem::style::Display::None),
+        });
+        let model_section = v_stack((
+            settings_group_label("Model"),
+            model_field,
+            suggestions,
+            // **The second sentence is about the chips, so it goes when they
+            // do.** Under Antigravity, which suggests nothing, "the buttons
+            // are shortcuts, not the whole list" pointed at buttons that
+            // were not on screen — a hint that describes an absent control
+            // reads as a bug in the modal rather than a note about the
+            // field.
+            label(move || {
+                let base = "Any id this CLI accepts — an alias, or a dated snapshot to pin \
+                                one across upgrades.";
+                match harness.get().suggested_models().is_empty() {
+                    true => base.to_string(),
+                    false => {
+                        format!("{base} The buttons are shortcuts, not the whole list.")
+                    }
+                }
+            })
+            .style(|s| {
+                s.width_full()
+                    .font_size(theme::font_hint())
+                    .color(theme::text_muted())
+            }),
+        ))
+        .style(group);
+        // **Hidden, not disabled, where the harness has no such flag.**
+        // Effort is Claude's `--effort` and Antigravity's; Codex takes no
+        // equivalent, and a greyed control still says "this exists
+        // for you and is off", which is a different and false claim. Asked
+        // as a capability so a harness that grows the flag needs no edit
+        // here.
+        //
+        // The dropdown is built *inside* the container because a floem view
+        // is not `Clone` — it has to be constructed on each keyed rebuild.
+        let effort_ring = ring.clone();
+        // **Keyed on the levels, not on `supports_effort()`.** The child
+        // reads `levels` from the value it is handed, so the key has to
+        // carry everything the child reads: a `bool` that is true for both
+        // Claude and Antigravity cannot tell the dropdown that the list
+        // behind it changed, and it went on offering `xhigh` under a harness
+        // whose flag does not take it.
+        //
+        // **Not because the key dedups — it does not.** The comment here
+        // used to say the child "was never rebuilt", which is the belief
+        // `docs/architecture.md`'s Floem gotcha exists to correct and the
+        // one that cost the DDL editors their caret: `dyn_container` runs
+        // `create_updater` and there is no equality check on that path
+        // (`floem-0.2.0/src/views/dyn_container.rs`,
+        // `floem_reactive-0.2.0/src/effect.rs`). The key is a *value handed
+        // to the child*, not a change detector, and stating it as one here
+        // — where it reads as the tidiest explanation in the file — teaches
+        // the wrong contract to whoever copies it next.
+        let effort_section = dyn_container(
+            move || harness.get().effort_levels(),
+            move |levels| {
+                if levels.is_empty() {
+                    return empty().into_any();
+                }
+                // Only the levels this harness's own flag takes — Claude has
+                // a fourth (`xhigh`) that Antigravity does not advertise.
+                // The rule lives in `AiEffort::offered_by` rather than here,
+                // because a decision inside a view closure is one no test
+                // can reach: the test that guarded this re-performed the
+                // filter in its own body and stayed green whatever this
+                // line did.
+                let offered = AiEffort::offered_by(levels);
+                // `width_full` on both levels: the page stretches its direct
+                // children, which this container is, but nothing stretches the
+                // container's own child — so the dropdown took its label's
+                // width while every other one on the page ran full width.
+                v_stack((
+                    settings_group_label("Effort"),
+                    focusable_dropdown(effort, offered, AiEffort::label, effort_ring.clone(), 30),
+                ))
+                .style(move |s| group(s).width_full())
+                .into_any()
+            },
+        )
+        // Hidden the same way the harness notice is, and for the same
+        // reason: an empty container between two group gaps reads as one
+        // double-width hole, which is what Codex showed between Model and
+        // Custom instructions.
+        .style(move |s| match harness.get().supports_effort() {
+            true => s.width_full(),
+            false => s.display(floem::style::Display::None),
+        });
+        let instr_section =
+            v_stack((settings_group_label("Custom instructions"), instr_field)).style(group);
+        // **What this setting is, said out loud.** It reads as a context
+        // budget — how much structure is worth spending the model's window
+        // on — and *Data access*, below and per-connection, is the consent
+        // control. But a budget of zero that one tool call walks around is
+        // neither, so `None` withholds `list_schema` and `describe_table`
+        // too; the hint says so, because a setting whose reach a user has to
+        // infer is one they will infer wrongly in the safe direction or the
+        // unsafe one.
+        let scope_section = v_stack((
+            settings_group_label("Schema context"),
+            scope_dd,
+            text(
+                "How much database structure rides in every message. None also withholds \
+                     the schema tools, so the assistant asks you for names instead of reading \
+                     the catalogue itself.",
+            )
+            .style(|s| {
+                s.width_full()
+                    .font_size(theme::font_hint())
+                    .color(theme::text_muted())
+            }),
+        ))
+        .style(group);
+        // Data access is *not* settable here: it belongs to the connection,
+        // because a scratch database and a client's production server are
+        // not the same risk and one global answer forces the careless
+        // setting on one of them. This section states what the connection in
+        // front of the user says, and where to change it — a modal that
+        // silently omitted the subject would read as "there is no such
+        // setting".
+        let data_section = v_stack((
+            settings_group_label("Data access"),
+            label(move || {
+                let (name, lvl) = active_ai_data.get();
+                if name.is_empty() {
+                    format!("{} — {}", lvl.label(), lvl.hint())
+                } else {
+                    format!("{name}: {} — {}", lvl.label(), lvl.hint())
+                }
+            })
+            .style(|s| {
+                s.width_full()
+                    .font_size(theme::font_hint())
+                    .color(theme::text_muted())
+            }),
+            text("Set per connection, in the connection's settings.").style(|s| {
+                s.width_full()
+                    .font_size(theme::font_hint())
+                    .color(theme::text_muted())
+            }),
+        ))
+        .style(group);
+        // Presentation, and the only setting here that is: it changes
+        // nothing about what is sent or how a turn runs, so it does not
+        // enter `ai_settings_now()` and closing the modal after flipping it
+        // leaves the live conversation alone.
+        let gutter_row = focusable_toggle_row(
+            "Accent rule on replies",
+            // Not "Claude's" — the panel is driven by whichever CLI the user
+            // picked, and this setting is about replies rather than about
+            // any one vendor's.
+            "Mark the assistant's replies with a coloured rule down their right edge. Off \
+                 gives them the same margin on both sides.",
+            gutter,
+            ring.clone(),
+            60,
+        );
+        v_stack((
+            cli_section,
+            model_section,
+            effort_section,
+            instr_section,
+            scope_section,
+            data_section,
+            gutter_row,
+        ))
+        .style(|s| s.flex_col().gap(theme::scaled(16.0)).width_full())
+        .into_any()
+    };
+    // The off arm is `nothing()`, whose `display:none` keeps the body's
+    // gap from opening a hole under the choice (§ Floem, the `.hide()`
+    // entry's else-arm).
+    let rest = dyn_container(
+        move || enabled.get(),
+        move |on| {
+            if on {
+                build_rest()
+            } else {
+                crate::widgets::nothing().into_any()
+            }
+        },
+    )
+    .style(move |s| {
+        let s = s.width_full();
+        if enabled.get() {
+            s
+        } else {
+            s.display(floem::style::Display::None)
+        }
+    });
+    container(section_page((
+        form_section_header(SettingsSection::Ai.label()),
+        harness_section,
+        rest,
+    )))
+    .on_cleanup(move || {
+        let apply = apply.clone();
+        floem::action::exec_after(std::time::Duration::ZERO, move |_| apply());
     })
+    .into_any()
 }
 
 /// One shortcut line: description on the left, the key combo on the right in a
@@ -1796,16 +1673,20 @@ pub enum SettingsSection {
     Editor,
     Formatting,
     Query,
+    Terminal,
+    Ai,
     Appearance,
 }
 
 impl SettingsSection {
     /// Every section, in the order the list shows them.
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 7] = [
         SettingsSection::General,
         SettingsSection::Editor,
         SettingsSection::Formatting,
         SettingsSection::Query,
+        SettingsSection::Terminal,
+        SettingsSection::Ai,
         SettingsSection::Appearance,
     ];
 
@@ -1816,9 +1697,18 @@ impl SettingsSection {
             SettingsSection::Editor => "Editor",
             SettingsSection::Formatting => "Code formatting",
             SettingsSection::Query => "Query",
+            SettingsSection::Terminal => "Terminal",
+            SettingsSection::Ai => "AI assistant",
             SettingsSection::Appearance => "Appearance",
         }
     }
+}
+
+/// Open Settings on `section` — the door the terminal's and the AI panel's
+/// gears use, each landing on its own section.
+pub(crate) fn open_settings_at(layout: LayoutUi, section: SettingsSection) {
+    layout.settings_section.set(section);
+    layout.theme_settings_open.set(true);
 }
 
 /// The section list's width, added to the page's: the page keeps the width
@@ -1829,11 +1719,43 @@ const SECTION_LIST_W: f64 = 170.0;
 /// was written to wrap within.
 const SECTION_PAGE_W: f64 = 420.0;
 
-pub(crate) fn theme_settings_overlay(
-    layout: LayoutUi,
-    open_config_dir: Rc<dyn Fn()>,
-    cli_command: crate::CliCommand,
-) -> impl IntoView {
+/// Everything the Settings modal reaches out of the root bundle, one field per
+/// domain its sections edit.
+///
+/// Holds no `Ui`, for `whole_ui_gate`'s reason and
+/// [`crate::compare_view::CompareCtx`]'s: it is built by naming the reads at
+/// its one call site, so what the modal touches stays written down there.
+pub(crate) struct SettingsCtx {
+    /// The app's own settings, and the modal's open flag and showing section.
+    pub(crate) layout: LayoutUi,
+    /// The Terminal section's settings, and the shell respawn a pick runs.
+    pub(crate) term: TermUi,
+    pub(crate) term_actions: Rc<TermActions>,
+    /// The AI assistant section's settings and actions — the `ConnUi` is the
+    /// active connection's data-access level, which the section reports.
+    pub(crate) ai: AiUi,
+    pub(crate) conn: ConnUi,
+    pub(crate) ai_actions: Rc<AiActions>,
+    /// General's two trips outside the app: the log's folder, and the
+    /// command-line install.
+    pub(crate) open_config_dir: Rc<dyn Fn()>,
+    pub(crate) cli_command: crate::CliCommand,
+}
+
+/// The Settings modal: every setting the app has, a section to a page. The
+/// terminal's and the assistant's took modals of their own until they joined
+/// it, which is why [`SettingsCtx`] carries their bundles too.
+pub(crate) fn settings_overlay(ctx: SettingsCtx) -> impl IntoView {
+    let SettingsCtx {
+        layout,
+        term,
+        term_actions,
+        ai,
+        conn,
+        ai_actions,
+        open_config_dir,
+        cli_command,
+    } = ctx;
     let open = layout.theme_settings_open;
     let section = layout.settings_section;
 
@@ -1856,6 +1778,8 @@ pub(crate) fn theme_settings_overlay(
                 let ring = ring.clone();
                 let open_config_dir = open_config_dir.clone();
                 let cli_command = cli_command.clone();
+                let term_actions = term_actions.clone();
+                let ai_actions = ai_actions.clone();
                 dyn_container(
                     move || section.get(),
                     move |s| {
@@ -1869,6 +1793,12 @@ pub(crate) fn theme_settings_overlay(
                             SettingsSection::Editor => editor_section(layout, ring.clone()),
                             SettingsSection::Formatting => formatting_section(layout, ring.clone()),
                             SettingsSection::Query => query_section(layout, ring.clone()),
+                            SettingsSection::Terminal => {
+                                terminal_section(term, term_actions.clone(), ring.clone())
+                            }
+                            SettingsSection::Ai => {
+                                ai_section(ai, conn, ai_actions.clone(), ring.clone())
+                            }
                             SettingsSection::Appearance => appearance_section(layout, ring.clone()),
                         };
                         // A page of its own scrolls on its own, from the top
@@ -1986,9 +1916,14 @@ fn section_list(section: RwSignal<SettingsSection>, ring: FocusRing) -> impl Int
 
 /// A settings page: its section's heading, then its settings, a group's gap
 /// apart.
+///
+/// **`width_full`, so a long hint wraps at the page rather than widening it.**
+/// The page is usually the child the modal pads, but the AI section's sits one
+/// container in (its teardown hook needs a view of its own), and without this
+/// it took its longest line's width and ran off the panel's right edge.
 fn section_page<V: ViewTuple + 'static>(children: V) -> AnyView {
     v_stack(children)
-        .style(|s| s.flex_col().gap(theme::scaled(16.0)))
+        .style(|s| s.flex_col().width_full().gap(theme::scaled(16.0)))
         .into_any()
 }
 
@@ -2593,10 +2528,12 @@ mod tests {
                 | SettingsSection::Editor
                 | SettingsSection::Formatting
                 | SettingsSection::Query
+                | SettingsSection::Terminal
+                | SettingsSection::Ai
                 | SettingsSection::Appearance => {}
             }
         }
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 7);
     }
 
     /// The wrap width's list leads with off, the default, and labels it so;
