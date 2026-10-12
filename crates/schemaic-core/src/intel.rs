@@ -13565,7 +13565,7 @@ mod lints {
             if !in_body {
                 unfiltered_write(stmt, raw, lo, ast, dialect, out);
             }
-            null_comparisons(stmt, lo, ast, out);
+            null_comparisons(stmt, raw, lo, ast, dialect, out);
             insert_row_lengths(stmt, lo, ast, catalog, dialect, out);
             not_in_nullable(stmt, lo, ast, catalog, out);
         }
@@ -13923,7 +13923,19 @@ mod lints {
     /// is flagged — `WHERE (@p = NULL OR c = @p)` is the classic optional
     /// filter that never applies (S8.2-L1-08); exempting every `@`-name on
     /// the left hid it.
-    fn null_comparisons(stmt: &str, lo: usize, ast: &Statement, out: &mut Vec<Diagnostic>) {
+    ///
+    /// The fix (Alt+Enter) never rebuilds the operand from its span: sqlparser
+    /// leaves a call's closing parenthesis, a cast's target and a subscript out
+    /// of one, so `ABS(salary) = NULL` became `ABS(salary IS NULL`
+    /// ([`null_fix`]).
+    fn null_comparisons(
+        stmt: &str,
+        raw: &str,
+        lo: usize,
+        ast: &Statement,
+        dialect: SqlDialect,
+        out: &mut Vec<Diagnostic>,
+    ) {
         if matches!(ast, Statement::Execute { .. }) {
             return;
         }
@@ -13938,16 +13950,27 @@ mod lints {
                 } else {
                     "IS NOT NULL"
                 };
-                // The operand that is not the NULL, as written, with the test
-                // that works: the whole comparison is the range it replaces.
-                let other = if is_null(left) { right } else { left };
-                let (a, b) = to_range(stmt, lo, other.span());
-                let replacement = stmt
-                    .get(a - lo..b - lo)
-                    .filter(|t| !t.trim().is_empty() && !is_null(other))
-                    .map(|t| format!("{} {fix}", t.trim()));
+                let range = to_range(stmt, lo, e.span());
+                let replacement = if is_null(left) && is_null(right) {
+                    None
+                } else {
+                    let (null, other) = if is_null(right) {
+                        (right, left)
+                    } else {
+                        (left, right)
+                    };
+                    null_fix(
+                        raw,
+                        lo,
+                        range,
+                        to_range(stmt, lo, null.span()),
+                        other,
+                        fix,
+                        dialect,
+                    )
+                };
                 out.push(Diagnostic {
-                    range: to_range(stmt, lo, e.span()),
+                    range,
                     severity: Severity::Warning,
                     message: format!("A comparison with NULL is never true — use {fix}"),
                     fix: replacement,
@@ -13955,6 +13978,106 @@ mod lints {
             }
             ControlFlow::<()>::Continue(())
         });
+    }
+
+    /// The text that replaces a NULL comparison's `range` (absolute offsets;
+    /// `raw` starts at `lo`), given the `NULL` literal's own range — exact, as a
+    /// one-token span is — and the other operand. `x op NULL` keeps everything
+    /// before the operator as written and swaps `op NULL` for `fix`, so an
+    /// operand whose span stops short is never cut. `NULL op x` has to move the
+    /// operand in front, which needs its whole text: offered only when the
+    /// rewritten statement parses back to `x IS [NOT] NULL` over the same
+    /// operand, and `None` otherwise — no fix rather than a broken one.
+    fn null_fix(
+        raw: &str,
+        lo: usize,
+        range: (usize, usize),
+        null: (usize, usize),
+        other: &Expr,
+        fix: &str,
+        dialect: SqlDialect,
+    ) -> Option<String> {
+        let rel = |at: usize| at.checked_sub(lo);
+        let (a, b) = (rel(range.0)?, rel(range.1)?);
+        let (na, nb) = (rel(null.0)?, rel(null.1)?);
+        if nb == b && na > a {
+            // `x op NULL`: the operator is the last one before the NULL, with
+            // nothing but blanks and comments between them.
+            let (op_a, op_b) = last_comparison_op(raw, a, na, dialect)?;
+            let between = raw.get(op_b..na)?;
+            if !super::skip_leading_noncode(between, dialect).is_empty() {
+                return None;
+            }
+            let operand = raw.get(a..op_a)?.trim_end();
+            return (!operand.trim().is_empty()).then(|| format!("{operand} {fix}"));
+        }
+        if na == a && nb < b {
+            // `NULL op x`: the operator follows the NULL directly.
+            let after = raw.get(nb..)?;
+            let rest = super::skip_leading_noncode(after, dialect);
+            let op_at = nb + (after.len() - rest.len());
+            let op_len = comparison_op_len(rest.as_bytes())?;
+            let operand = raw.get(op_at + op_len..b)?.trim();
+            if operand.is_empty() {
+                return None;
+            }
+            let replacement = format!("{operand} {fix}");
+            let candidate = format!("{}{replacement}{}", &raw[..a], &raw[b..]);
+            let want = other.to_string();
+            let parsed =
+                sqlparser::parser::Parser::parse_sql(&*dialect.parser(), &candidate).ok()?;
+            let mut same = false;
+            let _ = visit_expressions(&parsed, |e| {
+                if let Expr::IsNull(inner) | Expr::IsNotNull(inner) = e
+                    && inner.to_string() == want
+                {
+                    same = true;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+            return same.then_some(replacement);
+        }
+        None
+    }
+
+    /// The length of the comparison operator `=`, `<>` or `!=` at the start of
+    /// `b`, or `None` when it starts with none of them.
+    fn comparison_op_len(b: &[u8]) -> Option<usize> {
+        match b {
+            [b'<', b'>', ..] | [b'!', b'=', ..] => Some(2),
+            [b'=', next, ..] if *next != b'=' => Some(1),
+            [b'='] => Some(1),
+            _ => None,
+        }
+    }
+
+    /// The last `=`, `<>` or `!=` in the code of `raw[from..to]` — strings,
+    /// quoted names and comments skipped through the one boundary lexer — as a
+    /// byte range of `raw`. An `=` that ends `<=`, `>=`, `:=` or `==` is not one.
+    fn last_comparison_op(
+        raw: &str,
+        from: usize,
+        to: usize,
+        dialect: SqlDialect,
+    ) -> Option<(usize, usize)> {
+        let b = raw.as_bytes().get(..to)?;
+        let mut i = from;
+        let mut last = None;
+        while i < b.len() {
+            if let Some(j) = crate::sql::skip_noncode(b, i, dialect) {
+                i = j.max(i + 1);
+                continue;
+            }
+            let glued = i > from && matches!(b[i - 1], b'<' | b'>' | b':' | b'!' | b'=');
+            if !glued && let Some(n) = comparison_op_len(&b[i..]) {
+                last = Some((i, i + n));
+                i += n;
+                continue;
+            }
+            i += 1;
+        }
+        last
     }
 }
 
@@ -26865,6 +26988,76 @@ mod tests {
             fix_for("SELECT e.salery FROM employees e", "salery").as_deref(),
             Some("salary")
         );
+    }
+
+    /// The statement after Alt+Enter applies the NULL comparison's fix over its
+    /// range, as the editor does — `None` when there is no such diagnostic or
+    /// it carries no fix.
+    fn null_fixed(sql: &str, dialect: SqlDialect) -> Option<String> {
+        let (schema, db) = sample_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let d = diagnostics(sql, &cat, dialect)
+            .into_iter()
+            .find(|d| d.message.contains("comparison with NULL"))?;
+        let fix = d.fix?;
+        Some(format!("{}{fix}{}", &sql[..d.range.0], &sql[d.range.1..]))
+    }
+
+    /// **The `= NULL` fix rewrites only the operator and the `NULL`.** It used
+    /// to rebuild the operand from its AST span, and sqlparser's spans leave
+    /// out a call's closing parenthesis, a cast's target, a subscript — so
+    /// `ABS(salary) = NULL` became `ABS(salary IS NULL`, one keypress away. With
+    /// NULL on the left the operand has to move; that is offered only when the
+    /// rewrite parses back to the same operand, and withheld otherwise.
+    #[test]
+    fn the_null_fix_keeps_an_operand_its_span_cuts_short() {
+        let w = "SELECT * FROM employees WHERE ";
+        let my = SqlDialect::MySql;
+        for (cond, want) in [
+            ("ABS(salary) = NULL", "ABS(salary) IS NULL"),
+            ("(salary + 1) = NULL", "(salary + 1) IS NULL"),
+            ("CAST(name AS CHAR) = NULL", "CAST(name AS CHAR) IS NULL"),
+            ("COUNT(*) = NULL", "COUNT(*) IS NULL"),
+            ("NOW() <> NULL", "NOW() IS NOT NULL"),
+            (
+                "(SELECT max(id) FROM departments) = NULL",
+                "(SELECT max(id) FROM departments) IS NULL",
+            ),
+            ("name IN (1,2) = NULL", "name IN (1,2) IS NULL"),
+            ("name = /* c */ NULL", "name IS NULL"),
+            ("name = NULL", "name IS NULL"),
+            ("NULL <> salary", "salary IS NOT NULL"),
+        ] {
+            assert_eq!(
+                null_fixed(&format!("{w}{cond}"), my),
+                Some(format!("{w}{want}")),
+                "{cond}"
+            );
+        }
+        let pg = SqlDialect::Postgres;
+        assert_eq!(
+            null_fixed(&format!("{w}dept_id[1] = NULL"), pg),
+            Some(format!("{w}dept_id[1] IS NULL"))
+        );
+        assert_eq!(
+            null_fixed(&format!("{w}name::text = NULL"), pg),
+            Some(format!("{w}name::text IS NULL"))
+        );
+        assert_eq!(
+            null_fixed(&format!("{w}CAST(name AS varchar(9)) = NULL"), SqlDialect::MsSql),
+            Some(format!("{w}CAST(name AS varchar(9)) IS NULL"))
+        );
+        // NULL on the left of an operand its span cuts short: either the right
+        // text or no fix at all — never a broken one.
+        for cond in ["NULL = ABS(salary)", "NULL <> CAST(name AS CHAR)"] {
+            let got = null_fixed(&format!("{w}{cond}"), my);
+            let want_eq = format!("{w}ABS(salary) IS NULL");
+            let want_ne = format!("{w}CAST(name AS CHAR) IS NOT NULL");
+            assert!(
+                got.is_none() || got == Some(want_eq) || got == Some(want_ne),
+                "{cond}: {got:?}"
+            );
+        }
     }
 
     /// Alt+Enter finds the fix under the caret, the caret just past the word

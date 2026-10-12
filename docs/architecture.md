@@ -2153,8 +2153,14 @@ existing prose was left alone.
     per-scope resolver and the flat qualified check alike — quoted by `export::ident_if_needed` as
     the message quotes it. Three more checks fill it, and every other construction site states
     `None`: `null_comparisons`
-    writes `x IS NULL` for `x = NULL` (`IS NOT NULL` for `<>`/`!=`, the `NULL` on either side), the
-    other operand as written, sliced by its AST span — nothing for `NULL = NULL`; the keyword-typo
+    writes `x IS NULL` for `x = NULL` (`IS NOT NULL` for `<>`/`!=`) — nothing for `NULL = NULL`.
+    **It never rebuilds the operand from its AST span** (`null_fix`): sqlparser's spans leave out a
+    call's closing parenthesis, a cast's target and a subscript, and slicing by one turned
+    `ABS(salary) = NULL` into `ABS(salary IS NULL`. With the `NULL` on the right, everything before
+    the operator stays as written and only `op NULL` — the operator found over `skip_noncode`, the
+    `NULL` an exact one-token span — is replaced. With it on the left the operand has to move, which
+    is offered only when the rewritten statement parses back to `IS [NOT] NULL` over the same
+    operand, and withheld otherwise (`the_null_fix_keeps_an_operand_its_span_cuts_short`); the keyword-typo
     check asks `nearest_name` over `SQL_KEYWORDS` and `STMT_KEYWORDS`, and the function-typo check
     over the dialect's `CatalogIndex::lower`, both through the private `in_case_of`, which writes
     the answer all lower or all upper when the typed word was, and as the name has it otherwise. So
