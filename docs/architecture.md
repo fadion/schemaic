@@ -22622,9 +22622,10 @@ existing prose was left alone.
     the reset and leave `draft.id` at `None`, listed nowhere until Save, and a New that changed only
     what was in the inputs read as a button that did nothing (issue #6). It deliberately does **not**
     load the schema: the blank form points at 127.0.0.1 with no user, and connecting there is an
-    error nobody asked for. Until it is saved its id sits in the app's `unsaved_new`, which is how a
-    first-run import knows the active connection is a blank standing in for nothing (see *A first
-    launch saves nothing and selects nothing* below). Then it raises `DraftSignals::focus_name`, a
+    error nobody asked for. Until someone fills it in, `Connection::is_untouched_new` recognises it
+    from itself, which is how a first-run import knows the active connection is a blank standing in
+    for nothing, and how startup and the health poll know not to connect it (see *A first launch
+    saves nothing and selects nothing* below). Then it raises `DraftSignals::focus_name`, a
     request rather than form state, which `conn_form` answers in an effect created *after* the Name
     field — so the pulse it sends lands on Name's own effect once that has taken its first reading.
     The answer clears the flag, scrolls the form to the top through a `scroll_to` signal cleared on
@@ -22800,7 +22801,7 @@ existing prose was left alone.
     (`ExportPath::asks_before_writing`, through the app's `confirm`): the OS dialog checked the name
     as typed, so the write landing on `team.schemaic-connections.json` for a typed `team` replaced a
     teammate's export with nothing asked; a name the dialog itself showed is its own consent. A *New
-    connection* nobody has saved yet (`unsaved_new`) is left out: a 127.0.0.1 placeholder is nothing
+    connection* nobody has filled in (`Connection::is_untouched_new`) is left out: a 127.0.0.1 placeholder is nothing
     to share. The file is written with `persist::write_file_atomic` on `handle.spawn_blocking`; a failure
     reaches the error modal through `file_error`, and a success says nothing. What goes in the file
     is `core::conn_import`'s decision, under that entry.
@@ -28999,24 +29000,34 @@ existing prose was left alone.
     list came back empty, and write it to disk on the spot — so a fresh install opened onto a
     connection its user never made and probably couldn't reach, and deleting `connections.json`
     only made the next launch write it back. It is gone; the empty list stands, and the header's
-    button is what that state offers. `Connection::startup_active_id(saved, &connections)` picks the
-    active id — the saved one while it still names a connection, else the first, else
-    `next_id(&[])`, **the id the first connection created this session will take**, because
-    `save_conn` loads the schema for a connection only when it is the active one and a new user's
-    first connection should connect on save rather than wait to be selected. New now persists that
-    connection on the press, blank and unconnected, so it is still the first Save — the one that
-    fills in a real server — that connects it. That last arm was
-    unreachable while the seed existed and read `unwrap_or(1)`; the number is the same and the
-    coupling to `next_id` is the part under test. `import_chosen` is the second creator and asks
-    the same question: when the active id names nothing (`was_dangling`) the first imported
-    connection takes it, so the import loads its schema and calls `reset_activity` itself.
-    Persisting New on the press broke that check — the header's first-run button lists a blank
-    *New connection 1* under that very id, so the id no longer dangles, and a new user's imported
-    servers never connected. So `new_conn` records the id it minted in `unsaved_new` until
-    `save_conn` saves it, and an import while the active id is still that blank (`on_unsaved_new`)
-    calls `switch_conn` on the first id it added — a switch rather than the dangling path's two
-    calls, because here the active id *moves* and the tab strip, the expansion set and the persisted
-    active id have to follow it. The blank stays listed, as the user's to delete.
+    button is what that state offers. `Connection::startup_active_id(saved, &connections,
+    high_water)` picks the active id — the saved one while it still names a connection, else the
+    first, else `next_id_after(&[], high_water)`, **the id the first connection created this
+    session will take**, because `save_conn` loads the schema for a connection only when it is the
+    active one and a new user's first connection should connect on save rather than wait to be
+    selected. New now persists that connection on the press, blank and unconnected, so it is still
+    the first Save — the one that fills in a real server — that connects it. **The coupling is to
+    the minting function, high-water mark and all**, and that is what the test compares against:
+    the arm answered `next_id(&[])` = 1 after minting moved to `next_id_after`, so once any
+    connection had existed, deleting the last one and pressing New → Save minted 4 while the active
+    id stayed 1, and the header read *No connection* — the delete path and startup now both pass
+    the high-water mark (`an_empty_list_points_at_the_id_the_first_connection_will_take`).
+    `import_chosen` is the second creator and asks the same question: when the active id names
+    nothing (`was_dangling`) the first imported connection takes it, so the import loads its schema
+    and calls `reset_activity` itself. Persisting New on the press broke that check — the header's
+    first-run button lists a blank *New connection* under that very id, so the id no longer
+    dangles, and a new user's imported servers never connected. So an import while the active
+    connection is still a blank nobody filled in (`on_unsaved_new`, asked through
+    `Connection::is_untouched_new`) calls `switch_conn` on the first id it added — a switch rather
+    than the dangling path's two calls, because here the active id *moves* and the tab strip, the
+    expansion set and the persisted active id have to follow it. The blank stays listed, as the
+    user's to delete. **`is_untouched_new` asks the connection, not a memory of making it**: it is
+    `Connection::new_blank` under its own id, name and colour, named *New connection* or *New
+    connection N* — `DraftSignals::blank` loads that same value, so the two cannot drift. The app
+    used to keep the id in a session-only `unsaved_new`, which a restart lost while the blank stayed
+    on disk (and a second New overwrote), so the app then connected to the blank at startup,
+    exported it, and kept it active through a first-run import. Startup's schema load and
+    `check_conn` (the health poll's ping) now pass over a blank too.
     **`Connection::rebind_tab(saved, &known, fallback)` is the same question for a restored *tab*,
     and an empty list is deliberately not the same answer.** The saved id wins while it names a
     connection; when it does not, the tab's connection was deleted and the tab moves to the
@@ -29024,7 +29035,7 @@ existing prose was left alone.
     "deleted" and "the connection file did not load" both present as *the id is not in this list*
     and want opposite things — on a load failure the saved id is right and the list is wrong.
     Collapsing them rebound twelve tabs across three connections onto one id (that same
-    forward-looking `next_id(&[])`, which a *future* connection will occupy), and the debounced
+    forward-looking empty-list answer, which a *future* connection will occupy), and the debounced
     session save wrote it to disk before the user touched anything, so restoring `connections.json`
     from its `.bak` afterwards did not undo it. A tab naming a connection that does not exist is a
     state the app already handles — `db_for` answers "connection no longer exists" — while a tab
@@ -29275,8 +29286,9 @@ existing prose was left alone.
   is** — see *What an edit invalidates* below, where the same question is asked of a transaction and
   answered the other way. **`delete_conn_now` calls it too**, and for
   the same reason rather than a related one: deleting the *last* connection sets `active_conn` to
-  `startup_active_id(None, &[])`, which is `next_id(&[])`, which is `1` — the id the first connection
-  ever created holds — so deleting that one leaves the signal on the value it already had and the
+  `startup_active_id(None, &[], high_water)`, the id the next connection will take — which can be
+  the value the signal already held (on an install whose high-water mark was never written it is
+  `1`, the first connection's), so deleting that one leaves the signal where it was and the
   effect sees no change. The panel went on listing a deleted connection's sessions, offering to kill
   them. Two call sites, one for each way an id can fail to move.
   Inside it the generation bump comes first

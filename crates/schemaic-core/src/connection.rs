@@ -953,6 +953,10 @@ impl AuthMode {
     }
 }
 
+/// The name *New connection* gives a blank — `New connection 2` and so on when
+/// it is taken ([`Connection::is_untouched_new`]).
+pub const NEW_CONNECTION_NAME: &str = "New connection";
+
 /// A saved connection to a database server.
 ///
 /// [`Debug`] is hand-written and redacting — see the impl below the struct, and
@@ -1391,6 +1395,58 @@ impl Connection {
         Self::next_id(existing).max(high_water + 1)
     }
 
+    /// The connection *New connection* creates: MySQL on `127.0.0.1:3306`, no
+    /// user, nothing else set — under `id`, with the unique `name` and identity
+    /// `color` the caller picked. The form's blank (`DraftSignals::blank`) is
+    /// loaded from this, so the shape is decided once.
+    pub fn new_blank(id: u64, name: String, color: Option<String>) -> Connection {
+        Connection {
+            id,
+            name,
+            db_type: "MySQL".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: default_port("MySQL"),
+            user: String::new(),
+            password: String::new(),
+            file: String::new(),
+            database: String::new(),
+            ssh: SshTunnel::default(),
+            tls: Tls::default(),
+            color,
+            prominent_color: false,
+            read_only: false,
+            cli_access: false,
+            environment: Environment::None,
+            ai_data: Some(AiData::default()),
+            folder: String::new(),
+            auth: AuthMode::default(),
+        }
+    }
+
+    /// Is this a *New connection* nobody has filled in — still exactly
+    /// [`new_blank`](Self::new_blank) under its default name?
+    ///
+    /// New persists the blank on the press, so it is in the list (and the
+    /// header's switcher) at once; but it points at 127.0.0.1 with no user and
+    /// stands in for nothing. Startup does not connect it, the export leaves it
+    /// out, and an import made instead of filling it in becomes the active
+    /// connection. **Asked of the connection, not remembered**: a session-only
+    /// "unsaved" id was lost on a restart and overwritten by a second New, while
+    /// the blank it marked was on disk — so after a restart the app connected to
+    /// it, exported it, and kept it active through a first-run import.
+    pub fn is_untouched_new(&self) -> bool {
+        let named_new = self
+            .name
+            .strip_prefix(NEW_CONNECTION_NAME)
+            .is_some_and(|rest| {
+                rest.is_empty()
+                    || rest
+                        .strip_prefix(' ')
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            });
+        named_new && *self == Self::new_blank(self.id, self.name.clone(), self.color.clone())
+    }
+
     /// Which connection is active at startup, given the id the last session
     /// saved and the connections that actually loaded.
     ///
@@ -1398,20 +1454,26 @@ impl Connection {
     /// one does, since a list with nothing selected is a worse start than an
     /// arbitrary selection.
     ///
-    /// **With no connections at all it answers [`Connection::next_id`] of
-    /// nothing** — the id the first connection saved in this session is about to
-    /// take. That is not a placeholder: `save_conn` loads the schema for a
-    /// connection it saves *only* when it is the active one, so the first
-    /// connection a new user creates connects on save rather than sitting there
-    /// until they switch to it by hand. Until the seed connection was removed
-    /// this arm was unreachable and spelled `unwrap_or(1)`, which happens to be
-    /// the same number — the coupling to `next_id` is the part that has to hold,
-    /// and it is what this states.
-    pub fn startup_active_id(saved: Option<u64>, connections: &[Connection]) -> u64 {
+    /// **With no connections at all it answers
+    /// [`next_id_after`](Self::next_id_after) of nothing and `high_water`** —
+    /// the id the first connection saved in this session is about to take,
+    /// because that is the function every creator mints with. That is not a
+    /// placeholder: `save_conn` loads the schema for a connection it saves
+    /// *only* when it is the active one, so the first connection a new user
+    /// creates connects on save rather than sitting there until they switch to
+    /// it by hand. The coupling to the minting function is the part that has to
+    /// hold: this answered `next_id(&[])` = 1 after minting moved to
+    /// `next_id_after`, so once any connection had ever existed, deleting the
+    /// last one and creating another left "No connection".
+    pub fn startup_active_id(
+        saved: Option<u64>,
+        connections: &[Connection],
+        high_water: u64,
+    ) -> u64 {
         saved
             .filter(|id| connections.iter().any(|c| c.id == *id))
             .or_else(|| connections.first().map(|c| c.id))
-            .unwrap_or_else(|| Connection::next_id(&[]))
+            .unwrap_or_else(|| Connection::next_id_after(&[], high_water))
     }
 
     /// Which connection a restored tab belongs to, given the connections that
@@ -2329,9 +2391,9 @@ mod tests {
             Connection { id: 4, ..conn() },
             Connection { id: 9, ..conn() },
         ];
-        assert_eq!(Connection::startup_active_id(Some(9), &cs), 9);
-        assert_eq!(Connection::startup_active_id(Some(77), &cs), 4);
-        assert_eq!(Connection::startup_active_id(None, &cs), 4);
+        assert_eq!(Connection::startup_active_id(Some(9), &cs, 9), 9);
+        assert_eq!(Connection::startup_active_id(Some(77), &cs, 77), 4);
+        assert_eq!(Connection::startup_active_id(None, &cs, 9), 4);
     }
 
     /// With nothing saved, the active id is the one the *first* connection
@@ -2339,20 +2401,68 @@ mod tests {
     /// the save path connects it instead of leaving the user on a connection
     /// they have to select by hand. A number picked any other way would break
     /// that silently.
+    ///
+    /// **Compared against the minting function, not a sibling of it.** Every
+    /// creator mints with `next_id_after(cs, high_water)`, and this used to be
+    /// held to `next_id(&[])` — equal on a fresh install and nowhere else, so
+    /// once any connection had existed the id the empty state pointed at (1)
+    /// was never the id the next connection took, and New → Save left
+    /// "No connection".
     #[test]
     fn an_empty_list_points_at_the_id_the_first_connection_will_take() {
-        assert_eq!(
-            Connection::startup_active_id(None, &[]),
-            Connection::next_id(&[])
-        );
-        assert_eq!(Connection::startup_active_id(Some(3), &[]), 1);
+        for high_water in [0, 1, 3, 40] {
+            assert_eq!(
+                Connection::startup_active_id(None, &[], high_water),
+                Connection::next_id_after(&[], high_water),
+                "high-water mark {high_water}"
+            );
+        }
+        assert_eq!(Connection::startup_active_id(Some(3), &[], 0), 1);
         // **Reached mid-session too**, since deleting the last connection lands
         // in the same empty state and answers it the same way. It used to leave
         // `active_conn` on the deleted id, so the connection created next was
         // saved, took the switcher slot, and never connected — `save_conn` loads
-        // a schema only for the connection that is active, and the new one takes
-        // `next_id(&[])`.
-        assert_eq!(Connection::startup_active_id(Some(2), &[]), 1);
+        // a schema only for the connection that is active.
+        assert_eq!(Connection::startup_active_id(Some(3), &[], 3), 4);
+    }
+
+    /// **A blank nobody filled in is recognised from itself**, not from a
+    /// session's memory of having made it — which a restart lost while the
+    /// blank stayed on disk, so the app then connected to it, exported it and
+    /// kept it active through a first-run import. Any edit, the name included,
+    /// makes it a connection like any other.
+    #[test]
+    fn an_untouched_new_connection_is_recognised_and_an_edited_one_is_not() {
+        let blank = Connection::new_blank(4, "New connection".into(), Some("#aabbcc".into()));
+        assert!(blank.is_untouched_new());
+        let second = Connection::new_blank(5, "New connection 2".into(), None);
+        assert!(
+            second.is_untouched_new(),
+            "the name `unique_name` gives the next"
+        );
+        // What a restart reads back from disk: the same value, round-tripped.
+        let reread: Connection =
+            serde_json::from_str(&serde_json::to_string(&blank).unwrap()).unwrap();
+        assert!(reread.is_untouched_new());
+
+        let mut edited = blank.clone();
+        edited.user = "app".into();
+        assert!(!edited.is_untouched_new(), "a user typed");
+        let mut edited = blank.clone();
+        edited.host = "db.internal".into();
+        assert!(!edited.is_untouched_new(), "a server typed");
+        let mut renamed = blank.clone();
+        renamed.name = "Local MySQL".into();
+        assert!(!renamed.is_untouched_new(), "named by the user");
+        let mut sqlite = blank.clone();
+        sqlite.db_type = "SQLite".into();
+        assert!(!sqlite.is_untouched_new(), "an engine picked");
+        let mut odd = blank;
+        odd.name = "New connections".into();
+        assert!(
+            !odd.is_untouched_new(),
+            "only the default name and its numbers"
+        );
     }
 
     /// A restored tab whose connection was deleted moves to the fallback — that

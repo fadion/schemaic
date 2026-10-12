@@ -3666,37 +3666,16 @@ impl DraftSignals {
         self.auth.set(c.auth);
     }
 
-    /// Reset the form for a brand-new connection.
+    /// Reset the form for a brand-new connection — `Connection::new_blank`,
+    /// which is also what `Connection::is_untouched_new` compares against, so
+    /// the form's blank and the recognised one cannot drift apart.
     pub fn blank(&self) {
+        self.load(&Connection::new_blank(
+            0,
+            schemaic_core::connection::NEW_CONNECTION_NAME.to_string(),
+            None,
+        ));
         self.id.set(None);
-        self.name.set("New connection".to_string());
-        self.db_type.set("MySQL".to_string());
-        self.host.set("127.0.0.1".to_string());
-        self.port.set("3306".to_string());
-        self.user.set(String::new());
-        self.password.set(String::new());
-        self.file.set(String::new());
-        self.database.set(String::new());
-        self.ssh_enabled.set(false);
-        self.ssh_host.set(String::new());
-        self.ssh_port.set("22".to_string());
-        self.ssh_user.set(String::new());
-        self.ssh_password.set(String::new());
-        self.ssh_auth.set(SshAuth::Password);
-        self.ssh_key_path.set(String::new());
-        self.ssh_key_passphrase.set(String::new());
-        self.tls_mode.set(SslMode::default());
-        self.tls_ca_path.set(String::new());
-        self.tls_client_cert_path.set(String::new());
-        self.tls_client_key_path.set(String::new());
-        self.color.set(None);
-        self.prominent_color.set(false);
-        self.read_only.set(false);
-        self.cli_access.set(false);
-        self.environment.set(Environment::None);
-        self.ai_data.set(AiData::default());
-        self.folder.set(String::new());
-        self.auth.set(AuthMode::default());
     }
 
     /// Build a `Connection` from the current form values (with the given id).

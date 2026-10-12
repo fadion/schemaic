@@ -1873,15 +1873,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
         }
     }
-    let active_id = Connection::startup_active_id(cf.active, &cf.connections);
     // The highest id this install has ever handed out — see
     // `Connection::next_id_after`. Seeded to at least the maximum in the file, so
     // a `connections.json` written before the field existed (where it reads `0`)
     // still cannot hand back an id that is currently in use.
-    let highest_conn_id = RwSignal::new(
-        cf.highest_id
-            .max(cf.connections.iter().map(|c| c.id).max().unwrap_or(0)),
-    );
+    let high_water = cf
+        .highest_id
+        .max(cf.connections.iter().map(|c| c.id).max().unwrap_or(0));
+    let active_id = Connection::startup_active_id(cf.active, &cf.connections, high_water);
+    let highest_conn_id = RwSignal::new(high_water);
     let connections = RwSignal::new(cf.connections.clone());
     let active_conn = RwSignal::new(active_id);
 
@@ -8173,9 +8173,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     f(CheckAnswer::Reachable(false));
                 }
             };
-            let Some(conn) =
-                connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
-            else {
+            // A *New connection* nobody filled in is nothing to ping either: it
+            // is 127.0.0.1 with no user, and the poll would otherwise connect to
+            // it on every tick (`Connection::is_untouched_new`).
+            let Some(conn) = connections.with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == id && !c.is_untouched_new())
+                    .cloned()
+            }) else {
                 answer_none(&done);
                 return;
             };
@@ -10239,10 +10244,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // `startup_active_id` already made active, so it is the first Save — the
     // one that fills in a real server — that `save_conn` connects, as before.
     //
-    // `unsaved_new` remembers the id until `save_conn` saves it: on a first run
-    // that blank is the *active* connection, and the import needs to know it is
-    // standing in for nothing (see `import_chosen`).
-    let unsaved_new: RwSignal<Option<u64>> = RwSignal::new(None);
+    // A blank nobody has filled in is recognised from the connection itself
+    // (`Connection::is_untouched_new`), not remembered: on a first run it is the
+    // *active* connection, and startup, the export and the import each need to
+    // know it is standing in for nothing — after a restart too, which a
+    // session-only id could not answer.
     let new_conn: Rc<dyn Fn()> = Rc::new(move || {
         let (existing, used_colors, id) = connections.with_untracked(|cs| {
             (
@@ -10254,13 +10260,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             )
         });
         draft.blank();
-        draft.name.set(unique_name("New connection", &existing));
+        draft.name.set(unique_name(
+            schemaic_core::connection::NEW_CONNECTION_NAME,
+            &existing,
+        ));
         // Auto-assign a distinct identity colour (the user can change it below).
         draft.color.set(Some(pick_connection_color(&used_colors)));
         let conn = draft.to_connection(id);
         connections.update(|cs| cs.push(conn));
         draft.id.set(Some(id));
-        unsaved_new.set(Some(id));
         persist_conns(
             Some(active_conn.get_untracked()),
             persist::Saving::Replacing,
@@ -10505,12 +10513,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // The suffix is what the import keys on, so a name typed
                 // without it gets it back (`ExportPath::of`).
                 let target = conn_import::ExportPath::of(&picked);
-                // Not a *New connection* nobody has saved yet (`unsaved_new`):
-                // a 127.0.0.1 placeholder is nothing to share.
-                let draft = unsaved_new.get_untracked();
+                // Not a *New connection* nobody has filled in
+                // (`is_untouched_new`): a 127.0.0.1 placeholder is nothing to
+                // share.
                 let text = connections.with_untracked(|cs| {
-                    let saved: Vec<Connection> =
-                        cs.iter().filter(|c| Some(c.id) != draft).cloned().collect();
+                    let saved: Vec<Connection> = cs
+                        .iter()
+                        .filter(|c| !c.is_untouched_new())
+                        .cloned()
+                        .collect();
                     conn_import::export_connections(&saved)
                 });
                 let file_error = file_error.clone();
@@ -10675,9 +10686,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             }
             let added = picked.len();
-            // **Was the active id pointing at nothing?** On a fresh install
-            // `Connection::startup_active_id` answers `next_id(&[])` — the id the
-            // first connection saved this session is about to take — so the active
+            // **Was the active id pointing at nothing?** With an empty list
+            // `Connection::startup_active_id` answers `next_id_after(&[],
+            // high_water)` — the id the first connection saved this session is
+            // about to take, and so the first one added below — so the active
             // connection is about to come into existence below and nothing has
             // loaded it. `save_conn` handles the same case for a hand-created
             // connection; this is the second creator, and without the check the
@@ -10685,14 +10697,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // servers) ends with an empty schema tree and "Not connected".
             let active = active_conn.get_untracked();
             let was_dangling = connections.with_untracked(|cs| !cs.iter().any(|c| c.id == active));
-            // **Or at a blank New made and nobody has saved?** The same state
-            // in a different shape since New persists on the press: the first-run
-            // header button creates *New connection 1* under the very id above,
-            // so the list is no longer missing it — but it is 127.0.0.1 with no
-            // user, standing in for nothing, and the import is what the user did
-            // instead of filling it in. The first imported connection becomes
-            // the active one; the blank stays listed, as the user's to delete.
-            let on_unsaved_new = unsaved_new.get_untracked() == Some(active);
+            // **Or at a blank New made and nobody has filled in?** The same
+            // state in a different shape since New persists on the press: the
+            // first-run header button creates *New connection* under the very id
+            // above, so the list is no longer missing it — but it is 127.0.0.1
+            // with no user, standing in for nothing, and the import is what the
+            // user did instead of filling it in. The first imported connection
+            // becomes the active one; the blank stays listed, as the user's to
+            // delete. Asked of the connection (`is_untouched_new`), so a blank
+            // made before a restart still counts.
+            let on_unsaved_new = connections.with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == active)
+                    .is_some_and(Connection::is_untouched_new)
+            });
             let mut first_added = None;
             connections.update(|cs| {
                 for conn in picked {
@@ -10796,9 +10814,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             });
             draft.id.set(Some(id));
-            if unsaved_new.get_untracked() == Some(id) {
-                unsaved_new.set(None);
-            }
             persist_conns(
                 Some(active_conn.get_untracked()),
                 persist::Saving::Replacing,
@@ -11095,28 +11110,34 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // invisible until the empty state grew a New-connection
                         // button: `save_conn` loads the schema for a connection
                         // it saves only when it is the active one, and the new
-                        // one takes `next_id(&[])` — so the first connection
-                        // created after deleting the last was saved, took the
-                        // switcher slot, said "No connection", and never
-                        // connected. This is `startup_active_id`'s answer for
-                        // the same state, which is where the coupling is
-                        // documented and tested.
+                        // one takes `next_id_after(&[], high_water)` — so the
+                        // first connection created after deleting the last was
+                        // saved, took the switcher slot, said "No connection",
+                        // and never connected. This is `startup_active_id`'s
+                        // answer for the same state, which is where the
+                        // coupling is documented and tested — with the
+                        // high-water mark, which the answer has to share with
+                        // the minting or it is 1 while the new id is not.
                         // Through `use_conn`, which also empties `expanded`:
-                        // this id is `next_id(&[])` = 1, the id the *next*
-                        // connection created will take, so leaving the deleted
-                        // connection's keys in place opened that new connection
-                        // with the dead one's tree expanded and persisted it
-                        // under the new id.
-                        (use_conn)(Connection::startup_active_id(None, &[]));
+                        // this id is the one the *next* connection created
+                        // will take, so leaving the deleted connection's keys
+                        // in place opened that new connection with the dead
+                        // one's tree expanded and persisted it under the new id.
+                        (use_conn)(Connection::startup_active_id(
+                            None,
+                            &[],
+                            highest_conn_id.get_untracked(),
+                        ));
                     }
                 }
                 // **The id does not always move here either**, which is the same
                 // defect `save_conn` calls this for. Delete the *last* connection
                 // and the line above sets `active_conn` to
-                // `startup_active_id(None, &[])` — which is `next_id(&[])`, which
-                // is `1`, which is the id the first connection ever created has.
-                // Deleting that one leaves the signal on the value it already
-                // held, so the effect keyed on it sees no change and never clears:
+                // `startup_active_id(None, &[], high_water)` — the id the next
+                // connection created will take. That can be the id the signal
+                // already held (on an install whose high-water mark was never
+                // written, it is `1`, the first connection's), so the effect
+                // keyed on it sees no change and never clears:
                 // Server Activity went on listing a deleted connection's sessions,
                 // offering to kill them. Called unconditionally rather than only
                 // on that branch — where a fallback *did* change the id the effect
@@ -12183,8 +12204,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         active_table.set(src);
     });
 
-    // Kick off schema load for the active connection.
-    if let Some(conn) = cf.connections.iter().find(|c| c.id == active_id).cloned() {
+    // Kick off schema load for the active connection — unless it is a *New
+    // connection* nobody filled in, which points at 127.0.0.1 with no user:
+    // connecting it is an error the user did not ask for, the reason New does
+    // not connect it either (`Connection::is_untouched_new`).
+    if let Some(conn) = cf
+        .connections
+        .iter()
+        .find(|c| c.id == active_id && !c.is_untouched_new())
+        .cloned()
+    {
         load_schema(conn);
     }
 
