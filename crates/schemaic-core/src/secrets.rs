@@ -96,6 +96,31 @@ fn set_field(conn: &mut Connection, kind: SecretKind, value: String) {
     }
 }
 
+/// Blank every secret of `conn` — the copy that leaves this machine in a
+/// connections export.
+///
+/// Over [`SecretKind::ALL`] rather than the three field names, so a kind added
+/// there is kept out of an export by the same edit that keeps it out of
+/// `connections.json`. The export used to blank its own hand-written list.
+pub fn clear_secrets(conn: &mut Connection) {
+    for kind in SecretKind::ALL {
+        set_field(conn, kind, String::new());
+    }
+}
+
+/// Read a secret of `conn` by kind — so a test elsewhere in the crate can
+/// cover every kind without naming its field.
+#[cfg(test)]
+pub(crate) fn secret(conn: &Connection, kind: SecretKind) -> &str {
+    field(conn, kind)
+}
+
+/// Write a secret of `conn` by kind — [`secret`]'s other half.
+#[cfg(test)]
+pub(crate) fn set_secret(conn: &mut Connection, kind: SecretKind, value: &str) {
+    set_field(conn, kind, value.to_string());
+}
+
 /// Why a [`SecretStore`] read failed. Carries the backend's message for display;
 /// the *fact* of the error is what callers branch on.
 #[derive(Clone, Debug, PartialEq, Eq)]

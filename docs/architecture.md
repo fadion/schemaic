@@ -10801,9 +10801,15 @@ existing prose was left alone.
     unavailable (`core/secrets.rs`), so serialising it would export exactly what this function
     exists to leave out — the blanking is this function's own job, not the save path's
     `sanitize_file` (`an_export_round_trips_through_the_import_without_its_secrets`). `parse_schemaic`
-    reads it back as `ImportSource::Schemaic` rows through the ordinary `scan`, so dedupe,
-    `mark_existing` and the `NoPassword` note apply as to any source. **Both directions go through
-    one `shareable`** — id 0, the three secrets blank, both grants at their defaults — so a
+    reads it back as `ImportSource::Schemaic` rows through the ordinary `scan`, so
+    `mark_existing` and the `NoPassword` note apply as to any source — **but `dedupe` never folds
+    one Schemaic row into another**: the fold is for two clients describing one server, and this
+    app's own list is one row per connection somebody made, so a same-endpoint pair there is
+    *Duplicate*'s read-only twin or a second folder, and folding it dropped the twin, flag and
+    all, unlisted (`an_export_keeps_two_connections_to_one_server_apart`). **Both directions go
+    through one `shareable`** — id 0, every `SecretKind::ALL` secret blank through
+    `secrets::clear_secrets` rather than a list of its own, so a secret kind added there is kept
+    out of an export by the same edit, both grants at their defaults — so a
     hand-edited file can slip in neither a grant nor a password the next save would hand to the
     keyring, and the export and the import cannot come to disagree about what a shared file may
     carry (`a_hand_edited_export_is_stripped_and_a_newer_one_refused`). A version past

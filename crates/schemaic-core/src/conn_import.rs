@@ -2039,9 +2039,7 @@ const EXPORT_VERSION: u32 = 1;
 /// import cannot come to disagree about what a shared file may carry.
 fn shareable(mut c: Connection) -> Connection {
     c.id = 0;
-    c.password.clear();
-    c.ssh.password.clear();
-    c.ssh.key_passphrase.clear();
+    crate::secrets::clear_secrets(&mut c);
     c.cli_access = false;
     c.ai_data = None;
     c
@@ -3166,13 +3164,20 @@ fn same_path(a: &str, b: &str) -> bool {
 /// whatever the two sources, a field the survivor lacks and the duplicate has
 /// comes across. **Only what it lacks** — a later, worse row must never
 /// overwrite a better one's value.
+///
+/// **Two rows of a Schemaic export are never one.** The fold is for two
+/// *clients* describing one server; this app's own list is one row per
+/// connection somebody made, and a same-endpoint pair there is deliberate —
+/// *Duplicate*'s read-only twin, a second folder. Folding them dropped the
+/// twin, flag and all, with nothing in the review list to say so.
 pub fn dedupe(found: Vec<Imported>) -> Vec<Imported> {
     let mut out: Vec<Imported> = Vec::with_capacity(found.len());
     for imp in found {
-        match out
-            .iter_mut()
-            .find(|k| same_endpoint(&k.connection, &imp.connection))
-        {
+        let own = imp.source == ImportSource::Schemaic;
+        match out.iter_mut().find(|k| {
+            !(own && k.source == ImportSource::Schemaic)
+                && same_endpoint(&k.connection, &imp.connection)
+        }) {
             Some(kept) => absorb(kept, imp),
             None => out.push(imp),
         }
@@ -6645,12 +6650,20 @@ mod tests {
             host: "bastion".into(),
             port: 22,
             user: "me".into(),
-            password: "s3cret-ssh".into(),
-            key_passphrase: "s3cret-key".into(),
             ..SshTunnel::default()
         };
+        // Every kind the keyring knows, by kind rather than by field name, so
+        // a secret added to `SecretKind::ALL` is held to this test too.
+        use crate::secrets::{SecretKind, set_secret};
+        let secrets: Vec<String> = SecretKind::ALL
+            .iter()
+            .map(|k| format!("s3cret-{k:?}"))
+            .collect();
+        for (kind, value) in SecretKind::ALL.iter().zip(&secrets) {
+            set_secret(&mut c, *kind, value);
+        }
         let file = export_connections(std::slice::from_ref(&c));
-        for secret in ["s3cret-db", "s3cret-ssh", "s3cret-key"] {
+        for secret in &secrets {
             assert!(!file.contains(secret), "{secret} in the export:\n{file}");
         }
         let scan = scan(
@@ -6676,14 +6689,58 @@ mod tests {
             ("shop", "Work")
         );
         assert!(got.read_only && got.ssh.enabled && got.ssh.host == "bastion");
-        assert!(got.password.is_empty() && got.ssh.password.is_empty());
-        assert!(got.ssh.key_passphrase.is_empty());
+        for kind in SecretKind::ALL {
+            assert_eq!(crate::secrets::secret(got, kind), "", "{kind:?}");
+        }
         assert!(
             !got.cli_access && got.ai_data.is_none(),
             "grants are not carried"
         );
         assert!(row.has(ImportNote::NoPassword));
         assert_eq!(row.source.label(), "Schemaic");
+    }
+
+    /// **Two exported connections to one server are two connections.** A
+    /// Schemaic list is one row per connection somebody made — *Duplicate*
+    /// exists to give the same server a second identity, such as a read-only
+    /// twin — so the import must not fold them the way it folds two *clients*
+    /// describing one server. It did: the read-only row vanished, unlisted.
+    #[test]
+    fn an_export_keeps_two_connections_to_one_server_apart() {
+        let mut admin = blank(POSTGRES);
+        admin.name = "Shop admin".into();
+        admin.host = "db.internal".into();
+        admin.user = "app".into();
+        admin.database = "shop".into();
+        let mut guarded = admin.clone();
+        guarded.name = "Shop (read-only)".into();
+        guarded.read_only = true;
+        guarded.folder = "Prod".into();
+        let file = export_connections(&[admin, guarded]);
+        let scan = scan(
+            &[SourceFile {
+                source: ImportSource::Schemaic,
+                path: "team.schemaic-connections.json".into(),
+                text: file,
+                local: None,
+            }],
+            &[],
+        );
+        let rows: Vec<_> = scan
+            .found
+            .iter()
+            .map(|r| {
+                (
+                    r.connection.name.as_str(),
+                    r.connection.read_only,
+                    r.connection.folder.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("Shop admin", false, ""), ("Shop (read-only)", true, "Prod")]
+        );
     }
 
     /// **A hand-edited export is held to the export's rules**: a password or a
