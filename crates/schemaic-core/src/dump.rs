@@ -1546,6 +1546,18 @@ enum Hold {
     Refuse { object: String, why: String },
 }
 
+/// Does the file's structure step for `t` create it? Not for a sequence or
+/// a foreign table, whose step is a comment ([`TableInfo::create_ddl`]
+/// cannot restate either) — so no `DROP` may name one: dropping what the
+/// file cannot put back is destruction, not a dump, and a foreign table's
+/// name on a target where it is an ordinary table went with its dependents.
+fn file_creates(t: &TableInfo) -> bool {
+    match t.shape() {
+        TableShape::Table | TableShape::View => true,
+        TableShape::Sequence | TableShape::ForeignTable => false,
+    }
+}
+
 /// The [`Hold`] on table or view `t`, or `None` for one a replay may drop
 /// and put back. `any_edge` is whether the database has a graph edge table
 /// anywhere, in the export or not.
@@ -2878,7 +2890,7 @@ pub fn plan(
         drops.extend(routine_drops(Some(order.len())));
         for (k, &i) in order.iter().enumerate().rev() {
             let t = &schema.tables[i];
-            if t.shape() != TableShape::Sequence && !held.contains(&i) {
+            if file_creates(t) && !held.contains(&i) {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
                 drops.push(format!("DROP {kw} IF EXISTS {};", qname(t)));
             }
@@ -2943,12 +2955,9 @@ pub fn plan(
             // dropping what the file cannot put back is destruction, not a dump,
             // which is the same reason `data_only_plans_no_create_and_no_drop`
             // gives one file down.
+            // A foreign table's step is a comment too (`file_creates`).
             // Nor one it cannot put back as it is — see `Hold`.
-            if opts.drop_if_exists
-                && !up_front
-                && t.shape() != TableShape::Sequence
-                && !held.contains(&i)
-            {
+            if opts.drop_if_exists && !up_front && file_creates(t) && !held.contains(&i) {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
                 text!(format!(
                     "DROP {kw} IF EXISTS {}{};",
@@ -4226,6 +4235,42 @@ mod tests {
             !text.contains("DROP TABLE"),
             "the file drops an object it never recreates:\n{text}"
         );
+    }
+
+    /// The same rule for a **PostgreSQL foreign table**, whose structure step
+    /// became a comment too: its `DROP TABLE IF EXISTS … CASCADE` stayed, so a
+    /// replay onto a target where the name is an ordinary table dropped it and
+    /// its dependents with nothing put back (and onto the source failed at
+    /// `"ft" is not a table`). Held as one the file leaves as it is, and the
+    /// header says so.
+    #[test]
+    fn a_foreign_table_is_neither_dropped_nor_given_rows() {
+        let mut ft = table("ft");
+        ft.schema = Some("public".to_string());
+        ft.is_foreign = true;
+        let s = schema_of(vec![ft, table("orders")]);
+        for wrap in [true, false] {
+            let opts = DumpOptions {
+                data: true,
+                structure: true,
+                drop_if_exists: true,
+                wrap_transaction: wrap,
+                ..Default::default()
+            };
+            let p = plan(&s, "shop", &all(&s), opts, SqlDialect::Postgres);
+            let text = text_of(&p);
+            assert!(
+                !text.contains("DROP TABLE IF EXISTS \"public\".\"ft\""),
+                "the file drops an object it never recreates:\n{text}"
+            );
+            assert!(text.contains("DROP TABLE IF EXISTS"), "{text}");
+            assert!(
+                !p.steps
+                    .iter()
+                    .any(|s| matches!(s, DumpStep::Rows { table, .. } if table == "ft")),
+                "{text}"
+            );
+        }
     }
 
     // ── plan: what each option puts in the file ──────────────────────────────
