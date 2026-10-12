@@ -10503,29 +10503,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     return; // cancelled
                 };
                 // The suffix is what the import keys on, so a name typed
-                // without it gets it back.
-                let name = picked
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let path = if name
-                    .to_ascii_lowercase()
-                    .ends_with(conn_import::EXPORT_FILE_SUFFIX)
-                {
-                    picked
-                } else {
-                    // The name as typed, less a `.json` of its own.
-                    // Compared as bytes: `cut` may fall inside a multi-byte
-                    // character (`日本`), and a `str` slice there panics. A
-                    // match puts it on the ASCII `.`, a char boundary.
-                    let stem = match name.len().checked_sub(5) {
-                        Some(cut) if name.as_bytes()[cut..].eq_ignore_ascii_case(b".json") => {
-                            &name[..cut]
-                        }
-                        _ => name.as_str(),
-                    };
-                    picked.with_file_name(format!("{stem}.{}", conn_import::EXPORT_FILE_SUFFIX))
-                };
+                // without it gets it back (`ExportPath::of`).
+                let target = conn_import::ExportPath::of(&picked);
                 // Not a *New connection* nobody has saved yet (`unsaved_new`):
                 // a 127.0.0.1 placeholder is nothing to share.
                 let draft = unsaved_new.get_untracked();
@@ -10535,17 +10514,49 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     conn_import::export_connections(&saved)
                 });
                 let file_error = file_error.clone();
-                let report = create_ext_action(cx, move |res: Result<(), String>| {
-                    if let Err(e) = res {
-                        (file_error)(e);
-                    }
+                let handle = handle.clone();
+                let path = target.path.clone();
+                let write: Rc<dyn Fn()> = Rc::new(move || {
+                    let path = path.clone();
+                    let text = text.clone();
+                    let file_error = file_error.clone();
+                    let report = create_ext_action(cx, move |res: Result<(), String>| {
+                        if let Err(e) = res {
+                            (file_error)(e);
+                        }
+                    });
+                    handle.spawn_blocking(move || {
+                        report(
+                            schemaic_core::persist::write_file_atomic(&path, text.as_bytes())
+                                .map_err(|e| format!("Couldn't write {}: {e}", path.display())),
+                        );
+                    });
                 });
-                handle.spawn_blocking(move || {
-                    report(
-                        schemaic_core::persist::write_file_atomic(&path, text.as_bytes())
-                            .map_err(|e| format!("Couldn't write {}: {e}", path.display())),
-                    );
-                });
+                // **A file the dialog never named is not replaced unasked**:
+                // the dialog checked the name as typed, and the suffix moved
+                // the write onto another (`ExportPath::asks_before_writing`).
+                if target.asks_before_writing(target.path.exists()) {
+                    let file = target
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    confirm.set(Some(Confirm {
+                        title: format!("Replace “{file}”"),
+                        message: format!(
+                            "A file named “{file}” is already in that folder. The export \
+                             adds that ending to the name you typed, so the save dialog did \
+                             not ask about it. Replacing it can't be undone."
+                        ),
+                        resolve: Rc::new(move |yes| {
+                            if yes {
+                                (write)();
+                            }
+                        }),
+                    }));
+                } else {
+                    (write)();
+                }
             });
         })
     };

@@ -10824,8 +10824,9 @@ existing prose was left alone.
     re-picks the colour and uniquifies the name, as it does for any row.
     `EXPORT_FILE_SUFFIX` (`schemaic-connections.json`) is the end of an export's file name and the
     only way the app's picker tells one from DBeaver's `.json` (`conn_sources::source_for_path`);
-    the save dialog puts it back on a name typed without it, so a file renamed to plain `.json`
-    afterwards is read as a list of URLs.
+    the save dialog puts it back on a name typed without it (`ExportPath::of`, which also answers
+    whether that name, one the dialog never showed, must be confirmed before it is replaced), so a
+    file renamed to plain `.json` afterwards is read as a list of URLs.
   - `connection.rs` — the saved-connection model. A `Connection` is a database **server**, not one
     database — the sidebar lists all of its databases. **SQLite is the exception to that whole
     sentence**: there is no server, so `Connection::file` is the entire target and
@@ -22791,10 +22792,14 @@ existing prose was left alone.
     `in_ring_button` (`icons::UPLOAD` beside Import's `DOWNLOAD`, ring index `NAV_TAB + 3`), calling
     `ConnActions::export_connections`, which goes straight to a save dialog — the app's closure,
     titled *Export connections*, defaulting to `schemaic-connections.json`. A typed name without
-    `conn_import::EXPORT_FILE_SUFFIX` gets it appended, after any `.json` of its own and in the
-    user's casing, because the suffix is the only thing *Choose a file…* recognises an export by —
-    the `.json` is compared as bytes, since a name like `日本` puts the cut inside a character, where
-    a `str` slice panics in the dialog's callback (found reviewing it, before it shipped). A *New
+    `conn_import::EXPORT_FILE_SUFFIX` gets it appended (`conn_import::ExportPath::of`), after any
+    `.json` of its own and in the user's casing, because the suffix is the only thing *Choose a
+    file…* recognises an export by — the `.json` is compared as bytes, since a name like `日本` puts
+    the cut inside a character, where a `str` slice panics in the dialog's callback (found reviewing
+    it, before it shipped). **A renamed path that already exists is asked about first**
+    (`ExportPath::asks_before_writing`, through the app's `confirm`): the OS dialog checked the name
+    as typed, so the write landing on `team.schemaic-connections.json` for a typed `team` replaced a
+    teammate's export with nothing asked; a name the dialog itself showed is its own consent. A *New
     connection* nobody has saved yet (`unsaved_new`) is left out: a 127.0.0.1 placeholder is nothing
     to share. The file is written with `persist::write_file_atomic` on `handle.spawn_blocking`; a failure
     reaches the error modal through `file_error`, and a success says nothing. What goes in the file

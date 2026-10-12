@@ -2003,6 +2003,58 @@ fn looks_like_drive_path(s: &str) -> bool {
 /// too.
 pub const EXPORT_FILE_SUFFIX: &str = "schemaic-connections.json";
 
+/// Where *Export connections* writes, given the path the save dialog
+/// returned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportPath {
+    /// The file to write: `picked`, or `picked` with [`EXPORT_FILE_SUFFIX`]
+    /// put back on a name typed without it.
+    pub path: std::path::PathBuf,
+    /// The suffix was added, so `path` is a file the dialog never named.
+    pub renamed: bool,
+}
+
+impl ExportPath {
+    /// The suffix is what the import keys on, so a name typed without it gets
+    /// it back — less a `.json` of its own (`team.json` →
+    /// `team.schemaic-connections.json`).
+    pub fn of(picked: &std::path::Path) -> ExportPath {
+        let name = picked
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.to_ascii_lowercase().ends_with(EXPORT_FILE_SUFFIX) {
+            return ExportPath {
+                path: picked.to_path_buf(),
+                renamed: false,
+            };
+        }
+        // Compared as bytes: `cut` may fall inside a multi-byte character
+        // (`日本`), and a `str` slice there panics. A match puts it on the
+        // ASCII `.`, a char boundary.
+        let stem = match name.len().checked_sub(5) {
+            Some(cut) if name.as_bytes()[cut..].eq_ignore_ascii_case(b".json") => &name[..cut],
+            _ => name.as_str(),
+        };
+        ExportPath {
+            path: picked.with_file_name(format!("{stem}.{EXPORT_FILE_SUFFIX}")),
+            renamed: true,
+        }
+    }
+
+    /// Must the user be asked before the write, given whether `path` already
+    /// `exists`?
+    ///
+    /// **Only for a name the dialog never showed them.** The OS dialog asks
+    /// before replacing the file it names, and that is the consent a save
+    /// rests on; once the suffix is added the dialog checked a different
+    /// name, so a teammate's `team.schemaic-connections.json` was replaced by
+    /// typing `team`, with nothing asked and nothing to recover it from.
+    pub fn asks_before_writing(&self, exists: bool) -> bool {
+        self.renamed && exists
+    }
+}
+
 /// The export's envelope: a version, so a later shape can be told from this
 /// one, and the connections.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -6700,6 +6752,39 @@ mod tests {
         assert_eq!(row.source.label(), "Schemaic");
     }
 
+    /// **A file the save dialog never named is not replaced unasked.** Typing
+    /// `team` gets the suffix back, so the dialog checked `team` while the
+    /// write lands on `team.schemaic-connections.json` — a teammate's export,
+    /// replaced with no prompt. A name the dialog did show is its own consent.
+    #[test]
+    fn an_export_asks_before_replacing_a_file_the_dialog_never_named() {
+        use std::path::Path;
+        let typed = ExportPath::of(Path::new("dl/team"));
+        assert_eq!(
+            typed.path,
+            Path::new("dl/team.schemaic-connections.json"),
+            "the suffix comes back"
+        );
+        assert!(typed.asks_before_writing(true));
+        assert!(!typed.asks_before_writing(false), "nothing there to lose");
+
+        let json = ExportPath::of(Path::new("dl/team.JSON"));
+        assert_eq!(json.path, Path::new("dl/team.schemaic-connections.json"));
+        assert!(json.asks_before_writing(true));
+
+        let full = ExportPath::of(Path::new("dl/team.Schemaic-Connections.json"));
+        assert_eq!(full.path, Path::new("dl/team.Schemaic-Connections.json"));
+        assert!(
+            !full.asks_before_writing(true),
+            "the dialog named this one, and asked"
+        );
+
+        // A multi-byte name whose last five bytes are not `.json` must not
+        // be sliced inside a character.
+        let wide = ExportPath::of(Path::new("dl/日本"));
+        assert_eq!(wide.path, Path::new("dl/日本.schemaic-connections.json"));
+    }
+
     /// **Two exported connections to one server are two connections.** A
     /// Schemaic list is one row per connection somebody made — *Duplicate*
     /// exists to give the same server a second identity, such as a read-only
@@ -6739,7 +6824,10 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            [("Shop admin", false, ""), ("Shop (read-only)", true, "Prod")]
+            [
+                ("Shop admin", false, ""),
+                ("Shop (read-only)", true, "Prod")
+            ]
         );
     }
 
