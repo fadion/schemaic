@@ -5568,8 +5568,16 @@ existing prose was left alone.
     `bio(20)` prefix syntax only there; it named it on every engine but PostgreSQL.
     `supports_partial_index(dialect)` is true on PostgreSQL, SQLite and SQL Server — each a partial
     (or filtered) index whose `WHERE` `create_index_sql` writes and whose introspection reads the
-    condition back — and false on MySQL, which has none; the index form's *Only rows where* field
-    asks it. `supports_index_method(dialect)` is PostgreSQL's alone, where the access method is a free
+    condition back — and false on MySQL, which has none. It is necessary, not sufficient: the index
+    form's *Only rows where* field and `validate` ask `index_takes_filter(ix, dialect)`, which adds a
+    kind that can be filtered (`IndexStorage::takes_filter`) and refuses two shapes the plan could
+    not carry. One is a unique constraint's index where `constraint_takes_filter` says no — SQLite
+    alone, whose constraint index lives in the table body where no `WHERE` goes, so its rebuild kept
+    the constraint and dropped the condition without a word; PostgreSQL and SQL Server turn a
+    filtered constraint into a filtered `CREATE UNIQUE INDEX`. The other is a clustered index, which
+    covers every row (Msg 102 at the `WHERE`, measured on 2025)
+    (`a_filter_is_offered_only_where_the_index_can_carry_one`,
+    `a_filter_an_index_cannot_carry_is_refused`). `supports_index_method(dialect)` is PostgreSQL's alone, where the access method is a free
     choice among installed ones, and the *Method* field asks it. The two were one PostgreSQL-only
     block until the condition field was split off for the engines it serves
     (`a_partial_index_is_offered_where_the_emitter_writes_its_where`).
@@ -24193,8 +24201,9 @@ existing prose was left alone.
     may reject (`the_designers_mysql_fields_are_asked_as_capabilities`). **The last comparison took
     it 1 → 0**: the index form's PostgreSQL-only *Method* and partial-index predicate block, which
     is two fields now — *Method* built where `ddl::supports_index_method` holds (PostgreSQL alone),
-    *Only rows where* where `ddl::supports_partial_index` holds (PostgreSQL, SQLite and SQL Server)
-    and the kind `IndexStorage::takes_filter`. It was kept whole for as long as SQLite's
+    *Only rows where* where `ddl::index_takes_filter` answers yes (`supports_partial_index`, the
+    kind's `IndexStorage::takes_filter`, and neither a constraint index where
+    `constraint_takes_filter` says no nor a clustered index — under `ddl.rs`). It was kept whole for as long as SQLite's
     introspection read no predicate back, since the field would have opened empty over a partial
     index that was replayed verbatim; `sqlite::index_predicate_of` reading it is what made the split
     honest (under `sqlite.rs`). The index form's *Include* field, after

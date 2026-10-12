@@ -1771,9 +1771,11 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     } else {
         crate::widgets::nothing()
     };
-    // A partial index is PostgreSQL's, SQLite's and SQL Server's — on SQL
-    // Server only for a kind that can be filtered, which `apply` agrees with.
-    let filter_field: AnyView = if ddl::supports_partial_index(dialect) && kind.takes_filter() {
+    // A partial index is PostgreSQL's, SQLite's and SQL Server's — only for a
+    // kind that can be filtered, which `apply` agrees with, and not on a SQLite
+    // constraint index or a clustered one: `ddl::index_takes_filter`, which
+    // `validate` asks.
+    let filter_field: AnyView = if ddl::index_takes_filter(&ix, dialect) {
         form_setting(
             "Only rows where",
             field_with_hint(

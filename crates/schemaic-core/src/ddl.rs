@@ -716,6 +716,32 @@ impl TableDraft {
                     )
                 });
             }
+            // What `index_takes_filter` keeps the designer's field off, for a
+            // draft built any other way — refused rather than planned without
+            // the condition (S3.2-L1-02/04). A clustered columnstore index has
+            // its own line above.
+            if ix.info.predicate.is_some()
+                && !ix.info.is_clustered_columnstore()
+                && !index_takes_filter(&ix.info, dialect)
+            {
+                out.push(if ix.info.clustered == Some(true) {
+                    format!(
+                        "Index {} can't be filtered: a clustered index covers every row.",
+                        ix.info.name
+                    )
+                } else if is_sqlite_constraint_index(&ix.info) && supports_partial_index(dialect) {
+                    format!(
+                        "Index {} can't be filtered: it backs a UNIQUE constraint, which takes \
+                         no condition here. Drop it and add a unique index with the condition.",
+                        ix.info.name
+                    )
+                } else {
+                    format!(
+                        "Index {} can't be filtered: this index can't be partial here.",
+                        ix.info.name
+                    )
+                });
+            }
             for c in &ix.info.columns {
                 // An expression key names no column by design, so there is
                 // nothing to look up — `(lower(email))` is the index's *value*,
@@ -10187,6 +10213,34 @@ pub fn index_takes_include(ix: &IndexInfo, dialect: SqlDialect) -> bool {
         && IndexStorage::of_in(ix, dialect).takes_include()
         && !(ix.unique && ix.constraint.is_some() && !constraint_takes_include(dialect))
         && ix.clustered != Some(true)
+}
+
+/// Can `ix` carry a **condition** — `WHERE` — on `dialect`: the designer's
+/// *Only rows where* field and `validate` asking one question. An engine with
+/// partial indexes ([`supports_partial_index`]), a kind that can be filtered
+/// ([`IndexStorage::takes_filter`]), not a unique constraint where a filtered
+/// one has no form ([`constraint_takes_filter`]), and not a clustered index,
+/// which covers every row (Msg 102 at the `WHERE`, measured on 2025).
+pub fn index_takes_filter(ix: &IndexInfo, dialect: SqlDialect) -> bool {
+    supports_partial_index(dialect)
+        && IndexStorage::of_in(ix, dialect).takes_filter()
+        && !(is_sqlite_constraint_index(ix) && !constraint_takes_filter(dialect))
+        && ix.clustered != Some(true)
+}
+
+/// Can a **unique constraint** be given a condition on `dialect`? PostgreSQL
+/// and SQL Server have no filtered constraint, but the plan turns one into a
+/// filtered `CREATE UNIQUE INDEX`. SQLite's constraint index lives in the
+/// table body, where no `WHERE` goes, and its rebuild keeps it there — so a
+/// condition typed on one was dropped without a word. MySQL has no partial
+/// index at all ([`supports_partial_index`]).
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn constraint_takes_filter(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
 }
 
 /// Can a table and its columns carry a comment the emitter writes on `dialect`?
@@ -20249,6 +20303,94 @@ mod tests {
         for d in [MySql, Sqlite, MsSql] {
             assert!(!supports_index_method(d), "{d:?}");
         }
+    }
+
+    /// **Not every index an engine with partial indexes has can take a
+    /// condition.** SQLite's `UNIQUE (…)` constraint index lives in the table
+    /// body, where no `WHERE` goes — its rebuild kept the constraint and
+    /// dropped the condition without a word — and a SQL Server clustered
+    /// index covers every row (Msg 102 at the `WHERE`, measured on 2025).
+    /// PostgreSQL and SQL Server turn a filtered unique constraint into a
+    /// filtered `CREATE UNIQUE INDEX`, so theirs keep the field.
+    #[test]
+    fn a_filter_is_offered_only_where_the_index_can_carry_one() {
+        let plain = IndexInfo::plain("ix", vec!["n"], false);
+        let constraint = IndexInfo {
+            constraint: Some("uq".into()),
+            ..IndexInfo::plain("uq", vec!["n"], true)
+        };
+        let autoindex = IndexInfo::plain("sqlite_autoindex_t_1", vec!["n"], true);
+        let clustered = IndexInfo {
+            clustered: Some(true),
+            ..IndexInfo::plain("cx", vec!["n"], false)
+        };
+        for d in [Postgres, Sqlite, MsSql] {
+            assert!(index_takes_filter(&plain, d), "{d:?}");
+        }
+        assert!(!index_takes_filter(&plain, MySql));
+        assert!(!index_takes_filter(&constraint, Sqlite));
+        assert!(!index_takes_filter(&autoindex, Sqlite));
+        assert!(index_takes_filter(&constraint, Postgres));
+        assert!(index_takes_filter(&constraint, MsSql));
+        assert!(!index_takes_filter(&clustered, MsSql));
+    }
+
+    /// The same question asked by `validate`, for a draft built any other way
+    /// than through the form: a SQLite constraint index or a SQL Server
+    /// clustered one given a condition is refused, never planned without it.
+    #[test]
+    fn a_filter_an_index_cannot_carry_is_refused() {
+        let sqlite = TableInfo {
+            name: "t".into(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    type_name: "INTEGER".into(),
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "email".into(),
+                    type_name: "TEXT".into(),
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "n".into(),
+                    type_name: "INTEGER".into(),
+                    ..Default::default()
+                },
+            ],
+            indexes: vec![IndexInfo::plain(
+                "sqlite_autoindex_t_1",
+                vec!["email"],
+                true,
+            )],
+            ..Default::default()
+        };
+        let mut d = TableDraft::from_table(&sqlite);
+        d.indexes[0].info.predicate = Some("n > 0".into());
+        let errs = d.validate(Sqlite);
+        assert!(
+            errs.iter().any(|e| e.contains("sqlite_autoindex_t_1")),
+            "{errs:?}"
+        );
+
+        let ms = TableInfo {
+            name: "t".into(),
+            schema: Some("dbo".into()),
+            columns: vec![ms_col("id", "int"), ms_col("a", "int"), ms_col("n", "int")],
+            indexes: vec![IndexInfo {
+                clustered: Some(true),
+                ..IndexInfo::plain("cx", vec!["a"], false)
+            }],
+            ..Default::default()
+        };
+        let mut d = TableDraft::from_table(&ms);
+        d.indexes[0].info.predicate = Some("n IS NOT NULL".into());
+        let errs = d.validate(MsSql);
+        assert!(errs.iter().any(|e| e.contains("cx")), "{errs:?}");
+        // A nonclustered one is still filtered.
+        d.indexes[0].info.clustered = Some(false);
+        assert!(d.validate(MsSql).is_empty(), "{:?}", d.validate(MsSql));
     }
 
     /// **The preview's line for an added index says what the statement

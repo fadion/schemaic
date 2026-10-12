@@ -25,7 +25,7 @@ its **sequences, alias types, synonyms and XML schema collections**. What differ
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `rebuilds_tables`, `renames_indexes_in_place`,
-`constraint_takes_include`, `key_clusters_by_default`, `supports_change`, `alter_column_disturbs_checks`,
+`constraint_takes_include`, `constraint_takes_filter`, `key_clusters_by_default`, `supports_change`, `alter_column_disturbs_checks`,
 `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `bare_reference_is_own_namespace`,
 `ddl_is_transactional`, `catalogue_body_is_unescaped`, `users::revoke_cascades`, `supports_deny`,
 `table_grant_lifts_column_denies`, `table_revoke_clears_columns`, `blank_password_signs_in`, `drop_user_cuts_off_sessions`,
