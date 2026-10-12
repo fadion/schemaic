@@ -3268,12 +3268,14 @@ impl TriggerInfo {
         let q = |s: &str| ddl_ident_in(s, dialect);
         // `public` named too — the apply path runs this (see `qualified_ident`).
         let qtable = qualified_ident(&self.table, self.schema.as_deref(), dialect);
-        // `UPDATE OF a, b` is part of the event, not a clause after it.
+        // `UPDATE OF a, b` is part of the event, not a clause after it — written
+        // wherever the form offers the field, by asking the form's question.
+        let update_of = crate::ddl::supports_trigger_update_of(dialect);
         let events = self
             .events
             .iter()
             .map(|e| {
-                if (pg || sqlite) && *e == TriggerEvent::Update && !self.update_columns.is_empty() {
+                if update_of && *e == TriggerEvent::Update && !self.update_columns.is_empty() {
                     let cols = self
                         .update_columns
                         .iter()

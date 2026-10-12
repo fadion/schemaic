@@ -1431,6 +1431,15 @@ impl TriggerDraft {
                 if !t.update_columns.is_empty() && !t.events.contains(&TriggerEvent::Update) {
                     out.push("UPDATE OF names columns on an UPDATE trigger.".to_string());
                 }
+                // `INSTEAD OF triggers cannot have column lists`, measured on
+                // 16.15 — though SQLite's can, so this is PostgreSQL's alone.
+                if !t.update_columns.is_empty() && t.timing == TriggerTiming::InsteadOf {
+                    out.push(
+                        "An INSTEAD OF trigger takes no column list — PostgreSQL fires it on \
+                     any UPDATE of the view."
+                            .to_string(),
+                    );
+                }
             }
             SqlDialect::Sqlite => {
                 // Every rule below is one SQLite states itself, quoted from 3.45:
@@ -24552,6 +24561,30 @@ mod tests {
         );
         draft.info.events = vec![TriggerEvent::Update];
         assert!(problems(&draft).is_empty(), "{:?}", problems(&draft));
+    }
+
+    /// **PostgreSQL's INSTEAD OF trigger takes no column list** — `ERROR:
+    /// INSTEAD OF triggers cannot have column lists`, measured on 16.15 —
+    /// though SQLite's does. Refused in the form, which can say which control
+    /// is wrong, rather than at Apply.
+    #[test]
+    fn update_of_on_an_instead_of_trigger_is_refused_on_postgres() {
+        let mut draft = TriggerDraft::blank("tr", "v", Some("public".into()));
+        draft.info.timing = TriggerTiming::InsteadOf;
+        draft.info.level = TriggerLevel::Row;
+        draft.info.events = vec![TriggerEvent::Update];
+        draft.info.action = TriggerAction::Function {
+            name: "f".into(),
+            args: Vec::new(),
+        };
+        let problems = |d: &TriggerDraft| d.validate(Postgres, TriggerHost::View);
+        assert!(problems(&draft).is_empty(), "{:?}", problems(&draft));
+        draft.info.update_columns = vec!["a".into()];
+        assert!(
+            problems(&draft).iter().any(|e| e.contains("INSTEAD OF")),
+            "{:?}",
+            problems(&draft)
+        );
     }
 
     #[test]
