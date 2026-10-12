@@ -5981,8 +5981,13 @@ existing prose was left alone.
     (`partial_index_replay`), since its predicate is read back now and is free SQL naming columns:
     refused when the condition names a column the plan drops — nothing to repoint it to, and SQLite
     would refuse the `CREATE INDEX` with the whole rebuild rolled back — replayed verbatim when it is
-    untouched and no column moved, and otherwise emitted with the predicate repointed across each
-    renamed column by `repoint_check_column`, as the checks are. Before the predicate was read, a
+    untouched and no column moved, and otherwise emitted with the predicate repointed across every
+    rename at once by `repoint_check_columns`, as the checks are. The condition is the user's own
+    text, so the walk reads all three of SQLite's quoted-name forms (`"n"`, `` `n` ``, `[n]`) and
+    ends a bare name where `sql::continues_name` does: a `"n"` it once left behind was taken by
+    SQLite's double-quoted-string fallback for the constant `'n'`, quietly making the partial index
+    a whole one (`a_quoted_column_in_a_partial_index_condition_follows_a_rename`, red with a
+    `UNIQUE` failure on the exempted rows before). Before the predicate was read, a
     rename anywhere under a partial index refused the plan; emitting it naively instead fails with
     `no such column` in the re-emitted `CREATE INDEX`
     (`renaming_a_column_a_partial_index_names_carries_its_condition`,
@@ -6688,7 +6693,10 @@ existing prose was left alone.
     `sp_rename` renames a key column under its index, but refuses one a filter names (Msg 5074
     "The index 'ix_live' is dependent on column 'n'", measured on 2022). So the repair also takes
     an index off and puts it back when its `predicate` reads a column the plan renames, and
-    `remake_index` repoints that predicate across the renames with `repoint_check_column` — there
+    `remake_index` repoints that predicate across all the renames in one pass with
+    `repoint_check_columns` — one rename after another, in the renames map's `HashMap` order, turned
+    `a → a2` beside `b → a` into a filter on `a2` twice, at random
+    (`a_rename_chain_under_a_filtered_index_filters_the_right_columns`) — there
     and not in `rename_index`, which `diff_indexes` compares the draft through, and the draft keeps
     the condition as it was read (`sql_server_remakes_a_filtered_index_around_a_rename_its_condition_names`;
     live, `a_column_a_filtered_index_names_is_renamed`, red with Msg 5074 before and green on 2022
@@ -6999,8 +7007,11 @@ existing prose was left alone.
     and SQL Server's `sp_rename` likewise (Msg 15336), so there and only there `diff`
     adds a `DropCheck`+`AddCheck` pair with the predicate re-pointed through
     `repoint_check_column` (a **token walk** over `skip_noncode`, so `qty` never
-    matches inside `qty_total`, inside `'qty'`, or in a comment; it reads T-SQL's
-    `[qty]`, which opens and closes on different bytes, as a name too).
+    matches inside `qty_total` or `qty$x`, inside `'qty'`, or in a comment; it reads every
+    quoted-name form the engine does — T-SQL's `[qty]`, which opens and closes on different
+    bytes, and all three of SQLite's — as a name too). Several renames go through its plural,
+    `repoint_check_columns`, **as one substitution**: chained, `a → a2` beside `b → a` moved the
+    old `b` on to `a2`.
     **A retype needs the same move on SQL Server, and for every kind of dependent.** `ALTER COLUMN`
     is refused while an index, the key, a unique constraint, a foreign key or a check stands on the
     column (Msg 5074 naming it, then 4922, measured on 2022), where MySQL's `MODIFY` and

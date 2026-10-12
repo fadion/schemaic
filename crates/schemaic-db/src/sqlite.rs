@@ -8518,6 +8518,72 @@ mod rebuild_roundtrip_tests {
         assert_eq!(used, 1);
     }
 
+    /// **A condition naming its column quoted is still repointed** — `"n"` and
+    /// `[n]` are SQLite names as much as a bare `n`. Left behind, `"n"` on a
+    /// table with no `n` is read by SQLite's double-quoted-string fallback as
+    /// the constant `'n'`: the partial index becomes a whole one, and a
+    /// soft-delete `UNIQUE … WHERE` starts covering the rows it exempted —
+    /// here the rebuild itself fails on the two exempted duplicates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quoted_column_in_a_partial_index_condition_follows_a_rename() {
+        for (i, quoted) in ["\"n\"", "[n]", "`n`"].iter().enumerate() {
+            let (keeper, db) = shared_memory(&format!("rebuild_partial_quoted_{i}"));
+            keeper
+                .execute_batch(&format!(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, title TEXT);
+                     CREATE UNIQUE INDEX ix_live ON t (title) WHERE {quoted} IS NOT NULL;
+                     INSERT INTO t VALUES (1, NULL, 'A'), (2, NULL, 'A'), (3, 1, 'A');"
+                ))
+                .unwrap();
+            let before = table_of(&db, "t").await;
+            let mut draft = TableDraft::from_table(&before);
+            // A retype as well, so the plan is the twelve-step rebuild rather
+            // than SQLite's own `RENAME COLUMN`, which repoints it by itself.
+            draft.columns[2].info.type_name = "BLOB".into();
+            draft.rename_column(1, "cnt");
+            let cs = diff(&before, &draft, SqlDialect::Sqlite);
+            assert!(
+                cs.unsupported().is_empty(),
+                "{quoted}: {:?}",
+                cs.unsupported()
+            );
+            db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{quoted}: rebuild: {e:?}"));
+            let after = table_of(&db, "t").await;
+            let ix = after.indexes.iter().find(|i| i.name == "ix_live").unwrap();
+            let p = ix.predicate.as_deref().unwrap_or_default();
+            assert!(p.contains("cnt"), "{quoted}: {ix:?}");
+            // Still partial: another exempted duplicate goes in.
+            keeper
+                .execute("INSERT INTO t VALUES (4, NULL, 'A')", [])
+                .unwrap_or_else(|e| panic!("{quoted}: the index is whole now: {e}"));
+        }
+    }
+
+    /// The drop direction of the same: a quoted `"n"` is the column `n` the
+    /// plan drops, so the plan is refused rather than re-created with a
+    /// condition that names nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_column_a_partial_index_names_quoted_is_refused() {
+        let (keeper, db) = shared_memory("rebuild_partial_drop_quoted");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, title TEXT);
+                 CREATE INDEX ix_live ON t (title) WHERE \"n\" IS NOT NULL;",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[2].info.type_name = "BLOB".into();
+        draft.remove_column(1, SqlDialect::Sqlite);
+        let withheld = diff(&before, &draft, SqlDialect::Sqlite).unsupported();
+        assert!(
+            withheld.iter().any(|w| w.contains("ix_live")),
+            "{withheld:?}"
+        );
+    }
+
     /// A dropped column the condition names has nothing to be repointed to, so
     /// the plan is refused and says which index and which column.
     #[tokio::test(flavor = "multi_thread")]

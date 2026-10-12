@@ -11370,8 +11370,8 @@ fn needs_delimiter(stmt: &str, dialect: SqlDialect) -> bool {
 /// wrong re-points a constraint the user never touched, or corrupts a pattern.
 /// The walk is [`sql::skip_noncode`]'s, so string, comment and quoted-identifier
 /// boundaries are the ones the rest of the app agrees on. A quoted identifier is
-/// a *non-code* run to that scanner, so it is matched here explicitly — it is
-/// the form both servers print (`` `qty` `` / `"qty"`).
+/// a *non-code* run to that scanner, so it is matched here explicitly, in
+/// every form the engine reads as a name ([`repoint_check_columns`]).
 ///
 /// Case follows the engine: MySQL/MariaDB column names are case-insensitive,
 /// PostgreSQL's are exactly as written once quoted — the same split
@@ -11380,20 +11380,46 @@ fn needs_delimiter(stmt: &str, dialect: SqlDialect) -> bool {
 /// The replacement is always emitted quoted. This text goes into a statement
 /// Schemaic runs, and the new name is whatever the user typed in the designer.
 fn repoint_check_column(expr: &str, from: &str, to: &str, dialect: SqlDialect) -> Option<String> {
+    repoint_check_columns(expr, &[(from, to)], dialect)
+}
+
+/// [`repoint_check_column`] for several renames **at once**: each name in
+/// `expr` is looked up in `renames` a single time, so `a → a2` beside
+/// `b → a` moves the old `b` to `a` and leaves it there. Applied one rename
+/// after another instead, the second rewrites what the first just wrote, and
+/// which of the two runs first was a `HashMap`'s order.
+///
+/// A quoted name is one in any of the forms the engine reads as a name:
+/// SQLite all three (`"n"`, `` `n` ``, `[n]`), since a SQLite condition is the
+/// user's own text cut from `sqlite_master` rather than a server's reprint;
+/// SQL Server its bracket and, with `QUOTED_IDENTIFIER` on as every session
+/// of this app has it, a double quote. Where a bare name ends is
+/// [`sql::continues_name`]'s, so `n$x` is never the column `n`.
+fn repoint_check_columns(
+    expr: &str,
+    renames: &[(&str, &str)],
+    dialect: SqlDialect,
+) -> Option<String> {
     let pg = dialect == SqlDialect::Postgres;
-    // SQL Server's is the one quoted name that opens and closes differently —
-    // `[qty]` — and it is how it prints every check's predicate.
-    let (quote, close) = match dialect {
-        SqlDialect::Postgres => (b'"', b'"'),
-        SqlDialect::MySql | SqlDialect::Sqlite => (b'`', b'`'),
-        SqlDialect::MsSql => (b'[', b']'),
+    // SQL Server's bracket is a quoted name that opens and closes differently
+    // — `[qty]` — and it is how it prints every check's predicate.
+    let quotes: &[(u8, u8)] = match dialect {
+        SqlDialect::Postgres => &[(b'"', b'"')],
+        SqlDialect::MySql => &[(b'`', b'`')],
+        SqlDialect::Sqlite => &[(b'"', b'"'), (b'`', b'`'), (b'[', b']')],
+        SqlDialect::MsSql => &[(b'[', b']'), (b'"', b'"')],
     };
-    let same = |s: &str| {
-        if pg {
-            s == from
-        } else {
-            s.eq_ignore_ascii_case(from)
-        }
+    let target = |s: &str| {
+        renames
+            .iter()
+            .find(|(from, _)| {
+                if pg {
+                    s == *from
+                } else {
+                    s.eq_ignore_ascii_case(from)
+                }
+            })
+            .map(|(_, to)| *to)
     };
     let b = expr.as_bytes();
     let mut out = String::with_capacity(expr.len());
@@ -11404,34 +11430,39 @@ fn repoint_check_column(expr: &str, from: &str, to: &str, dialect: SqlDialect) -
             // Only a *quoted identifier* is a name; a string or comment that
             // reads like one isn't.
             let run = &expr[i..j];
-            let q = close as char;
             // A doubled closing quote inside the run is one literal one.
-            let inner = (b[i] == quote && j - i >= 2 && b[j - 1] == close)
-                .then(|| run[1..run.len() - 1].replace(&format!("{q}{q}"), &q.to_string()));
-            match inner {
-                Some(name) if same(&name) => {
+            let inner = quotes
+                .iter()
+                .find(|&&(open, close)| b[i] == open && j - i >= 2 && b[j - 1] == close)
+                .map(|&(_, close)| {
+                    let q = close as char;
+                    run[1..run.len() - 1].replace(&format!("{q}{q}"), &q.to_string())
+                });
+            match inner.as_deref().and_then(target) {
+                Some(to) => {
                     out.push_str(&ddl_ident_in(to, dialect));
                     hit = true;
                 }
-                _ => out.push_str(run),
+                None => out.push_str(run),
             }
             i = j;
             continue;
         }
         if sql::is_word_start(b[i]) {
             let start = i;
-            while i < b.len() && sql::is_word_byte(b[i]) {
+            while i < b.len() && sql::continues_name(b[i], dialect) {
                 i += 1;
             }
             let word = &expr[start..i];
             // A word immediately followed by `(` is a function call, not a
             // column — `qty(…)` names no column even in a table with a `qty`.
             let is_call = expr[i..].trim_start().starts_with('(');
-            if same(word) && !is_call {
-                out.push_str(&ddl_ident_in(to, dialect));
-                hit = true;
-            } else {
-                out.push_str(word);
+            match target(word).filter(|_| !is_call) {
+                Some(to) => {
+                    out.push_str(&ddl_ident_in(to, dialect));
+                    hit = true;
+                }
+                None => out.push_str(word),
             }
             continue;
         }
@@ -13852,16 +13883,14 @@ fn repair_tsql_dependents(
     }
     let d = SqlDialect::MsSql;
     let reads = |expr: &str, col: &str| repoint_check_column(expr, col, col, d).is_some();
-    // The expression re-pointed at the columns' new names.
-    let repointed = |expr: &str| {
-        let mut expr = expr.to_string();
-        for (f, t) in altered.iter().filter(|(f, t)| f.name != t.name) {
-            if let Some(e) = repoint_check_column(&expr, &f.name, &t.name, d) {
-                expr = e;
-            }
-        }
-        expr
-    };
+    // The expression re-pointed at the columns' new names, all at once.
+    let moves: Vec<(&str, &str)> = altered
+        .iter()
+        .filter(|(f, t)| f.name != t.name)
+        .map(|(f, t)| (f.name.as_str(), t.name.as_str()))
+        .collect();
+    let repointed =
+        |expr: &str| repoint_check_columns(expr, &moves, d).unwrap_or_else(|| expr.to_string());
     // **Computed columns first**, since what stands on one of them has to come
     // off with it. One is rebuilt when it reads a column the plan renames or
     // changes, and neither the draft's own edit nor its drop already covers it.
@@ -14596,14 +14625,20 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
     // to the edit at all. The other two engines repair this differently or not at
     // all ([`alter_column_disturbs_checks`]); SQLite's repair is the rebuild's,
     // because the rebuild is what writes the declaration.
-    for c in &draft.columns {
-        let Some(was) = c.original.as_deref().filter(|o| **o != c.info.name) else {
-            continue;
-        };
-        for ck in &mut build.check_constraints {
-            if let Some(e) = repoint_check_column(&ck.info.expression, was, &c.info.name, d) {
-                ck.info.expression = e;
-            }
+    //
+    // Every rename at once ([`repoint_check_columns`]): `a → a2` beside `b → a`
+    // applied one after the other would move the old `b` on to `a2`.
+    let moves: Vec<(&str, &str)> = draft
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let was = c.original.as_deref().filter(|o| **o != c.info.name)?;
+            Some((was, c.info.name.as_str()))
+        })
+        .collect();
+    for ck in &mut build.check_constraints {
+        if let Some(e) = repoint_check_columns(&ck.info.expression, &moves, d) {
+            ck.info.expression = e;
         }
     }
     out.extend(create_table_sql(&build, d));
@@ -14720,15 +14755,10 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
             // were, and the table it now goes on has them as they *will be*.
             IndexReplay::Emit if ix.info.predicate.is_some() => {
                 let mut info = ix.info.clone();
-                for c in &draft.columns {
-                    let Some(was) = c.original.as_deref().filter(|o| **o != c.info.name) else {
-                        continue;
-                    };
-                    if let Some(p) = info.predicate.as_deref()
-                        && let Some(e) = repoint_check_column(p, was, &c.info.name, d)
-                    {
-                        info.predicate = Some(e);
-                    }
+                if let Some(p) = info.predicate.as_deref()
+                    && let Some(e) = repoint_check_columns(p, &moves, d)
+                {
+                    info.predicate = Some(e);
                 }
                 out.push(create_index_sql(&info, &original, d));
             }
@@ -16704,11 +16734,11 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
             // back on after, which the emitter already orders that way. Measured
             // live: the drop, the `CHANGE COLUMN` and the add run in one
             // `ALTER TABLE`.
-            let renames: Vec<(String, String)> = changes
+            let renames: Vec<(&str, &str)> = changes
                 .iter()
                 .filter_map(|c| match c {
                     Change::AlterColumn { from, to, .. } if from.name != to.name => {
-                        Some((from.name.clone(), to.name.clone()))
+                        Some((from.name.as_str(), to.name.as_str()))
                     }
                     _ => None,
                 })
@@ -16718,15 +16748,7 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
                 if touched.contains(&ck.name) {
                     continue;
                 }
-                let mut expr = ck.expression.clone();
-                let mut hit = false;
-                for (from, to) in &renames {
-                    if let Some(e) = repoint_check_column(&expr, from, to, dialect) {
-                        expr = e;
-                        hit = true;
-                    }
-                }
-                if hit {
+                if let Some(expr) = repoint_check_columns(&ck.expression, &renames, dialect) {
                     pairs.push(CheckInfo {
                         expression: expr,
                         ..ck.clone()
@@ -17151,12 +17173,15 @@ fn remake_index(
     // A filter is text naming the columns as they were; created again after
     // the renames, it names them as they are. Here and not in `rename_index`,
     // which `diff` also compares the draft through — and the draft keeps the
-    // condition as it was read.
+    // condition as it was read. Every rename at once: one after another, in a
+    // `HashMap`'s order, `a → a2` beside `b → a` moved the old `b` on to `a2`.
     if let Some(p) = again.predicate.as_mut() {
-        for (from, to) in renamed {
-            if let Some(e) = repoint_check_column(p, from, to, SqlDialect::MsSql) {
-                *p = e;
-            }
+        let moves: Vec<(&str, &str)> = renamed
+            .iter()
+            .map(|(from, to)| (from.as_str(), to.as_str()))
+            .collect();
+        if let Some(e) = repoint_check_columns(p, &moves, SqlDialect::MsSql) {
+            *p = e;
         }
     }
     let now = index_name_after(&ix.name, ix_renamed);
@@ -23879,6 +23904,97 @@ mod tests {
             Some("[c]>(0)")
         );
         assert_eq!(repoint_check_column("[qtyx]>(0)", "qty", "q", MsSql), None);
+    }
+
+    /// **SQLite takes all three quote forms for a name**, and a partial
+    /// index's condition is the user's own text, cut verbatim from
+    /// `sqlite_master` — so `"n"` and `[n]` are as much the column as a bare
+    /// `n` or `` `n` ``. Missed, a rename left `"n"` behind, which SQLite's
+    /// double-quoted-string fallback then read as the constant `'n'`.
+    #[test]
+    fn every_sqlite_quote_form_is_repointed() {
+        for (expr, want) in [
+            ("\"n\" IS NOT NULL", "\"cnt\" IS NOT NULL"),
+            ("[n] IS NOT NULL", "\"cnt\" IS NOT NULL"),
+            ("`n` IS NOT NULL", "\"cnt\" IS NOT NULL"),
+            ("n IS NOT NULL", "\"cnt\" IS NOT NULL"),
+        ] {
+            assert_eq!(
+                repoint_check_column(expr, "n", "cnt", Sqlite).as_deref(),
+                Some(want),
+                "{expr}"
+            );
+        }
+        // A string is still not a name.
+        assert_eq!(repoint_check_column("'n' = x", "n", "cnt", Sqlite), None);
+    }
+
+    /// **Where a name ends is `sql::continues_name`'s**: `n$x` is one name on
+    /// every engine, so it is not the column `n`, neither for a rename nor for
+    /// the "does this condition read `n`" probe a drop asks.
+    #[test]
+    fn a_name_running_on_through_a_dollar_is_not_its_prefix() {
+        assert_eq!(repoint_check_column("n$x > 0", "n", "cnt", Sqlite), None);
+        assert_eq!(repoint_check_column("n$x > 0", "n", "n", Sqlite), None);
+        assert_eq!(repoint_check_column("[n#] > 0", "n", "c", MsSql), None);
+        assert_eq!(repoint_check_column("n#t > 0", "n", "c", MsSql), None);
+        assert_eq!(
+            repoint_check_column("n$x > n", "n$x", "m", Postgres).as_deref(),
+            Some("\"m\" > n")
+        );
+    }
+
+    /// **Several renames land at once, never one on top of another.** `a → a2`
+    /// and `b → a` together: a chain of single renames turned the `b` the
+    /// second one had just moved to `a` into `a2` as well, in whichever order a
+    /// `HashMap` handed the pairs out.
+    #[test]
+    fn several_renames_are_one_substitution() {
+        for (renames, want) in [
+            (vec![("a", "a2"), ("b", "a")], "[a2]>(0) AND [a]<(5)"),
+            (vec![("b", "a"), ("a", "a2")], "[a2]>(0) AND [a]<(5)"),
+        ] {
+            assert_eq!(
+                repoint_check_columns("[a]>(0) AND [b]<(5)", &renames, MsSql).as_deref(),
+                Some(want)
+            );
+        }
+        assert_eq!(repoint_check_columns("[c]>(0)", &[("a", "b")], MsSql), None);
+    }
+
+    /// The same chain under a SQL Server **filtered index**, end to end: the
+    /// remade index filters on the columns as they are now, every time — the
+    /// plan is built many times over because the bug was a `HashMap`'s order.
+    #[test]
+    fn a_rename_chain_under_a_filtered_index_filters_the_right_columns() {
+        let t = TableInfo {
+            name: "t".into(),
+            schema: Some("dbo".into()),
+            columns: vec![
+                ms_col("id", "int"),
+                ms_col("a", "int"),
+                ms_col("b", "int"),
+                ms_col("c", "int"),
+            ],
+            indexes: vec![IndexInfo {
+                predicate: Some("([a]>(0) AND [b]<(5))".into()),
+                ..IndexInfo::plain("ix_p", vec!["c"], false)
+            }],
+            ..Default::default()
+        };
+        for _ in 0..16 {
+            let mut d = TableDraft::from_table(&t);
+            d.rename_column(1, "a2");
+            d.rename_column(2, "a");
+            let cs = diff(&t, &d, MsSql);
+            assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+            let stmts = cs.emit();
+            let create = stmts
+                .iter()
+                .find(|s| s.contains("CREATE INDEX [ix_p]"))
+                .unwrap_or_else(|| panic!("{stmts:#?}"));
+            assert!(create.contains("WHERE ([a2]>(0) AND [a]<(5))"), "{create}");
+        }
     }
 
     /// **A column an unchanged check names is renamed around the check**: the
