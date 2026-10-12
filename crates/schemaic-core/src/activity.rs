@@ -1174,6 +1174,15 @@ pub struct LockInfo {
     pub granted: bool,
     /// For a waited-for lock, the sessions holding what it waits on.
     pub blocked_by: Vec<i64>,
+    /// Whether its holder is a **client session** — the kind the Sessions view
+    /// lists and a kill is offered on. The server's own processes take locks
+    /// too: a replica's applier (`system user`), PostgreSQL's parallel and
+    /// autovacuum workers, SQL Server's system spids. Their rows stay visible,
+    /// since they can be what a wait is stuck behind, but killing one stops
+    /// replication or fails a *different* session's statement, so
+    /// [`LockInfo::offers`] answers `false` for them. Each engine's lock query
+    /// computes it with the predicate its sessions query filters on.
+    pub killable: bool,
 }
 
 /// What one *Locks* poll found ([`LockInfo`], ordered and capped by
@@ -1418,36 +1427,91 @@ pub enum KillFrom {
     Locks,
 }
 
-/// The session a kill's confirm names ([`kill_confirm`]): its row in the
-/// sessions snapshot, where there is one.
+/// What a kill's confirm is about ([`kill_subject`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct KillSubject {
+    pub session: SessionInfo,
+    /// For a kill from the *Locks* view, the lock that row showed — the
+    /// confirm's only description of a session known there by its id.
+    pub lock: Option<LockInfo>,
+}
+
+impl KillSubject {
+    /// The confirm's title and body: [`kill_confirm`], plus — for a session
+    /// asked from the *Locks* view — the lock the user right-clicked, so the
+    /// question names something they can check against the row.
+    pub fn confirm(
+        &self,
+        kind: KillKind,
+        dialect: SqlDialect,
+        ours: Option<&str>,
+    ) -> (String, String) {
+        let (title, mut body) = kill_confirm(kind, &self.session, dialect, ours);
+        if let Some(l) = &self.lock {
+            let object = l.object.trim();
+            if !object.is_empty() {
+                let what = if l.granted { "holds" } else { "is waiting for" };
+                body.push_str(&format!(
+                    " Session {} {what} a {} lock on {object}.",
+                    self.session.id, l.mode
+                ));
+            }
+        }
+        (title, body)
+    }
+}
+
+/// The session a kill's confirm names ([`kill_confirm`]), taken from the list
+/// the kill was asked from **as that list is now**.
 ///
-/// **What a miss means depends on the list it was asked from.** From the
-/// sessions list, the row went away between the right-click and the click — a
-/// poll landed, or the session ended — and `None` asks nothing, which is the
-/// outcome the click wanted. From the *Locks* view it means nothing of the
-/// kind: the sessions list is polled only while it is shown, and capped, so a
-/// session holding a lock is routinely absent from it. There the session is
-/// confirmed by its id alone — no user, host or database — rather than the
-/// row offering a Kill that sometimes did nothing.
+/// From the sessions list it is the session's row there; a miss means the row
+/// went away between the right-click and the click — a poll landed, or the
+/// session ended — and `None` asks nothing, which is the outcome the click
+/// wanted.
+///
+/// **From the *Locks* view it is that session's row in the current lock list,
+/// and never the sessions snapshot.** The sessions list is not polled while
+/// Locks is shown, so its row for an id can be minutes old — and SQL Server
+/// hands a spid straight back to the next connection, PostgreSQL reuses pids.
+/// Naming the session from it put "Disconnect alice@app1 on sales?" over a
+/// `KILL` that ended an unrelated ETL connection which had since been given
+/// the same id. So the session is confirmed by its id and the lock the row
+/// shows, which come from the same poll. A miss in the lock list asks nothing,
+/// as a sessions miss does: the lock was released, so the row the user
+/// right-clicked no longer describes anything. A session that holds only
+/// [`LockInfo::killable`]-false locks is a server process, and is not offered.
 pub fn kill_subject(
     sessions: Option<&[SessionInfo]>,
+    locks: Option<&[LockInfo]>,
     id: i64,
     from: KillFrom,
-) -> Option<SessionInfo> {
-    let known = sessions.and_then(|ss| ss.iter().find(|s| s.id == id).cloned());
+) -> Option<KillSubject> {
     match from {
-        KillFrom::Sessions => known,
-        KillFrom::Locks => Some(known.unwrap_or(SessionInfo {
-            id,
-            user: String::new(),
-            client: None,
-            database: None,
-            state: SessionState::Idle,
-            sql: None,
-            seconds: None,
-            blocked_by: Vec::new(),
-            blocks: Vec::new(),
-        })),
+        KillFrom::Sessions => sessions
+            .and_then(|ss| ss.iter().find(|s| s.id == id).cloned())
+            .map(|session| KillSubject {
+                session,
+                lock: None,
+            }),
+        KillFrom::Locks => {
+            // The list is sorted waits first, so a waiting session is
+            // described by what it is stuck on.
+            let lock = locks?.iter().find(|l| l.session == id && l.killable)?;
+            Some(KillSubject {
+                session: SessionInfo {
+                    id,
+                    user: String::new(),
+                    client: None,
+                    database: None,
+                    state: SessionState::Idle,
+                    sql: None,
+                    seconds: None,
+                    blocked_by: Vec::new(),
+                    blocks: Vec::new(),
+                },
+                lock: Some(lock.clone()),
+            })
+        }
     }
 }
 
@@ -1457,12 +1521,60 @@ impl LockInfo {
     /// lock may belong to a session idle in its transaction with nothing
     /// running, so it offers only the kill — the lock row has no session state
     /// to ask [`KillKind::applies_to`] with.
+    ///
+    /// Neither kind on a lock a server process holds ([`LockInfo::killable`]).
     pub fn offers(&self, kind: KillKind) -> bool {
-        match kind {
-            KillKind::Query => !self.granted,
-            KillKind::Session => true,
-        }
+        self.killable
+            && match kind {
+                KillKind::Query => !self.granted,
+                KillKind::Session => true,
+            }
     }
+}
+
+/// The *Locks* view's tally ([`locks_tally`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocksTally {
+    /// "12 locks", or "500+ locks" when the cap cut the list.
+    pub total: String,
+    /// "3 waiting", or `None` when nothing waits.
+    pub waiting: Option<String>,
+}
+
+/// The header figures over one *Locks* poll.
+///
+/// **The `+` goes on the waiting count only when the waits could have been
+/// cut**, which is when every row kept is one: each engine's query sorts the
+/// waits ahead of its `LIMIT`, and [`prepare_locks`] does again before it
+/// truncates, so a capped list of 500 with three waits holds all three. A
+/// "3+ waiting" there told the user there might be more stuck sessions than
+/// the ones listed.
+pub fn locks_tally(list: &LockList) -> LocksTally {
+    let n = list.locks.len();
+    let waiting = list.locks.iter().filter(|l| !l.granted).count();
+    let more = if list.truncated { "+" } else { "" };
+    let waits_cut = list.truncated && waiting == n;
+    LocksTally {
+        total: format!("{n}{more} {}", if n == 1 { "lock" } else { "locks" }),
+        waiting: (waiting > 0)
+            .then(|| format!("{waiting}{} waiting", if waits_cut { "+" } else { "" })),
+    }
+}
+
+/// Does this MySQL-family server publish its locks in
+/// `information_schema.INNODB_LOCKS`, rather than MySQL 8's
+/// `performance_schema.data_locks`?
+///
+/// MariaDB has only the first, MySQL 8 only the second — it removed
+/// `INNODB_LOCKS` when it added `data_locks` in 8.0.1 — and **MySQL 5.7 has only
+/// the first too**, which is what deciding by "is it MariaDB" missed: on 5.7,
+/// and on 5.7-based servers such as Aurora MySQL 2, the Locks view was always
+/// "Table 'performance_schema.data_locks' doesn't exist". A version string this
+/// cannot read is taken as a current MySQL, the server most likely to send one.
+pub fn mysql_locks_in_information_schema(version: &str) -> bool {
+    let flavour = crate::schema::ServerFlavour::parse_version(version);
+    let (major, _) = crate::schema::major_minor(version);
+    flavour.is_mariadb() || (1..8).contains(&major)
 }
 
 /// What a cancelled statement leaves behind, per engine — the second half of
@@ -2853,45 +2965,138 @@ mod tests {
             mode: "X".to_string(),
             granted,
             blocked_by: blocked_by.to_vec(),
+            killable: true,
         }
     }
 
-    /// **A Locks row's session need not be in the sessions snapshot** — that
-    /// list is polled only while it is shown, and capped — so an id it does not
-    /// hold, asked from there, is still a session to confirm by its id. From
-    /// the sessions list the same miss means the row went away between the
-    /// right-click and the click, and nothing is asked.
+    /// **A Locks row's session is confirmed from the lock list it came from,
+    /// as that list is now — never from the sessions snapshot.** That snapshot
+    /// is not polled while Locks is shown, and SQL Server and PostgreSQL reuse
+    /// ids, so its row for the id can be a different, earlier connection: the
+    /// confirm said "alice@app1" over a kill that ended bob's ETL session.
     #[test]
-    fn a_lock_row_kill_names_a_session_the_snapshot_does_not_hold() {
-        let held = [sess(7, SessionState::IdleInTx, 40.0)];
+    fn a_lock_row_kill_names_the_session_from_the_current_lock_list() {
+        // The snapshot's 7 is somebody else by now.
+        let stale = [sess(7, SessionState::IdleInTx, 40.0)];
+        let locks = [lock(7, "dbo.orders", true, &[])];
 
-        let known = kill_subject(Some(&held), 7, KillFrom::Locks).expect("in the snapshot");
-        assert_eq!(known.user, "app", "the snapshot's row, with its who");
-
-        let bare = kill_subject(Some(&held), 1148, KillFrom::Locks).expect("asked by id");
-        assert_eq!(bare.id, 1148);
-        assert_eq!(bare.who(), "—");
-        assert!(bare.sql.is_none() && bare.database.is_none());
-        assert!(
-            kill_subject(None, 1148, KillFrom::Locks).is_some(),
-            "no snapshot at all"
+        let s = kill_subject(Some(&stale), Some(&locks), 7, KillFrom::Locks).expect("listed");
+        assert_eq!(s.session.id, 7);
+        assert!(s.session.user.is_empty(), "named from a stale snapshot");
+        assert!(s.session.database.is_none() && s.session.sql.is_none());
+        assert_eq!(
+            s.lock.as_ref().map(|l| l.object.as_str()),
+            Some("dbo.orders")
         );
 
-        assert!(kill_subject(Some(&held), 1148, KillFrom::Sessions).is_none());
-        assert!(kill_subject(None, 7, KillFrom::Sessions).is_none());
+        // Released since the right-click: nothing left to ask about.
+        assert!(kill_subject(Some(&stale), Some(&locks), 1148, KillFrom::Locks).is_none());
+        assert!(kill_subject(Some(&stale), None, 7, KillFrom::Locks).is_none());
+        assert!(kill_subject(None, Some(&[]), 7, KillFrom::Locks).is_none());
+
+        // A session row is still its row, and a miss there asks nothing.
+        let s = kill_subject(Some(&stale), None, 7, KillFrom::Sessions).expect("a row");
+        assert_eq!(s.session.user, "app");
+        assert!(s.lock.is_none());
+        assert!(kill_subject(Some(&stale), Some(&locks), 1148, KillFrom::Sessions).is_none());
+        assert!(kill_subject(None, Some(&locks), 7, KillFrom::Sessions).is_none());
+    }
+
+    /// A server process's locks are listed and never offered for a kill, so a
+    /// kill asked for one anyway — a stale menu — finds no subject.
+    #[test]
+    fn a_server_process_lock_is_neither_offered_nor_confirmed() {
+        let mut applier = lock(12, "shop.orders", false, &[40]);
+        applier.killable = false;
+        assert!(!applier.offers(KillKind::Session));
+        assert!(!applier.offers(KillKind::Query));
+        let locks = [applier];
+        assert!(kill_subject(None, Some(&locks), 12, KillFrom::Locks).is_none());
     }
 
     /// A session known only by its id is named by it, not by the dash the
-    /// row shows for an unattributable session: "Disconnect —?" asks nothing.
+    /// row shows for an unattributable session: "Disconnect —?" asks nothing —
+    /// and the lock the row showed says which session that is.
     #[test]
     fn a_confirm_for_a_session_known_only_by_id_names_the_id() {
-        let bare = kill_subject(None, 1148, KillFrom::Locks).unwrap();
-        let (title, body) = kill_confirm(KillKind::Session, &bare, SqlDialect::MySql, None);
+        let locks = [lock(1148, "shop.orders", true, &[])];
+        let bare = kill_subject(None, Some(&locks), 1148, KillFrom::Locks).unwrap();
+        let (title, body) = bare.confirm(KillKind::Session, SqlDialect::MySql, None);
         assert_eq!(title, "Kill session 1148");
         assert!(body.starts_with("Disconnect session 1148?"), "{body}");
         assert!(!body.contains('—'), "{body}");
-        let (_, body) = kill_confirm(KillKind::Query, &bare, SqlDialect::Postgres, None);
+        assert!(
+            body.ends_with("Session 1148 holds a X lock on shop.orders."),
+            "{body}"
+        );
+        let waits = [lock(1148, "shop.orders", false, &[7])];
+        let bare = kill_subject(None, Some(&waits), 1148, KillFrom::Locks).unwrap();
+        let (_, body) = bare.confirm(KillKind::Query, SqlDialect::Postgres, None);
         assert!(body.contains("session 1148 is running"), "{body}");
+        assert!(
+            body.contains("is waiting for a X lock on shop.orders"),
+            "{body}"
+        );
+    }
+
+    /// **"N+ waiting" only when the waits themselves could have been cut** —
+    /// every engine sorts the waits ahead of its limit, so a capped list keeps
+    /// them all unless it is nothing but waits.
+    #[test]
+    fn the_locks_tally_marks_the_waits_capped_only_when_they_could_be() {
+        let mut locks: Vec<LockInfo> = (0..MAX_LOCKS as i64)
+            .map(|i| lock(i, "t", i >= 3, &[]))
+            .collect();
+        let list = LockList {
+            locks: locks.clone(),
+            truncated: true,
+            contended_only: false,
+        };
+        let t = locks_tally(&list);
+        assert_eq!(t.total, "500+ locks");
+        assert_eq!(t.waiting.as_deref(), Some("3 waiting"));
+
+        for l in &mut locks {
+            l.granted = false;
+        }
+        let all_waits = LockList {
+            locks,
+            truncated: true,
+            contended_only: false,
+        };
+        assert_eq!(
+            locks_tally(&all_waits).waiting.as_deref(),
+            Some("500+ waiting")
+        );
+
+        let one = LockList {
+            locks: vec![lock(1, "t", true, &[])],
+            truncated: false,
+            contended_only: false,
+        };
+        let t = locks_tally(&one);
+        assert_eq!(t.total, "1 lock");
+        assert_eq!(t.waiting, None);
+        assert_eq!(locks_tally(&LockList::default()).total, "0 locks");
+    }
+
+    /// MySQL 5.7 has `INNODB_LOCKS` and not `data_locks`, as MariaDB does; only
+    /// MySQL 8 has the performance-schema table.
+    #[test]
+    fn mysql_5_7_reads_its_locks_where_mariadb_does() {
+        assert!(mysql_locks_in_information_schema("5.7.44-log"));
+        assert!(mysql_locks_in_information_schema("5.7.12")); // Aurora MySQL 2
+        assert!(mysql_locks_in_information_schema(
+            "10.11.14-MariaDB-1:10.11.14+maria~ubu2204"
+        ));
+        assert!(mysql_locks_in_information_schema("11.8.2-MariaDB"));
+        assert!(!mysql_locks_in_information_schema("8.4.11"));
+        assert!(!mysql_locks_in_information_schema("8.0.36-28"));
+        assert!(!mysql_locks_in_information_schema("9.1.0"));
+        assert!(
+            !mysql_locks_in_information_schema(""),
+            "unreadable: current MySQL"
+        );
     }
 
     /// A waiting lock is a statement stuck inside its wait, so its session has

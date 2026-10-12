@@ -837,17 +837,15 @@ fn session_row(
 /// as a caveat — and, where the engine shows only contended locks, that a
 /// short list is not a lock-free server.
 fn locks_header(list: &activity::LockList) -> floem::AnyView {
-    let n = list.locks.len();
-    let waiting = list.locks.iter().filter(|l| !l.granted).count();
-    let more = if list.truncated { "+" } else { "" };
+    let tally = activity::locks_tally(list);
     let mut parts: Vec<floem::AnyView> = vec![
-        text(format!("{n}{more} {}", plural(n, "lock", "locks")))
+        text(tally.total)
             .style(|s| s.font_size(font_label()).color(theme::text_muted()))
             .into_any(),
     ];
-    if waiting > 0 {
+    if let Some(waiting) = tally.waiting {
         parts.push(
-            text(format!("{waiting}{more} waiting"))
+            text(waiting)
                 .style(|s| s.font_size(font_label()).color(theme::error()))
                 .into_any(),
         );
@@ -1075,14 +1073,15 @@ fn row_menu(
 }
 
 /// A lock row's right-click menu: the same two kills as [`row_menu`], on the
-/// lock's session, asked `KillFrom::Locks` — that session need not be in the
-/// sessions snapshot, and the app confirms it by id when it is not
-/// (`activity::kill_subject`).
+/// lock's session, asked `KillFrom::Locks` — the app confirms it by its id
+/// and the lock, from the current lock list, never from the sessions
+/// snapshot (`activity::kill_subject`).
 ///
 /// *Cancel query* is dimmed on a held lock ([`activity::LockInfo::offers`]):
 /// its session may be idle in its transaction with nothing to cancel, and the
 /// row has no session state to tell. Absent, as on a session row, where the
-/// engine has no statement for it.
+/// engine has no statement for it. Both are dimmed on a lock the server's own
+/// process holds ([`activity::LockInfo::killable`]).
 fn lock_menu(
     l: &activity::LockInfo,
     kill: KillFn,

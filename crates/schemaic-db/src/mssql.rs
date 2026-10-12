@@ -3459,6 +3459,7 @@ pub(crate) async fn fetch_locks(db: &Db) -> Result<schemaic_core::activity::Lock
                 mode: cell(&r, 3),
                 granted: cell(&r, 4) == "1",
                 blocked_by: activity::parse_id_list(&cell(&r, 5)),
+                killable: cell(&r, 6) == "1",
             })
         })
         .collect();
@@ -3500,13 +3501,29 @@ pub(crate) async fn fetch_server_vars(
 /// [`fetch_locks`]' query, its first `limit` rows, waits first — with the
 /// objects' names (`named`), or labelled by database and id where asking for
 /// a name would wait behind the lock being listed.
+///
+/// **A name the server will not give falls back to that label, row by
+/// row.** `OBJECT_NAME` is NULL for an object the login has no metadata
+/// access to — `VIEW SERVER STATE` without being a user of the database — and
+/// for one dropped since the lock was read, and `+` carries a NULL through the
+/// whole concatenation, so the cell came out empty and the search could not
+/// find the lock by its database either.
+///
+/// **The last column is [`schemaic_core::activity::LockInfo::killable`]**: the session is a
+/// user process, the test the sessions list filters on. A system spid can
+/// hold a lock (and `KILL` refuses it, Msg 6107), so it is listed with no
+/// kill offered.
 fn locks_sql(limit: usize, named: bool) -> String {
     let object = if named {
-        "WHEN l.resource_type = 'OBJECT' THEN DB_NAME(l.resource_database_id) + '.' \
+        "WHEN l.resource_type = 'OBJECT' THEN COALESCE(DB_NAME(l.resource_database_id) + '.' \
            + OBJECT_SCHEMA_NAME(l.resource_associated_entity_id, l.resource_database_id) \
-           + '.' + OBJECT_NAME(l.resource_associated_entity_id, l.resource_database_id) \
-         WHEN p.object_id IS NOT NULL THEN DB_NAME(l.resource_database_id) + '.' \
-           + OBJECT_SCHEMA_NAME(p.object_id) + '.' + OBJECT_NAME(p.object_id) \
+           + '.' + OBJECT_NAME(l.resource_associated_entity_id, l.resource_database_id), \
+           ISNULL(DB_NAME(l.resource_database_id), '') + ': object ' \
+           + CAST(l.resource_associated_entity_id AS varchar(20))) \
+         WHEN p.object_id IS NOT NULL THEN COALESCE(DB_NAME(l.resource_database_id) + '.' \
+           + OBJECT_SCHEMA_NAME(p.object_id) + '.' + OBJECT_NAME(p.object_id), \
+           ISNULL(DB_NAME(l.resource_database_id), '') + ': object ' \
+           + CAST(p.object_id AS varchar(20))) \
            + ISNULL(' ' + NULLIF(RTRIM(l.resource_description), ''), '')"
     } else {
         "WHEN l.resource_type = 'OBJECT' THEN DB_NAME(l.resource_database_id) \
@@ -3529,9 +3546,11 @@ fn locks_sql(limit: usize, named: bool) -> String {
            END, \
            l.resource_type, l.request_mode, \
            CASE WHEN l.request_status = 'GRANT' THEN '1' ELSE '0' END, \
-           CAST(w.blocking_session_id AS varchar(20)) \
+           CAST(w.blocking_session_id AS varchar(20)), \
+           CASE WHEN s.is_user_process = 1 THEN '1' ELSE '0' END \
          FROM sys.dm_tran_locks l \
          {partitions} \
+         LEFT JOIN sys.dm_exec_sessions s ON s.session_id = l.request_session_id \
          LEFT JOIN sys.dm_os_waiting_tasks w ON w.resource_address = l.lock_owner_address \
            AND w.blocking_session_id IS NOT NULL \
          WHERE l.request_session_id > 0 AND l.request_session_id <> @@SPID \
@@ -5833,6 +5852,19 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name `OBJECT_NAME` will not give — no metadata access, or dropped
+    /// since — must not blank the whole cell: every named concatenation sits
+    /// under a `COALESCE` whose fallback is the database-and-id label.
+    #[test]
+    fn a_lock_object_the_server_will_not_name_keeps_its_database_and_id() {
+        let sql = locks_sql(501, true);
+        let named = sql.matches("OBJECT_NAME(").count();
+        assert_eq!(named, 2, "{sql}");
+        assert_eq!(sql.matches("COALESCE(DB_NAME(").count(), named, "{sql}");
+        assert_eq!(sql.matches(": object ").count(), named, "{sql}");
+        assert!(!locks_sql(501, false).contains("OBJECT_NAME("));
+    }
 
     fn xs_row(cells: &[Option<&str>]) -> Vec<Option<String>> {
         let mut r: Vec<Option<String>> =

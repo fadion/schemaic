@@ -1829,6 +1829,7 @@ pub(crate) async fn fetch_locks(db: &Db) -> Result<activity::LockList, DbError> 
                 blocked_by: opt(r, 5)
                     .map(|s| activity::parse_id_list(&s))
                     .unwrap_or_default(),
+                killable: opt(r, 6).as_deref() == Some("t"),
             })
         })
         .collect();
@@ -1869,6 +1870,14 @@ pub(crate) async fn fetch_server_vars(
 /// `LIMIT ` for the caller's bound. A granted `virtualxid` is every
 /// transaction's lock on itself and says nothing; a waited-for one is the
 /// `CREATE INDEX CONCURRENTLY` kind of wait and stays.
+///
+/// **The last column is [`activity::LockInfo::killable`]**, by the test
+/// `PG_ACTIVITY_SQL` admits a session with: a parallel query's workers and the
+/// autovacuum workers hold locks under pids of their own (measured on 16: two
+/// `parallel worker` pids each holding `AccessShareLock`), and terminating a
+/// worker fails its *leader's* statement — a different session from the one a
+/// confirm would name. A lock whose pid has no `pg_stat_activity` row any more
+/// is not offered either.
 const PG_LOCKS_SQL: &str = "SELECT l.pid::text, \
      CASE \
        WHEN l.relation IS NOT NULL AND l.database = \
@@ -1881,8 +1890,12 @@ const PG_LOCKS_SQL: &str = "SELECT l.pid::text, \
        WHEN l.locktype = 'advisory' THEN 'advisory ' || l.classid::text || ':' || l.objid::text \
        ELSE l.locktype END, \
      l.locktype, l.mode, l.granted, \
-     CASE WHEN NOT l.granted THEN pg_blocking_pids(l.pid)::text END \
+     CASE WHEN NOT l.granted THEN pg_blocking_pids(l.pid)::text END, \
+     COALESCE(a.backend_type = 'client backend' \
+       OR (a.backend_type IS NULL AND a.usename IS NOT NULL AND a.datname IS NOT NULL), \
+       false) \
      FROM pg_locks l LEFT JOIN pg_database d ON d.oid = l.database \
+     LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
      WHERE l.pid IS NOT NULL AND l.pid <> pg_backend_pid() \
        AND NOT (l.locktype = 'virtualxid' AND l.granted) \
      ORDER BY l.granted, l.pid LIMIT ";

@@ -8410,6 +8410,7 @@ async fn a_lock_wait_lists_the_waiter_and_its_holder() {
             // concurrent `the_lock_list_answers_while_ddl_holds_a_table` does.
             .any(|l| l.granted
                 && l.session == holder_id
+                && l.killable
                 && (l.object.contains(".dbo.t") || l.object.contains(": object "))),
         "the holder's lock on the table: {:?}",
         list.locks

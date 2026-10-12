@@ -5917,7 +5917,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // Usually "the SSH tunnel isn't established yet", which the next
                 // tick resolves. Said out loud rather than left as a permanent
                 // "Loading…", since with auto-refresh off there is no next tick.
+                //
+                // **On the list that is shown, too.** The Locks view draws a
+                // loaded lock list ahead of the sessions state's error, so a
+                // tunnel that dropped under it left the last locks on screen as
+                // if they were current — with a kill from them that did nothing.
                 Err(e) => {
+                    if activity_view.get_untracked() == schemaic_ui::ActivityView::Locks {
+                        activity_locks.set(schemaic_ui::LocksState::Failed(e.clone()));
+                    }
                     activity_state.set(ActivityState::Failed(e));
                     return;
                 }
@@ -6085,20 +6093,33 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let refresh = refresh_activity.clone();
         Rc::new(
             move |id: i64, kind: schemaic_core::activity::KillKind, from| {
-                // The confirm has to name the session, so it is built from the row in
-                // the current snapshot where there is one — and from the id alone
-                // for a Locks row, whose session that list need not hold.
-                let session = activity_state.with_untracked(|st| {
-                    let sessions = match st {
-                        ActivityState::Loaded { sessions, .. } => Some(sessions.as_slice()),
-                        _ => None,
-                    };
-                    schemaic_core::activity::kill_subject(sessions, id, from)
+                // The confirm has to name the session, so it is built from the list
+                // the kill was asked from, as it is now: the session's row, or for a
+                // Locks row its id and lock in the current lock list — never the
+                // sessions snapshot, which is not polled while Locks is shown and
+                // can hold an earlier session under a reused id.
+                let subject = activity_state.with_untracked(|st| {
+                    activity_locks.with_untracked(|lk| {
+                        schemaic_core::activity::kill_subject(
+                            match st {
+                                ActivityState::Loaded { sessions, .. } => Some(sessions.as_slice()),
+                                _ => None,
+                            },
+                            match lk {
+                                schemaic_ui::LocksState::Loaded(list) => {
+                                    Some(list.locks.as_slice())
+                                }
+                                _ => None,
+                            },
+                            id,
+                            from,
+                        )
+                    })
                 });
                 // Gone between the right-click and the click — a poll landed, or the
                 // session ended on its own. Nothing to ask about and nothing left to
                 // kill, which is the outcome the click wanted.
-                let Some(session) = session else {
+                let Some(subject) = subject else {
                     return;
                 };
                 // **The target is resolved now, not when the button is clicked.**
@@ -6111,8 +6132,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // in this panel is generation-guarded against exactly this drift;
                 // capturing the handle is that guard for the one destructive path.
                 let conn_id = active_conn.get_untracked();
-                let Ok(db) = db_for(conn_id) else {
-                    return;
+                // Said, not swallowed: an unreachable connection made the menu
+                // entry do nothing at all.
+                let db = match db_for(conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        activity_kill_error.set(Some(e));
+                        return;
+                    }
                 };
                 // **The shared destructive guard, at the launch.** A connection
                 // marked read-only is the protection with no "Run anyway", and
@@ -6139,8 +6166,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // `user@host` as every other row from that connection, so the modal
                 // was describing the user's own uncommitted work as a stranger's.
                 let ours = (owning_tab)(conn_id, id).map(|t| t.title());
-                let (title, message) =
-                    schemaic_core::activity::kill_confirm(kind, &session, dialect, ours.as_deref());
+                let (title, message) = subject.confirm(kind, dialect, ours.as_deref());
                 let (handle, refresh) = (handle.clone(), refresh.clone());
                 let repair_killed_session = repair_killed_session.clone();
                 confirm.set(Some(Confirm {

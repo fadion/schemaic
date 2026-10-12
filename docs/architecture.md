@@ -9093,7 +9093,7 @@ existing prose was left alone.
     equal to the default is still stored, or moving `DEFAULT_POLL_SECS` would silently move every
     connection someone had deliberately set to the old one.
     **The *Locks* view's model is here too, and is deliberately thinner.** `LockInfo`
-    (`session`/`object`/`kind`/`mode`/`granted`/`blocked_by`) is engine-neutral in its shape, as
+    (`session`/`object`/`kind`/`mode`/`granted`/`blocked_by`/`killable`) is engine-neutral in its shape, as
     `SessionInfo` is, but `kind` and `mode` are the engine's own words — MySQL's `RECORD` and
     `X,REC_NOT_GAP`, PostgreSQL's `transactionid` and `ShareLock`, SQL Server's `KEY` and `U` —
     shown and never interpreted; `object` is whatever the engine can name the lock on, a table with
@@ -9109,20 +9109,42 @@ existing prose was left alone.
     caller asks for, reading both PostgreSQL's array literal (`{5,9}`) and MySQL's `GROUP_CONCAT`
     (`5,9`). The pins are `waiting_locks_lead_and_their_blockers_are_distinct` and
     `a_lock_is_found_by_what_its_row_says`; they arrived with the functions they test, so there was
-    no unfixed tree for them to be watched failing against.
-    **A kill asked from a lock row means something different by a miss**, and `KillFrom` names the
-    list it came from so `kill_subject` — what the app's kill handler looks its confirm's subject up
-    through — can tell. From the sessions list (a row or the lock-wait banner) an id the snapshot no
-    longer holds is a row that went away between the right-click and the click, and `None` asks
-    nothing. From the Locks view it is the ordinary case: the sessions list is polled only while it
-    is shown, and capped, so a lock's session is routinely absent from it, and the subject is a bare
-    `SessionInfo` carrying the id alone — no user, host, database or statement. `kill_confirm` names
-    a session with neither user nor client as `session N` rather than through `who()`, whose em
-    dash made the question "Disconnect —?". `LockInfo::offers` stands in for `applies_to`, which a
-    lock row cannot ask — it carries no session state: *Cancel query* only on a **waiting** lock,
-    a statement stuck in its wait, and *Kill session* always, since a held lock may belong to a
-    session idle in its transaction with nothing to cancel. The pins are
-    `a_lock_row_kill_names_a_session_the_snapshot_does_not_hold`,
+    no unfixed tree for them to be watched failing against. `locks_tally` is the view's header
+    figures — `N locks` and `M waiting`, the first wearing `+` on a capped list and the second
+    **only when every row kept is a wait**, since each engine sorts the waits ahead of its limit and
+    `prepare_locks` again before it cuts, so a capped list of 500 with three waits holds all three;
+    "3+ waiting" there suggested stuck sessions the list did not show
+    (`the_locks_tally_marks_the_waits_capped_only_when_they_could_be`).
+    `mysql_locks_in_information_schema` is which MySQL-family table holds the locks: MariaDB's and
+    **MySQL 5.7's** `INNODB_LOCKS`, MySQL 8's `data_locks`. Deciding by "is it MariaDB" made the view
+    an error on every poll on 5.7 and Aurora MySQL 2 (`mysql_5_7_reads_its_locks_where_mariadb_does`).
+    **`killable` is whether the lock's holder is a client session**, computed by each engine's lock
+    query with the predicate its sessions query filters on. The server's own processes take locks —
+    a replica's applier, PostgreSQL's parallel and autovacuum workers, SQL Server's system spids —
+    and the Sessions view leaves them out because killing one stops replication or fails a different
+    session's statement; their lock rows stay listed, since they can be what a wait is stuck behind,
+    and `LockInfo::offers` answers `false` for both kills on them.
+    **A kill is confirmed from the list it was asked from, as that list is now**, and `KillFrom`
+    names it so `kill_subject` — what the app's kill handler looks its confirm's subject up through,
+    given both the sessions snapshot and the current lock list — can tell. From the sessions list (a
+    row or the lock-wait banner) the subject is the session's row; an id the snapshot no longer
+    holds is a row that went away between the right-click and the click, and `None` asks nothing.
+    **From the Locks view the subject never comes from the sessions snapshot.** That list is not
+    polled while Locks is shown, and SQL Server hands a spid straight back to the next connection
+    (PostgreSQL reuses pids too), so its row for the id could be an earlier, unrelated session: the
+    confirm said "alice@app1" over a kill that ended a later ETL connection given the same id. The
+    subject is a bare `SessionInfo` carrying the id, plus the lock the row showed (`KillSubject`), both
+    from the current lock list; an id it no longer holds, or holds only `killable`-false, asks
+    nothing, as a sessions miss does. `KillSubject::confirm` is `kill_confirm` with a closing
+    sentence naming that lock ("Session 53 holds a X lock on sales.dbo.orders."), which is something
+    the user can check against the row. `kill_confirm` names a session with neither user nor client
+    as `session N` rather than through `who()`, whose em dash made the question "Disconnect —?".
+    `LockInfo::offers` stands in for `applies_to`, which a lock row cannot ask — it carries no
+    session state: *Cancel query* only on a **waiting** lock, a statement stuck in its wait, and
+    *Kill session* on any, since a held lock may belong to a session idle in its transaction with
+    nothing to cancel — and neither on a lock that is not `killable`. The pins are
+    `a_lock_row_kill_names_the_session_from_the_current_lock_list` (seen failing against the
+    snapshot lookup), `a_server_process_lock_is_neither_offered_nor_confirmed`,
     `a_confirm_for_a_session_known_only_by_id_names_the_id` and
     `a_lock_row_offers_a_cancel_only_while_it_waits`.
   - `users.rs` — the **Users and privileges** browser's model: which accounts a server knows, and
@@ -15765,22 +15787,36 @@ existing prose was left alone.
   `CREATE INDEX CONCURRENTLY` kind of wait, stays. MySQL and MariaDB keep their locks in tables
   neither has of the other's — MySQL 8 removed `INNODB_LOCKS`, MariaDB never had
   `performance_schema.data_locks` — so `mysql::fetch_locks` **asks `SELECT @@version` once and
-  decides the flavour through `ServerFlavour::parse_version`** rather than trying one spelling and
+  decides through `activity::mysql_locks_in_information_schema`** (which asks
+  `ServerFlavour::parse_version`) rather than trying one spelling and
   falling back, which is the shape that cost MariaDB a failed query on every sessions poll (above)
   until `wait_graph_is_worth_fetching` learned to skip it. Its first draft decided the flavour with
   a hand-rolled `contains("mariadb")`, and `only_one_function_decides_which_mysql_family_server_this_is`
-  caught it. MySQL 8 (`MY_LOCKS_PS_SQL`) reads `data_locks` and `data_lock_waits` through
+  caught it; it then decided by flavour alone, and **MySQL 5.7** — which has `INNODB_LOCKS` and no
+  `data_locks` — answered every poll with "Table 'performance_schema.data_locks' doesn't exist".
+  MySQL 8 (`MY_LOCKS_PS_SQL`) reads `data_locks` and `data_lock_waits` through
   `performance_schema.threads`, because both name a *performance-schema* thread rather than the
   processlist id a session is known by everywhere else; the object is
-  `schema.table (INDEX) LOCK_DATA`. MariaDB (`MY_LOCKS_IS_SQL`) reads `INNODB_LOCKS` joined to
+  `schema.table (INDEX) LOCK_DATA`. MariaDB and MySQL 5.7 (`MY_LOCKS_IS_SQL`) read `INNODB_LOCKS` joined to
   `INNODB_TRX`: a lock is waiting when it is its transaction's `trx_requested_lock_id`, its blockers
   come through `INNODB_LOCK_WAITS`, and `lock_table` arrives backticked and is shown without them.
-  **MariaDB answers `contended_only = true`**, because `INNODB_LOCKS` lists a lock only while it is
+  **Both answer `contended_only = true`**, because `INNODB_LOCKS` lists a lock only while it is
   waited for or holds up a wait — a quiet list there is not a lock-free server, and the panel says
-  so. SQL Server (`mssql::locks_sql`) reads `sys.dm_tran_locks`. An `OBJECT` lock is named across
+  so. **Every engine's query ends in `LockInfo::killable`, by its sessions query's own filter**:
+  MySQL 8 a `FOREGROUND` thread whose user is neither NULL nor `system user` and whose command is
+  not `Daemon` (on 8.4 `compress_gtid_table` has processlist id 7 and user NULL, and
+  `event_scheduler` is a `Daemon`); MariaDB and 5.7 the same test on the thread's
+  `information_schema.PROCESSLIST` row, LEFT JOINed; PostgreSQL `pg_stat_activity`'s
+  `backend_type = 'client backend'` or the masked-row branch, LEFT JOINed on the pid, so a
+  parallel or autovacuum worker — and a pid gone since — is not offered a kill; SQL Server
+  `sys.dm_exec_sessions.is_user_process`. SQL Server (`mssql::locks_sql`) reads `sys.dm_tran_locks`. An `OBJECT` lock is named across
   databases, `OBJECT_SCHEMA_NAME`/`OBJECT_NAME` taking the database id; a `KEY`, `PAGE`, `RID` or
   `HOBT` lock names a heap or index that `sys.partitions` resolves only in the database this
   connection is in, so elsewhere it shows the database and the engine's own `resource_description`.
+  **Each named concatenation sits under a `COALESCE` whose fallback is the `db: object <id>`
+  label**: `OBJECT_NAME` is NULL for an object the login has no metadata access to, or one dropped
+  since, and `+` carried the NULL through the whole cell, leaving the lock unnamed and unsearchable
+  (`a_lock_object_the_server_will_not_name_keeps_its_database_and_id`).
   Blockers come from `sys.dm_os_waiting_tasks` on `lock_owner_address`, and besides `@@SPID` it
   leaves out every session's granted shared `DATABASE` lock, which is held by existing and would be
   most of the list. **The names are asked for under `SET LOCK_TIMEOUT 1000`, and dropped when they
@@ -15794,7 +15830,9 @@ existing prose was left alone.
   poll's deadline, and pass alone — a load flake, not a wrong answer.
   What the live tests saw (below): MariaDB `db.imp (PRIMARY) 1`, `RECORD` `X`;
   MySQL `RECORD` `X,REC_NOT_GAP` beside a `TABLE` `IX`; PostgreSQL the waiter on `transaction N`,
-  `transactionid` `ShareLock`, with relation and tuple locks on `imp` and `imp_pkey`.
+  `transactionid` `ShareLock`, with relation and tuple locks on `imp` and `imp_pkey`. The same
+  test asserts both sessions' locks are `killable` on every leg, and passed against a MySQL 5.7.44
+  container through the `INNODB_LOCKS` arm.
   **`Db::fetch_server_vars(kind)` is the Server variables viewer's backend**, beside the two above
   and on their terms: it asks `server_vars::supports_server_vars` and, for `VarKind::Status`,
   `supports_status` **before** the engine `match`, and a status list asked of an engine without one
@@ -23533,17 +23571,20 @@ existing prose was left alone.
     `FieldCfg::placeholder_of`, a placeholder read in its own reactive label so the switch relabels
     the box without rebuilding the field. The Locks view paints `LocksState` — `ActivityState`'s shape
     for the other list, `Idle`/`Loaded(Rc<LockList>)`/`Failed` — in three functions. `locks_header`
-    is the tally, from the whole snapshot as the sessions' counts are: `N locks`, then `M waiting`
-    in the error colour and left out at zero, both wearing the `+` on a capped list, then
+    is the tally, from the whole snapshot as the sessions' counts are: `activity::locks_tally`'s
+    `N locks`, then `M waiting` in the error colour and left out at zero (the `+` on the waits only
+    when they could have been cut), then
     "list capped" — and on `contended_only` a line saying the server lists only locks waited for or
     holding up a wait, so MariaDB's short list does not read as a lock-free server. `locks_list`
     filters by `lock_matches`, draws `render_slice`'s front for the sessions list's reason and counts
     the rest, and says which kind of empty it is: no match, no lock waits (where only contended
     locks are listed), or no other session holding a lock. A connection that could not be reached
-    at all is reported on the *sessions* state (`refresh_activity` fails before asking for either
-    list), so the Locks branch reads `ActivityState::Failed` too while its own state is still `Idle`
-    — read as `Idle` alone it said "Loading…" forever with auto-refresh off (found documenting it,
-    before it shipped). `lock_row` is a dot, red while waiting;
+    at all fails `refresh_activity` before it asks for either list; it reports on the *sessions*
+    state, and **on `LocksState` too while Locks is shown** — this view draws a loaded lock list
+    ahead of the sessions state's error, so a tunnel dropping under it left the last locks on
+    screen as current. The Locks branch still reads `ActivityState::Failed` while its own state is
+    `Idle` — read as `Idle` alone it said "Loading…" forever with auto-refresh off (found
+    documenting it, before it shipped). `lock_row` is a dot, red while waiting;
     the session id, "holds" or "waits for", and the engine's kind and mode; the object in mono; and
     "held by …" for a wait. **Right-click offers the lock's session the same two kills as a session
     row** (`lock_menu`, asked `KillFrom::Locks`), reversing a rule this entry used to state. Lock
@@ -23552,10 +23593,11 @@ existing prose was left alone.
     Locks list need not be, so a Kill there would have been a button that sometimes did nothing, and
     the Sessions view's lock-wait banner was the only way to end a blocker. The handler now looks
     the subject up through `activity::kill_subject` with the list the kill came from, and from Locks
-    a miss is confirmed by the id alone (`core::activity`). *Cancel query* is dimmed on a held lock
-    (`LockInfo::offers`: the row has no session state to say whether anything is running), absent
-    where the engine has no statement for it as on a session row, and both kills are dimmed on a
-    read-only connection.
+    confirms it by its id and lock from the current lock list (`core::activity`). *Cancel query* is
+    dimmed on a held lock (`LockInfo::offers`: the row has no session state to say whether anything
+    is running), absent where the engine has no statement for it as on a session row, and both
+    kills are dimmed on a read-only connection and on a lock a server process holds
+    (`LockInfo::killable`).
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
     read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
@@ -29479,8 +29521,11 @@ existing prose was left alone.
   and its transaction alive. The session the confirm names comes from `activity::kill_subject`, told
   which list the kill was asked from (`KillFrom`): from a session row or the banner, an id the
   snapshot no longer holds asks nothing, the row having gone away; from a Locks row it is confirmed
-  by its id alone, that list's session being routinely absent from a snapshot polled only while
-  shown. Everything after the lookup — both guards, the target, the confirm — is the same for both.
+  by its id and the lock the row showed, both read from the **current** `activity_locks` — never
+  from the sessions snapshot, which is not polled while Locks is shown and can hold an earlier
+  session under a reused id — and an id that list no longer holds asks nothing too. Everything
+  after the lookup — both guards, the target, the confirm — is the same for both. A `db_for`
+  failure at the click is said in `activity_kill_error` rather than returning in silence.
   **Opening and saving a tab's `.sql` file** is `TabsActions::open_sql_file`/`save_sql_file`/
   `save_sql_file_as`/`reload_sql_file` (Ctrl+O / Ctrl+S / Ctrl+Shift+S, bound in `NavKeys::handle`
   so they work at the workspace root and inside the editor alike, and offered as Open File / Save

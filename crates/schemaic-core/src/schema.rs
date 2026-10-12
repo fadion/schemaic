@@ -6857,7 +6857,7 @@ pub fn index_disabled_sql(version: &str) -> &'static str {
 /// Both families lead with the numbers and then diverge —
 /// `10.11.14-MariaDB-1:10.11.14+maria~ubu2204`, `8.4.11`, `5.7.44-log` — so the
 /// digits before the second `.` are the whole of what is portable here.
-fn major_minor(version: &str) -> (u32, u32) {
+pub(crate) fn major_minor(version: &str) -> (u32, u32) {
     let mut parts = version.split('.').map(|p| {
         p.chars()
             .take_while(char::is_ascii_digit)

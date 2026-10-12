@@ -1613,6 +1613,17 @@ pub async fn a_lock_wait_lists_the_waiter_and_its_holder(target: &'static Target
         "{}: the waits lead the list",
         target.name
     );
+    // Both are client sessions, so both are offered a kill — the predicate
+    // that keeps the server's own threads out of it must not catch them.
+    assert!(
+        list.locks
+            .iter()
+            .filter(|l| l.session == holder_id || l.blocked_by.contains(&holder_id))
+            .all(|l| l.killable),
+        "{}: a client session's lock is not killable: {:?}",
+        target.name,
+        list.locks
+    );
 
     holder
         .rollback()

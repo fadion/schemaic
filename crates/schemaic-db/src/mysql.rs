@@ -540,14 +540,14 @@ async fn collect_locks(conn: &mut Conn) -> Result<activity::LockList, DbError> {
         .query_first("SELECT @@version")
         .await
         .map_err(|e| DbError::Query(e.to_string()))?;
-    // The one decider of which server this is (see
-    // `only_one_function_decides_which_mysql_family_server_this_is`).
-    let mariadb = version
+    // MariaDB and MySQL 5.7 have `INNODB_LOCKS`, MySQL 8 `data_locks` — never
+    // both, so the version decides rather than an error to fall back on.
+    let in_is = version
         .as_deref()
-        .is_some_and(|v| schemaic_core::schema::ServerFlavour::parse_version(v).is_mariadb());
+        .is_some_and(activity::mysql_locks_in_information_schema);
     let sql = format!(
         "{}{}",
-        if mariadb {
+        if in_is {
             MY_LOCKS_IS_SQL
         } else {
             MY_LOCKS_PS_SQL
@@ -555,6 +555,7 @@ async fn collect_locks(conn: &mut Conn) -> Result<activity::LockList, DbError> {
         activity::MAX_LOCKS + 1
     );
     type Row = (
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -569,7 +570,7 @@ async fn collect_locks(conn: &mut Conn) -> Result<activity::LockList, DbError> {
     let truncated = rows.len() > activity::MAX_LOCKS;
     let locks = rows
         .into_iter()
-        .filter_map(|(id, object, kind, mode, granted, blockers)| {
+        .filter_map(|(id, object, kind, mode, granted, blockers, killable)| {
             Some(activity::LockInfo {
                 session: id?.parse().ok()?,
                 object: object.unwrap_or_default(),
@@ -579,13 +580,14 @@ async fn collect_locks(conn: &mut Conn) -> Result<activity::LockList, DbError> {
                 blocked_by: blockers
                     .map(|s| activity::parse_id_list(&s))
                     .unwrap_or_default(),
+                killable: killable.as_deref() == Some("1"),
             })
         })
         .collect();
     Ok(activity::LockList {
         locks,
         truncated,
-        contended_only: mariadb,
+        contended_only: in_is,
     })
 }
 
@@ -593,6 +595,12 @@ async fn collect_locks(conn: &mut Conn) -> Result<activity::LockList, DbError> {
 /// `LIMIT `. `data_locks` names a *performance-schema* thread, not the
 /// processlist id a session is known by everywhere else, so both it and the
 /// waits' blocking thread go through `threads`.
+///
+/// **The last column is [`activity::LockInfo::killable`]**, by the test
+/// [`MY_PROCESSLIST_SQL`] filters sessions on: the server's own threads — a
+/// replica's applier, `compress_gtid_table` — carry a processlist id here
+/// too (measured on 8.4: id 7, user NULL), and killing the applier stops
+/// replication. `threads` reports their user as NULL or `system user`.
 const MY_LOCKS_PS_SQL: &str = "SELECT CAST(t.PROCESSLIST_ID AS CHAR), \
      CONCAT(l.OBJECT_SCHEMA, '.', l.OBJECT_NAME, \
             IFNULL(CONCAT(' (', l.INDEX_NAME, ')'), ''), IFNULL(CONCAT(' ', l.LOCK_DATA), '')), \
@@ -600,17 +608,25 @@ const MY_LOCKS_PS_SQL: &str = "SELECT CAST(t.PROCESSLIST_ID AS CHAR), \
      (SELECT GROUP_CONCAT(DISTINCT CAST(bt.PROCESSLIST_ID AS CHAR)) \
         FROM performance_schema.data_lock_waits w \
         JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID \
-       WHERE w.REQUESTING_ENGINE_LOCK_ID = l.ENGINE_LOCK_ID) \
+       WHERE w.REQUESTING_ENGINE_LOCK_ID = l.ENGINE_LOCK_ID), \
+     IF(t.TYPE = 'FOREGROUND' AND IFNULL(t.PROCESSLIST_USER, 'system user') <> 'system user' \
+        AND IFNULL(t.PROCESSLIST_COMMAND, 'Daemon') <> 'Daemon', '1', '0') \
      FROM performance_schema.data_locks l \
      JOIN performance_schema.threads t ON t.THREAD_ID = l.THREAD_ID \
      WHERE t.PROCESSLIST_ID IS NOT NULL AND t.PROCESSLIST_ID <> CONNECTION_ID() \
      ORDER BY l.LOCK_STATUS = 'GRANTED', t.PROCESSLIST_ID LIMIT ";
 
-/// MariaDB's: `INNODB_LOCKS`, which holds only the locks that are waited for
-/// or block a wait. A lock is waiting when it is its transaction's
-/// `trx_requested_lock_id`; its blockers are `INNODB_LOCK_WAITS`' holders,
-/// named by their transactions' threads. `lock_table` arrives quoted
-/// (`` `shop`.`orders` ``), and is shown without the backticks.
+/// MariaDB's, and MySQL 5.7's: `INNODB_LOCKS`, which holds only the locks
+/// that are waited for or block a wait. A lock is waiting when it is its
+/// transaction's `trx_requested_lock_id`; its blockers are
+/// `INNODB_LOCK_WAITS`' holders, named by their transactions' threads.
+/// `lock_table` arrives quoted (`` `shop`.`orders` ``), and is shown without
+/// the backticks.
+///
+/// **The last column is [`activity::LockInfo::killable`]**, by
+/// [`MY_PROCESSLIST_SQL`]'s own filter on the thread's `PROCESSLIST` row:
+/// MariaDB's `Slave_SQL` thread holds InnoDB locks under its
+/// `trx_mysql_thread_id` like any client, and is `system user` there.
 const MY_LOCKS_IS_SQL: &str = "SELECT CAST(t.trx_mysql_thread_id AS CHAR), \
      CONCAT(REPLACE(l.lock_table, '`', ''), \
             IFNULL(CONCAT(' (', l.lock_index, ')'), ''), IFNULL(CONCAT(' ', l.lock_data), '')), \
@@ -618,9 +634,11 @@ const MY_LOCKS_IS_SQL: &str = "SELECT CAST(t.trx_mysql_thread_id AS CHAR), \
      (SELECT GROUP_CONCAT(DISTINCT CAST(bt.trx_mysql_thread_id AS CHAR)) \
         FROM information_schema.INNODB_LOCK_WAITS w \
         JOIN information_schema.INNODB_TRX bt ON bt.trx_id = w.blocking_trx_id \
-       WHERE w.requested_lock_id = l.lock_id) \
+       WHERE w.requested_lock_id = l.lock_id), \
+     IF(p.USER IS NOT NULL AND p.USER <> 'system user' AND p.COMMAND <> 'Daemon', '1', '0') \
      FROM information_schema.INNODB_LOCKS l \
      JOIN information_schema.INNODB_TRX t ON t.trx_id = l.lock_trx_id \
+     LEFT JOIN information_schema.PROCESSLIST p ON p.ID = t.trx_mysql_thread_id \
      WHERE t.trx_mysql_thread_id <> CONNECTION_ID() \
      ORDER BY 5, 1 LIMIT ";
 
