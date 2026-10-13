@@ -1586,6 +1586,11 @@ fn diagnostics_with(
 /// describe, which Alt+Enter compares with the buffer before applying a fix
 /// (`intel::current_fix_at`) — a pass lands a debounce and a parse after the
 /// keystroke, and its ranges are the older text's until the next one does.
+///
+/// **The inlay hints ride the same pass** (`intel::insert_value_hints`): the
+/// same text, the same catalog, the same worker, and the same generation
+/// check — so a hint set never lands over text it does not describe, since
+/// any edit after the pass read `sql` bumps `dgen` and drops the delivery.
 #[allow(clippy::too_many_arguments)]
 fn diagnose_in_background(
     syntax: RwSignal<Vec<Diagnostic>>,
@@ -1597,15 +1602,17 @@ fn diagnose_in_background(
     active_db: Option<&str>,
     dialect: SqlDialect,
     syntax_text: RwSignal<String>,
+    hints: inline_diff::HintSignal,
 ) {
     let catalog = crate::completion::build_catalog(db_nodes, active_db);
     let diagnosed = sql.clone();
     let deliver = floem::ext_event::create_ext_action(
         floem::reactive::Scope::current(),
-        move |diags: Vec<Diagnostic>| {
+        move |(diags, hinted): (Vec<Diagnostic>, Vec<intel::InlayHint>)| {
             if dgen.get() == g && syntax.try_get_untracked().is_some() {
                 syntax.set(diags);
                 syntax_text.set(diagnosed);
+                inline_diff::set_hints(hints, hinted);
             }
         },
     );
@@ -1614,7 +1621,8 @@ fn diagnose_in_background(
             let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
             diagnostics_with(&mut cache, &sql, &catalog, dialect)
         };
-        deliver(diags);
+        let hinted = intel::insert_value_hints(&sql, &catalog, dialect);
+        deliver((diags, hinted));
     });
 }
 
@@ -3299,6 +3307,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // lands, so a tab's diagnostics kept from before the pane mounted fix
     // nothing until they are this pane's own.
     let syntax_text: RwSignal<String> = RwSignal::new(String::new());
+    // The pane's inlay hints — the column names on `INSERT … VALUES` — set by
+    // the diagnostics pass and carried through each edit in `.update(…)`.
+    let hints: inline_diff::HintSignal = RwSignal::new(Vec::new());
     // Seed the tab's diagnostics from the text this pane opens on, and re-run when
     // the *catalog* moves under them — unknown-table/unknown-column errors depend
     // on it, so a set computed before introspection landed is stale. Tracks
@@ -3338,6 +3349,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     adb.as_deref(),
                     dia,
                     syntax_text,
+                    hints,
                 );
             });
         });
@@ -5599,13 +5611,27 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // installed at the *end* of the builder chain — see the `use_doc` call after
     // `.update(…)` for why the order is load-bearing.
     let inner_doc = editor.doc();
+    // Hints are baked into each line's cached layout, so a new set — a pass
+    // landing, or an edit carrying them along — has to throw those away, as
+    // `inline_diff::set_preview` explains for the preview. `set_hints` sets only
+    // a set that differs, so an unchanged one costs nothing.
+    {
+        let cache_rev = inner_doc.cache_rev();
+        create_effect(move |first: Option<()>| {
+            hints.track();
+            if first.is_some() {
+                cache_rev.update(|rev| *rev += 1);
+            }
+        });
+    }
     let input = editor
         // `SqlStyling` reads the INNER document deliberately: same rope, same
         // `cache_rev` signal (the wrapper delegates both), and it must not depend
         // on a wrapper installed later in this chain.
         .styling(
             sql_highlight::SqlStyling::new(inner_doc.clone(), dialect, zoom, cmdk.preview)
-                .following_edits(comp.edits, query),
+                .following_edits(comp.edits, query)
+                .with_hints(hints),
         )
         // `smart_tab` makes floem's own Tab insert spaces to the next tab stop.
         // Tab and Shift+Tab are the key handler's (`soft_tab_indent` /
@@ -5700,6 +5726,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     log.record(iv.start, d.base_len - iv.end);
                 }
             });
+            // The hints follow their values through the edit until the next
+            // pass replaces them — never left at offsets the text has moved
+            // out from under (`intel::shift_inlay_hints`).
+            if !hints.with_untracked(Vec::is_empty) {
+                let mut next = hints.get_untracked();
+                for d in upd.deltas() {
+                    let (iv, inserted) = d.summary();
+                    intel::shift_inlay_hints(&mut next, iv.start, iv.end, inserted);
+                }
+                inline_diff::set_hints(hints, next);
+            }
             // **The one copy of the document an edit makes.** Everything below
             // reads `query` when it runs — a debounce at the time it fires — so
             // a burst of keystrokes copies it once each, not once per reader.
@@ -5764,6 +5801,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         active_db.get_untracked().as_deref(),
                         dialect.get_untracked(),
                         syntax_text,
+                        hints,
                     );
                 });
             }
@@ -5863,6 +5901,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             inner_doc,
             cmdk.preview,
             comp.ghost,
+            hints,
             dialect.get_untracked(),
         )) as Rc<dyn floem::views::editor::text::Document>)
         .style(|s| {

@@ -300,6 +300,93 @@ const GHOST_ALPHA: f32 = 0.45;
 /// The editor's one ghost slot — see [`EditorGhost`].
 pub type GhostSignal = RwSignal<Option<EditorGhost>>;
 
+/// The editor's inlay hints (`intel::insert_value_hints`), sorted by offset —
+/// a third phantom this wrapper draws, in front of the values they label.
+/// Carried through each edit by `intel::shift_inlay_hints` and replaced by the
+/// next diagnostics pass, so between the two they are never more than one
+/// edit's arithmetic out of date.
+pub type HintSignal = RwSignal<Vec<schemaic_core::intel::InlayHint>>;
+
+/// How strongly a hint is drawn: dimmer than the ghost, because a hint is
+/// never something to take, only something to read past.
+const HINT_ALPHA: f32 = 0.38;
+
+/// The hints that fall on one line, as `(col, text)` in column order: those in
+/// `hints` (sorted by offset) between `line_start` and the end of `content`,
+/// the line's text without its line ending — and only where the column is
+/// still a character boundary of `content`, for the reason
+/// [`InlineDiffDoc::ghost_on`] checks one.
+pub fn hints_on_line(
+    hints: &[schemaic_core::intel::InlayHint],
+    line_start: usize,
+    content: &str,
+) -> Vec<(usize, String)> {
+    let from = hints.partition_point(|h| h.at < line_start);
+    hints[from..]
+        .iter()
+        .take_while(|h| h.at < line_start + content.len())
+        .map(|h| (h.at - line_start, h))
+        .filter(|(col, _)| content.is_char_boundary(*col))
+        .map(|(col, h)| (col, format!("{}: ", h.label)))
+        .collect()
+}
+
+/// The hints drawn on `line` of `doc`, as `(col, text)` — none while a Ctrl+K
+/// preview is up, which owns the line flow while it is.
+///
+/// **The one answer both halves read**: [`InlineDiffDoc`] draws these as
+/// phantoms and `SqlStyling` moves its colour spans past them, and a hint
+/// one drew and the other did not would slide every colour after it off its
+/// token.
+pub fn drawn_hints(
+    doc: &dyn Document,
+    preview: InlinePreview,
+    hints: HintSignal,
+    line: usize,
+) -> Vec<(usize, String)> {
+    if preview.with_untracked(|p| p.is_some()) {
+        return Vec::new();
+    }
+    hints.with_untracked(|hs| {
+        if hs.is_empty() {
+            return Vec::new();
+        }
+        let rope = doc.rope_text();
+        if line >= rope.num_lines() {
+            return Vec::new();
+        }
+        let content = rope.line_content(line);
+        let content = content.trim_end_matches(['\n', '\r']);
+        hints_on_line(hs, rope.offset_of_line(line), content)
+    })
+}
+
+/// How far phantoms at `(col, len)` push a span of the line's own text that
+/// starts at `col` — the sum of the lengths of those at or before it.
+///
+/// `Styling::apply_attr_styles` is handed the line's columns **before** its
+/// phantoms are folded in, and floem lays the spans it adds over the combined
+/// text; a hint in the middle of the line therefore has to move every span
+/// after it by its length, or the colours slide off their tokens.
+pub fn phantom_shift(spans: &[(usize, usize)], col: usize) -> usize {
+    spans
+        .iter()
+        .take_while(|(at, _)| *at <= col)
+        .map(|(_, len)| len)
+        .sum()
+}
+
+/// Publish `next` as the editor's hints — only when they differ, because the
+/// editor pane answers every change with the `cache_rev` bump [`set_preview`]
+/// explains (hints are baked into each line's layout), and that bump throws
+/// away every cached line layout.
+pub fn set_hints(hints: HintSignal, next: Vec<schemaic_core::intel::InlayHint>) {
+    if hints.with_untracked(|cur| cur == &next) {
+        return;
+    }
+    hints.set(next);
+}
+
 /// Publish `next` as the editor's ghost (`None` clears it), with the
 /// `cache_rev` bump [`set_preview`] explains: a ghost is phantom text too, and
 /// a bare `set` would draw it a keystroke late.
@@ -464,6 +551,9 @@ pub struct InlineDiffDoc {
     /// caret's column rather than off a hunk, and never while a Ctrl+K preview
     /// is up, which owns the editor's phantom space while it is.
     ghost: GhostSignal,
+    /// The inlay hints — drawn only while no Ctrl+K preview is up, which owns
+    /// the line flow while it is.
+    hints: HintSignal,
     dialect: SqlDialect,
 }
 
@@ -472,14 +562,21 @@ impl InlineDiffDoc {
         inner: Rc<dyn Document>,
         preview: InlinePreview,
         ghost: GhostSignal,
+        hints: HintSignal,
         dialect: SqlDialect,
     ) -> Self {
         Self {
             inner,
             preview,
             ghost,
+            hints,
             dialect,
         }
+    }
+
+    /// The hints to draw on `line`, as `(col, text)` — [`drawn_hints`].
+    fn hints_on(&self, line: usize) -> Vec<(usize, String)> {
+        drawn_hints(&*self.inner, self.preview, self.hints, line)
     }
 
     /// The ghost to draw on `line`, as `(col, text)` — none while a Ctrl+K
@@ -597,7 +694,12 @@ impl DocumentPhantom for InlineDiffDoc {
         if let Some(b) = block.filter(|b| !b.before) {
             spans.push((self.inner.rope_text().line_content(line).len(), b.len));
         }
-        // Where `phantom_text` puts it, so the two agree about every column.
+        // Hints, then the ghost, slotted in the order `phantom_text` slots
+        // them, so the two agree about every column.
+        for (at, text) in self.hints_on(line) {
+            let slot = phantom_slot(spans.iter().map(|s| s.0), at);
+            spans.insert(slot, (at, text.len()));
+        }
         if let Some((at, text)) = self.ghost_on(line) {
             let slot = phantom_slot(spans.iter().map(|s| s.0), at);
             spans.insert(slot, (at, text.len()));
@@ -609,6 +711,30 @@ impl DocumentPhantom for InlineDiffDoc {
         // Start from the real document's own phantoms (placeholder, IME preedit)
         // so wrapping never costs the editor either of them.
         let mut out = self.inner.phantom_text(edid, styling, line);
+        // The hints: before each value they label, dimmer than the ghost, and
+        // `Forward`, so a caret at the value's start sits after the label —
+        // next to the text it is about to edit, not in front of words that are
+        // not there.
+        let hints = self.hints_on(line);
+        if !hints.is_empty() {
+            let fg = crate::theme::editor_theme().fg.multiply_alpha(HINT_ALPHA);
+            for (col, text) in hints {
+                let slot = phantom_slot(out.text.iter().map(|p| p.col), col);
+                out.text.insert(
+                    slot,
+                    PhantomText {
+                        kind: PhantomTextKind::InlayHint,
+                        col,
+                        affinity: Some(CursorAffinity::Forward),
+                        text,
+                        font_size: None,
+                        fg: Some(fg),
+                        bg: None,
+                        under_line: None,
+                    },
+                );
+            }
+        }
         // The prediction: dim, at the caret, and `Backward` — floem's own rule
         // for completion phantoms, which keeps the caret *before* the text it
         // has not been given yet (`PhantomText::affinity`).
@@ -765,6 +891,7 @@ mod tests {
             Rc::new(inner),
             cx.create_rw_signal(None),
             ghost_sig,
+            cx.create_rw_signal(Vec::new()),
             SqlDialect::MySql,
         );
         assert_eq!(doc.ghost_on(0), None);
@@ -775,6 +902,77 @@ mod tests {
         // And past the line's end there is nothing to draw either.
         ghost_sig.update(|g| g.as_mut().unwrap().col = 200);
         assert_eq!(doc.ghost_on(0), None);
+    }
+
+    fn hint(at: usize, label: &str) -> schemaic_core::intel::InlayHint {
+        schemaic_core::intel::InlayHint {
+            at,
+            label: label.to_string(),
+        }
+    }
+
+    /// A line's hints are the ones between its start and its end, at their
+    /// columns in it — none past the line's text, and none on a column that
+    /// is no longer a character boundary after an edit the next pass has not
+    /// caught up with.
+    #[test]
+    fn a_line_takes_only_its_own_hints_at_their_columns() {
+        let hs = [hint(2, "x"), hint(12, "a"), hint(15, "b"), hint(30, "z")];
+        assert_eq!(
+            hints_on_line(&hs, 10, "(1, 2)"),
+            [(2, "a: ".to_string()), (5, "b: ".to_string())]
+        );
+        assert!(hints_on_line(&hs, 40, "(9)").is_empty());
+        // Column 1 is inside `é`.
+        assert!(hints_on_line(&[hint(1, "a")], 0, "é").is_empty());
+    }
+
+    /// Asked through the doc floem asks: a hint shows on the line it falls in,
+    /// and never while a Ctrl+K preview owns the line flow.
+    #[test]
+    fn the_doc_draws_hints_on_their_line_and_not_under_a_preview() {
+        let cx = floem::reactive::Scope::new();
+        let text = "SELECT 1;\nINSERT INTO t (a, b) VALUES (1, 2);";
+        let inner = floem::views::editor::text_document::TextDocument::new(cx, text);
+        let at1 = text.find("(1").unwrap() + 1;
+        let at2 = text.find(" 2)").unwrap() + 1;
+        let preview = cx.create_rw_signal(None);
+        let doc = InlineDiffDoc::new(
+            Rc::new(inner),
+            preview,
+            cx.create_rw_signal(None),
+            cx.create_rw_signal(vec![hint(at1, "a"), hint(at2, "b")]),
+            SqlDialect::MySql,
+        );
+        assert!(doc.hints_on(0).is_empty());
+        let line_start = text.find('\n').unwrap() + 1;
+        assert_eq!(
+            doc.hints_on(1),
+            [
+                (at1 - line_start, "a: ".to_string()),
+                (at2 - line_start, "b: ".to_string())
+            ]
+        );
+        preview.set(Some(InlineView::Working(0..1)));
+        assert!(doc.hints_on(1).is_empty());
+    }
+
+    /// A span of the line's own text moves right by every phantom at or before
+    /// its start, and not by one after it.
+    #[test]
+    fn a_span_moves_by_the_phantoms_before_it() {
+        let spans = [(3, 3), (7, 4)];
+        assert_eq!(phantom_shift(&spans, 0), 0);
+        assert_eq!(phantom_shift(&spans, 2), 0);
+        assert_eq!(
+            phantom_shift(&spans, 3),
+            3,
+            "a hint at a token's start precedes it"
+        );
+        assert_eq!(phantom_shift(&spans, 6), 3);
+        assert_eq!(phantom_shift(&spans, 7), 7);
+        assert_eq!(phantom_shift(&spans, 99), 7);
+        assert_eq!(phantom_shift(&[], 5), 0);
     }
 
     fn plan(hunks: Vec<InlineHunk>) -> InlineView {

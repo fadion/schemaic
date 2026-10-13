@@ -192,7 +192,7 @@ pub fn holds_code(text: &str, dialect: SqlDialect) -> bool {
 /// comments (every dialect; nesting per [`SqlDialect::nested_block_comments`] —
 /// ending a PostgreSQL comment at its first `*/` read the rest of it as the
 /// statement, and a quote there as the start of a string that hid the next one).
-fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
+pub(crate) fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     let n = b.len();
     if i >= n {
         return None;

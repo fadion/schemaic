@@ -6292,6 +6292,212 @@ impl Catalog {
     }
 }
 
+// ── Inlay hints ──────────────────────────────────────────────────────────────
+
+/// A label the editor draws **before** byte `at` of the buffer — phantom text,
+/// never part of the document, so nothing a hint says can be copied, run or
+/// saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlayHint {
+    /// The byte the label is drawn in front of.
+    pub at: usize,
+    /// What it says, without the punctuation the renderer adds.
+    pub label: String,
+}
+
+/// The longest statement [`insert_value_hints`] parses. A dump's extended
+/// `INSERT` runs to megabytes, and labelling it costs a parse of the whole of
+/// it on every pass for a hint nobody reads in a dump.
+pub const INSERT_HINT_STATEMENT_CAP: usize = 64 * 1024;
+
+/// How many hints one pass produces before it stops, whatever the document.
+pub const INSERT_HINT_CAP: usize = 2_000;
+
+/// The column each value of an `INSERT … VALUES` row goes into, as hints in
+/// front of the values — `INSERT INTO t (a, b) VALUES (1, 2)` labels `1` with
+/// `a` and `2` with `b`.
+///
+/// **With no column list the columns are the table's**, from the catalogue,
+/// and which of them the row names is the engine's question rather than a
+/// count: a row as long as the table's visible columns names all of them; one
+/// as long as the columns the server does not assign
+/// ([`Catalog::insert_columns_of`]) names those only on an engine whose
+/// implicit list leaves the assigned ones out
+/// ([`lints::implicit_list_skips_assigned`] — SQL Server, SQLite); on
+/// PostgreSQL a shorter row names the table's first columns
+/// ([`lints::short_row_takes_defaults`]), whatever its length. MySQL wants
+/// every column. Any other length is labelled nothing — the diagnostics already say it is wrong,
+/// and a hint there would be a guess. So is a row whose length differs from an
+/// explicit column list, a table the catalogue does not know, and a name two
+/// tables share.
+///
+/// Bounded: a statement past [`INSERT_HINT_STATEMENT_CAP`] is not parsed, and
+/// the pass stops at [`INSERT_HINT_CAP`] hints.
+pub fn insert_value_hints(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<InlayHint> {
+    use sqlparser::ast::{SetExpr, Statement, TableObject};
+    let mut out = Vec::new();
+    for (lo, hi) in crate::sql::statement_ranges(sql, dialect) {
+        let stmt = &sql[lo..hi];
+        if stmt.len() > INSERT_HINT_STATEMENT_CAP || !starts_an_insert(stmt, dialect) {
+            continue;
+        }
+        let Ok(asts) = parse_statements(stmt, dialect) else {
+            continue;
+        };
+        let [Statement::Insert(ins)] = asts.as_slice() else {
+            continue;
+        };
+        let Some(SetExpr::Values(values)) = ins.source.as_ref().map(|s| s.body.as_ref()) else {
+            continue;
+        };
+        let explicit: Vec<String> = ins
+            .columns
+            .iter()
+            .filter_map(|c| c.0.last().and_then(|p| p.as_ident()))
+            .map(|i| i.value.clone())
+            .collect();
+        if explicit.len() != ins.columns.len() {
+            continue;
+        }
+        // A bare INSERT's two candidate lists: every visible column, and the
+        // visible ones the server does not assign.
+        let bare = if explicit.is_empty() {
+            let TableObject::TableName(name) = &ins.table else {
+                continue;
+            };
+            let Some(r) = lints::local_table(name) else {
+                continue;
+            };
+            let (Some(all), Some(needed)) = (catalog.columns_of(&r), catalog.insert_columns_of(&r))
+            else {
+                continue;
+            };
+            let visible = |c: &&String| !catalog.column_invisible(&r, c);
+            let all: Vec<String> = all.iter().filter(visible).cloned().collect();
+            let needed: Vec<String> = needed.into_iter().filter(visible).cloned().collect();
+            Some((all, needed))
+        } else {
+            None
+        };
+        for row in &values.rows {
+            let m = row.content.len();
+            let labels: &[String] = match &bare {
+                None if m == explicit.len() => &explicit,
+                None => continue,
+                Some((all, _)) if m == all.len() => all,
+                Some((_, needed))
+                    if m == needed.len() && lints::implicit_list_skips_assigned(dialect) =>
+                {
+                    needed
+                }
+                Some((all, _)) if m < all.len() && lints::short_row_takes_defaults(dialect) => {
+                    &all[..m]
+                }
+                Some(_) => continue,
+            };
+            let (_, open) = colres::to_range(stmt, lo, row.opening_token.0.span);
+            let (close, _) = colres::to_range(stmt, lo, row.closing_token.0.span);
+            let starts = row_item_starts(sql, open, close, dialect);
+            if m == 0 || starts.len() != m {
+                continue;
+            }
+            for (at, label) in starts.into_iter().zip(labels) {
+                if out.len() >= INSERT_HINT_CAP {
+                    return out;
+                }
+                out.push(InlayHint {
+                    at,
+                    label: label.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Carry `hints` through one edit — `start..end` of the old text replaced by
+/// `inserted` bytes — so they stay on their values until the next pass
+/// replaces them.
+///
+/// A hint before the edit stays; one at or after its end moves with the text
+/// it labels (a hint *at* an insertion point follows the value the insertion
+/// pushed right); one inside the replaced text has lost its value and goes.
+pub fn shift_inlay_hints(hints: &mut Vec<InlayHint>, start: usize, end: usize, inserted: usize) {
+    hints.retain_mut(|h| {
+        if h.at < start {
+            true
+        } else if h.at >= end {
+            h.at = h.at - end + start + inserted;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Does `stmt` open with `INSERT` (or MySQL's `REPLACE`, the same grammar),
+/// past any comment before it? The cheap question asked before a parse.
+fn starts_an_insert(stmt: &str, dialect: SqlDialect) -> bool {
+    let b = stmt.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+        } else if let Some(j) = crate::sql::skip_comment(b, i, dialect) {
+            i = j;
+        } else {
+            break;
+        }
+    }
+    let word_end = (i..b.len())
+        .find(|&j| !crate::sql::is_word_byte(b[j]))
+        .unwrap_or(b.len());
+    let word = &stmt[i..word_end];
+    word.eq_ignore_ascii_case("INSERT") || word.eq_ignore_ascii_case("REPLACE")
+}
+
+/// Where each item of a `VALUES` row begins, between its parentheses
+/// (`sql[open..close]`, the parens themselves outside): the first byte after
+/// `(` or a top-level `,` that is neither space nor comment. Over
+/// [`crate::sql::skip_noncode`], so a comma inside a string, a quoted name or a
+/// nested call does not start an item — and lexical rather than read off the
+/// AST, whose span for `-1` starts at the `1`.
+fn row_item_starts(sql: &str, open: usize, close: usize, dialect: SqlDialect) -> Vec<usize> {
+    let b = sql.as_bytes();
+    let close = close.min(b.len());
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut expecting = true;
+    let mut i = open;
+    while i < close {
+        if let Some(j) = crate::sql::skip_comment(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if expecting {
+            out.push(i);
+            expecting = false;
+        }
+        if let Some(j) = crate::sql::skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => expecting = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 // ── Diagnostics ──────────────────────────────────────────────────────────────
 
 /// A diagnostic's severity — drives the squiggle colour.
@@ -13714,9 +13920,22 @@ mod lints {
         }
     }
 
+    /// Does `dialect`'s implicit column list — a bare `INSERT`'s — **leave out
+    /// the columns the server assigns**, so a row of just the others names
+    /// them? SQL Server leaves out an identity or computed column, SQLite a
+    /// generated one. MySQL lists every column, `AUTO_INCREMENT` included,
+    /// and PostgreSQL's list is the table's in order, a short row naming its
+    /// first columns ([`short_row_takes_defaults`]).
+    pub(super) fn implicit_list_skips_assigned(dialect: SqlDialect) -> bool {
+        match dialect {
+            SqlDialect::MsSql | SqlDialect::Sqlite => true,
+            SqlDialect::MySql | SqlDialect::Postgres => false,
+        }
+    }
+
     /// A one- or two-part table name as the catalogue is asked about it;
     /// `None` for a three-part one, which may be another database's.
-    fn local_table(name: &sqlparser::ast::ObjectName) -> Option<TableRef> {
+    pub(super) fn local_table(name: &sqlparser::ast::ObjectName) -> Option<TableRef> {
         let (db, table) = match super::object_name_parts(name).as_slice() {
             [t] => (None, t.clone()),
             [q, t] => (Some(q.clone()), t.clone()),
@@ -26450,6 +26669,183 @@ mod tests {
         );
         // Named in a column list, it is an ordinary column.
         assert!(errs("INSERT INTO z_inv (a, b, r) VALUES (1, 2, 3);").is_empty());
+    }
+
+    // -- Inlay hints on INSERT … VALUES ----------------------------------------
+
+    /// Each hint as `label@the text from its byte to the next space or comma`.
+    fn hints(sql: &str, cat: &Catalog, d: SqlDialect) -> Vec<String> {
+        insert_value_hints(sql, cat, d)
+            .into_iter()
+            .map(|h| {
+                let rest = &sql[h.at..];
+                let end = rest.find([',', ')', ' ']).unwrap_or(rest.len());
+                format!("{}@{}", h.label, &rest[..end])
+            })
+            .collect()
+    }
+
+    fn hint_catalog() -> Catalog {
+        let mut events = tbl("Events", &["id", "Name", "at"]);
+        events.columns[0].auto_increment = true;
+        let mut inv = tbl("z_inv", &["a", "b", "r"]);
+        inv.columns[2].invisible = true;
+        let schema = DbSchema {
+            tables: vec![events, inv],
+            ..Default::default()
+        };
+        Catalog::build(&[("company", &schema)], Some("company"))
+    }
+
+    #[test]
+    fn an_insert_with_a_column_list_labels_each_value_with_its_column() {
+        let cat = Catalog::build(&[], None);
+        let sql = "INSERT INTO t (a, `b c`) VALUES (1, 'x, y'), (-2, f(3, 4));";
+        assert_eq!(
+            hints(sql, &cat, SqlDialect::MySql),
+            ["a@1", "b c@'x", "a@-2", "b c@f(3"]
+        );
+    }
+
+    #[test]
+    fn a_hint_sits_on_the_value_not_on_a_comment_or_space_before_it() {
+        let cat = Catalog::build(&[], None);
+        let sql = "INSERT INTO t (a, b) VALUES (  /* first */ 1,\n   -- second\n   2);";
+        let hs = insert_value_hints(sql, &cat, SqlDialect::Postgres);
+        let at: Vec<&str> = hs.iter().map(|h| &sql[h.at..h.at + 1]).collect();
+        assert_eq!(at, ["1", "2"]);
+    }
+
+    #[test]
+    fn a_row_whose_length_is_wrong_is_not_labelled() {
+        let cat = Catalog::build(&[], None);
+        let sql = "INSERT INTO t (a, b) VALUES (1), (2, 3), (4, 5, 6);";
+        assert_eq!(hints(sql, &cat, SqlDialect::MySql), ["a@2", "b@3"]);
+    }
+
+    #[test]
+    fn a_bare_insert_takes_its_labels_from_the_catalogue() {
+        let cat = hint_catalog();
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            // As long as the table: every column, in the catalogue's case.
+            assert_eq!(
+                hints("INSERT INTO events VALUES (1, 'a', 2);", &cat, d),
+                ["id@1", "Name@'a'", "at@2"],
+                "{d:?}"
+            );
+            // As long as what the server does not assign: those columns where
+            // the engine's implicit list leaves the assigned one out (SQL
+            // Server, SQLite); the first columns where a short row takes
+            // defaults (PostgreSQL, which puts 'a' in `id`); nothing where the
+            // row is refused (MySQL).
+            let want: &[&str] = match d {
+                SqlDialect::MsSql | SqlDialect::Sqlite => &["Name@'a'", "at@2"],
+                SqlDialect::Postgres => &["id@'a'", "Name@2"],
+                SqlDialect::MySql => &[],
+            };
+            assert_eq!(
+                hints("INSERT INTO events VALUES ('a', 2);", &cat, d),
+                want,
+                "{d:?}"
+            );
+            // An unknown table is labelled nothing.
+            assert!(hints("INSERT INTO nosuch VALUES (1);", &cat, d).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_short_bare_row_names_the_first_columns_only_where_the_engine_says_so() {
+        let cat = hint_catalog();
+        let sql = "INSERT INTO events VALUES (7);";
+        assert_eq!(hints(sql, &cat, SqlDialect::Postgres), ["id@7"]);
+        assert!(hints(sql, &cat, SqlDialect::MySql).is_empty());
+    }
+
+    #[test]
+    fn a_bare_insert_leaves_an_invisible_column_out_of_its_labels() {
+        let cat = hint_catalog();
+        assert_eq!(
+            hints("INSERT INTO z_inv VALUES (1, 2);", &cat, SqlDialect::MySql),
+            ["a@1", "b@2"]
+        );
+    }
+
+    #[test]
+    fn only_insert_values_is_labelled() {
+        let cat = hint_catalog();
+        for sql in [
+            "SELECT 1, 2;",
+            "INSERT INTO events (id) SELECT 1;",
+            "UPDATE events SET id = 1;",
+            "INSERT INTO events (id, Name VALUES (1",
+        ] {
+            assert!(hints(sql, &cat, SqlDialect::MySql).is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn replace_into_and_a_script_of_several_statements_are_labelled() {
+        let cat = Catalog::build(&[], None);
+        let sql = "SELECT 1;\nREPLACE INTO t (a) VALUES (1);\nINSERT INTO u (b) VALUES (2)";
+        assert_eq!(hints(sql, &cat, SqlDialect::MySql), ["a@1", "b@2"]);
+    }
+
+    #[test]
+    fn a_hint_follows_its_value_through_an_edit() {
+        let h = |at| InlayHint {
+            at,
+            label: format!("c{at}"),
+        };
+        let shifted = |start, end, inserted| {
+            let mut hs = vec![h(5), h(10), h(20)];
+            shift_inlay_hints(&mut hs, start, end, inserted);
+            hs.iter()
+                .map(|x| (x.label.clone(), x.at))
+                .collect::<Vec<_>>()
+        };
+        let pairs = |v: &[(&str, usize)]| {
+            v.iter()
+                .map(|(l, a)| (l.to_string(), *a))
+                .collect::<Vec<_>>()
+        };
+        // Typed after the last: nothing moves.
+        assert_eq!(
+            shifted(25, 25, 3),
+            pairs(&[("c5", 5), ("c10", 10), ("c20", 20)])
+        );
+        // Typed right at a value's start: the value moves, and its label with it.
+        assert_eq!(
+            shifted(10, 10, 2),
+            pairs(&[("c5", 5), ("c10", 12), ("c20", 22)])
+        );
+        // A deletion before them pulls them left.
+        assert_eq!(
+            shifted(0, 3, 0),
+            pairs(&[("c5", 2), ("c10", 7), ("c20", 17)])
+        );
+        // A replacement over a value loses that value's label only.
+        assert_eq!(shifted(8, 12, 1), pairs(&[("c5", 5), ("c20", 17)]));
+    }
+
+    #[test]
+    fn the_hint_pass_is_bounded() {
+        let cat = Catalog::build(&[], None);
+        let big = format!(
+            "INSERT INTO t (a) VALUES {};",
+            vec!["(1)"; INSERT_HINT_STATEMENT_CAP / 4].join(",")
+        );
+        assert!(big.len() > INSERT_HINT_STATEMENT_CAP);
+        assert!(insert_value_hints(&big, &cat, SqlDialect::MySql).is_empty());
+        let many = "INSERT INTO t (a, b) VALUES (1, 2);\n".repeat(INSERT_HINT_CAP);
+        assert_eq!(
+            insert_value_hints(&many, &cat, SqlDialect::MySql).len(),
+            INSERT_HINT_CAP
+        );
     }
 
     /// A comma join with no `WHERE` at all combines every row with every row.

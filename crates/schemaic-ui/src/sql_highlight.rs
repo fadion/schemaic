@@ -93,6 +93,11 @@ pub struct SqlStyling {
     /// by counting the phantom rows the document emitted, so a second source of
     /// truth would paint bands over the wrong lines.
     preview: crate::inline_diff::InlinePreview,
+    /// The inlay hints the [`InlineDiffDoc`](crate::inline_diff::InlineDiffDoc)
+    /// draws in the middle of a line ([`SqlStyling::with_hints`]) — read here to
+    /// move the colour spans after each one past it
+    /// (`inline_diff::drawn_hints`, the answer both halves share).
+    hints: Option<crate::inline_diff::HintSignal>,
     /// The tab editor's edit log and its text ([`SqlStyling::following_edits`]):
     /// with them the caches below are keyed on the text's own revision and
     /// taken forward over the edits the log records, borrowing the text — no
@@ -212,6 +217,7 @@ impl SqlStyling {
             dialect,
             zoom,
             preview,
+            hints: None,
             edits: None,
             block_lines: RefCell::new(None),
             bracket_lines: RefCell::new(None),
@@ -239,6 +245,13 @@ impl SqlStyling {
         text: RwSignal<String>,
     ) -> Self {
         self.edits = Some((log, text));
+        self
+    }
+
+    /// Move the colour spans past the inlay hints the editor's document draws
+    /// from `hints` (see the field's doc).
+    pub fn with_hints(mut self, hints: crate::inline_diff::HintSignal) -> Self {
+        self.hints = Some(hints);
         self
     }
 
@@ -486,6 +499,17 @@ impl Styling for SqlStyling {
                 crate::inline_diff::block_at(v, line).map_or(0, |b| b.prefix_len()),
             )
         });
+        // Inlay hints sit *inside* the line, so each span moves by the hints at
+        // or before its start (`inline_diff::phantom_shift`). None are drawn
+        // while a preview is up, so this and `shift` never both apply.
+        let hint_spans: Vec<(usize, usize)> = self
+            .hints
+            .map(|h| crate::inline_diff::drawn_hints(&*self.doc, self.preview, h, line))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(col, text)| (col, text.len()))
+            .collect();
+        let at = |col: usize| shift + crate::inline_diff::phantom_shift(&hint_spans, col);
         let tint = |c: Color| match fade {
             Some(a) => c.multiply_alpha(a),
             None => c,
@@ -496,7 +520,7 @@ impl Styling for SqlStyling {
         // in the middle of a faded row.
         if faded {
             attrs.add_span(
-                shift..shift + content.len(),
+                shift..at(content.len()) + content.len(),
                 // The editor theme's own foreground — the same value
                 // `editor_pane` feeds the editor as its base text colour.
                 default.color(tint(crate::theme::editor_theme().fg)),
@@ -507,7 +531,8 @@ impl Styling for SqlStyling {
         let dialect = self.dialect.get_untracked();
         let brackets = crate::theme::editor_rainbow_brackets().then(|| self.depth_at(line));
         for (start, end, tok) in lex_line_with(&content, dialect, carry, brackets) {
-            attrs.add_span(shift + start..shift + end, default.color(tint(tok.color())));
+            let by = at(start);
+            attrs.add_span(by + start..by + end, default.color(tint(tok.color())));
         }
     }
 

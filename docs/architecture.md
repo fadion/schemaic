@@ -1093,6 +1093,39 @@ existing prose was left alone.
     a table the catalogue does not know, a name two tables share (`is_union`) and a three-part name.
     Nor is a bare name the statement declares as a CTE (`ast_scope::collect_statement`'s list, the
     one the table check reads): the catalogue's table of that name is not what the subquery reads.
+    **Inlay hints name the column each `INSERT … VALUES` item goes into** — `insert_value_hints`
+    → `Vec<InlayHint { at, label }>`, a label the editor draws in front of byte `at` as phantom text
+    (under `inline_diff.rs`), so nothing a hint says can be copied, run or saved. Per
+    `sql::statement_ranges` range it asks the cheap `starts_an_insert` first — `INSERT` or MySQL's
+    `REPLACE`, past any comment (`sql::skip_comment`, `pub(crate)` for it) — then parses, and labels
+    only a lone `Statement::Insert` whose source is `VALUES`. With a column list the labels are the
+    list, and a row of another length is labelled nothing. **With none they are the catalogue's, and
+    which columns a row names is the engine's question**, asked more exactly than
+    `bare_insert_row_lengths` above asks it, since a label names a column where a length check only
+    counts: the visible columns (`columns_of` less `column_invisible`) for a row as long as all of
+    them; the visible `insert_columns_of` for a row as long as those **only where
+    `lints::implicit_list_skips_assigned`** — SQL Server, which leaves an identity or computed column
+    out of the implicit list, and SQLite a generated one; the first m where
+    `lints::short_row_takes_defaults` (PostgreSQL, whose list is the table's in order) for any
+    shorter row; and nothing for any other length — MySQL lists every column, `AUTO_INCREMENT`
+    included, and refuses a short row. So `INSERT INTO events VALUES ('a', 2)` over a
+    server-assigned `id` is `Name`, `at` on SQL Server and SQLite, `id`, `Name` on PostgreSQL (where
+    the server does put `'a'` in `id`) and unlabelled on MySQL
+    (`a_bare_insert_takes_its_labels_from_the_catalogue`). A hint on a row the engine refuses would
+    be a guess. A table the catalogue does not know, a name two tables share and a three-part name
+    (`lints::local_table`, `pub(super)` for it) get none.
+    **Where an item starts is lexical, not the AST's**: `row_item_starts` walks between the row's
+    paren spans (`colres::to_range`) over `skip_comment` and `skip_noncode`, counting bracket depth,
+    and takes the first code byte after the `(` or a top-level `,` — the expression's own span for
+    `-1` starts at the `1`. A row whose walk counts other than its AST items is labelled nothing.
+    Two bounds (`the_hint_pass_is_bounded`): `INSERT_HINT_STATEMENT_CAP` (64 KiB), past which a
+    statement is not parsed, since a dump's extended `INSERT` runs to megabytes and labelling it
+    would cost a parse of the whole of it every pass for a hint nobody reads in a dump; and
+    `INSERT_HINT_CAP`, 2,000 hints a pass whatever the document. `shift_inlay_hints(hints, start,
+    end, inserted)` carries a set through one edit until the next pass replaces it: a hint before the
+    edit stays, one at or after its end moves with its text, and one inside the replaced text has lost
+    its value and goes — so a hint *at* a pure insertion point follows the value the insertion pushed
+    right (`a_hint_follows_its_value_through_an_edit`).
     **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres` and `lints`, which use sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. **A base table exposes more than
@@ -26587,6 +26620,15 @@ existing prose was left alone.
     and is set on `syntax` **only if its generation is still the pane's latest** (`diag_gen`) and
     the tab still lives, so a pass overtaken by typing never paints over a newer one; the status bar
     goes on reading `Tab::diagnostics`.
+    **The inlay hints ride the same pass** (`intel::insert_value_hints`, under `intel.rs`): the
+    worker computes them after the diagnostics, over the same text and the same catalog, and the two
+    come back as one `(diags, hints)` delivery under the one generation check — so a hint set never
+    lands over text it does not describe, any later edit having bumped `diag_gen`. Between passes
+    the `.update(…)` callback carries the pane's `hints` through each delta (`d.summary()` →
+    `intel::shift_inlay_hints`). An effect on `hints`, created once `inner_doc` exists, bumps its
+    `cache_rev`, since hints are baked into the cached line layouts (the Floem gotcha on phantom
+    text); it skips its first run, and `inline_diff::set_hints` leaves an unchanged set unwritten, so
+    a pass that finds nothing new discards no layout. Nothing gates them — there is no setting.
     **A failed run's squiggle is `run_diag`, a sibling of live validation's `db_diag`** rather than
     an entry in it, because validation `set`s `db_diag` whole and would wipe it. Every launch — the
     selection and lone-statement Ctrl+Enter, the run menu's two entries, the play button — records
@@ -27433,8 +27475,8 @@ existing prose was left alone.
     `dyn_container`, where it is in scope.
   - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
     it replaces stay where they are, faded, and the lines it proposes appear directly below them,
-    pushing the rest of the document down. They are Floem *phantom text* (the facility inlay hints
-    use), so **the rope is never touched** — `doc.text()` keeps returning the user's own SQL for the
+    pushing the rest of the document down. They are Floem *phantom text* (the facility the editor's
+    inlay hints use too, below), so **the rope is never touched** — `doc.text()` keeps returning the user's own SQL for the
     whole preview, and tab autosave, Ctrl+Enter, live validation, completion and the outline all
     keep seeing the buffer the user actually has. Splicing the diff into the rope would have been
     far less code and would have put text the user never wrote in front of every one of them.
@@ -27582,6 +27624,28 @@ existing prose was left alone.
     agree. That span is the ghost's own text length at its column, as the one `PhantomText`
     `phantom_text` inserts there — the two must stay in step, since a phantom drawn but not
     counted would put every caret column after the ghost out by its length.
+    **The inlay hints are a third phantom on the same wrapper** (`intel::insert_value_hints`, under
+    `intel.rs`), held in a `HintSignal` — `RwSignal<Vec<InlayHint>>`, sorted by offset — that
+    `InlineDiffDoc::new` takes beside the ghost. `phantom_text` draws each as a
+    `PhantomTextKind::InlayHint` reading `"{label}: "`, in `editor_theme().fg` at `HINT_ALPHA` (0.38,
+    dimmer than the ghost: a hint is read past, never taken), with `affinity:
+    Some(CursorAffinity::Forward)`, so a caret at the value's start sits after the label, next to the
+    text it is about to edit. **Which hints a line draws is `drawn_hints`, and both halves read it**:
+    the document draws those phantoms and `SqlStyling` moves its colour spans past them (under
+    `sql_highlight.rs`), and a hint one drew and the other did not would slide every colour after it
+    off its token. It draws none while a Ctrl+K view is up in either state, which owns the line flow
+    while it is; under that, the pure `hints_on_line` partitions the sorted set to the line's span
+    (its content less the line ending) and drops a hint whose column is no longer a character
+    boundary, for the reason `ghost_on` checks one
+    (`a_line_takes_only_its_own_hints_at_their_columns`,
+    `the_doc_draws_hints_on_their_line_and_not_under_a_preview`). Hints are slotted with
+    `phantom_slot` **before** the ghost is, in `phantom_text` and `before_phantom_col` alike, so the
+    column translation counts the spans the screen shows in the order it shows them — at a shared
+    column the ghost lands after the label. `set_hints` publishes only a set that differs, and unlike
+    `set_ghost` it bumps nothing itself: `editor_pane` bumps `cache_rev` from an effect on the signal
+    (under `editor_pane.rs`). Squiggles and carets needed no change for any of it — floem's
+    `points_of_offset` and `line_point_of_line_col` already map a column through phantom text
+    (`col_after`).
   - `erd_view.rs` — the **ER-diagram** canvas over `core::erd`. Edges are drawn by a custom paint
     view (`EdgeCanvas`), *not* a Floem `svg` — `svg` doesn't repaint reliably on reactive change
     here and blanked the edges on drag/hover. Zoom is **semantic, not a paint transform**: cards and
@@ -28536,6 +28600,16 @@ existing prose was left alone.
     per row falls back to lexing the rows as one text, carrying only what one row opens into the
     next — which is all `highlight_lines`, now a wrapper over it with no context, does
     (`a_run_of_lines_carries_its_regions`).
+    **An inlay hint moves every span after it.** `SqlStyling::with_hints(hints)` hands the tab
+    editor's styling the pane's `inline_diff::HintSignal`, and `apply_attr_styles` shifts each lexer
+    span by `inline_diff::phantom_shift` — the summed byte lengths of the line's `drawn_hints` at or
+    before the span's start. Floem hands the hook the line's *pre-phantom* columns and lays the spans
+    over the combined text (`new_text_layout`, in vendored floem's `views/editor/mod.rs`), which an
+    end-of-line Ctrl+K block never disturbs and a mid-line label does: unshifted, every colour after
+    a hint would sit the label's length early. `drawn_hints` is the very call the document draws
+    from, so the two cannot disagree about which hints a line has (under `inline_diff.rs`); and since
+    none is drawn while a Ctrl+K view is up, the hints' shift and a `before` block's `prefix_len`
+    never both apply. `FieldSql` takes no hints.
     **Rainbow brackets** (Settings → Editor, off by default — `UiState::editor_rainbow_brackets`,
     `theme::editor_rainbow_brackets`) are the one colour that depends on lines other than its own.
     `lex_line_with` takes the depth its line starts at, or `None` while the setting is off, which
@@ -36430,15 +36504,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   (it's `Option<Vec2>`, not `Point`). Thumbs use `scrollbar_hover()` + `CursorStyle::Default`.
 - **Phantom text is how you put rows in the editor that are not in the document — and its list is
   order-sensitive.** A `Document`'s `phantom_text` hook returns text that is combined into a line's
-  layout without ever entering the rope; it is the facility inlay hints use, and `inline_diff`
-  renders the whole Ctrl+K suggestion through it. It may be **multiline** — a `\n` in a phantom lays
+  layout without ever entering the rope; `inline_diff` renders the whole Ctrl+K suggestion, the
+  inline prediction and the editor's inlay hints through it. It may be **multiline** — a `\n` in a phantom lays
   out as an extra visual row, which is exactly why `TextLayoutLine::line_count` counts the line's
   nonempty layouts instead of assuming one per logical line, and why anything positioning by row has
   to go through that count. `PhantomTextLine.text` is walked **in stored order**, accumulating a
   column shift as it goes (`combine_with_text`), and floem never re-sorts it: the columns must be
   non-decreasing, so a block rendering *before* the line (column 0) has to lead the list and an
   end-of-line block has to trail it, and a phantom at a mid-line column — the inline prediction at
-  the caret — has to be inserted at its place (`inline_diff::phantom_slot`). Per-token colour therefore works by pushing one `PhantomText`
+  the caret, an inlay hint before its value — has to be inserted at its place (`inline_diff::phantom_slot`). Per-token colour therefore works by pushing one `PhantomText`
   per token — each carries a single `fg`, and the order you give them is the order they render in.
   **An added line that is empty has to render as a single space**: `relevant_layouts()` filters out
   layouts with no glyphs, so a genuinely empty row collapses and the block comes out one row shorter
@@ -36447,7 +36521,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `cache_rev`, so the write has to bump it or the rows appear a frame late, or not until the next
   keystroke happens to invalidate the line. `inline_diff::set_preview` and its twin `set_ghost` are
   the two places that pair is spelled out, and the only ways the Ctrl+K preview and the inline
-  prediction should be set.
+  prediction should be set. The inlay hints split it: `inline_diff::set_hints` only writes, and
+  the bump is an effect on the signal in `editor_pane`, so every write to the pane's `hints`
+  reaches the screen whoever makes it.
 - **Wrap the editor's document *last*: `TextEditor`'s document-callback builders silently do
   nothing on a wrapped doc.** `update`, `placeholder` and `pre_command` each resolve the document
   with `downcast_rc::<TextDocument>()` and are written `if let Some(doc) = self.text_doc() { … }`
