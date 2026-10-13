@@ -2234,10 +2234,9 @@ pub(crate) async fn fetch_table_list(db: &Db) -> Result<DbSchema, DbError> {
 
 /// The SQLite half of [`Db::count_rows`].
 ///
-/// The whole of SQLite's contribution to the properties surface. It publishes no
-/// per-table statistics to fetch — see
-/// [`schemaic_core::stats::supports_table_stats`] — so the exact count is not a
-/// fallback here, it is the only figure there is.
+/// SQLite's only row figure. [`fetch_table_stats`] answers sizes and no rows —
+/// SQLite keeps no estimate — so the exact count is not a fallback here, it is
+/// the only row figure there is.
 pub(crate) async fn count_rows(
     db: &Db,
     sql: &str,
@@ -2265,6 +2264,120 @@ pub(crate) async fn count_rows(
             Err(DbError::Cancelled)
         }
     }
+}
+
+/// The largest file [`fetch_table_stats`] measures.
+///
+/// `dbstat` has no catalogue to read: it walks every page of every b-tree, so
+/// its cost is the file's size, and the fetch runs on database expand. Measured
+/// on the bundled 3.53 in a release build, warm cache: 57 ms for a 100 MB file,
+/// 606 ms for 1 GB, linear between — so 1 GiB keeps the walk near a second on
+/// a warm cache, and holds the read lock a writer in another process waits on
+/// for no longer than that. A cold cache costs the disk's read of the file.
+const DBSTAT_CAP_BYTES: u64 = 1 << 30;
+
+/// The SQLite half of [`Db::fetch_table_stats`]: sizes per table and index,
+/// from the `dbstat` virtual table the bundled build compiles in
+/// (`SQLITE_ENABLE_DBSTAT_VTAB`).
+pub(crate) async fn fetch_table_stats(
+    db: &Db,
+) -> Result<schemaic_core::stats::SchemaStats, DbError> {
+    with_conn(db, |conn| table_stats(conn, DBSTAT_CAP_BYTES)).await
+}
+
+/// [`fetch_table_stats`] on an open connection, refusing a file over `cap`.
+///
+/// What SQLite can say and what it cannot: **sizes are exact** — `dbstat` sums
+/// the pages each b-tree really owns — and **rows are absent**, because SQLite
+/// keeps no estimate (`sqlite_stat1` samples indexes, and only after an
+/// `ANALYZE`); the panel's exact count is the way to one. Nothing counts index
+/// use, so every `scans` is `None` and no index is ever flagged unused. A
+/// rowid table's `INTEGER PRIMARY KEY` is the table's own b-tree and a `WITHOUT
+/// ROWID` table's key is too, so neither lists a key index of its own; any
+/// other key's automatic index is listed as `PRIMARY`, as the other engines
+/// print theirs. A virtual table has no b-tree under its own name, so no size.
+fn table_stats(conn: &SqliteConn, cap: u64) -> Result<schemaic_core::stats::SchemaStats, DbError> {
+    use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats, format_bytes};
+    let pragma = |name: &str| -> Result<u64, DbError> {
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
+            .map(|n| n.max(0) as u64)
+            .map_err(query_err)
+    };
+    let file = pragma("page_count")? * pragma("page_size")?;
+    if file > cap {
+        return Err(DbError::Refused(format!(
+            "Table sizes are read only for a database up to {}: SQLite measures them by \
+             reading every page of the file, and this one is {}.",
+            format_bytes(cap),
+            format_bytes(file)
+        )));
+    }
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT name, SUM(pgsize) FROM dbstat WHERE aggregate = TRUE GROUP BY name")
+            .map_err(query_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(query_err)?;
+        for row in rows {
+            let (name, bytes) = row.map_err(query_err)?;
+            sizes.insert(name, bytes.max(0) as u64);
+        }
+    }
+    let mut index_list = conn
+        .prepare("SELECT name, \"unique\", origin FROM pragma_index_list(?1)")
+        .map_err(query_err)?;
+    let mut tables = Vec::new();
+    for (name, kind, _) in master_entries(conn)? {
+        if kind == "view" {
+            tables.push(TableStats {
+                table: name,
+                ..Default::default()
+            });
+            continue;
+        }
+        let indexes = index_list
+            .query_map([&name], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(query_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(query_err)?
+            .into_iter()
+            // A `WITHOUT ROWID` key is listed, but it is the table's b-tree.
+            .filter(|(index, _, _)| sizes.contains_key(index))
+            .map(|(index, unique, origin)| {
+                let is_primary = origin == "pk";
+                IndexStats {
+                    bytes: sizes.get(&index).copied(),
+                    name: if is_primary {
+                        "PRIMARY".to_string()
+                    } else {
+                        index
+                    },
+                    cardinality: None,
+                    scans: None,
+                    is_primary,
+                    is_unique: unique,
+                }
+            })
+            .collect::<Vec<_>>();
+        let data_bytes = sizes.get(&name).copied();
+        tables.push(TableStats {
+            index_bytes: data_bytes.map(|_| indexes.iter().filter_map(|i| i.bytes).sum()),
+            data_bytes,
+            indexes,
+            table: name,
+            freshness: Freshness::Unknown,
+            ..Default::default()
+        });
+    }
+    Ok(SchemaStats::new(tables))
 }
 
 /// Names and kinds from `sqlite_master`, tables before views, each alphabetically.
@@ -5819,6 +5932,72 @@ mod tests {
         );
     }
 
+    /// **Sizes come from `dbstat`, one b-tree per table and per index.** A
+    /// rowid table's `INTEGER PRIMARY KEY` is the table's own b-tree, so it has
+    /// no index to list; a `TEXT` key's automatic index does, and is the
+    /// `PRIMARY` row the other engines print. A view has no b-tree, so no
+    /// figures. Rows stay `None`: SQLite keeps no estimate, and the panel's
+    /// exact count is still the way to one.
+    #[tokio::test]
+    async fn table_sizes_are_read_from_dbstat() {
+        let (keeper, db) = shared_memory("table_stats_dbstat");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INT);
+                 CREATE INDEX t_b ON t (b);
+                 CREATE TABLE k (code TEXT PRIMARY KEY, v TEXT);
+                 CREATE TABLE w (code TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+                 CREATE VIEW tv AS SELECT a FROM t;
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+                 INSERT INTO t (a, b) SELECT printf('%0200d', i), i % 97 FROM n;",
+            )
+            .unwrap();
+        let stats = db.fetch_table_stats(MAIN).await.expect("the sizes");
+
+        let t = stats.get(None, "t").expect("t");
+        assert!(t.data_bytes.unwrap() > 400_000, "{t:?}");
+        assert_eq!(t.rows, None);
+        assert_eq!(t.indexes.len(), 1, "{t:?}");
+        let ix = &t.indexes[0];
+        assert_eq!(ix.name, "t_b");
+        assert!(ix.bytes.unwrap() > 0);
+        assert_eq!(ix.scans, None, "SQLite counts no index use");
+        assert!(!ix.is_primary && !ix.is_unique);
+        assert_eq!(t.index_bytes, ix.bytes);
+
+        let k = stats.get(None, "k").expect("k");
+        let pk = k.indexes.iter().find(|i| i.is_primary).expect("the key");
+        assert_eq!(pk.name, "PRIMARY");
+        assert!(pk.is_unique && pk.bytes.is_some(), "{pk:?}");
+
+        // The key *is* the table's b-tree, so it has no size of its own.
+        let w = stats.get(None, "w").expect("w");
+        assert!(w.data_bytes.is_some());
+        assert_eq!(w.index_bytes, Some(0), "{w:?}");
+
+        let v = stats.get(None, "tv").expect("the view is listed");
+        assert!(!v.has_any(), "{v:?}");
+    }
+
+    /// **A file over the cap is refused, not walked.** `dbstat` reads every page
+    /// of the file, and the read runs on database expand; the refusal names
+    /// both sizes so the panel can say why there is nothing to show.
+    #[test]
+    fn table_sizes_are_refused_over_the_cap() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a TEXT);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+             INSERT INTO t SELECT printf('%0200d', i) FROM n;",
+        )
+        .unwrap();
+        match table_stats(&conn, 4096) {
+            Err(DbError::Refused(m)) => assert!(m.contains("4 KiB"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(table_stats(&conn, 1 << 30).is_ok());
+    }
+
     /// **A count that was cancelled reports as cancelled**, rather than the caller
     /// abandoning an answer while the scan runs on. A token cancelled before the
     /// call is the deterministic half of that: the interrupt handle reaches the
@@ -5876,20 +6055,6 @@ mod tests {
                 .unwrap(),
             1
         );
-    }
-
-    /// SQLite publishes no per-table statistics, and the fetch says so by
-    /// returning nothing — not by failing, and not by inventing zeroes.
-    #[tokio::test]
-    async fn sqlite_reports_no_table_statistics() {
-        let (keeper, db) = shared_memory("no_stats");
-        keeper
-            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);")
-            .unwrap();
-
-        let stats = db.fetch_table_stats(MAIN).await.expect("no error");
-        assert!(stats.is_empty());
-        assert!(stats.get(None, "t").is_none());
     }
 
     /// **A write cancelled before it starts writes nothing**, and says so.

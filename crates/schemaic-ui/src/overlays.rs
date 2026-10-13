@@ -1423,15 +1423,11 @@ pub(crate) fn gear_entries(
             disabled: GearKind::CreateDatabase.disabled_when(read_only, down),
         });
     }
-    // Absent where the engine has no sizes to show — a row that visibly toggles
-    // while nothing changes is worse than no row.
-    if schemaic_core::stats::supports_table_stats(dialect) {
-        out.push(GearEntry {
-            label: "Show table sizes",
-            kind: GearKind::ShowTableSizes,
-            disabled: false,
-        });
-    }
+    out.push(GearEntry {
+        label: "Show table sizes",
+        kind: GearKind::ShowTableSizes,
+        disabled: false,
+    });
     out
 }
 
@@ -7563,10 +7559,10 @@ mod tests {
     }
 
     /// **Absent means "not on this engine"; dimmed means "not here".** SQLite
-    /// has no accounts, no `CREATE DATABASE` and no per-table sizes, so the gear
-    /// keeps the two entries that need no server at all, and its settings —
-    /// its PRAGMAs, which it does have — rather than showing three dead rows a
-    /// user would hunt for the setting to enable.
+    /// has no accounts and no `CREATE DATABASE`, so the gear keeps the entries
+    /// that need no server, its settings — its PRAGMAs, which it does have —
+    /// and its table sizes, which `dbstat` answers, rather than showing two dead
+    /// rows a user would hunt for the setting to enable.
     #[test]
     fn the_gear_omits_what_the_engine_has_not_got() {
         assert_eq!(
@@ -7574,7 +7570,8 @@ mod tests {
             [
                 GearKind::Refresh,
                 GearKind::CollapseAll,
-                GearKind::ServerVariables
+                GearKind::ServerVariables,
+                GearKind::ShowTableSizes
             ]
         );
         // And with no saved connection: `edit_ctx` falls back to MySQL, so

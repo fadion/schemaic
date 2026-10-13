@@ -421,7 +421,7 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
 ///
 /// **For a gate whose rule is not about views.** "Ask a capability, never an
 /// engine" is stated in CLAUDE.md about the whole workspace, and it names
-/// `ddl::supports_change`, `supports_column_reorder`, `stats::supports_table_stats`
+/// `ddl::supports_change`, `supports_column_reorder`, `users::supports_users`
 /// and `ref_schema_is_database` — every one of them in `schemaic-core`. A gate
 /// over the two view crates therefore claimed a rule it could not reach: a
 /// `dialect == SqlDialect::MySql` planted in `core/ddl.rs` passed the whole

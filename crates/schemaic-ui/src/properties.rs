@@ -304,22 +304,6 @@ fn stats_body(
         .into_iter()
         .flatten()
         .collect(),
-        PropertiesState::Unsupported => [
-            Some(note_line(
-                icons::CIRCLE_QUESTION,
-                theme::text_dim,
-                // Named as a property of the engine, not as a missing feature —
-                // SQLite genuinely keeps no per-table size or row estimate.
-                "This engine publishes no per-table statistics. \
-                 The exact row count is still available below."
-                    .to_string(),
-            )),
-            structure_section(target, info),
-            count_row(target, None, counting, count_err, ctx, ring),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
         PropertiesState::Loaded(stats) if !stats.has_any() => [
             Some(note_line(
                 icons::CIRCLE_QUESTION,

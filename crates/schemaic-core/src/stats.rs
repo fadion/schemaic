@@ -3,7 +3,7 @@
 //!
 //! Every field here is an [`Option`], and that is the whole design. The three
 //! engines do not publish the same facts, do not refresh them on the same
-//! schedule, and one of them publishes almost nothing; a struct of plain `u64`s
+//! schedule, and SQLite publishes sizes and nothing else; a struct of plain `u64`s
 //! would have to invent a zero for each gap, and a fabricated `0 rows` is worse
 //! than an empty cell. So the UI asks *is this figure present*, never *which
 //! database is this* — the capability rule, applied to reading rather than
@@ -26,24 +26,6 @@ use std::collections::HashMap;
 use crate::intel::SqlDialect;
 use crate::schema::TableShape;
 use crate::text::human_count;
-
-/// Does `dialect` publish per-table statistics at all?
-///
-/// MySQL has `information_schema.TABLES`, PostgreSQL has `pg_class` plus the
-/// `pg_stat_*` views. **SQLite has neither, and this is a statement about SQLite
-/// rather than unfinished work**: it keeps no per-table row estimate outside
-/// `sqlite_stat1`, which exists only after an explicit `ANALYZE` and holds an
-/// index sample rather than a table size; per-table byte sizes need the `dbstat`
-/// virtual table, which is a compile-time option most builds omit (including the
-/// one bundled here); and `page_count * page_size` measures the whole database
-/// file, not a table in it.
-///
-/// So the properties surface tells a SQLite user that the engine doesn't keep
-/// these, and offers the one figure SQLite *can* answer exactly — a
-/// `SELECT COUNT(*)`, which is what [`crate::stats`] leaves to the caller.
-pub fn supports_table_stats(dialect: SqlDialect) -> bool {
-    !matches!(dialect, SqlDialect::Sqlite)
-}
 
 /// A row figure and whether the engine actually counted.
 ///
@@ -700,8 +682,9 @@ pub fn count_rows_sql(schema: Option<&str>, table: &str, dialect: SqlDialect) ->
 ///
 /// `result_db` is the database the statement ran in — the qualifier it left out.
 /// `None` when that is unknown and the statement didn't say, and `None` for
-/// SQLite, which publishes no statistics to key at all
-/// ([`supports_table_stats`]).
+/// SQLite, whose statistics are sizes only: it keeps no row estimate for the
+/// capped notice to print, and keying one would send a capped result's ask
+/// for a total into a `dbstat` walk of the whole file that cannot produce it.
 pub fn catalogue_key(
     dialect: SqlDialect,
     qualifier: Option<&str>,
@@ -1751,18 +1734,6 @@ mod tests {
         );
     }
 
-    // ── Capability ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn only_the_engines_with_a_catalogue_publish_stats() {
-        assert!(supports_table_stats(SqlDialect::MySql));
-        assert!(supports_table_stats(SqlDialect::Postgres));
-        assert!(
-            !supports_table_stats(SqlDialect::Sqlite),
-            "SQLite keeps no per-table size; see the doc comment"
-        );
-    }
-
     // ── Catalogue key ────────────────────────────────────────────────────────
 
     #[test]
@@ -1797,7 +1768,7 @@ mod tests {
         assert_eq!(
             catalogue_key(SqlDialect::Sqlite, Some("main"), Some("main")),
             None,
-            "SQLite publishes no statistics to look up"
+            "SQLite keeps no row estimate to look up"
         );
     }
 

@@ -15381,8 +15381,13 @@ existing prose was left alone.
       that moves on into the Tab that changes the value.
     - `stats.rs` — table statistics: `TableStats`/`IndexStats`/`SchemaStats`, `format_bytes`
       (1024-based, IEC units), `format_age`, and the honesty types. Every figure is an `Option`
-      because the three engines publish different facts — `supports_table_stats` is `false` for
-      SQLite, which keeps no per-table size at all. `RowCount::{Exact,Estimate}` stops an estimate
+      because the engines publish different facts — SQLite's sizes are exact, read from `dbstat`,
+      and it has no row figure at all (under `schemaic-db`'s entry). **There is no
+      `supports_table_stats` any more**: it was `false` for SQLite while nothing read SQLite's sizes,
+      and once `dbstat` answered it would have been `true` for every engine — a constant with a
+      function's name on it, which is the failure the capability rule names — so it was deleted,
+      with `PropertiesState::Unsupported` and the app's two early returns behind it, rather than
+      kept. `RowCount::{Exact,Estimate}` stops an estimate
       from printing as a fact, `Freshness` says *why* a figure may be stale (MySQL caches
       `information_schema` stats for `information_schema_stats_expiry`, a day by default;
       PostgreSQL's `reltuples` is only as fresh as the last `ANALYZE`), and `IndexStats::is_unused`
@@ -15399,7 +15404,10 @@ existing prose was left alone.
         disagree about what a qualifier *is* (a database on MySQL, a namespace on PostgreSQL and
         SQL Server) and
         getting it backwards reports one table's figures for another with nothing to show that it
-        happened. `SchemaStats::find` then resolves the name a *statement* wrote — unlike `get`,
+        happened. **SQLite's answer is `None`, and stays `None` now that it has sizes**: it keeps no
+        row estimate for the capped notice to print, so keying it would send a capped result's ask
+        for a total into a `dbstat` walk of the whole file that cannot produce one.
+        `SchemaStats::find` then resolves the name a *statement* wrote — unlike `get`,
         whose `None` namespace means "this engine has none", `find`'s means "the statement didn't
         say", so it matches by name alone and **only when exactly one table carries it**: an
         unqualified PostgreSQL name resolves through `search_path`, which the client does not know.
@@ -15626,7 +15634,9 @@ existing prose was left alone.
   `the_entry_point_list_is_what_the_dispatcher_actually_dispatches` derives the set the other way:
   every name the dispatcher calls on **all three** modules is an entry point whatever the list says,
   asserted in both directions, with a floor so that an empty intersection cannot satisfy the first
-  half having read nothing. `run_batch` is on the list and the list is fourteen; the const's doc
+  half having read nothing. `run_batch` is on the list, which was fourteen then and has since gained
+  `fetch_server_vars` and `fetch_table_stats` — the second once SQLite's sizes came from `dbstat`,
+  its SQLite arm having answered an empty set inline in the dispatcher until then; the const's doc
   carries no count at all now, having said "ten of thirteen" and "twelve of thirteen" about a list
   that was already fourteen long.
   **And the gate that most needed comments stripped was the one not stripping them.**
@@ -16684,8 +16694,27 @@ existing prose was left alone.
   rows-to-model step is a pure `map_mysql_stats`, so the decisions with a wrong answer that looks
   plausible — `MAX(CARDINALITY)` per index rather than per key *position*, the usage view's NULL
   index row, a missing usage entry leaving `scans: None` — are unit-tested without a server.
-  SQLite returns an empty set — it publishes none (`stats::supports_table_stats`), and
-  `count_rows` is not a fallback there but the only figure there is.
+  **SQLite answers from the `dbstat` virtual table** (`sqlite::table_stats`), which the bundled
+  `libsqlite3-sys` build compiles in (`SQLITE_ENABLE_DBSTAT_VTAB`) — this paragraph used to say it
+  was omitted and that SQLite publishes nothing, which was false, and the dispatcher's arm answered
+  an empty set inline on the strength of it. One `SELECT name, SUM(pgsize) FROM dbstat WHERE
+  aggregate = TRUE GROUP BY name` sizes every table b-tree and every index exactly, and what it
+  cannot say stays `None` rather than a plausible zero: **rows**, because SQLite keeps no estimate
+  (`sqlite_stat1` samples indexes, and only after an `ANALYZE`), so `count_rows` is still the only
+  row figure there is; and **scans**, because nothing counts index use, so `is_unused` never flags
+  one. A non-integer key's automatic index is listed as `PRIMARY` with `is_primary`, as the other
+  engines print theirs; a rowid table's `INTEGER PRIMARY KEY` and a `WITHOUT ROWID` table's key *are*
+  the table's b-tree, so neither lists a key index of its own. A view is listed with no figures and a
+  virtual table has no size, there being no b-tree under its name.
+  **The cost is the file, so the fetch is capped** — `DBSTAT_CAP_BYTES`, 1 GiB of `page_count ×
+  page_size`. `dbstat` has no catalogue to read: it walks every page of every b-tree, and this fetch
+  runs on database expand. Measured on the bundled 3.53, release build, warm cache: 57 ms for a
+  100 MB file, 606 ms for 1 GB, linear between — so the cap keeps the walk, and the read lock a
+  writer in another process waits on, near a second; a cold cache costs the disk's read of the
+  file. Over it the fetch is `DbError::Refused` naming both sizes, so the tree's slot settles at
+  `Unavailable` and the properties panel shows the sentence in its `Failed` state, Count rows still
+  offered beneath it (`table_sizes_are_read_from_dbstat`, `table_sizes_are_refused_over_the_cap`).
+  `fetch_table_stats` joined `ENGINE_ENTRY_POINTS` with it, now that all four modules answer it.
   **One fetch per database, shared by all three surfaces.** The properties modal used to issue its
   own, on its own connection, on every open — ten tables inspected in a row was ten whole-database
   catalogue fetches for figures already in memory, and worse on a server with
@@ -23705,8 +23734,8 @@ existing prose was left alone.
       uncapped `COUNT(*)`. Its result is folded into the loaded `TableStats::exact_rows` rather
       than kept beside it, so the headline and the Markdown copy read one figure. Its lifecycle is
       separate from the fetch's (`properties_counting`/`properties_count_err`) for the opposite
-      reason: a failed count must not replace statistics that loaded. **It is offered from all four
-      of `stats_body`'s arms, and the `Failed` one used to be the exception.** A `COUNT(*)` needs no
+      reason: a failed count must not replace statistics that loaded. **It is offered from every one
+      of `stats_body`'s arms past `Loading`, and the `Failed` one used to be the exception.** A `COUNT(*)` needs no
       catalogue — which is `count_row`'s whole argument, made twice more in this module and once in
       `stats::count_rows_sql` — so the state with least to show is not the state to withhold the one
       figure still obtainable from; and it was the only arm in which `CountHint::Error` could never
@@ -25933,12 +25962,13 @@ existing prose was left alone.
       *panel*, from the same `core::stats` figures the properties modal shows. It answers the
       question that modal cannot — *which* of these is the big one — and is off by default behind
       SCHEMA gear → **Show table sizes** (`SchemaUi::table_sizes`, persisted as
-      `UiState::show_table_sizes`). **That row is absent on an engine with no sizes to show**
-      (`schema_settings_overlay` asks `stats::supports_table_stats`, the same capability guarding the
-      fetch): on SQLite the column stays empty whichever way the setting is left, so a row that
-      visibly toggles while nothing changes is worse than no row. Absent rather than disabled, since
-      there is nothing here for another connection to enable — and the setting itself is untouched,
-      being global and persisted, so a MySQL connection comes back to whatever it was left at. The panel and not the row, because those are not the same edge:
+      `UiState::show_table_sizes`). **That row is offered on every engine now.** It used to be
+      absent on SQLite, behind `stats::supports_table_stats`, while nothing read SQLite's sizes and
+      a row that visibly toggled while nothing changed was worse than none; once SQLite's sizes came
+      from `dbstat` that predicate answered `true` for all four engines and was deleted (under
+      `stats.rs`), and `gear_entries` pushes the row unconditionally, as it does the panel's other
+      entries. A SQLite file over the `dbstat` cap leaves its slot at `Unavailable`, so that one
+      database's column stays empty while the row stays offered. The panel and not the row, because those are not the same edge:
       the badge started as a `flex_grow` spacer pushing the size to the end of its row, and tree
       rows stretch to the *widest* row (the tree is deliberately not `width_full` so it can scroll
       horizontally), so expanding any table — whose column rows are indented and carry a type —
@@ -34062,10 +34092,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   MySQL has — plus
   `supports_column_reorder`, `rebuilds_tables`, `alter_column_disturbs_checks`,
   `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `publishes_index_ddl`,
-  `renames_indexes_in_place`, true on SQL Server alone,
+  `renames_indexes_in_place`, true on SQL Server alone, and
   `bare_reference_is_own_namespace` — which asks where a bare table name resolves, and so whether a
-  foreign key with no namespace may be written without one — and
-  `stats::supports_table_stats`; `supports_extensions`, which decides whether the Create ▸
+  foreign key with no namespace may be written without one; `supports_extensions`, which decides
+  whether the Create ▸
   *Extension* entry and the Extensions folder's *Create extension* exist at all, PostgreSQL alone
   and computed from `supports_change` like the editor predicates above; and, for the *comparison* rather than
   any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies

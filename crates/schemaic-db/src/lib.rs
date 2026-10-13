@@ -423,6 +423,9 @@ pub(crate) const ENGINE_ENTRY_POINTS: &[&str] = &[
     // The Server variables viewer's list: every engine has settings to show,
     // SQLite's being its PRAGMAs, so all three modules answer it.
     "fetch_server_vars",
+    // Joined when SQLite's sizes came from `dbstat`: until then its arm in
+    // the dispatcher answered an empty set inline.
+    "fetch_table_stats",
 ];
 
 /// Which database engine a [`Db`] speaks. Selected from the saved connection's
@@ -1739,13 +1742,13 @@ impl Db {
     /// schema fetch runs on every connect; this one runs when someone asks to
     /// see the numbers.
     ///
-    /// SQLite returns an empty set — see
-    /// [`schemaic_core::stats::supports_table_stats`] for why that is a fact
-    /// about SQLite and not a gap here.
+    /// SQLite answers sizes from `dbstat` and no rows, and refuses a file over a
+    /// gigabyte rather than walk every page of it on an expand — see
+    /// `sqlite::table_stats`.
     pub async fn fetch_table_stats(&self, database: &str) -> Result<SchemaStats, DbError> {
         match self.engine {
             Engine::Postgres => pg::fetch_table_stats(self, database).await,
-            Engine::Sqlite => Ok(SchemaStats::default()),
+            Engine::Sqlite => sqlite::fetch_table_stats(self).await,
             Engine::MySql => mysql::fetch_table_stats(self, database).await,
             Engine::MsSql => mssql::fetch_table_stats(self, database).await,
         }

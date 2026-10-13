@@ -31,9 +31,9 @@ whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `table_grant_lifts_column_denies`, `table_revoke_clears_columns`, `blank_password_signs_in`, `drop_user_cuts_off_sessions`,
 `sql::SqlDialect::read_only_is_a_rollback`, `dump::drops_up_front`,
 `export::client_substitutes_variables`, `reads_dates_by_language`,
-`schema::unvalidated_check_waits_for_rows`, `writes_not_valid`,
-`stats::supports_table_stats` — alongside them the few that do decide whether a control is
-offered, because the clause behind it is one engine's alone:
+`schema::unvalidated_check_waits_for_rows`, `writes_not_valid`
+— alongside them the few that do decide whether a control is offered, because the clause
+behind it is one engine's alone:
 `ddl::supports_trigger_not_for_replication`, `supports_trigger_execute_as`,
 `supports_trigger_firing_rank`, `supports_view_triggers`, `supports_trigger_level_choice`,
 `supports_trigger_when`, `supports_trigger_update_of`, `trigger_runs_function`,

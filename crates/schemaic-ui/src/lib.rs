@@ -4219,7 +4219,7 @@ mod no_bare_active_set_gate {
 /// whichever side it happens to fall, and the narrow predicates that exist to
 /// be asked instead (`ddl::supports_change`, `supports_or_replace_view`,
 /// `supports_column_reorder`, `supports_view_rename`,
-/// `alter_column_disturbs_checks`, `stats::supports_table_stats`, …) live
+/// `alter_column_disturbs_checks`, `users::supports_users`, …) live
 /// inside a 9,000-line emitter that is legitimately per-dialect throughout, so
 /// a view author looking for one does not find it. The rule was unenforced,
 /// and the view crates' comparison count went from zero to two dozen
@@ -4337,12 +4337,8 @@ mod engine_comparison_gate {
              doubling, its trigger bodies, MySQL's `USE`, PostgreSQL's \
              dollar-quote), a lexical table for the same reason.",
         ),
-        (
-            "schemaic-core/stats.rs",
-            1,
-            "`supports_table_stats` — a capability definition, and one CLAUDE.md \
-             names by hand.",
-        ),
+        // `schemaic-core/stats.rs` left the census when SQLite's sizes came
+        // from `dbstat` and `supports_table_stats` had nothing left to say.
         // `schemaic-core/users.rs` left the census when `supports_users` became
         // an exhaustive `match`: SQL Server has accounts it cannot list yet,
         // and a `!matches!(… Sqlite)` sorted it onto "has them" in silence.
@@ -5649,11 +5645,6 @@ pub enum PropertiesState {
     /// Boxed: `TableStats` is a wide struct of optional figures, and this enum
     /// lives in a signal every other variant of which is a word or two.
     Loaded(Box<schemaic_core::stats::TableStats>),
-    /// This engine publishes no per-table statistics at all
-    /// ([`schemaic_core::stats::supports_table_stats`]). Distinct from an empty
-    /// `Loaded`: the modal explains the engine rather than the table, and still
-    /// offers the exact count, which every engine can answer.
-    Unsupported,
     /// The fetch failed (message shown in the modal body).
     Failed(String),
 }

@@ -9385,14 +9385,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     return;
                 }
             };
-            // Asked before the round trip: an engine that publishes nothing has
-            // a different thing to say than one whose fetch failed, and finding
-            // that out by running a query would be the same query returning
-            // empty either way.
-            if !schemaic_core::stats::supports_table_stats(db.engine().dialect()) {
-                properties_state.set(schemaic_ui::PropertiesState::Unsupported);
-                return;
-            }
             // **The tree and the toolbar already have a slot for this, so ask it
             // first.** One fetch covers a whole database — the query's cost is in
             // making the server materialize per-table statistics for all of them —
@@ -9599,10 +9591,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     return;
                 }
             };
-            // Asked before the round trip, for the reason `table_stats` asks
-            // `supports_table_stats` before its own: an engine that has no
-            // accounts has a different thing to say than one whose fetch failed,
-            // and no query can tell the two apart.
+            // Asked before the round trip: an engine that has no accounts has a
+            // different thing to say than one whose fetch failed, and no query
+            // can tell the two apart.
             if !schemaic_core::users::supports_users(db.engine().dialect()) {
                 users_state.set(schemaic_ui::UsersState::Unsupported);
                 return;
@@ -9772,13 +9763,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let Ok(db) = db_for(conn_id) else {
                     return;
                 };
-                // An engine with nothing to publish is settled here rather than
-                // by a round trip that would come back empty and be retried on
-                // the next expand.
-                if !schemaic_core::stats::supports_table_stats(db.engine().dialect()) {
-                    slot.set(schemaic_ui::DbStatsState::Unavailable);
-                    return;
-                }
                 slot.set(schemaic_ui::DbStatsState::Loading);
                 let report =
                     create_ext_action(cx, move |res: Option<schemaic_core::stats::SchemaStats>| {
