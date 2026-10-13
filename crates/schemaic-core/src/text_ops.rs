@@ -614,13 +614,19 @@ pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
     find_matches_in(hay, needle, FindOptions::default())
 }
 
-/// The find bar's two options. Both keep every hit exactly `needle.len()`
-/// bytes long — **match case** compares byte for byte, **whole word** only
-/// refuses a hit — which is why they can share [`find_matches`]' callers
-/// unchanged, where a regex could not.
+/// The find bar's options. **Match case** and **whole word** keep every hit
+/// exactly `needle.len()` bytes long — one compares byte for byte, the other
+/// only refuses a hit — which is why they can share [`find_matches`]' callers
+/// unchanged. **Regex** cannot, and is read only by the hit-based entry
+/// points ([`find_hits`], [`hit_holds`], [`replacement_for`],
+/// [`replace_hits`]), whose hits carry their own length; the plain-text
+/// functions ignore it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FindOptions {
     pub match_case: bool,
+    /// The needle is a regular expression (the `regex` crate's syntax, `^`/`$`
+    /// at line ends), and a replacement may name its groups as `$1`/`${name}`.
+    pub regex: bool,
     /// No name byte either side of the hit, by [`crate::sql::continues_name`]
     /// on [`Self::dialect`] — the one definition, so `_`, `$` and a non-ASCII
     /// letter continue a word as they do an identifier, and `@`/`#` do on SQL
@@ -634,14 +640,29 @@ pub struct FindOptions {
 
 /// [`find_matches`] under `opts`.
 pub fn find_matches_in(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize> {
+    find_matches_between(hay, needle, opts, 0, hay.len(), usize::MAX)
+}
+
+/// [`find_matches_in`] over the hits lying wholly in `hay[lo..hi]`, scanning
+/// from `lo` — the boundaries whole word asks about are still read from all of
+/// `hay` — and stopping after `cap` of them.
+fn find_matches_between(
+    hay: &str,
+    needle: &str,
+    opts: FindOptions,
+    lo: usize,
+    hi: usize,
+    cap: usize,
+) -> Vec<usize> {
     let n = needle.len();
-    if n == 0 || hay.len() < n {
+    let hi = hi.min(hay.len());
+    if n == 0 || hi < n {
         return Vec::new();
     }
     let ascii = needle.is_ascii();
     let mut out = Vec::new();
-    let mut i = 0;
-    while i + n <= hay.len() {
+    let mut i = lo;
+    while i + n <= hi && out.len() < cap {
         if hit_at(hay, i, needle, ascii, opts) {
             out.push(i);
             i += n; // non-overlapping
@@ -724,13 +745,24 @@ pub fn find_seed(text: &str, sel: (usize, usize)) -> Option<&str> {
     (!s.is_empty() && !s.contains(['\n', '\r'])).then_some(s)
 }
 
+/// The *in selection* scope Ctrl+F / Ctrl+H take from the selection: the
+/// selection itself when it spans more than one line — the block
+/// [`find_seed`] declines to make a needle of, being one to search *in* — and
+/// `None` otherwise. `sel` is `(start, end)` in either order.
+pub fn find_scope_seed(text: &str, sel: (usize, usize)) -> Option<(usize, usize)> {
+    let (a, b) = (sel.0.min(sel.1), sel.0.max(sel.1));
+    text.get(a..b)
+        .is_some_and(|s| s.contains(['\n', '\r']))
+        .then_some((a, b))
+}
+
 /// The hit a new find query starts at: the first at or after `from` (the
 /// selection's start, or the caret), wrapping to the first in the document —
 /// so a needle seeded from the selection, or typed one character at a time,
 /// stays on the match the user is looking at rather than leaping to the top.
 /// `0` for no hits, which the caller reads as "none" by the list's length.
-pub fn first_hit_from(hits: &[usize], from: usize) -> usize {
-    let i = hits.partition_point(|&h| h < from);
+pub fn first_hit_from(hits: &[Hit], from: usize) -> usize {
+    let i = hits.partition_point(|h| h.0 < from);
     if i < hits.len() { i } else { 0 }
 }
 
@@ -769,11 +801,78 @@ fn hit_at(hay: &str, off: usize, needle: &str, ascii: bool, opts: FindOptions) -
     if !spelled || !opts.whole_word {
         return spelled;
     }
+    word_bounded(hay, off, end, opts)
+}
+
+/// Does `hay[off..end]` stand as a whole word — no name byte either side of
+/// it, by [`crate::sql::continues_name`] on the options' dialect, asked only
+/// on a side where the span's own edge is a name byte?
+fn word_bounded(hay: &str, off: usize, end: usize, opts: FindOptions) -> bool {
     let name = |b: u8| crate::sql::continues_name(b, opts.dialect);
-    let (hb, nb) = (hay.as_bytes(), needle.as_bytes());
-    let open_left = !name(nb[0]) || off == 0 || !name(hb[off - 1]);
-    let open_right = !name(nb[nb.len() - 1]) || end == hb.len() || !name(hb[end]);
+    let hb = hay.as_bytes();
+    let open_left = !name(hb[off]) || off == 0 || !name(hb[off - 1]);
+    let open_right = !name(hb[end - 1]) || end == hb.len() || !name(hb[end]);
     open_left && open_right
+}
+
+/// The find bar's pattern, compiled — case-insensitive unless match case says
+/// otherwise, `^`/`$` at line ends — or the one-line sentence the bar shows.
+fn find_regex(needle: &str, opts: FindOptions) -> Result<regex::Regex, String> {
+    regex::RegexBuilder::new(needle)
+        .case_insensitive(!opts.match_case)
+        .multi_line(true)
+        .build()
+        .map_err(|e| {
+            // The crate's message draws a caret under the pattern over several
+            // lines; its last line is the sentence.
+            let msg = e.to_string();
+            let last = msg
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+                .trim_start_matches("error:")
+                .trim()
+                .to_string();
+            if last.is_empty() {
+                "Not a valid pattern".to_string()
+            } else {
+                format!("Not a valid pattern: {last}")
+            }
+        })
+}
+
+/// Every non-empty match of `re` lying wholly in `hay[lo..hi]` that whole
+/// word (if on) accepts, at most `cap` of them. `find_at` over `hay[..hi]`, so
+/// `\b` and `^` at `lo` see the text before it.
+fn regex_hits(
+    hay: &str,
+    re: &regex::Regex,
+    opts: FindOptions,
+    lo: usize,
+    hi: usize,
+    cap: usize,
+) -> Vec<Hit> {
+    let hi = hi.min(hay.len());
+    let text = &hay[..hi];
+    let mut out = Vec::new();
+    let mut at = lo;
+    while at <= hi && out.len() < cap {
+        let Some(m) = re.find_at(text, at) else {
+            break;
+        };
+        if m.start() == m.end() {
+            // An empty match: step past one character and look again.
+            at = m.end() + text[m.end()..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        if !opts.whole_word || word_bounded(hay, m.start(), m.end(), opts) {
+            out.push((m.start(), m.end() - m.start()));
+        }
+        at = m.end();
+    }
+    out
 }
 
 /// Replace every non-overlapping case-insensitive occurrence of `needle`
@@ -809,6 +908,202 @@ pub fn replace_all_in(
     }
     out.push_str(&hay[prev..]);
     (out, hits.len())
+}
+
+/// One find-bar hit: `(start, len)` in bytes. Under [`FindOptions::regex`] a
+/// hit is as long as what the pattern matched; otherwise always the needle's
+/// length.
+pub type Hit = (usize, usize);
+
+/// The most hits [`find_hits`] reports. A pattern like `.` over a large script
+/// matches every character, and a list of millions is a counter nobody reads
+/// and a Replace All nobody meant.
+pub const FIND_HIT_CAP: usize = 100_000;
+
+/// Every hit of `needle` in `hay` under `opts`, in order and non-overlapping —
+/// within `scope` (`(start, end)`, a selection the search is confined to) when
+/// there is one. `Err` carries the sentence the bar shows for a pattern that
+/// does not compile; plain text never fails.
+///
+/// A regex hit that matches nothing (`a*` between two letters) is not a hit:
+/// there is nothing to select or replace.
+pub fn find_hits(
+    hay: &str,
+    needle: &str,
+    opts: FindOptions,
+    scope: Option<(usize, usize)>,
+) -> Result<Vec<Hit>, String> {
+    let Some((lo, hi)) = scope_bounds(hay, scope) else {
+        return Ok(Vec::new());
+    };
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    if opts.regex {
+        let re = find_regex(needle, opts)?;
+        return Ok(regex_hits(hay, &re, opts, lo, hi, FIND_HIT_CAP));
+    }
+    let n = needle.len();
+    Ok(
+        find_matches_between(hay, needle, opts, lo, hi, FIND_HIT_CAP)
+            .into_iter()
+            .map(|off| (off, n))
+            .collect(),
+    )
+}
+
+/// `scope` as `(lo, hi)` within `hay` — all of it for none — or `None` when a
+/// bound is not a character boundary any more.
+fn scope_bounds(hay: &str, scope: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    let (lo, hi) = scope.map_or((0, hay.len()), |(a, b)| {
+        (a.min(b).min(hay.len()), a.max(b).min(hay.len()))
+    });
+    (hay.is_char_boundary(lo) && hay.is_char_boundary(hi)).then_some((lo, hi))
+}
+
+/// Is `hit` still a hit of `needle` in `hay` under `opts`, within `scope` —
+/// the same span, by the same rule [`find_hits`] used? What a stored hit asks
+/// before anything edits it ([`matches_at`] explains why that question
+/// exists).
+///
+/// **Against the text the search read**: a regex is matched over `hay` up to
+/// the scope's end, as [`find_hits`] matches it, so a greedy hit the scope cut
+/// short still holds — matched over the whole document it would be longer,
+/// and no longer the hit.
+pub fn hit_holds(
+    hay: &str,
+    hit: Hit,
+    needle: &str,
+    opts: FindOptions,
+    scope: Option<(usize, usize)>,
+) -> bool {
+    let (off, len) = hit;
+    let Some((lo, hi)) = scope_bounds(hay, scope) else {
+        return false;
+    };
+    if len == 0 || off < lo || off + len > hi {
+        return false;
+    }
+    if !opts.regex {
+        return len == needle.len() && matches_at_in(hay, off, needle, opts);
+    }
+    if !hay.is_char_boundary(off) {
+        return false;
+    }
+    let Ok(re) = find_regex(needle, opts) else {
+        return false;
+    };
+    // The match a scan would make starting here — `find_at`, so the text
+    // before `off` is context, as it was when the hit was found.
+    re.find_at(&hay[..hi], off)
+        .is_some_and(|m| m.start() == off && m.end() == off + len)
+        && (!opts.whole_word || word_bounded(hay, off, off + len, opts))
+}
+
+/// What `hit` is replaced with: `replacement` as written, or under
+/// [`FindOptions::regex`] with its `$1`/`${name}` groups filled from the match
+/// at `hit` (and `$$` for a dollar sign) — matched over the text up to the
+/// scope's end, as [`hit_holds`] matches it.
+pub fn replacement_for(
+    hay: &str,
+    hit: Hit,
+    needle: &str,
+    replacement: &str,
+    opts: FindOptions,
+    scope: Option<(usize, usize)>,
+) -> String {
+    if !opts.regex {
+        return replacement.to_string();
+    }
+    let (Ok(re), Some((_, hi))) = (find_regex(needle, opts), scope_bounds(hay, scope)) else {
+        return replacement.to_string();
+    };
+    let (off, len) = hit;
+    if off > hi {
+        return replacement.to_string();
+    }
+    match re.captures_at(&hay[..hi], off) {
+        Some(caps)
+            if caps
+                .get(0)
+                .is_some_and(|m| m.start() == off && m.len() == len) =>
+        {
+            let mut out = String::new();
+            caps.expand(replacement, &mut out);
+            out
+        }
+        _ => replacement.to_string(),
+    }
+}
+
+/// Replace every hit [`find_hits`] reports — the new text and how many there
+/// were. Left to right over the original text, so a replacement that itself
+/// matches is not replaced again.
+pub fn replace_hits(
+    hay: &str,
+    needle: &str,
+    replacement: &str,
+    opts: FindOptions,
+    scope: Option<(usize, usize)>,
+) -> Result<(String, usize), String> {
+    let hits = find_hits(hay, needle, opts, scope)?;
+    if hits.is_empty() {
+        return Ok((hay.to_string(), 0));
+    }
+    let re = if opts.regex {
+        Some(find_regex(needle, opts)?)
+    } else {
+        None
+    };
+    // The groups are read from the text the search read — up to the scope's
+    // end — so a hit the scope cut short fills `$1` with what it covers.
+    let (_, hi) = scope_bounds(hay, scope).unwrap_or((0, hay.len()));
+    let searched = &hay[..hi];
+    let mut out = String::with_capacity(hay.len());
+    let mut prev = 0;
+    for &(off, len) in &hits {
+        out.push_str(&hay[prev..off]);
+        match re.as_ref().and_then(|re| re.captures_at(searched, off)) {
+            Some(caps) => caps.expand(replacement, &mut out),
+            None => out.push_str(replacement),
+        }
+        prev = off + len;
+    }
+    out.push_str(&hay[prev..]);
+    Ok((out, hits.len()))
+}
+
+/// Carry a byte range — the find bar's *in selection* scope — through one
+/// edit, `start..end` of the old text replaced by `inserted` bytes: a bound
+/// before the edit stays, one after it moves by the edit's change in length,
+/// and one inside the replaced text lands at the start of what replaced it
+/// (the range's start) or its end (the range's end), so an edit inside the
+/// scope grows or shrinks it rather than losing it.
+pub fn shift_range(
+    range: (usize, usize),
+    start: usize,
+    end: usize,
+    inserted: usize,
+) -> (usize, usize) {
+    let moved = |p: usize| p - end + start + inserted;
+    let (a, b) = range;
+    // Typed *at* the start is typed inside the scope, so that one insertion
+    // leaves the start where it is.
+    let a = if a < start || (a == start && end == start) {
+        a
+    } else if a >= end {
+        moved(a)
+    } else {
+        start
+    };
+    let b = if b < start {
+        b
+    } else if b >= end {
+        moved(b)
+    } else {
+        start + inserted
+    };
+    (a, b)
 }
 
 /// Whether `hay` contains `needle`, ASCII-case-insensitively. Allocation-free
@@ -2875,7 +3170,7 @@ mod tests {
 
     #[test]
     fn a_new_find_query_starts_at_the_selection_and_wraps() {
-        let hits = [3, 10, 20];
+        let hits = [(3, 2), (10, 5), (20, 1)];
         assert_eq!(first_hit_from(&hits, 10), 1, "the selection's own match");
         assert_eq!(first_hit_from(&hits, 11), 2);
         assert_eq!(first_hit_from(&hits, 0), 0);
@@ -2937,6 +3232,238 @@ mod tests {
             replace_all("café bar", "bar", "pub"),
             ("café pub".to_string(), 1)
         );
+    }
+
+    // -- Hit-based find: regex, scope ------------------------------------------
+
+    fn re() -> FindOptions {
+        FindOptions {
+            regex: true,
+            ..FindOptions::default()
+        }
+    }
+
+    /// The hits as the text they cover.
+    fn spans<'a>(hay: &'a str, hits: &[Hit]) -> Vec<&'a str> {
+        hits.iter().map(|&(s, n)| &hay[s..s + n]).collect()
+    }
+
+    #[test]
+    fn plain_hits_are_the_plain_matches_with_the_needles_length() {
+        let hay = "SELECT a FROM t; select b";
+        let hits = find_hits(hay, "select", FindOptions::default(), None).unwrap();
+        assert_eq!(hits, [(0, 6), (17, 6)]);
+        // A regex metacharacter is literal text off regex mode.
+        assert_eq!(
+            find_hits("a.b axb", "a.b", FindOptions::default(), None).unwrap(),
+            [(0, 3)]
+        );
+    }
+
+    #[test]
+    fn a_regex_hit_is_as_long_as_its_match() {
+        let hay = "id = 1 AND id = 22 or id = 333";
+        let hits = find_hits(hay, r"id = \d+", re(), None).unwrap();
+        assert_eq!(spans(hay, &hits), ["id = 1", "id = 22", "id = 333"]);
+        // Case-insensitive unless match case says otherwise.
+        assert_eq!(
+            spans(hay, &find_hits(hay, "and|OR", re(), None).unwrap()),
+            ["AND", "or"]
+        );
+        let cased = FindOptions {
+            match_case: true,
+            ..re()
+        };
+        assert_eq!(
+            spans(hay, &find_hits(hay, "and|OR", cased, None).unwrap()),
+            Vec::<&str>::new()
+        );
+        // `^` and `$` are line ends.
+        let lines = "a1\nb2\na3";
+        assert_eq!(
+            spans(lines, &find_hits(lines, r"^a\d$", re(), None).unwrap()),
+            ["a1", "a3"]
+        );
+    }
+
+    #[test]
+    fn an_empty_regex_match_is_not_a_hit() {
+        assert!(find_hits("bcd", "a*", re(), None).unwrap().is_empty());
+        let hay = "baab";
+        assert_eq!(
+            spans(hay, &find_hits(hay, "a*", re(), None).unwrap()),
+            ["aa"]
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_does_not_compile_says_so_in_one_line() {
+        let err = find_hits("abc", "a(b", re(), None).unwrap_err();
+        assert!(!err.contains('\n'), "{err:?}");
+        assert!(err.starts_with("Not a valid pattern"), "{err:?}");
+    }
+
+    #[test]
+    fn whole_word_bounds_a_regex_hit_by_the_dialects_names() {
+        let hay = "user_id id ids";
+        let opts = FindOptions {
+            whole_word: true,
+            ..re()
+        };
+        assert_eq!(
+            spans(hay, &find_hits(hay, r"i\w*", opts, None).unwrap()),
+            ["id", "ids"]
+        );
+    }
+
+    #[test]
+    fn a_scope_confines_both_modes_and_keeps_offsets_absolute() {
+        let hay = "x a x\nx b x\nx c x";
+        let scope = Some((6, 11));
+        assert_eq!(
+            find_hits(hay, "x", FindOptions::default(), scope).unwrap(),
+            [(6, 1), (10, 1)]
+        );
+        assert_eq!(
+            find_hits(hay, "[a-z]", re(), scope).unwrap(),
+            [(6, 1), (8, 1), (10, 1)]
+        );
+        // A hit that runs past the scope's end is not in it.
+        assert!(
+            find_hits(hay, "x\nx", FindOptions::default(), scope)
+                .unwrap()
+                .is_empty()
+        );
+        // Whole word still reads the text outside the scope.
+        let hay = "abc";
+        let word = FindOptions {
+            whole_word: true,
+            ..FindOptions::default()
+        };
+        assert!(find_hits(hay, "b", word, Some((1, 2))).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_hit_list_is_capped() {
+        let hay = "a".repeat(FIND_HIT_CAP + 10);
+        assert_eq!(
+            find_hits(&hay, "a", FindOptions::default(), None)
+                .unwrap()
+                .len(),
+            FIND_HIT_CAP
+        );
+    }
+
+    #[test]
+    fn a_stored_hit_holds_only_while_the_text_still_matches_there() {
+        let hay = "id = 12; id = 3";
+        assert!(hit_holds(hay, (0, 7), r"id = \d+", re(), None));
+        // The same start, but the match there is now another length.
+        assert!(!hit_holds(hay, (0, 6), r"id = \d+", re(), None));
+        assert!(!hit_holds(hay, (1, 6), r"id = \d+", re(), None));
+        assert!(hit_holds(hay, (9, 2), "ID", FindOptions::default(), None));
+        assert!(!hit_holds(hay, (9, 3), "ID", FindOptions::default(), None));
+        assert!(!hit_holds(hay, (99, 2), "id", FindOptions::default(), None));
+        // Outside the scope it was found in, it is no hit of that scope's.
+        assert!(!hit_holds(
+            hay,
+            (9, 2),
+            "ID",
+            FindOptions::default(),
+            Some((0, 8))
+        ));
+    }
+
+    #[test]
+    fn a_regex_replacement_fills_its_groups() {
+        let hay = "name = 'x'";
+        let hit = find_hits(hay, r"(\w+) = ('\w+')", re(), None).unwrap()[0];
+        assert_eq!(
+            replacement_for(hay, hit, r"(\w+) = ('\w+')", "$2 AS ${1}_x $$", re(), None),
+            "'x' AS name_x $"
+        );
+        // Off regex mode, `$1` is two characters of text.
+        assert_eq!(
+            replacement_for(hay, (0, 4), "name", "$1", FindOptions::default(), None),
+            "$1"
+        );
+    }
+
+    #[test]
+    fn replace_hits_replaces_what_find_hits_found_and_nothing_outside_the_scope() {
+        assert_eq!(
+            replace_hits("a1 b22 a3", r"([ab])(\d+)", "$2$1", re(), None).unwrap(),
+            ("1a 22b 3a".to_string(), 3)
+        );
+        assert_eq!(
+            replace_hits("x x x", "x", "y", FindOptions::default(), Some((1, 4))).unwrap(),
+            ("x y x".to_string(), 1)
+        );
+        // Not re-replaced in the same pass.
+        assert_eq!(
+            replace_hits("a", "a", "aa", re(), None).unwrap(),
+            ("aa".to_string(), 1)
+        );
+        assert!(replace_hits("a", "(", "b", re(), None).is_err());
+    }
+
+    /// **A regex hit cut short by the scope's end is the same hit to every
+    /// question**: the search stops at the scope's end, so revalidating,
+    /// filling `$1` and Replace All must read the same text, or a greedy match
+    /// that ran on past the scope is "gone" to one and longer to another.
+    #[test]
+    fn a_hit_the_scope_cut_short_is_the_same_hit_everywhere() {
+        let hay = "aaaa";
+        let scope = Some((0, 2));
+        let hits = find_hits(hay, "(a+)", re(), scope).unwrap();
+        assert_eq!(hits, [(0, 2)]);
+        assert!(hit_holds(hay, hits[0], "(a+)", re(), scope));
+        assert!(!hit_holds(hay, hits[0], "(a+)", re(), None));
+        assert_eq!(
+            replacement_for(hay, hits[0], "(a+)", "<$1>", re(), scope),
+            "<aa>"
+        );
+        assert_eq!(
+            replace_hits(hay, "(a+)", "<$1>", re(), scope).unwrap(),
+            ("<aa>aa".to_string(), 1)
+        );
+        // `$` at the scope's end that is no line end.
+        let lines = "ab\ncd";
+        assert_eq!(
+            find_hits(lines, "b$", re(), Some((0, 2))).unwrap(),
+            [(1, 1)],
+            "the search ends at the scope, as `$` sees it"
+        );
+    }
+
+    #[test]
+    fn a_selection_over_several_lines_is_searched_in_not_for() {
+        let text = "SELECT a\nFROM t\nWHERE x";
+        assert_eq!(find_scope_seed(text, (16, 2)), Some((2, 16)));
+        assert_eq!(find_seed(text, (2, 16)), None);
+        // One line is a needle, not a scope; nothing selected is neither.
+        assert_eq!(find_scope_seed(text, (0, 6)), None);
+        assert_eq!(find_scope_seed(text, (4, 4)), None);
+        assert_eq!(find_scope_seed(text, (0, 999)), None);
+        // A lone `\r` ends a line too, as `find_seed` reads it.
+        assert_eq!(find_scope_seed("a\rb", (0, 3)), Some((0, 3)));
+    }
+
+    #[test]
+    fn a_scope_follows_the_edits_around_and_inside_it() {
+        // Before it: both bounds move.
+        assert_eq!(shift_range((10, 20), 0, 2, 5), (13, 23));
+        // After it: nothing moves.
+        assert_eq!(shift_range((10, 20), 25, 26, 0), (10, 20));
+        // Inside it: the end moves, the scope grows or shrinks.
+        assert_eq!(shift_range((10, 20), 12, 14, 0), (10, 18));
+        assert_eq!(shift_range((10, 20), 15, 15, 4), (10, 24));
+        // Typed at its very start: inside, not before.
+        assert_eq!(shift_range((10, 20), 10, 10, 1), (10, 21));
+        // Over its whole extent: what replaced it.
+        assert_eq!(shift_range((10, 20), 10, 20, 3), (10, 13));
+        // Over its start from before it.
+        assert_eq!(shift_range((10, 20), 5, 12, 1), (5, 14));
     }
 
     #[test]

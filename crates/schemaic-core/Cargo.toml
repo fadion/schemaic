@@ -19,6 +19,10 @@ tracing = { workspace = true }
 # central directory here, before calamine inflates anything. Already in the graph
 # under calamine; this is the same crate, asked one question earlier.
 zip = { workspace = true }
+# The editor find bar's regex mode (`text_ops::find_hits`). Already in the graph
+# under the editor's rope (`lapce-xi-rope`) and `mysql_common`; nothing new
+# enters the lock file.
+regex = "1.13"
 # `scram` computes PostgreSQL's SCRAM-SHA-256 password verifier, so a role's
 # password reaches the server as a verifier and never as text its logs can keep.
 # The same three crates and versions `postgres-protocol` (under tokio-postgres)

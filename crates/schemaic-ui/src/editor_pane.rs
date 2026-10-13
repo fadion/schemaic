@@ -45,10 +45,12 @@ use schemaic_core::pairs::{self, PairAction};
 use schemaic_core::params;
 use schemaic_core::prompt::{self, FixOrigin};
 use schemaic_core::sql::statement_range;
+// `find_hits as hits_in`: the pane's hit list is a signal named `find_hits`.
 use schemaic_core::text_ops::{
-    FindOptions, find_matches_in, find_seed, first_hit_from, join_lines, matches_at_in, move_line,
-    newline_indent, offset_of_line, replace_all_in, soft_tab_indent, soft_tab_outdent,
-    toggle_block_comment, toggle_case, toggle_line_comment,
+    FindOptions, Hit, find_hits as hits_in, find_scope_seed, find_seed, first_hit_from, hit_holds,
+    join_lines, move_line, newline_indent, offset_of_line, replace_hits, replacement_for,
+    shift_range, soft_tab_indent, soft_tab_outdent, toggle_block_comment, toggle_case,
+    toggle_line_comment,
 };
 
 use crate::completion::{
@@ -3150,20 +3152,40 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let run_sel: RwSignal<usize> = RwSignal::new(0usize);
 
     // In-editor find (Ctrl+F) / replace (Ctrl+H): a small bar over the editor.
-    // `find_hits` holds the byte offset of each match (recomputed as the query
-    // changes); `find_idx` is the current match. Selecting a match sets the editor
-    // selection (so it's highlighted) and centres it. `find_replace_visible`
-    // expands the second row (the replacement field + Replace / All buttons).
+    // `find_hits` holds each match as `(start, len)` (recomputed as the query
+    // changes) — a regex match is as long as what it matched, so the length
+    // travels with the hit; `find_idx` is the current match. Selecting a match
+    // sets the editor selection (so it's highlighted) and centres it.
+    // `find_replace_visible` expands the second row (the replacement field +
+    // Replace / All buttons).
     let find_open: RwSignal<bool> = RwSignal::new(false);
     let find_query: RwSignal<String> = RwSignal::new(String::new());
     let find_replace: RwSignal<String> = RwSignal::new(String::new());
     let find_replace_visible: RwSignal<bool> = RwSignal::new(false);
-    let find_hits: RwSignal<Vec<usize>> = RwSignal::new(Vec::new());
+    let find_hits: RwSignal<Vec<Hit>> = RwSignal::new(Vec::new());
     let find_idx: RwSignal<usize> = RwSignal::new(0usize);
-    // Match case / whole word. Per pane and for the pane's life, like the
-    // needle beside them; flipping one is a new query (the effect below keys on
-    // both), so it rescans and reveals rather than waiting out the edit debounce.
+    // Match case / whole word / regex. Per pane and for the pane's life, like
+    // the needle beside them; flipping one is a new query (the effect below
+    // keys on them), so it rescans and reveals rather than waiting out the edit
+    // debounce.
     let find_opts: RwSignal<FindOptions> = RwSignal::new(FindOptions::default());
+    // *In selection*: the `(start, end)` the search is confined to, taken from
+    // the selection when the bar opens over several lines or the toggle is
+    // pressed. Held apart from the editor's selection, which revealing a hit
+    // replaces, and carried through each edit in `.update(…)`
+    // (`text_ops::shift_range`), so Replace inside it grows or shrinks it.
+    let find_scope: RwSignal<Option<(usize, usize)>> = RwSignal::new(None);
+    // Bumped whenever the *user* sets or drops the scope — never by the edit
+    // that carries it — so the find effect can tell a new scope (a new query:
+    // rescan now and reveal) from the same scope moved by an edit (the
+    // debounced path), which the bounds alone cannot.
+    let find_scope_gen: RwSignal<u64> = RwSignal::new(0);
+    let set_find_scope = move |scope: Option<(usize, usize)>| {
+        find_scope.set(scope);
+        find_scope_gen.update(|g| *g = g.wrapping_add(1));
+    };
+    // Why the regex in the field does not compile, shown where the count is.
+    let find_error: RwSignal<Option<String>> = RwSignal::new(None);
 
     // Go-to-line (Ctrl+G, or clicking Ln/Col in the status bar): a small popup
     // styled like the find bar. `goto_open` lives on the `Tab` so the status bar
@@ -3521,6 +3543,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 find_open.set(false);
                 find_query.set(String::new());
                 find_replace.set(String::new());
+                set_find_scope(None);
                 return CommandExecuted::Yes;
             }
             KeyAction::CloseGoto => {
@@ -4091,13 +4114,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // else: fall through → default handler cuts the selection.
             }
             // A one-line selection seeds the find field (`text_ops::find_seed`);
-            // the bar's new-query path then starts at that very match.
+            // the bar's new-query path then starts at that very match. One over
+            // several lines becomes the *in selection* scope instead
+            // (`text_ops::find_scope_seed`). Anything else, on a bar being
+            // opened, clears it; on one already open (Ctrl+H over Ctrl+F) it
+            // stays, since the selection there is the hit a step revealed.
             let seed_find = || {
                 let sel = editor_sig.with_untracked(|e| e.cursor.get_untracked().get_selection());
                 let seed = sel
                     .and_then(|sel| query.with_untracked(|t| find_seed(t, sel).map(str::to_owned)));
                 if let Some(seed) = seed {
                     find_query.set(seed);
+                }
+                let scope = sel.and_then(|sel| query.with_untracked(|t| find_scope_seed(t, sel)));
+                if scope.is_some() || !find_open.get_untracked() {
+                    set_find_scope(scope);
                 }
             };
             if c.eq_ignore_ascii_case("f") {
@@ -5736,6 +5767,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     intel::shift_inlay_hints(&mut next, iv.start, iv.end, inserted);
                 }
                 inline_diff::set_hints(hints, next);
+            }
+            // The find bar's *in selection* scope, the same way: an edit inside
+            // it — a Replace, typing — grows or shrinks it.
+            if let Some(mut scope) = find_scope.get_untracked() {
+                for d in upd.deltas() {
+                    let (iv, inserted) = d.summary();
+                    scope = shift_range(scope, iv.start, iv.end, inserted);
+                }
+                find_scope.set(Some(scope));
             }
             // **The one copy of the document an edit makes.** Everything below
             // reads `query` when it runs — a debounce at the time it fires — so
@@ -7581,16 +7621,37 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // diagnostics and live-validation passes in this file already use.
         let find_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
         let ed = ed_find.clone();
-        create_effect(move |prev: Option<(String, FindOptions)>| {
+        // One scan, wherever it runs: the hits within the scope, and the
+        // pattern's complaint (or none) published beside them.
+        let scan = move |text: &str, q: &str, opts: FindOptions| -> Vec<Hit> {
+            match hits_in(text, q, opts, find_scope.get_untracked()) {
+                Ok(hits) => {
+                    if find_error.with_untracked(Option::is_some) {
+                        find_error.set(None);
+                    }
+                    hits
+                }
+                Err(why) => {
+                    find_error.set(Some(why));
+                    Vec::new()
+                }
+            }
+        };
+        // Keyed on the needle, the options and the scope's **generation** —
+        // bumped when the user sets or drops a scope, not by the edit that
+        // carries one, so a new scope is a new query while an edit inside it
+        // stays the debounced path below.
+        create_effect(move |prev: Option<(String, FindOptions, u64)>| {
             // Whole word ends a word where the tab's dialect ends a name.
             let opts = FindOptions {
                 dialect: dialect.get(),
                 ..find_opts.get()
             };
+            let scoped = find_scope_gen.get();
             // Closed, it forgets the query it ran for: reopening — seeded with
             // the needle it last had, say — is a new query, not an edit.
             if !find_open.get() {
-                return (String::new(), opts);
+                return (String::new(), opts, scoped);
             }
             let q = find_query.get();
             if q.is_empty() {
@@ -7599,12 +7660,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // would read a document it stopped following.
                 query.track();
                 find_idx.set(0);
+                if find_error.with_untracked(Option::is_some) {
+                    find_error.set(None);
+                }
                 if !find_hits.with_untracked(Vec::is_empty) {
                     find_hits.set(Vec::new());
                 }
-                return (q, opts);
+                return (q, opts, scoped);
             }
-            if prev.as_ref().map(|(p, o)| (p.as_str(), *o)) != Some((q.as_str(), opts)) {
+            if prev.as_ref().map(|(p, o, s)| (p.as_str(), *o, *s))
+                != Some((q.as_str(), opts, scoped))
+            {
                 // **A new query recomputes now.** The user is watching `n/total`
                 // and waiting to be taken to the first match; a delay here is a
                 // find bar that feels broken. `with`, not `get`: the scan borrows
@@ -7613,18 +7679,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Superseding any edit tick still out: it captured the old needle
                 // and options, and landing after this would put their hits back.
                 find_gen.set(find_gen.get().wrapping_add(1));
-                let hits = query.with(|text| find_matches_in(text, &q, opts));
+                let hits = query.with(|text| scan(text, &q, opts));
                 // From the selection's start, so a seeded needle — or one typed
-                // a character at a time — stays on the match in view.
+                // a character at a time — stays on the match in view
+                // (`text_ops::first_hit_from`).
                 let cur = ed.cursor.get_untracked();
                 let from = cur.get_selection().map_or(cur.offset(), |(a, b)| a.min(b));
                 let i = first_hit_from(&hits, from);
                 find_idx.set(i);
-                if let Some(&hit) = hits.get(i) {
-                    reveal(hit, q.len());
+                if let Some(&(off, len)) = hits.get(i) {
+                    reveal(off, len);
                 }
                 find_hits.set(hits);
-                return (q, opts);
+                return (q, opts, scoped);
             }
             // **An edit debounces.** Rescanning the whole document synchronously
             // on every keystroke is 17 ms at 16 MiB, on the UI thread, while the
@@ -7645,14 +7712,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if fgen.get() != g || find_hits.try_get_untracked().is_none() {
                     return;
                 }
-                let hits = query.with_untracked(|text| find_matches_in(text, &needle, opts));
+                let hits = query.with_untracked(|text| scan(text, &needle, opts));
                 // Same query, edited document: hold the position, clamped.
                 if !hits.is_empty() {
                     find_idx.update(|i| *i = (*i).min(hits.len() - 1));
                 }
                 find_hits.set(hits);
             });
-            (q, opts)
+            (q, opts, scoped)
         });
     }
     // Step to the next (+1) / previous (-1) match, wrapping.
@@ -7665,8 +7732,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
             let next = (find_idx.get_untracked() as i64 + delta).rem_euclid(n as i64) as usize;
             find_idx.set(next);
-            let off = find_hits.with_untracked(|v| v[next]);
-            reveal(off, find_query.with_untracked(|q| q.len()));
+            let (off, len) = find_hits.with_untracked(|v| v[next]);
+            reveal(off, len);
         })
     };
     let find_close: Rc<dyn Fn()> = {
@@ -7675,6 +7742,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             find_open.set(false);
             find_query.set(String::new());
             find_replace.set(String::new());
+            set_find_scope(None);
             // Return focus to the editor so typing resumes there.
             if let Some(Some(vid)) = ed.editor_view_id.try_get_untracked() {
                 vid.request_focus();
@@ -7742,31 +7810,39 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 dialect: dialect.get_untracked(),
                 ..find_opts.get_untracked()
             };
-            let off = if matches_at_in(&text_now, hits[idx], &q, opts) {
+            // A regex hit is revalidated as the same span, not merely a match
+            // starting there (`text_ops::hit_holds`).
+            let scope = find_scope.get_untracked();
+            let hit = if hit_holds(&text_now, hits[idx], &q, opts, scope) {
                 hits[idx]
             } else {
-                let fresh = find_matches_in(&text_now, &q, opts);
-                let Some(&off) = fresh.get(idx).or(fresh.first()) else {
+                let fresh = hits_in(&text_now, &q, opts, scope).unwrap_or_default();
+                let Some(&hit) = fresh.get(idx).or(fresh.first()) else {
                     find_hits.set(Vec::new());
                     find_idx.set(0);
                     return;
                 };
-                off
+                hit
             };
+            let (off, len) = hit;
+            // `$1` and its kin filled from this match, under regex.
+            let repl = replacement_for(&text_now, hit, &q, &repl, opts, scope);
             // Refused while the editor is frozen — and then the index must not
             // advance either, or Replace would walk the find bar forward over a
             // document it did not change.
             if !edit_untyped(
                 &ed,
                 comp,
-                Selection::region(off, off + q.len()),
+                Selection::region(off, off + len),
                 &repl,
                 EditType::Other,
             ) {
                 return;
             }
             let text = ed.doc().text().to_string();
-            let new_hits = find_matches_in(&text, &q, opts);
+            // Within the scope as the edit left it — `.update(…)` has carried
+            // it over the replacement by now.
+            let new_hits = hits_in(&text, &q, opts, find_scope.get_untracked()).unwrap_or_default();
             if new_hits.is_empty() {
                 find_hits.set(new_hits);
                 find_idx.set(0);
@@ -7775,9 +7851,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // Advance to the first match at/after the replacement end (wrapping),
             // so repeated Replace walks forward through the document.
             let after = off + repl.len();
-            let next = new_hits.iter().position(|&h| h >= after).unwrap_or(0);
+            let next = new_hits.iter().position(|h| h.0 >= after).unwrap_or(0);
             find_idx.set(next);
-            reveal(new_hits[next], q.len());
+            let (noff, nlen) = new_hits[next];
+            reveal(noff, nlen);
             find_hits.set(new_hits);
         })
     };
@@ -7796,10 +7873,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 dialect: dialect.get_untracked(),
                 ..find_opts.get_untracked()
             };
-            let (new_text, n) = replace_all_in(&text, &q, &repl, opts);
+            let scope = find_scope.get_untracked();
+            let Ok((new_text, n)) = replace_hits(&text, &q, &repl, opts, scope) else {
+                return;
+            };
             if n == 0 {
                 return;
             }
+            // In a scope, the edit is the scope's own span and no wider — the
+            // text outside it is unchanged, and an edit over the whole document
+            // would carry the scope (`text_ops::shift_range`) out to all of it.
+            let (lo, hi) = scope.map_or((0, text.len()), |(a, b)| (a, b.min(text.len())));
+            let tail = text.len() - hi;
+            let (edit_range, written) = (lo..hi, &new_text[lo..new_text.len() - tail]);
             // Refused while the editor is frozen, exactly as `replace_one`
             // above — and then the hit list must not be rewritten either. It
             // was set from `new_text`, which is text that was never written: for
@@ -7810,13 +7896,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if !edit_untyped(
                 &ed,
                 comp,
-                Selection::region(0, text.len()),
-                &new_text,
+                Selection::region(edit_range.start, edit_range.end),
+                written,
                 EditType::Other,
             ) {
                 return;
             }
-            find_hits.set(find_matches_in(&new_text, &q, opts));
+            find_hits
+                .set(hits_in(&new_text, &q, opts, find_scope.get_untracked()).unwrap_or_default());
             find_idx.set(0);
         })
     };
@@ -7899,8 +7986,28 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .style(|s| s.width(theme::scaled(170.0)));
                 let count = dyn_container(
                     // `with`, not `get` — reading a length shouldn't clone the hits.
-                    move || (find_hits.with(|h| h.len()), find_idx.get()),
-                    move |(n, i)| {
+                    move || {
+                        (
+                            find_hits.with(|h| h.len()),
+                            find_idx.get(),
+                            find_error.get(),
+                        )
+                    },
+                    move |(n, i, err)| {
+                        // A pattern that does not compile takes the count's
+                        // place, in the error colour, with the reason on hover.
+                        if let Some(why) = err {
+                            return text("Invalid")
+                                .style(|s| {
+                                    s.font_size(theme::font_label())
+                                        .color(theme::error())
+                                        .min_width(30.0)
+                                })
+                                .tooltip(move || {
+                                    text(why.clone()).style(crate::widgets::tooltip_style)
+                                })
+                                .into_any();
+                        }
                         let cur = if n == 0 { 0 } else { i + 1 };
                         text(format!("{cur}/{n}"))
                             .style(|s| {
@@ -7957,12 +8064,52 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     |o| o.whole_word,
                     |o| o.whole_word = !o.whole_word,
                 );
+                let regex_btn = opt_toggle(
+                    ".*",
+                    "Regular expression",
+                    |o| o.regex,
+                    |o| o.regex = !o.regex,
+                );
+                // *In selection*: lit while a scope is set. Pressing it takes
+                // the editor's selection as the scope, or drops the scope it
+                // has; with nothing selected there is nothing to take.
+                let scope_btn = container(text("Sel"))
+                    .on_click_stop({
+                        let ed = ed_find.clone();
+                        move |_| {
+                            if find_scope.with_untracked(Option::is_some) {
+                                set_find_scope(None);
+                                return;
+                            }
+                            let sel = ed.cursor.get_untracked().get_selection();
+                            if let Some((a, b)) = sel.filter(|(a, b)| a != b) {
+                                set_find_scope(Some((a.min(b), a.max(b))));
+                            }
+                        }
+                    })
+                    .style(move |s| {
+                        let lit = find_scope.with(Option::is_some);
+                        s.items_center()
+                            .justify_center()
+                            .min_width(theme::scaled(18.0))
+                            .font_size(theme::font_label())
+                            .font_bold()
+                            .color(if lit {
+                                theme::chip_active()
+                            } else {
+                                theme::chip_idle()
+                            })
+                            .hover(|s| s.color(theme::chip_active()))
+                    })
+                    .tooltip(|| text("Find in selection").style(crate::widgets::tooltip_style));
                 // A flex spacer pins the counter + nav + × to the right edge; row 2
                 // does the same, so `All` lines up under the ×.
                 let row1 = h_stack((
                     input,
                     case_btn,
                     word_btn,
+                    regex_btn,
+                    scope_btn,
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     count,
                     prev_btn,
@@ -8028,9 +8175,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // collapses, leaving `All` hugging `Replace` instead of pinned under
                 // the ×. Sized just to the find row's packed width so the leftover
                 // spacer (hence the field→controls gap) is ~15px, not ~33px.
-                // Wide enough for the two option toggles beside the find field
-                // (283 before them).
-                let content = v_stack((row1, replace_row)).style(|s| s.width(theme::scaled(331.0)));
+                // Wide enough for the four option toggles beside the find field
+                // (283 before them, 331 with two).
+                let content = v_stack((row1, replace_row)).style(|s| s.width(theme::scaled(389.0)));
                 h_stack((toggle, content))
                     .style(|s| {
                         s.items_center()

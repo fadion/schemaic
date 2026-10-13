@@ -13276,16 +13276,50 @@ existing prose was left alone.
     (`whole_word_ends_a_word_where_the_dialect_ends_a_name`) — asked
     only on a side where the needle's own edge is such a byte, so `f(` wants a boundary on its left
     alone. Both options keep every hit exactly `needle.len()` bytes, one by comparing the same span
-    more strictly and the other by only refusing, and that invariant is **why regex is not among
-    them**: a pattern's match has its own length, and the bar selects, reveals and replaces by the
-    needle's (`match_case_finds_only_the_exact_spelling`,
-    `whole_word_finds_the_word_and_not_the_identifier_containing_it`).
+    more strictly and the other by only refusing, and the plain functions keep that invariant
+    still: **`FindOptions::regex` is read only by the hit-based entry points** — `find_hits`,
+    `hit_holds`, `replacement_for`, `replace_hits` — and `find_matches_in`, `matches_at_in` and
+    `replace_all_in` ignore it, because a pattern's match has its own length and every caller of
+    those selects, highlights or replaces by the needle's (`match_case_finds_only_the_exact_spelling`,
+    `whole_word_finds_the_word_and_not_the_identifier_containing_it`). A **`Hit`** is
+    `(start, len)` instead. `find_hits` takes an optional `scope` — the find bar's *in selection* —
+    and in plain mode is `find_matches_between`, the ranged scan `find_matches_in` now delegates to,
+    which starts at the scope's start while whole word still reads its boundaries from all of
+    `hay`. In regex mode it compiles through `find_regex` — case-insensitive unless Match case,
+    `multi_line` so `^`/`$` are line ends, and a compile error turned into one line,
+    `Not a valid pattern: …`, from the last line of the crate's message, which otherwise draws a
+    caret under the pattern over several (`a_pattern_that_does_not_compile_says_so_in_one_line`) —
+    and walks `find_at` over `hay[..hi]`, so `\b` and `^` at the scope's start see the text before
+    it (`a_scope_confines_both_modes_and_keeps_offsets_absolute`). An empty match is skipped, there
+    being nothing to select or replace (`an_empty_regex_match_is_not_a_hit`), and whole word asks
+    `word_bounded`, the same test `hit_at` now calls, so the two modes cannot end a word in
+    different places (`whole_word_bounds_a_regex_hit_by_the_dialects_names`). Both modes stop at
+    `FIND_HIT_CAP`, 100,000: `.` over a large script matches every character, and a list of
+    millions is a counter nobody reads and a Replace All nobody meant (`the_hit_list_is_capped`).
+    `hit_holds` is `matches_at`'s question for a stored hit, and under regex it asks for **the same
+    span**, not merely a match starting there — the match `find_at` makes at the hit's start must
+    end where the hit ends, or a number that grew under a `\d+` hit would be replaced only as far
+    as its old length (`a_stored_hit_holds_only_while_the_text_still_matches_there`).
+    `replacement_for` is the text a hit is replaced with: literal off regex, where `$1` is two
+    characters of text; under regex the hit's `captures_at` run through `Captures::expand`, so
+    `$1`, `${name}` and `$$` work, falling back to the literal text when the match there is no
+    longer the hit's span (`a_regex_replacement_fills_its_groups`). `replace_hits` is Replace All
+    over `find_hits`' list, left to right over the original text, so a replacement that itself
+    matches is not replaced again. `shift_range` carries the scope through one edit: a bound before
+    the edit stays, one after it moves by the edit's change in length, and one inside the replaced
+    text lands at the start of what replaced it (the scope's start) or its end (the scope's end),
+    so an edit inside the scope grows or shrinks it rather than losing it — and **an insertion
+    exactly at the scope's start counts as inside**, so typing at the head of the block grows it
+    instead of pushing it along (`a_scope_follows_the_edits_around_and_inside_it`).
     `find_seed` and `first_hit_from` are how the editor's find bar opens: Ctrl+F/Ctrl+H seed the
     field from the selection only when it is non-empty and on one line — a multi-line selection is
     a block being worked on, not a needle, and the field is one line, so it seeds nothing and the
     field keeps what it held — and a new query starts at the first hit at or after the selection's
     start or the caret, wrapping to the first, rather than at match 0
     (`find_seeds_from_a_one_line_selection_only`, `a_new_find_query_starts_at_the_selection_and_wraps`).
+    `find_scope_seed` is the other half of the first rule: the selection that spans more than one
+    line — the block `find_seed` declines to make a needle of — becomes the scope to search *in*
+    (`a_selection_over_several_lines_is_searched_in_not_for`).
     `duplicate_lines` is Ctrl+D's: the spanned lines copied as `\n` + lines at the end of the last
     one, so the newline-less last line gets a line of its own, with the selection or caret moved
     onto the copy (`duplicating_the_last_line_makes_a_new_line`).
@@ -27324,7 +27358,7 @@ existing prose was left alone.
     query it last ran for, which is what separates the two. A **new query** recomputes now and
     reveals a match, because the user is watching `n/total` and waiting to be taken there;
     a delay in that path is a find bar that feels broken. The match is the first at or after the
-    selection's start, or the caret (`text_ops::first_hit_from`), not match 0: a needle Ctrl+F
+    selection's start, or the caret (`text_ops::first_hit_from`, over `Hit`s), not match 0: a needle Ctrl+F
     seeded from the selection stays on that occurrence, and one typed a character at a time stays
     on the match in view instead of leaping to the top — VS Code's behaviour. **While the bar is
     closed the effect returns an empty string, not the query it ran for**, so reopening on the same
@@ -27344,17 +27378,45 @@ existing prose was left alone.
     **Match case and Whole word are part of the query, not a filter on its hits.** They are a
     per-pane `find_opts: RwSignal<FindOptions>` (`text_ops`, above), its `dialect` filled from the
     pane's at every read rather than stored, held for the pane's life like
-    the needle beside them and not persisted, and the effect's previous value is `(query, opts)`
-    rather than the query alone — so flipping one is a new query, rescanned and revealed at once,
-    not an edit left to the debounce. **A new query bumps `find_gen` too**: it was bumped by the
-    edit path alone, so an edit's 120 ms tick still out when a new needle — or now an option flip —
-    landed would fire after it and put the old needle's hits back under `n/total`.
+    the needle beside them and not persisted, and the effect's previous value is
+    `(query, opts, scoped)` rather than the query alone — so flipping one is a new query, rescanned
+    and revealed at once, not an edit left to the debounce. `scoped` is the *in selection* scope's
+    **generation**, `find_scope_gen`, which `set_find_scope` bumps when the user sets or drops a
+    scope and the edit that carries one does not: keying on the bounds would send each keystroke
+    inside the scope down the new-query path, and keying on whether one is set made a move from one
+    scope straight to another an edit — no reveal, and the old scope's hits up for a tick. **A new query bumps `find_gen`
+    too**: it was bumped by the edit path alone, so an edit's 120 ms tick still out when a new
+    needle — or now an option flip — landed would fire after it and put the old needle's hits back
+    under `n/total`. Both paths scan through one `scan` closure over `hits_in` (the import alias
+    for `text_ops::find_hits`, the signal having that name), which publishes a pattern's compile
+    error to `find_error` or clears it, and the hits are `Vec<Hit>`, so the reveal and the step
+    select each hit's own length.
     `replace_one`'s revalidation and its rescan, and
-    `replace_all_cb`, take the same options through the `_in` forms: revalidating by the default
-    rule would let a hit Whole word had refused pass as a fold-equal span and be replaced. The
-    toggles are two text glyphs right of the find field, `Aa` and `W` (tooltips *Match case*,
-    *Whole word*), lit `chip_active` when on and `chip_idle` when off — the status bar's toggle
-    colours — which is what took the bar's content width from 283 to 331. Neither has a key.
+    `replace_all_cb`, take the same options — through `hit_holds`, `find_hits` and `replace_hits`:
+    revalidating by the default rule would let a hit Whole word had refused pass as a fold-equal
+    span and be replaced, and under regex `hit_holds` asks for the same span, not merely a match at
+    the same start. **All three read the text the search read** — `hay` up to the scope's end,
+    which `hit_holds` and `replacement_for` take the scope for — so a greedy hit the scope cut short
+    holds, and fills `$1`, with what it covers rather than with the longer match the whole document
+    would give (`a_hit_the_scope_cut_short_is_the_same_hit_everywhere`). `replace_one` then expands the replacement with `replacement_for` — so `$1` is
+    the hit's group — rescans within the scope, and advances past `off + expanded.len()`, the
+    replacement as written being the wrong length once a group has been filled in.
+    **The *in selection* scope** is `find_scope: RwSignal<Option<(usize, usize)>>`, held apart from
+    the editor's selection, which revealing a hit replaces, and carried through each delta in
+    `.update(…)` by `text_ops::shift_range`, beside the inlay hints' `shift_inlay_hints`. Ctrl+F and
+    Ctrl+H make a multi-line selection the scope (`find_scope_seed`); anything else clears it on a
+    bar being opened but **keeps it on one already open**, since there — Ctrl+H over Ctrl+F — the
+    selection is the hit a step revealed, not a new block. Closing (× or Escape's `CloseFind`)
+    clears it. **Replace All in a scope edits only the scope's span**, `new_text` cut to it by the
+    unchanged tail's length: an edit over the whole document, the ordinary Replace All's, would
+    carry the scope out through `shift_range` to all of it. The toggles are four text glyphs right
+    of the find field, `Aa`, `W`, `.*` and `Sel` (tooltips *Match case*, *Whole word*, *Regular
+    expression*, *Find in selection*), lit `chip_active` when on and `chip_idle` when off — the
+    status bar's toggle colours — which is what took the bar's content width from 283 to 331 with
+    the first two, and to 389 with all four. `Sel` is not an `opt_toggle`, the scope not being a
+    `FindOptions` field: pressing it takes the editor's non-empty selection, and pressing it again
+    drops the scope. A pattern that does not compile shows **Invalid** in `theme::error()` in the
+    count's place, with `find_error`'s sentence as its tooltip. None of them has a key.
     **Replace All honours `edit_untyped`'s refusal before it touches `find_hits`**, which is the
     guard `replace_one` beside it already had. `replace_all_cb` wrote the new hit list unconditionally
     and it was computed from `new_text` — text that, when the editor is frozen, was never written. For
