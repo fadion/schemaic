@@ -1550,8 +1550,8 @@ fn sqlite_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         ),
         form_hint(
             "A SQLite database is a single file, so there is no server to reach — \
-             no host, user, password or tunnel. Schema editing and manual \
-             transactions aren't available on one yet.",
+             no host, user, password or tunnel. Manual transactions aren't \
+             available on one yet: statements commit as they are sent.",
         )
         .style(|s| s.width_full()),
     ))
