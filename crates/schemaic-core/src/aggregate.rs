@@ -207,8 +207,10 @@ pub struct NumericAggregates {
 
 /// Aggregate `cells` under `column`.
 ///
-/// Non-numeric columns get counts only — there is nothing to sum in a name, and
-/// a lexicographic min/max reads as a bug more often than it answers a question.
+/// Non-numeric columns get no arithmetic — counts, a distinct count and the
+/// length range of their non-NULL values, and over bytes (a `<n bytes>`
+/// placeholder) counts alone. There is nothing to sum in a name, and a
+/// lexicographic min/max reads as a bug more often than it answers a question.
 /// A numeric cell that doesn't parse is counted as present but left out of the
 /// arithmetic: the column type says what it should be, and a wire value that
 /// isn't a number is not something to guess about.
@@ -892,7 +894,7 @@ mod tests {
     /// A total too large for the accumulator is absent rather than wrapped —
     /// a silently wrong sum is worse than no sum.
     ///
-    /// Overflow site 3 of 4: the running `checked_add`. The other three are
+    /// Overflow site 3 of 5: the running `checked_add`. The other four are
     /// below; they are tested apart because they did **not** degrade alike, and
     /// that is how three different answers to one question shipped.
     #[test]
@@ -903,7 +905,7 @@ mod tests {
         assert!(a.numeric.is_none());
     }
 
-    /// Overflow site 1 of 4, and the only one that ever produced a *wrong*
+    /// Overflow site 1 of 5, and the only one that ever produced a *wrong*
     /// number: a value wider than i128 was skipped like `"n/a"`, so the bar
     /// reported the total of everything else under a selection that visibly
     /// contained more. `1e39` is what a `DOUBLE` column really sends — through
@@ -920,7 +922,7 @@ mod tests {
         );
     }
 
-    /// Overflow site 2 of 4: bringing values to a common scale. Driven by the
+    /// Overflow site 2 of 5: bringing values to a common scale. Driven by the
     /// *spread* of scales rather than by magnitude, so it can erase a total that
     /// would have fitted comfortably. Left as a degrade on purpose — capping the
     /// working scale would make this the module's first rounding decision, and
@@ -937,7 +939,7 @@ mod tests {
         assert!(a.numeric.is_none());
     }
 
-    /// Overflow site 4 of 4, and the one that must **not** take the others with
+    /// Overflow site 4 of 5, and the one that must **not** take the others with
     /// it. The average alone divides, so it alone can fail to be representable;
     /// carried as a plain `Fixed` it propagated `?` and withheld an exact Sum,
     /// Min and Max because the *mean* of them didn't fit.
@@ -958,6 +960,37 @@ mod tests {
         let s = a.summary();
         assert!(s.contains("Sum "), "got {s}");
         assert!(!s.contains("Avg"), "an absent average is omitted, got {s}");
+    }
+
+    /// Overflow site 5 of 5, the median's, which degrades like the average's:
+    /// the two middles' sum, or the odd pair's `× 5` for its extra decimal
+    /// place, can fail to fit while the Sum, Min and Max are exact — and it
+    /// costs the median alone.
+    #[test]
+    fn an_unrepresentable_median_costs_only_the_median() {
+        let numeric = |vals: &[&str]| {
+            let rows: Vec<Value> = vals.iter().map(|v| Value::Str((*v).into())).collect();
+            agg_of("numeric", &rows)
+                .numeric
+                .expect("the sum fits and must still be reported")
+        };
+        // The odd pair: 4 × 10³⁷ + 1 fits, its `× 5` does not.
+        let odd = numeric(&[
+            "20000000000000000000000000000000000000",
+            "20000000000000000000000000000000000001",
+        ]);
+        assert_eq!(odd.sum.text(), "40000000000000000000000000000000000001");
+        assert!(odd.median.is_none(), "{:?}", odd.median);
+        // The middles' sum: 1.8 × 10³⁸ is past i128, while the running total,
+        // the negative value taken first, never leaves it.
+        let wide = numeric(&[
+            "-170000000000000000000000000000000000000",
+            "90000000000000000000000000000000000000",
+            "90000000000000000000000000000000000000",
+            "90000000000000000000000000000000000000",
+        ]);
+        assert_eq!(wide.sum.text(), "100000000000000000000000000000000000000");
+        assert!(wide.median.is_none(), "{:?}", wide.median);
     }
 
     /// The headroom argument in [`Fixed`]'s own doc, made a test: a

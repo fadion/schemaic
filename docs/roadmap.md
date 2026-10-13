@@ -72,9 +72,11 @@ assertions pin English wording — stays the regression net throughout.
    `stats`, `import`, `conn_import`, `users`), and core cannot — and should not — reach a UI
    catalogue. Each becomes a typed message (an id plus arguments, or an enum per area) the UI
    renders; core keeps an English rendering for the CLI and MCP. Settle the message type on one
-   area first and review it before the rest follow. The existing enums (`ImportError`,
-   `FilterError`, `ParamError`, `AliasRenameRefusal`) are the nearest starting points; they still
-   render their own prose through `message()`.
+   area first and review it before the rest follow. The existing enums are the nearest starting
+   points, though they render in three different ways: `AliasRenameRefusal` through `message()`,
+   `ImportError` and `ParamError` through `Display`, and `FilterError::BadCondition` not at all
+   — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
+   so its prose lives at its construction sites and it is the weakest of the four to start from.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-3 or phase-4 file is converted rather than as
    a pass of their own.

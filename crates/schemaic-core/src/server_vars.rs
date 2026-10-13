@@ -68,7 +68,7 @@ pub fn supports_status(dialect: SqlDialect) -> bool {
 
 /// Does `var` match the viewer's search `query`?
 ///
-/// A case-insensitive substring over the name, the value and the detail, so
+/// An ASCII case-insensitive substring over the name, the value and the detail, so
 /// *"utf8"* finds every setting whose value is a UTF-8 character set and
 /// *"parallel"* finds SQL Server's settings by their description. An empty
 /// query matches everything.

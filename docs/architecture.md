@@ -346,7 +346,7 @@ existing prose was left alone.
     (`a_truncated_count_shows_and_copies_as_a_floor`). `summary` prints distinct and median only once
     there are two non-NULL values — one value is its own of each, and `1 row · Sum 7` stays
     unpadded (`a_single_value_is_not_padded_with_distinct_or_median`).
-    **There are four overflow sites and they do not degrade alike**, which is how three different
+    **There are five overflow sites and they do not degrade alike**, which is how three different
     answers to one question shipped; each is tested apart. `Fixed::parse` answers
     `Parsed::{Value, Overflow, NotANumber}` — three, not two, because a number too wide returning
     the same `None` as `"n/a"` made `aggregate` *skip* it, and a `double` column holding `1e39` and
@@ -358,6 +358,9 @@ existing prose was left alone.
     on `NumericAggregates`: carried as a plain `Fixed` it propagated `?` and withheld an exact Sum,
     Min and Max because the *mean* of them didn't fit — and it divides before it scales, so the
     `DECIMAL(38,10)` case `Fixed`'s own headroom paragraph calls comfortable is representable.
+    The fifth is the median's, an `Option` beside it for the same reason: the two middles'
+    `checked_add`, or the odd pair's `checked_mul(5)`, answers `None` for the median alone and
+    leaves the rest standing (`an_unrepresentable_median_costs_only_the_median`, one case for each).
     The grid enters through the *text*-taking form — `aggregate_texts`' signature, which
     `aggregate_capped` (what it actually calls) shares — not `aggregate` over stored cells: a staged
     (green) edit and a pending new row are both on screen and neither is in the `ResultSet`, and a
@@ -6755,7 +6758,7 @@ existing prose was left alone.
     `repoint_check_columns` — one rename after another, in the renames map's `HashMap` order, turned
     `a → a2` beside `b → a` into a filter on `a2` twice, at random
     (`a_rename_chain_under_a_filtered_index_filters_the_right_columns`) — there
-    and not in `rename_index`, which `diff_indexes` compares the draft through, and the draft keeps
+    and not in `rename_index`, which `diff` compares the draft through, and the draft keeps
     the condition as it was read (`sql_server_remakes_a_filtered_index_around_a_rename_its_condition_names`;
     live, `a_column_a_filtered_index_names_is_renamed`, red with Msg 5074 before and green on 2022
     and 2025 after).
@@ -9100,9 +9103,15 @@ existing prose was left alone.
     its index and key where there are ones, a transaction, a database. `LockList` carries the locks,
     the truncation verdict and `contended_only` (MariaDB's, under `schemaic-db` below).
     `prepare_locks` is `prepare`'s counterpart: every **waiting** lock first — what is stuck is what
-    the view is opened for — then by object, session and mode so the order is total; `blocked_by`
-    deduplicated for the reason the sessions graph is, the engines answering one row per lock pair;
-    and a cut at `MAX_LOCKS` whose `bool` is said rather than hidden. The cap matters more here than
+    the view is opened for — then by object, session, mode and `kind`, and last by `blocked_by` and
+    `killable`, which no reader orders by but the merge needs; `blocked_by` deduplicated for the
+    reason the sessions graph is, the engines answering one row per lock pair; identical rows
+    merged (`locks.dedup()`), because SQL Server answers a row per lock *owner* and one
+    `ALTER TABLE`'s schema lock came back twenty times, burying everything else. `dedup` merges
+    only *adjacent* copies, so the sort has to reach every field — two copies kept apart by a row
+    differing only in a field it skipped both survived. Merged before the cut, so the copies do
+    not spend the cap; and a cut at `MAX_LOCKS` whose `bool` is said
+    rather than hidden. The cap matters more here than
     for sessions, since an `UPDATE` of a million rows holds a record lock on each on MySQL.
     `lock_matches` searches what the row shows — session, object, kind and mode — and the word
     `waiting` for a lock not yet granted. `parse_id_list` is `parse_pid_array` under the name a lock
@@ -9713,8 +9722,8 @@ existing prose was left alone.
     names every PRAGMA, the ones that act (`optimize`, `integrity_check`, `wal_checkpoint`)
     included, so a viewer reading that list would be a way to run them;
     `the_sqlite_pragmas_are_bare_names_and_unique` pins that each is a bare lower-case name, with
-    no `=` or `(` to be an assignment. `var_matches` is the search: a case-insensitive substring
-    over name, value *and* detail, so *utf8* finds every setting whose value is a UTF-8 character
+    no `=` or `(` to be an assignment. `var_matches` is the search: an ASCII case-insensitive
+    substring over name, value *and* detail, so *utf8* finds every setting whose value is a UTF-8 character
     set and *parallel* finds SQL Server's settings by their description; an empty query matches
     everything. `render_slice` is `activity::render_slice`'s rule — the first `RENDER_CAP` (300)
     matches as references, plus a *count* of the rest rather than a silent cut — because a MariaDB
@@ -13097,7 +13106,8 @@ existing prose was left alone.
     `contains_ignore_ascii_case` (find bars). Pure and byte-offset-preserving.
     **`find_matches`, `matches_at` and `replace_all` fold non-ASCII letters too** — `É`/`é`,
     `Ö`/`ö`, Cyrillic, Greek — where they used to fold ASCII only; `contains_ignore_ascii_case`
-    (called from `grid`, `history`, `snippet`, `users` and `activity`) still folds ASCII only, as
+    (called from `grid`, `history`, `snippet`, `users`, `activity` and `server_vars`) still folds
+    ASCII only, as
     its name says. The fold is per character, a char's lowercase when that is one char
     (`fold_char`) — and the word-final sigma `ς` as `σ`, since both have the capital `Σ` and a
     per-character lowercase cannot know which one `Σ` stands for, so every Greek word ending in
@@ -13390,10 +13400,15 @@ existing prose was left alone.
     `MIN_TERM_CHARS` (3) — one or two letters match nearly every body in a database — counted in
     characters rather than bytes, so three Cyrillic letters qualify as three ASCII ones do
     (`a_term_shorter_than_three_characters_searches_no_body`). `BODY_HIT_CAP` (50) is the palette's
-    cap on the tier. `body_snippet` is the row's text: the matching line, trimmed, its whitespace
-    runs collapsed to one space, and when longer than `SNIPPET_CHARS` (60) cut to a window keeping 20
-    characters ahead of the match, an `…` on each side that was cut — on character boundaries, so a
-    multibyte line is never split (`a_multibyte_line_is_cut_on_character_boundaries`). The window
+    cap on the tier. `body_snippet` is the row's text: the matching line, trimmed, and when longer
+    than `SNIPPET_CHARS` (60) cut to a window starting `SNIPPET_LEAD` (20) characters ahead of the
+    match — slid back when it would run past the line's end, so a match near the end keeps more than
+    20 ahead of it and the window stays 60 characters (`a_match_near_either_end_is_cut_on_one_side_only`) —
+    with an `…` on each side that was cut, on character boundaries, so a multibyte line is never
+    split (`a_multibyte_line_is_cut_on_character_boundaries`). **The window is measured on the line
+    as trimmed, before its whitespace runs are collapsed to one space**: the collapse happens as the
+    window's characters are copied out, so both the 60-character test and the window count raw
+    characters, and a line padded with runs of spaces or tabs can come out under 60. The window
     is counted out of the line rather than collected: a MySQL view's definition is one line, and
     gathering it into a `Vec<char>` cost four bytes a character of the whole definition per hit.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
@@ -19052,11 +19067,15 @@ existing prose was left alone.
   nothing, a script split at `GO`, introspection, a table's generated DDL rebuilding the table it
   was read from (`a_tables_ddl_rebuilds_the_table_it_was_read_from`), a cancel (of a running
   statement, and of one still compiling behind another session's lock), activity (the poll's own
-  session absent from it, and `a_lock_wait_lists_the_waiter_and_its_holder`: a holder batch
-  `BEGIN TRAN; UPDATE; WAITFOR` four seconds, `ROLLBACK` blocks a second `UPDATE`, and the waiting
-  lock must lead, its blocker's granted lock must be on `.dbo.t`, and `contended_only` must be
-  false — the blocker read off the wait rather than compared with a known id, there being no
-  pinned session in it; passing on 2022 and 2025), the grid's write-back (seven tests, from
+  session absent from it, and `a_lock_wait_lists_the_waiter_and_its_holder`: a pinned `Session`
+  holds a row in an open transaction and a spawned `UPDATE` of it blocks — pinned rather than a
+  holder batch on a `WAITFOR` timer, which could roll back before a loaded machine's poll saw the
+  wait, and did. `fetch_locks` is polled, up to a hundred times at 100 ms, until a waiting lock is
+  blocked by `holder.server_id()`; then the wait must lead, the holder must have a granted,
+  killable lock on the table, and `contended_only` must be false. The table is accepted as
+  `.dbo.t` *or* as `": object "` — the poll's nameless fallback, which another session's DDL
+  elsewhere puts it on, and a concurrent `the_lock_list_answers_while_ddl_holds_a_table` does), the
+  grid's write-back (seven tests, from
   `a_staged_edit_lands_on_its_row_and_reads_back` to `a_stopped_commit_is_undone`, under
   `mssql.rs` above), `run_ddl` and the designer's plans (from a designed table and a
   failing plan rolled back whole to an existing table's edit landing as drafted, an edit keeping
@@ -21383,7 +21402,7 @@ existing prose was left alone.
     Codex, `step_index` on Antigravity, `callID` on OpenCode, `toolCallId` on Copilot, `call_id` on
     Cursor — and without it a result can only be
     attached by recency, which is exactly backwards for the ordinary parallel shape: the model
-    makes two calls in one step, three of the tools the panel allow-lists being read-only ones
+    makes two calls in one step, the tools the panel allow-lists being read-only ones
     a model routinely batches, and their results arrive in **call** order, so the first result
     landed on the second chip and the second on the first. `is_error` travels with the text, so a
     query that *failed* read as having succeeded and returned another tool's output, under a green
@@ -22213,7 +22232,7 @@ existing prose was left alone.
     **Four became two when the terminal's and the assistant's modals joined Settings as sections**,
     and their signatures moved down a level unchanged but for the ring they now share:
     `terminal_section(TermUi, Rc<TermActions>, FocusRing)` and `ai_section(AiUi, ConnUi,
-    Rc<AiActions>, FocusRing)`, each an `AnyView` like its four neighbours. The modal holding them is
+    Rc<AiActions>, FocusRing)`, each an `AnyView` like its neighbours. The modal holding them is
     `settings_overlay(SettingsCtx)` — `theme_settings_overlay` renamed, since it is no longer the
     theme's — and the ctx is there for clippy rather than for the gate: `SettingsCtx { layout, term,
     term_actions, ai, conn, ai_actions, open_config_dir, cli_command }` is eight parameters named
@@ -22283,7 +22302,7 @@ existing prose was left alone.
     it was written would take a source gate over `app_version_label`'s body: the kind of test that
     reading the repository's own files is exempt for (the `ui::source_gate` family, `APP_ID`'s
     packager test), which nobody has judged worth writing for a one-line function.
-    It is a **caption, not a sixth row**: `theme::text_dim()` at `theme::font_hint()`, unbold, so it
+    It is a **caption, not another row**: `theme::text_dim()` at `theme::font_hint()`, unbold, so it
     identifies the panel instead of competing with the sections. It sits at the list's **foot**,
     pushed there by a growing spacer and inset by the rows' own 12 so its text starts where theirs
     do — which is what puts it in front of every section. It used to open the single column above
@@ -25745,7 +25764,7 @@ existing prose was left alone.
     and walks every dialect in `SqlDialect::ALL`, SQLite's menu included;
     see that gate for what it does and does not reach. The tests look entries up **by label**
     (`labels`/`disabled`, the second panicking when the row is absent) rather than by index, so a
-    fourth entry cannot silently shift what an older assertion checks, and an assertion about a row
+    new entry cannot silently shift what an older assertion checks, and an assertion about a row
     that is not there fails instead of passing by finding nothing.
     The standalone objects hang off the same levels the tables do, in
     `Types`/`Domains`/`Alias types`/`XML schema collections`/`Sequences`/`Synonyms`/`Functions`/
@@ -34622,7 +34641,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   the tree's filter found them and the palette did not, through the one delegation rather than a
   second exclusion; and when the form landed, removing that one term ended the divergence on
   both producers at once, the remembered row included. **A PostgreSQL extension is withheld the
-  same way and for the same reason, and is the second standing case:** it has no form (it is
+  same way and for the same reason, and is the third standing case** (the second is a routine
+  `RoutineInfo::is_editable` refuses, such as a `LANGUAGE c` one whose body is a link symbol). An
+  extension has no form (it is
   created from its picker and dropped from its row), so `is_editable_object` answers no for
   `ObjectItem::extension()` and the palette leaves it out while the tree's filter finds it. It is
   the same gate, not a second exclusion; give extensions a palette destination and the one term
@@ -35520,8 +35541,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **The nudge is a shift, not a flip, so an overlay hung under something at the window's bottom
     is pulled back up over it.** That put every status-bar icon's tooltip on the icon it names
     (GitHub #11). The fix cannot live in style: floem 0.2's `translate_y(pct(…))` is **not** a
-    percentage of the view's own size — `context.rs:653-656` turns `Pct(p)` into `p / 100` *pixels*
-    — so "up by my own height" is inexpressible, and the height has to be measured (`on_resize`)
+    percentage of the view's own size — the `PxPct::Pct` arms of the `translate_x`/`translate_y`
+    match in `vendor/floem/src/context.rs` turn `Pct(p)` into `p / 100` *pixels* — so "up by my own height" is inexpressible, and the height has to be measured (`on_resize`)
     and the translate computed. A translate also lands *after* the nudge, so it must undo it too.
     `tooltip.rs` (`tip_top`, `tip_shift`) is the worked example.
 - **Enter and Space arrive at a focused view as a synthesised `Click`, *before* its KeyDown
