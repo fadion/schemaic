@@ -218,6 +218,7 @@ live_suite!(
         a_staged_insert_lands_with_defaults_for_what_it_omits,
         a_staged_delete_removes_exactly_its_row,
         a_staged_null_is_written_as_a_null,
+        a_staged_default_writes_the_columns_default,
         deletes_run_before_inserts_so_a_unique_key_can_be_reused,
         a_key_that_matches_no_row_fails_the_batch_and_undoes_the_rest,
         a_key_that_matches_two_rows_fails_the_batch_and_undoes_the_rest,

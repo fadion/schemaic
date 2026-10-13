@@ -216,6 +216,44 @@ pub async fn a_staged_null_is_written_as_a_null(target: &'static Target) {
     scratch.teardown().await;
 }
 
+/// **A staged DEFAULT puts the column's declared default back**, written as
+/// the keyword in `SET` — which no parameter can carry, so only the server can
+/// say the statement is one it takes — and on a `NOT NULL` column, which is
+/// the case *Set to NULL* cannot reach.
+pub async fn a_staged_default_writes_the_columns_default(target: &'static Target) {
+    let scratch = Scratch::create(target, "default").await;
+    seed_rows(
+        &scratch,
+        "w",
+        "(id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(32) NOT NULL DEFAULT 'fresh', \
+         note VARCHAR(32))",
+    )
+    .await;
+    let mut e = edit(&scratch, "w", &[], &[("id", Value::Int(2))]);
+    e.set = vec![("name".to_string(), CellEdit::Default)];
+    commit(
+        &scratch,
+        GridWrite {
+            updates: vec![e],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{}: the commit failed: {e}", target.name));
+
+    assert_eq!(
+        rows(&scratch, "w").await,
+        [
+            ("one".to_string(), "n1".to_string()),
+            ("fresh".to_string(), "n2".to_string()),
+            ("three".to_string(), "n3".to_string()),
+        ],
+        "{}",
+        target.name
+    );
+    scratch.teardown().await;
+}
+
 /// Deletes run before inserts, so a row can be replaced by one carrying the same
 /// unique key in a single batch.
 ///

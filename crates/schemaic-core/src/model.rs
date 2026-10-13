@@ -448,6 +448,19 @@ impl Column {
     pub fn is_nullable(&self) -> bool {
         self.origin.as_ref().is_some_and(|o| !o.flags.not_null)
     }
+
+    /// Does the server have a default to give this column — the grid's *Set to
+    /// DEFAULT* asks it?
+    ///
+    /// `false` where the user must supply the value (`no_default`), where the
+    /// default would **re-key the row** — an auto-increment or identity column
+    /// draws the next number from its counter, which is not "put it back" — and
+    /// for a column with no [`ColumnOrigin`], which has no column to default.
+    pub fn takes_default(&self) -> bool {
+        self.origin
+            .as_ref()
+            .is_some_and(|o| !o.flags.no_default && !o.flags.auto_increment)
+    }
 }
 
 /// Width of the offset field in a packed cell word; the remaining top 3 bits
@@ -1119,6 +1132,16 @@ pub enum CellEdit {
     /// memcpy per repaint. The backends still take an owned `Vec` at bind time
     /// and that copy is unavoidable; every other one is not.
     Bytes(Arc<[u8]>),
+    /// The column's default — `SET c = DEFAULT`, written into the statement
+    /// rather than bound, since no parameter can carry it. What it will hold
+    /// is the server's to decide, so nothing client-side knows the value until
+    /// the post-commit re-read brings it back.
+    ///
+    /// SQLite has no `DEFAULT` in `UPDATE … SET`: its writer substitutes the
+    /// column's declared default expression, read on the write connection, and
+    /// leaves the column out of an `INSERT` (it refuses `DEFAULT` in `VALUES`)
+    /// — as MySQL's writer does too, since leaving it out means the same.
+    Default,
 }
 
 impl CellEdit {
@@ -1131,7 +1154,7 @@ impl CellEdit {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             CellEdit::Text(t) => Some(t.as_str()),
-            CellEdit::Null | CellEdit::Bytes(_) => None,
+            CellEdit::Null | CellEdit::Bytes(_) | CellEdit::Default => None,
         }
     }
 
@@ -1164,6 +1187,7 @@ impl CellEdit {
             CellEdit::Null => "NULL".to_string(),
             CellEdit::Text(t) => t.clone(),
             CellEdit::Bytes(b) => binary_display(b.len()),
+            CellEdit::Default => STAGED_DEFAULT.to_string(),
         }
     }
 
@@ -1182,6 +1206,9 @@ impl CellEdit {
             CellEdit::Null => Value::Null,
             CellEdit::Text(t) => Value::Str(t.clone()),
             CellEdit::Bytes(b) => Value::Str(binary_display(b.len())),
+            // The value is the server's and unknown until the re-read — the
+            // same blank a pending row's unset cell exports.
+            CellEdit::Default => Value::Null,
         }
     }
 
@@ -1195,6 +1222,10 @@ impl CellEdit {
         }
     }
 }
+
+/// What a cell staged to [`CellEdit::Default`] paints: the keyword itself,
+/// since that is what the statement will say and the value is not known yet.
+pub const STAGED_DEFAULT: &str = "DEFAULT";
 
 /// One row's staged edits, ready to execute as a single `UPDATE`. Built by the
 /// grid's editing system from the result's per-column provenance: `database` /
@@ -2544,6 +2575,25 @@ mod tests {
         c.origin.as_mut().unwrap().flags.not_null = true;
         assert!(!c.is_nullable());
         assert!(!col("int").is_nullable(), "an expression says nothing");
+    }
+
+    /// **Set DEFAULT is offered where the server has a default to give.** Not
+    /// where the user must supply the value (`no_default` — MySQL's flag, and
+    /// PostgreSQL's NOT NULL with nothing to fall back to), where a default
+    /// would re-key the row (an auto-increment or identity draws the next
+    /// number), or on an expression, which has no column to default.
+    #[test]
+    fn only_a_sourced_column_with_a_default_to_give_takes_one() {
+        let mut c = sourced("status", "shop", None, "t", "status");
+        assert!(c.takes_default(), "a plain base column");
+        c.origin.as_mut().unwrap().flags.not_null = true;
+        assert!(c.takes_default(), "NOT NULL with a default still has one");
+        c.origin.as_mut().unwrap().flags.no_default = true;
+        assert!(!c.takes_default(), "the user must supply this one");
+        let mut id = sourced("id", "shop", None, "t", "id");
+        id.origin.as_mut().unwrap().flags.auto_increment = true;
+        assert!(!id.takes_default(), "would draw a new key");
+        assert!(!col("int").takes_default(), "an expression has no default");
     }
 
     /// The namespace is part of the table's identity — the case `build_follow_specs`

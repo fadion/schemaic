@@ -4044,6 +4044,8 @@ fn pg_cell_lit(v: &CellEdit) -> String {
             format!("decode('{hex}', 'hex')")
         }
         CellEdit::Null => "NULL".to_string(),
+        // Legal in both `SET` and `VALUES`.
+        CellEdit::Default => "DEFAULT".to_string(),
     }
 }
 
@@ -5513,6 +5515,34 @@ mod tests {
             build_update(&edit),
             "UPDATE \"city\" SET \"name\" = 'Kabul', \"district\" = NULL \
              WHERE \"id\" IS NOT DISTINCT FROM 1"
+        );
+    }
+
+    #[test]
+    fn a_staged_default_is_the_keyword_in_set_and_values() {
+        let edit = RowEdit {
+            database: "world".into(),
+            schema: None,
+            table: "city".into(),
+            set: vec![("district".into(), CellEdit::Default)],
+            key: vec![("id".into(), Value::Int(1))],
+        };
+        assert_eq!(
+            build_update(&edit),
+            "UPDATE \"city\" SET \"district\" = DEFAULT WHERE \"id\" IS NOT DISTINCT FROM 1"
+        );
+        let ins = RowInsert {
+            database: "world".into(),
+            schema: None,
+            table: "city".into(),
+            cols: vec![
+                ("district".into(), CellEdit::Default),
+                ("name".into(), CellEdit::Text("Kabul".into())),
+            ],
+        };
+        assert_eq!(
+            build_insert(&ins),
+            "INSERT INTO \"city\" (\"district\", \"name\") VALUES (DEFAULT, 'Kabul')"
         );
     }
 

@@ -393,7 +393,11 @@ pub fn refetch_key(
             // Bound as text, exactly as the `UPDATE`'s own SET value was.
             Some(CellEdit::Text(text)) => Value::Str(text.clone()),
             Some(CellEdit::Null) => Value::Null,
-            Some(CellEdit::Bytes(_)) | None => rs
+            // A default's value is the server's, so there is nothing to look the
+            // row up by but the original: either the default left it as it was
+            // and the row is found, or it moved it and the short answer re-runs
+            // the whole result — never another row's.
+            Some(CellEdit::Bytes(_) | CellEdit::Default) | None => rs
                 .cell(di, kci)
                 .map(|c| c.to_value())
                 .unwrap_or(Value::Null),
@@ -707,6 +711,9 @@ pub fn staged_sql(write: &crate::model::GridWrite, rs: &ResultSet, dialect: SqlD
             bytes = true;
             crate::model::binary_display(b.len())
         }
+        // The keyword, as three of the four writers send it; SQLite's
+        // substitutes the declared default, which this script cannot see.
+        CellEdit::Default => crate::model::STAGED_DEFAULT.to_string(),
         e => script_literal(&e.to_value(), ty, dialect),
     };
     let key = |key: &[(String, Value)], ty: &dyn Fn(&str) -> String| {
@@ -1516,7 +1523,9 @@ impl GridCells<'_> {
         // `<n bytes>` has to be built.
         fn staged(v: &CellEdit) -> Option<Cow<'_, str>> {
             match v {
-                CellEdit::Null => None,
+                // A default is neither a value nor a null until the server says
+                // which — counted as a pending row's unset cell is, below.
+                CellEdit::Null | CellEdit::Default => None,
                 CellEdit::Text(t) => Some(Cow::Borrowed(t.as_str())),
                 CellEdit::Bytes(b) => Some(Cow::Owned(crate::model::binary_display(b.len()))),
             }
@@ -1783,6 +1792,15 @@ impl GridCells<'_> {
             let set = sets
                 .iter()
                 .map(|&ci| {
+                    // A staged default's export value is a blank, and `NULL`
+                    // here would be a different statement from Commit's.
+                    if matches!(self.dirty.get(&(di, ci)), Some(CellEdit::Default)) {
+                        return format!(
+                            "{} = {}",
+                            crate::export::ident_sql(&origin_column(self.rs, ci), dialect),
+                            crate::model::STAGED_DEFAULT
+                        );
+                    }
                     let v = out
                         .cell(di, ci)
                         .map(|c| c.to_value())
@@ -1948,8 +1966,23 @@ impl GridCells<'_> {
         let (real, pending): (Vec<usize>, Vec<usize>) =
             picked.into_iter().partition(|&di| di < nreal);
         let mut blocks = Vec::new();
-        if !real.is_empty() {
-            blocks.push((project(&out, cols), real));
+        // A stored row with a column staged to its default leaves that column
+        // out, as Commit's INSERT would — so stored rows group by which columns
+        // they keep, as pending rows do below. Almost always one group.
+        let mut stored: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        for di in real {
+            let keep: Vec<usize> = cols
+                .iter()
+                .copied()
+                .filter(|ci| !matches!(self.dirty.get(&(di, *ci)), Some(CellEdit::Default)))
+                .collect();
+            match stored.iter_mut().find(|(k, _)| *k == keep) {
+                Some((_, rows)) => rows.push(di),
+                None => stored.push((keep, vec![di])),
+            }
+        }
+        for (keep, rows) in stored.into_iter().filter(|(k, _)| !k.is_empty()) {
+            blocks.push((project(&out, &keep), rows));
         }
         let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
         for di in pending {
@@ -4176,6 +4209,17 @@ mod tests {
         assert_eq!(refetch_key(&tpl, &r, 0, &edited), vec![Value::Null]);
     }
 
+    /// A key set to its default has no value the client knows, so the re-read
+    /// asks by the original: either the default left it there and the row is
+    /// found, or it moved it and the short answer re-runs the whole result.
+    /// Never `NULL`, which would key the re-read on a value nobody wrote.
+    #[test]
+    fn a_key_column_set_to_its_default_refetches_by_its_original() {
+        let (r, tpl) = keyed_users_row();
+        let edited: HashMap<usize, CellEdit> = [(0, CellEdit::Default)].into_iter().collect();
+        assert_eq!(refetch_key(&tpl, &r, 0, &edited), vec![Value::Int(5)]);
+    }
+
     #[test]
     fn a_composite_key_takes_each_column_from_where_it_stands() {
         let r = ResultSet::from_rows(
@@ -4965,6 +5009,17 @@ mod tests {
         );
     }
 
+    /// A staged default reads as the keyword Commit sends, not as a literal
+    /// of whatever the cell held.
+    #[test]
+    fn staged_sql_writes_a_staged_default_as_the_keyword() {
+        let (r, _) = keyed_people();
+        let mut w = staged_write();
+        w.updates[0].set[1].1 = CellEdit::Default;
+        let sql = staged_sql(&w, &r, SqlDialect::Postgres);
+        assert!(sql.contains("\"note\" = DEFAULT WHERE"), "{sql}");
+    }
+
     /// A new row with nothing typed takes every default, which each engine
     /// spells its own way — and SQL Server's `N'…'` is the column's type speaking.
     #[test]
@@ -5094,6 +5149,25 @@ mod tests {
             sql,
             "UPDATE `db`.`t` SET `name` = 'ann', `note` = NULL WHERE `id` = 1;\n\
              UPDATE `db`.`t` SET `name` = 'o''neil', `note` = 'x' WHERE `id` = 2;\n"
+        );
+    }
+
+    /// **A staged DEFAULT copies as the keyword Commit sends**, not as the
+    /// `NULL` its export value is — `SET note = NULL` is a different statement.
+    #[test]
+    fn copy_as_update_writes_a_staged_default_as_the_keyword() {
+        let (r, m) = keyed_people();
+        let mut dirty = HashMap::new();
+        dirty.insert((1, 2), CellEdit::Default);
+        let (order, formats, new) = (vec![0, 1, 2], vec![], vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let sql = c
+            .updates_at(&m, Some((1, 1, 1, 2)), 1, None, SqlDialect::Postgres)
+            .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE \"db\".\"t\" SET \"name\" = 'o''neil', \"note\" = DEFAULT WHERE \"id\" = 2;
+"
         );
     }
 
@@ -5592,6 +5666,35 @@ mod tests {
         );
         // The empty pending row has nothing to insert.
         assert_eq!(sql.matches("INSERT INTO").count(), 2, "{sql}");
+    }
+
+    /// **A stored row with a staged DEFAULT copies as an INSERT that leaves
+    /// that column out** — what Commit's own INSERT does with one, and what
+    /// the default means; its export value is a blank, and `NULL` there would
+    /// write over the default. Rows staging none stay one block.
+    #[test]
+    fn an_insert_of_a_stored_row_omits_a_column_staged_to_its_default() {
+        let rs = three_cols();
+        let mut dirty = HashMap::new();
+        dirty.insert((0, 2), CellEdit::Default);
+        let (order, formats) = (vec![0], vec![Default::default(); 3]);
+        let new_rows = vec![];
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let sql: String = c
+            .insert_blocks_all()
+            .iter()
+            .map(|(out, ord)| {
+                crate::export::export_inserts(out, ord, None, crate::intel::SqlDialect::MySql)
+            })
+            .collect();
+        assert!(
+            sql.contains(
+                "(`a`, `b`) VALUES
+(1, 2)"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains("NULL"), "{sql}");
     }
 
     /// The same blocks written as a **file** — `export_insert_blocks`, what Save

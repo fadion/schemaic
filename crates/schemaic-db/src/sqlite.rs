@@ -1189,9 +1189,10 @@ pub(crate) async fn commit_writes(
         // `rebuild_fk_tests::the_script_guards_itself_when_run_outside_run_ddl`.
         let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
         let txn = conn.transaction().map_err(query_err)?;
+        let defaults = staged_defaults(&txn, &write)?;
         let mut total = 0u64;
         for step in write.plan() {
-            let (sql, params) = statement_for(step);
+            let (sql, params) = statement_for(step, &defaults);
             let affected = txn
                 .execute(&sql, rusqlite::params_from_iter(params))
                 .map_err(query_err)? as u64;
@@ -1224,12 +1225,73 @@ pub(crate) async fn commit_writes(
 /// `Blob` are different storage classes with different comparison semantics, and
 /// a blob bound as `Text` on a `BLOB`-affinity column stores text — the affinity
 /// converts nothing, since `BLOB` affinity is the one that never coerces.
-fn cell_param(v: &CellEdit) -> rusqlite::types::Value {
+///
+/// `None` for [`CellEdit::Default`], which is no parameter: see
+/// [`staged_defaults`] for what is written in its place.
+fn cell_param(v: &CellEdit) -> Option<rusqlite::types::Value> {
     match v {
-        CellEdit::Text(t) => rusqlite::types::Value::Text(t.clone()),
-        CellEdit::Bytes(b) => rusqlite::types::Value::Blob(b.to_vec()),
-        CellEdit::Null => rusqlite::types::Value::Null,
+        CellEdit::Text(t) => Some(rusqlite::types::Value::Text(t.clone())),
+        CellEdit::Bytes(b) => Some(rusqlite::types::Value::Blob(b.to_vec())),
+        CellEdit::Null => Some(rusqlite::types::Value::Null),
+        CellEdit::Default => None,
     }
+}
+
+/// `(table, column)` → the SQL an `UPDATE` writes for a staged
+/// [`CellEdit::Default`] on it.
+type StagedDefaults = HashMap<(String, String), String>;
+
+/// What each staged [`CellEdit::Default`] in `write`'s updates writes, read on
+/// the write transaction so it is the table as the statement will find it.
+///
+/// **SQLite has no `SET c = DEFAULT`** — a syntax error — so the declared
+/// default is spelt out: `pragma_table_xinfo`'s `dflt_value` is the expression
+/// as written in the `CREATE TABLE`, parenthesised here so any expression is
+/// one operand (`(CURRENT_TIMESTAMP)`, `('new')`, `((6 * 7))` are all legal
+/// in `SET`). A column declaring none gets `NULL`, which is SQLite's default
+/// for it. A **generated** column (`hidden` 2 or 3) is refused before anything
+/// runs: it has no default to go back to, and SQLite would refuse the `UPDATE`
+/// in words about something else. An `INSERT` needs none of this — the
+/// column is left out ([`statement_for`]).
+fn staged_defaults(conn: &SqliteConn, write: &GridWrite) -> Result<StagedDefaults, DbError> {
+    let mut out = StagedDefaults::new();
+    for u in &write.updates {
+        for (col, v) in &u.set {
+            if !matches!(v, CellEdit::Default) || out.contains_key(&(u.table.clone(), col.clone()))
+            {
+                continue;
+            }
+            let found: Option<(Option<String>, i64)> = conn
+                .query_row(
+                    "SELECT dflt_value, hidden FROM pragma_table_xinfo(?1) WHERE name = ?2",
+                    [&u.table, col],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(query_err(e)),
+                })?;
+            let sql = match found {
+                None => {
+                    return Err(DbError::Refused(format!(
+                        "{}.{} is not a column this table has, so it has no default to write",
+                        u.table, col
+                    )));
+                }
+                Some((_, 2 | 3)) => {
+                    return Err(DbError::Refused(format!(
+                        "{col} is a generated column: it has no default to set it back to, \
+                         and SQLite computes it from the row"
+                    )));
+                }
+                Some((Some(expr), _)) => format!("({expr})"),
+                Some((None, _)) => "NULL".to_string(),
+            };
+            out.insert((u.table.clone(), col.clone()), sql);
+        }
+    }
+    Ok(out)
 }
 
 /// The SQL and bound parameters for one step of a [`GridWrite`].
@@ -1242,7 +1304,10 @@ fn cell_param(v: &CellEdit) -> rusqlite::types::Value {
 /// `ATTACH` and no `temp` table, so a bare name here means `main`'s table
 /// whatever the result was read from. The two are one decision — see the
 /// refusal's note, and `every_attributed_column_is_one_the_bare_write_statement_reaches`.
-fn statement_for(step: WriteStep<'_>) -> (String, Vec<rusqlite::types::Value>) {
+fn statement_for(
+    step: WriteStep<'_>,
+    defaults: &StagedDefaults,
+) -> (String, Vec<rusqlite::types::Value>) {
     let mut params = Vec::new();
     let sql = match step {
         WriteStep::Delete(d) => {
@@ -1255,9 +1320,21 @@ fn statement_for(step: WriteStep<'_>) -> (String, Vec<rusqlite::types::Value>) {
             let sets = u
                 .set
                 .iter()
-                .map(|(col, val)| {
-                    params.push(cell_param(val));
-                    format!("{} = ?", ident_sqlite(col))
+                .map(|(col, val)| match cell_param(val) {
+                    Some(p) => {
+                        params.push(p);
+                        format!("{} = ?", ident_sqlite(col))
+                    }
+                    // `staged_defaults` read every one of these; a miss would
+                    // be a caller that skipped it, and `NULL` is not a guess
+                    // to make in its place.
+                    None => format!(
+                        "{} = {}",
+                        ident_sqlite(col),
+                        defaults
+                            .get(&(u.table.clone(), col.clone()))
+                            .map_or("DEFAULT", String::as_str)
+                    ),
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1268,9 +1345,11 @@ fn statement_for(step: WriteStep<'_>) -> (String, Vec<rusqlite::types::Value>) {
             let cols = i
                 .cols
                 .iter()
-                .map(|(col, val)| {
-                    params.push(cell_param(val));
-                    ident_sqlite(col)
+                // A staged default is left out: SQLite refuses `DEFAULT` in
+                // `VALUES`, and an absent column takes its default anyway.
+                .filter_map(|(col, val)| {
+                    params.push(cell_param(val)?);
+                    Some(ident_sqlite(col))
                 })
                 .collect::<Vec<_>>();
             if cols.is_empty() {
@@ -5126,6 +5205,78 @@ mod tests {
         }
     }
 
+    /// **SQLite has no `SET c = DEFAULT`, so the writer spells the default
+    /// out.** The declared expression goes in its place — a literal, a
+    /// parenthesised expression, `CURRENT_TIMESTAMP` — and a column declaring
+    /// none takes `NULL`, which is what SQLite's own default for it is. In an
+    /// `INSERT` the column is left out, since SQLite refuses `DEFAULT` there
+    /// too and leaving it out means the same.
+    #[tokio::test]
+    async fn a_staged_default_writes_the_declared_default() {
+        let (keeper, db) = shared_memory("default_write");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'new', \
+                     n INT DEFAULT (6 * 7), at TEXT DEFAULT CURRENT_TIMESTAMP, note TEXT);
+                 INSERT INTO t VALUES (1, 'done', 1, 'x', 'y');",
+            )
+            .unwrap();
+        let set = |c: &str| (c.to_string(), CellEdit::Default);
+        let write = GridWrite {
+            updates: vec![RowEdit {
+                set: vec![set("status"), set("n"), set("at"), set("note")],
+                ..edit("t", &[], &[("id", Value::Int(1))])
+            }],
+            inserts: vec![RowInsert {
+                database: MAIN.to_string(),
+                schema: None,
+                table: "t".to_string(),
+                cols: vec![("id".into(), CellEdit::Text("2".into())), set("status")],
+            }],
+            ..Default::default()
+        };
+        commit_writes(&db, &write, CancellationToken::new())
+            .await
+            .expect("commit");
+        let row = |id: i64| -> (String, i64, bool, Option<String>) {
+            keeper
+                .query_row(
+                    "SELECT status, n, at <> 'x', note FROM t WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(row(1), ("new".to_string(), 42, true, None));
+        assert_eq!(row(2).0, "new");
+    }
+
+    /// A generated column has no default to write back to, so the edit is
+    /// refused before anything runs — not sent as an `UPDATE` SQLite would
+    /// refuse with a message about a different thing.
+    #[tokio::test]
+    async fn a_staged_default_on_a_generated_column_is_refused() {
+        let (keeper, db) = shared_memory("default_generated");
+        keeper
+            .execute_batch(
+                "CREATE TABLE g (id INTEGER PRIMARY KEY, a INT, \
+                     b INT GENERATED ALWAYS AS (a * 2) VIRTUAL);
+                 INSERT INTO g (id, a) VALUES (1, 1);",
+            )
+            .unwrap();
+        let write = GridWrite {
+            updates: vec![RowEdit {
+                set: vec![("b".to_string(), CellEdit::Default)],
+                ..edit("g", &[], &[("id", Value::Int(1))])
+            }],
+            ..Default::default()
+        };
+        match commit_writes(&db, &write, CancellationToken::new()).await {
+            Err(DbError::Refused(m)) => assert!(m.contains("generated"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     /// **A write refused because the file is locked says whose lock it is.**
     ///
     /// SQLite is the one engine here where a long read blocks a write, and the
@@ -6863,7 +7014,7 @@ mod tests {
             table: "t".to_string(),
             cols: Vec::new(),
         };
-        let (sql, params) = statement_for(WriteStep::Insert(&ins));
+        let (sql, params) = statement_for(WriteStep::Insert(&ins), &StagedDefaults::new());
         assert_eq!(sql, r#"INSERT INTO "t" DEFAULT VALUES"#);
         assert!(params.is_empty());
     }

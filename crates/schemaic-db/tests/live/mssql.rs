@@ -2181,6 +2181,48 @@ async fn commit(s: &Scratch, write: GridWrite) -> Result<u64, DbError> {
     s.db.commit_writes(&write, CancellationToken::new()).await
 }
 
+/// **A staged DEFAULT is the keyword, and T-SQL takes it in both places**:
+/// `SET c = DEFAULT` puts the constraint's value back, and `VALUES (DEFAULT)`
+/// inserts it — including through a named default constraint, which is how
+/// SSMS writes one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_default_writes_the_columns_default() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("wb_default").await;
+    s.exec(
+        "CREATE TABLE dbo.d (id int NOT NULL PRIMARY KEY, \
+         status nvarchar(10) NOT NULL CONSTRAINT df_d_status DEFAULT N'fresh', note nvarchar(10)); \
+         INSERT dbo.d VALUES (1, N'done', N'n1')",
+    )
+    .await;
+    commit(
+        &s,
+        GridWrite {
+            updates: vec![row_edit(
+                &s,
+                "d",
+                &[("status", CellEdit::Default)],
+                &[("id", Value::Int(1))],
+            )],
+            inserts: vec![row_insert(
+                &s,
+                "d",
+                &[("id", txt("2")), ("status", CellEdit::Default)],
+            )],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the commit");
+    assert_eq!(
+        s.scalar("SELECT STRING_AGG(status + ':' + ISNULL(note, '-'), ',') WITHIN GROUP (ORDER BY id) FROM dbo.d")
+            .await,
+        "fresh:n1,fresh:-"
+    );
+}
+
 /// **An edit lands on exactly its row**, a NULL is stored as NULL, bytes as
 /// bytes, and what the grid re-reads and opens is what was written.
 #[tokio::test(flavor = "multi_thread")]

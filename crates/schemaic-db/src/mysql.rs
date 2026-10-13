@@ -6417,11 +6417,15 @@ pub(crate) async fn refetch_on(
 /// `Text` is the user's characters encoded as UTF-8, `Bytes` is the octets
 /// themselves, unencoded. Collapsing the two at the *call site* is what would
 /// hurt, because `String::into_bytes` on a lossily-decoded blob is not the blob.
-fn cell_param(v: &CellEdit) -> MyValue {
+///
+/// `None` for [`CellEdit::Default`], which no parameter can carry: the caller
+/// writes the keyword where the hole would have been.
+fn cell_param(v: &CellEdit) -> Option<MyValue> {
     match v {
-        CellEdit::Text(t) => MyValue::Bytes(t.clone().into_bytes()),
-        CellEdit::Bytes(b) => MyValue::Bytes(b.to_vec()),
-        CellEdit::Null => MyValue::NULL,
+        CellEdit::Text(t) => Some(MyValue::Bytes(t.clone().into_bytes())),
+        CellEdit::Bytes(b) => Some(MyValue::Bytes(b.to_vec())),
+        CellEdit::Null => Some(MyValue::NULL),
+        CellEdit::Default => None,
     }
 }
 
@@ -6432,9 +6436,12 @@ fn build_update(edit: &RowEdit) -> (String, Params) {
     let set_sql = edit
         .set
         .iter()
-        .map(|(col, val)| {
-            params.push(cell_param(val));
-            format!("{} = ?", ident(col))
+        .map(|(col, val)| match cell_param(val) {
+            Some(p) => {
+                params.push(p);
+                format!("{} = ?", ident(col))
+            }
+            None => format!("{} = DEFAULT", ident(col)),
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -6461,19 +6468,20 @@ fn build_update(edit: &RowEdit) -> (String, Params) {
 /// Build a parameterized `INSERT INTO db.table (cols) VALUES (?, …)` for one new
 /// row. Identifiers are backtick-escaped; every value is a bound parameter — see
 /// [`cell_param`]. Columns not listed take their server default — with none
-/// listed, `() VALUES ()` inserts an all-defaults row.
+/// listed, `() VALUES ()` inserts an all-defaults row — and so does a column
+/// staged to [`CellEdit::Default`], which is left out rather than spelt.
 fn build_insert(ins: &RowInsert) -> (String, Params) {
     let mut params: Vec<MyValue> = Vec::with_capacity(ins.cols.len());
     let cols_sql = ins
         .cols
         .iter()
-        .map(|(col, val)| {
-            params.push(cell_param(val));
-            ident(col)
+        .filter_map(|(col, val)| {
+            params.push(cell_param(val)?);
+            Some(ident(col))
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let placeholders = vec!["?"; ins.cols.len()].join(", ");
+    let placeholders = vec!["?"; params.len()].join(", ");
     let sql = format!(
         "INSERT INTO {}.{} ({cols_sql}) VALUES ({placeholders})",
         ident(&ins.database),
@@ -6876,6 +6884,43 @@ mod write_tests {
         assert!(matches!(&p[0], MyValue::Bytes(b) if b == b"Ada"));
         assert!(matches!(p[1], MyValue::NULL));
         assert!(matches!(p[2], MyValue::Int(7)));
+    }
+
+    /// **A staged default is the keyword, not a hole.** No parameter can carry
+    /// `DEFAULT`, so the `SET` writes it inline and binds nothing for it — the
+    /// holes after it still line up with their values — and an `INSERT` leaves
+    /// the column out, which takes the same default.
+    #[test]
+    fn a_staged_default_is_written_inline_and_binds_nothing() {
+        let edit = RowEdit {
+            database: "db".to_string(),
+            schema: None,
+            table: "users".to_string(),
+            set: vec![
+                ("status".to_string(), CellEdit::Default),
+                ("name".to_string(), CellEdit::Text("Ada".to_string())),
+            ],
+            key: vec![("id".to_string(), Value::Int(7))],
+        };
+        let (sql, params) = build_update(&edit);
+        assert_eq!(
+            sql,
+            "UPDATE `db`.`users` SET `status` = DEFAULT, `name` = ? WHERE `id` <=> ?"
+        );
+        assert_eq!(positional(&params).len(), 2);
+
+        let ins = RowInsert {
+            database: "db".to_string(),
+            schema: None,
+            table: "users".to_string(),
+            cols: vec![
+                ("status".to_string(), CellEdit::Default),
+                ("name".to_string(), CellEdit::Text("Ada".to_string())),
+            ],
+        };
+        let (sql, params) = build_insert(&ins);
+        assert_eq!(sql, "INSERT INTO `db`.`users` (`name`) VALUES (?)");
+        assert_eq!(positional(&params).len(), 1);
     }
 
     /// **Bytes bind as bytes, and the two shapes are not the same param.**

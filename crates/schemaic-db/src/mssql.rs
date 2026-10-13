@@ -4043,10 +4043,11 @@ fn key_param(col: &str, v: &Value, facts: &[ColumnFacts]) -> ColumnData<'static>
 
 /// A staged cell as a parameter, or `None` for NULL — which is written as the
 /// literal, since a TDS parameter is typed and a NULL of one type is not a
-/// NULL of every other. Text goes through [`column_text`], as a key does.
+/// NULL of every other — and for DEFAULT, which no parameter can carry. Text
+/// goes through [`column_text`], as a key does.
 fn cell_param(col: &str, v: &CellEdit, facts: &[ColumnFacts]) -> Option<ColumnData<'static>> {
     match v {
-        CellEdit::Null => None,
+        CellEdit::Null | CellEdit::Default => None,
         CellEdit::Text(t) => Some(ColumnData::String(Some(column_text(facts, col, t).into()))),
         CellEdit::Bytes(b) => Some(ColumnData::Binary(Some(b.to_vec().into()))),
     }
@@ -4076,7 +4077,8 @@ fn where_key(
         .join(" AND ")
 }
 
-/// The value side of one staged cell: its placeholder, or `NULL`.
+/// The value side of one staged cell: its placeholder, `NULL` or `DEFAULT` —
+/// T-SQL takes the keyword in both `SET` and `VALUES`.
 fn cell_sql(
     col: &str,
     v: &CellEdit,
@@ -4085,6 +4087,7 @@ fn cell_sql(
 ) -> String {
     match cell_param(col, v, facts) {
         Some(p) => hole(params, p),
+        None if matches!(v, CellEdit::Default) => "DEFAULT".to_string(),
         None => "NULL".to_string(),
     }
 }
@@ -5456,6 +5459,31 @@ mod write_tests {
                 ColumnData::Binary(Some(vec![1u8, 2].into())),
                 ColumnData::I64(Some(7)),
             ]
+        );
+    }
+
+    /// `DEFAULT` is the literal, like NULL, and binds nothing: the hole after
+    /// it is still `@P1`.
+    #[test]
+    fn a_staged_default_is_the_keyword_and_binds_nothing() {
+        let e = edit(
+            vec![
+                ("status", CellEdit::Default),
+                ("note", CellEdit::Text("hi".into())),
+            ],
+            vec![("id", Value::Int(7))],
+        );
+        let b = statement_for(WriteStep::Update(&e), &[]);
+        assert_eq!(
+            b.sql,
+            "UPDATE [shop].[dbo].[orders] SET [status] = DEFAULT, [note] = @P1 WHERE [id] = @P2"
+        );
+        assert_eq!(b.params.len(), 2);
+        let i = insert(vec![("status", CellEdit::Default)]);
+        let b = statement_for(WriteStep::Insert(&i), &[]);
+        assert_eq!(
+            b.sql,
+            "INSERT INTO [shop].[dbo].[orders] ([status]) VALUES (DEFAULT)"
         );
     }
 

@@ -1122,6 +1122,41 @@ impl GridState {
         self.clear_bar();
     }
 
+    /// Stage the column's **default** into real cell `(di, ci)` — *Set to
+    /// DEFAULT*, and the only producer of [`CellEdit::Default`].
+    ///
+    /// No revert rule, for `stage_bytes`' reason: what the default *is* is the
+    /// server's to say, so there is no original to compare it against, and the
+    /// edit always stages. The gate is re-asked here, as `stage_bytes` re-asks
+    /// its own — `Column::takes_default` and a row not marked for deletion, the
+    /// same two the menu offers on, so the offer and the sink cannot differ.
+    fn stage_default(&self, di: usize, ci: usize) {
+        let deleted = self.del_rows.with_untracked(|d| d.contains(&di));
+        let takes = self.edit_model.get_untracked().editable(ci)
+            && self
+                .rs
+                .with_untracked(|rs| rs.columns.get(ci).is_some_and(Column::takes_default));
+        if deleted || !takes {
+            return;
+        }
+        self.dirty.update(|d| {
+            d.insert((di, ci), CellEdit::Default);
+        });
+        self.clear_bar();
+    }
+
+    /// Put pending new-row `pidx`'s cell `ci` back to **unset** — what *Set to
+    /// DEFAULT* means before the row exists: an `INSERT` leaves an unset column
+    /// out, and the server fills its default.
+    fn unset_new(&self, pidx: usize, ci: usize) {
+        self.new_rows.update(|rows| {
+            if let Some(row) = rows.get_mut(pidx) {
+                row.remove(&ci);
+            }
+        });
+        self.clear_bar();
+    }
+
     /// Stage **bytes** into a real cell — the blob panel's *Load from file*, and
     /// the only producer of [`CellEdit::Bytes`] there is.
     ///
@@ -5971,7 +6006,8 @@ fn start_edit(gs: GridState, i: usize, ci: usize) {
             // only be reached by a caller that has already decided this column
             // takes text — `open_editor`'s own gate — so there is nothing to
             // seed it with and nothing that could be seeded wrongly.
-            Some(CellEdit::Null | CellEdit::Bytes(_)) => String::new(),
+            // A staged default has no value yet to seed with either.
+            Some(CellEdit::Null | CellEdit::Bytes(_) | CellEdit::Default) => String::new(),
             None => gs
                 .rs
                 .get_untracked()
@@ -7228,7 +7264,8 @@ fn cell_shape(editor: CellEditor, buf: &str) -> CellShape {
 enum CellInk {
     /// A staged edit — white on the green fill.
     Staged,
-    /// A staged **SQL NULL** — white, and italic like every other absence.
+    /// A staged **SQL NULL** or **DEFAULT** — white, and italic like every
+    /// other absence: neither is a value the user wrote.
     StagedNull,
     /// No value: a NULL original, or a pending row's `<auto>`/`<required>`/
     /// `<null>`/`<default>` placeholder.
@@ -7240,7 +7277,9 @@ enum CellInk {
 
 fn cell_ink(staged: Option<&CellEdit>, is_null: bool, placeholder: bool, is_fk: bool) -> CellInk {
     match staged {
-        Some(CellEdit::Null) => CellInk::StagedNull,
+        // A staged default is italic too: what it paints is the keyword, not a
+        // value, and the value will be the server's.
+        Some(CellEdit::Null | CellEdit::Default) => CellInk::StagedNull,
         // A staged blob is `Staged`, not `StagedNull`: it paints `<n bytes>`,
         // and the italic in this grid means *absence*. A stored blob's
         // placeholder is upright, so a loaded one is too — the green fill is
@@ -11682,6 +11721,22 @@ fn data_cell(
                 entries.push(MenuEntry::action("Set to NULL", move || match pending {
                     Some(p) => gs.stage_new(p, ci, None),
                     None => gs.stage(data_idx, ci, None),
+                }));
+            }
+            // Beside NULL, and not gated on nullable: a NOT NULL column with a
+            // default is the common case. On a pending row it is offered only
+            // once the cell holds something — unset already *is* the default.
+            let takes_default = editable
+                && !deleted
+                && rs.columns.get(ci).is_some_and(Column::takes_default)
+                && pending.is_none_or(|p| {
+                    gs.new_rows
+                        .with_untracked(|r| r.get(p).is_some_and(|row| row.contains_key(&ci)))
+                });
+            if takes_default {
+                entries.push(MenuEntry::action("Set to DEFAULT", move || match pending {
+                    Some(p) => gs.unset_new(p, ci),
+                    None => gs.stage_default(data_idx, ci),
                 }));
             }
             // Row actions (single writable table, real rows): duplicate + delete.

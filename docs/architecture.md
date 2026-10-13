@@ -131,6 +131,18 @@ existing prose was left alone.
     says `notnull = 0`: it cannot hold NULL, and taking the pragma at its word put the nullable
     mark on nearly every table's key and offered a *Set to NULL* that failed with `datatype
     mismatch`. `ColumnInfo::nullable` keeps the pragma's answer, which the designer's DDL needs.
+    `Column::takes_default` is its sibling beside it, read by the cell menu's *Set to DEFAULT*:
+    whether the server has a default to give — an origin, and neither `no_default` (the user must
+    supply the value) nor `auto_increment`, because an auto-increment or identity column's
+    "default" draws the next number from its counter, which re-keys the row rather than putting a
+    value back. No origin is `false` for the same reason as above — an expression has no column to
+    default (`only_a_sourced_column_with_a_default_to_give_takes_one`). It is deliberately **not**
+    `is_nullable`'s complement or subset: a `NOT NULL` column with a declared default is the common
+    case it exists for. **Its `no_default` half is only as good as the engine's flag**, and SQL
+    Server's `described_column` sets that flag `false` for every column, so there a `NOT NULL`
+    column with no default is offered *Set to DEFAULT* — T-SQL's `DEFAULT` on a column declaring
+    none is `NULL`, which that column refuses, so the batch rolls back with the server's error
+    rather than writing anything. Not exercised by a test.
     **A raw-bytes cell has exactly one rendering, and
     it lives here:** `binary_display(len)` → `<n bytes>`, with `is_binary_display` as its
     recognizer and `type_is_binary` / `Column::is_binary` as the question "is this column bytes at
@@ -201,10 +213,10 @@ existing prose was left alone.
     `one_row_verdict` (the 1-row safety net's verdict *and* its message),
     `Rollback`/`engine_is_transactional` (what a rollback actually achieved — see the invariant
     below), and `drop_committed` (which staged edits a commit un-stages).
-    **`CellEdit` is what one staged cell holds** — `Null | Text | Bytes` — and it replaced the
-    `Option<String>` that had room for exactly two of the three. `Text` is what was typed or pasted,
-    bound as a string parameter and coerced by the server to whatever the column is; `Bytes` is raw
-    octets and is the only shape that can write a binary column, a `BLOB` having no lossless text
+    **`CellEdit` is what one staged cell holds** — `Null | Text | Bytes | Default` — and it replaced
+    the `Option<String>` that had room for exactly two of the first three. `Text` is what was typed
+    or pasted, bound as a string parameter and coerced by the server to whatever the column is;
+    `Bytes` is raw octets and is the only shape that can write a binary column, a `BLOB` having no lossless text
     form. **It holds an `Arc<[u8]>` rather than a `Vec<u8>`**, because a staged cell is cloned far
     more often than it is written: the grid painter clones the value out of the dirty map on every
     repaint of that cell, the row panel's `blob_value` on every change to the map, and `build_edits`
@@ -221,14 +233,30 @@ existing prose was left alone.
     just been loaded into reads the way it will read after the commit and is no more copyable back
     into the column than a stored blob is. `to_value` is that same question answered for a reader
     that speaks **cells** rather than text — the export, which hands a `ResultSet` on and never asks
-    the painter — and it parts company with `display` on exactly one variant: `Null` becomes
-    `Value::Null`, not the word. A sentinel is the point where a cell is *drawn*; a file is written
+    the painter — and it parts company with `display` on two variants: `Null` becomes
+    `Value::Null`, not the word, and so does `Default` (below). A sentinel is the point where a cell is *drawn*; a file is written
     by a format that already knows what a null is, so the string `NULL` would land inside a JSON
     string and in an SQL `INSERT` where `null` belongs. Only the blob panel produces `Bytes`;
     `from_opt` is the
     widening for the text paths that still speak `Option<String>`. One type the whole way down —
     `StagedEdits`, `RowEdit::set`, `RowInsert::cols`, `edit::DirtyCells` and the grid's `dirty` /
     `new_rows` all carry it — so there is no seam where bytes would have to be re-encoded to cross.
+    **`Default` is the column's default, and it is the one variant that is never a parameter** — the
+    grid's *Set to DEFAULT*, staged by `GridState::stage_default` and nothing else. No bind can carry
+    `DEFAULT`, so each writer spells it into the statement (`db`'s write-back paragraphs have the four
+    spellings, SQLite's being a substitution rather than the keyword). What it will hold is the
+    server's to decide and unknown until the post-commit re-read brings it back, which sets every
+    reader's answer: `as_text` is `None`, `display` is `STAGED_DEFAULT` — the keyword `DEFAULT`,
+    since that is what the statement will say — and `to_value` is `Value::Null`, the same blank a
+    pending row's unset cell exports. **That last is a blank and not a claim**, so a CSV or JSON
+    export reads it as a null; the two copies that write *statements* must not, and ask the dirty map
+    instead of the exported value: *Copy as ▸ SQL UPDATE* (`GridCells::updates_at`) writes
+    `c = DEFAULT`, as `edit::staged_sql` does, and *Copy as ▸ SQL INSERT* (`insert_blocks`) leaves the
+    column out of that stored row's `INSERT` — grouping stored rows by the columns they keep, as it
+    already grouped pending rows — which is what Commit's own `INSERT` does with one
+    (`copy_as_update_writes_a_staged_default_as_the_keyword`,
+    `an_insert_of_a_stored_row_omits_a_column_staged_to_its_default`, both red against the copies that
+    wrote `NULL`).
     **`ErrorSource`, `ModalError` and `ErrorModalContent` decide what the shared error modal
     offers**, and sit beside `QueryState` because the modal's fallback is that type's `Failed`. A
     surface hands the modal a `ModalError` — the text and whose words it is, `Statement`, `Server`
@@ -3544,7 +3572,7 @@ existing prose was left alone.
     entries,
     and — through `activation`, below — the Enter key and the double-click). *Set to NULL*
     deliberately still asks `editable`, because
-    emptying a blob writes no text. `resolve_key`'s half is unchanged — a binary column is still no
+    emptying a blob writes no text, and *Set to DEFAULT* asks it for the same reason. `resolve_key`'s half is unchanged — a binary column is still no
     WHERE key, where the lossiness really is fatal and there is no byte-shaped way round it.
     **`activation(ci)` is where the two *open what I am on* gestures meet, and it exists because
     they had drifted apart.** A double-click has always fallen through to the binary panel on a cell
@@ -3574,7 +3602,7 @@ existing prose was left alone.
     the model rather than re-derived at each call because "editable" and "editable *as text*" are
     two different questions once a blob can be written, and the callers still asking the first are
     the two that write no text: `blob_launch`, the surface that puts bytes in a cell (through
-    `takes_bytes`, below), and *Set to NULL*.
+    `takes_bytes`, below), and *Set to NULL* and *Set to DEFAULT*.
     **`takes_bytes(ci, row_deleted)` — `editable(ci) && !row_deleted` — is the blob write's gate,
     and it is one function because it is asked twice.** The grid offers *Load from file* through it
     and asks it again when the bytes come back from the file dialog
@@ -3629,7 +3657,13 @@ existing prose was left alone.
     `refetch_key` reads a `Bytes` edit's **original** value rather than guessing at a text form for
     it, so the re-fetch finds nothing rather than the wrong row. That arm is unreachable today,
     since `resolve_key` never lets a binary column be a key; it is written down because the one
-    thing that function must not do is invent a byte string's text form.
+    thing that function must not do is invent a byte string's text form. **A staged `Default` takes
+    the same arm, and that one is reachable** — a key or confirming column can be set to its default
+    whenever `Column::takes_default` holds. The value it was changed *to* is the server's and not
+    known here, so the original is the only thing to look the row up by: either the default left it
+    as it was and the row is found, or it moved it and the short answer re-runs the whole result —
+    never another row's. `NULL` in its place would key the re-read on a value nobody wrote
+    (`a_key_column_set_to_its_default_refetches_by_its_original`).
     **`staged_cell` is the one revert-to-original rule**, for a single cell: `Revert` when the value
     being staged *is* what was already there — drop any edit at that cell and don't count it — and
     `Stage` otherwise. The NULL normalisation is inside it rather than at the call site because it is
@@ -3748,7 +3782,9 @@ existing prose was left alone.
     which columns they set, each group projected to those (`model::ResultSet::project_columns`); a
     pending row with nothing set has nothing to insert and is left out
     (`an_insert_of_a_pending_row_omits_the_cells_it_did_not_set`). `DEFAULT` in `VALUES` would say
-    the same in one statement, and SQLite refuses it. CSV and JSON keep `exported_rows_at`'s single
+    the same in one statement, and SQLite refuses it. A pending row never holds a
+    `CellEdit::Default` for this to meet: *Set to DEFAULT* on one puts the cell back to unset
+    (`GridState::unset_new`), which is what the default means before the row exists. CSV and JSON keep `exported_rows_at`'s single
     result, blank cells and all.
     **`updates_at` and `where_in_at` are the two *keyed* copies — *Copy as ▸ SQL UPDATE* and *SQL
     WHERE IN* — and they aim by `row_key`, the identity the write-back itself uses**, so a copied
@@ -3810,7 +3846,8 @@ existing prose was left alone.
     beside the painter's own resolution and there is one of it. An **unset** cell of a pending new
     row stays `None` and is deliberately not the same thing as a NULL of the same shape: what it
     will hold is a server default, previewed as `<auto>`, and it counts as neither a value nor a
-    null. It returns a `Cow`, for `with_text`'s reason — a Ctrl+A over a 200,000-row column
+    null. A staged `CellEdit::Default` on a real row is that same case and is counted the same way —
+    the server has not yet said which it is. It returns a `Cow`, for `with_text`'s reason — a Ctrl+A over a 200,000-row column
     resolves every cell and only a staged blob's `<n bytes>` has to be built.
     **`fill_plan(rect, layout, editable, fill)` is the cell menu's *Fill down* / *Fill up*, and it
     reads its source through `summary_text` because both of that reader's distinctions are the
@@ -3847,7 +3884,12 @@ existing prose was left alone.
     is bracketed by `SET IDENTITY_INSERT … ON/OFF` on SQL Server, as Commit runs it — the identity
     read off the result column's `flags.auto_increment`
     (`staged_sql_brackets_an_identity_insert_on_sql_server`). An `INSERT` that sets no
-    column is `() VALUES ()` on MySQL and `DEFAULT VALUES` elsewhere. **A staged blob is withheld,
+    column is `() VALUES ()` on MySQL and `DEFAULT VALUES` elsewhere. A staged `CellEdit::Default`
+    prints as the keyword `DEFAULT` on every engine
+    (`staged_sql_writes_a_staged_default_as_the_keyword`) — which is what three of the four writers
+    send, and **not** what SQLite's does: there Commit substitutes the column's declared default,
+    read on the write connection, and the script cannot see it, so the copied `SET c = DEFAULT` is a
+    syntax error if run on SQLite. **A staged blob is withheld,
     not written**: no literal here carries bytes, so its value is the grid's `<n bytes>`
     placeholder *unquoted* and a `-- NOTE:` line heads the text — the statement fails loudly if run,
     where a quoted placeholder would store that string in the column
@@ -16425,6 +16467,26 @@ existing prose was left alone.
   through either arm, so the storage class is the only thing that tells the wrong write apart), and
   `a_blob_column_is_writable_end_to_end_but_never_as_text` composes the four links the pure tests
   each pin apart — C2's narrowing, the `DirtyCells` widening, the grouping and the binding.
+  **A staged `CellEdit::Default` is the one value none of the bindings carries**, because no
+  parameter can hold the keyword, and the engines disagree on where it may be written. MySQL's
+  `cell_param` answers `None` for it: `build_update` writes `c = DEFAULT` inline in place of the
+  `?`, and `build_insert` leaves the column out, which means the same thing
+  (`a_staged_default_is_written_inline_and_binds_nothing`). PostgreSQL's `pg_cell_lit` renders
+  `DEFAULT`, legal in both `SET` and `VALUES` (`a_staged_default_is_the_keyword_in_set_and_values`).
+  **SQLite has neither**: `SET c = DEFAULT` is a syntax error and `VALUES` refuses it, so an
+  `INSERT` leaves the column out and an `UPDATE` cannot say it at all. `staged_defaults` reads each
+  staged column's `dflt_value` and `hidden` out of `pragma_table_xinfo` **on the write transaction
+  itself**, before the first step, and `statement_for(step, &defaults)` writes the declared default
+  expression parenthesised — `(CURRENT_TIMESTAMP)`, `('new')` and `((6 * 7))` are each one operand
+  in `SET` — or `NULL` for a column declaring none, which is SQLite's own default for it. A
+  generated column (`hidden` 2 or 3) and a column the table does not have are `DbError::Refused`
+  before anything runs, rather than an `UPDATE` SQLite refuses in words about something else
+  (`a_staged_default_writes_the_declared_default`,
+  `a_staged_default_on_a_generated_column_is_refused` — both red against a writer that sent the
+  bare keyword, on SQLite's syntax error at `DEFAULT`). SQL Server's arm is under its own entry.
+  The live tier's `a_staged_default_writes_the_columns_default` runs against MariaDB, MySQL 8 and
+  PostgreSQL (`tests/live/writeback.rs`) and against SQL Server 2022 and 2025
+  (`tests/live/mssql.rs`).
   **`Db::run_script` is `stream_query` inverted** — it takes a bounded
   `Receiver<script::Statement>` where that one takes a Sender — and it is the load half of the
   round trip `dump.rs` opens. It executes each statement in order on one pinned connection, stops
@@ -17846,7 +17908,10 @@ existing prose was left alone.
   names; `SET IDENTITY_INSERT` takes the three-part name too). A NULL written as the literal `NULL`
   and never a parameter, since a TDS parameter is
   typed; a NULL key value compared as `IS NULL`, T-SQL having no null-safe equality before 2022's
-  `IS NOT DISTINCT FROM`; an insert that sets nothing as `DEFAULT VALUES`. **A float key is bound
+  `IS NOT DISTINCT FROM`; an insert that sets nothing as `DEFAULT VALUES`; a staged
+  `CellEdit::Default` as the keyword `DEFAULT`, which `cell_param` answers `None` for and `cell_sql`
+  writes in place of the parameter — T-SQL takes it in `SET` and `VALUES` alike
+  (`a_staged_default_is_the_keyword_and_binds_nothing`). **A float key is bound
   as its text**: a `real` compared with an `f64` is widened to it, and `0.1` stored as a `real` is
   not `0.1` as an `f64`, so the key would match nothing — text converts to the column's own type
   instead, a string having the lowest precedence. A `u64` past `i64` goes as text too, other
@@ -38451,7 +38516,9 @@ this bundle's.
   *typed* `NULL` still does, so the distinction stays load-bearing (see the paste rules above). It
   takes the staged `CellEdit`, and a staged **blob** weighs as `Staged` rather than `StagedNull`:
   it paints `<n bytes>`, and the italic in this grid means *absence*, where a placeholder stands
-  for a value that is there. The green fill is what says it changed.
+  for a value that is there. The green fill is what says it changed. A staged **`DEFAULT`** weighs
+  as `StagedNull`, italic like a staged NULL: it paints the keyword, which is not a value the user
+  wrote, and the value will be the server's.
 - **Every menu this grid raises goes through one door, `GridState::open_menu`, and the door is
   where the liveness guard lives.** Each of them — the toolbar's Copy, Download and AI dropdowns,
   the gutter, header and cell context menus, the in-cell picker's own list — is a `Vec` of `Rc`
@@ -38505,7 +38572,15 @@ this bundle's.
   whole block when the right-click was inside a multi-cell selection, **Copy value** for one cell —
   the same word for three different amounts was the bug), `Set to NULL` (editable **and** nullable —
   stages a `CellEdit::Null`, and it is `editable` it asks, not `text_editable`, because emptying a
-  blob writes no text), and
+  blob writes no text), `Set to DEFAULT` right after it (editable, not on a row marked for
+  deletion, and `Column::takes_default` — **not** gated on nullable, since a `NOT NULL` column
+  with a default is the common case. On a real row it stages a `CellEdit::Default` through
+  `GridState::stage_default`, which re-asks the same gate and, like `stage_bytes`, has no
+  revert-to-original rule: the default's value is the server's, so there is nothing to compare it
+  against. On a pending row it is offered only once the cell holds something, and it calls
+  `GridState::unset_new`, putting the cell back to unset — which already *is* the default before
+  the row exists, an `INSERT` leaving that column out; the inline editor opens empty over a staged
+  `Default`, there being no value yet to seed it with), and
   `AI summary` (reveals the AI panel, prompts with the column's own table + column for context).
   **That table is the column's, not the tab's**: `source_table(gs, Some(ci))` asks
   `export::column_table` over `gs.rs`, and the chat attachment's " from db.t" label asks
@@ -38927,7 +39002,9 @@ this bundle's.
   never in it at all. A staged **blob** is a value there and not a NULL: `CellEdit::as_text` answers
   `None` for `Bytes`, which is what every *text* caller wants and what this one read as absence, so
   loading a file into a selected cell turned `3 rows` into `3 rows · 1 null` while the stored blob it
-  replaced counted as a value — the grid holds `<n bytes>` for that one, and that is a text.
+  replaced counted as a value — the grid holds `<n bytes>` for that one, and that is a text. A
+  staged `DEFAULT` is neither, counted as a pending row's unset cell is
+  (`edit::GridCells::summary_text`).
   `grid_selection_bar` renders at panel level (like the find bar, so it can sit at the panel's
   edge) while `grid_view` computes it, and it lifts itself above `grid_error_bar` when that one is
   up: they coincide exactly when a bulk delete fails, which is when both have something to say.
