@@ -3559,6 +3559,9 @@ pub struct DraftSignals {
     pub ssh_auth: RwSignal<SshAuth>,
     pub ssh_key_path: RwSignal<String>,
     pub ssh_key_passphrase: RwSignal<String>,
+    /// The jump hosts before the SSH host, `ProxyJump`-spelled
+    /// (`connection::SshTunnel::jump`).
+    pub ssh_jump: RwSignal<String>,
     /// How the transport is secured, and the files that mode needs. Independent
     /// of the SSH block above: a tunnelled connection may still want the server
     /// to prove who it is at the far end.
@@ -3617,6 +3620,7 @@ impl DraftSignals {
             ssh_auth: cx.create_rw_signal(SshAuth::Password),
             ssh_key_path: cx.create_rw_signal(String::new()),
             ssh_key_passphrase: cx.create_rw_signal(String::new()),
+            ssh_jump: cx.create_rw_signal(String::new()),
             tls_mode: cx.create_rw_signal(SslMode::default()),
             tls_ca_path: cx.create_rw_signal(String::new()),
             tls_client_cert_path: cx.create_rw_signal(String::new()),
@@ -3653,6 +3657,7 @@ impl DraftSignals {
         self.ssh_auth.set(c.ssh.auth);
         self.ssh_key_path.set(c.ssh.key_path.clone());
         self.ssh_key_passphrase.set(c.ssh.key_passphrase.clone());
+        self.ssh_jump.set(c.ssh.jump.clone());
         self.tls_mode.set(c.tls.mode);
         self.tls_ca_path.set(c.tls.ca_path.clone());
         self.tls_client_cert_path
@@ -3725,6 +3730,7 @@ impl DraftSignals {
                 auth: self.ssh_auth.get_untracked(),
                 key_path: self.ssh_key_path.get_untracked(),
                 key_passphrase: self.ssh_key_passphrase.get_untracked(),
+                jump: self.ssh_jump.get_untracked(),
             },
             tls: schemaic_core::connection::Tls {
                 mode: self.tls_mode.get_untracked(),

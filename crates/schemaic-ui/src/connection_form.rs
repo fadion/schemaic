@@ -263,6 +263,54 @@ fn path_field(
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
+/// The hosts the tunnel passes through before the SSH host
+/// (`connection::SshTunnel::jump`), in `ssh -J`'s spelling, with the reason it
+/// cannot be read under it as it is typed — the same `SshTunnel::route` the
+/// tunnel opens by, so the form and the connect cannot disagree about it.
+fn jump_hosts_field(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl IntoView {
+    let jump = draft.ssh_jump;
+    let note = dyn_container(
+        move || {
+            schemaic_core::connection::SshTunnel {
+                jump: jump.get(),
+                ..Default::default()
+            }
+            .route()
+            .err()
+        },
+        |err| match err {
+            Some(why) => text(why)
+                .style(|s| {
+                    s.font_size(theme::font_label())
+                        .color(theme::error())
+                        .width_full()
+                })
+                .into_any(),
+            None => form_hint(
+                "Optional. Hosts to pass through before the SSH host, nearest first — each signs \
+                 in the way set below.",
+            )
+            .into_any(),
+        },
+    )
+    .style(|s| s.width_full());
+    v_stack((
+        text("Jump hosts").style(form_label_style),
+        edit_field(
+            jump,
+            FieldCfg {
+                placeholder: "user@bastion:22, inner",
+                mono: true,
+                focus: Some((ring, tabindex)),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width(conn_field_w())),
+        note,
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
+}
+
 // Key-pair credentials: a private-key path (with a native "Browse…" picker) and
 // an optional passphrase. Shown when the SSH auth method is "Key pair".
 fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl IntoView {
@@ -1363,6 +1411,7 @@ fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 ),
                 field("SSH user", draft.ssh_user, ring.clone(), 120)
                     .style(|s| s.width(conn_field_w())),
+                jump_hosts_field(draft, ring.clone(), 125),
                 auth_field,
                 auth_creds,
             ))
@@ -1612,6 +1661,7 @@ fn conn_form(
         draft.ssh_auth.track();
         draft.ssh_key_path.track();
         draft.ssh_key_passphrase.track();
+        draft.ssh_jump.track();
         // The TLS settings decide whether the connection is *possible*, not just
         // how it looks: raising the mode to verify-full, or naming the wrong CA,
         // turns a working endpoint into a refused one. A green Test left standing

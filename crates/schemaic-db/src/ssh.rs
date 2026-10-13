@@ -5,6 +5,12 @@
 //! `host:port` through an SSH `direct-tcpip` channel. The caller then points
 //! the MySQL driver at `127.0.0.1:<local_port>`.
 //!
+//! **Jump hosts** (`SshTunnel::jump`, OpenSSH's `ProxyJump`) are hops before
+//! the SSH host: the first is dialled over TCP and each later one over a
+//! `direct-tcpip` channel of the one before it, every hop authenticated and
+//! its host key checked on its own `host:port`. The jump sessions live in the
+//! accept loop beside the last one, whose transport they carry.
+//!
 //! Lifetime: the returned [`TunnelHandle`] owns the accept-loop task; dropping
 //! it aborts that task, which drops the listener and frees the local port (so a
 //! superseded or evicted tunnel doesn't leak a listener/port/task — review H9).
@@ -245,20 +251,23 @@ impl Handler for TunnelClient {
     }
 }
 
-/// Authenticate the freshly connected SSH session per `ssh.auth`. Errors carry a
-/// human-readable reason (surfaced by the Manage-Connections "Test" button).
+/// Authenticate the freshly connected SSH session per `ssh.auth`, as `user` —
+/// the hop's own ([`SshTunnel::route`]), which a jump host may name apart from
+/// the tunnel's. Errors carry a human-readable reason (surfaced by the
+/// Manage-Connections "Test" button).
 async fn authenticate(
     session: &mut client::Handle<TunnelClient>,
     ssh: &SshTunnel,
+    user: &str,
 ) -> Result<(), DbError> {
     let ok = match ssh.auth {
         SshAuth::Password => session
-            .authenticate_password(ssh.user.clone(), ssh.password.clone())
+            .authenticate_password(user.to_string(), ssh.password.clone())
             .await
             .map_err(|e| DbError::Connect(format!("SSH auth error: {e}")))?
             .success(),
-        SshAuth::KeyPair => authenticate_key(session, ssh).await?,
-        SshAuth::Agent => authenticate_agent(session, &ssh.user).await?,
+        SshAuth::KeyPair => authenticate_key(session, ssh, user).await?,
+        SshAuth::Agent => authenticate_agent(session, user).await?,
     };
     if ok {
         Ok(())
@@ -272,6 +281,7 @@ async fn authenticate(
 async fn authenticate_key(
     session: &mut client::Handle<TunnelClient>,
     ssh: &SshTunnel,
+    user: &str,
 ) -> Result<bool, DbError> {
     let passphrase = (!ssh.key_passphrase.is_empty()).then_some(ssh.key_passphrase.as_str());
     let key = russh::keys::load_secret_key(&ssh.key_path, passphrase)
@@ -284,7 +294,7 @@ async fn authenticate_key(
         .flatten();
     let res = session
         .authenticate_publickey(
-            ssh.user.clone(),
+            user.to_string(),
             PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
         )
         .await
@@ -400,33 +410,70 @@ pub async fn open_tunnel(
         keepalive_max: 3,
         ..Default::default()
     });
-    let host_port = format!("{}:{}", ssh.host, ssh.port);
-    let refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let handler = TunnelClient {
-        host_port: host_port.clone(),
-        refusal: refusal.clone(),
-    };
-    let connect = async {
-        client::connect(config, (ssh.host.as_str(), ssh.port), handler)
-            .await
-            .map_err(|e| {
+    // Every SSH server on the way, jump hosts first (`SshTunnel::route`). The
+    // first is dialled over TCP; each later one over a `direct-tcpip` channel
+    // of the one before it, as `ssh -J` does — so the database's host need be
+    // reachable only from the last, and each hop's host key is checked, on its
+    // own `host:port`, exactly as a direct tunnel's is.
+    let route = ssh.route().map_err(DbError::Connect)?;
+    let mut sessions: Vec<client::Handle<TunnelClient>> = Vec::with_capacity(route.len());
+    for hop in &route {
+        let host_port = format!("{}:{}", hop.host, hop.port);
+        let refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let handler = TunnelClient {
+            host_port: host_port.clone(),
+            refusal: refusal.clone(),
+        };
+        let via = sessions.last();
+        let config = config.clone();
+        let connect = async {
+            let connected = match via {
+                None => client::connect(config, (hop.host.as_str(), hop.port), handler).await,
+                Some(prev) => {
+                    let channel = prev
+                        .channel_open_direct_tcpip(
+                            hop.host.clone(),
+                            hop.port as u32,
+                            "127.0.0.1",
+                            0,
+                        )
+                        .await
+                        .map_err(|e| {
+                            DbError::Connect(format!(
+                                "SSH jump host could not reach {host_port}: {e}"
+                            ))
+                        })?;
+                    client::connect_stream(config, channel.into_stream(), handler).await
+                }
+            };
+            connected.map_err(|e| {
                 // A host-key refusal reaches here as russh's generic `UnknownKey`.
                 // Our own verdict is the one worth showing.
                 match refusal.lock().ok().and_then(|g| g.clone()) {
                     Some(msg) => DbError::Connect(msg),
+                    None if route.len() > 1 => {
+                        DbError::Connect(format!("SSH connect to {host_port} failed: {e}"))
+                    }
                     None => DbError::Connect(format!("SSH connect failed: {e}")),
                 }
             })
-    };
-    let mut session = within(TUNNEL_CONNECT_TIMEOUT, "connect", &host_port, connect).await?;
-
-    within(
-        TUNNEL_AUTH_TIMEOUT,
-        "authentication",
-        &host_port,
-        authenticate(&mut session, ssh),
-    )
-    .await?;
+        };
+        let mut session = within(TUNNEL_CONNECT_TIMEOUT, "connect", &host_port, connect).await?;
+        within(
+            TUNNEL_AUTH_TIMEOUT,
+            "authentication",
+            &host_port,
+            authenticate(&mut session, ssh, &hop.user),
+        )
+        .await?;
+        sessions.push(session);
+    }
+    let session = sessions
+        .pop()
+        .ok_or_else(|| DbError::Connect("SSH tunnel has no host".to_string()))?;
+    // The jump hosts' sessions carry the last one's transport, so they live as
+    // long as the tunnel does — moved into the accept loop below.
+    let jumps = sessions;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -437,15 +484,20 @@ pub async fn open_tunnel(
         .port();
 
     tracing::info!(
-        "SSH tunnel up: 127.0.0.1:{local_port} → {target_host}:{target_port} via {}@{}:{}",
-        ssh.user,
-        ssh.host,
-        ssh.port
+        "SSH tunnel up: 127.0.0.1:{local_port} → {target_host}:{target_port} via {}",
+        route
+            .iter()
+            .map(|h| format!("{}@{}:{}", h.user, h.host, h.port))
+            .collect::<Vec<_>>()
+            .join(" → ")
     );
 
     let session = Arc::new(session);
     let target_host = target_host.to_string();
     let accept = tokio::spawn(async move {
+        // Held, not used: dropping a jump host's session would cut the
+        // transport every later hop runs over.
+        let _jumps = jumps;
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;

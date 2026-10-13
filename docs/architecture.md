@@ -10556,6 +10556,11 @@ existing prose was left alone.
     tagged the survivor `ImportNote::NoPassword` with the password sitting in plaintext in a file
     the same scan had just read. Merging closes the class rather than that one file, and takes
     **only what the survivor lacks**, a later and worse row never overwriting a better one's value.
+    **DBeaver's jump-server settings are not read**: its SSH handler writes `SshTunnel::jump` empty
+    on purpose, since a route half carried over would connect by a path the user did not configure.
+    And `same_endpoint` compares `jump` beside the SSH host and port, for the reason it compares
+    those: a saved connection through a jump host and an imported direct row to the same bastion
+    are two routes, and `mark_existing` would otherwise untick the imported one as already saved.
     **TLS is the exception to "a field at a time", because the three paths are not independent
     fields and merging them one by one builds a configuration neither source described.** The mode
     merges by strength (`SslMode::stronger_of`, never an equality sentinel — that branch was once
@@ -11160,6 +11165,24 @@ existing prose was left alone.
     `Debug`, and `duplicate`'s struct update carries it.
     `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
+    **`SshTunnel::jump` is the route before the SSH host**, in OpenSSH's `ProxyJump` spelling —
+    `[ssh://][user@]host[:port]`, comma-separated, nearest first — and `route()` reads it into
+    `SshHop`s: the jump hosts, then `SshTunnel::host` itself, which is the list `ssh::open_tunnel`
+    walks. An entry naming no user takes the tunnel's and one naming no port takes 22, as `ssh -J`
+    does; an IPv6 host is bracketed, and the user is split at the **last** `@`, so an email-shaped
+    one keeps its own (`jump_hosts_come_first_nearest_first_with_the_tunnels_user_and_port_22`).
+    **An entry it cannot read refuses the whole route** — empty from a stray comma, a space, no
+    host, a bad or zero port, an unclosed `[` — with *Jump host N: …*, because a hop dropped
+    silently would connect by a route the user did not write
+    (`a_jump_entry_that_cannot_be_read_refuses_the_route`); the form prints that same sentence
+    under the field as it is typed. Every hop signs in with the tunnel's own method and
+    credentials — one password, one key or one agent for the whole route — so a jump host needing
+    a different sign-in from the SSH host cannot be described. `jump` is no secret, so the
+    redacting `Debug` lists it; `trimmed` trims it; and it is one of `targets_same_server`'s terms,
+    since another route reaches the server through machines the open tunnel never touched — saving
+    a changed one evicts the cached tunnel through `save_conn`'s existing `repointed` path
+    (`every_ssh_field_has_been_judged` is the tripwire that made it a decision). `conn_import`
+    writes it empty on purpose; see there.
     `ConnStatus::is_down` treats `Unknown` (not yet checked, or a tunnel still coming up) as
     *non*-blocking — only a confirmed failure gates work.
     **`LoadFailure` and `TunnelFailures` are what an SSH connection with no tunnel says, in place of
@@ -11208,7 +11231,7 @@ existing prose was left alone.
     anything I have already opened still valid* is `save_conn`'s, and the two part company on the
     transport. Save a MySQL connection with TLS `Disable`, pin a tab to Manual so `open_session`
     builds a `Db` from the connection as it then stands, then set the mode to `Require` and press
-    Save: every one of `targets_same_server`'s nine fields is unchanged, so nothing was torn down —
+    Save: every one of `targets_same_server`'s eleven fields is unchanged, so nothing was torn down —
     the pinned `Session` kept running and every statement in that tab, its `COMMIT` included, went on
     travelling in the clear while the form, the status bar and every fresh operation reported TLS.
     So this adds the TLS mode and its three paths, in **both** directions (turning it off leaves a
@@ -11302,7 +11325,9 @@ existing prose was left alone.
     **The three secrets are deliberately not trimmed**, and that is asserted as hard as the rest: a
     leading or trailing space is a legal character in a password, an SSH password and a key
     passphrase, and mangling a credential the user cannot see is the worse failure of the two;
-    `name` is left alone too, being a label rather than a coordinate. `folder` is a label as well and
+    `name` is left alone too, being a label rather than a coordinate. `ssh.jump` is trimmed as a
+    whole and `route()` trims each comma-separated entry, so only a space *inside* an entry is
+    refused. `folder` is a label as well and
     *is* trimmed, because it is one that is matched: `Prod ` and `Prod` would be one folder on screen
     and two in the file. `conn_import` trims a host of
     its own, so a connection *imported* from DBeaver got one and a connection *typed* did not —
@@ -12202,7 +12227,7 @@ existing prose was left alone.
     `schema` signal, so the rows survive, and same node id, so the `dyn_stack` doesn't rebuild
     a surviving database at all. Reuse means the node `Scope` is kept rather than replaced, so
     it is gated on `Connection::targets_same_server` (id + engine + host/port/user + the SSH
-    hop; *not* the password, name, colour or `read_only`): a **switch** must still clear and
+    hop and the jump hosts before it; *not* the password, name, colour or `read_only`): a **switch** must still clear and
     dispose, or the tree shows one server's databases while another's load — and a saved
     connection repointed at a new host keeps its id, which is the case an id comparison alone
     gets wrong. **Keeping the rows means `Loaded` stopped meaning *current*, and two things
@@ -18943,6 +18968,23 @@ existing prose was left alone.
   `db:1500` rather than refused (S5-L1-02). `tcp_target` hands a named instance's host over *as
   saved*, and that is load-bearing: the bare server in its place would drop the `\` this refusal
   reads, and the tunnel would dial whatever listens on the saved port instead.
+  **Jump hosts are hops `open_tunnel` walks before the SSH host** (`SshTunnel::route`, under
+  `connection.rs`), as `ssh -J` does: the first is `client::connect` over TCP, each later one
+  `client::connect_stream` over a `channel_open_direct_tcpip` of the previous session's
+  `into_stream()`, so the database's host need be reachable only from the last. Each hop is a
+  tunnel of its own in every respect that matters for trust — its own `TunnelClient`, so the TOFU
+  check runs against *its* `host:port`; its own `within` bounds, so the 20 s and 60 s above apply
+  per hop and not to the route as a whole; and `authenticate` as the hop's user, which is why
+  `authenticate` and `authenticate_key` take a `user` now. An unreadable route is refused before
+  any I/O with `route()`'s sentence. **The jump sessions are moved into the accept loop's task**
+  and held there unused: each carries the transport of every hop after it, and dropping one —
+  the obvious tidy of a binding nothing reads — cuts the tunnel. On a multi-hop route a failure
+  names the host it happened at (*SSH connect to h:p failed*, *SSH jump host could not reach
+  h:p*), where a direct one keeps *SSH connect failed*; the info line logs the whole route.
+  Verified live by the change's author, not by a test — the tier does not cover SSH (see below):
+  a throwaway sshd in WSL with key auth, routes of 0, 1 and 2 jump hosts through it to the
+  MySQL 8.4 container all returned the server greeting, and a jump to a closed port was named in
+  the error.
   **PostgreSQL cannot connect without naming a database**, which is protocol rather than
   preference and stayed invisible while almost every server had a `postgres` one anybody could
   reach — so `connect_maintenance` guessed at that, the username and `template1` for server-level
@@ -23117,6 +23159,14 @@ existing prose was left alone.
     under `TestState::Ok`**, because `dyn_container` rebuilds its child on every change of its key,
     equal or not: keyed on the flash, a failure's unchanged line would be rebuilt when the timer ran out,
     closing the very tooltip it stays up for.
+    **The SSH box's *Jump hosts* field (`jump_hosts_field`) checks itself with the tunnel's own
+    parser.** It sits after SSH user at tabindex 125, in the gap before the Authentication
+    dropdown's 130, a mono field with the placeholder *user@bastion:22, inner*. Under it is
+    `SshTunnel::route`'s error as typed, in `theme::error()`, or else the hint *"Optional. Hosts to
+    pass through before the SSH host, nearest first — each signs in the way set below."* — the same
+    function `open_tunnel` connects by, so the form cannot pass a route the connect then refuses,
+    or the reverse. `DraftSignals::ssh_jump` is threaded through create, load and `to_connection`,
+    and the effect that resets a prior Test result tracks it, as it does every other SSH field.
     **`tls_fields` is always visible on a networked engine, not behind a toggle like the SSH
     block**: a database that enforces TLS is the ordinary case rather than the advanced one, and a
     checkbox marked "use SSL" is the control that leaves people believing a connection is verified

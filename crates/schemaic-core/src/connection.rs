@@ -350,6 +350,101 @@ pub struct SshTunnel {
     /// Passphrase decrypting `key_path`, if the key is encrypted (may be empty).
     #[serde(default)]
     pub key_passphrase: String,
+    /// The hosts the tunnel hops through **before** [`SshTunnel::host`], in
+    /// OpenSSH's `ProxyJump` spelling — `[user@]host[:port]`, comma-separated,
+    /// nearest first ([`SshTunnel::route`]). Empty for a direct connection.
+    /// Every hop signs in with this tunnel's own method and credentials.
+    #[serde(default)]
+    pub jump: String,
+}
+
+/// One SSH server a tunnel signs in to on its way to the database
+/// ([`SshTunnel::route`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshHop {
+    pub user: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl SshTunnel {
+    /// Every SSH server the tunnel signs in to, in order: the jump hosts
+    /// ([`SshTunnel::jump`]), then [`SshTunnel::host`] itself, which opens the
+    /// channel to the database. A jump host that names no user takes this
+    /// tunnel's, and one that names no port takes 22, as `ssh -J` does.
+    ///
+    /// `Err` with the sentence the form shows when a jump entry cannot be
+    /// read — never a silently dropped hop, which would connect by a route the
+    /// user did not write.
+    pub fn route(&self) -> Result<Vec<SshHop>, String> {
+        let mut hops = Vec::new();
+        if !self.jump.trim().is_empty() {
+            for (i, entry) in self.jump.split(',').enumerate() {
+                let hop = parse_jump_host(entry.trim(), &self.user)
+                    .map_err(|why| format!("Jump host {}: {why}", i + 1))?;
+                hops.push(hop);
+            }
+        }
+        hops.push(SshHop {
+            user: self.user.clone(),
+            host: self.host.clone(),
+            port: self.port,
+        });
+        Ok(hops)
+    }
+}
+
+/// One `ProxyJump` entry — `[ssh://][user@]host[:port]`, the host bracketed
+/// when it is an IPv6 address — or why it is not one.
+fn parse_jump_host(entry: &str, default_user: &str) -> Result<SshHop, String> {
+    let rest = entry.strip_prefix("ssh://").unwrap_or(entry);
+    if rest.is_empty() {
+        return Err("empty — remove the extra comma".to_string());
+    }
+    if rest.chars().any(char::is_whitespace) {
+        return Err(format!("\"{rest}\" holds a space"));
+    }
+    // The last `@`: a user may be an email address.
+    let (user, host_port) = match rest.rfind('@') {
+        Some(at) => (&rest[..at], &rest[at + 1..]),
+        None => ("", rest),
+    };
+    let (host, port) = if let Some(inner) = host_port.strip_prefix('[') {
+        let Some(close) = inner.find(']') else {
+            return Err(format!("\"{host_port}\" opens a [ it does not close"));
+        };
+        let after = &inner[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return Err(format!("\"{host_port}\" has text after its ]")),
+        };
+        (&inner[..close], port)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (host_port, None),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("\"{entry}\" names no host"));
+    }
+    let port = match port {
+        None => 22,
+        Some(p) => match p.parse::<u16>() {
+            Ok(n) if n > 0 => n,
+            _ => return Err(format!("\"{p}\" is not a port")),
+        },
+    };
+    Ok(SshHop {
+        user: if user.is_empty() {
+            default_user.to_string()
+        } else {
+            user.to_string()
+        },
+        host: host.to_string(),
+        port,
+    })
 }
 
 /// **Two secrets, and the derive printed both.** `Db` was given a redacting
@@ -376,6 +471,7 @@ impl std::fmt::Debug for SshTunnel {
             .field("auth", &self.auth)
             .field("key_path", &self.key_path)
             .field("key_passphrase", &Redacted(&self.key_passphrase))
+            .field("jump", &self.jump)
             .finish()
     }
 }
@@ -408,6 +504,7 @@ impl Default for SshTunnel {
             auth: SshAuth::Password,
             key_path: String::new(),
             key_passphrase: String::new(),
+            jump: String::new(),
         }
     }
 }
@@ -1222,6 +1319,7 @@ impl Connection {
         trim(&mut self.ssh.host);
         trim(&mut self.ssh.user);
         trim(&mut self.ssh.key_path);
+        trim(&mut self.ssh.jump);
         trim(&mut self.tls.ca_path);
         trim(&mut self.tls.client_cert_path);
         trim(&mut self.tls.client_key_path);
@@ -1583,6 +1681,9 @@ impl Connection {
             && self.ssh.host == other.ssh.host
             && self.ssh.port == other.ssh.port
             && self.ssh.user == other.ssh.user
+            // The hosts before it are the route there: another reaches the
+            // server through machines the open tunnel never touched.
+            && self.ssh.jump == other.ssh.jump
     }
 
     /// Does saving `other` over this connection make everything already **open**
@@ -3103,6 +3204,7 @@ mod tests {
                 auth: SshAuth::KeyPair,
                 key_path: "C:/keys/id_ed25519".to_string(),
                 key_passphrase: "key-secret".to_string(),
+                jump: "ops@jump.example.com".to_string(),
             },
             ..conn()
         }
@@ -3298,6 +3400,80 @@ mod tests {
         assert!(moved(|c| c.ssh.host = "bastion".into()), "ssh host");
         assert!(moved(|c| c.ssh.port = 2222), "ssh port");
         assert!(moved(|c| c.ssh.user = "deploy".into()), "ssh user");
+        assert!(moved(|c| c.ssh.jump = "jump.example".into()), "ssh jump");
+    }
+
+    fn hop(user: &str, host: &str, port: u16) -> SshHop {
+        SshHop {
+            user: user.into(),
+            host: host.into(),
+            port,
+        }
+    }
+
+    fn tunnel_via(jump: &str) -> SshTunnel {
+        SshTunnel {
+            enabled: true,
+            host: "bastion".into(),
+            port: 2222,
+            user: "deploy".into(),
+            jump: jump.into(),
+            ..SshTunnel::default()
+        }
+    }
+
+    #[test]
+    fn a_tunnel_with_no_jump_is_one_hop() {
+        assert_eq!(
+            tunnel_via("").route(),
+            Ok(vec![hop("deploy", "bastion", 2222)])
+        );
+        assert_eq!(
+            tunnel_via("  ").route(),
+            Ok(vec![hop("deploy", "bastion", 2222)])
+        );
+    }
+
+    #[test]
+    fn jump_hosts_come_first_nearest_first_with_the_tunnels_user_and_port_22() {
+        assert_eq!(
+            tunnel_via("ops@edge.example:2200, inner").route(),
+            Ok(vec![
+                hop("ops", "edge.example", 2200),
+                hop("deploy", "inner", 22),
+                hop("deploy", "bastion", 2222),
+            ])
+        );
+        // OpenSSH's URL spelling and a bracketed IPv6 host.
+        assert_eq!(
+            tunnel_via("ssh://ops@[fe80::1]:2200,[::1]").route(),
+            Ok(vec![
+                hop("ops", "fe80::1", 2200),
+                hop("deploy", "::1", 22),
+                hop("deploy", "bastion", 2222),
+            ])
+        );
+        // An email-shaped user keeps its own `@`.
+        assert_eq!(
+            tunnel_via("me@corp.com@edge").route().unwrap()[0],
+            hop("me@corp.com", "edge", 22)
+        );
+    }
+
+    #[test]
+    fn a_jump_entry_that_cannot_be_read_refuses_the_route() {
+        for bad in [
+            "edge,",
+            ",edge",
+            "ops@",
+            "edge:notaport",
+            "edge:0",
+            "[::1",
+            "a b",
+        ] {
+            let err = tunnel_via(bad).route().unwrap_err();
+            assert!(err.starts_with("Jump host"), "{bad:?}: {err}");
+        }
     }
 
     /// **Two saved connections on one server target the same server**, which is
@@ -3577,8 +3753,9 @@ mod tests {
     }
 
     /// A **tripwire**, not a behaviour test. `SshTunnel` grows fields, and the
-    /// comparison names four of them by hand — so a second hop, a bind address or
-    /// a jump host would be excluded *silently*, and the tree would keep one
+    /// comparison names five of them by hand — so a second hop, a bind address or
+    /// a jump host would be excluded *silently* (`jump` was, until this made it
+    /// a decision), and the tree would keep one
     /// server's databases while queries went to another. Writing the struct out
     /// in full means adding a field fails to compile here, at the one place that
     /// asks whether it moves the target.
@@ -3598,6 +3775,9 @@ mod tests {
             auth: SshAuth::KeyPair,
             key_path: "/k".into(),
             key_passphrase: "q".into(),
+            // The route: a different jump reaches the server by other hosts,
+            // so it is in `targets_same_server` (and in the test above).
+            jump: "jump1".into(),
         };
         // `auth` and `key_path` are excluded deliberately: they are *how* the
         // same hop is authenticated, not a different hop.

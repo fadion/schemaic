@@ -10972,7 +10972,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // transport is not part of `targets_same_server` — nor should it be,
             // since the schema tree's question really is only about which server
             // — but it *is* part of "is anything I have already opened still
-            // valid". Change a connection's TLS mode and every one of those nine
+            // valid". Change a connection's TLS mode and every one of its
             // fields is unchanged, so the block below was skipped and a pinned
             // Manual session went on running, and committing, over the plaintext
             // socket it was opened on, while the form and the status bar reported

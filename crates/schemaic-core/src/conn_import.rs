@@ -2304,6 +2304,10 @@ fn dbeaver_handlers(c: &mut Connection, cfg: &serde_json::Value) {
                 },
                 key_path: prop("keyPath"),
                 key_passphrase: String::new(),
+                // DBeaver's jump-server settings are not read: a route
+                // half-carried over would connect by a path the user did not
+                // configure.
+                jump: String::new(),
             };
         } else if k.contains("ssl") {
             // An enabled SSL handler with no mode of its own means "encrypt" and
@@ -3390,6 +3394,9 @@ pub fn same_endpoint(a: &Connection, b: &Connection) -> bool {
         // let [`absorb`] hand the survivor an SSH session it never declared.
         && a.ssh.host.eq_ignore_ascii_case(&b.ssh.host)
         && a.ssh.port == b.ssh.port
+        // And the jump hosts before it, for the same reason: they decide which
+        // machine the bastion's name reaches.
+        && a.ssh.jump.trim().eq_ignore_ascii_case(b.ssh.jump.trim())
 }
 
 /// Path comparison for the one engine whose target is a file. Separators are
@@ -6522,6 +6529,13 @@ mod tests {
         a.ssh.port = 22;
         let b = a.clone();
         assert!(same_endpoint(&a, &b));
+
+        // And the hosts *before* the bastion are the route too: a saved row
+        // through a jump host is not an imported direct one to the same
+        // bastion, which `mark_existing` would otherwise untick as saved.
+        let mut jumped = a.clone();
+        jumped.ssh.jump = "ops@edge.example".into();
+        assert!(!same_endpoint(&a, &jumped));
     }
 
     /// The survivor's own values are never overwritten: only what it *lacks*
