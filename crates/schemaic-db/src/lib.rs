@@ -3512,6 +3512,7 @@ mod tests {
             ai_data: None,
             folder: String::new(),
             auth: Default::default(),
+            statement_timeout_secs: None,
         };
         // No tunnel → direct host/port passthrough.
         let direct = Db::connect(&conn, None);
@@ -3560,6 +3561,7 @@ mod tests {
                 ai_data: None,
                 folder: String::new(),
                 auth: Default::default(),
+                statement_timeout_secs: None,
             };
 
             let direct = Db::connect(&conn, None);
@@ -3607,6 +3609,7 @@ mod tests {
             ai_data: None,
             folder: String::new(),
             auth: Default::default(),
+            statement_timeout_secs: None,
         };
         let tunneled = Db::connect(&ms, Some(55001));
         let plan = tunneled.tls_plan().unwrap();
@@ -3640,6 +3643,7 @@ mod tests {
             ai_data: None,
             folder: String::new(),
             auth: Default::default(),
+            statement_timeout_secs: None,
         };
         let db = Db::connect(&conn, Some(55001));
         assert_eq!(db.engine(), Engine::Sqlite);

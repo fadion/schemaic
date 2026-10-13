@@ -1388,7 +1388,7 @@ fn wrap_width_label(n: usize) -> String {
 /// cancels the statement the user asked for, and an import, a report or a
 /// `CREATE INDEX` on a large table legitimately takes longer than a person's
 /// patience. A timeout tight enough to kill honest work is worse than none.
-const STATEMENT_TIMEOUTS: [u64; 6] = [0, 60, 300, 900, 1_800, 3_600];
+pub(crate) const STATEMENT_TIMEOUTS: [u64; 6] = [0, 60, 300, 900, 1_800, 3_600];
 
 /// Label a statement timeout, **computed from the value** rather than looked up
 /// — the trap `row_limit_label`'s doc comment describes, and the reason none of

@@ -3190,7 +3190,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .row_cap_override
                 .get_untracked()
                 .unwrap_or_else(|| row_limit.get_untracked());
-            let timeout_secs = statement_timeout.get_untracked();
+            // The connection's own timeout over the app's, read per run as the
+            // app's always was.
+            let timeout = connections.with_untracked(|cs| {
+                schemaic_core::connection::statement_timeout_of(
+                    cs,
+                    tab.conn_id.get_untracked(),
+                    statement_timeout.get_untracked(),
+                )
+            });
             // A Manual tab's pinned session was opened enforcing this already
             // (`open_session`); an auto-commit run's own connection asks for it.
             let enforce =
@@ -3207,7 +3215,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // connection that never completes is as much a hang as a query
                 // that never returns.
                 let started = std::time::Instant::now();
-                let watchdog = RunTimeout::arm(&token, timeout_secs);
+                let watchdog = RunTimeout::arm(&token, timeout.secs);
                 let (res, stmt) = match &session {
                     Some(s) => {
                         // `BEGIN` is issued lazily, on the first statement of a
@@ -3271,7 +3279,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // user which of the two stopped their query. Schemaic's own
                     // watchdog, so its own words — like the two cancels here.
                     Err(DbError::Cancelled) if tx::timeout_reached(stmt, timed_out) => {
-                        QueryState::Failed(ModalError::app(note(timeout_message(timeout_secs))))
+                        QueryState::Failed(ModalError::app(note(timeout_message(timeout))))
                     }
                     // **A Stop is not a smaller timeout.** MySQL commits the
                     // open transaction before it runs a DDL statement, so
@@ -3401,12 +3409,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // ANALYZE is exactly as runaway-capable as the query itself. Plain
             // EXPLAIN only plans and is bounded too — it costs nothing, and an
             // introspection query that hangs is still a hang.
-            let timeout_secs = statement_timeout.get_untracked();
+            // The connection's own timeout over the app's, read per run as the
+            // app's always was.
+            let timeout = connections.with_untracked(|cs| {
+                schemaic_core::connection::statement_timeout_of(
+                    cs,
+                    tab.conn_id.get_untracked(),
+                    statement_timeout.get_untracked(),
+                )
+            });
             let read_only = connections
                 .with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()))
                 .is_some();
             handle.spawn(async move {
-                let watchdog = RunTimeout::arm(&token, timeout_secs);
+                let watchdog = RunTimeout::arm(&token, timeout.secs);
                 let res = db
                     .explain(database.as_deref(), &sql, analyze, read_only, token)
                     .await;
@@ -3418,7 +3434,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // this state, so returning would leave the modal spinning on
                     // `Running` for ever.
                     Err(DbError::Cancelled) if timed_out => {
-                        PlanState::Failed(timeout_message(timeout_secs))
+                        PlanState::Failed(timeout_message(timeout))
                     }
                     Err(DbError::Cancelled) => return, // superseded — leave state alone
                     Err(e) => PlanState::Failed(e.to_string()),
@@ -3721,7 +3737,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 },
             );
             let cap = row_limit.get_untracked();
-            let timeout_secs = statement_timeout.get_untracked();
+            // The connection's own timeout over the app's, read per run as the
+            // app's always was.
+            let timeout = connections.with_untracked(|cs| {
+                schemaic_core::connection::statement_timeout_of(
+                    cs,
+                    tab.conn_id.get_untracked(),
+                    statement_timeout.get_untracked(),
+                )
+            });
             // A Manual tab's pinned session carries it already (`open_session`).
             let enforce =
                 connections.with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()));
@@ -3788,7 +3812,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             }
                             // Per statement, so a long script isn't bounded as
                             // one long statement. Dropped before the next arms.
-                            let watchdog = RunTimeout::arm(&token, timeout_secs);
+                            let watchdog = RunTimeout::arm(&token, timeout.secs);
                             let out = s.fetch_query(sql, cap, token.clone()).await;
                             let timed_out = watchdog.fired();
                             drop(watchdog);
@@ -3818,7 +3842,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 {
                                     stopped = true;
                                     QueryState::Failed(ModalError::app(tx::run_failed_message(
-                                        &timeout_message(timeout_secs),
+                                        &timeout_message(timeout),
                                         out.stmt,
                                         before,
                                         engine,
@@ -3863,7 +3887,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // lands — the callback is the only per-statement seam
                         // this path has. It is dropped (and so disarmed) when
                         // the closure is, which is when `run_batch` returns.
-                        let mut watchdog = RunTimeout::arm(&token, timeout_secs);
+                        let mut watchdog = RunTimeout::arm(&token, timeout.secs);
                         db.run_batch_enforced(
                             database.as_deref(),
                             &stmts,
@@ -3872,13 +3896,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             |i, res| {
                                 let timed_out = watchdog.fired();
                                 clock_stopped |= timed_out;
-                                watchdog = RunTimeout::arm(&token, timeout_secs);
+                                watchdog = RunTimeout::arm(&token, timeout.secs);
                                 took[i] = clock.elapsed().as_millis() as u64;
                                 clock = std::time::Instant::now();
                                 states[i] = match res {
                                     Ok(rs) => QueryState::Loaded(Arc::new(rs)),
                                     Err(DbError::Cancelled) if timed_out => QueryState::Failed(
-                                        ModalError::app(timeout_message(timeout_secs)),
+                                        ModalError::app(timeout_message(timeout)),
                                     ),
                                     Err(DbError::Cancelled) => QueryState::Cancelled,
                                     Err(e) => QueryState::Failed(ModalError::new(
@@ -14027,12 +14051,18 @@ impl Drop for RunTimeout {
 /// A bare "Cancelled" is what the user's own Cancel button produces, and
 /// reusing it here would leave someone staring at a query they never stopped.
 /// So: what happened, the setting that caused it *in the same words the
-/// dropdown uses*, and where to change it.
-fn timeout_message(secs: u64) -> String {
+/// dropdown uses*, and where to change it — the connection's own setting when
+/// it was that one, since the app's may be off or different.
+fn timeout_message(t: schemaic_core::connection::StatementTimeout) -> String {
+    let place = if t.per_connection {
+        "this connection's settings"
+    } else {
+        "Settings → Query"
+    };
     format!(
         "Cancelled: the statement ran longer than the {} statement timeout. \
-         Change or turn it off in Settings → Query.",
-        persist::statement_timeout_label(secs).to_lowercase()
+         Change or turn it off in {place}.",
+        persist::statement_timeout_label(t.secs).to_lowercase()
     )
 }
 
@@ -15526,10 +15556,31 @@ mod app_tests {
     /// can be matched up.
     #[test]
     fn a_timed_out_statement_says_what_stopped_it_and_where_to_change_it() {
-        let msg = timeout_message(900);
+        let msg = timeout_message(app_timeout(900));
         assert!(msg.contains("15 minutes"), "{msg}");
         assert!(msg.contains("Settings"), "{msg}");
         assert_ne!(msg, "Cancelled");
+    }
+
+    /// **A connection's own timeout sends the user to the connection**, not
+    /// to Settings, where the app's value may be off or different — the
+    /// message would otherwise name a setting that did not fire.
+    #[test]
+    fn a_connections_own_timeout_names_the_connection_as_where_to_change_it() {
+        let msg = timeout_message(schemaic_core::connection::StatementTimeout {
+            secs: 3_600,
+            per_connection: true,
+        });
+        assert!(msg.contains("1 hour"), "{msg}");
+        assert!(msg.contains("this connection"), "{msg}");
+        assert!(!msg.contains("Settings"), "{msg}");
+    }
+
+    fn app_timeout(secs: u64) -> schemaic_core::connection::StatementTimeout {
+        schemaic_core::connection::StatementTimeout {
+            secs,
+            per_connection: false,
+        }
     }
 
     /// The label is shared with the settings dropdown for exactly this reason:
@@ -15540,7 +15591,7 @@ mod app_tests {
         for secs in [60u64, 300, 900, 1_800, 3_600] {
             let label = schemaic_core::persist::statement_timeout_label(secs);
             assert!(
-                timeout_message(secs).contains(&label.to_lowercase()),
+                timeout_message(app_timeout(secs)).contains(&label.to_lowercase()),
                 "{secs}s: {label}"
             );
         }
@@ -16437,6 +16488,7 @@ mod app_tests {
             ai_data: None,
             folder: String::new(),
             auth: Default::default(),
+            statement_timeout_secs: None,
         }
     }
 

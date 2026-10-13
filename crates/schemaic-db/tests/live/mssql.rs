@@ -10392,6 +10392,7 @@ fn sign_in_connection(
         ai_data: None,
         folder: String::new(),
         auth,
+        statement_timeout_secs: None,
     }
 }
 

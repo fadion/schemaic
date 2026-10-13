@@ -11069,6 +11069,25 @@ existing prose was left alone.
     (`cli/mcp.rs`'s entry). There is deliberately **no masking option** — a
     model cannot tell a masked value from a real one, so it reasons confidently about fiction, and
     the questions where values matter are exactly the ones masking ruins.
+    **`statement_timeout_secs` is this connection's statement timeout over the app's** (*Settings →
+    Query*, `persist::statement_timeout`) — the field's own example is a reporting replica that
+    legitimately runs for an hour beside a production primary that never should. It is
+    `Option<u64>` and `#[serde(default)]`, and the two non-values must not collapse: `None` follows
+    the app, which is what every connection saved before the field does
+    (`a_connection_saved_without_a_timeout_follows_the_app`), while `Some(0)` is **no timeout on
+    this connection whatever the app says** — read as "follow the app", a connection that turned
+    its timeout off would be held to the app's again
+    (`a_connections_own_timeout_wins_and_zero_means_none_here`). `Connection::statement_timeout(app_secs)`
+    resolves it to a `StatementTimeout { secs, per_connection }`, the flag being what lets the
+    timed-out message name the setting that fired (the app's `timeout_message`; the statement
+    timeout's passage under `ui/lib.rs`); `statement_timeout_of(list, id, app_secs)` is the registry's
+    accessor, and an unknown id follows the app for `read_only_of`'s reason — the run that asked
+    fails on the missing connection, not on this
+    (`a_timeout_is_looked_up_by_id_and_an_unknown_one_follows_the_app`).
+    `statement_timeout_choice_label` is the form's wording: *Same as the app* for `None`, otherwise
+    `persist::statement_timeout_label`, so a message quoting the value matches either dropdown
+    (`the_forms_timeout_labels_follow_the_app_or_say_its_words`). It is listed in the redacting
+    `Debug`, and `duplicate`'s struct update carries it.
     `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
     `ConnStatus::is_down` treats `Unknown` (not yet checked, or a tunnel still coming up) as
@@ -22815,7 +22834,8 @@ existing prose was left alone.
     write used to be unconditional, and the picker has one name per engine where `db_type` has
     several.
     **The form is four sections, not one column** (GitHub #16): **General** (Name and colour,
-    Folder), **Safeguards** (Prominent colour, Read-only, CLI access, AI data access), **Database**
+    Folder), **Safeguards** (Prominent colour, Read-only, CLI access, AI data access, Statement
+    timeout), **Database**
     (Environment, Type, then `engine_block` — Host/Port, Database, Authentication and User/Password
     for a server, the Database file for SQLite) and **Network** (the SSH tunnel and its fields, SSL /
     TLS). Each opens with `widgets::form_section_header` and they stand `widgets::form_section_gap()`
@@ -22840,6 +22860,18 @@ existing prose was left alone.
     `to_connection` exactly as `read_only` is, and that is the part worth pinning: a hardcoded
     `false` at `to_connection` would have compiled and silently cleared the flag every time a user
     edited an exposed connection for any other reason.
+    **The *Statement timeout* dropdown is `Connection::statement_timeout_secs`'s write surface**,
+    last in Safeguards after AI data access, at tabindex 37 — after that picker's 35, before
+    Environment's 40, for the CLI toggle's reason. Its choices are `CONN_STATEMENT_TIMEOUTS`:
+    *Same as the app* (`None`) first, because it is what every connection saved before the field
+    does, then the app's own list from *Settings → Query* — none, 1, 5, 15 and 30 minutes, an hour —
+    labelled by `connection::statement_timeout_choice_label`, so the words match the app's dropdown
+    and the timed-out message. **The list is built from `settings::STATEMENT_TIMEOUTS`** — a
+    `const` block prepends `None` and wraps each value — rather than copied, so a value added to
+    Settings appears in both dropdowns. Its hint is *"Cancels a statement on this
+    connection that runs longer."*, and `DraftSignals::statement_timeout` (`Option<u64>`) is
+    threaded through create, load and `to_connection` as `cli_access` is — the same hardcoded-`None`
+    hazard at `to_connection` would silently put every edited connection back on the app's value.
     **The *Folder* field is free text, right after Name and Colour**, because a folder is only its
     name (`Connection::folder`) and there is nothing to create first. It is still **suggested**:
     `table_designer::suggest_field` over `connection::folder_names`, a ghost to Tab into and a
@@ -29521,10 +29553,22 @@ existing prose was left alone.
   Cancel button arrive as the identical `DbError::Cancelled`, so the watchdog's `fired` flag is the
   only thing that can tell the user which stopped their query — hence `timeout_message`, which
   quotes the timeout in the very words the settings dropdown uses (`persist::statement_timeout_label`
-  is shared for exactly that reason). `EXPLAIN` is bounded too: `EXPLAIN ANALYZE` *executes* the
-  statement, so it is as runaway-capable as the query itself, and there the timeout must produce a
-  `PlanState::Failed` rather than the plain-cancel `return`, which would leave the modal spinning
-  on `Running` for ever.
+  is shared for exactly that reason) and says where to change it: *Settings → Query*, or *this
+  connection's settings* when the value that fired was the connection's own, since the app's may
+  then be off or different and the message would send the user to a setting that did not fire
+  (`a_connections_own_timeout_names_the_connection_as_where_to_change_it`). `EXPLAIN` is bounded
+  too: `EXPLAIN ANALYZE` *executes* the statement, so it is as runaway-capable as the query itself,
+  and there the timeout must produce a `PlanState::Failed` rather than the plain-cancel `return`,
+  which would leave the modal spinning on `Running` for ever.
+  **A connection may override the app's timeout** (`Connection::statement_timeout_secs`, under
+  `connection.rs`), and the three sites that arm the watchdog — the run, EXPLAIN and Run All —
+  each resolve it at launch through `connection::statement_timeout_of(connections, tab.conn_id,
+  app)`, read untracked as the app's value always was, and arm `timeout.secs`; the
+  `StatementTimeout` they get back travels to `timeout_message` so the wording follows whose value
+  it was. Nothing else changed about the clock: it is still client-side, through the same watchdog
+  and the same Cancel token, with nothing set on the server. It bounds the editor alone — the MCP
+  server and the CLI keep their own deadlines (`QUERY_TIMEOUT`, `--timeout`), and the AI panel's
+  MCP subprocess is not handed a connection's value.
   **The Server Activity poll is generation-guarded, and only runs while the panel is open *and the
   window has focus*.** One effect watches `(right_panel, active_conn, activity_interval,
   window_focused, activity_view)`; it bumps `activity_gen`, clears the snapshot when the

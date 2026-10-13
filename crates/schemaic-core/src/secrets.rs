@@ -680,6 +680,7 @@ mod tests {
             ai_data: None,
             folder: String::new(),
             auth: crate::connection::AuthMode::Password,
+            statement_timeout_secs: None,
         }
     }
 

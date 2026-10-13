@@ -1058,6 +1058,23 @@ pub struct Connection {
     /// before the field existed. Read through [`Self::effective_auth`].
     #[serde(default)]
     pub auth: AuthMode,
+    /// This connection's own statement timeout, in seconds, over the app's
+    /// (*Settings → Query*): `None` follows the app's, `Some(0)` is none here
+    /// whatever the app's says — a reporting replica that legitimately runs
+    /// for an hour beside a production primary that should never. Read through
+    /// [`Self::statement_timeout`].
+    #[serde(default)]
+    pub statement_timeout_secs: Option<u64>,
+}
+
+/// The statement timeout a run on one connection is held to, and whose
+/// setting it is — the timed-out message has to say where to change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatementTimeout {
+    /// Seconds; `0` is none (`persist::statement_timeout`).
+    pub secs: u64,
+    /// Set on the connection rather than inherited from the app.
+    pub per_connection: bool,
 }
 
 /// Redacting, for [`SshTunnel`]'s reasons — the DB password here, and the two
@@ -1083,6 +1100,7 @@ impl std::fmt::Debug for Connection {
             .field("ai_data", &self.ai_data)
             .field("folder", &self.folder)
             .field("auth", &self.auth)
+            .field("statement_timeout_secs", &self.statement_timeout_secs)
             .finish()
     }
 }
@@ -1313,6 +1331,22 @@ impl Connection {
         self.auth.in_force(&self.db_type)
     }
 
+    /// The statement timeout a run here is held to, given the app's
+    /// `app_secs`: this connection's own when it has one, `0` included —
+    /// which means "none here", not "follow the app".
+    pub fn statement_timeout(&self, app_secs: u64) -> StatementTimeout {
+        match self.statement_timeout_secs {
+            Some(secs) => StatementTimeout {
+                secs,
+                per_connection: true,
+            },
+            None => StatementTimeout {
+                secs: app_secs,
+                per_connection: false,
+            },
+        }
+    }
+
     /// The whole path of a SQLite connection's file, empty for any other engine.
     /// For a tooltip or a form, where [`Self::endpoint`]'s short name isn't enough
     /// to tell two files of the same name apart.
@@ -1420,6 +1454,7 @@ impl Connection {
             ai_data: Some(AiData::default()),
             folder: String::new(),
             auth: AuthMode::default(),
+            statement_timeout_secs: None,
         }
     }
 
@@ -2040,6 +2075,31 @@ pub fn read_only_of(list: &[Connection], id: u64) -> bool {
     read_only_ref(by_id(list, id))
 }
 
+/// The statement timeout a run on connection `id` is held to, given the app's
+/// `app_secs` — [`Connection::statement_timeout`] looked up by id. An id that
+/// names no connection follows the app, for [`read_only_of`]'s reason: the run
+/// that asked will fail on the missing connection, not on this.
+pub fn statement_timeout_of(list: &[Connection], id: u64, app_secs: u64) -> StatementTimeout {
+    by_id(list, id).map_or(
+        StatementTimeout {
+            secs: app_secs,
+            per_connection: false,
+        },
+        |c| c.statement_timeout(app_secs),
+    )
+}
+
+/// The connection form's label for a [`Connection::statement_timeout_secs`]
+/// choice: `None` follows the app, and any value is worded as the app's own
+/// dropdown words it (`persist::statement_timeout_label`), so a timed-out
+/// message quoting it matches either control.
+pub fn statement_timeout_choice_label(v: Option<u64>) -> String {
+    match v {
+        None => "Same as the app".to_string(),
+        Some(secs) => crate::persist::statement_timeout_label(secs),
+    }
+}
+
 /// [`read_only_of`] for a connection that is **already resolved**.
 ///
 /// The same one answer, reached by callers that hold the row rather than an id:
@@ -2565,6 +2625,7 @@ mod tests {
             ai_data: None,
             folder: String::new(),
             auth: AuthMode::Password,
+            statement_timeout_secs: None,
         };
         assert_eq!(c.endpoint(), "db.example.com:3307");
         // A server connection has no file to label.
@@ -2678,6 +2739,7 @@ mod tests {
             ai_data: None,
             folder: String::new(),
             auth: AuthMode::Password,
+            statement_timeout_secs: None,
         }
     }
 
@@ -4004,6 +4066,7 @@ mod tls_tests {
             ai_data: None,
             folder: String::new(),
             auth: AuthMode::Password,
+            statement_timeout_secs: None,
         }
     }
 
@@ -4456,5 +4519,58 @@ mod tls_tests {
         };
         let copy = c.duplicate(9, "copy".into(), None);
         assert_eq!(copy.tls, c.tls);
+    }
+
+    /// **`None` follows the app; `Some(0)` is none here.** The two must not
+    /// collapse: a connection that turned its timeout off would otherwise be
+    /// held to the app's again, and the message would send the user to a
+    /// setting that is not the one that fired.
+    #[test]
+    fn a_connections_own_timeout_wins_and_zero_means_none_here() {
+        let mut c = Connection::new_blank(1, "c".into(), None);
+        assert_eq!(
+            c.statement_timeout(300),
+            StatementTimeout {
+                secs: 300,
+                per_connection: false
+            }
+        );
+        c.statement_timeout_secs = Some(0);
+        assert_eq!(
+            c.statement_timeout(300),
+            StatementTimeout {
+                secs: 0,
+                per_connection: true
+            }
+        );
+        c.statement_timeout_secs = Some(3_600);
+        assert_eq!(c.statement_timeout(60).secs, 3_600);
+    }
+
+    #[test]
+    fn a_timeout_is_looked_up_by_id_and_an_unknown_one_follows_the_app() {
+        let mut c = Connection::new_blank(7, "c".into(), None);
+        c.statement_timeout_secs = Some(60);
+        let list = [c];
+        assert_eq!(statement_timeout_of(&list, 7, 900).secs, 60);
+        let other = statement_timeout_of(&list, 8, 900);
+        assert_eq!((other.secs, other.per_connection), (900, false));
+    }
+
+    #[test]
+    fn the_forms_timeout_labels_follow_the_app_or_say_its_words() {
+        assert_eq!(statement_timeout_choice_label(None), "Same as the app");
+        assert_eq!(statement_timeout_choice_label(Some(0)), "No timeout");
+        assert_eq!(statement_timeout_choice_label(Some(900)), "15 minutes");
+    }
+
+    /// A connection saved before the field existed follows the app's timeout.
+    #[test]
+    fn a_connection_saved_without_a_timeout_follows_the_app() {
+        let c = Connection::new_blank(1, "c".into(), None);
+        let mut v = serde_json::to_value(&c).unwrap();
+        v.as_object_mut().unwrap().remove("statement_timeout_secs");
+        let back: Connection = serde_json::from_value(v).unwrap();
+        assert_eq!(back.statement_timeout_secs, None);
     }
 }

@@ -1455,6 +1455,7 @@ mod tests {
             ai_data: None,
             folder: String::new(),
             auth: Default::default(),
+            statement_timeout_secs: None,
         }
     }
 

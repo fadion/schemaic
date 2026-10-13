@@ -3465,6 +3465,7 @@ fn blank(db_type: &str) -> Connection {
         ai_data: None,
         folder: String::new(),
         auth: crate::connection::AuthMode::Password,
+        statement_timeout_secs: None,
     }
 }
 

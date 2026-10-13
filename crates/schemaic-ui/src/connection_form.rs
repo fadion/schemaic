@@ -1513,6 +1513,25 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
 
+/// The connection form's statement-timeout choices: follow the app, then the
+/// app's own list, `0` being none here — **built from**
+/// `settings::STATEMENT_TIMEOUTS` rather than copied, so a value added to
+/// Settings appears in both dropdowns.
+const CONN_STATEMENT_TIMEOUTS: [Option<u64>; crate::settings::STATEMENT_TIMEOUTS.len() + 1] = {
+    let mut out = [None; crate::settings::STATEMENT_TIMEOUTS.len() + 1];
+    let mut i = 0;
+    while i < crate::settings::STATEMENT_TIMEOUTS.len() {
+        out[i + 1] = Some(crate::settings::STATEMENT_TIMEOUTS[i]);
+        i += 1;
+    }
+    out
+};
+
+/// [`CONN_STATEMENT_TIMEOUTS`]' labels, as the dropdown needs a `fn`.
+fn conn_statement_timeout_label(v: Option<u64>) -> String {
+    schemaic_core::connection::statement_timeout_choice_label(v)
+}
+
 /// What Windows sign-in presents, named: the account this process runs as,
 /// which is the one SSPI hands the server. From the environment Windows sets
 /// for every process; without it, the sentence says so generically.
@@ -1780,6 +1799,28 @@ fn conn_form(
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
+    // This connection's own statement timeout over the app's (Settings →
+    // Query). The app's choices plus "follow the app", which leads because it
+    // is what every connection saved before the field did.
+    let timeout_field = v_stack((
+        text("Statement timeout").style(form_label_style),
+        container(focusable_dropdown(
+            draft.statement_timeout,
+            CONN_STATEMENT_TIMEOUTS,
+            conn_statement_timeout_label,
+            ring.clone(),
+            // 37: after AI data access (35), before Environment (40).
+            37,
+        ))
+        .style(|s| s.width(theme::scaled(200.0))),
+        text("Cancels a statement on this connection that runs longer.").style(|s| {
+            s.width_full()
+                .font_size(theme::font_hint())
+                .color(theme::text_muted())
+        }),
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
+
     // Environment picker → the top-bar badge. Defaults to None (no badge).
     let env_field = v_stack((
         text("Environment").style(form_label_style),
@@ -1917,6 +1958,7 @@ fn conn_form(
         read_only_toggle,
         cli_access_toggle,
         ai_data_field,
+        timeout_field,
     ))
     .style(section);
     let database = v_stack((
