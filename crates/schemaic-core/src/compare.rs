@@ -1211,6 +1211,25 @@ impl SchemaComparison {
             .collect()
     }
 
+    /// The keys a comparison opened from **one table or view** starts with
+    /// ticked: that object and the triggers hanging off it, matched by
+    /// identity — namespace and exact name — never by the name fragment the
+    /// filter shows them with, which would tick `orders_archive` for `orders`.
+    ///
+    /// The same two exclusions as [`SchemaComparison::selectable_keys`], for
+    /// the same reasons.
+    pub fn selectable_keys_of(&self, schema: Option<&str>, name: &str) -> Vec<String> {
+        self.differences()
+            .filter(|e| !e.needs_source() && !e.unplannable())
+            .filter(|e| e.schema.as_deref() == schema)
+            .filter(|e| match &e.table {
+                Some(t) => t == name,
+                None => matches!(e.kind, CompareKind::Table | CompareKind::View) && e.name == name,
+            })
+            .map(|e| e.key())
+            .collect()
+    }
+
     /// The groups to open when a comparison is first shown: every kind that has
     /// a difference in it.
     ///
@@ -6264,6 +6283,47 @@ mod tests {
         });
         assert_eq!(narrowed.len(), 2, "{narrowed:?}");
         assert!(narrowed.iter().all(|k| k.contains("user_")), "{narrowed:?}");
+    }
+
+    /// **A table's comparison ticks that table and what hangs off it, by
+    /// identity.** The filter it opens with is a name fragment, so `orders`
+    /// also shows `orders_archive`; the seed must not tick that one, since the
+    /// user asked about `orders`.
+    #[test]
+    fn a_tables_comparison_ticks_only_that_table_and_its_triggers() {
+        let mut orders = table("orders", &[("id", "int")]);
+        orders.triggers = vec![trigger("orders_ins", "orders", "SELECT 1;")];
+        let mut other = table("orders_archive", &[("id", "int")]);
+        other.triggers = vec![trigger("archive_ins", "orders_archive", "SELECT 1;")];
+        let c = SchemaComparison::of(
+            &schema_of(vec![]),
+            &schema_of(vec![orders, other, view("orders_v", "SELECT 1")]),
+            SqlDialect::Sqlite,
+        );
+        let mut keys = c.selectable_keys_of(None, "orders");
+        keys.sort();
+        assert_eq!(keys, ["table:orders", "trigger:orders.orders_ins"]);
+        assert_eq!(c.selectable_keys_of(None, "orders_v"), ["view:orders_v"]);
+        assert!(c.selectable_keys_of(None, "nowhere").is_empty());
+    }
+
+    /// The namespace is part of the identity: `sales.orders` is not
+    /// `archive.orders`.
+    #[test]
+    fn a_tables_comparison_keeps_to_its_own_namespace() {
+        let t = |ns: &str| TableInfo {
+            schema: Some(ns.to_string()),
+            ..table("orders", &[("id", "int")])
+        };
+        let c = SchemaComparison::of(
+            &DbSchema::default(),
+            &schema_of(vec![t("sales"), t("archive")]),
+            SqlDialect::Postgres,
+        );
+        assert_eq!(
+            c.selectable_keys_of(Some("sales"), "orders"),
+            ["table:sales.orders"]
+        );
     }
 
     #[test]

@@ -8480,6 +8480,14 @@ existing prose was left alone.
     left out for the reason its row has no tick at all. It is also **what the app's compare landing
     seeds the tick set from**, with `RowFilter::default()` because no filter is on screen yet — see
     `compare_view.rs` below for the fourth spelling of the plannable predicate that replaced.
+    **`selectable_keys_of(schema, name)` is its sibling for a comparison raised from one table or
+    view**: the same two exclusions, then the entries in that namespace that *are* the table or view
+    of that exact name, or a trigger whose `table` is it. It matches by identity and not through
+    `RowFilter`, although such a comparison opens with the name in the filter box, because the
+    filter is a name fragment — `orders` would tick `orders_archive` and its triggers too
+    (`a_tables_comparison_ticks_only_that_table_and_its_triggers`); and the namespace is compared
+    because a PostgreSQL `sales.orders` is not `public.orders`
+    (`a_tables_comparison_keeps_to_its_own_namespace`).
     **`left_ddl`/`right_ddl` are the two `CREATE` texts captured at comparison time**, so a view
     showing both sides is one `diff::line_diff` over two strings. Handing a renderer the two
     `TableInfo`s and letting it ask would put a second opinion about what an object *is* in a view;
@@ -28054,11 +28062,17 @@ existing prose was left alone.
     two databases side by side, and the migration between them. Not a tab — there is no tab kind in
     this app, `Tab`/`SavedTab` being query tabs — so it is the sixth entry of the modal layer's
     **workspace** group, beside the ERD and the binary-cell panel, and counted by
-    `workspace_modals_up`. `open_compare(o, conn_id, database)` is the way in, from a database row's
-    **Compare with** (beside ER diagram in `overlays.rs`): it returns every signal the modal owns to
-    its opening value through `reset` — the one door `close` goes through too, since two paths
-    writing their own subsets is what left `show_same` cleared on open and not on close — and fixes
-    the **left** side, the right one being the question the modal is open to ask. It decides nothing
+    `workspace_modals_up`. `open_compare(o, conn_id, database, table)` is the way in, from a
+    database row's **Compare with** and a table or view row's (each beside ER diagram in
+    `overlays.rs`): it returns every signal the modal owns to its opening value through `reset` —
+    the one door `close` goes through too, since two paths writing their own subsets is what left
+    `show_same` cleared on open and not on close — and fixes the **left** side, the right one being
+    the question the modal is open to ask. **From a table or view the comparison is narrowed, not
+    reduced.** `CompareTarget::table` carries its namespace and name; `open_compare` writes the name
+    into `compare_query` *after* `reset`, which is what clears the filter for every other opening,
+    and the landing ticks only that object's differences (below). Both databases are still read
+    whole, because a table's foreign keys and its triggers' bodies name objects beyond it — only the
+    opening reading is narrowed, and clearing the filter shows the whole comparison. It decides nothing
     about what differs, in what order the statements run, or what a plan withholds — the tree's rows,
     each heading's tally, the diff pane's two sides and the plan the footer previews are all reads of
     one `SchemaComparison`, and an opinion of its own here would be the second differ the DDL
@@ -28120,7 +28134,9 @@ existing prose was left alone.
     arrives ticked, a comparison being opened to migrate the difference rather than to admire it.
     **The landing seeds that tick set through
     `SchemaComparison::selectable_keys(RowFilter::default())`, not through a filter written in
-    `main.rs`** — the default filter because none is on screen yet — and that is the same rule
+    `main.rs`** — the default filter because none is on screen yet; a comparison raised from one
+    table seeds through `selectable_keys_of` instead, by identity (under `compare.rs`) — and that
+    is the same rule
     `compare::is_planned` exists for: which differences a plan can carry has to have one spelling,
     or the footer's count, the Apply button
     and the statements actually built can disagree. The seed was a fourth one,
@@ -28739,8 +28755,9 @@ existing prose was left alone.
     `CompareCtx`: `overlay: OverlayUi`, `conn: ConnUi`, `ddl: DdlUi` and the
     `fetch`/`cancel`/`list_dbs` closures, no `Ui`, built once by naming the reads at its one call
     site — `CompareCtx::new(ui.overlay, ui.conn, ui.ddl, &ui.schema_actions)` in `modals.rs`. The
-    door stayed off it for `open_for_server`'s and `open_import`'s reason, and its one call site (the
-    database row's **Compare with** in `overlays.rs`) passes `ui.overlay`. **The three that return
+    door stayed off it for `open_for_server`'s and `open_import`'s reason, and its call sites (the
+    database row's and the table or view row's **Compare with** in `overlays.rs`) pass `ui.overlay`.
+    **The three that return
     `impl IntoView` take the ctx *by value*, and that is forced rather than stylistic.** In edition
     2024 a return-position `impl Trait` captures every lifetime in scope, so
     `fn sources_bar(ctx: &CompareCtx, …) -> impl IntoView` borrows the caller's local for as long as

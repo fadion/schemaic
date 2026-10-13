@@ -1742,6 +1742,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 ui.overlay,
                                 active_conn.get_untracked(),
                                 &cdb,
+                                None,
                             );
                         }));
                     }
@@ -2294,6 +2295,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 database: db.clone(),
                                 seed: schemaic_core::erd::DiagramSeed::Table(seed_id.clone()),
                             }));
+                        }));
+                    }
+                    // The database's comparison, narrowed to this object: beside
+                    // the ER diagram for the database menu's reason — a reading
+                    // that writes nothing itself.
+                    {
+                        let ui = import_ui.clone();
+                        let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                        entries.push(MenuEntry::action("Compare with", move || {
+                            crate::compare_view::open_compare(
+                                ui.overlay,
+                                active_conn.get_untracked(),
+                                &db,
+                                Some((ns.clone(), tbl.clone())),
+                            );
                         }));
                     }
                     // ── Generate ─────────────────────────────────────────────

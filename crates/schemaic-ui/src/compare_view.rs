@@ -141,15 +141,27 @@ fn picker_inset() -> f64 {
     theme::scaled(2.0)
 }
 
-/// Open the comparison on `database`, with no right-hand side chosen yet.
-pub(crate) fn open_compare(o: OverlayUi, conn_id: u64, database: &str) {
+/// Open the comparison on `database`, with no right-hand side chosen yet —
+/// narrowed to one table or view when `table` names one (see
+/// [`CompareTarget::table`]).
+pub(crate) fn open_compare(
+    o: OverlayUi,
+    conn_id: u64,
+    database: &str,
+    table: Option<(Option<String>, String)>,
+) {
     reset(o);
+    // After `reset`, which is what clears the filter for every other opening.
+    if let Some((_, name)) = &table {
+        o.compare_query.set(name.clone());
+    }
     o.compare.set(Some(CompareTarget {
         left: CompareSide {
             conn_id,
             database: database.to_string(),
         },
         right: None,
+        table,
     }));
 }
 

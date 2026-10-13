@@ -9330,14 +9330,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // footer's count and the Apply button ask through
                             // `is_planned` — and this seed used to re-spell half
                             // of it (`!needs_source()`, without `unplannable()`),
-                            // in a third crate and outside every test. No filter
-                            // is on screen yet, so `RowFilter::default()`.
+                            // in a third crate and outside every test. A database
+                            // target has no filter on screen yet, so
+                            // `RowFilter::default()`.
                             compare_expanded.set(c.default_expanded());
-                            compare_selected.set(
-                                c.selectable_keys(schemaic_core::compare::RowFilter::default())
-                                    .into_iter()
-                                    .collect(),
-                            );
+                            // Raised from one table, the seed is that table's
+                            // own differences, by identity — the filter it
+                            // opens with is a name fragment and shows more.
+                            let seed = match &want.table {
+                                Some((ns, name)) => c.selectable_keys_of(ns.as_deref(), name),
+                                None => {
+                                    c.selectable_keys(schemaic_core::compare::RowFilter::default())
+                                }
+                            };
+                            compare_selected.set(seed.into_iter().collect());
                             compare_state
                                 .set(schemaic_ui::CompareState::Ready(std::rc::Rc::new(c)));
                         }

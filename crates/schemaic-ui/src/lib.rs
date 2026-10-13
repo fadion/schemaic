@@ -3842,12 +3842,19 @@ pub struct CompareSide {
 ///
 /// `OverlayUi::compare` being `Some` means the overlay is open. `right` is
 /// `None` until a side is picked, which is the overlay's opening state: it is
-/// raised from one database's context menu, so the left is always known and the
-/// right is the question being asked.
+/// raised from a database's or a table's context menu, so the left is always
+/// known and the right is the question being asked.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CompareTarget {
     pub left: CompareSide,
     pub right: Option<CompareSide>,
+    /// The one table or view — namespace and name — the comparison was raised
+    /// from, or `None` for a whole database. It narrows the opening reading
+    /// only: the filter starts on the name, and only this object and its
+    /// triggers arrive ticked (`SchemaComparison::selectable_keys_of`). Both
+    /// databases are still read whole, since a table's foreign keys and its
+    /// triggers' bodies name objects beyond it.
+    pub table: Option<(Option<String>, String)>,
 }
 
 /// Where a schema comparison has got to.
