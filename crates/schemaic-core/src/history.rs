@@ -640,6 +640,41 @@ pub fn preview_for_highlight(sql: &str, dialect: crate::intel::SqlDialect) -> St
 // function kept alive by its tests (`compare::SchemaPlan::script`, which six
 // tests read a plan through and no production caller reached).
 
+/// The palette's cap on history rows ([`palette_hits`]).
+pub const PALETTE_HISTORY_CAP: usize = 20;
+
+/// Find Anywhere's **history** tier: the indices into `entries` of `conn_id`'s
+/// statements that match `needle` ([`matches_query`], the panel's own filter),
+/// newest first as the log is kept, at most `cap` of them — and none run
+/// against a database `visible` refuses, so a hidden database is gone from
+/// this tier as it is from every other.
+///
+/// **One connection's only**, the panel's and the empty query's scope: another
+/// connection's SQL, literals and all, has no business in this one's palette.
+/// Nothing for a term shorter than the body tier's
+/// [`crate::body_search::MIN_TERM_CHARS`], which matches nearly every
+/// statement.
+pub fn palette_hits(
+    entries: &[HistoryEntry],
+    conn_id: u64,
+    visible: impl Fn(&str) -> bool,
+    needle: &str,
+    cap: usize,
+) -> Vec<usize> {
+    if !crate::body_search::searches_bodies(needle.trim()) {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.conn_id == conn_id)
+        .filter(|(_, e)| e.database.as_deref().is_none_or(&visible))
+        .filter(|(_, e)| matches_query(e, needle))
+        .map(|(i, _)| i)
+        .take(cap)
+        .collect()
+}
+
 /// Whether a history entry matches a free-text filter (ASCII case-insensitive),
 /// checking the SQL, the database name, and the originating tab name. An empty
 /// (or whitespace-only) query matches everything. The SQL is matched against its
@@ -836,6 +871,29 @@ mod tests {
             rows_capped: false,
             outcome: Outcome::Unknown,
         }
+    }
+
+    #[test]
+    fn the_palette_finds_this_connections_matching_statements_newest_first() {
+        let mut log = vec![
+            entry(1, "SELECT * FROM orders", 30),
+            entry(2, "SELECT * FROM orders", 20),
+            entry(1, "DELETE FROM customers", 10),
+            entry(1, "select o.id from ORDERS o", 5),
+        ];
+        log[3].database = Some("archive".to_string());
+        let all = |_: &str| true;
+        assert_eq!(palette_hits(&log, 1, all, "orders", 10), [0, 3]);
+        // Another connection's statements are never offered.
+        assert_eq!(
+            palette_hits(&log, 2, all, "customers", 10),
+            Vec::<usize>::new()
+        );
+        // A hidden database's statements are gone.
+        assert_eq!(palette_hits(&log, 1, |d| d != "archive", "orders", 10), [0]);
+        // The cap, and the three-character floor.
+        assert_eq!(palette_hits(&log, 1, all, "orders", 1), [0]);
+        assert!(palette_hits(&log, 1, all, "or", 10).is_empty());
     }
 
     /// PostgreSQL and MySQL keep two databases apart by case; SQL Server and

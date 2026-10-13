@@ -282,6 +282,89 @@ impl BodyIndexCache {
     }
 }
 
+/// The palette's cap on open-tab rows ([`text_hits`]).
+pub const TAB_HIT_CAP: usize = 20;
+
+/// How many bytes of open-tab text [`text_hits`] scans per keystroke, across
+/// every tab. The palette is undebounced and tab text is neither folded nor
+/// cached, so a tab past what is left of it is skipped rather than scanned —
+/// a 7 MB script would otherwise cost a full case-folding walk per character
+/// typed, on the UI thread.
+pub const TAB_SCAN_BUDGET: usize = 4 * 1024 * 1024;
+
+/// One open-text hit: which of the texts, where its first match starts, and the
+/// matching line as a palette row shows it ([`body_snippet`]'s shape).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextHit {
+    pub index: usize,
+    pub at: usize,
+    pub snippet: String,
+}
+
+/// Find Anywhere's **open tabs** tier: the texts holding `needle`, one hit
+/// each at its first match, in the order given, at most `cap` of them.
+///
+/// The body tier's rule — the term as typed, matched case-insensitively by the
+/// find bar's own fold, comments and strings included, and nothing for a term
+/// shorter than [`MIN_TERM_CHARS`] — with the one difference that the text is
+/// scanned as it is rather than out of a folded index, which is what
+/// `budget` bounds: a text longer than what remains of it is not scanned.
+pub fn text_hits(texts: &[&str], needle: &str, cap: usize, budget: usize) -> Vec<TextHit> {
+    let mut scan = TextScan::new(needle, cap, budget);
+    for (index, text) in texts.iter().enumerate() {
+        scan.offer(index, text);
+    }
+    scan.finish()
+}
+
+/// [`text_hits`] one text at a time — for a caller whose texts each sit behind
+/// a borrow of their own (a tab's text signal), which a `&[&str]` cannot
+/// gather without copying every one.
+pub struct TextScan<'n> {
+    needle: &'n str,
+    searches: bool,
+    cap: usize,
+    left: usize,
+    hits: Vec<TextHit>,
+}
+
+impl<'n> TextScan<'n> {
+    pub fn new(needle: &'n str, cap: usize, budget: usize) -> Self {
+        TextScan {
+            needle,
+            searches: searches_bodies(needle),
+            cap,
+            left: budget,
+            hits: Vec::new(),
+        }
+    }
+
+    /// Whether another text can still add anything — short term, cap reached.
+    pub fn done(&self) -> bool {
+        !self.searches || self.hits.len() >= self.cap
+    }
+
+    /// Search `text`, the `index`th, unless it is longer than what remains of
+    /// the budget.
+    pub fn offer(&mut self, index: usize, text: &str) {
+        if self.done() || text.len() > self.left {
+            return;
+        }
+        self.left -= text.len();
+        if let Some(at) = first_match(text, self.needle) {
+            self.hits.push(TextHit {
+                index,
+                at,
+                snippet: snippet_at(text, at),
+            });
+        }
+    }
+
+    pub fn finish(self) -> Vec<TextHit> {
+        self.hits
+    }
+}
+
 /// The first case-insensitive occurrence of `needle` in `hay`, by the rule
 /// the editor's find bar uses ([`crate::text_ops::matches_at`]).
 fn first_match(hay: &str, needle: &str) -> Option<usize> {
@@ -693,5 +776,42 @@ mod tests {
         let snip = body_snippet(&line, "ZIEL").unwrap();
         assert!(snip.contains("ziel"), "{snip}");
         assert_eq!(snip.chars().count(), SNIPPET_CHARS + 2, "{snip}");
+    }
+
+    // -- Open tabs ----------------------------------------------------------
+
+    #[test]
+    fn a_tab_holding_the_term_is_one_hit_at_its_first_match() {
+        let tabs = [
+            "SELECT 1;",
+            "-- orders\nSELECT * FROM Orders o\nJOIN orders x",
+            "x",
+        ];
+        let hits = text_hits(&tabs, "orders", 10, usize::MAX);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].index, 1);
+        assert_eq!(hits[0].at, 3);
+        assert_eq!(hits[0].snippet, "-- orders");
+    }
+
+    #[test]
+    fn the_tab_tier_folds_case_as_typed_and_waits_for_three_characters() {
+        let tabs = ["SELECT * FROM ЗАКАЗЫ"];
+        assert_eq!(text_hits(&tabs, "заказ", 10, usize::MAX).len(), 1);
+        assert!(text_hits(&tabs, "se", 10, usize::MAX).is_empty());
+        assert!(text_hits(&tabs, "", 10, usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn the_tab_tier_stops_at_its_cap_and_its_byte_budget() {
+        let tabs = ["abc one", "abc two", "abc three"];
+        let idx = |hits: Vec<TextHit>| hits.iter().map(|h| h.index).collect::<Vec<_>>();
+        assert_eq!(idx(text_hits(&tabs, "abc", 2, usize::MAX)), [0, 1]);
+        // A tab longer than what is left of the budget is skipped, and a
+        // smaller one after it is still searched.
+        let big = format!("{}abc", "x".repeat(100));
+        let tabs = [big.as_str(), "abc small"];
+        assert_eq!(idx(text_hits(&tabs, "abc", 10, 50)), [1]);
+        assert_eq!(idx(text_hits(&tabs, "abc", 10, 1_000)), [0, 1]);
     }
 }

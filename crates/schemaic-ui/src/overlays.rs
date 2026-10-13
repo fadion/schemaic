@@ -3334,6 +3334,13 @@ enum ResultIcon {
     /// which is the one distinction that matters in a list where everything else
     /// is a thing on the server.
     Snippet,
+    /// An open query tab whose text holds the term — the file glyph the tab
+    /// strip's own rows suggest.
+    OpenTab,
+    /// A statement from this connection's query history — a plain clock, not
+    /// the rotating one, which already marks the palette's own recent
+    /// searches on the empty query.
+    History,
 }
 
 #[derive(Clone, Copy)]
@@ -3350,6 +3357,8 @@ impl ResultIcon {
             ResultIcon::Column(class, _) => crate::schema_tree::column_type_icon(class),
             ResultIcon::Object(kind) => crate::schema_tree::object_icon(kind),
             ResultIcon::Snippet => icons::BOOKMARK,
+            ResultIcon::OpenTab => icons::FILE,
+            ResultIcon::History => icons::CLOCK,
         }
     }
     fn color(self) -> floem::peniko::Color {
@@ -3361,6 +3370,9 @@ impl ResultIcon {
             // one result that is *yours* rather than the server's, and the
             // completion popup tints its snippet rows for the same reason.
             ResultIcon::Snippet => theme::accent(),
+            // Also the user's own text, but not the accent: that is the
+            // snippet's alone, and two accented kinds would mean neither.
+            ResultIcon::OpenTab | ResultIcon::History => theme::text_muted(),
             ResultIcon::Column(_, role) => {
                 let base = match role {
                     ColKeyRole::Primary => theme::key_primary(),
@@ -4654,6 +4666,157 @@ fn snippet_items(search: &SnippetSearch, q: &str, close: &Rc<dyn Fn()>) -> Vec<P
     })
 }
 
+/// What the palette's two **text** tiers search — the open tabs and the query
+/// history — and how a row of each is opened. Read untracked: the result list
+/// follows the query, and tracking every tab's text would re-run the palette
+/// on every keystroke in an editor.
+#[derive(Clone)]
+struct TextSearch {
+    tabs: RwSignal<Vec<crate::Tab>>,
+    active: RwSignal<usize>,
+    history: RwSignal<Vec<schemaic_core::history::HistoryEntry>>,
+    open_history: Rc<dyn Fn(schemaic_core::history::HistoryEntry)>,
+}
+
+/// Open-tab rows — the **sixth** category: this connection's tabs whose text
+/// holds the term (`body_search::TextScan`, the body tier's rule over text that
+/// is not indexed, so bounded by `TAB_SCAN_BUDGET`), one row per tab at its
+/// first match. Activating one switches to the tab and puts the caret on the
+/// match (`Tab::jump_offset`). A tab on a hidden database is left out, as its
+/// database's objects are. Not recorded in the search history: a tab is no
+/// catalogue object.
+fn tab_items(
+    search: &TextSearch,
+    needle: &str,
+    conn: u64,
+    hidden: &HashSet<String>,
+    close: &Rc<dyn Fn()>,
+) -> Vec<PaletteItem> {
+    use schemaic_core::body_search::{TAB_HIT_CAP, TAB_SCAN_BUDGET, TextScan};
+    let tabs: Vec<crate::Tab> = search.tabs.with_untracked(|tabs| {
+        tabs.iter()
+            .filter(|t| t.conn_id.get_untracked() == conn)
+            .filter(|t| {
+                t.database.with_untracked(|db| {
+                    db.as_deref()
+                        .is_none_or(|d| schemaic_core::schema::db_visible(hidden, d))
+                })
+            })
+            .copied()
+            .collect()
+    });
+    let mut scan = TextScan::new(needle, TAB_HIT_CAP, TAB_SCAN_BUDGET);
+    for (i, tab) in tabs.iter().enumerate() {
+        if scan.done() {
+            break;
+        }
+        // Borrowed, never cloned: a tab may hold megabytes.
+        tab.query.with_untracked(|text| scan.offer(i, text));
+    }
+    scan.finish()
+        .into_iter()
+        .map(|hit| {
+            let tab = tabs[hit.index];
+            let (active, tabs_sig, close) = (search.active, search.tabs, close.clone());
+            PaletteItem {
+                primary: tab.title(),
+                secondary: format!("open tab · {}", hit.snippet),
+                enabled: true,
+                activate: Rc::new(move || {
+                    // The tab may have closed since the row was built.
+                    if tabs_sig.with_untracked(|ts| ts.iter().any(|t| t.id == tab.id)) {
+                        crate::activate(active, tab.id);
+                        tab.jump_offset.set(Some(hit.at));
+                    }
+                    (close)();
+                }),
+                complete: None,
+                // Nothing highlighted: the primary line is the tab's title,
+                // which is not what matched — the body tier's rule.
+                match_term: None,
+                icon: Some(ResultIcon::OpenTab),
+                right_icon: None,
+                keys: None,
+            }
+        })
+        .collect()
+}
+
+/// History rows — the **seventh** and last category: this connection's past
+/// statements that match the term (`history::palette_hits`, the panel's own
+/// filter, newest first), skipping those run against a hidden database.
+/// Activating one opens it in a new tab, exactly as the history panel's row
+/// does — **without running it**, so nothing here goes near the write guard.
+/// Not recorded in the search history.
+fn history_items(
+    search: &TextSearch,
+    needle: &str,
+    conn: u64,
+    hidden: &HashSet<String>,
+    close: &Rc<dyn Fn()>,
+) -> Vec<PaletteItem> {
+    use schemaic_core::history;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    search.history.with_untracked(|entries| {
+        history::palette_hits(
+            entries,
+            conn,
+            |d| schemaic_core::schema::db_visible(hidden, d),
+            needle,
+            history::PALETTE_HISTORY_CAP,
+        )
+        .into_iter()
+        .map(|i| {
+            let entry = entries[i].clone();
+            // The matching line where the fold finds one; the statement's
+            // start where the match is the panel's (across a line break, or
+            // on the database or tab name).
+            let line = schemaic_core::body_search::body_snippet(&entry.sql, needle)
+                .unwrap_or_else(|| history::preview(&entry.sql).chars().take(60).collect());
+            let mut secondary = format!("history · {}", history::relative_time(entry.ts, now));
+            if let Some(db) = &entry.database {
+                secondary.push_str(" · ");
+                secondary.push_str(db);
+            }
+            let (open, close) = (search.open_history.clone(), close.clone());
+            PaletteItem {
+                primary: line,
+                secondary,
+                enabled: true,
+                activate: Rc::new(move || {
+                    (open)(entry.clone());
+                    (close)();
+                }),
+                complete: None,
+                match_term: Some(needle.to_string()),
+                icon: Some(ResultIcon::History),
+                right_icon: None,
+                keys: None,
+            }
+        })
+        .collect()
+    })
+}
+
+/// The open-tab rows then the history rows, for the active connection.
+fn text_tiers(
+    texts: &TextSearch,
+    needle: &str,
+    active_conn: RwSignal<u64>,
+    hidden: Memo<HashSet<String>>,
+    close: &Rc<dyn Fn()>,
+) -> Vec<PaletteItem> {
+    let needle = needle.trim();
+    let conn = active_conn.get_untracked();
+    hidden.with_untracked(|hidden| {
+        let mut rows = tab_items(texts, needle, conn, hidden, close);
+        rows.extend(history_items(texts, needle, conn, hidden, close));
+        rows
+    })
+}
+
 /// Turn a parsed query into the list of rows to show. `caret_end` is pulsed by a
 /// command→argument transition so the caret jumps to the end of the inserted text.
 #[allow(clippy::too_many_arguments)]
@@ -4671,6 +4834,7 @@ fn build_items(
     query: RwSignal<String>,
     caret_end: RwSignal<u64>,
     snippets: &SnippetSearch,
+    texts: &TextSearch,
 ) -> Vec<PaletteItem> {
     use schemaic_core::palette::Parsed;
     match parsed {
@@ -4783,6 +4947,7 @@ fn build_items(
                 })
                 .chain(bodies)
                 .chain(snippet_items(snippets, &q, close))
+                .chain(text_tiers(texts, &needles.body, active_conn, hidden, close))
                 .collect()
         }
         // Command mode, still choosing: filter the command list. Instant commands
@@ -4973,11 +5138,18 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     let active_conn = ui.conn.active_conn;
     let search_history = ui.overlay.search_history;
     let ui_reg = ui.clone(); // for building the command registry per open
-    // Snippets are the palette's fourth category. The dialect comes from the
+    // Snippets are the palette's fifth category. The dialect comes from the
     // active connection, like the library panel's, so the scopes are judged
     // against the connection whose objects the rest of the list is about.
     let snippet_items_sig = ui.snippets.items;
     let insert_snippet = ui.snippet_actions.insert.clone();
+    // The open tabs and the query history — the last two categories.
+    let text_search = TextSearch {
+        tabs: ui.tabs_ui.tabs,
+        active: ui.tabs_ui.active,
+        history: ui.history.entries,
+        open_history: ui.history_actions.open.clone(),
+    };
     let connections_for_dialect = ui.conn.connections;
     let snippet_dialect = floem::reactive::create_memo(move |_| {
         let cid = active_conn.get();
@@ -5042,6 +5214,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                 let open_table_col = open_table_col.clone();
                 let open_object = open_object.clone();
                 let close = close.clone();
+                let text_search = text_search.clone();
                 create_effect(move |prev: Option<String>| {
                     let raw = query.get();
                     // Everything the results are built from, tracked. `build_items`
@@ -5074,6 +5247,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                             conn_id: active_conn.get_untracked(),
                             insert: insert_snippet.clone(),
                         },
+                        &text_search,
                     ));
                     // Reset the cursor to the top for a new *query* only — a schema
                     // landing now re-runs this too, and it must not yank the

@@ -10082,6 +10082,17 @@ existing prose was left alone.
     the comparison rather than into a `String` first — `max_height` and
     `clip()` bound *paint*, not layout, so a multi-MB `INSERT` was laid out whole on every rebuild
     of the panel, but clamping what is drawn must not become a decision about what is findable.
+    **`palette_hits(entries, conn_id, visible, needle, cap)` is Find Anywhere's seventh tier through
+    that same filter**, so the palette finds a past statement exactly when the panel would: the
+    indices of `conn_id`'s entries that `matches_query` accepts, newest first as the log is kept, at
+    most `cap` (`PALETTE_HISTORY_CAP`, 20). **One connection's only** — the panel's scope and the
+    empty query's, since another connection's SQL, literals and all, has no business in this one's
+    palette — and an entry whose `database` `visible` refuses is skipped, so a hidden database is
+    gone from this tier as from every other; an entry with no database is kept. It waits for
+    `body_search::MIN_TERM_CHARS`, as the body and tab tiers do
+    (`the_palette_finds_this_connections_matching_statements_newest_first`). Note what sharing the
+    panel's filter brings with it: `matches_query` folds **ASCII** case only and also matches the
+    database and tab names, where the tab tier above it folds by the find bar's full rule.
     `same_database(dialect, a, b)` answers whether two database names one connection reported name
     the same database, by the engine's own rule (`database_names_ignore_case`, an exhaustive match):
     exact on PostgreSQL, which keeps `Sales` and `sales` apart, and on MySQL, which does so on a
@@ -13609,6 +13620,25 @@ existing prose was left alone.
     characters, and a line padded with runs of spaces or tabs can come out under 60. The window
     is counted out of the line rather than collected: a MySQL view's definition is one line, and
     gathering it into a `Vec<char>` cost four bytes a character of the whole definition per hit.
+    **It also answers the palette's sixth tier, the open tabs**, over text no schema holds:
+    `text_hits(texts, needle, cap, budget)` returns one `TextHit { index, at, snippet }` per text
+    that contains the term, at its *first* match, in the order given, at most `cap` of them
+    (`TAB_HIT_CAP`, 20). The rule is the body tier's — the term as typed, folded by the find bar's
+    rule through the private `first_match` (which `body_snippet` calls too), comments and strings
+    included, nothing under `MIN_TERM_CHARS` — and the snippet is `body_snippet`'s, cut by the same
+    `snippet_at` (`a_tab_holding_the_term_is_one_hit_at_its_first_match`,
+    `the_tab_tier_folds_case_as_typed_and_waits_for_three_characters`). **What differs is that
+    nothing here is indexed**: a tab's text changes with every keystroke in its editor, so there is
+    no `BodyIndex` to fold it into once, and `first_match` walks it with `matches_at` as it stands.
+    `budget` is what bounds that — `TAB_SCAN_BUDGET`, 4 MiB of text per palette keystroke across
+    every tab — and a text longer than what remains of it is **skipped, not truncated**, while a
+    smaller one after it is still searched (`the_tab_tier_stops_at_its_cap_and_its_byte_budget`).
+    The trade is stated plainly: a script larger than the budget is never found by this tier,
+    because the alternative was a full case-folding walk of it per character typed, on the UI
+    thread. A skipped text spends none of the budget; a searched one spends all of its length,
+    match or not. `TextScan` (`new`/`done`/`offer`/`finish`) is the same scan one text at a time,
+    and `text_hits` is a loop over it: the palette's texts each sit behind a signal of their own,
+    which a `&[&str]` could only gather by cloning every tab.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -35080,7 +35110,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   not go through `object_name_matches` for its match and this rule does not reach it; the one
   thing it asks the predicate is whether a name tier already lists the object, so as to skip it.
   A clause added to the predicate therefore moves which objects the body tier *skips*, never what
-  counts as a body hit.
+  counts as a body hit. The two text tiers below the snippets — open tabs and query history — read
+  no `DbSchema` at all, so the rule does not reach them either.
 - **A Find-Anywhere database is searched in three passes: table/view *names*, then objects, then
   columns** (`overlays::schema_hits`), and the object pass sits in the middle **deliberately**.
   Columns are the category that floods — one `user_id` foreign key across a hundred tables is a
@@ -35146,6 +35177,32 @@ Re-introducing the anti-patterns these guard against is a regression:
   catalogue, and a snippet is not a catalogue object, so remembering one would mean teaching the
   persisted `ObjectTag` about a thing no schema can confirm (and `snippet::next_id` reuses a
   deleted id, so a remembered one could later name a different query).
+  **Open tabs are the sixth category and query history the seventh, appended in that order after
+  the snippets** (`overlays::text_tiers`, chaining `tab_items` then `history_items`). Both take the
+  body tier's as-typed needle (`FindNeedles::body`, trimmed), both are the **active connection's
+  only**, and both drop a hidden database through `schema::db_visible` — a tab or an entry with no
+  database is kept. What they search arrives as `overlays::TextSearch { tabs, active, history,
+  open_history }`, built in `find_overlay` from `ui.tabs_ui` and from `ui.history` and
+  `history_actions.open`, and passed as `build_items`' last parameter. `tab_items` lists the tabs
+  whose text holds the term (`body_search::TextScan`, capped at `TAB_HIT_CAP` and bounded by
+  `TAB_SCAN_BUDGET`; why it needs a budget the body tier does not is under `body_search.rs`), each
+  tab's text **borrowed through `with_untracked`, never cloned**, since a tab may hold megabytes.
+  Its row is `Tab::title()` over `open tab · {snippet}`, with no highlight on the title — the body
+  tier's rule, since the title is not what matched; activating it re-checks the tab still
+  exists (it may have closed since the row was built), switches to it with `crate::activate` and
+  sets `Tab::jump_offset` to the match — the request *Go to Line* and *Go to Statement* use, which
+  the editor pane's effect consumes, and which an effect runs on creation too, so a request set
+  before the pane mounts is not lost. `history_items` lists `history::palette_hits` (capped at
+  `PALETTE_HISTORY_CAP`), its primary the matching line by `body_snippet` — or the first 60
+  characters of `history::preview` where the match is the panel's alone, across a line break the
+  preview collapses or on the database or tab name, which `body_snippet` cannot find — over
+  `history · {relative_time} · {db}`. **Activating one opens the statement in a new tab through
+  `HistoryActions::open`, exactly as the panel's row does, and does not run it**, so neither tier
+  goes anywhere near the write guard. Both glyphs are `text_muted` — `icons::FILE` for a tab and
+  `icons::CLOCK` for history, deliberately not the rotating clock, which marks the empty query's
+  recent searches — because the accent is the snippet's alone, and two accented kinds would mean
+  neither. Neither tier is recorded in the search history, for the snippets' reason: a tab or a
+  past statement is no catalogue object for a `SearchEntry` to resolve against.
 - **The Find-Anywhere query is not debounced.** Unlike the schema tree's filter box
   (`debounced(filter_input, SEARCH_DEBOUNCE_MS)`), the palette's effect re-runs on every keystroke,
   over every loaded database. So anything it calls per-database is on a per-character path: that is
@@ -35156,7 +35213,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   every loaded database — which is why it searches a copy of the bodies folded once per schema
   (`body_search::BodyIndex`) rather than folding per keystroke, `body_search::searches_bodies`
   holds it back until the term has three characters, and `body_hits_where` stops at the cap it is
-  given.
+  given. The open-tab tier is on it too, and has no index to search — hence its byte budget
+  (`body_search::TAB_SCAN_BUDGET`). **Neither text tier is tracked by the effect**: tab text and
+  history are read untracked, since tracking them would re-run the whole palette on every
+  keystroke in an editor behind it. The cost is that an open list does not notice a tab edited or
+  a statement run while it is up; the next keystroke in the palette catches up.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** so Unicode identifiers tokenize whole.
   `sql::is_word_byte` (continues a word) and `sql::is_word_start` (begins one — `alphabetic`, since a
   digit can't start a name) are the **only** definitions, next to `skip_noncode` because they answer
