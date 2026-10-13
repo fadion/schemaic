@@ -10498,7 +10498,8 @@ existing prose was left alone.
   - `conn_import.rs` — reading connections **out of other tools**: a pasted URL/DSN, DBeaver's
     `data-sources.json`, DataGrip's (or any JetBrains IDE's) `dataSources.xml`, the three
     plain-text files the command-line clients read — `~/.my.cnf`, `~/.pgpass`,
-    `~/.pg_service.conf` — and **Schemaic's own export**, the one source this module also writes
+    `~/.pg_service.conf` — the database containers Docker is running here (`docker inspect`'s
+    output, which the app runs rather than reads), and **Schemaic's own export**, the one source this module also writes
     (`export_connections`, at the end of this entry). Pure over *text*: `conn_sources` in the app finds and reads the files,
     this decides what they mean, which is what makes the whole surface unit-testable. Every parser
     answers with `Imported` values carrying **`id: 0`** and a *suggested* name — an import is a
@@ -10899,6 +10900,42 @@ existing prose was left alone.
     client group inherits, so a `[client_prod]` is read *layered on it* (what
     `--defaults-group-suffix` does); `[mysqld]` is the server's own configuration and is not a
     client at all.
+    **Docker's containers are the one source that is another program's answer rather than a
+    file.** `parse_docker_inspect` reads `docker inspect`'s JSON array, because `docker ps` alone
+    does not carry the environment and the environment is where the official images take their
+    credentials — plaintext on this machine already, set by whoever ran the container, so carried
+    the way `.my.cnf`'s are. The engine is read off the image's **repository**, never its tag
+    (`docker_engine`): a digest and tag go (a `:` before the last `/` being a registry's port, not a
+    tag), and the last path segment decides — `mysql`, `mysql-server`, `percona`/`percona-server`
+    and Oracle's `mysql/community-server` are MySQL, `mariadb`/`mariadb-server` MariaDB, `postgres`,
+    `postgresql` (bitnami's), `postgis`, `pgvector` and `timescaledb`/`timescaledb-ha` PostgreSQL,
+    with `mssql/server` and `azure-sql-edge` spelled out for SQL Server; `myapp:postgres` is nothing
+    (`the_engine_is_read_off_the_repository_not_the_tag_or_registry`). Anything else running — a
+    `redis`, an `adminer`, a `pgbouncer`, which listens on 5432 and is not the server — is **neither
+    offered nor counted as skipped**: it is not an entry at all
+    (`a_container_that_is_not_a_database_is_neither_offered_nor_counted`). A database container is
+    reached at the host port its engine's **fixed in-container port** is published on (3306, 5432,
+    1433 — `docker_container_port`, the official images' own), and one with nothing published there,
+    or a port out of range, is `SkipReason::NotPublished` *by name*: a server reachable only on
+    Docker's own network is not one the app can connect to
+    (`a_database_whose_port_is_not_published_is_skipped_by_name`). The trade is that an image told to
+    listen elsewhere inside its container reads as unpublished too. `docker_binding` reaches a
+    bind-to-everything (`0.0.0.0`, `::`, blank) at `127.0.0.1` and a specific address at that
+    address, preferring IPv4 because Docker lists one port once per family. The credentials:
+    PostgreSQL takes `POSTGRES_USER` (else `postgres`), `POSTGRES_PASSWORD` and `POSTGRES_DB`, with
+    bitnami's `POSTGRESQL_*` behind each, an unset database left for the server to default; SQL
+    Server signs in as `sa` with `MSSQL_SA_PASSWORD` or the older `SA_PASSWORD`; MySQL and MariaDB
+    take root with the root password, else the app user only where both its `*_USER` and
+    `*_PASSWORD` are set, else root with nothing — a generated root password
+    (`MYSQL_RANDOM_ROOT_PASSWORD`) or a `*_FILE` secret, which `scan`'s ordinary `NoPassword` note
+    then says (`a_generated_or_file_secret_root_password_arrives_without_one`). MariaDB reads its own
+    `MARIADB_*` names before the `MYSQL_*` aliases, as its image does
+    (`mariadb_reads_its_own_variables_before_the_mysql_ones`). An empty variable counts as unset and
+    a repeated one takes its last value. The row keeps the container's name; a stopped container
+    (`State.Running` false) offers nothing, and output that is not JSON is one `Unreadable` skip.
+    It goes through `scan` as every source does, so `dedupe`, `AlreadySaved` and `NoPassword` apply
+    — but the app's call hands `scan` Docker's answer alone, so no `~/.pgpass` sits beside it to lend
+    a password.
     **Schemaic's own export is the other direction, and it carries no secret and no consent.**
     `export_connections` turns a list of connections into a pretty-printed `ExportFile` — a
     `schemaic_connections` version (1) and the connections in this app's own shape — from a copy in
@@ -14591,6 +14628,16 @@ existing prose was left alone.
     Windows identity to present. The password travels as `SQLCMDPASSWORD`, which both clients read,
     never as `-P` — `sqlcmd_shell_puts_password_in_env_not_argv` in `app/main.rs`, which pins its
     `WSLENV` forwarding as well — and only for a mode that sends one (`uses_credentials`).
+    `DOCKER_PS_ARGS` and `docker_inspect_args` are the Docker import's two calls
+    (`conn_sources::docker_source`). The first is a constant; the second is built from the first's
+    output, which makes it this module's question even with no shell in between — **another
+    program's output on its way back into a process**. Each line must be a container id as Docker
+    spells one, 64 lowercase hex digits (`--no-trunc`) or 12, and any other line refuses the whole
+    call rather than being dropped, since a `docker` that printed something else is not the program
+    this was written against (`a_line_that_is_not_a_container_id_refuses_the_call`, whose cases
+    include a `--format=` line that would otherwise have reached the argv as an option).
+    `--type=container` keeps an image sharing an id prefix out of the answer, and empty output is an
+    empty argv — no second call at all (`nothing_running_is_no_call_at_all`).
   - `core/entra.rs` — **signing in to SQL Server with a Microsoft Entra token from the Azure CLI**:
     the pure half of `AuthMode::AzureCli`, `db/entra.rs` being the half that runs it. The token is
     the CLI's to mint and refresh — `az account get-access-token --resource
@@ -23081,8 +23128,8 @@ existing prose was left alone.
     to share. The file is written with `persist::write_file_atomic` on `handle.spawn_blocking`; a failure
     reaches the error modal through `file_error`, and a success says nothing. What goes in the file
     is `core::conn_import`'s decision, under that entry.
-    **Three ways in, and the modal opens empty.** A pasted *Connection URL* at the top, then
-    *Choose a file…* and *Scan installed clients* beneath it, then — only once one of them has
+    **Four ways in, and the modal opens empty.** A pasted *Connection URL* at the top, then
+    *Choose a file…*, *Scan installed clients* and *Docker containers* beneath it, then — only once one of them has
     produced something — the review list. The URL field holds its *Add* inside it
     (`FieldCfg::button`, under `lib.rs`) — beside it, as a `control_button`, it stood shorter than
     the field — and sits on the default field surface, `bg_deepest`: it wore `bg_editor`, with no
@@ -23092,9 +23139,10 @@ existing prose was left alone.
     Import, the other `Primary`, stays disabled until something is chosen, so the two never compete
     on an empty dialog. Opening does **not** scan: the walk reads the user's home
     directory, and a dialog that goes through it because it was opened is doing something nobody
-    asked for. The three sources all append through the app's one `add_import_result`, so a scan
-    cannot discard a URL pasted before it and the three cannot disagree about ticking or about
-    duplicates. **Two of the three run off the UI thread** — the client scan always did, and the
+    asked for. The four sources all append through the app's one `add_import_result`, so a scan
+    cannot discard a URL pasted before it and the four cannot disagree about ticking or about
+    duplicates. **Three of the four run off the UI thread** — the client scan always did, Docker's
+    did from the start (two process spawns and a daemon round trip), and the
     picked file now does: its read, its parse, its `~/.pgpass` completion and its merge all used to
     happen inside the file-picker callback, with a frozen window and no cancel, over the one input
     whose size and shape the app controls least. It is a `handle.spawn_blocking` reporting through
@@ -23108,6 +23156,19 @@ existing prose was left alone.
     find nothing. A session can confirm that the button fires and that the empty answer is the third
     state; anything about a row the walk actually produced has to be read off the pure half
     (`core::conn_import`) or checked by hand on an unredirected profile.
+    *Docker containers* (`ConnActions::scan_docker`, over `conn_sources::docker_source`) is `Quiet`
+    beside the scan's `Primary` — one source among several, and the only one that starts a program
+    — at tab stop 45 after the scan's 40, and reads *Asking Docker…*, disabled, while
+    `ConnImportUi::docker_busy` is set, for the reason the scan button is disabled while it runs.
+    That is its own flag rather than `scanning` because the two buttons are independent and either
+    may be pressed while the other is out. What Docker says that is not a row — not installed, the
+    daemon down, or *No database containers are running.*, which the app writes when the answer held
+    neither a row nor a skip, containers that are not databases included — goes in
+    `ConnImportUi::docker_note`, its own slot under the buttons beside `file_error`, as a
+    `form_hint` in the label colour rather than an error: "nothing is running" is an answer, and
+    most of the rest are about the machine rather than a mistake. `open_import` resets both — the
+    second clearing site, as it is for `scanning`, because a panic on the blocking side never
+    reaches the callback that would clear the flag.
     A review list, not a form: a row is a *proposal* with a tick box, its name, where it points
     (`row_target`, mono — `user@host:port/db`, or the file's name on SQLite; pure and tested, and
     deliberately **not** a `scheme://` URL, since this project has no URL builder on purpose and
@@ -23165,9 +23226,10 @@ existing prose was left alone.
     the module has exactly one piece of state.** All six of its `&Ui` functions read
     `ui.conn.import` and nothing else out of the signal half, so all six take `ConnImportUi`:
     `paste_row`, `source_buttons`, `row_list`, `skipped_note` and `footer`, each beside the actions
-    it calls (`add_pasted_url`, `choose_import_file`/`scan_installed_clients`, `import_chosen`), and
+    it calls (`add_pasted_url`, `choose_import_file`/`scan_installed_clients`/`scan_docker`,
+    `import_chosen`), and
     `conn_import_overlay(ConnImportUi, Rc<ConnActions>)`, which takes the actions bundle whole for
-    `schema_settings_overlay`'s reason — it is the one that hands all four down. The tell is worth
+    `schema_settings_overlay`'s reason — it is the one that hands all five down. The tell is worth
     carrying to the next module: **a body that opens `let imp = ui.conn.import;` and never says `ui`
     again was already narrow and only had to say so**, and six of six were, which is why a file's
     number says nothing about how hard it is to move — this 6 took minutes where `overlays.rs`'s
@@ -31235,6 +31297,25 @@ existing prose was left alone.
     read — it used to run inside the file-picker callback on the strength of being that cheap, and
     now rides the `spawn_blocking` the picked file's read and parse were moved onto anyway, since the
     parse beside it is the part with no bound on how long it takes.
+    **`docker_source` is the one source that is a process, not a file**, which is why it is its own
+    button rather than part of `discover`: a walk of the home directory costs a few `read_dir`s, and
+    this costs two spawns and whatever the daemon takes. Two calls, because `docker ps` does not
+    carry the environment the images take their credentials from — `launch::DOCKER_PS_ARGS` lists
+    the running ids and `launch::docker_inspect_args` turns them into the second call or refuses it;
+    nothing running is `Ok(None)`, with no second spawn. `docker` is looked for on `PATH` and must
+    pass `launch::direct_spawn_verdict`; on Windows, failing that, it is the default WSL
+    distribution's through `wsl.exe -e docker` — the engine installed inside WSL without Docker
+    Desktop, whose published ports WSL forwards to this machine's loopback — and the rows' origin
+    says which (`docker`, `docker (WSL)`). So on Windows a `PATH` docker the verdict refuses falls
+    through to WSL, and the refusal is the message only where there is no `wsl.exe`. `run_bounded`
+    spawns with no shell and, on Windows, `CREATE_NO_WINDOW`; drains both pipes on their own
+    threads, each capped at the files' 4 MiB, so a large `inspect` cannot fill a pipe and stall the
+    child while it is waited on; and gives each call `DOCKER_TIMEOUT` (15 s) before killing it,
+    since a wedged daemon would otherwise hold the button on *Asking Docker…* for as long as it
+    stays wedged. A failure reads as docker's own first line of standard error, *Docker answered:
+    …*, which is where it says the daemon is not running. None of this has a test — it is nothing
+    without a process — and was verified live, when it landed, against the WSL Docker containers
+    (two SQL Server, one MySQL 8 published on `127.0.0.1:3307`).
   - `app/script.rs` — the I/O half of `core::script`, and `dump.rs`'s mirror image: that module
     reads a database and writes a file, this reads a file and writes a database. Two halves at once — a
     **blocking reader** walks the file in `BLOCK`-sized reads, feeds `script::Splitter` and pushes

@@ -38,6 +38,7 @@ const TAB_PASTE: u32 = 10;
 const TAB_ADD: u32 = 20;
 const TAB_FILE: u32 = 30;
 const TAB_SCAN: u32 = 40;
+const TAB_DOCKER: u32 = 45;
 const TAB_ALL: u32 = 50;
 const TAB_NONE: u32 = 60;
 
@@ -60,17 +61,19 @@ pub(crate) fn conn_import_overlay(
             let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
             let (close_x, close_esc) = (close.clone(), close.clone());
 
-            // Three ways in, in the order they cost the user something: a URL
-            // they already have, a file they can point at, and — last, because
-            // it is the only one that reads the filesystem — the clients
-            // installed here. The review list appears **below all three**, and
-            // only once one of them has produced something.
+            // Four ways in, in the order they cost the user something: a URL
+            // they already have, a file they can point at, the clients
+            // installed here (the one that reads the filesystem), and the
+            // containers Docker is running (the one that starts a program).
+            // The review list appears **below all of them**, and only once one
+            // of them has produced something.
             let body = v_stack((
                 paste_row(imp, actions.add_pasted_url.clone(), ring.clone()),
                 source_buttons(
                     imp,
                     actions.choose_import_file.clone(),
                     actions.scan_installed_clients.clone(),
+                    actions.scan_docker.clone(),
                     ring.clone(),
                 ),
                 row_list(imp, ring.clone()),
@@ -195,10 +198,12 @@ fn source_buttons(
     imp: ConnImportUi,
     choose: Rc<dyn Fn()>,
     scan: Rc<dyn Fn()>,
+    docker: Rc<dyn Fn()>,
     ring: FocusRing,
 ) -> impl IntoView {
     let scanning = imp.scanning;
     let file_error = imp.file_error;
+    let docker_note = imp.docker_note;
 
     // **Under the buttons, not under the paste field.** A failed *Choose a
     // file…* used to be written into `paste_error`, so a file button's failure
@@ -219,16 +224,35 @@ fn source_buttons(
         },
     );
 
-    v_stack((row_of_buttons(choose, scan, scanning, ring), message))
-        .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
+    // Docker's answer when it is not a row — not installed, daemon down, nothing
+    // running — in the label colour rather than the error one: "no database
+    // containers are running" is an answer, and most of the others are about
+    // the machine rather than a mistake.
+    let docker_message = dyn_container(
+        move || docker_note.get(),
+        move |note| match note {
+            Some(n) => form_hint(n).into_any(),
+            None => empty().into_any(),
+        },
+    );
+
+    v_stack((
+        row_of_buttons(choose, scan, docker, scanning, imp.docker_busy, ring),
+        message,
+        docker_message,
+    ))
+    .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
 }
 
 fn row_of_buttons(
     choose: Rc<dyn Fn()>,
     scan: Rc<dyn Fn()>,
+    docker: Rc<dyn Fn()>,
     scanning: RwSignal<bool>,
+    docker_busy: RwSignal<bool>,
     ring: FocusRing,
 ) -> impl IntoView {
+    let ring_docker = ring.clone();
     h_stack((
         action_button_icon(
             "Choose a file…",
@@ -262,6 +286,28 @@ fn row_of_buttons(
                     ring,
                     TAB_SCAN,
                     move || (scan)(),
+                )
+            },
+        ),
+        // Quiet, beside Choose a file: one source among several, and the only
+        // one that starts a program — disabled while it is out for the reason
+        // the scan is.
+        dyn_container(
+            move || docker_busy.get(),
+            move |busy| {
+                let (docker, ring) = (docker.clone(), ring_docker.clone());
+                action_button_icon(
+                    if busy {
+                        "Asking Docker…"
+                    } else {
+                        "Docker containers"
+                    },
+                    icons::DATABASE,
+                    ActionKind::Quiet,
+                    !busy,
+                    ring,
+                    TAB_DOCKER,
+                    move || (docker)(),
                 )
             },
         ),

@@ -19,10 +19,16 @@
 //! scan. The one place a path comes from elsewhere is a JetBrains IDE's own list
 //! of its projects (`recentProjects.xml`), and there only one fixed file inside
 //! each named project is checked.
+//!
+//! **One source is a process rather than a file**: [`docker_source`] asks
+//! `docker` which containers are running. It is a separate button in the modal,
+//! never part of [`discover`], and the ids it passes from one `docker` call to
+//! the next are validated in `core::launch` first.
 
 use std::path::{Path, PathBuf};
 
 use schemaic_core::conn_import::{ImportSource, SourceFile};
+use schemaic_core::launch;
 
 /// Largest source file worth reading.
 ///
@@ -229,6 +235,143 @@ pub fn source_for_path(path: &Path) -> ImportSource {
         n if n.ends_with(schemaic_core::conn_import::EXPORT_FILE_SUFFIX) => ImportSource::Schemaic,
         _ => ImportSource::Url,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Docker
+// ---------------------------------------------------------------------------
+
+/// How long one `docker` call may take before it is given up on. A daemon that
+/// is down answers at once; one that is wedged would otherwise hold *Docker
+/// containers* on "Asking Docker…" for as long as it stays wedged.
+const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The running containers, as `docker inspect` describes them — `Ok(None)` when
+/// nothing is running, `Err` with the sentence for the modal otherwise.
+///
+/// **The one source that is a process, not a file**, which is why it is its own
+/// button rather than part of [`discover`]: a walk of the home directory costs
+/// a few `read_dir`s, and this costs two spawns and whatever the daemon takes.
+/// Two calls, because `docker ps` does not carry the environment the images
+/// take their credentials from — the ids the first prints go back to the second
+/// through `launch::docker_inspect_args`, which refuses anything that is not an
+/// id.
+///
+/// `docker` on `PATH` first; on Windows, failing that, the default WSL
+/// distribution's — the engine installed inside WSL without Docker Desktop,
+/// whose published ports WSL forwards to this machine's loopback.
+pub fn docker_source() -> Result<Option<SourceFile>, String> {
+    let (program, prefix, origin) = docker_launcher()?;
+    let run = |args: &[String]| {
+        let mut argv: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+        argv.extend(args.iter().cloned());
+        run_bounded(&program, &argv)
+    };
+    let ps_args: Vec<String> = launch::DOCKER_PS_ARGS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let ids = run(&ps_args)?;
+    let inspect = launch::docker_inspect_args(&ids).map_err(str::to_string)?;
+    if inspect.is_empty() {
+        return Ok(None);
+    }
+    let text = run(&inspect)?;
+    Ok(Some(SourceFile {
+        source: ImportSource::Docker,
+        path: origin.to_string(),
+        text,
+        local: None,
+    }))
+}
+
+/// Which program runs `docker`, the arguments in front of docker's own, and how
+/// the rows' origin is labelled.
+fn docker_launcher() -> Result<(PathBuf, &'static [&'static str], &'static str), String> {
+    use schemaic_term::shell::which;
+    let mut refused = None;
+    if let Some(path) = which("docker") {
+        match launch::direct_spawn_verdict(&path) {
+            Ok(()) => return Ok((path, &[], "docker")),
+            Err(why) => refused = Some(why),
+        }
+    }
+    if cfg!(windows)
+        && let Some(wsl) = which("wsl.exe")
+    {
+        return Ok((wsl, &["-e", "docker"], "docker (WSL)"));
+    }
+    Err(refused
+        .unwrap_or("Docker was not found — neither on PATH nor in WSL.")
+        .to_string())
+}
+
+/// Run `program` with `args`, no shell and no console window, and answer its
+/// standard output — or the first line it wrote to standard error when it
+/// fails, which is where `docker` says the daemon is not running.
+fn run_bounded(program: &Path, args: &[String]) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Docker could not be started: {e}"))?;
+    // Drained on their own threads, so a large `inspect` cannot fill the pipe
+    // and stall the child while this waits for it to exit.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(p) = pipe {
+                let _ = p.take(MAX_BYTES).read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > DOCKER_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Docker did not answer within 15 seconds.".to_string());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => return Err(format!("Docker could not be waited on: {e}")),
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
+    if status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
+    let first = stderr.lines().map(str::trim).find(|l| !l.is_empty());
+    Err(match first {
+        Some(line) => format!("Docker answered: {line}"),
+        None => format!("Docker exited with {status}."),
+    })
 }
 
 // ---------------------------------------------------------------------------

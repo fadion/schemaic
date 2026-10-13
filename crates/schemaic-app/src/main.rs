@@ -2617,6 +2617,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         paste: RwSignal::new(String::new()),
         paste_error: RwSignal::new(None),
         file_error: RwSignal::new(None),
+        docker_busy: RwSignal::new(false),
+        docker_note: RwSignal::new(None),
         done: RwSignal::new(None),
     };
     let find_open = RwSignal::new(false);
@@ -10499,6 +10501,49 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
         })
     };
+    // Ask Docker which database containers are running. Off the UI thread like
+    // the scan, and for a stronger reason: it is two process spawns and a
+    // daemon round trip, bounded at `conn_sources::DOCKER_TIMEOUT` each.
+    //
+    // Reopening the modal clears the busy flag too, for the reason the comment
+    // under `scan_installed_clients` gives: a panic on the blocking side never
+    // reaches the callback.
+    let scan_docker: Rc<dyn Fn()> = {
+        let handle = handle.clone();
+        Rc::new(move || {
+            if import_ui.docker_busy.get_untracked() {
+                return;
+            }
+            import_ui.docker_busy.set(true);
+            import_ui.docker_note.set(None);
+            import_ui.done.set(None);
+            let existing = connections.get_untracked();
+            let send = create_ext_action(
+                cx,
+                move |result: Result<conn_import::ImportScan, String>| {
+                    import_ui.docker_busy.set(false);
+                    match result {
+                        Ok(scan) => {
+                            if scan.found.is_empty() && scan.skipped.is_empty() {
+                                import_ui
+                                    .docker_note
+                                    .set(Some("No database containers are running.".to_string()));
+                            }
+                            add_import_result(import_ui, scan);
+                        }
+                        Err(why) => import_ui.docker_note.set(Some(why)),
+                    }
+                },
+            );
+            handle.spawn_blocking(move || {
+                let result = conn_sources::docker_source().map(|file| match file {
+                    Some(file) => conn_import::scan(&[file], &existing),
+                    None => conn_import::ImportScan::default(),
+                });
+                send(result);
+            });
+        })
+    };
     // **`scanning` had exactly one clearing site**, inside the callback above —
     // which never runs if the blocking closure panics, because tokio absorbs
     // the unwind. *Scan installed clients* then read "Scanning…" and stayed
@@ -10517,6 +10562,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         // See `scan_installed_clients`: this is the second clearing site, and
         // the only one a user can reach when the first never ran.
         import_ui.scanning.set(false);
+        import_ui.docker_busy.set(false);
+        import_ui.docker_note.set(None);
         import_ui.rows.set(Vec::new());
         import_ui.chosen.set(std::collections::HashSet::new());
         import_ui.skipped.set(Vec::new());
@@ -13327,6 +13374,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             open_import,
             export_connections,
             scan_installed_clients,
+            scan_docker,
             add_pasted_url,
             choose_import_file,
             import_chosen,

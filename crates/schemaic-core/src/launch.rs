@@ -616,10 +616,77 @@ pub fn shell_message_text(msg: &str) -> String {
     out.trim().to_string()
 }
 
+/// The arguments for `docker` that list the running containers' full ids, one
+/// per line — the first of the import's two calls. Fixed: nothing in it came
+/// from anywhere.
+pub const DOCKER_PS_ARGS: [&str; 3] = ["ps", "--quiet", "--no-trunc"];
+
+/// The arguments for `docker` that describe the containers [`DOCKER_PS_ARGS`]
+/// listed, from that call's output — or an empty list when nothing is running.
+///
+/// **The ids are another program's output on their way back into a process**,
+/// which is this module's question even with no shell in between: each line
+/// must be a container id as Docker spells one (64 lowercase hex digits with
+/// `--no-trunc`, 12 without), and anything else refuses the whole call rather
+/// than being dropped, since a `docker` that printed something else is not the
+/// program this was written against. `--type=container` keeps an image that
+/// happens to share an id prefix out of the answer.
+pub fn docker_inspect_args(ps_output: &str) -> Result<Vec<String>, &'static str> {
+    const NOT_AN_ID: &str = "docker ps printed something that is not a container id.";
+    let mut args = vec!["inspect".to_string(), "--type=container".to_string()];
+    for line in ps_output.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let is_id = matches!(line.len(), 12 | 64)
+            && line
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !is_id {
+            return Err(NOT_AN_ID);
+        }
+        args.push(line.to_string());
+    }
+    Ok(if args.len() == 2 { Vec::new() } else { args })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connection::{SslMode, Tls};
+
+    #[test]
+    fn docker_inspect_takes_the_ids_docker_ps_printed() {
+        let a = "a".repeat(64);
+        let b = format!("{}0123", "f".repeat(60));
+        let args = docker_inspect_args(&format!("{a}\r\n{b}\n\n")).expect("valid ids");
+        assert_eq!(
+            args,
+            ["inspect", "--type=container", a.as_str(), b.as_str()]
+        );
+        // The short spelling is an id too.
+        assert_eq!(
+            docker_inspect_args("0123456789ab").expect("short id").len(),
+            3
+        );
+    }
+
+    #[test]
+    fn nothing_running_is_no_call_at_all() {
+        assert_eq!(docker_inspect_args(""), Ok(Vec::new()));
+        assert_eq!(docker_inspect_args("  \n\n"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_container_id_refuses_the_call() {
+        for bad in [
+            "--format={{.Config.Env}}",
+            "abc",
+            &"A".repeat(64),
+            &"g".repeat(64),
+            &"a".repeat(65),
+            "0123456789ab cdef",
+        ] {
+            assert!(docker_inspect_args(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
 
     /// **The message terminal is the one place a string reaches a shell**, and
     /// its callers stopped being fixed sentences the moment one reported a

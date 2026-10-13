@@ -1,7 +1,8 @@
 //! Reading connections **out of other tools**: a pasted URL/DSN, DBeaver's
 //! `data-sources.json`, DataGrip's `dataSources.xml`, and the three plain-text
 //! files the command-line clients read — `~/.my.cnf`, `~/.pgpass` and
-//! `~/.pg_service.conf`.
+//! `~/.pg_service.conf` — and the database containers Docker is running here
+//! (`docker inspect`'s output, which the app runs rather than reads).
 //!
 //! Arriving from another client used to mean re-typing every server by hand,
 //! which is the actual switching cost. Everything here is pure over *text*: the
@@ -32,6 +33,7 @@
 //! | `.my.cnf` | yes | yes | **yes**, plaintext |
 //! | `.pgpass` | yes | yes | **yes**, plaintext |
 //! | `.pg_service.conf` | yes | yes | when written there |
+//! | Docker | its published port | the image's | from the container's environment, when set there |
 //!
 //! That table is the reason [`fill_missing_passwords`] exists: `.pgpass` is the
 //! one file on a PostgreSQL user's machine that can complete the twelve
@@ -76,6 +78,9 @@ pub enum ImportSource {
     PgService,
     /// Schemaic's own export ([`export_connections`]).
     Schemaic,
+    /// The database containers running here — `docker inspect`'s output
+    /// ([`parse_docker_inspect`]), which the app runs rather than reads.
+    Docker,
 }
 
 impl ImportSource {
@@ -89,6 +94,7 @@ impl ImportSource {
             ImportSource::Pgpass => ".pgpass",
             ImportSource::PgService => ".pg_service.conf",
             ImportSource::Schemaic => "Schemaic",
+            ImportSource::Docker => "Docker",
         }
     }
 }
@@ -208,6 +214,9 @@ pub enum SkipReason {
     /// Recognisably a connection, but with nothing to connect to — no host, or a
     /// `.pgpass` wildcard that names every server and therefore none.
     NoServer,
+    /// A database container whose engine port is not published to this machine
+    /// — reachable only on Docker's own network, so not by the app.
+    NotPublished,
     /// The file itself did not parse. Carries the parser's complaint.
     Unreadable(String),
 }
@@ -234,6 +243,7 @@ impl SkipReason {
         match self {
             SkipReason::UnsupportedEngine(d) => format!("unsupported engine ({d})"),
             SkipReason::NoServer => "no server to connect to".to_string(),
+            SkipReason::NotPublished => "its port is not published to this machine".to_string(),
             SkipReason::Unreadable(e) => format!("could not be read ({e})"),
         }
     }
@@ -872,6 +882,7 @@ pub fn scan(files: &[SourceFile], existing: &[Connection]) -> ImportScan {
             ImportSource::Pgpass => parse_pgpass(&f.text),
             ImportSource::PgService => parse_pg_service(&f.text),
             ImportSource::Schemaic => parse_schemaic(&f.text),
+            ImportSource::Docker => parse_docker_inspect(&f.text),
         };
         for imp in &mut one.found {
             imp.origin = f.path.clone();
@@ -3144,6 +3155,202 @@ pub enum PgpassScope {
     /// password for — and any row it does complete is flagged
     /// [`ImportNote::PasswordFromPgpass`] and left unticked.
     PickedFile,
+}
+
+// ---------------------------------------------------------------------------
+// Docker: the database containers running here
+// ---------------------------------------------------------------------------
+
+/// The engine a container image runs, read off its **repository name** — or
+/// `None` for an image this module will not guess about.
+///
+/// The repository is the part between any registry host and the tag or digest:
+/// `mcr.microsoft.com/mssql/server:2022-latest` is `mssql/server`,
+/// `docker.io/library/postgres:16` is `library/postgres`. The match is on the
+/// last path segment, with SQL Server's two-segment name spelled out, so
+/// `bitnami/postgresql` and `postgis/postgis` are PostgreSQL while a `redis`, a
+/// `pgbouncer` or an `adminer` beside them is nothing at all — a pooler that
+/// listens on 5432 is not the server, and *only decide what can be decided*
+/// says so.
+fn docker_engine(image: &str) -> Option<&'static str> {
+    let repo = image.split('@').next().unwrap_or("");
+    // A tag is a `:` after the last `/`; one before it is a registry's port.
+    let repo = match (repo.rfind(':'), repo.rfind('/')) {
+        (Some(c), Some(s)) if c > s => &repo[..c],
+        (Some(c), None) => &repo[..c],
+        _ => repo,
+    };
+    let repo = repo.to_ascii_lowercase();
+    if repo.ends_with("mssql/server") || repo.ends_with("azure-sql-edge") {
+        return Some(MSSQL);
+    }
+    match repo.rsplit('/').next().unwrap_or("") {
+        "mysql" | "mysql-server" | "percona" | "percona-server" => Some(MYSQL),
+        "community-server" if repo.contains("mysql/") => Some(MYSQL),
+        "mariadb" | "mariadb-server" => Some(MARIADB),
+        "postgres" | "postgresql" | "postgis" | "pgvector" | "timescaledb" | "timescaledb-ha" => {
+            Some(POSTGRES)
+        }
+        _ => None,
+    }
+}
+
+/// The port the engine listens on **inside** its container — the official
+/// images' fixed one, which is what `-p` maps from.
+fn docker_container_port(engine: &str) -> u16 {
+    if is_postgres(engine) {
+        5432
+    } else if engine == MSSQL {
+        1433
+    } else {
+        3306
+    }
+}
+
+/// Parse `docker inspect`'s JSON array — one object per running container —
+/// into the database servers it describes.
+///
+/// `docker ps` alone does not carry the environment, and the environment is
+/// where the official images take their credentials: `POSTGRES_PASSWORD`,
+/// `MYSQL_ROOT_PASSWORD`, `MSSQL_SA_PASSWORD`. Those are plaintext on this
+/// machine already, set by whoever ran the container, so they are carried the
+/// way `.my.cnf`'s are — and a container that took its password from a
+/// `*_FILE` secret or had one generated (`MYSQL_RANDOM_ROOT_PASSWORD`) arrives
+/// without one and says so.
+///
+/// A container is offered only when its image names an engine
+/// ([`docker_engine`]) — everything else running is not an entry and is not
+/// counted — and is skipped by name when the engine's port is not published to
+/// this machine, because a server reachable only on Docker's own network is not
+/// one the app can connect to.
+pub fn parse_docker_inspect(json: &str) -> ImportScan {
+    let mut out = ImportScan::default();
+    let containers: Vec<serde_json::Value> = match serde_json::from_str(strip_bom(json)) {
+        Ok(v) => v,
+        Err(e) => {
+            out.skip("", SkipReason::Unreadable(e.to_string()));
+            return out;
+        }
+    };
+    for ct in &containers {
+        if ct.pointer("/State/Running").and_then(|v| v.as_bool()) == Some(false) {
+            continue;
+        }
+        let image = ct
+            .pointer("/Config/Image")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let Some(engine) = docker_engine(image) else {
+            continue;
+        };
+        let name = ct
+            .get("Name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string();
+        let key = format!("{}/tcp", docker_container_port(engine));
+        let Some((host, port)) = ct
+            .pointer("/NetworkSettings/Ports")
+            .and_then(|p| p.get(&key))
+            .and_then(docker_binding)
+        else {
+            out.skip(name, SkipReason::NotPublished);
+            continue;
+        };
+        let env: Vec<(&str, &str)> = ct
+            .pointer("/Config/Env")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.as_str()?.split_once('='))
+            .collect();
+        let get = |k: &str| {
+            env.iter()
+                .rev()
+                .find(|(ek, _)| *ek == k)
+                .map(|(_, v)| v.to_string())
+                .filter(|v| !v.is_empty())
+        };
+
+        let mut c = blank(engine);
+        c.host = host;
+        c.port = port;
+        if is_postgres(engine) {
+            c.user = get("POSTGRES_USER")
+                .or_else(|| get("POSTGRESQL_USERNAME"))
+                .unwrap_or_else(|| "postgres".to_string());
+            c.password = get("POSTGRES_PASSWORD")
+                .or_else(|| get("POSTGRESQL_PASSWORD"))
+                .unwrap_or_default();
+            c.database = get("POSTGRES_DB")
+                .or_else(|| get("POSTGRESQL_DATABASE"))
+                .unwrap_or_default();
+        } else if engine == MSSQL {
+            c.user = "sa".to_string();
+            c.password = get("MSSQL_SA_PASSWORD")
+                .or_else(|| get("SA_PASSWORD"))
+                .unwrap_or_default();
+        } else {
+            // MariaDB's image reads its own `MARIADB_*` names first and the
+            // `MYSQL_*` ones as aliases; MySQL's reads only the latter.
+            let var = |suffix: &str| {
+                (engine == MARIADB)
+                    .then(|| get(&format!("MARIADB_{suffix}")))
+                    .flatten()
+                    .or_else(|| get(&format!("MYSQL_{suffix}")))
+            };
+            match (var("ROOT_PASSWORD"), var("USER"), var("PASSWORD")) {
+                (Some(root), _, _) => {
+                    c.user = "root".to_string();
+                    c.password = root;
+                }
+                (None, Some(user), Some(pw)) => {
+                    c.user = user;
+                    c.password = pw;
+                }
+                // A generated root password, a `*_FILE` secret, or an empty
+                // one allowed outright: root, and no password to carry.
+                _ => c.user = "root".to_string(),
+            }
+            c.database = var("DATABASE").unwrap_or_default();
+        }
+        c.name = if name.is_empty() {
+            suggest_name(&c)
+        } else {
+            name
+        };
+        out.found.push(imported(c, ImportSource::Docker));
+    }
+    out
+}
+
+/// The host and port one published container port is reachable at, from its
+/// `[{"HostIp": …, "HostPort": …}]` list — `None` when it is not published
+/// (`null`, empty) or names no usable port.
+///
+/// A binding to every address (`0.0.0.0`, `::`, or blank) is reached at the
+/// loopback address; one to a specific address is reached there. IPv4 is
+/// preferred because Docker lists the same port once per family.
+fn docker_binding(bindings: &serde_json::Value) -> Option<(String, u16)> {
+    let parsed: Vec<(String, u16)> = bindings
+        .as_array()?
+        .iter()
+        .filter_map(|b| {
+            let port = b.get("HostPort")?.as_str()?.trim().parse::<u16>().ok()?;
+            let ip = b.get("HostIp").and_then(|v| v.as_str()).unwrap_or("");
+            let host = match ip.trim() {
+                "" | "0.0.0.0" | "::" => "127.0.0.1",
+                other => other,
+            };
+            (port != 0).then(|| (host.to_string(), port))
+        })
+        .collect();
+    parsed
+        .iter()
+        .find(|(h, _)| !h.contains(':'))
+        .or_else(|| parsed.first())
+        .cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -6879,5 +7086,249 @@ mod tests {
                 s.skipped
             );
         }
+    }
+
+    // -- Docker -------------------------------------------------------------
+
+    /// One `docker inspect` object, with only the fields the parser reads.
+    fn container(name: &str, image: &str, env: &[&str], ports: &str) -> String {
+        let env: Vec<String> = env.iter().map(|e| format!("{e:?}")).collect();
+        format!(
+            r#"{{"Name":"/{name}","State":{{"Running":true}},"Config":{{"Image":"{image}","Env":[{}]}},"NetworkSettings":{{"Ports":{ports}}}}}"#,
+            env.join(",")
+        )
+    }
+
+    fn inspect(containers: &[String]) -> String {
+        format!("[{}]", containers.join(","))
+    }
+
+    #[test]
+    fn a_postgres_container_carries_its_published_port_and_credentials() {
+        let scan = parse_docker_inspect(&inspect(&[container(
+            "pg16",
+            "postgres:16",
+            &[
+                "POSTGRES_USER=app",
+                "POSTGRES_PASSWORD=s3cret",
+                "POSTGRES_DB=shop",
+                "PATH=/usr/bin",
+            ],
+            r#"{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"5433"},{"HostIp":"::","HostPort":"5433"}]}"#,
+        )]));
+        assert_eq!(scan.found.len(), 1, "{scan:?}");
+        let imp = &scan.found[0];
+        assert_eq!(imp.source, ImportSource::Docker);
+        let c = &imp.connection;
+        assert_eq!(c.db_type, "PostgreSQL");
+        assert_eq!(c.name, "pg16");
+        assert_eq!(c.host, "127.0.0.1");
+        assert_eq!(c.port, 5433);
+        assert_eq!(c.user, "app");
+        assert_eq!(c.password, "s3cret");
+        assert_eq!(c.database, "shop");
+    }
+
+    #[test]
+    fn a_postgres_container_without_a_user_signs_in_as_postgres() {
+        let scan = parse_docker_inspect(&inspect(&[container(
+            "pg",
+            "docker.io/library/postgres:16-alpine",
+            &["POSTGRES_PASSWORD=pw"],
+            r#"{"5432/tcp":[{"HostIp":"","HostPort":"5432"}]}"#,
+        )]));
+        let c = &scan.found[0].connection;
+        assert_eq!(c.user, "postgres");
+        assert_eq!(c.password, "pw");
+        // The image's default database is the user's own; left for the server
+        // to apply rather than restated.
+        assert_eq!(c.database, "");
+    }
+
+    #[test]
+    fn a_mysql_container_prefers_root_and_falls_back_to_the_app_user() {
+        let both = parse_docker_inspect(&inspect(&[container(
+            "my",
+            "mysql:8.4",
+            &[
+                "MYSQL_ROOT_PASSWORD=rootpw",
+                "MYSQL_USER=app",
+                "MYSQL_PASSWORD=apppw",
+                "MYSQL_DATABASE=shop",
+            ],
+            r#"{"3306/tcp":[{"HostIp":"0.0.0.0","HostPort":"3306"}],"33060/tcp":null}"#,
+        )]));
+        let c = &both.found[0].connection;
+        assert_eq!(c.db_type, "MySQL");
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("root", "rootpw"));
+        assert_eq!(c.database, "shop");
+
+        let app_only = parse_docker_inspect(&inspect(&[container(
+            "my",
+            "mysql:8.4",
+            &[
+                "MYSQL_RANDOM_ROOT_PASSWORD=yes",
+                "MYSQL_USER=app",
+                "MYSQL_PASSWORD=apppw",
+            ],
+            r#"{"3306/tcp":[{"HostIp":"0.0.0.0","HostPort":"13306"}]}"#,
+        )]));
+        let c = &app_only.found[0].connection;
+        assert_eq!((c.user.as_str(), c.password.as_str()), ("app", "apppw"));
+        assert_eq!(c.port, 13306);
+    }
+
+    #[test]
+    fn a_generated_or_file_secret_root_password_arrives_without_one() {
+        let scan = scan(
+            &[SourceFile {
+                source: ImportSource::Docker,
+                path: "docker".to_string(),
+                text: inspect(&[container(
+                    "maria",
+                    "mariadb:11",
+                    &["MARIADB_ROOT_PASSWORD_FILE=/run/secrets/root"],
+                    r#"{"3306/tcp":[{"HostIp":"127.0.0.1","HostPort":"3307"}]}"#,
+                )]),
+                local: None,
+            }],
+            &[],
+        );
+        let imp = &scan.found[0];
+        assert_eq!(imp.connection.db_type, "MariaDB");
+        assert_eq!(imp.connection.user, "root");
+        assert_eq!(imp.connection.password, "");
+        assert!(imp.has(ImportNote::NoPassword));
+        // A binding to one address is kept as that address.
+        assert_eq!(imp.connection.host, "127.0.0.1");
+        assert_eq!(imp.origin, "docker");
+    }
+
+    #[test]
+    fn mariadb_reads_its_own_variables_before_the_mysql_ones() {
+        let scan = parse_docker_inspect(&inspect(&[container(
+            "maria",
+            "mariadb:10.11",
+            &["MARIADB_ROOT_PASSWORD=new", "MYSQL_ROOT_PASSWORD=old"],
+            r#"{"3306/tcp":[{"HostIp":"0.0.0.0","HostPort":"3306"}]}"#,
+        )]));
+        assert_eq!(scan.found[0].connection.password, "new");
+    }
+
+    #[test]
+    fn a_sql_server_container_signs_in_as_sa() {
+        let scan = parse_docker_inspect(&inspect(&[container(
+            "mssql2022",
+            "mcr.microsoft.com/mssql/server:2022-latest",
+            &["ACCEPT_EULA=Y", "MSSQL_SA_PASSWORD=Schemaic_2026"],
+            r#"{"1433/tcp":[{"HostIp":"0.0.0.0","HostPort":"1434"}]}"#,
+        )]));
+        let c = &scan.found[0].connection;
+        assert_eq!(c.db_type, "SQL Server");
+        assert_eq!(
+            (c.user.as_str(), c.password.as_str()),
+            ("sa", "Schemaic_2026")
+        );
+        assert_eq!(c.port, 1434);
+    }
+
+    #[test]
+    fn the_older_sa_password_variable_is_read_too() {
+        let scan = parse_docker_inspect(&inspect(&[container(
+            "edge",
+            "mcr.microsoft.com/azure-sql-edge",
+            &["SA_PASSWORD=pw"],
+            r#"{"1433/tcp":[{"HostIp":"0.0.0.0","HostPort":"1433"}]}"#,
+        )]));
+        assert_eq!(scan.found[0].connection.password, "pw");
+    }
+
+    #[test]
+    fn a_container_that_is_not_a_database_is_neither_offered_nor_counted() {
+        let scan = parse_docker_inspect(&inspect(&[
+            container(
+                "cache",
+                "redis:7",
+                &[],
+                r#"{"6379/tcp":[{"HostIp":"0.0.0.0","HostPort":"6379"}]}"#,
+            ),
+            container(
+                "pool",
+                "edoburu/pgbouncer",
+                &[],
+                r#"{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"6432"}]}"#,
+            ),
+        ]));
+        assert!(scan.found.is_empty(), "{scan:?}");
+        assert!(scan.skipped.is_empty(), "{scan:?}");
+    }
+
+    #[test]
+    fn a_database_whose_port_is_not_published_is_skipped_by_name() {
+        let scan = parse_docker_inspect(&inspect(&[
+            container(
+                "internal",
+                "postgres:16",
+                &["POSTGRES_PASSWORD=pw"],
+                r#"{"5432/tcp":null}"#,
+            ),
+            container("noports", "mysql:8", &[], "{}"),
+        ]));
+        assert!(scan.found.is_empty());
+        let names: Vec<&str> = scan.skipped.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["internal", "noports"]);
+        assert!(
+            scan.skipped
+                .iter()
+                .all(|s| s.reason == SkipReason::NotPublished)
+        );
+    }
+
+    #[test]
+    fn the_engine_is_read_off_the_repository_not_the_tag_or_registry() {
+        assert_eq!(docker_engine("postgres"), Some(POSTGRES));
+        assert_eq!(docker_engine("localhost:5000/postgres:16"), Some(POSTGRES));
+        assert_eq!(docker_engine("bitnami/postgresql:16.4.0"), Some(POSTGRES));
+        assert_eq!(docker_engine("postgis/postgis:16-3.4"), Some(POSTGRES));
+        assert_eq!(
+            docker_engine("timescale/timescaledb-ha:pg16"),
+            Some(POSTGRES)
+        );
+        assert_eq!(docker_engine("mysql@sha256:abcdef"), Some(MYSQL));
+        assert_eq!(
+            docker_engine("container-registry.oracle.com/mysql/community-server:8.4"),
+            Some(MYSQL)
+        );
+        assert_eq!(docker_engine("MariaDB:11"), Some(MARIADB));
+        assert_eq!(
+            docker_engine("mcr.microsoft.com/mssql/server:2025-latest"),
+            Some(MSSQL)
+        );
+        // A tag that names an engine is not an image of one.
+        assert_eq!(docker_engine("myapp:postgres"), None);
+        assert_eq!(docker_engine("redis:7"), None);
+        assert_eq!(docker_engine(""), None);
+    }
+
+    #[test]
+    fn a_stopped_container_or_unreadable_output_offers_nothing() {
+        let stopped = r#"[{"Name":"/pg","State":{"Running":false},"Config":{"Image":"postgres","Env":[]},"NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"5432"}]}}}]"#;
+        assert!(parse_docker_inspect(stopped).found.is_empty());
+        let junk = parse_docker_inspect("not json");
+        assert!(junk.found.is_empty());
+        assert!(matches!(junk.skipped[0].reason, SkipReason::Unreadable(_)));
+        assert_eq!(parse_docker_inspect("[]"), ImportScan::default());
+    }
+
+    #[test]
+    fn a_published_port_out_of_range_is_not_a_port() {
+        let scan = parse_docker_inspect(&inspect(&[container(
+            "pg",
+            "postgres",
+            &[],
+            r#"{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"99999"}]}"#,
+        )]));
+        assert!(scan.found.is_empty());
+        assert_eq!(scan.skipped[0].reason, SkipReason::NotPublished);
     }
 }

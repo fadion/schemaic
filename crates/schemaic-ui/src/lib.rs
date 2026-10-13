@@ -5852,6 +5852,15 @@ pub struct ConnImportUi {
     /// there over a good URL typed afterwards, since only a paste clears that
     /// signal.
     pub file_error: RwSignal<Option<String>>,
+    /// True while `docker` is being asked which containers are running — its
+    /// own flag rather than [`ConnImportUi::scanning`], because the two buttons
+    /// are independent and either may be pressed while the other is out.
+    pub docker_busy: RwSignal<bool>,
+    /// What *Docker containers* has to say that is not a row: Docker is not
+    /// installed, its daemon is down, or nothing it runs is a database. Under
+    /// the buttons, beside [`ConnImportUi::file_error`], and its own slot for
+    /// the reason that one is.
+    pub docker_note: RwSignal<Option<String>>,
     /// The sentence shown after connections are added.
     pub done: RwSignal<Option<String>>,
 }
@@ -5891,6 +5900,9 @@ pub struct ConnActions {
     /// Search this machine for the files DBeaver, the JetBrains IDEs and the
     /// command-line clients keep their connections in.
     pub scan_installed_clients: Rc<dyn Fn()>,
+    /// Ask `docker` which database containers are running here and add them,
+    /// with their published ports and the credentials their environment holds.
+    pub scan_docker: Rc<dyn Fn()>,
     /// Parse whatever is in the paste field and add it to the review list.
     pub add_pasted_url: Rc<dyn Fn()>,
     /// Pick a source file by hand, for a layout the search doesn't cover (a
