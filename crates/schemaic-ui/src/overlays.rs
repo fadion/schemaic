@@ -4018,6 +4018,18 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             arg: instant(add_tab.clone(), &close),
         },
         Command {
+            name: "export settings",
+            label: "Export Settings",
+            hint: "",
+            arg: instant(ui.export_settings.clone(), &close),
+        },
+        Command {
+            name: "import settings",
+            label: "Import Settings",
+            hint: "",
+            arg: instant(ui.import_settings.clone(), &close),
+        },
+        Command {
             name: "duplicate tab",
             label: "Duplicate Tab",
             hint: "",

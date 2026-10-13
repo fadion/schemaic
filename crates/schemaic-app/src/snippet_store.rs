@@ -1,4 +1,4 @@
-//! The snippet library's store: the persisted user list and the nine closures
+//! The snippet library's store: the persisted user list and the ten closures
 //! that write it.
 //!
 //! The second cut of the `app_view` split, and it is the **same invariant** as
@@ -6,7 +6,8 @@
 //! the same shape rather than one "stores" grab-bag. Every mutation is followed
 //! by a save, and which save is policy: `Erasing` from the two paths that
 //! *remove* — a snippet deleted from its row's menu, and a deleted connection's
-//! connection-scoped snippets — and `Replacing` from the seven edits. A snippet
+//! connection-scoped snippets — and `Replacing` from the eight edits (a settings
+//! bundle's `import` among them). A snippet
 //! is the user's own
 //! SQL, written against a named server, and an ordinary save copies the
 //! pre-delete file — body and all — to `snippets.json.bak` at the moment the
@@ -90,6 +91,8 @@ pub(crate) struct SnippetStore {
     pub(crate) set_scope: Rc<dyn Fn(u64, Scope)>,
     /// Copy a snippet the caller has already found in the **merged** library.
     pub(crate) duplicate_from: Rc<dyn Fn(Snippet)>,
+    /// Merge a settings bundle's snippets in, returning how many were added.
+    pub(crate) import: Rc<dyn Fn(Vec<Snippet>) -> usize>,
     /// Delete a snippet, erasing. **Takes no confirm**: the caller raises it —
     /// see the module doc.
     pub(crate) remove: Rc<dyn Fn(u64)>,
@@ -181,6 +184,18 @@ pub(crate) fn wire() -> SnippetStore {
         save(snippets, persist::Saving::Replacing);
     });
 
+    // A settings bundle's snippets, merged in with fresh ids
+    // (`settings_bundle::merge_snippets`) and saved once; answers how many
+    // were added.
+    let import: Rc<dyn Fn(Vec<Snippet>) -> usize> = Rc::new(move |incoming: Vec<Snippet>| {
+        let mut added = 0;
+        snippets.update(|v| added = schemaic_core::settings_bundle::merge_snippets(v, incoming));
+        if added > 0 {
+            save(snippets, persist::Saving::Replacing);
+        }
+        added
+    });
+
     let remove: Rc<dyn Fn(u64)> = Rc::new(move |id: u64| {
         snippets.update(|v| schemaic_core::snippet::remove(v, id));
         save(snippets, persist::Saving::Erasing);
@@ -200,6 +215,7 @@ pub(crate) fn wire() -> SnippetStore {
         set_body,
         set_scope,
         duplicate_from,
+        import,
         remove,
         clear_conn,
     }
@@ -211,7 +227,7 @@ mod tests {
     /// `history_store::the_removal_paths_erase`, and deliberately spelled the
     /// same way so the pair reads as one rule in two places.
     ///
-    /// Exactly two erasing saves — `remove` and `clear_conn` — and seven
+    /// Exactly two erasing saves — `remove` and `clear_conn` — and eight
     /// ordinary ones. An edit that erased would delete a `.bak` the user might
     /// want; a *delete* that only replaced would leave the snippet's whole body
     /// in `snippets.json.bak` under a modal saying it cannot be undone, which is
@@ -248,6 +264,7 @@ mod tests {
                 "set_body",
                 "set_scope",
                 "duplicate_from",
+                "import",
                 "remove",
                 "clear_conn",
             ],
@@ -286,10 +303,10 @@ mod tests {
         );
         assert_eq!(
             body.matches(&replacing).count(),
-            7,
-            "seven ordinary saves in `wire` — record_use, create, rename, \
-             set_abbrev, set_body, set_scope, duplicate_from. A writer added \
-             without one would leave the library unpersisted"
+            8,
+            "eight ordinary saves in `wire` — record_use, create, rename, \
+             set_abbrev, set_body, set_scope, duplicate_from, import. A writer \
+             added without one would leave the library unpersisted"
         );
         assert_eq!(
             src.matches(&["snippets", ".json"].concat()).count(),

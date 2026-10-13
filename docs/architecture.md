@@ -9978,6 +9978,55 @@ existing prose was left alone.
     snippet that cannot be edited in place), `abbrev` is dropped because two snippets answering to
     one spelling is a coin toss, `last_used` is `None`, the name gains ` copy`, and `scope` is
     inherited because the copy is for the same place as the original.
+  - `settings_bundle.rs` — **the settings file**: the user's preferences and snippets in one JSON
+    file, to take to another machine or hand to a colleague, and read back. Pure over text and
+    values — the app gathers the current `UiState` and snippets, picks the file and applies what
+    comes back (Settings → General's *Settings file* row and the palette's *Export Settings* /
+    *Import Settings*; the app's two trips are described under `settings.rs`'s `bundle_row`).
+    `export_json(state, snippets)` writes the envelope `{schemaic_settings, settings, snippets}`,
+    pretty-printed, at `BUNDLE_VERSION` (1); `parse` reads it back BOM-tolerant, refuses a file
+    without the `schemaic_settings` key and one at a later version as *written by a newer
+    Schemaic* rather than half-reading it, and drops a snippet it cannot read alone rather than
+    the whole file. `BUNDLE_FILE_SUFFIX` (`schemaic-settings.json`) is only the save dialog's
+    default name: unlike the connection export's suffix, nothing recognises a bundle by it — the
+    import's picker has no filter, and the envelope key is what `parse` checks.
+    **`PORTABLE_KEYS` is an allowlist of `UiState` field names, and that it is an allowlist is the
+    point**: a field added to `UiState` later stays home until somebody decides it travels, where a
+    denylist would export it the day it lands. What travels is the themes and scale, the editor,
+    formatting, the row limit and statement timeout, `confirm_writes`, `live_validate`,
+    `notify_finished`, `restore_tabs` and the assistant's effort, instructions, schema scope and
+    gutter. What stays is the panel widths and the schema filter and visibility (this window's),
+    the expanded and hidden sets and the activity intervals (keyed by connection ids, which differ
+    per install), `ai_harness`, `ai_model` and `ai_cli_path` (they name what is installed *here*),
+    and the legacy `ai_run_queries` consent flag; `extra` and `show_table_sizes` are not on the list
+    either, and nothing records why for the second. `parse` keeps only listed keys, so a
+    hand-edited file cannot slip in a CLI path (`a_key_outside_the_allowlist_is_never_applied`),
+    and `every_portable_key_is_a_field_ui_state_writes` fails on a name that is not a field — a
+    renamed field would otherwise silently stop travelling.
+    **`apply(settings, state)` tries each key alone through `UiState`'s own serde**, so a value is
+    accepted exactly when a `ui_state.json` holding it would be read, and one that would not leaves
+    that field as it was without spoiling the rest. It answers the new `UiState` and how many
+    fields *actually changed* — compared after the round trip, since a shim may normalise a value
+    onto the one already held (`applying_counts_only_what_changed_and_skips_an_unreadable_value`).
+    **"Readable" is the app's word too, through `apply_with`**: the themes, the scale, the effort
+    and the schema scope are plain strings in `UiState`, and the font size and tab width bare
+    numbers, so serde alone would let a theme key this build does not know, or an out-of-range
+    font, through — to be counted as a change and then land as the app's fallback or clamp. So
+    `apply_with` takes the app's own reading as `normalise` and refuses a value that reading would
+    rewrite (`a_value_the_apps_own_reading_would_change_is_refused`); `apply` is `apply_with` with
+    nothing to normalise.
+    **A bundle never lowers a guard**: `confirm_writes` is taken only when it turns confirmation
+    *on*, so a file from someone else cannot quietly remove the question before a write
+    (`a_bundle_can_turn_confirmation_on_but_never_off`).
+    **Snippets travel when they are the user's own and scoped `Global` or `Dialect`** — a
+    `Scope::Conn` names a connection id that means nothing on another install, and a built-in ships
+    in the code anyway. `merge_snippets(existing, incoming)` adds only travelling ones, skips one
+    whose name *and* body a snippet already has, drops an abbreviation already taken
+    (case-insensitively, as `by_abbrev` matches) rather than leave two snippets answering to one
+    spelling, and gives each a fresh id through `snippet::next_id` one at a time — so two incoming
+    snippets never take the same id — with `last_used` cleared and `source` `User`
+    (`merged_snippets_get_fresh_ids_and_never_collide`). `summary(changed, snippets)` is the
+    sentence the confirmation names — *3 settings and 1 snippet*.
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`, capped at `MAX_PER_CONN` (200, was 50) entries per connection.
     **Not higher, because both readers walk all of them**: the history panel builds a highlighted
@@ -22606,8 +22655,9 @@ existing prose was left alone.
     Rc<AiActions>, FocusRing)`, each an `AnyView` like its neighbours. The modal holding them is
     `settings_overlay(SettingsCtx)` — `theme_settings_overlay` renamed, since it is no longer the
     theme's — and the ctx is there for clippy rather than for the gate: `SettingsCtx { layout, term,
-    term_actions, ai, conn, ai_actions, open_config_dir, cli_command }` is eight parameters named
-    one by one, past `too_many_arguments`' seven. It holds no `Ui`, for `CompareCtx`'s reason, and is
+    term_actions, ai, conn, ai_actions, open_config_dir, cli_command, export_settings,
+    import_settings }` is ten parameters named one by one, past `too_many_arguments`' seven (it
+    was eight until the settings file's two trips joined it). It holds no `Ui`, for `CompareCtx`'s reason, and is
     built by naming the reads at its one call site in `modals.rs`, so what the modal touches stays
     written down there.
     **The main modal is Manage connections' two panes, not one long column.** It had been five
@@ -22733,6 +22783,36 @@ existing prose was left alone.
     one `RwSignal<InstallState>` they share, the `RwSignal<bool>` behind Remove and the
     `RwSignal<RowStatus>` behind the hint and Install, which the app owns: a registry write or a
     symlink is the app boundary's job for `open_config_dir`'s reason.
+    `bundle_row` is the last row, **Settings file** — a hint saying what goes in the file and what
+    stays (connections, window layout and connection-specific snippets), and Quiet **Export** and
+    **Import** buttons at tab stops 40 and 41. Both are always enabled and the row holds no state:
+    each button calls one of `Ui::export_settings`/`import_settings`, carried in by `SettingsCtx`,
+    and the dialogs, the file I/O and the confirmation are all the app's (`app/main.rs`), over
+    `core::settings_bundle`. The same two closures are the palette's *Export Settings* and *Import
+    Settings*, `instant` commands in `palette_commands`, so the feature is reachable without
+    opening Settings.
+    **Export reads `current_ui_state`, the very gathering `save_ui` writes** — the `UiState`
+    literal that was inside `save_ui` is now that closure, and `save_ui` calls it — so the file and
+    `ui_state.json` cannot disagree about what a setting's value is. The save dialog defaults to
+    `BUNDLE_FILE_SUFFIX`, and the write is `persist::write_file_atomic` on `spawn_blocking`, a
+    failure reaching the error modal through `file_error`, as the connection export's does; unlike
+    that one, a typed name gets no suffix appended, nothing needing one to recognise the file.
+    **Import reads and parses off the UI thread** (`decode_text_file`, then `parse`), and decides
+    on it: `apply_with` runs against `current_ui_state()`, its `normalise` the same conversions and
+    clamps `apply_settings` uses below, and the snippet count is the merge itself run
+    over a *copy* of the library, so the number the confirmation names is the number that will be
+    added. Nothing to change at all is said through `file_error` (*Nothing to import: …*) rather
+    than asked about; otherwise the shared `Confirm` — *Import settings*, "{path} changes
+    {summary}. The settings it changes replace your current values; the snippets are added beside
+    yours." — and only on yes
+    `apply_settings` sets each portable signal, `save_ui(Replacing)` runs, and
+    `SnippetStore::import` merges the snippets. **`apply_settings` goes through startup's own
+    conversions and clamps** (`UiThemeKind`/`EditorThemeKind`/`UiScale::from_key`,
+    `theme::clamped_editor_font`, `clamped_tab_width`, `AiEffort::from_cli`,
+    `SchemaScope::from_key`) — the same reading `apply_with` was given, so nothing it accepted is
+    rewritten here: an unknown theme key or an out-of-range font was refused before the
+    confirmation counted it. It sets every portable signal, not only the changed ones, from the
+    `UiState` `apply_with` answered when the file landed.
     **Both buttons stay enabled while either runs**, and the guard against a click on either is
     `main.rs`'s, beside the launch — the labels only say so.
     **The AI assistant page is where the harness is chosen, and half its controls follow that
@@ -31832,14 +31912,16 @@ existing prose was left alone.
     `db_favorites`, `formats` and `accepted` toward the same count, and **bans `<store>.update(` for them in the
     closure by name**, since the text ban on `Saving::Replacing` cannot. That ban was watched
     failing against a `db_colors.update(` prune before the prune was switched to `erase`.
-  - `snippet_store.rs` — the snippet library's store: the persisted **user** list and the nine
+  - `snippet_store.rs` — the snippet library's store: the persisted **user** list and the ten
     closures that write it. **The matched pair to `history_store.rs`, and the pairing is the
     point** — two modules of the same shape rather than one "stores" grab-bag, because what
     justifies each of them is the same invariant: every mutation of the store is followed by a save,
     and which save is policy. `persist::save_json_erasing` from the two paths that **remove** — a
     snippet deleted from its row's menu, and a deleted connection's connection-scoped snippets — and
-    an ordinary `persist::save_json` from the seven edits (`record_use`, `create`, `rename`,
-    `set_abbrev`, `set_body`, `set_scope`, `duplicate_from`). A snippet is the user's own SQL written
+    an ordinary `persist::save_json` from the eight edits (`record_use`, `create`, `rename`,
+    `set_abbrev`, `set_body`, `set_scope`, `duplicate_from`, and `import`, a settings bundle's
+    snippets merged through `settings_bundle::merge_snippets` in one update and saved once, and
+    only when something was added). A snippet is the user's own SQL written
     against a named server, so an ordinary save on the delete copies the pre-delete file — body and
     all — to `snippets.json.bak` at the moment the modal says *"This can't be undone"*; on a library
     nobody edits again, that copy is forever. The choice is stated once in a private
@@ -31866,7 +31948,7 @@ existing prose was left alone.
     where a later release can fix one instead of copied into everybody's `snippets.json`.
     `the_remove_path_erases` is the module's gate, deliberately spelled as the twin of
     `history_store::the_removal_paths_erase` so the pair reads as one rule in two places: exactly
-    two erasing saves and seven replacing ones inside `wire`, and `snippets.json` named once, as
+    two erasing saves and eight replacing ones inside `wire`, and `snippets.json` named once, as
     `FILE`. It reads its own source through `source_gate::production_code` and carries that family's
     hazard — a gate in the same file as its subject is its own first match — so its needles are
     assembled from fragments and its counts are **exact rather than floors**, which is not pedantry:
@@ -31875,7 +31957,7 @@ existing prose was left alone.
     `remove` the `Replacing` and one edit the `Erasing` and every count is unchanged, while a
     deleted snippet's body survives in `snippets.json.bak` for as long as the library is never
     edited again — so the twin pairing holds here too: `source_gate::let_regions` cuts `wire` at its
-    nine `let` bindings and each closure is asserted against the one verb it may use, with the
+    ten `let` bindings and each closure is asserted against the one verb it may use, with the
     totals left standing underneath to catch a closure deleted rather than mis-saved.
     The other half is in `main.rs`, where
     `deleting_a_connection_erases_every_store_it_was_keyed_into` gained its **second** delegated
@@ -35534,7 +35616,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   level removed, with a second place to forget a field. What was worth taking out was the duplicated
   *decision* inside it rather than the state: `persist::migrate_legacy_once`, the legacy-list
   bargain `main.rs` had written out twice. Record the refusal where the next session will look for
-  it, or the step gets attempted again.
+  it, or the step gets attempted again. (The gathering has since come out of `save_ui` into a
+  `current_ui_state` closure beside it, because the settings export needs the same `UiState` —
+  it is still in `main.rs`, reading the same signals.)
   **`diagrams` is the seventh, and it is the sixth's near miss: nothing to lift, and worth the visit
   anyway.** Like `ui_state` it moved no code — the ER layout file is loaded and saved entirely in
   `schemaic-ui`'s `erd_view.rs`, and the app side is the layout prune inside `delete_conn_now` —

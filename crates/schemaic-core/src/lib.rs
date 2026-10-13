@@ -61,6 +61,7 @@ pub mod search_history;
 pub mod secrets;
 pub mod seed;
 pub mod server_vars;
+pub mod settings_bundle;
 pub mod skeleton;
 pub mod snippet;
 pub mod sql;

@@ -1504,6 +1504,50 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
 
+/// The Settings row that writes the portable settings and snippets to a file
+/// and reads one back (`core::settings_bundle`). The app owns both trips — a
+/// file dialog, a write, a confirmation before anything is replaced.
+/// `tabindex` is Export's; Import follows it.
+fn bundle_row(
+    export: Rc<dyn Fn()>,
+    import: Rc<dyn Fn()>,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
+    h_stack((
+        v_stack((
+            text("Settings file").style(|s| s.color(theme::text()).font_size(theme::font_label())),
+            form_hint(
+                "Your preferences and snippets in one file, to take to another machine. \
+                 Connections, window layout and connection-specific snippets stay here.",
+            ),
+        ))
+        .style(|s| {
+            s.flex_col()
+                .gap(theme::scaled(2.0))
+                .flex_grow(1.0_f32)
+                .min_width(0.0)
+        }),
+        action_button(
+            "Export",
+            ActionKind::Quiet,
+            true,
+            ring.clone(),
+            tabindex,
+            move || export(),
+        ),
+        action_button(
+            "Import",
+            ActionKind::Quiet,
+            true,
+            ring,
+            tabindex + 1,
+            move || import(),
+        ),
+    ))
+    .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
+}
+
 /// The Settings row that puts the `schemaic` command on `PATH`, or takes it
 /// off again.
 ///
@@ -1740,6 +1784,9 @@ pub(crate) struct SettingsCtx {
     /// command-line install.
     pub(crate) open_config_dir: Rc<dyn Fn()>,
     pub(crate) cli_command: crate::CliCommand,
+    /// The settings file's two trips: write one, read one back.
+    pub(crate) export_settings: Rc<dyn Fn()>,
+    pub(crate) import_settings: Rc<dyn Fn()>,
 }
 
 /// The Settings modal: every setting the app has, a section to a page. The
@@ -1755,6 +1802,8 @@ pub(crate) fn settings_overlay(ctx: SettingsCtx) -> impl IntoView {
         ai_actions,
         open_config_dir,
         cli_command,
+        export_settings,
+        import_settings,
     } = ctx;
     let open = layout.theme_settings_open;
     let section = layout.settings_section;
@@ -1778,6 +1827,8 @@ pub(crate) fn settings_overlay(ctx: SettingsCtx) -> impl IntoView {
                 let ring = ring.clone();
                 let open_config_dir = open_config_dir.clone();
                 let cli_command = cli_command.clone();
+                let (export_settings, import_settings) =
+                    (export_settings.clone(), import_settings.clone());
                 let term_actions = term_actions.clone();
                 let ai_actions = ai_actions.clone();
                 dyn_container(
@@ -1789,6 +1840,8 @@ pub(crate) fn settings_overlay(ctx: SettingsCtx) -> impl IntoView {
                                 ring.clone(),
                                 open_config_dir.clone(),
                                 cli_command.clone(),
+                                export_settings.clone(),
+                                import_settings.clone(),
                             ),
                             SettingsSection::Editor => editor_section(layout, ring.clone()),
                             SettingsSection::Formatting => formatting_section(layout, ring.clone()),
@@ -1950,6 +2003,8 @@ fn general_section(
     ring: FocusRing,
     open_config_dir: Rc<dyn Fn()>,
     cli_command: crate::CliCommand,
+    export_settings: Rc<dyn Fn()>,
+    import_settings: Rc<dyn Fn()>,
 ) -> AnyView {
     let restore_tabs = layout.restore_tabs;
     let restore_row = focusable_toggle_row(
@@ -1963,7 +2018,8 @@ fn general_section(
         form_section_header(SettingsSection::General.label()),
         restore_row,
         log_row(open_config_dir, ring.clone(), 20),
-        cli_row(cli_command, ring, 30),
+        cli_row(cli_command, ring.clone(), 30),
+        bundle_row(export_settings, import_settings, ring, 40),
     ))
 }
 

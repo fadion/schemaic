@@ -331,6 +331,8 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 ai_actions: ui.ai_actions.clone(),
                 open_config_dir: ui.open_config_dir.clone(),
                 cli_command: ui.cli_command.clone(),
+                export_settings: ui.export_settings.clone(),
+                import_settings: ui.import_settings.clone(),
             }),
             help_overlay(ui.layout),
         ))

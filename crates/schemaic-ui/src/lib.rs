@@ -6671,6 +6671,11 @@ pub struct Ui {
     /// Settings → General → Command line: put the `schemaic` command on `PATH`,
     /// or take it off again.
     pub cli_command: CliCommand,
+    /// Write the portable settings and snippets to a file
+    /// (`core::settings_bundle`) — Settings → General, and the palette.
+    pub export_settings: Rc<dyn Fn()>,
+    /// Read a settings file back, after a confirmation naming what it changes.
+    pub import_settings: Rc<dyn Fn()>,
 }
 
 /// The Command line row's two actions and the two signals they share: where

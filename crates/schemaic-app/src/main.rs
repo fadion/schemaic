@@ -7859,87 +7859,92 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // **Takes its `Saving`**, because one of its callers is a deletion — this
     // store's `expanded_rules`, `hidden_db_rules` and `activity_intervals` are
     // all keyed by connection. See `persist::save_ui_state`.
-    let save_ui: Rc<dyn Fn(persist::Saving)> = Rc::new({
+    //
+    // **`current_ui_state` is the one gathering of the signals into a
+    // `UiState`**, which the save writes and a settings export reads — so the
+    // two cannot disagree about what a setting's value is.
+    let current_ui_state: Rc<dyn Fn() -> UiState> = Rc::new({
         let pending_legacy_hidden = pending_legacy_hidden.clone();
         let carried_unknown = carried_unknown.clone();
-        move |saving| {
-            persist::save_ui_state(
-                &UiState {
-                    // Same bargain as `hidden_dbs` below: the legacy flat field is
-                    // written empty only once the migration has read it, and carried
-                    // back out unchanged until then, so a launch that could not
-                    // migrate leaves the upgrade to a later one rather than
-                    // collapsing every tree permanently.
-                    expanded: (*pending_legacy_expanded).clone(),
-                    expanded_rules: expanded_rules.get_untracked(),
-                    // The legacy flat field is written empty **once the migration has
-                    // actually read it** — `hidden_db_rules` is the truth after that.
-                    // Until then it is carried back out unchanged, so a launch that
-                    // could not migrate (no connections loaded) leaves the upgrade to a
-                    // later one instead of erasing it.
-                    hidden_dbs: (*pending_legacy_hidden).clone(),
-                    hidden_db_rules: hidden_db_rules.get_untracked(),
-                    schema_visible: schema_visible.get_untracked(),
-                    right_panel: right_panel.get_untracked().into(),
-                    activity_intervals: activity_intervals.get_untracked(),
-                    schema_w: schema_w.get_untracked(),
-                    right_w: right_w.get_untracked(),
-                    editor_h: editor_h.get_untracked(),
-                    // **The unknown key survives the save**, or the field's own promise
-                    // — "an unrecognised value is *not* silently replaced with the
-                    // default" — is false one save later. Cleared the moment the user
-                    // picks a harness themselves, which is the point at which the file
-                    // should start naming what is actually running.
-                    ai_harness: persist::ai_harness_to_persist(
-                        ai_harness_unknown.get_untracked().as_deref(),
-                        Agent::of(ai_enabled.get_untracked(), ai_harness.get_untracked()).key(),
-                    ),
-                    ai_cli_path: ai_cli_path.get_untracked(),
-                    ai_model: ai_model.get_untracked(),
-                    ai_effort: ai_effort.get_untracked().cli().to_string(),
-                    ai_instructions: ai_instructions.get_untracked(),
-                    ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
-                    ai_gutter: ai_gutter.get_untracked(),
-                    ai_run_queries: legacy_ai_run_queries,
-                    ui_theme: ui_theme.get_untracked().key().to_string(),
-                    editor_theme: editor_theme.get_untracked().key().to_string(),
-                    ui_scale: ui_scale.get_untracked().key().to_string(),
-                    editor_font_size: editor_font.get_untracked(),
-                    row_limit: row_limit.get_untracked(),
-                    statement_timeout_secs: statement_timeout.get_untracked(),
-                    confirm_writes: confirm_writes.get_untracked(),
-                    tab_width: tab_width.get_untracked(),
-                    soft_tabs: soft_tabs.get_untracked(),
-                    word_wrap: word_wrap.get_untracked(),
-                    editor_rainbow_brackets: rainbow_brackets.get_untracked(),
-                    format_keyword_case: keyword_case.get_untracked(),
-                    format_comma_style: comma_style.get_untracked(),
-                    format_statement_gap: statement_gap.get_untracked(),
-                    format_join_on_own_line: join_on_own_line.get_untracked(),
-                    format_river: format_river.get_untracked(),
-                    format_align: format_align.get_untracked(),
-                    format_wrap_width: wrap_width.get_untracked(),
-                    format_function_case: function_case.get_untracked(),
-                    format_type_case: type_case.get_untracked(),
-                    completion_table_aliases: table_aliases.get_untracked(),
-                    editor_show_whitespace: show_whitespace.get_untracked(),
-                    editor_indent_guides: indent_guides.get_untracked(),
-                    restore_tabs: restore_tabs.get_untracked(),
-                    live_validate: live_validate.get_untracked(),
-                    notify_finished: notify_finished.get_untracked(),
-                    editor_predictions: editor_predictions.get_untracked(),
-                    editor_remembered_predictions: editor_remembered_predictions.get_untracked(),
-                    show_table_sizes: table_sizes.get_untracked(),
-                    schema_filter: schema_filter.get_untracked(),
-                    // Carried straight back out — see `UiState::extra`. This
-                    // build cannot say anything about these keys except that
-                    // some build could.
-                    extra: (*carried_unknown).clone(),
-                },
-                saving,
-            );
+        move || {
+            UiState {
+                // Same bargain as `hidden_dbs` below: the legacy flat field is
+                // written empty only once the migration has read it, and carried
+                // back out unchanged until then, so a launch that could not
+                // migrate leaves the upgrade to a later one rather than
+                // collapsing every tree permanently.
+                expanded: (*pending_legacy_expanded).clone(),
+                expanded_rules: expanded_rules.get_untracked(),
+                // The legacy flat field is written empty **once the migration has
+                // actually read it** — `hidden_db_rules` is the truth after that.
+                // Until then it is carried back out unchanged, so a launch that
+                // could not migrate (no connections loaded) leaves the upgrade to a
+                // later one instead of erasing it.
+                hidden_dbs: (*pending_legacy_hidden).clone(),
+                hidden_db_rules: hidden_db_rules.get_untracked(),
+                schema_visible: schema_visible.get_untracked(),
+                right_panel: right_panel.get_untracked().into(),
+                activity_intervals: activity_intervals.get_untracked(),
+                schema_w: schema_w.get_untracked(),
+                right_w: right_w.get_untracked(),
+                editor_h: editor_h.get_untracked(),
+                // **The unknown key survives the save**, or the field's own promise
+                // — "an unrecognised value is *not* silently replaced with the
+                // default" — is false one save later. Cleared the moment the user
+                // picks a harness themselves, which is the point at which the file
+                // should start naming what is actually running.
+                ai_harness: persist::ai_harness_to_persist(
+                    ai_harness_unknown.get_untracked().as_deref(),
+                    Agent::of(ai_enabled.get_untracked(), ai_harness.get_untracked()).key(),
+                ),
+                ai_cli_path: ai_cli_path.get_untracked(),
+                ai_model: ai_model.get_untracked(),
+                ai_effort: ai_effort.get_untracked().cli().to_string(),
+                ai_instructions: ai_instructions.get_untracked(),
+                ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
+                ai_gutter: ai_gutter.get_untracked(),
+                ai_run_queries: legacy_ai_run_queries,
+                ui_theme: ui_theme.get_untracked().key().to_string(),
+                editor_theme: editor_theme.get_untracked().key().to_string(),
+                ui_scale: ui_scale.get_untracked().key().to_string(),
+                editor_font_size: editor_font.get_untracked(),
+                row_limit: row_limit.get_untracked(),
+                statement_timeout_secs: statement_timeout.get_untracked(),
+                confirm_writes: confirm_writes.get_untracked(),
+                tab_width: tab_width.get_untracked(),
+                soft_tabs: soft_tabs.get_untracked(),
+                word_wrap: word_wrap.get_untracked(),
+                editor_rainbow_brackets: rainbow_brackets.get_untracked(),
+                format_keyword_case: keyword_case.get_untracked(),
+                format_comma_style: comma_style.get_untracked(),
+                format_statement_gap: statement_gap.get_untracked(),
+                format_join_on_own_line: join_on_own_line.get_untracked(),
+                format_river: format_river.get_untracked(),
+                format_align: format_align.get_untracked(),
+                format_wrap_width: wrap_width.get_untracked(),
+                format_function_case: function_case.get_untracked(),
+                format_type_case: type_case.get_untracked(),
+                completion_table_aliases: table_aliases.get_untracked(),
+                editor_show_whitespace: show_whitespace.get_untracked(),
+                editor_indent_guides: indent_guides.get_untracked(),
+                restore_tabs: restore_tabs.get_untracked(),
+                live_validate: live_validate.get_untracked(),
+                notify_finished: notify_finished.get_untracked(),
+                editor_predictions: editor_predictions.get_untracked(),
+                editor_remembered_predictions: editor_remembered_predictions.get_untracked(),
+                show_table_sizes: table_sizes.get_untracked(),
+                schema_filter: schema_filter.get_untracked(),
+                // Carried straight back out — see `UiState::extra`. This
+                // build cannot say anything about these keys except that
+                // some build could.
+                extra: (*carried_unknown).clone(),
+            }
         }
     });
+    let save_ui: Rc<dyn Fn(persist::Saving)> = {
+        let current_ui_state = current_ui_state.clone();
+        Rc::new(move |saving| persist::save_ui_state(&current_ui_state(), saving))
+    };
 
     // Persist the layout whenever a panel is toggled (the footer chips mutate
     // these signals directly, so we react rather than route through a callback).
@@ -10616,6 +10621,190 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         import_ui.done.set(None);
         add_import_result(import_ui, scan);
     });
+
+    // ── Settings bundle (`core::settings_bundle`) ───────────────────────────
+    // Export: the portable settings and the travelling snippets, read through
+    // `current_ui_state` — the gathering the save itself writes — atomically,
+    // off the UI thread. Import: read and parsed off the UI thread, then a
+    // confirmation naming what would change, then the signals are set (their
+    // own effects persist them, and a save follows to be sure) and the
+    // snippets merged in with fresh ids.
+    let export_settings: Rc<dyn Fn()> = {
+        let handle = handle.clone();
+        let file_error = file_error.clone();
+        let current_ui_state = current_ui_state.clone();
+        let snippets = snippet_store.snippets;
+        Rc::new(move || {
+            use floem::file::{FileDialogOptions, FileSpec};
+            let opts = FileDialogOptions::new()
+                .title("Export settings")
+                .default_name(schemaic_core::settings_bundle::BUNDLE_FILE_SUFFIX)
+                .allowed_types(vec![FileSpec {
+                    name: "Schemaic settings",
+                    extensions: &["json"],
+                }]);
+            let text = snippets.with_untracked(|s| {
+                schemaic_core::settings_bundle::export_json(&current_ui_state(), s)
+            });
+            let (handle, file_error) = (handle.clone(), file_error.clone());
+            floem::action::save_as(opts, move |file| {
+                let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                    return; // cancelled
+                };
+                let file_error = file_error.clone();
+                let text = text.clone();
+                let report = create_ext_action(cx, move |res: Result<(), String>| {
+                    if let Err(e) = res {
+                        (file_error)(e);
+                    }
+                });
+                handle.spawn_blocking(move || {
+                    report(
+                        schemaic_core::persist::write_file_atomic(&path, text.as_bytes())
+                            .map_err(|e| format!("Couldn't write {}: {e}", path.display())),
+                    );
+                });
+            });
+        })
+    };
+    // The portable settings of `st` onto their signals, through the same
+    // conversions and clamps startup reads `ui_state.json` with.
+    let apply_settings: Rc<dyn Fn(&UiState)> = Rc::new(move |st: &UiState| {
+        ui_theme.set(UiThemeKind::from_key(&st.ui_theme));
+        editor_theme.set(EditorThemeKind::from_key(&st.editor_theme));
+        ui_scale.set(UiScale::from_key(&st.ui_scale));
+        editor_font.set(schemaic_ui::theme::clamped_editor_font(st.editor_font_size));
+        tab_width.set(schemaic_ui::theme::clamped_tab_width(st.tab_width));
+        soft_tabs.set(st.soft_tabs);
+        word_wrap.set(st.word_wrap);
+        rainbow_brackets.set(st.editor_rainbow_brackets);
+        show_whitespace.set(st.editor_show_whitespace);
+        indent_guides.set(st.editor_indent_guides);
+        editor_predictions.set(st.editor_predictions);
+        editor_remembered_predictions.set(st.editor_remembered_predictions);
+        table_aliases.set(st.completion_table_aliases);
+        keyword_case.set(st.format_keyword_case);
+        comma_style.set(st.format_comma_style);
+        statement_gap.set(st.format_statement_gap);
+        join_on_own_line.set(st.format_join_on_own_line);
+        format_river.set(st.format_river);
+        format_align.set(st.format_align);
+        wrap_width.set(st.format_wrap_width);
+        function_case.set(st.format_function_case);
+        type_case.set(st.format_type_case);
+        row_limit.set(st.row_limit);
+        statement_timeout.set(st.statement_timeout_secs);
+        confirm_writes.set(st.confirm_writes);
+        live_validate.set(st.live_validate);
+        notify_finished.set(st.notify_finished);
+        restore_tabs.set(st.restore_tabs);
+        ai_effort.set(AiEffort::from_cli(&st.ai_effort));
+        ai_instructions.set(st.ai_instructions.clone());
+        ai_schema_scope.set(SchemaScope::from_key(&st.ai_schema_scope));
+        ai_gutter.set(st.ai_gutter);
+    });
+    let import_settings: Rc<dyn Fn()> = {
+        let handle = handle.clone();
+        let file_error = file_error.clone();
+        let current_ui_state = current_ui_state.clone();
+        let save_ui = save_ui.clone();
+        let import_snippets = snippet_store.import.clone();
+        let snippets = snippet_store.snippets;
+        Rc::new(move || {
+            use floem::file::FileDialogOptions;
+            let (handle, file_error) = (handle.clone(), file_error.clone());
+            let (current_ui_state, save_ui) = (current_ui_state.clone(), save_ui.clone());
+            let (apply_settings, import_snippets) =
+                (apply_settings.clone(), import_snippets.clone());
+            floem::file_action::open_file(
+                FileDialogOptions::new().title("Import settings"),
+                move |file| {
+                    let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                        return; // cancelled
+                    };
+                    let file_error = file_error.clone();
+                    let (current_ui_state, save_ui) = (current_ui_state.clone(), save_ui.clone());
+                    let (apply_settings, import_snippets) =
+                        (apply_settings.clone(), import_snippets.clone());
+                    let shown = path.display().to_string();
+                    let land = create_ext_action(
+                        cx,
+                        move |read: Result<schemaic_core::settings_bundle::Bundle, String>| {
+                            let bundle = match read {
+                                Ok(b) => b,
+                                Err(e) => return (file_error)(format!("{shown}: {e}")),
+                            };
+                            // Through the reading `apply_settings` gives each
+                            // value, so one it would rewrite — a theme key this
+                            // build does not know, a font past the clamp — is
+                            // refused rather than counted and then defaulted.
+                            let (applied, changed) = schemaic_core::settings_bundle::apply_with(
+                                &bundle.settings,
+                                &current_ui_state(),
+                                |s: &mut UiState| {
+                                    s.ui_theme = UiThemeKind::from_key(&s.ui_theme).key().into();
+                                    s.editor_theme =
+                                        EditorThemeKind::from_key(&s.editor_theme).key().into();
+                                    s.ui_scale = UiScale::from_key(&s.ui_scale).key().into();
+                                    s.editor_font_size =
+                                        schemaic_ui::theme::clamped_editor_font(s.editor_font_size);
+                                    s.tab_width =
+                                        schemaic_ui::theme::clamped_tab_width(s.tab_width);
+                                    s.ai_effort = AiEffort::from_cli(&s.ai_effort).cli().into();
+                                    s.ai_schema_scope =
+                                        SchemaScope::from_key(&s.ai_schema_scope).key().into();
+                                },
+                            );
+                            // How many snippets would be added, by the merge
+                            // itself over a copy.
+                            let adds = snippets.with_untracked(|s| {
+                                schemaic_core::settings_bundle::merge_snippets(
+                                    &mut s.clone(),
+                                    bundle.snippets.clone(),
+                                )
+                            });
+                            if changed == 0 && adds == 0 {
+                                return (file_error)(format!(
+                                    "Nothing to import: every setting in {shown} already \
+                                     matches yours, and it adds no snippets."
+                                ));
+                            }
+                            let what = schemaic_core::settings_bundle::summary(changed, adds);
+                            let (save_ui, apply_settings, import_snippets) = (
+                                save_ui.clone(),
+                                apply_settings.clone(),
+                                import_snippets.clone(),
+                            );
+                            confirm.set(Some(Confirm {
+                                title: "Import settings".to_string(),
+                                message: format!(
+                                    "{shown} changes {what}. The settings it changes replace \
+                                     your current values; the snippets are added beside yours."
+                                ),
+                                resolve: Rc::new(move |yes| {
+                                    if yes {
+                                        (apply_settings)(&applied);
+                                        (save_ui)(persist::Saving::Replacing);
+                                        (import_snippets)(bundle.snippets.clone());
+                                    }
+                                }),
+                            }));
+                        },
+                    );
+                    handle.spawn_blocking(move || {
+                        let read = std::fs::read(&path)
+                            .map_err(|e| format!("couldn't read it: {e}"))
+                            .and_then(|bytes| {
+                                schemaic_core::settings_bundle::parse(
+                                    &schemaic_core::text::decode_text_file(&bytes),
+                                )
+                            });
+                        land(read);
+                    });
+                },
+            );
+        })
+    };
 
     // *Export connections*: every saved connection to a file to share, without
     // its secrets or this machine's grants (`conn_import::export_connections`,
@@ -13563,6 +13752,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         apply_update,
         open_config_dir: Rc::new(open_config_dir),
         cli_command,
+        export_settings,
+        import_settings,
     };
     // Every config file loaded *during this build* has been loaded by now. If any
     // of them was unreadable it was preserved as `.corrupt` and recovered from
