@@ -1220,10 +1220,13 @@ pub fn prepare_locks(locks: &mut Vec<LockInfo>) -> bool {
             .then_with(|| a.session.cmp(&b.session))
             .then_with(|| a.mode.cmp(&b.mode))
             .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.blocked_by.cmp(&b.blocked_by))
+            .then_with(|| a.killable.cmp(&b.killable))
     });
     // An identical row is one lock: SQL Server answers a row per lock
     // *owner*, so one `ALTER TABLE`'s schema lock came back twenty times.
-    // Sorted on every field first, so duplicates are adjacent.
+    // Sorted on every field first, so duplicates are adjacent — a field left
+    // out of the sort could keep two copies apart.
     locks.dedup();
     let truncated = locks.len() > MAX_LOCKS;
     if truncated {
@@ -3138,6 +3141,23 @@ mod tests {
         ];
         prepare_locks(&mut twice);
         assert_eq!(twice.len(), 2, "{twice:?}");
+        // The merge reads adjacency, so the sort has to reach every field: a
+        // copy kept apart by a row differing only in a field the sort skipped
+        // would survive it.
+        let server = LockInfo {
+            killable: false,
+            ..lock(5, "t", true, &[])
+        };
+        let mut apart = vec![lock(5, "t", true, &[]), server, lock(5, "t", true, &[])];
+        prepare_locks(&mut apart);
+        assert_eq!(apart.len(), 2, "{apart:?}");
+        let mut waits_apart = vec![
+            lock(9, "t", false, &[5]),
+            lock(9, "t", false, &[6]),
+            lock(9, "t", false, &[5]),
+        ];
+        prepare_locks(&mut waits_apart);
+        assert_eq!(waits_apart.len(), 2, "{waits_apart:?}");
         let mut many: Vec<LockInfo> = (0..MAX_LOCKS as i64 + 3)
             .map(|i| lock(i, "t", true, &[]))
             .collect();
