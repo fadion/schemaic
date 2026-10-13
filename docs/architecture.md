@@ -11193,7 +11193,10 @@ existing prose was left alone.
     since another route reaches the server through machines the open tunnel never touched — saving
     a changed one evicts the cached tunnel through `save_conn`'s existing `repointed` path
     (`every_ssh_field_has_been_judged` is the tripwire that made it a decision). `conn_import`
-    writes it empty on purpose; see there.
+    writes it empty on purpose; see there. What `open_tunnel` walks is the route of the tunnel
+    *after* `~/.ssh/config` has resolved its host as an alias and filled what it left open, the
+    jump hosts included (`ssh_config.rs`); the saved fields, and so `targets_same_server`, keep the
+    alias as typed.
     `ConnStatus::is_down` treats `Unknown` (not yet checked, or a tunnel still coming up) as
     *non*-blocking — only a confirmed failure gates work.
     **`LoadFailure` and `TunnelFailures` are what an SSH connection with no tunnel says, in place of
@@ -11346,6 +11349,44 @@ existing prose was left alone.
     a composition, so `trimmed`'s own unit test cannot see it: the call site reads a couple of dozen signals
     and needs a Floem scope, which is why the second half is the source gate
     `the_connection_form_trims_through_core` (under `ui/lib.rs`).
+  - `ssh_config.rs` — **reading `~/.ssh/config` for an SSH tunnel's host**, so a tunnel whose host
+    is one of the user's `Host` aliases reaches what `ssh <alias>` would. Pure over the file's text:
+    `db::ssh::read_ssh_config` reads the file (see the `ssh.rs` passage) and this decides what it
+    says. `resolve(text, alias, home)` answers an `SshConfigHost` — `hostname`, `port`, `user`,
+    `identity_file`, `proxy_jump`, each `None` where no matching block set it, and `proxy_jump`
+    `Some("")` for an explicit `none`, so a caller can tell *no jump, said so* from *nothing said*.
+    OpenSSH's rules as far as they go here: keywords case-insensitive with the argument after
+    whitespace or `=`, double quotes stripped, `#` comments, options before the first `Host`
+    applying to every host, `Host` patterns with `*` and `?` matched ASCII-case-insensitively, a `!`
+    pattern refusing the block outright, and the **first** value found winning — so the specific
+    blocks a config lists first beat the `Host *` it ends with
+    (`an_alias_takes_its_blocks_first_values`,
+    `a_wildcard_block_applies_and_a_later_star_fills_only_what_is_left`,
+    `a_negated_pattern_refuses_the_block_and_percent_h_is_the_alias`). **Not read, and the module
+    doc says so rather than half-doing them**: `Match` blocks, whose conditions need the local user,
+    the network and a shell — skipped as a block that did not match, so their options never leak
+    into the answer (`a_match_block_is_skipped_and_its_options_never_leak`); `Include`; and every
+    token but `%h`, `%d`, a leading `~` and `%%`, with `~` and `%d` left as written when no home
+    directory is known. An unparseable `Port` or a keyword with no argument says nothing
+    (`an_empty_or_unparseable_config_says_nothing`). `MAX_CONFIG_BYTES` (1 MiB) is the largest file
+    the reader takes; a real one is a few kilobytes.
+    **`apply(tunnel, cfg)` is where the connection and the file meet, and what the connection
+    states wins**, as on `ssh`'s command line. The host always becomes the alias's `HostName` — the
+    connection's host *is* the name looked up, so an alias always resolves. The port takes the
+    config's only where the connection's is 22, which is the form's default and cannot be told from
+    a 22 typed on purpose, so a deliberate 22 loses to a config `Port`. The user is the config's
+    where the connection names none; the key path is the config's `IdentityFile` only for
+    `SshAuth::KeyPair` with no key file, since a key file means nothing to password or agent
+    sign-in; and the jump hosts are the config's `ProxyJump` where the connection names none
+    (`the_config_fills_what_the_connection_leaves_open`,
+    `what_the_connection_states_wins_over_the_config`, `an_explicit_proxyjump_none_names_no_jump`).
+    `apply_to_hop(hop, cfg)` is the jump hosts' narrower version: `HostName`, and the config's port
+    where the hop's is 22, but **never the config's `User`** — `SshTunnel::route` has already filled
+    an unnamed hop's user with the tunnel's, so by then a config `User` cannot be told from an
+    override (`a_jump_hop_takes_its_hostname_and_a_port_left_at_22`). Nor does it read a jump host's
+    own `ProxyJump` or `IdentityFile`: a route is not followed recursively as `ssh` follows it, and
+    every hop signs in with the tunnel's credentials anyway (`SshTunnel::jump`, under
+    `connection.rs`).
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
     (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
@@ -19015,6 +19056,24 @@ existing prose was left alone.
   a throwaway sshd in WSL with key auth, routes of 0, 1 and 2 jump hosts through it to the
   MySQL 8.4 container all returned the server greeting, and a jump to a closed port was named in
   the error.
+  **The SSH host and each jump host may be a `~/.ssh/config` alias** (`core::ssh_config`, under its
+  entry). `read_ssh_config` reads `<USERPROFILE or HOME>/.ssh/config` once per `open_tunnel` call,
+  as `ssh` reads it per connection — so an edit applies at the next tunnel opened, while one already
+  open keeps the route it was opened by, since nothing watches the file — refusing a file over
+  `MAX_CONFIG_BYTES` and decoding it with `text::decode_text_file`. A missing, unreadable or
+  oversized file is no error: the tunnel opens on the connection's fields as written. `open_tunnel`
+  resolves the tunnel through `resolve` + `apply` **before** `route()`, so a `ProxyJump` the file
+  supplies is parsed by the same reader as a typed one — and one it cannot read is refused with the
+  same *Jump host N: …*, about a string the form never showed — then each jump hop, all but the
+  last, through `apply_to_hop`; the last is the SSH host, already resolved. Known-hosts entries
+  are therefore keyed by the **resolved** `host:port`, not the alias. Nothing in the connection
+  form shows the resolution yet: it displays the alias, and only the info line's route and an
+  error's `h:p` name what the alias became. Verified live by the change's author, not by a test: a
+  throwaway root sshd in WSL on `127.0.0.1:2222` and a temporary home whose config had `Host
+  zzalias` (`HostName`, `Port`, `User`, `IdentityFile ~/client`, `ProxyJump zzjump`) and `Host
+  zzjump` (`HostName`, `Port`); a tunnel naming only host `zzalias`, key-pair sign-in, with no
+  user, key or jump of its own, reached the MySQL 8.4 container and its greeting came back, and the
+  known-hosts entry written was `127.0.0.1:2222`.
   **PostgreSQL cannot connect without naming a database**, which is protocol rather than
   preference and stayed invisible while almost every server had a `postgres` one anybody could
   reach — so `connect_maintenance` guessed at that, the username and `template1` for server-level

@@ -66,6 +66,7 @@ pub mod snippet;
 pub mod sql;
 pub mod sqlfile;
 pub mod sqlfmt;
+pub mod ssh_config;
 pub mod stats;
 pub mod sticky_header;
 pub mod summary;

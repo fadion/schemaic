@@ -11,6 +11,10 @@
 //! its host key checked on its own `host:port`. The jump sessions live in the
 //! accept loop beside the last one, whose transport they carry.
 //!
+//! **`~/.ssh/config` is read per tunnel** ([`read_ssh_config`]): the SSH host
+//! and each jump host are looked up as `Host` aliases (`core::ssh_config`), and
+//! the file fills what the connection leaves open, as `ssh <alias>` would.
+//!
 //! Lifetime: the returned [`TunnelHandle`] owns the accept-loop task; dropping
 //! it aborts that task, which drops the listener and frees the local port (so a
 //! superseded or evicted tunnel doesn't leak a listener/port/task — review H9).
@@ -36,6 +40,7 @@ use tokio::net::TcpListener;
 
 use crate::DbError;
 use schemaic_core::connection::{SshAuth, SshTunnel};
+use schemaic_core::ssh_config;
 
 /// The persisted known-hosts store: `"host:port"` → server-key SHA256 fingerprint.
 const KNOWN_HOSTS_FILE: &str = "ssh_known_hosts.json";
@@ -392,6 +397,25 @@ pub(crate) fn tunnel_target_refusal(target_host: &str) -> Option<String> {
     ))
 }
 
+/// `~/.ssh/config`'s text and the home directory it sits in, or `None` when
+/// there is no such file (or it is too large to be one). Read per tunnel, as
+/// `ssh` reads it per connection, so an edit to it applies at the next connect.
+fn read_ssh_config() -> Option<(String, Option<String>)> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .filter(|h| !h.is_empty())?;
+    let path = std::path::Path::new(&home).join(".ssh").join("config");
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > ssh_config::MAX_CONFIG_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    Some((
+        schemaic_core::text::decode_text_file(&bytes),
+        Some(home.to_string_lossy().into_owned()),
+    ))
+}
+
 /// Open an SSH tunnel to `target_host:target_port` and return a handle carrying
 /// the local port the engine's connection should use. The tunnel forwards connections
 /// until the handle is dropped.
@@ -415,7 +439,27 @@ pub async fn open_tunnel(
     // of the one before it, as `ssh -J` does — so the database's host need be
     // reachable only from the last, and each hop's host key is checked, on its
     // own `host:port`, exactly as a direct tunnel's is.
-    let route = ssh.route().map_err(DbError::Connect)?;
+    // An alias in `~/.ssh/config` resolves as `ssh <alias>` would — the SSH
+    // host and each jump host alike — with what the connection states winning
+    // over the file (`ssh_config::apply`).
+    let user_config = read_ssh_config();
+    let resolved;
+    let ssh = match &user_config {
+        Some((text, home)) => {
+            let found = ssh_config::resolve(text, &ssh.host, home.as_deref());
+            resolved = ssh_config::apply(ssh, &found);
+            &resolved
+        }
+        None => ssh,
+    };
+    let mut route = ssh.route().map_err(DbError::Connect)?;
+    if let Some((text, home)) = &user_config {
+        let jumps = route.len() - 1;
+        for hop in route.iter_mut().take(jumps) {
+            let found = ssh_config::resolve(text, &hop.host, home.as_deref());
+            *hop = ssh_config::apply_to_hop(hop.clone(), &found);
+        }
+    }
     let mut sessions: Vec<client::Handle<TunnelClient>> = Vec::with_capacity(route.len());
     for hop in &route {
         let host_port = format!("{}:{}", hop.host, hop.port);
