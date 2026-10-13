@@ -11367,8 +11367,9 @@ existing prose was left alone.
     the network and a shell — skipped as a block that did not match, so their options never leak
     into the answer (`a_match_block_is_skipped_and_its_options_never_leak`); `Include`; and every
     token but `%h`, `%d`, a leading `~` and `%%`, with `~` and `%d` left as written when no home
-    directory is known. An unparseable `Port` or a keyword with no argument says nothing
-    (`an_empty_or_unparseable_config_says_nothing`). `MAX_CONFIG_BYTES` (1 MiB) is the largest file
+    directory is known. An unparseable `Port` or a keyword with no argument says nothing — and the
+    first `Port` still counts when it is unreadable, so a later block's cannot slip in behind it,
+    where OpenSSH would refuse the file (`an_empty_or_unparseable_config_says_nothing`). `MAX_CONFIG_BYTES` (1 MiB) is the largest file
     the reader takes; a real one is a few kilobytes.
     **`apply(tunnel, cfg)` is where the connection and the file meet, and what the connection
     states wins**, as on `ssh`'s command line. The host always becomes the alias's `HostName` — the
