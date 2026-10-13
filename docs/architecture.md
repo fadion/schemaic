@@ -35408,7 +35408,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   underline (`editor_pane.rs`). It also has `StyleCx::style_view` hand a hovered view's new cursor
   over at restyle time when its old one is the cursor showing — for any view, not only the
   editor's. Floem resolves the cursor only on a pointer move, so without it a Ctrl pressed with
-  the mouse still kept the I-beam until the mouse moved. No test covers it. **Three measures
+  the mouse still kept the I-beam until the mouse moved. No test covers it. The eighth stops a view
+  removed earlier in an update batch from hearing the rest of it. `process_update_messages` takes
+  the window's whole queue and delivers each `UpdateMessage::State` through `id.view()`, but
+  `ViewId::remove` drops the id from `view_ids` and never from `views`, so a removed view still
+  resolves and still runs `update` — and a `dyn_container`'s `swap_val` removes its old child and
+  then disposes that child's scope, both synchronously, so a nested `dyn_container` in the child
+  with its own message in the same batch rebuilt against disposed signals. The patch adds
+  `ViewId::is_registered` (`pub(crate)`, membership of `view_ids`) and drops a `State` message whose
+  id fails it, on the immediate and the deferred queue alike. The crash it fixed, and what it leaves uncovered, are under *A view must not
+  subscribe to a signal that changes as part of unmounting it*, below. No test covers it. **Three measures
   keep upstream's code out of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
   manifest, since a path dependency inside the workspace directory would otherwise join it as a
   member; `vendor/floem/rustfmt.toml` with `disable_all_formatting = true`, since `cargo fmt --all`
@@ -35500,6 +35509,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   have a departing entity keep its last answer rather than report a "gone" value on the way out.
   The neighbouring rule (**show and hide with `.hide()`, never a rebuild**) is a defence against the
   same hazard: a view that is never rebuilt has no new child to read a dead signal.
+  **One ordering of that race was Floem's own, and vendored patch 8 now closes it at delivery.** A
+  `dyn_container` rebuilds through a queued `UpdateMessage::State`, and `process_update_messages`
+  used to deliver one to a view removed earlier in the same batch: `ViewId::remove` leaves the
+  entry in `views`, so `id.view()` still found it. A connection switch hit exactly that,
+  intermittently — twice in seven tries in the sandboxed app. The switch queued `results_area`'s
+  swap (keyed on the active tab); clearing the schema tree (`db_nodes.set`) re-ran the grid's
+  key-map effect, which bumped `key_gen` for a result with a source table and so queued a rebuild of
+  the grid body's `dyn_container` (`body_rebuild_key`). When both landed in one batch the swap
+  removed the grid and disposed `GridState`'s scope first, the body's message was delivered anyway,
+  and its closure's `gs.rs.get_untracked()` took the same unwrap. A source-less `SELECT 1` has no
+  key map to change and could not trigger it. A `State` message whose id fails
+  `ViewId::is_registered` is now dropped. **That narrows the hazard; it does not retire this rule,
+  nor `Tab::panel_frozen_memo`.** The guard covers one route — a queued `State` message to a
+  removed id, on the immediate queue and on the deferred one (`update_state_deferred`, delivered by
+  `process_deferred_update_messages`). An effect or style closure that runs without a message is
+  untouched, and `views` still keeps every removed view's entry, so `id.view()` on one still
+  answers. Whether the patch alone would have stopped the `ai_menu` crash above was not
+  tested; the memo answers a question about the grid's own panel either way, and stays.
 - **A view's own `event_before_children` runs *before* its listeners, and a processed event stops
   there** (`context.rs::unconditional_view_event`) — so `on_event(KeyDown, …)` on a built-in view
   never sees a key that view handles itself. **`floem::views::text_input` handles Escape by calling
@@ -37932,7 +37959,10 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
   result cannot flip it at teardown either. The `· kept — read-only` note is shown and hidden by
   `s.hide()` for the same reason — the *Floem 0.2 gotchas* rule, and here also the safe construction.
   `Tab::shown_frozen` is the untracked half of the pair, for callers acting *now* inside an event
-  handler; anything answering the question while a grid is mounted takes the memo.
+  handler; anything answering the question while a grid is mounted takes the memo. Vendored Floem
+  patch 8 has since added a general guard against this class — a removed view no longer hears a
+  queued `State` message in the batch that removed it — but it covers that one route only, so the
+  memo stays (*Floem 0.2 gotchas*, *A view must not subscribe…*).
 - **What a panel remembers.** `PanelView` — column widths (with the `grid_char_w` they were measured
   against), the client-side sort, the frozen columns, the hidden columns (`hidden_cols`, an index set,
   the panel's for the frozen columns' reason), and the **staged-edit trio** `dirty` /

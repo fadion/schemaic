@@ -99,6 +99,13 @@ impl ViewId {
         })
     }
 
+    /// schemaic patch (PATCHES.md): whether this id is still live — created and
+    /// not yet [`remove`](Self::remove)d. `remove` leaves the id's entry in
+    /// `views`, so [`view`](Self::view) cannot answer this.
+    pub(crate) fn is_registered(&self) -> bool {
+        VIEW_STORAGE.with_borrow(|s| s.view_ids.contains_key(*self))
+    }
+
     pub(crate) fn view(&self) -> Rc<RefCell<Box<dyn View>>> {
         VIEW_STORAGE.with_borrow(|s| {
             s.views

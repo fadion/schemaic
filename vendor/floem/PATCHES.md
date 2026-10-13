@@ -146,3 +146,32 @@ kept the old one until the mouse twitched.
   cursor, the view is hovered and its old cursor is the one showing
   (`app_state.cursor`), the new one replaces it; `set_cursor` at the end of
   the update then applies it.
+
+### 8. A view removed in an update batch hears no more of that batch
+
+**Why.** `process_update_messages` takes a whole batch of queued messages and
+delivers each `UpdateMessage::State` through `id.view()`. `ViewId::remove`
+drops the id from `view_ids` but never from `views`, so a view removed by an
+earlier message in the same batch still resolves and still runs `update`. A
+`dyn_container` swap removes its old child and then disposes the child's scope,
+both synchronously. A nested `dyn_container` in that child, with its own
+message queued in the same batch, then runs its child closure against signals
+that no longer exist. Schemaic hit this on a connection switch: the switch
+queued the results area's swap, and the cleared schema tree made the result
+grid's key map change, which queued a rebuild of the grid's body. The body
+rebuilt after its `GridState` was disposed and the app panicked in
+`get_untracked`. It happened only when both messages landed in one batch, so it
+was intermittent.
+
+**What.**
+
+- `src/id.rs`: `ViewId::is_registered`, whether the id is still in `view_ids`.
+- `src/window_handle.rs`, `process_update_messages`: a `State` message whose id
+  is no longer registered is dropped rather than delivered.
+- `src/window_handle.rs`, `process_deferred_update_messages`: the same check
+  for the deferred queue (`update_state_deferred`), which delivered through
+  `id.view()` just the same.
+
+`views` still keeps a removed view's entry. Evicting it as well would change
+when a removed view's closures are dropped, which is a wider change than this
+crash needs.

@@ -880,6 +880,13 @@ impl WindowHandle {
                         id.request_style_recursive();
                     }
                     UpdateMessage::State { id, state } => {
+                        // schemaic patch (PATCHES.md): a view removed earlier in
+                        // this batch still resolves through `views`, so without
+                        // this check a removed `dyn_container` would rebuild its
+                        // child against a scope its parent's swap just disposed.
+                        if !id.is_registered() {
+                            continue;
+                        }
                         let view = id.view();
                         view.borrow_mut().update(&mut cx, state);
                     }
@@ -1034,6 +1041,11 @@ impl WindowHandle {
             app_state: &mut self.app_state,
         };
         for (id, state) in msgs {
+            // schemaic patch (PATCHES.md): as for an immediate `State` message,
+            // a view removed since this was queued hears nothing.
+            if !id.is_registered() {
+                continue;
+            }
             let view = id.view();
             view.borrow_mut().update(&mut cx, state);
         }
