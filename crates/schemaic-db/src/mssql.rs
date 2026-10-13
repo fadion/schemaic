@@ -3294,21 +3294,48 @@ const TABLE_STATS: &str = "SELECT s.name, t.name, \
      WHERE t.is_ms_shipped = 0 \
      GROUP BY s.name, t.name, t.object_id, t.create_date, t.modify_date";
 
-/// Each index's size and use, for the same properties surface.
-const INDEX_STATS: &str = "SELECT s.name, t.name, i.name, \
-            SUM(p.used_page_count) * 8192, \
-            MAX(COALESCE(u.user_seeks, 0) + COALESCE(u.user_scans, 0) \
-                + COALESCE(u.user_lookups, 0)), \
-            CAST(i.is_primary_key AS int), CAST(i.is_unique AS int) \
-     FROM sys.indexes i \
-     JOIN sys.tables t ON t.object_id = i.object_id \
-     JOIN sys.schemas s ON s.schema_id = t.schema_id \
-     JOIN sys.dm_db_partition_stats p ON p.object_id = i.object_id AND p.index_id = i.index_id \
-     LEFT JOIN sys.dm_db_index_usage_stats u \
-            ON u.object_id = i.object_id AND u.index_id = i.index_id \
-           AND u.database_id = DB_ID() \
-     WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.name IS NOT NULL \
-     GROUP BY s.name, t.name, i.name, i.is_primary_key, i.is_unique";
+/// Each index's size and, when `usage`, its use, for the same properties
+/// surface.
+///
+/// **A missing `dm_db_index_usage_stats` row is a counted zero**, which is why
+/// it is `COALESCE`d rather than left `NULL`: the server makes the row on an
+/// index's first seek, scan, lookup or update since the counters were last
+/// cleared, so no row means none of those happened in that window — the same
+/// fact as PostgreSQL's `idx_scan = 0` after a stats reset, and the window is
+/// what [`schemaic_core::stats::unused_note`] already says out loud. Just after
+/// a restart every secondary index reads unused, as it does on PostgreSQL just
+/// after a reset; that is the counter, not a gap in it.
+///
+/// What *is* a gap is a login that may not read the view at all: it needs the
+/// server-level `VIEW SERVER (PERFORMANCE) STATE`, while the sizes need only the
+/// database-level grant. Without `usage` the column is `NULL` — not counted —
+/// and [`fetch_table_stats`] falls back to that read on the refusal.
+fn index_stats_sql(usage: bool) -> String {
+    let (scans, join) = if usage {
+        (
+            "MAX(COALESCE(u.user_seeks, 0) + COALESCE(u.user_scans, 0) \
+             + COALESCE(u.user_lookups, 0))",
+            "LEFT JOIN sys.dm_db_index_usage_stats u \
+             ON u.object_id = i.object_id AND u.index_id = i.index_id \
+             AND u.database_id = DB_ID() ",
+        )
+    } else {
+        ("CAST(NULL AS bigint)", "")
+    };
+    format!(
+        "SELECT s.name, t.name, i.name, \
+                SUM(p.used_page_count) * 8192, {scans}, \
+                CAST(i.is_primary_key AS int), CAST(i.is_unique AS int) \
+         FROM sys.indexes i \
+         JOIN sys.tables t ON t.object_id = i.object_id \
+         JOIN sys.schemas s ON s.schema_id = t.schema_id \
+         JOIN sys.dm_db_partition_stats p \
+              ON p.object_id = i.object_id AND p.index_id = i.index_id \
+         {join}\
+         WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.name IS NOT NULL \
+         GROUP BY s.name, t.name, i.name, i.is_primary_key, i.is_unique"
+    )
+}
 
 pub(crate) async fn fetch_table_stats(
     db: &Db,
@@ -3321,7 +3348,14 @@ pub(crate) async fn fetch_table_stats(
     };
     let mut by_table: std::collections::HashMap<(String, String), Vec<IndexStats>> =
         std::collections::HashMap::new();
-    for r in query_rows(&mut client, INDEX_STATS).await? {
+    // The usage view's refusal costs only the usage: a login granted the
+    // database-level state still gets every size (measured: Msg 300 for the
+    // one on 2022 and 2025, while the other read fine).
+    let index_rows = match query_rows(&mut client, &index_stats_sql(true)).await {
+        Ok(rows) => rows,
+        Err(_) => query_rows(&mut client, &index_stats_sql(false)).await?,
+    };
+    for r in index_rows {
         by_table
             .entry((cell(&r, 0), cell(&r, 1)))
             .or_default()

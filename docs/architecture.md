@@ -16648,10 +16648,14 @@ existing prose was left alone.
   runs on every connect. MySQL adds `STATISTICS` for cardinality and
   `performance_schema.table_io_waits_summary_by_index_usage` for index usage — that last one is
   routinely off or ungranted, and a failure there leaves every scan count `None`, because zero is
-  what marks an index unused. SQL Server (`mssql.rs`'s `INDEX_STATS`) sums `user_seeks`,
+  what marks an index unused. SQL Server (`mssql.rs`'s `index_stats_sql`) sums `user_seeks`,
   `user_scans` and `user_lookups` from `sys.dm_db_index_usage_stats`, and an index with no row
   there reads as zero rather than `None` — the `COALESCE`s in that query — so `is_unused` can flag
-  it; the count runs from the last restart, not from the index's creation. PostgreSQL reads
+  it; the count runs from the last restart, not from the index's creation, and a missing row *is*
+  that counted zero (the server makes the row on first use). That view needs the server-level
+  `VIEW SERVER (PERFORMANCE) STATE` while the sizes need only the database-level grant, so a
+  refusal re-reads the indexes without it and leaves every scan count `None` — it used to fail the
+  whole fetch for a login that could see every size. PostgreSQL reads
   `pg_table_size`/`pg_indexes_size`, `reltuples`
   (`-1` is "don't know", so it becomes `None`), `n_dead_tup` and the last analyze, through
   `query_all_optional` so a restricted `pg_stat_*` can't fail the fetch; a **partitioned parent**

@@ -9360,6 +9360,66 @@ impl Drop for ScratchLogin {
     }
 }
 
+/// **A login granted `VIEW DATABASE STATE` gets the sizes, with usage not
+/// counted.** The sizes read `sys.dm_db_partition_stats`, which that grant
+/// opens; the index usage reads `sys.dm_db_index_usage_stats`, which needs
+/// the *server*-level one (Msg 300, measured on 2022 and 2025). The two were
+/// one fetch, so the denied half took the sizes down with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn table_stats_survive_a_login_that_may_not_read_index_usage() {
+    if !enabled() || azure_cannot("creates a login, so one without the server-level grant") {
+        return;
+    }
+    let s = Scratch::create("stperm").await;
+    let name = format!("{PREFIX}{}_mssql_stperm", std::process::id());
+    let _login = ScratchLogin(name.clone());
+    base_db()
+        .fetch_query(
+            None,
+            &format!("CREATE LOGIN [{name}] WITH PASSWORD = N'Stat_2026!pass', CHECK_POLICY = OFF"),
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a login");
+    s.exec(&format!(
+        "CREATE USER [{name}] FOR LOGIN [{name}]; ALTER ROLE db_datareader ADD MEMBER [{name}]; \
+         GRANT VIEW DATABASE STATE TO [{name}]; \
+         CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v int NULL); \
+         CREATE INDEX ix_v ON dbo.t (v); INSERT dbo.t VALUES (1, 1), (2, 2)"
+    ))
+    .await;
+    let low = Db::from_parts(
+        Engine::MsSql,
+        var("HOST", "127.0.0.1"),
+        var("PORT", "1433").parse().unwrap(),
+        name.clone(),
+        "Stat_2026!pass".to_string(),
+        s.name.clone(),
+    );
+    let stats = low
+        .fetch_table_stats(&s.name)
+        .await
+        .expect("the sizes, without the usage");
+    let t = stats.get(Some("dbo"), "t").expect("the table");
+    assert_eq!(t.rows, Some(2));
+    let ix = t
+        .indexes
+        .iter()
+        .find(|i| i.name == "ix_v")
+        .expect("the index");
+    assert!(ix.bytes.is_some(), "{ix:?}");
+    assert_eq!(ix.scans, None, "not counted, so never flagged unused");
+    // The administrator's read still counts it: a missing usage row is a
+    // counted zero there.
+    let full = base_db().fetch_table_stats(&s.name).await.expect("as sa");
+    let ix = full
+        .get(Some("dbo"), "t")
+        .and_then(|t| t.indexes.iter().find(|i| i.name == "ix_v"))
+        .expect("the index, as sa");
+    assert!(ix.scans.is_some(), "{ix:?}");
+}
+
 /// **A `datetime` key and a `datetime` value mean the same day under every
 /// login language.** Under `british` — the default for a German, French,
 /// Italian or Spanish installation — `yyyy-mm-dd hh:mm:ss` converts to
