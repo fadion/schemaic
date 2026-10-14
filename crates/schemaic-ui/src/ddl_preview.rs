@@ -211,6 +211,23 @@ pub(crate) fn open_preview(d: crate::DdlUi, preview: DdlPreview) {
     d.preview.set(Some(preview));
 }
 
+/// `preview` with its *Used by* lines — what in the loaded schema of its
+/// database still names something `cs` renames, drops or retypes
+/// (`used_by::change_warnings`). Left empty while that schema is not loaded:
+/// the preview opens either way, and the tree's *Used by* says why it cannot
+/// answer. Called by the editors that hold a `SchemaUi`, which `preview_of`
+/// does not.
+pub(crate) fn with_used_by(
+    mut preview: DdlPreview,
+    schema: crate::SchemaUi,
+    cs: &schemaic_core::ddl::ChangeSet,
+) -> DdlPreview {
+    if let Some(db) = crate::table_designer::loaded_schema(schema, &preview.database) {
+        preview.used_by = schemaic_core::used_by::change_warnings(&db, cs);
+    }
+    preview
+}
+
 /// Build a preview from a change set — the one conversion every caller uses, so
 /// the summaries, the warnings and the SQL can't come from different places.
 pub(crate) fn preview_of(
@@ -242,6 +259,7 @@ pub(crate) fn preview_of(
         changes: cs.changes.iter().map(|c| c.summary()).collect(),
         destructive: cs.destructive(),
         risk_heading: cs.risk_heading(),
+        used_by: Vec::new(),
         withheld: cs.unsupported(),
         // A single object's edit is about that object: it is either in the plan
         // or there is no plan. Nothing can be left out of it.
@@ -325,6 +343,7 @@ pub(crate) fn preview_of_plan(
         changes: plan.summaries(),
         destructive: plan.destructive(),
         risk_heading: plan.risk_heading(),
+        used_by: Vec::new(),
         // The same refusal a single set gets: non-empty disables Apply and is
         // re-checked inside `apply`, so a plan that can't be expressed in full
         // is not applied in part.
@@ -672,6 +691,43 @@ fn risk_block(heading: &'static str, risks: Vec<String>) -> impl IntoView {
             .border_color(theme::error())
             .border_radius(6.0)
             .background(theme::error().multiply_alpha(0.08));
+        if empty_block { s.hide() } else { s }
+    })
+}
+
+/// The *Used by* block: what still names something the plan renames, drops
+/// or retypes ([`DdlPreview::used_by`]). Not the risk block's error box — the
+/// plan loses nothing by it; what it costs is a fix-up afterwards, so it reads
+/// as a note to act on, and Apply stays live.
+fn used_by_block(lines: Vec<String>) -> impl IntoView {
+    let empty_block = lines.is_empty();
+    v_stack((
+        h_stack((
+            icons::icon(icons::TRIANGLE_ALERT, 15.0)
+                .style(|s| s.color(theme::accent()).flex_shrink(0.0_f32)),
+            text("Used by").style(|s| {
+                s.color(theme::text())
+                    .font_size(theme::font_body())
+                    .font_bold()
+            }),
+        ))
+        .style(|s| {
+            s.flex_row()
+                .items_center()
+                .gap(theme::scaled(7.0))
+                .margin_bottom(theme::scaled(5.0))
+        }),
+        v_stack_from_iter(lines.into_iter().map(|w| {
+            text(w).style(|s| {
+                s.color(theme::text())
+                    .font_size(theme::font_body())
+                    .width_full()
+                    .margin_bottom(theme::scaled(2.0))
+            })
+        })),
+    ))
+    .style(move |s| {
+        let s = s.flex_col().width_full();
         if empty_block { s.hide() } else { s }
     })
 }
@@ -1047,6 +1103,7 @@ pub(crate) fn ddl_preview_overlay(
                         .style(|s| s.flex_col().width_full()),
                     risk_block(p.risk_heading, p.destructive.clone())
                         .style(|s| s.margin_top(theme::scaled(14.0))),
+                    used_by_block(p.used_by.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
                     withheld_block(p.withheld.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
                     omitted_block(p.omitted.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
                     form_section("SQL").style(|s| s.margin_top(theme::scaled(18.0))),

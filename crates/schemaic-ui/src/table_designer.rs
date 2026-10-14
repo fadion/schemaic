@@ -483,16 +483,14 @@ pub(crate) fn preview_draft_edit(
     if cs.is_empty() {
         return;
     }
-    ddl_preview::open_preview(
-        d,
-        ddl_preview::preview_of(
-            ctx.conn_id,
-            database,
-            schemaic_core::schema::display_name(schema, table),
-            &cs,
-            ctx.read_only,
-        ),
+    let preview = ddl_preview::preview_of(
+        ctx.conn_id,
+        database,
+        schemaic_core::schema::display_name(schema, table),
+        &cs,
+        ctx.read_only,
     );
+    ddl_preview::open_preview(d, ddl_preview::with_used_by(preview, schema_ui, &cs));
 }
 
 /// Open the designer on a blank draft — Create table.
@@ -2504,7 +2502,11 @@ fn change_set(target: &DesignerTarget, draft: &TableDraft) -> ddl::ChangeSet {
 
 /// The table designer. Absolutely positioned over the workspace when
 /// `ui.ddl.designer` is `Some`.
-pub(crate) fn table_designer_overlay(d: DdlUi, overlay_ui: OverlayUi) -> impl IntoView {
+pub(crate) fn table_designer_overlay(
+    d: DdlUi,
+    overlay_ui: OverlayUi,
+    schema: SchemaUi,
+) -> impl IntoView {
     let close = move || d.designer.set(None);
 
     dyn_container(
@@ -2695,7 +2697,14 @@ pub(crate) fn table_designer_overlay(d: DdlUi, overlay_ui: OverlayUi) -> impl In
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(d, preview_from(&target, &draft, &cs));
+                                ddl_preview::open_preview(
+                                    d,
+                                    ddl_preview::with_used_by(
+                                        preview_from(&target, &draft, &cs),
+                                        schema,
+                                        &cs,
+                                    ),
+                                );
                             },
                         ),
                     ))

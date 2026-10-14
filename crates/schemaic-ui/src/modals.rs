@@ -171,8 +171,8 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                         s
                     }
                 }),
-                table_designer::table_designer_overlay(ui.ddl, ui.overlay),
-                view_editor::view_editor_overlay(ui.ddl),
+                table_designer::table_designer_overlay(ui.ddl, ui.overlay, ui.schema),
+                view_editor::view_editor_overlay(ui.ddl, ui.schema),
                 // The trigger, routine and event editors share one tuple
                 // element — this stack is at Floem's 16-arity `ViewTuple`
                 // limit, and only one of the three is ever painted: the

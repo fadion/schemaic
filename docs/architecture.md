@@ -14052,8 +14052,9 @@ existing prose was left alone.
     which a `&[&str]` could only gather by cloning every tab.
   - `used_by.rs` — **what depends on a table, a view, a column or a routine**: the views, routines,
     triggers, events, foreign keys and table expressions that would break, or go with it, if it
-    changed — behind the schema tree's *Used by* (`ui/used_by_view.rs`) and a table Drop's preview
-    warning. `used_by(schema, target, dialect) -> Vec<Dependent>` takes a `Target` —
+    changed — behind the schema tree's *Used by* (`ui/used_by_view.rs`), a table Drop's preview
+    warning, and the *Used by* block of a rename's or column edit's preview.
+    `used_by(schema, target, dialect) -> Vec<Dependent>` takes a `Target` —
     `Relation { ns, name, column }` or `Routine { ns, name }` — and returns each `Dependent` with its
     `DependentKind` (`View`, `Routine`, `Trigger`, `Event`, `ForeignKey`, `Expression`), its name as
     the tree shows it (`schema::display_name`), a `detail` (the table a trigger or key is on, and the
@@ -14091,6 +14092,31 @@ existing prose was left alone.
     the dropped table goes with it and is no breakage, so the sentence is about what the drop
     breaks (`a_trigger_on_the_table_is_listed_and_one_elsewhere_that_writes_it`,
     `the_drop_warning_counts_by_kind_and_names_the_first_few`).
+    **A rename or a column edit asks the same question**, since it breaks a dependent as surely as
+    a drop does. `touched(&[Change]) -> Vec<Touch>` reads off a plan the names it takes away or
+    alters — a `Touch { column, kind }`, `column: None` for the object itself, `TouchKind` one of
+    `Rename`, `Drop` or `Retype`: `RenameTable`, `RenameView` and `RenameRoutine` touch the whole
+    object, `DropColumn` drops a column, and `AlterColumn` is a rename when the name differs, a
+    retype when only the type does — compared case-insensitively, so `int` → `INT` is no change —
+    and nothing otherwise (`an_edit_that_keeps_name_and_type_touches_nothing`). A column renamed
+    *and* retyped is **one** rename, the name being what breaks a dependent first
+    (`a_renamed_and_retyped_column_is_one_rename`). **A whole-object drop is deliberately not
+    here**: its preview already asks through `drop_warning`, and listing it twice would put the
+    same dependents under two headings. `change_warning(touch, object, deps)` words one —
+    *"orders is used by 2 views and 1 routine: a, b, c. They still name orders after the
+    rename."*, *"Column note is used by …. They break when it is dropped."*, *"… Check them against
+    its new type."* — over the private `listing`, which `drop_warning` was factored onto with its
+    text unchanged, so the `goes_with_it` rows drop out here too: a trigger on a table follows the
+    table's rename on every engine (`the_change_warning_leaves_out_what_goes_with_the_object`).
+    `change_warnings(&DbSchema, &ChangeSet)` is the composition the preview calls, and it asks
+    **under the name before the plan** — the set's `table`, which is the server's name, or a
+    renamed routine's `from` — because the loaded schema still holds the old one and a dependent
+    still names it (`a_plan_is_warned_about_by_what_uses_the_names_it_changes`,
+    `a_routine_rename_asks_after_the_routine_by_its_old_name`). **A routine rename is seen only
+    where it is a `RenameRoutine`**, which `diff_routine` emits on PostgreSQL alone, and there only
+    when the signature is unchanged: everywhere else — MySQL, SQL Server, a PostgreSQL rename that
+    also changes the signature — the rename is folded into a recreate (`supports_routine_rename`),
+    `touched` finds nothing to ask about, and the preview carries no *Used by* lines.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -24758,7 +24784,7 @@ existing prose was left alone.
     so mid-refresh too), and the modal **says so** — *"expand it in the tree, then ask again"* —
     rather than *"Nothing in db uses it."*, which is the separate answer for an empty list. The Drop
     has no such note to show: with no schema loaded its preview simply carries no *Used by*
-    sentence. The dialect is `ConnUi::dialect`, the active connection's, which is right because
+    sentence, and neither does a rename's or column edit's (`ddl_preview::with_used_by`). The dialect is `ConnUi::dialect`, the active connection's, which is right because
     every database the tree shows is that connection's.
     Mounted in the workspace group directly after `properties_overlay`, and counted by
     `workspace_modals_up` whenever it is open — it raises nothing, so it is a plain term like
@@ -25568,8 +25594,9 @@ existing prose was left alone.
     **Off `whole_ui_gate`'s list, 4 to zero, and the last four were the three opening paths and the
     overlay.** Those three write across `ddl`, `schema` and the peer editors, so they name all
     three — `open_for_table(ConnUi, SchemaUi, DdlUi, …)`, and the same for `preview_draft_edit` and
-    `open_for_new` — while `table_designer_overlay` takes `(DdlUi, OverlayUi)`, there being no
-    opening path under it. **That last step is half of what unblocked `overlays.rs`**, the other
+    `open_for_new` — while `table_designer_overlay` takes `(DdlUi, OverlayUi, SchemaUi)`, there
+    being no opening path under it; the `SchemaUi` is read only at *Preview SQL*, for the preview's
+    *Used by* lines (`ddl_preview::with_used_by`, below). **That last step is half of what unblocked `overlays.rs`**, the other
     half being `database_editor.rs`: `create_submenu` routes to four editors' doors, so it could not
     be narrower than the widest of them, and `open_for_new(&Ui, …)` here was the widest. How this
     file got from 29 to 4 is under `lib.rs`'s `whole_ui_gate`, and the steps before that are in
@@ -25614,6 +25641,20 @@ existing prose was left alone.
     the entry is clicked), so what the drop breaks — *"Used by 2 views …"* — is named before Apply
     rather than by the next error; nothing is appended when the database's schema is not loaded, or
     when everything that uses the object goes with it.
+    **A rename's and a column edit's dependents are `DdlPreview::used_by`, a block of their own** —
+    not more lines in `destructive`. A rename that breaks a view loses nothing; what it costs is a
+    fix-up afterwards, and under "This can't be undone" in the error box it would claim a loss the
+    plan does not make. So `used_by_block`, drawn between the risk block and the withheld block,
+    heads itself a neutral *"Used by"* beside an accent-coloured triangle, has no error box, hides
+    when empty, and **Apply stays live**. A drop's dependents stay where they were, in
+    `destructive`, since `used_by::touched` leaves whole-object drops out. It is filled by
+    `ddl_preview::with_used_by(preview, SchemaUi, &cs)` over `used_by::change_warnings`, reading the
+    schema through `table_designer::loaded_schema` and leaving the list empty while that is not
+    loaded — the preview opens either way. `preview_of` cannot fill it, holding no `SchemaUi`, so
+    every editor that previews a rename or a column edit calls `with_used_by` itself: the table
+    designer's *Preview SQL*, `preview_draft_edit` (the tree's column Drop), the view editor's and
+    the routine editor's *Preview SQL*. A new path that previews such a plan has to call it too,
+    and nothing checks that it does — skipping it just loses the block, silently.
     **`ddl_preview::close_peers` is the one editor-target list**, called by every editor's `open`
     before it sets its own and by `close_editors` after an Apply. Each of those `open`s used to
     keep its own copy and they had **drifted**: the table designer cleared the view editor and
@@ -29776,7 +29817,9 @@ existing prose was left alone.
     opens something else; this one has no such path — `fetch_algorithm` is reached from
     `open_for_view`, not from the modal — so the draft, the target, the body's row cap
     (`view_rows`, read by `form`) and the hand-off to `ddl_preview::open_preview` are the whole of
-    what it touches, it takes `DdlUi`, and `modals.rs` passes `ui.ddl`. That left
+    what it touches, it takes `DdlUi`, and `modals.rs` passes `ui.ddl`. It has since taken a
+    `SchemaUi` beside it (`ui.schema`), read at *Preview SQL* for what uses the view under the
+    name a rename takes from it (`ddl_preview::with_used_by`) — still no opening path. That left
     `view_editor.rs` at **6**: exactly the six opening functions, `open_editor`, `open_for_view`,
     `fetch_algorithm`, `open_for_new`, `open_from_query` and `open_blank` — all six of which have
     since come down too, in the entry after `script_view.rs`'s below.

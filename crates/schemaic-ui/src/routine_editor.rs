@@ -1162,15 +1162,16 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
+                                let preview = ddl_preview::preview_of(
+                                    target.conn_id,
+                                    &target.database,
+                                    subject.clone(),
+                                    &cs,
+                                    target.read_only,
+                                );
                                 ddl_preview::open_preview(
                                     d,
-                                    ddl_preview::preview_of(
-                                        target.conn_id,
-                                        &target.database,
-                                        subject.clone(),
-                                        &cs,
-                                        target.read_only,
-                                    ),
+                                    ddl_preview::with_used_by(preview, schema, &cs),
                                 );
                             },
                         ),

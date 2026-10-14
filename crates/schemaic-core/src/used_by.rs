@@ -281,6 +281,116 @@ fn function_is(name: &str, ns: Option<&str>, routine: &str) -> bool {
 /// nothing outside the object uses it (a trigger on the dropped table goes
 /// with it, and is no breakage). Names the first few, then counts the rest.
 pub fn drop_warning(deps: &[Dependent]) -> Option<String> {
+    Some(format!("Used by {}.", listing(deps)?))
+}
+
+/// What a change does to a name something else may use: the object's own
+/// (`column: None`) or one of its columns, by its name before the change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Touch {
+    pub column: Option<String>,
+    pub kind: TouchKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchKind {
+    Rename,
+    Drop,
+    /// The column's type changed, its name did not.
+    Retype,
+}
+
+/// The names `changes` take away or alter, in the plan's order — what the
+/// rename and column-edit previews ask [`used_by`] about. A drop of the whole
+/// object is not here: its preview asks for itself, through [`drop_warning`].
+/// A column renamed *and* retyped is one rename, the name being what breaks a
+/// dependent first; a type spelled in another case is no change.
+pub fn touched(changes: &[crate::ddl::Change]) -> Vec<Touch> {
+    use crate::ddl::Change;
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::RenameTable { .. }
+            | Change::RenameView { .. }
+            | Change::RenameRoutine { .. } => Some(Touch {
+                column: None,
+                kind: TouchKind::Rename,
+            }),
+            Change::DropColumn { name, .. } => Some(Touch {
+                column: Some(name.clone()),
+                kind: TouchKind::Drop,
+            }),
+            Change::AlterColumn { from, to, .. } => {
+                let kind = if from.name != to.name {
+                    TouchKind::Rename
+                } else if !from.type_name.eq_ignore_ascii_case(&to.type_name) {
+                    TouchKind::Retype
+                } else {
+                    return None;
+                };
+                Some(Touch {
+                    column: Some(from.name.clone()),
+                    kind,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The sentence a rename's or column edit's preview adds for `touch`, whose
+/// object is called `object` — `None` when nothing outside the object uses it.
+/// What goes with the object is left out as [`drop_warning`] leaves it: a
+/// trigger on a table follows the table's rename on every engine.
+pub fn change_warning(touch: &Touch, object: &str, deps: &[Dependent]) -> Option<String> {
+    let listed = listing(deps)?;
+    let (subject, name) = match &touch.column {
+        Some(c) => (format!("Column {c}"), c.as_str()),
+        None => (object.to_string(), object),
+    };
+    let then = match touch.kind {
+        TouchKind::Rename => format!("They still name {name} after the rename."),
+        TouchKind::Drop => "They break when it is dropped.".to_string(),
+        TouchKind::Retype => "Check them against its new type.".to_string(),
+    };
+    Some(format!("{subject} is used by {listed}. {then}"))
+}
+
+/// The *Used by* sentences a preview of `plan` shows: one per name it
+/// renames, drops or retypes ([`touched`]) that something in `schema` uses,
+/// asked under the name **before** the plan — the server's, which is the
+/// set's `table`, or a renamed routine's `from`. Empty when nothing does.
+pub fn change_warnings(schema: &DbSchema, plan: &crate::ddl::ChangeSet) -> Vec<String> {
+    use crate::ddl::Change;
+    let routine = plan.changes.iter().find_map(|c| match c {
+        Change::RenameRoutine { from, .. } => Some(from),
+        _ => None,
+    });
+    let (ns, name) = match routine {
+        Some(r) => (r.schema.as_deref(), r.name.as_str()),
+        None => (plan.schema.as_deref(), plan.table.as_str()),
+    };
+    let shown = display_name(ns, name);
+    touched(&plan.changes)
+        .iter()
+        .filter_map(|t| {
+            let target = match routine {
+                Some(_) => Target::Routine { ns, name },
+                None => Target::Relation {
+                    ns,
+                    name,
+                    column: t.column.as_deref(),
+                },
+            };
+            change_warning(t, &shown, &used_by(schema, target, plan.dialect))
+        })
+        .collect()
+}
+
+/// `2 views and 1 routine: a, b, c` — the dependents that would break, by
+/// kind and then by name, the first few named and the rest counted. `None`
+/// when only what goes with the object uses it.
+fn listing(deps: &[Dependent]) -> Option<String> {
     const NAMED: usize = 4;
     let deps: Vec<&Dependent> = deps.iter().filter(|d| !d.goes_with_it).collect();
     if deps.is_empty() {
@@ -306,7 +416,7 @@ pub fn drop_warning(deps: &[Dependent]) -> Option<String> {
         _ => counted.join(""),
     };
     Some(format!(
-        "Used by {counted}: {}{}.",
+        "{counted}: {}{}",
         names.join(", "),
         more.unwrap_or_default()
     ))
@@ -315,6 +425,7 @@ pub fn drop_warning(deps: &[Dependent]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ddl::Change;
     use crate::schema::{
         CheckInfo, ColumnInfo, ForeignKeyInfo, RoutineInfo, TableInfo, TriggerInfo,
     };
@@ -567,5 +678,258 @@ mod tests {
             drop_warning(&deps).unwrap(),
             "Used by 2 views, 1 routine and 2 foreign keys: a, b, c, d and 1 more."
         );
+    }
+
+    fn col(name: &str, ty: &str) -> Box<ColumnInfo> {
+        Box::new(ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            ..Default::default()
+        })
+    }
+
+    fn alter(from: Box<ColumnInfo>, to: Box<ColumnInfo>) -> Change {
+        Change::AlterColumn {
+            from,
+            to,
+            position: None,
+            inline_check: None,
+        }
+    }
+
+    #[test]
+    fn a_rename_of_the_object_touches_it_whole() {
+        assert_eq!(
+            touched(&[Change::RenameTable { to: "o2".into() }]),
+            vec![Touch {
+                column: None,
+                kind: TouchKind::Rename
+            }]
+        );
+        assert_eq!(
+            touched(&[Change::RenameView { to: "v2".into() }]),
+            vec![Touch {
+                column: None,
+                kind: TouchKind::Rename
+            }]
+        );
+    }
+
+    #[test]
+    fn a_column_is_touched_under_its_old_name() {
+        let got = touched(&[
+            alter(col("total", "int"), col("amount", "int")),
+            Change::DropColumn {
+                name: "note".into(),
+                type_name: "text".into(),
+            },
+            alter(col("qty", "int"), col("qty", "bigint")),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                Touch {
+                    column: Some("total".into()),
+                    kind: TouchKind::Rename
+                },
+                Touch {
+                    column: Some("note".into()),
+                    kind: TouchKind::Drop
+                },
+                Touch {
+                    column: Some("qty".into()),
+                    kind: TouchKind::Retype
+                },
+            ]
+        );
+    }
+
+    /// A rename that also changes the type is reported once, as the rename —
+    /// the name is what breaks a dependent first.
+    #[test]
+    fn a_renamed_and_retyped_column_is_one_rename() {
+        assert_eq!(
+            touched(&[alter(col("a", "int"), col("b", "bigint"))]),
+            vec![Touch {
+                column: Some("a".into()),
+                kind: TouchKind::Rename
+            }]
+        );
+    }
+
+    /// Nothing that leaves the column's name and type alone — a default, a
+    /// nullability, a type spelled in another case, an added column.
+    #[test]
+    fn an_edit_that_keeps_name_and_type_touches_nothing() {
+        let mut nullable = col("a", "int");
+        nullable.nullable = true;
+        assert_eq!(touched(&[alter(col("a", "int"), nullable)]), vec![]);
+        assert_eq!(touched(&[alter(col("a", "int"), col("a", "INT"))]), vec![]);
+        assert_eq!(
+            touched(&[Change::AddColumn {
+                column: col("z", "int"),
+                position: None,
+            }]),
+            vec![]
+        );
+        assert_eq!(touched(&[]), vec![]);
+    }
+
+    #[test]
+    fn the_change_warning_says_what_the_change_does_to_its_users() {
+        let d = |kind, name: &str| Dependent::new(kind, name.into(), "");
+        let deps = vec![d(DependentKind::View, "a"), d(DependentKind::Routine, "p")];
+        let warn = |column: Option<&str>, kind| {
+            change_warning(
+                &Touch {
+                    column: column.map(Into::into),
+                    kind,
+                },
+                "orders",
+                &deps,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            warn(None, TouchKind::Rename),
+            "orders is used by 1 view and 1 routine: a, p. They still name orders after the rename."
+        );
+        assert_eq!(
+            warn(Some("total"), TouchKind::Rename),
+            "Column total is used by 1 view and 1 routine: a, p. They still name total after the rename."
+        );
+        assert_eq!(
+            warn(Some("note"), TouchKind::Drop),
+            "Column note is used by 1 view and 1 routine: a, p. They break when it is dropped."
+        );
+        assert_eq!(
+            warn(Some("qty"), TouchKind::Retype),
+            "Column qty is used by 1 view and 1 routine: a, p. Check them against its new type."
+        );
+    }
+
+    fn plan(table: &str, changes: Vec<Change>) -> crate::ddl::ChangeSet {
+        crate::ddl::ChangeSet {
+            table: table.into(),
+            schema: None,
+            dialect: MY,
+            flavour: crate::schema::ServerFlavour::Unknown,
+            changes,
+        }
+    }
+
+    /// The composition the previews call: a plan's touched names, each asked
+    /// of the loaded schema under its name *before* the plan — the server's
+    /// name, which is the set's `table`, or a routine's `from`.
+    #[test]
+    fn a_plan_is_warned_about_by_what_uses_the_names_it_changes() {
+        let mut orders = table("orders");
+        orders.columns.push(ColumnInfo {
+            name: "total".into(),
+            type_name: "int".into(),
+            ..Default::default()
+        });
+        let schema = DbSchema {
+            tables: vec![
+                orders,
+                view("big", "SELECT id, total FROM orders WHERE total > 9"),
+                view("ids", "SELECT id FROM orders"),
+            ],
+            routines: vec![routine("cap", "UPDATE orders SET total = 0")],
+            ..Default::default()
+        };
+        assert_eq!(
+            change_warnings(
+                &schema,
+                &plan("orders", vec![Change::RenameTable { to: "o2".into() }])
+            ),
+            vec![
+                "orders is used by 2 views and 1 routine: big, ids, cap. \
+                 They still name orders after the rename."
+                    .to_string()
+            ]
+        );
+        // The column, not the table: `ids` names `orders` but not `total`.
+        assert_eq!(
+            change_warnings(
+                &schema,
+                &plan(
+                    "orders",
+                    vec![alter(col("total", "int"), col("amount", "int"))]
+                )
+            ),
+            vec![
+                "Column total is used by 1 view and 1 routine: big, cap. \
+                 They still name total after the rename."
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            change_warnings(
+                &schema,
+                &plan("orders", vec![alter(col("id", "int"), col("id", "bigint"))])
+            ),
+            vec![
+                "Column id is used by 2 views: big, ids. Check them against its new type."
+                    .to_string()
+            ]
+        );
+        // What nothing uses says nothing, and a plan touching no name asks nothing.
+        assert!(
+            change_warnings(
+                &schema,
+                &plan("ids", vec![Change::RenameView { to: "x".into() }])
+            )
+            .is_empty()
+        );
+        assert!(change_warnings(&schema, &plan("orders", vec![])).is_empty());
+    }
+
+    #[test]
+    fn a_routine_rename_asks_after_the_routine_by_its_old_name() {
+        let schema = DbSchema {
+            tables: vec![table("t")],
+            routines: vec![
+                routine("calc", "SELECT 1"),
+                routine("caller", "CALL calc()"),
+            ],
+            ..Default::default()
+        };
+        let from = Box::new(RoutineInfo {
+            name: "calc".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            change_warnings(
+                &schema,
+                &plan(
+                    "calc",
+                    vec![Change::RenameRoutine {
+                        from,
+                        to: "calc2".into()
+                    }]
+                )
+            ),
+            vec![
+                "calc is used by 1 routine: caller. They still name calc after the rename."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A trigger on the table follows a rename of it on every engine, so it is
+    /// no breakage — as it is none for a drop.
+    #[test]
+    fn the_change_warning_leaves_out_what_goes_with_the_object() {
+        let own_trigger = Dependent {
+            goes_with_it: true,
+            ..Dependent::new(DependentKind::Trigger, "audit".into(), "")
+        };
+        let touch = Touch {
+            column: None,
+            kind: TouchKind::Rename,
+        };
+        assert_eq!(change_warning(&touch, "orders", &[own_trigger]), None);
+        assert_eq!(change_warning(&touch, "orders", &[]), None);
     }
 }

@@ -1295,6 +1295,14 @@ pub struct DdlPreview {
     /// consequence that *is* undone does not appear under "This can't be undone"
     /// two entries away from `DROP USER`.
     pub risk_heading: &'static str,
+    /// What uses a name the plan renames, drops or retypes — one sentence per
+    /// touched name, from `schemaic_core::used_by::change_warning`, filled in
+    /// by the editor that opened the preview (`ddl_preview::with_used_by`),
+    /// which holds the loaded schema `preview_of` does not. Its own block, apart
+    /// from `destructive`: a rename that breaks a view is a fix-up to make, not
+    /// something lost, and does not belong under "This can't be undone". A
+    /// drop's dependents stay in `destructive`, where they are.
+    pub used_by: Vec<String>,
     /// What the plan asks for that this engine **can't express** — see
     /// [`schemaic_core::ddl::ChangeSet::unsupported`]. Non-empty ⇒ the modal
     /// names each one and Apply refuses, because `statements` is then less than

@@ -496,8 +496,10 @@ fn preview_from(target: &ViewTarget, draft: &ViewDraft, cs: &ddl::ChangeSet) -> 
 /// overlays, nothing under here is an *opening* path — the draft, the target,
 /// the body's row cap and the preview it hands off to all live in this one
 /// child bundle, and `fetch_algorithm` is reached from `open_for_view` rather
-/// than from the modal.
-pub(crate) fn view_editor_overlay(d: DdlUi) -> impl IntoView {
+/// than from the modal. The `SchemaUi` is read once, at *Preview SQL*: what in
+/// the loaded schema uses the view under the name a rename takes from it
+/// (`ddl_preview::with_used_by`).
+pub(crate) fn view_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
     let close = move || d.view.set(None);
 
     // The preview stacks on top and this stays open behind it (Cancel there
@@ -617,7 +619,14 @@ pub(crate) fn view_editor_overlay(d: DdlUi) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(d, preview_from(&target, &draft, &cs));
+                                ddl_preview::open_preview(
+                                    d,
+                                    ddl_preview::with_used_by(
+                                        preview_from(&target, &draft, &cs),
+                                        schema,
+                                        &cs,
+                                    ),
+                                );
                             },
                         ),
                     ))
