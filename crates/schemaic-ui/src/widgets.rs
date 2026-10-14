@@ -1879,11 +1879,7 @@ pub(crate) fn fact_note(
     message: String,
 ) -> AnyView {
     h_stack((
-        icons::icon(icon, 14.0).style(move |s| {
-            s.flex_shrink(0.0_f32)
-                .color(color())
-                .margin_top(theme::scaled(1.0))
-        }),
+        icons::icon(icon, 14.0).style(move |s| s.flex_shrink(0.0_f32).color(color())),
         text(message).style(move |s| {
             s.font_size(theme::font_body())
                 .color(color())
