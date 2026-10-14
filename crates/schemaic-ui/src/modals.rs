@@ -281,6 +281,9 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             // What uses an object — a reading of the loaded schema, raised
             // from the tree's menu beside Properties.
             crate::used_by_view::used_by_overlay(ui.overlay, ui.schema, ui.conn),
+            // A chart of the result on screen — raised from the results
+            // strip, a reading like the properties modal above it.
+            crate::chart_view::chart_overlay(ui.overlay),
             users_view::users_overlay(users_view::UsersCtx::new(
                 ui.conn,
                 ui.ddl,
@@ -538,6 +541,7 @@ fn workspace_modals_up(
     let erd_open = overlay.erd;
     let props_open = overlay.properties;
     let used_by_open = overlay.used_by;
+    let chart_open = overlay.chart;
     let users_open = overlay.users;
     let vars_open = overlay.server_vars;
     let blob_open = blob.target;
@@ -555,6 +559,7 @@ fn workspace_modals_up(
             || erd_open.get().is_some()
             || props_open.get().is_some()
             || used_by_open.with(Option::is_some)
+            || chart_open.with(Option::is_some)
             || vars_open.with(Option::is_some)
             || blob_open.get().is_some()
             || (users_open.get().is_some()
@@ -667,6 +672,9 @@ mod modal_backdrop_gate {
     /// more often than not. The floor below is what stops a rename making it pass by
     /// finding nothing.
     const PAINTS_A_BACKDROP: &[&str] = &[
+        // In the layer's workspace group, after `used_by_view.rs`, raised by
+        // `workspace_modals_up`'s `chart_open` arm.
+        "chart_view.rs",
         // In the layer's DDL group, sharing `snippet_edit.rs`'s tuple element,
         // raised by `ddl_modals_up`'s `alias_rename` arm.
         "alias_rename.rs",

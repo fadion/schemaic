@@ -411,6 +411,40 @@ existing prose was left alone.
     module already makes for overflow, arrived at by a different route. It reads exactly one cell
     past the budget, which is how "there were more" is told from "that was all" without a second
     pass.
+  - `chart.rs` — **the numbers behind a result's *Chart*** (`ui/chart_view.rs`): which columns can
+    be plotted, one column's values against another's labels, a histogram of one column, and the
+    axis a range is drawn against. Pure over a `ResultSet`, so the view only paints what this
+    answers — and over **the rows already read**, never a fetch of its own: a chart of a capped
+    result is a chart of the rows read, which the modal says under it.
+    **A number is a cell whose *text* reads as one** — trimmed, parsed as a finite `f64`; a NULL, a
+    non-number and a NaN are not — rather than one whose wire tag says so, because `decimal` and
+    `numeric` arrive as text from every engine (the storage model `aggregate.rs` above describes)
+    and are the columns most worth charting. The cost of asking the text is the other direction: a
+    `varchar` column that happens to hold only digits is offered too. Unlike `aggregate.rs` this is
+    plain `f64`, not fixed-point — nothing here prints a cell's value back, only a position and a
+    tick. `numeric_columns(rs)` is every column whose non-NULL cells all read as numbers, with at
+    least one non-NULL (`a_column_is_numeric_when_every_value_reads_as_a_number`), so a column of
+    nothing but NULLs is not offered.
+    `ChartKind::{Bar, Line, Histogram}` (`ALL`, `label`). `series(rs, x: Option<usize>, y)` →
+    `Series { labels, values, skipped }`, in row order: `y`'s numbers labelled by `x`'s text,
+    `"NULL"` for a NULL label, and the 1-based row number with no `x`; `skipped` counts the rows left
+    out, a NULL or non-numeric value **and** everything past `MAX_POINTS` (2,000 — past it a bar is
+    thinner than a pixel on any panel the chart fits), so the modal can say how many it did not draw
+    (`a_series_pairs_labels_with_values_and_counts_what_it_left_out`,
+    `a_long_result_draws_at_most_the_cap`). `histogram(rs, col)` → `(Vec<Bin { lo, hi, count }>,
+    skipped)` over `bins(values)`: equal-width bins, how many by Sturges' rule (`⌈log₂ n⌉ + 1`,
+    clamped to 50), each `[lo, hi)` with **the last one closed** so the maximum lands in it, and a
+    flat column one bin holding everything (`a_histogram_bins_every_value_and_closes_its_last_bin`).
+    A histogram takes every numeric row — the cap is `series`' alone — so its `skipped` is only the
+    NULLs and non-numbers.
+    `ticks(lo, hi, want)` is the value axis: a step of 1, 2 or 5 × 10ᵏ, the first at least the raw
+    `(hi − lo) / want`, covering the range from `floor(lo / step)` up past `hi`, each tick snapped to
+    a multiple of the step to drop the float noise of repeated addition. A flat range is widened by
+    1 either side so it still gets an axis; a non-finite bound gets none
+    (`ticks_are_round_and_cover_the_range`). A bar chart passes a range that includes 0, so bars
+    stand on it — that is the caller's to do. `tick_label(v)` prints at most two decimals with
+    trailing zeros dropped, `-0` as `0`, and shortens `≥ 1e4`/`1e6`/`1e9` to `k`/`m`/`b`
+    (`tick_labels_drop_noise_and_shorten_large_values`).
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
@@ -22870,7 +22904,7 @@ existing prose was left alone.
     signals, and the two must not be able to disagree. **The Server variables viewer, mounted
     directly after the browser, is the contrast**: it raises nothing, so `vars_open` is a plain term
     and counts whenever the viewer is open. The *Used by* modal, mounted after Properties, is the
-    same plain term (`used_by_open`).
+    same plain term (`used_by_open`), and so is the *Chart* modal mounted after it (`chart_open`).
     **Schema compare, the group's seventh member, takes the same `preview_open` clause — and there for
     the rule rather than for a case.** It raises the DDL preview too, painted in the earlier DDL
     group, so a wrapper that went on filling the layer would sit on top of it exactly as above. What
@@ -24610,6 +24644,40 @@ existing prose was left alone.
     Mounted in the workspace group directly after `properties_overlay`, and counted by
     `workspace_modals_up` whenever it is open — it raises nothing, so it is a plain term like
     `vars_open`.
+  - `chart_view.rs` — the **Chart** modal (`chart_overlay`): a bar, line or histogram of the result
+    on screen, over `core::chart`, opened by setting `overlay.chart` to a `ChartTarget { rs:
+    Arc<ResultSet>, title }` (re-exported as `schemaic_ui::ChartTarget`; the app creates the signal
+    beside `used_by`) from the results strip's chart icon (*Data grid*), which titles it *"Chart —
+    this result"*. Read-only like Properties: a title, the pickers, the chart, a footer of **Close**,
+    and Escape and the backdrop closing it. The modal is keyed on the `Arc`'s pointer, so charting
+    another result rebuilds it and nothing else does.
+    **Three pickers**: *Chart* — the kind, a `settings::focusable_dropdown`, tab 10; *Values* — the
+    numeric columns only (`chart::numeric_columns`, read once per open), a
+    `table_designer::focusable_owned_dropdown`, tab 20, starting on the **last** numeric column; and
+    *Labels* — *Row number* or any column, tab 30, starting on the first column that is not the
+    value, and not built at all for a histogram, whose labels are its bins — a `dyn_container` on the
+    kind rather than `s.hide()`, since a hidden picker would still be a Tab stop. A picked name maps
+    back to the first column of that name, so of two columns sharing a name the second cannot be
+    picked. The body is a `dyn_container` keyed on `(kind, value, label)`: *"No column of numbers to
+    chart in this result."* where there is none, *"Every value in that column is NULL."* where the
+    series or the bins came back empty, and otherwise the canvas, 360 high, with one faint line under
+    it — *"N rows · K not drawn (NULL, or past 2000) · the rows read, not the whole result"*, the
+    middle clause when anything was skipped and the last when the result is `truncated`.
+    **The canvas is a painted view, `ChartCanvas`** — floem 0.2 has no plotting, so it is a custom
+    `View` with a `paint` of its own, as the frozen header's `Hatch` (*Data grid*) and the ER
+    diagram's `EdgeCanvas` (under `erd_view.rs`) are. The value axis is `chart::ticks` over the
+    drawn range — a bar's or a histogram's range always includes 0 — with grid lines in
+    `theme::border` and the tick labels laid out by floem's own `TextLayout` and drawn with
+    `cx.draw_text`, so the axis is the app's face at the app's scale; the gutter is the widest
+    label. Bars, or a 2px polyline (with a dot per point while there are at most 60), or contiguous
+    histogram bins, all in `theme::accent`; a zero line over the marks; and three labels under the
+    axis — first, middle and last, cut at 18 characters, a histogram's being its edges and midpoint
+    as tick labels. **Every colour is read at paint time**, so a theme switch repaints in the new
+    one, and the text helper takes its colour as `fn() -> Color` for the same reason the
+    themable-colour invariant gives.
+    Mounted in the workspace group directly after `used_by_overlay`, counted by
+    `workspace_modals_up` as a plain term (`chart_open`) — it raises nothing — and on
+    `modal_backdrop_gate::PAINTS_A_BACKDROP`.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
     It lists the server's accounts, shows one account's privileges, and is where the five write
     actions are raised from — the forms themselves are `account_editor.rs`. Mounted in the
@@ -38010,7 +38078,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   the ring, because rebuilding would reflow the sub-header the moment the first change lands, and
   Enter on a dimmed one does nothing because each closure re-checks the log. Passing `has_log()`
   into `enabled` is the tidy-looking edit that breaks this — it is read once, at build.
-  The results toolbar's copy and save icons take the second too, since they became gated on the
+  The results toolbar's copy, save and chart icons take the second too, since they became gated on the
   result having rows: ring membership is unchanged (`in_strip_button(…, true, …)`), the icons dim on
   a 0-row result, and the `Rc<dyn Fn()>` each shares between its click listener and its Enter/Space
   arm carries the refusal — so the pointer and the keyboard refuse together, where dimming the face
@@ -38843,7 +38911,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   *first*: a request in flight makes the glyph inert, whatever the menu and the pointer are doing.
   **A trigger with nothing to offer is dim and stays dim**, through
   `widgets::menu_icon_color_gated(enabled, open, hovered)` — the results strip's copy and download
-  icons on a 0-row result (*Data grid*). It *composes* `menu_icon_color` rather than adding a fourth
+  icons on a 0-row result (*Data grid*), and its chart icon, which raises a modal rather than a
+  menu and so passes `open` as `false`. It *composes* `menu_icon_color` rather than adding a fourth
   arm inside it, because five of that function's six callers are triggers that are always available
   and would all have had to start saying so. The gate outranks all three states and **hover is the
   arm that proves it**: an icon lighting up under the pointer promises a menu the click does not
@@ -39253,7 +39322,9 @@ this bundle's.
   **A frozen column's header is hatched** — faint 45° `/` lines over the whole cell (`header_cell`'s
   `Hatch`, `text_faint` at 0.22, `FROZEN_HATCH_STEP` apart), the one cue that it is frozen, since the
   cell has no room for another icon and a background tint already means *formatted*. `Hatch` is a
-  custom painted view because floem 0.2 has no pattern fill; it clips to its own rect, reads its
+  custom painted view because floem 0.2 has no pattern fill (the ER diagram's `EdgeCanvas` and the
+  *Chart* modal's `ChartCanvas` are painted the same way, the second because floem has no
+  plotting); it clips to its own rect, reads its
   colour at paint time so a theme switch repaints it, and is absolute, `pointer_events(false)`,
   hidden unless the column is frozen, and stacked under the label and `col_resize_handle`. Painted
   rather than bordered, because a border would take width from the header that its column's values
@@ -40255,6 +40326,14 @@ this bundle's.
   replaces the rows under it, so a flag read while it was built would gate the menus on the previous
   result. It reads `gs.order` rather than the result set, because `order` is what an export actually
   writes; the two agree today and the one that decides the file is the honest thing to ask.
+  **The chart icon takes the same gate and the same shape** — `icons::CHART_COLUMN` (Lucide
+  `chart-column`) at `TB_CHART` (65), between the AI menu and copy, an `in_strip_button` registered
+  unconditionally with its `open_chart` built by `gated_action(has_rows, …)` and its face dimmed by
+  `menu_icon_color_gated`. It raises the *Chart* modal (`chart_view.rs`) rather than a menu, by
+  setting `GridState::chart` — `GridCtx::chart`, which `lib.rs` fills with `ui.overlay.chart` — to
+  the result on screen, so it has no toggle. **It asks only whether there are rows, not whether any
+  column is numeric**: that is the modal's to say (*"No column of numbers to chart in this
+  result."*), rather than a scan of every cell each time the strip is built.
   **Every way the file will differ from the grid is declared at the point of choice, not discovered
   in the file**, and the label is `export::all_rows_label(size, sorted, manual_tx, staged)` — one
   tested
@@ -40456,7 +40535,7 @@ this bundle's.
   and writer is bounded, so a reader-side count would run two blocks ahead of the file, reporting
   rows that are not in it yet and being two blocks wrong about what survived a cancel.
 - **The results strip shrinks its prose, never its controls.** It is one flex row — stats, the
-  read-more offer, the pager, the two red notes, a spacer, then the commit/row/AI/copy/save cluster — and a
+  read-more offer, the pager, the two red notes, a spacer, then the commit/row/AI/chart/copy/save cluster — and a
   flex row squeezes its children before it overflows, so whichever child refuses to shrink is the
   one that wins. The description lost that fight by default: at a 200k cap on a ~292k table the
   line was long enough to push the icon cluster off the right edge of a narrow panel, and the user
@@ -40580,7 +40659,7 @@ this bundle's.
   `on_move`/`on_resize` stay on the padded container inside — and that box is what the dropdown
   hangs off.
 - **Every control on the results toolbar carries a tooltip**, and where it sits is a correctness
-  rule. The eight are commit ✓, discard ✗, ＋, －, clone, ✦ AI, copy and save (the pager's two
+  rule. The nine are commit ✓, discard ✗, ＋, －, clone, ✦ AI, chart, copy and save (the pager's two
   chevrons, outside the ring, carry one each as well); before they were added
   nothing in the strip was labelled but the commit count, which is a bare number saying neither what
   it counts nor what pressing it does, and the glyphs doing the least reversible work (discard,
@@ -40596,7 +40675,8 @@ this bundle's.
   which is a different action from the format menu the icon raises. `－` and clone keep their tip
   while dimmed and it names the selection, which is also the answer to why they are inert. Copy and
   save keep theirs while dimmed too, in an empty-result form — "Nothing to copy — no rows" /
-  "Nothing to save — no rows": a dimmed icon says only that it cannot be used, the tip says why, and
+  "Nothing to save — no rows", and chart's "Chart the results" becomes "Nothing to chart — no
+  rows": a dimmed icon says only that it cannot be used, the tip says why, and
   without the second half the only reading left is that the app is broken.
   `toolbar_sep` takes 8px of horizontal margin on top of the cluster's own 3px gap: the icons carry
   a padded hitbox and no visible edge, so a divider set at the plain group gap reads as *part of*

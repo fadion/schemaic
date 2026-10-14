@@ -42,6 +42,8 @@ mod plan_view;
 mod properties;
 mod used_by_view;
 pub use used_by_view::UsedByTarget;
+mod chart_view;
+pub use chart_view::ChartTarget;
 mod routine_editor;
 mod schema_tree;
 mod script_view;
@@ -6487,6 +6489,8 @@ pub struct OverlayUi {
     pub properties: RwSignal<Option<PropertiesTarget>>,
     /// The *Used by* modal's object (`used_by_view`): `Some` opens it.
     pub used_by: RwSignal<Option<UsedByTarget>>,
+    /// The result the *Chart* modal draws (`chart_view`): `Some` opens it.
+    pub chart: RwSignal<Option<ChartTarget>>,
     pub properties_state: RwSignal<PropertiesState>,
     pub properties_counting: RwSignal<bool>,
     pub properties_count_err: RwSignal<Option<String>>,
@@ -9373,6 +9377,7 @@ fn center(ui: Ui) -> impl IntoView {
                     // such problem, and an export the user navigates away from
                     // still reports into it rather than onto a disposed signal.
                     export_modal: ui.export,
+                    chart: ui.overlay.chart,
                     tx_holders: {
                         // Answered when a write has been waiting a while, not at
                         // build time: the user can open (or end) a transaction in

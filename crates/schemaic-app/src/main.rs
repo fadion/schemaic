@@ -2822,6 +2822,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // being described, so a stale fetch can check it before writing.
     let properties: RwSignal<Option<schemaic_ui::PropertiesTarget>> = RwSignal::new(None);
     let used_by: RwSignal<Option<schemaic_ui::UsedByTarget>> = RwSignal::new(None);
+    let chart: RwSignal<Option<schemaic_ui::ChartTarget>> = RwSignal::new(None);
     let properties_state: RwSignal<schemaic_ui::PropertiesState> =
         RwSignal::new(schemaic_ui::PropertiesState::Loading);
     let properties_counting: RwSignal<bool> = RwSignal::new(false);
@@ -13839,6 +13840,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             compare_show_same: RwSignal::new(false),
             properties,
             used_by,
+            chart,
             properties_state,
             properties_counting,
             properties_count_err,

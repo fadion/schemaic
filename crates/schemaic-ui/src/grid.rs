@@ -346,6 +346,8 @@ struct GridState {
     /// Which of the user's other tabs hold an open transaction that this tab's
     /// write could be queued behind — the wait note's subject.
     tx_holders: RwSignal<Option<TxHoldersFn>>,
+    /// Where the chart icon sends this result (`GridCtx::chart`).
+    chart: RwSignal<Option<crate::ChartTarget>>,
     /// Last commit error, shown in the toolbar until the next edit/commit. With
     /// its source, which only the setter knows: the same bar reports a server's
     /// refusal and Schemaic's own (a paste that landed nothing, bad JSON).
@@ -749,6 +751,7 @@ impl GridState {
             // Shared with the panel-level error bar (rendered in `results_section`).
             commit_wait: gctx.commit_wait,
             tx_holders: RwSignal::new(Some(gctx.tx_holders.clone())),
+            chart: gctx.chart,
             commit_err: gctx.commit_err,
             commit_note: gctx.commit_note,
             popup: gctx.popup,
@@ -4104,6 +4107,9 @@ pub(crate) struct GridCtx {
     pub(crate) commit_wait: RwSignal<Option<WaitNote>>,
     /// The tabs the wait note can name (see [`TxHoldersFn`]).
     pub(crate) tx_holders: TxHoldersFn,
+    /// The *Chart* modal's target (`OverlayUi::chart`), which the strip's
+    /// chart icon sets to this result.
+    pub(crate) chart: RwSignal<Option<crate::ChartTarget>>,
     /// `ROLLBACK` another tab's transaction — the wait note's one-click way out
     /// when exactly one transaction of the user's own could be the holder.
     pub(crate) rollback_tx: Rc<dyn Fn(usize)>,
@@ -8751,6 +8757,7 @@ const TB_ADD: u32 = 30;
 const TB_DELETE: u32 = 40;
 const TB_CLONE: u32 = 50;
 const TB_AI: u32 = 60;
+const TB_CHART: u32 = 65;
 const TB_COPY: u32 = 70;
 const TB_SAVE: u32 = 80;
 
@@ -9783,9 +9790,48 @@ fn grid_toolbar(
         },
     );
 
+    // Chart the rows on screen (`chart_view`). Enabled whenever there are rows:
+    // whether any column is numbers is the modal's to say, rather than a scan
+    // of every cell each time the strip is built.
+    let open_chart: Rc<dyn Fn()> = gated_action(has_rows, move || {
+        gs.chart.set(Some(crate::ChartTarget {
+            rs: gs.rs.get_untracked(),
+            title: "this result".to_string(),
+        }));
+    });
+    let chart_hov = RwSignal::new(false);
+    let chart_click = open_chart.clone();
+    let chart_btn = container(
+        icons::icon(icons::CHART_COLUMN, crate::consts::TOOLBAR_ICON_BASE).style(move |s| {
+            s.color(crate::widgets::menu_icon_color_gated(
+                has_rows(),
+                false,
+                chart_hov.get(),
+            ))
+            .flex_shrink(0.0_f32)
+        }),
+    )
+    .on_click_stop(move |_| (chart_click)())
+    .on_event_cont(EventListener::PointerEnter, move |_| chart_hov.set(true))
+    .on_event_cont(EventListener::PointerLeave, move |_| chart_hov.set(false))
+    .style(|s| {
+        s.items_center()
+            .padding_vert(theme::scaled(3.0))
+            .padding_horiz(theme::scaled(5.0))
+            .cursor(CursorStyle::Default)
+    })
+    .tooltip(move || {
+        text(if has_rows() {
+            "Chart the results"
+        } else {
+            "Nothing to chart — no rows"
+        })
+        .style(crate::widgets::tooltip_style)
+    });
+
     // The icon cluster — 3px between icons (on top of each icon's padded hitbox),
     // separators pushed further out by their own 8px margin:
-    // [commit ✓][discard ✗] │ [＋][－][clone] │ [✦ AI][copy][save].
+    // [commit ✓][discard ✗] │ [＋][－][clone] │ [✦ AI][chart][copy][save].
     //
     // Every one of them carries a tooltip. Nothing here is labelled but the commit
     // count, and that is a bare number; the glyphs that do the least reversible
@@ -9794,6 +9840,15 @@ fn grid_toolbar(
         commit_ctrl,
         row_actions,
         ai_menu,
+        in_strip_button(
+            chart_btn,
+            strip.clone(),
+            TB_CHART,
+            true,
+            leave,
+            panel_keys,
+            move || (open_chart)(),
+        ),
         in_strip_button(
             copy_menu,
             strip.clone(),
