@@ -11636,7 +11636,20 @@ existing prose was left alone.
     Server's. Neither of those reads the form's user or password (`uses_credentials`): Windows
     presents the identity the app runs as, through SSPI, so there is nothing to store, and
     `AzureCli` hands the server a Microsoft Entra token from the Azure CLI's own sign-in, fetched
-    when a connection needs one and never saved (`core/entra.rs`, `db/entra.rs`). `offered(db_type)`
+    when a connection needs one and never saved (`core/entra.rs`, `db/entra.rs`). **PostgreSQL and
+    the MySQL family offer two more, the clouds' IAM sign-in** — `AwsIam`, an RDS token from the
+    AWS CLI, and `GcpIam`, a Cloud SQL one from the Google Cloud CLI, what RDS and Cloud SQL run —
+    while SQLite, a file, offers the password alone (`postgres_and_mysql_offer_cloud_iam_sign_in`,
+    which replaced the assertion that every engine but SQL Server offered nothing else). These two
+    sit between the others: they read the form's **user** and never its password (`uses_user`
+    true, `uses_credentials` false — `a_cloud_iam_mode_reads_the_user_and_not_the_password`),
+    because the token signs in as a server account the user names, and it is sent where the
+    password would go. `cloud()` names the CLI that mints it (`core/cloud_iam.rs`,
+    `db/cloud_iam.rs`). **`external_client_refusal` is what that costs**: `psql`, `mysql`,
+    `pg_dump` and `mysqldump` are handed the connection's password in their environment, and an
+    IAM connection has none — the token is fetched by the driver, inside the app — so *Open in CLI*,
+    *Back up* and *Restore* refuse one with its sentence (under `app/main.rs`) and `sqlcmd_args`
+    has an arm for the two that refuses with it too. `offered(db_type)`
     is the one list, in picker order with the default first, and it is where the OS enters:
     Windows sign-in is offered in a Windows build alone, a process anywhere else having no Windows
     identity to present. **The mode a driver sees is `effective_auth`, asked through the engine as
@@ -11661,8 +11674,8 @@ existing prose was left alone.
     account can reach — and it used to travel over whatever the picker said. A hand-made
     connection defaults to `Disable`, which on SQL Server is TDS `Off` with `AnyCertificate`
     (`db/tls.rs`), so anyone on the path presenting any certificate received the token in the
-    login packet. `AuthMode::tls_floor` is `Disable` for the other two modes and `VerifyFull` for
-    `AzureCli`, and **`Connection::tls_mode_in_force` — the picked mode `stronger_of` the floor of
+    login packet. `AuthMode::tls_floor` is `Disable` for `Password` and `Windows`, `VerifyFull` for
+    `AzureCli` and the clouds' below, and **`Connection::tls_mode_in_force` — the picked mode `stronger_of` the floor of
     `effective_auth` — is what `uses_tls` and `tls_plan` read**, so the plan `Db::connect` builds,
     and the one the MCP endpoint handoff serialises off `Db::tls_plan`, are raised, with the
     connection's own CA path and client identity (`an_entra_sign_in_always_plans_a_verifying_handshake`).
@@ -11676,7 +11689,20 @@ existing prose was left alone.
     things silently. `TlsPlan::verifies_server` is the rung read back off a plan (no plaintext
     retry, no invalid certificate, the name checked), and `transport_refusal` compares a plan with
     the floor for the driver's own check, which `mssql.rs` makes before any token is fetched
-    (`an_entra_token_is_refused_over_a_transport_that_verifies_nothing`).
+    (`an_entra_token_is_refused_over_a_transport_that_verifies_nothing`), and `Db::sign_in_secret`
+    makes for the clouds (`an_iam_sign_in_without_tls_is_refused_before_any_token_is_asked`).
+    **The two clouds' floors follow what their tokens open**
+    (`the_cloud_floors_follow_what_their_tokens_open`). An RDS token is a password for one host,
+    port and user and lives fifteen minutes, so `AwsIam`'s floor is `Require` — an encrypted
+    session, which on MySQL is also what keeps the `mysql_clear_password` plugin's clear text off
+    the wire (`Db::opts_with_tls`). Verifying the server needs AWS's RDS CA bundle, which no system
+    store holds, so a verifying rung stays the user's call and the note says Verify full needs the
+    bundle as Root CA. The trade is stated rather than hidden: under `Require` anyone on the path
+    who presents a certificate receives the token, good for that one server for what is left of its
+    fifteen minutes. Google's is Entra's exposure — an OAuth access token valid an hour for every
+    Cloud SQL instance the account reaches — so `GcpIam`'s floor verifies the certificate, at
+    `VerifyCa` rather than `VerifyFull` because a Cloud SQL certificate names the instance, not the
+    host; its note and refusal ask for the instance's server CA as Root CA.
     **`Connection::trimmed` is the padding rule, and it is one answer because the form had made it
     seven times and omitted it five.** `to_connection` trimmed `port`, `file`, `database`, the SSH
     port and all three TLS paths and stored `host`, `user`, `ssh.host`, `ssh.user` and
@@ -15273,7 +15299,9 @@ existing prose was left alone.
     `effective_auth`: `-U<user>` for a SQL login, `-E` — a trusted connection, the same flag in both
     clients — for Windows sign-in with no user sent, and a refusal for Entra, since `sqlcmd` cannot
     be handed the Azure CLI's token and falling back to a SQL login would be a different sign-in from
-    the one saved (`sqlcmd_signs_in_the_way_the_connection_does`). `mssql_shell_config` adds the one
+    the one saved (`sqlcmd_signs_in_the_way_the_connection_does`). The two cloud IAM modes have an
+    arm of their own, refused with `AuthMode::external_client_refusal`'s sentence — never in force
+    on SQL Server (`AuthMode::offered`), so it is there for a hand-made one. `mssql_shell_config` adds the one
     refusal the argv cannot see: Windows sign-in through a WSL `sqlcmd`, a Linux process having no
     Windows identity to present. The password travels as `SQLCMDPASSWORD`, which both clients read,
     never as `-P` — `sqlcmd_shell_puts_password_in_env_not_argv` in `app/main.rs`, which pins its
@@ -15288,6 +15316,13 @@ existing prose was left alone.
     include a `--format=` line that would otherwise have reached the argv as an option).
     `--type=container` keeps an image sharing an id prefix out of the answer, and empty output is an
     empty argv — no second call at all (`nothing_running_is_no_call_at_all`).
+    `cli_flag_value(what, value)` is the check for **a connection's own setting as the value of a
+    cloud CLI's flag** — `core::cloud_iam`'s `aws rds generate-db-auth-token --hostname <host>
+    --username <user>`, the first argv in which a sign-in CLI is handed anything but constants. The
+    CLIs read any word beginning with `-` as an option, so a user named `--profile=prod` would sign
+    in under somebody else's profile rather than fail; an empty value is refused because a flag
+    with none takes the next flag as one, and a control character because none belongs in a host or
+    a user (`a_value_shaped_like_an_option_is_refused`, under `cloud_iam.rs`, is what exercises it).
     **The backup-and-restore half** is the argv for the engines' own tools, which the database
     menu's *Back up* and *Restore from file* run in the terminal panel as *Open in CLI* runs a client
     — argv only, the password in the tool's environment variable. `backup_file_target` is the check
@@ -15355,6 +15390,54 @@ existing prose was left alone.
     `AZURE_CONFIG_DIR`'s `azureProfile.json`, or `.azure`'s under the home directory — which
     `db/entra.rs` keys its token cache on
     (`the_cli_profile_is_under_its_config_dir_or_the_home_directory`).
+  - `core/cloud_iam.rs` — **signing in to PostgreSQL and the MySQL family with a cloud's IAM
+    token**: the pure half of `AuthMode::AwsIam` (an RDS token from the AWS CLI) and
+    `AuthMode::GcpIam` (a Cloud SQL one from the Google Cloud CLI), `db/cloud_iam.rs` being the half
+    that runs it. It is `core/entra.rs`'s shape, and for its reasons: the CLI holds the long-lived
+    sign-in and its refresh, a short-lived token is asked for when a connection needs one, and
+    nothing here stores one — the token goes where the password would. `Cloud` (`Aws`, `Gcloud`)
+    carries the CLI's name as a message says it (`cli()`) and how long a fetched token is reused
+    (`reuse_secs`: ten minutes of an AWS token's fifteen, fifty of gcloud's hour — a margin for the
+    clock and the connect). `cli_candidates` is `azure_cli_candidates` again: every absolute `PATH`
+    directory in order, then on Windows the installers' own folders, which find a CLI installed after
+    the app started — `Program Files\Amazon\AWSCLIV2\aws.exe`, and the Cloud SDK's
+    `Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd` under `%LOCALAPPDATA%` or Program Files
+    (`the_candidates_cover_path_and_the_installers`). `rds_region` reads the region off an RDS
+    endpoint — `db.abc.eu-west-1.rds.amazonaws.com`, and the `.amazonaws.com.cn` spelling — and
+    answers `None` for any other host, a custom DNS name or an address, where the CLI's configured
+    default region applies (`an_rds_endpoint_names_its_region`,
+    `any_other_host_leaves_the_region_to_the_cli`). **There is no region field on the connection**,
+    so behind a custom name the CLI's default is the only way to name one.
+    **`token_args` puts connection-supplied values on a sign-in CLI's argv, which `entra`'s never
+    did.** AWS's is `rds generate-db-auth-token --hostname <host> --port <port> --username <user>`
+    plus `--region` where `rds_region` found one, the host and user each through
+    `launch::cli_flag_value` — a user named `--profile=prod` is an option to the CLI, not a user
+    (`the_aws_ask_names_the_host_port_user_and_region`, `a_value_shaped_like_an_option_is_refused`).
+    gcloud's is the constant `sql generate-login-token`: its token is the account's and names neither
+    the user nor the instance, the server reading the user off the connection
+    (`the_gcloud_ask_is_constant`). **`token_argv` keeps `launch`'s first rule as
+    `azure_cli_token_argv` does, and refuses where there is no way round the shell.** The Cloud SDK's
+    `gcloud.cmd` runs the Python it bundles over `lib\gcloud.py`, so that is what runs here —
+    `<sdk>\platform\bundledpython\python.exe <sdk>\lib\gcloud.py`, the SDK being the shim's `bin`'s
+    parent — and a shim without both is refused rather than handed to `cmd`
+    (`a_gcloud_shim_runs_the_sdks_own_python_and_nothing_else`). An `aws.cmd` is the old
+    pip-installed version 1 and is refused with that reason, version 2 being an `.exe`
+    (`an_aws_v1_shim_is_refused_and_an_exe_runs_as_found`). An `.exe`, or the CLI on any other OS,
+    runs as found — a script there, as `az` is. `parse_token` takes exactly one non-empty line with
+    no whitespace in it and refuses anything else: a warning or a prompt on stdout is not a token,
+    and accepted it would go to the server as the password (`a_token_is_one_line_and_nothing_else`).
+    `failure_text` is `entra`'s: a signed-out CLI says to run `aws configure` or `aws sso login`, or
+    `gcloud auth login`, and anything else keeps the CLI's own first stderr line
+    (`a_signed_out_cli_says_how_to_sign_in`). `identity_files` names what the token cache keys on,
+    as `azure_cli_profile` does for Entra: AWS's `~/.aws/credentials` and `~/.aws/config`, or the
+    files `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` name; gcloud's `active_config`,
+    the **active** configuration's own `configurations/config_<name>` and `credentials.db` under
+    `CLOUDSDK_CONFIG`, else `%APPDATA%\gcloud` on Windows and `~/.config/gcloud` elsewhere
+    (`the_identity_is_read_off_each_clis_own_files`). The active configuration's and not the
+    default's, because `gcloud config set account` on a named configuration rewrites that file
+    alone when the account already has credentials: its name is `CLOUDSDK_ACTIVE_CONFIG_NAME`, else
+    `active_config`'s content (read through the caller's `read`), else `default`, and a name gcloud
+    would not make is not joined onto a path (`gcloud_is_keyed_on_the_active_configuration`).
   - `cli_install.rs` — **putting the `schemaic` command on `PATH`, and taking it off again**: the
     decision half of Settings → General → Command line → Install / Remove and of the Windows
     uninstall hook, with the registry write, the symlink and the broadcast left to
@@ -18484,7 +18567,9 @@ existing prose was left alone.
   `libkrb5`, a system dependency for every Linux build; elsewhere the arm is a refusal, never reached
   because `AuthMode::offered` does not offer the mode. `AzureCli` is `AuthMethod::aad_token` over
   `entra::sql_token()`, the login's FedAuth extension in stock tiberius — none of the vendored
-  patches is about it. That is why `config` is `async` now. **`config` refuses an Entra sign-in
+  patches is about it. That is why `config` is `async` now. The two cloud IAM modes are an arm that
+  refuses (`DbError::Refused`) — PostgreSQL's and the MySQL family's, never in force here, so it is
+  for a hand-made `Db`. **`config` refuses an Entra sign-in
   whose plan does not reach its TLS floor, and does it before the token is fetched**
   (`AuthMode::transport_refusal` → `DbError::Refused`). A `Db` resolved from a connection already
   carries the `VerifyFull` plan `Connection::tls_plan` raises it to (`connection.rs`), so this is
@@ -18600,6 +18685,37 @@ existing prose was left alone.
   spawn is why this crate's `tokio` gained the `process` feature. The MCP subprocess is another
   process and so has a cache of its own: it asks the CLI itself, and only the mode crosses in its
   endpoint (under `ai.rs`).
+  **`db/cloud_iam.rs` is the same process half for PostgreSQL and the MySQL family**, the pure half
+  being `core/cloud_iam.rs`. `token(cloud, host, port, user)` caches in memory for `db/entra.rs`'s
+  reason, in one `Mutex<Vec<Cached>>`, with one difference of shape: **an AWS token is its
+  target's**, signed for one host, port and user, so its entries are keyed on the host lowercased,
+  the port and the user and one is never handed to another target, where gcloud's — the account's —
+  is a single entry serving every connection
+  (`an_aws_token_is_handed_out_only_to_the_target_it_was_minted_for`). An entry is reused within
+  `Cloud::reuse_secs` of its fetch, and only while every identity file's modification time and
+  length — `None` for one that is absent — are what they were when it was cached, read after the
+  fetch as the Azure CLI's profile is, since asking can rewrite them (an SSO refresh, gcloud's token
+  store); so `aws configure` or removed credentials end its reuse
+  (`a_token_expires_from_the_cache_and_does_not_outlive_its_sign_in`). **There is no `forget` on a
+  refused login, unlike the Entra cache**: a changed CLI sign-in is caught by the identity key, not
+  by the server turning the token away. `fetch` is the Entra fetch again — `cli_candidates`,
+  `token_argv`, `tokio::process` with stdin null and `kill_on_drop`, `CREATE_NO_WINDOW` on Windows,
+  a 60 s `CLI_TIMEOUT` because gcloud's first run after an update can take tens of seconds — and
+  its failures are `DbError::Connect` sentences: *"The {cli} was not found. Install it and sign in
+  with it, or sign in with a password."*, a timeout, a CLI that could not be started, or
+  `failure_text`. **`Db::sign_in_secret` is its one caller**, and what MySQL's `dial` and
+  PostgreSQL's `connect_probe` hand their driver where the password goes: the password, or under an
+  IAM mode `AuthMode::transport_refusal` first — a `DbError::Refused`, with no CLI run, for a plan
+  short of the floor, the case being a handle assembled from parts — and then the token
+  (`an_iam_sign_in_without_tls_is_refused_before_any_token_is_asked`, red with the transport check
+  removed: the CLI was looked for and a Connect error came back). On MySQL the token travels through
+  `mysql_clear_password`, which RDS and Cloud SQL ask for and `mysql_async` leaves off by default, so
+  `opts_with_tls` takes the secret and enables the plugin for the two IAM modes alone, their TLS
+  floor keeping the clear text inside an encrypted session; `opts`, which handed the stored
+  password itself, is `#[cfg(test)]` now. **What has been checked is narrow**: the live password
+  sign-in suites pass on MariaDB, MySQL 8, PostgreSQL 16 and SQL Server 2022 with the secret routed
+  through here, and with no AWS or Google Cloud account to sign in to, the IAM path is verified only
+  as far as invoking the CLI.
   **Values arrive typed**, not as text — an `int` as an `i32`, a `decimal` as a scaled integer, a
   `datetime2` as a day count and ticks — so `cell_value` renders each to the text SQL Server's own
   tools print, and nothing in it is lossy: a `decimal` from its scaled integer, never through a
@@ -23972,8 +24088,10 @@ existing prose was left alone.
     **Under Entra sign-in with anything short of Verify full picked, a hint says the picker is not
     what connects** (`tls_floor_note` → `AuthMode::tls_note` of the mode in force, hidden when it
     is `None`): *"Microsoft Entra sign-in connects at Verify full
-    whatever is picked here: its token opens every Azure SQL database the account can reach."* A
-    note rather than writing the picker up to `VerifyFull`, deliberately: an effect cannot tell a
+    whatever is picked here: its token opens every Azure SQL database the account can reach."* The
+    two cloud IAM modes have notes of their own below their floors (`Require`, `VerifyCa`): AWS's
+    adds that Verify full needs the RDS CA bundle as Root CA, Google's asks for the instance's
+    server CA there. A note rather than writing the picker up to `VerifyFull`, deliberately: an effect cannot tell a
     pick from a load, and raising on a load would edit a saved connection by opening it. The raise
     itself is `Connection::tls_mode_in_force`, under `connection.rs`.
     Every TLS signal joins host/port/user/password
@@ -23988,28 +24106,32 @@ existing prose was left alone.
     duplicate of its layout; its Browse went from tabindex 62 to 61 in the move, the order
     unchanged.
     **An *Authentication* picker appears only on an engine offering more than one mode** — SQL
-    Server's, through `AuthMode::offered` — between Database and the credentials, at tabindex 68 in
+    Server, PostgreSQL and the MySQL family, through `AuthMode::offered`; SQLite has none — between Database and the credentials, at tabindex 68 in
     the gap the surrounding indices were spaced to leave. `DraftSignals::auth` is threaded through
     create, load, reset and `to_connection` like the rest. The list is read once, untracked, because
     `server_fields` is rebuilt when the engine changes. What follows the dropdown is keyed on the
     mode **in force**, not the stored one — a SQL Server connection switched to MySQL keeps
     `AzureCli` in its draft and must still show a password — through one `in_force` closure over
-    `AuthMode::in_force`, the rule the driver asks. The credentials are a `dyn_container` building
-    User and Password where the mode in force `uses_credentials` and `nothing()` where it does not,
-    each its own child rather than hidden fields, for the reason `conn_form`'s
+    `AuthMode::in_force`, the rule the driver asks. The credentials are a `dyn_container` keyed on
+    the mode in force's `(uses_user, uses_credentials)`, asked rather than matched, so the rows
+    exist exactly where the driver reads them: User and Password for a password, the User row alone
+    for a cloud IAM token — the server account it signs in as — and `nothing()` for Windows and
+    Entra, each its own child rather than hidden fields, for the reason `conn_form`'s
     `engine_block` is built per engine — a hidden field stays in the Tab ring, so Tab would land on
-    a password nobody can see. **The other two modes' hint is not a credentials arm but the
+    a password nobody can see. **Every other mode's hint is not a credentials arm but the
     picker's own third child** (`sign_in_hint`), under the dropdown at the stack's 6px as the
     Database field's hint sits under its field. As a credentials arm it sat in the server column's
     20px gap, over three times further from the dropdown, and read as a field of its own rather
     than a note about the choice above it. Both containers are also styled
-    `widgets::collapse_unless` on the mode, not only emptied: an empty `dyn_container` is still a
+    `widgets::collapse_unless` on the mode (the credentials' on `uses_user`), not only emptied: an empty `dyn_container` is still a
     box, and the credentials' would claim the column's 20px below the picker. The picker's stack is
     `width_full` so the hint wraps at the column. Windows names the account from
     `USERDOMAIN`/`USERNAME` (*"Signs in as the Windows account Schemaic runs as (DOMAIN\user). The
     server must know that account as a Windows login."*), and Entra says *"Signs in as whoever is
     signed in to the Azure CLI (run `az login` first). The token is fetched when a connection needs
-    one and never saved."*
+    one and never saved."* The two cloud IAM modes say what the server side needs as well: AWS's
+    that the user needs the `rds_iam` role (PostgreSQL) or the `AWSAuthenticationPlugin` (MySQL),
+    Google's that the user is the IAM user or service account Cloud SQL knows.
     **Under the Host/Port row, a SQL Server named instance says Port goes unused**
     (`connection::named_instance_port_note`, read in `server_fields` from the draft's engine and
     host): SQL Server Browser answers with the port, so a number left in the field is not what is
@@ -31619,10 +31741,10 @@ existing prose was left alone.
   the path sitting in `.cursor/mcp.json` inside the model's own working directory; Codex's read-only
   sandbox; Antigravity's `view_file`. The keyring is out of a file reader's reach, and since the
   same blob rides Claude's config `env` map, that no longer holds the password either. **The
-  sign-in mode crosses as `"auth"`, and an Entra token does not cross at all**: `endpoint_from_value`
+  sign-in mode crosses as `"auth"`, and an Entra or cloud IAM token does not cross at all**: `endpoint_from_value`
   hands the mode to `Db::with_auth`, an absent one being a password as every blob written before
   the field meant (`the_endpoint_handoff_carries_the_sign_in_mode`), and the subprocess asks the
-  Azure CLI for its own token through its own process's cache (`db/entra.rs`). **The connection's
+  CLI for its own token through its own process's cache (`db/entra.rs`, `db/cloud_iam.rs`). **The connection's
   init SQL crosses as `"init_sql"`**, written from `Db::init_sql()` and handed back to
   `Db::with_init_sql`, so the assistant's queries run under the `search_path` or role the user's
   own do; an absent one is none, which is what every blob written before the field meant
@@ -35085,7 +35207,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `mssql_shell`. **Each of the four local-file builders asks the tunnel refusal itself**, through
   `tool_tunnel_check` (`tunnelled_verify_blocker` for a tunnelled connection), so no launch path
   compiles without it — `both_cli_builders_refuse_a_tunnelled_verifying_connection_themselves` reads
-  them beside the three client builders. Two helpers sit after `open_db_cli` in `main.rs`: `reach_for_cli` is its tunnel
+  them beside the three client builders. **`tool_tunnel_check` carries the cloud IAM refusal
+  too** (`AuthMode::external_client_refusal` of `effective_auth`), and `mysql_shell_config` and
+  `psql_shell_config` ask it first, so neither a client nor a backup tool is launched for a
+  connection whose sign-in is a token the app fetched and the tool is never handed
+  (`a_cloud_iam_connection_opens_no_external_client` pins all three). Two helpers sit after `open_db_cli` in `main.rs`: `reach_for_cli` is its tunnel
   step — `tunnelled_verify_blocker` first, then the tunnel's local port or its refusal — as a second
   copy rather than a shared one, `open_db_cli` still carrying its own; and `run_in_panel` reveals the
   terminal and installs the config or a `message_shell` of the refusal, never with an engine badge.
@@ -35402,6 +35528,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   the request is `core::entra`'s constant arguments and the token comes back on the CLI's piped
   stdout. It is never on disk: `db/entra.rs` holds it in process memory, the MCP endpoint carries
   the mode and not the token, and `sqlcmd` is refused an Entra connection rather than handed one.
+  **The two clouds' IAM tokens are held the same way** (`db/cloud_iam.rs`): process memory only,
+  never written, the endpoint carrying the mode, and every external client refused an IAM
+  connection (`AuthMode::external_client_refusal`). They are bare `String`s, as the password is,
+  so the guard is that nothing holding one formats it — `Cached`, the cache's entry, derives no
+  `Debug`, and adding one would print the token. Unlike Entra's request, AWS's argv carries the
+  connection's host and user, which is why they pass `launch::cli_flag_value` first.
   **And it includes a script the user asked for a copy of.** The DDL preview's *Copy* and *Open in
   editor* both put their text somewhere durable — the OS clipboard, which on Windows persists in
   Clipboard History and cloud-syncs, and a query tab whose text the next session save writes into

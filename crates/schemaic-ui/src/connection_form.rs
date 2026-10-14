@@ -1505,7 +1505,8 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
     // How it signs in, where the engine offers more than a password — SQL
-    // Server's Windows and Entra sign-in (`AuthMode::offered`). Read once:
+    // Server's Windows and Entra sign-in, PostgreSQL's and the MySQL family's
+    // cloud IAM (`AuthMode::offered`). Read once:
     // this block is rebuilt when the engine changes, so the list is this
     // engine's. The credentials below follow the mode, built per mode rather
     // than hidden, for `engine_block`'s Tab-ring reason.
@@ -1532,6 +1533,21 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         )
         .style(|s| s.width_full())
         .into_any(),
+        AuthMode::AwsIam => form_hint(
+            "Signs in as the user below with a token from the AWS CLI's credentials \
+             (`aws configure` or `aws sso login` first). The user needs the rds_iam role \
+             (PostgreSQL) or the AWSAuthenticationPlugin (MySQL). The token is fetched when a \
+             connection needs one and never saved.",
+        )
+        .style(|s| s.width_full())
+        .into_any(),
+        AuthMode::GcpIam => form_hint(
+            "Signs in as the user below — the IAM user or service account Cloud SQL knows — \
+             with a token from the Google Cloud CLI (`gcloud auth login` first). The token is \
+             fetched when a connection needs one and never saved.",
+        )
+        .style(|s| s.width_full())
+        .into_any(),
     })
     // Collapsed on a password, or its empty box would add the stack's 6px
     // under the dropdown.
@@ -1552,27 +1568,38 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         crate::widgets::nothing()
     };
     let ring_creds = ring.clone();
-    // Built on `AuthMode::uses_credentials`, asked rather than matched: the
-    // rows exist exactly where the driver reads them.
-    let reads_credentials = {
+    // Built on `AuthMode::uses_user` and `uses_credentials`, asked rather than
+    // matched: the rows exist exactly where the driver reads them — both for a
+    // password, the user alone for a cloud IAM token, neither for Windows or
+    // Entra.
+    let reads = {
         let in_force = in_force.clone();
-        move || in_force().uses_credentials()
+        move || {
+            let m = in_force();
+            (m.uses_user(), m.uses_credentials())
+        }
     };
-    let credentials = dyn_container(reads_credentials.clone(), move |reads| {
-        if !reads {
+    let credentials = dyn_container(reads.clone(), move |(user, password)| {
+        if !user {
             return crate::widgets::nothing();
         }
+        let password_row = if password {
+            masked_field("Password", draft.password, ring_creds.clone(), 80)
+                .style(|s| s.width(conn_field_w()))
+                .into_any()
+        } else {
+            crate::widgets::nothing()
+        };
         v_stack((
             field("User", draft.user, ring_creds.clone(), 70).style(|s| s.width(conn_field_w())),
-            masked_field("Password", draft.password, ring_creds.clone(), 80)
-                .style(|s| s.width(conn_field_w())),
+            password_row,
         ))
         .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
         .into_any()
     })
     // `collapse_unless`, not just the `nothing()` inside: an empty box here
     // would still claim the column's 20px below the picker.
-    .style(move |s| crate::widgets::collapse_unless(s, reads_credentials()));
+    .style(move |s| crate::widgets::collapse_unless(s, reads().0));
 
     // Under Host and Port, a named instance's: Port goes unused, the Browser
     // answering with it. Hidden, not empty, where there is nothing to say —

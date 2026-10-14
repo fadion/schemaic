@@ -71,6 +71,7 @@
 //! that packet but keeps only the alias name + type, so it can't tell which real
 //! table/column a result cell came from.
 
+mod cloud_iam;
 mod entra;
 pub mod mssql;
 pub mod mysql;
@@ -736,6 +737,25 @@ impl Db {
         self.auth
     }
 
+    /// What PostgreSQL and the MySQL family are handed where the password
+    /// goes: the password, or under a cloud IAM sign-in a token from the
+    /// cloud's CLI (`cloud_iam`).
+    ///
+    /// **The transport is asked first**, as SQL Server's Entra path asks it:
+    /// a `Db` resolved from a `Connection` already carries the plan raised to
+    /// the mode's floor, but one assembled from parts — the MCP endpoint
+    /// handoff — is only as good as what it was handed, and a token must not
+    /// be fetched for a plan that would send it in the clear.
+    pub(crate) async fn sign_in_secret(&self) -> Result<String, DbError> {
+        let Some(cloud) = self.auth.cloud() else {
+            return Ok(self.pass.clone());
+        };
+        if let Some(why) = self.auth.transport_refusal(self.tls.as_ref()) {
+            return Err(DbError::Refused(why.to_string()));
+        }
+        cloud_iam::token(cloud, &self.host, self.port, &self.user).await
+    }
+
     /// The database this handle opens in when none is named, or `None`.
     pub fn database(&self) -> Option<&str> {
         (!self.database.is_empty()).then_some(self.database.as_str())
@@ -808,24 +828,38 @@ impl Db {
     /// database (`USE`d on connect so unqualified names resolve) and
     /// `CLIENT_FOUND_ROWS` (so `affected_rows()` counts *matched* rows, not
     /// *changed* ones — the commit path's exactly-one-row guard relies on it).
+    ///
+    /// The tests' door: a connect goes through `dial`, which fetches the
+    /// sign-in secret first ([`Self::sign_in_secret`]) and hands it to
+    /// [`Self::opts_with_tls`] itself.
+    #[cfg(test)]
     fn opts(&self, scope: Scope<'_>, found_rows: bool) -> OptsBuilder {
-        self.opts_with_tls(scope, found_rows, self.tls.as_ref())
+        self.opts_with_tls(scope, found_rows, self.tls.as_ref(), &self.pass)
     }
 
-    /// [`Self::opts`] with the TLS plan named explicitly, so the `prefer`
+    /// The connection options with the TLS plan named explicitly, so the `prefer`
     /// fallback can build the *same* options minus the handshake rather than a
     /// second, subtly different set.
+    ///
+    /// `secret` is what goes where the password does — the password, or a
+    /// cloud IAM token ([`Self::sign_in_secret`]). A token reaches MySQL
+    /// through the `mysql_clear_password` plugin, which RDS and Cloud SQL
+    /// both ask for and the driver leaves off by default: enabled for those
+    /// two modes alone, whose TLS floor (`AuthMode::tls_floor`) keeps the
+    /// clear text inside an encrypted session.
     fn opts_with_tls(
         &self,
         scope: Scope<'_>,
         found_rows: bool,
         tls: Option<&schemaic_core::connection::TlsPlan>,
+        secret: &str,
     ) -> OptsBuilder {
         let mut b = OptsBuilder::default()
             .ip_or_hostname(self.host.clone())
             .tcp_port(self.port)
             .user(Some(self.user.clone()))
-            .pass(Some(self.pass.clone()))
+            .pass(Some(secret.to_string()))
+            .enable_cleartext_plugin(self.auth.cloud().is_some())
             .client_found_rows(found_rows)
             .ssl_opts(tls.map(tls::mysql_ssl_opts));
         // The connection's own database is a *fallback*, never an override: an
@@ -916,7 +950,9 @@ impl Db {
         }
         // Refused before the connect, so none of it runs.
         let init = self.init_statements()?;
-        let first = Conn::new(self.opts(scope, found_rows)).await;
+        let secret = self.sign_in_secret().await?;
+        let first =
+            Conn::new(self.opts_with_tls(scope, found_rows, self.tls.as_ref(), &secret)).await;
         let mut conn = match first {
             Ok(conn) => conn,
             Err(e) => {
@@ -929,7 +965,7 @@ impl Db {
                 }
                 // The plaintext error is the one worth reporting: having chosen
                 // to fall back, the user's problem is whatever plaintext hit.
-                Conn::new(self.opts_with_tls(scope, found_rows, None))
+                Conn::new(self.opts_with_tls(scope, found_rows, None, &secret))
                     .await
                     .map_err(|e| DbError::Connect(e.to_string()))?
             }
@@ -3457,6 +3493,36 @@ mod tests {
         assert!(shown.contains("db.internal"), "{shown}");
         assert!(shown.contains("3306"), "{shown}");
         assert!(shown.contains("app"), "{shown}");
+    }
+
+    // ── Cloud IAM sign-in ─────────────────────────────────────────────────
+
+    /// **A token is never fetched for a session that would send it in the
+    /// clear.** A `Db` assembled from parts — the MCP endpoint handoff — with
+    /// an IAM mode and no TLS plan is refused before any CLI runs; the same
+    /// endpoint signing in with its password is handed the password.
+    #[tokio::test]
+    async fn an_iam_sign_in_without_tls_is_refused_before_any_token_is_asked() {
+        use schemaic_core::connection::AuthMode;
+        let db = || {
+            Db::from_parts(
+                Engine::Postgres,
+                "db.x.eu-west-1.rds.amazonaws.com".into(),
+                5432,
+                "app".into(),
+                "secret".into(),
+                String::new(),
+            )
+        };
+        for mode in [AuthMode::AwsIam, AuthMode::GcpIam] {
+            let err = db()
+                .with_auth(mode)
+                .sign_in_secret()
+                .await
+                .expect_err("no TLS, no token");
+            assert!(matches!(err, DbError::Refused(_)), "{mode:?}: {err}");
+        }
+        assert_eq!(db().sign_in_secret().await.unwrap(), "secret");
     }
 
     // ── The server-level DDL runner ───────────────────────────────────────

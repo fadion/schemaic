@@ -896,6 +896,12 @@ impl TlsPlan {
 ///   when a connection needs one and never saved: the CLI holds the refresh,
 ///   and the token names its user.
 ///
+/// PostgreSQL and the MySQL family have two more, the clouds' IAM sign-in
+/// (`cloud_iam`): [`AuthMode::AwsIam`] asks the AWS CLI for an RDS token,
+/// [`AuthMode::GcpIam`] the Google Cloud CLI for a Cloud SQL one. Both read the
+/// form's user — the account the token signs in as — and send the token where
+/// a password would go ([`AuthMode::uses_user`]).
+///
 /// Deserialized through [`AuthModeRaw`], the persisted-enum shim.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(from = "AuthModeRaw")]
@@ -904,6 +910,8 @@ pub enum AuthMode {
     Password,
     Windows,
     AzureCli,
+    AwsIam,
+    GcpIam,
 }
 
 /// Parsing shim for [`AuthMode`]; see [`crate::persist::RightPanelState`].
@@ -912,6 +920,8 @@ enum AuthModeRaw {
     Password,
     Windows,
     AzureCli,
+    AwsIam,
+    GcpIam,
     #[serde(other)]
     Unknown,
 }
@@ -922,6 +932,8 @@ impl From<AuthModeRaw> for AuthMode {
             AuthModeRaw::Password => AuthMode::Password,
             AuthModeRaw::Windows => AuthMode::Windows,
             AuthModeRaw::AzureCli => AuthMode::AzureCli,
+            AuthModeRaw::AwsIam => AuthMode::AwsIam,
+            AuthModeRaw::GcpIam => AuthMode::GcpIam,
             // A mode a newer build added: the password is what the form still
             // holds, and the server says so plainly if it is not enough.
             AuthModeRaw::Unknown => AuthMode::Password,
@@ -940,6 +952,9 @@ impl AuthMode {
                 modes.push(AuthMode::Windows);
             }
             modes.push(AuthMode::AzureCli);
+        } else if !is_sqlite(db_type) {
+            // PostgreSQL and the MySQL family: what RDS and Cloud SQL run.
+            modes.extend([AuthMode::AwsIam, AuthMode::GcpIam]);
         }
         modes
     }
@@ -967,7 +982,40 @@ impl AuthMode {
     pub fn uses_credentials(self) -> bool {
         match self {
             AuthMode::Password => true,
+            AuthMode::Windows | AuthMode::AzureCli | AuthMode::AwsIam | AuthMode::GcpIam => false,
+        }
+    }
+
+    /// Does this mode read the form's **user**? A password mode does, and so
+    /// do the IAM modes — the token signs in as a server account the user
+    /// names — where Windows and Entra sign in as an identity of their own.
+    pub fn uses_user(self) -> bool {
+        match self {
+            AuthMode::Password | AuthMode::AwsIam | AuthMode::GcpIam => true,
             AuthMode::Windows | AuthMode::AzureCli => false,
+        }
+    }
+
+    /// The cloud whose CLI mints this mode's token, for the two IAM modes.
+    pub fn cloud(self) -> Option<crate::cloud_iam::Cloud> {
+        match self {
+            AuthMode::AwsIam => Some(crate::cloud_iam::Cloud::Aws),
+            AuthMode::GcpIam => Some(crate::cloud_iam::Cloud::Gcloud),
+            AuthMode::Password | AuthMode::Windows | AuthMode::AzureCli => None,
+        }
+    }
+
+    /// Why an **external client** — `psql`, `mysql`, `pg_dump`, `mysqldump` —
+    /// cannot be opened on this sign-in, or `None`. They are handed the
+    /// connection's password in their environment, and an IAM connection has
+    /// none: the token is fetched by the driver, inside the app.
+    pub fn external_client_refusal(self) -> Option<&'static str> {
+        match self {
+            AuthMode::AwsIam | AuthMode::GcpIam => Some(
+                "This connection signs in through a cloud CLI's token, which an external client \
+                 is not handed. Open it in a query tab instead.",
+            ),
+            AuthMode::Password | AuthMode::Windows | AuthMode::AzureCli => None,
         }
     }
 
@@ -987,10 +1035,22 @@ impl AuthMode {
     ///
     /// A floor, applied by [`Connection::tls_mode_in_force`], rather than a
     /// refusal the user has to answer: raising it can only fail loudly.
+    ///
+    /// **The two clouds' floors follow what their tokens open.** An RDS token
+    /// is signed for one host, port and user and lives fifteen minutes, so an
+    /// encrypted session — [`SslMode::Require`] — is its floor; verifying the
+    /// server needs AWS's RDS CA bundle, which no system store holds, so it
+    /// stays the user's call. Google's is an access token for every Cloud SQL
+    /// instance the account reaches, for an hour — Entra's exposure — so the
+    /// server's certificate must be verified; by its CA
+    /// ([`SslMode::VerifyCa`]), since a Cloud SQL certificate names the
+    /// instance rather than the host.
     pub fn tls_floor(self) -> SslMode {
         match self {
             AuthMode::Password | AuthMode::Windows => SslMode::Disable,
             AuthMode::AzureCli => SslMode::VerifyFull,
+            AuthMode::AwsIam => SslMode::Require,
+            AuthMode::GcpIam => SslMode::VerifyCa,
         }
     }
 
@@ -1017,6 +1077,14 @@ impl AuthMode {
                  Azure SQL database the account can reach, so the server must prove its name \
                  before it is handed one."
             }
+            AuthMode::AwsIam => {
+                "AWS IAM sign-in needs SSL / TLS of at least Require: its token is a password \
+                 for this server, and must not cross the network in the clear."
+            }
+            AuthMode::GcpIam => {
+                "Google Cloud IAM sign-in needs SSL / TLS at Verify CA, with the instance's server \
+                 CA as Root CA: its token opens every Cloud SQL instance the account can reach."
+            }
             AuthMode::Password | AuthMode::Windows => {
                 "This sign-in needs a stronger SSL / TLS mode than the connection's."
             }
@@ -1034,6 +1102,15 @@ impl AuthMode {
                     "Microsoft Entra sign-in connects at Verify full whatever is picked here: its \
                  token opens every Azure SQL database the account can reach."
                 }
+                AuthMode::AwsIam => {
+                    "AWS IAM sign-in connects at Require at least: its token must not cross the \
+                     network in the clear. Verify full needs the RDS CA bundle as Root CA."
+                }
+                AuthMode::GcpIam => {
+                    "Google Cloud IAM sign-in connects at Verify CA at least — set Root CA to the \
+                     instance's server CA: its token opens every Cloud SQL instance the account \
+                     can reach."
+                }
                 AuthMode::Password | AuthMode::Windows => {
                     "This sign-in connects at a stronger mode than the one picked here."
                 }
@@ -1046,6 +1123,8 @@ impl AuthMode {
             AuthMode::Password => "User and password",
             AuthMode::Windows => "Windows (this account)",
             AuthMode::AzureCli => "Microsoft Entra (Azure CLI)",
+            AuthMode::AwsIam => "AWS IAM (AWS CLI)",
+            AuthMode::GcpIam => "Google Cloud IAM (gcloud)",
         }
     }
 }
@@ -2891,16 +2970,78 @@ mod tests {
         assert_eq!(back.auth, AuthMode::AzureCli);
     }
 
-    /// **Only SQL Server offers another way in**, and Windows sign-in only on
-    /// Windows, where the process has a Windows identity to present.
+    /// **SQL Server offers Windows and Entra sign-in**, and Windows sign-in only
+    /// on Windows, where the process has a Windows identity to present.
     #[test]
     fn sql_server_offers_windows_and_azure_sign_in() {
         let mssql = AuthMode::offered("SQL Server");
         assert_eq!(mssql[0], AuthMode::Password, "the default first");
         assert!(mssql.contains(&AuthMode::AzureCli));
         assert_eq!(mssql.contains(&AuthMode::Windows), cfg!(windows));
-        for other in ["MySQL", "MariaDB", "PostgreSQL", "SQLite"] {
-            assert_eq!(AuthMode::offered(other), [AuthMode::Password], "{other}");
+        assert!(!mssql.contains(&AuthMode::AwsIam) && !mssql.contains(&AuthMode::GcpIam));
+    }
+
+    /// **PostgreSQL and the MySQL family offer the two clouds' IAM sign-in** —
+    /// RDS and Cloud SQL both run them — and SQLite, a file, nothing but its
+    /// default.
+    #[test]
+    fn postgres_and_mysql_offer_cloud_iam_sign_in() {
+        for engine in ["MySQL", "MariaDB", "PostgreSQL"] {
+            assert_eq!(
+                AuthMode::offered(engine),
+                [AuthMode::Password, AuthMode::AwsIam, AuthMode::GcpIam],
+                "{engine}"
+            );
+        }
+        assert_eq!(AuthMode::offered("SQLite"), [AuthMode::Password]);
+    }
+
+    /// An IAM mode reads the form's **user** — the server's account the token
+    /// signs in as — and never its password, which the token replaces.
+    #[test]
+    fn a_cloud_iam_mode_reads_the_user_and_not_the_password() {
+        for m in [AuthMode::AwsIam, AuthMode::GcpIam] {
+            assert!(m.uses_user(), "{m:?}");
+            assert!(!m.uses_credentials(), "{m:?}");
+            assert!(m.cloud().is_some());
+            assert!(m.external_client_refusal().is_some());
+        }
+        assert!(AuthMode::Password.uses_user());
+        assert!(!AuthMode::AzureCli.uses_user() && !AuthMode::Windows.uses_user());
+        for m in [AuthMode::Password, AuthMode::Windows, AuthMode::AzureCli] {
+            assert_eq!(m.cloud(), None);
+            assert_eq!(m.external_client_refusal(), None);
+        }
+    }
+
+    /// **The floors follow what a token opens.** An RDS token is signed for
+    /// one host, port and user and lives fifteen minutes: an encrypted session
+    /// is its floor. Google's is an access token for every Cloud SQL instance
+    /// the account reaches, for an hour: the server's certificate must be
+    /// verified — by its CA, since a Cloud SQL certificate names the instance
+    /// rather than the host.
+    #[test]
+    fn the_cloud_floors_follow_what_their_tokens_open() {
+        assert_eq!(AuthMode::AwsIam.tls_floor(), SslMode::Require);
+        assert_eq!(AuthMode::GcpIam.tls_floor(), SslMode::VerifyCa);
+        assert!(AuthMode::AwsIam.tls_note(SslMode::Prefer).is_some());
+        assert_eq!(AuthMode::AwsIam.tls_note(SslMode::Require), None);
+        assert!(AuthMode::GcpIam.tls_note(SslMode::Require).is_some());
+        assert_eq!(AuthMode::GcpIam.tls_note(SslMode::VerifyFull), None);
+    }
+
+    #[test]
+    fn a_cloud_iam_mode_round_trips_through_json() {
+        for m in [AuthMode::AwsIam, AuthMode::GcpIam] {
+            let c = Connection {
+                db_type: "PostgreSQL".into(),
+                auth: m,
+                ..conn()
+            };
+            let back: Connection =
+                serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+            assert_eq!(back.auth, m);
+            assert_eq!(back.effective_auth(), m);
         }
     }
 

@@ -607,6 +607,10 @@ fn mysql_shell_config(
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
 ) -> Result<schemaic_term::ShellConfig, &'static str> {
+    // An IAM connection has no password to hand the client.
+    if let Some(why) = conn.effective_auth().external_client_refusal() {
+        return Err(why);
+    }
     if matches!(launcher, CliLauncher::Wsl(_))
         && let Some(why) = launch::wsl_tls_blocker(&conn.tls)
     {
@@ -698,6 +702,10 @@ fn psql_shell_config(
     db: &str,
 ) -> Result<schemaic_term::ShellConfig, &'static str> {
     let db = launch::psql_target(db)?;
+    // An IAM connection has no password to hand the client.
+    if let Some(why) = conn.effective_auth().external_client_refusal() {
+        return Err(why);
+    }
     if matches!(launcher, CliLauncher::Wsl(_))
         && let Some(why) = launch::wsl_tls_blocker(&conn.tls)
     {
@@ -729,8 +737,13 @@ fn psql_shell_config(
 /// (`launch::tunnelled_verify_blocker`): asked **inside** each builder, as
 /// `mysql_shell_config` asks it, so no launch path compiles without it —
 /// `reach_for_cli` asking it first is only so the refusal comes before the
-/// tunnel's own.
+/// tunnel's own. It also carries the IAM refusal the shell builders ask
+/// (`AuthMode::external_client_refusal`): the tools are handed the password,
+/// and an IAM connection has none.
 fn tool_tunnel_check(conn: &Connection) -> Result<(), String> {
+    if let Some(why) = conn.effective_auth().external_client_refusal() {
+        return Err(why.to_string());
+    }
     match conn
         .uses_tunnel()
         .then(|| launch::tunnelled_verify_blocker(&conn.tls))
@@ -17881,6 +17894,22 @@ mod app_tests {
             ..c
         };
         assert!(mysql_shell_config(CliLauncher::Wsl("mysql"), &c, None).is_ok());
+    }
+
+    /// **No external client is opened on a cloud IAM connection** — the
+    /// shells and, through `tool_tunnel_check`, every backup and restore
+    /// tool. Each is handed the connection's password, and an IAM
+    /// connection's sign-in is a token only the driver fetches.
+    #[test]
+    fn a_cloud_iam_connection_opens_no_external_client() {
+        use schemaic_core::connection::AuthMode;
+        for auth in [AuthMode::AwsIam, AuthMode::GcpIam] {
+            let c = Connection { auth, ..conn() };
+            assert!(mysql_shell_config(CliLauncher::Native("mysql"), &c, None).is_err());
+            assert!(psql_shell_config(CliLauncher::Native("psql"), &c, "x").is_err());
+            assert!(crate::tool_tunnel_check(&c).is_err(), "{auth:?}");
+        }
+        assert!(crate::tool_tunnel_check(&conn()).is_ok());
     }
 
     #[test]

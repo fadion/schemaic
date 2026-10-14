@@ -95,11 +95,13 @@ pub(crate) async fn connect_to(db: &Db, database: &str) -> Result<Client, DbErro
 async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool)> {
     // Refused before the connect, so none of it runs.
     let init = db.init_statements().map_err(|e| (e, false))?;
+    // The password, or a cloud IAM token in its place (`Db::sign_in_secret`).
+    let secret = db.sign_in_secret().await.map_err(|e| (e, false))?;
     let mut cfg = Config::new();
     cfg.host(&db.host)
         .port(db.port)
         .user(&db.user)
-        .password(&db.pass)
+        .password(&secret)
         .dbname(database)
         // **The one session setting this module's SQL depends on, pinned rather
         // than assumed.** `pg_str_lit` doubles quotes and nothing else, and

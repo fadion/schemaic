@@ -15,6 +15,7 @@ pub mod celledit;
 pub mod chart;
 pub mod chat;
 pub mod cli_install;
+pub mod cloud_iam;
 pub mod compare;
 pub mod conn_import;
 pub mod connection;

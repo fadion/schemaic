@@ -183,6 +183,11 @@ async fn auth_method(db: &Db) -> Result<tiberius::AuthMethod, DbError> {
         AuthMode::AzureCli => Ok(tiberius::AuthMethod::aad_token(
             crate::entra::sql_token().await?,
         )),
+        // PostgreSQL's and the MySQL family's, never in force here
+        // (`AuthMode::offered`) — refused should a hand-made `Db` carry one.
+        AuthMode::AwsIam | AuthMode::GcpIam => Err(DbError::Refused(
+            "Cloud IAM sign-in is for PostgreSQL and MySQL connections.".to_string(),
+        )),
     }
 }
 

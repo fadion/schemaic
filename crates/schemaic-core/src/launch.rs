@@ -252,6 +252,32 @@ pub fn sqlite_target(file: &str) -> Result<&str, &'static str> {
     Ok(file)
 }
 
+/// A connection's own setting — a host, a user, a region — as the **value** of
+/// a cloud CLI's flag (`cloud_iam`'s `aws rds generate-db-auth-token
+/// --hostname <host>`).
+///
+/// The CLIs parse their argv as options wherever a word begins with `-`, so a
+/// user named `--profile=prod` would sign in as somebody else's profile rather
+/// than fail; and a control character has no business in any of the three.
+/// Empty is refused too: a flag with no value takes the next flag as one.
+pub fn cli_flag_value<'a>(what: &str, value: &'a str) -> Result<&'a str, String> {
+    if value.is_empty() {
+        return Err(format!("The connection has no {what} to sign in with."));
+    }
+    if value.starts_with('-') {
+        return Err(format!(
+            "The connection's {what} begins with '-', which the cloud CLI would read as an \
+             option rather than as the {what}."
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "The connection's {what} holds a control character."
+        ));
+    }
+    Ok(value)
+}
+
 /// Which of the two MySQL-family clients an argv is being built for.
 ///
 /// **They do not share the option.** `--ssl-mode` is MySQL's; MariaDB's client
@@ -499,6 +525,11 @@ pub fn sqlcmd_args(
         AuthMode::Password => format!("-U{user}"),
         AuthMode::Windows => "-E".to_string(),
         AuthMode::AzureCli => return Err(ENTRA),
+        // Never in force on SQL Server (`AuthMode::offered`), and refused the
+        // same way should a hand-made one arrive.
+        AuthMode::AwsIam | AuthMode::GcpIam => {
+            return Err(auth.external_client_refusal().unwrap_or(ENTRA));
+        }
     };
     let mut args = vec![address, sign_in];
     if let Some(db) = database.filter(|d| !d.is_empty()) {
