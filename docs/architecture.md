@@ -27836,6 +27836,19 @@ existing prose was left alone.
     statement's scope — is non-empty, the popup opens on those rows (anchored at the caret,
     selection 0, `give_way(true)`) instead of closing. Any other literal or comment still closes
     it. `SchemaIndex::build` fills `enum_types` from the in-scope databases' `DbSchema::enums`.
+    **Nor does one open on a number**: `numeric_literal_at` closes the popup where the word before
+    the caret begins with an ASCII digit, straight after the literal gate above, and on Ctrl+Space
+    too. **After that gate, not ahead of it**: inside a string a digit is no number, and the enum
+    members it lets through may begin with one — placed first, it closed the list on `size = '7`
+    against `ENUM('7x','10x')`
+    (`an_enum_member_that_begins_with_a_digit_is_still_offered`). `word_start` walks word
+    bytes, which include digits, so `WHERE id = 7` handed the fuzzy matcher the prefix `7`, a
+    subsequence of the builtin `UUID_V7`; the list opened, and Enter, meant to end the line,
+    replaced the number with `UUID_V7()` (`typing_a_number_offers_nothing`).
+    `sql::is_word_start` excludes digits for the same reason. The exception is load-bearing: a
+    word after `` ` ``, `"`, `[` or `.` is a name that happens to start with a digit — MySQL's
+    `` `7days` ``, `t.1col` — and still completes
+    (`a_quoted_or_qualified_name_may_begin_with_a_digit`).
     **`Completion::word_complete` carries `rank::Ranked::completes_a_word` to the key handler**
     (under `editor_pane.rs`). `set_items` resets it to `false` — every path that fills the list goes
     through there, so the FK join row or an emptied list never inherits the last ranked list's

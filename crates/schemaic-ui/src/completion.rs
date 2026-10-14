@@ -244,6 +244,15 @@ fn word_start(text: &str, offset: usize, dialect: SqlDialect) -> usize {
     start
 }
 
+/// Is `prefix`, the word starting at `word_lo`, a numeric literal rather than a
+/// name — does it begin with a digit, with no quote or `.` in front to make it
+/// a name that happens to (`` `7days` ``, `t.1col`)?
+fn numeric_literal_at(text: &str, word_lo: usize, prefix: &str) -> bool {
+    let starts_with_digit = prefix.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let before = word_lo.checked_sub(1).and_then(|i| text.as_bytes().get(i));
+    starts_with_digit && !matches!(before, Some(b'`' | b'"' | b'[' | b'.'))
+}
+
 /// Byte offset where the identifier the caret is in ends — [`word_start`]'s
 /// mirror. An accept replaces the word from its start to here, not to the
 /// caret: accepting `customer_id` at `cust|_id` wrote `customer_id_id`.
@@ -1324,6 +1333,19 @@ fn recompute_completions_in(
                 return;
             }
         }
+        comp.open.set(false);
+        set_items(comp, Vec::new());
+        return;
+    }
+    // **A number is a value, not the start of a name** (`sql::is_word_start`
+    // excludes digits for the same reason). `word_start` walks word bytes, which
+    // include digits, so `id = 7` handed the matcher the prefix `7`, a
+    // subsequence of `UUID_V7` — and Enter, meant to end the line, replaced the
+    // number. Unless it follows a quote or a `.`, where a name may begin with a
+    // digit (`` `7days` ``, `t.1col`). **Below the literal gate, not above it**:
+    // inside a string a digit is no number, and the enum members that gate lets
+    // through may begin with one (`'7x'`).
+    if numeric_literal_at(text, word_lo, &prefix) {
         comp.open.set(false);
         set_items(comp, Vec::new());
         return;
@@ -3555,5 +3577,155 @@ mod index_tests {
         let nodes = [node("Shop", vec![]), node("shop", vec![])];
         let ix = index::build(&nodes, &HashSet::new(), None);
         assert_eq!(ix.databases, vec!["Shop".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod numeric_literal_tests {
+    use super::{Completion, CompletionCtx, recompute_completions};
+    use floem::kurbo::Point;
+    use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate};
+    use floem::views::editor::Editor;
+    use floem::views::editor::text::SimpleStyling;
+    use floem::views::editor::text_document::TextDocument;
+    use schemaic_core::intel::SqlDialect;
+    use std::collections::HashSet;
+    use std::rc::Rc;
+
+    /// The suggestions `recompute_completions` offers with the caret at the end
+    /// of `text`, as if its last character had just been typed — the call the
+    /// editor makes per keystroke, over a headless editor and an empty catalog
+    /// (builtins are offered without one).
+    fn offered(text: &str) -> Vec<String> {
+        offered_with(text, Vec::new())
+    }
+
+    /// [`offered`] over database `shop` holding `tables`.
+    fn offered_with(text: &str, tables: Vec<schemaic_core::schema::TableInfo>) -> Vec<String> {
+        let cx = Scope::new();
+        let nodes = if tables.is_empty() {
+            Vec::new()
+        } else {
+            let n = crate::ConnNode::new(cx, 1, "conn", "shop");
+            n.schema.set(schemaic_core::schema::SchemaState::Loaded(
+                std::sync::Arc::new(schemaic_core::schema::DbSchema {
+                    tables,
+                    ..Default::default()
+                }),
+            ));
+            vec![n]
+        };
+        let active_db = (!nodes.is_empty()).then_some("shop");
+        let doc = Rc::new(TextDocument::new(cx, text));
+        let ed = Editor::new(cx, doc, Rc::new(SimpleStyling::new()), false);
+        ed.cursor.update(|c| c.set_offset(text.len(), false, false));
+        let comp = Completion {
+            items: RwSignal::new(Vec::new()),
+            width: RwSignal::new(0.0),
+            sel: RwSignal::new(0),
+            open: RwSignal::new(false),
+            point: RwSignal::new(Point::ZERO),
+            line_top: RwSignal::new(0.0),
+            suppress: RwSignal::new(false),
+            typed: RwSignal::new(true),
+            sig: RwSignal::new(None),
+            sig_point: RwSignal::new(Point::ZERO),
+            ghost: RwSignal::new(None),
+            word_complete: RwSignal::new(false),
+            wide: RwSignal::new(false),
+            accepted: crate::stored::Stored::new(
+                RwSignal::new(Default::default()),
+                Rc::new(|_| {}),
+            ),
+            conn: RwSignal::new(1),
+            stmts: RwSignal::new(None),
+            temps: RwSignal::new(Default::default()),
+            query: RwSignal::new(text.to_string()),
+            edits: RwSignal::new(Default::default()),
+            stops: RwSignal::new(None),
+        };
+        let ctx = CompletionCtx {
+            db_nodes: RwSignal::new(nodes),
+            hidden_dbs: cx.create_memo(|_| HashSet::new()),
+            active_db,
+            dialect: SqlDialect::MySql,
+            snippets: cx.create_memo(|_| Vec::new()),
+            conn_id: 1,
+            predictions: false,
+            remembered: false,
+            history: RwSignal::new(Vec::new()),
+            tabs: RwSignal::new(Vec::new()),
+        };
+        recompute_completions(&ed, ctx, comp, false);
+        let got = if comp.open.get() {
+            comp.items.get().into_iter().map(|s| s.text).collect()
+        } else {
+            Vec::new()
+        };
+        cx.dispose();
+        got
+    }
+
+    /// **A number is a value, not the start of a name.** `id = 7` opened the
+    /// list on `UUID_V7` — the prefix `7` is a subsequence of it — and Enter,
+    /// meant to end the line, replaced the number with `UUID_V7()`. A word that
+    /// begins with a digit is a numeric literal in every dialect here, so
+    /// typing one offers nothing, whatever its tail (`1e5`, `0x1F`).
+    #[test]
+    fn typing_a_number_offers_nothing() {
+        assert!(
+            offered("SELECT * FROM t WHERE id = uuid_v")
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case("UUID_V7")),
+            "the control: a name prefix still reaches the builtin"
+        );
+        for sql in [
+            "SELECT * FROM t WHERE id = 7",
+            "SELECT * FROM t WHERE id = 17",
+            "SELECT * FROM t LIMIT 1",
+            "SELECT 1e5",
+            "SELECT 0x1F",
+        ] {
+            assert_eq!(offered(sql), Vec::<String>::new(), "{sql}");
+        }
+    }
+
+    /// **A digit inside a string is not a number.** The literal gate lets one
+    /// value through — an enum's members, for a string compared with an enum
+    /// column — and a member may begin with a digit. Typing `size = '7` must
+    /// still offer `7x`; the number gate, placed ahead of the literal gate,
+    /// closed the list first.
+    #[test]
+    fn an_enum_member_that_begins_with_a_digit_is_still_offered() {
+        let t = schemaic_core::schema::TableInfo {
+            name: "shirts".into(),
+            columns: vec![schemaic_core::schema::ColumnInfo {
+                name: "size".into(),
+                type_name: "enum('7x','10x')".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let got = offered_with("SELECT * FROM shirts WHERE size = '7", vec![t]);
+        assert!(got.iter().any(|s| s.contains("7x")), "{got:?}");
+    }
+
+    /// A name may begin with a digit where something marks it as one: inside
+    /// a quoted identifier, or after a `.` (MySQL's `t.1col`). Those stay names.
+    #[test]
+    fn a_quoted_or_qualified_name_may_begin_with_a_digit() {
+        use super::numeric_literal_at;
+        let at = |text: &str, word: &str| {
+            let lo = text.rfind(word).unwrap();
+            numeric_literal_at(text, lo, word)
+        };
+        assert!(at("WHERE id = 7", "7"));
+        assert!(at("LIMIT 10", "10"));
+        assert!(!at("SELECT `7days", "7days"));
+        assert!(!at("SELECT \"7days", "7days"));
+        assert!(!at("SELECT [7days", "7days"));
+        assert!(!at("SELECT t.1col", "1col"));
+        assert!(!at("SELECT uuid_v7", "uuid_v7"));
+        assert!(!at("SELECT ", ""));
     }
 }
