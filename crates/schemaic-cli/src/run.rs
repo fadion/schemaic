@@ -312,6 +312,21 @@ async fn dispatch(command: Command) -> Exit {
             )
             .await
         }
+        Command::Explain {
+            sql,
+            target,
+            output: _,
+            timeout,
+        } => {
+            run_explain(
+                &file.connections,
+                &target,
+                &sql,
+                out,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
         Command::Exec {
             sql,
             target,
@@ -369,8 +384,173 @@ async fn dispatch(command: Command) -> Exit {
             )
             .await
         }
+        Command::Compare {
+            connection,
+            database,
+            source_connection,
+            source_database,
+            tables,
+            timeout,
+        } => {
+            let sides = CompareSides {
+                connection: &connection,
+                database: database.as_deref(),
+                source_connection: source_connection.as_deref().unwrap_or(&connection),
+                source_database: source_database.as_deref(),
+            };
+            run_compare(
+                &file.connections,
+                sides,
+                &tables,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
         Command::Mcp { target } => serve_mcp(&file.connections, &target).await,
     }
+}
+
+/// The two databases `compare` was named, as typed.
+struct CompareSides<'a> {
+    connection: &'a str,
+    database: Option<&'a str>,
+    source_connection: &'a str,
+    source_database: Option<&'a str>,
+}
+
+/// One side of a `compare`: `database`'s whole schema, bounded by `timeout`,
+/// or the line that says why not.
+async fn read_schema(
+    db: &Db,
+    database: &str,
+    timeout: Duration,
+) -> Result<schemaic_core::schema::DbSchema, String> {
+    let token = tokio_util::sync::CancellationToken::new();
+    match crate::deadline::with_deadline(db.fetch_schema(database, token.clone()), token, timeout)
+        .await
+    {
+        Some(Ok(s)) => Ok(s),
+        Some(Err(e)) => Err(format!("reading {database}: {e}")),
+        None => Err(format!(
+            "reading {database} exceeded {}s and was stopped",
+            timeout.as_secs().max(1)
+        )),
+    }
+}
+
+/// How `compare` names one side on stderr: the database, and the connection
+/// too when the two sides are on different ones.
+fn side_label(conn: &Connection, database: &str, two_connections: bool) -> String {
+    if two_connections {
+        format!("{database} on {}", conn.name)
+    } else {
+        database.to_string()
+    }
+}
+
+/// `schemaic compare`: the app's Compare with, headless — both schemas read
+/// fresh (`Db::fetch_schema`, concurrently), `core::compare` over them, and
+/// the plan's script printed. **Nothing is run**, so there is no guard to
+/// pass: what reaches the servers is catalogue reads, as `dump`'s are.
+///
+/// Refused before anything is dialled: a connection without CLI access (on
+/// either side), a side with no database, a database compared with itself,
+/// and two engines `compare::comparable` will not pair.
+async fn run_compare(
+    conns: &[Connection],
+    sides: CompareSides<'_>,
+    tables: &[String],
+    timeout: Duration,
+) -> Exit {
+    // No `--password-stdin` here: with two connections it would be unclear
+    // whose password it was, so both come from the keyring.
+    let conn_args = |c: &str| ConnArgs {
+        connection: c.to_string(),
+        password_stdin: false,
+    };
+    let (target_args, source_args) = (
+        conn_args(sides.connection),
+        conn_args(sides.source_connection),
+    );
+    let target = match select_conn(conns, &target_args) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let source = match select_conn(conns, &source_args) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let (Some(target_db), Some(source_db)) = (
+        default_database(sides.database, target),
+        default_database(sides.source_database, source),
+    ) else {
+        warn(
+            "a comparison needs a database on each side: name them with -d and \
+             --source-database",
+        );
+        return Exit::Usage;
+    };
+    let two_connections = target.id != source.id;
+    if !two_connections && target_db == source_db {
+        warn(&format!(
+            "both sides are {target_db} on {}: name the database to match with \
+             --source-database, or another connection with --source-connection",
+            target.name
+        ));
+        return Exit::Usage;
+    }
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&target.db_type);
+    let source_dialect = schemaic_core::intel::SqlDialect::from_db_type(&source.db_type);
+    if let Err(e) = schemaic_core::compare::comparable(dialect, source_dialect) {
+        warn(&e);
+        return Exit::Usage;
+    }
+    let (target_db_handle, _target_tunnel) = match connect(target, &target_args, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let (source_db_handle, _source_tunnel) = match connect(source, &source_args, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let (left, right) = tokio::join!(
+        read_schema(&target_db_handle, &target_db, timeout),
+        read_schema(&source_db_handle, &source_db, timeout)
+    );
+    let (left, right) = match (left, right) {
+        (Ok(l), Ok(r)) => (l, r),
+        (Err(e), _) | (_, Err(e)) => {
+            warn(&e);
+            return Exit::Failed;
+        }
+    };
+    let cmp = schemaic_core::compare::SchemaComparison::of(&left, &right, dialect);
+    let report = match crate::compare::report(
+        &cmp,
+        tables,
+        &side_label(target, &target_db, two_connections),
+        &side_label(source, &source_db, two_connections),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn(&e);
+            return Exit::Usage;
+        }
+    };
+    if let Some(script) = &report.script {
+        let script = if script.ends_with('\n') {
+            script.clone()
+        } else {
+            format!("{script}\n")
+        };
+        if let Err(exit) = emit_stdout(&script) {
+            return exit;
+        }
+    }
+    for note in &report.notes {
+        warn(note);
+    }
+    Exit::Ok
 }
 
 /// `schemaic dump`: the app's SQL dump (`crate::dump::run`, the one driver
@@ -1130,6 +1310,105 @@ async fn run_query(
     }
 }
 
+/// `schemaic explain`: [`query::read_only_explain`]'s plan — the MCP server's
+/// `explain`, plain `EXPLAIN` on a read-only session behind `query`'s gate —
+/// in [`run_query`]'s order: select, gate, then connect.
+async fn run_explain(
+    conns: &[Connection],
+    target: &Target,
+    sql: &SqlArgs,
+    out: Output,
+    timeout: Duration,
+) -> Exit {
+    let conn = match select_conn(conns, &target.conn) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let sql = match statement(sql, target, conn) {
+        Ok(s) => s,
+        Err(exit) => return exit,
+    };
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    if let Err(e) = query::gate(&sql, dialect) {
+        warn(&e.message());
+        return exit_for_no_rows(&e);
+    }
+    let (db, _tunnel) = match connect(conn, &target.conn, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let database = database_for(target, conn);
+    match query::read_only_explain(&db, database.as_deref(), &sql, timeout).await {
+        Ok(plan) => {
+            if !plan.rows.is_empty()
+                && let Err(exit) = emit_rows(&plan_rows(&plan), out)
+            {
+                return exit;
+            }
+            for note in plan_notes(&plan) {
+                warn(&note);
+            }
+            Exit::Ok
+        }
+        Err(e) => {
+            warn(&e.message());
+            if let Some(how) = no_database_failure(database.as_deref(), &e, dialect) {
+                hint(&no_database_hint(&target.conn.connection, how));
+            }
+            exit_for_no_rows(&e)
+        }
+    }
+}
+
+/// A plan as rows, so `--format` renders it as it renders a query: the
+/// server's own columns, each cell as the server wrote it.
+///
+/// **Never marked truncated**, though the plan may be: the renderers' "capped"
+/// wording points at `--limit`, which `explain` has none of. [`plan_notes`]
+/// says it instead.
+///
+/// **A cell that reads exactly `NULL` is a null.** The plan holds display
+/// text, which is how MySQL's empty `key` and `ref` arrive, and JSON printed
+/// them as the string `"NULL"`; no engine's plan writes that word as a whole
+/// cell for anything else.
+fn plan_rows(plan: &schemaic_core::plan::QueryPlan) -> ResultSet {
+    let columns = plan.columns.iter().map(|c| text_column(c)).collect();
+    let rows = plan
+        .rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|c| match c.as_str() {
+                    "NULL" => Value::Null,
+                    _ => Value::Str(c.clone()),
+                })
+                .collect()
+        })
+        .collect();
+    ResultSet::from_rows(columns, rows)
+}
+
+/// What `explain` says on stderr: each finding of `core::plan`'s heuristics,
+/// that the plan was cut where the server read cut it, or that there was no
+/// plan at all.
+fn plan_notes(plan: &schemaic_core::plan::QueryPlan) -> Vec<String> {
+    if plan.rows.is_empty() {
+        return vec!["the server returned no plan".to_string()];
+    }
+    let mut notes: Vec<String> = plan
+        .warnings
+        .iter()
+        .map(|w| format!("possible issue: {}", w.message))
+        .collect();
+    if plan.truncated {
+        notes.push(format!(
+            "warning: the plan was cut at its first {} rows; the issues above cover only those",
+            plan.rows.len()
+        ));
+    }
+    notes
+}
+
 /// Run one of [`catalog`]'s canned reads for `target`, as `what`: the rows, or
 /// the exit that has already been explained on stderr.
 ///
@@ -1540,6 +1819,67 @@ mod tests {
         assert_eq!(Exit::Failed as u8, 4);
         assert_eq!(Exit::Unknown as u8, 5);
         assert_eq!(Exit::Capped as u8, 6);
+    }
+
+    fn plan(rows: usize, truncated: bool) -> schemaic_core::plan::QueryPlan {
+        use schemaic_core::plan::{PlanWarning, PlanWarningKind, QueryPlan};
+        QueryPlan {
+            columns: vec!["id".into(), "detail".into(), "key".into()],
+            rows: (0..rows)
+                .map(|i| vec![i.to_string(), format!("SCAN t{i}"), "NULL".into()])
+                .collect(),
+            warnings: vec![PlanWarning {
+                row: 0,
+                kind: PlanWarningKind::FullScan,
+                message: "Full table scan on t0".into(),
+            }],
+            truncated,
+        }
+    }
+
+    /// **A plan prints as rows**, so `--format` means what it means for a
+    /// query: the server's own columns, every cell as the server wrote it.
+    #[test]
+    fn a_plan_prints_as_rows_in_any_format() {
+        let rs = plan_rows(&plan(2, false));
+        let out = format::render_rows(&rs, Format::Jsonl);
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["id"], "1");
+        assert_eq!(rows[1]["detail"], "SCAN t1");
+        assert!(rows[1]["key"].is_null(), "MySQL's empty key: {}", rows[1]);
+        assert!(!rs.truncated);
+    }
+
+    /// **The heuristics' findings are not rows** — stdout is data — so they
+    /// go to stderr, one line each, and a cut plan says it was cut, with no
+    /// `--limit` to point at: the cap is the server read's own.
+    #[test]
+    fn a_plans_findings_and_its_cut_go_to_stderr() {
+        let notes = plan_notes(&plan(2, false));
+        assert_eq!(notes, ["possible issue: Full table scan on t0"]);
+        let notes = plan_notes(&plan(3, true));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[1].contains("first 3 rows"), "{notes:?}");
+        assert!(!notes[1].contains("--limit"), "{notes:?}");
+        let quiet = schemaic_core::plan::QueryPlan {
+            warnings: Vec::new(),
+            ..plan(1, false)
+        };
+        assert!(plan_notes(&quiet).is_empty());
+    }
+
+    /// No plan at all is said, not printed as an empty table.
+    #[test]
+    fn an_empty_plan_is_said() {
+        let notes = plan_notes(&schemaic_core::plan::QueryPlan {
+            warnings: Vec::new(),
+            ..plan(0, false)
+        });
+        assert_eq!(notes, ["the server returned no plan"]);
     }
 
     fn two_rows(truncated: bool) -> ResultSet {

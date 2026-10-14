@@ -8264,7 +8264,7 @@ existing prose was left alone.
     names neither the option nor why, and `INLINE = ON` beside `EXECUTE AS`, which a scalar function
     cannot be inlined with (Msg 16203, measured on SQL Server 2022)
     (`a_sql_server_routine_option_its_shape_refuses_is_refused`).
-  - `compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
+  - `core/compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
     one migration. The pure half of schema compare (the UI half is `ui/compare_view.rs`): no DB, no
     view code, nothing here runs anything (98 unit tests).
     **The differ is the comparator.** An object is `ObjectStatus::Differing` precisely when
@@ -8365,7 +8365,8 @@ existing prose was left alone.
     disagree with it (only `flavour`). That single parameter is the honest encoding of a real limit
     rather than a missing feature — type names, defaults and index shapes do not map between
     engines, so a MySQL-to-PostgreSQL plan would be confidently wrong exactly where it mattered —
-    and the caller pairing two connections refuses the mismatch before it reaches here, through
+    and both callers pairing two connections — the app's compare overlay and `schemaic compare`
+    (`cli/run.rs`'s `run_compare`) — refuse the mismatch before it reaches here, through
     `comparable`. That refusal is **by dialect and not by engine**: MySQL and MariaDB speak one
     dialect and compare perfectly well, the difference between them riding on the schema's
     `ServerFlavour`, while the three dialects do not map onto one another at all. It is asked before
@@ -8406,7 +8407,8 @@ existing prose was left alone.
     `SchemaPlan`'s own `dialect` field rather than the first set's, so an empty plan still answers as
     the engine it was built for.
     `export_script` is `ChangeSet::export_script`'s counterpart and is what a preview's `script`
-    field must be given: it returns `editor_script` unless some set holds a `ddl::is_account_change`,
+    field must be given — and what `schemaic compare` prints, the one way a plan leaves without the
+    preview, as text and never run (`cli/compare.rs`): it returns `editor_script` unless some set holds a `ddl::is_account_change`,
     in which case each set writes its own redaction notice beside its own statements under the one
     withheld header. For a comparison the two are byte-identical, no builder it calls producing an
     account change — which is exactly why it exists as a function rather than as a sentence saying
@@ -8629,6 +8631,9 @@ existing prose was left alone.
     these objects have no tick to clear. `ddl_preview::omitted_block` therefore **discloses and does
     not refuse** (`a_mysql_body_is_kept_out_of_the_plan_and_disclosed_by_it`,
     `a_blocked_body_cannot_be_planned_however_the_predicate_answers`).
+    **`CompareEntry::omission_note` is `pub` for `schemaic compare --table`**, which discloses only
+    the named objects' omissions and so cannot take the plan's whole list: `omitted` is built over
+    every difference in the comparison, whatever `include` answered (`cli/compare.rs`).
     **`SchemaComparison::new_namespaces` is the prerequisite a migration had no way to state.** A
     namespace is not an object this comparison pairs — there is nothing in it to diff — so a
     right-only PostgreSQL namespace meant `CREATE TABLE reporting.sales`
@@ -33356,7 +33361,7 @@ existing prose was left alone.
     beside it. So the ordering between them is free, and this way the protocol stream stays clean
     whichever of the six opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`export`/`dump`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
+    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`explain`/`export`/`dump`/`compare`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
     logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
     to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
     read no session state and is not safe in the middle of a command whose output someone is piping.
@@ -33455,7 +33460,7 @@ existing prose was left alone.
     byte-identical to the backup and logged the removal. **`row_status` is not yet verified by
     hand**: the greyed Install and the "comes with the app" hint need a real `.deb` install to see.
 - `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `tables` /
-  `describe` / `query` / `export` / `dump` / `exec` / `mcp` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+  `describe` / `query` / `explain` / `export` / `dump` / `compare` / `exec` / `mcp` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. It also holds the **MCP server** (`mcp.rs`), which has two ways in — the
   app's `--mcp-serve` for the AI panel, and `schemaic mcp -c <conn>` for any MCP client. Its whole
   dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`, `clap`, `serde_json`, `tokio`
@@ -33500,9 +33505,10 @@ existing prose was left alone.
     no-database arm exists to stop, reached without the guard seeing it
     (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
     **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
-    flag on the command line wins), on `query`, `export`, `dump`, `exec`, `tables` and `describe` alike, `-c` on
+    flag on the command line wins), on `query`, `explain`, `export`, `dump`, `exec`, `tables` and `describe` alike, `-c` on
     `databases` and `ping`
-    (through `ConnArgs`) and both on `mcp` (through `McpTarget`), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
+    (through `ConnArgs`), both on `mcp` (through `McpTarget`) and both on `compare`, whose
+    `--source-*` pair has no fallback (below), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
     but blank goes through the same `non_blank` and is refused, not read as unset — it is `-d "$DB"`
     one step removed — which is why the message names both sources. The test reads the `env`
     attribute off clap's `Command` rather than setting the variable, since the process environment
@@ -33516,13 +33522,22 @@ existing prose was left alone.
     (`fail_on_cap_is_an_opt_in_query_flag`). `exec` has no `--limit` and its cap bounds only what
     is printed, so there is nothing for the flag to report (`exec_has_no_fail_on_cap_flag`).
     **`OutputArgs { format, no_header }` is flattened into every subcommand that prints rows** —
-    `list`, `databases`, `ping`, `tables`, `describe`, `query` and `exec` — in place of a `format`
+    `list`, `databases`, `ping`, `tables`, `describe`, `query`, `explain` and `exec` — in place of a `format`
     field of each one's own, so `--no-header` is on all of them at once
     (`no_header_is_on_every_row_printing_subcommand`).
     `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
     there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`,
-    `mcp`, `export` and `dump` — the last two write their rows to a file, `export` in a format of its
-    own, so they have no stdout format to judge.
+    `mcp`, `export`, `dump` and `compare` — `export` and `dump` write their rows to a file, `export`
+    in a format of its own, and `compare` prints a script rather than rows, so none of the three
+    has a stdout format to judge.
+    **`explain` is `query`'s inputs and nothing a read does not take**: `SqlArgs`, `Target` and
+    `OutputArgs` as `query` has them, comment-led SQL included, and `--timeout` at
+    `DEFAULT_TIMEOUT_SECS`. It has no `--yes`, for `query`'s reason; no `--limit`, the plan being
+    bounded by the server read's own cap rather than the caller's (`run.rs`); and **no
+    `--analyze`**, because a headless plan never runs the statement — the analysing form executes
+    it, and `a_headless_plan_never_executes_the_statement` pins the `false` on the call
+    (`query.rs`). `explain_takes_a_statement_a_target_and_the_output_flags` holds all three to
+    parse errors.
     **`export` is `query` without the cap, into a file**: `SqlArgs` and `Target` as `query` takes
     them, `-o`/`--output <PATH>` required, and a `--format` of its own — a bare `Option<String>`,
     not `OutputArgs`'s `Format`, because the names are `core::export`'s six (`json`, `csv`, `sql`,
@@ -33536,6 +33551,18 @@ existing prose was left alone.
     `conflicts_with` makes a parse error together. Its `--timeout` is `export`'s
     `EXPORT_TIMEOUT_SECS`. It has no `--format`, the file being `.sql` by definition, and is the
     fourth `None` of `output_args()`.
+    **`compare` names two databases, and its flags are its own rather than a `Target`**: `-c` and
+    `-d` (`SCHEMAIC_CONNECTION`/`SCHEMAIC_DATABASE`, `-d` through `non_blank`) are the database the
+    script would change — the comparison's left side, where every other subcommand's `-c`/`-d`
+    point too — and `--source-connection` (defaulting to `-c`'s, in `run.rs`) and
+    `--source-database` (`non_blank`, defaulting to that connection's own) the one it should come
+    to match, so two databases on one server is the short form. `-t`/`--table` repeats, as
+    `dump`'s does. **No `--password-stdin`**: with two connections it would be unclear whose
+    password it was, so both sides come from the keyring. **No `OutputArgs`**, since what it prints
+    is a script, not rows. Its `--timeout` is `COMPARE_TIMEOUT_SECS`, 120 s, because two whole
+    catalogues are read and a large one takes longer than one statement's 30 s
+    (`compare_takes_a_target_a_source_and_tables`, which holds `--password-stdin` and `--format`
+    to parse errors and a blank `--source-database` to a validation error).
     **The top-level `--help` ends with the formats and the exit codes** (`AFTER_HELP`, as `Cli`'s
     `after_help`), since a script's author reads the help and would otherwise have had to find
     either in the README; `OutputArgs::format`'s doc line names the five, so each subcommand's
@@ -33563,7 +33590,7 @@ existing prose was left alone.
     character — "Access denied" for the right password — while the newline `echo` adds is the
     pipe's but a second one may be the password's, which stripping every trailing CR/LF, as it
     used to, took as well (`a_piped_password_loses_a_bom_and_one_line_ending`).
-    **The statement is `SqlArgs`, flattened into `query`, `export` and `exec`: the positional or `-f`/`--file
+    **The statement is `SqlArgs`, flattened into `query`, `explain`, `export` and `exec`: the positional or `-f`/`--file
     <PATH>`, exactly one**, which `#[group(required = true, multiple = false)]` makes a parse error
     (exit 2) rather than a precedence rule (`the_statement_can_come_from_a_file`,
     `a_statement_and_a_file_together_are_refused`, `a_statement_or_a_file_is_required`).
@@ -33584,16 +33611,18 @@ existing prose was left alone.
     else came back refused. Only a *leading* mark goes; anywhere else it is data
     (`a_statement_from_a_file_or_pipe_loses_its_bom`, which asserts the gate refuses the raw text
     first). Both readers go through `read_source`, which takes them as parameters so the
-    composition is tested too (`a_file_or_pipe_source_reads_without_its_bom`). `--timeout`'s two `default_value_t`s read
+    composition is tested too (`a_file_or_pipe_source_reads_without_its_bom`). `--timeout`'s six `default_value_t`s read
     `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
     (`exec_defaults_to_the_shared_timeout`).
     **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
-    `Target { conn, database }` for `query`, `export`, `dump`, `exec`, `tables` and `describe`, and taken alone by the
+    `Target { conn, database }` for `query`, `explain`, `export`, `dump`, `exec`, `tables` and `describe`, and taken alone by the
     two subcommands with
     no database to run in: `databases` lists the names `-d` takes, and `ping` asks whether the
     server answers at all, so neither has a `-d` and passing one is a parse error
     (`databases_has_no_database_flag`, `ping_takes_a_connection_and_the_reachability_timeout`).
-    `run.rs`'s `select_conn` and `connect` take `&ConnArgs`, which is what lets all six share them.
+    `run.rs`'s `select_conn` and `connect` take `&ConnArgs`, which is what lets every subcommand
+    above share them — and `compare`, which has no `ConnArgs` of its own, build one per side with
+    `password_stdin: false` to use them too.
     **`ping`'s `--timeout` defaults to `PING_TIMEOUT_SECS`, not `DEFAULT_TIMEOUT_SECS`** — it is
     `schemaic_db::PING_TIMEOUT`, five seconds, the bound after which the app's own health check
     says *Disconnected*, so the CLI and the app agree on when a host is dead; the 30 s statement
@@ -33625,8 +33654,8 @@ existing prose was left alone.
     app's own binary a new subcommand does not reach the CLI until its name is added here, as
     `databases` and `ping` were, and `tables` and `describe` after them — the test was seen red
     until both names went in (`every_subcommand_routes_to_the_cli`) — and `mcp`, which is not
-    the app's `--mcp-serve` above though both start the one server, and `export` after it, and
-    `dump` after that.
+    the app's `--mcp-serve` above though both start the one server, and `export` after it,
+    `dump` after that, `explain` after that, and `compare` after that.
     `schemaic.com` calls
     `run::main` without asking, so a missing name shows everywhere except through it. **That test
     and `the_help_text_names_every_subcommand` read the names off clap's `Command`**
@@ -33662,7 +33691,7 @@ existing prose was left alone.
     same reason. `listed` is what `list` prints; `list --all` is what shows the rest, with their
     status, so a human can see *why* an expected connection is unreachable.
   - `cli/query.rs` — **the one headless read path, and both non-GUI front ends are on it**:
-    `schemaic query` and the MCP server's `run_query` and `explain` — and `tables` and `describe`, whose canned SQL
+    `schemaic query` and `schemaic explain`, and the MCP server's `run_query` and `explain` — and `tables` and `describe`, whose canned SQL
     (`catalog.rs`) is a query the user did not type — and `schemaic export`, whose uncapped
     `read_only_export` sits beside `read_only_query` behind the same gate (below). Written twice they would have had every
     reason to drift — same gate, same timeout, same normalisation, and only one of them getting the
@@ -33697,7 +33726,10 @@ existing prose was left alone.
     `NoRows::NotARead`, whose message points at `exec`, or `NoRows::NotPermitted` — a lock, a
     sleep, a second statement — whose message does not: the CLI answered a `FOR UPDATE` with "use
     `exec` to write" after core's own words said it was no write
-    (`refusing_what_is_no_write_does_not_name_exec`). Both exit 3. It is asked in the **connection's own**
+    (`refusing_what_is_no_write_does_not_name_exec`). Both exit 3. **`NotARead`'s message names no
+    subcommand but `exec`** — "Only reads are taken here" — because `query`, `explain` and `export`
+    all refuse through it, and a message that said `query` told the other two's callers they had
+    typed it. It is asked in the **connection's own**
     dialect, so a PostgreSQL `#` operator is not lexed as a comment on the way in. `normalize_stmt`
     is pure and owns the trailing-`;` rule — a person types the semicolon out of habit and a
     `SELECT 1;` answered "empty query" would be a baffling way to learn it was unwanted — and
@@ -33717,7 +33749,7 @@ existing prose was left alone.
     succeeded.
     **`read_only_explain` is the plan of a read, behind the same `gate`**, then `Db::explain` under
     `deadline::with_deadline`, parsed by `core::plan::QueryPlan::from_result` — the MCP server's
-    `explain` tool. Gated although a plan executes nothing, because the planner is not inert —
+    `explain` tool and `schemaic explain`, one function for both. Gated although a plan executes nothing, because the planner is not inert —
     PostgreSQL folds an `IMMUTABLE` function's call at plan time, and nothing stops such a function
     writing — and because a statement `run_query` would refuse to run has no reason to be planned.
     **Only ever the plain form**: `analyze` is `false`, since the analysing form executes the
@@ -34037,6 +34069,46 @@ existing prose was left alone.
     `.part` file: the caller's `sweep()` deletes it three lines later, so the one sentence telling
     the user where their rows went named a path that no longer existed by the time they read it. It
     names the destination instead.
+  - `cli/compare.rs` — `schemaic compare`'s decisions, apart from the reading so they are tested
+    without a server: which objects the script covers, and what is said about it. **No differ of its
+    own** — the comparison is `core::compare`'s, the one the app's *Compare with* builds,
+    `SchemaComparison::of` over two freshly introspected schemas (`run.rs` reads them), and the
+    script is `SchemaComparison::plan`'s. `report(cmp, tables, target, source)` is pure and returns
+    a `Report { script, notes }`. With no `--table` it plans everything (`plan(|_| true)`); with
+    some, it plans the union of each named object's `selectable_keys_of(schema, name)` — the rule a
+    comparison opened from one table node ticks by, so a table brings the triggers on it and
+    `orders` does not bring `orders_archive` (under `core/compare.rs`). **A name resolves three ways, in
+    order**: as the comparison labels it (`orders`, `sales.orders`), then as `schema.name` — so
+    `public.orders` finds the entry whose label leaves `public` off — then by bare name if only one
+    namespace has a table or view of it, all three compared case-insensitively where the target's
+    names are (`names_ignore_case`). **A name that resolves to nothing is an `Err`**, which `run.rs`
+    makes exit 2, rather than a plan of nothing: a typo would otherwise read as "they agree"
+    (`an_unknown_table_is_refused`). A bare name two namespaces share is refused with both labels,
+    asking to be qualified rather than guessed (`a_namespaced_table_resolves_by_label_or_qualified_name`).
+    **`script` is `plan.export_script()`, and `None` when the plan is empty** — an empty plan's
+    script would be a header alone and read as a migration to run
+    (`agreeing_databases_print_no_script`). **So an empty stdout means "nothing to script", not
+    "they agree"** — the first stderr line says which. `notes` are the stderr lines, and the first
+    has three arms: "the script makes X match Y: N objects — it has not been run"
+    (`plan.subject()`) when the plan holds anything; "no differences[ in t1, t2]: X already matches
+    Y" only when the plan is empty **and nothing in scope is left out**; and "nothing to script[ in
+    …]: X differs from Y only in what is left out below" when the plan is empty but something in
+    scope is — the CLI's counterpart of the app's `EmptyRows::AgreesExceptNoted`. The middle arm
+    used to be the whole of "empty", and a MySQL comparison whose only difference was a trigger body
+    `needs_source` keeps out printed "no differences: … already matches …" over a `left out:` line
+    naming that trigger (`differences_only_left_out_are_not_called_no_differences`). Then
+    `destructive: …` for each of `plan.destructive()` and `not in the script: …` for each of
+    `plan.unsupported()`. **The `left out: …` lines are not `plan.omitted`**, which they were:
+    that list is built over the whole comparison, so `-t a` listed a trigger left out on another
+    table under "no differences in a" (`named_tables_narrow_the_left_out_lines_too`). `report`
+    builds them from `cmp.differences()` through `plan`'s own two exclusions, `needs_source() ||
+    unplannable()`, and an `in_scope` predicate — everything with no `--table`, else the named
+    objects matched as `selectable_keys_of` matches them (the same namespace, and the object
+    itself or a trigger whose `table` is it) — each line being `CompareEntry::omission_note`, made
+    `pub` for this (under `core/compare.rs`). The comparison's own `notes`, which are about the reading
+    rather than any one object, follow as `note: …` lines whatever the scope. Both tests were
+    watched fail against the old `report`. Nothing here runs anything; the script is printed for a
+    person to read.
   - `cli/deadline.rs` — one deadline, for every database read the headless front ends make.
     `with_deadline(fut, token, timeout)` awaits `fut` for at most `timeout` and, on expiry, cancels
     the token and **waits for the future to finish unwinding**. That last part is the whole reason
@@ -34254,8 +34326,8 @@ existing prose was left alone.
     `OutputArgs::output`, and a pair that does not go together — `--no-header` with a format that
     has no header — is a `warn` and `Exit::Usage` before anything is read, the way clap's own
     refusals are. The resolved
-    `Output` is what `list`, `databases`, `ping`, `tables`, `describe`, `run_query`, `run_exec` and
-    `emit_rows` take in place of
+    `Output` is what `list`, `databases`, `ping`, `tables`, `describe`, `run_query`, `run_explain`,
+    `run_exec` and `emit_rows` take in place of
     a `Format`. No test pins that order; it is the code's.
     **`databases` lists the names `-d` takes, because a CLI user usually starts with none.** The
     app never needs a default database — the tree lists every one — so a saved connection often
@@ -34297,6 +34369,26 @@ existing prose was left alone.
     `query::read_only_export`. **The one line of success goes to stderr** — `wrote N rows to
     <path>` — since stdout is not where the rows went. A failure is `run_query`'s: the message, the
     no-database `hint:` when it applies, and `exit_for_no_rows`.
+    **`explain` is `run_explain`, `run_query`'s order around the MCP server's `explain`**:
+    `select_conn`, `statement`, `query::gate` in the connection's dialect, `connect`, then
+    `query::read_only_explain` — the one function both front ends plan through, so the CLI's plan
+    is the tool's, on the same read-only session behind the same gate. Refusal is exit 3 with
+    nothing sent and a server failure or timeout exit 4, with the no-database `hint:`, all as
+    `query`. **The plan's rows go to stdout through the ordinary renderers**, by way of the pure
+    `plan_rows(&QueryPlan) -> ResultSet`, so `--format` and `--no-header` mean what they mean for
+    a query, and two details there are load-bearing. **The `ResultSet` is never marked
+    truncated**, even when the plan was: the renderers' capped wording points at `--limit`, which
+    `explain` does not have. **A cell reading exactly `NULL` becomes a real null** — `QueryPlan`
+    holds display text, and MySQL's empty `key` and `ref` came out of `--format json` as the string
+    `"NULL"`; the function's doc rests on no engine's plan writing that word as a whole cell for
+    anything else (`a_plan_prints_as_rows_in_any_format`). Everything else is `plan_notes`, on
+    stderr, since stdout is data: a `possible issue: …` line per finding of `core::plan`'s
+    heuristics, then a warning when the plan was cut by the server read's own cap
+    (`QueryPlan::truncated`) that the issues cover only the rows shown — never naming `--limit`
+    (`a_plans_findings_and_its_cut_go_to_stderr`). **A plan with no rows prints nothing to stdout**,
+    not an empty table, and says "the server returned no plan" on stderr, still exit 0
+    (`an_empty_plan_is_said`). Unlike the MCP tool there is no row or cell cap of this command's
+    own: the whole plan the server read returned is printed.
     **`dump` is `run_dump`, and it is the app's Export ▸ SQL dump, not a second one** — it builds a
     `core::dump::DumpRequest` and calls `dump::run`, the driver the modal calls (`cli/dump.rs`).
     The usage errors come first, before anything is dialled: an output whose folder does not exist,
@@ -34321,6 +34413,31 @@ existing prose was left alone.
     `dump::cancel_note` — both `Exit::Failed`. It asks no read gate and runs no `Enforce` session:
     every statement it sends is one `core::dump::plan` built, through the driver's plain
     `fetch_schema` and `stream_query`, exactly as the modal's dump does.
+    **`compare` is `run_compare`, the app's *Compare with* without the window**, and every refusal
+    comes before anything is dialled. `CompareSides` carries the two databases as typed, the
+    source connection already defaulted to `-c`'s. Each side is `select_conn` over a `ConnArgs`
+    with `password_stdin: false` — so CLI access is asked of **both** connections, with exits 2
+    and 3 as everywhere — then `default_database` for each; a side with neither a flag nor a
+    connection default is a `warn` naming `-d` and `--source-database`, and `Exit::Usage`. **A
+    database compared with itself** — the same connection id and the same name — is `Exit::Usage`
+    too, the message naming the two flags that would make it a comparison. Then
+    `compare::comparable` over the two connections' dialects, so two engines are refused as the
+    app's overlay refuses them, before either round trip (exit 2). Only then are the two connected,
+    one after the other and each under the compare's own `--timeout` rather than
+    `query::DEFAULT_TIMEOUT`, and the two schemas read **concurrently** — `tokio::join!` over
+    `read_schema`, each `Db::fetch_schema` under `deadline::with_deadline` — a failure or a
+    deadline on either side being its `reading <db>: …` line and `Exit::Failed` (the target's,
+    when both fail). Then `SchemaComparison::of(&target, &source, dialect)`, the target's dialect,
+    and `cli::compare::report`, whose `Err` is a `warn` and `Exit::Usage`. **The script goes to
+    stdout, the notes after it to stderr**, and the exit is 0 whether or not the two differ.
+    `side_label` names each side by its
+    database, adding "on <connection>" only when the two sides are different connections.
+    **Nothing is run, so no guard is asked**: what reaches the servers is catalogue reads, as
+    `dump`'s are, and the plan leaves as text for a person — the app's preview and `Db::run_ddl`
+    stay the only way a comparison's plan is applied. Verified live on MariaDB, two databases on one
+    connection: a table created, one altered, one dropped and a view re-addressed into the target
+    by `as_read_from`; and the three refusals — no database, the same database, two engines — each
+    exiting 2. `run_compare` itself has no unit test.
     **After a failure for want of a database, a `hint:` line on stderr names the way out** — `-d
     <database>`, a default picked in Schemaic, and `schemaic databases -c <conn>` with the user's own
     `-c` echoed back, quoted if it has whitespace (`shell_word`, which `mcp_notice` shares).
@@ -34956,8 +35073,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic mcp` is a second way into that same server rather than a new path: its `run_query` is
   the same call, the connection it serves has passed `cli/select.rs`'s `cli_access` gate like every
   subcommand's, and the one tool that could lead toward a write, `propose_table_change`, is not
-  offered there at all. The server's `explain` tool is the same gate again — `query::gate`, inside
-  `read_only_explain` — and **the same session half**: it passes `Db::explain` `read_only = true`,
+  offered there at all. The server's `explain` tool, and `schemaic explain` through the same
+  function, are the same gate again — `query::gate`, inside `read_only_explain` — and **the same
+  session half**: it passes `Db::explain` `read_only = true`,
   which puts even the plain `EXPLAIN` on a read-only session, since planning ran a writing function
   on PostgreSQL and MariaDB (`schemaic-db`'s entry). It never asks for the analysing form, and
   `a_headless_plan_never_executes_the_statement` pins both literals in source.
@@ -34974,11 +35092,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic-db`'s entry for the `sql_mode` smuggle that closed). That session half is pinned by
   source, as the editor's is — `every_headless_read_runs_on_a_read_only_session` — since dropping
   it to `Enforce::None` kept every behavioural test green. **`read_only_reason` has no minted
-  request**: it is enforced inside `read_only_query` and `read_only_export` themselves, and the
-  refusals and the requests are two separate lists. `schemaic query` and `schemaic export` also ask
+  request**: it is enforced inside `read_only_query`, `read_only_export` and `read_only_explain`
+  themselves, and the
+  refusals and the requests are two separate lists. `schemaic query`, `schemaic explain` and
+  `schemaic export` also ask
   it once *earlier*, through `query::gate`, before the keyring is read or a tunnel opened — as
   `schemaic exec` runs `ExecRequest::approved` before it connects — so that exit 3's "nothing was
-  sent" is true; the asking inside the two read functions is what keeps the early one from being
+  sent" is true; the asking inside the three read functions is what keeps the early one from being
   the only check. The refusals are `rerunnable_for_export`, `script_verdict`,
   `read_only_reason` and `init_sql::check` (below); the requests are `RerunRequest`, minted against the first, `ScriptRequest`,
   against the second, and `ExecRequest`, minted against `run_verdict` itself.
@@ -35845,7 +35965,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   so a compare plan takes the same preview, the same Apply and the same `Db::run_ddl`, and reads its
   `scope` and `whole` off every set's changes rather than letting the caller pick a runner. A compare that
   applied its own plan without the preview would be the path this rule forbids, and the aggregate is
-  where doing so would be cheapest: it already holds every statement in order.
+  where doing so would be cheapest: it already holds every statement in order. **`schemaic compare`
+  is on the written side as `cli::dump` is**: it prints the same plan's `export_script()` to stdout
+  and runs none of it, so its servers see catalogue reads alone (`cli/compare.rs`, `run_compare`).
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
   the preview names each one and Apply refuses while it does — on the action, not only on the
   disabled button. The "INCOMPLETE" preamble that carries the same omission *out* through Copy and

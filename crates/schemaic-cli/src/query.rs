@@ -5,7 +5,8 @@
 //! same gate, same timeout, same normalisation, two copies, and only one of
 //! them getting a fix. What differs between them is what they do with the rows,
 //! which is the caller's business and stays there. A plan — the MCP server's
-//! `explain` — is a read too, and [`read_only_explain`] takes the same gate.
+//! `explain` and `schemaic explain` — is a read too, and [`read_only_explain`]
+//! takes the same gate.
 //!
 //! The gate is [`schemaic_core::sql::read_only_reason`], and it is **strictly
 //! stronger than the editor's** `run_verdict`: an allowlist of read-only
@@ -60,8 +61,11 @@ impl NoRows {
     pub fn message(&self) -> String {
         match self {
             NoRows::Empty => "empty query".to_string(),
+            // No subcommand named but `exec`: `query`, `explain` and `export`
+            // all refuse through here, and naming one told the other two's
+            // callers they had typed `query`.
             NoRows::NotARead(why) => {
-                format!("refused: {why}. `query` only runs reads; use `exec` to write")
+                format!("refused: {why}. Only reads are taken here; use `exec` to write")
             }
             NoRows::NotPermitted(why) => format!("refused: {why}"),
             // No prefix of our own: `DbError`'s Display already says what
@@ -281,7 +285,8 @@ pub fn export_verdict(
     }
 }
 
-/// The plan of a **read**, or why not — the MCP server's `explain` tool.
+/// The plan of a **read**, or why not — the MCP server's `explain` tool and
+/// `schemaic explain`.
 ///
 /// **Behind the same gate as [`read_only_query`]**, although a plan executes
 /// nothing: the planner is not inert. PostgreSQL folds an `IMMUTABLE`
@@ -425,6 +430,11 @@ mod tests {
         let m = NoRows::NotARead("DELETE is not a read".into()).message();
         assert!(m.contains("DELETE is not a read"));
         assert!(m.contains("exec"), "the message must say where writes go");
+        // `query`, `explain` and `export` all refuse through here; naming one
+        // told the other two's callers they had typed it.
+        for other in ["`query`", "`explain`", "`export`"] {
+            assert!(!m.contains(other), "{m}");
+        }
     }
 
     /// **And only a write's does.** Through `gate`, the composition: a

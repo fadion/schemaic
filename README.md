@@ -96,6 +96,11 @@ schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" -c prod
 
 - `query` only reads, on a session the server holds read-only, and returns 200
   rows unless you raise `--limit`.
+- `explain` shows a read's query plan and flags what looks slow. It plans the
+  statement without running it.
+- `compare` prints the SQL that would make one database's structure match
+  another's, on the same connection or across two of the same engine. It runs
+  nothing.
 - `exec` writes. It refuses on a read-only connection, and a statement the guard
   flags, such as a `DELETE` with no `WHERE`, needs `--yes`.
 - Output is a table, JSON, JSON Lines, CSV or vertical records. Rows go to

@@ -146,6 +146,24 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
+    /// Show how the server would run a read-only statement, and what in its
+    /// plan looks slow.
+    ///
+    /// The plan's rows go to stdout like a query's; the likely problems —
+    /// full scans, sorts, temporary tables, an index the server says it
+    /// lacks — go to stderr. Planned, never executed: the figures are the
+    /// optimiser's estimates.
+    Explain {
+        #[command(flatten)]
+        sql: SqlArgs,
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        output: OutputArgs,
+        /// Seconds before the planning is cancelled.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
     /// Run a read-only statement and write its whole result to a file.
     ///
     /// Not capped by --limit: the rows stream from the server into the file.
@@ -192,6 +210,35 @@ pub enum Command {
         data_only: bool,
         /// Seconds before the dump is stopped — an hour by default.
         #[arg(long, default_value_t = EXPORT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
+    /// Print the SQL that would make one database's structure match another's.
+    ///
+    /// The app's Compare with: -c/-d name the database the script would
+    /// change, --source-connection/--source-database the one it should come
+    /// to match. Nothing is run — the script goes to stdout for you to read,
+    /// and what it drops or leaves out goes to stderr. Both sides must be the
+    /// same engine.
+    Compare {
+        /// The saved connection holding the database the script would change.
+        #[arg(short = 'c', long, env = "SCHEMAIC_CONNECTION")]
+        connection: String,
+        /// The database the script would change. Defaults to the
+        /// connection's own.
+        #[arg(short = 'd', long, env = "SCHEMAIC_DATABASE", value_parser = non_blank)]
+        database: Option<String>,
+        /// The connection holding the database to match. Defaults to -c's.
+        #[arg(long)]
+        source_connection: Option<String>,
+        /// The database to match. Defaults to the source connection's own.
+        #[arg(long, value_parser = non_blank)]
+        source_database: Option<String>,
+        /// Only this table or view, and the triggers on it (`orders`, or
+        /// `sales.orders` outside the default schema). Repeat for more.
+        #[arg(short = 't', long = "table")]
+        tables: Vec<String>,
+        /// Seconds before reading the two databases is given up on.
+        #[arg(long, default_value_t = COMPARE_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
     /// Run a statement that writes.
@@ -254,6 +301,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = crate::query::DEFAULT_TIMEOUT.as_secs();
 /// `export`'s default `--timeout`: an hour, a whole table's worth of time.
 const EXPORT_TIMEOUT_SECS: u64 = 3600;
 
+/// `compare`'s default `--timeout`: two whole catalogues are read, which on a
+/// large schema takes longer than one statement's thirty seconds.
+const COMPARE_TIMEOUT_SECS: u64 = 120;
+
 /// `ping`'s default: the app's own answer to "the server is not responding",
 /// the five seconds after which its health check says Disconnected — so the
 /// two agree on a dead host.
@@ -293,10 +344,13 @@ impl Command {
             | Command::Tables { output, .. }
             | Command::Describe { output, .. }
             | Command::Query { output, .. }
+            | Command::Explain { output, .. }
             | Command::Exec { output, .. } => Some(output),
             // `export` writes its rows to a file, in its own `--format`.
+            // `compare` prints a script, not rows.
             Command::Export { .. }
             | Command::Dump { .. }
+            | Command::Compare { .. }
             | Command::Mcp { .. }
             | Command::Version => None,
         }
@@ -476,8 +530,10 @@ pub fn wants_cli(argv: &[String]) -> bool {
                 | "tables"
                 | "describe"
                 | "query"
+                | "explain"
                 | "export"
                 | "dump"
+                | "compare"
                 | "exec"
                 | "mcp"
                 | "version"
@@ -587,7 +643,7 @@ mod tests {
     /// banner; a token with a line break in it is no option spelling either.
     #[test]
     fn sql_led_by_a_line_comment_is_the_statement() {
-        for sub in ["query", "exec"] {
+        for sub in ["query", "explain", "exec"] {
             for sql in [
                 "-- note\nSELECT 1",
                 "--\tnote\nSELECT 1",
@@ -600,6 +656,12 @@ mod tests {
                 let cli = parse_argv(argv).unwrap_or_else(|e| panic!("{sub} {sql:?}: {e}"));
                 let (got, target, output) = match cli.command {
                     Command::Query {
+                        sql,
+                        target,
+                        output,
+                        ..
+                    }
+                    | Command::Explain {
                         sql,
                         target,
                         output,
@@ -649,9 +711,52 @@ mod tests {
 
     fn sql_of(cli: Cli) -> SqlArgs {
         match cli.command {
-            Command::Query { sql, .. } | Command::Exec { sql, .. } => sql,
+            Command::Query { sql, .. }
+            | Command::Explain { sql, .. }
+            | Command::Exec { sql, .. } => sql,
             other => panic!("{other:?}"),
         }
+    }
+
+    /// **`explain` takes its statement the way `query` does** — argument,
+    /// `-f` or stdin, in a database, printed in any `--format` — and nothing
+    /// a read does not take: no `--yes`, no `--limit`, and no `--analyze`,
+    /// since a headless plan never runs the statement.
+    #[test]
+    fn explain_takes_a_statement_a_target_and_the_output_flags() {
+        let cli = parse(&[
+            "schemaic", "explain", "SELECT 1", "-c", "prod", "-d", "shop", "--format", "json",
+        ])
+        .unwrap();
+        let Command::Explain {
+            sql,
+            target,
+            output,
+            timeout,
+        } = cli.command
+        else {
+            panic!("expected an explain");
+        };
+        assert_eq!(sql.source(), SqlSource::Text("SELECT 1"));
+        assert_eq!(target.conn.connection, "prod");
+        assert_eq!(target.database.as_deref(), Some("shop"));
+        assert_eq!(output.format, Format::Json);
+        assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
+        for flag in ["--yes", "--limit", "--analyze"] {
+            let err = parse(&["schemaic", "explain", "SELECT 1", "-c", "1", flag]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+        assert!(
+            parse(&["schemaic", "explain", "SELECT 1", "-c", "1"])
+                .unwrap()
+                .command
+                .output_args()
+                .is_some()
+        );
     }
 
     /// **`-f` is a third place for the statement, beside the argument and
@@ -659,7 +764,7 @@ mod tests {
     /// spelling `psql -f -` taught.
     #[test]
     fn the_statement_can_come_from_a_file() {
-        for sub in ["query", "exec"] {
+        for sub in ["query", "explain", "exec"] {
             for flag in ["-f", "--file"] {
                 let sql = sql_of(parse(&["schemaic", sub, flag, "q.sql", "-c", "1"]).unwrap());
                 assert_eq!(
@@ -813,6 +918,72 @@ mod tests {
         );
         assert!(
             parse(&["schemaic", "mcp", "-c", "1"])
+                .unwrap()
+                .command
+                .output_args()
+                .is_none()
+        );
+    }
+
+    /// **`compare` names two databases and prints a script.** `-c`/`-d` are
+    /// the side that would change, as they are where every other subcommand
+    /// runs; the source defaults to the same connection, so two databases on
+    /// one server is the short form. No `--password-stdin` — two connections
+    /// would leave it unclear whose password it is — and no `--format`.
+    #[test]
+    fn compare_takes_a_target_a_source_and_tables() {
+        let cli = parse(&[
+            "schemaic",
+            "compare",
+            "-c",
+            "prod",
+            "-d",
+            "shop",
+            "--source-database",
+            "shop_staging",
+            "-t",
+            "orders",
+            "-t",
+            "sales.items",
+        ])
+        .unwrap();
+        let Command::Compare {
+            connection,
+            database,
+            source_connection,
+            source_database,
+            tables,
+            timeout,
+        } = cli.command
+        else {
+            panic!("expected a compare");
+        };
+        assert_eq!(connection, "prod");
+        assert_eq!(database.as_deref(), Some("shop"));
+        assert_eq!(source_connection, None);
+        assert_eq!(source_database.as_deref(), Some("shop_staging"));
+        assert_eq!(tables, ["orders", "sales.items"]);
+        assert_eq!(timeout, COMPARE_TIMEOUT_SECS);
+        for extra in [&["--password-stdin"][..], &["--format", "json"]] {
+            let args: Vec<&str> = ["schemaic", "compare", "-c", "1", "--source-connection", "2"]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .collect();
+            let err = parse(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{extra:?}"
+            );
+        }
+        let err = parse(&["schemaic", "compare", "-c", "1", "--source-database", ""]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert_eq!(
+            env_of("compare", "connection").as_deref(),
+            Some("SCHEMAIC_CONNECTION")
+        );
+        assert!(
+            parse(&["schemaic", "compare", "-c", "1", "--source-connection", "2"])
                 .unwrap()
                 .command
                 .output_args()

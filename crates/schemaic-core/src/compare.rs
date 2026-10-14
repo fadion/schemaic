@@ -407,8 +407,10 @@ impl CompareEntry {
     }
 
     /// The one-line disclosure for an entry a plan cannot carry — see
-    /// [`SchemaPlan::omitted`].
-    fn omission_note(&self) -> String {
+    /// [`SchemaPlan::omitted`]. Public for `schemaic compare --table`, which
+    /// discloses only the named objects' and so cannot take the plan's whole
+    /// list.
+    pub fn omission_note(&self) -> String {
         let why = if let Some(why) = &self.held_back {
             why.as_str()
         } else if self.needs_source() {
