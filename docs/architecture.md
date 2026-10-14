@@ -27328,9 +27328,10 @@ existing prose was left alone.
     mark `archive.orders` as unknown over a view preference. Hiding governs what is *offered*,
     never what is *true*. The same line runs through the built-in **MCP server**: `list_schema`'s
     *overview* asks `mcp::listed_databases` (so the assistant's tools agree with its prompt about
-    what this session can see), and so does `search_objects` without a `database`, which searches
-    that same overview, while `list_schema {"database": …}`, `search_objects {"database": …}`,
-    `describe_table`, `run_query` and `explain` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
+    what this session can see), and so do `search_objects` without a `database`, which searches
+    that same overview, and `list_databases`, which is its names alone, while
+    `list_schema {"database": …}`, `search_objects {"database": …}`,
+    `describe_table`, `sample_rows`, `run_query` and `explain` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
     walks through anyway would be theatre. The MCP subprocess is handed a **blob, not a signal**
     (`hidden` on the endpoint JSON, absent in older blobs → nothing hidden), so hiding a database
     mid-session takes effect on the next one, exactly as the system prompt beside it does. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the
@@ -31993,7 +31994,13 @@ existing prose was left alone.
   a code block for the user to run) is the one every model reaches for by default. It is stated
   whether or not queries are allowed, since proposing reads the schema and that was never the gated
   part, and the tag comes from the constant the renderer reads
-  (`the_prompt_names_the_fence_tag_the_renderer_reads`). The MCP server itself is `cli/mcp.rs`
+  (`the_prompt_names_the_fence_tag_the_renderer_reads`). Its **tools line** names the tools the
+  connection's `AiData` level leaves the session: `list_databases`, `list_schema`,
+  `search_objects` and `describe_table` at every level, `sample_rows`, `run_query` and `explain`
+  at `Full` alone; and at *Schema context: None* the withheld-schema sentence names
+  `list_databases`, `list_schema`, `search_objects`, `describe_table` and `sample_rows` as
+  unavailable. The harnesses' allow-lists need no such edit when a tool is added, being derived
+  from `McpTool::ALL` and `offered`. The MCP server itself is `cli/mcp.rs`
   now, under `schemaic-cli` below — its tools, its gates, its deadlines, and how `ai_allowed_tools`
   is derived from them. What stays here is the blob the panel hands it: `McpEndpoint` is an alias
   of `schemaic_cli::mcp::Endpoint`, and `endpoint_from_value` builds one as `Host::Panel`, only the
@@ -34493,20 +34500,22 @@ existing prose was left alone.
     database connection is made before the first tool call**, deliberately: a database that is down
     right now is an error the model sees on that call and may retry, not a server that never
     started. stdout is the protocol's, so the line goes to stderr, which MCP clients keep as the
-    server's log, and it is `mcp_notice`: which connection is served and — when `run_query` is
-    withheld — the level the connection is at and the one that allows it, because a model that finds
-    no query tool reports it as a bug and the reason has to be in the log beside it
-    (`the_mcp_notice_explains_a_withheld_query_tool`) — and, when the endpoint has no database, that
+    server's log, and it is `mcp_notice`: which connection is served and — when the row-reading
+    tools are withheld — that `run_query`, `explain` and `sample_rows` are, the level the connection
+    is at and the one that allows it, because a model that finds no query tool reports it as a bug
+    and the reason has to be in the log beside it (`the_mcp_notice_explains_a_withheld_query_tool`;
+    it named `run_query` alone, though `explain` was withheld with it) — and, when the endpoint has no database, that
     the tools run where the server puts them unless a call names one, with `-d` and the `schemaic
     databases -c <name>` that lists what to give it. An agent that does not know that sees
     `relation does not exist` for a table `list_schema` just showed it
     (`the_mcp_notice_says_when_there_is_no_default_database`). `connect` is handed a `ConnArgs` with
     `password_stdin: false`, `mcp` having no such flag.
-  - `cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and six
+  - `cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and eight
     tools, none of which writes anything. It was `app/mcp.rs` until `schemaic mcp` needed it, and it
     lives here so that the second way in is the same server rather than a copy of its gates —
-    `schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The six (`run_query`,
-    `explain`, `list_schema`, `describe_table`, `search_objects`, `propose_table_change`) are described
+    `schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The eight (`run_query`,
+    `explain`, `sample_rows`, `list_databases`, `list_schema`, `describe_table`, `search_objects`,
+    `propose_table_change`, in `McpTool::ALL`'s order, which is `tools/list`'s) are described
     for **this** connection's engine and listed for **this** connection's access levels and **this** host:
     `tools_list(engine, reads_data, schema, host)` builds
     `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
@@ -34566,7 +34575,7 @@ existing prose was left alone.
     (`run_query_takes_a_database_and_uses_it`). The panel lists the same tools, so it has the
     argument too, which the SCHEMA eye's rule already allows for: `run_query` answers in full, a
     hidden database included.
-    **The six are a type — `McpTool` — and that is what makes the advertised array and the gates one
+    **The eight are a type — `McpTool` — and that is what makes the advertised array and the gates one
     set.** They used to be written out independently in five places the compiler related to nothing:
     the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
     `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
@@ -34668,7 +34677,8 @@ existing prose was left alone.
     MySQL's `EXPLAIN` reads a `const` table to plan it and answers "Impossible WHERE noticed after
     reading const tables" exactly when no row has that key — an existence oracle over values, one
     key per call. So below `AiData::Full` it is withheld and refused with `NO_DATA_ACCESS`, whose
-    two wordings now name both tools (`only_the_query_and_plan_tools_count_as_reading_rows`).
+    two wordings name both tools, and `sample_rows` beside them
+    (`only_the_query_plan_and_sample_tools_count_as_reading_rows`).
     `reads_schema` answers `false`, as `run_query`'s does: the plan names the tables and indexes of
     a statement the model wrote, which is what `run_query` on the same text would tell it. Its
     refusals and failures are `run_query`'s sentences, through the shared `no_rows_reply`, since it
@@ -34702,7 +34712,10 @@ existing prose was left alone.
     unselectable view already produces, with the table's DDL and keys still returned.
     **The sample runs on a read-only session too** (`fetch_query_enforced` with `Enforce::ReadOnly`,
     as `run_query`'s read does): the statement is `filter::table_query`'s own, but the object it names
-    is not, and a view can call a function that writes.
+    is not, and a view can call a function that writes. It is one function, `sample(db, database,
+    info, n)`, shared by `describe_table`'s five rows and `sample_rows`' whole answer; `Err` is
+    the reason, which
+    `describe_table` words as "(unavailable: …)" and `sample_rows` returns as its error.
     **A read with nothing to cancel needs the other wrapper, and `with_deadline` over one is not a
     deadline at all.** `list_schema`'s per-database table-list loop calls `fetch_table_list`, which
     takes no `CancellationToken` on any of the three engines — it is a name listing, not the full
@@ -34786,9 +34799,10 @@ existing prose was left alone.
     (`the_answer_is_the_newest_version_the_client_can_know`). The loop keeps what was agreed, and
     `tools/list` goes through `annotated`: from `2025-03-26` on — the revision that introduced
     them — every tool carries `annotations: {readOnlyHint}` from `McpTool::read_only`, an
-    exhaustive match that answers `true` for all six (`run_query` runs on a read-only session,
-    `explain` plans without the analysing form that would run the statement, `search_objects`
-    reads only the catalogue, `propose_table_change` runs nothing). A `2024-11-05` session, or a `tools/list` sent before the
+    exhaustive match that answers `true` for all eight (`run_query` and `sample_rows` read on a
+    read-only session, `explain` plans without the analysing form that would run the statement,
+    `search_objects` and `list_databases` read only the catalogue, `propose_table_change` runs
+    nothing). A `2024-11-05` session, or a `tools/list` sent before the
     handshake, gets the list as it always was
     (`a_2025_session_is_told_every_tool_is_read_only`).
     **`search_objects` is Find-Anywhere's question asked over this server's two reads, not a third
@@ -34816,6 +34830,43 @@ existing prose was left alone.
     `a_search_of_one_database_also_names_matching_columns`,
     `a_search_that_finds_nothing_says_so_and_where_it_looked` and
     `a_search_stops_at_the_cap_and_says_so`).
+    **`list_databases` is the cheap first rung on a server with many databases**: the names, without
+    even the tables `list_schema`'s overview carries. It is `db.fetch_databases()` under
+    `with_deadline_abandoning` — tokenless, as the overview's is, for the overview's reason —
+    filtered through `listed_databases`, so the hidden set applies and the endpoint's default is
+    kept even when hidden, and rendered by the pure `format_database_names`: a `- name` line each,
+    the default marked `(default)`, since that is where a call naming no database runs, a `(N
+    databases)` count, and a pointer to `list_schema` with `{"database": …}` for one in full
+    (`the_database_names_mark_the_default_and_point_at_list_schema`). It takes no arguments.
+    `reads_schema` is `true` — it is the overview's first half — and `reads_row_data` `false`, so
+    *Schema context: None* withholds it and `NO_SCHEMA_ACCESS` names it, while every data level
+    offers it.
+    **`sample_rows {table, limit?, database?}` reads a table's rows without the model writing the
+    query.** The table is resolved as `describe_table` resolves it — `fetch_schema` under
+    `with_deadline`, then `find_described`, an unknown name answering "Table … not found" with a
+    pointer to `list_schema` — and read through `sample` (above): `filter::table_query` with
+    `BrowseKey::None`, so unordered, and the tool's description says the rows are a sample and not
+    the top of anything, pointing at `run_query` for a filter or an order. A failed read is an
+    error, "Could not read t: …", where `describe_table` degrades the same failure to a line.
+    `limit` is the pure `sample_limit`: absent or `null` is `SAMPLE_ROWS_DEFAULT` (10), and
+    anything but a whole number from 1 to `SAMPLE_ROWS_MAX` (50) is **refused in words naming the
+    range, never clamped** — a string, a float, `0` and a negative all refused — so the model is
+    not handed an answer to a question it did not ask (`a_sample_limit_is_a_whole_number_in_range_or_refused`);
+    past 50 it wants a query, and `run_query` is there. **It answers both gates yes.**
+    `reads_row_data`, because a sample is rows whoever wrote the `SELECT`; and `reads_schema`,
+    because resolving the table against the catalogue is the existence oracle
+    `propose_table_change`'s note describes. So a data level below `Full` withholds it, and so
+    does *Schema context: None*; it is not `needs_panel`.
+    **Both new arms in `call_tool` are `Box::pin`ned**, which a tidy-up would undo: inlined, their
+    state made `call_tool`'s future large enough that the existing
+    `a_call_is_gated_by_its_own_level_not_the_others` overflowed a debug test thread's 2 MiB stack,
+    the serve loop holding that future on the stack. Boxed, each adds a pointer. Their gate test,
+    `the_new_tools_are_refused_at_their_own_gates`, runs on `run::block_on_own_stack` — the real
+    server's 8 MiB — for the same reason: it sends several calls through the serve loop in one
+    future. It refuses `sample_rows` at each gate and `list_databases` at the schema one, and has a
+    call missing its `table`, or with `limit: 0`, told so before anything is read. Verified live
+    through `schemaic mcp` on PostgreSQL: `list_databases` listed 20, `sample_rows` on `city` with
+    `limit` 3 returned 3 rows, `limit` 500 was refused, and an unknown table was refused.
     `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
     `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
     and hands the model back the change list in the *preview's own words* plus the SQL and anything

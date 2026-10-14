@@ -125,8 +125,9 @@ for the agent to launch:
 { "mcpServers": { "prod": { "command": "schemaic", "args": ["mcp", "--connection=prod"] } } }
 ```
 
-The agent gets `list_schema` and `describe_table`, plus `run_query` (read-only,
-200 rows) when the connection's **AI data access** is *Let it read data*. Like
+The agent gets `list_databases`, `list_schema`, `describe_table` and
+`search_objects`, plus `run_query` (read-only, 200 rows), `explain` and
+`sample_rows` when the connection's **AI data access** is *Let it read data*. Like
 the command line, it needs **CLI access** turned on for the connection.
 
 ## Install

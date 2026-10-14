@@ -261,9 +261,10 @@ pub enum Command {
     /// Serve a connection to an AI agent over MCP, on stdin/stdout.
     ///
     /// For an MCP client to spawn, not for a terminal: the agent gets
-    /// read-only tools over this one connection — list_schema, describe_table,
-    /// and run_query when the connection's AI data access is "Let it read
-    /// data". Runs until the client closes stdin.
+    /// read-only tools over this one connection — list_databases, list_schema,
+    /// describe_table and search_objects, and run_query, explain and
+    /// sample_rows when the connection's AI data access is "Let it read data".
+    /// Runs until the client closes stdin.
     Mcp {
         #[command(flatten)]
         target: McpTarget,

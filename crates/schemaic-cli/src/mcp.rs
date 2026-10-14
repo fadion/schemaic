@@ -1,19 +1,25 @@
 //! The MCP (stdio) server — one server, with two ways in.
 //!
-//! Speaks newline-delimited JSON-RPC over stdin/stdout and exposes four tools,
-//! none of which writes anything:
+//! Speaks newline-delimited JSON-RPC over stdin/stdout and exposes these tools
+//! ([`McpTool::ALL`]), none of which writes anything:
 //!   - `run_query` — run a single read-only statement, return the rows.
+//!   - `explain` — a read-only statement's plan, never executed, and what in it
+//!     looks slow.
+//!   - `sample_rows` — the first rows of one table, every column, unordered.
+//!   - `list_databases` — the databases' names alone.
 //!   - `list_schema` — the server as an overview (databases → table names), or
 //!     one database in full (columns, PK/NOT NULL markers, foreign-key edges).
 //!   - `describe_table` — one table's DDL, foreign keys, and — where the
 //!     connection sends rows — a few sample rows.
+//!   - `search_objects` — tables, views and columns by part of their name.
 //!   - `propose_table_change` — check a schema change and show the DDL it would
 //!     produce, for the AI panel to turn into a preview. Runs nothing.
 //!
-//! The split between the two schema tools is deliberate: enriching every table
-//! with keys makes each entry bigger, so the broad listing stays cheap and the
+//! The split between the schema tools is deliberate: enriching every table
+//! with keys makes each entry bigger, so the broad listings stay cheap and the
 //! detail lives behind a drill-down rather than blowing the model's context on
-//! a 50-database server.
+//! a 50-database server. `list_databases` is the cheapest rung, the names
+//! without even the tables.
 //!
 //! **Who starts it decides the [`Host`]**, and the host decides what is offered:
 //!
@@ -384,6 +390,8 @@ const INVALID_REQUEST: i64 = -32600;
 pub enum McpTool {
     RunQuery,
     Explain,
+    SampleRows,
+    ListDatabases,
     ListSchema,
     DescribeTable,
     SearchObjects,
@@ -392,9 +400,11 @@ pub enum McpTool {
 
 impl McpTool {
     /// Every tool, in the order `tools/list` advertises them.
-    pub const ALL: [McpTool; 6] = [
+    pub const ALL: [McpTool; 8] = [
         McpTool::RunQuery,
         McpTool::Explain,
+        McpTool::SampleRows,
+        McpTool::ListDatabases,
         McpTool::ListSchema,
         McpTool::DescribeTable,
         McpTool::SearchObjects,
@@ -406,6 +416,8 @@ impl McpTool {
         match self {
             McpTool::RunQuery => "run_query",
             McpTool::Explain => "explain",
+            McpTool::SampleRows => "sample_rows",
+            McpTool::ListDatabases => "list_databases",
             McpTool::ListSchema => "list_schema",
             McpTool::DescribeTable => "describe_table",
             McpTool::SearchObjects => "search_objects",
@@ -420,6 +432,8 @@ impl McpTool {
         match self {
             McpTool::RunQuery => "mcp__schemaic__run_query",
             McpTool::Explain => "mcp__schemaic__explain",
+            McpTool::SampleRows => "mcp__schemaic__sample_rows",
+            McpTool::ListDatabases => "mcp__schemaic__list_databases",
             McpTool::ListSchema => "mcp__schemaic__list_schema",
             McpTool::DescribeTable => "mcp__schemaic__describe_table",
             McpTool::SearchObjects => "mcp__schemaic__search_objects",
@@ -445,8 +459,9 @@ impl McpTool {
             // after reading const tables" exactly when no row has that key —
             // an existence oracle over values, one key per call. So `explain`
             // stands wherever `run_query` does and nowhere else.
-            McpTool::RunQuery | McpTool::Explain => true,
-            McpTool::ListSchema
+            McpTool::RunQuery | McpTool::Explain | McpTool::SampleRows => true,
+            McpTool::ListDatabases
+            | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
             | McpTool::ProposeTableChange => false,
@@ -477,8 +492,12 @@ impl McpTool {
             // wrote — what `run_query` on the same text would tell it.
             McpTool::RunQuery | McpTool::Explain => false,
             // A name search is the existence oracle `propose_table_change`'s
-            // note above describes, asked on purpose.
-            McpTool::ListSchema
+            // note above describes, asked on purpose. `sample_rows` resolves
+            // its table against the catalogue, which is the same oracle, and
+            // `list_databases` is the overview's first half.
+            McpTool::SampleRows
+            | McpTool::ListDatabases
+            | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
             | McpTool::ProposeTableChange => true,
@@ -490,14 +509,17 @@ impl McpTool {
     ///
     /// All of them do, and that is the server's whole shape rather than a
     /// coincidence: `run_query` goes through `read_only_query` on a read-only
-    /// session, `explain` plans without the analysing form that would run the
-    /// statement, `search_objects` reads only the catalogue, and
+    /// session and `sample_rows` reads on one too, `explain` plans without the
+    /// analysing form that would run the statement, `search_objects`,
+    /// `list_databases` and the other listings read only the catalogue, and
     /// `propose_table_change` runs nothing — its DDL goes to the user's
     /// preview. Asked per tool all the same, so a new one has to answer.
     pub fn read_only(self) -> bool {
         match self {
             McpTool::RunQuery
             | McpTool::Explain
+            | McpTool::SampleRows
+            | McpTool::ListDatabases
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
@@ -519,6 +541,8 @@ impl McpTool {
             McpTool::ProposeTableChange => true,
             McpTool::RunQuery
             | McpTool::Explain
+            | McpTool::SampleRows
+            | McpTool::ListDatabases
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects => false,
@@ -540,15 +564,15 @@ impl McpTool {
 /// Names the setting, because the model's next move should be to ask the user
 /// for the table and column names (or to raise the setting) rather than retry.
 const NO_SCHEMA_ACCESS: &str = "Refused: the user's Schema context setting is None, so the \
-     assistant is given no database structure and list_schema, describe_table, search_objects \
-     and propose_table_change are unavailable. Ask the user for the table and column names you need \
+     assistant is given no database structure and list_databases, list_schema, describe_table, \
+     search_objects, sample_rows and propose_table_change are unavailable. Ask the user for the table and column names you need \
      — or tell them to set Schema context to a database in AI settings.";
 
 /// What the server says when a withheld tool is called anyway. It names the
 /// setting, because the model's next move should be to ask the user for the
 /// values (or to change the level) rather than to retry the same call.
 const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set so the assistant \
-     reads no rows on its own, so run_query and explain are unavailable. Ask the user for the values you need \
+     reads no rows on its own, so run_query, explain and sample_rows are unavailable. Ask the user for the values you need \
      — they can attach rows from a result grid, or raise the connection's AI data access \
      setting.";
 
@@ -557,7 +581,8 @@ const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set s
 /// model passing it on would send the user looking for a grid that is not
 /// there.
 const NO_DATA_ACCESS_STANDALONE: &str = "Refused: this connection's AI data access, set in \
-     Schemaic, lets no assistant read rows on its own, so run_query and explain are unavailable. Ask the \
+     Schemaic, lets no assistant read rows on its own, so run_query, explain and sample_rows are \
+     unavailable. Ask the \
      user \
      for the values you need — or ask them to set the connection's AI data access to \"Let it \
      read data\" in Schemaic's connection settings and restart this server.";
@@ -663,6 +688,41 @@ pub fn tools_list(
                 },
                 "required": ["sql"]
             }
+        },
+        {
+            "name": "sample_rows",
+            "description": format!(
+                "Read the first rows of one table or view, every column, without writing the \
+                 query — to see what the values look like. Up to {SAMPLE_ROWS_MAX} rows; \
+                 {SAMPLE_ROWS_DEFAULT} unless `limit` says otherwise. Unordered, so they are \
+                 a sample, not the top of anything: for a filter or an order, use run_query."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": "Table name, exactly as list_schema printed it — including \
+                                        the `schema.` prefix when it showed one."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": format!("How many rows, 1 to {SAMPLE_ROWS_MAX}.")
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Defaults to the connection's active database."
+                    }
+                },
+                "required": ["table"]
+            }
+        },
+        {
+            "name": "list_databases",
+            "description": "List the databases on the active connection, by name only — the \
+                            cheap first look on a server with many of them. list_schema with \
+                            `database` then shows one in full.",
+            "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "list_schema",
@@ -852,6 +912,18 @@ async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
             let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
             explain(db, tool_database(args, database), sql).await
         }
+        // **Boxed**, so each adds a pointer to this future rather than its
+        // own state: the serve loop holds `call_tool`'s future on the stack,
+        // and inlining these two overflowed a debug test thread's 2 MiB in
+        // `a_call_is_gated_by_its_own_level_not_the_others`.
+        McpTool::SampleRows => match (arg("table"), sample_limit(args)) {
+            (None, _) => ("sample_rows needs a `table`.".to_string(), true),
+            (_, Err(e)) => (e, true),
+            (Some(table), Ok(n)) => {
+                Box::pin(sample_rows(db, database, arg("database"), table, n)).await
+            }
+        },
+        McpTool::ListDatabases => Box::pin(list_databases(db, hidden, database)).await,
         McpTool::ListSchema => list_schema(db, arg("database"), database, hidden, reads_data).await,
         McpTool::DescribeTable => match arg("table") {
             Some(table) => describe_table(db, database, arg("database"), table, reads_data).await,
@@ -1509,29 +1581,40 @@ async fn describe_table(
     if !samples {
         return (out, false);
     }
+    out.push_str(&format!("\nSample rows (up to {SAMPLE_ROWS}):\n"));
+    // A sample is a bonus, so a failure or a timeout degrades to an
+    // "(unavailable: …)" line: the table's DDL and keys are still returned.
+    match sample(db, database, info, SAMPLE_ROWS).await {
+        Ok(rs) => out.push_str(&format_table(&rs)),
+        Err(e) => out.push_str(&format!("(unavailable: {e})")),
+    }
+    (out, false)
+}
+
+/// The first `n` rows of `info`, unordered, every column — `describe_table`'s
+/// sample and `sample_rows`' whole answer. `Err` is the reason, in words that
+/// follow "unavailable:" or stand alone.
+async fn sample(db: &Db, database: &str, info: &TableInfo, n: usize) -> Result<ResultSet, String> {
     // Reuse the same dialect-aware, properly quoted builder the grid's "open
     // table" uses, so a reserved-word or spaced name is safe. No key is passed
     // for either purpose: the sample is unordered on purpose, and an implicit row
     // key would add a column the assistant has no use for — nothing writes back
     // through this path.
     let sql = schemaic_core::filter::table_query(
-        dialect,
+        dialect_of(db),
         database,
         info.schema.as_deref(),
         &info.name,
         schemaic_core::filter::BrowseKey::None,
         schemaic_core::filter::Order::Asc,
-        SAMPLE_ROWS,
+        n,
     );
-    out.push_str(&format!("\nSample rows (up to {SAMPLE_ROWS}):\n"));
     let token = CancellationToken::new();
     // **The read this whole finding is about.** A view over an aggregate is the
     // ordinary expensive case and a steered model can pick one deliberately;
     // with no deadline it held the sequential serve loop open for as long as the
     // server took — measured over 100 s on PG 16.15, with the `ping` behind it
-    // never answered. A sample is a bonus, so a timeout degrades to the same
-    // "(unavailable: …)" line an unselectable view already produces: the table's
-    // DDL and keys are still returned.
+    // never answered.
     //
     // A read-only session, like `run_query`'s: the statement is ours, but the
     // object is not — a view can call a function that writes.
@@ -1539,7 +1622,7 @@ async fn describe_table(
         db.fetch_query_enforced(
             Some(database),
             &sql,
-            SAMPLE_ROWS,
+            n,
             token.clone(),
             schemaic_db::Enforce::ReadOnly,
         ),
@@ -1547,11 +1630,112 @@ async fn describe_table(
     )
     .await
     {
-        Some(Ok(rs)) => out.push_str(&format_table(&rs)),
-        Some(Err(e)) => out.push_str(&format!("(unavailable: {e})")),
-        None => out.push_str("(unavailable: timed out after 30s and was cancelled)"),
+        Some(Ok(rs)) => Ok(rs),
+        Some(Err(e)) => Err(e.to_string()),
+        None => Err("timed out after 30s and was cancelled".to_string()),
     }
-    (out, false)
+}
+
+/// `sample_rows`' row count when the call names none — a screenful, more
+/// than `describe_table`'s glimpse.
+const SAMPLE_ROWS_DEFAULT: usize = 10;
+
+/// The most `sample_rows` returns. A sample shows what values look like;
+/// past this the model wants a query, and `run_query` is there.
+const SAMPLE_ROWS_MAX: usize = 50;
+
+/// `sample_rows`' `limit`: absent is [`SAMPLE_ROWS_DEFAULT`]; anything but a
+/// whole number from 1 to [`SAMPLE_ROWS_MAX`] is refused in words the model can
+/// correct from, rather than clamped into an answer it did not ask for. Pure.
+fn sample_limit(args: &Value) -> Result<usize, String> {
+    match args.get("limit") {
+        None | Some(Value::Null) => Ok(SAMPLE_ROWS_DEFAULT),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| (1..=SAMPLE_ROWS_MAX).contains(n))
+            .ok_or_else(|| {
+                format!("sample_rows' `limit` is a whole number from 1 to {SAMPLE_ROWS_MAX}.")
+            }),
+    }
+}
+
+/// `sample_rows` — the first `n` rows of one table, resolved as
+/// `describe_table` resolves it, read as its sample is.
+async fn sample_rows(
+    db: &Db,
+    default_db: Option<&str>,
+    database: Option<&str>,
+    table: &str,
+    n: usize,
+) -> (String, bool) {
+    let Some(database) = database.or(default_db) else {
+        return (
+            "No database given and the connection has no default — pass a `database`.".to_string(),
+            true,
+        );
+    };
+    let token = CancellationToken::new();
+    let schema = match with_deadline(db.fetch_schema(database, token.clone()), token).await {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return (format!("Error reading schema for {database}: {e}"), true),
+        None => {
+            return (
+                format!("Reading the schema for {database} timed out (30s) and was cancelled."),
+                true,
+            );
+        }
+    };
+    let Some(info) = find_described(&schema, table) else {
+        return (
+            format!("Table {table} not found in {database}. Call list_schema to see what exists."),
+            true,
+        );
+    };
+    match sample(db, database, info, n).await {
+        Ok(rs) => (format_table(&rs), false),
+        Err(e) => (format!("Could not read {table}: {e}"), true),
+    }
+}
+
+/// `list_databases` — the overview's names without its tables: the hidden
+/// set applied as every listing applies it ([`listed_databases`]), and the
+/// endpoint's default marked, since that is where a call naming none runs.
+async fn list_databases(
+    db: &Db,
+    hidden: &HashSet<String>,
+    default_db: Option<&str>,
+) -> (String, bool) {
+    // Tokenless, so dropped at the deadline — `overview`'s reason.
+    match with_deadline_abandoning(db.fetch_databases()).await {
+        Some(Ok(names)) => (
+            format_database_names(&listed_databases(names, hidden, default_db), default_db),
+            false,
+        ),
+        Some(Err(e)) => (format!("Error listing databases: {e}"), true),
+        None => ("Listing databases timed out (30s).".to_string(), true),
+    }
+}
+
+/// `list_databases`' answer: a line per database, the default marked, a
+/// count, and the call that shows one in full. Pure.
+fn format_database_names(names: &[String], default_db: Option<&str>) -> String {
+    let mut out = String::new();
+    for n in names {
+        let mark = if Some(n.as_str()) == default_db {
+            " (default)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("- {n}{mark}\n"));
+    }
+    let k = names.len();
+    out.push_str(&format!(
+        "({k} {})\n\nCall list_schema with {{\"database\": \"<name>\"}} for one database's tables, \
+         columns and keys.\n",
+        if k == 1 { "database" } else { "databases" }
+    ));
+    out
 }
 
 /// The proposal inside a `propose_table_change` call's arguments.
@@ -1835,13 +2019,16 @@ mod tests {
             schemaic_db::Engine::Sqlite,
         ] {
             let names = offered(engine, false);
-            assert!(
-                !names.contains(&"run_query".to_string()),
-                "{engine:?} still advertises run_query: {names:?}"
-            );
+            for gone in ["run_query", "explain", "sample_rows"] {
+                assert!(
+                    !names.contains(&gone.to_string()),
+                    "{engine:?} still advertises {gone}: {names:?}"
+                );
+            }
             // The schema tools are untouched — the level withholds *data*, not
             // the ability to look at the shape of the database.
             for kept in [
+                "list_databases",
                 "list_schema",
                 "describe_table",
                 "search_objects",
@@ -1858,10 +2045,13 @@ mod tests {
     /// One predicate decides both halves, so a tool can never be listed by one
     /// rule and refused by another.
     #[test]
-    fn only_the_query_and_plan_tools_count_as_reading_rows() {
+    fn only_the_query_plan_and_sample_tools_count_as_reading_rows() {
         assert!(McpTool::RunQuery.reads_row_data());
         assert!(McpTool::Explain.reads_row_data());
+        // A sample is rows, whoever wrote the `SELECT`.
+        assert!(McpTool::SampleRows.reads_row_data());
         for schema_tool in [
+            McpTool::ListDatabases,
             McpTool::ListSchema,
             McpTool::DescribeTable,
             McpTool::ProposeTableChange,
@@ -1919,7 +2109,13 @@ mod tests {
             refusal_for(McpTool::RunQuery, true, true, Host::Panel),
             None
         );
+        assert_eq!(
+            refusal_for(McpTool::SampleRows, false, true, Host::Panel),
+            Some(NO_DATA_ACCESS)
+        );
+        assert!(NO_DATA_ACCESS.contains("sample_rows"));
         for schema_tool in [
+            McpTool::ListDatabases,
             McpTool::ListSchema,
             McpTool::DescribeTable,
             McpTool::ProposeTableChange,
@@ -1961,10 +2157,14 @@ mod tests {
             // set into one `RebuildTable`, whose emitted SQL is the table's
             // complete `CREATE TABLE` plus an `INSERT … SELECT` naming every
             // column again.
+            // `sample_rows` too: it resolves its table against the catalogue,
+            // the existence oracle above, before it reads a row.
             for gone in [
+                "list_databases",
                 "list_schema",
                 "describe_table",
                 "search_objects",
+                "sample_rows",
                 "propose_table_change",
             ] {
                 assert!(
@@ -1980,8 +2180,10 @@ mod tests {
         }
         // …and a call to one anyway is refused with the setting named.
         for gone in [
+            McpTool::ListDatabases,
             McpTool::ListSchema,
             McpTool::DescribeTable,
+            McpTool::SampleRows,
             McpTool::ProposeTableChange,
         ] {
             let refusal = refusal_for(gone, true, false, Host::Panel).expect("refused");
@@ -2010,6 +2212,8 @@ mod tests {
                 [
                     "run_query",
                     "explain",
+                    "sample_rows",
+                    "list_databases",
                     "list_schema",
                     "describe_table",
                     "search_objects"
@@ -2029,6 +2233,8 @@ mod tests {
         );
         for kept in [
             McpTool::RunQuery,
+            McpTool::SampleRows,
+            McpTool::ListDatabases,
             McpTool::ListSchema,
             McpTool::DescribeTable,
         ] {
@@ -2044,7 +2250,15 @@ mod tests {
     #[test]
     fn rows_are_withheld_standalone_with_advice_that_fits_the_client() {
         let names = offered_with(schemaic_db::Engine::Postgres, false, true, Host::Standalone);
-        assert_eq!(names, ["list_schema", "describe_table", "search_objects"]);
+        assert_eq!(
+            names,
+            [
+                "list_databases",
+                "list_schema",
+                "describe_table",
+                "search_objects"
+            ]
+        );
         let refusal = refusal_for(McpTool::RunQuery, false, true, Host::Standalone);
         assert_eq!(refusal, Some(NO_DATA_ACCESS_STANDALONE));
         assert!(!NO_DATA_ACCESS_STANDALONE.contains("grid"));
@@ -2159,6 +2373,95 @@ mod tests {
             schema,
             host,
         }
+    }
+
+    /// **`sample_rows`' `limit` is a count it can honour or a refusal** —
+    /// never clamped into a number the model did not ask for, and never a
+    /// string read as one.
+    #[test]
+    fn a_sample_limit_is_a_whole_number_in_range_or_refused() {
+        use serde_json::json;
+        assert_eq!(
+            super::sample_limit(&json!({})),
+            Ok(super::SAMPLE_ROWS_DEFAULT)
+        );
+        assert_eq!(
+            super::sample_limit(&json!({ "limit": null })),
+            Ok(super::SAMPLE_ROWS_DEFAULT)
+        );
+        assert_eq!(super::sample_limit(&json!({ "limit": 1 })), Ok(1));
+        assert_eq!(
+            super::sample_limit(&json!({ "limit": super::SAMPLE_ROWS_MAX })),
+            Ok(super::SAMPLE_ROWS_MAX)
+        );
+        for bad in [
+            json!(0),
+            json!(super::SAMPLE_ROWS_MAX + 1),
+            json!(-3),
+            json!(2.5),
+            json!("10"),
+        ] {
+            let err = super::sample_limit(&json!({ "limit": bad })).unwrap_err();
+            assert!(
+                err.contains(&super::SAMPLE_ROWS_MAX.to_string()),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// **`list_databases` is names only**, with the database a call naming
+    /// none lands in marked — the one fact a model needs before it picks.
+    #[test]
+    fn the_database_names_mark_the_default_and_point_at_list_schema() {
+        let names = vec!["shop".to_string(), "archive".to_string()];
+        let out = super::format_database_names(&names, Some("shop"));
+        assert!(out.starts_with("- shop (default)\n- archive\n"), "{out}");
+        assert!(out.contains("(2 databases)"), "{out}");
+        assert!(out.contains("list_schema"), "{out}");
+        let one = super::format_database_names(&names[..1], None);
+        assert!(
+            one.contains("(1 database)") && !one.contains("default"),
+            "{one}"
+        );
+    }
+
+    /// **The new tools are gated through the call**, at the gate each one
+    /// answers: `sample_rows` reads rows and resolves a name against the
+    /// catalogue, so either setting off refuses it; `list_databases` reads
+    /// the catalogue alone.
+    ///
+    /// On the stack the real server runs on (`run::block_on_own_stack`):
+    /// several calls through the serve loop in one future outgrow a debug
+    /// test thread's 2 MiB.
+    #[test]
+    fn the_new_tools_are_refused_at_their_own_gates() {
+        crate::run::block_on_own_stack(the_new_tools_gates).expect("the runtime starts");
+    }
+
+    async fn the_new_tools_gates() {
+        let ep = unreachable(false, true, super::Host::Standalone);
+        assert_eq!(
+            call(&ep, "sample_rows", r#"{"table":"t"}"#).await,
+            (super::NO_DATA_ACCESS_STANDALONE.to_string(), true)
+        );
+        let ep = unreachable(true, false, super::Host::Standalone);
+        for (tool, args) in [
+            ("sample_rows", r#"{"table":"t"}"#),
+            ("list_databases", "{}"),
+        ] {
+            assert_eq!(
+                call(&ep, tool, args).await,
+                (super::NO_SCHEMA_ACCESS.to_string(), true),
+                "{tool}"
+            );
+        }
+        // Past the gates, a malformed call is told what it lacks before
+        // anything is read.
+        let ep = unreachable(true, true, super::Host::Standalone);
+        let (text, err) = call(&ep, "sample_rows", "{}").await;
+        assert!(err && text.contains("`table`"), "{text}");
+        let (text, err) = call(&ep, "sample_rows", r#"{"table":"t","limit":0}"#).await;
+        assert!(err && text.contains("`limit`"), "{text}");
     }
 
     /// One `tools/call`'s text and `isError`, through the real serve loop.

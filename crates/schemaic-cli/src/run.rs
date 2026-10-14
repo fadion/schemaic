@@ -799,7 +799,8 @@ async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
 }
 
 /// What `schemaic mcp` says on stderr as it starts: which connection, and —
-/// when it is withheld — why `run_query` is missing and where that is changed.
+/// when they are withheld — why the row-reading tools (`McpTool::reads_row_data`)
+/// are missing and where that is changed.
 /// A model that finds no query tool reports it as a bug, so the reason has to
 /// be in the log beside it.
 ///
@@ -814,8 +815,8 @@ fn mcp_notice(conn: &Connection, rows: bool, database: Option<&str>) -> String {
     );
     if !rows {
         s.push_str(&format!(
-            "; run_query is withheld — its AI data access is \"{}\" (set \"{}\" in \
-             Schemaic's connection settings to allow it)",
+            "; run_query, explain and sample_rows are withheld — its AI data access is \"{}\" \
+             (set \"{}\" in Schemaic's connection settings to allow them)",
             conn.ai_data.unwrap_or_default().label(),
             schemaic_core::connection::AiData::Full.label(),
         ));
