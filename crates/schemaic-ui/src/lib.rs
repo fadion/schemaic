@@ -6203,6 +6203,9 @@ pub struct LayoutUi {
     pub statement_timeout: RwSignal<u64>,
     /// Confirm before running any write/DDL statement.
     pub confirm_writes: RwSignal<bool>,
+    /// Keep values in the write log rather than masking them
+    /// (`persist::UiState::write_log_values`).
+    pub write_log_values: RwSignal<bool>,
     /// Reopen the previous session's query tabs on startup.
     pub restore_tabs: RwSignal<bool>,
     /// Validate the statement under the cursor against the live DB (non-executing

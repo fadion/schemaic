@@ -2254,6 +2254,7 @@ fn query_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     let row_limit = layout.row_limit;
     let statement_timeout = layout.statement_timeout;
     let confirm_writes = layout.confirm_writes;
+    let write_log_values = layout.write_log_values;
     let live_validate = layout.live_validate;
     let notify_finished = layout.notify_finished;
     let row_dd = focusable_dropdown(row_limit, ROW_LIMITS, row_limit_label, ring.clone(), 200);
@@ -2293,6 +2294,15 @@ fn query_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         ring.clone(),
         240,
     );
+    let write_log_row = focusable_toggle_row(
+        "Keep values in the write log",
+        "Every write Schemaic or schemaic exec runs is appended to write_log.jsonl in the \
+                 settings folder, and never cleared. Values in its SQL are masked unless \
+                 this is on; a password is masked either way.",
+        write_log_values,
+        ring.clone(),
+        250,
+    );
     let timeout_section = v_stack((
         settings_group_label("Statement timeout"),
         timeout_dd,
@@ -2309,6 +2319,7 @@ fn query_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         confirm_row,
         validate_row,
         notify_row,
+        write_log_row,
     ))
 }
 

@@ -1671,6 +1671,27 @@ fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::his
     }
 }
 
+/// Hand a run's write-log `entry` to `log` with how `state` says it ended:
+/// rows affected, the engine's message, or a cancel (which may still have
+/// written — a statement already sent is not unsent). A state with no verdict
+/// logs nothing.
+fn log_landed(
+    log: &Rc<dyn Fn(u64, SqlDialect, schemaic_core::write_log::Entry)>,
+    conn_id: u64,
+    dialect: SqlDialect,
+    entry: schemaic_core::write_log::Entry,
+    state: &QueryState,
+) {
+    use schemaic_core::write_log::Outcome;
+    let entry = match state {
+        QueryState::Loaded(rs) => entry.ended(Ok(rs.affected)),
+        QueryState::Failed(m) => entry.ended(Err(m.text.clone())),
+        QueryState::Cancelled => entry.ended_as(Outcome::Cancelled, None),
+        QueryState::Idle | QueryState::Running => return,
+    };
+    log(conn_id, dialect, entry);
+}
+
 /// The schema reload a run's completion calls, filled once `refresh_db`
 /// exists (see `refresh_after_run`).
 type LateRefresh = Rc<RefCell<Option<Rc<dyn Fn(String)>>>>;
@@ -2403,6 +2424,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let row_limit = RwSignal::new(ui_state.row_limit);
     let statement_timeout = RwSignal::new(ui_state.statement_timeout_secs);
     let confirm_writes = RwSignal::new(ui_state.confirm_writes);
+    let write_log_values = RwSignal::new(ui_state.write_log_values);
     let live_validate = RwSignal::new(ui_state.live_validate);
     let notify_finished = RwSignal::new(ui_state.notify_finished);
     let editor_predictions = RwSignal::new(ui_state.editor_predictions);
@@ -2782,6 +2804,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let clear_history = history.clear.clone();
     let remove_history = history.remove.clone();
 
+    // ── The write log (`core::write_log`) ──────────────────────────────────
+    // Each write path hands its entry here when it lands, with the connection
+    // it ran on: the connection's name is filled in, the masking setting read,
+    // and the line appended off the UI thread. A failure to append is logged
+    // and dropped — the write it records has already happened, and must not be
+    // reported as failing because its record did.
+    let log_write: Rc<dyn Fn(u64, SqlDialect, schemaic_core::write_log::Entry)> = {
+        let handle = handle.clone();
+        Rc::new(move |conn_id, dialect, mut entry| {
+            entry.connection = connections
+                .with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).map(|c| c.name.clone()))
+                .unwrap_or_else(|| format!("connection {conn_id}"));
+            let keep = write_log_values.get_untracked();
+            handle.spawn_blocking(move || {
+                if let Err(e) = schemaic_core::write_log::append(&entry, dialect, keep) {
+                    tracing::warn!("couldn't append to the write log: {e}");
+                }
+            });
+        })
+    };
+
     // ── The snippet library ─────────────────────────────────────────────────
     //
     // One persisted list across every connection; which of them a connection may
@@ -2967,6 +3010,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let session_for = session_for.clone();
         let record_history = record_history.clone();
         let finish_history = finish_history.clone();
+        let log_write = log_write.clone();
         Rc::new(move |sql: String, is_view: bool| {
             if sql.trim().is_empty() {
                 return;
@@ -3074,6 +3118,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let finish_history = finish_history.clone();
             let refresh_after_run = refresh_after_run.clone();
             let ddl_owed = ddl_owed.clone();
+            // The write log's entry, for a run that writes — a view re-run is a
+            // read Schemaic built, and `contains_write` errs toward a write.
+            let conn_id = tab.conn_id.get_untracked();
+            let write_entry =
+                (!is_view && schemaic_core::sql::contains_write(&sql, dialect)).then(|| {
+                    schemaic_core::write_log::Entry::now(
+                        schemaic_core::write_log::Source::Editor,
+                        "",
+                        database.as_deref(),
+                        &sql,
+                    )
+                });
+            let log_write = log_write.clone();
             let send = create_ext_action(
                 cx,
                 move |(state, stmt, took, stopped): (
@@ -3082,6 +3139,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     u64,
                     bool,
                 )| {
+                    // Logged before the supersede check, as the history is:
+                    // the write happened whichever run the tab now shows.
+                    if let Some(entry) = write_entry {
+                        log_landed(&log_write, conn_id, dialect, entry, &state);
+                    }
                     // Fold the transaction state first, and unconditionally: it
                     // tracks the *connection*, so it stays true even when a newer run
                     // has superseded this one for display purposes.
@@ -3568,6 +3630,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let finish_history = finish_history.clone();
         let refresh_after_run = refresh_after_run.clone();
         let ddl_owed = ddl_owed.clone();
+        let log_write = log_write.clone();
         Rc::new(move |stmts: Vec<String>| {
             let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
             if stmts.is_empty() {
@@ -3659,6 +3722,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let dialect = dialect_of(&db);
             let refresh_after_run = refresh_after_run.clone();
             let ddl_owed = ddl_owed.clone();
+            // Each writing statement's write-log entry, stamped at launch.
+            let write_entries: Vec<Option<schemaic_core::write_log::Entry>> = stmts
+                .iter()
+                .map(|s| {
+                    schemaic_core::sql::contains_write(s, dialect).then(|| {
+                        schemaic_core::write_log::Entry::now(
+                            schemaic_core::write_log::Source::Editor,
+                            "",
+                            database.as_deref(),
+                            s,
+                        )
+                    })
+                })
+                .collect();
+            let log_write = log_write.clone();
             let send = create_ext_action(
                 cx,
                 move |(states, outcomes, took, stopped): (
@@ -3667,6 +3745,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Vec<u64>,
                     bool,
                 )| {
+                    // The write log, before the supersede check like the
+                    // history. A `Cancelled` statement in a batch was never
+                    // dispatched — except the one in flight when the user
+                    // pressed Stop, which is the first statement without a
+                    // verdict after a run of successes.
+                    let in_flight = stopped
+                        .then(|| {
+                            states
+                                .iter()
+                                .position(|s| !matches!(s, QueryState::Loaded(_)))
+                        })
+                        .flatten();
+                    for (i, (entry, state)) in write_entries.iter().zip(&states).enumerate() {
+                        let Some(entry) = entry else { continue };
+                        if matches!(state, QueryState::Cancelled) && in_flight != Some(i) {
+                            continue;
+                        }
+                        log_landed(&log_write, conn_id, dialect, entry.clone(), state);
+                    }
                     for (sql, stmt) in tx_stmts.iter().zip(&outcomes) {
                         if let Some(stmt) = stmt {
                             tab.tx.update(|t| *t = t.on_statement(engine, sql, *stmt));
@@ -4064,6 +4161,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let handle = handle.clone();
         let db_for = db_for.clone();
         let import_token = import_token.clone();
+        let log_write = log_write.clone();
         Rc::new(
             move |req: schemaic_ui::ImportRunRequest, done: schemaic_ui::ImportDoneFn| {
                 const MAX_ISSUES: usize = 200;
@@ -4077,6 +4175,38 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let dialect = db.engine().dialect();
                 let token = CancellationToken::new();
                 *import_token.borrow_mut() = Some(token.clone());
+                // The write log, for the load only — the check before it writes
+                // nothing. The file and the target are the record; the rows are
+                // the file's.
+                let log_load = {
+                    let target = [
+                        Some(req.target.database.as_str()),
+                        req.target.schema.as_deref(),
+                        Some(req.target.table.name.as_str()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                    let entry = schemaic_core::write_log::Entry::now(
+                        schemaic_core::write_log::Source::Import,
+                        "",
+                        Some(req.target.database.as_str()),
+                        "",
+                    )
+                    .with_detail(format!("import {} into {target}", req.path.display()));
+                    let (log_write, conn_id) = (log_write.clone(), req.target.conn_id);
+                    create_ext_action(cx, move |result: Result<Option<u64>, Option<String>>| {
+                        use schemaic_core::write_log::Outcome;
+                        let entry = match result {
+                            Ok(n) => entry.ended(Ok(n)),
+                            Err(Some(e)) => entry.ended(Err(e)),
+                            Err(None) => entry.ended_as(Outcome::Cancelled, None),
+                        };
+                        (log_write)(conn_id, dialect, entry);
+                    })
+                };
                 let report = {
                     let import_token = import_token.clone();
                     create_ext_action(cx, move |o: schemaic_ui::ImportOutcome| {
@@ -4179,6 +4309,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             token,
                         )
                         .await;
+                    log_load(match &outcome {
+                        Ok(n) => Ok(Some(*n)),
+                        Err(DbError::Cancelled) => Err(None),
+                        Err(e) => Err(Some(e.to_string())),
+                    });
                     report(match outcome {
                         Ok(n) => schemaic_ui::ImportOutcome::Done(n),
                         Err(DbError::Cancelled) => schemaic_ui::ImportOutcome::Cancelled,
@@ -5040,6 +5175,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let db_for = db_for.clone();
         let script_token = script_token.clone();
         let script_tx = script_tx.clone();
+        let log_write = log_write.clone();
         Rc::new(
             move |req: schemaic_ui::ScriptRequest, done: schemaic_ui::ScriptDoneFn| {
                 use schemaic_core::script::RunOutcome;
@@ -5058,9 +5194,46 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let token = CancellationToken::new();
                 *script_token.borrow_mut() = Some(token.clone());
                 let started = Instant::now();
+                // A file is a write unread (`sql::script_verdict`), so its run
+                // is logged whole: the file, how many statements ran, and the
+                // one that failed.
+                let (conn_id, dialect) = (req.conn_id(), req.dialect());
+                let entry = schemaic_core::write_log::Entry::now(
+                    schemaic_core::write_log::Source::Script,
+                    "",
+                    Some(req.database()),
+                    "",
+                );
+                let file = req.path().display().to_string();
+                let log_write = log_write.clone();
                 let report = {
                     let script_token = script_token.clone();
                     create_ext_action(cx, move |o: RunOutcome| {
+                        use schemaic_core::write_log::Outcome;
+                        let ran = |n: &usize| {
+                            let s = schemaic_core::text::plural(*n, "statement", "statements");
+                            format!("file {file}, {n} {s} ran")
+                        };
+                        let logged = match &o {
+                            RunOutcome::Done { ran: n } => {
+                                entry.with_detail(ran(n)).ended(Ok(None))
+                            }
+                            RunOutcome::Cancelled { ran: n } => {
+                                entry.with_detail(ran(n)).ended_as(Outcome::Cancelled, None)
+                            }
+                            RunOutcome::Failed {
+                                message,
+                                ran: n,
+                                at,
+                            } => {
+                                let mut e = entry.with_detail(ran(n));
+                                if let Some((sql, _)) = at {
+                                    e.sql = sql.clone();
+                                }
+                                e.ended(Err(message.clone()))
+                            }
+                        };
+                        (log_write)(conn_id, dialect, logged);
                         *script_token.borrow_mut() = None;
                         if !matches!(o, RunOutcome::Cancelled { .. }) {
                             call_back_after(
@@ -5358,6 +5531,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let handle = handle.clone();
         let run = run.clone();
         let db_for = db_for.clone();
+        let log_write = log_write.clone();
         Rc::new(
             move |write: GridWrite,
                   refetch: Option<RefetchRequest>,
@@ -5445,6 +5619,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     tab.tx
                         .update(|t| *t = t.on_statement(engine, "SELECT", stmt));
                 });
+                // The write log's entry, written when the rows are (before the
+                // re-fetch, which is a read): the batch as statements, and the
+                // count `commit_writes` answers.
+                let log_commit = {
+                    let entry = schemaic_core::write_log::Entry::now(
+                        schemaic_core::write_log::Source::Grid,
+                        "",
+                        tab.database.get_untracked().as_deref(),
+                        &schemaic_core::write_log::grid_sql(&write, dialect_of(&db)),
+                    );
+                    let (log_write, conn_id, dialect) = (
+                        log_write.clone(),
+                        tab.conn_id.get_untracked(),
+                        dialect_of(&db),
+                    );
+                    create_ext_action(cx, move |result: Result<Option<u64>, String>| {
+                        (log_write)(conn_id, dialect, entry.ended(result));
+                    })
+                };
                 let finish = create_ext_action(cx, move |outcome: CommitDone| {
                     // This closure gathers signals; `model::settle_after_switch`
                     // decides. The re-run must happen on the UI thread and only
@@ -5514,6 +5707,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                         None => db.commit_writes(&write, token.clone()).await,
                     };
+                    log_commit(match &written {
+                        Ok(n) => Ok(Some(*n)),
+                        Err(e) => Err(e.to_string()),
+                    });
                     if let Err(e) = written {
                         tracing::error!("commit failed: {e}");
                         // The server's refusal, or the one-row net's account of
@@ -5604,6 +5801,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let end_tx: EndTxFn = {
         let sessions = sessions.clone();
         let handle = handle.clone();
+        let log_write = log_write.clone();
         let db_for = db_for.clone();
         let refresh_after_run = refresh_after_run.clone();
         let ddl_owed = ddl_owed.clone();
@@ -5645,7 +5843,28 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     return;
                 };
+                // The write log records the transaction's end — what makes a
+                // Manual tab's logged statements durable or undoes them — for a
+                // transaction that was actually open.
+                let log_end = (tab.tx.get_untracked().is_open())
+                    .then(|| db_for(tab.conn_id.get_untracked()).ok())
+                    .flatten()
+                    .map(|db| {
+                        let entry = schemaic_core::write_log::Entry::now(
+                            schemaic_core::write_log::Source::Editor,
+                            "",
+                            tab.database.get_untracked().as_deref(),
+                            if commit { "COMMIT" } else { "ROLLBACK" },
+                        );
+                        (dialect_of(&db), entry)
+                    });
+                let log_write = log_write.clone();
+                let conn_id = tab.conn_id.get_untracked();
                 let done = create_ext_action(cx, move |err: Option<ModalError>| {
+                    if let Some((dialect, entry)) = log_end.clone() {
+                        let result = err.as_ref().map_or(Ok(None), |e| Err(e.text.clone()));
+                        (log_write)(conn_id, dialect, entry.ended(result));
+                    }
                     match err {
                         // Even a failed COMMIT/ROLLBACK leaves no usable
                         // transaction — the server has ended it or the connection
@@ -7911,6 +8130,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 row_limit: row_limit.get_untracked(),
                 statement_timeout_secs: statement_timeout.get_untracked(),
                 confirm_writes: confirm_writes.get_untracked(),
+                write_log_values: write_log_values.get_untracked(),
                 tab_width: tab_width.get_untracked(),
                 soft_tabs: soft_tabs.get_untracked(),
                 word_wrap: word_wrap.get_untracked(),
@@ -8037,6 +8257,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             row_limit.get();
             statement_timeout.get();
             confirm_writes.get();
+            write_log_values.get();
             restore_tabs.get();
             live_validate.get();
             notify_finished.get();
@@ -9984,6 +10205,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let refresh_schema = refresh_schema.clone();
         let guard_tx = guard_tx.clone();
         let ddl_token = ddl_token.clone();
+        let log_write = log_write.clone();
         // The account list has its own refresh — see the `users` arm inside.
         let principals_for_ddl = principals.clone();
         Rc::new(
@@ -10006,6 +10228,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let done = done.clone();
                     let ddl_token = ddl_token.clone();
                     let principals_refresh = principals_for_ddl.clone();
+                    let log_write = log_write.clone();
                     Rc::new(move || {
                         let db = db.clone();
                         let req = req.clone();
@@ -10017,9 +10240,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let scope = req.scope;
                         let token = CancellationToken::new();
                         *ddl_token.borrow_mut() = Some(token.clone());
+                        // The write log: the plan as previewed, and how it
+                        // ended. A credential in it (an account's password) is
+                        // masked by the log whatever the setting says.
+                        let log_entry = schemaic_core::write_log::Entry::now(
+                            schemaic_core::write_log::Source::Ddl,
+                            "",
+                            Some(req.database.as_str()),
+                            &req.statements.join(";\n"),
+                        );
+                        let (log_write, dialect) = (log_write.clone(), dialect_of(&db));
                         let report = create_ext_action(
                             cx,
                             move |(changed, res): (bool, Result<Option<String>, String>)| {
+                                (log_write)(
+                                    conn_id,
+                                    dialect,
+                                    log_entry.ended(res.clone().map(|_| None)),
+                                );
                                 // Refresh before reporting, so the modal's success
                                 // state and the tree can't be seen disagreeing for
                                 // a frame. `changed`, not `is_ok()`: a MySQL plan
@@ -13762,6 +14000,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             row_limit,
             statement_timeout,
             confirm_writes,
+            write_log_values,
             restore_tabs,
             live_validate,
             notify_finished,

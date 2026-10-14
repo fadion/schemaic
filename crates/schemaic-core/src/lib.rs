@@ -80,6 +80,7 @@ pub mod typename;
 pub mod update;
 pub mod users;
 pub mod window_chrome;
+pub mod write_log;
 
 /// Product name, shown in the window title and the Settings version line.
 pub const APP_NAME: &str = "Schemaic";

@@ -324,6 +324,11 @@ pub struct UiState {
     /// Confirm before running any write/DDL statement. Default: on.
     #[serde(default = "default_true")]
     pub confirm_writes: bool,
+    /// Keep the values in `write_log.jsonl`'s SQL rather than masking them
+    /// (`core::write_log`). Off by default: the SQL is the user's data. Not a
+    /// portable setting — a bundle must not turn it on.
+    #[serde(default)]
+    pub write_log_values: bool,
     /// Editor tab width (columns).
     #[serde(default = "default_tab_width")]
     pub tab_width: usize,
@@ -495,6 +500,7 @@ impl Default for UiState {
             editor_font_size: default_editor_font(),
             row_limit: default_row_limit(),
             confirm_writes: true,
+            write_log_values: false,
             tab_width: default_tab_width(),
             soft_tabs: true,
             word_wrap: false,

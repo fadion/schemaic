@@ -10001,7 +10001,10 @@ existing prose was left alone.
     gutter. What stays is the panel widths and the schema filter and visibility (this window's),
     the expanded and hidden sets and the activity intervals (keyed by connection ids, which differ
     per install), `ai_harness`, `ai_model` and `ai_cli_path` (they name what is installed *here*),
-    and the legacy `ai_run_queries` consent flag; `extra` and `show_table_sizes` are not on the list
+    and the legacy `ai_run_queries` consent flag; `write_log_values` stays too, because a file from
+    someone else must not be what turns on keeping the write log's values in the clear — and
+    nothing tests its absence, the allowlist being all that keeps it home; `extra` and
+    `show_table_sizes` are not on the list
     either, and nothing records why for the second. `parse` keeps only listed keys, so a
     hand-edited file cannot slip in a CLI path (`a_key_outside_the_allowlist_is_never_applied`),
     and `every_portable_key_is_a_field_ui_state_writes` fails on a name that is not a field — a
@@ -10182,6 +10185,67 @@ existing prose was left alone.
     machine, and the SQL may carry the very values it wrote. `Finished` is four kinds — `Query`
     (one statement or Run Everything's batch), `Script`, `Export` (a file or a folder of them),
     `Dump` — and whether it failed is the caller's to read off its own outcome type.
+  - `write_log.rs` — **the write log**: an append-only record of every write the app and
+    `schemaic exec` ran — when, on which connection and database, what ran, how many rows it
+    touched and how it ended — one JSON object a line in `<config_dir>/write_log.jsonl` (`FILE`).
+    **It is not the history, and the difference is the point.** `history.json` is capped at
+    `MAX_PER_CONN`, folds a re-run statement onto its newest run, deletes the runs a batch never
+    dispatched, leaves a credential-bearing statement out altogether and has a *Clear* — all right
+    for a recall list, and each a way for a record to lose a write. **Nothing in Schemaic
+    truncates, rewrites, prunes or rotates this file**: deleting a connection leaves its lines,
+    and there is no *Clear*, because a record the tool can quietly drop is not one. It is the
+    user's file to archive or delete, and the next write starts a fresh one. The cost is named
+    rather than hidden: it grows without bound, and a Run All logs one line per writing statement
+    with the statement in it. Nothing in the app reads it back; `a_line_reads_back_as_the_entry`
+    holds a line to the `Entry` it came from.
+    **Each entry is opened, written and closed.** `append` resolves `persist::config_dir`, opens
+    the file through `persist::open_private_append` (0600 on Unix, the tracing log's reason) and
+    writes the whole line in one `write_all`, so the GUI and a `schemaic exec` in another process
+    appending at once do not interleave inside a line. Its error is the caller's to report or drop
+    and never to turn into the write failing: the write it records has already happened.
+    `Entry { ts, source, connection, database, sql, detail, rows, outcome, error, masked }` — `ts`
+    in Unix milliseconds, `Source` one of `editor`/`script`/`grid`/`ddl`/`import`/`cli`,
+    `connection` the name the user saved. `Outcome` is `ok`/`failed`/`cancelled` and **`unknown`,
+    for a write the client lost track of** — `schemaic exec`'s deadline passing after the
+    statement was sent, which may or may not have taken effect (exit 5, under `cli/exec.rs`). `sql`
+    is empty where a path has no statement to name — an import, a file that ran to the end — and
+    `detail` says what happened instead, in Schemaic's own words over a path and a table name, so
+    it is never masked. `now` stamps an entry (an empty database is `None`,
+    `an_empty_database_is_no_database`), `with_detail` adds the detail, and `ended` (`Ok(rows)` or
+    `Err(message)`) and `ended_as` (an outcome with no row count) say how it went.
+    **Values are masked by default, because the SQL is the user's data.** An `UPDATE … SET email =
+    'ann@example.com'` carries the very value a log kept for years should not hold in the clear.
+    `line(entry, dialect, keep_values)` is the entry as the file holds it: unless `keep_values`
+    (`UiState::write_log_values`, off by default), `sql` goes through `mask_values` and `error`
+    through `prompt::redact_engine_error`, which strips the values a uniqueness or not-null report
+    quotes back. **A credential is masked whatever the setting says**: a statement
+    `sql::carries_credential` flags is masked under `keep_values` too, where `history.rs` drops it
+    altogether (`keeping_values_keeps_them_but_never_a_credentials`). `masked` is written on every
+    line, so a reader can tell a `?` that was a value from the statement's own placeholder
+    (`a_line_masks_by_default_and_says_so`).
+    `mask_values` replaces every string literal — its prefix or introducer with it (`N'…'`, `E'…'`,
+    `X'…'`, `_utf8mb4'…'`), and a double-quoted string where the dialect makes one a string rather
+    than a name — and every numeric literal with `?`, and **drops comments, since a comment is
+    prose the user may have put a value in**. Identifiers, keywords and bind placeholders (`?`,
+    `$1`, `:name`, `@p1`) stay, so which table, which columns and which `WHERE` remain readable. A
+    prefix is only a lone `E`/`N`/`X`/`B`/`U` or an `_`-led word directly before the quote; any
+    other word stays and the literal after it becomes the `?`. **A dollar-quoted body is masked as
+    code, not swallowed** — it is a function's body, so its literals go and its shape stays
+    (`a_dollar_quoted_body_is_masked_as_code_not_swallowed`). Boundaries come from
+    `sql::skip_noncode` and `skip_comment`, the one boundary lexer, so a quote inside a bracketed
+    `[o'k]` name or a comment opens no "string" (`placeholders_and_quoted_names_are_left_alone`).
+    `grid_sql(write, dialect)` is a grid commit as the log names it: each staged step in
+    `GridWrite::plan`'s order — the executor's, deletes then updates then inserts — as a statement
+    with its values written in through `export::sql_literal` and its names through
+    `export::ident_sql`, a NULL key column as `IS NULL`, a column set to its default as `DEFAULT`,
+    and **a byte value as `<binary, N bytes>`, never its bytes, even with values kept**. It is the
+    record's spelling, not what went over the wire — the executor binds its values
+    (`a_grid_commit_is_named_step_by_step_in_the_executors_order`); a PostgreSQL step is qualified
+    by its schema, a MySQL one by its database (`a_postgres_grid_write_is_qualified_by_its_schema`).
+    **What counts as a write is the caller's path, not this module's**: the editor and `exec` log a
+    statement `sql::contains_write` calls a write (it errs toward one), and the grid commit, the
+    DDL preview, the import and a `.sql` file run log whatever they ran. Where each path hooks in,
+    and what is deliberately not logged, is under `app/main.rs` and `cli/run.rs`.
   - `sticky_header.rs` — which band header of a scrolled list is **pinned** to its top edge, and
     how far the next one has pushed it: the pure half of the history and snippet panels' sticky
     bands (the view half is `widgets::banded_list`). `pinned(headers, scroll_y, pinned_height)`
@@ -30324,6 +30388,37 @@ existing prose was left alone.
   because the flash is the quiet half and this is the half that interrupts. Seen live on Windows 11
   in a sandboxed profile — a toast headed *Schemaic* with the app icon, *Query finished* / *Took
   2.0s.*, and none with the toggle off; macOS and Linux have not been watched.
+  **Every write the app runs is appended to the write log (`core::write_log`) when it lands.**
+  `log_write`, built beside the history writers, is the one sink: it fills the entry's
+  `connection` with the saved name looked up by `conn_id` (`connection N` once it has gone),
+  reads `write_log_values` at that moment, and appends on `spawn_blocking`. An append that fails
+  is a `tracing::warn!` and nothing else — the write it records has already happened, and must not
+  be reported as failing because its record did. `log_landed` maps a run's `QueryState` onto the
+  entry: `Loaded` its `affected`, `Failed` the engine's message, `Cancelled` cancelled, which may
+  still have written, a sent statement not being unsent. The hooks, and why each sits where it does:
+  `run_query_core` stamps an entry at launch for a statement `contains_write` calls a write and
+  that is not a view re-run (`!is_view`), and logs it in the `send` ext action **before the
+  supersede check**, where the history is finished: the write happened whichever run the tab now
+  shows. Run All stamps one per writing statement and logs them the same way, **skipping a
+  `Cancelled` statement**, which a batch reports for every statement after a failure without
+  dispatching it (`drop_runs`' reason, under `history.rs`) — except the one in flight when the
+  user pressed Stop, the first statement without a `Loaded` state. `end_tx` logs a Manual tab's
+  `COMMIT` or `ROLLBACK` when the transaction was open (`TxState::is_open`): the tab's writes are
+  logged `ok` as they run, before anything commits them, and that end entry is the only line that
+  says whether they stayed. `script_run` logs a `.sql` file whole — `Source::Script`, its detail
+  `file <path>, N statements ran`, and as `sql` the failing statement when `RunOutcome::Failed`'s
+  `at` names one; the statements that succeeded are not lines of their own. `commit_edits` logs
+  `grid_sql` of the staged batch with `commit_writes`' count, through a `log_commit` ext action
+  called right after the write and before the re-fetch, which is a read. The DDL preview's run
+  logs the plan's statements joined by `;\n` — an account's password masked by the log whatever
+  the setting says. `import_run` logs the load alone (`log_load`, after `import_rows`), never the
+  validation pass before it, which writes nothing; its detail is `import <path> into
+  db.schema.table` and it has no `sql`, the rows being the file's.
+  **Not logged**: EXPLAIN ANALYZE, which `Db::explain` always rolls back or never executes; a view
+  re-run, a read Schemaic built; and the MCP server, which has no write tool. The setting is
+  Settings → Query's *Keep values in the write log* (`LayoutUi::write_log_values`, tabindex 250
+  after the notify row's 240), `serde`-defaulted off and autosaved as `confirm_writes` is; its
+  hint says the log is never cleared and a password is masked either way.
   **A file changed by another program is offered back when the window regains focus**, not by a
   filesystem watcher: the edit that matters was made elsewhere, and coming back is when the user
   would act on a stale copy. A second `create_effect` on `window_focused`, beside the connection
@@ -33192,6 +33287,17 @@ existing prose was left alone.
     DATABASES` all run fine without one — and PostgreSQL never reports "no database" at all. So the
     server decides and the CLI adds the hint; `exec`'s up-front `no_database` arm — a PostgreSQL
     statement that `needs_database`, which no read is — is unchanged.
+    **`run_exec` appends to the write log the GUI keeps**, so `schemaic exec` is in the same record
+    as the editor (`core::write_log`). `log_entry` stamps a `Source::Cli` entry under the
+    connection's saved name only when `sql::contains_write` calls the statement a write, because
+    `exec` runs reads too and the log has no business holding them. It is stamped after `connect`,
+    so a refusal or a connection that failed leaves no line, nothing having been sent. `log_exec`
+    ends it from `exec::run`'s answer — rows affected, the message on a failure, and
+    **`Outcome::Unknown` for `NoRows::Indeterminate`** — exit 5's statement that may have been
+    applied in whole or in part — and for `TimedOut` alike. It reads `ui_state.json`'s `write_log_values` on every
+    run, so the one file follows the setting the user chose in the GUI, and an append that fails is
+    a warning on stderr that **leaves the exit status alone**: the status is the statement's, and
+    the write has happened either way.
     **`mcp` is `serve_mcp`, and it keeps the order that makes exit 3 true.** `select_conn` first, so
     `cli_access` gates it like every subcommand: a connection the user never exposed is exit 3 and
     an unknown one exit 2, before the keyring is read, and the MCP client shows a server that failed

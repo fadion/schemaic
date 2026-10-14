@@ -1050,7 +1050,12 @@ async fn run_exec(
         Ok(v) => v,
         Err(exit) => return exit,
     };
-    match exec::run(&db, request, timeout).await {
+    let logged = log_entry(conn, database.as_deref(), &sql, dialect);
+    let ran = exec::run(&db, request, timeout).await;
+    if let Some(entry) = logged {
+        log_exec(entry, &ran, dialect);
+    }
+    match ran {
         Ok(rs) => {
             // A write reports what it changed; a statement that happened to
             // return rows through `exec` reports those instead.
@@ -1071,6 +1076,51 @@ async fn run_exec(
             }
             exit_for_no_rows(&e)
         }
+    }
+}
+
+/// The write log's entry for an `exec` of `sql`, stamped before it runs — or
+/// `None` for a statement that does not write (`exec` runs reads too), which
+/// the log has no business holding. `contains_write` errs toward a write.
+fn log_entry(
+    conn: &Connection,
+    database: Option<&str>,
+    sql: &str,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> Option<schemaic_core::write_log::Entry> {
+    schemaic_core::sql::contains_write(sql, dialect).then(|| {
+        schemaic_core::write_log::Entry::now(
+            schemaic_core::write_log::Source::Cli,
+            &conn.name,
+            database,
+            sql,
+        )
+    })
+}
+
+/// Append `entry` to the write log with how `ran` ended — the GUI's masking
+/// setting honoured, since the log is one file — and say so on stderr if it
+/// could not be, without changing the exit status: the write it records has
+/// happened either way.
+fn log_exec(
+    entry: schemaic_core::write_log::Entry,
+    ran: &Result<schemaic_core::model::ResultSet, crate::query::NoRows>,
+    dialect: schemaic_core::intel::SqlDialect,
+) {
+    use crate::query::NoRows;
+    use schemaic_core::write_log::Outcome;
+    let entry = match ran {
+        Ok(rs) => entry.ended(Ok(rs.affected)),
+        Err(NoRows::Indeterminate(_)) | Err(NoRows::TimedOut(_)) => {
+            entry.ended_as(Outcome::Unknown, ran.as_ref().err().map(NoRows::message))
+        }
+        Err(e) => entry.ended(Err(e.message())),
+    };
+    let keep =
+        schemaic_core::persist::load_json::<schemaic_core::persist::UiState>("ui_state.json")
+            .write_log_values;
+    if let Err(e) = schemaic_core::write_log::append(&entry, dialect, keep) {
+        warn(&format!("couldn't append to the write log: {e}"));
     }
 }
 
