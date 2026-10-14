@@ -5930,10 +5930,12 @@ pub struct ConnActions {
 }
 
 /// Query-history signals (Copy bundle). The full list across all connections;
-/// the panel filters it to the active connection.
+/// the panel filters it to the active connection, or not while `all_conns`.
 #[derive(Clone, Copy)]
 pub struct HistoryUi {
     pub entries: RwSignal<Vec<HistoryEntry>>,
+    /// The panel's *All connections* toggle (`UiState::history_all_connections`).
+    pub all_conns: RwSignal<bool>,
 }
 
 /// The snippet library's state (Copy bundle).

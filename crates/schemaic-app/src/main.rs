@@ -2846,6 +2846,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let server_vars_generation: RwSignal<u64> = RwSignal::new(0);
     // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
     let table_sizes = RwSignal::new(ui_state.show_table_sizes);
+    // The history panel's *All connections* toggle (`UiState::history_all_connections`).
+    let history_all_conns = RwSignal::new(ui_state.history_all_connections);
     // The schema tree's filter text, as it was left (see `UiState::schema_filter`).
     // The panel types into this signal directly.
     let schema_filter = RwSignal::new(ui_state.schema_filter.clone());
@@ -8096,11 +8098,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
-    // Reopen a query-history entry in a new tab. Unlike `open_query` (which
-    // targets the *active* connection/db), this restores the entry's own
-    // `conn_id`/`database` and its originating tab name — all recorded on the
-    // entry. The history panel is per-connection, so `conn_id` is the active
-    // (valid) connection. Does NOT run the query.
     // The snippet library's "Open in new tab" — down here rather than with the
     // rest of the snippet actions because it needs `open_query`, which is
     // defined above this line and below those.
@@ -8117,10 +8114,31 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // Reopen a query-history entry in a new tab. Unlike `open_query` (which
+    // targets the *active* connection/db), this restores the entry's own
+    // `conn_id`/`database` and its originating tab name — all recorded on the
+    // entry. Does NOT run the query.
+    //
+    // **Another connection's entry switches to it first** — the history
+    // panel's *All connections* lists them. The strip shows only the active
+    // connection's tabs, so a tab placed on another would be active and
+    // invisible at once; switching is the only correct way to reach it, as
+    // `open_sql_file` does for a file already open on another connection.
     let open_history: Rc<dyn Fn(schemaic_core::history::HistoryEntry)> = {
         let next_id = next_id.clone();
         let place_tab = place_tab.clone();
+        let switch_conn_late = switch_conn_late.clone();
         Rc::new(move |entry: schemaic_core::history::HistoryEntry| {
+            if entry.conn_id != active_conn.get_untracked() {
+                let switch = switch_conn_late.borrow().clone();
+                let known =
+                    connections.with_untracked(|cs| cs.iter().any(|c| c.id == entry.conn_id));
+                match switch {
+                    Some(switch) if known => (switch)(entry.conn_id),
+                    // A connection gone since the panel drew: nothing to open on.
+                    _ => return,
+                }
+            }
             let id = next_id.get();
             next_id.set(id + 1);
             let tab = Tab::new(cx, id, &entry.sql, entry.conn_id, entry.database);
@@ -8322,6 +8340,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 editor_predictions: editor_predictions.get_untracked(),
                 editor_remembered_predictions: editor_remembered_predictions.get_untracked(),
                 show_table_sizes: table_sizes.get_untracked(),
+                history_all_connections: history_all_conns.get_untracked(),
                 schema_filter: schema_filter.get_untracked(),
                 // Carried straight back out — see `UiState::extra`. This
                 // build cannot say anything about these keys except that
@@ -8343,6 +8362,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             schema_visible.get();
             right_panel.get();
             table_sizes.get();
+            history_all_conns.get();
             activity_intervals.get();
             save_ui(persist::Saving::Replacing);
         });
@@ -14075,6 +14095,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         }),
         history: HistoryUi {
             entries: history_entries,
+            all_conns: history_all_conns,
         },
         history_actions: Rc::new(HistoryActions {
             clear: clear_history,

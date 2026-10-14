@@ -675,6 +675,13 @@ pub fn palette_hits(
         .collect()
 }
 
+/// Does the history panel list `entry`? `scope` is the connection it is
+/// showing, or `None` for every connection (its *All connections* toggle);
+/// then the search box's [`matches_query`].
+pub fn in_view(entry: &HistoryEntry, scope: Option<u64>, query: &str) -> bool {
+    scope.is_none_or(|conn| entry.conn_id == conn) && matches_query(entry, query)
+}
+
 /// Whether a history entry matches a free-text filter (ASCII case-insensitive),
 /// checking the SQL, the database name, and the originating tab name. An empty
 /// (or whitespace-only) query matches everything. The SQL is matched against its
@@ -858,6 +865,16 @@ mod tests {
 
     /// `ts` doubles as the run id — every entry in a test gets its own, which is
     /// what the caller's counter guarantees in the app.
+    #[test]
+    fn the_panel_shows_one_connection_or_every_one_under_the_same_search() {
+        let a = entry(1, "SELECT * FROM orders", 1);
+        let b = entry(2, "SELECT * FROM orders", 2);
+        assert!(in_view(&a, Some(1), "orders"));
+        assert!(!in_view(&b, Some(1), "orders"), "another connection's row");
+        assert!(in_view(&b, None, "orders"), "every connection");
+        assert!(!in_view(&b, None, "customers"), "the search still narrows");
+    }
+
     fn entry(conn_id: u64, sql: &str, ts: u64) -> HistoryEntry {
         HistoryEntry {
             conn_id,

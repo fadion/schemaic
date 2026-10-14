@@ -7,7 +7,9 @@
 //! tab (`open_query`). The title carries a trash-2 that clears the
 //! *current connection's* history, behind a confirm. The list is filtered from the app-wide
 //! `history.entries` signal by the active connection, so switching connections
-//! shows only that connection's queries.
+//! shows only that connection's queries — unless the title's *All connections*
+//! toggle is on, when every connection's rows are listed, each named for its
+//! connection and lexed in its dialect, and opening one switches to it.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -69,12 +71,14 @@ pub(crate) fn history_panel(
         })
     };
 
-    // Which lexer colours the previews. The list is filtered to the **active
-    // connection**, so every row on screen ran against it and its dialect is the
-    // right one for all of them — and it is now literally the same memo the
-    // snippet library reads, rather than a third copy of it. See
-    // `ConnUi::dialect` for why it has to be tracked.
+    // Which lexer colours the previews. Filtered to the **active connection**,
+    // every row on screen ran against it and its dialect is the right one for
+    // all of them — the same memo the snippet library reads. See
+    // `ConnUi::dialect` for why it has to be tracked. With *All connections* on,
+    // each row is lexed in its own connection's dialect instead (`row_conn`).
     let dialect = conn.dialect;
+    let all_conns = history.all_conns;
+    let connections = conn.connections;
 
     // Panel-local search filter (matched against SQL / database / tab name). Local
     // to this panel build — resets when the History panel is re-opened.
@@ -83,14 +87,15 @@ pub(crate) fn history_panel(
     let search_input = RwSignal::new(String::new());
     let search = debounced(search_input, Duration::from_millis(SEARCH_DEBOUNCE_MS));
 
-    // The active connection's entries, newest-first (already stored that way),
-    // narrowed to the search filter.
+    // The active connection's entries — or every connection's, while the
+    // toggle is on — newest-first (already stored that way), narrowed to the
+    // search filter (`history::in_view`).
     let visible = create_memo(move |_| {
-        let conn = active_conn.get();
+        let scope = (!all_conns.get()).then(|| active_conn.get());
         let q = search.get();
         entries.with(|v| {
             v.iter()
-                .filter(|e| e.conn_id == conn && history::matches_query(e, &q))
+                .filter(|e| history::in_view(e, scope, &q))
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -102,13 +107,15 @@ pub(crate) fn history_panel(
     // The dialect rides along for the same reason: switching connections normally
     // changes `visible` as well, but two connections with no history between them
     // both yield an empty list, and the memo would hold the rows at the previous
-    // engine's lexer.
+    // engine's lexer. The *All connections* toggle too: when only the active
+    // connection has history, turning it on leaves `visible` the same, but the
+    // rows must still take their connection's name and lexer.
     //
     // `viewport` outlives the rebuilds: it belongs to the scroll, which stays.
     let viewport: RwSignal<floem::kurbo::Rect> = RwSignal::new(floem::kurbo::Rect::ZERO);
     let list = dyn_container(
-        move || (visible.get(), search.get(), dialect.get()),
-        move |(rows, q, dialect)| {
+        move || (visible.get(), search.get(), dialect.get(), all_conns.get()),
+        move |(rows, q, dialect, all)| {
             if rows.is_empty() {
                 // Distinguish "nothing recorded" from "filtered everything out".
                 let msg = if q.trim().is_empty() {
@@ -132,6 +139,21 @@ pub(crate) fn history_panel(
                 let t = q.trim();
                 (!t.is_empty()).then(|| t.to_string())
             };
+            // With every connection listed, a row names its connection and is
+            // lexed in that connection's dialect; one the list no longer has
+            // (its entries outlive nothing — a delete clears them — but a
+            // rebuild can race it) falls back to the active connection's.
+            let row_conn = move |id: u64| -> (Option<String>, SqlDialect) {
+                if !all {
+                    return (None, dialect);
+                }
+                connections.with_untracked(|cs| {
+                    cs.iter()
+                        .find(|c| c.id == id)
+                        .map(|c| (Some(c.name.clone()), SqlDialect::from_db_type(&c.db_type)))
+                        .unwrap_or((None, dialect))
+                })
+            };
             // Grouped by when they ran, each group under its own header, which
             // sticks while its group scrolls (`widgets::banded_list`).
             let bands = history::group_by_recency(rows, now)
@@ -141,6 +163,7 @@ pub(crate) fn history_panel(
                     let rows = group
                         .into_iter()
                         .map(|e| {
+                            let (conn_name, dialect) = row_conn(e.conn_id);
                             history_row(
                                 e,
                                 now,
@@ -149,6 +172,7 @@ pub(crate) fn history_panel(
                                 db_colors,
                                 term.clone(),
                                 dialect,
+                                conn_name,
                             )
                             .into_any()
                         })
@@ -201,11 +225,33 @@ pub(crate) fn history_panel(
             }));
         },
     )
-    // Named for what it clears: this panel lists one connection's queries, and a
-    // bare "Clear history" beside a filtered list reads as "all of it".
+    // Named for what it clears: a bare "Clear history" beside a filtered list —
+    // or beside every connection's, with *All connections* on — reads as "all
+    // of it", and it only ever clears the active connection's.
     .tooltip(|| text("Clear this connection's history…").style(crate::widgets::tooltip_style));
-    let title_row = h_stack((section_title("QUERY HISTORY"), trash))
-        .style(|s| s.width_full().flex_row().items_start().justify_between());
+    // *All connections*: every connection's queries in one list, each row
+    // naming its connection. The trash keeps to the active connection either
+    // way — its tooltip and its confirm say so — so a toggle left on can never
+    // widen what a click deletes.
+    let all_toggle = crate::widgets::toggle_icon(
+        icons::DATABASE,
+        || true,
+        move || all_conns.get(),
+        move || all_conns.update(|on| *on = !*on),
+    )
+    .tooltip(move || {
+        text(if all_conns.get() {
+            "Showing every connection's queries — show this connection's only"
+        } else {
+            "Show every connection's queries"
+        })
+        .style(crate::widgets::tooltip_style)
+    });
+    let title_row = h_stack((
+        section_title("QUERY HISTORY"),
+        h_stack((all_toggle, trash)).style(|s| s.items_start().gap(theme::scaled(2.0))),
+    ))
+    .style(|s| s.width_full().flex_row().items_start().justify_between());
 
     v_stack((
         title_row,
@@ -270,6 +316,7 @@ fn history_row(
     db_colors: floem::reactive::ReadSignal<Vec<DbColorRule>>,
     term: Option<String>,
     dialect: SqlDialect,
+    conn_name: Option<String>,
 ) -> impl IntoView {
     // Full entry for the click handler — restores SQL + database + tab name.
     let entry_click = entry.clone();
@@ -346,6 +393,13 @@ fn history_row(
     // Database name + its identity dot as a tight group, so the footer's `gap(8)`
     // applies only between this group and the timestamp — the dot's spacing from
     // the name is then purely its own `margin_left`.
+    //
+    // With every connection listed, the connection's name leads it, so two
+    // servers' `shop` databases read as two places.
+    let db = match conn_name {
+        Some(name) => format!("{name} · {db}"),
+        None => db,
+    };
     let db_group = h_stack((
         highlight_text(db, term.clone(), font_label, theme::text_dim, false, 1.0)
             .style(|s| s.min_width(0.0)),

@@ -182,6 +182,11 @@ pub struct UiState {
     /// something every session pays for.
     #[serde(default)]
     pub show_table_sizes: bool,
+    /// The history panel lists every connection's queries rather than the
+    /// active one's (its *All connections* toggle). This window's, like the
+    /// panel widths — not a portable setting.
+    #[serde(default)]
+    pub history_all_connections: bool,
     /// The schema tree's filter text, as it was left — one box over every
     /// connection's tree, so one value rather than a rule per connection.
     /// Default: empty, which filters nothing. Saved on a trailing debounce
@@ -477,6 +482,7 @@ impl Default for UiState {
             expanded: Vec::new(),
             expanded_rules: Vec::new(),
             show_table_sizes: false,
+            history_all_connections: false,
             schema_filter: String::new(),
             hidden_dbs: Vec::new(),
             hidden_db_rules: Vec::new(),

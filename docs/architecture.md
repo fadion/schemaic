@@ -9998,7 +9998,8 @@ existing prose was left alone.
     denylist would export it the day it lands. What travels is the themes and scale, the editor,
     formatting, the row limit and statement timeout, `confirm_writes`, `live_validate`,
     `notify_finished`, `restore_tabs` and the assistant's effort, instructions, schema scope and
-    gutter. What stays is the panel widths and the schema filter and visibility (this window's),
+    gutter. What stays is the panel widths, the history panel's *All connections* toggle
+    (`history_all_connections`) and the schema filter and visibility (this window's),
     the expanded and hidden sets and the activity intervals (keyed by connection ids, which differ
     per install), `ai_harness`, `ai_model` and `ai_cli_path` (they name what is installed *here*),
     and the legacy `ai_run_queries` consent flag; `write_log_values` stays too, because a file from
@@ -10153,10 +10154,17 @@ existing prose was left alone.
     the comparison rather than into a `String` first — `max_height` and
     `clip()` bound *paint*, not layout, so a multi-MB `INSERT` was laid out whole on every rebuild
     of the panel, but clamping what is drawn must not become a decision about what is findable.
+    **`in_view(entry, scope, query)` is the panel's own question**: `scope` is the connection it
+    shows, `None` every connection (its *All connections* toggle), and then `matches_query` — so
+    the toggle widens which connections are listed and never what the search box matches
+    (`the_panel_shows_one_connection_or_every_one_under_the_same_search`). With it on, the panel
+    walks every connection's entries, so `MAX_PER_CONN` bounds that list per connection and not in
+    total.
     **`palette_hits(entries, conn_id, visible, needle, cap)` is Find Anywhere's seventh tier through
     that same filter**, so the palette finds a past statement exactly when the panel would: the
     indices of `conn_id`'s entries that `matches_query` accepts, newest first as the log is kept, at
-    most `cap` (`PALETTE_HISTORY_CAP`, 20). **One connection's only** — the panel's scope and the
+    most `cap` (`PALETTE_HISTORY_CAP`, 20). **One connection's only** — the panel's scope with its
+    *All connections* toggle off, and the
     empty query's, since another connection's SQL, literals and all, has no business in this one's
     palette — and an entry whose `database` `visible` refuses is skipped, so a hidden database is
     gone from this tier as from every other; an entry with no database is kept. It waits for
@@ -23830,6 +23838,19 @@ existing prose was left alone.
     memo is tracked in the row `dyn_container`'s trigger tuple alongside `visible` and `search` —
     two connections that both have no history yield the same empty `visible`, and without it the
     rows would stay built with the previous engine's lexer.
+    **The title's *All connections* toggle lifts that filter** — `widgets::toggle_icon(
+    icons::DATABASE, …)` beside the trash, `HistoryUi::all_conns`, persisted as
+    `UiState::history_all_connections`. `visible` asks `history::in_view` with scope
+    `(!all_conns).then(active_conn)`, and `all_conns` joins the trigger tuple. With it on, the
+    reasoning above no longer holds — the rows on screen ran against several engines — so each row
+    is lexed in its own connection's dialect (`SqlDialect::from_db_type` of that connection in
+    `conn.connections`, falling back to the active memo's for one the list no longer has) and its
+    heading reads `<connection> · <database>`, so two servers' `shop` read as two places.
+    `connections` is read untracked there, so a renamed connection relabels its rows at the next
+    rebuild, not at once. **The trash keeps to the active connection either way** — its count is
+    still `count_conn` of the active connection, and its tooltip and confirm say *this connection*
+    — so a toggle left on never widens what a click deletes. Opening another connection's row
+    switches to it first (`open_history`, under `history_store.rs`).
     Its TODAY / THIS WEEK / EARLIER bands (`history::group_by_recency`, titled by `bucket.label()`)
     are laid out by `widgets::banded_list`, so their headers stick while their rows scroll. The
     `viewport` signal that list reads is created at panel level, outside that `dyn_container`: it
@@ -32190,9 +32211,14 @@ existing prose was left alone.
     **`record` and `finish` are deliberately not in `HistoryActions`**: they go to the run paths,
     being how a query run reports itself rather than something the panel offers, so the store hands
     them out separately. **`open_history` deliberately stayed in `app_view`** — it is the history
-    panel's double-click, but what it does is open a *tab* from a `HistoryEntry`, so it needs the
+    panel's click, but what it does is open a *tab* from a `HistoryEntry`, so it needs the
     tab-id allocator and the placement closure and never touches this store; it is put into
-    `HistoryActions` beside `clear` and `remove` at the `Ui` literal. And the connection-deletion
+    `HistoryActions` beside `clear` and `remove` at the `Ui` literal. **An entry from another
+    connection switches to that connection first** — the panel's *All connections* toggle lists
+    them, and the strip shows only the active connection's tabs, so a tab placed on another would
+    be active and invisible at once. The switch goes through `switch_conn_late`, the `LateAction`
+    the Open command takes for a file already open on another connection (`switch_conn` is defined
+    below both); an entry whose connection no longer exists opens nothing. And the connection-deletion
     prune became a one-line `(history_clear_conn)(id)` call rather than moving, because the block it
     sits in erases fourteen stores in a row under an invariant of its own, and each store being one
     line is what keeps that readable.
