@@ -155,6 +155,132 @@ pub async fn read_only_query(
     }
 }
 
+/// Rows per chunk a streamed export reads — the app's whole-result export's
+/// figure, a block worth the per-chunk cost and modest to hold.
+pub const EXPORT_CHUNK_ROWS: usize = 10_000;
+
+/// What a finished export wrote.
+#[derive(Debug)]
+pub struct Exported {
+    pub tally: schemaic_core::export::ExportTally,
+}
+
+/// Run a **read** and write its whole result to `path` in `format` — the
+/// uncapped sibling of [`read_only_query`], behind the same gate and on the
+/// same read-only session, and the one other headless read path (so the
+/// read-only census reads this file for both).
+///
+/// The rows stream: a reader task pulls chunks off the server while a blocking
+/// writer renders each into the file (`ExportFormat::stream_to`), so memory is
+/// a chunk or two, not the result. The file is built under `export::part_file`
+/// and renamed into place only when everything was written; a failure leaves
+/// the `.part`, which the message names. `timeout` bounds the whole read, as
+/// every read in this crate is bounded (`deadline`'s gate); the command's
+/// default is an hour, since a table export can legitimately take a while.
+pub async fn read_only_export(
+    db: &Db,
+    database: Option<&str>,
+    sql: &str,
+    format: schemaic_core::export::ExportFormat,
+    path: &std::path::Path,
+    timeout: Duration,
+) -> Result<Exported, NoRows> {
+    let stmt = gate(sql, db.engine().dialect())?;
+    let token = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<schemaic_db::ExportChunk>(2);
+    let part = schemaic_core::export::part_file(path);
+    let dialect = db.engine().dialect();
+    let writer = {
+        let (part, token) = (part.clone(), token.clone());
+        tokio::task::spawn_blocking(
+            move || -> std::io::Result<schemaic_core::export::ExportTally> {
+                use std::io::Write as _;
+                let mut w = std::io::BufWriter::new(std::fs::File::create(&part)?);
+                let mut src =
+                    schemaic_core::export::PullChunks::new(move || match rx.blocking_recv() {
+                        None if token.is_cancelled() => {
+                            Err(std::io::Error::other("export cancelled"))
+                        }
+                        None => Ok(None),
+                        Some(Ok(rs)) => Ok(Some(rs)),
+                        Some(Err(e)) => Err(std::io::Error::other(e)),
+                    });
+                let tally = format.stream_to(&mut w, &mut src, None, dialect)?;
+                w.flush()?;
+                Ok(tally)
+            },
+        )
+    };
+    // **Read-only at the session too**, for `read_only_query`'s reason: the
+    // gate reads the text, the session refuses what the statement does.
+    let read = crate::deadline::with_deadline(
+        db.stream_query_enforced(
+            database,
+            stmt,
+            EXPORT_CHUNK_ROWS,
+            token.clone(),
+            tx,
+            Some(Enforce::ReadOnly),
+        ),
+        token.clone(),
+        timeout,
+    )
+    .await
+    .ok_or(NoRows::TimedOut(timeout));
+    let written = writer
+        .await
+        .map_err(|e| NoRows::Failed(format!("the export's writer stopped: {e}")))?
+        .map_err(|e| e.to_string());
+    let read = match read {
+        Err(_) => Err(timeout),
+        Ok(r) => Ok(r.map(|_| ()).map_err(|e| e.to_string())),
+    };
+    let shown = part.display().to_string();
+    let tally = export_verdict(read, written, format.writes_incrementally(), &shown)
+        .map_err(NoRows::Failed)?;
+    std::fs::rename(&part, path).map_err(|e| {
+        NoRows::Failed(format!(
+            "the export is complete in {shown} but could not be renamed to {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(Exported { tally })
+}
+
+/// How an export ended, from its two halves: the read (`Err` for the deadline
+/// passing) and the writer's own result — the tally, or the message the user
+/// is told.
+///
+/// **The writer's error wins**, unless the deadline stopped the read: a writer
+/// that fails (a full disk, a folder that went away) drops its end of the
+/// channel, and the reader's next send then fails with its own "the export
+/// stopped reading" — true, and useless, with the real cause thrown away. So a
+/// failed write is told as itself. A failed read is told as the server's.
+/// Either way the `.part` is named only where it holds the rows written so far
+/// (`incremental`) — an XLSX workbook is assembled whole and its `.part` is
+/// empty until the end.
+pub fn export_verdict(
+    read: Result<Result<(), String>, Duration>,
+    written: Result<schemaic_core::export::ExportTally, String>,
+    incremental: bool,
+    part: &str,
+) -> Result<schemaic_core::export::ExportTally, String> {
+    let left = if incremental {
+        format!("; what was written is in {part}")
+    } else {
+        String::new()
+    };
+    match (read, written) {
+        (Err(t), _) => Err(format!(
+            "the export exceeded {}s and was stopped{left}",
+            t.as_secs().max(1)
+        )),
+        (_, Err(w)) => Err(format!("could not write {part}: {w}")),
+        (Ok(Err(r)), Ok(_)) => Err(format!("{r}{left}")),
+        (Ok(Ok(())), Ok(tally)) => Ok(tally),
+    }
+}
+
 /// The plan of a **read**, or why not — the MCP server's `explain` tool.
 ///
 /// **Behind the same gate as [`read_only_query`]**, although a plan executes
@@ -189,6 +315,70 @@ pub async fn read_only_explain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod export_verdict_tests {
+        use super::*;
+        use schemaic_core::export::ExportTally;
+
+        fn tally(rows: u64) -> ExportTally {
+            ExportTally {
+                rows,
+                ..ExportTally::default()
+            }
+        }
+
+        #[test]
+        fn a_whole_read_and_write_is_the_tally() {
+            assert_eq!(
+                export_verdict(Ok(Ok(())), Ok(tally(5)), true, "a.part"),
+                Ok(tally(5))
+            );
+        }
+
+        /// The writer's own error, not the reader's echo of it.
+        #[test]
+        fn a_failed_write_is_told_as_itself() {
+            let got = export_verdict(
+                Ok(Err("the export stopped reading".into())),
+                Err("No space left on device".into()),
+                true,
+                "a.part",
+            );
+            assert_eq!(
+                got,
+                Err("could not write a.part: No space left on device".into())
+            );
+        }
+
+        #[test]
+        fn a_failed_read_names_the_part_only_where_it_holds_rows() {
+            let read = || Ok(Err("query failed: relation does not exist".to_string()));
+            assert_eq!(
+                export_verdict(read(), Ok(tally(0)), true, "a.part"),
+                Err("query failed: relation does not exist; what was written is in a.part".into())
+            );
+            assert_eq!(
+                export_verdict(read(), Ok(tally(0)), false, "a.xlsx.part"),
+                Err("query failed: relation does not exist".into()),
+                "an XLSX .part is empty until the end"
+            );
+        }
+
+        #[test]
+        fn a_timeout_says_so_and_names_what_it_left() {
+            assert_eq!(
+                export_verdict(
+                    Err(Duration::from_secs(60)),
+                    Err("cancelled".into()),
+                    true,
+                    "a.part"
+                ),
+                Err(
+                    "the export exceeded 60s and was stopped; what was written is in a.part".into()
+                )
+            );
+        }
+    }
 
     #[test]
     fn a_trailing_semicolon_is_not_part_of_the_statement() {

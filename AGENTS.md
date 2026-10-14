@@ -114,7 +114,8 @@ substitute for the statement, and none of these is a style preference.
   re-fetch, and `cli::exec::ExecRequest::approved` for `schemaic exec` — minted against
   `run_verdict` itself, whose `--yes` answers a `Confirm` and cannot answer a `Block`.
   `read_only_reason` has no request: it is enforced inside `cli::query::read_only_query`, the one
-  headless read path, which both front ends call — and inside its plan sibling
+  headless read path, which both front ends call — inside its streaming sibling `read_only_export`
+  behind `schemaic export`, on `stream_query_enforced(…, Enforce::ReadOnly)` — and inside its plan sibling
   `read_only_explain`, behind the MCP server's `explain`, whose plain `EXPLAIN` also runs on a
   read-only session, since planning can run a function that writes. That shape is the invariant, not a detail of
   it: the guard being a

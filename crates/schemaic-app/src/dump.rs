@@ -81,12 +81,8 @@ enum Msg {
 /// the file that message names drift apart — in the one situation where the
 /// fragment is the thing the user still wants.
 pub(crate) fn part_of(path: &Path) -> PathBuf {
-    match path.file_name().map(|n| n.to_string_lossy().to_string()) {
-        Some(name) => path.with_file_name(schemaic_core::export::part_path(&name)),
-        // A path with no file name is not one we can write to anyway; the
-        // `File::create` below is where that is reported.
-        None => path.to_path_buf(),
-    }
+    // `export::part_file`, which `schemaic export` builds its file under too.
+    schemaic_core::export::part_file(path)
 }
 
 /// Run a dump to completion, reporting each table on `progress`.

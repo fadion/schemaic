@@ -2726,6 +2726,35 @@ pub fn part_path(name: &str) -> String {
     format!("{name}.part")
 }
 
+/// The `.part` sibling a file is built in before it is renamed into place —
+/// [`part_path`] over the file's name, for every writer that streams one
+/// (the app's dump and whole-result export, `schemaic export`). A path with
+/// no file name is answered unchanged: it is not one anything can write, and
+/// the create is where that is reported.
+pub fn part_file(path: &std::path::Path) -> std::path::PathBuf {
+    match path.file_name().map(|n| n.to_string_lossy().to_string()) {
+        Some(name) => path.with_file_name(part_path(&name)),
+        None => path.to_path_buf(),
+    }
+}
+
+impl ExportFormat {
+    /// The format a name or an extension spells — `csv`, `JSON`, `md`,
+    /// `markdown`, `htm`, `xlsx`, ignoring case and a leading dot — or `None`.
+    pub fn from_name(name: &str) -> Option<ExportFormat> {
+        let n = name.trim().trim_start_matches('.');
+        ExportFormat::ALL.into_iter().find(|f| {
+            f.extensions().iter().any(|e| e.eq_ignore_ascii_case(n))
+                || f.label().eq_ignore_ascii_case(n)
+        })
+    }
+
+    /// The format `path`'s extension names, or `None`.
+    pub fn for_path(path: &std::path::Path) -> Option<ExportFormat> {
+        ExportFormat::from_name(path.extension()?.to_str()?)
+    }
+}
+
 /// What a failed export says. `partial` is the destination's file name when the
 /// write had begun, and `None` when the export never got that far.
 ///
@@ -3363,6 +3392,27 @@ pub fn export_insert_blocks<W: Write>(
 mod tests {
     use super::*;
     use crate::model::Column;
+
+    #[test]
+    fn a_format_is_named_by_its_extension_or_label() {
+        assert_eq!(ExportFormat::from_name("CSV"), Some(ExportFormat::Csv));
+        assert_eq!(ExportFormat::from_name(".md"), Some(ExportFormat::Markdown));
+        assert_eq!(ExportFormat::from_name("excel"), Some(ExportFormat::Xlsx));
+        assert_eq!(ExportFormat::from_name("tsv"), None);
+        assert_eq!(
+            ExportFormat::for_path(std::path::Path::new("out/rows.HTM")),
+            Some(ExportFormat::Html)
+        );
+        assert_eq!(ExportFormat::for_path(std::path::Path::new("rows")), None);
+    }
+
+    #[test]
+    fn a_file_is_built_beside_itself_under_part() {
+        assert_eq!(
+            part_file(std::path::Path::new("out/rows.csv")),
+            std::path::PathBuf::from("out/rows.csv.part")
+        );
+    }
 
     fn col(name: &str) -> Column {
         Column {

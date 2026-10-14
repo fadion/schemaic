@@ -146,6 +146,28 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
+    /// Run a read-only statement and write its whole result to a file.
+    ///
+    /// Not capped by --limit: the rows stream from the server into the file.
+    /// The file is built beside itself as `<file>.part` and renamed into
+    /// place when complete.
+    Export {
+        #[command(flatten)]
+        sql: SqlArgs,
+        #[command(flatten)]
+        target: Target,
+        /// The file to write.
+        #[arg(short = 'o', long = "output")]
+        output: std::path::PathBuf,
+        /// json, csv, sql, md, html or xlsx. Defaults to what the file's
+        /// extension names.
+        #[arg(long = "format")]
+        format: Option<String>,
+        /// Seconds before the export is stopped — an hour by default, since a
+        /// large table can take a while.
+        #[arg(long, default_value_t = EXPORT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
     /// Run a statement that writes.
     Exec {
         #[command(flatten)]
@@ -203,6 +225,9 @@ pub fn version_text() -> String {
 /// [`crate::query::DEFAULT_TIMEOUT`] in the unit `--timeout` takes.
 const DEFAULT_TIMEOUT_SECS: u64 = crate::query::DEFAULT_TIMEOUT.as_secs();
 
+/// `export`'s default `--timeout`: an hour, a whole table's worth of time.
+const EXPORT_TIMEOUT_SECS: u64 = 3600;
+
 /// `ping`'s default: the app's own answer to "the server is not responding",
 /// the five seconds after which its health check says Disconnected — so the
 /// two agree on a dead host.
@@ -243,7 +268,8 @@ impl Command {
             | Command::Describe { output, .. }
             | Command::Query { output, .. }
             | Command::Exec { output, .. } => Some(output),
-            Command::Mcp { .. } | Command::Version => None,
+            // `export` writes its rows to a file, in its own `--format`.
+            Command::Export { .. } | Command::Mcp { .. } | Command::Version => None,
         }
     }
 }
@@ -421,6 +447,7 @@ pub fn wants_cli(argv: &[String]) -> bool {
                 | "tables"
                 | "describe"
                 | "query"
+                | "export"
                 | "exec"
                 | "mcp"
                 | "version"

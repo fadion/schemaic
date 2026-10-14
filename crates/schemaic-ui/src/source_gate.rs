@@ -658,35 +658,43 @@ mod headless_read_session_gate {
                  refuses nothing — a headless read must go through \
                  `fetch_query_enforced(…, Enforce::ReadOnly)`"
             );
+            assert!(
+                !body.contains(".stream_query("),
+                "{file} calls plain `stream_query` — `schemaic export`'s read must go \
+                 through `stream_query_enforced(…, Some(Enforce::ReadOnly))`"
+            );
             let mut calls = 0usize;
-            let mut from = 0usize;
-            while let Some(rel) = body[from..].find(".fetch_query_enforced(") {
-                let open = from + rel + ".fetch_query_enforced".len();
-                // The argument list, to its matching `)`.
-                let mut depth = 0usize;
-                let mut end = open;
-                for (k, c) in body[open..].char_indices() {
-                    match c {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                end = open + k;
-                                break;
+            // Both the capped read and the streamed one (`schemaic export`).
+            for needle in [".fetch_query_enforced(", ".stream_query_enforced("] {
+                let mut from = 0usize;
+                while let Some(rel) = body[from..].find(needle) {
+                    let open = from + rel + needle.len() - 1;
+                    // The argument list, to its matching `)`.
+                    let mut depth = 0usize;
+                    let mut end = open;
+                    for (k, c) in body[open..].char_indices() {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = open + k;
+                                    break;
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                let args = &body[open..end];
-                assert!(
-                    args.contains("Enforce::ReadOnly"),
-                    "{file}: a headless read runs on a session that is not read-only — \
+                    let args = &body[open..end];
+                    assert!(
+                        args.contains("Enforce::ReadOnly"),
+                        "{file}: a headless read runs on a session that is not read-only — \
                      the text gate passes `SELECT setval(…)`, so only the session stops \
                      it writing:\n{args}"
-                );
-                calls += 1;
-                from = end;
+                    );
+                    calls += 1;
+                    from = end;
+                }
             }
             assert!(
                 calls >= 1,

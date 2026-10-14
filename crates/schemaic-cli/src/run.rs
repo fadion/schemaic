@@ -329,7 +329,100 @@ async fn dispatch(command: Command) -> Exit {
             )
             .await
         }
+        Command::Export {
+            sql,
+            target,
+            output,
+            format,
+            timeout,
+        } => {
+            run_export(
+                &file.connections,
+                &target,
+                &sql,
+                &output,
+                format.as_deref(),
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
         Command::Mcp { target } => serve_mcp(&file.connections, &target).await,
+    }
+}
+
+/// `schemaic export`. **Select, name the format, gate, then connect** — the
+/// order [`run_query`] keeps, plus the format, which is the command line's to
+/// get right before anything is read: an unknown one is a usage error.
+async fn run_export(
+    conns: &[Connection],
+    target: &Target,
+    sql: &SqlArgs,
+    output: &std::path::Path,
+    format: Option<&str>,
+    timeout: Duration,
+) -> Exit {
+    use schemaic_core::export::ExportFormat;
+    let fmt = match format {
+        Some(name) => ExportFormat::from_name(name),
+        None => ExportFormat::for_path(output),
+    };
+    let Some(fmt) = fmt else {
+        warn(&match format {
+            Some(name) => format!("unknown format {name:?}: use json, csv, sql, md, html or xlsx"),
+            None => "the output file's extension names no format: add --format \
+                     json, csv, sql, md, html or xlsx"
+                .to_string(),
+        });
+        return Exit::Usage;
+    };
+    // A folder that is not there is the command line's mistake too — told
+    // before anything is read, rather than after a whole query has run.
+    if let Some(dir) = output.parent().filter(|d| !d.as_os_str().is_empty())
+        && !dir.is_dir()
+    {
+        warn(&format!(
+            "no folder {} to write the export in",
+            dir.display()
+        ));
+        return Exit::Usage;
+    }
+    let conn = match select_conn(conns, &target.conn) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let sql = match statement(sql, target, conn) {
+        Ok(s) => s,
+        Err(exit) => return exit,
+    };
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    if let Err(e) = query::gate(&sql, dialect) {
+        warn(&e.message());
+        return exit_for_no_rows(&e);
+    }
+    // The connect is bounded as `query`'s is; the export by its own `--timeout`.
+    let (db, _tunnel) = match connect(conn, &target.conn, query::DEFAULT_TIMEOUT).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let database = database_for(target, conn);
+    match query::read_only_export(&db, database.as_deref(), &sql, fmt, output, timeout).await {
+        Ok(done) => {
+            // What was written, on stderr — stdout is not where the rows went.
+            let n = done.tally.rows;
+            warn(&format!(
+                "wrote {n} {} to {}",
+                schemaic_core::text::plural(n as usize, "row", "rows"),
+                output.display()
+            ));
+            Exit::Ok
+        }
+        Err(e) => {
+            warn(&e.message());
+            if let Some(how) = no_database_failure(database.as_deref(), &e, dialect) {
+                hint(&no_database_hint(&target.conn.connection, how));
+            }
+            exit_for_no_rows(&e)
+        }
     }
 }
 

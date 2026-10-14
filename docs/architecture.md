@@ -4576,6 +4576,15 @@ existing prose was left alone.
     pointing at it directs the user to an empty file. Both are pinned across every format by
     `neither_note_points_at_an_empty_sibling`, which asserts the `.part` sentence appears exactly
     where `writes_incrementally` says and that the *destination survived* half is said either way.
+    **`part_file(path)` is `part_path` over a whole path** — the sibling with the suffix on its file
+    name, a path with no file name coming back unchanged for the create to refuse — lifted from the
+    app's `dump::part_of` so that `schemaic export`, a crate with no access to the app, builds its
+    file under the same spelling the app does; `part_of` now delegates to it
+    (`a_file_is_built_beside_itself_under_part`). `ExportFormat::from_name` and `for_path` are the
+    other half of that command's needs: a format named by any of its `extensions()` or its
+    `label()`, case-insensitively and with a leading dot ignored — so `excel` and `htm` both resolve
+    — and the one an output path's extension names, `None` for either when nothing matches
+    (`a_format_is_named_by_its_extension_or_label`).
     **The schema tree's folder export has three sentences of its own beside those**, and they are
     here rather than in the modal's callback for the reason `absorb` is here: a report with arms
     (nothing finished, some finished, a table ticked and never found) is a decision, and one written
@@ -32380,7 +32389,8 @@ existing prose was left alone.
     (`DumpStep::Rows::server`), neither of which the grid's export writes. Rows are
     read at `EXPORT_CHUNK_ROWS` with the same bound of two blocks in flight, and the `.part`-sibling
     + atomic-rename guarantee is the export's unchanged — `part_of` builds that sibling through
-    `export::part_path`, the one function that decides the suffix, because the modal's cancel
+    `export::part_file`, which is `export::part_path` — the one function that decides the suffix —
+    over the file name, and which `schemaic export` builds its file under too, because the modal's cancel
     sentence names the same fragment through it and two spellings of `.part` could drift apart in
     exactly the situation where the fragment is the thing the user still wants. **So `part_of` is
     `pub(crate)` and is now the crate's only speller of it.** `main.rs`'s `export_file` had an
@@ -33066,7 +33076,7 @@ existing prose was left alone.
     beside it. So the ordering between them is free, and this way the protocol stream stays clean
     whichever of the six opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
+    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`export`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
     logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
     to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
     read no session state and is not safe in the middle of a command whose output someone is piping.
@@ -33165,7 +33175,7 @@ existing prose was left alone.
     byte-identical to the backup and logged the removal. **`row_status` is not yet verified by
     hand**: the greyed Install and the "comes with the app" hint need a real `.deb` install to see.
 - `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `tables` /
-  `describe` / `query` / `exec` / `mcp` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+  `describe` / `query` / `export` / `exec` / `mcp` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. It also holds the **MCP server** (`mcp.rs`), which has two ways in — the
   app's `--mcp-serve` for the AI panel, and `schemaic mcp -c <conn>` for any MCP client. Its whole
   dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`, `clap`, `serde_json`, `tokio`
@@ -33210,7 +33220,7 @@ existing prose was left alone.
     no-database arm exists to stop, reached without the guard seeing it
     (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
     **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
-    flag on the command line wins), on `query`, `exec`, `tables` and `describe` alike, `-c` on
+    flag on the command line wins), on `query`, `export`, `exec`, `tables` and `describe` alike, `-c` on
     `databases` and `ping`
     (through `ConnArgs`) and both on `mcp` (through `McpTarget`), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
     but blank goes through the same `non_blank` and is refused, not read as unset — it is `-d "$DB"`
@@ -33230,8 +33240,16 @@ existing prose was left alone.
     field of each one's own, so `--no-header` is on all of them at once
     (`no_header_is_on_every_row_printing_subcommand`).
     `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
-    there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`
-    and `mcp`.
+    there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`,
+    `mcp` and `export` — the last writes its rows to a file in a format of its own, so it has no
+    stdout format to judge.
+    **`export` is `query` without the cap, into a file**: `SqlArgs` and `Target` as `query` takes
+    them, `-o`/`--output <PATH>` required, and a `--format` of its own — a bare `Option<String>`,
+    not `OutputArgs`'s `Format`, because the names are `core::export`'s six (`json`, `csv`, `sql`,
+    `md`, `html`, `xlsx`) rather than stdout's five, and `None` means the output's extension decides
+    (`run.rs` resolves it). It has no `--limit`, the whole result being the point, and its
+    `--timeout` defaults to `EXPORT_TIMEOUT_SECS`, an hour rather than `query`'s 30 s, since a whole
+    table can legitimately take that long to stream; it still refuses `0`.
     **The top-level `--help` ends with the formats and the exit codes** (`AFTER_HELP`, as `Cli`'s
     `after_help`), since a script's author reads the help and would otherwise have had to find
     either in the README; `OutputArgs::format`'s doc line names the five, so each subcommand's
@@ -33259,7 +33277,7 @@ existing prose was left alone.
     character — "Access denied" for the right password — while the newline `echo` adds is the
     pipe's but a second one may be the password's, which stripping every trailing CR/LF, as it
     used to, took as well (`a_piped_password_loses_a_bom_and_one_line_ending`).
-    **The statement is `SqlArgs`, flattened into `query` and `exec`: the positional or `-f`/`--file
+    **The statement is `SqlArgs`, flattened into `query`, `export` and `exec`: the positional or `-f`/`--file
     <PATH>`, exactly one**, which `#[group(required = true, multiple = false)]` makes a parse error
     (exit 2) rather than a precedence rule (`the_statement_can_come_from_a_file`,
     `a_statement_and_a_file_together_are_refused`, `a_statement_or_a_file_is_required`).
@@ -33284,7 +33302,7 @@ existing prose was left alone.
     `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
     (`exec_defaults_to_the_shared_timeout`).
     **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
-    `Target { conn, database }` for `query`, `exec`, `tables` and `describe`, and taken alone by the
+    `Target { conn, database }` for `query`, `export`, `exec`, `tables` and `describe`, and taken alone by the
     two subcommands with
     no database to run in: `databases` lists the names `-d` takes, and `ping` asks whether the
     server answers at all, so neither has a `-d` and passing one is a parse error
@@ -33320,8 +33338,9 @@ existing prose was left alone.
     `schemaic --mcp-serve list` is the app being asked to serve). The converse holds too: through the
     app's own binary a new subcommand does not reach the CLI until its name is added here, as
     `databases` and `ping` were, and `tables` and `describe` after them — the test was seen red
-    until both names went in (`every_subcommand_routes_to_the_cli`) — and `mcp` last, which is not
-    the app's `--mcp-serve` above though both start the one server. `schemaic.com` calls
+    until both names went in (`every_subcommand_routes_to_the_cli`) — and `mcp`, which is not
+    the app's `--mcp-serve` above though both start the one server, and `export` after it.
+    `schemaic.com` calls
     `run::main` without asking, so a missing name shows everywhere except through it. **That test
     and `the_help_text_names_every_subcommand` read the names off clap's `Command`**
     (`subcommand_names()`, plus `help`) rather than a list of their own, which is what makes them
@@ -33357,7 +33376,8 @@ existing prose was left alone.
     status, so a human can see *why* an expected connection is unreachable.
   - `cli/query.rs` — **the one headless read path, and both non-GUI front ends are on it**:
     `schemaic query` and the MCP server's `run_query` and `explain` — and `tables` and `describe`, whose canned SQL
-    (`catalog.rs`) is a query the user did not type. Written twice they would have had every
+    (`catalog.rs`) is a query the user did not type — and `schemaic export`, whose uncapped
+    `read_only_export` sits beside `read_only_query` behind the same gate (below). Written twice they would have had every
     reason to drift — same gate, same timeout, same normalisation, and only one of them getting the
     next fix. The gate is
     `core::sql::read_only_reason` and is strictly stronger than the editor's `run_verdict`: an
@@ -33376,7 +33396,9 @@ existing prose was left alone.
     `read_only_query`'s `Enforce::ReadOnly` to `Enforce::None` passed the whole suite, because
     in-memory SQLite has no statement that passes its gate and writes. So
     `ui/source_gate.rs`'s `every_headless_read_runs_on_a_read_only_session` reads this file and
-    `mcp.rs` instead. A **locking read** (`FOR UPDATE`, `FOR NO KEY
+    `mcp.rs` instead — forbidding plain `.fetch_query(` and `.stream_query(` in both, and requiring
+    `Enforce::ReadOnly` inside the argument list of every `.fetch_query_enforced(` and
+    `.stream_query_enforced(` call, both needles counted toward its floor. A **locking read** (`FOR UPDATE`, `FOR NO KEY
     UPDATE`, `LOCK IN SHARE MODE`, and the shared `FOR SHARE`/`FOR KEY SHARE` no deny-list word
     catches, which a MySQL 8 read-only session runs, locks held) is refused by naming the clause and
     the lock (`sql::locking_clause`, `shared_locks`); it used to answer "`UPDATE` is not permitted",
@@ -33422,6 +33444,30 @@ existing prose was left alone.
     Server's `SHOWPLAN_XML` executes nothing and needs no session. Both `bool`s are positional, which is what a later edit
     flips without anything failing (SQLite, the one engine the suite can reach, ignores `analyze`),
     so `a_headless_plan_never_executes_the_statement` pins them in source (`ui/source_gate.rs`).
+    **`read_only_export(db, database, sql, format, path, timeout)` is `read_only_query` without the
+    cap, into a file** — `schemaic export`'s read, returning `Exported { tally }`. Same `gate`,
+    asked again here for the reason `read_only_query` asks it, and the same session half: the rows
+    come through `Db::stream_query_enforced` with `Some(Enforce::ReadOnly)`, `EXPORT_CHUNK_ROWS`
+    (10,000, the app's whole-result export's figure) at a time, down a channel two chunks deep, the
+    read inside `deadline::with_deadline` as every `db.` read in this crate must be. The other end
+    is a `spawn_blocking` writer over a `BufWriter` on `export::part_file(path)`, rendering through
+    `PullChunks` and `ExportFormat::stream_to` — so memory is a chunk or two rather than the result,
+    and every byte is core's emitter's, as `format.rs`'s are. **A closed channel is an end of stream
+    only while the token is not cancelled**: after the deadline cancels it, `PullChunks` is handed
+    an error rather than `Ok(None)`, the renderers reading `None` as a finished result; an `Err`
+    chunk — `stream_query_enforced` sends its failure down the channel as well as returning it — is
+    an `io::Error` the same way. The `.part` is renamed onto `path` only once the read returned `Ok`
+    and the writer finished; how it ended otherwise is the pure `export_verdict(read, written,
+    incremental, part)`. **The writer's error wins** unless the deadline stopped the read: a failed
+    write drops its end of the channel, and the reader's next send fails with its own "the export
+    stopped reading", which is true and useless — so the disk's error is what the user reads. A
+    deadline says it was exceeded; a failed read is the server's message. Each names the `.part`
+    only where it holds rows (`ExportFormat::writes_incrementally` — an XLSX `.part` is empty
+    until the end), as the app's export does (`export_verdict_tests`). A rename that fails says the
+    export is complete in the `.part` rather than that it failed. `run_export` also refuses an
+    output whose folder does not exist, as a usage error before anything is read. Verified live:
+    25,000 rows from PostgreSQL to CSV across three chunks, a `DELETE` refused with exit 3, and an
+    XLSX from SQL Server; the read itself has no unit test.
   - `cli/catalog.rs` — the canned SQL behind `schemaic tables` and `schemaic describe <table>`: two
     pure builders, `tables_sql(dialect, database)` and `describe_sql(dialect, database, table)`, and
     `DESCRIBE_COLUMNS`. **Text run through `query::read_only_query`, not a `Db` method of its
@@ -33781,6 +33827,16 @@ existing prose was left alone.
     table meets (SQLite's compile-time column ceiling is 32 767), and **zero rows is "no table or
     view named 'x' in <db>", exit 2** — the command named something that is not there, as a
     connection that is not there is.
+    **`export` is `run_export`, `run_query`'s order with the format judged first.** The format is
+    the command line's to get right, so it is resolved before a connection is selected:
+    `ExportFormat::from_name(--format)`, else `ExportFormat::for_path(--output)`, and neither is a
+    `warn` naming the six — json, csv, sql, md, html, xlsx — and `Exit::Usage`, an extensionless
+    output with no `--format` included. Then `select_conn`, `statement`, `query::gate` in the
+    connection's dialect (a refusal is exit 3 with nothing sent, as for `query`), `connect` under
+    `query::DEFAULT_TIMEOUT` — the export's own `--timeout` bounds the read, not the login — and
+    `query::read_only_export`. **The one line of success goes to stderr** — `wrote N rows to
+    <path>` — since stdout is not where the rows went. A failure is `run_query`'s: the message, the
+    no-database `hint:` when it applies, and `exit_for_no_rows`.
     **After a failure for want of a database, a `hint:` line on stderr names the way out** — `-d
     <database>`, a default picked in Schemaic, and `schemaic databases -c <conn>` with the user's own
     `-c` echoed back, quoted if it has whitespace (`shell_word`, which `mcp_notice` shares).
@@ -34406,11 +34462,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   tests over `script_verdict` all passed because every one of them exercised the function alone —
   the defect living, as ever here, at its composition with the caller.
   **The headless CLI is the fourth path, and it splits the question in two rather than adding a
-  gate.** `schemaic query` runs `cli/query.rs`'s `read_only_query`, whose gate is
+  gate.** `schemaic query` runs `cli/query.rs`'s `read_only_query`, and `schemaic export` its
+  uncapped streaming sibling `read_only_export` in the same file; their gate is
   `sql::read_only_reason` — an allowlist of read heads per dialect plus a keyword deny-list, and on
   PostgreSQL and SQL Server an allowlist of functions, with **no `Confirm` arm to say yes to**, which is the right shape when there is nobody at the keyboard,
-  and stronger than the verdict on the same axis `rerunnable_for_export` is. That function is the
-  one headless read path: the MCP server's `run_query` calls it too, rather than the CLI writing a
+  and stronger than the verdict on the same axis `rerunnable_for_export` is. That file is the
+  one headless read path: the MCP server's `run_query` calls `read_only_query` too, rather than the CLI writing a
   second copy of the gate beside the one `mcp.rs` already had. Both live in `schemaic-cli` now, and
   `schemaic mcp` is a second way into that same server rather than a new path: its `run_query` is
   the same call, the connection it serves has passed `cli/select.rs`'s `cli_access` gate like every
@@ -34425,18 +34482,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   a `SELECT` of a function whose body `DELETE`s all passed it and wrote through both front ends —
   shown live on PostgreSQL 16 and MariaDB 10.11. A text gate cannot see what a function does, so
   `read_only_query` now runs the statement through `Db::fetch_query_enforced` with
-  `Enforce::ReadOnly`, a session that refuses a write by its effect, and the gate stays in front for
+  `Enforce::ReadOnly` — and `read_only_export` through `Db::stream_query_enforced` with the same —
+  a session that refuses a write by its effect, and the gate stays in front for
   what that session still allows (sleeps, locks, server-side file reads, PostgreSQL's writes that
   are not transactional — `core::sql`'s entry) and for the one-statement
   count — which that session also pins, on MySQL/MariaDB, to the lexer the gate counted with (see
   `schemaic-db`'s entry for the `sql_mode` smuggle that closed). That session half is pinned by
   source, as the editor's is — `every_headless_read_runs_on_a_read_only_session` — since dropping
   it to `Enforce::None` kept every behavioural test green. **`read_only_reason` has no minted
-  request**: it is enforced inside `read_only_query` itself, and the refusals and the requests are
-  two separate lists. `schemaic query` also asks it once *earlier*, through `query::gate`, before
-  the keyring is read or a tunnel opened — as `schemaic exec` runs `ExecRequest::approved` before
-  it connects — so that exit 3's "nothing was sent" is true; the asking inside `read_only_query`
-  is what keeps the early one from being the only check. The refusals are `rerunnable_for_export`, `script_verdict`,
+  request**: it is enforced inside `read_only_query` and `read_only_export` themselves, and the
+  refusals and the requests are two separate lists. `schemaic query` and `schemaic export` also ask
+  it once *earlier*, through `query::gate`, before the keyring is read or a tunnel opened — as
+  `schemaic exec` runs `ExecRequest::approved` before it connects — so that exit 3's "nothing was
+  sent" is true; the asking inside the two read functions is what keeps the early one from being
+  the only check. The refusals are `rerunnable_for_export`, `script_verdict`,
   `read_only_reason` and `init_sql::check` (below); the requests are `RerunRequest`, minted against the first, `ScriptRequest`,
   against the second, and `ExecRequest`, minted against `run_verdict` itself.
   **`schemaic exec` is the write half, and it is the third minted request.** `ExecRequest`'s
