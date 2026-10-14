@@ -317,9 +317,72 @@ pub fn worth_remembering(query: &str, has_source: bool, has_name: bool, has_path
     !query.trim().is_empty() || has_source || has_name || has_path
 }
 
+/// How a closed tab reads in *Reopen Closed Tab*'s list: the title its tab
+/// had — the name the user gave it, else its file's name, else "Query N" —
+/// then, when it held any, the start of its text on one line, so two closed
+/// "Query 3"s from different sessions can be told apart.
+pub fn closed_tab_choice(
+    name: Option<&str>,
+    path: Option<&std::path::Path>,
+    label: usize,
+    query: &str,
+) -> String {
+    const SHOWN: usize = 80;
+    let title = match (name, path) {
+        (Some(n), _) => n.to_string(),
+        (None, Some(p)) => crate::sqlfile::tab_title(p),
+        (None, None) if label > 0 => format!("Query {label}"),
+        (None, None) => "Query".to_string(),
+    };
+    let line = crate::history::preview(query);
+    if line.is_empty() {
+        return title;
+    }
+    let cut = if line.chars().count() > SHOWN {
+        let end = line
+            .char_indices()
+            .nth(SHOWN)
+            .map_or(line.len(), |(i, _)| i);
+        format!("{}…", line[..end].trim_end())
+    } else {
+        line
+    };
+    format!("{title} — {cut}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_tab_reads_as_its_title_then_its_text() {
+        assert_eq!(
+            closed_tab_choice(None, None, 3, "SELECT *\n  FROM t"),
+            "Query 3 — SELECT * FROM t"
+        );
+        assert_eq!(
+            closed_tab_choice(
+                Some("Monthly"),
+                Some(std::path::Path::new("/a/r.sql")),
+                3,
+                ""
+            ),
+            "Monthly"
+        );
+        assert_eq!(
+            closed_tab_choice(None, Some(std::path::Path::new("/a/r.sql")), 3, "x"),
+            "r.sql — x"
+        );
+        assert_eq!(closed_tab_choice(None, None, 0, ""), "Query");
+    }
+
+    #[test]
+    fn a_long_closed_tab_is_cut_on_a_character() {
+        let q = "é".repeat(200);
+        let shown = closed_tab_choice(None, None, 1, &q);
+        assert!(shown.ends_with('…'));
+        assert_eq!(shown.chars().filter(|c| *c == 'é').count(), 80);
+    }
 
     fn dbs() -> Vec<String> {
         ["world", "classicmodels"]

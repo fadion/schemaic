@@ -12582,8 +12582,8 @@ existing prose was left alone.
     the next candidate and finally to `None` is what the callers already handle.
     `UiState`/`ui_state.json` is the original tenant and
     `tabs.json`, `connections.json`, `history.json`, `chats.json`, `snippets.json`,
-    `favorites.json`, `db_colors.json`, `diagrams.json`, `search_history.json`, `accepted.json` and
-    `ssh_known_hosts.json` all arrived behind it. Every decision in it is pure and testable because
+    `favorites.json`, `db_colors.json`, `diagrams.json`, `search_history.json`, `accepted.json`,
+    `ssh_known_hosts.json` and `closed_tabs.json` all arrived behind it. Every decision in it is pure and testable because
     **the filesystem is an argument**: `FileStore` is the seam `write_bytes` and `read_bytes` take,
     the way `secrets::SecretStore` does for the keyring and for the same reason. What had no test
     was never `classify` or `sibling` but the *composition* — that what a save produces is what a
@@ -12640,7 +12640,8 @@ existing prose was left alone.
     announced in a modal, so the privacy argument that justifies scrubbing the `.bak` does not carry
     across. For a while every erasing save removed both, and **every erasing call site is a *per-row*
     erasure** — one snippet, one chat, one history row, a deleted connection's cascade across
-    thirteen stores — never an erasure of the whole store, so deleting one snippet destroyed
+    fourteen stores — never an erasure of the whole store (the one exception now is `closed_tabs.json`
+    emptied while *restore tabs* is off, below), so deleting one snippet destroyed
     `snippets.json.corrupt` and with it the snippets that existed only there, with no message, as the
     side effect of deleting a *different* row
     (`an_erasing_save_keeps_a_corrupt_sibling_it_did_not_write`, and the composition in
@@ -12685,7 +12686,8 @@ existing prose was left alone.
     is a parameter rather than a `clear_*_backup` per file; `save_json_erasing` is the public entry,
     and the erasing callers are the history panel's trash, one history row removed from its menu, a
     deleted connection's history, chats and snippets, the AI panel's New chat, one snippet deleted
-    from the snippet panel, and the connection delete itself. **`write_json_store(file, value,
+    from the snippet panel, the connection delete itself, and the reopen ring's `closed_tabs.json`
+    on that delete and whenever *restore tabs* is off. **`write_json_store(file, value,
     saving)` is the third entry point beside the two fixed-verb ones**, and it exists because some
     stores are written by a single shared closure that both a menu upsert and the connection delete
     reach: the colour, favourite, formatter and `ui_state` savers are `Rc<dyn Fn(persist::Saving)>`,
@@ -12705,10 +12707,11 @@ existing prose was left alone.
     keeps no policy of its own. They are no longer on `Ui` at all: each is sealed with its signal
     inside a `ui/stored.rs` `Stored`, whose `update` passes `Replacing` and whose `erase` passes
     `Erasing`; the app's `save_ui` takes one directly. The delete closure's own gate asserts
-    exactly twelve erasing saves in it — an equality, since a floor of ten stayed green with
-    `table_colors.erase` deleted — **two of the twelve delegated**, since the history store's
+    exactly thirteen erasing saves in it — an equality, since a floor of ten stayed green with
+    `table_colors.erase` deleted — **three of the thirteen delegated**, since the history store's
     prune moved to `app/history_store.rs` and the snippet store's to `app/snippet_store.rs`, the
-    closure holding only the call to each, whose erase is gated in the module it moved to — and
+    closure holding only the call to each, whose erase is gated in the module it moved to, and the
+    reopen ring's `closed_tabs.json` is `(save_closed)(true)`, erasing by its argument — and
     counts the five `Stored` stores' `.erase(` calls toward the same total.
     **The tenth is the Find-Anywhere search history, and it was pruned in that closure while being
     saved nowhere in it** — its persistence was a `create_effect` at the top of `main` calling
@@ -12779,6 +12782,18 @@ existing prose was left alone.
     (`the_schema_filter_round_trips_and_defaults_to_none`). It changes per keystroke, so it is saved
     on a debounce and again at quit rather than by the effects the other fields share (*app/main.rs*,
     beside the `WindowClosed` flush).
+    **`ClosedTabsFile` is the reopen ring across a restart** — `closed_tabs.json`, at most
+    `CLOSED_TABS_CAP` (10) `ClosedTabEntry`s, most recent first, so Ctrl+Shift+T and the palette's
+    *Reopen Closed Tab* reach a tab closed before the last quit. An entry is a `SavedTab` under
+    `#[serde(flatten)]` beside its `label`, the *Query N* number (`0` for none, which a reopen
+    numbers afresh rather than restoring), so it is the same flat shape `tabs.json` writes and a
+    file tab comes back the way a restored open one does: the file's contents never stored, only
+    `file_dirty` (`a_closed_tab_round_trips_as_a_saved_tab_and_its_label`). `capped()` holds a
+    hand-edited or future file to the ring's length on read
+    (`a_closed_tabs_file_reads_no_longer_than_the_ring`). **It is written only while *restore
+    tabs* is on**, and emptied with no `.bak` while it is off: it is the text of tabs the user
+    *closed*, and keeping it against their wish to start fresh is the wrong default. The writer is
+    the app's `save_closed`, under the session-restore passage in *app/main.rs*.
     **`ai_harness` has two defaults, and the difference between them is the point.** A file *without*
     the key takes the serde default, `default_ai_harness` — `"claude"`, which is what every file
     written before multiple harnesses meant, since that was the one CLI the app drove; an upgrade must
@@ -15769,6 +15784,12 @@ existing prose was left alone.
       terms between them and each would carry two it does not mean.
       They agree on the term both do hold: a tab bound to a `.sql` file is neither reusable nor
       forgettable even when the file is empty, because the binding to the path is the thing at stake.
+      `closed_tab_choice(name, path, label, query)` is how one ring entry reads in the palette's
+      *Reopen Closed Tab*: the title the tab had — its name, else its file's (`sqlfile::tab_title`),
+      else *Query N*, or a bare *Query* for label `0` — then ` — ` and the start of its text on one
+      line (`history::preview`), so two closed *Query 3*s from different sessions can be told
+      apart (`a_closed_tab_reads_as_its_title_then_its_text`). The text is cut at 80 characters with
+      a `…`, counted in `char`s and sliced on a boundary (`a_long_closed_tab_is_cut_on_a_character`).
     - `palette.rs` — parses the command palette's `>` command mode into
       `Parsed::{Search,Filter,Command{name,arg}}`. The hard part is when typing stops filtering the
       command list and becomes an argument: longest-word-prefix match against the caller's
@@ -26374,6 +26395,14 @@ existing prose was left alone.
     alike collapsed a hit deep in a statement to `c…`), and the field's grey completion ghost is
     bounded at the field's inner edge with `inset_right` and ends in a `…` too — both used to run
     past the palette. Text Tab writes into the field is the field's own and scrolls there.
+    **The palette's *Reopen Closed Tab* is the reopen ring as a list** — a `CmdArg::Options` command
+    (hint `<tab>`) right after *Close Tab*, listing `TabsActions::closed_tabs_list`: the active
+    connection's ring entries, most recent first, keyed by their **ring index** and worded by
+    `tabsel::closed_tab_choice`. The pick runs `TabsActions::reopen_closed_at` with that index —
+    the same rebuild Ctrl+Shift+T's `reopen_closed_tab` delegates to once it has found the first
+    entry on the active connection — which removes the entry and saves the ring. It is scoped to
+    the active connection for the shortcut's reason: the strip shows only that connection's tabs,
+    so reopening another's would restore it out of sight.
     **The error modal wears `modal_title("Error", …)` and its ✕**, where it used to have neither a
     title row nor a close button and only click-away and Escape closed it. All three exits run the
     one `close`, which is also what clears `error_modal_text` so the editor bar's next *View* falls
@@ -30458,7 +30487,10 @@ existing prose was left alone.
   lost, even from an empty file. The file's *contents* are deliberately not persisted: `file_dirty`
   is one bit that lets the restore decide whether the `query` it already has **is** the on-disk copy
   (`disk_sql = Some(query)`) or unknown (`None`, which reads as modified until the next save or
-  reload settles it).
+  reload settles it). The reopen ring takes the same road to and from `closed_tabs.json`:
+  `ClosedTab::to_entry` writes `file_dirty` by `Tab::modified`'s rule (a path, and `disk_sql` not
+  the text) with `pinned` false, and `from_entry` comes back through `sqlfile::restored_binding`,
+  as a restored open tab does.
   **A long run that ends behind another window calls the user back**: the taskbar flash on Windows
   and Linux, the dock bounce on macOS (`WindowIdExt::request_attention` with
   `Urgency::Informational`, which stops on its own once the window is focused). `call_back_after`
@@ -30586,6 +30618,22 @@ existing prose was left alone.
   user can retype or a table they can reopen, so nothing else is stored against their preference; the
   same subset is read back so a full session left over from when the setting was *on* isn't silently
   restored either.
+  **The reopen ring follows the same setting, with no such carve-out.** `closed_tabs.json`
+  (`core/persist.rs`'s entry) seeds `recently_closed` at startup only when *restore tabs* is on,
+  less any entry whose connection no longer exists — the delete prunes the ring, but a file from
+  before that rule, or edited by hand, may still hold one. `save_closed(erasing)`, defined beside
+  the `restore_tabs` signal, writes the ring after every change to it — each push in
+  `close_tab_now`'s `record` (capped at `CLOSED_TABS_CAP`), each reopen, and the connection delete
+  straight after its `retain` — so it needs no `WindowClosed` flush. With the setting off it
+  writes an empty file instead, erasing; the delete passes `erasing = true` whatever the setting,
+  so no `.bak` keeps a deleted connection's closed queries. An effect on `restore_tabs` calls it,
+  so turning the setting off empties the file at once rather than at the next close; its first
+  run, at startup, rewrites the file as just filtered. **An empty file is written once, not per
+  change**: `save_closed` keeps an `emptied` flag and skips a write that would leave the file
+  saying nothing again, so with the setting off a close is not an erasing save paying the fsync
+  `persist.rs` budgets one per deletion. What this does not
+  keep, stated rather than implied: with the setting off, a closed file tab's unsaved text in the
+  ring does not survive a restart, unlike an open one's.
   **What the assistant knows about the result on screen, and how rows reach it.** `TurnContext`
   carries a `result` — `core::prompt::result_shape` over `Tab::shown_result`, which is
   `shown_panel` again rather than a second fallback rule (a stale `active_result` shows the first

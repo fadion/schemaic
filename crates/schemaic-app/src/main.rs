@@ -109,6 +109,66 @@ struct ClosedTab {
     disk_sql: Option<String>,
     file_format: schemaic_core::sqlfile::SqlFormat,
 }
+
+impl ClosedTab {
+    /// As `closed_tabs.json` keeps it: the shape `tabs.json` keeps an open tab
+    /// in, so a file tab's text is never stored twice — only whether it had
+    /// drifted from the file, which is `Tab::modified`'s rule.
+    fn to_entry(&self) -> schemaic_core::persist::ClosedTabEntry {
+        let dirty = self.path.is_some() && self.disk_sql.as_deref() != Some(self.query.as_str());
+        schemaic_core::persist::ClosedTabEntry {
+            tab: schemaic_core::persist::SavedTab {
+                query: self.query.clone(),
+                conn_id: self.conn_id,
+                database: self.database.clone(),
+                source: self
+                    .source
+                    .as_ref()
+                    .map(|s| (s.database.clone(), s.table.clone())),
+                source_schema: self.source.as_ref().and_then(|s| s.schema.clone()),
+                name: self.name.clone(),
+                pinned: false,
+                path: self.path.clone(),
+                file_crlf: self.file_format.crlf,
+                file_bom: self.file_format.bom,
+                file_utf16: self.file_format.utf16,
+                file_lossy: self.file_format.lossy,
+                file_dirty: dirty,
+            },
+            label: self.label,
+        }
+    }
+
+    /// Back from `closed_tabs.json`, through `sqlfile::restored_binding` as a
+    /// restored open tab is.
+    fn from_entry(e: schemaic_core::persist::ClosedTabEntry) -> ClosedTab {
+        let s = e.tab;
+        let binding = schemaic_core::sqlfile::restored_binding(
+            s.path.clone(),
+            s.file_dirty,
+            &s.query,
+            schemaic_core::sqlfile::SqlFormat {
+                crlf: s.file_crlf,
+                bom: s.file_bom,
+                lossy: s.file_lossy,
+                utf16: s.file_utf16,
+            },
+        );
+        ClosedTab {
+            source: s
+                .source
+                .map(|(db, table)| TableSource::new(db, s.source_schema, table)),
+            query: s.query,
+            conn_id: s.conn_id,
+            database: s.database,
+            name: s.name,
+            label: e.label,
+            path: binding.path,
+            disk_sql: binding.disk_sql,
+            file_format: binding.format,
+        }
+    }
+}
 /// Resolve the pinned session a tab's statements must run on: `Ok(None)` in
 /// Auto-commit (fresh connection per op, as everywhere else), `Err` when the tab
 /// is Manual but its connection isn't up.
@@ -2091,7 +2151,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let next_id = Rc::new(Cell::new(first_free_id));
     // Ring of recently-closed tabs (most-recent first, capped) for Ctrl+Shift+T.
     // Plain `ClosedTab` data so entries survive the closed tab's scope disposal.
-    let recently_closed: Rc<RefCell<VecDeque<ClosedTab>>> = Rc::new(RefCell::new(VecDeque::new()));
+    //
+    // Restored from `closed_tabs.json` when "restore tabs" is on — the same
+    // gate the session itself comes back through — less any entry whose
+    // connection is gone (the connection delete prunes it, but a file from
+    // before that rule, or edited by hand, may still hold one).
+    let recently_closed: Rc<RefCell<VecDeque<ClosedTab>>> =
+        Rc::new(RefCell::new(if ui_state.restore_tabs {
+            persist::load_json::<schemaic_core::persist::ClosedTabsFile>(
+                schemaic_core::persist::CLOSED_TABS_FILE,
+            )
+            .capped()
+            .tabs
+            .into_iter()
+            .filter(|e| cf.connections.iter().any(|c| c.id == e.tab.conn_id))
+            .map(ClosedTab::from_entry)
+            .collect()
+        } else {
+            VecDeque::new()
+        }));
     let flashing: RwSignal<Option<usize>> = RwSignal::new(None);
     // Where the user last was on each connection (connection id → tab id), so
     // switching away and back returns to that tab instead of the first one.
@@ -2430,6 +2508,54 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let editor_predictions = RwSignal::new(ui_state.editor_predictions);
     let editor_remembered_predictions = RwSignal::new(ui_state.editor_remembered_predictions);
     let restore_tabs = RwSignal::new(ui_state.restore_tabs);
+    // Write the reopen ring to `closed_tabs.json` — after every change to it,
+    // since it is a handful of entries and changes once per close or reopen.
+    // **Only while "restore tabs" is on**: off, the file is emptied with no
+    // `.bak`, because it is the text of tabs the user closed and they asked
+    // not to have their session kept. `erasing` is the connection delete's
+    // spelling, which must leave no copy of a deleted connection's queries.
+    //
+    // **An empty file is written once, not per change**: with the setting off
+    // every close would otherwise be an erasing save, and each pays the fsync
+    // `Saving::Erasing` takes — one per *deletion* is what that cost is for.
+    // `emptied` remembers that the file already says nothing.
+    let save_closed: Rc<dyn Fn(bool)> = {
+        let recently_closed = recently_closed.clone();
+        let emptied = Rc::new(Cell::new(false));
+        Rc::new(move |erasing: bool| {
+            let empty = !restore_tabs.get_untracked() || recently_closed.borrow().is_empty();
+            if empty && emptied.get() {
+                return;
+            }
+            emptied.set(empty);
+            let file = if restore_tabs.get_untracked() {
+                schemaic_core::persist::ClosedTabsFile {
+                    tabs: recently_closed
+                        .borrow()
+                        .iter()
+                        .map(ClosedTab::to_entry)
+                        .collect(),
+                }
+            } else {
+                schemaic_core::persist::ClosedTabsFile::default()
+            };
+            let name = schemaic_core::persist::CLOSED_TABS_FILE;
+            if erasing || !restore_tabs.get_untracked() {
+                persist::save_json_erasing(name, &file);
+            } else {
+                persist::save_json(name, &file);
+            }
+        })
+    };
+    // Turning the setting off empties the file at once, and on writes the
+    // ring as it stands — the effect's first run writes what was just read.
+    {
+        let save_closed = save_closed.clone();
+        create_effect(move |_| {
+            restore_tabs.track();
+            (save_closed)(false);
+        });
+    }
     schemaic_ui::theme::set_editor_font(editor_font.get_untracked());
     schemaic_ui::theme::set_editor_tab_width(tab_width.get_untracked());
     schemaic_ui::theme::set_editor_soft_tabs(soft_tabs.get_untracked());
@@ -6807,6 +6933,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let close_tab_now: Rc<dyn Fn(usize)> = {
         let tokens = tokens.clone();
         let recently_closed = recently_closed.clone();
+        let save_closed = save_closed.clone();
         let drop_session = drop_session.clone();
         Rc::new(move |id: usize| {
             // Snapshot a closing tab into the reopen ring (most-recent first,
@@ -6827,21 +6954,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 ) {
                     return;
                 }
-                let mut ring = recently_closed.borrow_mut();
-                if ring.len() >= 10 {
-                    ring.pop_back();
+                {
+                    let mut ring = recently_closed.borrow_mut();
+                    if ring.len() >= schemaic_core::persist::CLOSED_TABS_CAP {
+                        ring.pop_back();
+                    }
+                    ring.push_front(ClosedTab {
+                        query,
+                        conn_id: tab.conn_id.get_untracked(),
+                        database: tab.database.get_untracked(),
+                        source,
+                        name,
+                        label: tab.label,
+                        path,
+                        disk_sql: tab.disk_sql.get_untracked(),
+                        file_format: tab.file_format.get_untracked(),
+                    });
                 }
-                ring.push_front(ClosedTab {
-                    query,
-                    conn_id: tab.conn_id.get_untracked(),
-                    database: tab.database.get_untracked(),
-                    source,
-                    name,
-                    label: tab.label,
-                    path,
-                    disk_sql: tab.disk_sql.get_untracked(),
-                    file_format: tab.file_format.get_untracked(),
-                });
+                (save_closed)(false);
             };
             // Pinned tabs aren't closable, and this is the last thing every close
             // path (× click, middle-click, Ctrl+W, the Close-all/others chains)
@@ -8002,23 +8132,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Reopen the most-recently-closed tab (Ctrl+Shift+T): pop the ring and rebuild
     // the tab from the snapshot — its own connection/database, query, source (so it
     // stays editable if it was a table view), and name. No-op when the ring's empty.
-    let reopen_closed_tab: Rc<dyn Fn()> = {
+    //
+    // `reopen_closed_at` is the rebuild, for the ring entry at an index — the
+    // palette's *Reopen Closed Tab* picks one by it — and `reopen_closed_tab` is
+    // that for the most recent entry on the active connection. Either way the
+    // entry leaves the ring and the ring is saved.
+    let reopen_closed_at: Rc<dyn Fn(usize)> = {
         let next_id = next_id.clone();
         let place_tab = place_tab.clone();
         let recently_closed = recently_closed.clone();
-        Rc::new(move || {
-            // Reopen the most recent close *on this connection*. The strip is
-            // scoped, so reopening another connection's tab would restore it out
-            // of sight; its own connection reopens it when the user goes back.
-            let Some(snap) = ({
-                let mut ring = recently_closed.borrow_mut();
-                let conn = active_conn.get_untracked();
-                ring.iter()
-                    .position(|s| s.conn_id == conn)
-                    .and_then(|at| ring.remove(at))
-            }) else {
+        let save_closed = save_closed.clone();
+        Rc::new(move |at: usize| {
+            let Some(snap) = recently_closed.borrow_mut().remove(at) else {
                 return;
             };
+            (save_closed)(false);
             let id = next_id.get();
             next_id.set(id + 1);
             // Named tabs already restore their name; for unnamed ones, restore the
@@ -8042,7 +8170,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             && t.conn_id.get_untracked() == snap.conn_id
                     })
                 });
-                if !clash {
+                if !clash && orig_label > 0 {
                     tabs.update(|v| {
                         if let Some(t) = v.iter_mut().find(|t| t.id == id) {
                             t.label = orig_label;
@@ -8050,6 +8178,47 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     });
                 }
             }
+        })
+    };
+    let reopen_closed_tab: Rc<dyn Fn()> = {
+        let recently_closed = recently_closed.clone();
+        let reopen_closed_at = reopen_closed_at.clone();
+        Rc::new(move || {
+            // Reopen the most recent close *on this connection*. The strip is
+            // scoped, so reopening another connection's tab would restore it out
+            // of sight; its own connection reopens it when the user goes back.
+            let conn = active_conn.get_untracked();
+            let at = recently_closed
+                .borrow()
+                .iter()
+                .position(|s| s.conn_id == conn);
+            if let Some(at) = at {
+                (reopen_closed_at)(at);
+            }
+        })
+    };
+    // The active connection's closed tabs as the palette lists them, most
+    // recent first: the ring index (what `reopen_closed_at` takes) and the
+    // row's words (`tabsel::closed_tab_choice`).
+    let closed_tabs_list: Rc<dyn Fn() -> Vec<(String, String)>> = {
+        let recently_closed = recently_closed.clone();
+        Rc::new(move || {
+            let conn = active_conn.get_untracked();
+            recently_closed
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.conn_id == conn)
+                .map(|(i, s)| {
+                    let shown = schemaic_core::tabsel::closed_tab_choice(
+                        s.name.as_deref(),
+                        s.path.as_deref(),
+                        s.label,
+                        &s.query,
+                    );
+                    (i.to_string(), shown)
+                })
+                .collect()
         })
     };
 
@@ -11551,6 +11720,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let drop_session = drop_session.clone();
         let tokens = tokens.clone();
         let recently_closed = recently_closed.clone();
+        let save_closed = save_closed.clone();
         let last_tab = last_tab.clone();
         let open_tab_on = open_tab_on.clone();
         let save_search_history = save_search_history.clone();
@@ -11769,6 +11939,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 tabs.update(|v| v.retain(|t| t.conn_id.get_untracked() != id));
             }
             recently_closed.borrow_mut().retain(|s| s.conn_id != id);
+            // Erasing, like every other store here: no `.bak` may keep the
+            // deleted connection's closed queries.
+            (save_closed)(true);
             last_tab.borrow_mut().remove(&id);
             // Whatever is active now may have just been removed; make sure it's
             // a tab the strip will show, opening one if this connection has none.
@@ -13575,6 +13748,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             save_sql_file_as,
             reload_sql_file,
             reopen_closed_tab,
+            closed_tabs_list,
+            reopen_closed_at,
             can_reopen_closed_tab,
             can_close_other_tabs,
             open_table_filtered,
@@ -14777,7 +14952,13 @@ mod app_tests {
                  in `<store>.bak`"
             );
         }
-        let delegated = ["(history_clear_conn)(", "(snippet_clear_conn)("];
+        // `(save_closed)(true)` is the reopen ring's `closed_tabs.json`, saved
+        // erasing by its own argument.
+        let delegated = [
+            "(history_clear_conn)(",
+            "(snippet_clear_conn)(",
+            "(save_closed)(true)",
+        ];
         let erasing = region.matches("Saving::Erasing").count()
             + region.matches("save_json_erasing(").count()
             + delegated
@@ -14804,8 +14985,8 @@ mod app_tests {
         // green — the slack a floor leaves is exactly one lost store. A new
         // store raises this number in the same change that adds its erase.
         assert_eq!(
-            erasing, 12,
-            "{erasing} erasing saves in the delete closure, not the twelve stores \
+            erasing, 13,
+            "{erasing} erasing saves in the delete closure, not the thirteen stores \
              keyed to the connection; every one has to be erased, and a new one \
              raises this count"
         );

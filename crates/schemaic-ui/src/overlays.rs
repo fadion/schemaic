@@ -4061,6 +4061,28 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 &close,
             ),
         },
+        // Ctrl+Shift+T reopens the most recent; this lists the active
+        // connection's closed tabs — the ring outlives a restart while
+        // "restore tabs" is on — to pick an older one.
+        Command {
+            name: "reopen closed tab",
+            label: "Reopen Closed Tab",
+            hint: "<tab>",
+            arg: CmdArg::Options {
+                live: None,
+                list: ui.tab_actions.closed_tabs_list.clone(),
+                run: {
+                    let close = close.clone();
+                    let reopen = ui.tab_actions.reopen_closed_at.clone();
+                    Rc::new(move |v: String| {
+                        if let Ok(at) = v.parse::<usize>() {
+                            (reopen)(at);
+                        }
+                        (close)();
+                    })
+                },
+            },
+        },
         // The file group, right after the tab lifecycle it belongs to: a tab is
         // where a `.sql` file is opened into and saved from.
         Command {

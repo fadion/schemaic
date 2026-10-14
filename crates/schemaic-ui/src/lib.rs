@@ -5081,6 +5081,12 @@ pub struct TabsActions {
     /// connection — same per-connection scoping it applies itself. The tab menu
     /// dims its entry rather than offering a click that does nothing.
     pub can_reopen_closed_tab: Rc<dyn Fn() -> bool>,
+    /// The active connection's closed tabs, most recent first, as
+    /// `(key, row)` for the palette's *Reopen Closed Tab* — the key is what
+    /// [`Self::reopen_closed_at`] takes.
+    pub closed_tabs_list: Rc<dyn Fn() -> Vec<(String, String)>>,
+    /// Reopen the closed tab a [`Self::closed_tabs_list`] key names.
+    pub reopen_closed_at: Rc<dyn Fn(usize)>,
     /// Whether "Close other tabs" on this tab has anything to close, so the entry
     /// can be dimmed rather than silently doing nothing. Answered by the same
     /// `core::tabsel::others_to_close` the action itself calls.

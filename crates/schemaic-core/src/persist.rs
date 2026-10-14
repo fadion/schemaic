@@ -599,6 +599,47 @@ pub struct SavedTab {
     pub file_dirty: bool,
 }
 
+/// The file the recently-closed ring is kept in across restarts.
+pub const CLOSED_TABS_FILE: &str = "closed_tabs.json";
+
+/// The recently-closed ring as it stood — most recent first, at most
+/// [`CLOSED_TABS_CAP`] — so Ctrl+Shift+T and *Reopen Closed Tab* reach a tab
+/// closed before the last restart.
+///
+/// **Written only while "restore tabs" is on**, and emptied (with no `.bak`)
+/// when it is off: it is the text of tabs the user *closed*, and keeping it
+/// against their wish to start fresh is the wrong default. Each entry is a
+/// [`SavedTab`], so a file tab comes back the way `tabs.json` brings one back
+/// — the file's contents never stored, only whether the text had drifted from
+/// it — plus the "Query N" number it had.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClosedTabsFile {
+    #[serde(default)]
+    pub tabs: Vec<ClosedTabEntry>,
+}
+
+/// How many closed tabs the ring keeps.
+pub const CLOSED_TABS_CAP: usize = 10;
+
+/// One closed tab: what `tabs.json` keeps of an open one, and its label.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClosedTabEntry {
+    #[serde(flatten)]
+    pub tab: SavedTab,
+    /// The tab's "Query N" number, restored when no live tab claims it.
+    #[serde(default)]
+    pub label: usize,
+}
+
+impl ClosedTabsFile {
+    /// The ring as read, held to [`CLOSED_TABS_CAP`] — a hand-edited or
+    /// future file cannot make it longer than the ring the app keeps.
+    pub fn capped(mut self) -> ClosedTabsFile {
+        self.tabs.truncate(CLOSED_TABS_CAP);
+        self
+    }
+}
+
 /// The set of open tabs at last save, plus which one was active (its index).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SavedTabsFile {
@@ -3659,6 +3700,49 @@ mod tests {
         assert_eq!(at(0), 0, "itself");
         assert_eq!(at(1), 1, "the query tab is gone; the next survivor");
         assert_eq!(at(2), 1, "itself, renumbered");
+    }
+
+    /// A closed tab is a saved tab beside its label — the same flat keys
+    /// `tabs.json` writes, so one reader shape serves both — and an entry with
+    /// no label reads as 0, which a reopen treats as "number it afresh".
+    #[test]
+    fn a_closed_tab_round_trips_as_a_saved_tab_and_its_label() {
+        let file = super::ClosedTabsFile {
+            tabs: vec![super::ClosedTabEntry {
+                tab: saved(Some("/sql/a.sql"), true, "select 1"),
+                label: 4,
+            }],
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        assert!(json.contains(r#""query":"select 1""#), "flattened: {json}");
+        let back: super::ClosedTabsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tabs[0].label, 4);
+        assert_eq!(back.tabs[0].tab.path, Some(PathBuf::from("/sql/a.sql")));
+        assert!(back.tabs[0].tab.file_dirty);
+        let unlabelled: super::ClosedTabsFile =
+            serde_json::from_str(r#"{"tabs":[{"query":"x","conn_id":2}]}"#).unwrap();
+        assert_eq!(unlabelled.tabs[0].label, 0);
+        assert!(
+            serde_json::from_str::<super::ClosedTabsFile>("{}")
+                .unwrap()
+                .tabs
+                .is_empty()
+        );
+    }
+
+    /// A file holding more than the ring keeps reads as the ring's length.
+    #[test]
+    fn a_closed_tabs_file_reads_no_longer_than_the_ring() {
+        let entry = |q: &str| super::ClosedTabEntry {
+            tab: saved(None, false, q),
+            label: 1,
+        };
+        let file = super::ClosedTabsFile {
+            tabs: (0..15).map(|i| entry(&i.to_string())).collect(),
+        }
+        .capped();
+        assert_eq!(file.tabs.len(), super::CLOSED_TABS_CAP);
+        assert_eq!(file.tabs[0].tab.query, "0", "most recent kept");
     }
 
     /// A fresh directory under the system temp dir, removed by `Dir`'s drop.
