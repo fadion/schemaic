@@ -27579,7 +27579,9 @@ existing prose was left alone.
     an open table lists each of its `TableInfo::partitioning`'s partitions after its keys as a
     static leaf, `partition_row`: the Lucide `layers` glyph (`icons::LAYERS`), the name, the bound
     muted, and its share of the size through `size_badge`'s `partition` parameter, which reads
-    `TableStats::partition(name)` rather than the table's figures (under `stats.rs`). It opens
+    `TableStats::partition(name)` rather than the table's figures (under `stats.rs`). It takes the
+    table's schema and hands it on, because SQL Server keys its statistics by schema: looked up
+    without one, no partition there ever showed a size. It opens
     nothing, so like a key row it is not in the nav walk; the *N partitions* capsule counts these
     rows too.
     **`key_under(database, key)` owns which expansion-key families live under a database**, and it
@@ -27717,10 +27719,15 @@ existing prose was left alone.
       border box the same way, but a row wears no left or right border, so there is nothing there
       to displace it. The trade is that a table name long enough to reach the panel
       edge now runs *under* the size instead of pushing it along — tolerable because sizes appear
-      on table rows only, so there is no column row beneath to collide with. MySQL's partition
-      rows (above) are the one exception, and take the same trade: a long bound runs under the
-      partition's size as a long name does under a table's. What runs underneath
-      is also the chevron and the name, so `.pointer_events(|| false)` on the badge is load-bearing
+      on table rows only, so there is no column row beneath to collide with. MySQL's and SQL
+      Server's partition rows (above) are the one exception, and **do not** take the same trade:
+      a bound is the one thing on a tree row that is routinely long, and drawn under the size it
+      was unreadable. So `partition_row` holds itself to `width(tree_row_min_w())` — the panel's
+      width rather than the widest row's — and while sizes are on gives the bound `min_width(0)`,
+      `text_ellipsis()` and a `theme::scaled(72.0)` right margin (the badge's 18px inset less the
+      row's 8, plus room for a figure like *999.9 KiB*), so it clips short of the size. The name
+      beside it does not shrink, so a partition name long enough still runs under. What runs
+      underneath is also the chevron and the name, so `.pointer_events(|| false)` on the badge is load-bearing
       and not decoration: without it the badge, as the row's last child, won Floem's back-to-front
       pointer walk for the panel's full width and clicking a table stopped expanding it — with the
       column *off* too, because the empty state is still a full-width box. Keyboard nav kept

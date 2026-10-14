@@ -2747,10 +2747,12 @@ fn object_row(
 /// every row whatever its depth.
 ///
 /// The cost of leaving the flow is that a table name long enough to reach the
-/// panel edge now runs under the size instead of pushing it along. Sizes sit on
-/// table rows only, which is what makes that trade a good one: there is no
-/// column row underneath to collide with, and the alternative was a column that
-/// disappeared whenever anything was open.
+/// panel edge now runs under the size instead of pushing it along. On a table
+/// row that trade is a good one: there is no column row underneath to collide
+/// with, and the alternative was a column that disappeared whenever anything
+/// was open. A storage partition's row is the exception and does not take it —
+/// its bound is routinely long — so [`partition_row`] clips the bound short of
+/// the size instead.
 fn size_badge(
     stats: Option<RwSignal<crate::DbStatsState>>,
     enabled: RwSignal<bool>,
@@ -3009,6 +3011,7 @@ fn table_node(
         _ => Vec::new(),
     };
     let storage_table = table.name.clone();
+    let storage_schema = table.schema.clone();
     let cols = table.columns;
     let idxs = table.indexes;
     let fkeys = table.foreign_keys;
@@ -3088,6 +3091,7 @@ fn table_node(
                     p,
                     db_stats,
                     table_sizes,
+                    storage_schema.clone(),
                     storage_table.clone(),
                     indent_levels,
                 )
@@ -3364,10 +3368,19 @@ fn key_row(
 /// [`schemaic_core::schema::partitions_are_tables`] says no): its name, its
 /// bound, and its share of the table's size. A static leaf like a key row —
 /// it opens nothing, so it is not in the nav walk.
+///
+/// `schema` is the table's own: SQL Server keys its statistics by schema, and
+/// a lookup without one found no size for any partition there.
+///
+/// The bound is the one thing on a tree row that can be long *and* sit under
+/// the size, which `size_badge` pins at the panel's edge out of flow — so this
+/// row is held to the panel's width and the bound clips with an ellipsis short
+/// of the size column while sizes are shown, rather than being drawn under it.
 fn partition_row(
     p: schemaic_core::schema::Partition,
     stats: Option<RwSignal<crate::DbStatsState>>,
     sizes: RwSignal<bool>,
+    schema: Option<String>,
     table: String,
     indent_levels: u32,
 ) -> impl IntoView {
@@ -3377,18 +3390,32 @@ fn partition_row(
                 .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
-        text(p.name.clone()),
-        text(p.bound).style(|s| {
-            s.color(theme::text_muted())
+        text(p.name.clone()).style(|s| s.flex_shrink(0.0_f32)),
+        text(p.bound).style(move |s| {
+            let s = s
+                .color(theme::text_muted())
                 .font_size(theme::font_label())
                 .margin_left(theme::scaled(12.0))
+                .min_width(0.0)
+                .text_ellipsis();
+            // The badge's own 18px inset less the row's 8, plus room for a
+            // figure like "999.9 KiB" and a gap before it.
+            if sizes.get() {
+                s.margin_right(theme::scaled(72.0))
+            } else {
+                s
+            }
         }),
-        size_badge(stats, sizes, None, table, Some(p.name)),
+        size_badge(stats, sizes, schema, table, Some(p.name)),
     ))
     // See `failed_row`: a row, so a secondary click on it is not one on
     // blank space.
     .on_secondary_click_stop(|_| {})
-    .style(move |s| tree_row_static(s, leaf_icon_pad(indent_levels)).items_center())
+    .style(move |s| {
+        tree_row_static(s, leaf_icon_pad(indent_levels))
+            .items_center()
+            .width(tree_row_min_w())
+    })
 }
 
 // A clickable disclosure chevron: chevron-down when expanded, chevron-right
