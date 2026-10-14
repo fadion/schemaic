@@ -5695,8 +5695,15 @@ existing prose was left alone.
     fixture with range partitions across two schemas, a sub-partitioned partition, two `DEFAULT`
     partitions, a parent index, a partition's own index and a foreign key, dumped as
     `events` + `customers` and restored into a fresh database with the same per-partition row
-    counts (641/546/552/261), 13 indexes and 6 foreign-key constraints. Only PostgreSQL is
-    affected: no other engine's reader fills the partitioning (under `schema.rs`).
+    counts (641/546/552/261), 13 indexes and 6 foreign-key constraints. **None of this touches
+    MySQL**, where a partition is no table: `partition_of` stays `None`, so nothing waits on
+    anything, and `rows_live_in_partitions` answers no, so the partitioned table keeps its data
+    step — its partitions coming back inside its own `CREATE TABLE`, through
+    `Partitioning::clause_sql` (under `schema.rs`). Verified live on MariaDB 10.11 (per the
+    change's author): a database of `RANGE`, `LIST COLUMNS`, `HASH`, `KEY`, `RANGE COLUMNS` and
+    `RANGE` + `SUBPARTITION BY HASH` tables, dumped through the CLI's `dump::run` and restored into
+    a fresh database, listed an identical `information_schema.PARTITIONS` (an md5 of every
+    partition and subpartition row equal) with identical row counts.
     **The views are then sorted among themselves, by the same walk.** "Views last" ordered them
     against the base tables and left them in name order against each other, and a view built on
     another view is `CREATE VIEW … FROM other_view` where `other_view` does not exist yet — MySQL
@@ -6970,13 +6977,21 @@ existing prose was left alone.
     `NOT ENFORCED` there (`CheckInfo::clause_sql`, asking `writes_not_enforced`), T-SQL having no
     such clause (`create_table_on_sql_server_writes_t_sql`,
     `create_table_on_sql_server_writes_no_mysql_options`).
-    **A PostgreSQL partitioning is a `create`-only field**: `TableDraft::partition_key` and
-    `partition_of`, which `from_table` copies off `TableInfo::partitioning`'s key and
-    `TableInfo::partition_of` (under `schema.rs`). `create_table_sql` writes a partition as
+    **A partitioning is a `create`-only field**: `TableDraft::partitioning` and `partition_of`,
+    which `from_table` clones off `TableInfo::partitioning` and `TableInfo::partition_of` (under
+    `schema.rs`). `create_table_sql` writes a partition as
     `CREATE TABLE q PARTITION OF parent [(…)] <bound>`, its parenthesised list holding only its
     own foreign keys and checks, since the parent gives it its columns and key, and appends
-    ` PARTITION BY <key>` to a partitioned table or a sub-partitioned partition; an inherited
-    foreign key or index (`inherited`) is skipped, coming with the partition from its parent.
+    `Partitioning::clause_sql` to a partitioned table or a sub-partitioned partition — **after the
+    table options**, where MySQL takes it, so a MySQL table reads `) ENGINE=InnoDB PARTITION BY
+    RANGE (…)` and then its partitions, PostgreSQL's the key alone; an inherited foreign key or
+    index (`inherited`) is skipped, coming with the partition from its parent. **The clause is
+    written only where `schema::restates_partitioning` says a `CREATE TABLE` carries one** — false
+    on SQL Server, which now reads a `Partitioning` too, so without the filter MySQL's `PARTITION
+    BY` spelling would reach T-SQL; the comparison holds such a table back instead of creating it
+    plain (under `compare.rs`). The draft held the
+    key alone (`partition_key`) until MySQL's were read, which a table that must declare its
+    partitions cannot be created from.
     **`diff` never reads either**, because no `ALTER` changes a table's partitioning — so an edit in
     the designer cannot express one, and the comparison holds a repartitioned table back rather
     than letting the two sides read as the same table (under `compare.rs`). Copy to clears both
@@ -8693,10 +8708,11 @@ existing prose was left alone.
     fine. **The third is a set that emits and must not run.** `CompareEntry::held_back` is the
     sentence saying why no plan may carry an entry's changes, set where the server would refuse the
     statements and the only change it would take does damage the comparison may not choose for the
-    user; `unplannable` is true whenever it is set, and `omission_note` reads it ahead of its other
+    user, or where the difference needs a statement the comparison does not write at all;
+    `unplannable` is true whenever it is set, and `omission_note` reads it ahead of its other
     three arms, so the omitted line is that sentence. Two producers set it — `tsql_entry`, through
     `held_back_sequence`, for a SQL Server sequence's range, and `table_entry` for a table whose
-    partitioning differs (both below) — and every other entry is built with `None`. `is_planned` carries the same term, so counting and building cannot answer
+    partitioning differs or a partitioned one no `CREATE TABLE` can restate (both below) — and every other entry is built with `None`. `is_planned` carries the same term, so counting and building cannot answer
     differently.
     It is a second list rather than more lines in
     `unsupported()` because the two ask different things of the reader: `unsupported` means this plan
@@ -8845,19 +8861,35 @@ existing prose was left alone.
     options, so the only statements the table arms could write are a `CREATE TABLE` making an empty
     local table where the wrapper's rows were, and an `ALTER` or `DROP TABLE` the server refuses on
     one (`a_foreign_table_is_disclosed_not_planned`).
-    **A PostgreSQL table partitioned differently on the two sides is held back, not planned.** No
-    `ALTER` changes a table's partition key, nor which table it is a partition of or for which
-    values, and `ddl::diff` reads neither field — so where the key (`TableInfo::partitioning`'s) or
-    the whole `partition_of` differs, `table_entry` makes the entry `Differing` whatever its change
-    set says, and sets `held_back` to *"its partitioning differs, and no ALTER changes a table's
-    partitioning — recreate it by hand"*; without it the two would have read as the same table, or
+    **A table partitioned differently on the two sides is held back, not planned.** No
+    PostgreSQL `ALTER` changes a table's partition key, nor which table it is a partition of or for
+    which values, and `ddl::diff` reads neither field. So where partitions are tables
+    (`partitions_are_tables`) and the key (`TableInfo::partitioning`'s) or the whole `partition_of`
+    differs — or elsewhere (MySQL, SQL Server) the whole `Partitioning` does, the partitions being the table's
+    own, so a partition added or a bound moved is the same difference — `table_entry` makes the
+    entry `Differing` whatever its change set says, and sets `held_back` to *"its partitioning
+    differs, and this comparison writes no statement that repartitions a table — recreate it by
+    hand"* — worded for the differ rather than the server, since MySQL does have `ALTER TABLE …
+    PARTITION BY` and `ADD`/`REORGANIZE PARTITION` and `ddl::diff` writes none of them, so the
+    sentence is true on every engine; without it the two would have read as the same table, or
     been planned as alters that leave the partitioning as it was
     (`a_change_of_partitioning_is_held_back`, over a changed key and a partition moved to
-    `DEFAULT`). The partitions themselves are not compared through the key — each is a table of
-    its own and pairs as one. A partitioned table the target lacks is created partitioned, through
-    `ddl::create_table_sql`, with its partitions after it, since `fk_rank`'s `dump::order_tables`
-    makes a partition wait on its parent
-    (`a_missing_partitioned_table_is_created_with_its_partitions`).
+    `DEFAULT`). On PostgreSQL the partitions themselves are not compared through the key — each is
+    a table of its own and pairs as one. A partitioned table the target lacks is created
+    partitioned, through `ddl::create_table_sql`, with its partitions after it, since `fk_rank`'s
+    `dump::order_tables` makes a partition wait on its parent
+    (`a_missing_partitioned_table_is_created_with_its_partitions`); on MySQL in one statement,
+    `) ENGINE=InnoDB PARTITION BY RANGE (…)` and every partition, and a changed partition list is
+    held back (`a_mysql_tables_partitions_are_created_and_compared_with_it`); on SQL Server, whose
+    key names the scheme, a moved boundary or another scheme is that difference between two
+    existing tables. **A partitioned table the target lacks is held back where no `CREATE TABLE` restates the
+    partitioning** (`schema::restates_partitioning`, false on SQL Server, whose partitioning is a
+    partition scheme over a partition function, objects the model does not hold): `table_entry`
+    sets `held_back` to *"it is partitioned, and no CREATE TABLE here restates its partition scheme
+    — create the partition function and scheme, then the table, by hand"*, because created plain
+    it would have read as done
+    (`a_missing_partitioned_sql_server_table_is_held_back_not_created_plain`, which asserts the
+    plan writes no `CREATE TABLE` and no `PARTITION`).
     **Extensions are not compared at all**:
     installing one is a server-side act — its control files must be on the target's disk — rather
     than a definition a plan can restate, and the comparison does not read the two sides' lists.
@@ -9060,10 +9092,12 @@ existing prose was left alone.
     (`the_plan_creates_the_copy_and_never_names_the_source`). **Foreign keys are cleared**: the
     tables they reference need not exist on the target, and a key naming a missing table refuses
     the whole `CREATE`. **Triggers do not come**, a draft not carrying them. **A copy is one plain
-    table**, whatever the source's partitioning: `partition_key` and `partition_of` are cleared,
-    since a partitioned copy has no partition for any row it then inserts and a partition copied
-    `PARTITION OF` names a parent the target may not have — while the rows a partitioned table
-    reads are its partitions', so the plain copy holds them all — and an index the source
+    table**, whatever the source's partitioning, on every engine by choice: `partitioning` and
+    `partition_of` are cleared. The reasons are PostgreSQL's — a partitioned copy there has no
+    partition for any row it then inserts, and a partition copied `PARTITION OF` names a parent the
+    target may not have — while the rows a partitioned table reads are its partitions', so the
+    plain copy holds them all; a MySQL copy, which could have declared its partitions, simply keeps
+    none of the source's partitioning. An index the source
     inherited from its parent (`IndexInfo::inherited`) becomes the copy's own, there being no
     parent to give it one (`a_partitioned_table_or_a_partition_is_copied_as_a_plain_table`).
     **An index's and a
@@ -12167,9 +12201,9 @@ existing prose was left alone.
     draws it as a table, and the tree and the palette give it `schema_tree::table_glyph`'s
     `EXTERNAL_LINK`.
     **A partition is not a fifth shape: it is a table, on the one engine where it is a table.**
-    `TableInfo::partitioning` is how a table is partitioned — `Partitioning { key, partitions }`,
-    the key as the engine prints it (`RANGE (at)`, `pg_get_partkeydef`'s text) and each
-    `Partition { name, schema, bound }`, its namespace kept because a PostgreSQL partition may live
+    `TableInfo::partitioning` is how a table is partitioned — `Partitioning { key, partitions,
+    subpartition }`, the key as the engine prints it (`RANGE (at)`, `pg_get_partkeydef`'s text)
+    and each `Partition { name, schema, bound }`, its namespace kept because a PostgreSQL partition may live
     in another than its parent's — and `TableInfo::partition_of` is the other end, `PartitionOf {
     schema, parent, bound }`; a sub-partitioned partition has both. `partitions_are_tables(dialect)`
     is the capability the two are read through, `true` on PostgreSQL alone: there a partition is
@@ -12177,10 +12211,40 @@ existing prose was left alone.
     whereas on MySQL and SQL Server a partition is storage inside its table and the table holds
     every row. `TableInfo::rows_live_in_partitions` asks it of one table (partitioned, on such an
     engine) and `is_partition_of(parent)` matches `partition_of` against a table by name and
-    namespace; the dump is their reader (under `dump.rs`). **Only PostgreSQL fills them today** —
-    `pg_fold_partitions` (under `pg.rs`) — so on MySQL and SQL Server both stay `None` and a
-    partitioned table reads as an unpartitioned one; the model's doc comments already allow for
-    MySQL's `p0`/`VALUES LESS THAN`, which no reader produces yet.
+    namespace; the dump is their reader (under `dump.rs`). **PostgreSQL, MySQL and SQL Server fill
+    `partitioning`, and PostgreSQL alone `partition_of`** — `pg_fold_partitions`,
+    `mysql_fold_partitions` and `mssql_partitioning` (under `pg.rs`, `mysql.rs` and `mssql.rs`).
+    On MySQL a `Partition` is `p0` with
+    `VALUES LESS THAN (2024)`, `VALUES IN (…)` or, for `HASH`/`KEY`, no bound at all, its `schema`
+    `None`; `subpartition` is MySQL's clause after `SUBPARTITION BY`
+    (`` HASH (`id`) SUBPARTITIONS 2 ``), the subpartitions' own names not kept, so restated they
+    take the engine's defaults.
+    On SQL Server the key is `RANGE RIGHT ([at]) ON [ps_year]` — the function's side, the
+    partitioning column and the scheme — and the partitions are named by number, `1` to `n + 1`,
+    as the server names them, each bound from `tsql_partition_bounds(range_right, boundaries)`:
+    `RANGE RIGHT` puts a boundary value in the partition to its right, so `< b1`,
+    `>= b1 AND < b2`, …, `>= bn`, and `RANGE LEFT` in the one to its left, `<= b1`,
+    `> b1 AND <= b2`, …, `> bn`; `n` boundaries make `n + 1` partitions, and none makes one partition
+    with an empty bound (`tsql_partition_bounds_follow_the_range_side`).
+    **`restates_partitioning(dialect)` is whether a `CREATE TABLE` carries the partitioning** —
+    `true` on PostgreSQL and MySQL, where it is a clause of the statement; `false` on SQL Server,
+    where a table is partitioned onto a partition scheme over a partition function, objects of their
+    own that the model does not hold, and on SQLite, which has none
+    (`partitioning_is_restated_on_postgres_and_mysql`). It is a second capability rather than
+    `partitions_are_tables` asked again, because MySQL and SQL Server answer that one alike and
+    this one apart. `ddl::create_table_sql` and the comparison ask it (under `ddl.rs` and
+    `compare.rs`); `create_ddl`'s T-SQL arm, *Script table as CREATE*, answers it with a note
+    line instead of the clause — `-- [dbo].[orders] is partitioned (RANGE RIGHT ([at]) ON
+    [ps_year]); its partition function and scheme are not read, so this script creates it
+    unpartitioned.`, the key through `export::comment_text` — so a script that creates the table
+    plain says so rather than passing for a restatement
+    (`a_partitioned_sql_server_tables_script_says_it_is_not_restated`).
+    **`Partitioning::clause_sql(dialect)` is the one spelling of the clause**, which `create_ddl`
+    and `ddl::create_table_sql` both write where `restates_partitioning`. Where `partitions_are_tables` it is `PARTITION BY
+    <key>` alone, each partition being a `CREATE` of its own; elsewhere a partition is storage the
+    table must declare, so the clause goes on to the `SUBPARTITION BY` line and every partition,
+    `` PARTITION `name` <bound> `` — or a bare `` PARTITION `p0` `` for `HASH`/`KEY`
+    (`the_partition_clause_lists_mysqls_partitions_and_only_postgres_key`).
     **Where a partition is listed is `DbSchema::lists_under_parent`**: one whose parent this schema
     holds is shown under it — the schema tree nests it there, and the ER diagram and the assistant's
     schema draw the parent alone (under `schema_tree.rs`, `erd.rs` and `cli/mcp.rs`) — while one
@@ -12202,6 +12266,9 @@ existing prose was left alone.
     Restated as two plain tables, the parent held no rows and routed none, and the partition was a
     stray copy beside it (`a_partitioned_table_and_its_partition_are_restated_as_such`,
     `a_sub_partitioned_partition_keeps_its_own_key`, `partitions_are_tables_on_postgres_alone`).
+    The MySQL arm ends `\n) PARTITION BY …;` with every partition listed, a partition there being
+    storage its table declares rather than a `CREATE` of its own
+    (`a_mysql_partitioned_tables_script_keeps_its_partitions`).
     **`IndexInfo::inherited` and `ForeignKeyInfo::inherited` are what the partition takes from its
     parent with it**: PostgreSQL clones a parent's index and key onto every partition, and both are
     read and marked (under `pg.rs`) — kept, since a partition's grid edits key on its primary key,
@@ -16486,6 +16553,12 @@ existing prose was left alone.
       PostgreSQL's `pg_stat_all_indexes` and SQL Server's `sys.dm_db_index_usage_stats`; SQLite
       keeps none. `count_rows_sql` builds the exact-count statement here
       rather than three times in the db crate, through the one quoter (`export::ident_sql`).
+      **`TableStats::partitions` is each partition's share where a partition is storage inside
+      its table** — `PartitionStats { name, rows, data_bytes, index_bytes }`, its `total_bytes` by
+      `TableStats::total_bytes`' rule, found by `TableStats::partition(name)` — in the partitions'
+      order, and filled on MySQL and SQL Server (under `mysql.rs` and `mssql.rs`). It is empty where
+      partitions are tables (`schema::partitions_are_tables`, i.e. PostgreSQL), each partition
+      having a `TableStats` of its own, and on SQLite, which has no partitioning.
       Filled by `Db::fetch_table_stats`; rendered by `ui/properties.rs`, the schema tree's
       size column, the results toolbar, the Truncate confirmation and a table drop's preview.
       - **Where a figure may be printed, and in what words, is decided here too** — the surfaces
@@ -17835,6 +17908,20 @@ existing prose was left alone.
   rows-to-model step is a pure `map_mysql_stats`, so the decisions with a wrong answer that looks
   plausible — `MAX(CARDINALITY)` per index rather than per key *position*, the usage view's NULL
   index row, a missing usage entry leaving `scans: None` — are unit-tested without a server.
+  A fourth, `MY_PARTITION_STATS_SQL`, sums each partition's `TABLE_ROWS`, `DATA_LENGTH` and
+  `INDEX_LENGTH` over `information_schema.PARTITIONS` — a subpartitioned partition's
+  subpartitions summed into it — and `map_mysql_stats` puts them on `TableStats::partitions`
+  (under `stats.rs`) through its last parameter (`a_partitions_figures_land_on_its_table`). A
+  1109/1146 there degrades to no partition figures, as the schema's partition read does (under
+  `mysql.rs`'s `collect_schema`, below); any other error fails the fetch. Verified live on MariaDB
+  10.11 (per the change's author): each partition's size and rows matched the catalogue,
+  subpartitions summed. SQL Server's counterpart is `mssql.rs`'s `PARTITION_STATS`: for each table
+  with more than one partition, per partition number, the rows of index 0 or 1 and the data and
+  index bytes from used pages × 8192, as `TABLE_STATS` sums them per table, onto
+  `TableStats::partitions` under the numbers `mssql_partitioning` names the partitions by (below).
+  It is a `?` like the queries beside it, so a failure there fails the fetch. Verified live on SQL
+  Server 2022 (per the change's author): per-partition rows of 71/121/108 and 100/100/50 matched
+  `sys.dm_db_partition_stats`.
   **SQLite answers from the `dbstat` virtual table** (`sqlite::table_stats`), which the bundled
   `libsqlite3-sys` build compiles in (`SQLITE_ENABLE_DBSTAT_VTAB`) — this paragraph used to say it
   was omitted and that SQLite publishes nothing, which was false, and the dispatcher's arm answered
@@ -18188,6 +18275,27 @@ existing prose was left alone.
   `event_body_of` is its pure reader and is the simplest of the three, since `DO` is a keyword it
   can anchor on — what it still needs is `sql::skip_noncode`, for the event named `` `do` `` and
   the `COMMENT 'do not touch'` that both sit before the real one.
+  **Partitions are read in `collect_schema` and degrade as events do.** `MY_PARTITIONS_SQL` reads
+  `information_schema.PARTITIONS`' rows that carry a partition name — an unpartitioned table has
+  one row without, left out — ordered by table, partition and then subpartition ordinal, so a
+  subpartitioned partition comes back once per subpartition; a 1109/1146 leaves the list empty,
+  for the events read's reason. The pure `mysql_fold_partitions` puts them on
+  `TableInfo::partitioning` (under `schema.rs`): the key is the method and expression as the
+  server prints them (`` RANGE (`y`) ``, `` LIST COLUMNS (`region`) ``, `KEY ()`), and each bound
+  is rebuilt from `PARTITION_DESCRIPTION` the way `SHOW CREATE TABLE` writes it —
+  `VALUES LESS THAN (2024)`, `VALUES LESS THAN (MAXVALUE,MAXVALUE)` for a `RANGE COLUMNS`, `VALUES
+  IN (…)`, nothing for `HASH`/`KEY`. **A description of exactly `MAXVALUE` is written bare**
+  (`VALUES LESS THAN MAXVALUE`), as `SHOW CREATE TABLE` writes it, where every other description
+  is wrapped in parentheses — the catalogue prints a plain range's `MAXVALUE` alone, and a
+  `RANGE COLUMNS` one as `MAXVALUE,MAXVALUE`, which takes the parentheses. The subpartitioning
+  is `SUBPARTITION BY` method and expression plus a `SUBPARTITIONS n` counted off the first
+  partition's rows, the subpartitions' names not kept
+  (`partitions_fold_into_the_clauses_the_server_writes`, its rows taken from MariaDB 10.11).
+  Unlike PostgreSQL's, the fold is not in `fetch_table_list`, so the first-paint list knows no
+  partitioning until the full read lands. Verified live on MariaDB 10.11 (per the change's
+  author): `RANGE`, `LIST COLUMNS`, `HASH`, `KEY`, `RANGE COLUMNS` and `RANGE` +
+  `SUBPARTITION BY HASH` tables read back as these clauses; the dump and restore are under
+  `dump.rs`.
   **`sqlite.rs` is the third engine**, and five things make it unlike the other two rather than a
   third set of catalogue queries. **There is no server**: a connection is a *file*
   (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` has nothing
@@ -19776,6 +19884,21 @@ existing prose was left alone.
   **`sys.objects.type` is `char(2)`**, so a procedure's `P` arrives padded as `P `, and until
   `routine_shape` trimmed it every stored procedure was read as a function
   (`a_routine_is_shaped_by_its_padded_object_type`).
+  **Partitioning is read in `collect_schema`, from two listings.** `PARTITION_LISTING` takes each
+  table whose heap or clustered index (index 0 or 1) sits on a partition scheme, with the scheme,
+  its function, the function's `boundary_value_on_right` and the partitioning column, the one
+  whose `sys.index_columns.partition_ordinal` is 1; `PARTITION_BOUNDARY_LISTING` takes every
+  function's `sys.partition_range_values` in order, each as a SQL literal — a date quoted in style
+  121, a string quoted with its quotes doubled, a number bare. The pure `mssql_partitioning` folds
+  the two into `TableInfo::partitioning` per table: the key `RANGE RIGHT ([at]) ON [ps_year]`, and
+  the partitions named `1` to `n + 1` with `tsql_partition_bounds`' bounds (under `schema.rs`;
+  `partition_schemes_fold_into_numbered_partitions`). Both are `?` reads like the rest of the
+  load. Nothing restates it: no `CREATE TABLE` here writes a partition scheme
+  (`schema::restates_partitioning`), so *Script table as CREATE* says the table is partitioned and
+  the comparison holds a missing one back (under `schema.rs` and `compare.rs`). Verified live on
+  SQL Server 2022 (per the change's author): a `RANGE RIGHT` date function over a table with a
+  clustered primary key and a `RANGE LEFT` int function over a heap read back as these keys and bounds, and the
+  script note appeared.
   **A schema load names no catalogue column the server has not got.** A static query naming one
   fails whole at compile time (Msg 207, `CASE` or not), and `collect_schema` stops at the first
   failure, so once the graph, temporal and sequence reads arrived every schema load on SQL Server
@@ -21226,6 +21349,10 @@ existing prose was left alone.
   (generous against a cold service container — the whole tier runs in ~10 s locally). The lint job
   compiles it via `--features schemaic-db/live-tests`, since otherwise it
   would be the one code in the repository no push compiles.
+  **On Windows the SQL Server legs, 2022's and 2025's, need a larger test-thread stack** —
+  `RUST_MIN_STACK=16777216` — because `mssql::a_sequence_restart_is_honoured_and_not_compared`
+  overflows the default one. It already did on the commit before SQL Server's partitioning was
+  read, so it is not that change's (per its author).
 - `schemaic-ai` — agent-CLI sessions (stream-json) and turn parsing, for whichever CLI the user has
   installed. `harness.rs` and `stream.rs` model six of them (`claude`, `codex`, `antigravity`,
   `opencode`, `copilot`, `cursor`), and **all six are driven, with database tools**. Each is
@@ -27447,6 +27574,14 @@ existing prose was left alone.
     **While a filter runs, every table is listed flat**, partitions included and none nested, so a
     partition that matches is reached without its parent having to match. The counts row under a
     table adds *N partitions* where it has any.
+    **Where a partition is storage rather than a table** (MySQL and SQL Server —
+    `partitions_are_tables` says no),
+    an open table lists each of its `TableInfo::partitioning`'s partitions after its keys as a
+    static leaf, `partition_row`: the Lucide `layers` glyph (`icons::LAYERS`), the name, the bound
+    muted, and its share of the size through `size_badge`'s `partition` parameter, which reads
+    `TableStats::partition(name)` rather than the table's figures (under `stats.rs`). It opens
+    nothing, so like a key row it is not in the nav walk; the *N partitions* capsule counts these
+    rows too.
     **`key_under(database, key)` owns which expansion-key families live under a database**, and it
     is what "Collapse all" on a database row drops. That entry collapsed only the *tables*:
     `collapse_db` retained `!k.starts_with("tbl:{db}:")`, while the same set also holds the `col:`,
@@ -27582,7 +27717,9 @@ existing prose was left alone.
       border box the same way, but a row wears no left or right border, so there is nothing there
       to displace it. The trade is that a table name long enough to reach the panel
       edge now runs *under* the size instead of pushing it along — tolerable because sizes appear
-      on table rows only, so there is no column row beneath to collide with. What runs underneath
+      on table rows only, so there is no column row beneath to collide with. MySQL's partition
+      rows (above) are the one exception, and take the same trade: a long bound runs under the
+      partition's size as a long name does under a table's. What runs underneath
       is also the chevron and the name, so `.pointer_events(|| false)` on the badge is load-bearing
       and not decoration: without it the badge, as the row's last child, won Floem's back-to-front
       pointer walk for the panel's full width and clicking a table stopped expanding it — with the
@@ -29772,8 +29909,8 @@ existing prose was left alone.
     nowhere (CMP-03). The empty tree says `EmptyRows::AgreesExceptNoted` then, not
     `EverythingAgrees` (under `compare.rs`). The banner reads `SchemaComparison::standing_notes()`
     rather than `notes`, which puts each **held-back** entry's omission line first
-    (`CompareEntry::held_back` — a SQL Server sequence range the target's counter has left, or a
-    PostgreSQL table whose partitioning differs): that
+    (`CompareEntry::held_back` — a SQL Server sequence range the target's counter has left, a
+    table whose partitioning differs, or a partitioned SQL Server table the target lacks): that
     line is the instruction for the one difference no plan carries, and a comparison holding only
     that difference plans nothing, so Preview is never enabled and the omitted list it would have
     been read in is never shown.
@@ -29890,8 +30027,8 @@ existing prose was left alone.
     the row's `blocked` is `needs_source() || held_back.is_some()` — with the warning triangle where
     its tick would be and "held back from the plan; the note above says why" as its hint, the
     sentence itself standing in the banner (above). Unlike a MySQL body there is nothing to lift
-    here: the user restarts the sequence, or recreates the repartitioned table, on the target and
-    compares again.
+    here: the user restarts the sequence, recreates the repartitioned table, or creates the
+    partition function, scheme and table, on the target and compares again.
     **Preview never applies.** `open_plan_preview` builds the `SchemaPlan`, reads the left
     connection's `read_only` off the connection list, names it through `SchemaPlan::subject_in` —
     the count and the database it lands in, both from the plan rather than hand-rolled here — and hands it to
@@ -35058,7 +35195,11 @@ existing prose was left alone.
     one whose parent the schema holds (`DbSchema::lists_under_parent`, under `schema.rs`) is no
     `###` section of its own, having its parent's columns and keys; the parent's heading reads
     `### events (partitioned by RANGE (id))` and lists a `  partition <name>: <bound>` line per
-    partition above its columns (`database_schema_names_partitions_under_their_parent`).
+    partition above its columns (`database_schema_names_partitions_under_their_parent`). Those
+    lines come from `DbSchema::partitions_of`, which only a partition that is a table answers; where
+    it finds none — a MySQL or SQL Server table, whose partitions are storage it declares — the
+    lines are the table's own `Partitioning::partitions` instead, name and bound
+    (`database_schema_names_a_mysql_tables_partitions`).
     `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
     `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
     and hands the model back the change list in the *preview's own words* plus the SQL and anything
@@ -36315,7 +36456,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   whether the Create ▸
   *Extension* entry and the Extensions folder's *Create extension* exist at all, PostgreSQL alone
   and computed from `supports_change` like the editor predicates above; and, for the *comparison* rather than
-  any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies
+  any editor, `ref_schema_is_database` and `view_definition_is_qualified`; and
+  `schema::restates_partitioning`, which asks whether a `CREATE TABLE` carries the partitioning —
+  false on SQL Server and SQLite — for `ddl::create_table_sql` and the comparison both. **The same
+  rule applies
   inside the emitter, and two loops there answered it by not asking.** `emit_sqlite`'s table-rename
   loop iterated `&self.changes` where every loop above it iterates `supported()`, and
   `view_statements`' `DropView` arm had no `supports_change` guard while its `RefreshView`

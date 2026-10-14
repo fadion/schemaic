@@ -2756,6 +2756,9 @@ fn size_badge(
     enabled: RwSignal<bool>,
     schema: Option<String>,
     table: String,
+    // One partition's share, where a partition is storage inside the table
+    // (`TableStats::partitions`); the whole table's otherwise.
+    partition: Option<String>,
 ) -> impl IntoView {
     dyn_container(
         move || {
@@ -2766,7 +2769,10 @@ fn size_badge(
             stats.with(|st| match st {
                 crate::DbStatsState::Loaded(set) => set
                     .get(schema.as_deref(), &table)
-                    .and_then(|t| t.total_bytes())
+                    .and_then(|t| match &partition {
+                        Some(p) => t.partition(p).and_then(|p| p.total_bytes()),
+                        None => t.total_bytes(),
+                    })
                     .map(schemaic_core::stats::format_bytes),
                 _ => None,
             })
@@ -2971,6 +2977,7 @@ fn table_node(
             table_sizes,
             source.schema.clone(),
             table.name.clone(),
+            None,
         ),
     ))
     .on_double_click_stop(move |_| (open_table)(dbl_source.clone()))
@@ -2996,6 +3003,12 @@ fn table_node(
     let key_children = key.clone();
     let part_db = database.clone();
     let part_schema = schema;
+    // Where a partition is storage rather than a table, its rows are leaves.
+    let storage_parts: Vec<schemaic_core::schema::Partition> = match &table.partitioning {
+        Some(p) if !schemaic_core::schema::partitions_are_tables(dialect) => p.partitions.clone(),
+        _ => Vec::new(),
+    };
+    let storage_table = table.name.clone();
     let cols = table.columns;
     let idxs = table.indexes;
     let fkeys = table.foreign_keys;
@@ -3008,7 +3021,12 @@ fn table_node(
             if !open {
                 return empty().into_any();
             }
-            let counts = count_row(col_count, key_count, parts.len(), indent_levels);
+            let counts = count_row(
+                col_count,
+                key_count,
+                parts.len() + storage_parts.len(),
+                indent_levels,
+            );
             let csrc = col_source.clone();
             let key_source = col_source.clone();
             let otc = open_table_col.clone();
@@ -3065,7 +3083,17 @@ fn table_node(
                     table_node(part_db.clone(), p, part_ctx.clone(), part_schema.clone())
                 }))
                 .style(|s| s.flex_col());
-            v_stack((counts, cols_block, keys_block, parts_block))
+            let storage_block = v_stack_from_iter(storage_parts.iter().cloned().map(|p| {
+                partition_row(
+                    p,
+                    db_stats,
+                    table_sizes,
+                    storage_table.clone(),
+                    indent_levels,
+                )
+            }))
+            .style(|s| s.flex_col());
+            v_stack((counts, cols_block, keys_block, parts_block, storage_block))
                 .style(|s| s.flex_col())
                 .into_any()
         },
@@ -3330,6 +3358,37 @@ fn key_row(
             &mark_key,
         )
     })
+}
+
+/// One partition that is storage inside its table (MySQL, SQL Server —
+/// [`schemaic_core::schema::partitions_are_tables`] says no): its name, its
+/// bound, and its share of the table's size. A static leaf like a key row —
+/// it opens nothing, so it is not in the nav walk.
+fn partition_row(
+    p: schemaic_core::schema::Partition,
+    stats: Option<RwSignal<crate::DbStatsState>>,
+    sizes: RwSignal<bool>,
+    table: String,
+    indent_levels: u32,
+) -> impl IntoView {
+    h_stack((
+        icons::icon(icons::LAYERS, SCHEMA_ICON_BASE).style(|s| {
+            s.color(theme::text_muted())
+                .margin_right(icon_gap())
+                .flex_shrink(0.0_f32)
+        }),
+        text(p.name.clone()),
+        text(p.bound).style(|s| {
+            s.color(theme::text_muted())
+                .font_size(theme::font_label())
+                .margin_left(theme::scaled(12.0))
+        }),
+        size_badge(stats, sizes, None, table, Some(p.name)),
+    ))
+    // See `failed_row`: a row, so a secondary click on it is not one on
+    // blank space.
+    .on_secondary_click_stop(|_| {})
+    .style(move |s| tree_row_static(s, leaf_icon_pad(indent_levels)).items_center())
 }
 
 // A clickable disclosure chevron: chevron-down when expanded, chevron-right

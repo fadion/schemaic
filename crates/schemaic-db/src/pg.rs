@@ -1511,6 +1511,9 @@ fn pg_fold_partitions(tables: &mut [TableInfo], rows: &[PartitionRow]) {
         t.partitioning = keys.remove(&key).map(|k| Partitioning {
             key: k,
             partitions: parts.remove(&key).unwrap_or_default(),
+            // A PostgreSQL partition partitioned in turn is a table with
+            // its own `partitioning`.
+            subpartition: None,
         });
     }
 }
@@ -1752,6 +1755,8 @@ pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaS
                 created: None,
                 updated: None,
                 freshness,
+                // Each partition is a table with figures of its own.
+                partitions: Vec::new(),
             }
         })
         .collect();

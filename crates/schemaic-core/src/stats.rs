@@ -328,9 +328,39 @@ pub struct TableStats {
     /// How much to trust the figures above.
     pub freshness: Freshness,
     pub indexes: Vec<IndexStats>,
+    /// **Each partition's share**, where a partition is storage inside the
+    /// table (MySQL) rather than a table with figures of its own
+    /// ([`crate::schema::partitions_are_tables`]). In the partitions' order;
+    /// empty for a table that is not partitioned.
+    pub partitions: Vec<PartitionStats>,
+}
+
+/// One partition's figures ([`TableStats::partitions`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartitionStats {
+    pub name: String,
+    pub rows: Option<u64>,
+    pub data_bytes: Option<u64>,
+    pub index_bytes: Option<u64>,
+}
+
+impl PartitionStats {
+    /// Data plus indexes, by [`TableStats::total_bytes`]' rule.
+    pub fn total_bytes(&self) -> Option<u64> {
+        match (self.data_bytes, self.index_bytes) {
+            (None, None) => None,
+            (d, i) => Some(d.unwrap_or(0).saturating_add(i.unwrap_or(0))),
+        }
+    }
 }
 
 impl TableStats {
+    /// The figures of the partition `name`, where a partition is storage
+    /// inside this table.
+    pub fn partition(&self, name: &str) -> Option<&PartitionStats> {
+        self.partitions.iter().find(|p| p.name == name)
+    }
+
     /// Did the engine publish a **figure** at all? `false` drives the
     /// properties surface's "this engine doesn't publish these" state, which
     /// must not look like a table of zeros.

@@ -2917,10 +2917,16 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
             });
     }
 
+    let mut partitioning = mssql_partitioning(
+        &query_rows(client, PARTITION_LISTING).await?,
+        &query_rows(client, PARTITION_BOUNDARY_LISTING).await?,
+    );
+
     for t in &mut tables {
         let ns = t.schema.clone().unwrap_or_default();
         let key = (ns.clone(), t.name.clone());
         t.comment = comments.get(&key).cloned();
+        t.partitioning = partitioning.remove(&key);
         t.tsql_kind = kinds.get(&key).cloned().unwrap_or_default();
         t.tsql_bindings = bindings.remove(&key).unwrap_or_default();
         t.check_constraints = checks_by.remove(&key).unwrap_or_default();
@@ -3298,6 +3304,99 @@ pub(crate) async fn count_rows(
         .map_err(|_| DbError::Query(format!("the count came back as {text:?}, not a number")))
 }
 
+/// Each partitioned table — its heap or clustered index on a partition scheme
+/// — with the scheme, its function, the function's side (`RANGE RIGHT` is
+/// 1) and the partitioning column: `(schema, table, scheme, function, right,
+/// column)`.
+const PARTITION_LISTING: &str = "SELECT s.name, t.name, ps.name, pf.name, \
+            CAST(pf.boundary_value_on_right AS int), c.name \
+     FROM sys.tables t \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     JOIN sys.indexes i ON i.object_id = t.object_id AND i.index_id IN (0, 1) \
+     JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id \
+     JOIN sys.partition_functions pf ON pf.function_id = ps.function_id \
+     JOIN sys.index_columns ic ON ic.object_id = i.object_id \
+          AND ic.index_id = i.index_id AND ic.partition_ordinal = 1 \
+     JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+     WHERE t.is_ms_shipped = 0";
+
+/// Every partition function's boundary values, in order, each as a SQL
+/// literal: a string or a date quoted (a date in style 121, which reads back
+/// as itself), a number as it is. `(function, boundary id, literal)`.
+const PARTITION_BOUNDARY_LISTING: &str = "SELECT pf.name, rv.boundary_id, \
+            CASE WHEN SQL_VARIANT_PROPERTY(rv.value, 'BaseType') IN \
+                      ('date', 'datetime', 'datetime2', 'smalldatetime', 'datetimeoffset', 'time') \
+                 THEN N'''' + CONVERT(nvarchar(4000), rv.value, 121) + N'''' \
+                 WHEN SQL_VARIANT_PROPERTY(rv.value, 'BaseType') IN \
+                      ('char', 'varchar', 'nchar', 'nvarchar', 'uniqueidentifier') \
+                 THEN N'''' + REPLACE(CONVERT(nvarchar(4000), rv.value), N'''', N'''''') + N'''' \
+                 ELSE CONVERT(nvarchar(4000), rv.value) END \
+     FROM sys.partition_range_values rv \
+     JOIN sys.partition_functions pf ON pf.function_id = rv.function_id \
+     ORDER BY pf.name, rv.boundary_id";
+
+/// The partitioning [`PARTITION_LISTING`] and [`PARTITION_BOUNDARY_LISTING`]
+/// read, per `(schema, table)`: the key as `RANGE RIGHT ([at]) ON [ps_year]`,
+/// and one partition per number — `n` boundaries make `n + 1` — with its
+/// bound ([`schemaic_core::schema::tsql_partition_bounds`]). A partition is
+/// named by its number, which is what the server names it by.
+fn mssql_partitioning(
+    tables: &[Vec<Option<String>>],
+    bounds: &[Vec<Option<String>>],
+) -> std::collections::HashMap<(String, String), schemaic_core::schema::Partitioning> {
+    use schemaic_core::schema::{Partition, Partitioning, tsql_partition_bounds};
+    use std::collections::HashMap;
+    let mut values: HashMap<String, Vec<String>> = HashMap::new();
+    for r in bounds {
+        values.entry(cell(r, 0)).or_default().push(cell(r, 2));
+    }
+    let q = |s: &str| schemaic_core::export::ident_sql(s, MS);
+    tables
+        .iter()
+        .map(|r| {
+            let right = cell(r, 4) == "1";
+            let boundaries = values.get(&cell(r, 3)).map(Vec::as_slice).unwrap_or(&[]);
+            let partitions = tsql_partition_bounds(right, boundaries)
+                .into_iter()
+                .enumerate()
+                .map(|(i, bound)| Partition {
+                    name: (i + 1).to_string(),
+                    schema: None,
+                    bound,
+                })
+                .collect();
+            (
+                (cell(r, 0), cell(r, 1)),
+                Partitioning {
+                    key: format!(
+                        "RANGE {} ({}) ON {}",
+                        if right { "RIGHT" } else { "LEFT" },
+                        q(&cell(r, 5)),
+                        q(&cell(r, 2))
+                    ),
+                    partitions,
+                    subpartition: None,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Each partitioned table's rows and sizes per partition number, as
+/// [`TABLE_STATS`] sums them per table: `(schema, table, number, rows, data
+/// bytes, index bytes)`.
+const PARTITION_STATS: &str = "SELECT s.name, t.name, p.partition_number, \
+            SUM(CASE WHEN p.index_id IN (0, 1) THEN p.row_count ELSE 0 END), \
+            SUM(CASE WHEN p.index_id IN (0, 1) THEN p.used_page_count ELSE 0 END) * 8192, \
+            SUM(CASE WHEN p.index_id > 1 THEN p.used_page_count ELSE 0 END) * 8192 \
+     FROM sys.tables t \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     JOIN sys.dm_db_partition_stats p ON p.object_id = t.object_id \
+     WHERE t.is_ms_shipped = 0 AND EXISTS (SELECT 1 FROM sys.partitions x \
+           WHERE x.object_id = t.object_id AND x.partition_number > 1) \
+     GROUP BY s.name, t.name, p.partition_number \
+     ORDER BY s.name, t.name, p.partition_number";
+
 /// Rows and sizes per table, from `sys.dm_db_partition_stats` — what SSMS's
 /// *Disk usage by table* reads. The row count is the heap or clustered
 /// index's (index 0 or 1), summed over partitions; pages are 8 KiB.
@@ -3394,6 +3493,22 @@ pub(crate) async fn fetch_table_stats(
                 is_unique: cell(&r, 6) == "1",
             });
     }
+    // Each partitioned table's figures per partition, named by number as
+    // `mssql_partitioning` names the partitions.
+    let mut parts: std::collections::HashMap<
+        (String, String),
+        Vec<schemaic_core::stats::PartitionStats>,
+    > = std::collections::HashMap::new();
+    for r in query_rows(&mut client, PARTITION_STATS).await? {
+        parts.entry((cell(&r, 0), cell(&r, 1))).or_default().push(
+            schemaic_core::stats::PartitionStats {
+                name: cell(&r, 2),
+                rows: num(&r, 3),
+                data_bytes: num(&r, 4),
+                index_bytes: num(&r, 5),
+            },
+        );
+    }
     let tables = query_rows(&mut client, TABLE_STATS)
         .await?
         .into_iter()
@@ -3401,6 +3516,9 @@ pub(crate) async fn fetch_table_stats(
             let (ns, name) = (cell(&r, 0), cell(&r, 1));
             TableStats {
                 indexes: by_table
+                    .remove(&(ns.clone(), name.clone()))
+                    .unwrap_or_default(),
+                partitions: parts
                     .remove(&(ns.clone(), name.clone()))
                     .unwrap_or_default(),
                 table: name,
@@ -5938,6 +6056,43 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rows SQL Server 2022 gave for a `RANGE RIGHT` date function and a
+    /// `RANGE LEFT` int one, folded into each table's key and its numbered
+    /// partitions with their bounds.
+    #[test]
+    fn partition_schemes_fold_into_numbered_partitions() {
+        let row = |v: &[&str]| v.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        let tables = [
+            row(&["dbo", "orders", "ps_year", "pf_year", "1", "at"]),
+            row(&["dbo", "heap", "ps_id", "pf_id", "0", "id"]),
+        ];
+        let bounds = [
+            row(&["pf_id", "1", "100"]),
+            row(&["pf_id", "2", "200"]),
+            row(&["pf_year", "1", "'2023-01-01'"]),
+            row(&["pf_year", "2", "'2024-01-01'"]),
+        ];
+        let p = mssql_partitioning(&tables, &bounds);
+        let orders = &p[&("dbo".to_string(), "orders".to_string())];
+        assert_eq!(orders.key, "RANGE RIGHT ([at]) ON [ps_year]");
+        assert_eq!(
+            orders
+                .partitions
+                .iter()
+                .map(|x| (x.name.as_str(), x.bound.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("1", "< '2023-01-01'"),
+                ("2", ">= '2023-01-01' AND < '2024-01-01'"),
+                ("3", ">= '2024-01-01'"),
+            ]
+        );
+        let heap = &p[&("dbo".to_string(), "heap".to_string())];
+        assert_eq!(heap.key, "RANGE LEFT ([id]) ON [ps_id]");
+        assert_eq!(heap.partitions[0].bound, "<= 100");
+        assert_eq!(heap.partitions.len(), 3);
+    }
 
     /// A name `OBJECT_NAME` will not give — no metadata access, or dropped
     /// since — must not blank the whole cell: every named concatenation sits

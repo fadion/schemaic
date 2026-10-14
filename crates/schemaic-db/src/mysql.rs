@@ -52,7 +52,7 @@ use schemaic_core::schema::{
     RoutineInfo, TableInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerOrder, TriggerSource,
     TriggerTiming, ViewOptions, event_interval_expr, event_time_expr,
 };
-use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats};
+use schemaic_core::stats::{Freshness, IndexStats, PartitionStats, SchemaStats, TableStats};
 use schemaic_core::users::{self, Grants, MyUserRow, Principal};
 use schemaic_core::{export, sql};
 use tokio_util::sync::CancellationToken;
@@ -1075,8 +1075,41 @@ async fn collect_table_stats(conn: &mut Conn, database: &str) -> Result<SchemaSt
         _ => Freshness::Unknown,
     };
 
-    Ok(map_mysql_stats(rows, &idx_rows, &usage, freshness))
+    // Each partition's figures, a subpartitioned one's summed. Degrades to
+    // none, as the schema's partition read does.
+    let partition_rows: Vec<MyPartitionStatRow> = match conn
+        .exec_map(
+            MY_PARTITION_STATS_SQL,
+            (database,),
+            |r: MyPartitionStatRow| r,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(mysql_async::Error::Server(e)) if e.code == 1109 || e.code == 1146 => Vec::new(),
+        Err(e) => return Err(qerr(e)),
+    };
+
+    Ok(map_mysql_stats(
+        rows,
+        &idx_rows,
+        &usage,
+        freshness,
+        &partition_rows,
+    ))
 }
+
+/// One partition's figures: `(table, partition, rows, data bytes, index
+/// bytes)`.
+type MyPartitionStatRow = (String, String, Option<u64>, Option<u64>, Option<u64>);
+
+const MY_PARTITION_STATS_SQL: &str = "SELECT CAST(TABLE_NAME AS CHAR), CAST(PARTITION_NAME AS CHAR), \
+            CAST(SUM(TABLE_ROWS) AS UNSIGNED), CAST(SUM(DATA_LENGTH) AS UNSIGNED), \
+            CAST(SUM(INDEX_LENGTH) AS UNSIGNED) \
+     FROM information_schema.PARTITIONS \
+     WHERE TABLE_SCHEMA = ? AND PARTITION_NAME IS NOT NULL \
+     GROUP BY TABLE_NAME, PARTITION_NAME \
+     ORDER BY TABLE_NAME, MIN(PARTITION_ORDINAL_POSITION)";
 
 /// The three MySQL statistics queries' rows, as the model the panel reads.
 ///
@@ -1090,7 +1123,17 @@ fn map_mysql_stats(
     idx_rows: &[(String, String, Option<u64>, Option<i64>)],
     usage: &HashMap<(String, String), u64>,
     freshness: Freshness,
+    partition_rows: &[MyPartitionStatRow],
 ) -> SchemaStats {
+    let mut parts: HashMap<&str, Vec<PartitionStats>> = HashMap::new();
+    for (table, name, rows, data, index) in partition_rows {
+        parts.entry(table).or_default().push(PartitionStats {
+            name: name.clone(),
+            rows: *rows,
+            data_bytes: *data,
+            index_bytes: *index,
+        });
+    }
     let mut by_table: HashMap<&str, Vec<IndexStats>> = HashMap::new();
     for (table, index, cardinality, non_unique) in idx_rows {
         let is_primary = index == "PRIMARY";
@@ -1116,8 +1159,10 @@ fn map_mysql_stats(
         .map(
             |(name, rows, data, index, free, auto, row_format, engine, created, updated)| {
                 let indexes = by_table.remove(name.as_str()).unwrap_or_default();
+                let partitions = parts.remove(name.as_str()).unwrap_or_default();
                 TableStats {
                     indexes,
+                    partitions,
                     table: name,
                     schema: None,
                     rows,
@@ -1253,6 +1298,7 @@ mod tests {
             &idx,
             &usage,
             Freshness::Unknown,
+            &[],
         );
 
         let orders = stats.find(None, "orders").expect("orders");
@@ -1291,10 +1337,37 @@ mod tests {
             &[],
             &HashMap::new(),
             Freshness::Unknown,
+            &[],
         );
         let v = stats.find(None, "v").expect("v");
         assert!(v.indexes.is_empty());
         assert_eq!(v.rows, Some(4_213_551));
+    }
+
+    /// A partition's figures land on its table, in the partitions' order.
+    #[test]
+    fn a_partitions_figures_land_on_its_table() {
+        let stats = map_mysql_stats(
+            vec![stat_row("r"), stat_row("plain")],
+            &[],
+            &HashMap::new(),
+            Freshness::Unknown,
+            &[
+                ("r".into(), "p2023".into(), Some(1000), Some(65536), Some(0)),
+                ("r".into(), "pmax".into(), Some(10), None, None),
+            ],
+        );
+        let r = stats.find(None, "r").unwrap();
+        assert_eq!(
+            r.partitions
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["p2023", "pmax"]
+        );
+        assert_eq!(r.partition("p2023").unwrap().total_bytes(), Some(65536));
+        assert_eq!(r.partition("pmax").unwrap().total_bytes(), None);
+        assert!(stats.find(None, "plain").unwrap().partitions.is_empty());
     }
 }
 
@@ -1359,6 +1432,93 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
         .map_err(|e| DbError::Query(e.to_string()));
     let _ = conn.disconnect().await;
     out
+}
+
+/// One `information_schema.PARTITIONS` row: `(table, partition, subpartition,
+/// method, subpartition method, expression, subpartition expression,
+/// description)`.
+type MyPartitionRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+const MY_PARTITIONS_SQL: &str = "SELECT CAST(TABLE_NAME AS CHAR), CAST(PARTITION_NAME AS CHAR), \
+            CAST(SUBPARTITION_NAME AS CHAR), CAST(PARTITION_METHOD AS CHAR), \
+            CAST(SUBPARTITION_METHOD AS CHAR), CAST(PARTITION_EXPRESSION AS CHAR), \
+            CAST(SUBPARTITION_EXPRESSION AS CHAR), CAST(PARTITION_DESCRIPTION AS CHAR) \
+     FROM information_schema.PARTITIONS \
+     WHERE TABLE_SCHEMA = ? AND PARTITION_NAME IS NOT NULL \
+     ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION";
+
+/// The partitioning [`MY_PARTITIONS_SQL`] read, onto the tables.
+///
+/// The key is the method and its expression as the server prints them
+/// (`RANGE (`y`)`, `LIST COLUMNS (`region`)`, `KEY ()`), and each partition's
+/// bound is rebuilt from its description the way `SHOW CREATE TABLE` writes
+/// it: `VALUES LESS THAN (2024)` — or bare `MAXVALUE`, which the catalogue
+/// prints bare — for a range, `VALUES IN (…)` for a list, none for a hash or
+/// key partition. A subpartitioned table keeps its subpartitioning as
+/// `HASH (`id`) SUBPARTITIONS 2`, counted off its first partition.
+fn mysql_fold_partitions(tables: &mut [TableInfo], rows: &[MyPartitionRow]) {
+    use schemaic_core::schema::{Partition, Partitioning};
+    let clause = |method: &Option<String>, expr: &Option<String>| {
+        format!(
+            "{} ({})",
+            method.as_deref().unwrap_or_default(),
+            expr.as_deref().unwrap_or_default()
+        )
+    };
+    let mut by_table: HashMap<&str, Partitioning> = HashMap::new();
+    let mut subs: HashMap<&str, (String, &str, usize)> = HashMap::new();
+    for (table, name, sub, method, sub_method, expr, sub_expr, desc) in rows {
+        let p = by_table.entry(table).or_insert_with(|| Partitioning {
+            key: clause(method, expr),
+            ..Default::default()
+        });
+        if sub.is_some() {
+            let (_, first, n) = subs
+                .entry(table)
+                .or_insert_with(|| (clause(sub_method, sub_expr), name, 0));
+            if *first == name.as_str() {
+                *n += 1;
+            }
+        }
+        if p.partitions.last().is_some_and(|last| last.name == *name) {
+            continue;
+        }
+        let method = method.as_deref().unwrap_or_default();
+        let desc = desc.as_deref().unwrap_or_default();
+        let bound = if method.starts_with("RANGE") {
+            if desc == "MAXVALUE" {
+                "VALUES LESS THAN MAXVALUE".to_string()
+            } else {
+                format!("VALUES LESS THAN ({desc})")
+            }
+        } else if method.starts_with("LIST") {
+            format!("VALUES IN ({desc})")
+        } else {
+            String::new()
+        };
+        p.partitions.push(Partition {
+            name: name.clone(),
+            schema: None,
+            bound,
+        });
+    }
+    for t in tables {
+        if let Some(mut p) = by_table.remove(t.name.as_str()) {
+            p.subpartition = subs
+                .remove(t.name.as_str())
+                .map(|(clause, _, n)| format!("{clause} SUBPARTITIONS {n}"));
+            t.partitioning = Some(p);
+        }
+    }
 }
 
 async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbError> {
@@ -1758,6 +1918,19 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         Err(e) => return Err(qerr(e)),
     };
 
+    // Partitions, one row per partition — or per subpartition, the partition's
+    // repeated. A table that is not partitioned has one row with no
+    // partition name, left out here. Degrades as the events read does: a
+    // MySQL-protocol server without the catalogue has no partitions to say.
+    let partition_rows: Vec<MyPartitionRow> = match conn
+        .exec_map(MY_PARTITIONS_SQL, (database,), |r: MyPartitionRow| r)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(mysql_async::Error::Server(e)) if e.code == 1109 || e.code == 1146 => Vec::new(),
+        Err(e) => return Err(qerr(e)),
+    };
+
     let mut schema = assemble_schema(
         // MySQL: the database is the namespace, so tables carry none.
         None,
@@ -1780,6 +1953,7 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     apply_fk_rules(&mut schema, &fk_rule_rows);
     apply_check_constraints(&mut schema, &check_rows, mariadb);
     apply_triggers(&mut schema, mysql_triggers(&trigger_rows));
+    mysql_fold_partitions(&mut schema.tables, &partition_rows);
     // The flavour was computed at the top of this function and then thrown
     // away, so the emitter — which is where MySQL and MariaDB actually diverge
     // — had no way to ask. It rides on the schema now, and it is the *same*
@@ -3167,6 +3341,154 @@ mod schema_tests {
 
     fn s(x: &str) -> String {
         x.to_string()
+    }
+
+    /// The rows MariaDB 10.11 gave for a range, a list-columns, a hash, a
+    /// key, a range-columns and a subpartitioned table, folded back into the
+    /// clauses `SHOW CREATE TABLE` writes for them.
+    #[test]
+    fn partitions_fold_into_the_clauses_the_server_writes() {
+        let o = |x: &str| Some(x.to_string());
+        let row = |t: &str,
+                   p: &str,
+                   sp: Option<&str>,
+                   m: &str,
+                   sm: Option<&str>,
+                   e: &str,
+                   se: Option<&str>,
+                   d: Option<&str>| {
+            (
+                s(t),
+                s(p),
+                sp.map(s),
+                o(m),
+                sm.map(s),
+                o(e),
+                se.map(s),
+                d.map(s),
+            )
+        };
+        let rows = vec![
+            row("h", "p0", None, "HASH", None, "`id`", None, None),
+            row("h", "p1", None, "HASH", None, "`id`", None, None),
+            row("k", "p0", None, "KEY", None, "", None, None),
+            row(
+                "l",
+                "eu",
+                None,
+                "LIST COLUMNS",
+                None,
+                "`region`",
+                None,
+                Some("'de','fr'"),
+            ),
+            row("r", "p2023", None, "RANGE", None, "`y`", None, Some("2024")),
+            row(
+                "r",
+                "pmax",
+                None,
+                "RANGE",
+                None,
+                "`y`",
+                None,
+                Some("MAXVALUE"),
+            ),
+            row(
+                "rc",
+                "p1",
+                None,
+                "RANGE COLUMNS",
+                None,
+                "`a`,`b`",
+                None,
+                Some("MAXVALUE,MAXVALUE"),
+            ),
+            row(
+                "s",
+                "a",
+                Some("asp0"),
+                "RANGE",
+                Some("HASH"),
+                "`y`",
+                Some("`id`"),
+                Some("2000"),
+            ),
+            row(
+                "s",
+                "a",
+                Some("asp1"),
+                "RANGE",
+                Some("HASH"),
+                "`y`",
+                Some("`id`"),
+                Some("2000"),
+            ),
+            row(
+                "s",
+                "b",
+                Some("bsp0"),
+                "RANGE",
+                Some("HASH"),
+                "`y`",
+                Some("`id`"),
+                Some("MAXVALUE"),
+            ),
+            row(
+                "s",
+                "b",
+                Some("bsp1"),
+                "RANGE",
+                Some("HASH"),
+                "`y`",
+                Some("`id`"),
+                Some("MAXVALUE"),
+            ),
+        ];
+        let mut tables: Vec<TableInfo> = ["h", "k", "l", "plain", "r", "rc", "s"]
+            .into_iter()
+            .map(|n| TableInfo {
+                name: s(n),
+                ..Default::default()
+            })
+            .collect();
+        mysql_fold_partitions(&mut tables, &rows);
+        let clause = |n: &str| {
+            tables
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap()
+                .partitioning
+                .as_ref()
+                .map(|p| p.clause_sql(schemaic_core::intel::SqlDialect::MySql))
+        };
+        assert_eq!(
+            clause("h").unwrap(),
+            "PARTITION BY HASH (`id`)\n(PARTITION `p0`,\n PARTITION `p1`)"
+        );
+        assert_eq!(
+            clause("k").unwrap(),
+            "PARTITION BY KEY ()\n(PARTITION `p0`)"
+        );
+        assert_eq!(
+            clause("l").unwrap(),
+            "PARTITION BY LIST COLUMNS (`region`)\n(PARTITION `eu` VALUES IN ('de','fr'))"
+        );
+        assert_eq!(
+            clause("r").unwrap(),
+            "PARTITION BY RANGE (`y`)\n(PARTITION `p2023` VALUES LESS THAN (2024),\n \
+             PARTITION `pmax` VALUES LESS THAN MAXVALUE)"
+        );
+        assert_eq!(
+            clause("rc").unwrap(),
+            "PARTITION BY RANGE COLUMNS (`a`,`b`)\n(PARTITION `p1` VALUES LESS THAN \
+             (MAXVALUE,MAXVALUE))"
+        );
+        assert_eq!(
+            clause("s").unwrap(),
+            "PARTITION BY RANGE (`y`)\nSUBPARTITION BY HASH (`id`) SUBPARTITIONS 2\n\
+             (PARTITION `a` VALUES LESS THAN (2000),\n PARTITION `b` VALUES LESS THAN MAXVALUE)"
+        );
+        assert_eq!(clause("plain"), None);
     }
 
     /// A raw catalogue row, for the default-normalization tests.

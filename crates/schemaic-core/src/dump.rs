@@ -4654,6 +4654,7 @@ mod tests {
                 schema: None,
                 bound: "FOR VALUES FROM (1) TO (10)".into(),
             }],
+            subpartition: None,
         });
         let mut child = refs(table("aa_2024"), "customers");
         child.foreign_keys[0].inherited = true;

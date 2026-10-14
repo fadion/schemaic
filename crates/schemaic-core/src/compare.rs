@@ -250,8 +250,9 @@ pub struct CompareEntry {
     /// refuse the statements and the only change it would take does damage
     /// the comparison may not choose for the user: a sequence range its
     /// target's counter has already left ([`held_back_sequence`]) — or where
-    /// no statement exists for the difference at all: a table partitioned
-    /// differently on the two sides.
+    /// the comparison writes no statement for the difference at all: a table
+    /// partitioned differently on the two sides, or a partitioned one no
+    /// `CREATE TABLE` here restates.
     pub held_back: Option<String>,
     /// The object's `CREATE` as the **left** side has it, and empty when only
     /// the right side does.
@@ -2713,10 +2714,16 @@ fn table_entry(
     // no `ALTER` changes a table's key, or which table it is a partition of
     // and for which values, and the differ reads neither — so it is held back
     // and said, rather than reading as the same table.
+    // Where a partition is storage rather than a table of its own, the
+    // partitions are the table's too, and a changed list is as unplannable.
     let repartitioned = match (l, r) {
         (Some(l), Some(r)) => {
-            l.partitioning.as_ref().map(|p| &p.key) != r.partitioning.as_ref().map(|p| &p.key)
-                || l.partition_of != r.partition_of
+            if crate::schema::partitions_are_tables(dialect) {
+                l.partitioning.as_ref().map(|p| &p.key) != r.partitioning.as_ref().map(|p| &p.key)
+                    || l.partition_of != r.partition_of
+            } else {
+                l.partitioning != r.partitioning
+            }
         }
         _ => false,
     };
@@ -2734,11 +2741,25 @@ fn table_entry(
         },
         changes,
         uncertain,
-        held_back: repartitioned.then(|| {
-            "its partitioning differs, and no ALTER changes a table's partitioning — \
-             recreate it by hand"
-                .to_string()
-        }),
+        held_back: if repartitioned {
+            Some(
+                "its partitioning differs, and this comparison writes no statement that \
+                 repartitions a table — recreate it by hand"
+                    .to_string(),
+            )
+        } else if l.is_none()
+            && r.is_some_and(|r| r.partitioning.is_some())
+            && !crate::schema::restates_partitioning(dialect)
+        {
+            // Created plain, it would read as done.
+            Some(
+                "it is partitioned, and no CREATE TABLE here restates its partition scheme — \
+                 create the partition function and scheme, then the table, by hand"
+                    .to_string(),
+            )
+        } else {
+            None
+        },
         left_ddl,
         right_ddl,
     }
@@ -3332,6 +3353,7 @@ mod tests {
                     schema: Some("public".into()),
                     bound: bound.into(),
                 }],
+                subpartition: None,
             }),
             ..Default::default()
         };
@@ -3370,6 +3392,82 @@ mod tests {
             )
             .expect(&sql);
         assert!(by < of, "the parent first: {sql}");
+    }
+
+    /// **On MySQL the partitions are the table's**, so a missing one is
+    /// created with every partition declared, and a changed list — a
+    /// partition added, a bound moved — is a difference held back, the key
+    /// alone being the same.
+    #[test]
+    fn a_mysql_tables_partitions_are_created_and_compared_with_it() {
+        use crate::schema::{Partition, Partitioning};
+        let part = |name: &str, bound: &str| Partition {
+            name: name.into(),
+            schema: None,
+            bound: bound.into(),
+        };
+        let t = TableInfo {
+            name: "r".to_string(),
+            columns: vec![col("y", "int")],
+            engine: Some("InnoDB".into()),
+            partitioning: Some(Partitioning {
+                key: "RANGE (`y`)".into(),
+                partitions: vec![part("p0", "VALUES LESS THAN (10)")],
+                subpartition: None,
+            }),
+            ..Default::default()
+        };
+        let my = |l: Vec<TableInfo>, r: Vec<TableInfo>| {
+            SchemaComparison::of(&schema_of(l), &schema_of(r), SqlDialect::MySql)
+        };
+        let sql = my(vec![], vec![t.clone()]).plan(|_| true).emit().join("\n");
+        assert!(
+            sql.contains(
+                ") ENGINE=InnoDB PARTITION BY RANGE (`y`)\n(PARTITION `p0` VALUES LESS THAN (10));"
+            ),
+            "{sql}"
+        );
+        let mut more = t.clone();
+        more.partitioning
+            .as_mut()
+            .unwrap()
+            .partitions
+            .push(part("pmax", "VALUES LESS THAN MAXVALUE"));
+        let plan = my(vec![t], vec![more]).plan(|_| true);
+        assert!(
+            plan.omitted
+                .iter()
+                .any(|o| o.contains("partitioning differs")),
+            "{:?}",
+            plan.omitted
+        );
+    }
+
+    /// **A partitioned SQL Server table the target lacks is held back**: no
+    /// `CREATE TABLE` here restates its partition scheme, and created plain
+    /// it would read as done.
+    #[test]
+    fn a_missing_partitioned_sql_server_table_is_held_back_not_created_plain() {
+        let t = TableInfo {
+            name: "orders".to_string(),
+            schema: Some("dbo".to_string()),
+            columns: vec![col("at", "date")],
+            partitioning: Some(crate::schema::Partitioning {
+                key: "RANGE RIGHT ([at]) ON [ps_year]".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = SchemaComparison::of(&schema_of(vec![]), &schema_of(vec![t]), SqlDialect::MsSql)
+            .plan(|_| true);
+        let sql = plan.emit().join("\n");
+        assert!(!sql.contains("CREATE TABLE"), "{sql}");
+        assert!(!sql.contains("PARTITION"), "{sql}");
+        assert!(
+            plan.omitted.iter().any(|o| o.contains("partition scheme")),
+            "{:?}",
+            plan.omitted
+        );
     }
 
     /// A table partitioned differently on the two sides is held back and

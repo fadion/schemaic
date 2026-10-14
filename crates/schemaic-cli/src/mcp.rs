@@ -1429,7 +1429,19 @@ fn format_database_schema(database: &str, schema: &DbSchema) -> String {
             .map(|p| format!(" (partitioned by {})", p.key))
             .unwrap_or_default();
         out.push_str(&format!("### {}{view}{by}\n", table_label(t, qualify)));
-        for p in schema.partitions_of(t) {
+        // Its partitions: tables of their own (PostgreSQL), or else storage
+        // the table itself declares (MySQL, SQL Server).
+        let tables = schema.partitions_of(t);
+        if tables.is_empty() {
+            for p in t.partitioning.iter().flat_map(|p| &p.partitions) {
+                // A hash or key partition has no bound to name.
+                match p.bound.as_str() {
+                    "" => out.push_str(&format!("  partition {}\n", p.name)),
+                    bound => out.push_str(&format!("  partition {}: {bound}\n", p.name)),
+                }
+            }
+        }
+        for p in tables {
             let bound = p.partition_of.as_ref().map_or("", |o| o.bound.as_str());
             out.push_str(&format!(
                 "  partition {}: {bound}\n",
@@ -3174,7 +3186,7 @@ mod tests {
         let mut events = tbl("events", vec![c("id", "int", false, true)]);
         events.partitioning = Some(schemaic_core::schema::Partitioning {
             key: "RANGE (id)".into(),
-            partitions: Vec::new(),
+            ..Default::default()
         });
         let mut part = tbl("events_2024", vec![c("id", "int", false, true)]);
         part.partition_of = Some(schemaic_core::schema::PartitionOf {
@@ -3196,6 +3208,35 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("### events_2024"), "{out}");
+    }
+
+    /// Where a partition is storage inside its table (MySQL), the table's
+    /// own partitions are named under it the same way.
+    #[test]
+    fn database_schema_names_a_mysql_tables_partitions() {
+        let mut r = tbl("r", vec![c("y", "int", false, false)]);
+        r.partitioning = Some(schemaic_core::schema::Partitioning {
+            key: "RANGE (`y`)".into(),
+            partitions: vec![schemaic_core::schema::Partition {
+                name: "pmax".into(),
+                schema: None,
+                bound: "VALUES LESS THAN MAXVALUE".into(),
+            }],
+            subpartition: None,
+        });
+        let out = format_database_schema(
+            "shop",
+            &DbSchema {
+                tables: vec![r],
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.contains(
+                "### r (partitioned by RANGE (`y`))\n  partition pmax: VALUES LESS THAN MAXVALUE\n"
+            ),
+            "{out}"
+        );
     }
 
     #[test]

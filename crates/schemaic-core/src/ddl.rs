@@ -230,10 +230,11 @@ pub struct TableDraft {
     pub without_rowid: bool,
     /// SQLite `STRICT` — see [`TableInfo::strict`], and the note above.
     pub strict: bool,
-    /// The partition key a created table takes (`RANGE (at)`) —
-    /// [`crate::schema::Partitioning::key`]. Written by [`create`] alone: no
-    /// `ALTER` changes a table's partitioning, so [`diff`] never reads it.
-    pub partition_key: Option<String>,
+    /// How a created table is partitioned — [`TableInfo::partitioning`],
+    /// written through [`crate::schema::Partitioning::clause_sql`]. Written by
+    /// [`create`] alone: no `ALTER` here changes a table's partitioning, so
+    /// [`diff`] never reads it.
+    pub partitioning: Option<crate::schema::Partitioning>,
     /// The table a created table is a partition of, with its bound —
     /// [`TableInfo::partition_of`]. Created `PARTITION OF` it, which gives it
     /// its columns, key and every inherited index and foreign key.
@@ -285,7 +286,7 @@ impl TableDraft {
             comment: t.comment.clone(),
             without_rowid: t.without_rowid,
             strict: t.strict,
-            partition_key: t.partitioning.as_ref().map(|p| p.key.clone()),
+            partitioning: t.partitioning.clone(),
             partition_of: t.partition_of.clone(),
         }
     }
@@ -9601,9 +9602,6 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
             format!("CREATE TABLE {qname} (\n{}\n)", lines.join(",\n"))
         }
     };
-    if let Some(key) = &d.partition_key {
-        head.push_str(&format!(" PARTITION BY {key}"));
-    }
     // None of the three exists in SQLite: no storage engine to name, no table
     // collation (it is per column there), and no comments anywhere in the
     // language. Nor in T-SQL, which collates per column and per database.
@@ -9634,6 +9632,16 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
                 " STRICT"
             });
         }
+    }
+    // After the table options, where MySQL takes it — and only where the
+    // statement has the clause (`restates_partitioning`).
+    if let Some(p) = d
+        .partitioning
+        .as_ref()
+        .filter(|_| crate::schema::restates_partitioning(dialect))
+    {
+        head.push(' ');
+        head.push_str(&p.clause_sql(dialect));
     }
     head.push(';');
     let mut out = vec![head];

@@ -1627,6 +1627,44 @@ pub struct Partitioning {
     pub key: String,
     /// The partitions, in the engine's order.
     pub partitions: Vec<Partition>,
+    /// MySQL's subpartitioning, as written after `SUBPARTITION BY`: `HASH
+    /// (`id`) SUBPARTITIONS 2`. The subpartitions' own names are not kept —
+    /// restated, they take the engine's defaults.
+    pub subpartition: Option<String>,
+}
+
+impl Partitioning {
+    /// **The clause that partitions a created table**, in `dialect`'s
+    /// spelling — the one both `create_ddl` and `ddl::create_table_sql`
+    /// write. Where each partition is a table of its own
+    /// ([`partitions_are_tables`]) it is the key alone, each partition being a
+    /// `CREATE` of its own; elsewhere a partition is storage the table must
+    /// declare, so every one is listed with its bound.
+    pub fn clause_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let mut out = format!("PARTITION BY {}", self.key);
+        if partitions_are_tables(dialect) {
+            return out;
+        }
+        if let Some(sub) = &self.subpartition {
+            out.push_str(&format!("\nSUBPARTITION BY {sub}"));
+        }
+        if !self.partitions.is_empty() {
+            let defs: Vec<String> = self
+                .partitions
+                .iter()
+                .map(|p| {
+                    let name = ddl_ident_in(&p.name, dialect);
+                    if p.bound.is_empty() {
+                        format!("PARTITION {name}")
+                    } else {
+                        format!("PARTITION {name} {}", p.bound)
+                    }
+                })
+                .collect();
+            out.push_str(&format!("\n({})", defs.join(",\n ")));
+        }
+        out
+    }
 }
 
 /// One partition of a [`Partitioning`].
@@ -1650,6 +1688,48 @@ pub struct PartitionOf {
     pub parent: String,
     /// `FOR VALUES …` or `DEFAULT`, as `pg_get_expr(relpartbound)` prints it.
     pub bound: String,
+}
+
+/// **Does a `CREATE TABLE` restate the partitioning?** On PostgreSQL and
+/// MySQL a clause of the statement does ([`Partitioning::clause_sql`]). SQL
+/// Server partitions a table onto a partition scheme over a partition
+/// function, objects of their own that the model does not hold, so its
+/// scripts say the table is partitioned rather than restate it; SQLite has
+/// no partitioning.
+pub fn restates_partitioning(dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect as D;
+    match dialect {
+        D::Postgres | D::MySql => true,
+        D::MsSql | D::Sqlite => false,
+    }
+}
+
+/// **Each SQL Server partition's bound**, from its function's boundary
+/// values (as SQL literals, in order): `RANGE RIGHT` puts a boundary value in
+/// the partition to its right — `< b1`, `>= b1 AND < b2`, …, `>= bn` — and
+/// `RANGE LEFT` in the one to its left. `n` boundaries make `n + 1`
+/// partitions; none, one partition holding every row, whose bound is empty.
+pub fn tsql_partition_bounds(range_right: bool, boundaries: &[String]) -> Vec<String> {
+    let (below, at_or_above) = if range_right {
+        ("<", ">=")
+    } else {
+        ("<=", ">")
+    };
+    let n = boundaries.len();
+    if n == 0 {
+        return vec![String::new()];
+    }
+    (0..=n)
+        .map(|k| match k {
+            0 => format!("{below} {}", boundaries[0]),
+            k if k == n => format!("{at_or_above} {}", boundaries[n - 1]),
+            k => format!(
+                "{at_or_above} {} AND {below} {}",
+                boundaries[k - 1],
+                boundaries[k]
+            ),
+        })
+        .collect()
 }
 
 /// **Is each partition a table of its own?** On PostgreSQL it is — listed,
@@ -5691,13 +5771,14 @@ impl TableInfo {
             .indexes
             .iter()
             .filter(|ix| !ix.is_primary() && !ix.inherited);
+        // The partitioning, through the one clause emitter.
+        let by = self
+            .partitioning
+            .as_ref()
+            .map(|p| format!(" {}", p.clause_sql(dialect)))
+            .unwrap_or_default();
         if pg {
             // Postgres: indexes are separate statements after the table.
-            let by = self
-                .partitioning
-                .as_ref()
-                .map(|p| format!(" PARTITION BY {}", p.key))
-                .unwrap_or_default();
             // **A partition is created `PARTITION OF` its parent**, which
             // gives it its columns, key and inherited indexes; only its own
             // key and checks are restated with it.
@@ -5789,7 +5870,7 @@ impl TableInfo {
                     crate::ddl::mysql_index_clause(ix, "KEY", dialect)
                 ));
             }
-            format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"))
+            format!("CREATE TABLE {qname} (\n{}\n){by};", lines.join(",\n"))
         }
     }
 
@@ -5955,6 +6036,16 @@ impl TableInfo {
         }
         let mut lines: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        // Its partition scheme and function are objects of their own, which
+        // the model does not hold (`restates_partitioning`): the table is
+        // created unpartitioned, and the script says so.
+        if let Some(p) = &self.partitioning {
+            notes.push(format!(
+                "-- {cname} is partitioned ({}); its partition function and scheme are not \
+                 read, so this script creates it unpartitioned.",
+                crate::export::comment_text(&p.key)
+            ));
+        }
         if self.tsql_kind.edge_constraints {
             notes.push(format!(
                 "-- {cname}: its edge constraints (CONNECTION) are not read, and are left out."
@@ -9957,6 +10048,7 @@ mod tests {
                     schema: Some("public".into()),
                     bound: "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')".into(),
                 }],
+                subpartition: None,
             }),
             ..Default::default()
         };
@@ -10041,13 +10133,141 @@ mod tests {
         let (_, mut child) = partitioned_pair();
         child.partitioning = Some(Partitioning {
             key: "LIST (id)".into(),
-            partitions: Vec::new(),
+            ..Default::default()
         });
         let c = child.create_ddl(crate::intel::SqlDialect::Postgres);
         assert!(
             c.contains("TO ('2025-01-01') PARTITION BY LIST (id);"),
             "{c}"
         );
+    }
+
+    /// **On MySQL the clause names every partition**, a partition being
+    /// storage the `CREATE TABLE` must declare; on PostgreSQL only the key,
+    /// each partition being a `CREATE` of its own.
+    #[test]
+    fn the_partition_clause_lists_mysqls_partitions_and_only_postgres_key() {
+        use crate::intel::SqlDialect as D;
+        let p = |name: &str, bound: &str| Partition {
+            name: name.into(),
+            schema: None,
+            bound: bound.into(),
+        };
+        let range = Partitioning {
+            key: "RANGE (`y`)".into(),
+            partitions: vec![
+                p("p2023", "VALUES LESS THAN (2024)"),
+                p("pmax", "VALUES LESS THAN MAXVALUE"),
+            ],
+            subpartition: None,
+        };
+        assert_eq!(
+            range.clause_sql(D::MySql),
+            "PARTITION BY RANGE (`y`)\n(PARTITION `p2023` VALUES LESS THAN (2024),\n \
+             PARTITION `pmax` VALUES LESS THAN MAXVALUE)"
+        );
+        assert_eq!(range.clause_sql(D::Postgres), "PARTITION BY RANGE (`y`)");
+        let hash = Partitioning {
+            key: "HASH (`id`)".into(),
+            partitions: vec![p("p0", ""), p("p1", "")],
+            subpartition: None,
+        };
+        assert_eq!(
+            hash.clause_sql(D::MySql),
+            "PARTITION BY HASH (`id`)\n(PARTITION `p0`,\n PARTITION `p1`)"
+        );
+        let sub = Partitioning {
+            subpartition: Some("HASH (`id`) SUBPARTITIONS 2".into()),
+            ..range
+        };
+        assert!(sub.clause_sql(D::MySql).starts_with(
+            "PARTITION BY RANGE (`y`)\nSUBPARTITION BY HASH (`id`) SUBPARTITIONS 2\n("
+        ));
+    }
+
+    /// A MySQL table's script keeps its partitioning, after its options.
+    #[test]
+    fn a_mysql_partitioned_tables_script_keeps_its_partitions() {
+        let t = TableInfo {
+            name: "r".into(),
+            columns: vec![ColumnInfo {
+                name: "y".into(),
+                type_name: "int".into(),
+                nullable: false,
+                ..Default::default()
+            }],
+            partitioning: Some(Partitioning {
+                key: "RANGE (`y`)".into(),
+                partitions: vec![Partition {
+                    name: "p0".into(),
+                    schema: None,
+                    bound: "VALUES LESS THAN MAXVALUE".into(),
+                }],
+                subpartition: None,
+            }),
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
+        assert!(
+            ddl.ends_with(
+                "\n) PARTITION BY RANGE (`y`)\n(PARTITION `p0` VALUES LESS THAN MAXVALUE);"
+            ),
+            "{ddl}"
+        );
+    }
+
+    /// A SQL Server partition's bound, from its function's boundary values:
+    /// `RANGE RIGHT` puts a boundary in the partition to its right, `RANGE
+    /// LEFT` in the one to its left — `n` boundaries, `n + 1` partitions.
+    #[test]
+    fn tsql_partition_bounds_follow_the_range_side() {
+        let b = ["100".to_string(), "200".to_string()];
+        assert_eq!(
+            tsql_partition_bounds(true, &b),
+            ["< 100", ">= 100 AND < 200", ">= 200"]
+        );
+        assert_eq!(
+            tsql_partition_bounds(false, &b),
+            ["<= 100", "> 100 AND <= 200", "> 200"]
+        );
+        assert_eq!(tsql_partition_bounds(true, &b[..1]), ["< 100", ">= 100"]);
+        assert_eq!(tsql_partition_bounds(true, &[]), [""]);
+    }
+
+    /// Only PostgreSQL and MySQL have a clause a `CREATE TABLE` partitions
+    /// itself with; SQL Server's partitioning is a function and a scheme of
+    /// their own, which the model does not hold.
+    #[test]
+    fn partitioning_is_restated_on_postgres_and_mysql() {
+        use crate::intel::SqlDialect as D;
+        assert!(restates_partitioning(D::Postgres) && restates_partitioning(D::MySql));
+        assert!(!restates_partitioning(D::MsSql) && !restates_partitioning(D::Sqlite));
+    }
+
+    /// Script table as CREATE on SQL Server says the table it writes is not
+    /// partitioned as the source is, rather than restating it silently plain.
+    #[test]
+    fn a_partitioned_sql_server_tables_script_says_it_is_not_restated() {
+        let t = TableInfo {
+            name: "orders".into(),
+            schema: Some("dbo".into()),
+            columns: vec![ColumnInfo {
+                name: "at".into(),
+                type_name: "date".into(),
+                ..Default::default()
+            }],
+            partitioning: Some(Partitioning {
+                key: "RANGE RIGHT ([at]) ON [ps_year]".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(
+            ddl.contains("-- [dbo].[orders] is partitioned (RANGE RIGHT ([at]) ON [ps_year])"),
+            "{ddl}"
+        );
+        assert!(!ddl.contains("PARTITION BY"), "{ddl}");
     }
 
     #[test]

@@ -80,7 +80,7 @@ pub fn draft(src: &TableInfo, to: &CopyTarget) -> TableDraft {
     d.foreign_keys.clear();
     // **A plain table**, whatever the source's partitioning: it holds every
     // row the source reads, and no parent gives it an index.
-    d.partition_key = None;
+    d.partitioning = None;
     d.partition_of = None;
     let renamed = |name: &str| moved_name(name, &src.name, &to.name);
     d.indexes = d
@@ -272,7 +272,7 @@ mod tests {
         let mut src = orders();
         src.partitioning = Some(crate::schema::Partitioning {
             key: "RANGE (id)".into(),
-            partitions: Vec::new(),
+            ..Default::default()
         });
         src.partition_of = Some(crate::schema::PartitionOf {
             schema: Some("public".into()),
