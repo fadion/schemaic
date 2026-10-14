@@ -67,7 +67,7 @@ pub enum Outcome {
     Unknown,
 }
 
-/// One write, as its path reports it — before masking ([`line`] masks).
+/// One write, as its path reports it — before masking ([`line()`] masks).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     /// Unix time in milliseconds.
