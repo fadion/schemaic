@@ -14,6 +14,8 @@ pub use ai_panel::mark_messages_seen;
 pub use blob_view::{BlobPane, BlobState, BlobTarget, BlobUi};
 mod cell_editors;
 mod compare_view;
+mod copy_table_view;
+pub use copy_table_view::{CopyOutcome, CopyRowsFn, CopyRowsRequest, CopySource};
 mod completion;
 mod connection_form;
 mod connection_import;
@@ -1303,6 +1305,11 @@ pub struct DdlPreview {
     /// something lost, and does not belong under "This can't be undone". A
     /// drop's dependents stay in `destructive`, where they are.
     pub used_by: Vec<String>,
+    /// What runs **once this plan has committed** — and only then: not on a
+    /// failure, a declined prompt, or a preview reopened on another plan
+    /// meanwhile. *Copy to* is the one user: its `CREATE TABLE` is this plan,
+    /// and the rows follow it (`copy_table_view`). `None` on every other.
+    pub then: Option<Rc<dyn Fn()>>,
     /// What the plan asks for that this engine **can't express** — see
     /// [`schemaic_core::ddl::ChangeSet::unsupported`]. Non-empty ⇒ the modal
     /// names each one and Apply refuses, because `statements` is then less than
@@ -5223,6 +5230,11 @@ pub struct SchemaActions {
     /// List one connection's databases, for the compare picker's second step —
     /// see [`OverlayUi::compare_dbs`] for why it is asked per connection.
     pub compare_list_dbs: Rc<dyn Fn(u64)>,
+    /// *Copy to*'s rows, after its `CREATE TABLE` committed — `Db::copy_rows`
+    /// from the source connection into the target, then the counter settle.
+    pub copy_rows: CopyRowsFn,
+    /// Stop the rows [`SchemaActions::copy_rows`] has in flight.
+    pub copy_cancel: Rc<dyn Fn()>,
     /// Run the exact `SELECT COUNT(*)` behind the properties modal's **Count
     /// rows**. Separate from [`SchemaActions::table_stats`] because it is a full
     /// scan the user asked for, not part of opening the panel.
@@ -6311,6 +6323,11 @@ pub struct OverlayUi {
     pub properties: RwSignal<Option<PropertiesTarget>>,
     /// The *Used by* modal's object (`used_by_view`): `Some` opens it.
     pub used_by: RwSignal<Option<UsedByTarget>>,
+    /// The table *Copy to* copies (`copy_table_view`): `Some` opens it.
+    pub copy_table: RwSignal<Option<CopySource>>,
+    /// Rows a running copy has handed to its writer so far — set by the app
+    /// from the copy's progress channel.
+    pub copy_progress: RwSignal<u64>,
     /// The result the *Chart* modal draws (`chart_view`): `Some` opens it.
     pub chart: RwSignal<Option<ChartTarget>>,
     /// The two results *Compare results* diffs (`result_diff_view`): `Some`

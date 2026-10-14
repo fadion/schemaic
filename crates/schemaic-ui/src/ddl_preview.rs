@@ -260,6 +260,7 @@ pub(crate) fn preview_of(
         destructive: cs.destructive(),
         risk_heading: cs.risk_heading(),
         used_by: Vec::new(),
+        then: None,
         withheld: cs.unsupported(),
         // A single object's edit is about that object: it is either in the plan
         // or there is no plan. Nothing can be left out of it.
@@ -344,6 +345,7 @@ pub(crate) fn preview_of_plan(
         destructive: plan.destructive(),
         risk_heading: plan.risk_heading(),
         used_by: Vec::new(),
+        then: None,
         // The same refusal a single set gets: non-empty disables Apply and is
         // re-checked inside `apply`, so a plan that can't be expressed in full
         // is not applied in part.
@@ -881,6 +883,7 @@ fn apply(d: DdlUi, conn: ConnUi, run_ddl: DdlFn) {
     d.applying.set(true);
     d.error.set(None);
     let opened = d.generation.get_untracked();
+    let then = p.then.clone();
     (run_ddl)(
         DdlRunRequest {
             conn_id: p.conn_id,
@@ -906,6 +909,12 @@ fn apply(d: DdlUi, conn: ConnUi, run_ddl: DdlFn) {
                     // The draft behind this is now the server's state, so
                     // whichever editor opened it has nothing left to show.
                     close_editors(d);
+                    // Only after *this* plan committed — not on a failure, a
+                    // declined prompt, or a preview reopened on something
+                    // else (the generation check above).
+                    if let Some(then) = &then {
+                        then();
+                    }
                 }
                 DdlOutcome::Failed(e) => d.error.set(Some(e)),
                 // The user answered "Cancel" to a question the apply raised, so

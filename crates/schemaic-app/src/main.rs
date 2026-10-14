@@ -2941,6 +2941,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // being described, so a stale fetch can check it before writing.
     let properties: RwSignal<Option<schemaic_ui::PropertiesTarget>> = RwSignal::new(None);
     let used_by: RwSignal<Option<schemaic_ui::UsedByTarget>> = RwSignal::new(None);
+    let copy_table: RwSignal<Option<schemaic_ui::CopySource>> = RwSignal::new(None);
+    let copy_progress: RwSignal<u64> = RwSignal::new(0);
     let chart: RwSignal<Option<schemaic_ui::ChartTarget>> = RwSignal::new(None);
     let result_diff: RwSignal<Option<schemaic_ui::DiffTarget>> = RwSignal::new(None);
     let properties_state: RwSignal<schemaic_ui::PropertiesState> =
@@ -9809,6 +9811,163 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // ── Copy to: the rows, once the copy's `CREATE TABLE` has committed ──────
+    //
+    // Raised by the DDL preview's `then`, so the table exists on the target by
+    // the time this runs. `Db::copy_rows` is the whole transfer — a read-only
+    // stream on the source, the import's one-transaction writer on the target
+    // — and `settle` moves a PostgreSQL identity's counter past the copied
+    // values afterwards. Progress is a channel, the dump's way, because
+    // `create_ext_action` answers once.
+    let copy_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+    let (copy_tx, copy_rx) = crossbeam_channel::unbounded::<u64>();
+    {
+        let stream = create_signal_from_channel(copy_rx);
+        create_effect(move |_| {
+            if let Some(n) = stream.get() {
+                copy_progress.set(n);
+            }
+        });
+    }
+    let copy_rows: schemaic_ui::CopyRowsFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let copy_token = copy_token.clone();
+        let log_write = log_write.clone();
+        Rc::new(
+            move |req: schemaic_ui::CopyRowsRequest, done: Rc<dyn Fn(schemaic_ui::CopyOutcome)>| {
+                use schemaic_ui::CopyOutcome;
+                // **The launch guards itself**, in the step that launches it:
+                // the preview's Apply asked the target's read-only flag for the
+                // `CREATE`, and this is a second write, launched later.
+                let (read_only, dialect) = connections.with_untracked(|cs| {
+                    (
+                        schemaic_core::connection::read_only_of(cs, req.dst_conn),
+                        schemaic_core::connection::by_id(cs, req.dst_conn)
+                            .map(|c| SqlDialect::from_db_type(&c.db_type)),
+                    )
+                });
+                if read_only {
+                    return done(CopyOutcome::Failed(
+                        "The target connection is read-only, so no rows were copied.".into(),
+                    ));
+                }
+                // A target connection deleted while its `CREATE` ran: nothing
+                // to log the write against, and nothing to write to.
+                let Some(dialect) = dialect else {
+                    return done(CopyOutcome::Failed(
+                        "The target connection is gone, so no rows were copied.".into(),
+                    ));
+                };
+                let (src, dst) = match (db_for(req.src_conn), db_for(req.dst_conn)) {
+                    (Ok(s), Ok(d)) => (s, d),
+                    (Err(e), _) | (_, Err(e)) => {
+                        return done(CopyOutcome::Failed(format!("No rows were copied: {e}")));
+                    }
+                };
+                let token = CancellationToken::new();
+                *copy_token.borrow_mut() = Some(token.clone());
+                let target_label = [
+                    Some(req.target.database.as_str()),
+                    req.target.schema.as_deref(),
+                    Some(req.target.name.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(".");
+                let entry = schemaic_core::write_log::Entry::now(
+                    schemaic_core::write_log::Source::Copy,
+                    "",
+                    Some(req.target.database.as_str()),
+                    "",
+                )
+                .with_detail(format!("copy {} into {target_label}", req.select));
+                let report = {
+                    let (copy_token, log_write, dst_conn) =
+                        (copy_token.clone(), log_write.clone(), req.dst_conn);
+                    create_ext_action(
+                        cx,
+                        move |res: Result<u64, (Option<u64>, Option<String>)>| {
+                            use schemaic_core::write_log::Outcome;
+                            *copy_token.borrow_mut() = None;
+                            // `(committed, message)`: the rows that were in before
+                            // what failed — the settle runs after they committed —
+                            // and what did.
+                            let entry = match &res {
+                                Ok(n) => entry.clone().ended(Ok(Some(*n))),
+                                Err((committed, Some(e))) => {
+                                    let mut entry = entry.clone().ended(Err(e.clone()));
+                                    entry.rows = *committed;
+                                    entry
+                                }
+                                Err((_, None)) => entry.clone().ended_as(Outcome::Cancelled, None),
+                            };
+                            (log_write)(dst_conn, dialect, entry);
+                            done(match res {
+                                Ok(n) => CopyOutcome::Done(n),
+                                Err((_, None)) => CopyOutcome::Cancelled,
+                                Err((Some(n), Some(e))) => CopyOutcome::Failed(format!(
+                                    "{n} rows were copied, but the table's counter was not moved \
+                                 past them, so the next insert may collide: {e}"
+                                )),
+                                // **Not "the table is empty"**: the rows are one
+                                // transaction, but a table whose engine ignores the
+                                // rollback (a MyISAM or Aria copy of one) keeps
+                                // what arrived, and the error's own note says so.
+                                Err((None, Some(e))) => CopyOutcome::Failed(format!(
+                                    "The copy stopped on an error: {e}"
+                                )),
+                            });
+                        },
+                    )
+                };
+                let tx = copy_tx.clone();
+                handle.spawn(async move {
+                    let progress = move |n: u64| {
+                        let _ = tx.send(n);
+                    };
+                    let copied = src
+                        .copy_rows(
+                            Some(&req.src_database),
+                            &req.select,
+                            &dst,
+                            schemaic_db::ImportTarget {
+                                database: &req.target.database,
+                                schema: req.target.schema.as_deref(),
+                                table: &req.target.name,
+                                columns: &req.columns,
+                            },
+                            token.clone(),
+                            &progress,
+                        )
+                        .await;
+                    let outcome = match copied {
+                        Ok(n) if req.settle.is_empty() => Ok(n),
+                        Ok(n) => {
+                            match dst.run_ddl(&req.target.database, &req.settle, token).await {
+                                Ok(()) => Ok(n),
+                                Err(e) => Err((Some(n), Some(e.to_string()))),
+                            }
+                        }
+                        Err(DbError::Cancelled) => Err((None, None)),
+                        Err(e) => Err((None, Some(e.to_string()))),
+                    };
+                    report(outcome);
+                });
+            },
+        )
+    };
+    let copy_cancel: Rc<dyn Fn()> = {
+        let copy_token = copy_token.clone();
+        Rc::new(move || {
+            if let Some(t) = copy_token.borrow().as_ref() {
+                t.cancel();
+            }
+        })
+    };
+
     // Introspect both sides and compare them.
     //
     // **Its own fetch, not the tree's.** The ER diagram reads whatever the tree
@@ -14185,6 +14344,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             compare_show_same: RwSignal::new(false),
             properties,
             used_by,
+            copy_table,
+            copy_progress,
             chart,
             result_diff,
             properties_state,
@@ -14255,6 +14416,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             compare_fetch,
             compare_cancel,
             compare_list_dbs,
+            copy_rows,
+            copy_cancel,
             count_rows,
             count_cancel,
             principals,

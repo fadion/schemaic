@@ -7001,6 +7001,67 @@ async fn an_import_loads_every_row_across_batches() {
     s.exec("INSERT dbo.imp (name) VALUES (N'after')").await;
 }
 
+/// **A copied table holds every row and numbers on past them** — *Copy to*'s
+/// SQL Server leg (the other engines' is `runtime.rs`'s): the identity values
+/// go in under the import's `IDENTITY_INSERT`, and the engine moves its
+/// counter past them itself, so `settle_sql` is empty and the closing insert
+/// takes 4.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copied_table_has_every_row_and_numbers_on_past_them() {
+    use schemaic_core::copy_table::{self, CopyTarget};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("copy_table").await;
+    s.exec("CREATE TABLE dbo.src (id int IDENTITY(1,1) PRIMARY KEY, v nvarchar(20) NOT NULL)")
+        .await;
+    s.exec("INSERT dbo.src (v) VALUES (N'a'), (N'b'), (N'c')")
+        .await;
+    s.exec("CREATE INDEX src_v_idx ON dbo.src (v)").await;
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    let info = schema
+        .tables
+        .iter()
+        .find(|t| t.name == "src")
+        .expect("src")
+        .clone();
+    let to = CopyTarget {
+        database: s.name.clone(),
+        schema: info.schema.clone(),
+        name: "dst".into(),
+    };
+    let plan = copy_table::plan(&info, &to, SqlDialect::MsSql);
+    s.db.run_ddl(&s.name, &plan.emit(), CancellationToken::new())
+        .await
+        .expect("the copy's CREATE");
+    let columns = copy_table::columns(&info);
+    let copied =
+        s.db.copy_rows(
+            Some(&s.name),
+            &copy_table::select_sql(&s.name, &info, &columns, SqlDialect::MsSql),
+            &s.db,
+            schemaic_db::ImportTarget {
+                database: &s.name,
+                schema: to.schema.as_deref(),
+                table: "dst",
+                columns: &columns,
+            },
+            CancellationToken::new(),
+            &|_| {},
+        )
+        .await
+        .expect("the copy");
+    assert_eq!(copied, 3);
+    assert!(copy_table::settle_sql(&to, &info, SqlDialect::MsSql).is_empty());
+    s.exec("INSERT dbo.dst (v) VALUES (N'd')").await;
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.dst").await, "4");
+    assert_eq!(s.scalar("SELECT MAX(id) FROM dbo.dst").await, "4");
+    assert_eq!(s.scalar("SELECT v FROM dbo.dst WHERE id = 2").await, "b");
+}
+
 /// **A row the server refuses rolls the whole import back**, batches already
 /// sent included — a duplicate key past the first batch boundary.
 #[tokio::test(flavor = "multi_thread")]

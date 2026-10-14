@@ -7338,6 +7338,107 @@ mod tests {
         assert_eq!(count, n as i64);
     }
 
+    /// **A copy is the source's rows, all of them, in the target** — read by
+    /// one `Db`, written by another, across several chunks and several insert
+    /// batches, with the progress callback seeing them go by.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_moves_every_row_from_one_database_to_another() {
+        let (src_keeper, src) = shared_memory("copy_src");
+        let (dst_keeper, dst) = shared_memory("copy_dst");
+        src_keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, n REAL);")
+            .unwrap();
+        let n = crate::COPY_CHUNK_ROWS + schemaic_core::import::INSERT_BATCH_ROWS + 3;
+        for i in 1..=n {
+            src_keeper
+                .execute(
+                    "INSERT INTO t VALUES (?1, ?2, ?3)",
+                    rusqlite::params![i as i64, format!("v{i}"), i as f64 / 2.0],
+                )
+                .unwrap();
+        }
+        dst_keeper
+            .execute_batch("CREATE TABLE t2 (id INTEGER PRIMARY KEY, v TEXT, n REAL);")
+            .unwrap();
+        let cols = vec!["id".to_string(), "v".to_string(), "n".to_string()];
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen2 = seen.clone();
+        let copied = src
+            .copy_rows(
+                Some(MAIN),
+                "SELECT id, v, n FROM t",
+                &dst,
+                crate::ImportTarget {
+                    database: MAIN,
+                    schema: None,
+                    table: "t2",
+                    columns: &cols,
+                },
+                CancellationToken::new(),
+                &move |rows| seen2.store(rows, std::sync::atomic::Ordering::Relaxed),
+            )
+            .await
+            .expect("copy");
+        assert_eq!(copied, n as u64);
+        let (count, last): (i64, String) = dst_keeper
+            .query_row(
+                "SELECT count(*), max(v) FROM t2 WHERE n = id / 2.0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, n as i64, "every row, with its values");
+        assert_eq!(last, "v999");
+        assert!(seen.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// **A read that fails leaves the target empty** — not the rows read
+    /// before the failure, committed as if they were the table. The read here
+    /// fails *after* a whole chunk has gone to the writer: `abs` of the
+    /// smallest integer overflows on row 3,001, so a write that took the
+    /// channel's close for the end of the rows would commit the first 2,000.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_whose_read_fails_writes_nothing() {
+        let (src_keeper, src) = shared_memory("copy_fail_src");
+        let (dst_keeper, dst) = shared_memory("copy_fail_dst");
+        src_keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4000)
+                 INSERT INTO t SELECT i FROM n;",
+            )
+            .unwrap();
+        const _: () = assert!(
+            crate::COPY_CHUNK_ROWS < 3000,
+            "the failure must come after a chunk"
+        );
+        dst_keeper
+            .execute_batch("CREATE TABLE t2 (id INTEGER);")
+            .unwrap();
+        let cols = vec!["id".to_string()];
+        let err = src
+            .copy_rows(
+                Some(MAIN),
+                "SELECT CASE WHEN id > 3000 THEN abs(-9223372036854775808) ELSE id END FROM t",
+                &dst,
+                crate::ImportTarget {
+                    database: MAIN,
+                    schema: None,
+                    table: "t2",
+                    columns: &cols,
+                },
+                CancellationToken::new(),
+                &|_| {},
+            )
+            .await
+            .expect_err("the read fails");
+        assert!(err.to_string().contains("overflow"), "{err}");
+        let count: i64 = dst_keeper
+            .query_row("SELECT count(*) FROM t2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     /// **What the import actually *wrote*, not how many rows it wrote.** Nothing
     /// read a value back before this, so `coerce`'s per-dialect literal could be
     /// wrong for a whole engine and every test still passed.

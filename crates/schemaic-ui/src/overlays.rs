@@ -2564,6 +2564,24 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 &table,
                             )),
                         ));
+                        // **Beside the export**, the other way a table leaves
+                        // here — into a database rather than a file. Offered on
+                        // a read-only connection too: it only reads this one,
+                        // and the target's flag is asked at the preview's Apply.
+                        // A table only, and only where the engine can write one
+                        // (`offers.edit`), since the copy is a `CREATE TABLE`.
+                        if offers.edit && !is_view {
+                            let copy_open = import_ui.overlay.copy_table;
+                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            entries.push(MenuEntry::action("Copy to", move || {
+                                copy_open.set(Some(crate::CopySource {
+                                    conn_id: active_conn.get_untracked(),
+                                    database: db.clone(),
+                                    schema: ns.clone(),
+                                    table: tbl.clone(),
+                                }));
+                            }));
+                        }
 
                         // ── Schema editing ────────────────────────────────────
                         // Everything here ends at the DDL preview; nothing runs
@@ -8471,7 +8489,10 @@ fn ",
             // picker rather than the object editor, spelled as a literal.
             // `Back up` writes a file, not the server, like `Export` beside
             // it; it sits with the node's round trips for the same reason.
+            // `Copy to` writes another database — a `CREATE TABLE` there and
+            // its rows — so it is a write, if not of this one.
             CREATE_SUBMENU | "Create {}" | "Create extension" | "Import" | "Back up"
+            | "Copy to"
             | "Restore from file" | "Edit table" | "Edit view"
             | "Edit column" | "Edit index" | "Edit primary key" | "Edit foreign key"
             | "Edit {}" | "Triggers" | "Refresh view" | "Truncate" | "Drop" | "Drop index"

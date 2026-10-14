@@ -315,6 +315,18 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 ui.ddl,
                 &ui.schema_actions,
             )),
+            // *Copy to*, beside compare for compare's reason: raised from the
+            // tree, it hands its `CREATE` to the DDL preview and steps aside
+            // while that is up, then counts the rows once it commits.
+            crate::copy_table_view::copy_table_overlay(crate::copy_table_view::CopyCtx {
+                overlay: ui.overlay,
+                conn: ui.conn,
+                schema: ui.schema,
+                ddl: ui.ddl,
+                list_dbs: ui.schema_actions.compare_list_dbs.clone(),
+                copy_rows: ui.schema_actions.copy_rows.clone(),
+                cancel: ui.schema_actions.copy_cancel.clone(),
+            }),
         ))
         .style(move |s| {
             if workspace_modals_up() {
@@ -550,6 +562,7 @@ fn workspace_modals_up(
     let vars_open = overlay.server_vars;
     let blob_open = blob.target;
     let compare_open = overlay.compare;
+    let copy_open = overlay.copy_table;
     // **The browser counts only while it is the thing on screen.** It renders
     // nothing while one of the account forms or the DDL preview is up — those
     // are raised from it and painted in an earlier group — and a wrapper that
@@ -578,6 +591,10 @@ fn workspace_modals_up(
             // this is the rule stated rather than a case that arises, and it is
             // here so that stops being load-bearing.
             || (compare_open.get().is_some() && preview_open.get().is_none())
+            // *Copy to* the same way, and for the same reason — except that
+            // here it is load-bearing: the modal stays open behind the
+            // preview it raised, to count the rows once the plan commits.
+            || (copy_open.with(Option::is_some) && preview_open.with(Option::is_none))
     }
 }
 
@@ -692,6 +709,9 @@ mod modal_backdrop_gate {
         // In the layer's workspace group, beside `erd_view.rs`, raised by
         // `workspace_modals_up`'s `compare_open.get().is_some()` arm.
         "compare_view.rs",
+        // In the layer's workspace group, after `compare_view.rs`, raised by
+        // `workspace_modals_up`'s `copy_open` arm.
+        "copy_table_view.rs",
         "connection_form.rs",
         // A loose child of the layer, directly above `connection_form.rs`'s
         // modal, which is what raises it.

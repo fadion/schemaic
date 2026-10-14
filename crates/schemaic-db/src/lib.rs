@@ -2840,6 +2840,129 @@ impl Db {
             Engine::MsSql => mssql::import_rows(self, target, rows, cancel).await,
         }
     }
+
+    /// **Copy the rows `select` reads here into `target` on `to`** — the data
+    /// half of *Copy to* (`core::copy_table`), after the preview created the
+    /// table. The read streams on a read-only session (`Enforce::ReadOnly`: the
+    /// `SELECT` is generated, but a copy writes nothing on its source by any
+    /// route); the write is [`Db::import_rows`], one transaction with every
+    /// batch's count checked, so a copy that stops part-way leaves the target
+    /// table empty rather than holding the first rows as if they were all.
+    ///
+    /// **The read is a task of its own**, feeding a bounded channel the write
+    /// pulls from under `block_in_place`. Joined on one task instead, the
+    /// write's blocking pull would hold the very thread the read needs to make
+    /// the next chunk. And **the read's failure arrives down the channel**,
+    /// which [`Db::stream_query_enforced`] guarantees by sending it there as
+    /// well as returning it: the write ends when the channel closes, so a read
+    /// that stopped on an error and merely dropped its sender would have read
+    /// as the end of the rows and committed what had arrived
+    /// (`a_copy_whose_read_fails_writes_nothing`).
+    ///
+    /// `progress` is called with the rows handed to the writer so far, a chunk
+    /// at a time. Needs the multi-threaded runtime the app runs; on another it
+    /// refuses rather than block the only thread the read could run on.
+    pub async fn copy_rows(
+        &self,
+        database: Option<&str>,
+        select: &str,
+        to: &Db,
+        target: ImportTarget<'_>,
+        cancel: CancellationToken,
+        progress: &(dyn Fn(u64) + Send + Sync),
+    ) -> Result<u64, DbError> {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        if !matches!(
+            Handle::try_current().map(|h| h.runtime_flavor()),
+            Ok(RuntimeFlavor::MultiThread)
+        ) {
+            return Err(DbError::Query(
+                "A copy needs the multi-threaded runtime".to_string(),
+            ));
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel::<ExportChunk>(2);
+        let read_cancel = cancel.child_token();
+        let reader = {
+            let db = self.clone();
+            let database = database.map(str::to_string);
+            let select = select.to_string();
+            let read_cancel = read_cancel.clone();
+            tokio::spawn(async move {
+                db.stream_query_enforced(
+                    database.as_deref(),
+                    &select,
+                    COPY_CHUNK_ROWS,
+                    read_cancel,
+                    tx,
+                    Some(Enforce::ReadOnly),
+                )
+                .await
+            })
+        };
+        let mut rows = ChunkRows {
+            rx,
+            chunk: None,
+            at: 0,
+            handed: 0,
+            progress,
+        };
+        let written = to.import_rows(target, &mut rows, cancel).await;
+        // Whatever the write did, the read has nothing left to feed: a write
+        // that failed stops it, and one that finished found its end.
+        read_cancel.cancel();
+        drop(rows);
+        let read = reader
+            .await
+            .map_err(|e| DbError::Query(format!("The read stopped: {e}")))?;
+        match (written, read) {
+            (Ok(n), Ok(_)) => Ok(n),
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(e),
+        }
+    }
+}
+
+/// How many rows a copy's read hands over at a time — `Db::copy_rows`. The
+/// import's writer batches them again, by rows and bytes, on its own terms.
+pub const COPY_CHUNK_ROWS: usize = 2_000;
+
+/// A copy's read, as the import's [`RowSource`]: the streamed chunks, a row at
+/// a time, pulled with a blocking receive — which `next_batch_off_executor`
+/// makes legal by pulling under `block_in_place`.
+struct ChunkRows<'a> {
+    rx: tokio::sync::mpsc::Receiver<ExportChunk>,
+    chunk: Option<ResultSet>,
+    at: usize,
+    handed: u64,
+    progress: &'a (dyn Fn(u64) + Send + Sync),
+}
+
+impl Iterator for ChunkRows<'_> {
+    type Item = Result<Vec<Value>, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(rs) = &self.chunk
+                && self.at < rs.row_count()
+            {
+                let r = self.at;
+                self.at += 1;
+                self.handed += 1;
+                let row = (0..rs.columns.len())
+                    .map(|c| rs.cell(r, c).map_or(Value::Null, |v| v.to_value()))
+                    .collect();
+                return Some(Ok(row));
+            }
+            (self.progress)(self.handed);
+            match self.rx.blocking_recv()? {
+                Ok(rs) => {
+                    self.chunk = Some(rs);
+                    self.at = 0;
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
 }
 
 /// ` ORDER BY a, b` for the Live Monitor's window, or `""` when there is no key

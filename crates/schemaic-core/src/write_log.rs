@@ -51,6 +51,8 @@ pub enum Source {
     Ddl,
     /// Rows imported from a file.
     Import,
+    /// Rows copied from another table by *Copy to* (its `CREATE` is a `Ddl`).
+    Copy,
     /// `schemaic exec`.
     Cli,
 }

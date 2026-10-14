@@ -8900,6 +8900,56 @@ existing prose was left alone.
     (`an_uncertain_match_is_counted_even_though_its_row_is_hidden`,
     `the_uncertain_tally_does_not_come_out_of_the_status_tallies`).
     `cycles` is the third.
+  - `copy_table.rs` — **a table, structure and rows, into another database** of the same engine,
+    on this connection or another: the pure half of the tree's *Copy to* (the UI half is
+    `ui/copy_table_view.rs`, the rows `Db::copy_rows`). **Same engine only, and that is a non-goal
+    rather than a gap**: a copy across engines is a type mapping — `datetime` → `timestamp`, an
+    `enum` with no counterpart at all — and nothing in the workspace has one, so the picker offers
+    only the connections `connection::same_engine` matches. That predicate counts MySQL and MariaDB
+    as one engine, so a copy between them is offered and nothing here translates a type or a table
+    option one server has and the other lacks.
+    `CopyTarget { database, schema, name }` is where it goes. `refusal(src, to, same_database)`
+    answers a sentence or `None`: no name, no database, or — when the caller says the target is
+    the source's own connection and database — the source's own name in the source's own namespace,
+    compared ASCII-case-insensitively, which would be a copy onto itself.
+    **The copy is a new table, and `draft` is the one place that makes it one.** It is
+    `TableDraft::from_table` with `original = None` and every column, index and check rebuilt
+    through its `::new`, so `ddl::create` treats nothing as already there; `plan` is exactly
+    `ddl::create(&draft(…))`, which is what keeps the copy on the DDL invariant's one path — the
+    preview shows it and `Db::run_ddl` runs it like any other plan
+    (`the_plan_creates_the_copy_and_never_names_the_source`). **Foreign keys are cleared**: the
+    tables they reference need not exist on the target, and a key naming a missing table refuses
+    the whole `CREATE`. **Triggers do not come**, a draft not carrying them. **An index's and a
+    check's name move onto the copy's** (`moved_name`), because index names are per schema on
+    PostgreSQL and per database on SQLite and a check's per schema on MySQL and SQL Server, so a copy
+    beside its source under the source's index names would collide on every one: where the name
+    holds the table's it is substituted (`orders_total_idx` → `orders_copy_total_idx`), elsewhere
+    the copy's name is put in front (`an_index_and_a_check_take_the_copys_name`). A copy that keeps
+    the table's name keeps every name (`a_copy_under_the_same_name_keeps_every_name`) — it is in
+    another database, or `refusal` stopped it — and SQLite's `sqlite_autoindex_*` stay as they are,
+    being the engine's, re-declared as `UNIQUE` rather than created by name
+    (`sqlites_own_indexes_are_not_renamed`). The substitution is a plain case-sensitive `find`.
+    `columns` is every column but those `ColumnInfo::is_server_assigned` names — a generated column
+    and PostgreSQL's `GENERATED ALWAYS AS IDENTITY`, the import's own rule — so those are neither
+    read nor written, and take fresh values on the target
+    (`a_generated_column_is_not_read_or_written`, `an_always_identity_takes_fresh_values`).
+    `select_sql` is the read on the source, those columns in table order through
+    `export::ident_sql`, qualified by `export::qualified_table` and unsorted, since an insert needs
+    no order.
+    **A copied counter is the engine's question, asked as a capability.**
+    `counter_follows_written_values(dialect)` is whether an explicit value written into an
+    auto-numbered column moves the engine's counter past it: MySQL's `AUTO_INCREMENT`, SQL Server's
+    identity under the import's `IDENTITY_INSERT` and SQLite's rowid do; a PostgreSQL identity's
+    sequence does not, and would hand out `1` next on a table that already holds it. `settle_sql` is
+    what runs on the target after the rows where it is `false` — per auto-increment column whose
+    values were copied, `SELECT setval(pg_get_serial_sequence('<qualified>', '<col>'),
+    COALESCE(MAX(col), 0) + 1, false) FROM <qualified>`, the table name quoted inside the string so
+    case and schema survive `pg_get_serial_sequence`'s parse, and `is_called = false` so the next
+    value is exactly `MAX + 1`, and `1` on an empty table
+    (`only_postgres_settles_its_counter_after_the_rows`). The live tier's
+    `a_copied_table_has_every_row_and_numbers_on_past_them` is what proves it moved: it seeds ids
+    1–3, copies, settles and inserts one more row expecting id 4, and with PostgreSQL's settle
+    skipped it fails on a duplicate key at 1 (per the change's author).
   - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
     introspected `DbSchema` into a `DiagramGraph` — nodes = tables, edges = FKs — seeded either by
     `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one
@@ -10362,7 +10412,7 @@ existing prose was left alone.
     appending at once do not interleave inside a line. Its error is the caller's to report or drop
     and never to turn into the write failing: the write it records has already happened.
     `Entry { ts, source, connection, database, sql, detail, rows, outcome, error, masked }` — `ts`
-    in Unix milliseconds, `Source` one of `editor`/`script`/`grid`/`ddl`/`import`/`cli`,
+    in Unix milliseconds, `Source` one of `editor`/`script`/`grid`/`ddl`/`import`/`copy`/`cli`,
     `connection` the name the user saved. `Outcome` is `ok`/`failed`/`cancelled` and **`unknown`,
     for a write the client lost track of** — `schemaic exec`'s deadline passing after the
     statement was sent, which may or may not have taken effect (exit 5, under `cli/exec.rs`). `sql`
@@ -19824,6 +19874,34 @@ existing prose was left alone.
   interruption belongs *inside* `run_statement`, between those two statements, where it can clean up
   after itself. That half is a deletion and no test can be made to fail on it, which is said here
   and in the commit rather than left to look like coverage.
+  **`Db::copy_rows(database, select, to, ImportTarget, cancel, progress)` is `import_rows` with a
+  database for its file** — the data half of *Copy to* (`core::copy_table`), run once the preview
+  has created the table. The read is `stream_query_enforced(…, Some(Enforce::ReadOnly))` on `self`
+  in `COPY_CHUNK_ROWS` (2,000) chunks: the `SELECT` is generated, but a copy writes nothing on its
+  source by any route. The write is `to.import_rows`, so it inherits that path's whole discipline —
+  one transaction, every batch's count checked, the cancel inside the loop — and a copy that stops
+  part-way leaves a transactional target table as the `CREATE` made it rather than holding the
+  first rows as if they were all. A non-transactional one keeps what arrived, exactly as an import
+  into it does, and the error carries `Rollback::note` to say so. **The read is a spawned task of its own, and that is load-bearing.** The writer
+  pulls its rows through the private `ChunkRows` iterator with `blocking_recv`, which
+  `next_batch_off_executor` makes legal by pulling under `block_in_place`; joined on one task
+  instead, that blocking pull would hold the very thread the read needs to produce the next chunk.
+  The channel between them holds two chunks. `next_batch_off_executor` pulls inline on any other
+  runtime flavour, so `copy_rows` **refuses on anything but the multi-threaded runtime** rather
+  than block the only thread the read could run on — the app runs that runtime, and the SQLite
+  tests that call it are `flavor = "multi_thread"`. **It relies on
+  `stream_query_enforced` sending its failure down the channel as well as returning it**: the
+  write ends when the channel closes, so a read that stopped on an error and only dropped its
+  sender would read as the end of the rows and commit what had arrived.
+  `a_copy_whose_read_fails_writes_nothing` (SQLite) pins it with an `abs` overflow on row 3,001,
+  after a whole chunk has gone to the writer — a `const` assertion holds `COPY_CHUNK_ROWS` under
+  3,000 so it stays after one — and it was seen to fail with 2,000 rows committed when that send
+  was removed (per the change's author). After the write, whatever it did, the read's child token
+  is cancelled and the task awaited; the write's error wins over the read's. `progress` is called
+  with the rows handed to the writer so far, once per chunk.
+  `a_copy_moves_every_row_from_one_database_to_another` is the SQLite happy path; the live tier's
+  `a_copied_table_has_every_row_and_numbers_on_past_them` runs it end to end — plan, rows, settle —
+  in `runtime.rs` on MariaDB, MySQL 8 and PostgreSQL and under the same name in `mssql.rs`.
   **`tests/live/` is the DB layer against real servers**, and it exists because the pure suite can
   only reach the *decisions*: SQLite is testable directly (in-memory, shared-cache), so it is the
   one backend whose wire layer was covered at all, while MySQL, MariaDB and PostgreSQL — the
@@ -23051,6 +23129,13 @@ existing prose was left alone.
     preview, so the clause guards nothing that arises today; it is written down anyway, because the
     alternative is a member of this group whose correctness rests on a caller remembering to close
     itself first.
+    **The *Copy to* modal, mounted directly after compare, takes the same clause — and there it is
+    load-bearing.** It does *not* close on its way to the preview it raises: it stays
+    open behind it, hidden by its own `copy_open && preview_open.is_none()` style, so it can count
+    the rows once the plan commits (`DdlPreview::then`). Without the clause in
+    `workspace_modals_up` the group's wrapper would fill the layer over the preview's Apply for the
+    whole time the plan is on screen. The two must ask the same two signals, as the users browser
+    and its predicate do.
     **`whole_ui_gate` 5 → 2, and the two left are the layer and the union.** The three group
     predicates take the bundles they read — `ddl_modals_up(OverlayUi, ImportUi, DumpUi, ScriptUi,
     DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and `settings_modals_up(LayoutUi)` —
@@ -25655,6 +25740,13 @@ existing prose was left alone.
     designer's *Preview SQL*, `preview_draft_edit` (the tree's column Drop), the view editor's and
     the routine editor's *Preview SQL*. A new path that previews such a plan has to call it too,
     and nothing checks that it does — skipping it just loses the block, silently.
+    **`DdlPreview::then` is what runs once *this* plan has committed**, and only then: `apply`
+    clones it when Apply is pressed and calls it in the `Applied` arm, after `close_editors` — not
+    on `Failed`, not on `Declined`, and not when the generation check above it finds the preview
+    reopened on another plan meanwhile, which returns before any arm. *Copy to* is its one user —
+    its `CREATE TABLE` is the plan, and the rows follow it (`copy_table_view.rs`) — and
+    `preview_of` and `preview_of_plan` both build `None`. It is not `after_commit`, which is SQL
+    the app runs after the plan and the box shows; `then` is UI work, and nothing is shown for it.
     **`ddl_preview::close_peers` is the one editor-target list**, called by every editor's `open`
     before it sets its own and by `close_editors` after an Apply. Each of those `open`s used to
     keep its own copy and they had **drifted**: the table designer cleared the view editor and
@@ -29457,6 +29549,68 @@ existing prose was left alone.
     whichever step is showing rather than instead of one, because an error arm of its own replaced
     the connection rows that were the only control able to clear `compare_dbs_err` — a listing that
     failed could then be escaped only by closing the whole modal.
+  - `copy_table_view.rs` — the **Copy to** modal (`copy_table_overlay`, over `core::copy_table`): a
+    table's structure and rows into another database, on this connection or another of the same
+    engine. It is raised from a table row's *Copy to* in `overlays.rs`, directly after the Export
+    submenu — the other way a table leaves the tree, into a database rather than a file — offered
+    where `offers.edit && !is_view`, and **not dimmed on a read-only source**, since it only reads
+    the source and the target's flag is asked at the preview's Apply. `menu_order_gate` files it in
+    the write group (4): it writes another database, if not this one. Setting `OverlayUi::copy_table`
+    to a `CopySource { conn_id, database, schema, table }` opens it; the source is always the
+    active connection's, the tree showing no other. `CopySource`, `CopyRowsRequest`, `CopyOutcome`
+    (`Done(n)`, `Cancelled`, `Failed(sentence)`) and `CopyRowsFn` are re-exported from `lib.rs`.
+    **The `CREATE TABLE` goes through the DDL preview like every other generated DDL, and the rows
+    follow only once it has committed.** *Preview SQL* first refuses — *"The active connection
+    changed — reopen Copy to from the table."* — when `ConnUi::active_conn` is no longer
+    `CopySource::conn_id`: the schema it reads and the dialect it emits in are the **active**
+    connection's, so after a switch they would describe another server's same-named table while
+    the rows still came from the source. It then reads the source's `TableInfo` through
+    `table_designer::loaded_table` — refusing with *"expand it in the tree"* while the database's
+    schema is not loaded — asks `copy_table::refusal`, builds `copy_table::plan`, and opens it with
+    `ddl_preview::preview_of` on the **target** connection and database, with the target's
+    `read_only`, and a `then` (`DdlPreview::then`, under `ddl_preview.rs`) carrying a
+    `CopyRowsRequest` built at that moment — the `select_sql`, the `columns` and the `settle_sql`.
+    So the write guard and the target's read-only flag are the preview's, asked at Apply, and a
+    `CREATE` that fails, is declined or is superseded copies no rows. `then` closes the preview
+    through `ddl_preview::close_preview` — the one door, so the SQL box is cleared with it —
+    switches the modal to *Copying* and calls `SchemaActions::copy_rows`.
+    **It stays open behind the preview it raised, and hides itself while that is up** —
+    `copy_open && preview_open.is_none()`, the clause `modals::workspace_modals_up` asks too —
+    because the preview is painted in the earlier DDL group and a backdrop of this one's over it
+    would swallow every click meant for Apply. Compare closes itself on the way to its preview;
+    this one cannot, being where the rows are counted.
+    **The target picker is compare's, borrowed.** Connection first — filtered to those
+    `connection::same_engine` matches with the source's, the source's own included — then that
+    connection's databases through `SchemaActions::compare_list_dbs` into
+    `OverlayUi::compare_dbs`/`compare_dbs_err`, the same lister and the same signals, since the two
+    modals never open together and it is the same question; rows are `compare_view::pick_row`,
+    `pub(crate)` for this. The database is picked against the connection id that travels with the
+    list, compare's defence against a stale listing. The modal clears `compare_dbs` and
+    `copy_progress` when it opens. Below the picker are **Schema**, hidden when the source has
+    none, defaulting to the source's, and **Name**, defaulting to `<table>_copy`, and a line saying
+    what does not come: foreign keys and triggers, and a generated column's values.
+    **Three stages** — *Choosing* (the form, Cancel and Preview SQL), *Copying* (*"Copying rows…
+    n"* off `OverlayUi::copy_progress`, and Stop) and *Finished* (what happened, and Close). The form
+    is built once and only hidden past *Choosing*, so its fields keep their text. A cancel reads
+    *"Stopped before every row was copied. The table was created."* — not "holds no rows", which a
+    MyISAM or Aria copy (the draft carries the source's `engine`) does not make true; a failure is
+    the app's whole sentence, since only it knows whether the rows were in before what failed. **There is no click-away**:
+    a stray click must not close a copy in flight. ✕ and Escape close it, and **closing
+    mid-copy cancels** through `SchemaActions::copy_cancel`.
+    **The rows are the app's** (`main.rs`, beside `compare_list_dbs`). `copy_rows` **guards its own
+    launch** by re-reading the target's read-only flag — Apply asked it for the `CREATE`, and this
+    is a second write, launched later — and a target connection deleted meanwhile **fails the
+    copy** rather than falling back to some engine. It runs `Db::copy_rows` from the source's `Db`
+    into the target's, then `run_ddl(settle)` on the target when there is anything to settle, on
+    the same token, reports once through `create_ext_action` and logs `Source::Copy` (under
+    `app/main.rs`'s write-log paragraph). Progress comes through a crossbeam channel into
+    `copy_progress`, the dump's way, since an ext action answers once; `copy_cancel` cancels the
+    token held in a slot for the copy in flight. The failure sentence says which side of the
+    commit it fell. Before it, *"The copy stopped on an error: {e}"* — **deliberately not "the table
+    is empty"**: the rows are one transaction, but a non-transactional copy keeps what arrived, and
+    `e` carries `Rollback::note` saying so, so the sentence used to contradict its own error. After
+    it, *"{n} rows were copied, but the table's counter was not moved past them, so the next insert
+    may collide: {e}"*.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
     surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
@@ -30991,7 +31145,13 @@ existing prose was left alone.
   logs the plan's statements joined by `;\n` — an account's password masked by the log whatever
   the setting says. `import_run` logs the load alone (`log_load`, after `import_rows`), never the
   validation pass before it, which writes nothing; its detail is `import <path> into
-  db.schema.table` and it has no `sql`, the rows being the file's.
+  db.schema.table` and it has no `sql`, the rows being the file's. *Copy to*'s rows are
+  `Source::Copy`, logged against the **target** connection in `copy_rows`' report with no `sql`
+  and the detail `copy <SELECT> into db.schema.table` — the `SELECT` being `copy_table::select_sql`,
+  identifiers only; its `CREATE` is the DDL preview's entry like any plan's. A copy whose rows
+  committed but whose PostgreSQL settle failed is logged `failed` **with the committed count** in
+  `rows` — the report's payload is `Result<u64, (Option<u64>, Option<String>)>`, its `Option<u64>`
+  `Some` only for that case — so the line does not read as a copy that wrote nothing.
   **Not logged**: EXPLAIN ANALYZE, which `Db::explain` always rolls back or never executes; a view
   re-run, a read Schemaic built; and the MCP server, which has no write tool. The setting is
   Settings → Query's *Keep values in the write log* (`LayoutUi::write_log_values`, tabindex 250

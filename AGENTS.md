@@ -30,6 +30,7 @@ whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `ddl_is_transactional`, `catalogue_body_is_unescaped`, `users::revoke_cascades`, `supports_deny`,
 `table_grant_lifts_column_denies`, `table_revoke_clears_columns`, `blank_password_signs_in`, `drop_user_cuts_off_sessions`,
 `sql::SqlDialect::read_only_is_a_rollback`, `dump::drops_up_front`,
+`copy_table::counter_follows_written_values`,
 `export::client_substitutes_variables`, `reads_dates_by_language`,
 `schema::unvalidated_check_waits_for_rows`, `writes_not_valid`
 — alongside them the few that do decide whether a control is offered, because the clause

@@ -508,8 +508,9 @@ fn left_db_type(connections: RwSignal<Vec<Connection>>, left: &CompareSide) -> S
 ///
 /// `color` is a parameter because `‹ back` is not one of the things being
 /// picked — it is the way out of the list — and reads dimmer than the names it
-/// sits above so the eye lands on those first.
-fn pick_row(
+/// sits above so the eye lands on those first. *Copy to*'s target picker
+/// (`copy_table_view`) draws its rows with it too.
+pub(crate) fn pick_row(
     label: String,
     color: fn() -> floem::peniko::Color,
     on_pick: impl Fn() + 'static,

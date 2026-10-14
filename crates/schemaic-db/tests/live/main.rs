@@ -168,6 +168,7 @@ live_suite!(
         a_refused_statement_stops_the_run_and_names_its_line,
         an_empty_script_finishes_having_run_nothing,
         an_import_loads_every_row,
+        a_copied_table_has_every_row_and_numbers_on_past_them,
         a_reader_error_rolls_the_whole_import_back,
         a_refused_row_rolls_the_whole_import_back,
         a_manual_transaction_is_invisible_until_it_commits,

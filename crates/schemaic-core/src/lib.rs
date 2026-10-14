@@ -18,6 +18,7 @@ pub mod cli_install;
 pub mod compare;
 pub mod conn_import;
 pub mod connection;
+pub mod copy_table;
 pub mod date;
 pub mod db_color;
 pub mod db_hidden;
