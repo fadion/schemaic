@@ -1632,6 +1632,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let active_conn = ui.conn.active_conn;
     let open_query = ui.tab_actions.open_query.clone();
     let open_db_cli = ui.tab_actions.open_db_cli.clone();
+    let backup_db = ui.tab_actions.backup_db.clone();
+    let restore_db = ui.tab_actions.restore_db.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
     let refresh_db = ui.schema_actions.refresh_db.clone();
     let collapse_db = ui.schema_actions.collapse_db.clone();
@@ -1856,6 +1858,26 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         );
                     }
                     entries.push(export_submenu(&dump_ctx, &menu.name, None, None));
+                    // The engine's own backup beside Export, and its restore:
+                    // in the terminal, through the engine's tools (`core::launch`).
+                    // A backup writes a file and never the server, so a
+                    // read-only connection may take one, as it may export; a
+                    // restore writes the whole database, so it is dimmed there.
+                    {
+                        let backup = backup_db.clone();
+                        let db = menu.name.clone();
+                        entries.push(MenuEntry::action("Back up", move || (backup)(db.clone())));
+                    }
+                    if schemaic_core::launch::restore_offered(
+                        crate::table_designer::edit_ctx(import_ui.conn).dialect,
+                    ) {
+                        let restore = restore_db.clone();
+                        let db = menu.name.clone();
+                        entries.push(
+                            MenuEntry::action("Restore from file", move || (restore)(db.clone()))
+                                .disabled(conn_read_only(&connections, active_conn)),
+                        );
+                    }
                     // On PostgreSQL a database node stands for its `public`
                     // namespace, on SQL Server for `dbo` (other namespaces get
                     // their own node), so a new
@@ -8447,7 +8469,10 @@ fn ",
             // opposite sides of the separator.
             // `Create extension` is the Extensions folder's `Create {}`: the
             // picker rather than the object editor, spelled as a literal.
-            CREATE_SUBMENU | "Create {}" | "Create extension" | "Import" | "Edit table" | "Edit view"
+            // `Back up` writes a file, not the server, like `Export` beside
+            // it; it sits with the node's round trips for the same reason.
+            CREATE_SUBMENU | "Create {}" | "Create extension" | "Import" | "Back up"
+            | "Restore from file" | "Edit table" | "Edit view"
             | "Edit column" | "Edit index" | "Edit primary key" | "Edit foreign key"
             | "Edit {}" | "Triggers" | "Refresh view" | "Truncate" | "Drop" | "Drop index"
             | "Drop foreign key" => 4,

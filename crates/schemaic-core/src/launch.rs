@@ -296,7 +296,9 @@ impl MysqlClient {
             .split('.')
             .next()
             .unwrap_or(prog);
-        if stem.eq_ignore_ascii_case("mariadb") {
+        // MariaDB's dump tool is its client family too, and spells TLS as
+        // its client does.
+        if stem.eq_ignore_ascii_case("mariadb") || stem.eq_ignore_ascii_case("mariadb-dump") {
             MysqlClient::MariaDb
         } else {
             MysqlClient::Mysql
@@ -647,9 +649,301 @@ pub fn docker_inspect_args(ps_output: &str) -> Result<Vec<String>, &'static str>
     Ok(if args.len() == 2 { Vec::new() } else { args })
 }
 
+// ── Backup and restore ──────────────────────────────────────────────────────
+//
+// The database tree's *Back up* and *Restore from file* run the engine's own
+// tools in the terminal panel, as *Open in CLI* runs its client: argv only,
+// the password in the client's environment variable, never on the command
+// line. The file is one the user picked in a dialog, so it is a Windows path
+// on Windows — which is why the app runs these native only, never through
+// WSL, where the path would name somewhere else.
+
+/// A backup or restore file the user picked, or why it cannot be handed to a
+/// client: a line break, which no file name holds and which `mysql`'s
+/// `source` would read as the end of its argument and the start of a second
+/// command.
+pub fn backup_file_target(file: &str) -> Result<&str, &'static str> {
+    const LINE_BREAK: &str = "That file name contains a line break, which the client would read \
+        as two arguments. Choose another name.";
+    if file.trim().is_empty() || file.contains(['\n', '\r', '\0']) {
+        return Err(LINE_BREAK);
+    }
+    Ok(file)
+}
+
+/// `pg_dump`'s argv: the database in the custom format (`-F c`), which
+/// `pg_restore` reads selectively and in parallel, to `file`.
+pub fn pg_dump_args(
+    host: &str,
+    port: u16,
+    user: &str,
+    db: &str,
+    file: &str,
+) -> Result<Vec<String>, &'static str> {
+    let db = psql_target(db)?;
+    let file = backup_file_target(file)?;
+    Ok(vec![
+        "-h".into(),
+        host.into(),
+        "-p".into(),
+        port.to_string(),
+        "-U".into(),
+        user.into(),
+        "-F".into(),
+        "c".into(),
+        "-f".into(),
+        file.into(),
+        "-d".into(),
+        db.into(),
+    ])
+}
+
+/// The client and argv that restore `file` into `db`: `psql -f` for a plain
+/// `.sql` script (stopping at its first error, so a half-restored database is
+/// not reported as done), `pg_restore` for anything else — the custom or
+/// directory format `pg_dump` writes — without restoring ownership, which
+/// names roles this server may not have.
+pub fn pg_restore_args(
+    host: &str,
+    port: u16,
+    user: &str,
+    db: &str,
+    file: &str,
+) -> Result<(&'static str, Vec<String>), &'static str> {
+    let db = psql_target(db)?;
+    let file = backup_file_target(file)?;
+    let mut args: Vec<String> = vec![
+        "-h".into(),
+        host.into(),
+        "-p".into(),
+        port.to_string(),
+        "-U".into(),
+        user.into(),
+        "-d".into(),
+        db.into(),
+    ];
+    if ends_with_ignore_ascii_case(file, ".sql") {
+        args.extend([
+            "-v".into(),
+            "ON_ERROR_STOP=1".into(),
+            "-f".into(),
+            file.into(),
+        ]);
+        Ok(("psql", args))
+    } else {
+        // `--` before a file the user named, as before a server-supplied name.
+        args.extend(["--no-owner".into(), "--".into(), file.into()]);
+        Ok(("pg_restore", args))
+    }
+}
+
+/// `mysqldump`'s argv for `db` to `file`: one consistent snapshot of the
+/// transactional tables (`--single-transaction`, no lock held), and the
+/// routines, triggers and events with them. `tls` is
+/// [`mysql_cli_tls_args`]' answer for the client found, as *Open in CLI*
+/// passes it; `--` before the database name, which the server supplied.
+pub fn mysqldump_args(
+    host: &str,
+    port: u16,
+    user: &str,
+    tls: Vec<String>,
+    db: &str,
+    file: &str,
+) -> Result<Vec<String>, &'static str> {
+    let file = backup_file_target(file)?;
+    let mut args: Vec<String> = vec![
+        "-h".into(),
+        host.into(),
+        "-P".into(),
+        port.to_string(),
+        "-u".into(),
+        user.into(),
+    ];
+    args.extend(tls);
+    args.extend([
+        "--single-transaction".into(),
+        "--routines".into(),
+        "--triggers".into(),
+        "--events".into(),
+        format!("--result-file={file}"),
+        "--".into(),
+        db.into(),
+    ]);
+    Ok(args)
+}
+
+/// The `mysql` client's argv restoring `file` into `db`: its `source` command,
+/// which runs a script the way a dump expects (its `DELIMITER` lines
+/// included), reading the file itself — there is no shell to redirect one in.
+pub fn mysql_restore_args(
+    host: &str,
+    port: u16,
+    user: &str,
+    tls: Vec<String>,
+    db: &str,
+    file: &str,
+) -> Result<Vec<String>, &'static str> {
+    let file = backup_file_target(file)?;
+    let mut args: Vec<String> = vec![
+        "-h".into(),
+        host.into(),
+        "-P".into(),
+        port.to_string(),
+        "-u".into(),
+        user.into(),
+    ];
+    args.extend(tls);
+    args.extend([format!("--execute=source {file}"), "--".into(), db.into()]);
+    Ok(args)
+}
+
+/// The T-SQL that backs `db` up on SQL Server: to `file`, a bare name, which
+/// the server places in **its own** default backup folder — the backup is
+/// written by the server, so a path on this machine would mean nothing to it.
+/// `COPY_ONLY`, so it does not reset the differential base a scheduled backup
+/// plan relies on; `INIT`, so a file of that name is replaced rather than
+/// appended to.
+pub fn mssql_backup_sql(db: &str, file: &str) -> String {
+    use crate::export::{ident_sql, sql_literal};
+    use crate::intel::SqlDialect;
+    format!(
+        "BACKUP DATABASE {} TO DISK = {} WITH COPY_ONLY, INIT",
+        ident_sql(db, SqlDialect::MsSql),
+        sql_literal(
+            &crate::model::Value::Str(file.to_string()),
+            SqlDialect::MsSql
+        )
+    )
+}
+
+/// Is *Restore from file* offered on `dialect`? Where a client restores a
+/// file from this machine into a database: `psql`/`pg_restore` and `mysql`.
+/// Not SQL Server, whose `RESTORE` reads a file **on the server** and needs
+/// the database to itself, nor SQLite, where a backup is a database file one
+/// opens as a connection. Exhaustive, so a fifth engine answers here.
+pub fn restore_offered(dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect;
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => true,
+        SqlDialect::MsSql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// The local time as a backup file's name spells it: `20261014-1530`.
+pub fn backup_stamp_now() -> String {
+    chrono::Local::now().format("%Y%m%d-%H%M").to_string()
+}
+
+/// A backup's default file name: the database, a timestamp and `ext`, with
+/// anything a file name cannot hold replaced by `_`.
+pub fn backup_file_name(db: &str, stamp: &str, ext: &str) -> String {
+    let safe: String = db
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{safe}_{stamp}.{ext}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Backup and restore ──────────────────────────────────────────────────
+
+    #[test]
+    fn pg_dump_writes_the_custom_format_to_the_picked_file() {
+        let args = pg_dump_args("h", 5432, "u", "shop", "C:/b/shop.dump").unwrap();
+        assert_eq!(
+            args.join(" "),
+            "-h h -p 5432 -U u -F c -f C:/b/shop.dump -d shop"
+        );
+        assert!(
+            pg_dump_args("h", 5432, "u", "host=evil", "f").is_err(),
+            "psql_target's rule"
+        );
+    }
+
+    #[test]
+    fn a_sql_script_restores_through_psql_and_a_dump_through_pg_restore() {
+        let (prog, args) = pg_restore_args("h", 1, "u", "shop", "x.SQL").unwrap();
+        assert_eq!(prog, "psql");
+        assert!(args.ends_with(&[
+            "-v".into(),
+            "ON_ERROR_STOP=1".into(),
+            "-f".into(),
+            "x.SQL".into()
+        ]));
+        let (prog, args) = pg_restore_args("h", 1, "u", "shop", "-x.dump").unwrap();
+        assert_eq!(prog, "pg_restore");
+        assert!(
+            args.ends_with(&["--no-owner".into(), "--".into(), "-x.dump".into()]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn mysqldump_snapshots_with_routines_and_ends_options_before_the_name() {
+        let args = mysqldump_args(
+            "h",
+            3306,
+            "u",
+            vec!["--ssl-mode=REQUIRED".into()],
+            "--evil",
+            "o.sql",
+        )
+        .unwrap();
+        assert_eq!(
+            args.join(" "),
+            "-h h -P 3306 -u u --ssl-mode=REQUIRED --single-transaction --routines --triggers \
+             --events --result-file=o.sql -- --evil"
+        );
+    }
+
+    #[test]
+    fn a_mysql_restore_sources_the_file_and_refuses_a_line_break() {
+        let args = mysql_restore_args("h", 1, "u", vec![], "shop", "C:/a b/x.sql").unwrap();
+        assert!(args.contains(&"--execute=source C:/a b/x.sql".to_string()));
+        assert_eq!(&args[args.len() - 2..], ["--", "shop"]);
+        assert!(
+            mysql_restore_args("h", 1, "u", vec![], "shop", "x.sql\nDROP DATABASE shop").is_err()
+        );
+        assert!(backup_file_target("  ").is_err());
+    }
+
+    #[test]
+    fn a_sql_server_backup_is_quoted_and_leaves_the_backup_chain_alone() {
+        assert_eq!(
+            mssql_backup_sql("o]rders", "o_1.bak"),
+            "BACKUP DATABASE [o]]rders] TO DISK = N'o_1.bak' WITH COPY_ONLY, INIT"
+        );
+    }
+
+    #[test]
+    fn mariadbs_dump_tool_spells_tls_as_its_client_does() {
+        assert_eq!(MysqlClient::of("mariadb-dump"), MysqlClient::MariaDb);
+        assert_eq!(MysqlClient::of("mysqldump"), MysqlClient::Mysql);
+    }
+
+    #[test]
+    fn restore_is_offered_where_a_client_restores_a_local_file() {
+        use crate::intel::SqlDialect;
+        assert!(restore_offered(SqlDialect::MySql) && restore_offered(SqlDialect::Postgres));
+        assert!(!restore_offered(SqlDialect::MsSql) && !restore_offered(SqlDialect::Sqlite));
+    }
+
+    #[test]
+    fn a_backup_file_name_is_safe_whatever_the_database_is_called() {
+        assert_eq!(
+            backup_file_name("sales/2026 q1", "20261014-1530", "dump"),
+            "sales_2026_q1_20261014-1530.dump"
+        );
+    }
     use crate::connection::{SslMode, Tls};
 
     #[test]

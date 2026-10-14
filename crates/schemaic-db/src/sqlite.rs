@@ -2077,6 +2077,22 @@ pub(crate) async fn ping(db: &Db) -> Result<(), DbError> {
     .await
 }
 
+/// Copy the database whole to `target` — `VACUUM INTO`, which writes a
+/// compacted, consistent copy under the read transaction it takes, so a write
+/// landing meanwhile is either in the copy entirely or not at all. Schemaic's
+/// own statement over a path the user picked, bound as a parameter; it
+/// changes nothing in the source file, so a read-only connection may take it.
+/// SQLite refuses a target that already exists, and that refusal is passed on
+/// rather than the file being removed first.
+pub(crate) async fn backup_to(db: &Db, target: String) -> Result<(), DbError> {
+    with_conn(db, move |conn| {
+        conn.execute("VACUUM INTO ?1", [target.as_str()])
+            .map(|_| ())
+            .map_err(query_err)
+    })
+    .await
+}
+
 /// Validate `sql` without running it.
 ///
 /// `prepare` compiles the statement and reports a syntax error or an unknown
@@ -5023,6 +5039,28 @@ mod tests {
             uri,
         );
         (keeper, db)
+    }
+
+    /// **A backup is the whole database, copied** — to a second shared
+    /// in-memory database here, so the suite touches no file. The copy's
+    /// keeper is opened first, as an empty database, which `VACUUM INTO`
+    /// accepts as its target.
+    #[tokio::test]
+    async fn a_backup_copies_the_database_whole() {
+        let (keeper, db) = shared_memory("backup_source");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1), (2);",
+            )
+            .expect("seed");
+        let (copy, _) = shared_memory("backup_copy");
+        db.backup_to_file("file:backup_copy?mode=memory&cache=shared")
+            .await
+            .expect("the backup runs");
+        let n: i64 = copy
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .expect("the copy has the table");
+        assert_eq!(n, 2);
     }
 
     /// **A connection's init SQL runs on the connection an operation opens**,

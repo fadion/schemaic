@@ -5110,6 +5110,12 @@ pub struct TabsActions {
     /// Open the DB CLI for the active connection in the terminal, optionally
     /// scoped to a database.
     pub open_db_cli: Rc<dyn Fn(Option<String>)>,
+    /// Back up a database of the active connection with its engine's own tool
+    /// (`pg_dump`, `mysqldump`, `BACKUP DATABASE`, SQLite's `VACUUM INTO`).
+    pub backup_db: Rc<dyn Fn(String)>,
+    /// Restore a file into a database of the active connection
+    /// (`pg_restore`/`psql`, `mysql`), after a confirmation.
+    pub restore_db: Rc<dyn Fn(String)>,
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when arg 2 is true) for a statement,
     /// filling the plan modal's state. Targets the active tab's connection/db.
     pub run_plan: Rc<dyn Fn(String, bool)>,

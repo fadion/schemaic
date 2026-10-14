@@ -723,6 +723,123 @@ fn psql_shell_config(
     Ok(wrap_launcher(launcher, cli_args, env))
 }
 
+/// The backup and restore builders' copy of the CLI builders' tunnel refusal
+/// (`launch::tunnelled_verify_blocker`): asked **inside** each builder, as
+/// `mysql_shell_config` asks it, so no launch path compiles without it —
+/// `reach_for_cli` asking it first is only so the refusal comes before the
+/// tunnel's own.
+fn tool_tunnel_check(conn: &Connection) -> Result<(), String> {
+    match conn
+        .uses_tunnel()
+        .then(|| launch::tunnelled_verify_blocker(&conn.tls))
+        .flatten()
+    {
+        Some(why) => Err(why.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// The first of `progs` on `PATH`, native only — a backup tool is handed a
+/// path from this machine's file dialog, which inside WSL would name somewhere
+/// else (`sqlite_shell`'s reason) — or the panel's line for none.
+fn native_tool<'a>(progs: &[&'a str], none: &str) -> Result<&'a str, String> {
+    let mut refused = None;
+    for p in progs {
+        match resolve_native_cli(p) {
+            Ok(CliLauncher::Native(p)) | Ok(CliLauncher::Wsl(p)) => return Ok(p),
+            Err(e) if e != NO_CLIENT => {
+                refused.get_or_insert(e);
+            }
+            Err(_) => {}
+        }
+    }
+    Err(refused.unwrap_or(none).to_string())
+}
+
+/// `pg_dump` of `db` to `file`, in the terminal (`launch::pg_dump_args`).
+fn pg_dump_shell(
+    conn: &Connection,
+    db: &str,
+    file: &str,
+) -> Result<schemaic_term::ShellConfig, String> {
+    tool_tunnel_check(conn)?;
+    let prog = native_tool(&["pg_dump"], "No pg_dump found on PATH.")?;
+    let args = launch::pg_dump_args(&conn.host, conn.port, &conn.user, db, file)?;
+    let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
+    env.extend(launch::psql_cli_tls_env(&conn.tls));
+    Ok(wrap_launcher(CliLauncher::Native(prog), args, env))
+}
+
+/// A restore of `file` into `db` — `pg_restore`, or `psql` for a `.sql`
+/// script (`launch::pg_restore_args`).
+fn pg_restore_shell(
+    conn: &Connection,
+    db: &str,
+    file: &str,
+) -> Result<schemaic_term::ShellConfig, String> {
+    tool_tunnel_check(conn)?;
+    let (tool, args) = launch::pg_restore_args(&conn.host, conn.port, &conn.user, db, file)?;
+    let prog = native_tool(&[tool], &format!("No {tool} found on PATH."))?;
+    let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
+    env.extend(launch::psql_cli_tls_env(&conn.tls));
+    Ok(wrap_launcher(CliLauncher::Native(prog), args, env))
+}
+
+/// `mysqldump` (or MariaDB's `mariadb-dump`) of `db` to `file`
+/// (`launch::mysqldump_args`), its TLS flags spelled for the tool found.
+fn mysqldump_shell(
+    conn: &Connection,
+    db: &str,
+    file: &str,
+) -> Result<schemaic_term::ShellConfig, String> {
+    tool_tunnel_check(conn)?;
+    let prog = native_tool(
+        &["mysqldump", "mariadb-dump"],
+        "No mysqldump or mariadb-dump found on PATH.",
+    )?;
+    let tls = launch::mysql_cli_tls_args(&conn.tls, launch::MysqlClient::of(prog));
+    let args = launch::mysqldump_args(&conn.host, conn.port, &conn.user, tls, db, file)?;
+    Ok(wrap_launcher(
+        CliLauncher::Native(prog),
+        args,
+        vec![("MYSQL_PWD".to_string(), conn.password.clone())],
+    ))
+}
+
+/// `mysql`'s `source` of `file` into `db` (`launch::mysql_restore_args`).
+fn mysql_restore_shell(
+    conn: &Connection,
+    db: &str,
+    file: &str,
+) -> Result<schemaic_term::ShellConfig, String> {
+    tool_tunnel_check(conn)?;
+    let prog = native_tool(
+        &["mysql", "mariadb"],
+        "No mysql or mariadb client found on PATH.",
+    )?;
+    let tls = launch::mysql_cli_tls_args(&conn.tls, launch::MysqlClient::of(prog));
+    let args = launch::mysql_restore_args(&conn.host, conn.port, &conn.user, tls, db, file)?;
+    Ok(wrap_launcher(
+        CliLauncher::Native(prog),
+        args,
+        vec![("MYSQL_PWD".to_string(), conn.password.clone())],
+    ))
+}
+
+/// SQL Server's `BACKUP DATABASE`, through `sqlcmd -Q`: the statement is
+/// `launch::mssql_backup_sql`'s, and the file is written by the server into
+/// its own backup folder, so any `sqlcmd` will do — inside WSL too.
+fn mssql_backup_shell(
+    conn: &Connection,
+    db: &str,
+    file: &str,
+) -> Result<schemaic_term::ShellConfig, String> {
+    let mut cfg = mssql_shell(conn, Some(db))?;
+    let q = launch::mssql_backup_sql(db, file);
+    cfg.args.extend(["-Q".to_string(), q]);
+    Ok(cfg)
+}
+
 /// Turn a client's argv into a spawnable config, native or through WSL, with
 /// every variable in `env` carried across the WSL boundary — the half every
 /// engine shares, so none of them can lose the rule that the password never
@@ -13586,6 +13703,222 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (install_terminal)(&cfg, label, "db cli spawn");
         })
     };
+
+    // ── Back up and restore (`core::launch`'s backup half) ──────────────────
+    // The engine's own tools, run in the terminal panel as *Open in CLI* runs
+    // its client: the password in the tool's environment variable, the tunnel's
+    // local port for an SSH connection, and every refusal said in the panel.
+    // **Native only**: the file is a path the save/open dialog gave, which a
+    // tool inside WSL would read as somewhere else. SQLite's backup is the one
+    // in-process, `Db::backup_to_file`, and reports in the panel too.
+    let reach_for_cli: Rc<dyn Fn(Connection) -> Result<Connection, String>> = {
+        let tunnels = tunnels.clone();
+        let tunnel_failures = tunnel_failures.clone();
+        Rc::new(move |conn: Connection| {
+            if !conn.uses_tunnel() {
+                return Ok(conn);
+            }
+            if let Some(why) = launch::tunnelled_verify_blocker(&conn.tls) {
+                return Err(why.to_string());
+            }
+            match tunnels.borrow().get(&conn.id).map(|h| h.port()) {
+                Some(port) => Ok(Connection {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    ..conn
+                }),
+                None => Err(tunnel_failures.borrow().refusal(conn.id)),
+            }
+        })
+    };
+    // Show `cfg` in the terminal panel, revealing it first.
+    let run_in_panel: Rc<dyn Fn(Result<schemaic_term::ShellConfig, String>, &'static str)> = {
+        let install_terminal = install_terminal.clone();
+        Rc::new(move |built, why| {
+            if !matches!(right_panel.get_untracked(), RightPanel::Terminal) {
+                right_panel.set(RightPanel::Terminal);
+            }
+            let cfg = built.unwrap_or_else(|e| message_shell(&e));
+            (install_terminal)(&cfg, None, why);
+        })
+    };
+    let active_connection = move || {
+        connections.with_untracked(|cs| {
+            cs.iter()
+                .find(|c| c.id == active_conn.get_untracked())
+                .cloned()
+        })
+    };
+    let backup_db: Rc<dyn Fn(String)> = {
+        let reach = reach_for_cli.clone();
+        let run_in_panel = run_in_panel.clone();
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(move |db: String| {
+            use floem::file::{FileDialogOptions, FileSpec};
+            let Some(conn) = active_connection() else {
+                return;
+            };
+            let stamp = launch::backup_stamp_now();
+            let engine = schemaic_db::Engine::from_db_type(&conn.db_type);
+            if engine == schemaic_db::Engine::MsSql {
+                // Written by the server, into its own backup folder — no dialog.
+                let file = launch::backup_file_name(&db, &stamp, "bak");
+                let built = reach(conn).and_then(|c| mssql_backup_shell(&c, &db, &file));
+                (run_in_panel)(built, "backup");
+                return;
+            }
+            let (ext, exts, kind): (&str, &'static [&'static str], &str) = match engine {
+                schemaic_db::Engine::Postgres => {
+                    ("dump", &["dump"], "PostgreSQL custom-format dump")
+                }
+                schemaic_db::Engine::MySql => ("sql", &["sql"], "SQL script"),
+                _ => ("db", &["db"], "SQLite database"),
+            };
+            let name = schemaic_core::launch::backup_file_name(&db, &stamp, ext);
+            let opts = FileDialogOptions::new()
+                .title("Back up database")
+                .default_name(name)
+                .allowed_types(vec![FileSpec {
+                    name: kind,
+                    extensions: exts,
+                }]);
+            let (reach, run_in_panel, handle, db_for) = (
+                reach.clone(),
+                run_in_panel.clone(),
+                handle.clone(),
+                db_for.clone(),
+            );
+            let db = db.clone();
+            floem::action::save_as(opts, move |file| {
+                let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                    return; // cancelled
+                };
+                let path = path.display().to_string();
+                match engine {
+                    schemaic_db::Engine::Sqlite => {
+                        let handle_db = match db_for(conn.id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                (run_in_panel)(
+                                    Err(format!("The backup did not start: {e}")),
+                                    "backup report",
+                                );
+                                return;
+                            }
+                        };
+                        let run_in_panel = run_in_panel.clone();
+                        let shown = path.clone();
+                        let report = create_ext_action(cx, move |r: Result<(), String>| {
+                            let line = match r {
+                                Ok(()) => format!("Backed up to {shown}."),
+                                Err(e) => format!("The backup failed: {e}"),
+                            };
+                            (run_in_panel)(Ok(message_shell(&line)), "backup report");
+                        });
+                        handle.spawn(async move {
+                            report(
+                                handle_db
+                                    .backup_to_file(&path)
+                                    .await
+                                    .map_err(|e| e.to_string()),
+                            );
+                        });
+                    }
+                    schemaic_db::Engine::Postgres => {
+                        let built = reach(conn.clone()).and_then(|c| pg_dump_shell(&c, &db, &path));
+                        (run_in_panel)(built, "backup");
+                    }
+                    schemaic_db::Engine::MySql => {
+                        let built =
+                            reach(conn.clone()).and_then(|c| mysqldump_shell(&c, &db, &path));
+                        (run_in_panel)(built, "backup");
+                    }
+                    schemaic_db::Engine::MsSql => {}
+                }
+            });
+        })
+    };
+    let restore_db: Rc<dyn Fn(String)> = {
+        let reach = reach_for_cli.clone();
+        let run_in_panel = run_in_panel.clone();
+        Rc::new(move |db: String| {
+            use floem::file::FileDialogOptions;
+            let Some(conn) = active_connection() else {
+                return;
+            };
+            // The guard on the launch, as `open_db_cli`'s is, read live: a
+            // restore writes the whole database.
+            if connections.with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn.id))
+            {
+                (run_in_panel)(
+                    Err(
+                        "This connection is read-only in Schemaic, so nothing is restored into it."
+                            .to_string(),
+                    ),
+                    "read-only refusal message shell",
+                );
+                return;
+            }
+            let (reach, run_in_panel) = (reach.clone(), run_in_panel.clone());
+            let db = db.clone();
+            floem::file_action::open_file(
+                FileDialogOptions::new().title("Restore from file"),
+                move |file| {
+                    let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                        return; // cancelled
+                    };
+                    let path = path.display().to_string();
+                    let (reach, run_in_panel) = (reach.clone(), run_in_panel.clone());
+                    let (db_c, path_c, conn) = (db.clone(), path.clone(), conn.clone());
+                    // **Asked first**: a restore writes over what is there, and
+                    // nothing undoes it.
+                    confirm.set(Some(Confirm {
+                        title: "Restore from file".to_string(),
+                        message: format!(
+                            "Run {path} into {db} on {}? What it creates or replaces cannot \
+                             be undone. It runs in the terminal, where Ctrl+C stops it.",
+                            conn.name
+                        ),
+                        resolve: Rc::new(move |yes| {
+                            if !yes {
+                                return;
+                            }
+                            // **Asked again at the yes**: the flag can move from
+                            // the status bar while the dialog and the question
+                            // stood open (`widgets::accept_launch`'s rule).
+                            if connections.with_untracked(|cs| {
+                                schemaic_core::connection::read_only_of(cs, conn.id)
+                            }) {
+                                (run_in_panel)(
+                                    Err("This connection is read-only in Schemaic, so nothing \
+                                         is restored into it."
+                                        .to_string()),
+                                    "read-only refusal message shell",
+                                );
+                                return;
+                            }
+                            let built = reach(conn.clone()).and_then(|c| {
+                                match schemaic_db::Engine::from_db_type(&c.db_type) {
+                                    schemaic_db::Engine::Postgres => {
+                                        pg_restore_shell(&c, &db_c, &path_c)
+                                    }
+                                    schemaic_db::Engine::MySql => {
+                                        mysql_restore_shell(&c, &db_c, &path_c)
+                                    }
+                                    schemaic_db::Engine::MsSql | schemaic_db::Engine::Sqlite => {
+                                        Err("This engine's backups are not restored from here."
+                                            .to_string())
+                                    }
+                                }
+                            });
+                            (run_in_panel)(built, "restore");
+                        }),
+                    }));
+                },
+            );
+        })
+    };
     let term_apply_shell: Rc<dyn Fn(usize)> = {
         let install_terminal = install_terminal.clone();
         let save_term_prefs = save_term_prefs.clone();
@@ -13778,6 +14111,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             open_table_filtered,
             set_active_db,
             open_db_cli,
+            backup_db,
+            restore_db,
             run_plan: {
                 // Pinned to the tab for the reason `gate1_on_tab` gives:
                 // `run_plan` re-resolves `active` when it lands, and the gate can
@@ -15266,13 +15601,20 @@ mod app_tests {
             "fn mysql_shell_config(",
             "fn psql_shell_config(",
             "fn mssql_shell_config(",
+            // The backup and restore tools, through their one helper.
+            "fn pg_dump_shell(",
+            "fn pg_restore_shell(",
+            "fn mysqldump_shell(",
+            "fn mysql_restore_shell(",
         ] {
             let at = body.find(builder).unwrap_or_else(|| {
                 panic!("{builder} is gone — this gate is stale");
             });
             let end = at + body[at..].find("\n}\n").expect("the end of the builder");
+            let asks = body[at..end].contains("launch::tunnelled_verify_blocker(&conn.tls)")
+                || body[at..end].contains("tool_tunnel_check(conn)?");
             assert!(
-                body[at..end].contains("launch::tunnelled_verify_blocker(&conn.tls)"),
+                asks,
                 "{builder} no longer refuses a tunnelled verifying connection \
                  itself, so the refusal is once again a caller's `if`"
             );

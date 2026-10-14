@@ -1662,6 +1662,18 @@ pub const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Db {
+    /// Copy a SQLite database whole to the file `target` (`sqlite::backup_to`).
+    /// The server engines back up through their own tools, which the app runs
+    /// in the terminal; asked of one, this refuses.
+    pub async fn backup_to_file(&self, target: &str) -> Result<(), DbError> {
+        match self.engine {
+            Engine::Sqlite => sqlite::backup_to(self, target.to_string()).await,
+            Engine::MySql | Engine::Postgres | Engine::MsSql => Err(DbError::Refused(
+                "A server database is backed up by its own tools, in the terminal.".to_string(),
+            )),
+        }
+    }
+
     /// Lightweight reachability check: connect and run `SELECT 1`, all bounded by
     /// `timeout` so a dead host/tunnel can't hang the caller. `Ok(())` means the
     /// server answered. [`PING_TIMEOUT`] is the app's answer for `timeout`.

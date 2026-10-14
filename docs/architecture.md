@@ -15183,6 +15183,45 @@ existing prose was left alone.
     include a `--format=` line that would otherwise have reached the argv as an option).
     `--type=container` keeps an image sharing an id prefix out of the answer, and empty output is an
     empty argv — no second call at all (`nothing_running_is_no_call_at_all`).
+    **The backup-and-restore half** is the argv for the engines' own tools, which the database
+    menu's *Back up* and *Restore from file* run in the terminal panel as *Open in CLI* runs a client
+    — argv only, the password in the tool's environment variable. `backup_file_target` is the check
+    every file passes. The path is one the user picked in a dialog, so nothing in it is
+    server-supplied, but a CR, LF or NUL (or a blank name) is refused, because `mysql`'s `source`
+    reads to the end of its line and what follows a break would be a second command —
+    `x.sql\nDROP DATABASE shop` is the test's case
+    (`a_mysql_restore_sources_the_file_and_refuses_a_line_break`). `pg_dump_args` writes the custom
+    format (`-F c -f <file> -d <db>`), which `pg_restore` reads selectively, and the database still
+    goes through `psql_target`, `pg_dump`'s `-d` being libpq's and re-read as a conninfo string by the
+    same rule (`pg_dump_writes_the_custom_format_to_the_picked_file`). **`pg_restore_args` returns
+    the program as well as the argv, because the file decides it**: a `.sql` (in any case) is a plain
+    script and goes to `psql -v ON_ERROR_STOP=1 -f`, so a half-restored database stops at its first
+    error rather than being reported done; anything else is `pg_restore --no-owner -- <file>`, the
+    `--` ahead of a name that may begin with `-`, and `--no-owner` because a dump names roles this
+    server may not have (`a_sql_script_restores_through_psql_and_a_dump_through_pg_restore`).
+    `mysqldump_args` is `--single-transaction --routines --triggers --events --result-file=<file> --
+    <db>` — one consistent snapshot of the transactional tables with no lock held, the database name
+    behind `--` for `mysql_shell_config`'s reason, and the TLS flags handed in from
+    `mysql_cli_tls_args` for whichever tool was found
+    (`mysqldump_snapshots_with_routines_and_ends_options_before_the_name`); `mysql_restore_args` is
+    `--execute=source <file> -- <db>`, there being no shell to redirect a file into the client. Which
+    tool was found is why **`MysqlClient::of` reads `mariadb-dump` as MariaDB too**: the dump tool
+    spells TLS as its client does, and taken for Oracle's it would be handed an `--ssl-mode` it does
+    not know (`mariadbs_dump_tool_spells_tls_as_its_client_does`). `mssql_backup_sql` is T-SQL
+    rather than an argv — `BACKUP DATABASE [db] TO DISK = N'<file>' WITH COPY_ONLY, INIT`, quoted
+    through `export::ident_sql` and `sql_literal`
+    (`a_sql_server_backup_is_quoted_and_leaves_the_backup_chain_alone`). The server writes the file,
+    so the name is a **bare** one and lands in the server's own default backup folder (verified on
+    SQL Server 2022 when this landed); `COPY_ONLY` leaves the differential base a scheduled backup
+    plan relies on where it was; `INIT` replaces a file of the same name rather than appending to it
+    — which, with the minute-resolution stamp below, means a second backup of one database within the
+    same minute replaces the first. `backup_stamp_now` is the local time as `%Y%m%d-%H%M`, and
+    `backup_file_name(db, stamp, ext)` the default name, every character but an alphanumeric, `-`,
+    `_` or `.` turned to `_` (`a_backup_file_name_is_safe_whatever_the_database_is_called`).
+    **`restore_offered(dialect)` is an exhaustive capability**, so a fifth engine answers it: MySQL
+    and PostgreSQL yes; SQL Server no, its `RESTORE` reading a file *on the server* and needing the
+    database to itself; SQLite no, a backup there being a database file one opens as a connection
+    (`restore_is_offered_where_a_client_restores_a_local_file`).
   - `core/entra.rs` — **signing in to SQL Server with a Microsoft Entra token from the Azure CLI**:
     the pure half of `AuthMode::AzureCli`, `db/entra.rs` being the half that runs it. The token is
     the CLI's to mint and refresh — `az account get-access-token --resource
@@ -16932,6 +16971,9 @@ existing prose was left alone.
   `commit_writes`/`refetch_rows`/`prepare_check`
   (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`run_script`/`fetch_table_stats`/
   `count_rows`/`fetch_blob` are `Db` methods taking the target DB per call.
+  `backup_to_file(target)` takes a *file* instead, and answers on SQLite alone
+  (`sqlite::backup_to`); the three server engines get `DbError::Refused`, inline in the dispatcher,
+  their backups being their own tools run in the terminal (`core::launch`).
   **`Db::fetch_blob` is the binary-cell panel's whole backend** — one connection, one `SELECT`, one
   row, like everything else here. `Ok(None)` means the cell is SQL `NULL` **or** the row is gone,
   and both are "there are no bytes to show" rather than an error the panel would have to phrase.
@@ -18118,6 +18160,15 @@ existing prose was left alone.
   reason — a `Session` cannot exist without a live connection, and reading MySQL's forgiving model
   as PostgreSQL's poisoned one is the difference between "still committable" and "discard
   everything".
+  **A backup is `VACUUM INTO`** (`backup_to`, behind `Db::backup_to_file` and the database menu's
+  *Back up*): a compacted, consistent copy taken under the read transaction the statement holds, so
+  a write landing meanwhile is in the copy entirely or not at all. The target is a path the user
+  picked, bound as `?1` rather than spliced in. It writes nothing to the source, which is why a
+  read-only connection may take one. **SQLite refuses a target that already exists, and that
+  refusal is passed on** rather than the file being removed first — so picking an existing file in
+  the save dialog ends in "The backup failed: …" in the terminal panel. The test copies into a
+  second shared in-memory database, opened first as an empty one, which `VACUUM INTO` accepts as a
+  target (`a_backup_copies_the_database_whole`), so the suite touches no file.
   **`mssql.rs` is the fourth engine — SQL Server over TDS, through `tiberius` 0.13.** What it does:
   connect (following **one** routing redirect, which is how Azure SQL's
   gateway hands a client to the node that serves its database), `ping`, the database list,
@@ -25091,7 +25142,8 @@ existing prose was left alone.
   - `script_view.rs` — the **script-load** modal, **Import** to the user, over `core::script`; the
     inverse of `dump_view.rs` below, and the entry directly *above* it in the two menus that carry
     both (a database's and a PostgreSQL namespace's), where the group reads
-    **`Import → Export ▸ → Create ▸`**. Those menus could write a `.sql` file nothing here could read
+    **`Import → Export ▸ → Create ▸`** (a database's with *Back up* and *Restore from file* before
+    `Create ▸`). Those menus could write a `.sql` file nothing here could read
     back, which is the hole this closes. **Import leads and the order is not alphabetical**: it is
     the entry that changes the database, so it takes the slot furthest from where the pointer rests
     after a right-click — the reasoning that keeps `Drop` last everywhere else in these menus.
@@ -25144,7 +25196,8 @@ existing prose was left alone.
   - `dump_view.rs` — the **schema + data dump** modal, **Export** to the user, over `core::dump`.
     Three entry points and one modal: a database's schema context menu and a PostgreSQL namespace's,
     where it is the middle of **`Import → Export ▸ → Create ▸`** — the three entries about the node
-    as a whole, behind their own separator — and a **table's, directly below *Import***. All three
+    as a whole, behind their own separator, a database's carrying *Back up* and *Restore from file*
+    between the last two (`core::launch`) — and a **table's, directly below *Import***. All three
     pair it with the import it is the round trip of. **`Export` is a submenu of six**, one entry per
     `export::ExportFormat::ALL` — JSON, CSV, SQL, Markdown, HTML, Excel, in the order the grid's
     Download menu already lists them, so a user meets the formats in one order throughout the app.
@@ -34476,6 +34529,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   `opening_the_database_cli_refuses_a_read_only_connection_at_the_launch` reads that closure's own
   span and asserts both halves, because either alone is the bug: the launch has to refuse, and the
   refusal has to be about the connection being launched.
+  **The database menu's *Back up* and *Restore from file* are two more doors onto the same tools,
+  and only the second writes.** A restore hands a whole file of statements to `psql`, `pg_restore`
+  or `mysql` — user SQL that never meets `run_verdict` — so its entry is dimmed on a read-only
+  connection and `restore_db` refuses at the click as well, on `read_only_of` read live, with the
+  message in the panel; after the open dialog it asks the shared `Confirm` (*"… cannot be undone. It
+  runs in the terminal, where Ctrl+C stops it."*) before anything spawns. The `yes` arm reads
+  `read_only_of` **again**, as the destructive-launch rule asks of a guard behind a confirm — the
+  flag can move from the status bar while the dialog and the question stood open. A backup is offered on a
+  read-only connection, as Export is: `pg_dump` and `mysqldump` read the server and write a local
+  file, SQLite's `VACUUM INTO` writes nothing to its source, and SQL Server's is one statement of
+  Schemaic's own through `sqlcmd -Q`, which runs it and exits rather than leaving a session open.
 - **A row reaches the model only where `AiData` says it may, and the level is the connection's.**
   Every path that can put a cell value in a prompt — `run_query`, the `explain` tool (whose MySQL
   plan says whether a key exists, `cli/mcp.rs`'s entry), `describe_table`'s samples, the
@@ -34665,6 +34729,25 @@ Re-introducing the anti-patterns these guard against is a regression:
   password. (It was `Option<(var, password)>` until the TLS settings had to travel the same road;
   see `core::launch`.) `mssql_shell` is the fourth arm, and takes the WSL fallback — a host and a
   port again.
+  **The backup and restore tools split the same way, on their *file* rather than their database.**
+  `native_tool` resolves `pg_dump`, `pg_restore`/`psql`, `mysqldump`/`mariadb-dump` and
+  `mysql`/`mariadb` through `resolve_native_cli` only, because the file is a path this machine's
+  dialog gave and a tool inside WSL would read it as somewhere else; like `resolve_cli` it skips a
+  refused candidate and keeps the first refusal as the answer of last resort. `mssql_backup_shell`
+  is `mssql_shell` with `-Q <launch::mssql_backup_sql>` appended, WSL fallback included, since the
+  server writes its own file and no local path reaches the tool. The passwords travel as *Open in
+  CLI*'s do — `PGPASSWORD` with `psql_cli_tls_env`, `MYSQL_PWD`, `SQLCMDPASSWORD` through
+  `mssql_shell`. **Each of the four local-file builders asks the tunnel refusal itself**, through
+  `tool_tunnel_check` (`tunnelled_verify_blocker` for a tunnelled connection), so no launch path
+  compiles without it — `both_cli_builders_refuse_a_tunnelled_verifying_connection_themselves` reads
+  them beside the three client builders. Two helpers sit after `open_db_cli` in `main.rs`: `reach_for_cli` is its tunnel
+  step — `tunnelled_verify_blocker` first, then the tunnel's local port or its refusal — as a second
+  copy rather than a shared one, `open_db_cli` still carrying its own; and `run_in_panel` reveals the
+  terminal and installs the config or a `message_shell` of the refusal, never with an engine badge.
+  `backup_db` asks no dialog on SQL Server (the bare `backup_file_name` goes straight to `sqlcmd`)
+  and a save dialog elsewhere, defaulting to `<db>_<stamp>.dump`, `.sql` or `.db`; SQLite's is the
+  one backup that runs in-process, `Db::backup_to_file` off the UI thread, its "Backed up to …" or
+  "The backup failed: …" shown as a message in the same panel.
   **The search in front of that `match` had a `?` where it wanted a `continue`.** `resolve_cli` takes
   a list of candidate names and `direct_spawn_verdict` refuses a `.cmd`/`.bat` image, which `cmd.exe`
   runs and which does not know what the `--` terminator in front of a server-supplied database name
@@ -38710,6 +38793,9 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   arm pushes `Collapse all` after `Refresh` where the skeleton closes the read group with `Refresh`,
   and the table arm's write group is `Import` → `Edit table` → `Triggers` where the skeleton lists
   Create/Edit/Import/Triggers. Order *within* group 4 is not checked; `Drop` being last is.
+  `Back up` and `Restore from file` are group 4 beside `Import`. The restore is a write; `Back up`
+  writes a file and never the server, like `Export` beside it, but sits with the node's round trips
+  rather than taking `Export`'s skip, so an unknown-label failure still covers it.
   **The near-collision the table is load-bearing for is `Refresh` (group 2) beside
   `Refresh view` (group 4)**, which a materialized view's menu carries both of: the first
   re-introspects the *database* into the tree, the second re-runs the view's query on the
