@@ -7063,6 +7063,17 @@ impl TermCursor {
     }
 }
 
+/// `size` if the terminal's font picker offers it, else the default 13 — the
+/// reading an imported settings bundle's terminal size is checked against, so
+/// one off the ladder is refused rather than drawn at a size no row selects.
+pub fn term_font_offered(size: u16) -> u16 {
+    if consts::TERM_FONT_SIZES.contains(&size) {
+        size
+    } else {
+        13
+    }
+}
+
 /// IBM Plex Mono cell metrics (width, height) for a given font size. The width
 /// ratio (0.6023) is confirmed by `DIFF_CELL_W` (8.43 at 14px); height keeps the
 /// original 18px-at-13px leading. Only these drive how many cols/rows we request.

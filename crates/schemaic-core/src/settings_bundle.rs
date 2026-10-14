@@ -21,7 +21,15 @@
 //! Snippets travel when they are the user's own and scoped to everyone or to
 //! an engine; one scoped to a connection names an id that means nothing on
 //! another install, and is left out as the connection export leaves ids out.
+//!
+//! **The terminal's preferences travel too**, from `terminal.json` under their
+//! own allowlist ([`TERMINAL_KEYS`]): its font, cursor and copy-on-select, but
+//! never its shell, which names a program installed on this machine — and a
+//! file from someone else must not choose what the terminal launches. The
+//! terminal's settings type lives in a crate this one does not depend on, so
+//! both halves go through [`apply_keys`], generic over the type that reads them.
 
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 use crate::persist::UiState;
@@ -71,25 +79,35 @@ pub const PORTABLE_KEYS: &[&str] = &[
     "ai_gutter",
 ];
 
+/// The `terminal.json` fields a bundle carries — everything but `shell`; see
+/// the module doc.
+pub const TERMINAL_KEYS: &[&str] = &[
+    "font_size",
+    "copy_on_select",
+    "cursor_style",
+    "cursor_blink",
+];
+
 /// A bundle as read: the portable settings it names (only those — any other
-/// key in the file is dropped here) and its snippets.
+/// key in the file is dropped here), the terminal's, and its snippets.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bundle {
     pub settings: Map<String, Value>,
+    pub terminal: Map<String, Value>,
     pub snippets: Vec<Snippet>,
 }
 
-/// The bundle for `state` and `snippets`, as the file's text.
-pub fn export_json(state: &UiState, snippets: &[Snippet]) -> String {
-    let all = serde_json::to_value(state).unwrap_or(Value::Null);
-    let settings: Map<String, Value> = PORTABLE_KEYS
-        .iter()
-        .filter_map(|k| Some((k.to_string(), all.get(*k)?.clone())))
-        .collect();
+/// The bundle for `state`, the terminal's settings `terminal` and `snippets`,
+/// as the file's text.
+pub fn export_json(state: &UiState, terminal: &impl Serialize, snippets: &[Snippet]) -> String {
     let snippets: Vec<&Snippet> = snippets.iter().filter(|s| travels(s)).collect();
     let mut out = Map::new();
     out.insert("schemaic_settings".into(), Value::from(BUNDLE_VERSION));
-    out.insert("settings".into(), Value::Object(settings));
+    out.insert("settings".into(), Value::Object(pick(state, PORTABLE_KEYS)));
+    out.insert(
+        "terminal".into(),
+        Value::Object(pick(terminal, TERMINAL_KEYS)),
+    );
     out.insert(
         "snippets".into(),
         serde_json::to_value(snippets).unwrap_or(Value::Array(Vec::new())),
@@ -110,16 +128,20 @@ pub fn parse(json: &str) -> Result<Bundle, String> {
             "written by a newer Schemaic (format {version}); update to read it"
         ));
     }
-    let settings = v
-        .get("settings")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter(|(k, _)| PORTABLE_KEYS.contains(&k.as_str()))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let allowed = |section: &str, keys: &[&str]| -> Map<String, Value> {
+        v.get(section)
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter(|(k, _)| keys.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let settings = allowed("settings", PORTABLE_KEYS);
+    // A bundle from before the terminal travelled has no section: nothing to apply.
+    let terminal = allowed("terminal", TERMINAL_KEYS);
     // A snippet this build cannot read is dropped alone, not the whole file.
     let snippets = v
         .get("snippets")
@@ -130,7 +152,11 @@ pub fn parse(json: &str) -> Result<Bundle, String> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Bundle { settings, snippets })
+    Ok(Bundle {
+        settings,
+        terminal,
+        snippets,
+    })
 }
 
 /// `state` with the bundle's settings applied, and how many of them changed
@@ -153,12 +179,26 @@ pub fn apply_with(
     state: &UiState,
     normalise: impl Fn(&mut UiState),
 ) -> (UiState, usize) {
+    apply_keys(PORTABLE_KEYS, settings, state, normalise)
+}
+
+/// The rule [`apply_with`] applies, for any settings type `T` and allowlist
+/// `keys` — the terminal's half of a bundle goes through it with
+/// [`TERMINAL_KEYS`]. Each key is tried alone against `T`'s own reading, then
+/// against `normalise`; a value either refuses is skipped. `confirm_writes`,
+/// wherever it is allowed, is taken only when it turns confirmation on.
+pub fn apply_keys<T: Serialize + DeserializeOwned + Clone>(
+    keys: &[&str],
+    settings: &Map<String, Value>,
+    state: &T,
+    normalise: impl Fn(&mut T),
+) -> (T, usize) {
     let Ok(Value::Object(mut current)) = serde_json::to_value(state) else {
         return (state.clone(), 0);
     };
     let mut changed = 0;
     for (key, value) in settings {
-        if !PORTABLE_KEYS.contains(&key.as_str()) || current.get(key) == Some(value) {
+        if !keys.contains(&key.as_str()) || current.get(key) == Some(value) {
             continue;
         }
         if key == "confirm_writes" && value != &Value::Bool(true) {
@@ -166,7 +206,7 @@ pub fn apply_with(
         }
         let mut candidate = current.clone();
         candidate.insert(key.clone(), value.clone());
-        let Ok(read) = serde_json::from_value::<UiState>(Value::Object(candidate)) else {
+        let Ok(read) = serde_json::from_value::<T>(Value::Object(candidate)) else {
             continue;
         };
         // What the field reads back as — a shim may have normalised it.
@@ -175,7 +215,7 @@ pub fn apply_with(
         };
         // And what the app would make of it: a value its own reading rewrites
         // is not the file's value at all.
-        let mut honoured = match serde_json::from_value::<UiState>(Value::Object(read.clone())) {
+        let mut honoured = match serde_json::from_value::<T>(Value::Object(read.clone())) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -236,6 +276,14 @@ pub fn summary(changed: usize, snippets: usize) -> String {
     format!("{changed} {settings} and adds {snippets} {snips}")
 }
 
+/// The `keys` fields of `value` as written, those it has.
+fn pick(value: &impl Serialize, keys: &[&str]) -> Map<String, Value> {
+    let all = serde_json::to_value(value).unwrap_or(Value::Null);
+    keys.iter()
+        .filter_map(|k| Some((k.to_string(), all.get(*k)?.clone())))
+        .collect()
+}
+
 /// Does `s` travel in a bundle?
 fn travels(s: &Snippet) -> bool {
     s.source == Source::User && matches!(s.scope, Scope::Global | Scope::Dialect(_))
@@ -256,6 +304,85 @@ mod tests {
             source: Source::User,
             last_used: Some(5),
         }
+    }
+
+    /// The shape of `schemaic_term::TerminalSettings`, which this crate cannot
+    /// name — its shell included, to prove it stays home.
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Term {
+        shell: Option<String>,
+        font_size: u16,
+        copy_on_select: bool,
+        cursor_style: String,
+        cursor_blink: bool,
+    }
+
+    impl Default for Term {
+        fn default() -> Self {
+            Term {
+                shell: Some("C:/Windows/System32/cmd.exe".into()),
+                font_size: 13,
+                copy_on_select: false,
+                cursor_style: "block".into(),
+                cursor_blink: true,
+            }
+        }
+    }
+
+    #[test]
+    fn the_terminal_travels_without_its_shell() {
+        let term = Term {
+            font_size: 16,
+            ..Term::default()
+        };
+        let json = export_json(&UiState::default(), &term, &[]);
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["terminal"]["font_size"], 16);
+        assert!(v["terminal"].get("shell").is_none());
+        assert_eq!(
+            v["terminal"].as_object().unwrap().len(),
+            TERMINAL_KEYS.len()
+        );
+        assert_eq!(parse(&json).unwrap().terminal["font_size"], 16);
+    }
+
+    #[test]
+    fn a_shell_named_in_a_bundle_is_never_applied() {
+        let b = parse(
+            r#"{"schemaic_settings": 1, "terminal": {"shell": "evil.exe", "cursor_style": "bar"}}"#,
+        )
+        .unwrap();
+        assert!(b.terminal.get("shell").is_none());
+        // Even handed straight to the applier, the allowlist holds.
+        let mut sneaky = b.terminal.clone();
+        sneaky.insert("shell".into(), Value::String("evil.exe".into()));
+        let (applied, changed) = apply_keys(TERMINAL_KEYS, &sneaky, &Term::default(), |_| {});
+        assert_eq!(changed, 1);
+        assert_eq!(applied.cursor_style, "bar");
+        assert_eq!(applied.shell, Term::default().shell);
+    }
+
+    #[test]
+    fn the_terminal_half_refuses_what_its_own_reading_would_change() {
+        let mut m = Map::new();
+        m.insert("font_size".into(), Value::from(400u64));
+        m.insert("copy_on_select".into(), Value::from("yes"));
+        m.insert("cursor_blink".into(), Value::Bool(false));
+        let offered = |t: &mut Term| {
+            if ![12, 13, 14, 16, 18].contains(&t.font_size) {
+                t.font_size = 13;
+            }
+        };
+        let (applied, changed) = apply_keys(TERMINAL_KEYS, &m, &Term::default(), offered);
+        assert_eq!(changed, 1);
+        assert_eq!(applied.font_size, 13);
+        assert!(!applied.cursor_blink);
+    }
+
+    #[test]
+    fn a_bundle_from_before_the_terminal_travelled_reads_with_none() {
+        let b = parse(r#"{"schemaic_settings": 1, "settings": {}}"#).unwrap();
+        assert!(b.terminal.is_empty());
     }
 
     #[test]
@@ -284,7 +411,7 @@ mod tests {
             ),
             snip(3, "one server", "SELECT 3", Scope::Conn(7)),
         ];
-        let json = export_json(&state, &snippets);
+        let json = export_json(&state, &Term::default(), &snippets);
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schemaic_settings"], BUNDLE_VERSION);
         let settings = v["settings"].as_object().unwrap();
@@ -307,7 +434,11 @@ mod tests {
             editor_font_size: 17.0,
             ..UiState::default()
         };
-        let json = export_json(&state, &[snip(1, "a", "SELECT 1", Scope::Global)]);
+        let json = export_json(
+            &state,
+            &Term::default(),
+            &[snip(1, "a", "SELECT 1", Scope::Global)],
+        );
         let b = parse(&json).unwrap();
         assert_eq!(b.settings["editor_font_size"], 17.0);
         assert_eq!(b.snippets.len(), 1);

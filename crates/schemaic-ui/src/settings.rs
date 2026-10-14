@@ -1519,7 +1519,8 @@ fn bundle_row(
             text("Settings file").style(|s| s.color(theme::text()).font_size(theme::font_label())),
             form_hint(
                 "Your preferences and snippets in one file, to take to another machine. \
-                 Connections, window layout and connection-specific snippets stay here.",
+                 Connections, window layout, the terminal's shell and connection-specific \
+                 snippets stay here.",
             ),
         ))
         .style(|s| {

@@ -9983,8 +9983,11 @@ existing prose was left alone.
     values — the app gathers the current `UiState` and snippets, picks the file and applies what
     comes back (Settings → General's *Settings file* row and the palette's *Export Settings* /
     *Import Settings*; the app's two trips are described under `settings.rs`'s `bundle_row`).
-    `export_json(state, snippets)` writes the envelope `{schemaic_settings, settings, snippets}`,
-    pretty-printed, at `BUNDLE_VERSION` (1); `parse` reads it back BOM-tolerant, refuses a file
+    `export_json(state, terminal, snippets)` writes the envelope
+    `{schemaic_settings, settings, terminal, snippets}`, pretty-printed, at `BUNDLE_VERSION` (1) —
+    `terminal` is any `Serialize`, because the terminal's settings type is
+    `schemaic_term::TerminalSettings` and this crate does not depend on that one, so the app passes
+    its own and the tests a mirror of its shape. `parse` reads it back BOM-tolerant, refuses a file
     without the `schemaic_settings` key and one at a later version as *written by a newer
     Schemaic* rather than half-reading it, and drops a snippet it cannot read alone rather than
     the whole file. `BUNDLE_FILE_SUFFIX` (`schemaic-settings.json`) is only the save dialog's
@@ -10014,7 +10017,23 @@ existing prose was left alone.
     font, through — to be counted as a change and then land as the app's fallback or clamp. So
     `apply_with` takes the app's own reading as `normalise` and refuses a value that reading would
     rewrite (`a_value_the_apps_own_reading_would_change_is_refused`); `apply` is `apply_with` with
-    nothing to normalise.
+    nothing to normalise. Both are now thin: the rule itself is `apply_keys(keys, settings, state,
+    normalise)`, generic over any `Serialize + DeserializeOwned + Clone` settings type, and
+    `apply_with` is `apply_keys(PORTABLE_KEYS, …)` over `UiState` — the generic form exists so the
+    terminal's half goes through the same per-key, serde-then-`normalise` test rather than a second
+    copy of it.
+    **The terminal's preferences travel under their own allowlist, `TERMINAL_KEYS`** — `font_size`,
+    `copy_on_select`, `cursor_style` and `cursor_blink` from `terminal.json` — and **never `shell`**,
+    which names a program installed on this machine: a file from someone else must not choose what
+    the terminal launches. `Bundle::terminal` is that section as `parse` filtered it, so a shell
+    written into a hand-edited file is dropped on reading, and `apply_keys` checks the allowlist again
+    when handed one anyway (`a_shell_named_in_a_bundle_is_never_applied`; the export side is
+    `the_terminal_travels_without_its_shell`). The terminal half is refused by its own reading just as
+    the settings half is (`the_terminal_half_refuses_what_its_own_reading_would_change`). A bundle
+    written before the terminal travelled has no `terminal` section and reads as an empty map —
+    `BUNDLE_VERSION` stayed 1 (`a_bundle_from_before_the_terminal_travelled_reads_with_none`), and in
+    the other direction `parse` only ever looks up the sections it knows, so a build from before
+    reads a newer file's `terminal` as nothing rather than refusing the file.
     **A bundle never lowers a guard**: `confirm_writes` is taken only when it turns confirmation
     *on*, so a file from someone else cannot quietly remove the question before a write
     (`a_bundle_can_turn_confirmation_on_but_never_off`).
@@ -10026,7 +10045,7 @@ existing prose was left alone.
     spelling, and gives each a fresh id through `snippet::next_id` one at a time — so two incoming
     snippets never take the same id — with `last_used` cleared and `source` `User`
     (`merged_snippets_get_fresh_ids_and_never_collide`). `summary(changed, snippets)` is the
-    sentence the confirmation names — *3 settings and 1 snippet*.
+    phrase the confirmation names after *changes* — *3 settings and adds 1 snippet*.
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`, capped at `MAX_PER_CONN` (200, was 50) entries per connection.
     **Not higher, because both readers walk all of them**: the history panel builds a highlighted
@@ -22784,7 +22803,8 @@ existing prose was left alone.
     `RwSignal<RowStatus>` behind the hint and Install, which the app owns: a registry write or a
     symlink is the app boundary's job for `open_config_dir`'s reason.
     `bundle_row` is the last row, **Settings file** — a hint saying what goes in the file and what
-    stays (connections, window layout and connection-specific snippets), and Quiet **Export** and
+    stays (connections, window layout, the terminal's shell and connection-specific snippets), and
+    Quiet **Export** and
     **Import** buttons at tab stops 40 and 41. Both are always enabled and the row holds no state:
     each button calls one of `Ui::export_settings`/`import_settings`, carried in by `SettingsCtx`,
     and the dialogs, the file I/O and the confirmation are all the app's (`app/main.rs`), over
@@ -22793,20 +22813,31 @@ existing prose was left alone.
     opening Settings.
     **Export reads `current_ui_state`, the very gathering `save_ui` writes** — the `UiState`
     literal that was inside `save_ui` is now that closure, and `save_ui` calls it — so the file and
-    `ui_state.json` cannot disagree about what a setting's value is. The save dialog defaults to
-    `BUNDLE_FILE_SUFFIX`, and the write is `persist::write_file_atomic` on `spawn_blocking`, a
-    failure reaching the error modal through `file_error`, as the connection export's does; unlike
+    `ui_state.json` cannot disagree about what a setting's value is. The terminal's half is
+    `current_term`, a `TerminalSettings` built from the four terminal appearance signals with
+    `shell: None` — the bundle's allowlist leaves the shell out regardless, so nothing is gathered
+    for it. **Those signals and `term_prefs` (the `terminal.json` read) are created just above the
+    bundle section, not beside the terminal** they configure, so that both closures can read and
+    set them; the terminal code further down uses the same `term_prefs` for its shell. The save
+    dialog defaults to `BUNDLE_FILE_SUFFIX`, and the write is `persist::write_file_atomic` on
+    `spawn_blocking`, a failure reaching the error modal through `file_error`, as the connection export's does; unlike
     that one, a typed name gets no suffix appended, nothing needing one to recognise the file.
     **Import reads and parses off the UI thread** (`decode_text_file`, then `parse`), and decides
     on it: `apply_with` runs against `current_ui_state()`, its `normalise` the same conversions and
     clamps `apply_settings` uses below, and the snippet count is the merge itself run
     over a *copy* of the library, so the number the confirmation names is the number that will be
-    added. Nothing to change at all is said through `file_error` (*Nothing to import: …*) rather
+    added. The terminal half runs beside it as `apply_keys(TERMINAL_KEYS, …)` against
+    `current_term()`, its `normalise` the terminal picker's own reading — `ui::term_font_offered`
+    (the size if `TERM_FONT_SIZES` holds it, else 13, so a size no row of the picker selects is
+    refused) and `TermCursor::from_key(..).key()` — and its change count is added to the settings
+    count, so the confirmation's *N settings* covers both halves. Nothing to change at all is said through `file_error` (*Nothing to import: …*) rather
     than asked about; otherwise the shared `Confirm` — *Import settings*, "{path} changes
     {summary}. The settings it changes replace your current values; the snippets are added beside
     yours." — and only on yes
-    `apply_settings` sets each portable signal, `save_ui(Replacing)` runs, and
-    `SnippetStore::import` merges the snippets. **`apply_settings` goes through startup's own
+    `apply_settings` sets each portable signal, the four terminal signals are set from the
+    `apply_keys` answer, `save_ui(Replacing)` runs, and `SnippetStore::import` merges the snippets.
+    Nothing writes `terminal.json` here: the terminal's own save effect, subscribed to those four
+    signals, does — through `shell_to_persist`, so the shell it writes is this machine's. **`apply_settings` goes through startup's own
     conversions and clamps** (`UiThemeKind`/`EditorThemeKind`/`UiScale::from_key`,
     `theme::clamped_editor_font`, `clamped_tab_width`, `AiEffort::from_cli`,
     `SchemaScope::from_key`) — the same reading `apply_with` was given, so nothing it accepted is

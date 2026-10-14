@@ -10622,6 +10622,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         add_import_result(import_ui, scan);
     });
 
+    // The terminal's preferences, read here rather than beside the terminal so
+    // the settings bundle below can carry and set them; the terminal's own save
+    // effect persists whatever an import sets.
+    let term_prefs = persist::load_json::<schemaic_term::TerminalSettings>("terminal.json");
+    let term_font_size = RwSignal::new(term_prefs.font_size);
+    let term_copy_on_select = RwSignal::new(term_prefs.copy_on_select);
+    let term_cursor_style = RwSignal::new(TermCursor::from_key(&term_prefs.cursor_style));
+    let term_cursor_blink = RwSignal::new(term_prefs.cursor_blink);
+
     // ── Settings bundle (`core::settings_bundle`) ───────────────────────────
     // Export: the portable settings and the travelling snippets, read through
     // `current_ui_state` — the gathering the save itself writes — atomically,
@@ -10629,6 +10638,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // confirmation naming what would change, then the signals are set (their
     // own effects persist them, and a save follows to be sure) and the
     // snippets merged in with fresh ids.
+    //
+    // The terminal's half is its signals, not the shell (which never travels —
+    // the bundle leaves it out by its own allowlist).
+    let current_term = move || schemaic_term::TerminalSettings {
+        shell: None,
+        font_size: term_font_size.get_untracked(),
+        copy_on_select: term_copy_on_select.get_untracked(),
+        cursor_style: term_cursor_style.get_untracked().key().to_string(),
+        cursor_blink: term_cursor_blink.get_untracked(),
+    };
     let export_settings: Rc<dyn Fn()> = {
         let handle = handle.clone();
         let file_error = file_error.clone();
@@ -10644,7 +10663,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     extensions: &["json"],
                 }]);
             let text = snippets.with_untracked(|s| {
-                schemaic_core::settings_bundle::export_json(&current_ui_state(), s)
+                schemaic_core::settings_bundle::export_json(&current_ui_state(), &current_term(), s)
             });
             let (handle, file_error) = (handle.clone(), file_error.clone());
             floem::action::save_as(opts, move |file| {
@@ -10755,6 +10774,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                         SchemaScope::from_key(&s.ai_schema_scope).key().into();
                                 },
                             );
+                            // The terminal's, through the reading its picker
+                            // gives: a size off the ladder, a cursor it does
+                            // not know.
+                            let (term, term_changed) = schemaic_core::settings_bundle::apply_keys(
+                                schemaic_core::settings_bundle::TERMINAL_KEYS,
+                                &bundle.terminal,
+                                &current_term(),
+                                |t: &mut schemaic_term::TerminalSettings| {
+                                    t.font_size = schemaic_ui::term_font_offered(t.font_size);
+                                    t.cursor_style =
+                                        TermCursor::from_key(&t.cursor_style).key().into();
+                                },
+                            );
+                            let changed = changed + term_changed;
                             // How many snippets would be added, by the merge
                             // itself over a copy.
                             let adds = snippets.with_untracked(|s| {
@@ -10784,6 +10817,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 resolve: Rc::new(move |yes| {
                                     if yes {
                                         (apply_settings)(&applied);
+                                        term_font_size.set(term.font_size);
+                                        term_copy_on_select.set(term.copy_on_select);
+                                        term_cursor_style
+                                            .set(TermCursor::from_key(&term.cursor_style));
+                                        term_cursor_blink.set(term.cursor_blink);
                                         (save_ui)(persist::Saving::Replacing);
                                         (import_snippets)(bundle.snippets.clone());
                                     }
@@ -12697,8 +12735,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let term_shells = RwSignal::new(detected_shells.clone());
     let term_dims = Rc::new(Cell::new((80u16, 24u16)));
 
-    // Persisted shell preference → initial shell + which list row is selected.
-    let term_prefs = persist::load_json::<schemaic_term::TerminalSettings>("terminal.json");
+    // Persisted shell preference → initial shell + which list row is selected
+    // (`term_prefs` is read above, beside the settings bundle that carries it).
     let init_shell = term_prefs
         .shell
         .as_ref()
@@ -12724,11 +12762,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     );
     let current_shell = RwSignal::new(init_profile);
     let term_shell_selected = RwSignal::new(init_selected);
-    // Terminal appearance/behaviour, restored from `terminal.json`.
-    let term_font_size = RwSignal::new(term_prefs.font_size);
-    let term_copy_on_select = RwSignal::new(term_prefs.copy_on_select);
-    let term_cursor_style = RwSignal::new(TermCursor::from_key(&term_prefs.cursor_style));
-    let term_cursor_blink = RwSignal::new(term_prefs.cursor_blink);
     // Blink phase; the cursor is shown when `!blink || blink_on` (and focused).
     let term_blink_on = RwSignal::new(true);
 
