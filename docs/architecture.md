@@ -11418,9 +11418,12 @@ existing prose was left alone.
     and needs a Floem scope, which is why the second half is the source gate
     `the_connection_form_trims_through_core` (under `ui/lib.rs`).
   - `ssh_config.rs` — **reading `~/.ssh/config` for an SSH tunnel's host**, so a tunnel whose host
-    is one of the user's `Host` aliases reaches what `ssh <alias>` would. Pure over the file's text:
-    `db::ssh::read_ssh_config` reads the file (see the `ssh.rs` passage) and this decides what it
-    says. `resolve(text, alias, home)` answers an `SshConfigHost` — `hostname`, `port`, `user`,
+    is one of the user's `Host` aliases reaches what `ssh <alias>` would. Pure over the file's text
+    but for **`read_user_config`, the one read of it** — `<USERPROFILE or HOME>/.ssh/config`, refused
+    over `MAX_CONFIG_BYTES`, decoded with `text::decode_text_file`, answering the text and the home
+    directory or `None`. It was `db::ssh`'s private `read_ssh_config`, moved here verbatim so the
+    connection form reads the same file the tunnel does; when each of them reads it is in the
+    `ssh.rs` passage and under `connection_form.rs`. `resolve(text, alias, home)` answers an `SshConfigHost` — `hostname`, `port`, `user`,
     `identity_file`, `proxy_jump`, each `None` where no matching block set it, and `proxy_jump`
     `Some("")` for an explicit `none`, so a caller can tell *no jump, said so* from *nothing said*.
     OpenSSH's rules as far as they go here: keywords case-insensitive with the argument after
@@ -11456,6 +11459,17 @@ existing prose was left alone.
     own `ProxyJump` or `IdentityFile`: a route is not followed recursively as `ssh` follows it, and
     every hop signs in with the tunnel's credentials anyway (`SshTunnel::jump`, under
     `connection.rs`).
+    **`describe(tunnel, cfg)` is what the connection form says the file made of the tunnel** —
+    `~/.ssh/config: user@hostname:port`, the user left off when neither the connection nor the file
+    names one, then `, key <path>` and `, through <jump>` **only where the config supplied them**,
+    not where the connection already states them, so the line attributes to the file what came
+    from the file. It is phrased over `apply` and compares its answer with the tunnel it was given:
+    `None` when nothing changed, which is a host no block names as much as a field-for-field match,
+    and an explicit `ProxyJump none` adds no *through*
+    (`the_form_is_told_what_an_alias_resolved_to`,
+    `a_host_the_config_does_not_change_is_described_as_nothing`,
+    `a_user_left_open_everywhere_reads_as_the_host_alone`). Going through `apply` rather than
+    reading `cfg` is the point: the form cannot describe a resolution the connect does not perform.
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
     (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
@@ -19126,7 +19140,8 @@ existing prose was left alone.
   MySQL 8.4 container all returned the server greeting, and a jump to a closed port was named in
   the error.
   **The SSH host and each jump host may be a `~/.ssh/config` alias** (`core::ssh_config`, under its
-  entry). `read_ssh_config` reads `<USERPROFILE or HOME>/.ssh/config` once per `open_tunnel` call,
+  entry). `core::ssh_config::read_user_config` reads `<USERPROFILE or HOME>/.ssh/config` once per
+  `open_tunnel` call,
   as `ssh` reads it per connection — so an edit applies at the next tunnel opened, while one already
   open keeps the route it was opened by, since nothing watches the file — refusing a file over
   `MAX_CONFIG_BYTES` and decoding it with `text::decode_text_file`. A missing, unreadable or
@@ -19135,9 +19150,11 @@ existing prose was left alone.
   supplies is parsed by the same reader as a typed one — and one it cannot read is refused with the
   same *Jump host N: …*, about a string the form never showed — then each jump hop, all but the
   last, through `apply_to_hop`; the last is the SSH host, already resolved. Known-hosts entries
-  are therefore keyed by the **resolved** `host:port`, not the alias. Nothing in the connection
-  form shows the resolution yet: it displays the alias, and only the info line's route and an
-  error's `h:p` name what the alias became. Verified live by the change's author, not by a test: a
+  are therefore keyed by the **resolved** `host:port`, not the alias. The connection form keeps the
+  alias in its field and says what it became on a line under it (`ssh_config_hint`, under
+  `connection_form.rs`) — from its own read of the file, taken when the tunnel's fields are built,
+  so after an edit to the file the form can lag the connect until it is reopened; the info line's
+  route and an error's `h:p` name the resolution too. Verified live by the change's author, not by a test: a
   throwaway root sshd in WSL on `127.0.0.1:2222` and a temporary home whose config had `Host
   zzalias` (`HostName`, `Port`, `User`, `IdentityFile ~/client`, `ProxyJump zzjump`) and `Host
   zzjump` (`HostName`, `Port`); a tunnel naming only host `zzalias`, key-pair sign-in, with no
@@ -23368,6 +23385,17 @@ existing prose was left alone.
     function `open_tunnel` connects by, so the form cannot pass a route the connect then refuses,
     or the reverse. `DraftSignals::ssh_jump` is threaded through create, load and `to_connection`,
     and the effect that resets a prior Test result tracks it, as it does every other SSH field.
+    **Under the SSH host/port row, `ssh_config_hint` says what `~/.ssh/config` makes of the tunnel**
+    — `core::ssh_config::describe`'s line, so a host typed as an alias shows the `HostName`, port,
+    user, key and jump hosts the connect will actually use. The row and the hint share an inner
+    `v_stack` at 6px, as the Database field's hint sits under its field, rather than standing in the
+    SSH box's 20px gap. **The file is read once, when the tunnel's fields are built** — the `on`
+    arm of `network_fields`' `dyn_container`, so reopening the form or toggling the tunnel off and on
+    — and `describe` is memoised over the draft's trimmed host, port, user, auth, key path and jump,
+    so typing re-resolves against that text without touching the disk. The trade is that an edit to
+    the file shows here only on that rebuild, while the tunnel itself re-reads per connect. The
+    label is `widgets::collapse_unless`'d on the line being `Some`, not merely emptied: a host the
+    config does not change claims no 6px gap under the row.
     **`tls_fields` is always visible on a networked engine, not behind a toggle like the SSH
     block**: a database that enforces TLS is the ordinary case rather than the advanced one, and a
     checkbox marked "use SSL" is the control that leaves people believing a connection is verified

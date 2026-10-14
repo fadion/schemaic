@@ -33,6 +33,27 @@ pub struct SshConfigHost {
 /// The largest config file worth reading. A real one is a few kilobytes.
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
+/// `~/.ssh/config`'s text and the home directory it sits in, or `None` when
+/// there is no such file (or it is too large to be one). The one read of it:
+/// the tunnel opener reads it per connect (`db::ssh::open_tunnel`), as `ssh`
+/// reads it per connection, so an edit applies at the next connect; the
+/// connection form reads it once when the tunnel's fields are shown.
+pub fn read_user_config() -> Option<(String, Option<String>)> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .filter(|h| !h.is_empty())?;
+    let path = std::path::Path::new(&home).join(".ssh").join("config");
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    Some((
+        crate::text::decode_text_file(&bytes),
+        Some(home.to_string_lossy().into_owned()),
+    ))
+}
+
 /// What `text` (an `ssh_config`) says about `alias`, with `home` (when known)
 /// for `~` and `%d` in an `IdentityFile`.
 pub fn resolve(text: &str, alias: &str, home: Option<&str>) -> SshConfigHost {
@@ -116,6 +137,30 @@ pub fn apply(
         t.jump = j.clone();
     }
     t
+}
+
+/// What `~/.ssh/config` makes of `tunnel`, as the connection form shows it
+/// under the SSH host — `~/.ssh/config: user@hostname:port`, then the key and
+/// the jump hosts where the config supplied them — or `None` when the config
+/// changes nothing ([`apply`] answers the tunnel as it was).
+pub fn describe(tunnel: &crate::connection::SshTunnel, cfg: &SshConfigHost) -> Option<String> {
+    let t = apply(tunnel, cfg);
+    if t == *tunnel {
+        return None;
+    }
+    let user = t.user.trim();
+    let mut out = if user.is_empty() {
+        format!("~/.ssh/config: {}:{}", t.host, t.port)
+    } else {
+        format!("~/.ssh/config: {user}@{}:{}", t.host, t.port)
+    };
+    if t.key_path != tunnel.key_path {
+        out.push_str(&format!(", key {}", t.key_path));
+    }
+    if t.jump != tunnel.jump && !t.jump.is_empty() {
+        out.push_str(&format!(", through {}", t.jump));
+    }
+    Some(out)
 }
 
 /// A jump host as `~/.ssh/config` completes it: its `HostName`, and the
@@ -425,6 +470,58 @@ Host *
     fn options_before_the_first_host_apply_to_every_host() {
         let h = resolve("User early\nHost h\n  User late\n", "h", None);
         assert_eq!(h.user.as_deref(), Some("early"));
+    }
+
+    #[test]
+    fn the_form_is_told_what_an_alias_resolved_to() {
+        use crate::connection::{SshAuth, SshTunnel};
+        let open = SshTunnel {
+            enabled: true,
+            host: "prod-db".into(),
+            port: 22,
+            auth: SshAuth::KeyPair,
+            ..SshTunnel::default()
+        };
+        assert_eq!(
+            describe(&open, &cfg()).as_deref(),
+            Some(
+                "~/.ssh/config: deploy@db.prod.internal:2222, key /home/me/.ssh/prod, through bastion"
+            )
+        );
+        // What the connection states is not reported as the config's.
+        let stated = SshTunnel {
+            user: "me".into(),
+            key_path: "/k".into(),
+            jump: "edge".into(),
+            ..open.clone()
+        };
+        assert_eq!(
+            describe(&stated, &cfg()).as_deref(),
+            Some("~/.ssh/config: me@db.prod.internal:2222")
+        );
+    }
+
+    #[test]
+    fn a_host_the_config_does_not_change_is_described_as_nothing() {
+        assert_eq!(describe(&open_tunnel(), &SshConfigHost::default()), None);
+        // A HostName equal to the host typed changes nothing either.
+        let same = SshConfigHost {
+            hostname: Some("h".into()),
+            ..SshConfigHost::default()
+        };
+        assert_eq!(describe(&open_tunnel(), &same), None);
+    }
+
+    #[test]
+    fn a_user_left_open_everywhere_reads_as_the_host_alone() {
+        let c = SshConfigHost {
+            hostname: Some("real.example".into()),
+            ..SshConfigHost::default()
+        };
+        assert_eq!(
+            describe(&open_tunnel(), &c).as_deref(),
+            Some("~/.ssh/config: real.example:22")
+        );
     }
 
     #[test]

@@ -311,6 +311,41 @@ fn jump_hosts_field(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
+/// What `~/.ssh/config` makes of the tunnel as typed — the host an alias names,
+/// and the port, user, key and jump hosts the file fills in
+/// (`core::ssh_config::describe`) — or nothing when it changes nothing. The
+/// file is read once, when the tunnel's fields are built; the tunnel itself
+/// re-reads it at every connect, so an edit shows here on reopening the form.
+fn ssh_config_hint(draft: DraftSignals) -> impl IntoView {
+    let config = schemaic_core::ssh_config::read_user_config();
+    let line = floem::reactive::create_memo(move |_| {
+        let (text, home) = config.as_ref()?;
+        let tunnel = schemaic_core::connection::SshTunnel {
+            enabled: true,
+            host: draft.ssh_host.get().trim().to_string(),
+            port: draft.ssh_port.get().trim().parse().unwrap_or(22),
+            user: draft.ssh_user.get().trim().to_string(),
+            auth: draft.ssh_auth.get(),
+            key_path: draft.ssh_key_path.get().trim().to_string(),
+            jump: draft.ssh_jump.get().trim().to_string(),
+            ..Default::default()
+        };
+        if tunnel.host.is_empty() {
+            return None;
+        }
+        let found = schemaic_core::ssh_config::resolve(text, &tunnel.host, home.as_deref());
+        schemaic_core::ssh_config::describe(&tunnel, &found)
+    });
+    // The box collapses with the line, so an alias-free host claims no gap
+    // (`widgets::collapse_unless`).
+    label(move || line.get().unwrap_or_default()).style(move |s| {
+        crate::widgets::collapse_unless(
+            crate::widgets::form_hint_style(s),
+            line.with(Option::is_some),
+        )
+    })
+}
+
 // Key-pair credentials: a private-key path (with a native "Browse…" picker) and
 // an optional passphrase. Shown when the SSH auth method is "Key pair".
 fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl IntoView {
@@ -1401,14 +1436,18 @@ fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             .style(|s| s.width_full());
 
             v_stack((
-                host_port_row(
-                    "SSH host",
-                    draft.ssh_host,
-                    "SSH port",
-                    draft.ssh_port,
-                    ring.clone(),
-                    100,
-                ),
+                v_stack((
+                    host_port_row(
+                        "SSH host",
+                        draft.ssh_host,
+                        "SSH port",
+                        draft.ssh_port,
+                        ring.clone(),
+                        100,
+                    ),
+                    ssh_config_hint(draft),
+                ))
+                .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full()),
                 field("SSH user", draft.ssh_user, ring.clone(), 120)
                     .style(|s| s.width(conn_field_w())),
                 jump_hosts_field(draft, ring.clone(), 125),
