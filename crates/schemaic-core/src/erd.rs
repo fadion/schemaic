@@ -200,7 +200,12 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
     // dropping it costs the diagram nothing and it cannot be the target of an
     // edge. Asked through `shape()`, which is the question with all three
     // answers; `is_view` has two and put this on the table side.
-    let drawable = |t: &&TableInfo| t.shape() != TableShape::Sequence;
+    //
+    // **Nor is a partition**, whose parent this schema holds: it is the
+    // parent's rows, under the parent's columns, and its key is the parent's
+    // cloned — drawn, it repeated the card and the edge.
+    let drawable =
+        |t: &&TableInfo| t.shape() != TableShape::Sequence && !schema.lists_under_parent(t);
     let by_id: HashMap<String, &TableInfo> = schema
         .tables
         .iter()
@@ -212,6 +217,12 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
     let included: Vec<&TableInfo> = match seed {
         DiagramSeed::Database => schema.tables.iter().filter(drawable).collect(),
         DiagramSeed::Table(seed_id) => {
+            // A partition seeds its parent's diagram.
+            let seed_id = &schema
+                .tables
+                .iter()
+                .find(|t| node_id(t) == *seed_id)
+                .map_or_else(|| seed_id.clone(), |t| node_id(schema.listed_as(t)));
             let Some(seed_t) = by_id.get(seed_id.as_str()) else {
                 return DiagramGraph::default();
             };
@@ -1671,6 +1682,47 @@ mod tests {
         // And a table-seeded diagram cannot reach it either.
         let g = build_graph(&s, "shop", &DiagramSeed::Table("sq1".to_string()));
         assert!(g.nodes.is_empty(), "{:?}", g.nodes);
+    }
+
+    /// **A partition is its parent's card**, not one of its own: drawn too,
+    /// every partition repeated the parent's columns and its cloned key drew
+    /// one more edge into the same table. A diagram asked for from a
+    /// partition is its parent's.
+    #[test]
+    fn a_partition_is_drawn_as_its_parent() {
+        let mut s = shop();
+        let orders = s
+            .tables
+            .iter()
+            .find(|t| t.name == "orders")
+            .unwrap()
+            .clone();
+        let mut part = orders.clone();
+        part.name = "orders_2024".into();
+        for fk in &mut part.foreign_keys {
+            fk.inherited = true;
+        }
+        part.partition_of = Some(crate::schema::PartitionOf {
+            schema: None,
+            parent: "orders".into(),
+            bound: "DEFAULT".into(),
+        });
+        s.tables.push(part);
+        let g = build_graph(&s, "shop", &DiagramSeed::Database);
+        assert!(
+            g.nodes.iter().all(|n| n.id != "orders_2024"),
+            "{:?}",
+            g.nodes
+        );
+        assert_eq!(g.edges.len(), 3, "no edge of the partition's own");
+        let g = build_graph(&s, "shop", &DiagramSeed::Table("orders_2024".into()));
+        let names: HashSet<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            names,
+            ["orders", "customers", "orderdetails"]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]

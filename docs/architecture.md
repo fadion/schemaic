@@ -9115,6 +9115,11 @@ existing prose was left alone.
     A PostgreSQL **foreign table** is drawable and is drawn as the table it reads as
     (`NodeKind::Table`), its columns being real ones. The `match` on
     `shape()` names all four shapes rather than taking a `_`, so a fifth is a compile error there.
+    **Nor is a partition whose parent the schema holds** (`DbSchema::lists_under_parent`, in the
+    same `drawable` closure): it is the parent's rows under the parent's columns, and its key is the
+    parent's cloned, so drawn, every partition repeated the parent's card and drew one more edge into
+    the same table. A `DiagramSeed::Table` naming a partition seeds its topmost ancestor's diagram
+    instead (`DbSchema::listed_as`) (`a_partition_is_drawn_as_its_parent`).
     `fit_toolbar` is the diagram **toolbar's responsive rule**, and it is here rather than in the
     view because it is arithmetic over widths: given the room available and what each optional
     group costs, it drops them in a fixed priority order — the count pills, then the zoom stepper,
@@ -12175,11 +12180,25 @@ existing prose was left alone.
     namespace; the dump is their reader (under `dump.rs`). **Only PostgreSQL fills them today** —
     `pg_fold_partitions` (under `pg.rs`) — so on MySQL and SQL Server both stay `None` and a
     partitioned table reads as an unpartitioned one; the model's doc comments already allow for
-    MySQL's `p0`/`VALUES LESS THAN`, which no reader produces yet. Nor does the schema tree nest a
-    partition under its parent: every partition is still listed beside the other tables.
+    MySQL's `p0`/`VALUES LESS THAN`, which no reader produces yet.
+    **Where a partition is listed is `DbSchema::lists_under_parent`**: one whose parent this schema
+    holds is shown under it — the schema tree nests it there, and the ER diagram and the assistant's
+    schema draw the parent alone (under `schema_tree.rs`, `erd.rs` and `cli/mcp.rs`) — while one
+    whose parent is not here stands on its own, since under a parent nobody lists it would be
+    listed nowhere. `partitions_of(t)` is the other direction, in the schema's order, and
+    `listed_as(t)` the topmost ancestor held — the table a sub-partition is drawn as — its walk
+    bounded by the table count, since a catalogue cannot hold a cycle but a model built by hand
+    could (`a_partition_is_listed_under_the_parent_this_schema_holds`).
+    `TableInfo::partition_lines(cap)` is what the properties panel says about either end, as
+    `(label, value)` rows: *Partition of* and *Bound*, or *Partitioned by* and each partition with
+    its bound (`—` where it has none) up to `cap`, then *and N more partitions*
+    (`partition_lines_name_the_key_the_partitions_and_the_parent`).
     `create_ddl`'s PostgreSQL arm restates both ends: a partitioned table's `CREATE TABLE` closes
-    `) PARTITION BY <key>;`, and a partition is `CREATE TABLE q PARTITION OF parent [(own checks)]
-    <bound> [PARTITION BY <key>];` — no column list and no key, which it takes from the parent.
+    `) PARTITION BY <key>;`, and a partition is `CREATE TABLE q PARTITION OF parent [(own key, own
+    checks)] <bound> [PARTITION BY <key>];` — no column list, which it takes from the parent, and a
+    primary key only where the partition declared one itself (its `PRIMARY` index not `inherited`,
+    possible where the parent has none), an inherited one coming back with it from the parent
+    (`a_partitions_own_primary_key_is_restated_and_an_inherited_one_is_not`).
     Restated as two plain tables, the parent held no rows and routed none, and the partition was a
     stray copy beside it (`a_partitioned_table_and_its_partition_are_restated_as_such`,
     `a_sub_partitioned_partition_keeps_its_own_key`, `partitions_are_tables_on_postgres_alone`).
@@ -25187,6 +25206,11 @@ existing prose was left alone.
       `Created`/`Updated` rows, which on that view were the only thing the server had said about it.
       `options_section` is reached from two arms, not only the full `Loaded` one, and its own
       emptiness guard is what keeps it silent on an engine that publishes nothing.
+    - **A *Partitioning* section follows *Options*** (`partition_section`), from the same two arms:
+      `TableInfo::partition_lines(PARTITIONS_LISTED)` — the key and up to 24 partitions with their
+      bounds, then how many more — or, on a partition, the table it is a partition of and its bound
+      (under `schema.rs`). It reads the in-memory `TableInfo`, not the statistics, and its own
+      emptiness check leaves it out for a table that is neither.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
   - `used_by_view.rs` — the **Used by** modal (`used_by_overlay`), over `core::used_by`, opened by
@@ -27410,6 +27434,19 @@ existing prose was left alone.
     two spelled the question separately. It derives `ns_hit` itself rather than taking it, since a
     namespace whose *name* matches reveals all of its tables — the rule the children already applied,
     and the half a caller cannot supply correctly by accident.
+    **A PostgreSQL partition hangs off its parent rather than sitting beside it**, and
+    `lists_here(schema, t, filtering)` is the one predicate both the render — `tables_shown` and the
+    flat database list — and `nav_rows` ask whether a table is listed at its level: not where
+    `DbSchema::lists_under_parent` says it belongs under its parent (under `schema.rs`). So the
+    namespace's capsule counts the tables listed there, its partitions not among them. The partition
+    comes after the parent's columns and keys, as a full `table_node` one indent level in, so it
+    keeps its own size badge, menu and columns; `table_node` takes the `Arc<DbSchema>` to find them
+    and returns `AnyView`, because it recurses — a sub-partitioned partition nests its own.
+    `push_table_rows` is the nav walk's same recursion in the same order, columns then partitions,
+    the key rows between them still not navigable (`nav_walk_hangs_a_partition_off_its_parent`).
+    **While a filter runs, every table is listed flat**, partitions included and none nested, so a
+    partition that matches is reached without its parent having to match. The counts row under a
+    table adds *N partitions* where it has any.
     **`key_under(database, key)` owns which expansion-key families live under a database**, and it
     is what "Collapse all" on a database row drops. That entry collapsed only the *tables*:
     `collapse_db` retained `!k.starts_with("tbl:{db}:")`, while the same set also holds the `col:`,
@@ -33978,8 +34015,8 @@ existing prose was left alone.
     for a name to mean (`a_sqlite_listing_ignores_the_database_it_is_given`).
     **PostgreSQL's listing reads `pg_class`, not `information_schema.tables`**, which has no
     materialized views: relkinds `r`/`p`/`v`/`m`/`f`, partitions left out (`NOT relispartition` —
-    their parent is the table), and `pg_catalog`, `information_schema`, `pg_toast*` and the
-    per-session `pg_temp_*` schemas with them. Its `describe` finds the relation through
+    their parent is the table; the GUI's tree lists them, nested under it, under `schema_tree.rs`),
+    and `pg_catalog`, `information_schema`, `pg_toast*` and the per-session `pg_temp_*` schemas with them. Its `describe` finds the relation through
     `pg_catalog.to_regclass(<literal>)`, which reads the name the way a query would — through the
     search path when bare, `schema.table` when qualified, case-folded unless double-quoted — and a
     name it cannot find is NULL, matching no row. **`to_regclass` also finds an index or a
@@ -35017,6 +35054,11 @@ existing prose was left alone.
     call missing its `table`, or with `limit: 0`, told so before anything is read. Verified live
     through `schemaic mcp` on PostgreSQL: `list_databases` listed 20, `sample_rows` on `city` with
     `limit` 3 returned 3 rows, `limit` 500 was refused, and an unknown table was refused.
+    **`list_schema {"database": …}` names a partition under its parent** (`format_database_schema`):
+    one whose parent the schema holds (`DbSchema::lists_under_parent`, under `schema.rs`) is no
+    `###` section of its own, having its parent's columns and keys; the parent's heading reads
+    `### events (partitioned by RANGE (id))` and lists a `  partition <name>: <bound>` line per
+    partition above its columns (`database_schema_names_partitions_under_their_parent`).
     `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
     `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
     and hands the model back the change list in the *preview's own words* plus the SQL and anything

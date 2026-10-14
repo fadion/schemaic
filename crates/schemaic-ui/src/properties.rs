@@ -326,6 +326,7 @@ fn stats_body(
             // about the object. `options_section` has its own emptiness guard,
             // so on an engine that publishes nothing at all it adds nothing.
             options_section(&stats, info),
+            partition_section(info),
             count_row(target, None, counting, count_err, ctx, ring),
         ]
         .into_iter()
@@ -337,6 +338,7 @@ fn stats_body(
             storage_section(&stats),
             structure_section(target, info),
             options_section(&stats, info),
+            partition_section(info),
             vacuum_note(&stats),
             index_section(&stats),
             freshness_note(&stats),
@@ -647,6 +649,24 @@ fn options_section(stats: &TableStats, info: Option<&TableInfo>) -> Option<AnyVi
     }
     Some(section("Options", rows))
 }
+
+/// How the table is partitioned, or which table it is a partition of
+/// ([`TableInfo::partition_lines`]). `None` for a table that is neither.
+fn partition_section(info: Option<&TableInfo>) -> Option<AnyView> {
+    let lines = info?.partition_lines(PARTITIONS_LISTED);
+    if lines.is_empty() {
+        return None;
+    }
+    // Labels are partition names here, so not `detail`'s `&'static str`.
+    let rows = lines
+        .into_iter()
+        .map(|(label, value)| crate::widgets::fact_row(label, value, label_w))
+        .collect();
+    Some(section("Partitioning", rows))
+}
+
+/// How many partitions the panel names before it says how many more there are.
+const PARTITIONS_LISTED: usize = 24;
 
 /// The dead-tuple warning, when PostgreSQL says there are enough of them for its
 /// own autovacuum to agree.

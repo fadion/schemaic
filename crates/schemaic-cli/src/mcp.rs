@@ -1416,9 +1416,26 @@ fn format_database_schema(database: &str, schema: &DbSchema) -> String {
         return out;
     }
     let qualify = needs_qualifier(schema);
-    for t in &schema.tables {
+    // A partition is named under its parent, whose columns and keys it has.
+    for t in schema
+        .tables
+        .iter()
+        .filter(|t| !schema.lists_under_parent(t))
+    {
         let view = if t.is_view { " (view)" } else { "" };
-        out.push_str(&format!("### {}{view}\n", table_label(t, qualify)));
+        let by = t
+            .partitioning
+            .as_ref()
+            .map(|p| format!(" (partitioned by {})", p.key))
+            .unwrap_or_default();
+        out.push_str(&format!("### {}{view}{by}\n", table_label(t, qualify)));
+        for p in schema.partitions_of(t) {
+            let bound = p.partition_of.as_ref().map_or("", |o| o.bound.as_str());
+            out.push_str(&format!(
+                "  partition {}: {bound}\n",
+                table_label(p, qualify)
+            ));
+        }
         for c in &t.columns {
             let pk = if c.primary_key { " PK" } else { "" };
             // Nullable is the default; only the constraint is worth the tokens.
@@ -3148,6 +3165,37 @@ mod tests {
         // Nullable is the default — no marker, no noise.
         assert!(out.contains("  total decimal(10,2)\n"));
         assert!(out.contains("  FK: customer_id -> customers.id"));
+    }
+
+    /// A partition is named under its parent, not listed as a table of its
+    /// own with the parent's columns and keys again.
+    #[test]
+    fn database_schema_names_partitions_under_their_parent() {
+        let mut events = tbl("events", vec![c("id", "int", false, true)]);
+        events.partitioning = Some(schemaic_core::schema::Partitioning {
+            key: "RANGE (id)".into(),
+            partitions: Vec::new(),
+        });
+        let mut part = tbl("events_2024", vec![c("id", "int", false, true)]);
+        part.partition_of = Some(schemaic_core::schema::PartitionOf {
+            schema: None,
+            parent: "events".into(),
+            bound: "FOR VALUES FROM (1) TO (10)".into(),
+        });
+        let schema = DbSchema {
+            tables: vec![events, part],
+            ..Default::default()
+        };
+        let out = format_database_schema("shop", &schema);
+        assert!(
+            out.contains("### events (partitioned by RANGE (id))\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  partition events_2024: FOR VALUES FROM (1) TO (10)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("### events_2024"), "{out}");
     }
 
     #[test]

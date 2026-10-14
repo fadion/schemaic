@@ -410,6 +410,7 @@ pub(crate) fn tables_shown<'a>(
         .tables
         .iter()
         .filter(|t| t.schema.as_deref() == Some(ns))
+        .filter(|t| lists_here(schema, t, filtering))
         .filter(|t| !filtering || db_hit || ns_hit || t.matches_search(filt))
         .collect()
 }
@@ -653,6 +654,59 @@ fn visible_nav_rows(
     })
 }
 
+/// **Is `t` listed at its level?** Not a partition whose parent the schema
+/// holds — that one hangs off its parent ([`DbSchema::lists_under_parent`])
+/// — except while filtering, which lists every match flat, so a partition
+/// that matches is shown without its parent having to. The render and
+/// [`nav_rows`] both ask this.
+fn lists_here(schema: &DbSchema, t: &TableInfo, filtering: bool) -> bool {
+    filtering || !schema.lists_under_parent(t)
+}
+
+/// One table's rows in the nav walk: the table, and while it is open its
+/// columns and then its partitions, each as a table of its own — the order
+/// [`table_node`] renders them in. `filt` is the trimmed, lower-cased filter.
+fn push_table_rows(
+    rows: &mut Vec<NavRow>,
+    database: &str,
+    schema: &DbSchema,
+    t: &TableInfo,
+    parent: &str,
+    exp: &HashSet<String>,
+    filt: &str,
+) {
+    let filtering = !filt.is_empty();
+    let tbl_key = table_key(database, t);
+    // A column match force-reveals the table's columns/keys (like the tree).
+    let force_cols = filtering && t.any_column_matches(filt);
+    let tbl_open = exp.contains(&tbl_key) || force_cols;
+    rows.push(NavRow {
+        key: tbl_key.clone(),
+        parent: Some(parent.to_string()),
+        expandable: true,
+        expanded: tbl_open,
+    });
+    if !tbl_open {
+        return;
+    }
+    for c in &t.columns {
+        rows.push(NavRow {
+            key: column_key(database, t, &c.name),
+            parent: Some(tbl_key.clone()),
+            expandable: false,
+            expanded: false,
+        });
+    }
+    // Key/index rows are intentionally *not* navigable: they open nowhere, so
+    // keyboard-selecting them would be a dead end (columns are the only leaf
+    // that acts on Enter/double-click). A partition is a table, and is.
+    if !filtering {
+        for p in schema.partitions_of(t) {
+            push_table_rows(rows, database, schema, p, &tbl_key, exp, filt);
+        }
+    }
+}
+
 /// The nav walk. Mirrors the tree's own render rules: hidden DBs dropped; a
 /// non-empty filter force-expands DBs and narrows their tables to name matches;
 /// only expanded tables contribute columns. Pure — this is the function that must
@@ -703,34 +757,12 @@ fn nav_rows(
                 .tables
                 .iter()
                 .filter(|t| scope.covers(t.schema.as_deref()))
+                .filter(|t| lists_here(schema, t, filtering))
             {
                 if filtering && !db_hit && !ns_hit && !t.matches_search(&filt) {
                     continue;
                 }
-                let tbl_key = table_key(&n.database, t);
-                // A column match force-reveals the table's columns/keys (like the tree).
-                let force_cols = filtering && t.any_column_matches(&filt);
-                let tbl_open = exp.contains(&tbl_key) || force_cols;
-                rows.push(NavRow {
-                    key: tbl_key.clone(),
-                    parent: Some(parent.clone()),
-                    expandable: true,
-                    expanded: tbl_open,
-                });
-                if !tbl_open {
-                    continue;
-                }
-                for c in &t.columns {
-                    rows.push(NavRow {
-                        key: column_key(&n.database, t, &c.name),
-                        parent: Some(tbl_key.clone()),
-                        expandable: false,
-                        expanded: false,
-                    });
-                }
-                // Key/index rows are intentionally *not* navigable: they open
-                // nowhere, so keyboard-selecting them would be a dead end (columns
-                // are the only leaf that acts on Enter/double-click).
+                push_table_rows(rows, &n.database, schema, t, parent, exp, &filt);
             }
         };
         // The standalone-object folders, which sit after a level's tables. Unlike
@@ -2121,6 +2153,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                     let tables: Vec<TableInfo> = schema
                         .tables
                         .iter()
+                        .filter(|t| lists_here(&schema, t, filtering))
                         .filter(|t| !filtering || db_hit || t.matches_search(&filt))
                         .cloned()
                         .collect();
@@ -2155,12 +2188,11 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                             objects.into_any()
                         };
                     }
+                    let schema_tables = schema.clone();
                     v_stack((
-                        v_stack_from_iter(
-                            tables
-                                .into_iter()
-                                .map(move |t| table_node(db.clone(), t, child_ctx(0))),
-                        )
+                        v_stack_from_iter(tables.into_iter().map(move |t| {
+                            table_node(db.clone(), t, child_ctx(0), schema_tables.clone())
+                        }))
                         .style(|s| s.flex_col()),
                         objects,
                     ))
@@ -2290,56 +2322,56 @@ fn schema_node(
 
     let key_children = key.clone();
     let ns_children = ns.clone();
-    let children = dyn_container(
-        dedup_key(move || (expanded.with(|e| e.contains(&key_children)), filter.get())),
-        move |(open, filt)| {
-            let filt = filt.trim().to_lowercase();
-            let filtering = !filt.is_empty();
-            if !open && !filtering {
-                return empty().into_any();
-            }
-            // The schema's own name matching reveals all its tables, mirroring the
-            // database-level `db_hit` rule.
-            let ns_hit = object_name_matches(&ns_children, &filt);
-            let tables: Vec<TableInfo> = tables_shown(&schema, &ns_children, db_hit, &filt)
-                .into_iter()
-                .cloned()
-                .collect();
-            let db = database.clone();
-            let ctx = ctx.clone();
-            let objects = object_group_nodes(
-                db.clone(),
-                Some(ns_children.clone()),
-                schema.clone(),
-                db_hit || ns_hit,
-                filt.clone(),
-                ctx.clone(),
-                false,
-            );
-            if tables.is_empty() {
-                // Asked, not built — see the flat case above.
-                let none = !schema.has_objects_in(Some(Some(&ns_children)));
-                return if filtering {
-                    objects.into_any()
-                } else if none {
-                    info_row("No tables", theme::text_muted).into_any()
-                } else {
-                    objects.into_any()
-                };
-            }
-            v_stack((
-                v_stack_from_iter(
-                    tables
-                        .into_iter()
-                        .map(move |t| table_node(db.clone(), t, ctx.clone())),
-                )
-                .style(|s| s.flex_col()),
-                objects,
-            ))
-            .style(|s| s.flex_col())
-            .into_any()
-        },
-    );
+    let children =
+        dyn_container(
+            dedup_key(move || (expanded.with(|e| e.contains(&key_children)), filter.get())),
+            move |(open, filt)| {
+                let filt = filt.trim().to_lowercase();
+                let filtering = !filt.is_empty();
+                if !open && !filtering {
+                    return empty().into_any();
+                }
+                // The schema's own name matching reveals all its tables, mirroring the
+                // database-level `db_hit` rule.
+                let ns_hit = object_name_matches(&ns_children, &filt);
+                let tables: Vec<TableInfo> = tables_shown(&schema, &ns_children, db_hit, &filt)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                let db = database.clone();
+                let ctx = ctx.clone();
+                let objects = object_group_nodes(
+                    db.clone(),
+                    Some(ns_children.clone()),
+                    schema.clone(),
+                    db_hit || ns_hit,
+                    filt.clone(),
+                    ctx.clone(),
+                    false,
+                );
+                if tables.is_empty() {
+                    // Asked, not built — see the flat case above.
+                    let none = !schema.has_objects_in(Some(Some(&ns_children)));
+                    return if filtering {
+                        objects.into_any()
+                    } else if none {
+                        info_row("No tables", theme::text_muted).into_any()
+                    } else {
+                        objects.into_any()
+                    };
+                }
+                let schema_tables = schema.clone();
+                v_stack((
+                    v_stack_from_iter(tables.into_iter().map(move |t| {
+                        table_node(db.clone(), t, ctx.clone(), schema_tables.clone())
+                    }))
+                    .style(|s| s.flex_col()),
+                    objects,
+                ))
+                .style(|s| s.flex_col())
+                .into_any()
+            },
+        );
 
     v_stack((header, children)).style(|s| s.flex_col())
 }
@@ -2697,7 +2729,8 @@ fn object_row(
 /// which needs them all on screen at once.
 ///
 /// Renders nothing at all unless the column is on **and** this table has a size,
-/// so a view, a partitioned parent, or an engine that publishes nothing leaves
+/// so a view, a partitioned parent with no partitions, or an engine that
+/// publishes nothing leaves
 /// the row exactly as it was rather than showing a placeholder dash down the
 /// whole tree.
 ///
@@ -2785,7 +2818,20 @@ fn size_badge(
     })
 }
 
-fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl IntoView {
+/// One table's row, and while it is open its counts, columns, keys and then
+/// its partitions — each a table node of its own one level in, read from
+/// `schema` ([`DbSchema::partitions_of`]), except while filtering, which lists
+/// every table flat ([`lists_here`]). [`push_table_rows`] walks the same order.
+fn table_node(
+    database: String,
+    table: TableInfo,
+    ctx: SchemaTreeCtx,
+    schema: std::sync::Arc<DbSchema>,
+) -> AnyView {
+    let part_ctx = SchemaTreeCtx {
+        indent_levels: ctx.indent_levels + 1,
+        ..ctx.clone()
+    };
     // The size column's two inputs, read before `ctx` is destructured. The stats
     // signal is looked up by database name rather than threaded through
     // `SchemaTreeCtx`: `db_nodes` is replaced wholesale on a connection switch,
@@ -2829,6 +2875,12 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let force_cols = match &name_term {
         Some(t) => table.any_column_matches(&t.to_lowercase()),
         None => false,
+    };
+    // Its partitions, nested — none while filtering, which lists them flat.
+    let parts: Vec<TableInfo> = if name_term.is_some() {
+        Vec::new()
+    } else {
+        schema.partitions_of(&table).into_iter().cloned().collect()
     };
     let key = table_key(&database, &table);
     let source = table_source(&database, &table);
@@ -2942,6 +2994,8 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let header = with_nav_scroll(header.into_any(), nav, key.clone(), Some(open_menu));
 
     let key_children = key.clone();
+    let part_db = database.clone();
+    let part_schema = schema;
     let cols = table.columns;
     let idxs = table.indexes;
     let fkeys = table.foreign_keys;
@@ -2954,7 +3008,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             if !open {
                 return empty().into_any();
             }
-            let counts = count_row(col_count, key_count, indent_levels);
+            let counts = count_row(col_count, key_count, parts.len(), indent_levels);
             let csrc = col_source.clone();
             let key_source = col_source.clone();
             let otc = open_table_col.clone();
@@ -3006,20 +3060,37 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                 key_row(ix, context_menu, key_src.clone(), fk, nav, indent_levels)
             }))
             .style(|s| s.flex_col());
-            v_stack((counts, cols_block, keys_block))
+            let parts_block =
+                v_stack_from_iter(parts.iter().cloned().map(|p| {
+                    table_node(part_db.clone(), p, part_ctx.clone(), part_schema.clone())
+                }))
+                .style(|s| s.flex_col());
+            v_stack((counts, cols_block, keys_block, parts_block))
                 .style(|s| s.flex_col())
                 .into_any()
         },
     );
 
-    v_stack((header, children)).style(|s| s.flex_col())
+    v_stack((header, children))
+        .style(|s| s.flex_col())
+        .into_any()
 }
 
-// The "N cols · M keys" capsule row shown directly under a table's header.
-fn count_row(cols: usize, keys: usize, indent_levels: u32) -> impl IntoView {
+// The "N cols · M keys" capsule row shown directly under a table's header,
+// and "· P partitions" where it has any.
+fn count_row(cols: usize, keys: usize, parts: usize, indent_levels: u32) -> impl IntoView {
     h_stack((
         capsule(format!("{cols} {}", plural(cols, "col", "cols"))),
         capsule(format!("{keys} {}", plural(keys, "key", "keys"))),
+        if parts > 0 {
+            capsule(format!(
+                "{parts} {}",
+                plural(parts, "partition", "partitions")
+            ))
+            .into_any()
+        } else {
+            empty().into_any()
+        },
     ))
     // See `failed_row`: the counts are a row, so a secondary click on them is
     // not a click on blank space.
@@ -3594,6 +3665,47 @@ mod tests {
                 "namespace {ns:?}"
             );
         }
+    }
+
+    /// **A partition hangs off its parent**, after the parent's columns, and
+    /// only while the parent is open — the render's order. A filter lists
+    /// every match flat, so a partition that matches is reached without its
+    /// parent matching.
+    #[test]
+    fn nav_walk_hangs_a_partition_off_its_parent() {
+        let parent = tbl_cols(None, "events", &["id"]);
+        let mut part = tbl_cols(None, "events_2024", &["id"]);
+        part.partition_of = Some(schemaic_core::schema::PartitionOf {
+            schema: None,
+            parent: "events".into(),
+            bound: "DEFAULT".into(),
+        });
+        let dbs = vec![db("shop", vec![parent, part])];
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            walk(&dbs, &["db:shop"], &[], ""),
+            vec![
+                (s("db:shop"), String::new()),
+                (s("tbl:shop:events"), s("db:shop")),
+            ],
+            "closed, the parent hides its partitions"
+        );
+        assert_eq!(
+            walk(&dbs, &["db:shop", "tbl:shop:events"], &[], ""),
+            vec![
+                (s("db:shop"), String::new()),
+                (s("tbl:shop:events"), s("db:shop")),
+                (s("col:shop:events:id"), s("tbl:shop:events")),
+                (s("tbl:shop:events_2024"), s("tbl:shop:events")),
+            ]
+        );
+        assert_eq!(
+            walk(&dbs, &["db:shop"], &[], "2024"),
+            vec![
+                (s("db:shop"), String::new()),
+                (s("tbl:shop:events_2024"), s("db:shop")),
+            ]
+        );
     }
 
     #[test]

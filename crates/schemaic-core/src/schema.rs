@@ -5499,6 +5499,43 @@ impl ObjectItem {
 }
 
 impl TableInfo {
+    /// What the properties panel says about this table's partitioning, as
+    /// `(label, value)` rows: its key and each partition with its bound, at
+    /// most `cap` of them and then how many more; or the table it is a
+    /// partition of and its bound. Empty for a table that is neither.
+    pub fn partition_lines(&self, cap: usize) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(of) = &self.partition_of {
+            out.push((
+                "Partition of".to_string(),
+                display_name(of.schema.as_deref(), &of.parent),
+            ));
+            out.push(("Bound".to_string(), of.bound.clone()));
+        }
+        if let Some(p) = &self.partitioning {
+            out.push(("Partitioned by".to_string(), p.key.clone()));
+            for part in p.partitions.iter().take(cap) {
+                let bound = if part.bound.is_empty() {
+                    "—".to_string()
+                } else {
+                    part.bound.clone()
+                };
+                out.push((display_name(part.schema.as_deref(), &part.name), bound));
+            }
+            let more = p.partitions.len().saturating_sub(cap);
+            if more > 0 {
+                out.push((
+                    String::new(),
+                    format!(
+                        "and {more} more {}",
+                        if more == 1 { "partition" } else { "partitions" }
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
     /// Is this table a partition of `parent` ([`TableInfo::partition_of`])?
     pub fn is_partition_of(&self, parent: &TableInfo) -> bool {
         self.partition_of
@@ -5663,7 +5700,7 @@ impl TableInfo {
                 .unwrap_or_default();
             // **A partition is created `PARTITION OF` its parent**, which
             // gives it its columns, key and inherited indexes; only its own
-            // checks are restated with it.
+            // key and checks are restated with it.
             let mut out = match &self.partition_of {
                 Some(of) => {
                     let parent = qualified_ident(&of.parent, of.schema.as_deref(), dialect);
@@ -6997,6 +7034,37 @@ pub(crate) fn major_minor(version: &str) -> (u32, u32) {
 impl DbSchema {
     pub fn table_count(&self) -> usize {
         self.tables.len()
+    }
+
+    /// **Is `t` shown under its parent rather than beside it?** A partition
+    /// whose parent this schema holds — the tree nests it there, and the ER
+    /// diagram and the assistant's schema draw the parent alone. One whose
+    /// parent is not here stands on its own.
+    pub fn lists_under_parent(&self, t: &TableInfo) -> bool {
+        t.partition_of.is_some() && self.tables.iter().any(|p| t.is_partition_of(p))
+    }
+
+    /// The partitions of `t` this schema holds, in its order.
+    pub fn partitions_of<'a>(&'a self, t: &TableInfo) -> Vec<&'a TableInfo> {
+        self.tables
+            .iter()
+            .filter(|c| c.is_partition_of(t))
+            .collect()
+    }
+
+    /// The table a partition is drawn as — its topmost ancestor this schema
+    /// holds; `t` itself for any other table.
+    pub fn listed_as<'a>(&'a self, t: &'a TableInfo) -> &'a TableInfo {
+        let mut at = t;
+        // Bounded: a cycle cannot be read off a catalogue, but a model built
+        // by hand could hold one.
+        for _ in 0..self.tables.len() {
+            match self.tables.iter().find(|p| at.is_partition_of(p)) {
+                Some(p) => at = p,
+                None => break,
+            }
+        }
+        at
     }
 
     /// Each SQL Server synonym in this schema (read from `database`), with
@@ -9989,6 +10057,71 @@ mod tests {
         for d in [D::MySql, D::MsSql, D::Sqlite] {
             assert!(!partitions_are_tables(d), "{d:?}");
         }
+    }
+
+    #[test]
+    fn partition_lines_name_the_key_the_partitions_and_the_parent() {
+        let (mut parent, child) = partitioned_pair();
+        let lines = parent.partition_lines(10);
+        assert_eq!(lines[0], ("Partitioned by".into(), "RANGE (at)".into()));
+        assert_eq!(
+            lines[1],
+            (
+                "m_2024".into(),
+                "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')".into()
+            )
+        );
+        assert_eq!(lines.len(), 2);
+        let p = parent.partitioning.as_mut().unwrap();
+        for n in 0..3 {
+            p.partitions.push(Partition {
+                name: format!("p{n}"),
+                ..Default::default()
+            });
+        }
+        let capped = parent.partition_lines(2);
+        assert_eq!(capped.len(), 4);
+        assert_eq!(capped[2].1, "—", "a bound-less partition says so");
+        assert_eq!(capped[3], (String::new(), "and 2 more partitions".into()));
+        assert_eq!(
+            child.partition_lines(10),
+            vec![
+                ("Partition of".into(), "measurements".into()),
+                (
+                    "Bound".into(),
+                    "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')".into()
+                ),
+            ]
+        );
+        assert!(TableInfo::default().partition_lines(10).is_empty());
+    }
+
+    /// A partition is listed under its parent where the schema holds the
+    /// parent, and on its own where it does not; a sub-partition's drawn
+    /// table is its topmost ancestor.
+    #[test]
+    fn a_partition_is_listed_under_the_parent_this_schema_holds() {
+        let (parent, child) = partitioned_pair();
+        let mut grandchild = child.clone();
+        grandchild.name = "m_2024_q1".into();
+        grandchild.partition_of.as_mut().unwrap().parent = "m_2024".into();
+        let s = DbSchema {
+            tables: vec![parent.clone(), child.clone(), grandchild.clone()],
+            ..Default::default()
+        };
+        assert!(!s.lists_under_parent(&parent));
+        assert!(s.lists_under_parent(&child) && s.lists_under_parent(&grandchild));
+        let names = |v: Vec<&TableInfo>| v.into_iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(s.partitions_of(&parent)), ["m_2024"]);
+        assert_eq!(names(s.partitions_of(&child)), ["m_2024_q1"]);
+        assert_eq!(s.listed_as(&grandchild).name, "measurements");
+        assert_eq!(s.listed_as(&parent).name, "measurements");
+        let orphan = DbSchema {
+            tables: vec![child.clone()],
+            ..Default::default()
+        };
+        assert!(!orphan.lists_under_parent(&child));
+        assert_eq!(orphan.listed_as(&child).name, "m_2024");
     }
 
     /// An extension is the **database's**: it lists in the flat folder and by

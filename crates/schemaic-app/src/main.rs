@@ -10179,8 +10179,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             set.get(want.schema.as_deref(), &want.table)
                                 .cloned()
                                 // A table the catalogue didn't list — a view on
-                                // MySQL, a partitioned parent — is "nothing to
-                                // report", not a failure.
+                                // MySQL — is "nothing to report", not a failure.
                                 .unwrap_or_default(),
                         )),
                         Err(e) => schemaic_ui::PropertiesState::Failed(e.clone()),
