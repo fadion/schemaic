@@ -8272,8 +8272,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .hover(|s| s.color(theme::chip_active()))
                     })
                     .tooltip(|| text("Find in selection").style(crate::widgets::tooltip_style));
-                // A flex spacer pins the counter + nav + × to the right edge; row 2
-                // does the same, so `All` lines up under the ×.
+                // A flex spacer pins the counter + nav + × to the right edge.
                 let row1 = h_stack((
                     input,
                     case_btn,
@@ -8321,18 +8320,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // The replace row is always mounted but shown/hidden via `display`
                 // (no animation — an in-flow height transition through a clip was
                 // janky, and the reveal isn't worth it here). Hidden ⇒ `display:none`.
-                // Left-packed (gap 0, explicit margins): `Replace` is offset 16px past
-                // the field so it lines up under the "n/total" counter in the find row
-                // (input 170 + the row's 2×8px gaps), and `All` sits 15px after it.
+                // Left-packed with the find row's 8px gap, so `Replace` starts under
+                // `Aa` and `All` follows it at the same spacing the toggles keep.
                 let replace_row = h_stack((
                     rinput,
-                    text_btn("Replace", replace_one.clone())
-                        .style(|s| s.margin_left(theme::scaled(16.0))),
-                    text_btn("All", replace_all_cb.clone())
-                        .style(|s| s.margin_left(theme::scaled(15.0))),
+                    text_btn("Replace", replace_one.clone()),
+                    text_btn("All", replace_all_cb.clone()),
                 ))
                 .style(move |s| {
-                    let s = s.items_center().padding_top(theme::scaled(6.0));
+                    let s = s
+                        .items_center()
+                        .gap(theme::scaled(8.0))
+                        .padding_top(theme::scaled(6.0));
                     if find_replace_visible.get() {
                         s.flex()
                     } else {
@@ -8340,11 +8339,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     }
                 });
 
-                // Fixed content width so BOTH rows have free space for their flex
-                // spacer — otherwise the wider row drives the width and its spacer
-                // collapses, leaving `All` hugging `Replace` instead of pinned under
-                // the ×. Sized just to the find row's packed width so the leftover
-                // spacer (hence the field→controls gap) is ~15px, not ~33px.
+                // Fixed content width so the find row has free space for its flex
+                // spacer. Sized just to its packed width so the leftover spacer
+                // (hence the toggles→counter gap) is ~15px, not ~33px.
                 // Wide enough for the four option toggles beside the find field
                 // (283 before them, 331 with two).
                 let content = v_stack((row1, replace_row)).style(|s| s.width(theme::scaled(389.0)));
