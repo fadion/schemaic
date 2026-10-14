@@ -17,7 +17,9 @@
 //! own — inserting the body puts them in the editor and
 //! [`crate::params`] gives them a parameters bar. That is why there is no
 //! tab-stop syntax here: the second template mechanism would have to be taught
-//! everything the first one already knows.
+//! everything the first one already knows. **The placeholders are the tab
+//! stops** instead ([`crate::tab_stops`]): once a body is inserted, Tab walks
+//! its `:name`s, and a stop left unfilled is still the parameter it was.
 
 use serde::{Deserialize, Serialize};
 

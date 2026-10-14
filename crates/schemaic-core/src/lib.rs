@@ -72,6 +72,7 @@ pub mod ssh_config;
 pub mod stats;
 pub mod sticky_header;
 pub mod summary;
+pub mod tab_stops;
 pub mod tabsel;
 pub mod text;
 pub mod text_ops;

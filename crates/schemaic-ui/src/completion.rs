@@ -117,6 +117,12 @@ pub(crate) struct Completion {
     /// what keeps an answer about the text ([`stmt_index`], the styling's
     /// caches) takes it forward without keeping a copy of the text.
     pub(crate) edits: RwSignal<schemaic_core::text::EditLog>,
+    /// The inserted snippet's tab stops being walked (`core::tab_stops`), or
+    /// `None`. Set by both snippet insert paths — the library's insert and
+    /// [`accept_completion`] of a snippet row — carried through every edit by
+    /// the pane's update hook, and ended by Escape, by Tab past the last stop,
+    /// or by the caret leaving the stops.
+    pub(crate) stops: RwSignal<Option<schemaic_core::tab_stops::TabStops>>,
 }
 
 /// `f` over the editor's text, **borrowed** from the pane's `query` — set from
@@ -1525,6 +1531,31 @@ fn recompute_completions_in(
     comp.open.set(open);
 }
 
+/// After a snippet `body` has been spliced in at byte `at`: walk its `:name`
+/// stops (`core::tab_stops`) with the first selected, or — with none — put the
+/// caret after it, as an insert always did. Both snippet insert paths end
+/// here, so the two cannot place the caret differently.
+pub(crate) fn begin_snippet(
+    ed: &Editor,
+    comp: Completion,
+    body: &str,
+    at: usize,
+    dialect: SqlDialect,
+) {
+    match schemaic_core::tab_stops::TabStops::new(body, at, dialect) {
+        Some(stops) => {
+            let (a, b) = stops.current();
+            comp.stops.set(Some(stops));
+            ed.cursor.update(|c| c.set_insert(Selection::region(a, b)));
+        }
+        None => {
+            comp.stops.set(None);
+            ed.cursor
+                .update(|c| c.set_offset(at + body.len(), false, false));
+        }
+    }
+}
+
 /// Replace the word at the caret with the selected suggestion — a name quoted
 /// where bare it would be something else, unless the caret is inside a quote
 /// already (`rank::accepted_insert`).
@@ -1570,9 +1601,14 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion, dialect: SqlDiale
         // a specific range instead (the `*` / `t.*`).
         let (from, to) = replace.unwrap_or((start, end));
         doc.edit_single(Selection::region(from, to), &insert, EditType::Completion);
-        // `edit_single` doesn't move the caret, so place it explicitly.
-        ed.cursor
-            .update(|c| c.set_offset(from + caret, false, false));
+        // `edit_single` doesn't move the caret, so place it explicitly — on a
+        // snippet's first `:name` stop when it has any (`begin_snippet`).
+        if kind == SuggestKind::Snippet {
+            begin_snippet(ed, comp, &insert, from, dialect);
+        } else {
+            ed.cursor
+                .update(|c| c.set_offset(from + caret, false, false));
+        }
         // Taken once more on this connection: it ranks higher next time.
         let conn = comp.conn.get_untracked();
         comp.accepted

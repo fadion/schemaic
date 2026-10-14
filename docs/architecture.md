@@ -9933,7 +9933,10 @@ existing prose was left alone.
     difference between a library and a log: a "running queries" snippet is wanted on every MySQL
     connection, not on the one it was saved from. Nothing is capped or evicted, for the same
     reason. A body's `:name` placeholders are not stored (they would go stale on the first edit)
-    and need no tab-stop syntax of their own — inserting the body hands them to `params`.
+    and need no tab-stop syntax of their own — inserting the body hands them to `params`, and
+    **the placeholders are the tab stops** (`tab_stops.rs`, below): a second template mechanism
+    would have to be taught everything the first already knows, and a stop left unfilled is
+    still the parameter it was.
     `Scope` is a **preserving** persisted enum: `Unknown(String)` keeps the text it didn't
     recognise and the hand-written `Serialize` writes it back verbatim, the rule
     `search_history::ObjectTag` states, because this file is rewritten whole on every change.
@@ -9978,6 +9981,27 @@ existing prose was left alone.
     snippet that cannot be edited in place), `abbrev` is dropped because two snippets answering to
     one spelling is a coin toss, `last_used` is `None`, the name gains ` copy`, and `scope` is
     inherited because the copy is for the same place as the original.
+  - `tab_stops.rs` — **a snippet's tab stops**, walked with Tab once its body is in the editor.
+    There is no new syntax: a stop is a `:name` parameter `params::scan` finds in the body, so
+    the one template mechanism a snippet has gains a way to be filled in from the keyboard rather
+    than a second mechanism beside it (`snippet.rs`, above). `TabStops::new(body, at, dialect)`
+    answers `None` for a body with no parameters — nothing to walk, so Tab indents as ever — and
+    otherwise holds the stops as byte ranges offset by `at`, where the body landed, plus the
+    snippet's end. A parameter-shaped string, comment or `::` cast is not a stop, `scan` already
+    refusing them (`a_body_without_parameters_has_no_stops`). **A name used twice is one stop, at
+    its first use**, matched exactly as `params::names` keys parameters, so `:id` and `:ID` — two
+    rows in the parameters bar — are two stops (`a_name_used_twice_is_one_stop`). The module decides nothing about
+    the editor and the editor decides nothing about the stops: `current()` is what to select,
+    `forward()` answers `Step::Select(a, b)` for the next stop or, past the last,
+    `Step::Finish(end)` — the caret goes to the snippet's end and the walk is over — and `back()`
+    the previous, staying on the first. `shift(start, end, inserted)` carries every stop **and the
+    end** through one edit by `text_ops::shift_range`, the function the find bar's *in selection*
+    scope follows edits with, so typing over a selected stop makes the stop *what was typed* and
+    typing at its end grows it (`typing_over_a_stop_makes_the_stop_what_was_typed`). `holds(offset)`
+    is whether the caret is still in the walk — inside a stop or at either edge of one, the edge
+    being where typing into it goes on. The UI half (`Completion::stops`,
+    `completion::begin_snippet`, the `StopNext`/`StopPrev`/`StopEnd` key actions) is under
+    `completion.rs` and `editor_pane.rs`.
   - `settings_bundle.rs` — **the settings file**: the user's preferences and snippets in one JSON
     file, to take to another machine or hand to a colleague, and read back. Pure over text and
     values — the app gathers the current `UiState` and snippets, picks the file and applies what
@@ -24236,6 +24260,9 @@ existing prose was left alone.
     copies without that note were the ones most likely to be "simplified" to a `get_untracked`. **A row click inserts the body at the caret** (`Tab::insert_req`),
     where a history row opens a new tab — a record of a past run wants its own tab, a snippet is
     something you compose *with*; "Open in new tab" is on the row's menu for when it isn't. The
+    editor pane's `insert_req` effect splices it over the selection when there is one and hands it
+    to `completion::begin_snippet`, which selects the first `:name` stop for Tab to walk from
+    (`tab_stops.rs`), or with none puts the caret after the body, as the effect used to itself. The
     parameter chips under a body are read live from `params::names`, never stored, so they cannot
     disagree with the body above them. **The body preview is syntax-coloured** (`highlight_sql_mono`,
     over the editor's own `sql_highlight::highlight_spans`, with the search match added last so it
@@ -26776,7 +26803,13 @@ existing prose was left alone.
     uses — as does a builtin the engine calls bare (`CURRENT_TIMESTAMP`, under `rank.rs`), which
     is why `accept_completion` appends `()` to a function row only when it carries no `insert` —
     a routine inserted qualified or quoted carries its `()` in the `insert`, and
-    `rank::override_splice` places the caret between them.
+    `rank::override_splice` places the caret between them. **A snippet row is the exception to
+    that caret placement**: `accept_completion` hands it to `begin_snippet(ed, comp, body, at,
+    dialect)`, which selects the body's first `:name` stop and sets `Completion::stops`
+    (`core::tab_stops`, under `tab_stops.rs`), or with no parameters clears them and puts the
+    caret after the body. The library's Insert ends in the same function (`editor_pane.rs`), so
+    the two snippet insert paths cannot place the caret differently; every other row kind still
+    places it by `override_splice`/`completion_insertion`.
     **An accept replaces the whole word the caret is in**, from `word_start` to `word_end` — the
     part after the caret too, and the `(` test reads past it — so accepting `customer_id` at
     `cust|_id` no longer writes `customer_id_id`
@@ -27908,7 +27941,12 @@ existing prose was left alone.
     replacement as written being the wrong length once a group has been filled in.
     **The *in selection* scope** is `find_scope: RwSignal<Option<(usize, usize)>>`, held apart from
     the editor's selection, which revealing a hit replaces, and carried through each delta in
-    `.update(…)` by `text_ops::shift_range`, beside the inlay hints' `shift_inlay_hints`. Ctrl+F and
+    `.update(…)` by `text_ops::shift_range`, beside the inlay hints' `shift_inlay_hints` and a
+    snippet's tab stops' `TabStops::shift` (`Completion::stops`, under `tab_stops.rs`). *When* the
+    stops are set is load-bearing: floem calls the update callbacks
+    synchronously inside the edit (`on_update` in its `text_document.rs`), so a snippet's own
+    splice runs the hook before `begin_snippet` has set the stops it creates, and never shifts
+    them by the body's own length — setting the stops ahead of the splice would. Ctrl+F and
     Ctrl+H make a multi-line selection the scope (`find_scope_seed`); anything else clears it on a
     bar being opened but **keeps it on one already open**, since there — Ctrl+H over Ctrl+F — the
     selection is the hit a step revealed, not a new block. Closing (× or Escape's `CloseFind`)
@@ -27937,8 +27975,13 @@ existing prose was left alone.
     (`inline_diff::shown_ghost`, below), `lone_caret`, and whether the caret ends its line, which it
     works out only for a → with a ghost showing — applies the returned `KeyPlan`'s `dismiss` and
     `close_list`, then performs its one `KeyAction`. Escape closes the find bar, then Go-to-line,
-    then turns down signature help, the list and the ghost; an open list with rows takes a bare ↑/↓,
-    Enter and Tab, and any other ↑, ↓, → or `Move` closes it and goes on; then Tab takes a ghost and
+    then turns down signature help, the list and the ghost, and only with none of those on screen
+    ends a snippet's tab-stop walk (`StopEnd`, spent; `KeyCtx::stops`, under `tab_stops.rs`); an
+    open list with rows takes a bare ↑/↓, Enter and Tab, and any other ↑, ↓, → or `Move` closes it
+    and goes on; then, with stops being walked, Tab without the primary modifier is `StopNext` and
+    Shift+Tab `StopPrev`, closing the list — behind the open list's Tab, whose word may be what is
+    going into the stop, but ahead of everything below, since the user is filling a template in;
+    then Tab takes a ghost and
     → a word or the whole of it, ahead of Tab's indent, Enter's carried indent and Shift+Tab's
     outdent, which closes the list as a caret move does. **The clearing that falls through is
     modelled inside the function, not left to the signals**: after an Escape that turned down
@@ -27949,9 +27992,16 @@ existing prose was left alone.
     to floem rather than indenting (`tab_over_an_empty_open_list_is_passed_on`). The order is pinned
     in `ghost_key_tests` (`escape_closes_find_then_goto_then_dismisses`,
     `an_open_list_owns_its_keys_and_a_caret_move_closes_it`,
-    `a_ghost_takes_tab_and_right_ahead_of_the_indent`, `enter_indents_and_shift_tab_outdents`); what
+    `a_ghost_takes_tab_and_right_ahead_of_the_indent`, `enter_indents_and_shift_tab_outdents`,
+    `a_snippets_stops_take_tab_and_shift_tab`,
+    `escape_ends_a_snippets_stops_after_what_is_on_screen`); what
     stays in the view is the edit each action makes, and Enter's own fall-through to floem when the
-    caret is not one region.
+    caret is not one region. For the stops that is: select the range `forward()`/`back()` answers,
+    or on `Step::Finish` clear the stops and put the caret at the snippet's end, or on `StopEnd`
+    just clear them. **The walk also ends when the caret leaves it** — an effect on the cursor
+    clears the stops once the lone caret, or a selection's higher end (`max` of the two, where a selected stop ends), is no longer one
+    `TabStops::holds` — so a click elsewhere or an arrow out of the last stop does not leave Tab
+    to jump back into a template the user has moved on from.
     **Enter is a newline once the word is typed in full.** With the list open, a bare ↑/↓ moves the
     selection (`list_takes_arrow`: with Shift, Alt or Ctrl the arrow closes the list and does its
     own work — Shift+↓ used to walk the rows instead of extending the selection) and Enter or Tab

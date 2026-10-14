@@ -258,6 +258,10 @@ struct KeyCtx {
     caret: Option<usize>,
     /// The caret has nothing after it on its line.
     at_line_end: bool,
+    /// An inserted snippet's stops are being walked ([`Completion::stops`]).
+    ///
+    /// [`Completion::stops`]: crate::completion::Completion::stops
+    stops: bool,
 }
 
 /// The one action a key takes, once [`KeyPlan`]'s clearing is done.
@@ -280,6 +284,12 @@ enum KeyAction {
     /// Enter, with the line's indent carried — when the caret is one region.
     NewlineIndent,
     Outdent,
+    /// Tab in a snippet's stops: the next one, or past the last the end.
+    StopNext,
+    /// Shift+Tab in a snippet's stops: the previous one.
+    StopPrev,
+    /// Escape in a snippet's stops, with nothing else to turn down: the walk ends.
+    StopEnd,
     /// None of these: on to the handler's later keys, then floem's.
     Pass,
 }
@@ -338,6 +348,11 @@ fn editor_key_plan(c: KeyCtx) -> KeyPlan {
         if c.sig_up || c.list_open || c.ghost_at.is_some() {
             return done(plan, KeyAction::Dismissed);
         }
+        // Nothing on screen to turn down: an Escape inside a snippet's stops
+        // ends the walk, and is spent doing it.
+        if c.stops {
+            return done(plan, KeyAction::StopEnd);
+        }
         list_open = false;
         ghost_at = None;
     }
@@ -367,6 +382,16 @@ fn editor_key_plan(c: KeyCtx) -> KeyPlan {
             plan.close_list = true;
             list_open = false;
         }
+    }
+    // A snippet's stops take Tab and Shift+Tab ahead of the ghost and the
+    // indent — the user is filling a template in — but behind an open list's
+    // Tab above, whose word may be what is going into the stop.
+    if key == EdKey::Tab && c.stops && !primary {
+        if shift {
+            plan.close_list = true;
+            return done(plan, KeyAction::StopPrev);
+        }
+        return done(plan, KeyAction::StopNext);
     }
     if key == EdKey::Tab && ghost_takes_tab(ghost_at, c.caret, list_open, shift, primary) {
         return done(plan, KeyAction::TakeGhost);
@@ -3114,6 +3139,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         temps: RwSignal::new(Default::default()),
         query,
         edits: RwSignal::new(schemaic_core::text::EditLog::default()),
+        stops: RwSignal::new(None),
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),
@@ -3523,6 +3549,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 ghost_at,
                 caret: crate::completion::lone_caret(&cursor),
                 at_line_end,
+                stops: comp.stops.with_untracked(Option::is_some),
             })
         });
         if plan.dismiss {
@@ -3649,6 +3676,39 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // width, and it **replaces a selection** with one `\t` — three selected
         // lines became a single tab when hard tabs fell through to it. Both are
         // the tested pure `soft_tab_indent` / `hard_tab_indent`.
+        // A snippet's stops (`core::tab_stops`): select the next or previous
+        // one, or — past the last, or on Escape — end the walk, Tab leaving the
+        // caret at the snippet's end.
+        if matches!(
+            plan.action,
+            KeyAction::StopNext | KeyAction::StopPrev | KeyAction::StopEnd
+        ) {
+            use schemaic_core::tab_stops::Step;
+            let step = match plan.action {
+                KeyAction::StopEnd => None,
+                KeyAction::StopPrev => comp
+                    .stops
+                    .try_update(|s| s.as_mut().map(|s| s.back()))
+                    .flatten(),
+                _ => comp
+                    .stops
+                    .try_update(|s| s.as_mut().map(|s| s.forward()))
+                    .flatten(),
+            };
+            match step {
+                Some(Step::Select(a, b)) => editor_sig.with_untracked(|e| {
+                    e.cursor.update(|c| c.set_insert(Selection::region(a, b)));
+                }),
+                Some(Step::Finish(at)) => {
+                    comp.stops.set(None);
+                    editor_sig.with_untracked(|e| {
+                        e.cursor.update(|c| c.set_offset(at, false, false));
+                    });
+                }
+                None => comp.stops.set(None),
+            }
+            return CommandExecuted::Yes;
+        }
         if plan.action == KeyAction::Indent {
             let tw = theme::editor_tab_width();
             let soft = theme::editor_soft_tabs();
@@ -4887,8 +4947,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     (off, off)
                 });
             let (lo, hi) = (a.min(b), a.max(b));
-            // Caret after the inserted text, so typing continues where the
-            // snippet left off rather than in front of it.
+            // On its first `:name` stop when it has one, else after the
+            // inserted text, so typing continues where the snippet left off
+            // rather than in front of it (`completion::begin_snippet`).
             if edit_untyped(
                 &ed_ins,
                 comp,
@@ -4896,9 +4957,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 &body,
                 EditType::Other,
             ) {
-                ed_ins
-                    .cursor
-                    .update(|cc| cc.set_offset(lo + body.len(), false, false));
+                crate::completion::begin_snippet(&ed_ins, comp, &body, lo, dialect.get_untracked());
             }
         });
     }
@@ -5604,6 +5663,26 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // and hides the moment the caret leaves the call's parentheses. Focus is read
         // untracked so a programmatic cursor change on an unfocused editor can't pop a
         // phantom hint (blur clears it separately).
+        // A snippet's stops end once the caret leaves them — a click elsewhere,
+        // an arrow out of the last one — rather than Tab later jumping back
+        // into a template the user has moved on from (`TabStops::holds`). A
+        // selected stop is held at its end, where the caret of a selection is.
+        let ed_stops = ed.clone();
+        create_effect(move |_| {
+            let cursor = ed_stops.cursor.get();
+            if comp.stops.with_untracked(Option::is_none) {
+                return;
+            }
+            let held = crate::completion::lone_caret(&cursor)
+                .or_else(|| cursor.get_selection().map(|(a, b)| a.max(b)))
+                .is_some_and(|at| {
+                    comp.stops
+                        .with_untracked(|s| s.as_ref().is_some_and(|s| s.holds(at)))
+                });
+            if !held {
+                comp.stops.set(None);
+            }
+        });
         let ed_caret = ed.clone();
         create_effect(move |_| {
             ed_caret.cursor.track();
@@ -5776,6 +5855,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     scope = shift_range(scope, iv.start, iv.end, inserted);
                 }
                 find_scope.set(Some(scope));
+            }
+            // A snippet's tab stops, the same way: typing over a selected stop
+            // makes the stop what was typed (`tab_stops::TabStops::shift`).
+            // The snippet's own splice reaches here before `begin_snippet`
+            // sets them, so it never shifts the stops it creates.
+            if comp.stops.with_untracked(Option::is_some) {
+                comp.stops.update(|s| {
+                    if let Some(s) = s {
+                        for d in upd.deltas() {
+                            let (iv, inserted) = d.summary();
+                            s.shift(iv.start, iv.end, inserted);
+                        }
+                    }
+                });
             }
             // **The one copy of the document an edit makes.** Everything below
             // reads `query` when it runs — a debounce at the time it fires — so
@@ -8826,6 +8919,66 @@ mod ghost_key_tests {
 
     fn act(c: KeyCtx) -> KeyAction {
         editor_key_plan(c).action
+    }
+
+    /// **A snippet's stops take Tab ahead of the ghost and the indent**, and
+    /// Shift+Tab ahead of the outdent; an open list still takes Tab first,
+    /// since the word being typed into a stop may be completed.
+    #[test]
+    fn a_snippets_stops_take_tab_and_shift_tab() {
+        let tab = KeyCtx {
+            stops: true,
+            ghost_at: Some(12),
+            ..ctx(EdKey::Tab)
+        };
+        assert_eq!(act(tab), KeyAction::StopNext);
+        assert_eq!(
+            act(KeyCtx {
+                mods: Modifiers::SHIFT,
+                ..tab
+            }),
+            KeyAction::StopPrev
+        );
+        assert_eq!(
+            act(KeyCtx {
+                list_open: true,
+                list_rows: true,
+                ..tab
+            }),
+            KeyAction::Accept
+        );
+        assert_eq!(
+            act(KeyCtx {
+                stops: false,
+                ghost_at: None,
+                ..tab
+            }),
+            KeyAction::Indent
+        );
+    }
+
+    /// Escape turns down what is on screen first, then ends the walk.
+    #[test]
+    fn escape_ends_a_snippets_stops_after_what_is_on_screen() {
+        let esc = KeyCtx {
+            stops: true,
+            ..ctx(EdKey::Escape)
+        };
+        assert_eq!(act(esc), KeyAction::StopEnd);
+        assert_eq!(
+            act(KeyCtx {
+                sig_up: true,
+                ..esc
+            }),
+            KeyAction::Dismissed
+        );
+        assert_eq!(
+            act(KeyCtx {
+                stops: false,
+                ..esc
+            }),
+            KeyAction::Pass
+        );
     }
 
     /// Escape answers the innermost thing first: the find bar, then
