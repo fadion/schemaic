@@ -5172,7 +5172,8 @@ existing prose was left alone.
     `CREATE VIEW` (Msg 208, measured on 2022) and *One transaction* rolled everything back, where
     without it the file restored one table short; a routine that only reads the table when it runs
     stays. Names are matched with their qualifier read off the text (`names_object`), so a view
-    over `sales.emp` is not taken for one over `dbo.emp`. The lot is `DumpPlan::left_out`, named
+    over `sales.emp` is not taken for one over `dbo.emp` — `pub(crate)`, because `core::used_by`
+    asks the same question of every body in a schema. The lot is `DumpPlan::left_out`, named
     in the header and, through `dump::done_note`, in the modal's report beside the missing tables
     (`what_reads_a_table_left_out_of_the_file_is_left_out_with_it`; live,
     `a_dump_leaves_out_what_reads_a_table_it_cannot_restate`). A graph edge is restated, empty, and the header says why: an edge names
@@ -13924,6 +13925,47 @@ existing prose was left alone.
     match or not. `TextScan` (`new`/`done`/`offer`/`finish`) is the same scan one text at a time,
     and `text_hits` is a loop over it: the palette's texts each sit behind a signal of their own,
     which a `&[&str]` could only gather by cloning every tab.
+  - `used_by.rs` — **what depends on a table, a view, a column or a routine**: the views, routines,
+    triggers, events, foreign keys and table expressions that would break, or go with it, if it
+    changed — behind the schema tree's *Used by* (`ui/used_by_view.rs`) and a table Drop's preview
+    warning. `used_by(schema, target, dialect) -> Vec<Dependent>` takes a `Target` —
+    `Relation { ns, name, column }` or `Routine { ns, name }` — and returns each `Dependent` with its
+    `DependentKind` (`View`, `Routine`, `Trigger`, `Event`, `ForeignKey`, `Expression`), its name as
+    the tree shows it (`schema::display_name`), a `detail` (the table a trigger or key is on, and the
+    key's columns) and `goes_with_it`, sorted by kind and then name.
+    **No round trip, and no dependency catalogue**: it is a scan of the loaded `DbSchema`, which
+    already holds every view's definition, every routine, trigger and event body and every foreign
+    key (`body_search.rs`, above, reads the same fields), so the answer costs nothing and is the same
+    on every engine. The module doc gives the reason not to have asked the server instead: only SQL
+    Server keeps a dependency catalogue worth the name, and a PostgreSQL function body is opaque to
+    `pg_depend` anyway.
+    **A body uses the target when it names it as it would be resolved**, which is the question
+    `core::dump` already asked before leaving an object out of a file, so it is the same function:
+    `dump::names_object` (`pub(crate)` for this) over `intel::code_mask` — a whole word in code, not
+    in a string or comment, its qualifier read so `sales.emp` is not `dbo.emp`, a bare name reaching
+    its own namespace or the default one (`another_namespaces_same_name_is_not_the_target`). This
+    is not `body_search`'s substring match, deliberately the other way round: that one is meant to
+    find a mention in a comment, and here a comment that names a table does not depend on it. A
+    **column** is used where a body that uses its table also names the column word — the nearest a
+    text scan gets, and it errs toward listing: a same-named column of another table in that body
+    counts, and a dynamic-SQL string naming the object is not seen at all, which the modal says
+    under every answer (`a_column_is_used_where_its_table_and_its_name_both_are`).
+    **A foreign key is exact** — its `ref_table`, in its `ref_schema` or else its own table's
+    namespace, and for a column target its `ref_columns`. **A trigger is listed three ways**: one
+    *on* the table, with `goes_with_it`, since dropping the table drops it; one on another table
+    whose body uses the target; and, for a routine target, a PostgreSQL trigger whose
+    `TriggerAction::Function` names it — that name is emittable SQL, quoted and qualified outside
+    `public`, so `function_is` unquotes it and reads the qualifier rather than comparing strings
+    (`a_qualified_pg_trigger_function_matches_only_its_schema`). A routine target also finds the
+    tables whose column defaults, generated columns or checks call it, as `Expression`
+    (`a_routine_is_used_by_callers_expressions_and_pg_triggers`). A table's key onto itself is
+    `goes_with_it` too.
+    `drop_warning(deps)` is the sentence a drop's preview adds — *"Used by 2 views, 1 routine and 2
+    foreign keys: a, b, c, d and 1 more."*, counted by kind and naming the first four — and **leaves
+    out every `goes_with_it` dependent**, returning `None` when nothing else is left: a trigger on
+    the dropped table goes with it and is no breakage, so the sentence is about what the drop
+    breaks (`a_trigger_on_the_table_is_listed_and_one_elsewhere_that_writes_it`,
+    `the_drop_warning_counts_by_kind_and_names_the_first_few`).
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -22589,6 +22631,9 @@ existing prose was left alone.
     `users_view::section`/`detail`/`note`) for the label column and row gap that legitimately differ
     between the two panels. The gap and the label width are `fn() -> f64` and not numbers, for the
     reason every other length here is: one resolved at build freezes at the scale it was built at.
+    `fact_section_owned` is `fact_section` under a heading built at run time — the *Used by* modal's
+    *"Views (3)"*, where the count is the heading — and `fact_section` delegates to it, so there is
+    still one section view.
     Also the right-hand panels' shared list chrome — `panel_search`, `panel_group_header` (a band's
     title and count; its colour and border rulings are on the function) and **`banded_list`, which
     makes those bands sticky**: the band under the top edge keeps its header pinned while its rows
@@ -22793,7 +22838,8 @@ existing prose was left alone.
     rather than through a group that is closed. `users_view::users_overlay` asks the identical three
     signals, and the two must not be able to disagree. **The Server variables viewer, mounted
     directly after the browser, is the contrast**: it raises nothing, so `vars_open` is a plain term
-    and counts whenever the viewer is open.
+    and counts whenever the viewer is open. The *Used by* modal, mounted after Properties, is the
+    same plain term (`used_by_open`).
     **Schema compare, the group's seventh member, takes the same `preview_open` clause — and there for
     the rule rather than for a case.** It raises the DDL preview too, painted in the earlier DDL
     group, so a wrapper that went on filling the layer would sit on top of it exactly as above. What
@@ -24512,6 +24558,27 @@ existing prose was left alone.
       emptiness guard is what keeps it silent on an engine that publishes nothing.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
+  - `used_by_view.rs` — the **Used by** modal (`used_by_overlay`), over `core::used_by`, opened by
+    setting `overlay.used_by` to a `UsedByTarget { database, schema, name, column, routine }`
+    (re-exported as `schemaic_ui::UsedByTarget`; the app creates the signal beside `properties`)
+    from the schema tree's menu on a table or view, a column, or a routine. Properties' shape and
+    read-only like it: `modal_title_owned` *"Used by — x"*, a scrolling body, a footer of **Copy**
+    (the list as Markdown) and **Close**, Escape and the backdrop closing it. The body groups the
+    dependents under a counted heading per kind — `widgets::fact_section_owned`, *"Views (3)"* —
+    each row the name in mono and its detail beside it, a `goes_with_it` one marked *"· dropped
+    with it"*, since the list is read before a drop; and under every answer one faint line saying
+    what the scan does not see: SQL built at run time, and other databases.
+    **No fetch and no loading state** — it opens with its answer. `dependents_of(schema, conn,
+    target)`, which the table Drop's preview warning calls too, reads the database's schema through
+    `table_designer::loaded_schema` and returns `None` while that is not loaded (the same funnel,
+    so mid-refresh too), and the modal **says so** — *"expand it in the tree, then ask again"* —
+    rather than *"Nothing in db uses it."*, which is the separate answer for an empty list. The Drop
+    has no such note to show: with no schema loaded its preview simply carries no *Used by*
+    sentence. The dialect is `ConnUi::dialect`, the active connection's, which is right because
+    every database the tree shows is that connection's.
+    Mounted in the workspace group directly after `properties_overlay`, and counted by
+    `workspace_modals_up` whenever it is open — it raises nothing, so it is a plain term like
+    `vars_open`.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
     It lists the server's accounts, shows one account's privileges, and is where the five write
     actions are raised from — the forms themselves are `account_editor.rs`. Mounted in the
@@ -25295,7 +25362,11 @@ existing prose was left alone.
     both, for facts it holds and the change set does not: the schema tree's Drop passes
     `stats::drop_preview` — a table's row figure, a MariaDB sequence's `DROP TABLE` worded as a
     sequence's in its line and its warning alike — which is what the confirm it replaced had said
-    before the preview said everything else again.
+    before the preview said everything else again. The same closure then appends
+    `used_by::drop_warning` over the object's dependents (`used_by_view::dependents_of`, read when
+    the entry is clicked), so what the drop breaks — *"Used by 2 views …"* — is named before Apply
+    rather than by the next error; nothing is appended when the database's schema is not loaded, or
+    when everything that uses the object goes with it.
     **`ddl_preview::close_peers` is the one editor-target list**, called by every editor's `open`
     before it sets its own and by `close_editors` after an Apply. Each of those `open`s used to
     keep its own copy and they had **drifted**: the table designer cleared the view editor and
@@ -38442,7 +38513,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   kind of row — and each arm emits the same five groups in the same order, separated by
   `MenuEntry::Separator`, so an action sits in the same place whatever was right-clicked:
   **Open** (what a double-click would have done), **Read** (`Copy name`, `Copy qualified name`,
-  then what the node can *show* you — `Properties`, `Live monitor`, `ER diagram`, `Generate DDL` —
+  then what the node can *show* you — `Properties`, `Used by`, `Live monitor`, `ER diagram`,
+  `Generate DDL` —
   closing with
   `Refresh`), **Tree state** (`Favourite`, `Colour ▸`, `Hide`, which act on the row and not on the
   object), **Write** (`Create`/`Edit`/`Import`/`Triggers`, with the entries that can't be taken

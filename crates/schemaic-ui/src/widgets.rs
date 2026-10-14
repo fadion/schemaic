@@ -1794,8 +1794,14 @@ pub(crate) fn form_section_owned(label: String) -> impl IntoView {
 
 /// A heading with its rows under it.
 pub(crate) fn fact_section(title: &'static str, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
+    fact_section_owned(title.to_string(), rows, gap)
+}
+
+/// [`fact_section`] under a heading built at run time — *Used by*'s
+/// "Views (3)", where the count is the heading.
+pub(crate) fn fact_section_owned(title: String, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
     v_stack((
-        form_section(title),
+        form_section_owned(title),
         v_stack_from_iter(rows).style(move |s| s.flex_col().gap(gap()).width_full().min_width(0.0)),
     ))
     // `min_width(0)` all the way down, so a row holding a sentence can shrink to

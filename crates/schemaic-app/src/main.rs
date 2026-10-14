@@ -2821,6 +2821,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Table-properties modal. `properties` is both the open flag and the object
     // being described, so a stale fetch can check it before writing.
     let properties: RwSignal<Option<schemaic_ui::PropertiesTarget>> = RwSignal::new(None);
+    let used_by: RwSignal<Option<schemaic_ui::UsedByTarget>> = RwSignal::new(None);
     let properties_state: RwSignal<schemaic_ui::PropertiesState> =
         RwSignal::new(schemaic_ui::PropertiesState::Loading);
     let properties_counting: RwSignal<bool> = RwSignal::new(false);
@@ -13837,6 +13838,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             compare_query: RwSignal::new(String::new()),
             compare_show_same: RwSignal::new(false),
             properties,
+            used_by,
             properties_state,
             properties_counting,
             properties_count_err,

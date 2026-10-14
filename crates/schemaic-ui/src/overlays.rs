@@ -1928,6 +1928,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         copy(item.name().to_string()),
                     ));
                     entries.push(MenuEntry::action("Copy qualified name", copy(qualified)));
+                    // What calls a routine — views, other routines, triggers
+                    // and table expressions (`core::used_by`).
+                    if let Some(r) = item.routine() {
+                        let used_by = import_ui.overlay.used_by;
+                        let target = crate::UsedByTarget {
+                            database: database.clone(),
+                            schema: r.schema.clone(),
+                            name: r.name.clone(),
+                            column: None,
+                            routine: true,
+                        };
+                        entries.push(MenuEntry::action("Used by", move || {
+                            used_by.set(Some(target.clone()))
+                        }));
+                    }
                     {
                         let oq = open_query.clone();
                         let db = database.clone();
@@ -2266,6 +2281,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 &tbl,
                                 is_view,
                             );
+                        }));
+                    }
+                    // What depends on it — before a drop, a rename or a column
+                    // change, the question worth asking (`core::used_by`).
+                    {
+                        let used_by = import_ui.overlay.used_by;
+                        let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                        entries.push(MenuEntry::action("Used by", move || {
+                            used_by.set(Some(crate::UsedByTarget {
+                                database: db.clone(),
+                                schema: ns.clone(),
+                                name: tbl.clone(),
+                                column: None,
+                                routine: false,
+                            }));
                         }));
                     }
                     // Watch this table for row changes — the same action the
@@ -2718,6 +2748,17 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                             entries.push(
                                 MenuEntry::action_colored("Drop", theme::error, move || {
+                                    let used = crate::used_by_view::dependents_of(
+                                        ui.schema,
+                                        ui.conn,
+                                        &crate::UsedByTarget {
+                                            database: db.clone(),
+                                            schema: ns.clone(),
+                                            name: tbl.clone(),
+                                            column: None,
+                                            routine: false,
+                                        },
+                                    );
                                     // **Straight to the preview.** A confirm
                                     // asked first, and then the preview asked
                                     // again with Apply — the same question
@@ -2738,9 +2779,17 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         // warning are worded as a sequence's.
                                         object_drop_change(shape, materialized),
                                         |lines, w| {
-                                            schemaic_core::stats::drop_preview(
+                                            let (lines, mut w) = schemaic_core::stats::drop_preview(
                                                 lines, w, rows, shape,
-                                            )
+                                            );
+                                            // What it breaks, named before Apply
+                                            // rather than by the next error
+                                            // (`core::used_by`).
+                                            w.extend(
+                                                used.as_deref()
+                                                    .and_then(schemaic_core::used_by::drop_warning),
+                                            );
+                                            (lines, w)
                                         },
                                     );
                                 })
@@ -2763,6 +2812,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             column
                         )),
                     ));
+                    // What uses this column — the table's views, routines,
+                    // triggers and foreign keys that name it (`core::used_by`).
+                    {
+                        let used_by = import_ui.overlay.used_by;
+                        let (src, col) = (source.clone(), column.clone());
+                        entries.push(MenuEntry::action("Used by", move || {
+                            used_by.set(Some(crate::UsedByTarget {
+                                database: src.database.clone(),
+                                schema: src.schema.clone(),
+                                name: src.table.clone(),
+                                column: Some(col.clone()),
+                                routine: false,
+                            }));
+                        }));
+                    }
                     let read_only = conn_read_only(&connections, active_conn);
                     entries.push(MenuEntry::Separator);
                     let offers = field_entries(
@@ -8341,6 +8405,8 @@ fn ",
             "Copy name"
             | "Copy qualified name"
             | "Properties"
+            // A reading of the loaded schema, writing nothing.
+            | "Used by"
             | "Live monitor"
             | "ER diagram"
             // **Group 2, beside the ER diagram, and not the writing group.** A

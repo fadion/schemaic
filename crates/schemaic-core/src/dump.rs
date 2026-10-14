@@ -1611,8 +1611,9 @@ fn table_hold(t: &TableInfo, any_edge: bool, dialect: SqlDialect) -> Option<Hold
 ///
 /// Matched in code as a whole word ([`crate::intel::code_word_hits_in`]),
 /// with the qualifier in front of the hit read off rather than the name
-/// searched for twice, so `sales.emp` is not taken for `dbo.emp`.
-fn names_object(
+/// searched for twice, so `sales.emp` is not taken for `dbo.emp`. Shared with
+/// `used_by`, which asks the same question of every body in a schema.
+pub(crate) fn names_object(
     text: &str,
     code: &[bool],
     dialect: SqlDialect,

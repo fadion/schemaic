@@ -278,6 +278,9 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 ui.ddl,
                 &ui.schema_actions,
             )),
+            // What uses an object — a reading of the loaded schema, raised
+            // from the tree's menu beside Properties.
+            crate::used_by_view::used_by_overlay(ui.overlay, ui.schema, ui.conn),
             users_view::users_overlay(users_view::UsersCtx::new(
                 ui.conn,
                 ui.ddl,
@@ -534,6 +537,7 @@ fn workspace_modals_up(
     let mon_open = overlay.monitor_open;
     let erd_open = overlay.erd;
     let props_open = overlay.properties;
+    let used_by_open = overlay.used_by;
     let users_open = overlay.users;
     let vars_open = overlay.server_vars;
     let blob_open = blob.target;
@@ -550,6 +554,7 @@ fn workspace_modals_up(
         mon_open.get()
             || erd_open.get().is_some()
             || props_open.get().is_some()
+            || used_by_open.with(Option::is_some)
             || vars_open.with(Option::is_some)
             || blob_open.get().is_some()
             || (users_open.get().is_some()
@@ -715,6 +720,9 @@ mod modal_backdrop_gate {
         "account_editor.rs",
         "table_designer.rs",
         "trigger_editor.rs",
+        // In the layer's workspace group, after `properties.rs`, raised by
+        // `workspace_modals_up`'s `used_by_open` arm.
+        "used_by_view.rs",
         // In the layer's workspace group, raised by `workspace_modals_up`'s
         // `users_open.get().is_some()` arm.
         "users_view.rs",

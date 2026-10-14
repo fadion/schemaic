@@ -40,6 +40,8 @@ mod object_editor;
 mod overlays;
 mod plan_view;
 mod properties;
+mod used_by_view;
+pub use used_by_view::UsedByTarget;
 mod routine_editor;
 mod schema_tree;
 mod script_view;
@@ -6483,6 +6485,8 @@ pub struct OverlayUi {
     /// successful count is written into the loaded [`PropertiesState::Loaded`]'s
     /// `exact_rows` where the rest of the panel can read it.
     pub properties: RwSignal<Option<PropertiesTarget>>,
+    /// The *Used by* modal's object (`used_by_view`): `Some` opens it.
+    pub used_by: RwSignal<Option<UsedByTarget>>,
     pub properties_state: RwSignal<PropertiesState>,
     pub properties_counting: RwSignal<bool>,
     pub properties_count_err: RwSignal<Option<String>>,

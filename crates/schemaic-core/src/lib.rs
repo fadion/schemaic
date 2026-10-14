@@ -80,6 +80,7 @@ pub mod transcript;
 pub mod tx;
 pub mod typename;
 pub mod update;
+pub mod used_by;
 pub mod users;
 pub mod window_chrome;
 pub mod write_log;
