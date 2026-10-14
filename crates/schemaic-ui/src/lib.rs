@@ -5774,7 +5774,8 @@ pub struct ConnActions {
 #[derive(Clone, Copy)]
 pub struct HistoryUi {
     pub entries: RwSignal<Vec<HistoryEntry>>,
-    /// The panel's *All connections* toggle (`UiState::history_all_connections`).
+    /// The panel's *Current*/*All* switch, `true` on *All*
+    /// (`UiState::history_all_connections`).
     pub all_conns: RwSignal<bool>,
 }
 

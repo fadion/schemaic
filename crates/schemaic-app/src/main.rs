@@ -2985,7 +2985,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let server_vars_generation: RwSignal<u64> = RwSignal::new(0);
     // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
     let table_sizes = RwSignal::new(ui_state.show_table_sizes);
-    // The history panel's *All connections* toggle (`UiState::history_all_connections`).
+    // The history panel's *Current*/*All* switch (`UiState::history_all_connections`).
     let history_all_conns = RwSignal::new(ui_state.history_all_connections);
     // The schema tree's filter text, as it was left (see `UiState::schema_filter`).
     // The panel types into this signal directly.
@@ -8266,7 +8266,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // entry. Does NOT run the query.
     //
     // **Another connection's entry switches to it first** — the history
-    // panel's *All connections* lists them. The strip shows only the active
+    // panel's *All* tab lists them. The strip shows only the active
     // connection's tabs, so a tab placed on another would be active and
     // invisible at once; switching is the only correct way to reach it, as
     // `open_sql_file` does for a file already open on another connection.

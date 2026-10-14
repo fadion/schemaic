@@ -7,8 +7,8 @@
 //! tab (`open_query`). The title carries a trash-2 that clears the
 //! *current connection's* history, behind a confirm. The list is filtered from the app-wide
 //! `history.entries` signal by the active connection, so switching connections
-//! shows only that connection's queries — unless the title's *All connections*
-//! toggle is on, when every connection's rows are listed, each named for its
+//! shows only that connection's queries — unless the *All* tab under the
+//! title is selected, when every connection's rows are listed, each named for its
 //! connection and lexed in its dialect, and opening one switches to it.
 
 use std::rc::Rc;
@@ -74,7 +74,7 @@ pub(crate) fn history_panel(
     // Which lexer colours the previews. Filtered to the **active connection**,
     // every row on screen ran against it and its dialect is the right one for
     // all of them — the same memo the snippet library reads. See
-    // `ConnUi::dialect` for why it has to be tracked. With *All connections* on,
+    // `ConnUi::dialect` for why it has to be tracked. On the *All* tab,
     // each row is lexed in its own connection's dialect instead (`row_conn`).
     let dialect = conn.dialect;
     let all_conns = history.all_conns;
@@ -107,8 +107,8 @@ pub(crate) fn history_panel(
     // The dialect rides along for the same reason: switching connections normally
     // changes `visible` as well, but two connections with no history between them
     // both yield an empty list, and the memo would hold the rows at the previous
-    // engine's lexer. The *All connections* toggle too: when only the active
-    // connection has history, turning it on leaves `visible` the same, but the
+    // engine's lexer. The *Current*/*All* switch too: when only the active
+    // connection has history, choosing *All* leaves `visible` the same, but the
     // rows must still take their connection's name and lexer.
     //
     // `viewport` outlives the rebuilds: it belongs to the scroll, which stays.
@@ -226,39 +226,35 @@ pub(crate) fn history_panel(
         },
     )
     // Named for what it clears: a bare "Clear history" beside a filtered list —
-    // or beside every connection's, with *All connections* on — reads as "all
-    // of it", and it only ever clears the active connection's.
+    // or beside every connection's, with *All* on — reads as "all of it", and
+    // it only ever clears the active connection's.
     .tooltip(|| text("Clear this connection's history…").style(crate::widgets::tooltip_style));
-    // *All connections*: every connection's queries in one list, each row
-    // naming its connection. The trash keeps to the active connection either
-    // way — its tooltip and its confirm say so — so a toggle left on can never
-    // widen what a click deletes.
-    let all_toggle = crate::widgets::toggle_icon(
-        icons::DATABASE,
-        || true,
-        move || all_conns.get(),
-        move || all_conns.update(|on| *on = !*on),
-    )
-    .tooltip(move || {
-        text(if all_conns.get() {
-            "Showing every connection's queries — show this connection's only"
-        } else {
-            "Show every connection's queries"
-        })
-        .style(crate::widgets::tooltip_style)
-    });
-    let title_row = h_stack((
-        section_title("QUERY HISTORY"),
-        h_stack((all_toggle, trash)).style(|s| s.items_start().gap(theme::scaled(2.0))),
+    let title_row = h_stack((section_title("QUERY HISTORY"), trash))
+        .style(|s| s.width_full().flex_row().items_start().justify_between());
+    // *Current* / *All*: the active connection's queries, or every
+    // connection's in one list with each row naming its connection. The same
+    // tab bar, and the same spacing around it, as the activity panel's
+    // Sessions/Locks. The trash keeps to the active connection either way — its
+    // tooltip and its confirm say so — so *All* left on can never widen what a
+    // click deletes.
+    let scope_switch = container(crate::widgets::segmented_tabs(
+        vec![("Current", false), ("All", true)],
+        all_conns,
     ))
-    .style(|s| s.width_full().flex_row().items_start().justify_between());
+    .style(|s| {
+        s.padding_horiz(theme::scaled(12.0))
+            .padding_top(theme::scaled(4.0))
+            .flex_shrink(0.0_f32)
+    });
 
     v_stack((
         title_row,
-        // Same 5px above / 10px below the search box as the schema panel (≈15px
-        // each visually); spacers (not margins) so the flex-grow scroll's height
-        // stays exact (a sibling's vertical margin isn't subtracted → overflow).
-        empty().style(|s| s.height(theme::scaled(5.0)).flex_shrink(0.0_f32)),
+        scope_switch,
+        // 10px between the tab bar and the search box and 10px below it, as the
+        // activity panel spaces its own; spacers (not margins) so the flex-grow
+        // scroll's height stays exact (a sibling's vertical margin isn't
+        // subtracted → overflow).
+        empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
         history_search(search_input),
         empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
         scrolled,

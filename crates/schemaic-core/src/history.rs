@@ -676,7 +676,7 @@ pub fn palette_hits(
 }
 
 /// Does the history panel list `entry`? `scope` is the connection it is
-/// showing, or `None` for every connection (its *All connections* toggle);
+/// showing, or `None` for every connection (its *All* tab);
 /// then the search box's [`matches_query`].
 pub fn in_view(entry: &HistoryEntry, scope: Option<u64>, query: &str) -> bool {
     scope.is_none_or(|conn| entry.conn_id == conn) && matches_query(entry, query)

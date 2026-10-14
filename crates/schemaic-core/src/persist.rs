@@ -183,7 +183,7 @@ pub struct UiState {
     #[serde(default)]
     pub show_table_sizes: bool,
     /// The history panel lists every connection's queries rather than the
-    /// active one's (its *All connections* toggle). This window's, like the
+    /// active one's (its *All* tab). This window's, like the
     /// panel widths — not a portable setting.
     #[serde(default)]
     pub history_all_connections: bool,

@@ -10387,7 +10387,7 @@ existing prose was left alone.
     denylist would export it the day it lands. What travels is the themes and scale, the editor,
     formatting, the row limit and statement timeout, `confirm_writes`, `live_validate`,
     `notify_finished`, `restore_tabs` and the assistant's effort, instructions, schema scope and
-    gutter. What stays is the panel widths, the history panel's *All connections* toggle
+    gutter. What stays is the panel widths, the history panel's *Current | All* switch
     (`history_all_connections`) and the schema filter and visibility (this window's),
     the expanded and hidden sets and the activity intervals (keyed by connection ids, which differ
     per install), `ai_harness`, `ai_model` and `ai_cli_path` (they name what is installed *here*),
@@ -10544,8 +10544,8 @@ existing prose was left alone.
     `clip()` bound *paint*, not layout, so a multi-MB `INSERT` was laid out whole on every rebuild
     of the panel, but clamping what is drawn must not become a decision about what is findable.
     **`in_view(entry, scope, query)` is the panel's own question**: `scope` is the connection it
-    shows, `None` every connection (its *All connections* toggle), and then `matches_query` — so
-    the toggle widens which connections are listed and never what the search box matches
+    shows, `None` every connection (its *All* tab), and then `matches_query` — so
+    the switch widens which connections are listed and never what the search box matches
     (`the_panel_shows_one_connection_or_every_one_under_the_same_search`). With it on, the panel
     walks every connection's entries, so `MAX_PER_CONN` bounds that list per connection and not in
     total.
@@ -10553,7 +10553,7 @@ existing prose was left alone.
     that same filter**, so the palette finds a past statement exactly when the panel would: the
     indices of `conn_id`'s entries that `matches_query` accepts, newest first as the log is kept, at
     most `cap` (`PALETTE_HISTORY_CAP`, 20). **One connection's only** — the panel's scope with its
-    *All connections* toggle off, and the
+    *Current* tab, and the
     empty query's, since another connection's SQL, literals and all, has no business in this one's
     palette — and an entry whose `database` `visible` refuses is skipped, so a hidden database is
     gone from this tier as from every other; an entry with no database is kept. It waits for
@@ -23313,8 +23313,9 @@ existing prose was left alone.
     `scaled(3)` padding and gap), so it reads as a control of the same family as the search box it
     sits above. The active tab is filled in `btn_primary` (radius 4) with a `text` label and answers
     no hover — it is already where a click would go; the others are `text_dim` and a hover only
-    brightens them to `text`. Server Activity's *Sessions | Locks* is its one caller, replacing the
-    row of accent-underlined labels it drew before; `pill_tab_style`'s loose pills stay the look of
+    brightens them to `text`. Server Activity's *Sessions | Locks* was its first caller, replacing the
+    row of accent-underlined labels it drew before, and Query History's *Current | All* the second,
+    replacing an unlabelled icon toggle; `pill_tab_style`'s loose pills stay the look of
     a modal's section strip.
     **There is no `footer_button` any more.** Every modal with a footer bar wears the filled
     `action_button`, and the text-only button that sat beside it at a smaller padding left with the
@@ -24680,9 +24681,13 @@ existing prose was left alone.
     memo is tracked in the row `dyn_container`'s trigger tuple alongside `visible` and `search` —
     two connections that both have no history yield the same empty `visible`, and without it the
     rows would stay built with the previous engine's lexer.
-    **The title's *All connections* toggle lifts that filter** — `widgets::toggle_icon(
-    icons::DATABASE, …)` beside the trash, `HistoryUi::all_conns`, persisted as
-    `UiState::history_all_connections`. `visible` asks `history::in_view` with scope
+    **A *Current | All* switch under the title lifts that filter** — `widgets::segmented_tabs(
+    vec![("Current", false), ("All", true)], …)` on `HistoryUi::all_conns`, persisted as
+    `UiState::history_all_connections`, with the activity panel's Sessions/Locks spacing exactly
+    (`scaled(12)` side padding, `scaled(4)` from the title, `scaled(10)` spacers either side of the
+    search box). It replaced a `widgets::toggle_icon(icons::DATABASE, …)` beside the trash: an
+    unlabelled icon was poor at saying what it switched, and the monitor already had the tab bar
+    for exactly this. `visible` asks `history::in_view` with scope
     `(!all_conns).then(active_conn)`, and `all_conns` joins the trigger tuple. With it on, the
     reasoning above no longer holds — the rows on screen ran against several engines — so each row
     is lexed in its own connection's dialect (`SqlDialect::from_db_type` of that connection in
@@ -24691,7 +24696,7 @@ existing prose was left alone.
     `connections` is read untracked there, so a renamed connection relabels its rows at the next
     rebuild, not at once. **The trash keeps to the active connection either way** — its count is
     still `count_conn` of the active connection, and its tooltip and confirm say *this connection*
-    — so a toggle left on never widens what a click deletes. Opening another connection's row
+    — so *All* left on never widens what a click deletes. Opening another connection's row
     switches to it first (`open_history`, under `history_store.rs`).
     Its TODAY / THIS WEEK / EARLIER bands (`history::group_by_recency`, titled by `bucket.label()`)
     are laid out by `widgets::banded_list`, so their headers stick while their rows scroll. The
@@ -33216,7 +33221,7 @@ existing prose was left alone.
     panel's click, but what it does is open a *tab* from a `HistoryEntry`, so it needs the
     tab-id allocator and the placement closure and never touches this store; it is put into
     `HistoryActions` beside `clear` and `remove` at the `Ui` literal. **An entry from another
-    connection switches to that connection first** — the panel's *All connections* toggle lists
+    connection switches to that connection first** — the panel's *All* tab lists
     them, and the strip shows only the active connection's tabs, so a tab placed on another would
     be active and invisible at once. The switch goes through `switch_conn_late`, the `LateAction`
     the Open command takes for a file already open on another connection (`switch_conn` is defined
