@@ -380,8 +380,12 @@ pub fn phantom_shift(spans: &[(usize, usize)], col: usize) -> usize {
 /// editor pane answers every change with the `cache_rev` bump [`set_preview`]
 /// explains (hints are baked into each line's layout), and that bump throws
 /// away every cached line layout.
+///
+/// A pass can deliver after its pane unmounted (a connection switch while the
+/// worker ran), so a disposed `hints` takes nothing — `with_untracked` on it
+/// unwraps and panics.
 pub fn set_hints(hints: HintSignal, next: Vec<schemaic_core::intel::InlayHint>) {
-    if hints.with_untracked(|cur| cur == &next) {
+    if hints.try_with_untracked(|cur| cur.is_none_or(|cur| cur == &next)) {
         return;
     }
     hints.set(next);
@@ -909,6 +913,19 @@ mod tests {
             at,
             label: label.to_string(),
         }
+    }
+
+    /// A diagnostics pass can land after its pane is gone — switching the
+    /// connection unmounts the pane while a pass started by a schema arrival is
+    /// still on its worker. The hints it carries then have nowhere to go, and
+    /// publishing them is a no-op rather than an unwrap of a disposed signal,
+    /// which took the whole app down.
+    #[test]
+    fn hints_landing_after_their_pane_is_gone_are_dropped() {
+        let cx = floem::reactive::Scope::new();
+        let hints: HintSignal = cx.create_rw_signal(Vec::new());
+        cx.dispose();
+        set_hints(hints, vec![hint(3, "a")]);
     }
 
     /// A line's hints are the ones between its start and its end, at their

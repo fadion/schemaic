@@ -28163,6 +28163,10 @@ existing prose was left alone.
     `cache_rev`, since hints are baked into the cached line layouts (the Floem gotcha on phantom
     text); it skips its first run, and `inline_diff::set_hints` leaves an unchanged set unwritten, so
     a pass that finds nothing new discards no layout. Nothing gates them — there is no setting.
+    **The tab outliving its pane is the case the delivery's check misses**: `syntax` is the tab's,
+    `hints` the pane's, and a connection switch while the worker runs unmounts the pane and leaves
+    the tab. So `set_hints` reads with `try_with_untracked` and a disposed `hints` takes nothing —
+    `with_untracked` there unwrapped on the dead signal and crashed the app.
     **A failed run's squiggle is `run_diag`, a sibling of live validation's `db_diag`** rather than
     an entry in it, because validation `set`s `db_diag` whole and would wipe it. Every launch — the
     selection and lone-statement Ctrl+Enter, the run menu's two entries, the play button — records
