@@ -223,7 +223,7 @@ pub(crate) fn with_used_by(
     cs: &schemaic_core::ddl::ChangeSet,
 ) -> DdlPreview {
     if let Some(db) = crate::table_designer::loaded_schema(schema, &preview.database) {
-        preview.used_by = schemaic_core::used_by::change_warnings(&db, cs);
+        preview.used_by = schemaic_core::used_by::change_warnings(&db, cs, &preview.database);
     }
     preview
 }

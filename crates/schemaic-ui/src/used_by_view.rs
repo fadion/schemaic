@@ -73,6 +73,7 @@ pub(crate) fn dependents_of(
         &db,
         t.target(),
         conn.dialect.get_untracked(),
+        &t.database,
     ))
 }
 

@@ -11939,12 +11939,17 @@ pub fn publishes_index_ddl(dialect: SqlDialect) -> bool {
 /// than part of it. PostgreSQL's is a real namespace inside one database, and
 /// SQLite has neither.
 ///
-/// The question matters exactly once, and it is not cosmetic: comparing two
+/// It is not cosmetic. Comparing two
 /// databases holding the same schema, every table holding a foreign key differs
 /// on this field alone, and the migration re-points the left database's key at
 /// the right one. [`crate::compare::SchemaComparison::of`] subtracts each side's
 /// own address first, and asks this to know whether there is an address to
-/// subtract.
+/// subtract. The dump's plan and the schema's key walks (`follow_target`,
+/// `incoming_keys`, `referencing_target`) ask it too, and
+/// [`crate::used_by::used_by`] reads a qualifier equal to the database it was
+/// handed — in a key, or in a body, which the catalogue qualifies the same way
+/// — as that database: without it no MySQL view or key was ever found using
+/// anything, since the tables carry no namespace at all.
 ///
 /// An exhaustive `match`, for the reason [`supports_owners`] gives.
 pub fn ref_schema_is_database(dialect: SqlDialect) -> bool {
@@ -11964,7 +11969,7 @@ pub fn ref_schema_is_database(dialect: SqlDialect) -> bool {
 /// `pg_get_viewdef` rewrites too, but qualifies with the *schema*, which is part
 /// of the object rather than its address. SQLite stores the statement verbatim.
 ///
-/// Same consequence as [`ref_schema_is_database`] and the same one caller: two
+/// Same consequence as [`ref_schema_is_database`], asked by the comparison: two
 /// databases holding one view differ in every byte of that qualifier, and the
 /// `CREATE OR REPLACE VIEW` the comparison emits against the **left** database
 /// carries the right one's name into it — so the left view starts reading the

@@ -6002,10 +6002,13 @@ existing prose was left alone.
     `VIEWS.VIEW_DEFINITION` turns `CREATE VIEW v AS SELECT id FROM t` in `shop` into
     ``select `shop`.`t`.`id` AS `id` from `shop`.`t` ``, while `pg_get_viewdef` rewrites but
     qualifies with the *schema* and SQLite stores the statement verbatim. Both are exhaustive
-    `match`es, both have `compare::SchemaComparison::of` as their one caller, and the consequence of
+    `match`es, both are asked by `compare::SchemaComparison::of`, and the consequence of
     getting either wrong is written down where it lands: two identical databases differ in every
     object holding one, and the migration carries the right database's name into a statement that
-    runs against the left.
+    runs against the left. `ref_schema_is_database` is not the comparison's alone: `dump::plan`,
+    `schema::follow_target`, `incoming_keys` and `referencing_target` ask it too, and so does
+    `used_by::used_by`, which reads a qualifier equal to the database it was handed — in a key or in
+    a view body, which the catalogue qualifies the same way — as that database (under `used_by.rs`).
     **One more asks where a bare name resolves, which decides how a foreign key's target is
     *written*.** `bare_reference_is_own_namespace` asks whether a bare table name in a statement
     about a table resolves in that table's own namespace, so that a key whose
@@ -14393,7 +14396,7 @@ existing prose was left alone.
     triggers, events, foreign keys and table expressions that would break, or go with it, if it
     changed — behind the schema tree's *Used by* (`ui/used_by_view.rs`), a table Drop's preview
     warning, and the *Used by* block of a rename's or column edit's preview.
-    `used_by(schema, target, dialect) -> Vec<Dependent>` takes a `Target` —
+    `used_by(schema, target, dialect, database) -> Vec<Dependent>` takes a `Target` —
     `Relation { ns, name, column }` or `Routine { ns, name }` — and returns each `Dependent` with its
     `DependentKind` (`View`, `Routine`, `Trigger`, `Event`, `ForeignKey`, `Expression`), its name as
     the tree shows it (`schema::display_name`), a `detail` (the table a trigger or key is on, and the
@@ -14416,8 +14419,15 @@ existing prose was left alone.
     counts, and a dynamic-SQL string naming the object is not seen at all, which the modal says
     under every answer (`a_column_is_used_where_its_table_and_its_name_both_are`).
     **A foreign key is exact** — its `ref_table`, in its `ref_schema` or else its own table's
-    namespace, and for a column target its `ref_columns`. **A trigger is listed three ways**: one
-    *on* the table, with `goes_with_it`, since dropping the table drops it; one on another table
+    namespace, and for a column target its `ref_columns`.
+    **`database` is the one the schema was read from, and on MySQL it is the only qualifier there
+    is.** Where `ddl::ref_schema_is_database` says yes, the catalogue writes the database into every
+    view body (`` `shop`.`orders` ``) and into every key's `ref_schema`, while the tables themselves
+    carry no namespace — so until `used_by` was handed the database, no MySQL or MariaDB view or
+    foreign key was ever found using anything, in the modal, a drop's warning or a preview's *Used
+    by* block alike. A qualifier equal to `database` now counts as this database, and one naming
+    another database does not (`a_mysql_catalogue_qualifier_naming_this_database_is_a_use`).
+    **A trigger is listed three ways**: one *on* the table, with `goes_with_it`, since dropping the table drops it; one on another table
     whose body uses the target; and, for a routine target, a PostgreSQL trigger whose
     `TriggerAction::Function` names it — that name is emittable SQL, quoted and qualified outside
     `public`, so `function_is` unquotes it and reads the qualifier rather than comparing strings
@@ -14447,8 +14457,13 @@ existing prose was left alone.
     its new type."* — over the private `listing`, which `drop_warning` was factored onto with its
     text unchanged, so the `goes_with_it` rows drop out here too: a trigger on a table follows the
     table's rename on every engine (`the_change_warning_leaves_out_what_goes_with_the_object`).
-    `change_warnings(&DbSchema, &ChangeSet)` is the composition the preview calls, and it asks
-    **under the name before the plan** — the set's `table`, which is the server's name, or a
+    **A rename's sentence leaves foreign keys out too**, and a drop's or a retype's keeps them: a
+    key is held against the object, not its name, and was checked live to follow both a renamed
+    referenced table and a renamed referenced column on MariaDB, MySQL 8, PostgreSQL, SQL Server and
+    SQLite — so *"They still name orders after the rename"* was false of every key it listed
+    (`a_rename_does_not_claim_a_foreign_key_keeps_the_old_name`).
+    `change_warnings(&DbSchema, &ChangeSet, database)` is the composition the preview calls, and it
+    asks **under the name before the plan** — the set's `table`, which is the server's name, or a
     renamed routine's `from` — because the loaded schema still holds the old one and a dependent
     still names it (`a_plan_is_warned_about_by_what_uses_the_names_it_changes`,
     `a_routine_rename_asks_after_the_routine_by_its_old_name`). **A routine rename is seen only

@@ -131,7 +131,20 @@ impl Dependent {
 }
 
 /// Everything in `schema` that uses `target`, by kind, then name.
-pub fn used_by(schema: &DbSchema, target: Target, dialect: SqlDialect) -> Vec<Dependent> {
+///
+/// `database` is the one `schema` was read from. Where a qualifier names a
+/// database rather than a schema inside it (MySQL — [`ref_schema_is_database`]),
+/// the catalogue writes it into every view body and every key's `ref_schema`,
+/// while the tables themselves carry no namespace at all; a qualifier equal to
+/// `database` is therefore this database, and one naming any other is not.
+///
+/// [`ref_schema_is_database`]: crate::ddl::ref_schema_is_database
+pub fn used_by(
+    schema: &DbSchema,
+    target: Target,
+    dialect: SqlDialect,
+    database: &str,
+) -> Vec<Dependent> {
     let same_ns = |a: Option<&str>, b: Option<&str>| match (a, b) {
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
         (None, None) => true,
@@ -144,13 +157,17 @@ pub fn used_by(schema: &DbSchema, target: Target, dialect: SqlDialect) -> Vec<De
         Target::Relation { column, .. } => column,
         Target::Routine { .. } => None,
     };
+    // A qualifier names a database here, and the tables carry none: the
+    // database's own name in front of the target is the target.
+    let qualifier_is_database = crate::ddl::ref_schema_is_database(dialect);
     // Does `text`, written in `own`, use the target?
     let uses = |text: &str, own: Option<&str>| -> bool {
         if text.is_empty() {
             return false;
         }
         let code = crate::intel::code_mask(text, dialect);
-        crate::dump::names_object(text, &code, dialect, own, t_ns, t_name)
+        let names = |ns| crate::dump::names_object(text, &code, dialect, own, ns, t_name);
+        (names(t_ns) || (qualifier_is_database && t_ns.is_none() && names(Some(database))))
             && column.is_none_or(|c| !crate::intel::code_word_hits_in(text, &code, c).is_empty())
     };
     let mut out = Vec::new();
@@ -191,7 +208,10 @@ pub fn used_by(schema: &DbSchema, target: Target, dialect: SqlDialect) -> Vec<De
         }
         if let Target::Relation { .. } = target {
             for fk in &t.foreign_keys {
-                let ref_ns = fk.ref_schema.as_deref().or(own);
+                let ref_ns = match fk.ref_schema.as_deref() {
+                    Some(db) if qualifier_is_database && db.eq_ignore_ascii_case(database) => own,
+                    named => named.or(own),
+                };
                 let onto = same_ns(ref_ns, t_ns) && fk.ref_table.eq_ignore_ascii_case(t_name);
                 let on_column =
                     column.is_none_or(|c| fk.ref_columns.iter().any(|r| r.eq_ignore_ascii_case(c)));
@@ -343,6 +363,20 @@ pub fn touched(changes: &[crate::ddl::Change]) -> Vec<Touch> {
 /// What goes with the object is left out as [`drop_warning`] leaves it: a
 /// trigger on a table follows the table's rename on every engine.
 pub fn change_warning(touch: &Touch, object: &str, deps: &[Dependent]) -> Option<String> {
+    // A key follows a rename of what it points at on every engine — the server
+    // holds it against the object, not the name — so a rename leaves it whole.
+    let kept: Vec<Dependent>;
+    let deps = match touch.kind {
+        TouchKind::Rename => {
+            kept = deps
+                .iter()
+                .filter(|d| d.kind != DependentKind::ForeignKey)
+                .cloned()
+                .collect();
+            &kept[..]
+        }
+        TouchKind::Drop | TouchKind::Retype => deps,
+    };
     let listed = listing(deps)?;
     let (subject, name) = match &touch.column {
         Some(c) => (format!("Column {c}"), c.as_str()),
@@ -360,7 +394,12 @@ pub fn change_warning(touch: &Touch, object: &str, deps: &[Dependent]) -> Option
 /// renames, drops or retypes ([`touched`]) that something in `schema` uses,
 /// asked under the name **before** the plan — the server's, which is the
 /// set's `table`, or a renamed routine's `from`. Empty when nothing does.
-pub fn change_warnings(schema: &DbSchema, plan: &crate::ddl::ChangeSet) -> Vec<String> {
+/// `database` is the one `schema` was read from, as [`used_by`] takes it.
+pub fn change_warnings(
+    schema: &DbSchema,
+    plan: &crate::ddl::ChangeSet,
+    database: &str,
+) -> Vec<String> {
     use crate::ddl::Change;
     let routine = plan.changes.iter().find_map(|c| match c {
         Change::RenameRoutine { from, .. } => Some(from),
@@ -382,7 +421,7 @@ pub fn change_warnings(schema: &DbSchema, plan: &crate::ddl::ChangeSet) -> Vec<S
                     column: t.column.as_deref(),
                 },
             };
-            change_warning(t, &shown, &used_by(schema, target, plan.dialect))
+            change_warning(t, &shown, &used_by(schema, target, plan.dialect, database))
         })
         .collect()
 }
@@ -499,10 +538,74 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            names(&used_by(&schema, rel("orders"), MY)),
+            names(&used_by(&schema, rel("orders"), MY, "shop")),
             [
                 (DependentKind::View, "big_orders"),
                 (DependentKind::Routine, "archive"),
+                (DependentKind::ForeignKey, "fk_lines_order"),
+            ]
+        );
+    }
+
+    /// What MySQL's catalogue actually hands back: a view body rewritten as
+    /// `` `shop`.`orders` `` (`ddl::view_definition_is_qualified`) and a key's
+    /// `ref_schema` holding the database (`ddl::ref_schema_is_database`), while
+    /// the tables themselves have no namespace. Both name the database the
+    /// schema was read from, so both are uses; the same spelling naming
+    /// another database is not.
+    #[test]
+    fn a_mysql_catalogue_qualifier_naming_this_database_is_a_use() {
+        let mut child = table("order_lines");
+        child.foreign_keys.push(ForeignKeyInfo {
+            name: "fk_lines_order".into(),
+            columns: vec!["order_id".into()],
+            ref_schema: Some("shop".into()),
+            ref_table: "orders".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        });
+        let mut elsewhere = table("archive_lines");
+        elsewhere.foreign_keys.push(ForeignKeyInfo {
+            name: "fk_archive_order".into(),
+            columns: vec!["order_id".into()],
+            ref_schema: Some("archive".into()),
+            ref_table: "orders".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        });
+        let schema = DbSchema {
+            tables: vec![
+                table("orders"),
+                child,
+                elsewhere,
+                view(
+                    "totals",
+                    "select `shop`.`orders`.`id` AS `id` from `shop`.`orders`",
+                ),
+                view(
+                    "old_totals",
+                    "select `archive`.`orders`.`id` AS `id` from `archive`.`orders`",
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            names(&used_by(&schema, rel("orders"), MY, "shop")),
+            [
+                (DependentKind::View, "totals"),
+                (DependentKind::ForeignKey, "fk_lines_order"),
+            ]
+        );
+        // A column of it, through the same qualified spelling.
+        let id = Target::Relation {
+            ns: None,
+            name: "orders",
+            column: Some("id"),
+        };
+        assert_eq!(
+            names(&used_by(&schema, id, MY, "shop")),
+            [
+                (DependentKind::View, "totals"),
                 (DependentKind::ForeignKey, "fk_lines_order"),
             ]
         );
@@ -528,7 +631,7 @@ mod tests {
             tables: vec![orders, lines],
             ..Default::default()
         };
-        let got = used_by(&schema, rel("orders"), MY);
+        let got = used_by(&schema, rel("orders"), MY, "shop");
         assert_eq!(
             names(&got),
             [
@@ -560,13 +663,13 @@ mod tests {
             name: "emp",
             column: None,
         };
-        assert!(used_by(&schema, hr_emp, PG).is_empty());
+        assert!(used_by(&schema, hr_emp, PG, "app").is_empty());
         let sales_emp = Target::Relation {
             ns: Some("sales"),
             name: "emp",
             column: None,
         };
-        assert_eq!(names(&used_by(&schema, sales_emp, PG)).len(), 2);
+        assert_eq!(names(&used_by(&schema, sales_emp, PG, "app")).len(), 2);
     }
 
     #[test]
@@ -594,14 +697,14 @@ mod tests {
             column: Some(c),
         };
         assert_eq!(
-            names(&used_by(&schema, col("code"), MY)),
+            names(&used_by(&schema, col("code"), MY, "shop")),
             [
                 (DependentKind::View, "by_code"),
                 (DependentKind::ForeignKey, "fk_code"),
             ]
         );
         assert_eq!(
-            names(&used_by(&schema, col("total"), MY)),
+            names(&used_by(&schema, col("total"), MY, "shop")),
             [(DependentKind::View, "by_total")]
         );
     }
@@ -636,7 +739,7 @@ mod tests {
             name: "valid_sku",
         };
         assert_eq!(
-            names(&used_by(&schema, target, PG)),
+            names(&used_by(&schema, target, PG, "app")),
             [
                 (DependentKind::View, "skus"),
                 (DependentKind::Routine, "caller"),
@@ -808,6 +911,49 @@ mod tests {
         );
     }
 
+    /// A foreign key is held by the server against the object, not its name:
+    /// renaming the table it points at, or the column, re-points the key on
+    /// every engine (checked live on MariaDB, MySQL 8, PostgreSQL, SQL Server
+    /// and SQLite). So a rename does not leave a key naming the old name, and
+    /// saying it does was false. A drop or a retype still reaches the key.
+    #[test]
+    fn a_rename_does_not_claim_a_foreign_key_keeps_the_old_name() {
+        let d = |kind, name: &str| Dependent::new(kind, name.into(), "");
+        let fk_only = vec![d(DependentKind::ForeignKey, "fk_lines")];
+        let rename = |column: Option<&str>, deps: &[Dependent]| {
+            change_warning(
+                &Touch {
+                    column: column.map(Into::into),
+                    kind: TouchKind::Rename,
+                },
+                "orders",
+                deps,
+            )
+        };
+        assert_eq!(rename(None, &fk_only), None);
+        assert_eq!(rename(Some("id"), &fk_only), None);
+        let both = vec![
+            d(DependentKind::View, "v"),
+            d(DependentKind::ForeignKey, "fk_lines"),
+        ];
+        assert_eq!(
+            rename(None, &both).as_deref(),
+            Some("orders is used by 1 view: v. They still name orders after the rename.")
+        );
+        let drop = change_warning(
+            &Touch {
+                column: None,
+                kind: TouchKind::Drop,
+            },
+            "orders",
+            &fk_only,
+        );
+        assert_eq!(
+            drop.as_deref(),
+            Some("orders is used by 1 foreign key: fk_lines. They break when it is dropped.")
+        );
+    }
+
     fn plan(table: &str, changes: Vec<Change>) -> crate::ddl::ChangeSet {
         crate::ddl::ChangeSet {
             table: table.into(),
@@ -841,7 +987,8 @@ mod tests {
         assert_eq!(
             change_warnings(
                 &schema,
-                &plan("orders", vec![Change::RenameTable { to: "o2".into() }])
+                &plan("orders", vec![Change::RenameTable { to: "o2".into() }]),
+                "shop"
             ),
             vec![
                 "orders is used by 2 views and 1 routine: big, ids, cap. \
@@ -856,7 +1003,8 @@ mod tests {
                 &plan(
                     "orders",
                     vec![alter(col("total", "int"), col("amount", "int"))]
-                )
+                ),
+                "shop"
             ),
             vec![
                 "Column total is used by 1 view and 1 routine: big, cap. \
@@ -867,7 +1015,8 @@ mod tests {
         assert_eq!(
             change_warnings(
                 &schema,
-                &plan("orders", vec![alter(col("id", "int"), col("id", "bigint"))])
+                &plan("orders", vec![alter(col("id", "int"), col("id", "bigint"))]),
+                "shop"
             ),
             vec![
                 "Column id is used by 2 views: big, ids. Check them against its new type."
@@ -878,11 +1027,12 @@ mod tests {
         assert!(
             change_warnings(
                 &schema,
-                &plan("ids", vec![Change::RenameView { to: "x".into() }])
+                &plan("ids", vec![Change::RenameView { to: "x".into() }]),
+                "shop"
             )
             .is_empty()
         );
-        assert!(change_warnings(&schema, &plan("orders", vec![])).is_empty());
+        assert!(change_warnings(&schema, &plan("orders", vec![]), "shop").is_empty());
     }
 
     #[test]
@@ -908,7 +1058,8 @@ mod tests {
                         from,
                         to: "calc2".into()
                     }]
-                )
+                ),
+                "shop"
             ),
             vec![
                 "calc is used by 1 routine: caller. They still name calc after the rename."
