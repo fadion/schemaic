@@ -4110,6 +4110,9 @@ pub(crate) struct GridCtx {
     /// The *Chart* modal's target (`OverlayUi::chart`), which the strip's
     /// chart icon sets to this result.
     pub(crate) chart: RwSignal<Option<crate::ChartTarget>>,
+    /// The *Compare results* modal's pair (`OverlayUi::result_diff`), which a
+    /// result chip's *Compare with* sets.
+    pub(crate) result_diff: RwSignal<Option<crate::DiffTarget>>,
     /// `ROLLBACK` another tab's transaction — the wait note's one-click way out
     /// when exactly one transaction of the user's own could be the holder.
     pub(crate) rollback_tx: Rc<dyn Fn(usize)>,

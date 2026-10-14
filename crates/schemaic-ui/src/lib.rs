@@ -44,6 +44,8 @@ mod used_by_view;
 pub use used_by_view::UsedByTarget;
 mod chart_view;
 pub use chart_view::ChartTarget;
+mod result_diff_view;
+pub use result_diff_view::DiffTarget;
 mod routine_editor;
 mod schema_tree;
 mod script_view;
@@ -6491,6 +6493,9 @@ pub struct OverlayUi {
     pub used_by: RwSignal<Option<UsedByTarget>>,
     /// The result the *Chart* modal draws (`chart_view`): `Some` opens it.
     pub chart: RwSignal<Option<ChartTarget>>,
+    /// The two results *Compare results* diffs (`result_diff_view`): `Some`
+    /// opens it.
+    pub result_diff: RwSignal<Option<DiffTarget>>,
     pub properties_state: RwSignal<PropertiesState>,
     pub properties_counting: RwSignal<bool>,
     pub properties_count_err: RwSignal<Option<String>>,
@@ -9378,6 +9383,7 @@ fn center(ui: Ui) -> impl IntoView {
                     // still reports into it rather than onto a disposed signal.
                     export_modal: ui.export,
                     chart: ui.overlay.chart,
+                    result_diff: ui.overlay.result_diff,
                     tx_holders: {
                         // Answered when a write has been waiting a while, not at
                         // build time: the user can open (or end) a transaction in
@@ -10194,6 +10200,55 @@ fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
     // with the same entry: the pin above it is the way to get it back.
     if resultsel::can_close(&refs, id) {
         entries.push(MenuEntry::action("Close", move || tab.close_panels(&[id])));
+    }
+    // **Compare with** each other result of this tab that has rows — a kept
+    // one against a fresh run, or two kept ones (`result_diff_view`). The one
+    // that ran first is the left side, so "added" means added since.
+    let loaded = |p: &ResultPanel| match &p.state {
+        QueryState::Loaded(rs) if rs.affected.is_none() => Some(rs.clone()),
+        _ => None,
+    };
+    type Side = (Arc<schemaic_core::model::ResultSet>, String, u64);
+    let (this, others_loaded): (Option<Side>, Vec<Side>) = tab.result_tabs.with_untracked(|v| {
+        let this = v
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| Some((loaded(p)?, p.label.clone(), p.ran_at)));
+        let others = v
+            .iter()
+            .filter(|p| p.id != id)
+            .filter_map(|p| Some((loaded(p)?, p.label.clone(), p.ran_at)))
+            .collect();
+        (this, others)
+    });
+    if let Some(this) = this
+        && !others_loaded.is_empty()
+    {
+        entries.push(MenuEntry::Separator);
+        for other in others_loaded {
+            let shown: String = if other.1.chars().count() > 40 {
+                format!("{}…", other.1.chars().take(39).collect::<String>())
+            } else {
+                other.1.clone()
+            };
+            let (a, b) = if other.2 < this.2 {
+                (other, this.clone())
+            } else {
+                (this.clone(), other)
+            };
+            let target = gctx.result_diff;
+            entries.push(MenuEntry::action(
+                format!("Compare with {shown}"),
+                move || {
+                    target.set(Some(DiffTarget {
+                        left: a.0.clone(),
+                        left_label: a.1.clone(),
+                        right: b.0.clone(),
+                        right_label: b.1.clone(),
+                    }));
+                },
+            ));
+        }
     }
     entries.push(MenuEntry::Separator);
     let others = resultsel::others_to_close(&refs, id);

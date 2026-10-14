@@ -284,6 +284,8 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             // A chart of the result on screen — raised from the results
             // strip, a reading like the properties modal above it.
             crate::chart_view::chart_overlay(ui.overlay),
+            // Two results' differences — raised from a result chip's menu.
+            crate::result_diff_view::result_diff_overlay(ui.overlay),
             users_view::users_overlay(users_view::UsersCtx::new(
                 ui.conn,
                 ui.ddl,
@@ -527,8 +529,9 @@ pub(crate) fn ddl_editors_up(d: DdlUi) -> impl Fn() -> bool + Copy + 'static {
     }
 }
 
-/// The workspace group's modals — Live Monitor, the ER diagram, Properties, the
-/// Server variables viewer, the binary-cell panel, and the two that are not simply open or closed: the Users
+/// The workspace group's modals — Live Monitor, the ER diagram, Properties,
+/// Used by, Chart, Compare results, the Server variables viewer, the
+/// binary-cell panel, and the two that are not simply open or closed: the Users
 /// and privileges browser, and schema compare. Both of those raise something
 /// painted in an earlier group and so stop counting while it is up. See the
 /// note in the body.
@@ -542,6 +545,7 @@ fn workspace_modals_up(
     let props_open = overlay.properties;
     let used_by_open = overlay.used_by;
     let chart_open = overlay.chart;
+    let diff_open = overlay.result_diff;
     let users_open = overlay.users;
     let vars_open = overlay.server_vars;
     let blob_open = blob.target;
@@ -560,6 +564,7 @@ fn workspace_modals_up(
             || props_open.get().is_some()
             || used_by_open.with(Option::is_some)
             || chart_open.with(Option::is_some)
+            || diff_open.with(Option::is_some)
             || vars_open.with(Option::is_some)
             || blob_open.get().is_some()
             || (users_open.get().is_some()
@@ -675,6 +680,9 @@ mod modal_backdrop_gate {
         // In the layer's workspace group, after `used_by_view.rs`, raised by
         // `workspace_modals_up`'s `chart_open` arm.
         "chart_view.rs",
+        // In the layer's workspace group, after `chart_view.rs`, raised by
+        // `workspace_modals_up`'s `diff_open` arm.
+        "result_diff_view.rs",
         // In the layer's DDL group, sharing `snippet_edit.rs`'s tuple element,
         // raised by `ddl_modals_up`'s `alias_rename` arm.
         "alias_rename.rs",

@@ -445,6 +445,37 @@ existing prose was left alone.
     stand on it — that is the caller's to do. `tick_label(v)` prints at most two decimals with
     trailing zeros dropped, `-0` as `0`, and shortens `≥ 1e4`/`1e6`/`1e9` to `k`/`m`/`b`
     (`tick_labels_drop_noise_and_shorten_large_values`).
+  - `result_diff.rs` — **what two results differ by**, behind a result chip's *Compare with*
+    (`ui/result_diff_view.rs`): the rows one has that the other has not, and the rows both have
+    with different values, matched by a key the user picks. Pure over two `ResultSet`s and over
+    the rows already read, like `chart.rs` above — a capped result is compared up to its cap, and
+    the modal says so. **Columns are matched by name**: `shared_columns(left, right)` is the
+    compared set, in the left's order, and a column only one side has goes to `only_left` /
+    `only_right` and is reported rather than failing the comparison.
+    `diff(left, right, key)` → `ResultDiff { shared, only_left, only_right, left_only, right_only,
+    changed: Vec<Changed { left, right, columns }>, same, repeated_keys }` — `left_only` being the
+    *removed* rows and `right_only` the *added* ones, so which result goes on which side is the
+    caller's decision and decides the words. **Keyed**, a row is matched by its key columns'
+    values; **a key repeated within one side** is counted in `repeated_keys` and its later rows
+    ignored, the first kept, because the diff can only say which row a key names when it names one
+    (`a_repeated_key_is_counted_and_its_later_rows_ignored`). **A key with a NULL in it names no
+    row**, as in SQL: such a row matches nothing and is its own side's alone, and is not counted as a
+    repeat (`a_null_key_matches_nothing`). **With an empty key
+    the whole shared row is the identity, as a multiset**: a row is in both or in one, never
+    *changed*, and one repeated n times on one side and m on the other is |n − m| rows added or
+    removed (`without_a_key_rows_are_counted_as_a_multiset`) — the honest answer for a result with
+    nothing that identifies a row. A key column one side lacks is `DiffError::MissingKey`
+    (`a_key_one_side_lacks_is_refused`).
+    **Values compare by their displayed text, NULL being its own value**, so `1` and `1.0` from two
+    engines differ, as they would on screen, and NULL is not `''`
+    (`null_is_its_own_value_and_text_compares_as_shown`). `is_identical` and `summary` give the
+    headline — *"3 added, 1 removed, 2 changed, 40 the same"*, a zero count left out, or *"No
+    differences — N rows the same"*. `suggested_key` is where the picker starts: a shared column
+    named `id` in any case, else the first shared column unique and never NULL on both sides, else
+    none, the whole row (`the_suggested_key_is_id_else_a_unique_column_else_the_row`).
+    `row_line(rs, row)` prints a row as `name = value · …` and `change_line(left, right, key,
+    changed)` a changed one as `id = 3 · qty: 7 → 9`, both with `NULL` for a null and each value cut
+    at 40 characters — the cut is the line's only; the comparison reads the whole value.
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
@@ -22904,7 +22935,8 @@ existing prose was left alone.
     signals, and the two must not be able to disagree. **The Server variables viewer, mounted
     directly after the browser, is the contrast**: it raises nothing, so `vars_open` is a plain term
     and counts whenever the viewer is open. The *Used by* modal, mounted after Properties, is the
-    same plain term (`used_by_open`), and so is the *Chart* modal mounted after it (`chart_open`).
+    same plain term (`used_by_open`), and so are the *Chart* modal mounted after it (`chart_open`)
+    and *Compare results* after that (`diff_open`).
     **Schema compare, the group's seventh member, takes the same `preview_open` clause — and there for
     the rule rather than for a case.** It raises the DDL preview too, painted in the earlier DDL
     group, so a wrapper that went on filling the layer would sit on top of it exactly as above. What
@@ -24677,6 +24709,33 @@ existing prose was left alone.
     themable-colour invariant gives.
     Mounted in the workspace group directly after `used_by_overlay`, counted by
     `workspace_modals_up` as a plain term (`chart_open`) — it raises nothing — and on
+    `modal_backdrop_gate::PAINTS_A_BACKDROP`.
+  - `result_diff_view.rs` — the **Compare results** modal (`result_diff_overlay`): two results of
+    one tab as their differences, over `core::result_diff`, opened by setting `overlay.result_diff`
+    to a `DiffTarget { left, left_label, right, right_label }` (re-exported as
+    `schemaic_ui::DiffTarget`; the app creates the signal beside `chart`, and `lib.rs` hands it to
+    the grid as `GridCtx::result_diff`) from a result chip's *Compare with* (*The results strip*).
+    The left is the earlier result, so its rows are the *removed* ones. Of the two results **as they
+    were read** — a kept one is a snapshot, a live one is what its panel held when the menu opened —
+    and of their rows only: nothing is fetched. Read-only like *Chart*, 820 wide: a title, the
+    controls, the body, a footer of **Close**, and Escape and the backdrop closing it. Unlike
+    *Chart* it is keyed on whether it is open, not on the pair, which holds only because nothing
+    can set a second pair while it stands — the chip menu that raises it is under its backdrop.
+    **One picker, *Match rows by*** — *Whole row* or any shared column, a
+    `table_designer::focusable_owned_dropdown`, tab 10, starting on `result_diff::suggested_key` —
+    and beside it the two labels as *left → right*. It picks **one** column; the core takes a
+    composite key, which nothing here offers yet. The body is a `dyn_container` keyed on the pick,
+    so each pick re-runs `diff` over every row read, on the UI thread: the summary; faint notes for
+    the columns only one side has, the repeated keys left out, and a capped result (*"rows past its
+    cap are not compared"*); then up to `SHOWN` (500) lines per section through
+    `widgets::fact_section_owned` — *Added (n)*, `+ ` and the right's `row_line`, in
+    `theme::grid_edit_staged`; *Removed (n)*, `− ` and the left's, in `theme::error`; *Changed (n)*,
+    `~ ` and `change_line`, in `theme::text` — with *"and N more"* past it, in a scroll capped at
+    `modal_body_h(440)`. A key one side lacks is `DiffError::MissingKey`'s sentence in the error
+    colour in place of the body. The lines are monospaced and every colour is a `fn() -> Color`
+    read in the style, as the themable-colour invariant asks.
+    Mounted in the workspace group directly after `chart_overlay`, counted by
+    `workspace_modals_up` as a plain term (`diff_open`) — it raises nothing — and on
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
     It lists the server's accounts, shows one account's privileges, and is where the five write
@@ -39153,6 +39212,16 @@ changing, the "before" is simply gone. Right-click a chip for Pin/Unpin, Close, 
 Close all results; the pinned block sits at the front in pin order, a pinned chip shows a pin where
 its × would be, and "Close all" spares the pins — the query strip's rules, restated in
 `core::resultsel` and applied by `Tab::begin_run` / `set_pinned` / `close_panels`.
+**The comparison itself is a menu entry too.** On a chip whose panel is `Loaded` with a result set
+(`affected.is_none()` — a statement's *N rows affected* has nothing to compare; a 0-row result is
+offered too, unlike the toolbar's menus), `result_chip_menu`
+adds, after Pin and Close and behind a separator, one *Compare with <label>* per other such panel
+of the tab, the label cut at 40 characters. Whichever of the two ran first (`ResultPanel::ran_at`)
+is the left side, so *added* means added since, whichever chip was right-clicked. The panels are
+read **once, when the menu opens**, and each entry captures its pair of `Arc<ResultSet>`s — the
+opposite of *Close other results* below it, which asks again at the click. The entry sets
+`GridCtx::result_diff` and raises *Compare results* (`result_diff_view.rs`, over
+`core::result_diff`).
 
 - **A pinned result is frozen, and this is a safety rule rather than a nicety.** `ResultPanel::frozen`
   is asked by exactly two things, and everything else follows from them. It empties the **edit

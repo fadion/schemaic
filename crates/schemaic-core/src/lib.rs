@@ -54,6 +54,7 @@ pub mod propose;
 pub mod quickinfo;
 pub mod rank;
 pub mod resource;
+pub mod result_diff;
 pub mod resultsel;
 pub mod rowjson;
 pub mod schema;
