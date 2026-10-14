@@ -4577,9 +4577,10 @@ existing prose was left alone.
     `neither_note_points_at_an_empty_sibling`, which asserts the `.part` sentence appears exactly
     where `writes_incrementally` says and that the *destination survived* half is said either way.
     **`part_file(path)` is `part_path` over a whole path** — the sibling with the suffix on its file
-    name, a path with no file name coming back unchanged for the create to refuse — lifted from the
-    app's `dump::part_of` so that `schemaic export`, a crate with no access to the app, builds its
-    file under the same spelling the app does; `part_of` now delegates to it
+    name, a path with no file name coming back unchanged for the create to refuse — lifted from
+    `dump::part_of`, then the app's, so that `schemaic export`, a crate with no access to the app,
+    builds its file under the same spelling the app does; `part_of` (now `cli/dump.rs`'s) delegates
+    to it
     (`a_file_is_built_beside_itself_under_part`). `ExportFormat::from_name` and `for_path` are the
     other half of that command's needs: a format named by any of its `extensions()` or its
     `label()`, case-insensitively and with a leading dot ignored — so `excel` and `htm` both resolve
@@ -5081,19 +5082,19 @@ existing prose was left alone.
     `same_connection` because `db_nodes` holds only the **active** connection's databases — nothing
     compared them, so switching connection discarded a hand-built mapping. Pure + unit-tested.
   - `core/dump.rs` — the **schema + data dump**: what one replayable `.sql` file holds and in what
-    order, as a `DumpPlan` of `DumpStep::Text`/`DumpStep::Rows` that `schemaic-app`'s `dump.rs`
-    executes. It writes nothing and connects to nothing, so every decision in it is unit-tested.
+    order, as a `DumpPlan` of `DumpStep::Text`/`DumpStep::Rows` that `cli/dump.rs` executes for
+    both the app's modal and `schemaic dump`. It writes nothing and connects to nothing, so every decision in it is unit-tested.
     **The interface calls this *Export*; the code calls it a dump, and the split is deliberate.**
     `export` is already taken in this crate by `crate::export`, which renders *one result set* to a
     file — a different feature with different inputs, and a reader who meets `export` in
     `schemaic-core` should be able to assume the grid one. So the menu entries, the modal's title and
-    its primary button all say Export, while `dump_run`, `DumpPlan` and `app::dump` keep the code
+    its primary button all say Export, while `dump_run`, `DumpPlan` and `cli::dump` keep the code
     name; the module doc is where the two vocabularies are reconciled, and it is what to read before
     "fixing" a `dump_` name that sits behind a menu called Export.
     **It joins the emitters that already existed.** Structure is `TableInfo::create_ddl_holding`
     (`create_ddl` split around the rows, which routes a view on to `ddl::view_ddl`), the closing
     constraints are a `ddl::ChangeSet` of `Change::AddForeignKey` through `ChangeSet::emit` — the
-    emitter the apply path uses — and the rows are `dump::render_rows`, streamed by the app, which
+    emitter the apply path uses — and the rows are `dump::render_rows`, streamed by `cli/dump.rs`, which
     shares `export::export_inserts_ending` with the grid's SQL export: on MySQL, PostgreSQL and
     SQLite the two write the same statements, while on SQL Server each `INSERT` closes its own
     `GO` batch and binary, CLR and variant columns go out as the literals the server rendered,
@@ -5202,7 +5203,7 @@ existing prose was left alone.
     `close_batches` runs over the finished plan wherever `SqlDialect::batch_separator` is true —
     SQL Server — and ends each `Text` step that is more than comments with a `GO` line, unless its
     last line already is one (`ddl::client_script`'s trigger text carries its own). **A `Rows` step
-    closes its own batches, one per `INSERT`**: `dump::render_rows` is the renderer the app's writer
+    closes its own batches, one per `INSERT`**: `dump::render_rows` is the renderer the driver's writer
     runs for every such step (through `export::export_inserts_ending`, which ends each statement
     `;\nGO\n` there), where the step used to share one `GO` placed after it. SQL Server refuses a
     batch past 65,536 network packets — 256 MB at the default size — so a `sqlcmd` restore of a
@@ -5220,7 +5221,7 @@ existing prose was left alone.
     whose computed column, check and default call the function, a disabled check and key and an
     untrusted check over violating rows, more rows than one `INSERT` carries, `float`/`real`
     extremes and `datetime`/`smalldatetime`/`datetime2`/`date`/`decimal`/Unicode values is dumped,
-    its rows rendered through `render_rows` as the app's writer renders them, split and replayed
+    its rows rendered through `render_rows` as the driver's writer renders them, split and replayed
     through `run_script` into an empty database under `SET LANGUAGE british`, then replayed a second
     time onto that copy; each time one query per side (a debug build's poll frame grows with every
     `await`, and the fixture overflowed a 2 MiB test thread) must read back the same rows,
@@ -5557,7 +5558,7 @@ existing prose was left alone.
     of the files the export was going to replace, the ones it actually has — and it counts a `.part`
     as destroyed **with its published sibling**, since the rename that publishes `orders.csv` is what
     consumes `orders.csv.part`; a fragment whose table the run never reached is still sitting there
-    and is not named. See `app/dump.rs` for the two contradictory sentences that made it necessary.
+    and is not named. See `cli/dump.rs` for the two contradictory sentences that made it necessary.
     **`Listing`/`PickerBody`/`picker_body` are here for that same reason** — what the table picker
     says when it has no rows is a decision, and it was a `bool` plus an `if` in the view that told a
     failed read from an empty database wrongly. `dump_view.rs`'s entry has the bug in full.
@@ -14805,7 +14806,7 @@ existing prose was left alone.
     complaining about text the user is still filling in. A placeholder in an identifier position
     (`FROM :tbl`) is the case that does not parse — which is what `neutralize` exists to rescue.
   - `core/script.rs` — reading a `.sql` script **back**, as a stream of statements. The counterpart
-    to `dump.rs`: that module decides what a replayable file holds and hands the app a plan to write
+    to `dump.rs`: that module decides what a replayable file holds and hands the driver a plan to write
     it, this one takes such a file apart a block at a time, so a dump far larger than memory can be
     replayed. Until it existed the round trip did not close — Schemaic wrote `.sql` files only
     another tool could read, because the import path takes CSV, JSON and Excel and
@@ -17498,7 +17499,8 @@ existing prose was left alone.
   **`fetch_schema` takes one too**, and it was the last counter-example to that rule. It reads every
   column, index, key, view, check and trigger of a whole database, so on a few hundred tables it runs
   for a long time — and the Export modal mounts its `Reading the schema` phase over it behind a full
-  backdrop whose only exit is a cancel, so Stop did nothing at all and `app/dump.rs`'s
+  backdrop whose only exit is a cancel, so Stop did nothing at all and the dump driver's (then
+  `app/dump.rs`, now `cli/dump.rs`)
   `Err(DbError::Cancelled)` arm was unreachable code. Each engine cancels its own way: MySQL races
   `collect_schema` against the token and `KILL`s through a second connection, PostgreSQL races the
   catalogue reads — split out of the connect into a private `pg::collect_schema` for exactly that, so
@@ -24411,6 +24413,12 @@ existing prose was left alone.
     a floor of one call across both files fails a needle that stops matching. A source gate for the
     same reason: SQLite, the one engine the suite reaches, ignores `analyze`, so no behavioural test
     could tell. Seen red with `analyze` flipped to `true`.
+    **`folder_export_consent_gate` is the same arrangement again, over `schemaic-cli/dump.rs`**:
+    `the_folder_export_consents_to_the_list_the_user_was_shown` was that file's own test while the
+    dump's driver lived in `schemaic-app`, which could reach `production_code`, and came here when
+    the driver moved into the Floem-free crate. It asserts the folder export hands `folder_verdict`
+    `req.approved.as_deref()` — the list the user was shown — and a `colliding_files` census read
+    off the folder; `cli/dump.rs`'s entry has why a swap would pass every other test.
   - `stored.rs` — `Stored<T>`, **a persisted store the UI can read freely and write only by
     saving**. `formats`, `db_colors`, `table_colors` and `db_favorites` used to sit on `Ui` as public
     `RwSignal`s beside three public save closures (`save_formats`, `save_db_colors`,
@@ -32355,7 +32363,7 @@ existing prose was left alone.
     …*, which is where it says the daemon is not running. None of this has a test — it is nothing
     without a process — and was verified live, when it landed, against the WSL Docker containers
     (two SQL Server, one MySQL 8 published on `127.0.0.1:3307`).
-  - `app/script.rs` — the I/O half of `core::script`, and `dump.rs`'s mirror image: that module
+  - `app/script.rs` — the I/O half of `core::script`, and `cli/dump.rs`'s mirror image: that module
     reads a database and writes a file, this reads a file and writes a database. Two halves at once — a
     **blocking reader** walks the file in `BLOCK`-sized reads, feeds `script::Splitter` and pushes
     completed statements into a bounded channel, while `Db::run_script` pulls from the other end.
@@ -32377,154 +32385,6 @@ existing prose was left alone.
     and why a 2 GB file read at disk speed cannot pile up ahead of a server applying it one statement
     at a time. Progress is reported in **bytes**: a file's statement total cannot be known without
     reading it, and its byte length is known at `open`.
-  - `dump.rs` — the I/O half of `core::dump`: introspect, plan, write. Its shape is `export_file`'s
-    `AllRows` branch with one difference that drives the whole module — an export is one statement
-    into one file and a dump is **many**, so the writer has to outlive each table. A single blocking
-    task owns the file and reads `Msg`s: a `Text` is written as it arrives, and a `Table` carries the
-    *receiving end* of that table's row channel, which the writer drains through
-    `dump::render_rows`. That shares `export::export_inserts_ending` with the grid's SQL export, so
-    on MySQL, PostgreSQL and SQLite a dump's `INSERT`s and the export's are the same statements;
-    on a batch-separated engine they are not — on SQL Server each `INSERT` closes its own `GO`
-    batch, and binary, CLR and variant columns are written from the literals the server rendered
-    (`DumpStep::Rows::server`), neither of which the grid's export writes. Rows are
-    read at `EXPORT_CHUNK_ROWS` with the same bound of two blocks in flight, and the `.part`-sibling
-    + atomic-rename guarantee is the export's unchanged — `part_of` builds that sibling through
-    `export::part_file`, which is `export::part_path` — the one function that decides the suffix —
-    over the file name, and which `schemaic export` builds its file under too, because the modal's cancel
-    sentence names the same fragment through it and two spellings of `.part` could drift apart in
-    exactly the situation where the fragment is the thing the user still wants. **So `part_of` is
-    `pub(crate)` and is now the crate's only speller of it.** `main.rs`'s `export_file` had an
-    inline closure appending the literal, and that is the site that matters most: it serves both
-    export scopes and all five grid formats, and its cancel and failure arms are the ones that name
-    the fragment — a change to `part_path` (a dot prefix to hide it, a timestamp so two exports
-    cannot collide) would have pointed both sentences at a path that does not exist, on the one
-    path where the fragment is the only copy of the user's rows.
-    `nothing_in_this_crate_spells_the_fragment_suffix_itself` scans `schemaic-app/src` for the
-    literal and answers with the call to make instead; comment lines are dropped before the scan,
-    so the several paragraphs that discuss the sibling are not hits. Unchanged too is
-    **cancel is the reader's to declare
-    and every other failure the writer's to describe** — a cancelled read closes the channels, which
-    the writer sees as an ordinary end of stream and would otherwise call a truncated file finished.
-    That five-arm resolution is now `core::dump::dump_verdict`, with tests: written out here it sat
-    inside an `async fn` needing a `Db`, a runtime handle and two channels to reach, so swapping two
-    arms turned *The disk is full* into *connection reset* with the suite still green.
-    **`DumpVerdict::Cancelled` carries `partial` as well, and `DumpOutcome::Cancelled` with it.** A
-    cancel during the schema read returns before `part_of` is computed and before the writer is
-    spawned, so no `shop.sql.part` exists anywhere — while the modal said *what had been written is
-    in shop.sql.part* regardless and sent the user to look for a file that was never opened. That is
-    the identical false claim already removed from the `Failed` arm one line over, which this enum
-    had not followed. The writer stays the only thing that knows, so the cancel arm reads
-    `WriteEnd::Failed`'s `opened` rather than assuming, and the view is routed through
-    `export::export_cancel_note`, which already had both sentences and already took `partial`.
-    **One check the export path has no need of**: after the join, `token.is_cancelled()` is asked
-    directly, because a cancel that arrives while no table is streaming — anywhere in a
-    structure-only dump — never reaches the reader's error, and the writer's refusal to
-    publish surfaces as an *error*, so a stopped dump would be reported as a failed one. **The schema
-    is freshly introspected, never the tree's cache**: a dump is a backup, and a `CREATE TABLE` for a
-    shape the server no longer has is a backup that restores the wrong table. That read takes the
-    run's own token (`Db::fetch_schema`'s entry has why), so the `Err(DbError::Cancelled)` arm ahead
-    of the plan is reached rather than being the dead code it was while Stop could not touch the
-    longest phase of a large dump. The two counts in the
-    report are deliberately different figures and must not be made to agree — progress counts the
-    `DumpStep::Rows` steps (`DumpPlan::streamed_tables`), since a view has no rows of its own and a
-    structure-only dump streams nothing at all, so counting tables would promise a "12 of 12" that
-    never arrives, while `DumpOutcome::Done`'s `tables` is `DumpPlan::tables`, what the file actually
-    covers, and its `missing` is what the fresh introspection could not find at all. Its
-    `refused` is `DumpPlan::refused`, what a replay of the file will not replace, its `left_out`
-    what the file leaves out though the export asked for it, and its `rows_left_out` the graph
-    edges created without their rows; the modal's sentence is `dump::done_note`, each part a
-    sentence of its own with one space between — the `format!` it replaced put a space after the
-    tally whatever followed, so a quiet dump read "Wrote 2 tables. " and a short one had two
-    spaces in it (`the_done_note_says_what_the_file_is_short_of_in_single_spaced_sentences`).
-    **Beside it rides an `ExportTally`, not a row count.** `write` folds each table's tally into one
-    through `ExportTally::absorb` — rows summed, and a withheld or blanked column named once however
-    many tables it appears in, the rule `ExportTally::note` already follows within a single export —
-    because the driver used to
-    discard `withheld`/`blanked` and an export that wrote every BLOB as `NULL` came back as a green
-    *Wrote 5 tables and 115k rows.* What the file could **not** carry is the difference between a
-    backup and something that looks like one, so it has to survive the trip back. Progress
-    reaches the modal as a **crossbeam channel + `create_signal_from_channel`** rather than a
-    callback, for the reason the AI stream and `update.rs`'s download do: `create_ext_action` is
-    one-shot and has to be built on the UI thread, so a worker reporting *repeatedly* needs a signal
-    fed from a channel. **The dump owns its own cancel slot** (`dump_token`) rather than sharing
-    `export_token`: the *grid* export's slot exists to stop two result-set exports competing for one
-    disk, while a dump can only be launched from a modal that already refuses a second one, and
-    folding the two together would let a running result-set export's Cancel stop a dump the user
-    cannot even see. (Both features are called Export in the interface, which is why that sentence
-    names which one it means; `core::dump`'s entry has the naming split in full.) **The folder
-    export shares that slot rather than taking a third**, which is the opposite call and rests on the
-    same fact: `files_run` and `dump_run` are launched from the one modal, which refuses a second run
-    while either is going, so the two can never be in flight together — and separate slots would only
-    create the case where the footer's Stop reaches neither. Its progress rides the dump's channel
-    for the same reason: it is the same footer line counting the same `3 of 12`. The sentences this
-    module produces are worded for the interface — `Export failed: {e}`, and
-    `Nothing to export — no table matched the selection.` for a plan with no steps.
-    **`run_files` is the file-per-table sibling of `run`**, over `core::dump::file_plan`, and it
-    keeps every one of the guarantees above **per file**: a freshly introspected schema, rows
-    streamed rather than gathered, a `.part` sibling (`write_one`) renamed over the destination only
-    once that table is whole, the token checked *before* that rename and asked again after the join
-    — a stop that lands between the last chunk and the publish never reaches the reader at all, so
-    the writer's refusal would otherwise be reported as a failure — and a cancelled read raised as a
-    channel *error* rather than read as end of stream. **The `.part` sweep here is unconditional,
-    which is where a folder export parts company with the single-file one**: there the fragment is
-    the only trace of the rows that arrived and `export_cancel_note` points the user straight at it,
-    so removing it would destroy the one thing they might still want; here the finished files *are*
-    that trace — whole, published, and exactly what `files_cancel_note` and `files_failure_note`
-    promise — and a fragment left beside them makes both sentences false and drops an unreadable
-    `orders.csv.part` into a folder the user chose for output and is about to go looking through.
-    (The single-file paths do gate their sweep on `writes_incrementally()`, and this paragraph used
-    to claim the same for `run_files`.) **The loop is sequential, one table at a time, on purpose**:
-    writing four at once would need four connections and four sets of blocks in flight, and it would
-    make the progress line's `3 of 12` a lie about what is happening — a folder export is disk-bound
-    at the end anyway. The per-file tallies are folded with `ExportTally::absorb`, the same fold the
-    single file uses, so one sentence can name what none of them could carry. `FilesOutcome` is its
-    own type rather than `DumpOutcome` because all three of its endings count **files in a folder**,
-    which is the one thing the dump's three never have to say — and all three now carry
-    `replaced: Vec<String>` as well. Its fourth arm, `WouldReplace`, is not an ending at all: it is
-    the question below.
-    **What the export is about to overwrite is collected before it overwrites any of it, and it is
-    the guard as well as the report.** A pre-flight walks the plan's file names against the chosen
-    directory and keeps the ones already there, once, ahead of the loop: after the first `rename` the
-    answer is contaminated by this export's own output, and a `Cancelled` or `Failed` arm would
-    report whichever prefix it happened to reach. `select_directories()` has no overwrite prompt, so
-    this is the folder form's only equivalent of the save dialog's "replace?" — and for one range it
-    was a disclosure rather than a refusal, which meant the files were replaced and then named. Now
-    `core::dump::colliding_files` is the census (the one line here that touches a filesystem is the
-    `req.folder.join(f).is_file()` closure it takes) and `folder_verdict` is the decision: an
-    unapproved run with collisions returns `FilesOutcome::WouldReplace` **before the first
-    `rename`**, so the folder is untouched, and the modal asks. The list still reaches all three
-    reporting arms as well — `export::files_note`/`files_cancel_note`/`files_failure_note` take it
-    and `replaced_clause` renders it — because an approved run has still destroyed something worth
-    naming. **What they take is `core::dump::destroyed(&replaced, &published, &attempted)`, not the
-    census.** The
-    census has to be read before the first rename or this export's own output contaminates it, but
-    only the *finished* arm is reached with the loop complete, and the whole-plan list went verbatim
-    to all three — so pressing Stop while the first table was still streaming reported *"Export
-    cancelled — no file was finished, so nothing was written to out. 3 existing files were replaced:
-    orders.csv, items.csv, users.csv."* Two flatly contradictory sentences, of which the false one is
-    also the **only** disclosure that a folder export destroys anything, wrong in the direction that
-    sends a user looking for a backup they do not need. **`attempted` is the third argument because a
-    `.part` dies at the *start* of a table's attempt, not at its end**: the rename that publishes
-    `orders.csv` consumes `orders.csv.part`, so publishing is one way to destroy it — but the writer
-    truncates the fragment with `File::create` before it writes a byte, and both the cancel and the
-    failure arms then sweep it. A table whose retry was stopped or failed therefore destroyed the
-    fragment an earlier run had left, and nothing named it, `published` holding only the tables that
-    finished — so the one file `export_failure_note` had just taught the user to care about was the
-    one the report was silent about. `published` is a subset of `attempted`, so the published-sibling
-    rule is the same rule; it stays a term of its own because a published file is destroyed under its
-    *own* name as well as its fragment's. A fragment whose table the export never reached is still
-    sitting there and is still not named, which is unchanged.
-    **The per-file resolution is `core::dump::dump_verdict` too, not a second copy of it.** Those
-    five arms were written out again here and the copy diverged in the one arm the extraction exists
-    to protect: `WriteEnd::Failed` carries the writer's own words, which already begin
-    *"Export failed:"*, and re-prefixing them produced *"Export failed: Export failed: No space left
-    on device (os error 28) — 3 files already written to out are kept."* The writer's refusal to
-    publish a truncated file is folded into the **read** end before asking, because that is what it
-    is — a cancel whose only witness is the token, a stop that landed between the last chunk and the
-    rename never reaching the reader at all. And `write_one`'s rename failure no longer names the
-    `.part` file: the caller's `sweep()` deletes it three lines later, so the one sentence telling
-    the user where their rows went named a path that no longer existed by the time they read it. It
-    names the destination instead.
   - `history_store.rs` — the query-history store: the persisted entry list, the run-id allocator,
     and the five closures that write it. **Carved out of `app_view` because of an invariant, not a
     line count**, which is the splitting procedure's own rule — and the invariant is that *every
@@ -33076,7 +32936,7 @@ existing prose was left alone.
     beside it. So the ordering between them is free, and this way the protocol stream stays clean
     whichever of the six opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`export`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
+    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`export`/`dump`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
     logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
     to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
     read no session state and is not safe in the middle of a command whose output someone is piping.
@@ -33175,7 +33035,7 @@ existing prose was left alone.
     byte-identical to the backup and logged the removal. **`row_status` is not yet verified by
     hand**: the greyed Install and the "comes with the app" hint need a real `.deb` install to see.
 - `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `tables` /
-  `describe` / `query` / `export` / `exec` / `mcp` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+  `describe` / `query` / `export` / `dump` / `exec` / `mcp` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. It also holds the **MCP server** (`mcp.rs`), which has two ways in — the
   app's `--mcp-serve` for the AI panel, and `schemaic mcp -c <conn>` for any MCP client. Its whole
   dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`, `clap`, `serde_json`, `tokio`
@@ -33220,7 +33080,7 @@ existing prose was left alone.
     no-database arm exists to stop, reached without the guard seeing it
     (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
     **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
-    flag on the command line wins), on `query`, `export`, `exec`, `tables` and `describe` alike, `-c` on
+    flag on the command line wins), on `query`, `export`, `dump`, `exec`, `tables` and `describe` alike, `-c` on
     `databases` and `ping`
     (through `ConnArgs`) and both on `mcp` (through `McpTarget`), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
     but blank goes through the same `non_blank` and is refused, not read as unset — it is `-d "$DB"`
@@ -33241,8 +33101,8 @@ existing prose was left alone.
     (`no_header_is_on_every_row_printing_subcommand`).
     `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
     there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`,
-    `mcp` and `export` — the last writes its rows to a file in a format of its own, so it has no
-    stdout format to judge.
+    `mcp`, `export` and `dump` — the last two write their rows to a file, `export` in a format of its
+    own, so they have no stdout format to judge.
     **`export` is `query` without the cap, into a file**: `SqlArgs` and `Target` as `query` takes
     them, `-o`/`--output <PATH>` required, and a `--format` of its own — a bare `Option<String>`,
     not `OutputArgs`'s `Format`, because the names are `core::export`'s six (`json`, `csv`, `sql`,
@@ -33250,6 +33110,12 @@ existing prose was left alone.
     (`run.rs` resolves it). It has no `--limit`, the whole result being the point, and its
     `--timeout` defaults to `EXPORT_TIMEOUT_SECS`, an hour rather than `query`'s 30 s, since a whole
     table can legitimately take that long to stream; it still refuses `0`.
+    **`dump` is the app's SQL dump, and takes no statement**: `Target`, `-o`/`--output <PATH>`
+    required, `-t`/`--table` repeatable — a display name, `orders` or `sales.orders` outside the
+    default schema, and every table and view when absent — and `--schema-only`/`--data-only`, which
+    `conflicts_with` makes a parse error together. Its `--timeout` is `export`'s
+    `EXPORT_TIMEOUT_SECS`. It has no `--format`, the file being `.sql` by definition, and is the
+    fourth `None` of `output_args()`.
     **The top-level `--help` ends with the formats and the exit codes** (`AFTER_HELP`, as `Cli`'s
     `after_help`), since a script's author reads the help and would otherwise have had to find
     either in the README; `OutputArgs::format`'s doc line names the five, so each subcommand's
@@ -33302,7 +33168,7 @@ existing prose was left alone.
     `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
     (`exec_defaults_to_the_shared_timeout`).
     **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
-    `Target { conn, database }` for `query`, `export`, `exec`, `tables` and `describe`, and taken alone by the
+    `Target { conn, database }` for `query`, `export`, `dump`, `exec`, `tables` and `describe`, and taken alone by the
     two subcommands with
     no database to run in: `databases` lists the names `-d` takes, and `ping` asks whether the
     server answers at all, so neither has a `-d` and passing one is a parse error
@@ -33339,7 +33205,8 @@ existing prose was left alone.
     app's own binary a new subcommand does not reach the CLI until its name is added here, as
     `databases` and `ping` were, and `tables` and `describe` after them — the test was seen red
     until both names went in (`every_subcommand_routes_to_the_cli`) — and `mcp`, which is not
-    the app's `--mcp-serve` above though both start the one server, and `export` after it.
+    the app's `--mcp-serve` above though both start the one server, and `export` after it, and
+    `dump` after that.
     `schemaic.com` calls
     `run::main` without asking, so a missing name shows everywhere except through it. **That test
     and `the_help_text_names_every_subcommand` read the names off clap's `Command`**
@@ -33577,6 +33444,179 @@ existing prose was left alone.
     `1` `run.rs` used to pass printed one row of a thousand-row `UPDATE … RETURNING` with no warning,
     and a parameter would let a call site choose it again. The cap is on what is printed, never on
     the statement — each engine's row loop stops reading and leaves the statement to finish.
+  - `cli/dump.rs` — the I/O half of `core::dump`: introspect, plan, write — and **the one driver
+    both front ends call**, the app's *Export ▸ SQL dump* modal and `schemaic dump`. It was
+    `app/dump.rs` until `schemaic dump` needed it, and moved here so that the CLI calls the same
+    driver rather than a copy of it; the app reaches it as `schemaic_cli::dump`. The request and outcome types moved with it, out
+    of `ui/lib.rs` and into `core::dump` — `DumpRequest`, `FilesRequest` and its `approved`,
+    `FilesOutcome`, `DumpProgress`, `DumpOutcome` — so the driver and its two callers share one
+    vocabulary; `schemaic-ui` re-exports them with `pub use`, and every `schemaic_ui::` path still
+    resolves. Its shape is the app's `export_file`'s
+    `AllRows` branch with one difference that drives the whole module — an export is one statement
+    into one file and a dump is **many**, so the writer has to outlive each table. A single blocking
+    task owns the file and reads `Msg`s: a `Text` is written as it arrives, and a `Table` carries the
+    *receiving end* of that table's row channel, which the writer drains through
+    `dump::render_rows`. That shares `export::export_inserts_ending` with the grid's SQL export, so
+    on MySQL, PostgreSQL and SQLite a dump's `INSERT`s and the export's are the same statements;
+    on a batch-separated engine they are not — on SQL Server each `INSERT` closes its own `GO`
+    batch, and binary, CLR and variant columns are written from the literals the server rendered
+    (`DumpStep::Rows::server`), neither of which the grid's export writes. Rows are
+    read at `EXPORT_CHUNK_ROWS` with the same bound of two blocks in flight, and the `.part`-sibling
+    + atomic-rename guarantee is the export's unchanged — `part_of` builds that sibling through
+    `export::part_file`, which is `export::part_path` — the one function that decides the suffix —
+    over the file name, and which `schemaic export` builds its file under too, because the modal's cancel
+    sentence names the same fragment through it and two spellings of `.part` could drift apart in
+    exactly the situation where the fragment is the thing the user still wants. **So `part_of` is
+    `pub` — the app's `export_file` reaches it as `schemaic_cli::dump::part_of` — and is the only
+    speller of it in either crate.** `main.rs`'s `export_file` had an
+    inline closure appending the literal, and that is the site that matters most: it serves both
+    export scopes and all five grid formats, and its cancel and failure arms are the ones that name
+    the fragment — a change to `part_path` (a dot prefix to hide it, a timestamp so two exports
+    cannot collide) would have pointed both sentences at a path that does not exist, on the one
+    path where the fragment is the only copy of the user's rows.
+    `nothing_in_this_crate_spells_the_fragment_suffix_itself` scans `schemaic-cli/src` for the
+    literal and answers with the call to make instead — **and walks `../schemaic-app/src` as well**,
+    because the site that matters most stayed behind when the driver moved, and a gate over this
+    crate alone would have lost it without a sound; comment lines are dropped before the scan,
+    so the several paragraphs that discuss the sibling are not hits. Unchanged too is
+    **cancel is the reader's to declare
+    and every other failure the writer's to describe** — a cancelled read closes the channels, which
+    the writer sees as an ordinary end of stream and would otherwise call a truncated file finished.
+    That five-arm resolution is now `core::dump::dump_verdict`, with tests: written out here it sat
+    inside an `async fn` needing a `Db`, a runtime handle and two channels to reach, so swapping two
+    arms turned *The disk is full* into *connection reset* with the suite still green.
+    **`DumpVerdict::Cancelled` carries `partial` as well, and `DumpOutcome::Cancelled` with it.** A
+    cancel during the schema read returns before `part_of` is computed and before the writer is
+    spawned, so no `shop.sql.part` exists anywhere — while the modal said *what had been written is
+    in shop.sql.part* regardless and sent the user to look for a file that was never opened. That is
+    the identical false claim already removed from the `Failed` arm one line over, which this enum
+    had not followed. The writer stays the only thing that knows, so the cancel arm reads
+    `WriteEnd::Failed`'s `opened` rather than assuming, and the view is routed through
+    `export::export_cancel_note`, which already had both sentences and already took `partial`.
+    **One check the export path has no need of**: after the join, `token.is_cancelled()` is asked
+    directly, because a cancel that arrives while no table is streaming — anywhere in a
+    structure-only dump — never reaches the reader's error, and the writer's refusal to
+    publish surfaces as an *error*, so a stopped dump would be reported as a failed one. **The schema
+    is freshly introspected, never the tree's cache**: a dump is a backup, and a `CREATE TABLE` for a
+    shape the server no longer has is a backup that restores the wrong table. That read takes the
+    run's own token (`Db::fetch_schema`'s entry has why), so the `Err(DbError::Cancelled)` arm ahead
+    of the plan is reached rather than being the dead code it was while Stop could not touch the
+    longest phase of a large dump. The two counts in the
+    report are deliberately different figures and must not be made to agree — progress counts the
+    `DumpStep::Rows` steps (`DumpPlan::streamed_tables`), since a view has no rows of its own and a
+    structure-only dump streams nothing at all, so counting tables would promise a "12 of 12" that
+    never arrives, while `DumpOutcome::Done`'s `tables` is `DumpPlan::tables`, what the file actually
+    covers, and its `missing` is what the fresh introspection could not find at all. Its
+    `refused` is `DumpPlan::refused`, what a replay of the file will not replace, its `left_out`
+    what the file leaves out though the export asked for it, and its `rows_left_out` the graph
+    edges created without their rows; the modal's sentence is `dump::done_note`, each part a
+    sentence of its own with one space between — the `format!` it replaced put a space after the
+    tally whatever followed, so a quiet dump read "Wrote 2 tables. " and a short one had two
+    spaces in it (`the_done_note_says_what_the_file_is_short_of_in_single_spaced_sentences`).
+    **Beside it rides an `ExportTally`, not a row count.** `write` folds each table's tally into one
+    through `ExportTally::absorb` — rows summed, and a withheld or blanked column named once however
+    many tables it appears in, the rule `ExportTally::note` already follows within a single export —
+    because the driver used to
+    discard `withheld`/`blanked` and an export that wrote every BLOB as `NULL` came back as a green
+    *Wrote 5 tables and 115k rows.* What the file could **not** carry is the difference between a
+    backup and something that looks like one, so it has to survive the trip back.
+    **Progress leaves the driver through a callback, `dump::Progress`** — `Box<dyn Fn(DumpProgress)
+    + Send + Sync>`, called on the run's task as each table starts, so it must return at once —
+    rather than the crossbeam `Sender` it took while it lived in the app, because its two callers
+    want different things of it: `schemaic dump` prints `i of n — table` to stderr, and the app
+    wraps its channel's sender in one. **The channel is the app's half and stays there**: progress
+    reaches the modal as a **crossbeam channel + `create_signal_from_channel`** rather than a
+    callback into the view, for the reason the AI stream and `update.rs`'s download do:
+    `create_ext_action` is one-shot and has to be built on the UI thread, so a worker reporting
+    *repeatedly* needs a signal fed from a channel. **In the app, the dump owns its own cancel slot**
+    (`dump_token`) rather than sharing
+    `export_token`: the *grid* export's slot exists to stop two result-set exports competing for one
+    disk, while a dump can only be launched from a modal that already refuses a second one, and
+    folding the two together would let a running result-set export's Cancel stop a dump the user
+    cannot even see. (Both features are called Export in the interface, which is why that sentence
+    names which one it means; `core::dump`'s entry has the naming split in full.) **The folder
+    export shares that slot rather than taking a third**, which is the opposite call and rests on the
+    same fact: `files_run` and `dump_run` are launched from the one modal, which refuses a second run
+    while either is going, so the two can never be in flight together — and separate slots would only
+    create the case where the footer's Stop reaches neither. Its progress rides the dump's channel
+    for the same reason: it is the same footer line counting the same `3 of 12`. The sentences this
+    module produces are worded for the interface — `Export failed: {e}`, and
+    `Nothing to export — no table matched the selection.` for a plan with no steps.
+    **`run_files` is the file-per-table sibling of `run`**, over `core::dump::file_plan`, and it
+    keeps every one of the guarantees above **per file**: a freshly introspected schema, rows
+    streamed rather than gathered, a `.part` sibling (`write_one`) renamed over the destination only
+    once that table is whole, the token checked *before* that rename and asked again after the join
+    — a stop that lands between the last chunk and the publish never reaches the reader at all, so
+    the writer's refusal would otherwise be reported as a failure — and a cancelled read raised as a
+    channel *error* rather than read as end of stream. **The `.part` sweep here is unconditional,
+    which is where a folder export parts company with the single-file one**: there the fragment is
+    the only trace of the rows that arrived and `export_cancel_note` points the user straight at it,
+    so removing it would destroy the one thing they might still want; here the finished files *are*
+    that trace — whole, published, and exactly what `files_cancel_note` and `files_failure_note`
+    promise — and a fragment left beside them makes both sentences false and drops an unreadable
+    `orders.csv.part` into a folder the user chose for output and is about to go looking through.
+    (The single-file paths do gate their sweep on `writes_incrementally()`, and this paragraph used
+    to claim the same for `run_files`.) **The loop is sequential, one table at a time, on purpose**:
+    writing four at once would need four connections and four sets of blocks in flight, and it would
+    make the progress line's `3 of 12` a lie about what is happening — a folder export is disk-bound
+    at the end anyway. The per-file tallies are folded with `ExportTally::absorb`, the same fold the
+    single file uses, so one sentence can name what none of them could carry. `FilesOutcome` is its
+    own type rather than `DumpOutcome` because all three of its endings count **files in a folder**,
+    which is the one thing the dump's three never have to say — and all three now carry
+    `replaced: Vec<String>` as well. Its fourth arm, `WouldReplace`, is not an ending at all: it is
+    the question below. `schemaic dump` does not call `run_files`; the folder export is the app's
+    alone.
+    **What the export is about to overwrite is collected before it overwrites any of it, and it is
+    the guard as well as the report.** A pre-flight walks the plan's file names against the chosen
+    directory and keeps the ones already there, once, ahead of the loop: after the first `rename` the
+    answer is contaminated by this export's own output, and a `Cancelled` or `Failed` arm would
+    report whichever prefix it happened to reach. `select_directories()` has no overwrite prompt, so
+    this is the folder form's only equivalent of the save dialog's "replace?" — and for one range it
+    was a disclosure rather than a refusal, which meant the files were replaced and then named. Now
+    `core::dump::colliding_files` is the census (the one line here that touches a filesystem is the
+    `req.folder.join(f).is_file()` closure it takes) and `folder_verdict` is the decision: an
+    unapproved run with collisions returns `FilesOutcome::WouldReplace` **before the first
+    `rename`**, so the folder is untouched, and the modal asks. **Which list is the consent is
+    pinned in source, not here**: both of `folder_verdict`'s parameters are lists of file names, so
+    `folder_verdict(Some(&replaced), &replaced)` compiles, always answers `Write`, and leaves every
+    one of `core::dump`'s cases green. `the_folder_export_consents_to_the_list_the_user_was_shown`
+    asserts the call is made with `req.approved.as_deref()` and that the census is the
+    `colliding_files` reading of the folder; it was this module's own test while the driver lived
+    in the app, and is `ui/source_gate.rs`'s `folder_export_consent_gate` now, reading this file by
+    its workspace path, because it needs that module's comment-stripping reader and this crate is
+    Floem-free. The list still reaches all three
+    reporting arms as well — `export::files_note`/`files_cancel_note`/`files_failure_note` take it
+    and `replaced_clause` renders it — because an approved run has still destroyed something worth
+    naming. **What they take is `core::dump::destroyed(&replaced, &published, &attempted)`, not the
+    census.** The
+    census has to be read before the first rename or this export's own output contaminates it, but
+    only the *finished* arm is reached with the loop complete, and the whole-plan list went verbatim
+    to all three — so pressing Stop while the first table was still streaming reported *"Export
+    cancelled — no file was finished, so nothing was written to out. 3 existing files were replaced:
+    orders.csv, items.csv, users.csv."* Two flatly contradictory sentences, of which the false one is
+    also the **only** disclosure that a folder export destroys anything, wrong in the direction that
+    sends a user looking for a backup they do not need. **`attempted` is the third argument because a
+    `.part` dies at the *start* of a table's attempt, not at its end**: the rename that publishes
+    `orders.csv` consumes `orders.csv.part`, so publishing is one way to destroy it — but the writer
+    truncates the fragment with `File::create` before it writes a byte, and both the cancel and the
+    failure arms then sweep it. A table whose retry was stopped or failed therefore destroyed the
+    fragment an earlier run had left, and nothing named it, `published` holding only the tables that
+    finished — so the one file `export_failure_note` had just taught the user to care about was the
+    one the report was silent about. `published` is a subset of `attempted`, so the published-sibling
+    rule is the same rule; it stays a term of its own because a published file is destroyed under its
+    *own* name as well as its fragment's. A fragment whose table the export never reached is still
+    sitting there and is still not named, which is unchanged.
+    **The per-file resolution is `core::dump::dump_verdict` too, not a second copy of it.** Those
+    five arms were written out again here and the copy diverged in the one arm the extraction exists
+    to protect: `WriteEnd::Failed` carries the writer's own words, which already begin
+    *"Export failed:"*, and re-prefixing them produced *"Export failed: Export failed: No space left
+    on device (os error 28) — 3 files already written to out are kept."* The writer's refusal to
+    publish a truncated file is folded into the **read** end before asking, because that is what it
+    is — a cancel whose only witness is the token, a stop that landed between the last chunk and the
+    rename never reaching the reader at all. And `write_one`'s rename failure no longer names the
+    `.part` file: the caller's `sweep()` deletes it three lines later, so the one sentence telling
+    the user where their rows went named a path that no longer existed by the time they read it. It
+    names the destination instead.
   - `cli/deadline.rs` — one deadline, for every database read the headless front ends make.
     `with_deadline(fut, token, timeout)` awaits `fut` for at most `timeout` and, on expiry, cancels
     the token and **waits for the future to finish unwinding**. That last part is the whole reason
@@ -33837,6 +33877,30 @@ existing prose was left alone.
     `query::read_only_export`. **The one line of success goes to stderr** — `wrote N rows to
     <path>` — since stdout is not where the rows went. A failure is `run_query`'s: the message, the
     no-database `hint:` when it applies, and `exit_for_no_rows`.
+    **`dump` is `run_dump`, and it is the app's Export ▸ SQL dump, not a second one** — it builds a
+    `core::dump::DumpRequest` and calls `dump::run`, the driver the modal calls (`cli/dump.rs`).
+    The usage errors come first, before anything is dialled: an output whose folder does not exist,
+    as `run_export` refuses it, then `select_conn`, then a database — `database_for`, so `-d` or the
+    connection's own, and neither is a `warn` that a dump needs one and `Exit::Usage`. Then
+    `connect` under `query::DEFAULT_TIMEOUT`. **With no `-t` it names every table itself**: it lists
+    the database through `Db::fetch_table_list`, under `deadline::with_deadline` and
+    `query::DEFAULT_TIMEOUT`, and passes all of their display names (a failed or timed-out listing
+    is `Exit::Failed`). That is the command's default and not the request's
+    — to `core::dump::plan` an empty list still means nothing was chosen, and the modal's empty
+    selection is unchanged; the order is not taken from the listing either, the driver's own fresh
+    introspection deciding it. A `-t` name only *selects*: `plan` matches it against the
+    introspected display names, so it never reaches the SQL, and one that matches nothing comes back
+    in `missing`. `--schema-only` and `--data-only` are `DumpOptions::structure`/`data` turned off,
+    and clap makes them a conflict. **The whole driver runs under `with_deadline`**, the dump's own
+    `--timeout` (an hour by default, `export`'s figure) rather than the login's, and its token is the
+    run's, so the deadline is a cancel the driver honours and not a dropped future. Progress is a
+    `dump::Progress` that prints `i of n — table` to stderr, a line per streamed table. A finished
+    dump prints `dump::done_note`, the modal's own sentence, over `export::export_note`'s tally
+    clause, and exits 0; a failure prints `export::export_failure_note`, naming the `.part` only
+    where `partial` says one exists, and a deadline says it was exceeded and adds
+    `dump::cancel_note` — both `Exit::Failed`. It asks no read gate and runs no `Enforce` session:
+    every statement it sends is one `core::dump::plan` built, through the driver's plain
+    `fetch_schema` and `stream_query`, exactly as the modal's dump does.
     **After a failure for want of a database, a `hint:` line on stderr names the way out** — `-d
     <database>`, a default picked in Schemaic, and `schemaic databases -c <conn>` with the user's own
     `-c` echoed back, quoted if it has whitespace (`shell_word`, which `mcp_notice` shares).
@@ -35337,7 +35401,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   consequence is stated in plain language and where "Open in editor" hands the script over.
   **A dump is on the written side of this rule rather than an exception to it.** `core::dump::plan`
   composes a file out of the emitters that already exist — `TableInfo::create_ddl`, `ddl::view_ddl`,
-  `TriggerInfo::create_sql` and `ChangeSet::emit` for the closing foreign keys — and `app::dump`
+  `TriggerInfo::create_sql` and `ChangeSet::emit` for the closing foreign keys — and `cli::dump`
   writes it to disk; nothing on that path can execute it, which is exactly the standing Copy DDL has.
   A second emitter would be the regression here, not the missing preview.
   **`core::compare` is on the differ side of the rule, and it is the only aggregate.** A schema

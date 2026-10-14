@@ -330,7 +330,7 @@ mod tests {
         #[test]
         fn a_whole_read_and_write_is_the_tally() {
             assert_eq!(
-                export_verdict(Ok(Ok(())), Ok(tally(5)), true, "a.part"),
+                export_verdict(Ok(Ok(())), Ok(tally(5)), true, "frag.csv"),
                 Ok(tally(5))
             );
         }
@@ -342,11 +342,11 @@ mod tests {
                 Ok(Err("the export stopped reading".into())),
                 Err("No space left on device".into()),
                 true,
-                "a.part",
+                "frag.csv",
             );
             assert_eq!(
                 got,
-                Err("could not write a.part: No space left on device".into())
+                Err("could not write frag.csv: No space left on device".into())
             );
         }
 
@@ -354,11 +354,13 @@ mod tests {
         fn a_failed_read_names_the_part_only_where_it_holds_rows() {
             let read = || Ok(Err("query failed: relation does not exist".to_string()));
             assert_eq!(
-                export_verdict(read(), Ok(tally(0)), true, "a.part"),
-                Err("query failed: relation does not exist; what was written is in a.part".into())
+                export_verdict(read(), Ok(tally(0)), true, "frag.csv"),
+                Err(
+                    "query failed: relation does not exist; what was written is in frag.csv".into()
+                )
             );
             assert_eq!(
-                export_verdict(read(), Ok(tally(0)), false, "a.xlsx.part"),
+                export_verdict(read(), Ok(tally(0)), false, "frag.xlsx"),
                 Err("query failed: relation does not exist".into()),
                 "an XLSX .part is empty until the end"
             );
@@ -371,10 +373,11 @@ mod tests {
                     Err(Duration::from_secs(60)),
                     Err("cancelled".into()),
                     true,
-                    "a.part"
+                    "frag.csv"
                 ),
                 Err(
-                    "the export exceeded 60s and was stopped; what was written is in a.part".into()
+                    "the export exceeded 60s and was stopped; what was written is in frag.csv"
+                        .into()
                 )
             );
         }

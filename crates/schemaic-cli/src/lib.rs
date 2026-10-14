@@ -25,6 +25,7 @@
 pub mod args;
 pub mod catalog;
 pub mod deadline;
+pub mod dump;
 pub mod exec;
 pub mod format;
 pub mod mcp;

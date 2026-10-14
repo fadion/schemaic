@@ -26,10 +26,10 @@
 
 use std::path::{Path, PathBuf};
 
+use schemaic_core::dump::{DumpOutcome, DumpProgress, DumpRequest, FilesOutcome, FilesRequest};
 use schemaic_core::dump::{DumpStep, DumpVerdict, ReadEnd, WriteEnd, dump_verdict, plan};
 use schemaic_core::export::{ExportFormat, ExportTally, PullChunks};
 use schemaic_db::{Db, DbError, ExportChunk};
-use schemaic_ui::{DumpOutcome, DumpProgress, DumpRequest, FilesOutcome, FilesRequest};
 use tokio_util::sync::CancellationToken;
 
 /// A writer failure, and whether the `.part` file exists to name in the note.
@@ -80,21 +80,26 @@ enum Msg {
 /// same function. Spelling `.part` again here would let the file this writes and
 /// the file that message names drift apart — in the one situation where the
 /// fragment is the thing the user still wants.
-pub(crate) fn part_of(path: &Path) -> PathBuf {
+pub fn part_of(path: &Path) -> PathBuf {
     // `export::part_file`, which `schemaic export` builds its file under too.
     schemaic_core::export::part_file(path)
 }
+
+/// Where a run reports each table as it starts — the app's modal (through a
+/// channel to its UI thread), `schemaic dump`'s stderr. Called on the run's
+/// task, so it must return at once: a reporter must never hold up a dump.
+pub type Progress = Box<dyn Fn(DumpProgress) + Send + Sync>;
 
 /// Run a dump to completion, reporting each table on `progress`.
 ///
 /// Returns the outcome rather than reporting it, so the caller owns the single
 /// hop back onto the UI thread.
-pub(crate) async fn run(
+pub async fn run(
     db: Db,
     req: DumpRequest,
     handle: tokio::runtime::Handle,
     token: CancellationToken,
-    progress: crossbeam_channel::Sender<DumpProgress>,
+    progress: Progress,
     chunk_rows: usize,
 ) -> DumpOutcome {
     let failed = |message: String, partial: bool| DumpOutcome::Failed { message, partial };
@@ -159,7 +164,7 @@ pub(crate) async fn run(
             } => {
                 index += 1;
                 // Best-effort: a full progress channel must never hold up a dump.
-                let _ = progress.send(DumpProgress {
+                progress(DumpProgress {
                     index,
                     total,
                     table: table.clone(),
@@ -263,12 +268,12 @@ pub(crate) async fn run(
 /// Writing four files at once would need four connections and four in-flight
 /// blocks each, and it would make the progress line ("3 of 12") a lie about what
 /// is happening. A folder export is disk-bound at the end anyway.
-pub(crate) async fn run_files(
+pub async fn run_files(
     db: Db,
     req: FilesRequest,
     handle: tokio::runtime::Handle,
     token: CancellationToken,
-    progress: crossbeam_channel::Sender<DumpProgress>,
+    progress: Progress,
     chunk_rows: usize,
 ) -> FilesOutcome {
     // Freshly introspected, never the tree's cache — [`run`]'s rule, for the same
@@ -375,7 +380,7 @@ pub(crate) async fn run_files(
         }
         // Best-effort, exactly as the dump's: a full progress channel must never
         // hold up a write.
-        let _ = progress.send(DumpProgress {
+        progress(DumpProgress {
             index: i + 1,
             total,
             table: step.table.clone(),
@@ -747,6 +752,10 @@ mod tests {
         let mut offenders = Vec::new();
         let mut files = 0usize;
         walk(&dir, "", &mut offenders, &mut files);
+        // **And the app's**, which wrote dumps until this driver moved here and
+        // still writes the whole-result export beside it.
+        let app = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../schemaic-app/src");
+        walk(&app, "schemaic-app/", &mut offenders, &mut files);
         assert!(
             offenders.is_empty(),
             "call `dump::part_of` (which asks `export::part_path`) instead:\n{}",
@@ -757,37 +766,7 @@ mod tests {
         assert!(files >= 12, "only {files} source files scanned");
     }
 
-    /// **Which list is the consent and which is the census.**
-    ///
-    /// `folder_verdict`'s whole point is that the consent is the list the user
-    /// was shown and said yes to, while the collisions are a *fresh* reading of
-    /// the folder — so a file that appeared while the modal stood is asked about
-    /// again instead of being destroyed silently. Both parameters are lists of
-    /// file names, so `folder_verdict(Some(&replaced), &replaced)` compiles,
-    /// always answers `Write`, and restores the exact defect the `Option<&[…]>`
-    /// signature replaced — with the whole suite green. `core::dump`'s eight
-    /// cases drive the pure function and none of them can see which list *this*
-    /// caller hands it.
-    ///
-    /// The other half is that the census is read before the first `rename`: once
-    /// this export has published a file, the folder's contents are partly its
-    /// own output and the answer is contaminated.
-    #[test]
-    fn the_folder_export_consents_to_the_list_the_user_was_shown() {
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dump.rs"))
-            .expect("this file's own source");
-        let body = schemaic_ui::source_gate::production_code(&src);
-        assert!(
-            body.contains("folder_verdict(req.approved.as_deref(), &replaced)"),
-            "the folder export's consent is no longer the list the user saw. \
-             Handing it the fresh census instead answers `Write` unconditionally, \
-             and every test of the pure function stays green."
-        );
-        // And the census the verdict judges is read from the folder, not
-        // reconstructed from the plan.
-        assert!(
-            body.contains("colliding_files(&plan, |f| req.folder.join(f).is_file())"),
-            "the collision census is no longer a reading of the folder"
-        );
-    }
+    // `the_folder_export_consents_to_the_list_the_user_was_shown` lives in
+    // `schemaic_ui::source_gate`, which has the comment-stripping reader this
+    // crate cannot reach; it reads this file by its workspace path.
 }

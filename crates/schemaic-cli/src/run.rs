@@ -346,7 +346,156 @@ async fn dispatch(command: Command) -> Exit {
             )
             .await
         }
+        Command::Dump {
+            target,
+            output,
+            tables,
+            schema_only,
+            data_only,
+            timeout,
+        } => {
+            let opts = schemaic_core::dump::DumpOptions {
+                structure: !data_only,
+                data: !schema_only,
+                ..Default::default()
+            };
+            run_dump(
+                &file.connections,
+                &target,
+                &output,
+                tables,
+                opts,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
         Command::Mcp { target } => serve_mcp(&file.connections, &target).await,
+    }
+}
+
+/// `schemaic dump`: the app's SQL dump (`crate::dump::run`, the one driver
+/// both front ends call), against a database the command names or the
+/// connection's own. Every table and view when none is named — read from the
+/// server's table list, so the dump's own fresh introspection is what decides
+/// their order. Progress goes to stderr, a line per table; the result note is
+/// the modal's own sentence (`dump::done_note`).
+async fn run_dump(
+    conns: &[Connection],
+    target: &Target,
+    output: &std::path::Path,
+    tables: Vec<String>,
+    opts: schemaic_core::dump::DumpOptions,
+    timeout: Duration,
+) -> Exit {
+    if let Some(dir) = output.parent().filter(|d| !d.as_os_str().is_empty())
+        && !dir.is_dir()
+    {
+        warn(&format!("no folder {} to write the dump in", dir.display()));
+        return Exit::Usage;
+    }
+    let conn = match select_conn(conns, &target.conn) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    let Some(database) = database_for(target, conn) else {
+        warn("a dump needs a database: name one with -d");
+        return Exit::Usage;
+    };
+    let (db, _tunnel) = match connect(conn, &target.conn, query::DEFAULT_TIMEOUT).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let tables = if tables.is_empty() {
+        let token = tokio_util::sync::CancellationToken::new();
+        match crate::deadline::with_deadline(
+            db.fetch_table_list(&database),
+            token,
+            query::DEFAULT_TIMEOUT,
+        )
+        .await
+        {
+            Some(Ok(s)) => s
+                .tables
+                .iter()
+                .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+                .collect(),
+            Some(Err(e)) => {
+                warn(&format!("could not list the tables of {database}: {e}"));
+                return Exit::Failed;
+            }
+            None => {
+                warn(&format!("listing the tables of {database} timed out"));
+                return Exit::Failed;
+            }
+        }
+    } else {
+        tables
+    };
+    let name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let req = schemaic_core::dump::DumpRequest {
+        path: output.to_path_buf(),
+        conn_id: conn.id,
+        database,
+        tables,
+        opts,
+        dialect,
+    };
+    let progress: crate::dump::Progress = Box::new(|p| {
+        warn(&format!("{} of {} — {}", p.index, p.total, p.table));
+    });
+    let token = tokio_util::sync::CancellationToken::new();
+    let outcome = crate::deadline::with_deadline(
+        crate::dump::run(
+            db,
+            req,
+            tokio::runtime::Handle::current(),
+            token.clone(),
+            progress,
+            query::EXPORT_CHUNK_ROWS,
+        ),
+        token,
+        timeout,
+    )
+    .await;
+    use schemaic_core::dump::DumpOutcome;
+    match outcome {
+        Some(DumpOutcome::Done {
+            tables,
+            tally,
+            missing,
+            refused,
+            left_out,
+            rows_left_out,
+        }) => {
+            warn(&schemaic_core::dump::done_note(
+                tables,
+                schemaic_core::export::export_note(&tally, &name, true).as_deref(),
+                &missing,
+                &left_out,
+                &rows_left_out,
+                &refused,
+            ));
+            Exit::Ok
+        }
+        Some(DumpOutcome::Failed { message, partial }) => {
+            warn(&schemaic_core::export::export_failure_note(
+                &message,
+                partial.then_some(name.as_str()),
+            ));
+            Exit::Failed
+        }
+        Some(DumpOutcome::Cancelled { .. }) | None => {
+            warn(&format!(
+                "the dump exceeded {}s and was stopped — {}",
+                timeout.as_secs(),
+                schemaic_core::dump::cancel_note(&name, true)
+            ));
+            Exit::Failed
+        }
     }
 }
 

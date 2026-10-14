@@ -17,7 +17,9 @@ mod antigravity;
 mod conn_sources;
 mod copilot;
 mod cursor;
-mod dump;
+// The dump's driver is `schemaic-cli`'s, so `schemaic dump` and the modal run
+// the one writer.
+use schemaic_cli::dump;
 mod heap;
 mod history_store;
 mod install_cli;
@@ -4663,7 +4665,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // fragment went. Two spellings is two things to keep in step,
                 // on the one path where the fragment is the only copy of the
                 // rows.
-                let part_of = crate::dump::part_of;
+                let part_of = dump::part_of;
                 let create = |path: &std::path::Path| {
                     std::fs::File::create(path).map(std::io::BufWriter::new)
                 };
@@ -5291,7 +5293,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 let (handle2, tx) = (handle.clone(), dump_tx.clone());
                 handle.spawn(async move {
-                    let outcome = dump::run(db, req, handle2, token, tx, EXPORT_CHUNK_ROWS).await;
+                    let progress: dump::Progress = Box::new(move |p| {
+                        let _ = tx.send(p);
+                    });
+                    let outcome =
+                        dump::run(db, req, handle2, token, progress, EXPORT_CHUNK_ROWS).await;
                     report(outcome);
                 });
             },
@@ -5349,8 +5355,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 let (handle2, tx) = (handle.clone(), dump_tx.clone());
                 handle.spawn(async move {
+                    let progress: dump::Progress = Box::new(move |p| {
+                        let _ = tx.send(p);
+                    });
                     let outcome =
-                        dump::run_files(db, req, handle2, token, tx, EXPORT_CHUNK_ROWS).await;
+                        dump::run_files(db, req, handle2, token, progress, EXPORT_CHUNK_ROWS).await;
                     report(outcome);
                 });
             },

@@ -168,6 +168,32 @@ pub enum Command {
         #[arg(long, default_value_t = EXPORT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
+    /// Write a database's tables — structure, rows, and its types, sequences
+    /// and routines — to a .sql file that recreates them.
+    ///
+    /// The app's Export ▸ SQL dump: freshly introspected, the rows streamed,
+    /// built beside itself as `<file>.part` and renamed into place when
+    /// complete.
+    Dump {
+        #[command(flatten)]
+        target: Target,
+        /// The .sql file to write.
+        #[arg(short = 'o', long = "output")]
+        output: std::path::PathBuf,
+        /// A table to dump, by name (`orders`, or `sales.orders` outside the
+        /// default schema). Repeat for more; every table and view when absent.
+        #[arg(short = 't', long = "table")]
+        tables: Vec<String>,
+        /// The structure only — no rows.
+        #[arg(long, conflicts_with = "data_only")]
+        schema_only: bool,
+        /// The rows only — no `CREATE`s.
+        #[arg(long)]
+        data_only: bool,
+        /// Seconds before the dump is stopped — an hour by default.
+        #[arg(long, default_value_t = EXPORT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
     /// Run a statement that writes.
     Exec {
         #[command(flatten)]
@@ -269,7 +295,10 @@ impl Command {
             | Command::Query { output, .. }
             | Command::Exec { output, .. } => Some(output),
             // `export` writes its rows to a file, in its own `--format`.
-            Command::Export { .. } | Command::Mcp { .. } | Command::Version => None,
+            Command::Export { .. }
+            | Command::Dump { .. }
+            | Command::Mcp { .. }
+            | Command::Version => None,
         }
     }
 }
@@ -448,6 +477,7 @@ pub fn wants_cli(argv: &[String]) -> bool {
                 | "describe"
                 | "query"
                 | "export"
+                | "dump"
                 | "exec"
                 | "mcp"
                 | "version"
