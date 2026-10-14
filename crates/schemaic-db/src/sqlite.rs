@@ -2302,6 +2302,9 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
                 // SQL Server's too.
                 tsql_kind: Default::default(),
                 tsql_bindings: Vec::new(),
+                // SQLite has no partitioning.
+                partitioning: None,
+                partition_of: None,
             });
         }
         Ok(DbSchema {
@@ -3511,6 +3514,7 @@ fn table_indexes(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<IndexIn
             include: Vec::new(),
             using: None,
             order: Vec::new(),
+            inherited: false,
             unique,
             foreign: false,
             method: None,

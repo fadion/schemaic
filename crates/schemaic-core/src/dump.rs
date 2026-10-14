@@ -1173,6 +1173,34 @@ pub fn order_tables(
     let mut picked: Vec<usize> = (0..tables.len())
         .filter(|&i| chosen.iter().any(|c| *c == key(i)))
         .collect();
+    // **A partitioned table comes with its partitions, and a partition with
+    // the tables it is created `OF`** — the first hold the rows, the second
+    // are what its `CREATE` names — but not with its siblings.
+    let relatives = |from: &[usize], up: bool| -> Vec<usize> {
+        let mut out = from.to_vec();
+        let mut k = 0;
+        while k < out.len() {
+            let t = &tables[out[k]];
+            for (j, other) in tables.iter().enumerate() {
+                let next = if up {
+                    t.is_partition_of(other)
+                } else {
+                    other.is_partition_of(t)
+                };
+                if next && !out.contains(&j) {
+                    out.push(j);
+                }
+            }
+            k += 1;
+        }
+        out
+    };
+    let down = relatives(&picked, false);
+    for j in relatives(&picked, true).into_iter().chain(down) {
+        if !picked.contains(&j) {
+            picked.push(j);
+        }
+    }
     picked.sort_by_key(|&i| key(i));
     // Views after every base table: a view's body selects from the tables above
     // it, and it holds no rows to order against anything.
@@ -1188,10 +1216,11 @@ pub fn order_tables(
                 .enumerate()
                 .filter(|&(_, &j)| {
                     j != i
-                        && tables[i]
-                            .foreign_keys
-                            .iter()
-                            .any(|fk| fk_targets(fk, &tables[i], &tables[j], home))
+                        && (tables[i].is_partition_of(&tables[j])
+                            || tables[i]
+                                .foreign_keys
+                                .iter()
+                                .any(|fk| fk_targets(fk, &tables[i], &tables[j], home)))
                 })
                 .map(|(pos, _)| pos)
                 .collect()
@@ -1896,10 +1925,10 @@ fn creation_order(
         let def = t.view_definition.as_deref().filter(|_| t.is_view);
         let def_code = def.map(code);
         for (p, &j) in order.iter().enumerate().take(k) {
-            let keyed = t
-                .foreign_keys
-                .iter()
-                .any(|fk| fk_targets(fk, t, &tables[j], home));
+            let keyed = t.is_partition_of(&tables[j])
+                || t.foreign_keys
+                    .iter()
+                    .any(|fk| fk_targets(fk, t, &tables[j], home));
             let read = def
                 .zip(def_code.as_deref())
                 .is_some_and(|(d, c)| names(d, c, &tables[j].name));
@@ -2223,11 +2252,16 @@ pub fn plan(
     if opts.structure {
         for &i in &order {
             let t = &schema.tables[i];
-            if t.is_view || t.foreign_keys.is_empty() {
+            // A key a partition inherited comes back with it.
+            if t.is_view || t.foreign_keys.iter().all(|fk| fk.inherited) {
                 continue;
             }
-            let (here, elsewhere): (Vec<_>, Vec<_>) =
-                t.foreign_keys.iter().cloned().partition(|fk| {
+            let (here, elsewhere): (Vec<_>, Vec<_>) = t
+                .foreign_keys
+                .iter()
+                .filter(|fk| !fk.inherited)
+                .cloned()
+                .partition(|fk| {
                     order
                         .iter()
                         .any(|&j| fk_targets(fk, t, &schema.tables[j], home))
@@ -3002,7 +3036,14 @@ pub fn plan(
         // creates no `sq1` — the restore then stops there, and every later
         // table's structure and rows are never applied.
         // And not a graph edge's, which the header explains.
-        if opts.data && t.shape() == TableShape::Table && !cols.is_empty() && !t.tsql_kind.edge {
+        // Nor a partitioned table whose partitions hold its rows: its
+        // `SELECT` reads theirs, which their own steps write.
+        if opts.data
+            && t.shape() == TableShape::Table
+            && !cols.is_empty()
+            && !t.tsql_kind.edge
+            && !t.rows_live_in_partitions(dialect)
+        {
             // An identity the rows carry needs its switch thrown around them.
             let identity = t
                 .columns
@@ -4598,6 +4639,84 @@ mod tests {
             text_of(&p).contains("v_recent"),
             "but it is still recreated"
         );
+    }
+
+    // ── plan: partitions ─────────────────────────────────────────────────────
+
+    /// `zz_events`, partitioned and keyed onto `customers`, and its partition
+    /// `aa_2024` — named to sort *before* its parent — which inherited the key.
+    fn partitioned() -> DbSchema {
+        let mut parent = refs(table("zz_events"), "customers");
+        parent.partitioning = Some(crate::schema::Partitioning {
+            key: "RANGE (id)".into(),
+            partitions: vec![crate::schema::Partition {
+                name: "aa_2024".into(),
+                schema: None,
+                bound: "FOR VALUES FROM (1) TO (10)".into(),
+            }],
+        });
+        let mut child = refs(table("aa_2024"), "customers");
+        child.foreign_keys[0].inherited = true;
+        child.partition_of = Some(crate::schema::PartitionOf {
+            schema: None,
+            parent: "zz_events".into(),
+            bound: "FOR VALUES FROM (1) TO (10)".into(),
+        });
+        schema_of(vec![child, table("customers"), parent])
+    }
+
+    /// **A partition is created after its parent, and holds the rows**: the
+    /// parent's `SELECT` reads every partition's rows, so dumped too it put
+    /// each row back twice — once routed through the parent, once into the
+    /// partition directly — or refused them over a unique key.
+    #[test]
+    fn a_partition_follows_its_parent_and_the_parent_carries_no_rows() {
+        let s = partitioned();
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(pos(&file, "PARTITION BY RANGE (id)") < pos(&file, "PARTITION OF"));
+        assert!(file.contains("<<rows aa_2024"), "{file}");
+        assert!(!file.contains("<<rows zz_events"), "{file}");
+    }
+
+    /// The key the partition inherited comes back with it, so the file does
+    /// not add it a second time — which fails the restore.
+    #[test]
+    fn a_partitions_inherited_key_is_not_restated() {
+        let s = partitioned();
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(file.contains("fk_zz_events_customers"), "{file}");
+        assert!(!file.contains("fk_aa_2024_customers"), "{file}");
+    }
+
+    /// **Dumping a partitioned table dumps its partitions**, which hold its
+    /// rows; dumping a partition brings the parent it is created `OF`.
+    #[test]
+    fn choosing_one_side_of_a_partition_brings_the_other() {
+        let s = partitioned();
+        for chosen in ["zz_events", "aa_2024"] {
+            let file = file_of(&plan(
+                &s,
+                "shop",
+                &[chosen.to_string()],
+                DumpOptions::default(),
+                SqlDialect::Postgres,
+            ));
+            assert!(file.contains("PARTITION BY RANGE (id)"), "{chosen}: {file}");
+            assert!(file.contains("<<rows aa_2024"), "{chosen}: {file}");
+            assert!(!file.contains("<<rows customers"), "{chosen}: {file}");
+        }
     }
 
     // ── plan: the sections that make the file replayable ─────────────────────

@@ -1431,18 +1431,88 @@ fn user_schema_filter(ns: &str) -> String {
 /// Checked against the live fixtures: identical output to the old query on
 /// `world`, `chinook` and the multi-schema `warehouse`, differing only by the
 /// matview it now returns.
+///
+/// **Then the partitioning, four columns more**: a partition's parent (its
+/// namespace and name, through `pg_inherits`) and its bound
+/// (`pg_get_expr(relpartbound)` — `FOR VALUES …` or `DEFAULT`), and a
+/// partitioned table's key (`pg_get_partkeydef`), each empty where it does not
+/// apply. [`pg_fold_partitions`] reads them.
 fn table_list_sql() -> String {
     format!(
         "SELECT n.nspname, c.relname, \
                 CASE WHEN c.relkind IN ('v','m') THEN 'VIEW' \
                      WHEN c.relkind = 'f' THEN 'FOREIGN TABLE' \
                      ELSE 'BASE TABLE' END, \
-                COALESCE(obj_description(c.oid, 'pg_class'), '') \
+                COALESCE(obj_description(c.oid, 'pg_class'), ''), \
+                COALESCE(pn.nspname, ''), COALESCE(pc.relname, ''), \
+                CASE WHEN c.relispartition \
+                     THEN pg_get_expr(c.relpartbound, c.oid) ELSE '' END, \
+                CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) ELSE '' END \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_inherits i ON c.relispartition AND i.inhrelid = c.oid \
+         LEFT JOIN pg_class pc ON pc.oid = i.inhparent \
+         LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
          WHERE c.relkind IN ('r','v','m','p','f') AND {} \
          ORDER BY n.nspname, c.relname",
         user_schema_filter("n.nspname")
     )
+}
+
+/// One [`table_list_sql`] row's partitioning: `(namespace, name, parent's
+/// namespace, parent, bound, key)`, the last four empty where they do not
+/// apply.
+type PartitionRow = (String, String, String, String, String, String);
+
+fn partition_row(r: &[Option<String>]) -> PartitionRow {
+    (
+        cell(r, 0),
+        cell(r, 1),
+        cell(r, 4),
+        cell(r, 5),
+        cell(r, 6),
+        cell(r, 7),
+    )
+}
+
+/// The partitioning [`table_list_sql`] read, onto the tables: each
+/// partitioned table's key and its partitions in name order, and each
+/// partition's parent and bound.
+fn pg_fold_partitions(tables: &mut [TableInfo], rows: &[PartitionRow]) {
+    use schemaic_core::schema::{Partition, PartitionOf, Partitioning};
+    let mut parts: HashMap<(String, String), Vec<Partition>> = HashMap::new();
+    let mut of: HashMap<(String, String), PartitionOf> = HashMap::new();
+    let mut keys: HashMap<(String, String), String> = HashMap::new();
+    for (ns, name, pns, parent, bound, key) in rows {
+        if !key.is_empty() {
+            keys.insert((ns.clone(), name.clone()), key.clone());
+        }
+        if !parent.is_empty() {
+            parts
+                .entry((pns.clone(), parent.clone()))
+                .or_default()
+                .push(Partition {
+                    name: name.clone(),
+                    schema: Some(ns.clone()),
+                    bound: bound.clone(),
+                });
+            of.insert(
+                (ns.clone(), name.clone()),
+                PartitionOf {
+                    schema: Some(pns.clone()),
+                    parent: parent.clone(),
+                    bound: bound.clone(),
+                },
+            );
+        }
+    }
+    for t in tables {
+        let key = (t.schema.clone().unwrap_or_default(), t.name.clone());
+        t.partition_of = of.remove(&key);
+        t.partitioning = keys.remove(&key).map(|k| Partitioning {
+            key: k,
+            partitions: parts.remove(&key).unwrap_or_default(),
+        });
+    }
 }
 
 use crate::{ColRow, IdxRow, group_by};
@@ -1478,7 +1548,8 @@ fn index_list_sql() -> String {
                 pg_get_indexdef(ix.indexrelid, k.ord::int, true) AS keydef, \
                 COALESCE((o.opt & 1) <> 0, false) AS descending, \
                 pg_get_indexdef(ix.indexrelid) AS idxdef, \
-                k.ord > ix.indnkeyatts AS included \
+                k.ord > ix.indnkeyatts AS included, \
+                ic.relispartition AS inherited \
          FROM pg_index ix \
          JOIN pg_class c ON c.oid = ix.indrelid \
          JOIN pg_class ic ON ic.oid = ix.indexrelid \
@@ -1530,17 +1601,21 @@ fn schema_sort_key(name: &str) -> (u8, String) {
 /// fetch starts from, and none of the four catalogue queries after it.
 pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema, DbError> {
     let client = connect_to(db, database).await?;
-    let tables = query_all(&client, &table_list_sql())
-        .await?
-        .into_iter()
+    let list = query_all(&client, &table_list_sql()).await?;
+    let mut tables: Vec<TableInfo> = list
+        .iter()
         .map(|r| TableInfo {
-            schema: Some(cell(&r, 0)),
-            name: cell(&r, 1),
-            is_view: cell(&r, 2) == "VIEW",
-            is_foreign: cell(&r, 2) == "FOREIGN TABLE",
+            schema: Some(cell(r, 0)),
+            name: cell(r, 1),
+            is_view: cell(r, 2) == "VIEW",
+            is_foreign: cell(r, 2) == "FOREIGN TABLE",
             ..Default::default()
         })
         .collect();
+    // The partitioning rides on the light list too, so whatever is drawn from
+    // it can tell a partition from a table.
+    let rows: Vec<PartitionRow> = list.iter().map(|r| partition_row(r)).collect();
+    pg_fold_partitions(&mut tables, &rows);
     Ok(DbSchema {
         tables,
         ..Default::default()
@@ -1558,18 +1633,26 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
 /// table reports zero rows, and the estimate label plus **Count rows** are the
 /// only remedy. 13 went end-of-life in November 2025.
 ///
-/// Only `r` (ordinary) and `m` (materialized view) are asked for a size. A
-/// **partitioned** parent (`p`) has no storage of its own — `pg_table_size`
-/// would return a truthful `0` that reads as "this 40 GB table is empty" — so it
-/// is listed with null sizes; its partitions are ordinary relations and appear
-/// in their own right. Foreign tables (`f`) are excluded for the same reason.
+/// Only `r` (ordinary) and `m` (materialized view) are asked for a size of
+/// their own. A **partitioned** parent (`p`) has no storage — `pg_table_size`
+/// would return a truthful `0` that reads as "this 40 GB table is empty" — so
+/// its figures are **its leaf partitions' totals** (`pg_partition_tree`), its
+/// rows `NULL` while any leaf is unanalysed; its partitions also appear in
+/// their own right. Foreign tables (`f`) are excluded, having no storage here.
 /// Plain views (`v`) are not here at all, having neither rows nor bytes.
 fn table_stats_sql() -> String {
+    let leaves = |what: &str| {
+        format!(
+            "(SELECT {what} FROM pg_partition_tree(c.oid) pt \
+              JOIN pg_class lc ON lc.oid = pt.relid WHERE pt.isleaf)"
+        )
+    };
     format!(
         "SELECT n.nspname, c.relname, \
-                CASE WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END, \
-                CASE WHEN c.relkind = 'p' THEN NULL ELSE pg_table_size(c.oid) END, \
-                CASE WHEN c.relkind = 'p' THEN NULL ELSE pg_indexes_size(c.oid) END, \
+                CASE WHEN c.relkind = 'p' THEN {} \
+                     WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END, \
+                CASE WHEN c.relkind = 'p' THEN {} ELSE pg_table_size(c.oid) END, \
+                CASE WHEN c.relkind = 'p' THEN {} ELSE pg_indexes_size(c.oid) END, \
                 s.n_dead_tup, \
                 GREATEST(s.last_analyze, s.last_autoanalyze) \
          FROM pg_class c \
@@ -1577,6 +1660,12 @@ fn table_stats_sql() -> String {
          LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid \
          WHERE c.relkind IN ('r','m','p') AND {} \
          ORDER BY n.nspname, c.relname",
+        leaves(
+            "CASE WHEN bool_or(lc.reltuples < 0) THEN NULL \
+                  ELSE sum(lc.reltuples)::bigint END"
+        ),
+        leaves("sum(pg_table_size(lc.oid))::bigint"),
+        leaves("sum(pg_indexes_size(lc.oid))::bigint"),
         user_schema_filter("n.nspname")
     )
 }
@@ -2005,11 +2094,12 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
     // Every browsable object (BASE TABLE / VIEW / materialized view), across
     // every user schema. See `table_list_sql` for why this can't come from
     // `information_schema`.
-    let table_rows: Vec<(String, String, String, String)> = query_all(client, &table_list_sql())
-        .await?
-        .into_iter()
-        .map(|r| (cell(&r, 0), cell(&r, 1), cell(&r, 2), cell(&r, 3)))
+    let list = query_all(client, &table_list_sql()).await?;
+    let table_rows: Vec<(String, String, String, String)> = list
+        .iter()
+        .map(|r| (cell(r, 0), cell(r, 1), cell(r, 2), cell(r, 3)))
         .collect();
+    let partition_rows: Vec<PartitionRow> = list.iter().map(|r| partition_row(r)).collect();
 
     // Indexes via `pg_catalog` (every index, not just constraint-backed ones),
     // columns in `indkey` order. `unnest(... ) WITH ORDINALITY` preserves column
@@ -2176,7 +2266,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                     rn.nspname, rc.relname, ra.attname, \
                     con.confdeltype, con.confupdtype, \
                     con.confmatchtype, con.condeferrable, con.condeferred, \
-                    con.convalidated \
+                    con.convalidated, con.conparentid <> 0 \
              FROM pg_constraint con \
              JOIN pg_class c ON c.oid = con.conrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -2410,7 +2500,21 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         .filter(|(.., cm)| !cm.is_empty())
         .map(|(ns, name, _, cm)| ((ns.clone(), name.clone()), cm.clone()))
         .collect();
+    // What PostgreSQL cloned onto a partition from its parent: an index
+    // attached to the parent's (`relispartition` on the index) and a key with
+    // a parent constraint (`conparentid`). Kept, marked, never restated.
+    let inherited_indexes: HashSet<(String, String, String)> = idx_all
+        .iter()
+        .filter(|r| cell(r, 14) == "t")
+        .map(|r| (cell(r, 0), cell(r, 1), cell(r, 2)))
+        .collect();
+    let inherited_fks: HashSet<(String, String, String)> = fk_all
+        .iter()
+        .filter(|r| cell(r, 13) == "t")
+        .map(|r| (cell(r, 0), cell(r, 1), cell(r, 2)))
+        .collect();
     pg_fold_checks_and_triggers(&mut tables, &check_all, &trigger_all, &trigger_cols_all);
+    pg_fold_partitions(&mut tables, &partition_rows);
     for t in &mut tables {
         let ns = t.schema.clone().unwrap_or_default();
         let key = (ns.clone(), t.name.clone());
@@ -2419,11 +2523,12 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
             t.view_options = view_options.get(&key).cloned();
         }
         for ix in &mut t.indexes {
-            ix.constraint = idx_constraints
-                .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
-                .cloned();
+            let k = (ns.clone(), t.name.clone(), ix.name.clone());
+            ix.constraint = idx_constraints.get(&k).cloned();
+            ix.inherited = inherited_indexes.contains(&k);
         }
         for fk in &mut t.foreign_keys {
+            fk.inherited = inherited_fks.contains(&(ns.clone(), t.name.clone(), fk.name.clone()));
             if let Some((on_delete, on_update, match_type, deferrable, not_validated)) =
                 fk_rules.get(&(ns.clone(), t.name.clone(), fk.name.clone()))
             {
@@ -5805,22 +5910,26 @@ mod tests {
     // convention exists to catch is the one that shipped — a guard present in one
     // builder and absent from its sibling.
 
-    /// A partitioned parent has no storage of its own, so it is listed with null
-    /// sizes rather than a truthful `0` that reads as "this 40 GB table is empty".
+    /// A partitioned parent has no storage of its own, so it is sized as its
+    /// leaf partitions together rather than a truthful `0` that reads as "this
+    /// 40 GB table is empty".
     #[test]
-    fn the_table_stats_query_nulls_a_partitioned_parents_sizes() {
+    fn the_table_stats_query_sizes_a_partitioned_parent_by_its_partitions() {
         let q = table_stats_sql();
         assert!(
-            q.contains("CASE WHEN c.relkind = 'p' THEN NULL ELSE pg_table_size(c.oid) END"),
+            q.contains("sum(pg_table_size(lc.oid))::bigint FROM pg_partition_tree(c.oid)"),
             "{q}"
         );
         assert!(
-            q.contains("CASE WHEN c.relkind = 'p' THEN NULL ELSE pg_indexes_size(c.oid) END"),
+            q.contains("sum(pg_indexes_size(lc.oid))::bigint FROM pg_partition_tree(c.oid)"),
             "both sizes, or the split disagrees with the total: {q}"
         );
+        assert!(q.contains("WHERE pt.isleaf"), "{q}");
         // `reltuples` is -1 on a relation that has never been analyzed. Passed
-        // through it would say "0 rows" about a full table.
-        assert!(q.contains("CASE WHEN c.reltuples < 0 THEN NULL"), "{q}");
+        // through it would say "0 rows" about a full table — and summed, it
+        // would subtract.
+        assert!(q.contains("WHEN c.reltuples < 0 THEN NULL"), "{q}");
+        assert!(q.contains("bool_or(lc.reltuples < 0) THEN NULL"), "{q}");
         // Sized relkinds only, and the partitioned parent listed among them so it
         // still gets its row estimate.
         assert!(q.contains("c.relkind IN ('r','m','p')"), "{q}");
@@ -5990,6 +6099,82 @@ mod table_list_tests {
             schemaic_core::schema::TableShape::ForeignTable
         );
         assert!(!schema.tables[1].is_foreign);
+    }
+
+    /// The partitioning rides on the list: a partition's parent through
+    /// `pg_inherits`, its bound, and a partitioned table's key.
+    #[test]
+    fn the_object_list_reads_the_partitioning() {
+        let sql = table_list_sql();
+        for part in [
+            "pg_inherits i ON c.relispartition AND i.inhrelid = c.oid",
+            "pg_get_expr(c.relpartbound, c.oid)",
+            "WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid)",
+        ] {
+            assert!(sql.contains(part), "{part} missing from {sql}");
+        }
+    }
+
+    /// A partitioned table gets its key and its partitions; each partition
+    /// its parent — in another namespace too — and its bound; a
+    /// sub-partitioned partition both.
+    #[test]
+    fn partitions_fold_onto_their_parent_and_name_it() {
+        let t = |ns: &str, name: &str| TableInfo {
+            schema: Some(ns.into()),
+            name: name.into(),
+            ..Default::default()
+        };
+        let mut tables = vec![
+            t("public", "m"),
+            t("archive", "m_2023"),
+            t("public", "m_2024"),
+            t("public", "plain"),
+        ];
+        let s = |x: &str| x.to_string();
+        let row = |ns: &str, name: &str, pns: &str, parent: &str, bound: &str, key: &str| {
+            (s(ns), s(name), s(pns), s(parent), s(bound), s(key))
+        };
+        pg_fold_partitions(
+            &mut tables,
+            &[
+                row("public", "m", "", "", "", "RANGE (at)"),
+                row(
+                    "archive",
+                    "m_2023",
+                    "public",
+                    "m",
+                    "FOR VALUES FROM (1) TO (2)",
+                    "",
+                ),
+                row(
+                    "public",
+                    "m_2024",
+                    "public",
+                    "m",
+                    "FOR VALUES FROM (2) TO (3)",
+                    "LIST (id)",
+                ),
+                row("public", "plain", "", "", "", ""),
+            ],
+        );
+        let p = tables[0].partitioning.as_ref().unwrap();
+        assert_eq!(p.key, "RANGE (at)");
+        assert_eq!(
+            p.partitions
+                .iter()
+                .map(|x| (x.schema.as_deref().unwrap(), x.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("archive", "m_2023"), ("public", "m_2024")]
+        );
+        assert!(tables[1].is_partition_of(&tables[0]));
+        assert_eq!(
+            tables[1].partition_of.as_ref().unwrap().bound,
+            "FOR VALUES FROM (1) TO (2)"
+        );
+        assert!(tables[2].is_partition_of(&tables[0]));
+        assert_eq!(tables[2].partitioning.as_ref().unwrap().key, "LIST (id)");
+        assert!(tables[3].partitioning.is_none() && tables[3].partition_of.is_none());
     }
 
     #[test]

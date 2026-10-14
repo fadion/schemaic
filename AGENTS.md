@@ -32,7 +32,7 @@ whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `sql::SqlDialect::read_only_is_a_rollback`, `dump::drops_up_front`,
 `copy_table::counter_follows_written_values`,
 `export::client_substitutes_variables`, `reads_dates_by_language`,
-`schema::unvalidated_check_waits_for_rows`, `writes_not_valid`
+`schema::unvalidated_check_waits_for_rows`, `writes_not_valid`, `partitions_are_tables`
 — alongside them the few that do decide whether a control is offered, because the clause
 behind it is one engine's alone:
 `ddl::supports_trigger_not_for_replication`, `supports_trigger_execute_as`,

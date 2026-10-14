@@ -304,6 +304,12 @@ pub struct IndexInfo {
     /// and for every other index; a column list, not text, so a column the
     /// designer renames or drops is followed here as it is in `include`.
     pub order: Vec<String>,
+    /// **PostgreSQL's index cloned onto a partition** by an index on its
+    /// parent (`pg_class.relispartition` on the index). Kept, since a
+    /// partition's grid edits key on it, but never restated: the partition
+    /// gets it again from its parent when it is created, and a second
+    /// `CREATE INDEX` of the name fails the restore. `false` everywhere else.
+    pub inherited: bool,
 }
 
 /// What a [`TableInfo`] actually **is** — the three answers
@@ -628,6 +634,11 @@ pub struct ForeignKeyInfo {
     /// state. `false` on every engine that does not report it, for the reason
     /// `not_enforced` is.
     pub not_validated: bool,
+    /// **PostgreSQL's key cloned onto a partition** by a key on its parent
+    /// (`conparentid` set) — never restated, as [`IndexInfo::inherited`]: the
+    /// partition gets it from its parent, and a second `ADD CONSTRAINT` of the
+    /// name fails the restore. `false` everywhere else.
+    pub inherited: bool,
 }
 
 /// Backtick-quote a SQL identifier, doubling any embedded backtick.
@@ -1597,6 +1608,60 @@ pub struct TableInfo {
     /// differs compare: a binding no script can restate is no difference a
     /// plan could act on. Empty on every other engine.
     pub tsql_bindings: Vec<TsqlColumnBinding>,
+    /// **How this table is partitioned**, where it is: its key and its
+    /// partitions. On PostgreSQL each partition is a table of its own (see
+    /// [`partitions_are_tables`]) whose [`TableInfo::partition_of`] names
+    /// this one; on MySQL a partition is storage inside this table.
+    pub partitioning: Option<Partitioning>,
+    /// **The table this one is a partition of** — PostgreSQL's, where a
+    /// partition is a table of its own. A sub-partitioned partition has
+    /// [`TableInfo::partitioning`] too.
+    pub partition_of: Option<PartitionOf>,
+}
+
+/// How a table is partitioned ([`TableInfo::partitioning`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Partitioning {
+    /// The key as the engine prints it: `RANGE (created_at)` — PostgreSQL's
+    /// `pg_get_partkeydef`, MySQL's method and expression.
+    pub key: String,
+    /// The partitions, in the engine's order.
+    pub partitions: Vec<Partition>,
+}
+
+/// One partition of a [`Partitioning`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Partition {
+    /// Its name: a PostgreSQL partition's table, MySQL's `p0`.
+    pub name: String,
+    /// A PostgreSQL partition's namespace, which may differ from its
+    /// parent's. `None` elsewhere.
+    pub schema: Option<String>,
+    /// Its bound as the engine prints it: `FOR VALUES FROM (1) TO (10)`,
+    /// `DEFAULT`, MySQL's `VALUES LESS THAN (10)`. Empty for a `HASH`/`KEY`
+    /// partition on MySQL, which has none.
+    pub bound: String,
+}
+
+/// The table a partition belongs to ([`TableInfo::partition_of`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartitionOf {
+    pub schema: Option<String>,
+    pub parent: String,
+    /// `FOR VALUES …` or `DEFAULT`, as `pg_get_expr(relpartbound)` prints it.
+    pub bound: String,
+}
+
+/// **Is each partition a table of its own?** On PostgreSQL it is — listed,
+/// sized, queried and dumped as one, holding the rows while its parent holds
+/// none. On MySQL and SQL Server a partition is storage inside its table, and
+/// the table holds every row.
+pub fn partitions_are_tables(dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect as D;
+    match dialect {
+        D::Postgres => true,
+        D::MySql | D::MsSql | D::Sqlite => false,
+    }
 }
 
 /// A default or rule bound to one column ([`TableInfo::tsql_bindings`]), by
@@ -5434,6 +5499,20 @@ impl ObjectItem {
 }
 
 impl TableInfo {
+    /// Is this table a partition of `parent` ([`TableInfo::partition_of`])?
+    pub fn is_partition_of(&self, parent: &TableInfo) -> bool {
+        self.partition_of
+            .as_ref()
+            .is_some_and(|of| of.parent == parent.name && of.schema == parent.schema)
+    }
+
+    /// **Does this table hold no rows of its own?** A partitioned table whose
+    /// partitions are tables ([`partitions_are_tables`]): its rows are theirs,
+    /// and reading it reads them.
+    pub fn rows_live_in_partitions(&self, dialect: crate::intel::SqlDialect) -> bool {
+        self.partitioning.is_some() && partitions_are_tables(dialect)
+    }
+
     /// Which of the three things in [`TableShape`] this is — the question the
     /// menus, the designer and the dump ask, in place of the two-answer
     /// `is_view`.
@@ -5570,10 +5649,52 @@ impl TableInfo {
         for ck in &self.check_constraints {
             lines.push(format!("  {}", ck.clause_sql(dialect)));
         }
-        let non_pk = self.indexes.iter().filter(|ix| !ix.is_primary());
+        // An index a partition inherited comes back with the partition.
+        let non_pk = self
+            .indexes
+            .iter()
+            .filter(|ix| !ix.is_primary() && !ix.inherited);
         if pg {
             // Postgres: indexes are separate statements after the table.
-            let mut out = format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"));
+            let by = self
+                .partitioning
+                .as_ref()
+                .map(|p| format!(" PARTITION BY {}", p.key))
+                .unwrap_or_default();
+            // **A partition is created `PARTITION OF` its parent**, which
+            // gives it its columns, key and inherited indexes; only its own
+            // checks are restated with it.
+            let mut out = match &self.partition_of {
+                Some(of) => {
+                    let parent = qualified_ident(&of.parent, of.schema.as_deref(), dialect);
+                    // A key it declared itself — its parent having none — and
+                    // not one it inherited.
+                    let own_key = self
+                        .indexes
+                        .iter()
+                        .any(|ix| ix.is_primary() && !ix.inherited)
+                        .then(|| format!("  PRIMARY KEY ({})", pk.join(", ")))
+                        .filter(|_| !pk.is_empty());
+                    let checks: Vec<String> = own_key
+                        .into_iter()
+                        .chain(
+                            self.check_constraints
+                                .iter()
+                                .map(|ck| format!("  {}", ck.clause_sql(dialect))),
+                        )
+                        .collect();
+                    let own = if checks.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (\n{}\n)", checks.join(",\n"))
+                    };
+                    format!(
+                        "CREATE TABLE {qname} PARTITION OF {parent}{own} {}{by};",
+                        of.bound
+                    )
+                }
+                None => format!("CREATE TABLE {qname} (\n{}\n){by};", lines.join(",\n")),
+            };
             for ix in non_pk {
                 // **An index the model only partly read is emitted from the
                 // server's own statement**, because emitting it from the model
@@ -9738,6 +9859,136 @@ mod tests {
             ddl.lines().all(|l| l.trim_start().starts_with("--")),
             "{ddl}"
         );
+    }
+
+    /// `measurements(id, at)` in `public`, partitioned by `at`, with a
+    /// non-primary index — and its partition `m_2024`, which inherited that
+    /// index and has one of its own.
+    fn partitioned_pair() -> (TableInfo, TableInfo) {
+        let col = |n: &str, ty: &str| ColumnInfo {
+            name: n.into(),
+            type_name: ty.into(),
+            nullable: false,
+            ..Default::default()
+        };
+        let ix = |name: &str, col: &str, inherited: bool| IndexInfo {
+            name: name.into(),
+            columns: vec![IndexColumn::plain(col)],
+            inherited,
+            ..Default::default()
+        };
+        let parent = TableInfo {
+            name: "measurements".into(),
+            schema: Some("public".into()),
+            columns: vec![col("id", "integer"), col("at", "date")],
+            indexes: vec![ix("measurements_at_idx", "at", false)],
+            partitioning: Some(Partitioning {
+                key: "RANGE (at)".into(),
+                partitions: vec![Partition {
+                    name: "m_2024".into(),
+                    schema: Some("public".into()),
+                    bound: "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let child = TableInfo {
+            name: "m_2024".into(),
+            schema: Some("public".into()),
+            columns: parent.columns.clone(),
+            indexes: vec![
+                ix("m_2024_at_idx", "at", true),
+                ix("m_2024_id_idx", "id", false),
+            ],
+            partition_of: Some(PartitionOf {
+                schema: Some("public".into()),
+                parent: "measurements".into(),
+                bound: "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')".into(),
+            }),
+            ..Default::default()
+        };
+        (parent, child)
+    }
+
+    /// **A partitioned table's script keeps its `PARTITION BY`**, and a
+    /// partition's is `PARTITION OF` its parent with its bound — restored as
+    /// two plain tables, the parent held no rows and routed none, and the
+    /// partition was a stray copy beside it.
+    #[test]
+    fn a_partitioned_table_and_its_partition_are_restated_as_such() {
+        let pg = crate::intel::SqlDialect::Postgres;
+        let (parent, child) = partitioned_pair();
+        let p = parent.create_ddl(pg);
+        assert!(
+            p.contains("\n) PARTITION BY RANGE (at);"),
+            "the parent keeps its key: {p}"
+        );
+        let c = child.create_ddl(pg);
+        assert!(
+            c.starts_with(
+                "CREATE TABLE \"public\".\"m_2024\" PARTITION OF \"public\".\"measurements\" \
+                 FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');"
+            ),
+            "{c}"
+        );
+        assert!(
+            !c.contains("\"id\" integer"),
+            "its columns are the parent's: {c}"
+        );
+        // The index it inherited comes back with the partition; its own does
+        // not, and is restated.
+        assert!(!c.contains("m_2024_at_idx"), "{c}");
+        assert!(c.contains("CREATE INDEX \"m_2024_id_idx\""), "{c}");
+    }
+
+    /// **A key the partition declared itself is restated** — possible where
+    /// its parent has none — while one it inherited is not, coming back with
+    /// it from the parent.
+    #[test]
+    fn a_partitions_own_primary_key_is_restated_and_an_inherited_one_is_not() {
+        let pg = crate::intel::SqlDialect::Postgres;
+        let (_, mut child) = partitioned_pair();
+        child.columns[0].primary_key = true;
+        child.indexes.push(IndexInfo {
+            name: "PRIMARY".into(),
+            columns: vec![IndexColumn::plain("id")],
+            unique: true,
+            ..Default::default()
+        });
+        let own = child.create_ddl(pg);
+        assert!(
+            own.contains(
+                "PARTITION OF \"public\".\"measurements\" (\n  PRIMARY KEY (\"id\")\n) FOR VALUES"
+            ),
+            "{own}"
+        );
+        child.indexes.last_mut().unwrap().inherited = true;
+        let inherited = child.create_ddl(pg);
+        assert!(!inherited.contains("PRIMARY KEY"), "{inherited}");
+    }
+
+    /// A partition that is itself partitioned says both.
+    #[test]
+    fn a_sub_partitioned_partition_keeps_its_own_key() {
+        let (_, mut child) = partitioned_pair();
+        child.partitioning = Some(Partitioning {
+            key: "LIST (id)".into(),
+            partitions: Vec::new(),
+        });
+        let c = child.create_ddl(crate::intel::SqlDialect::Postgres);
+        assert!(
+            c.contains("TO ('2025-01-01') PARTITION BY LIST (id);"),
+            "{c}"
+        );
+    }
+
+    #[test]
+    fn partitions_are_tables_on_postgres_alone() {
+        use crate::intel::SqlDialect as D;
+        assert!(partitions_are_tables(D::Postgres));
+        for d in [D::MySql, D::MsSql, D::Sqlite] {
+            assert!(!partitions_are_tables(d), "{d:?}");
+        }
     }
 
     /// An extension is the **database's**: it lists in the flat folder and by

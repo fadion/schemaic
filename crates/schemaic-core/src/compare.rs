@@ -249,7 +249,9 @@ pub struct CompareEntry {
     /// the omitted list and the row's hint show. Set where the server would
     /// refuse the statements and the only change it would take does damage
     /// the comparison may not choose for the user: a sequence range its
-    /// target's counter has already left ([`held_back_sequence`]).
+    /// target's counter has already left ([`held_back_sequence`]) — or where
+    /// no statement exists for the difference at all: a table partitioned
+    /// differently on the two sides.
     pub held_back: Option<String>,
     /// The object's `CREATE` as the **left** side has it, and empty when only
     /// the right side does.
@@ -2707,17 +2709,36 @@ fn table_entry(
     };
     let left_ddl = side_ddl(l, |t| t.create_ddl(dialect));
     let right_ddl = side_ddl(r, |t| t.create_ddl(dialect));
+    // **A table partitioned differently is a difference no plan can carry**:
+    // no `ALTER` changes a table's key, or which table it is a partition of
+    // and for which values, and the differ reads neither — so it is held back
+    // and said, rather than reading as the same table.
+    let repartitioned = match (l, r) {
+        (Some(l), Some(r)) => {
+            l.partitioning.as_ref().map(|p| &p.key) != r.partitioning.as_ref().map(|p| &p.key)
+                || l.partition_of != r.partition_of
+        }
+        _ => false,
+    };
     CompareEntry {
         kind,
         schema: any.schema.clone(),
         name: any.name.clone(),
         table: None,
         signature: None,
-        status: unread_status(l.is_some(), unread_source, &left_ddl, &right_ddl)
-            .unwrap_or_else(|| status_of(l.is_some(), r.is_some(), &changes)),
+        status: if repartitioned {
+            ObjectStatus::Differing
+        } else {
+            unread_status(l.is_some(), unread_source, &left_ddl, &right_ddl)
+                .unwrap_or_else(|| status_of(l.is_some(), r.is_some(), &changes))
+        },
         changes,
         uncertain,
-        held_back: None,
+        held_back: repartitioned.then(|| {
+            "its partitioning differs, and no ALTER changes a table's partitioning — \
+             recreate it by hand"
+                .to_string()
+        }),
         left_ddl,
         right_ddl,
     }
@@ -3294,6 +3315,88 @@ mod tests {
                 plan.omitted
             );
         }
+    }
+
+    /// `events`, partitioned by `at`, and its partition `a_2024`, named to sort before it.
+    fn partitioned_events() -> (TableInfo, TableInfo) {
+        use crate::schema::{Partition, PartitionOf, Partitioning};
+        let bound = "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')";
+        let parent = TableInfo {
+            name: "events".to_string(),
+            schema: Some("public".to_string()),
+            columns: vec![col("id", "integer"), col("at", "date")],
+            partitioning: Some(Partitioning {
+                key: "RANGE (at)".into(),
+                partitions: vec![Partition {
+                    name: "a_2024".into(),
+                    schema: Some("public".into()),
+                    bound: bound.into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let child = TableInfo {
+            name: "a_2024".to_string(),
+            schema: Some("public".to_string()),
+            columns: parent.columns.clone(),
+            partition_of: Some(PartitionOf {
+                schema: Some("public".into()),
+                parent: "events".into(),
+                bound: bound.into(),
+            }),
+            ..Default::default()
+        };
+        (parent, child)
+    }
+
+    /// **A partitioned table the target lacks is created partitioned**, and
+    /// its partition `PARTITION OF` it after it — through the one table
+    /// emitter, not a second spelling.
+    #[test]
+    fn a_missing_partitioned_table_is_created_with_its_partitions() {
+        let (parent, child) = partitioned_events();
+        let plan = SchemaComparison::of(
+            &schema_of(vec![]),
+            &schema_of(vec![child, parent]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true);
+        let sql = plan.emit().join("\n");
+        let by = sql.find(") PARTITION BY RANGE (at);").expect(&sql);
+        let of = sql
+            .find(
+                "CREATE TABLE \"public\".\"a_2024\" PARTITION OF \"public\".\"events\" \
+                 FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+            )
+            .expect(&sql);
+        assert!(by < of, "the parent first: {sql}");
+    }
+
+    /// A table partitioned differently on the two sides is held back and
+    /// said, not planned as the same table nor as an `ALTER` no server takes.
+    #[test]
+    fn a_change_of_partitioning_is_held_back() {
+        let (parent, child) = partitioned_events();
+        let mut other = parent.clone();
+        other.partitioning.as_mut().unwrap().key = "LIST (id)".into();
+        let mut moved = child.clone();
+        moved.partition_of.as_mut().unwrap().bound = "DEFAULT".into();
+        let cmp = SchemaComparison::of(
+            &schema_of(vec![parent, child]),
+            &schema_of(vec![other, moved]),
+            SqlDialect::Postgres,
+        );
+        let plan = cmp.plan(|_| true);
+        for name in ["events", "a_2024"] {
+            assert!(
+                plan.omitted
+                    .iter()
+                    .any(|o| o.contains(name) && o.contains("partitioning differs")),
+                "{name}: {:?}",
+                plan.omitted
+            );
+        }
+        assert!(!plan.emit().join("\n").contains("ALTER"));
     }
 
     /// **A `Same` row can still have two different texts under it.** On SQLite

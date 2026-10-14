@@ -60,7 +60,7 @@ pub fn refusal(src: &TableInfo, to: &CopyTarget, same_database: bool) -> Option<
 
 /// The table the copy creates: the source's columns, key, indexes and checks,
 /// all **new** to the target, under `to`'s name and schema, without its
-/// foreign keys.
+/// foreign keys or its partitioning.
 ///
 /// **An index's or a check's name moves with the table's.** Index names are
 /// per schema on PostgreSQL and per database on SQLite, and a check's name per
@@ -78,12 +78,17 @@ pub fn draft(src: &TableInfo, to: &CopyTarget) -> TableDraft {
     d.schema = to.schema.clone();
     d.columns = src.columns.iter().cloned().map(ColumnDraft::new).collect();
     d.foreign_keys.clear();
+    // **A plain table**, whatever the source's partitioning: it holds every
+    // row the source reads, and no parent gives it an index.
+    d.partition_key = None;
+    d.partition_of = None;
     let renamed = |name: &str| moved_name(name, &src.name, &to.name);
     d.indexes = d
         .indexes
         .into_iter()
         .map(|mut ix| {
             ix.info.name = renamed(&ix.info.name);
+            ix.info.inherited = false;
             IndexDraft::new(ix.info)
         })
         .collect();
@@ -255,6 +260,32 @@ mod tests {
         assert!(d.check_constraints.iter().all(|ck| ck.original.is_none()));
         assert!(d.foreign_keys.is_empty());
         assert_eq!(d.primary_key, vec!["id".to_string()]);
+    }
+
+    /// **A copy is one plain table**: a partitioned source copied partitioned
+    /// has no partition for any row it then inserts, and a partition copied
+    /// `PARTITION OF` names a parent the target may not have. The rows a
+    /// partitioned table reads are its partitions', so the copy holds them
+    /// all; and an index the source inherited is the copy's own.
+    #[test]
+    fn a_partitioned_table_or_a_partition_is_copied_as_a_plain_table() {
+        let mut src = orders();
+        src.partitioning = Some(crate::schema::Partitioning {
+            key: "RANGE (id)".into(),
+            partitions: Vec::new(),
+        });
+        src.partition_of = Some(crate::schema::PartitionOf {
+            schema: Some("public".into()),
+            parent: "all_orders".into(),
+            bound: "DEFAULT".into(),
+        });
+        src.indexes[0].inherited = true;
+        let sql = plan(&src, &to("orders_copy"), PG).emit().join("\n");
+        assert!(!sql.contains("PARTITION"), "{sql}");
+        assert!(
+            sql.contains("CREATE INDEX \"orders_copy_total_idx\""),
+            "{sql}"
+        );
     }
 
     #[test]

@@ -5674,6 +5674,29 @@ existing prose was left alone.
     created before itself. A real cycle is **reported, never dropped**: no creation order satisfies
     one, so an edge is broken at the smallest name, every chosen table still reaches the file, and
     `DumpPlan::cycles` is what puts the explanation in the header.
+    **A PostgreSQL partition is an edge too, and it widens the selection.** A partition waits on
+    the table it is a partition of (`TableInfo::is_partition_of`), in `order_tables`' base edges and
+    again in `creation_order`'s waits, since its `CREATE TABLE … PARTITION OF` names the parent —
+    sorted by name alone, a partition called `aa_2024` would be created ahead of `zz_events`,
+    which is how the tests name the pair. And
+    `order_tables` expands what was chosen before it sorts: a chosen table brings its partitions,
+    and theirs, because they hold its rows; a chosen partition brings the tables it is a partition
+    of, up to the root, because its `CREATE` names them — but **not its siblings**, which nothing in
+    it needs (`choosing_one_side_of_a_partition_brings_the_other`). The comparison's `fk_rank`
+    passes every table on a side as chosen, so the widening adds nothing there. **A table whose
+    rows live in its partitions gets no data step** (`TableInfo::rows_live_in_partitions`): its
+    `SELECT` reads every partition's rows, so dumped beside them each row went back twice — once
+    routed through the parent, once into the partition directly — or was refused over a unique key
+    (`a_partition_follows_its_parent_and_the_parent_carries_no_rows`). **A key a partition
+    inherited is not restated** in the closing constraints section, the parent's own
+    `ADD CONSTRAINT` putting it back on every partition, while a second one of the same name fails
+    the restore (`a_partitions_inherited_key_is_not_restated`); a partition with only inherited
+    keys is skipped there like a view. Verified live on PostgreSQL 16 (per the change's author): a
+    fixture with range partitions across two schemas, a sub-partitioned partition, two `DEFAULT`
+    partitions, a parent index, a partition's own index and a foreign key, dumped as
+    `events` + `customers` and restored into a fresh database with the same per-partition row
+    counts (641/546/552/261), 13 indexes and 6 foreign-key constraints. Only PostgreSQL is
+    affected: no other engine's reader fills the partitioning (under `schema.rs`).
     **The views are then sorted among themselves, by the same walk.** "Views last" ordered them
     against the base tables and left them in name order against each other, and a view built on
     another view is `CREATE VIEW … FROM other_view` where `other_view` does not exist yet — MySQL
@@ -6947,6 +6970,18 @@ existing prose was left alone.
     `NOT ENFORCED` there (`CheckInfo::clause_sql`, asking `writes_not_enforced`), T-SQL having no
     such clause (`create_table_on_sql_server_writes_t_sql`,
     `create_table_on_sql_server_writes_no_mysql_options`).
+    **A PostgreSQL partitioning is a `create`-only field**: `TableDraft::partition_key` and
+    `partition_of`, which `from_table` copies off `TableInfo::partitioning`'s key and
+    `TableInfo::partition_of` (under `schema.rs`). `create_table_sql` writes a partition as
+    `CREATE TABLE q PARTITION OF parent [(…)] <bound>`, its parenthesised list holding only its
+    own foreign keys and checks, since the parent gives it its columns and key, and appends
+    ` PARTITION BY <key>` to a partitioned table or a sub-partitioned partition; an inherited
+    foreign key or index (`inherited`) is skipped, coming with the partition from its parent.
+    **`diff` never reads either**, because no `ALTER` changes a table's partitioning — so an edit in
+    the designer cannot express one, and the comparison holds a repartitioned table back rather
+    than letting the two sides read as the same table (under `compare.rs`). Copy to clears both
+    (under `copy_table.rs`). The comparison's
+    `a_missing_partitioned_table_is_created_with_its_partitions` is the pin on this emitter.
     **Clustering is written wherever T-SQL's default would be wrong, and the default differs by
     kind**: a key is `CLUSTERED` unless it says otherwise, an index or a unique constraint
     `NONCLUSTERED`. So `create_index_sql` writes `CREATE [UNIQUE] CLUSTERED INDEX` for an
@@ -8659,9 +8694,9 @@ existing prose was left alone.
     sentence saying why no plan may carry an entry's changes, set where the server would refuse the
     statements and the only change it would take does damage the comparison may not choose for the
     user; `unplannable` is true whenever it is set, and `omission_note` reads it ahead of its other
-    three arms, so the omitted line is that sentence. One producer sets it — `tsql_entry`, through
-    `held_back_sequence`, for a SQL Server sequence's range (below) — and every other entry is built
-    with `None`. `is_planned` carries the same term, so counting and building cannot answer
+    three arms, so the omitted line is that sentence. Two producers set it — `tsql_entry`, through
+    `held_back_sequence`, for a SQL Server sequence's range, and `table_entry` for a table whose
+    partitioning differs (both below) — and every other entry is built with `None`. `is_planned` carries the same term, so counting and building cannot answer
     differently.
     It is a second list rather than more lines in
     `unsupported()` because the two ask different things of the reader: `unsupported` means this plan
@@ -8809,7 +8844,21 @@ existing prose was left alone.
     disclosed in `omitted` as a sequence is. The model holds its columns and not its server or
     options, so the only statements the table arms could write are a `CREATE TABLE` making an empty
     local table where the wrapper's rows were, and an `ALTER` or `DROP TABLE` the server refuses on
-    one (`a_foreign_table_is_disclosed_not_planned`). **Extensions are not compared at all**:
+    one (`a_foreign_table_is_disclosed_not_planned`).
+    **A PostgreSQL table partitioned differently on the two sides is held back, not planned.** No
+    `ALTER` changes a table's partition key, nor which table it is a partition of or for which
+    values, and `ddl::diff` reads neither field — so where the key (`TableInfo::partitioning`'s) or
+    the whole `partition_of` differs, `table_entry` makes the entry `Differing` whatever its change
+    set says, and sets `held_back` to *"its partitioning differs, and no ALTER changes a table's
+    partitioning — recreate it by hand"*; without it the two would have read as the same table, or
+    been planned as alters that leave the partitioning as it was
+    (`a_change_of_partitioning_is_held_back`, over a changed key and a partition moved to
+    `DEFAULT`). The partitions themselves are not compared through the key — each is a table of
+    its own and pairs as one. A partitioned table the target lacks is created partitioned, through
+    `ddl::create_table_sql`, with its partitions after it, since `fk_rank`'s `dump::order_tables`
+    makes a partition wait on its parent
+    (`a_missing_partitioned_table_is_created_with_its_partitions`).
+    **Extensions are not compared at all**:
     installing one is a server-side act — its control files must be on the target's disk — rather
     than a definition a plan can restate, and the comparison does not read the two sides' lists.
     `a_compare_group_is_named_as_the_tree_names_it` names `ObjectKind::Extension` as the one kind
@@ -9010,7 +9059,14 @@ existing prose was left alone.
     preview shows it and `Db::run_ddl` runs it like any other plan
     (`the_plan_creates_the_copy_and_never_names_the_source`). **Foreign keys are cleared**: the
     tables they reference need not exist on the target, and a key naming a missing table refuses
-    the whole `CREATE`. **Triggers do not come**, a draft not carrying them. **An index's and a
+    the whole `CREATE`. **Triggers do not come**, a draft not carrying them. **A copy is one plain
+    table**, whatever the source's partitioning: `partition_key` and `partition_of` are cleared,
+    since a partitioned copy has no partition for any row it then inserts and a partition copied
+    `PARTITION OF` names a parent the target may not have — while the rows a partitioned table
+    reads are its partitions', so the plain copy holds them all — and an index the source
+    inherited from its parent (`IndexInfo::inherited`) becomes the copy's own, there being no
+    parent to give it one (`a_partitioned_table_or_a_partition_is_copied_as_a_plain_table`).
+    **An index's and a
     check's name move onto the copy's** (`moved_name`), because index names are per schema on
     PostgreSQL and per database on SQLite and a check's per schema on MySQL and SQL Server, so a copy
     beside its source under the source's index names would collide on every one: where the name
@@ -12105,6 +12161,36 @@ existing prose was left alone.
     (`stats::drop_change`), the comparison keys it apart and plans nothing for it, the diagram
     draws it as a table, and the tree and the palette give it `schema_tree::table_glyph`'s
     `EXTERNAL_LINK`.
+    **A partition is not a fifth shape: it is a table, on the one engine where it is a table.**
+    `TableInfo::partitioning` is how a table is partitioned — `Partitioning { key, partitions }`,
+    the key as the engine prints it (`RANGE (at)`, `pg_get_partkeydef`'s text) and each
+    `Partition { name, schema, bound }`, its namespace kept because a PostgreSQL partition may live
+    in another than its parent's — and `TableInfo::partition_of` is the other end, `PartitionOf {
+    schema, parent, bound }`; a sub-partitioned partition has both. `partitions_are_tables(dialect)`
+    is the capability the two are read through, `true` on PostgreSQL alone: there a partition is
+    listed, sized, queried and dumped as a table, holding the rows while its parent holds none,
+    whereas on MySQL and SQL Server a partition is storage inside its table and the table holds
+    every row. `TableInfo::rows_live_in_partitions` asks it of one table (partitioned, on such an
+    engine) and `is_partition_of(parent)` matches `partition_of` against a table by name and
+    namespace; the dump is their reader (under `dump.rs`). **Only PostgreSQL fills them today** —
+    `pg_fold_partitions` (under `pg.rs`) — so on MySQL and SQL Server both stay `None` and a
+    partitioned table reads as an unpartitioned one; the model's doc comments already allow for
+    MySQL's `p0`/`VALUES LESS THAN`, which no reader produces yet. Nor does the schema tree nest a
+    partition under its parent: every partition is still listed beside the other tables.
+    `create_ddl`'s PostgreSQL arm restates both ends: a partitioned table's `CREATE TABLE` closes
+    `) PARTITION BY <key>;`, and a partition is `CREATE TABLE q PARTITION OF parent [(own checks)]
+    <bound> [PARTITION BY <key>];` — no column list and no key, which it takes from the parent.
+    Restated as two plain tables, the parent held no rows and routed none, and the partition was a
+    stray copy beside it (`a_partitioned_table_and_its_partition_are_restated_as_such`,
+    `a_sub_partitioned_partition_keeps_its_own_key`, `partitions_are_tables_on_postgres_alone`).
+    **`IndexInfo::inherited` and `ForeignKeyInfo::inherited` are what the partition takes from its
+    parent with it**: PostgreSQL clones a parent's index and key onto every partition, and both are
+    read and marked (under `pg.rs`) — kept, since a partition's grid edits key on its primary key,
+    and never restated, because the partition gets them again when it is created and a second
+    `CREATE INDEX` or `ADD CONSTRAINT` of the same name fails the restore. `create_ddl` skips an
+    inherited index, as `ddl::create_table_sql` and the dump's key section skip both. Not to be
+    confused with `CheckInfo::inherited`, which is the opposite flag on a different question —
+    `false` there means `NO INHERIT`.
     **`IndexInfo::identifies_a_row` is the one answer to "does this index name a row", and it is not
     "is it unique"** — the question three parts of the app ask and used to answer three ways. Unique,
     not a foreign key, not partial (a `WHERE deleted_at IS NULL` promises uniqueness only over the
@@ -17085,7 +17171,7 @@ existing prose was left alone.
   `UPDATE OF` map itself, keyed `(namespace, table, trigger)` — two tables may each have a `trg` —
   and `a_check_goes_to_the_table_of_its_own_schema` and
   `a_trigger_takes_its_own_update_of_columns_in_order` pin the two keys.
-  **`table_list_sql` returns four columns, and the fourth is the table comment.** It is the one
+  **`table_list_sql`'s fourth column is the table comment.** It is the one
   table option PostgreSQL has and nothing was reading it: the designer emits `COMMENT ON TABLE`
   correctly and this query never selected `obj_description`, so a comment set through the app was
   **write-only** — it vanished from the app the moment it landed, and re-applying could not restore
@@ -17099,6 +17185,23 @@ existing prose was left alone.
   off that value, so the first-paint list and the full read agree (`a_foreign_table_is_typed_as_one`;
   live, `a_foreign_table_is_read_and_dropped_as_one` asserts both reads). What follows from the
   shape is under `schema.rs`'s `TableShape`.
+  **Its last four columns are the partitioning**: a partition's parent, namespace and name, through
+  `pg_inherits` (joined only where `c.relispartition`, so a table that merely inherits is not taken
+  for one); its bound, `pg_get_expr(relpartbound)` — `FOR VALUES …` or `DEFAULT`; and a
+  partitioned table's key, `pg_get_partkeydef` — each empty where it does not apply. The pure
+  `pg_fold_partitions` puts them on `TableInfo::partitioning` and `partition_of` (under
+  `schema.rs`), and runs in `fetch_table_list` as well as the full read, so the first-paint list
+  already knows which table is a partition of which (`the_object_list_reads_the_partitioning`,
+  `partitions_fold_onto_their_parent_and_name_it`). A parent may sit in another namespace than its
+  partitions, which is why the parent's namespace is a column and the fold keys on the pair.
+  **What PostgreSQL clones onto a partition is read and marked, never restated**: `index_list_sql`
+  selects `ic.relispartition AS inherited` — an index attached to its parent's — and the
+  foreign-key query `con.conparentid <> 0`, a key with a parent constraint, into
+  `IndexInfo::inherited` and `ForeignKeyInfo::inherited`. They stay in the model because a
+  partition's grid edits key on its primary key, which is one of them; they are kept out of every
+  script because the partition gets each again from its parent when it is created, and a second
+  `CREATE INDEX` or `ADD CONSTRAINT` of the name fails the restore. A cloned trigger is the one
+  clone not in the model at all — `tgparentid = 0` filters it out (below).
   **`pg_extensions` fills `DbSchema::extensions`** from `pg_extension` joined to `pg_namespace` for
   `extnamespace`, and is **deliberately not on `user_schema_filter`**: an extension is the
   database's rather than a namespace's, and `plpgsql` lives in `pg_catalog`, which that filter
@@ -17682,7 +17785,13 @@ existing prose was left alone.
   `pg_table_size`/`pg_indexes_size`, `reltuples`
   (`-1` is "don't know", so it becomes `None`), `n_dead_tup` and the last analyze, through
   `query_all_optional` so a restricted `pg_stat_*` can't fail the fetch; a **partitioned parent**
-  is listed with null sizes rather than the truthful `0` that would read as an empty table.
+  has no storage of its own, so `pg_table_size` on it is a truthful `0` that reads as an empty
+  table. It was listed with null sizes for that reason, and is now sized as **its leaf partitions'
+  totals** — table bytes, index bytes and row estimates summed over `pg_partition_tree(c.oid)`'s
+  `isleaf` rows, the row figure `NULL` while any leaf is unanalysed, since a sum over a `-1` is no
+  count — while each partition is still listed in its own right
+  (`the_table_stats_query_sizes_a_partitioned_parent_by_its_partitions`). A sub-partitioned
+  partition is a parent too and is sized the same way, from its own leaves.
   A partitioned **index** (`relkind = 'I'`) carries the same guard in its own spelling, and did not
   at first: `pg_relation_size` on one returns `0`, so an index spread over 40 GB of partitions
   printed `0 B` in the panel and exported it — the exact reading the sibling query's comment says it
@@ -29626,7 +29735,8 @@ existing prose was left alone.
     nowhere (CMP-03). The empty tree says `EmptyRows::AgreesExceptNoted` then, not
     `EverythingAgrees` (under `compare.rs`). The banner reads `SchemaComparison::standing_notes()`
     rather than `notes`, which puts each **held-back** entry's omission line first
-    (`CompareEntry::held_back` — a SQL Server sequence range the target's counter has left): that
+    (`CompareEntry::held_back` — a SQL Server sequence range the target's counter has left, or a
+    PostgreSQL table whose partitioning differs): that
     line is the instruction for the one difference no plan carries, and a comparison holding only
     that difference plans nothing, so Preview is never enabled and the omitted list it would have
     been read in is never shown.
@@ -29743,7 +29853,8 @@ existing prose was left alone.
     the row's `blocked` is `needs_source() || held_back.is_some()` — with the warning triangle where
     its tick would be and "held back from the plan; the note above says why" as its hint, the
     sentence itself standing in the banner (above). Unlike a MySQL body there is nothing to lift
-    here: the user restarts the sequence on the target and compares again.
+    here: the user restarts the sequence, or recreates the repartitioned table, on the target and
+    compares again.
     **Preview never applies.** `open_plan_preview` builds the `SchemaPlan`, reads the left
     connection's `read_only` off the connection list, names it through `SchemaPlan::subject_in` —
     the count and the database it lands in, both from the plan rather than hand-rolled here — and hands it to

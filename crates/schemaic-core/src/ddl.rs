@@ -230,6 +230,14 @@ pub struct TableDraft {
     pub without_rowid: bool,
     /// SQLite `STRICT` — see [`TableInfo::strict`], and the note above.
     pub strict: bool,
+    /// The partition key a created table takes (`RANGE (at)`) —
+    /// [`crate::schema::Partitioning::key`]. Written by [`create`] alone: no
+    /// `ALTER` changes a table's partitioning, so [`diff`] never reads it.
+    pub partition_key: Option<String>,
+    /// The table a created table is a partition of, with its bound —
+    /// [`TableInfo::partition_of`]. Created `PARTITION OF` it, which gives it
+    /// its columns, key and every inherited index and foreign key.
+    pub partition_of: Option<crate::schema::PartitionOf>,
 }
 
 impl TableDraft {
@@ -277,6 +285,8 @@ impl TableDraft {
             comment: t.comment.clone(),
             without_rowid: t.without_rowid,
             strict: t.strict,
+            partition_key: t.partitioning.as_ref().map(|p| p.key.clone()),
+            partition_of: t.partition_of.clone(),
         }
     }
 
@@ -9556,18 +9566,44 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
             lines.push(format!("  UNIQUE ({})", ix.info.key_sql(dialect)));
         }
     }
-    for fk in &d.foreign_keys {
-        lines.push(format!(
-            "  {}",
-            fk_clause(&fk.info, d.schema.as_deref(), dialect)
-        ));
-    }
+    // A key a partition inherited comes with it from its parent.
+    let own_fks = d.foreign_keys.iter().filter(|fk| !fk.info.inherited);
+    let fk_lines: Vec<String> = own_fks
+        .map(|fk| format!("  {}", fk_clause(&fk.info, d.schema.as_deref(), dialect)))
+        .collect();
     // Inline on both engines — a check is a table constraint, not an index, so
     // PostgreSQL has nothing to split out here.
-    for ck in &d.check_constraints {
-        lines.push(format!("  {}", ck.info.clause_sql(dialect)));
+    let ck_lines: Vec<String> = d
+        .check_constraints
+        .iter()
+        .map(|ck| format!("  {}", ck.info.clause_sql(dialect)))
+        .collect();
+    let mut head = match &d.partition_of {
+        // **A partition is created `PARTITION OF` its parent**, which gives it
+        // its columns and key: only its own constraints are listed, and its
+        // bound follows them.
+        Some(of) => {
+            let parent = qualified(&of.parent, of.schema.as_deref(), dialect);
+            let own: Vec<String> = fk_lines.into_iter().chain(ck_lines).collect();
+            let list = if own.is_empty() {
+                String::new()
+            } else {
+                format!(" (\n{}\n)", own.join(",\n"))
+            };
+            format!(
+                "CREATE TABLE {qname} PARTITION OF {parent}{list} {}",
+                of.bound
+            )
+        }
+        None => {
+            lines.extend(fk_lines);
+            lines.extend(ck_lines);
+            format!("CREATE TABLE {qname} (\n{}\n)", lines.join(",\n"))
+        }
+    };
+    if let Some(key) = &d.partition_key {
+        head.push_str(&format!(" PARTITION BY {key}"));
     }
-    let mut head = format!("CREATE TABLE {qname} (\n{}\n)", lines.join(",\n"));
     // None of the three exists in SQLite: no storage engine to name, no table
     // collation (it is per column there), and no comments anywhere in the
     // language. Nor in T-SQL, which collates per column and per database.
@@ -9606,7 +9642,9 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
         // plan's index phase and Copy DDL order them: a draft read off the
         // catalogue lists `ixml_…` before the `pxml` it is built on (Msg
         // 6333). A stable sort, so the rest keep the draft's order.
-        let mut indexes: Vec<&IndexDraft> = d.indexes.iter().collect();
+        // Not one a partition inherited, which comes with it.
+        let mut indexes: Vec<&IndexDraft> =
+            d.indexes.iter().filter(|ix| !ix.info.inherited).collect();
         indexes.sort_by_key(|ix| !ix.info.is_tsql_xml_parent());
         for ix in indexes {
             // A SQLite constraint-backed index went into the table body above.
