@@ -2931,6 +2931,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let snippet_edit_open: RwSignal<Option<u64>> = RwSignal::new(None);
     // The SQL editor's *Rename alias* dialog, raised from its context menu.
     let alias_rename_open: RwSignal<Option<schemaic_ui::AliasRenameRequest>> = RwSignal::new(None);
+    // Its *Find usages* list, raised from the same menu.
+    let usages_open: RwSignal<Option<schemaic_ui::UsagesRequest>> = RwSignal::new(None);
 
     // Query-plan (EXPLAIN) modal signals.
     let plan_open = RwSignal::new(false);
@@ -14378,6 +14380,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             run_guard,
             snippet_edit: snippet_edit_open,
             alias_rename: alias_rename_open,
+            usages: usages_open,
         },
         schema: SchemaUi {
             db_nodes,

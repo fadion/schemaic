@@ -2991,6 +2991,8 @@ pub(crate) struct QueryPaneParams {
     pub error_modal_open: RwSignal<bool>,
     /// Raises *Rename alias*'s dialog ([`crate::OverlayUi::alias_rename`]).
     pub alias_rename: RwSignal<Option<crate::AliasRenameRequest>>,
+    /// Raises *Find usages*' list ([`crate::OverlayUi::usages`]).
+    pub usages: RwSignal<Option<crate::UsagesRequest>>,
     pub schema_visible: RwSignal<bool>,
     pub right_panel: RwSignal<RightPanel>,
     pub ai_send: Rc<dyn Fn(String)>,
@@ -3089,6 +3091,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         ai_enabled,
         error_modal_open,
         alias_rename,
+        usages,
         schema_visible,
         right_panel,
         ai_send,
@@ -5399,15 +5402,72 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // binds it) in one edit — or refuses a name that would rebind a
             // reference (R3-L5-03), which typing at a caret per name could
             // never be checked against.
+            //
+            // **One entry for both kinds of alias**: a table's first, and where
+            // there is none here an output column's (`intel::output_alias_rename`),
+            // whose binding rests on which names the loaded schema says the
+            // `FROM` sources have — so the catalogue is built at the click.
+            let catalog = move || {
+                crate::completion::build_catalog(db_nodes, active_db.get_untracked().as_deref())
+            };
+            // "Find usages": the same names, listed rather than renamed — a
+            // table alias, a CTE or an output column's alias, every place the
+            // statement writes it (`intel::usages_at`); a row selects it, as
+            // Ctrl+click selects a definition.
+            let usages_here = move || {
+                query.with_untracked(|sql| {
+                    let at = menu_offset.get_untracked();
+                    intel::usages_at(sql, at, dialect.get_untracked(), &catalog())
+                        .map(|(name, spans)| (name, intel::usage_lines(sql, &spans)))
+                })
+            };
+            if usages_here().is_some() {
+                let ed = ed_rename.clone();
+                entries.push(MenuEntry::action("Find usages", move || {
+                    let Some((name, rows)) = usages_here() else {
+                        return;
+                    };
+                    let back = ed
+                        .editor_view_id
+                        .get_untracked()
+                        .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
+                    let target = ed.clone();
+                    // The rows' offsets are the text's at the click: changed
+                    // under the open list (an agent's edit, say), they may name
+                    // something else, or lie past the end — so the jump is
+                    // skipped, as *Rename alias* refuses with `Changed`.
+                    let opened_on = query.get_untracked();
+                    let jump = move |a: usize, b: usize| {
+                        if query.with_untracked(|now| *now != opened_on) {
+                            return;
+                        }
+                        target
+                            .cursor
+                            .update(|c| c.set_insert(Selection::region(a, b)));
+                        target.center_window();
+                    };
+                    usages.set(Some(crate::UsagesRequest {
+                        name,
+                        rows,
+                        jump: Rc::new(jump),
+                        back,
+                    }));
+                }));
+            }
             let alias_name = move || {
                 query.with_untracked(|sql| {
-                    intel::alias_name_at(sql, menu_offset.get_untracked(), dialect.get_untracked())
+                    let (at, d) = (menu_offset.get_untracked(), dialect.get_untracked());
+                    intel::alias_name_at(sql, at, d)
+                        .map(|n| (n, false))
+                        .or_else(|| {
+                            intel::output_alias_name_at(sql, at, d, &catalog()).map(|n| (n, true))
+                        })
                 })
             };
             if alias_name().is_some() {
                 let ed = ed_rename.clone();
                 entries.push(MenuEntry::action("Rename alias", move || {
-                    let Some(name) = alias_name() else {
+                    let Some((name, output)) = alias_name() else {
                         return;
                     };
                     let at = menu_offset.get_untracked();
@@ -5427,7 +5487,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             if *sql != opened_on {
                                 return Err(intel::AliasRenameRefusal::Changed);
                             }
-                            intel::alias_rename(sql, at, new, dialect.get_untracked())
+                            if output {
+                                intel::output_alias_rename(
+                                    sql,
+                                    at,
+                                    new,
+                                    dialect.get_untracked(),
+                                    &catalog(),
+                                )
+                            } else {
+                                intel::alias_rename(sql, at, new, dialect.get_untracked())
+                            }
                         })?;
                         if !edit_untyped_multi(&ed, comp, &m, EditType::Other) {
                             return Err(intel::AliasRenameRefusal::ReadOnly);

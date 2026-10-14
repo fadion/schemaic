@@ -66,6 +66,8 @@ mod shortcuts;
 mod snippet_edit;
 mod snippet_panel;
 pub use alias_rename::AliasRenameRequest;
+mod usages_view;
+pub use usages_view::UsagesRequest;
 /// The shared machinery behind this crate's source gates.
 ///
 /// **The module is compiled always, its corpus walkers only under `cfg(test)`.**
@@ -6381,6 +6383,9 @@ pub struct OverlayUi {
     /// *Rename alias*'s dialog: the alias's name and the editor's rename, or
     /// `None`. Set by the SQL editor's context menu.
     pub alias_rename: RwSignal<Option<AliasRenameRequest>>,
+    /// *Find usages*' list (`usages_view`), or `None`. Set by the SQL
+    /// editor's context menu, beside *Rename alias*.
+    pub usages: RwSignal<Option<UsagesRequest>>,
     /// A run the write guard held back, or `None`. Set by
     /// [`TabsActions::run`]/[`TabsActions::run_all`] — which *are* the guarded
     /// run path — and rendered as the editor's guard bar. It lives here, not in
@@ -9087,6 +9092,7 @@ fn center(ui: Ui) -> impl IntoView {
                     ai_enabled: ui.ai.enabled,
                     error_modal_open,
                     alias_rename: ui.overlay.alias_rename,
+                    usages: ui.overlay.usages,
                     schema_visible,
                     right_panel,
                     ai_send: ai_send.clone(),

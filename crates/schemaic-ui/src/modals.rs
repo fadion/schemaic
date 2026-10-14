@@ -106,6 +106,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let script_open = ui.script.target;
             let snippet_open = ui.overlay.snippet_edit;
             let alias_open = ui.overlay.alias_rename;
+            let usages_open = ui.overlay.usages;
             stack((
                 // The snippet editor and *Rename alias* share one tuple
                 // element (this stack is at Floem's 16-arity limit): both are
@@ -120,9 +121,15 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                         ui.conn.dialect,
                     ),
                     crate::alias_rename::alias_rename_overlay(alias_open),
+                    // *Find usages*' list, the third of the editor's small
+                    // dialogs about its text, raised from the same menu.
+                    crate::usages_view::usages_overlay(usages_open),
                 ))
                 .style(move |s| {
-                    if snippet_open.get().is_some() || alias_open.with(Option::is_some) {
+                    if snippet_open.get().is_some()
+                        || alias_open.with(Option::is_some)
+                        || usages_open.with(Option::is_some)
+                    {
                         s.absolute().inset(0.0)
                     } else {
                         s
@@ -475,6 +482,7 @@ fn ddl_modals_up(
     let script_open = script.target;
     let snippet_edit = overlay.snippet_edit;
     let alias_rename = overlay.alias_rename;
+    let usages = overlay.usages;
     let editors = ddl_editors_up(ddl);
     move || {
         // **The shared error modal is deliberately not here.** It is its own
@@ -508,6 +516,8 @@ fn ddl_modals_up(
             // *Rename alias* shares the snippet editor's tuple element, so it
             // is painted in this group too.
             || alias_rename.with(Option::is_some)
+            // And *Find usages*' list, the element's third.
+            || usages.with(Option::is_some)
             || editors()
     }
 }
@@ -703,6 +713,9 @@ mod modal_backdrop_gate {
         // In the layer's DDL group, sharing `snippet_edit.rs`'s tuple element,
         // raised by `ddl_modals_up`'s `alias_rename` arm.
         "alias_rename.rs",
+        // In the layer's DDL group, the third of that tuple element, raised by
+        // `ddl_modals_up`'s `usages` arm.
+        "usages_view.rs",
         // In the layer's workspace group, beside `properties.rs`, raised by
         // `workspace_modals_up`'s `blob_open.get().is_some()` arm.
         "blob_view.rs",

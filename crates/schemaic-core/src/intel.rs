@@ -12365,6 +12365,37 @@ mod colres {
         (sources, proj_aliases(sel))
     }
 
+    /// Every column `sel`'s `FROM` sources expose, lower-cased — or `None`
+    /// when any one of them cannot be enumerated (a table the catalogue does
+    /// not hold, a table function, a `SELECT *` subquery): the answer
+    /// `output_alias` needs to know a bare name **is not** a column, which an
+    /// open source can never prove. A CTE is looked up as a table, so it too
+    /// answers `None`.
+    pub(super) fn select_columns(
+        sel: &Select,
+        catalog: &Catalog,
+        dialect: super::SqlDialect,
+        stmt: &str,
+        lo: usize,
+    ) -> Option<HashSet<String>> {
+        let (sources, _) = build_sources(
+            sel,
+            catalog,
+            dialect.implicit_columns(),
+            &HashMap::new(),
+            stmt,
+            lo,
+        );
+        let mut all = HashSet::new();
+        for s in sources {
+            match s.cols {
+                Cols::Known(cols) => all.extend(cols),
+                Cols::Open => return None,
+            }
+        }
+        Some(all)
+    }
+
     /// Hint at an inner `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`
     /// condition — MySQL treats it as a cross join (every row combined), almost
     /// always an accident. An explicit `CROSS JOIN` (a distinct operator) is
@@ -12996,6 +13027,10 @@ pub enum AliasRenameRefusal {
     /// The name would rebind a reference or clash with one the query
     /// already exposes ([`alias_rename_conflicts`]).
     Conflict,
+    /// An output alias's reference in `GROUP BY`, `HAVING` or `WHERE` may be
+    /// a same-named column instead — which the server reads first there — and
+    /// the loaded schema cannot say ([`output_alias_rename`]).
+    Unsure,
     /// The text changed while the dialog was open, so the place it was
     /// opened on may now be another alias. The editor's call, not this walk's.
     Changed,
@@ -13152,6 +13187,10 @@ impl AliasRenameRefusal {
                  which table a reference reads.",
                 new_name.trim()
             ),
+            Self::Unsure => "A column of this name may be what GROUP BY, HAVING or WHERE reads \
+                             here, and the loaded schema cannot tell — so no edit is made. Load \
+                             the tables' schema, or rename by hand."
+                .to_string(),
             Self::Changed => {
                 "The query changed while this was open. Close it and rename again.".to_string()
             }
@@ -13161,6 +13200,129 @@ impl AliasRenameRefusal {
             }
         }
     }
+}
+
+/// The output column alias at `caret` — its `AS` in the select list, or a
+/// reference the engine may bind to it — as its definition writes it, quotes
+/// off: what *Rename alias* offers and opens with where [`alias_name_at`] has
+/// no table alias. `None` anywhere [`output_alias_rename`] has nothing to do.
+/// See [`output_alias`] for which references those are.
+pub fn output_alias_name_at(
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+    catalog: &Catalog,
+) -> Option<String> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi)?;
+    let asts = parse_statements(stmt, dialect).ok()?;
+    let [ast] = asts.as_slice() else {
+        return None;
+    };
+    let (found, _) = output_alias::find(stmt, lo, ast, caret, dialect, catalog)?;
+    let (a, b) = alias_refs::unquoted(stmt, lo, found.def);
+    sql.get(a..b).map(str::to_string)
+}
+
+/// *Rename alias* for an **output column's** alias ([`output_alias`]): the
+/// edits that rename its `AS` and every reference the engine binds to it, or
+/// why not — [`AliasRenameRefusal::Unsure`] where a reference in `GROUP BY`,
+/// `HAVING` or `WHERE` might be a same-named column the catalogue cannot rule
+/// out, [`AliasRenameRefusal::Conflict`] where the new name is another
+/// output's, is written bare in `ORDER BY` (which would read the renamed
+/// alias instead), or is a column that would now win over it.
+pub fn output_alias_rename(
+    sql: &str,
+    caret: usize,
+    new_name: &str,
+    dialect: SqlDialect,
+    catalog: &Catalog,
+) -> Result<crate::text_ops::MultiEdit, AliasRenameRefusal> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi).ok_or(AliasRenameRefusal::NoAlias)?;
+    let asts = parse_statements(stmt, dialect).map_err(|_| AliasRenameRefusal::NoAlias)?;
+    let [ast] = asts.as_slice() else {
+        return Err(AliasRenameRefusal::NoAlias);
+    };
+    let (found, ctx) = output_alias::find(stmt, lo, ast, caret, dialect, catalog)
+        .ok_or(AliasRenameRefusal::NoAlias)?;
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err(AliasRenameRefusal::Empty);
+    }
+    if found.unsure {
+        return Err(AliasRenameRefusal::Unsure);
+    }
+    match output_alias::conflicts(&ctx, name) {
+        Some(false) => {}
+        Some(true) => return Err(AliasRenameRefusal::Conflict),
+        None => return Err(AliasRenameRefusal::Unsure),
+    }
+    let mut spans = found.refs;
+    spans.push(found.def);
+    spans.sort();
+    Ok(rename_edit(
+        spans,
+        caret,
+        crate::export::ident_if_needed(name, dialect),
+    ))
+}
+
+/// *Find usages*: the name at `caret` and every place the statement writes it
+/// — whole spellings, in order — for the three names this module binds the way
+/// the server does: a table alias (the walk *Rename alias* edits), a CTE
+/// (*Rename CTE*'s), and an output column's alias ([`output_alias`]). The
+/// name is the definition's, quotes off. `None` on anything else, and where
+/// the walk refuses to bind (a bare name that may be a column) — a list that
+/// would miss a usage is not offered.
+pub fn usages_at(
+    sql: &str,
+    caret: usize,
+    dialect: SqlDialect,
+    catalog: &Catalog,
+) -> Option<(String, Vec<(usize, usize)>)> {
+    let (lo, hi) = crate::sql::statement_range(sql, caret, dialect);
+    let stmt = sql.get(lo..hi)?;
+    let asts = parse_statements(stmt, dialect).ok()?;
+    let [ast] = asts.as_slice() else {
+        return None;
+    };
+    let named = |def: (usize, usize)| {
+        let (a, b) = alias_refs::unquoted(stmt, lo, def);
+        sql.get(a..b).map(str::to_string)
+    };
+    if let Some((def, spans)) = alias_refs::spans(stmt, lo, ast, caret) {
+        return Some((named(def)?, spans));
+    }
+    if let Some((def, spans)) = alias_refs::cte_spans(stmt, lo, ast, caret) {
+        return Some((named(def)?, spans));
+    }
+    let (found, _) = output_alias::find(stmt, lo, ast, caret, dialect, catalog)?;
+    // An output alias whose `GROUP BY` reference the catalogue could not
+    // settle would be listed short of one.
+    if found.unsure {
+        return None;
+    }
+    let name = named(found.def)?;
+    let mut all = found.refs;
+    all.push(found.def);
+    all.sort();
+    Some((name, all))
+}
+
+/// *Find usages*' rows for `spans` of `sql`: each one's line, 1-based, and
+/// that line's text, trimmed and cut at 160 characters.
+pub fn usage_lines(sql: &str, spans: &[(usize, usize)]) -> Vec<(usize, usize, usize, String)> {
+    spans
+        .iter()
+        .map(|&(a, b)| {
+            let start = sql[..a].rfind('\n').map_or(0, |n| n + 1);
+            let end = sql[a..].find('\n').map_or(sql.len(), |n| a + n);
+            let line = sql[..a].matches('\n').count() + 1;
+            let text: String = sql[start..end].trim().chars().take(160).collect();
+            (a, b, line, text)
+        })
+        .collect()
 }
 
 /// The name *Rename CTE*'s dialog opens with: the CTE at `caret` — its
@@ -13901,6 +14063,305 @@ mod alias_refs {
                     .any(|s| w.exposes(s, &new, *def_at))
         });
         Some(reaches_out)
+    }
+}
+
+/// *Rename alias* for an **output column's** alias — `SELECT total * 2 AS
+/// doubled … ORDER BY doubled` — and the references the server binds to it.
+///
+/// **Where an output alias is visible, and what beats it, are each engine's**,
+/// and both decide what a rename may touch:
+///
+/// - `ORDER BY` sees it on every engine, and **ahead of** a column of the same
+///   name — as a whole item everywhere, inside an expression (`ORDER BY
+///   doubled + 1`) on MySQL and SQLite alone
+///   ([`order_by_expression_sees_output_aliases`], completion's predicate, with
+///   the versions measured).
+/// - `GROUP BY`, `HAVING` and `WHERE` see it where
+///   [`group_by_sees_output_aliases`], [`select_alias_in_having`] and
+///   [`select_alias_in_where`] say, and **behind** a column of the same name:
+///   MySQL and PostgreSQL both document the input column winning there. So a
+///   name in one of those clauses is the alias only where no `FROM` source
+///   has that column — which the loaded catalogue must prove
+///   ([`colres::select_columns`]), or the rename refuses rather than guess.
+///
+/// **Only a statement's top-level `SELECT`.** An alias inside a derived table
+/// or a CTE is a column name the outer query reads (`d.total`), and in a set
+/// operation the first branch's names are the union's; neither is renamed by
+/// this walk, which finds nothing there rather than half of it.
+mod output_alias {
+    use std::collections::HashSet;
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{
+        Expr, GroupByExpr, Ident, OrderByKind, Query, SelectItem, SetExpr, Statement, Visit,
+        Visitor,
+    };
+
+    use super::{Catalog, SqlDialect, colres};
+
+    /// One output alias's place in a statement.
+    pub(super) struct Found {
+        /// The alias's definition, its whole spelling (quotes included).
+        pub def: (usize, usize),
+        /// Every reference the server binds to it, whole spellings.
+        pub refs: Vec<(usize, usize)>,
+        /// A reference whose binding the catalogue could not settle — a name
+        /// in `GROUP BY`/`HAVING`/`WHERE` with an unknowable source beside it.
+        pub unsure: bool,
+    }
+
+    /// The names a rename to `new` must not collide with, beside [`Found`].
+    pub(super) struct Context {
+        /// The other output aliases, as written, with their quoting.
+        others: Vec<(String, bool)>,
+        /// Names written bare in `ORDER BY` that do not bind to the alias —
+        /// where a rename to one would take it over.
+        order_names: Vec<(String, bool)>,
+        /// The `FROM` sources' columns, `None` where unknowable.
+        columns: Option<HashSet<String>>,
+        /// Some reference sits in a clause where a column beats the alias.
+        refs_behind_columns: bool,
+    }
+
+    fn same(a: &Ident, b: &str, b_quoted: bool) -> bool {
+        if a.quote_style.is_some() || b_quoted {
+            a.value == b
+        } else {
+            a.value.eq_ignore_ascii_case(b)
+        }
+    }
+
+    /// Bare identifiers in `expr` outside any subquery (whose names are its
+    /// own), each with whether it is the whole expression. **Every** one the
+    /// AST holds, through sqlparser's own visitor rather than a match over
+    /// the expression kinds: a reference missed here would be left behind by
+    /// a rename, to bind to a same-named column instead.
+    fn bare_idents(expr: &Expr) -> Vec<(Ident, bool)> {
+        struct V {
+            depth: usize,
+            out: Vec<Ident>,
+        }
+        impl Visitor for V {
+            type Break = ();
+            fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+                self.depth += 1;
+                ControlFlow::Continue(())
+            }
+            fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+                self.depth -= 1;
+                ControlFlow::Continue(())
+            }
+            fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+                if self.depth == 0
+                    && let Expr::Identifier(id) = e
+                {
+                    self.out.push(id.clone());
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        if let Expr::Identifier(id) = expr {
+            return vec![(id.clone(), true)];
+        }
+        let mut v = V {
+            depth: 0,
+            out: Vec::new(),
+        };
+        let _ = expr.visit(&mut v);
+        v.out.into_iter().map(|id| (id, false)).collect()
+    }
+
+    /// The top-level `SELECT` of `ast`, and its query.
+    fn top_select(ast: &Statement) -> Option<(&Query, &sqlparser::ast::Select)> {
+        let Statement::Query(q) = ast else {
+            return None;
+        };
+        match q.body.as_ref() {
+            SetExpr::Select(sel) => Some((q, sel)),
+            _ => None,
+        }
+    }
+
+    /// Where a candidate reference stands, which decides what beats it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Clause {
+        OrderWhole,
+        OrderInside,
+        /// `GROUP BY`, `HAVING`, `WHERE` — a column wins there.
+        BehindColumns,
+    }
+
+    /// The alias at `caret` — on its definition, or on a reference the engine
+    /// may bind to it — with its references.
+    pub(super) fn find(
+        stmt: &str,
+        lo: usize,
+        ast: &Statement,
+        caret: usize,
+        dialect: SqlDialect,
+        catalog: &Catalog,
+    ) -> Option<(Found, Context)> {
+        let (q, sel) = top_select(ast)?;
+        let lines = super::LineIndex::new(stmt);
+        let range = |s| colres::to_range_in(&lines, stmt, lo, s);
+        let outputs: Vec<&Ident> = sel
+            .projection
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::ExprWithAlias { alias, .. } => Some(alias),
+                _ => None,
+            })
+            .collect();
+        if outputs.is_empty() {
+            return None;
+        }
+        // Every bare name in a clause that can see an output alias.
+        let mut cands: Vec<(Ident, Clause)> = Vec::new();
+        if let Some(ob) = &q.order_by
+            && let OrderByKind::Expressions(items) = &ob.kind
+        {
+            for item in items {
+                for (id, whole) in bare_idents(&item.expr) {
+                    cands.push((
+                        id,
+                        if whole {
+                            Clause::OrderWhole
+                        } else {
+                            Clause::OrderInside
+                        },
+                    ));
+                }
+            }
+        }
+        let behind = |e: &Expr, visible: bool, out: &mut Vec<(Ident, Clause)>| {
+            if visible {
+                for (id, _) in bare_idents(e) {
+                    out.push((id, Clause::BehindColumns));
+                }
+            }
+        };
+        let mut behind_cands = Vec::new();
+        if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+            for e in exprs {
+                behind(
+                    e,
+                    super::group_by_sees_output_aliases(dialect),
+                    &mut behind_cands,
+                );
+            }
+        }
+        if let Some(h) = &sel.having {
+            behind(h, super::select_alias_in_having(dialect), &mut behind_cands);
+        }
+        if let Some(w) = &sel.selection {
+            behind(w, super::select_alias_in_where(dialect), &mut behind_cands);
+        }
+        cands.extend(behind_cands);
+        let on = |(a, b): (usize, usize)| a <= caret && caret <= b;
+        let target: &Ident = outputs
+            .iter()
+            .copied()
+            .find(|a| on(range(a.span)))
+            .or_else(|| {
+                let (id, _) = cands.iter().find(|(id, _)| on(range(id.span)))?;
+                outputs
+                    .iter()
+                    .copied()
+                    .find(|a| same(id, &a.value, a.quote_style.is_some()))
+            })?;
+        // Two outputs of one name: which one a reference means is the
+        // engine's business, and not a rename's to settle.
+        let twins = outputs
+            .iter()
+            .filter(|a| same(a, &target.value, target.quote_style.is_some()))
+            .count();
+        if twins > 1 {
+            return None;
+        }
+        let columns = colres::select_columns(sel, catalog, dialect, stmt, lo);
+        let is_column = |name: &str| -> Option<bool> {
+            columns
+                .as_ref()
+                .map(|c| c.contains(&name.to_ascii_lowercase()))
+        };
+        let order_inside = super::order_by_expression_sees_output_aliases(dialect);
+        let mut refs = Vec::new();
+        let mut unsure = false;
+        let mut refs_behind_columns = false;
+        let mut order_names = Vec::new();
+        for (id, clause) in &cands {
+            let named = same(id, &target.value, target.quote_style.is_some());
+            match clause {
+                Clause::OrderWhole => {
+                    if named {
+                        refs.push(range(id.span));
+                    } else {
+                        order_names.push((id.value.clone(), id.quote_style.is_some()));
+                    }
+                }
+                Clause::OrderInside if order_inside => {
+                    if named {
+                        refs.push(range(id.span));
+                    } else {
+                        order_names.push((id.value.clone(), id.quote_style.is_some()));
+                    }
+                }
+                Clause::OrderInside => {}
+                Clause::BehindColumns if named => match is_column(&id.value) {
+                    Some(true) => {}
+                    Some(false) => {
+                        refs.push(range(id.span));
+                        refs_behind_columns = true;
+                    }
+                    None => unsure = true,
+                },
+                Clause::BehindColumns => {}
+            }
+        }
+        refs.sort();
+        refs.dedup();
+        let others = outputs
+            .iter()
+            .filter(|a| !std::ptr::eq(**a, target))
+            .map(|a| (a.value.clone(), a.quote_style.is_some()))
+            .collect();
+        Some((
+            Found {
+                def: range(target.span),
+                refs,
+                unsure,
+            },
+            Context {
+                others,
+                order_names,
+                columns,
+                refs_behind_columns,
+            },
+        ))
+    }
+
+    /// Would renaming to `new` (unquoted as typed) change what a name binds
+    /// to? `Some(true)` for a capture, `None` where a column the catalogue
+    /// cannot rule out would decide it.
+    pub(super) fn conflicts(ctx: &Context, new: &str) -> Option<bool> {
+        let eq = |(n, quoted): &(String, bool)| {
+            if *quoted {
+                n == new
+            } else {
+                n.eq_ignore_ascii_case(new)
+            }
+        };
+        if ctx.others.iter().any(eq) || ctx.order_names.iter().any(eq) {
+            return Some(true);
+        }
+        if ctx.refs_behind_columns {
+            return ctx
+                .columns
+                .as_ref()
+                .map(|c| c.contains(&new.to_ascii_lowercase()));
+        }
+        Some(false)
     }
 }
 
@@ -35605,5 +36066,293 @@ mod tests {
         let b = cache.get(&[], None);
         assert!(Arc::ptr_eq(&a, &b));
         assert!(!knows(&a, "employees"));
+    }
+}
+
+#[cfg(test)]
+mod output_alias_tests {
+    use super::*;
+    use crate::schema::{ColumnInfo, DbSchema, TableInfo};
+
+    const MY: SqlDialect = SqlDialect::MySql;
+    const PG: SqlDialect = SqlDialect::Postgres;
+    const MS: SqlDialect = SqlDialect::MsSql;
+    const LITE: SqlDialect = SqlDialect::Sqlite;
+    const ALL: [SqlDialect; 4] = [MY, PG, MS, LITE];
+
+    /// `orders(id, total, qty)` in `shop`, the active database.
+    fn catalog() -> Catalog {
+        let col = |n: &str| ColumnInfo {
+            name: n.into(),
+            type_name: "int".into(),
+            ..Default::default()
+        };
+        let schema = DbSchema {
+            tables: vec![TableInfo {
+                name: "orders".into(),
+                columns: vec![col("id"), col("total"), col("qty")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Catalog::build(&[("shop", &schema)], Some("shop"))
+    }
+
+    /// `sql` with `|` at the caret, renamed to `new`.
+    fn renamed(sql: &str, new: &str, dialect: SqlDialect) -> Result<String, AliasRenameRefusal> {
+        let caret = sql.find('|').unwrap();
+        let mut sql = sql.replace('|', "");
+        let m = output_alias_rename(&sql, caret, new, dialect, &catalog())?;
+        for (a, b, text) in m.edits.into_iter().rev() {
+            sql.replace_range(a..b, &text);
+        }
+        Ok(sql)
+    }
+
+    #[test]
+    fn order_by_reads_the_alias_on_every_engine() {
+        for d in ALL {
+            assert_eq!(
+                renamed(
+                    "SELECT total * 2 AS doub|led FROM orders ORDER BY doubled DESC",
+                    "twice",
+                    d
+                ),
+                Ok("SELECT total * 2 AS twice FROM orders ORDER BY twice DESC".to_string()),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// A reference is a place to start from, as the definition is.
+    #[test]
+    fn a_rename_starts_from_a_reference_too() {
+        assert_eq!(
+            renamed("SELECT total AS t FROM orders ORDER BY t|", "amount", PG),
+            Ok("SELECT total AS amount FROM orders ORDER BY amount".to_string())
+        );
+        let sql = "SELECT total AS t FROM orders ORDER BY t";
+        assert_eq!(
+            output_alias_name_at(sql, sql.len(), PG, &catalog()).as_deref(),
+            Some("t")
+        );
+    }
+
+    /// Inside an `ORDER BY` expression only MySQL and SQLite read the alias;
+    /// PostgreSQL and SQL Server read a column there, so the name stays.
+    #[test]
+    fn an_alias_inside_an_order_by_expression_is_mysql_and_sqlites() {
+        let sql = "SELECT total AS t| FROM orders ORDER BY t + 1";
+        for d in [MY, LITE] {
+            assert_eq!(
+                renamed(sql, "x", d),
+                Ok("SELECT total AS x FROM orders ORDER BY x + 1".to_string()),
+                "{d:?}"
+            );
+        }
+        for d in [PG, MS] {
+            assert_eq!(
+                renamed(sql, "x", d),
+                Ok("SELECT total AS x FROM orders ORDER BY t + 1".to_string()),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// `GROUP BY` reads the alias on MySQL, PostgreSQL and SQLite — not SQL
+    /// Server — when no column has its name.
+    #[test]
+    fn group_by_reads_the_alias_where_the_engine_lets_it() {
+        let sql = "SELECT qty % 2 AS pari|ty, count(*) FROM orders GROUP BY parity";
+        for d in [MY, PG, LITE] {
+            assert_eq!(
+                renamed(sql, "odd", d),
+                Ok("SELECT qty % 2 AS odd, count(*) FROM orders GROUP BY odd".to_string()),
+                "{d:?}"
+            );
+        }
+        assert_eq!(
+            renamed(sql, "odd", MS),
+            Ok("SELECT qty % 2 AS odd, count(*) FROM orders GROUP BY parity".to_string())
+        );
+    }
+
+    /// **A column beats the alias in `GROUP BY`**: `total` there is
+    /// `orders.total`, so it stays — while `ORDER BY total` is the alias,
+    /// which wins there.
+    #[test]
+    fn a_column_of_the_same_name_keeps_group_by_and_loses_order_by() {
+        assert_eq!(
+            renamed(
+                "SELECT qty AS tot|al FROM orders GROUP BY total ORDER BY total",
+                "q",
+                MY
+            ),
+            Ok("SELECT qty AS q FROM orders GROUP BY total ORDER BY q".to_string())
+        );
+    }
+
+    /// `WHERE` reads an output alias on SQLite alone.
+    #[test]
+    fn where_reads_the_alias_on_sqlite_alone() {
+        let sql = "SELECT total AS t| FROM orders WHERE t > 1";
+        assert_eq!(
+            renamed(sql, "x", LITE),
+            Ok("SELECT total AS x FROM orders WHERE x > 1".to_string())
+        );
+        assert_eq!(
+            renamed(sql, "x", MY),
+            Ok("SELECT total AS x FROM orders WHERE t > 1".to_string())
+        );
+    }
+
+    /// **No guess**: beside a table the catalogue does not hold, a name in
+    /// `GROUP BY` may be one of its columns, so the rename refuses — where
+    /// `ORDER BY`, which the alias wins, needs no catalogue at all.
+    #[test]
+    fn an_unknowable_source_refuses_a_group_by_reference() {
+        assert_eq!(
+            renamed("SELECT a AS x| FROM nowhere GROUP BY x", "y", MY),
+            Err(AliasRenameRefusal::Unsure)
+        );
+        assert_eq!(
+            renamed("SELECT a AS x| FROM nowhere ORDER BY x", "y", MY),
+            Ok("SELECT a AS y FROM nowhere ORDER BY y".to_string())
+        );
+    }
+
+    #[test]
+    fn a_name_that_would_capture_is_a_conflict() {
+        // Another output's name.
+        assert_eq!(
+            renamed("SELECT total AS a|, qty AS b FROM orders", "b", PG),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        // Written bare in ORDER BY, where the renamed alias would now win.
+        assert_eq!(
+            renamed("SELECT total * 2 AS d| FROM orders ORDER BY qty", "qty", PG),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        // A column, which would win over the renamed alias in GROUP BY.
+        assert_eq!(
+            renamed("SELECT qty % 2 AS p| FROM orders GROUP BY p", "total", MY),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        assert_eq!(
+            renamed("SELECT total AS a| FROM orders", "  ", PG),
+            Err(AliasRenameRefusal::Empty)
+        );
+    }
+
+    #[test]
+    fn a_quoted_alias_is_renamed_where_it_is_written_quoted() {
+        assert_eq!(
+            renamed(
+                "SELECT total AS \"Big|\" FROM orders ORDER BY \"Big\"",
+                "small",
+                PG
+            ),
+            Ok("SELECT total AS small FROM orders ORDER BY small".to_string())
+        );
+        // `big` unquoted is another name on PostgreSQL than `"Big"`.
+        assert_eq!(
+            renamed("SELECT total AS \"Big|\" FROM orders ORDER BY big", "x", PG),
+            Ok("SELECT total AS x FROM orders ORDER BY big".to_string())
+        );
+    }
+
+    /// Only a statement's top-level `SELECT`: a derived table's alias is a
+    /// column the outer query reads, and a union's names are the first
+    /// branch's — neither is offered.
+    #[test]
+    fn a_derived_table_or_a_union_offers_nothing() {
+        let derived = "SELECT d.doubled FROM (SELECT total * 2 AS doubled FROM orders) d";
+        let at = derived.find("AS doubled").unwrap() + 4;
+        assert_eq!(output_alias_name_at(derived, at, PG, &catalog()), None);
+        let union = "SELECT total AS t FROM orders UNION SELECT qty FROM orders ORDER BY t";
+        let at = union.find("AS t").unwrap() + 3;
+        assert_eq!(output_alias_name_at(union, at, PG, &catalog()), None);
+        let plain = "SELECT total FROM orders";
+        assert_eq!(output_alias_name_at(plain, 9, PG, &catalog()), None);
+    }
+
+    /// A subquery's own names are its own: `t` inside it is not the outer
+    /// alias.
+    #[test]
+    fn a_subquerys_names_are_left_alone() {
+        assert_eq!(
+            renamed(
+                "SELECT total AS t| FROM orders ORDER BY (SELECT max(t) FROM other)",
+                "x",
+                MY
+            ),
+            Ok("SELECT total AS x FROM orders ORDER BY (SELECT max(t) FROM other)".to_string())
+        );
+    }
+
+    /// *Find usages* answers for each of the three names, with the same
+    /// places their renames write.
+    #[test]
+    fn usages_are_found_for_a_table_alias_a_cte_and_an_output_alias() {
+        let words = |sql: &str, at: usize| {
+            let (name, spans) = usages_at(sql, at, PG, &catalog()).unwrap();
+            (
+                name,
+                spans
+                    .iter()
+                    .map(|&(a, b)| sql[a..b].to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let alias = "SELECT o.id FROM orders o WHERE o.qty > 1";
+        assert_eq!(
+            words(alias, alias.find("o.id").unwrap()),
+            ("o".to_string(), vec!["o".into(), "o".into(), "o".into()])
+        );
+        let cte = "WITH big AS (SELECT * FROM orders) SELECT * FROM big";
+        assert_eq!(
+            words(cte, cte.rfind("big").unwrap() + 1),
+            ("big".to_string(), vec!["big".into(), "big".into()])
+        );
+        let output = "SELECT total AS \"T\" FROM orders ORDER BY \"T\"";
+        assert_eq!(
+            words(output, output.find("\"T\"").unwrap() + 1),
+            ("T".to_string(), vec!["\"T\"".into(), "\"T\"".into()])
+        );
+        assert_eq!(
+            usages_at("SELECT total FROM orders", 9, PG, &catalog()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_usage_is_listed_by_its_line() {
+        let sql = "SELECT o.id\n  FROM orders o\n WHERE o.qty > 1";
+        let at = |n: usize| {
+            sql.match_indices('o')
+                .map(|(i, _)| i)
+                .filter(|&i| sql[i + 1..].starts_with('.') || sql[i + 1..].starts_with('\n'))
+                .nth(n)
+                .unwrap()
+        };
+        let spans = [(at(0), at(0) + 1), (at(1), at(1) + 1), (at(2), at(2) + 1)];
+        assert_eq!(
+            usage_lines(sql, &spans),
+            [
+                (at(0), at(0) + 1, 1, "SELECT o.id".to_string()),
+                (at(1), at(1) + 1, 2, "FROM orders o".to_string()),
+                (at(2), at(2) + 1, 3, "WHERE o.qty > 1".to_string()),
+            ]
+        );
+        assert!(usage_lines("x", &[]).is_empty());
+    }
+
+    #[test]
+    fn find_usages_lists_the_definition_and_its_references() {
+        let sql = "SELECT total AS t FROM orders ORDER BY t";
+        let (_, got) = usages_at(sql, 17, PG, &catalog()).unwrap();
+        let words: Vec<&str> = got.iter().map(|&(a, b)| &sql[a..b]).collect();
+        assert_eq!(words, ["t", "t"]);
+        assert_eq!(got[0].0, sql.find("t FROM").unwrap());
     }
 }

@@ -2943,7 +2943,8 @@ existing prose was left alone.
     A quoted name's range is the name inside its quotes, which stay. It is `None` where the text at the
     caret does not parse to exactly one statement, or the caret is on no alias — a qualifier that is
     a table's own name or a CTE's binds to no definition, and a select-list `AS` is not one, so none
-    of those is offered here — a CTE's name is *Rename CTE*'s, below
+    of those is offered here — a CTE's name is *Rename CTE*'s, below, and an output column's alias
+    `output_alias`'s, after it
     (`an_alias_is_found_with_every_reference_to_it`,
     `an_alias_is_bound_by_its_own_query`, `an_alias_is_found_in_a_star_an_update_and_quotes`,
     `no_alias_where_the_caret_is_not_on_one`). **`alias_rename_conflicts` is the capture check**
@@ -3022,7 +3023,9 @@ existing prose was left alone.
     rule of its own (`a_cte_rename_writes_its_declaration_and_every_reference`,
     `a_cte_rename_refuses_a_capturing_name` — neither could fail first, the functions not existing).
     The refusals' `message`s are worded for either rename: `NoAlias` says *There is nothing here to
-    rename any more.*, `Empty` *Give it a name.* **Ctrl+click binds through the same `Ctes`**:
+    rename any more.*, `Empty` *Give it a name.*; `Unsure` is the output-alias rename's alone (below),
+    and says a column of the name may be what `GROUP BY`, `HAVING` or `WHERE` reads and the loaded
+    schema cannot tell. **Ctrl+click binds through the same `Ctes`**:
     `cte_definition` is `Ctes::bound` at a reference and `cte_spans` at a qualifier, so the jump and the rename cannot disagree
     about what a name names. Names compare by `same_name` — a quoted one on either side exactly, a
     bare pair ASCII-case-insensitively — so on PostgreSQL, where `WITH "C"` and `FROM c` name two
@@ -3031,6 +3034,50 @@ existing prose was left alone.
     two were one). Where the statement parses, the tree's answer is final — `definition_at` no
     longer falls through to the leading-`WITH` token walk, which had reached a later sibling from an
     earlier one's body.
+    **`output_alias` is *Rename alias*'s walk for an output column's alias** — `SELECT total * 2 AS
+    doubled … ORDER BY doubled` — which the table-alias walk above does not count as an alias at
+    all. Where such a name is visible, and what beats it there, are each engine's, and both decide
+    what a rename may touch. `ORDER BY` sees it on every engine **ahead of** a same-named column: as
+    a whole item everywhere, inside an expression (`ORDER BY t + 1`) on MySQL and SQLite alone
+    (`order_by_expression_sees_output_aliases`, the predicate completion already asks, so the two
+    cannot drift) — PostgreSQL 16 and SQL Server 2022 refuse that statement
+    and MariaDB takes it, checked live through `schemaic query`
+    (`an_alias_inside_an_order_by_expression_is_mysql_and_sqlites`). `GROUP BY`, `HAVING` and
+    `WHERE` see it only where `group_by_sees_output_aliases`, `select_alias_in_having` and
+    `select_alias_in_where` say — SQL Server refuses a `GROUP BY` of an alias, checked the same way
+    — and there **a column wins**: on PostgreSQL and MariaDB, `GROUP BY name` beside a column `name`
+    groups by the column. So a name in one of those clauses is the alias only where
+    `colres::select_columns` — the `FROM` sources' columns through `build_sources`, `None` if any
+    source is `Open` or unknown, a CTE included — proves no column has it. Where it cannot, the
+    reference is *unsure* and `output_alias_rename` refuses with `AliasRenameRefusal::Unsure` rather
+    than guess, while an `ORDER BY` reference, which the alias wins, needs no catalogue at all
+    (`an_unknowable_source_refuses_a_group_by_reference`,
+    `a_column_of_the_same_name_keeps_group_by_and_loses_order_by`). The bare names are collected by
+    sqlparser's own visitor at depth 0 rather than by a match over the expression kinds — a kind the
+    match left out would be a reference the rename leaves behind, to bind to a same-named column —
+    and a subquery's names are its own (`a_subquerys_names_are_left_alone`). **It answers only for
+    a statement's top-level `SELECT`**: an alias inside a derived table or a CTE body is a column
+    name the outer query reads (`d.total`), and in a set operation the first branch's names are the
+    union's, so it finds nothing there rather than half of it
+    (`a_derived_table_or_a_union_offers_nothing`); nor where two outputs share the name, which one a
+    reference means being the engine's business. `output_alias::conflicts` is the capture check:
+    `Conflict` for a name another output has, or one written bare in `ORDER BY` that would now bind
+    to the renamed alias; where some reference sits behind columns, a column of the new name is a
+    `Conflict` too, since it would win there, and a catalogue that cannot say is `Unsure`
+    (`a_name_that_would_capture_is_a_conflict`). The edit is `rename_edit`'s, quoting through
+    `ident_if_needed` as the other two renames do (`a_quoted_alias_is_renamed_where_it_is_written_quoted`);
+    the dialog's starting name is `output_alias_name_at`'s, and the catalogue is the caller's — the
+    editor builds it from the loaded schema when asked (under `editor_pane.rs`).
+    **`usages_at` is *Find usages*' answer, and it is the three walks above asked in turn** — the
+    table alias (`alias_refs::spans`), then the CTE (`alias_refs::cte_spans`), then the output
+    alias — so what it lists is exactly what the matching rename would write: the name as its
+    definition writes it, quotes off, and every whole spelling, in order
+    (`usages_are_found_for_a_table_alias_a_cte_and_an_output_alias`). It keeps their refusals and
+    adds one: an output alias with an unsure reference answers `None` here, where *Rename alias*
+    still opens and says `Unsure`, because **a list that would miss a usage is not offered**.
+    `usage_lines` turns the spans into rows — each usage's line, 1-based, and that line's text
+    trimmed and cut at 160 characters (`a_usage_is_listed_by_its_line`;
+    `find_usages_lists_the_definition_and_its_references` pins an output alias's list).
     **A `(` is filled from the schema only where the schema names one answer.** `paren_contents`,
     asked right after `insert_columns`, answers three openers through the same `column_list`.
     `REFERENCES t (` gets `t`'s primary key from `Catalog::key_columns_of` — its columns in the
@@ -24369,7 +24416,7 @@ existing prose was left alone.
     `ddl_modals_up` group and is therefore *in* that predicate: an overlay in that group whose flag
     the predicate doesn't know about resolves its `inset(0)` against a zero-by-zero box and paints
     nothing, which is exactly how the event editor once shipped invisible. It shares its tuple
-    element with *Rename alias* (`alias_rename.rs`, next).
+    element with *Rename alias* and *Find usages* (`alias_rename.rs` and `usages_view.rs`, next).
   - `alias_rename.rs` — the SQL editor's *Rename alias* and *Rename CTE* dialog
     (`alias_rename_overlay`, raised by `OverlayUi::alias_rename`): a title, one *New name* field
     opened on the name as its definition writes it, Cancel and Rename. The two share it whole;
@@ -24378,7 +24425,8 @@ existing prose was left alone.
     checked.** The entry used to hand over a multi-caret selection and let typing do the rename, so
     nothing ever compared the name with those the query already binds, and renaming the outer `o` to
     an inner query's `i` rebound a correlated `o.id` — in a `DELETE … WHERE EXISTS`, every row or
-    none (R3-L5-03). The decision is `intel::alias_rename`'s (under `intel.rs`); this file asks and
+    none (R3-L5-03). The decision is `intel::alias_rename`'s — `output_alias_rename`'s for an output
+    column's alias, which *Rename alias* also offers (under `intel.rs`); this file asks and
     shows the answer, and `AliasRenameRequest::apply` is the editor's own rename, so it knows no
     buffer or offset. A refusal — `AliasRenameRefusal::message` — is written in the error colour
     under the field and **the dialog stays open on it**, the name still there to correct; editing
@@ -24392,12 +24440,25 @@ existing prose was left alone.
     `editor_view_id` is unset). The outer `dyn_container` is keyed on *whether* a request is open
     rather than on the request, so nothing rebuilds the field and takes its caret; the footer is keyed on whether the
     trimmed name is empty, so the buttons rebuild when Rename turns on and not on every keystroke.
-    It shares `snippet_edit.rs`'s tuple element in the modal layer's DDL group — that stack is at
-    floem's 16-arity limit, and the two are not up together: that is a stated claim rather than a
-    check, resting on both being modal, so neither can be raised from behind the other — so the
+    It shares `snippet_edit.rs`'s tuple element in the modal layer's DDL group, with `usages_view.rs`
+    as the element's third member — that stack is at
+    floem's 16-arity limit, and no two of the three are up together: that is a stated claim rather
+    than a check, resting on each being modal, so none can be raised from behind another — so the
     element fills the layer while
-    either is open, `ddl_modals_up` has an `alias_rename` arm, and the file is on
+    any of them is open, `ddl_modals_up` has an `alias_rename` arm, and the file is on
     `PAINTS_A_BACKDROP`. Left out of the predicate it would paint nothing, for the reason the snippet
+    editor's entry gives.
+  - `usages_view.rs` — the SQL editor's *Find usages* list (`usages_overlay`, raised by
+    `OverlayUi::usages` with a `UsagesRequest`, which `lib.rs` re-exports for the app): a modal
+    titled *N usages of name* (*usage* for one), whose rows are a line number and that line's text
+    in the mono family, ellipsised rather than wrapped, in a scroll capped at 360 scaled px, over a
+    Close button. The rows are `intel::usage_lines` over `intel::usages_at`'s answer (under
+    `intel.rs`), so it lists exactly the places the matching rename would write, and it knows no
+    buffer: `UsagesRequest::jump` is the editor's own, as `AliasRenameRequest::apply` is. Clicking a
+    row closes the list and then jumps. Close, Escape, ✕ and **a click on the backdrop** close it —
+    unlike *Rename alias*, it has a click-away. However it closes, it calls `UsagesRequest::back`,
+    for the reason `alias_rename.rs` gives. As the tuple element's third member it is in
+    `ddl_modals_up` (its `usages` arm) and on `PAINTS_A_BACKDROP`, for the reason the snippet
     editor's entry gives.
   - `source_gate.rs` — the shared machinery behind the crate's *source gates*:
     the tests that read the crate's own `.rs` files and fail on a spelling production code must not
@@ -28031,15 +28092,20 @@ existing prose was left alone.
     formats is asked — and the same `sqlfmt` answer and `rewrite_range`. **The menu entries wear no
     keycap on purpose**: they act on the statement under the click, the key on the one at the caret,
     so a keycap would claim the key does what the click does.
-    ***Rename alias*** is offered where `intel::alias_name_at` answers at the right-click —
+    ***Rename alias*** is offered where `intel::alias_name_at` answers at the right-click, or failing
+    that `intel::output_alias_name_at` — one entry for both kinds of alias, a table's first —
     absent otherwise, and re-derived when clicked, like the rest — and is appended after the entries
-    above, ahead of *Create view*'s group. It has no key. It used to open no modal either: it set the
+    above (*Find usages*, below, straight before it), ahead of *Create view*'s group. An output
+    alias's binding rests on which columns the loaded schema says the `FROM` sources have, so the
+    entry carries no catalogue: `completion::build_catalog(db_nodes, active_db)` is called each time
+    one is asked for — when the menu is built, and again when Rename is pressed. It has no key. It used to open no modal either: it set the
     cursor to one `SelRegion` per `alias_occurrences` range and let the next word typed replace every
     one at once, which left the name nowhere a check could stand — renaming the outer `o` to an inner
     query's `i` silently rebound a correlated `o.id` (R3-L5-03, under `intel.rs`). It now sets
     `OverlayUi::alias_rename` (threaded in as `QueryPaneParams::alias_rename`) to an
-    `AliasRenameRequest`: the name `alias_name_at` read, and an `apply` that re-runs
-    `intel::alias_rename` against the buffer **when Rename is pressed**, at the offset the menu was
+    `AliasRenameRequest`: the name whichever of the two read, and an `apply` that re-runs
+    `intel::alias_rename` — `output_alias_rename` where the click found an output alias, the kind
+    being fixed then — against the buffer **when Rename is pressed**, at the offset the menu was
     opened on, and writes the `MultiEdit` through `edit_untyped_multi` — one undo step — plus a
     `back` that returns the keyboard to the editor when the dialog closes (*A menu the keyboard
     opened gives focus back*, under *Popup menus*, says why the menu's own return cannot). Its
@@ -28057,6 +28123,16 @@ existing prose was left alone.
     on stays: Backspace and an auto-paired `(` used to collapse the
     regions to the primary one; they now act at every caret (`text_ops.rs`, *Several carets*), as
     do Tab, Shift+Tab, Ctrl+/, Ctrl+D, Alt+↑/↓, Ctrl+Shift+U, Ctrl+Shift+J and Ctrl+Shift+/.
+    ***Find usages*** sits straight before *Rename alias*, offered where `intel::usages_at` answers
+    at the right-click with the same catalogue — a table alias, a CTE or an output alias (under
+    `intel.rs`) — and re-derived when clicked. It sets `OverlayUi::usages` (threaded in as
+    `QueryPaneParams::usages`) to a `UsagesRequest` (`usages_view.rs`): the name, the rows
+    `intel::usage_lines` makes of the spans, the same `back` as the renames, and a `jump` that
+    selects the usage's range and calls `center_window()`, as Ctrl+click's *Defined* arm does. **The
+    rows' offsets are the ones taken at the click**, so `jump` holds the text they were taken in and
+    does nothing once the buffer differs — an edit made under the open list (an agent's, say) would
+    otherwise have a row select whatever those offsets now hold, or past the end; Rename's `Changed`
+    is the same check.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or
@@ -39698,7 +39774,7 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   Standing down leaves the editor with nothing to come back to once the dialog closes — its root's
   own hand-back finds no other root — so the dialog carries its own return
   (`AliasRenameRequest::back`, under `alias_rename.rs`); without it Ctrl+Z after a rename did nothing
-  until the editor was clicked.
+  until the editor was clicked. *Find usages*' list carries the same (`UsagesRequest::back`).
   **Opening that menu blurs the editor, and the caret must not go with it** — `looks_focused`
   (`focused || own_menu_open`), which `editor_style` reads for the caret colour and the
   current-line band in place of `editor_focused` alone. Both paint `Color::TRANSPARENT` while the
