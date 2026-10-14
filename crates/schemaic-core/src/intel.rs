@@ -12365,35 +12365,28 @@ mod colres {
         (sources, proj_aliases(sel))
     }
 
-    /// Every column `sel`'s `FROM` sources expose, lower-cased — or `None`
-    /// when any one of them cannot be enumerated (a table the catalogue does
-    /// not hold, a table function, a `SELECT *` subquery): the answer
+    /// Every column the table `name` has, lower-cased, the engine's undeclared
+    /// ones (`rowid`) included — or `None` where the catalogue cannot
+    /// enumerate them (not loaded, not found, a linked server's): the answer
     /// `output_alias` needs to know a bare name **is not** a column, which an
-    /// open source can never prove. A CTE is looked up as a table, so it too
-    /// answers `None`.
-    pub(super) fn select_columns(
-        sel: &Select,
+    /// unknown table can never prove. The name is read as a table, never as a
+    /// CTE — `output_alias` binds those itself.
+    pub(super) fn table_columns(
+        name: &ObjectName,
         catalog: &Catalog,
         dialect: super::SqlDialect,
-        stmt: &str,
-        lo: usize,
     ) -> Option<HashSet<String>> {
-        let (sources, _) = build_sources(
-            sel,
+        let src = named_source(
+            name,
+            None,
             catalog,
             dialect.implicit_columns(),
             &HashMap::new(),
-            stmt,
-            lo,
-        );
-        let mut all = HashSet::new();
-        for s in sources {
-            match s.cols {
-                Cols::Known(cols) => all.extend(cols),
-                Cols::Open => return None,
-            }
+        )?;
+        match src.cols {
+            Cols::Known(cols) => Some(cols),
+            Cols::Open => None,
         }
-        Some(all)
     }
 
     /// Hint at an inner `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`
@@ -12602,7 +12595,7 @@ mod colres {
     /// plus whether a `NATURAL` join is present. A reference to a coalesced column is
     /// unambiguous even when several sources expose it; NATURAL suppresses the check
     /// entirely (its common-column set isn't enumerated here).
-    fn coalesced_cols(sel: &Select) -> (HashSet<String>, bool) {
+    pub(super) fn coalesced_cols(sel: &Select) -> (HashSet<String>, bool) {
         let mut cols = HashSet::new();
         let mut natural = false;
         fn walk(twj: &TableWithJoins, cols: &mut HashSet<String>, natural: &mut bool) {
@@ -13027,9 +13020,10 @@ pub enum AliasRenameRefusal {
     /// The name would rebind a reference or clash with one the query
     /// already exposes ([`alias_rename_conflicts`]).
     Conflict,
-    /// An output alias's reference in `GROUP BY`, `HAVING` or `WHERE` may be
-    /// a same-named column instead — which the server reads first there — and
-    /// the loaded schema cannot say ([`output_alias_rename`]).
+    /// An output alias's reference may be a same-named column instead — in
+    /// `GROUP BY`, `HAVING` or `WHERE`, or in a query reading it through a
+    /// derived table or CTE — and the loaded schema cannot say; or a query
+    /// reads it where the walk cannot follow ([`output_alias_rename`]).
     Unsure,
     /// The text changed while the dialog was open, so the place it was
     /// opened on may now be another alias. The editor's call, not this walk's.
@@ -13187,9 +13181,10 @@ impl AliasRenameRefusal {
                  which table a reference reads.",
                 new_name.trim()
             ),
-            Self::Unsure => "A column of this name may be what GROUP BY, HAVING or WHERE reads \
-                             here, and the loaded schema cannot tell — so no edit is made. Load \
-                             the tables' schema, or rename by hand."
+            Self::Unsure => "A reference here may read another column of this name, or read \
+                             this one where the rename cannot follow, and the loaded schema \
+                             cannot tell — so no edit is made. Load the tables' schema, or \
+                             rename by hand."
                 .to_string(),
             Self::Changed => {
                 "The query changed while this was open. Close it and rename again.".to_string()
@@ -13225,12 +13220,14 @@ pub fn output_alias_name_at(
 }
 
 /// *Rename alias* for an **output column's** alias ([`output_alias`]): the
-/// edits that rename its `AS` and every reference the engine binds to it, or
-/// why not — [`AliasRenameRefusal::Unsure`] where a reference in `GROUP BY`,
-/// `HAVING` or `WHERE` might be a same-named column the catalogue cannot rule
-/// out, [`AliasRenameRefusal::Conflict`] where the new name is another
-/// output's, is written bare in `ORDER BY` (which would read the renamed
-/// alias instead), or is a column that would now win over it.
+/// edits that rename its `AS` and every reference the engine binds to it —
+/// those of the queries reading it through a derived table or CTE included —
+/// or why not: [`AliasRenameRefusal::Unsure`] where a reference might be a
+/// same-named column the catalogue cannot rule out, or a reader is one the
+/// walk cannot follow; [`AliasRenameRefusal::Conflict`] where the new name is
+/// another output's, is written bare in `ORDER BY` (which would read the
+/// renamed alias instead), is a column that would now win over it, or is a
+/// name a reading query already uses.
 pub fn output_alias_rename(
     sql: &str,
     caret: usize,
@@ -13890,6 +13887,18 @@ mod alias_refs {
         }
     }
 
+    /// Every one-part table reference bound to a CTE, as `(reference, the
+    /// declaration's name)` — [`Ctes::bound`]'s answer, so `output_alias`
+    /// binds a CTE exactly as the jump and *Rename CTE* do.
+    pub(super) fn cte_bindings(stmt: &str, lo: usize, ast: &Statement) -> Vec<(Span, Span)> {
+        let c = Ctes::of(stmt, lo, ast);
+        c.refs
+            .iter()
+            .filter(|r| r.single)
+            .filter_map(|r| Some((r.at, c.decls[c.bound(&r.name, r.quoted, r.at)?].at)))
+            .collect()
+    }
+
     /// [`super::cte_rename`]'s walk: the CTE at `caret` — its declaration, or
     /// a reference bound to it — and every place it is written, its
     /// declaration first in the list's order, each a whole spelling. `None`
@@ -14083,37 +14092,57 @@ mod alias_refs {
 ///   MySQL and PostgreSQL both document the input column winning there. So a
 ///   name in one of those clauses is the alias only where no `FROM` source
 ///   has that column — which the loaded catalogue must prove
-///   ([`colres::select_columns`]), or the rename refuses rather than guess.
+///   ([`colres::table_columns`]), or the rename refuses rather than guess.
 ///
-/// **Only a statement's top-level `SELECT`.** An alias inside a derived table
-/// or a CTE is a column name the outer query reads (`d.total`), and in a set
-/// operation the first branch's names are the union's; neither is renamed by
-/// this walk, which finds nothing there rather than half of it.
+/// **Any `SELECT` that is not a set operation's branch** — the top level, a
+/// subquery, a derived table, a CTE's body. In a set operation the first
+/// branch's names are the union's, so a branch's alias is not offered.
+///
+/// **An alias a derived table or a CTE defines is a column its readers read**
+/// (`d.total`, or a bare `total` where no other source has one), and the
+/// rename follows it there (`Tree::reach`) — onwards too, where a reader
+/// passes the column on under the same name (`SELECT d.total`, `SELECT *`) and
+/// is itself read. It stops at a reader that names the column itself (an
+/// alias, `AS d(x)`, a CTE's column list). A reader the walk cannot see whole
+/// — a write's `FROM`, a `USING` or `NATURAL` join, `TABLE c`, a bare name
+/// beside a source whose columns are unknown, a union that is read in turn —
+/// refuses the rename rather than leave a reference behind.
 mod output_alias {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        Expr, GroupByExpr, Ident, OrderByKind, Query, SelectItem, SetExpr, Statement, Visit,
-        Visitor,
+        Expr, GroupByExpr, Ident, OrderByKind, Query, Select, SelectItem,
+        SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, TableObject,
+        TableWithJoins, Visit, Visitor,
     };
 
-    use super::{Catalog, SqlDialect, colres};
+    use super::{Catalog, LineIndex, SqlDialect, colres};
+
+    /// A byte range in the buffer.
+    type Span = (usize, usize);
 
     /// One output alias's place in a statement.
     pub(super) struct Found {
         /// The alias's definition, its whole spelling (quotes included).
-        pub def: (usize, usize),
+        pub def: Span,
         /// Every reference the server binds to it, whole spellings.
-        pub refs: Vec<(usize, usize)>,
+        pub refs: Vec<Span>,
         /// A reference whose binding the catalogue could not settle — a name
-        /// in `GROUP BY`/`HAVING`/`WHERE` with an unknowable source beside it.
+        /// in `GROUP BY`/`HAVING`/`WHERE` with an unknowable source beside it
+        /// — or a reader the walk cannot see whole.
         pub unsure: bool,
+        /// Where the unsettled references stand, so a caret on one finds the
+        /// alias it may be — and is refused, rather than offered nothing.
+        pub maybe: Vec<Span>,
     }
 
     /// The names a rename to `new` must not collide with, beside [`Found`].
     pub(super) struct Context {
-        /// The other output aliases, as written, with their quoting.
+        /// The alias's own name as written, and whether it is quoted.
+        own: (String, bool),
+        /// The other output names, as written, with their quoting: the
+        /// aliases, and the columns written unaliased.
         others: Vec<(String, bool)>,
         /// Names written bare in `ORDER BY` that do not bind to the alias —
         /// where a rename to one would take it over.
@@ -14122,13 +14151,396 @@ mod output_alias {
         columns: Option<HashSet<String>>,
         /// Some reference sits in a clause where a column beats the alias.
         refs_behind_columns: bool,
+        /// One per query reading the alias from outside its own.
+        outer: Vec<Reach>,
     }
 
-    fn same(a: &Ident, b: &str, b_quoted: bool) -> bool {
-        if a.quote_style.is_some() || b_quoted {
-            a.value == b
-        } else {
-            a.value.eq_ignore_ascii_case(b)
+    /// What a rename must not collide with in one query that reads the alias
+    /// through a derived table or a CTE.
+    struct Reach {
+        /// Every bare name written there, folded: once the source has the new
+        /// name too, one of them would be ambiguous or bind to it instead.
+        bare: HashSet<String>,
+        /// A bare reference there is renamed, so the other sources' columns
+        /// compete with the new name.
+        renamed_bare: bool,
+        /// Those columns, folded; `None` where one source's are unknowable.
+        rivals: Option<HashSet<String>>,
+        /// The query's other output names, which the column would now share.
+        outputs: Vec<(String, bool)>,
+    }
+
+    /// A name as the statement writes it.
+    #[derive(Clone)]
+    struct Name {
+        value: String,
+        quoted: bool,
+        at: Span,
+    }
+
+    impl Name {
+        /// Do the two name the same thing? A quoted side is that spelling
+        /// exactly; a bare pair compares as the server folds it.
+        fn same(&self, other: &Name) -> bool {
+            if self.quoted || other.quoted {
+                self.value == other.value
+            } else {
+                self.value.eq_ignore_ascii_case(&other.value)
+            }
+        }
+
+        fn folded(&self) -> String {
+            self.value.to_ascii_lowercase()
+        }
+    }
+
+    /// Where a column reference stands in its `SELECT`, which decides whether
+    /// an output alias of its name is visible to it.
+    #[derive(Clone, Copy)]
+    enum Place {
+        /// `ORDER BY`, as the whole item or inside an expression.
+        Order {
+            whole: bool,
+        },
+        Group,
+        Having,
+        Where,
+        Other,
+    }
+
+    /// A column reference at its `SELECT`'s own level.
+    struct ColRef {
+        qual: Option<Name>,
+        col: Name,
+        place: Place,
+    }
+
+    /// One item of a projection, as far as its name goes.
+    enum Out {
+        Alias(Name),
+        /// An unaliased column reference, which outputs under its own name.
+        Ref(Name),
+        Star,
+        /// `q.*`, by its qualifier.
+        QualStar(Name),
+        /// An unnamed expression: the engine names it, each its own way.
+        Other,
+    }
+
+    enum Kind {
+        Table {
+            /// The name when it is one part, which a CTE may be.
+            single: Option<Name>,
+            cols: Option<HashSet<String>>,
+        },
+        /// The subquery's address until the walk ends, then its query.
+        Derived {
+            addr: usize,
+            query: Option<usize>,
+        },
+        Cte(usize),
+        Opaque,
+    }
+
+    /// One `FROM` source of a `SELECT`.
+    struct Source {
+        /// What a qualifier names it by: its alias, or the table's last part.
+        qual: Option<Name>,
+        kind: Kind,
+        /// Where a table's one-part name is written.
+        named_at: Option<Span>,
+    }
+
+    /// What a query's output names are for.
+    enum Role {
+        /// The statement's own: the result's columns.
+        Top,
+        /// A subquery expression's, an `INSERT`'s source: read by no name.
+        Opaque,
+        /// A parenthesised set-operation branch: its names are the union's.
+        Branch,
+        /// A derived table's body, with its `AS d(x, y)` list if it has one.
+        Derived(Option<HashSet<String>>),
+        Cte(usize),
+    }
+
+    struct QNode {
+        role: Role,
+        range: Span,
+        parent_query: Option<usize>,
+        /// The `SELECT` whose sources this query's names can reach past its
+        /// own: `None` for a CTE's body, which sees no enclosing `FROM`.
+        parent_block: Option<usize>,
+        /// The address of its body when that is a plain `SELECT`.
+        body_select: Option<usize>,
+        /// A union with an `ORDER BY`, which reads its branches' names.
+        ordered: bool,
+        /// Its `ORDER BY`'s references, for the body's block.
+        order_refs: Vec<ColRef>,
+        /// Its `ORDER BY`'s bare names, for [`Tree::plan`].
+        order_cands: Vec<(Name, Clause)>,
+    }
+
+    /// One `SELECT`.
+    struct Block {
+        query: usize,
+        /// A set operation's branch rather than its query's whole body.
+        branch: bool,
+        /// Its query's range for a whole body (its `ORDER BY` included), its
+        /// own for a branch.
+        range: Span,
+        sources: Vec<Source>,
+        outs: Vec<Out>,
+        refs: Vec<ColRef>,
+        /// Bare names where an output alias may stand ([`Tree::plan`]).
+        cands: Vec<(Name, Clause)>,
+        using: HashSet<String>,
+        natural: bool,
+    }
+
+    /// A CTE a `WITH` declares.
+    struct Decl {
+        name: Name,
+        listed: Option<HashSet<String>>,
+        body: Option<usize>,
+    }
+
+    /// A source's columns, folded, and whether that is all of them.
+    struct Cols {
+        names: HashSet<String>,
+        complete: bool,
+    }
+
+    impl Cols {
+        fn unknown() -> Cols {
+            Cols {
+                names: HashSet::new(),
+                complete: false,
+            }
+        }
+    }
+
+    /// What a bare name binds to.
+    #[derive(PartialEq)]
+    enum Bare {
+        /// `(block, source)`.
+        Source(usize, usize),
+        /// A source on the way out whose columns are unknown, or two that
+        /// both have it, or a `USING`/`NATURAL` join that may coalesce it.
+        Unknown,
+        Free,
+    }
+
+    /// Every `SELECT` of a statement with its scope, sources and outputs.
+    struct Tree {
+        queries: Vec<QNode>,
+        blocks: Vec<Block>,
+        decls: Vec<Decl>,
+        /// One-part names that may be a CTE read where the walk sees no
+        /// `FROM`: `TABLE c`, an `INSERT`'s target, a write's own tables.
+        blind: HashSet<String>,
+    }
+
+    /// A node's address: what the visitor's callbacks can share about a node,
+    /// which the borrow each is handed does not outlive.
+    fn addr<T>(t: &T) -> usize {
+        std::ptr::from_ref(t).addr()
+    }
+
+    /// The column references at `node`'s own level, none inside a nested
+    /// query (whose names are its own): `(qualifier, column)`.
+    fn refs_in(node: &impl Visit) -> Vec<(Option<Ident>, Ident)> {
+        struct R {
+            depth: usize,
+            out: Vec<(Option<Ident>, Ident)>,
+        }
+        impl Visitor for R {
+            type Break = ();
+            fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+                self.depth += 1;
+                ControlFlow::Continue(())
+            }
+            fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+                self.depth -= 1;
+                ControlFlow::Continue(())
+            }
+            fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+                if self.depth == 0 {
+                    match e {
+                        Expr::Identifier(id) => self.out.push((None, id.clone())),
+                        Expr::CompoundIdentifier(p) if p.len() >= 2 => self
+                            .out
+                            .push((Some(p[p.len() - 2].clone()), p[p.len() - 1].clone())),
+                        _ => {}
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        let mut r = R {
+            depth: 0,
+            out: Vec::new(),
+        };
+        let _ = node.visit(&mut r);
+        r.out
+    }
+
+    struct Build<'a> {
+        stmt: &'a str,
+        lines: LineIndex,
+        lo: usize,
+        catalog: &'a Catalog,
+        dialect: SqlDialect,
+        tree: Tree,
+        stack: Vec<usize>,
+        /// Query addresses → their role or index, as the walk learns them.
+        tops: HashSet<usize>,
+        derived: HashMap<usize, Option<HashSet<String>>>,
+        branches: HashSet<usize>,
+        bodies: HashMap<usize, usize>,
+        queries: HashMap<usize, usize>,
+        /// Every one-part table name written, with where.
+        tables: Vec<(String, Span)>,
+    }
+
+    impl Build<'_> {
+        fn name(&self, id: &Ident) -> Name {
+            Name {
+                value: id.value.clone(),
+                quoted: id.quote_style.is_some(),
+                at: colres::to_range_in(&self.lines, self.stmt, self.lo, id.span),
+            }
+        }
+
+        fn col_refs(&self, found: Vec<(Option<Ident>, Ident)>, place: Place) -> Vec<ColRef> {
+            found
+                .into_iter()
+                .map(|(q, c)| ColRef {
+                    qual: q.map(|q| self.name(&q)),
+                    col: self.name(&c),
+                    place,
+                })
+                .collect()
+        }
+
+        fn sources(&self, twj: &TableWithJoins, out: &mut Vec<Source>) {
+            self.source(&twj.relation, out);
+            for j in &twj.joins {
+                self.source(&j.relation, out);
+            }
+        }
+
+        fn source(&self, f: &TableFactor, out: &mut Vec<Source>) {
+            match f {
+                TableFactor::Table {
+                    name,
+                    alias,
+                    args: None,
+                    ..
+                } => {
+                    let last = name.0.last().and_then(|p| p.as_ident());
+                    let single = last.filter(|_| name.0.len() == 1).map(|id| self.name(id));
+                    out.push(Source {
+                        qual: alias
+                            .as_ref()
+                            .map(|a| self.name(&a.name))
+                            .or_else(|| last.map(|id| self.name(id))),
+                        named_at: single.as_ref().map(|n| n.at),
+                        kind: Kind::Table {
+                            single,
+                            cols: colres::table_columns(name, self.catalog, self.dialect),
+                        },
+                    });
+                }
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => out.push(Source {
+                    qual: alias.as_ref().map(|a| self.name(&a.name)),
+                    kind: Kind::Derived {
+                        addr: addr(&**subquery),
+                        query: None,
+                    },
+                    named_at: None,
+                }),
+                TableFactor::NestedJoin {
+                    table_with_joins, ..
+                } => self.sources(table_with_joins, out),
+                _ => out.push(Source {
+                    qual: None,
+                    kind: Kind::Opaque,
+                    named_at: None,
+                }),
+            }
+        }
+
+        fn outs(&self, sel: &Select) -> Vec<Out> {
+            sel.projection
+                .iter()
+                .map(|item| match item {
+                    SelectItem::ExprWithAlias { alias, .. } => Out::Alias(self.name(alias)),
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => Out::Ref(self.name(id)),
+                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(p)) if p.len() >= 2 => {
+                        Out::Ref(self.name(&p[p.len() - 1]))
+                    }
+                    SelectItem::Wildcard(_) => Out::Star,
+                    SelectItem::QualifiedWildcard(
+                        SelectItemQualifiedWildcardKind::ObjectName(n),
+                        _,
+                    ) => {
+                        n.0.last()
+                            .and_then(|p| p.as_ident())
+                            .map_or(Out::Other, |id| Out::QualStar(self.name(id)))
+                    }
+                    _ => Out::Other,
+                })
+                .collect()
+        }
+
+        /// `ctes`: [`super::alias_refs::cte_bindings`], the one CTE binder.
+        fn finish(mut self, ctes: &[(Span, Span)]) -> Tree {
+            let queries = &self.queries;
+            for b in &mut self.tree.blocks {
+                for s in &mut b.sources {
+                    if let Kind::Derived { addr, query } = &mut s.kind {
+                        *query = queries.get(addr).copied();
+                    }
+                }
+            }
+            for (body, &d) in &self.bodies {
+                self.tree.decls[d].body = queries.get(body).copied();
+            }
+            let mut bound = Vec::new();
+            for (b, blk) in self.tree.blocks.iter().enumerate() {
+                for (s, src) in blk.sources.iter().enumerate() {
+                    if let Kind::Table {
+                        single: Some(n), ..
+                    } = &src.kind
+                        && let Some((_, decl)) = ctes.iter().find(|(r, _)| *r == n.at)
+                        && let Some(d) = self.tree.decls.iter().position(|d| d.name.at == *decl)
+                    {
+                        bound.push((b, s, d));
+                    }
+                }
+            }
+            for (b, s, d) in bound {
+                self.tree.blocks[b].sources[s].kind = Kind::Cte(d);
+            }
+            // A one-part table no `SELECT` reads in its `FROM` — an `UPDATE`'s
+            // target or its `FROM`, a `DELETE … USING` — may be a CTE read
+            // where no reader is walked.
+            let read: HashSet<Span> = self
+                .tree
+                .blocks
+                .iter()
+                .flat_map(|b| &b.sources)
+                .filter_map(|s| s.named_at)
+                .collect();
+            for (name, at) in std::mem::take(&mut self.tables) {
+                if !read.contains(&at) {
+                    self.tree.blind.insert(name);
+                }
+            }
+            self.tree
         }
     }
 
@@ -14172,14 +14584,669 @@ mod output_alias {
         v.out.into_iter().map(|id| (id, false)).collect()
     }
 
-    /// The top-level `SELECT` of `ast`, and its query.
-    fn top_select(ast: &Statement) -> Option<(&Query, &sqlparser::ast::Select)> {
-        let Statement::Query(q) = ast else {
-            return None;
-        };
-        match q.body.as_ref() {
-            SetExpr::Select(sel) => Some((q, sel)),
-            _ => None,
+    impl Visitor for Build<'_> {
+        type Break = ();
+
+        fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
+            match s {
+                Statement::Query(q) => {
+                    self.tops.insert(addr(&**q));
+                }
+                Statement::Insert(ins) => {
+                    if let TableObject::TableName(name) = &ins.table
+                        && let [part] = name.0.as_slice()
+                        && let Some(id) = part.as_ident()
+                    {
+                        self.tree.blind.insert(id.value.to_ascii_lowercase());
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            let idx = self.tree.queries.len();
+            let a = addr(q);
+            let role = if self.tops.contains(&a) {
+                Role::Top
+            } else if let Some(listed) = self.derived.get(&a) {
+                Role::Derived(listed.clone())
+            } else if let Some(&d) = self.bodies.get(&a) {
+                Role::Cte(d)
+            } else if self.branches.contains(&a) {
+                Role::Branch
+            } else {
+                Role::Opaque
+            };
+            let range = colres::to_range_in(&self.lines, self.stmt, self.lo, q.span());
+            let parent_query = self.stack.last().copied();
+            // The parent query's `SELECT` holding this one — a CTE's body
+            // holds none, as it sees no enclosing `FROM`.
+            let parent_block = match (&role, parent_query) {
+                (Role::Cte(_), _) | (_, None) => None,
+                (_, Some(p)) => self
+                    .tree
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.query == p && b.range.0 <= range.0 && range.1 <= b.range.1)
+                    .min_by_key(|(_, b)| b.range.1 - b.range.0)
+                    .map(|(i, _)| i),
+            };
+            if let Some(with) = &q.with {
+                for cte in &with.cte_tables {
+                    let listed = (!cte.alias.columns.is_empty()).then(|| {
+                        cte.alias
+                            .columns
+                            .iter()
+                            .map(|c| c.name.value.to_ascii_lowercase())
+                            .collect()
+                    });
+                    self.bodies.insert(addr(&*cte.query), self.tree.decls.len());
+                    self.tree.decls.push(Decl {
+                        name: self.name(&cte.alias.name),
+                        listed,
+                        body: None,
+                    });
+                }
+            }
+            fn branches(e: &SetExpr, out: &mut HashSet<usize>, blind: &mut HashSet<String>) {
+                match e {
+                    SetExpr::Query(q) => {
+                        out.insert(addr(&**q));
+                    }
+                    SetExpr::SetOperation { left, right, .. } => {
+                        branches(left, out, blind);
+                        branches(right, out, blind);
+                    }
+                    SetExpr::Table(t) if t.schema_name.is_none() => {
+                        if let Some(n) = &t.table_name {
+                            blind.insert(n.trim_matches(['"', '`', '[', ']']).to_ascii_lowercase());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            branches(&q.body, &mut self.branches, &mut self.tree.blind);
+            let mut order_refs = Vec::new();
+            let mut order_cands = Vec::new();
+            if let Some(ob) = &q.order_by
+                && let OrderByKind::Expressions(items) = &ob.kind
+            {
+                for item in items {
+                    let whole =
+                        matches!(item.expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+                    order_refs.extend(self.col_refs(refs_in(&item.expr), Place::Order { whole }));
+                    for (id, whole) in bare_idents(&item.expr) {
+                        let clause = if whole {
+                            Clause::OrderWhole
+                        } else {
+                            Clause::OrderInside
+                        };
+                        order_cands.push((self.name(&id), clause));
+                    }
+                }
+            }
+            self.queries.insert(a, idx);
+            self.tree.queries.push(QNode {
+                role,
+                range,
+                parent_query,
+                parent_block,
+                body_select: match q.body.as_ref() {
+                    SetExpr::Select(s) => Some(addr(&**s)),
+                    _ => None,
+                },
+                ordered: q.order_by.is_some(),
+                order_refs,
+                order_cands,
+            });
+            self.stack.push(idx);
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            self.stack.pop();
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_select(&mut self, sel: &Select) -> ControlFlow<()> {
+            let Some(&query) = self.stack.last() else {
+                return ControlFlow::Continue(());
+            };
+            let branch = self.tree.queries[query].body_select != Some(addr(sel));
+            let range = if branch {
+                colres::to_range_in(&self.lines, self.stmt, self.lo, sel.span())
+            } else {
+                self.tree.queries[query].range
+            };
+            let mut sources = Vec::new();
+            for twj in &sel.from {
+                self.sources(twj, &mut sources);
+            }
+            // Each reference's clause, by where its column is written.
+            let spans = |e: Option<&Expr>| -> HashSet<Span> {
+                e.map(|e| refs_in(e).iter().map(|(_, c)| self.name(c).at).collect())
+                    .unwrap_or_default()
+            };
+            let wheres = spans(sel.selection.as_ref());
+            let havings = spans(sel.having.as_ref());
+            let groups: HashSet<Span> = match &sel.group_by {
+                GroupByExpr::Expressions(exprs, _) => {
+                    exprs.iter().flat_map(|e| spans(Some(e))).collect()
+                }
+                GroupByExpr::All(_) => HashSet::new(),
+            };
+            let mut refs: Vec<ColRef> = self
+                .col_refs(refs_in(sel), Place::Other)
+                .into_iter()
+                .map(|mut r| {
+                    r.place = if wheres.contains(&r.col.at) {
+                        Place::Where
+                    } else if groups.contains(&r.col.at) {
+                        Place::Group
+                    } else if havings.contains(&r.col.at) {
+                        Place::Having
+                    } else {
+                        Place::Other
+                    };
+                    r
+                })
+                .collect();
+            let mut cands = Vec::new();
+            if !branch {
+                let q = &mut self.tree.queries[query];
+                refs.append(&mut q.order_refs);
+                cands.append(&mut q.order_cands);
+                let mut behind = |e: &Expr, visible: bool| {
+                    if visible {
+                        for (id, _) in bare_idents(e) {
+                            cands.push((self.name(&id), Clause::BehindColumns));
+                        }
+                    }
+                };
+                if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+                    for e in exprs {
+                        behind(e, super::group_by_sees_output_aliases(self.dialect));
+                    }
+                }
+                if let Some(h) = &sel.having {
+                    behind(h, super::select_alias_in_having(self.dialect));
+                }
+                if let Some(w) = &sel.selection {
+                    behind(w, super::select_alias_in_where(self.dialect));
+                }
+            }
+            let (using, natural) = colres::coalesced_cols(sel);
+            let outs = self.outs(sel);
+            self.tree.blocks.push(Block {
+                query,
+                branch,
+                range,
+                sources,
+                outs,
+                refs,
+                cands,
+                using,
+                natural,
+            });
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            match t {
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let listed = alias.as_ref().filter(|a| !a.columns.is_empty()).map(|a| {
+                        a.columns
+                            .iter()
+                            .map(|c| c.name.value.to_ascii_lowercase())
+                            .collect()
+                    });
+                    self.derived.insert(addr(&**subquery), listed);
+                }
+                TableFactor::Table { name, .. } => {
+                    if let [part] = name.0.as_slice()
+                        && let Some(id) = part.as_ident()
+                    {
+                        let n = self.name(id);
+                        self.tables.push((n.folded(), n.at));
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    impl Tree {
+        fn build(
+            stmt: &str,
+            lo: usize,
+            ast: &Statement,
+            catalog: &Catalog,
+            dialect: SqlDialect,
+        ) -> Tree {
+            let mut b = Build {
+                stmt,
+                lines: LineIndex::new(stmt),
+                lo,
+                catalog,
+                dialect,
+                tree: Tree {
+                    queries: Vec::new(),
+                    blocks: Vec::new(),
+                    decls: Vec::new(),
+                    blind: HashSet::new(),
+                },
+                stack: Vec::new(),
+                tops: HashSet::new(),
+                derived: HashMap::new(),
+                branches: HashSet::new(),
+                bodies: HashMap::new(),
+                queries: HashMap::new(),
+                tables: Vec::new(),
+            };
+            let _ = ast.visit(&mut b);
+            b.finish(&super::alias_refs::cte_bindings(stmt, lo, ast))
+        }
+
+        fn parent(&self, b: usize) -> Option<usize> {
+            self.queries[self.blocks[b].query].parent_block
+        }
+
+        /// Is block `b` block `of`, or inside it?
+        fn within(&self, b: usize, of: usize) -> bool {
+            let mut cur = Some(b);
+            while let Some(x) = cur {
+                if x == of {
+                    return true;
+                }
+                cur = self.parent(x);
+            }
+            false
+        }
+
+        /// Is block `b` part of query `q`, or of a query inside it?
+        fn under_query(&self, b: usize, q: usize) -> bool {
+            let mut cur = Some(self.blocks[b].query);
+            while let Some(x) = cur {
+                if x == q {
+                    return true;
+                }
+                cur = self.queries[x].parent_query;
+            }
+            false
+        }
+
+        fn source_cols(&self, b: usize, s: usize, depth: usize) -> Cols {
+            let listed = |l: &HashSet<String>| Cols {
+                names: l.clone(),
+                complete: true,
+            };
+            match &self.blocks[b].sources[s].kind {
+                Kind::Table { cols, .. } => cols.as_ref().map_or_else(Cols::unknown, listed),
+                Kind::Derived { query: Some(q), .. } => match &self.queries[*q].role {
+                    Role::Derived(Some(l)) => listed(l),
+                    _ => self.query_outputs(*q, depth),
+                },
+                Kind::Cte(d) => match (&self.decls[*d].listed, self.decls[*d].body) {
+                    (Some(l), _) => listed(l),
+                    (None, Some(q)) => self.query_outputs(q, depth),
+                    (None, None) => Cols::unknown(),
+                },
+                Kind::Derived { query: None, .. } | Kind::Opaque => Cols::unknown(),
+            }
+        }
+
+        /// A query's output names: its body's, or a union's first branch's.
+        fn query_outputs(&self, q: usize, depth: usize) -> Cols {
+            if depth > 8 {
+                return Cols::unknown();
+            }
+            // Blocks are made in order, so a union's first is its leftmost.
+            self.blocks
+                .iter()
+                .position(|b| b.query == q)
+                .map_or_else(Cols::unknown, |b| self.block_outputs(b, depth + 1))
+        }
+
+        fn block_outputs(&self, b: usize, depth: usize) -> Cols {
+            let blk = &self.blocks[b];
+            let mut out = Cols {
+                names: HashSet::new(),
+                complete: true,
+            };
+            let mut take = |c: Cols| {
+                out.names.extend(c.names);
+                out.complete &= c.complete;
+            };
+            for o in &blk.outs {
+                match o {
+                    Out::Alias(n) | Out::Ref(n) => take(Cols {
+                        names: HashSet::from([n.folded()]),
+                        complete: true,
+                    }),
+                    Out::Star => {
+                        for s in 0..blk.sources.len() {
+                            take(self.source_cols(b, s, depth));
+                        }
+                    }
+                    Out::QualStar(q) => match self.own_source(b, q) {
+                        Some(s) => take(self.source_cols(b, s, depth)),
+                        None => take(Cols::unknown()),
+                    },
+                    Out::Other => take(Cols::unknown()),
+                }
+            }
+            out
+        }
+
+        fn own_source(&self, b: usize, qual: &Name) -> Option<usize> {
+            self.blocks[b]
+                .sources
+                .iter()
+                .position(|s| s.qual.as_ref().is_some_and(|x| x.same(qual)))
+        }
+
+        /// Every column block `b`'s sources expose — `None` where one cannot
+        /// be enumerated.
+        fn columns(&self, b: usize) -> Option<HashSet<String>> {
+            let mut all = HashSet::new();
+            for s in 0..self.blocks[b].sources.len() {
+                let c = self.source_cols(b, s, 0);
+                if !c.complete {
+                    return None;
+                }
+                all.extend(c.names);
+            }
+            Some(all)
+        }
+
+        /// The source a qualifier written in block `from` names: the nearest
+        /// `SELECT` outwards with a source of that name.
+        fn resolve_qual(&self, from: usize, qual: &Name) -> Option<(usize, usize)> {
+            let mut cur = Some(from);
+            while let Some(b) = cur {
+                if let Some(s) = self.own_source(b, qual) {
+                    return Some((b, s));
+                }
+                cur = self.parent(b);
+            }
+            None
+        }
+
+        /// The source a bare column name written in block `from` reads: the
+        /// nearest `SELECT` outwards with a source that has it. One source
+        /// that has it, beside one whose columns are unknown, is that one —
+        /// were the unknown one to have it too, the server would refuse the
+        /// name as ambiguous.
+        fn resolve_bare(&self, from: usize, name: &Name) -> Bare {
+            let folded = name.folded();
+            let mut cur = Some(from);
+            while let Some(b) = cur {
+                let blk = &self.blocks[b];
+                if blk.natural || blk.using.contains(&folded) {
+                    return Bare::Unknown;
+                }
+                let mut hits = Vec::new();
+                let mut open = false;
+                for s in 0..blk.sources.len() {
+                    let c = self.source_cols(b, s, 0);
+                    if c.names.contains(&folded) {
+                        hits.push(s);
+                    } else if !c.complete {
+                        open = true;
+                    }
+                }
+                match hits.as_slice() {
+                    [s] => return Bare::Source(b, *s),
+                    [] if !open => cur = self.parent(b),
+                    _ => return Bare::Unknown,
+                }
+            }
+            Bare::Free
+        }
+
+        /// The alias `target` of block `b`: where it is read inside its own
+        /// query, and — through [`Tree::reach`] — outside it.
+        fn plan(&self, b: usize, target: &Name, dialect: SqlDialect) -> Option<(Found, Context)> {
+            let blk = &self.blocks[b];
+            let twins = blk
+                .outs
+                .iter()
+                .filter(|o| matches!(o, Out::Alias(a) if a.same(target)))
+                .count();
+            // Two outputs of one name: which one a reference means is the
+            // engine's business, and not a rename's to settle.
+            if twins > 1 {
+                return None;
+            }
+            let columns = self.columns(b);
+            let is_column = |name: &Name| -> Option<bool> {
+                columns.as_ref().map(|c| c.contains(&name.folded()))
+            };
+            let order_inside = super::order_by_expression_sees_output_aliases(dialect);
+            let mut found = Found {
+                def: target.at,
+                refs: Vec::new(),
+                unsure: false,
+                maybe: Vec::new(),
+            };
+            let mut refs_behind_columns = false;
+            let mut order_names = Vec::new();
+            for (id, clause) in &blk.cands {
+                let named = id.same(target);
+                match clause {
+                    Clause::OrderWhole => {
+                        if named {
+                            found.refs.push(id.at);
+                        } else {
+                            order_names.push((id.value.clone(), id.quoted));
+                        }
+                    }
+                    Clause::OrderInside if order_inside => {
+                        if named {
+                            found.refs.push(id.at);
+                        } else {
+                            order_names.push((id.value.clone(), id.quoted));
+                        }
+                    }
+                    Clause::OrderInside => {}
+                    Clause::BehindColumns if named => match is_column(id) {
+                        Some(true) => {}
+                        Some(false) => {
+                            found.refs.push(id.at);
+                            refs_behind_columns = true;
+                        }
+                        None => {
+                            found.unsure = true;
+                            found.maybe.push(id.at);
+                        }
+                    },
+                    Clause::BehindColumns => {}
+                }
+            }
+            let others = blk
+                .outs
+                .iter()
+                .filter_map(|o| match o {
+                    Out::Alias(n) | Out::Ref(n) if n.at != target.at => {
+                        Some((n.value.clone(), n.quoted))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut ctx = Context {
+                own: (target.value.clone(), target.quoted),
+                others,
+                order_names,
+                columns,
+                refs_behind_columns,
+                outer: Vec::new(),
+            };
+            self.reach(blk.query, target, dialect, &mut found, &mut ctx, 0);
+            found.refs.sort_unstable();
+            found.refs.dedup();
+            Some((found, ctx))
+        }
+
+        /// Follow column `name` of query `q`'s output to every `SELECT` that
+        /// reads it — through the derived table `q` is, or the CTE — and on
+        /// through any that passes it on under the same name.
+        fn reach(
+            &self,
+            q: usize,
+            name: &Name,
+            dialect: SqlDialect,
+            found: &mut Found,
+            ctx: &mut Context,
+            depth: usize,
+        ) {
+            if depth > 8 {
+                found.unsure = true;
+                return;
+            }
+            let readers = |is: &dyn Fn(&Kind) -> bool| -> Vec<(usize, usize)> {
+                let mut out = Vec::new();
+                for (b, blk) in self.blocks.iter().enumerate() {
+                    for (s, src) in blk.sources.iter().enumerate() {
+                        if is(&src.kind) {
+                            out.push((b, s));
+                        }
+                    }
+                }
+                out
+            };
+            let readers = match &self.queries[q].role {
+                Role::Top | Role::Opaque | Role::Derived(Some(_)) => return,
+                Role::Branch => {
+                    found.unsure = true;
+                    return;
+                }
+                Role::Derived(None) => {
+                    let r =
+                        readers(&|k| matches!(k, Kind::Derived { query: Some(x), .. } if *x == q));
+                    // A derived table no walked `SELECT` reads: a write's
+                    // `FROM`, a `MERGE … USING`.
+                    if r.is_empty() {
+                        found.unsure = true;
+                    }
+                    r
+                }
+                Role::Cte(d) => {
+                    let decl = &self.decls[*d];
+                    if decl.listed.is_some() {
+                        return;
+                    }
+                    if self.blind.contains(&decl.name.folded()) {
+                        found.unsure = true;
+                    }
+                    readers(&|k| matches!(k, Kind::Cte(x) if x == d))
+                }
+            };
+            let order_inside = super::order_by_expression_sees_output_aliases(dialect);
+            for (c, s) in readers {
+                let cb = &self.blocks[c];
+                let mut reach = Reach {
+                    bare: HashSet::new(),
+                    renamed_bare: false,
+                    rivals: Some(HashSet::new()),
+                    outputs: Vec::new(),
+                };
+                if cb.natural || cb.using.contains(&name.folded()) {
+                    found.unsure = true;
+                }
+                for (d, db) in self.blocks.iter().enumerate() {
+                    if !self.within(d, c) || self.under_query(d, q) {
+                        continue;
+                    }
+                    for r in &db.refs {
+                        if r.qual.is_none() {
+                            reach.bare.insert(r.col.folded());
+                        }
+                        if !r.col.same(name) {
+                            continue;
+                        }
+                        if let Some(qual) = &r.qual {
+                            if self.resolve_qual(d, qual) == Some((c, s)) {
+                                found.refs.push(r.col.at);
+                            }
+                            continue;
+                        }
+                        let alias_here = !db.branch
+                            && db
+                                .outs
+                                .iter()
+                                .any(|o| matches!(o, Out::Alias(a) if a.same(name)));
+                        let sees_alias = match r.place {
+                            Place::Order { whole } => whole || order_inside,
+                            Place::Group => super::group_by_sees_output_aliases(dialect),
+                            Place::Having => super::select_alias_in_having(dialect),
+                            Place::Where => super::select_alias_in_where(dialect),
+                            Place::Other => false,
+                        };
+                        // `ORDER BY` reads an output alias ahead of a column.
+                        if sees_alias && alias_here && matches!(r.place, Place::Order { .. }) {
+                            continue;
+                        }
+                        match self.resolve_bare(d, name) {
+                            Bare::Source(x, i) if (x, i) == (c, s) => {
+                                // Elsewhere a column of its own query beats
+                                // the alias, and an outer one does not.
+                                if x != d && sees_alias && alias_here {
+                                    continue;
+                                }
+                                found.refs.push(r.col.at);
+                                reach.renamed_bare = true;
+                                let mut level = Some(d);
+                                while let Some(l) = level {
+                                    for j in 0..self.blocks[l].sources.len() {
+                                        if (l, j) == (c, s) {
+                                            continue;
+                                        }
+                                        let cols = self.source_cols(l, j, 0);
+                                        match &mut reach.rivals {
+                                            Some(r) if cols.complete => r.extend(cols.names),
+                                            _ => reach.rivals = None,
+                                        }
+                                    }
+                                    level = if l == c { None } else { self.parent(l) };
+                                }
+                            }
+                            Bare::Unknown => {
+                                found.unsure = true;
+                                found.maybe.push(r.col.at);
+                            }
+                            Bare::Source(..) | Bare::Free => {}
+                        }
+                    }
+                }
+                let mut passes_on = false;
+                for o in &cb.outs {
+                    match o {
+                        Out::Ref(n) if found.refs.contains(&n.at) => passes_on = true,
+                        Out::Star => passes_on = true,
+                        Out::QualStar(qs) if self.own_source(c, qs) == Some(s) => passes_on = true,
+                        Out::Alias(n) | Out::Ref(n) => {
+                            reach.outputs.push((n.value.clone(), n.quoted))
+                        }
+                        Out::QualStar(_) | Out::Other => {}
+                    }
+                }
+                ctx.outer.push(reach);
+                if passes_on {
+                    let cq = &self.queries[cb.query];
+                    if !cb.branch {
+                        self.reach(cb.query, name, dialect, found, ctx, depth + 1);
+                    } else if !matches!(cq.role, Role::Top | Role::Opaque) || cq.ordered {
+                        // A union's names are its first branch's, read on.
+                        found.unsure = true;
+                    }
+                }
+            }
         }
     }
 
@@ -14202,143 +15269,28 @@ mod output_alias {
         dialect: SqlDialect,
         catalog: &Catalog,
     ) -> Option<(Found, Context)> {
-        let (q, sel) = top_select(ast)?;
-        let lines = super::LineIndex::new(stmt);
-        let range = |s| colres::to_range_in(&lines, stmt, lo, s);
-        let outputs: Vec<&Ident> = sel
-            .projection
-            .iter()
-            .filter_map(|i| match i {
-                SelectItem::ExprWithAlias { alias, .. } => Some(alias),
-                _ => None,
-            })
-            .collect();
-        if outputs.is_empty() {
-            return None;
-        }
-        // Every bare name in a clause that can see an output alias.
-        let mut cands: Vec<(Ident, Clause)> = Vec::new();
-        if let Some(ob) = &q.order_by
-            && let OrderByKind::Expressions(items) = &ob.kind
-        {
-            for item in items {
-                for (id, whole) in bare_idents(&item.expr) {
-                    cands.push((
-                        id,
-                        if whole {
-                            Clause::OrderWhole
-                        } else {
-                            Clause::OrderInside
-                        },
-                    ));
+        let tree = Tree::build(stmt, lo, ast, catalog, dialect);
+        let on = |(a, b): Span| a <= caret && caret <= b;
+        for (b, blk) in tree.blocks.iter().enumerate() {
+            if blk.branch {
+                continue;
+            }
+            for o in &blk.outs {
+                let Out::Alias(alias) = o else {
+                    continue;
+                };
+                let Some((found, ctx)) = tree.plan(b, alias, dialect) else {
+                    continue;
+                };
+                if on(found.def)
+                    || found.refs.iter().any(|&r| on(r))
+                    || found.maybe.iter().any(|&r| on(r))
+                {
+                    return Some((found, ctx));
                 }
             }
         }
-        let behind = |e: &Expr, visible: bool, out: &mut Vec<(Ident, Clause)>| {
-            if visible {
-                for (id, _) in bare_idents(e) {
-                    out.push((id, Clause::BehindColumns));
-                }
-            }
-        };
-        let mut behind_cands = Vec::new();
-        if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
-            for e in exprs {
-                behind(
-                    e,
-                    super::group_by_sees_output_aliases(dialect),
-                    &mut behind_cands,
-                );
-            }
-        }
-        if let Some(h) = &sel.having {
-            behind(h, super::select_alias_in_having(dialect), &mut behind_cands);
-        }
-        if let Some(w) = &sel.selection {
-            behind(w, super::select_alias_in_where(dialect), &mut behind_cands);
-        }
-        cands.extend(behind_cands);
-        let on = |(a, b): (usize, usize)| a <= caret && caret <= b;
-        let target: &Ident = outputs
-            .iter()
-            .copied()
-            .find(|a| on(range(a.span)))
-            .or_else(|| {
-                let (id, _) = cands.iter().find(|(id, _)| on(range(id.span)))?;
-                outputs
-                    .iter()
-                    .copied()
-                    .find(|a| same(id, &a.value, a.quote_style.is_some()))
-            })?;
-        // Two outputs of one name: which one a reference means is the
-        // engine's business, and not a rename's to settle.
-        let twins = outputs
-            .iter()
-            .filter(|a| same(a, &target.value, target.quote_style.is_some()))
-            .count();
-        if twins > 1 {
-            return None;
-        }
-        let columns = colres::select_columns(sel, catalog, dialect, stmt, lo);
-        let is_column = |name: &str| -> Option<bool> {
-            columns
-                .as_ref()
-                .map(|c| c.contains(&name.to_ascii_lowercase()))
-        };
-        let order_inside = super::order_by_expression_sees_output_aliases(dialect);
-        let mut refs = Vec::new();
-        let mut unsure = false;
-        let mut refs_behind_columns = false;
-        let mut order_names = Vec::new();
-        for (id, clause) in &cands {
-            let named = same(id, &target.value, target.quote_style.is_some());
-            match clause {
-                Clause::OrderWhole => {
-                    if named {
-                        refs.push(range(id.span));
-                    } else {
-                        order_names.push((id.value.clone(), id.quote_style.is_some()));
-                    }
-                }
-                Clause::OrderInside if order_inside => {
-                    if named {
-                        refs.push(range(id.span));
-                    } else {
-                        order_names.push((id.value.clone(), id.quote_style.is_some()));
-                    }
-                }
-                Clause::OrderInside => {}
-                Clause::BehindColumns if named => match is_column(&id.value) {
-                    Some(true) => {}
-                    Some(false) => {
-                        refs.push(range(id.span));
-                        refs_behind_columns = true;
-                    }
-                    None => unsure = true,
-                },
-                Clause::BehindColumns => {}
-            }
-        }
-        refs.sort();
-        refs.dedup();
-        let others = outputs
-            .iter()
-            .filter(|a| !std::ptr::eq(**a, target))
-            .map(|a| (a.value.clone(), a.quote_style.is_some()))
-            .collect();
-        Some((
-            Found {
-                def: range(target.span),
-                refs,
-                unsure,
-            },
-            Context {
-                others,
-                order_names,
-                columns,
-                refs_behind_columns,
-            },
-        ))
+        None
     }
 
     /// Would renaming to `new` (unquoted as typed) change what a name binds
@@ -14355,13 +15307,37 @@ mod output_alias {
         if ctx.others.iter().any(eq) || ctx.order_names.iter().any(eq) {
             return Some(true);
         }
+        let folded = new.to_ascii_lowercase();
+        let mut unknown = false;
         if ctx.refs_behind_columns {
-            return ctx
-                .columns
-                .as_ref()
-                .map(|c| c.contains(&new.to_ascii_lowercase()));
+            match &ctx.columns {
+                Some(c) if c.contains(&folded) => return Some(true),
+                Some(_) => {}
+                None => unknown = true,
+            }
         }
-        Some(false)
+        // A change of case alone collides with nothing outside: every bare
+        // name there already reads the same folded one.
+        let recase = folded == ctx.own.0.to_ascii_lowercase();
+        for r in &ctx.outer {
+            if r.outputs.iter().any(eq) {
+                return Some(true);
+            }
+            if recase {
+                continue;
+            }
+            if r.bare.contains(&folded) {
+                return Some(true);
+            }
+            if r.renamed_bare {
+                match &r.rivals {
+                    Some(c) if c.contains(&folded) => return Some(true),
+                    Some(_) => {}
+                    None => unknown = true,
+                }
+            }
+        }
+        if unknown { None } else { Some(false) }
     }
 }
 
@@ -36261,14 +37237,10 @@ mod output_alias_tests {
         );
     }
 
-    /// Only a statement's top-level `SELECT`: a derived table's alias is a
-    /// column the outer query reads, and a union's names are the first
-    /// branch's — neither is offered.
+    /// A union's names are the first branch's, so a branch's alias is not
+    /// offered; nor is a column that has no alias.
     #[test]
-    fn a_derived_table_or_a_union_offers_nothing() {
-        let derived = "SELECT d.doubled FROM (SELECT total * 2 AS doubled FROM orders) d";
-        let at = derived.find("AS doubled").unwrap() + 4;
-        assert_eq!(output_alias_name_at(derived, at, PG, &catalog()), None);
+    fn a_union_branch_or_a_bare_column_offers_nothing() {
         let union = "SELECT total AS t FROM orders UNION SELECT qty FROM orders ORDER BY t";
         let at = union.find("AS t").unwrap() + 3;
         assert_eq!(output_alias_name_at(union, at, PG, &catalog()), None);
@@ -36345,6 +37317,285 @@ mod output_alias_tests {
             ]
         );
         assert!(usage_lines("x", &[]).is_empty());
+    }
+
+    /// A derived table's alias is a column the outer query reads: `d.doubled`
+    /// is renamed with it, on every engine.
+    #[test]
+    fn a_derived_tables_alias_is_renamed_where_the_outer_query_reads_it() {
+        for d in ALL {
+            assert_eq!(
+                renamed(
+                    "SELECT d.doubled FROM (SELECT total * 2 AS doub|led FROM orders) d \
+                     ORDER BY d.doubled",
+                    "twice",
+                    d
+                ),
+                Ok(
+                    "SELECT d.twice FROM (SELECT total * 2 AS twice FROM orders) d \
+                    ORDER BY d.twice"
+                        .to_string()
+                ),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// A bare name in the outer query is the derived table's column when no
+    /// other source there has it.
+    #[test]
+    fn a_bare_outer_reference_is_renamed_when_only_the_derived_table_has_it() {
+        assert_eq!(
+            renamed(
+                "SELECT doubled FROM (SELECT total * 2 AS doubled| FROM orders) d \
+                 WHERE doubled > 1",
+                "twice",
+                PG
+            ),
+            Ok(
+                "SELECT twice FROM (SELECT total * 2 AS twice FROM orders) d WHERE twice > 1"
+                    .to_string()
+            )
+        );
+    }
+
+    /// The outer reference is a place to start from, as the definition is.
+    #[test]
+    fn a_rename_starts_from_the_outer_reference() {
+        let sql = "SELECT d.doub|led FROM (SELECT total * 2 AS doubled FROM orders) d";
+        assert_eq!(
+            renamed(sql, "twice", MY),
+            Ok("SELECT d.twice FROM (SELECT total * 2 AS twice FROM orders) d".to_string())
+        );
+        let at = sql.find('|').unwrap();
+        let sql = sql.replace('|', "");
+        assert_eq!(
+            output_alias_name_at(&sql, at, MY, &catalog()).as_deref(),
+            Some("doubled")
+        );
+    }
+
+    /// A CTE's alias reaches every query that reads the CTE, through its own
+    /// name or an alias of it.
+    #[test]
+    fn a_ctes_alias_is_renamed_where_the_ctes_readers_read_it() {
+        assert_eq!(
+            renamed(
+                "WITH big AS (SELECT total AS amount FROM orders) \
+                 SELECT amount, b.amount FROM big JOIN big b ON true WHERE big.am|ount > 1",
+                "grand",
+                PG
+            ),
+            Err(AliasRenameRefusal::Unsure),
+            "a bare name two readers both have is not settled"
+        );
+        assert_eq!(
+            renamed(
+                "WITH big AS (SELECT total AS amount FROM orders) \
+                 SELECT amount FROM big WHERE big.am|ount > 1",
+                "grand",
+                PG
+            ),
+            Ok("WITH big AS (SELECT total AS grand FROM orders) \
+                SELECT grand FROM big WHERE big.grand > 1"
+                .to_string())
+        );
+    }
+
+    /// An outer query that passes the column on — by name or by `*` — makes
+    /// it its own output, and the query reading *that* is renamed too.
+    #[test]
+    fn a_column_passed_on_is_followed_outwards() {
+        assert_eq!(
+            renamed(
+                "SELECT x.amount FROM (SELECT d.amount FROM \
+                 (SELECT total AS am|ount FROM orders) d) x",
+                "grand",
+                MY
+            ),
+            Ok("SELECT x.grand FROM (SELECT d.grand FROM \
+                (SELECT total AS grand FROM orders) d) x"
+                .to_string())
+        );
+        assert_eq!(
+            renamed(
+                "SELECT x.amount FROM (SELECT * FROM (SELECT total AS am|ount FROM orders) d) x",
+                "grand",
+                MY
+            ),
+            Ok(
+                "SELECT x.grand FROM (SELECT * FROM (SELECT total AS grand FROM orders) d) x"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Where the outer query names the column itself — a column list, or an
+    /// alias of its own — the rename stops there.
+    #[test]
+    fn a_column_list_or_an_outer_alias_stops_the_rename() {
+        assert_eq!(
+            renamed(
+                "SELECT d.x FROM (SELECT total AS am|ount FROM orders ORDER BY amount) AS d(x)",
+                "grand",
+                PG
+            ),
+            Ok(
+                "SELECT d.x FROM (SELECT total AS grand FROM orders ORDER BY grand) AS d(x)"
+                    .to_string()
+            )
+        );
+        // `ORDER BY amount` is the outer query's own alias, which wins there.
+        assert_eq!(
+            renamed(
+                "SELECT d.amount * 2 AS amount FROM (SELECT total AS am|ount FROM orders) d \
+                 ORDER BY amount",
+                "grand",
+                PG
+            ),
+            Ok(
+                "SELECT d.grand * 2 AS amount FROM (SELECT total AS grand FROM orders) d \
+                 ORDER BY amount"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A top-level union's names go to the result alone, so a branch reading
+    /// the column is renamed; a union that is itself read is not followed.
+    #[test]
+    fn a_union_reading_the_column_is_renamed_only_at_the_top() {
+        assert_eq!(
+            renamed(
+                "SELECT d.amount FROM (SELECT total AS am|ount FROM orders) d UNION SELECT 1",
+                "grand",
+                PG
+            ),
+            Ok(
+                "SELECT d.grand FROM (SELECT total AS grand FROM orders) d UNION SELECT 1"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            renamed(
+                "SELECT u.amount FROM (SELECT d.amount FROM \
+                 (SELECT total AS am|ount FROM orders) d UNION SELECT 1) u",
+                "grand",
+                PG
+            ),
+            Err(AliasRenameRefusal::Unsure)
+        );
+    }
+
+    /// **No guess** about a reader the walk cannot see whole: a bare name
+    /// beside an unknown table, a `USING` list, a write's `FROM`, a `TABLE`.
+    #[test]
+    fn a_reader_the_walk_cannot_settle_refuses() {
+        for sql in [
+            "SELECT (SELECT max(amount) FROM nowhere) FROM (SELECT total AS am|ount FROM orders) d",
+            "SELECT * FROM (SELECT total AS am|ount FROM orders) d JOIN orders o USING (amount)",
+            "UPDATE orders SET qty = d.amount FROM (SELECT id, total AS am|ount FROM orders) d \
+             WHERE orders.id = d.id",
+            "WITH big AS (SELECT total AS am|ount FROM orders) TABLE big",
+        ] {
+            assert_eq!(
+                renamed(sql, "grand", PG),
+                Err(AliasRenameRefusal::Unsure),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_the_outer_query_already_uses_is_a_conflict() {
+        let derived = "SELECT amount FROM (SELECT total AS am|ount FROM orders) d \
+                       JOIN orders o ON o.id = 1";
+        // `qty` is `o`'s column: the renamed bare `qty` would be ambiguous.
+        assert_eq!(
+            renamed(derived, "qty", PG),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        assert!(renamed(derived, "grand", PG).is_ok());
+        for (sql, new) in [
+            // Another output of the derived table, though unaliased.
+            (
+                "SELECT d.amount FROM (SELECT total AS am|ount, qty FROM orders) d",
+                "qty",
+            ),
+            // Another output of the outer query, which passes the column on.
+            (
+                "SELECT d.amount, 1 AS z FROM (SELECT total AS am|ount FROM orders) d",
+                "z",
+            ),
+            // A bare name the outer query reads, which `d` would now have too.
+            (
+                "SELECT d.amount FROM (SELECT total AS am|ount FROM orders) d \
+                 JOIN orders o ON qty > 1",
+                "qty",
+            ),
+        ] {
+            assert_eq!(
+                renamed(sql, new, PG),
+                Err(AliasRenameRefusal::Conflict),
+                "{sql}"
+            );
+        }
+    }
+
+    /// A correlated subquery reads the column too; a later sibling CTE that
+    /// passes it on is followed; an inner `WITH` that declares the same name
+    /// shadows the CTE, and what reads that one is left alone.
+    #[test]
+    fn correlated_sibling_and_shadowed_readers_bind_by_scope() {
+        assert_eq!(
+            renamed(
+                "SELECT (SELECT max(o.qty) FROM orders o WHERE o.total > d.amount) \
+                 FROM (SELECT total AS am|ount FROM orders) d",
+                "grand",
+                PG
+            ),
+            Ok(
+                "SELECT (SELECT max(o.qty) FROM orders o WHERE o.total > d.grand) \
+                FROM (SELECT total AS grand FROM orders) d"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            renamed(
+                "WITH a AS (SELECT total AS am|ount FROM orders), b AS (SELECT amount FROM a) \
+                 SELECT b.amount FROM b",
+                "grand",
+                PG
+            ),
+            Ok(
+                "WITH a AS (SELECT total AS grand FROM orders), b AS (SELECT grand FROM a) \
+                SELECT b.grand FROM b"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            renamed(
+                "WITH a AS (SELECT total AS am|ount FROM orders) \
+                 SELECT a.amount, (WITH a AS (SELECT qty AS amount FROM orders) \
+                 SELECT max(a.amount) FROM a) FROM a",
+                "grand",
+                PG
+            ),
+            Ok("WITH a AS (SELECT total AS grand FROM orders) \
+                SELECT a.grand, (WITH a AS (SELECT qty AS amount FROM orders) \
+                SELECT max(a.amount) FROM a) FROM a"
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn usages_follow_a_derived_tables_alias_outwards() {
+        let sql = "SELECT d.amount FROM (SELECT total AS amount FROM orders) d ORDER BY amount";
+        let (name, spans) =
+            usages_at(sql, sql.find("d.amount").unwrap() + 3, PG, &catalog()).unwrap();
+        assert_eq!(name, "amount");
+        assert_eq!(spans.len(), 3);
+        assert!(spans.iter().all(|&(a, b)| &sql[a..b] == "amount"));
     }
 
     #[test]

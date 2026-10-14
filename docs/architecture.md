@@ -3024,8 +3024,8 @@ existing prose was left alone.
     `a_cte_rename_refuses_a_capturing_name` — neither could fail first, the functions not existing).
     The refusals' `message`s are worded for either rename: `NoAlias` says *There is nothing here to
     rename any more.*, `Empty` *Give it a name.*; `Unsure` is the output-alias rename's alone (below),
-    and says a column of the name may be what `GROUP BY`, `HAVING` or `WHERE` reads and the loaded
-    schema cannot tell. **Ctrl+click binds through the same `Ctes`**:
+    and says a reference may read another column of the name, or read this one where the rename
+    cannot follow, and the loaded schema cannot tell. **Ctrl+click binds through the same `Ctes`**:
     `cte_definition` is `Ctes::bound` at a reference and `cte_spans` at a qualifier, so the jump and the rename cannot disagree
     about what a name names. Names compare by `same_name` — a quoted one on either side exactly, a
     bare pair ASCII-case-insensitively — so on PostgreSQL, where `WITH "C"` and `FROM c` name two
@@ -3046,25 +3046,63 @@ existing prose was left alone.
     `WHERE` see it only where `group_by_sees_output_aliases`, `select_alias_in_having` and
     `select_alias_in_where` say — SQL Server refuses a `GROUP BY` of an alias, checked the same way
     — and there **a column wins**: on PostgreSQL and MariaDB, `GROUP BY name` beside a column `name`
-    groups by the column. So a name in one of those clauses is the alias only where
-    `colres::select_columns` — the `FROM` sources' columns through `build_sources`, `None` if any
-    source is `Open` or unknown, a CTE included — proves no column has it. Where it cannot, the
-    reference is *unsure* and `output_alias_rename` refuses with `AliasRenameRefusal::Unsure` rather
-    than guess, while an `ORDER BY` reference, which the alias wins, needs no catalogue at all
-    (`an_unknowable_source_refuses_a_group_by_reference`,
+    groups by the column. So a name in one of those clauses is the alias only where the sources
+    prove no column has it — a table's columns through `colres::table_columns`, `None` where the
+    catalogue cannot enumerate them, and a derived table's or a CTE's through the walk's own
+    outputs. Where they cannot, the reference is *unsure* and `output_alias_rename` refuses with
+    `AliasRenameRefusal::Unsure` rather than guess, while an `ORDER BY` reference, which the alias
+    wins, needs no catalogue at all (`an_unknowable_source_refuses_a_group_by_reference`,
     `a_column_of_the_same_name_keeps_group_by_and_loses_order_by`). The bare names are collected by
-    sqlparser's own visitor at depth 0 rather than by a match over the expression kinds — a kind the
-    match left out would be a reference the rename leaves behind, to bind to a same-named column —
-    and a subquery's names are its own (`a_subquerys_names_are_left_alone`). **It answers only for
-    a statement's top-level `SELECT`**: an alias inside a derived table or a CTE body is a column
-    name the outer query reads (`d.total`), and in a set operation the first branch's names are the
-    union's, so it finds nothing there rather than half of it
-    (`a_derived_table_or_a_union_offers_nothing`); nor where two outputs share the name, which one a
-    reference means being the engine's business. `output_alias::conflicts` is the capture check:
-    `Conflict` for a name another output has, or one written bare in `ORDER BY` that would now bind
-    to the renamed alias; where some reference sits behind columns, a column of the new name is a
-    `Conflict` too, since it would win there, and a catalogue that cannot say is `Unsure`
-    (`a_name_that_would_capture_is_a_conflict`). The edit is `rename_edit`'s, quoting through
+    sqlparser's own visitor at their `SELECT`'s own level rather than by a match over the expression
+    kinds — a kind the match left out would be a reference the rename leaves behind, to bind to a
+    same-named column — and a subquery's names are its own (`a_subquerys_names_are_left_alone`).
+    **`output_alias::find` builds a `Tree` of every `SELECT` in the statement** — a sqlparser
+    `Visitor` over `pre_visit_query`, `pre_visit_select` and `pre_visit_table_factor`, keyed by node
+    address, since the borrow each callback is handed cannot be stored — holding each block's
+    sources (a table with its catalogue columns, a derived table, a CTE — bound through
+    `alias_refs::cte_bindings`, which is `Ctes::bound`'s answer, so this walk, the jump and *Rename
+    CTE* cannot disagree about which CTE a name reads — an opaque factor), its outputs, its
+    own-level column references with the
+    clause each stands in, and its query's `Role`: the top level, an opaque subquery read by no
+    name, a set-operation branch, a derived table's body with its `AS d(x)` list if it has one, a
+    CTE's body. Any `SELECT` but a branch offers its aliases — a subquery's, a derived table's, a
+    CTE body's. A branch's does not, since the first branch's names are the union's and the walk
+    would find half of them (`a_union_branch_or_a_bare_column_offers_nothing`); nor does a name two
+    outputs share, which one a reference means being the engine's business. **An alias a derived
+    table or a CTE defines is a column its readers read, and `Tree::reach` follows it there**: a
+    qualified `d.total`, bound by `resolve_qual` at the nearest scope outwards, and a bare `total`
+    where `resolve_bare` proves the reader's source is the only one with it — one source having it
+    beside one whose columns are unknown is that one, since were the unknown one to have it too the
+    server would refuse the name as ambiguous
+    (`a_derived_tables_alias_is_renamed_where_the_outer_query_reads_it`,
+    `a_bare_outer_reference_is_renamed_when_only_the_derived_table_has_it`,
+    `a_ctes_alias_is_renamed_where_the_ctes_readers_read_it`). A correlated subquery is a reader too
+    (`correlated_sibling_and_shadowed_readers_bind_by_scope`). A reader's `ORDER BY` reads that
+    reader's own alias of the name ahead of the column, so such a reference is left alone. The walk
+    goes on outwards where a reader passes the column on under the same name — `SELECT d.total`,
+    `*`, `d.*` — and is itself a derived table or a CTE (`a_column_passed_on_is_followed_outwards`),
+    and stops at a reader that names the column itself — its own alias, `AS d(x)`, a CTE's column
+    list — and at the top level or an opaque subquery
+    (`a_column_list_or_an_outer_alias_stops_the_rename`). A caret on any reference it reaches finds
+    the alias (`a_rename_starts_from_the_outer_reference`), and `Found::maybe` holds the unsettled
+    ones' spans, so a caret on one of those finds it too and is refused rather than offered nothing.
+    **Where a reader cannot be seen whole the rename is `Unsure`, never partial**: a derived table
+    no walked `SELECT` reads (a write's `FROM`, a `MERGE … USING`), a CTE whose name also stands
+    where no `FROM` reads it (`Tree::blind` — `TABLE c`, an `INSERT` target, an `UPDATE`'s tables),
+    a `USING` or `NATURAL` join in the reader, a bare name with an unknown source on the way out,
+    and a union that passes the column on and is itself read — a top-level unordered one is fine,
+    its names being the result's (`a_reader_the_walk_cannot_settle_refuses`,
+    `a_union_reading_the_column_is_renamed_only_at_the_top`). `output_alias::conflicts` is the
+    capture check: `Conflict` for a name another output has — an alias, or a column written
+    unaliased — or one written bare in `ORDER BY` that would now bind to the renamed alias; where
+    some reference sits behind columns, a column of the new name is a `Conflict` too, since it would
+    win there, and a catalogue that cannot say is `Unsure`
+    (`a_name_that_would_capture_is_a_conflict`). Each reader adds its own, one `Reach` apiece in
+    `Context::outer`: a name written bare there, another of its outputs, and — where a bare
+    reference there is renamed — another source's column, an unknowable one being `Unsure`
+    (`a_name_the_outer_query_already_uses_is_a_conflict`). A change of case alone skips the bare
+    names and the rival columns, every bare name there already reading the same folded name; the
+    readers' outputs are still checked. The edit is `rename_edit`'s, quoting through
     `ident_if_needed` as the other two renames do (`a_quoted_alias_is_renamed_where_it_is_written_quoted`);
     the dialog's starting name is `output_alias_name_at`'s, and the catalogue is the caller's — the
     editor builds it from the loaded schema when asked (under `editor_pane.rs`).
@@ -3072,7 +3110,8 @@ existing prose was left alone.
     table alias (`alias_refs::spans`), then the CTE (`alias_refs::cte_spans`), then the output
     alias — so what it lists is exactly what the matching rename would write: the name as its
     definition writes it, quotes off, and every whole spelling, in order
-    (`usages_are_found_for_a_table_alias_a_cte_and_an_output_alias`). It keeps their refusals and
+    (`usages_are_found_for_a_table_alias_a_cte_and_an_output_alias`) — an output alias's readers
+    outside its own query included (`usages_follow_a_derived_tables_alias_outwards`). It keeps their refusals and
     adds one: an output alias with an unsure reference answers `None` here, where *Rename alias*
     still opens and says `Unsure`, because **a list that would miss a usage is not offered**.
     `usage_lines` turns the spans into rows — each usage's line, 1-based, and that line's text
