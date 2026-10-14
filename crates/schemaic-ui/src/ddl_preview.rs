@@ -1456,6 +1456,7 @@ mod tests {
             folder: String::new(),
             auth: Default::default(),
             statement_timeout_secs: None,
+            init_sql: String::new(),
         }
     }
 

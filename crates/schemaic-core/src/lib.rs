@@ -35,6 +35,7 @@ pub mod format;
 pub mod health;
 pub mod history;
 pub mod import;
+pub mod init_sql;
 pub mod intel;
 pub mod jsontree;
 pub mod launch;

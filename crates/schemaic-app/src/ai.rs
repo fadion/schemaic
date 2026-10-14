@@ -437,11 +437,19 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         .get("auth")
         .and_then(|a| serde_json::from_value(a.clone()).ok())
         .unwrap_or_default();
+    // The connection's init SQL, so the assistant's session is set up as the
+    // user's is. Absent — every blob written before the field — means none,
+    // which is what those connections had.
+    let init_sql = v
+        .get("init_sql")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default();
     McpEndpoint {
         db: Db::from_parts(engine, host, port, user, pass, file)
             .with_tls(tls)
             .with_database(conn_database)
-            .with_auth(auth),
+            .with_auth(auth)
+            .with_init_sql(init_sql),
         database,
         // Absent → on, matching the endpoint blobs written before the flag
         // existed (which also predate any tool that reads rows from schema).
@@ -489,7 +497,8 @@ fn endpoint_json(
         "host": host, "port": port, "user": user, "file": file,
         "database": database, "engine": db.engine().as_str(), "samples": samples,
         "schema": schema, "hidden": hidden, "tls": db.tls_plan(),
-        "connection_database": db.database(), "conn_id": conn_id, "auth": db.auth()
+        "connection_database": db.database(), "conn_id": conn_id, "auth": db.auth(),
+        "init_sql": db.init_sql()
     })
     .to_string()
 }
@@ -4630,6 +4639,31 @@ mod tests {
         let mut old = v.clone();
         old.as_object_mut().unwrap().remove("auth");
         assert_eq!(endpoint_from_value(&old).db.auth(), AuthMode::Password);
+    }
+
+    /// **The assistant's session is set up as the user's is** — a handoff
+    /// that dropped the init SQL would run its queries without the user's
+    /// `search_path` or role. A blob from before the key means none.
+    #[test]
+    fn the_endpoint_handoff_carries_the_init_sql() {
+        let db = Db::from_parts(
+            schemaic_db::Engine::Postgres,
+            "h".into(),
+            5432,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+        .with_init_sql("SET search_path TO app");
+        let json = endpoint_json(&db, 7, None, true, true, &HashSet::new());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            endpoint_from_value(&v).db.init_sql(),
+            "SET search_path TO app"
+        );
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("init_sql");
+        assert_eq!(endpoint_from_value(&old).db.init_sql(), "");
     }
 
     /// **The subprocess must reach the server the same way the app does.** The

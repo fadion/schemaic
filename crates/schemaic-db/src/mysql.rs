@@ -666,6 +666,18 @@ pub(crate) async fn kill_session(db: &Db, id: i64, kind: KillKind) -> Result<(),
     out
 }
 
+/// Run a connection's checked init statements (`Db::init_statements`) on a
+/// connection `Db::dial` has just made, before it is handed to anyone — here
+/// rather than in the dispatcher, which executes nothing itself.
+pub(crate) async fn run_init(conn: &mut Conn, init: &[String]) -> Result<(), DbError> {
+    for stmt in init {
+        conn.query_drop(stmt.as_str())
+            .await
+            .map_err(|e| Db::init_failed(stmt, e))?;
+    }
+    Ok(())
+}
+
 /// Best-effort server-side cancel: connect afresh and `KILL QUERY <id>`.
 ///
 /// **The same statement [`kill_session`] writes for [`KillKind::Query`], and

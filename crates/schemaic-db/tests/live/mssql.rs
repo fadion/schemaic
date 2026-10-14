@@ -470,6 +470,38 @@ async fn a_ping_and_the_database_list_reach_the_server() {
     }
 }
 
+/// **A connection's init SQL is in force on the operation's own connection**,
+/// sent as a batch rather than an RPC — a `SET` inside `sp_executesql` would
+/// end with that call — and a statement the server refuses fails the
+/// operation, naming the init SQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_init_sql_is_in_force_and_a_refused_one_fails_the_operation() {
+    if !enabled() {
+        return;
+    }
+    let db = base_db().with_init_sql("SET LANGUAGE British; SET DATEFIRST 3");
+    let rs = db
+        .fetch_query(
+            None,
+            "SELECT @@LANGUAGE, CAST(@@DATEFIRST AS int)",
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the read runs");
+    assert_eq!(
+        rs.cell(0, 0).expect("a language").display().to_string(),
+        "British"
+    );
+    assert_eq!(rs.cell(0, 1).expect("datefirst").display().to_string(), "3");
+    let err = base_db()
+        .with_init_sql("SET LANGUAGE NoSuchLanguage")
+        .fetch_query(None, "SELECT 1", 10, CancellationToken::new())
+        .await
+        .expect_err("an operation ran past a refused init statement");
+    assert!(err.to_string().contains("init SQL"), "{err}");
+}
+
 /// **The server's settings are `sys.configurations`**, each with the value in
 /// use and its description — and SQL Server has no status list, which is an
 /// error that says so rather than an empty one.
@@ -10393,6 +10425,7 @@ fn sign_in_connection(
         folder: String::new(),
         auth,
         statement_timeout_secs: None,
+        init_sql: String::new(),
     }
 }
 

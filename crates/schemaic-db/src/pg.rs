@@ -93,6 +93,8 @@ pub(crate) async fn connect_to(db: &Db, database: &str) -> Result<Client, DbErro
 /// certificate the user had misconfigured reported "timed out" instead of
 /// naming the certificate.
 async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool)> {
+    // Refused before the connect, so none of it runs.
+    let init = db.init_statements().map_err(|e| (e, false))?;
     let mut cfg = Config::new();
     cfg.host(&db.host)
         .port(db.port)
@@ -121,7 +123,8 @@ async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool
         // module already refuses to take twice, in `roles`' prefix comparison
         // and in `pg_cell_lit`'s own seventeen-line argument for `decode`.
         // Sent on the startup packet, so it is in force before the first
-        // statement and cannot be undone by anything the app runs.
+        // statement; nothing the app runs undoes it, and a connection's init
+        // SQL may not name it (`init_sql::check`).
         .options("-c standard_conforming_strings=on")
         // `Prefer` here is what implements the mode of the same name: unlike
         // MySQL, the Postgres driver negotiates the downgrade itself, so no
@@ -140,10 +143,20 @@ async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool
         }
     };
 
-    connected.map_err(|e| {
+    let client = connected.map_err(|e| {
         let retry = another_database_might_work(e.code());
         (DbError::Connect(error_chain(&e)), retry)
-    })
+    })?;
+    // The connection's init SQL, before the caller sees the client — so before
+    // any `Enforce` it goes on to set. A failure is the same for every
+    // database, so no other candidate is tried.
+    for stmt in &init {
+        client
+            .batch_execute(stmt)
+            .await
+            .map_err(|e| (Db::init_failed(stmt, error_chain(&e)), false))?;
+    }
+    Ok(client)
 }
 
 /// Is this failure about the *database* we asked for, rather than the server,

@@ -3587,6 +3587,8 @@ pub struct DraftSignals {
     /// This connection's own statement timeout — `None` follows the app's
     /// (`Connection::statement_timeout_secs`).
     pub statement_timeout: RwSignal<Option<u64>>,
+    /// Session settings run on every connect (`Connection::init_sql`).
+    pub init_sql: RwSignal<String>,
     /// The folder the connection lists under; empty for none.
     pub folder: RwSignal<String>,
     /// How it signs in — see `connection::AuthMode`. Kept whatever the
@@ -3632,6 +3634,7 @@ impl DraftSignals {
             environment: cx.create_rw_signal(Environment::None),
             ai_data: cx.create_rw_signal(AiData::default()),
             statement_timeout: cx.create_rw_signal(None),
+            init_sql: cx.create_rw_signal(String::new()),
             folder: cx.create_rw_signal(String::new()),
             auth: cx.create_rw_signal(AuthMode::default()),
             focus_name: cx.create_rw_signal(false),
@@ -3672,6 +3675,7 @@ impl DraftSignals {
         // level actually in force rather than a blank the user has to guess at.
         self.ai_data.set(c.ai_data.unwrap_or_default());
         self.statement_timeout.set(c.statement_timeout_secs);
+        self.init_sql.set(c.init_sql.clone());
         self.folder.set(c.folder.clone());
         self.auth.set(c.auth);
     }
@@ -3747,6 +3751,7 @@ impl DraftSignals {
             folder: self.folder.get_untracked(),
             auth: self.auth.get_untracked(),
             statement_timeout_secs: self.statement_timeout.get_untracked(),
+            init_sql: self.init_sql.get_untracked(),
         }
         .trimmed()
         .sanitized()

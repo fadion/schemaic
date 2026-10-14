@@ -228,6 +228,14 @@ fn open(db: &Db) -> Result<SqliteConn, DbError> {
     // — which is what [`LOCK_ADVICE`] is for.
     conn.busy_timeout(std::time::Duration::from_secs(15))
         .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))?;
+    // The connection's init SQL — PRAGMAs only (`init_sql::check`) — before
+    // the caller sees the connection, so before a `query_only` it goes on to
+    // set. Checked before any runs. A pragma the caller sets after this
+    // (`foreign_keys` on the write paths) is the caller's to have.
+    for stmt in db.init_statements()? {
+        conn.execute_batch(&stmt)
+            .map_err(|e| Db::init_failed(&stmt, e))?;
+    }
     Ok(conn)
 }
 
@@ -5015,6 +5023,38 @@ mod tests {
             uri,
         );
         (keeper, db)
+    }
+
+    /// **A connection's init SQL runs on the connection an operation opens**,
+    /// before the operation's own statement: the setting is there to be read
+    /// back on that same connection.
+    #[tokio::test]
+    async fn the_init_sql_runs_on_every_connection_an_operation_opens() {
+        let (_keeper, db) = shared_memory("init_sql_runs");
+        let db = db.with_init_sql("PRAGMA cache_size = -1234");
+        let rs = db
+            .fetch_query(None, "PRAGMA cache_size", 10, CancellationToken::new())
+            .await
+            .expect("the pragma reads");
+        assert_eq!(rs.cell(0, 0).expect("cell").text(), "-1234");
+    }
+
+    /// **Init SQL the gate refuses never runs, and the operation is refused**
+    /// — not run on a session missing the setting, and not part-run: the
+    /// allowed first statement does not take effect either.
+    #[tokio::test]
+    async fn a_refused_init_sql_refuses_the_connect_before_any_of_it_runs() {
+        let (keeper, db) = shared_memory("init_sql_refused");
+        let db = db.with_init_sql("PRAGMA cache_size = 7; PRAGMA user_version = 3");
+        let err = db
+            .fetch_query(None, "SELECT 1", 10, CancellationToken::new())
+            .await
+            .expect_err("a refused init SQL connected");
+        assert!(matches!(err, crate::DbError::Refused(_)), "{err}");
+        let v: i64 = keeper
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(v, 0, "part of a refused init SQL ran");
     }
 
     /// **The session refuses a write the text gate let through.** The gate is

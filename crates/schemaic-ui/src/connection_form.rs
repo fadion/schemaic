@@ -29,6 +29,7 @@ use schemaic_core::connection::{Connection, ListedRow, folder_names, listed_ids,
 
 use schemaic_core::connection::SshAuth;
 use schemaic_core::connection::SslMode;
+use schemaic_core::intel::SqlDialect;
 
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
@@ -1701,6 +1702,9 @@ fn conn_form(
         draft.ssh_key_path.track();
         draft.ssh_key_passphrase.track();
         draft.ssh_jump.track();
+        // The init SQL runs inside every connect, so a Test before an edit to
+        // it says nothing about the connect after.
+        draft.init_sql.track();
         // The TLS settings decide whether the connection is *possible*, not just
         // how it looks: raising the mode to verify-full, or naming the wrong CA,
         // turns a working endpoint into a refused one. A green Test left standing
@@ -1910,6 +1914,64 @@ fn conn_form(
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
+    // Init SQL: the session settings every connection runs first
+    // (`Connection::init_sql`). Multi-line SQL, coloured for the engine picked —
+    // rebuilt when the engine changes, since the colouring is fixed at build.
+    // Under it, what `init_sql::check` makes of it as typed: the connect itself
+    // refuses the same text, so saying so here is the only way the user hears
+    // it before a connect fails. 85: after the engine's own fields (to 80),
+    // before the tunnel (90).
+    let init_ring = ring.clone();
+    let init_field = v_stack((
+        text("Init SQL").style(form_label_style),
+        dyn_container(
+            move || SqlDialect::from_db_type(&draft.db_type.get()),
+            move |dialect| {
+                edit_field(
+                    draft.init_sql,
+                    FieldCfg {
+                        multiline: true,
+                        mono: true,
+                        sql: Some(dialect),
+                        min_rows: 2,
+                        placeholder: "SET search_path TO app, public",
+                        focus: Some((init_ring.clone(), 85)),
+                        ..Default::default()
+                    },
+                )
+                .style(|s| s.width_full())
+                .into_any()
+            },
+        )
+        .style(|s| s.width_full()),
+        label(move || {
+            let dialect = SqlDialect::from_db_type(&draft.db_type.get());
+            draft
+                .init_sql
+                .with(|sql| match schemaic_core::init_sql::check(sql, dialect) {
+                    Err(why) => why,
+                    Ok(_) if schemaic_core::init_sql::settings_are_pragmas(dialect) => {
+                        "Optional. PRAGMA settings run on every connection Schemaic opens."
+                            .to_string()
+                    }
+                    Ok(_) => "Optional. SET statements run on every connection Schemaic \
+                              opens — a search path, a time zone, a role."
+                        .to_string(),
+                })
+        })
+        .style(move |s| {
+            let bad = draft.init_sql.with(|sql| {
+                schemaic_core::init_sql::check(sql, SqlDialect::from_db_type(&draft.db_type.get()))
+                    .is_err()
+            });
+            s.width_full()
+                .font_size(theme::font_hint())
+                .apply_if(bad, |s| s.color(theme::error()))
+                .apply_if(!bad, |s| s.color(theme::text_muted()))
+        }),
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
+
     // Environment picker → the top-bar badge. Defaults to None (no badge).
     let env_field = v_stack((
         text("Environment").style(form_label_style),
@@ -2055,6 +2117,7 @@ fn conn_form(
         env_field,
         type_field,
         engine_block,
+        init_field,
     ))
     .style(section);
     let fields = v_stack((general, safeguards, database, network_block)).style(|s| {

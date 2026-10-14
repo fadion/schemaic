@@ -3680,6 +3680,7 @@ fn blank(db_type: &str) -> Connection {
         folder: String::new(),
         auth: crate::connection::AuthMode::Password,
         statement_timeout_secs: None,
+        init_sql: String::new(),
     }
 }
 

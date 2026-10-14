@@ -3278,6 +3278,7 @@ mod tests {
             folder: String::new(),
             auth: crate::connection::AuthMode::Password,
             statement_timeout_secs: None,
+            init_sql: String::new(),
         };
         let file = ConnectionsFile {
             connections: vec![c],

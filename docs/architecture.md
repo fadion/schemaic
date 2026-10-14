@@ -11306,6 +11306,17 @@ existing prose was left alone.
     `persist::statement_timeout_label`, so a message quoting the value matches either dropdown
     (`the_forms_timeout_labels_follow_the_app_or_say_its_words`). It is listed in the redacting
     `Debug`, and `duplicate`'s struct update carries it.
+    **`init_sql` is the session settings every connection opened for this one runs first** —
+    `SET search_path …`, `SET time_zone …`, `SET ROLE …` — and what may be in it is
+    `core::init_sql`'s decision, asked at every connect rather than on save: the form says what
+    `check` makes of the text as it is typed, and Save does not refuse it, the connect does. `""` is
+    none, and it is `#[serde(default)]`, so a connection saved before the field runs nothing
+    (`a_connection_saved_before_init_sql_runs_none`). It is no secret, so the redacting `Debug`
+    prints it, and it travels in a connection export and import through serde as `folder` does. It
+    is a term of `invalidates_open_connections` (not of `targets_same_server`: the server is the
+    same), so saving a changed one tears down a Manual tab's pinned `Session` — set up by the old
+    text, it would otherwise go on running under the old `search_path` or role while every fresh
+    operation ran under the new (`an_init_sql_edit_invalidates_what_is_open`).
     `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
     **`SshTunnel::jump` is the route before the SSH host**, in OpenSSH's `ProxyJump` spelling —
@@ -11382,7 +11393,8 @@ existing prose was left alone.
     travelling in the clear while the form, the status bar and every fresh operation reported TLS.
     So this adds the TLS mode and its three paths, in **both** directions (turning it off leaves a
     session negotiating it, the same lie the other way), plus `ssh.auth` and `ssh.key_path`, which
-    decide what the tunnel authenticates as. The password stays out for `targets_same_server`'s
+    decide what the tunnel authenticates as, and `init_sql`, which decides what the session was set
+    up as. The password stays out for `targets_same_server`'s
     reason: a corrected one reaches the same server over the same socket, and an already
     authenticated session is not made wrong by it.
     **`Tls` and `SslMode` are the transport half**, and they live here rather than in
@@ -11475,7 +11487,9 @@ existing prose was left alone.
     whole and `route()` trims each comma-separated entry, so only a space *inside* an entry is
     refused. `folder` is a label as well and
     *is* trimmed, because it is one that is matched: `Prod ` and `Prod` would be one folder on screen
-    and two in the file. `conn_import` trims a host of
+    and two in the file. `init_sql` is trimmed at its two ends and nowhere else — the lines and
+    indentation between its statements are left as typed (`init_sql_is_trimmed_only_at_its_ends`).
+    `conn_import` trims a host of
     its own, so a connection *imported* from DBeaver got one and a connection *typed* did not —
     routing that path through here as well is a separate change and has not been made. The defect is
     a composition, so `trimmed`'s own unit test cannot see it: the call site reads a couple of dozen signals
@@ -11534,6 +11548,42 @@ existing prose was left alone.
     `a_host_the_config_does_not_change_is_described_as_nothing`,
     `a_user_left_open_everywhere_reads_as_the_host_alone`). Going through `apply` rather than
     reading `cfg` is the point: the form cannot describe a resolution the connect does not perform.
+  - `init_sql.rs` — **a connection's init SQL**: the session settings `Connection::init_sql` runs on
+    every connection Schemaic opens for it — a `search_path`, a time zone, a role — and `check(sql,
+    dialect)`, the gate they pass first. **It is user SQL that runs with nobody confirming it, on
+    every operation** — one connection per operation makes that a run, a listing, a ping, a `KILL` —
+    so the gate is an **allowlist** with no `Confirm` arm, the fourth of the refusals strictly
+    stronger than `run_verdict` that the write-guard invariant names. `check` answers the
+    statements, each trimmed and without its `;`, or the first refusal in words the connection form
+    shows; empty SQL and a comment alone are no statements (`nothing_is_nothing_to_run`). A
+    statement passes only as a `SET` — on SQLite, a `PRAGMA` named in `SQLITE_PRAGMAS`, which lists
+    the per-connection ones and leaves out what writes the file (`journal_mode`, `user_version`,
+    `auto_vacuum`) or lifts the read-only guard (`query_only`, `writable_schema`) — and then only
+    with no `(` at code level, since `SET @x = f()` on MySQL or SQL Server calls a function and a
+    function can write; with none of the `DENIED` words; not as `SET DEFAULT …`, which changes an
+    account rather than the session; and naming no `TRANSACTION` except where the read-only guard
+    is a rollback (`SqlDialect::read_only_is_a_rollback` — SQL Server), which an isolation level
+    cannot lift. Which engine's settings are `PRAGMA`s is the capability `settings_are_pragmas`,
+    which the form's hint asks too, never an engine comparison. **`USE` is
+    refused with every other non-`SET`**, because it would move each operation off the database it
+    asked for — the tab's, the tree node's — and an `INSERT` would be a write on every ping. The
+    deny list has two halves: what is server-wide or durable (`GLOBAL`, `PERSIST`, `PERSIST_ONLY`,
+    `PASSWORD`), and **what the read-only guard and the write path rest on** — the transaction
+    characteristics and read-only flags (`CHARACTERISTICS`, `TRANSACTION_READ_ONLY`,
+    `TX_READ_ONLY`, `DEFAULT_TRANSACTION_READ_ONLY`, SQLite's `QUERY_ONLY`), `AUTOCOMMIT` (a write
+    would never commit), `IMPLICIT_TRANSACTIONS`, `NOCOUNT` and `ROWCOUNT` (the row counts the
+    one-row safety net reads), and the two settings the literals Schemaic writes are lexed by:
+    PostgreSQL's `STANDARD_CONFORMING_STRINGS`, the one `pg::connect_probe` pins on the startup
+    packet, and MySQL's `SQL_MODE` (`what_the_guards_rest_on_cannot_be_moved`). SQL Server keeps
+    `SET TRANSACTION ISOLATION LEVEL`, because its read-only guard is a rollback, which no
+    isolation level lifts. Words are read over `sql::statement_ranges` and `skip_noncode`, the one
+    boundary lexer, so a denied word or a parenthesis inside a literal is only a value
+    (`a_denied_word_inside_a_value_is_only_a_value`, and `SET application_name = 'a (b)'` in
+    `a_setting_that_calls_a_function_is_refused`). **The list is not the last line**: a read-only
+    connection's enforcement statements run *after* the init SQL, inside each operation, so even a
+    setting it missed is overridden there; the list is what keeps such a setting from mattering on
+    the paths that are not enforced. Where and when the statements run is under `schemaic-db`'s
+    init SQL paragraph, beside the PostgreSQL probe.
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
     (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
@@ -16816,7 +16866,8 @@ existing prose was left alone.
   setting is `USERSET` and settable per database and per role, so the default is no guarantee:
   `connect_probe` sends `-c standard_conforming_strings=on` in the connection's `options`, on the
   **startup packet**, so it is in force before the first statement and cannot be undone by anything
-  the app runs. It is the belt and not the fix — the values still reach the server inside statement
+  the app runs — a connection's init SQL included, which `init_sql::check` refuses to let name
+  it. It is the belt and not the fix — the values still reach the server inside statement
   text, and binding them is open work — but it removes a dependency this module already refuses to
   take twice, in `roles`' prefix comparison and in `pg_cell_lit`'s argument for `decode`.
   **It is also why `run_ddl` here issues nothing where `mysql::run_ddl` issues
@@ -16976,7 +17027,11 @@ existing prose was left alone.
   the asked-for state fails the statement**: it never runs on a session that was only *meant* to be
   guarded. The editor asks for `ReadOnly` on a read-only connection and for nothing otherwise
   (`main.rs`'s `session_enforce`), so a writable connection's run is plain `fetch_query` as it always
-  was. `sqlite.rs` carries
+  was. **A connection's init SQL runs before all of this**, inside the connect and before the
+  caller sees the connection, so every enforcement statement here — and SQL Server's `BEGIN
+  TRANSACTION` — is issued after it and overrides whatever it set; that ordering, not the init
+  SQL's own allowlist, is why it cannot lift the guard (the init SQL paragraph below, and the live
+  tier's `a_read_only_session_with_init_sql_still_refuses_a_write`). `sqlite.rs` carries
   `a_read_only_fetch_refuses_a_write_and_still_reads` (the row count afterwards, not just the error,
   and a read beside it so a session that refuses everything fails) and
   `only_the_read_only_enforcement_refuses_a_write`, which holds `AsJudged` and plain `fetch_query` to
@@ -19243,7 +19298,37 @@ existing prose was left alone.
   failure (`3D000`, or `28000`, which reads as an auth error but is matched per database) is worth
   another candidate, because repeating a rejected certificate or a wrong password once per
   candidate is how a misconfigured certificate came to report "timed out" rather than naming
-  itself.
+  itself. A failed init statement is not one either: it would fail the same way in every
+  candidate, so `connect_probe` returns it with the retry flag cleared.
+  **A connection's init SQL runs inside each engine's one connect function, right after it
+  connects and before the caller sees the connection** — what may be in it is `core::init_sql`'s.
+  `Db` carries it as `init_sql`, filled by both arms of `Db::connect` and empty from `from_parts`,
+  which the MCP endpoint handoff fills back through `with_init_sql` from what `init_sql()` wrote
+  (`schemaic-app`'s `ai.rs` entry). Every connect asks **`Db::init_statements`** before any of it
+  runs — `init_sql::check` for this engine, its refusal a `DbError::Refused` reading *Not
+  connected — this connection's init SQL was refused: …* — so a refused init runs none of it; the
+  three networked engines ask before they dial. A statement the server then refuses is
+  `Db::init_failed`, a `DbError::Connect` naming it (*init SQL `…` failed: …*), and the operation
+  fails with it. **That is deliberate**: a `SET ROLE` that did not take would run the operation as
+  the login's own role, so nothing goes on in a session missing a setting the user asked for, and
+  the fix is the connection form. The four sites: **MySQL's is `Db::dial`**, which every `open`
+  and `open_serverless` passes through, calling `mysql::run_init` — in `mysql.rs` rather than
+  inline because `the_dispatcher_executes_nothing_itself` forbids `lib.rs` a `query_drop`;
+  **PostgreSQL's is `connect_probe`**, by `batch_execute`; **SQLite's is `sqlite::open`**, by
+  `execute_batch` after its `busy_timeout`, and a pragma a caller sets after the open —
+  `foreign_keys` on the write paths — wins over the init's; and **SQL Server's is
+  `mssql::connect`**, now the check, then `login` (the old body, up to the login), then each
+  statement through `simple_query` — **not `execute`**, which sends an RPC, and a `SET` inside
+  `sp_executesql` lasts only as long as that call, so the setting would be gone before the
+  operation began. **Running before the caller sees the connection is what keeps it below the
+  read-only guard**: every `Enforce` statement is the caller's, issued afterwards (under
+  `fetch_query_enforced`, above). The one connection it skips is `pg::cancel_query`'s, a
+  `CancelToken` that runs no SQL; the terminal's database client is opened by none of these and
+  does not run it either. Without a server, `sqlite.rs`'s
+  `the_init_sql_runs_on_every_connection_an_operation_opens` and
+  `a_refused_init_sql_refuses_the_connect_before_any_of_it_runs` pin both halves; the server legs
+  are the live tier's `init_sql.rs` and `mssql::the_init_sql_is_in_force_and_a_refused_one_fails_the_operation`,
+  below.
   **`tls.rs` translates a connection's TLS settings into the networked drivers**, and only
   translates: the decisions were already made by `core::connection::Tls::plan`, which collapses the
   five libpq `sslmode` levels into the four booleans a handshake is actually made of. The drivers
@@ -20143,6 +20228,20 @@ existing prose was left alone.
   case here**: no leg sets a mode that moves a quote, so the smuggle `AsJudged` closes on the MySQL
   family was measured once, by hand, on a throwaway MariaDB 11.8, and what holds it now is
   `core::sql`'s pure tests over the strip and the read-back. Nothing in the tier reproduces that run.
+  **`init_sql.rs` is a connection's init SQL against the real servers**, its own group in
+  `live_suite!`, so MariaDB 10.11, MySQL 8.4 and PostgreSQL 16 each run all three — each with a
+  setting the engine reads back, `SET application_name` on PostgreSQL and `SET time_zone` on the
+  MySQL family. `the_init_sql_is_in_force_on_the_operations_connection` reads it back through plain
+  `fetch_query`, whose connection is a fresh one, so it can only hold the value if the connect ran
+  the init; `a_read_only_session_with_init_sql_still_refuses_a_write` reads it back through
+  `fetch_query_enforced` with `Enforce::ReadOnly` and then has the same enforced path refuse an
+  `INSERT`, the count afterwards still `0` — the ordering half, which no pure test can hold; and
+  `a_refused_init_statement_fails_the_operation` sets a setting no server has and asserts the
+  operation fails with an error naming the init SQL. SQL Server is not a leg of the macro, so its
+  case is `mssql.rs`'s `the_init_sql_is_in_force_and_a_refused_one_fails_the_operation` — `SET
+  LANGUAGE British; SET DATEFIRST 3` read back, which is also what proves the batch-not-RPC send,
+  and `SET LANGUAGE NoSuchLanguage` failing the operation — passing on 2022 and 2025 by the
+  change's author's report.
   **In `users.rs` the reads are of accounts that were already there and the writes make their own.**
   An account is server-wide — it is not inside the scratch database and would not go away with it —
   so the read half asks about the account the suite **connected as** (`Target::user()`), that being
@@ -23275,7 +23374,7 @@ existing prose was left alone.
     Folder), **Safeguards** (Prominent colour, Read-only, CLI access, AI data access, Statement
     timeout), **Database**
     (Environment, Type, then `engine_block` — Host/Port, Database, Authentication and User/Password
-    for a server, the Database file for SQLite) and **Network** (the SSH tunnel and its fields, SSL /
+    for a server, the Database file for SQLite — then Init SQL) and **Network** (the SSH tunnel and its fields, SSL /
     TLS). Each opens with `widgets::form_section_header` and they stand `widgets::form_section_gap()`
     apart with no divider, as Settings' did while it was one column; inside a section the fields
     keep the form's 20. It had
@@ -23329,6 +23428,19 @@ existing prose was left alone.
     in `text_faint` at `font_label`) is the one heading both lists draw: this one and the header's
     `conn_menu_overlay`, which iterates `listed_rows` the same way and looks each connection up by
     id. It is deliberately not a pointer or a keyboard stop — it names a group, it does nothing.
+    **The *Init SQL* field is `Connection::init_sql`'s write surface**, last in Database after the
+    engine block, at tabindex 85 — after the engine's own fields (to 80), before the tunnel's 90.
+    It is a multi-line mono `edit_field` coloured for the engine picked, `min_rows` 2, with the
+    placeholder `SET search_path TO app, public`, and it sits in a `dyn_container` keyed on the
+    dialect read off `draft.db_type`, because an `edit_field`'s colouring is fixed when it is built
+    — so changing the engine rebuilds it. **Under it is what `init_sql::check` makes of the text as
+    typed**: the refusal in `theme::error`, or else a hint in `text_muted` — *"Optional. SET
+    statements run on every connection Schemaic opens — a search path, a time zone, a role."*, and
+    on SQLite the `PRAGMA` sentence. The connect refuses the same text, and this line is the only
+    place the user hears that before a connect fails; Save does not check it. `DraftSignals::init_sql`
+    is threaded through create, load (and so `blank`) and `to_connection`, and the Test result's
+    reset effect tracks it, since the init SQL runs inside every connect and a Test from before an
+    edit to it says nothing about the connect after.
     **New creates the connection; it does not merely clear the form.** `new_conn` blanks the shared
     `DraftSignals`, names it a unique *New connection N* with a distinct colour, mints its id through
     `Connection::next_id_after`, pushes it, persists (`Saving::Replacing`) and selects it by setting
@@ -30868,7 +30980,12 @@ existing prose was left alone.
   sign-in mode crosses as `"auth"`, and an Entra token does not cross at all**: `endpoint_from_value`
   hands the mode to `Db::with_auth`, an absent one being a password as every blob written before
   the field meant (`the_endpoint_handoff_carries_the_sign_in_mode`), and the subprocess asks the
-  Azure CLI for its own token through its own process's cache (`db/entra.rs`).
+  Azure CLI for its own token through its own process's cache (`db/entra.rs`). **The connection's
+  init SQL crosses as `"init_sql"`**, written from `Db::init_sql()` and handed back to
+  `Db::with_init_sql`, so the assistant's queries run under the `search_path` or role the user's
+  own do; an absent one is none, which is what every blob written before the field meant
+  (`the_endpoint_handoff_carries_the_init_sql`). The subprocess's connects check it again, as
+  every connect does (`schemaic-db`'s init SQL paragraph).
   `resolve_password` is pure with the lookup injected; `keyring_password(id)` is the real one —
   `conn::secrets::load_connections_readonly`, **never** the app's self-healing load, which may
   rewrite `connections.json` under the running app; the connection found by id; `hydrate_for_cli`,
@@ -33911,8 +34028,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   two separate lists. `schemaic query` also asks it once *earlier*, through `query::gate`, before
   the keyring is read or a tunnel opened — as `schemaic exec` runs `ExecRequest::approved` before
   it connects — so that exit 3's "nothing was sent" is true; the asking inside `read_only_query`
-  is what keeps the early one from being the only check. The refusals are `rerunnable_for_export`, `script_verdict` and
-  `read_only_reason`; the requests are `RerunRequest`, minted against the first, `ScriptRequest`,
+  is what keeps the early one from being the only check. The refusals are `rerunnable_for_export`, `script_verdict`,
+  `read_only_reason` and `init_sql::check` (below); the requests are `RerunRequest`, minted against the first, `ScriptRequest`,
   against the second, and `ExecRequest`, minted against `run_verdict` itself.
   **`schemaic exec` is the write half, and it is the third minted request.** `ExecRequest`'s
   fields are private — the statement, its `Enforce`, and the connection and database the verdict
@@ -33933,6 +34050,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   report "1 and 2 committed, 3 failed". The policy it assembles passes `confirm_writes: false`, and
   `cli/exec.rs` carries the reason that is where the consent lives rather than a setting being
   ignored.
+  **A connection's init SQL is the fourth refusal, and the one guarding SQL the user never ran.**
+  `Connection::init_sql` runs at every connect, so on every operation — a run, a listing, a ping, a
+  `KILL` — with nobody at the keyboard and no moment to confirm anything. `core::init_sql::check`
+  is its gate, with no `Confirm` arm: an allowlist of session `SET`s (on SQLite, named `PRAGMA`s),
+  no `(` at code level, `USE` refused because it would move operations off the database they asked
+  for, and a deny list of what is server-wide or what a guard rests on — the transaction and
+  read-only settings, `autocommit`, the row counts the one-row net reads, the literal lexing
+  (`core::init_sql`'s entry has the list and each reason). It has **no minted request**, as
+  `read_only_reason` has none: it is asked inside the connect, by `Db::init_statements`, in each
+  engine's one connect function and before any of it runs, so there is no launcher to forget it.
+  And it cannot weaken the guards beside it, because it runs before the caller sees the
+  connection and so before every `Enforce` statement — the ordering, not the list, is what holds
+  a read-only connection (`schemaic-db`'s init SQL paragraph;
+  `a_read_only_session_with_init_sql_still_refuses_a_write` in the live tier).
   **One tested function is asked by everything that re-runs**, and that is the shape of the fix
   rather than a tidy-up. `filter::rerun_statement(base, &GridQuery, dialect)` composes *what* would
   run (`build_query`, or the base verbatim when there is no filter or sort) with *whether it may*
@@ -33956,7 +34087,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `an_unfiltered_read_reruns_as_itself_even_when_it_cannot_be_rewritten`, the join-and-CTE property
   the read-more link exists for).
   **The terminal is where this model stops, and the position is stated here rather than left to be
-  inferred.** The sentence above is *every path that executes user SQL*, with three named refusals
+  inferred.** The sentence above is *every path that executes user SQL*, with four named refusals
   beside it — and a terminal running `mysql`, `psql` or `sqlite3` executes user SQL that never
   passes through this app. No per-statement guard is possible there: the statements are typed into
   another process, Schemaic sees bytes on a PTY, there is no `&[String]` for `run_verdict` to judge
@@ -34095,7 +34226,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   are the pure ones, `Agent::of`, `Agent::apply` and `ai_panel::input_state_of`.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
-  read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`, and `users::redact_secrets`, where
+  read-only gate, `init_sql::check`, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`, and `users::redact_secrets`, where
   a span ended early leaves the tail of a password hash on screen). Never hand-roll a second
   scanner — five drifting copies was the original bug. **It binds outside `schemaic-core` too**:
   `intel::code_names` is `pub` so a *backend* can ask "does this SQL name this identifier, in code"

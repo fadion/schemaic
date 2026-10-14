@@ -39,6 +39,7 @@ mod ddl;
 mod editable;
 mod endpoint;
 mod enforced;
+mod init_sql;
 mod mariadb_catalog;
 mod mssql;
 mod namespaces;
@@ -131,6 +132,11 @@ live_suite!(
         a_read_only_plan_refuses_a_write_its_planner_makes,
         a_read_only_stream_refuses_a_write_a_select_hides,
         a_read_only_batch_refuses_a_write_a_select_hides,
+    ],
+    init_sql: [
+        the_init_sql_is_in_force_on_the_operations_connection,
+        a_read_only_session_with_init_sql_still_refuses_a_write,
+        a_refused_init_statement_fails_the_operation,
     ],
     routines: [
         a_pg_redefinition_keeps_a_functions_planner_attributes,

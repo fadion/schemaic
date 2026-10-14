@@ -7037,6 +7037,7 @@ mod tests {
                 folder: String::new(),
                 auth: crate::connection::AuthMode::Password,
                 statement_timeout_secs: None,
+                init_sql: String::new(),
             };
             let p = GuardPolicy::of(Some(&c), true, false);
             assert!(p.no_database, "{db_type}");
@@ -7186,6 +7187,7 @@ mod tests {
             folder: String::new(),
             auth: crate::connection::AuthMode::Password,
             statement_timeout_secs: None,
+            init_sql: String::new(),
         };
         assert!(GuardPolicy::of(Some(&c), false, false).read_only);
         assert!(matches!(

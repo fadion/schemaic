@@ -160,6 +160,7 @@ fn connection(db_type: &str, host: &str, port: u16, tls: Tls) -> Connection {
         folder: String::new(),
         auth: Default::default(),
         statement_timeout_secs: None,
+        init_sql: String::new(),
     }
 }
 

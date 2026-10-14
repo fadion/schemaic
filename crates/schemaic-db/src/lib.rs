@@ -538,6 +538,12 @@ pub struct Db {
     /// the engine does not offer never reaches a driver. Only SQL Server's
     /// reads anything but the password ([`mssql`]).
     pub(crate) auth: schemaic_core::connection::AuthMode,
+    /// The connection's init SQL as saved (`Connection::init_sql`), run by
+    /// every engine's connect function right after it connects and before
+    /// anything else — an `Enforce` included. Checked there, per connect,
+    /// through [`Db::init_statements`]: a connect whose init SQL is not all
+    /// settings is refused before any of it runs.
+    pub(crate) init_sql: String,
 }
 
 /// **Hand-written, because the derived one printed the password.**
@@ -570,6 +576,7 @@ impl std::fmt::Debug for Db {
             .field("database", &self.database)
             .field("tls", &self.tls)
             .field("auth", &self.auth)
+            .field("init_sql", &self.init_sql)
             .finish()
     }
 }
@@ -610,6 +617,7 @@ impl Db {
         // switch never reaches a driver that has no databases to open.
         let database = conn.default_database().unwrap_or_default().to_string();
         let auth = conn.effective_auth();
+        let init_sql = conn.init_sql.clone();
         match tunnel_port.filter(|_| engine.is_networked()) {
             // **The certificate is still the far end's.** Rewriting the endpoint
             // to `127.0.0.1` would have `verify-full` compare a perfectly good
@@ -632,6 +640,7 @@ impl Db {
                     ..p
                 }),
                 auth,
+                init_sql,
             },
             None => Db {
                 engine,
@@ -643,6 +652,7 @@ impl Db {
                 database,
                 tls,
                 auth,
+                init_sql,
             },
         }
     }
@@ -672,7 +682,41 @@ impl Db {
             database: String::new(),
             tls: None,
             auth: schemaic_core::connection::AuthMode::Password,
+            init_sql: String::new(),
         }
+    }
+
+    /// Attach a connection's init SQL to a handle built by
+    /// [`Self::from_parts`] — the endpoint handoff's half, as
+    /// [`Self::with_database`] is: without it the assistant's queries would
+    /// run without the `search_path` or role the user's own do.
+    pub fn with_init_sql(mut self, init_sql: &str) -> Db {
+        self.init_sql = init_sql.to_string();
+        self
+    }
+
+    /// The init SQL as carried, for the endpoint handoff.
+    pub fn init_sql(&self) -> &str {
+        &self.init_sql
+    }
+
+    /// The init SQL's statements, each checked by `init_sql::check` for this
+    /// engine — or the refusal, as the connect's error. Asked by every
+    /// engine's connect function before it runs any of them.
+    pub(crate) fn init_statements(&self) -> Result<Vec<String>, DbError> {
+        schemaic_core::init_sql::check(&self.init_sql, self.engine.dialect()).map_err(|why| {
+            DbError::Refused(format!(
+                "Not connected — this connection's init SQL was refused: {why}"
+            ))
+        })
+    }
+
+    /// A server's refusal of one of the init statements, as the connect's
+    /// error: the connect cannot go on in a session missing a setting the
+    /// user asked for (a `SET ROLE` that did not take would run as the
+    /// login's own role).
+    pub(crate) fn init_failed(stmt: &str, err: impl std::fmt::Display) -> DbError {
+        DbError::Connect(format!("init SQL `{stmt}` failed: {err}"))
     }
 
     /// This endpoint, signing in as `auth` — for the MCP subprocess, which
@@ -870,9 +914,11 @@ impl Db {
         if let Some(plan) = self.tls.as_ref() {
             tls::preflight(plan)?;
         }
+        // Refused before the connect, so none of it runs.
+        let init = self.init_statements()?;
         let first = Conn::new(self.opts(scope, found_rows)).await;
-        match first {
-            Ok(conn) => Ok(conn),
+        let mut conn = match first {
+            Ok(conn) => conn,
             Err(e) => {
                 if !self
                     .tls
@@ -885,9 +931,13 @@ impl Db {
                 // to fall back, the user's problem is whatever plaintext hit.
                 Conn::new(self.opts_with_tls(scope, found_rows, None))
                     .await
-                    .map_err(|e| DbError::Connect(e.to_string()))
+                    .map_err(|e| DbError::Connect(e.to_string()))?
             }
-        }
+        };
+        // The connection's init SQL, before the caller sees the connection —
+        // so before any `Enforce` it goes on to set.
+        mysql::run_init(&mut conn, &init).await?;
+        Ok(conn)
     }
 }
 
@@ -3513,6 +3563,7 @@ mod tests {
             folder: String::new(),
             auth: Default::default(),
             statement_timeout_secs: None,
+            init_sql: String::new(),
         };
         // No tunnel → direct host/port passthrough.
         let direct = Db::connect(&conn, None);
@@ -3562,6 +3613,7 @@ mod tests {
                 folder: String::new(),
                 auth: Default::default(),
                 statement_timeout_secs: None,
+                init_sql: String::new(),
             };
 
             let direct = Db::connect(&conn, None);
@@ -3610,6 +3662,7 @@ mod tests {
             folder: String::new(),
             auth: Default::default(),
             statement_timeout_secs: None,
+            init_sql: String::new(),
         };
         let tunneled = Db::connect(&ms, Some(55001));
         let plan = tunneled.tls_plan().unwrap();
@@ -3644,6 +3697,7 @@ mod tests {
             folder: String::new(),
             auth: Default::default(),
             statement_timeout_secs: None,
+            init_sql: String::new(),
         };
         let db = Db::connect(&conn, Some(55001));
         assert_eq!(db.engine(), Engine::Sqlite);

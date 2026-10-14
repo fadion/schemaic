@@ -93,7 +93,9 @@ substitute for the statement, and none of these is a style preference.
 
 - **The write guard lives on the run action**, not in a caller of it — every path executing user
   SQL goes through `TabsActions::run`/`run_all` and `sql::run_verdict`, or through a refusal
-  *strictly stronger* than it. There are **three** such refusals now:
+  *strictly stronger* than it. There are **four** such refusals now — the fourth,
+  `init_sql::check`, is the allowlist a connection's init SQL (session `SET`s, SQLite
+  `PRAGMA`s, nothing a guard rests on) must pass before any of it runs at a connect — and the three before it:
   `sql::rerunnable_for_export`, which has no `Confirm` arm; `sql::script_verdict`, which treats
   a whole `.sql` file as a write without reading it; and `sql::read_only_reason`, a per-dialect
   allowlist of read-only statement *heads* plus a keyword deny-list — and, on PostgreSQL and

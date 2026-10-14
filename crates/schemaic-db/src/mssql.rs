@@ -194,6 +194,25 @@ async fn auth_method(db: &Db) -> Result<tiberius::AuthMethod, DbError> {
 /// the CLI as someone else since, or was removed — would otherwise be handed
 /// over until it expired.
 pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient, DbError> {
+    // Refused before the connect, so none of it runs.
+    let init = db.init_statements()?;
+    let mut client = login(db, database).await?;
+    // The connection's init SQL, before the caller sees the client — so
+    // before the transaction a read-only run opens.
+    for stmt in &init {
+        // `simple_query`, not `execute`: `execute` sends an RPC, and a `SET`
+        // inside `sp_executesql` lasts only as long as that call.
+        let ran = match client.simple_query(stmt.as_str()).await {
+            Ok(stream) => stream.into_results().await.map(drop),
+            Err(e) => Err(e),
+        };
+        ran.map_err(|e| Db::init_failed(stmt, ms_text(&e)))?;
+    }
+    Ok(client)
+}
+
+/// [`connect`] up to the login, without the init SQL.
+async fn login(db: &Db, database: Option<&str>) -> Result<MsClient, DbError> {
     let cfg = config(db, database).await?;
     let named = schemaic_core::connection::sql_server_instance(&db.host);
     let result = match connect_with(cfg.clone(), named.is_some()).await {

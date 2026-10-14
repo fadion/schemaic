@@ -1162,6 +1162,12 @@ pub struct Connection {
     /// [`Self::statement_timeout`].
     #[serde(default)]
     pub statement_timeout_secs: Option<u64>,
+    /// Session settings run on every connection Schemaic opens for this one —
+    /// `SET search_path …`, `SET time_zone …`, `SET ROLE …`; empty is none.
+    /// Only what `init_sql::check` accepts ever runs: a connect with anything
+    /// else in it is refused, not partly run.
+    #[serde(default)]
+    pub init_sql: String,
 }
 
 /// The statement timeout a run on one connection is held to, and whose
@@ -1198,6 +1204,7 @@ impl std::fmt::Debug for Connection {
             .field("folder", &self.folder)
             .field("auth", &self.auth)
             .field("statement_timeout_secs", &self.statement_timeout_secs)
+            .field("init_sql", &self.init_sql)
             .finish()
     }
 }
@@ -1326,6 +1333,8 @@ impl Connection {
         // A label, like `name`, but one that is matched: `Prod ` and `Prod`
         // would be one folder on screen and two in the file.
         trim(&mut self.folder);
+        // At its ends only: a statement's own lines are the user's layout.
+        trim(&mut self.init_sql);
         self
     }
 
@@ -1553,6 +1562,7 @@ impl Connection {
             folder: String::new(),
             auth: AuthMode::default(),
             statement_timeout_secs: None,
+            init_sql: String::new(),
         }
     }
 
@@ -1714,6 +1724,10 @@ impl Connection {
     /// itself stays on the *server* question: a TLS change needs no new
     /// listener.
     ///
+    /// The init SQL is in for the same reason as the transport: a pinned
+    /// session set up by the old one would go on running under the old
+    /// `search_path` or role while every fresh operation ran under the new.
+    ///
     /// Password is still out, for the reason `targets_same_server` gives: a
     /// corrected password reaches the same server over the same socket, and an
     /// already-authenticated session is not made wrong by it.
@@ -1725,6 +1739,8 @@ impl Connection {
             || self.tls.client_key_path != other.tls.client_key_path
             || self.ssh.auth != other.ssh.auth
             || self.ssh.key_path != other.ssh.key_path
+            // A session set up by the old init SQL is not the one asked for.
+            || self.init_sql != other.init_sql
     }
 
     /// Is `other` **this same saved connection, still pointing where it did** —
@@ -2727,6 +2743,7 @@ mod tests {
             folder: String::new(),
             auth: AuthMode::Password,
             statement_timeout_secs: None,
+            init_sql: String::new(),
         };
         assert_eq!(c.endpoint(), "db.example.com:3307");
         // A server connection has no file to label.
@@ -2841,6 +2858,7 @@ mod tests {
             folder: String::new(),
             auth: AuthMode::Password,
             statement_timeout_secs: None,
+            init_sql: String::new(),
         }
     }
 
@@ -3742,6 +3760,17 @@ mod tests {
         }
     }
 
+    /// **An init SQL edit invalidates what is open**: a pinned Manual session
+    /// was set up by the old one, and would go on running under the old
+    /// `search_path` or role while every fresh operation ran under the new.
+    #[test]
+    fn an_init_sql_edit_invalidates_what_is_open() {
+        let mut edited = conn();
+        edited.init_sql = "SET ROLE reporting".into();
+        assert!(conn().invalidates_open_connections(&edited));
+        assert!(edited.invalidates_open_connections(&conn()));
+    }
+
     /// Everything that moves the *server* still invalidates what is open — the
     /// wider predicate is a superset, not a replacement.
     #[test]
@@ -4247,6 +4276,7 @@ mod tls_tests {
             folder: String::new(),
             auth: AuthMode::Password,
             statement_timeout_secs: None,
+            init_sql: String::new(),
         }
     }
 
@@ -4752,5 +4782,23 @@ mod tls_tests {
         v.as_object_mut().unwrap().remove("statement_timeout_secs");
         let back: Connection = serde_json::from_value(v).unwrap();
         assert_eq!(back.statement_timeout_secs, None);
+    }
+
+    /// A connection saved before init SQL runs none.
+    #[test]
+    fn a_connection_saved_before_init_sql_runs_none() {
+        let c = Connection::new_blank(1, "c".into(), None);
+        let mut v = serde_json::to_value(&c).unwrap();
+        v.as_object_mut().unwrap().remove("init_sql");
+        let back: Connection = serde_json::from_value(v).unwrap();
+        assert_eq!(back.init_sql, "");
+    }
+
+    /// Trimmed at its ends, never inside: a statement's own lines are kept.
+    #[test]
+    fn init_sql_is_trimmed_only_at_its_ends() {
+        let mut c = Connection::new_blank(1, "c".into(), None);
+        c.init_sql = "\n  SET a = 1;\n  SET b = 2;  \n".into();
+        assert_eq!(c.trimmed().init_sql, "SET a = 1;\n  SET b = 2;");
     }
 }
