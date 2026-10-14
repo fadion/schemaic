@@ -25100,7 +25100,10 @@ existing prose was left alone.
     something you compose *with*; "Open in new tab" is on the row's menu for when it isn't. The
     editor pane's `insert_req` effect splices it over the selection when there is one and hands it
     to `completion::begin_snippet`, which selects the first `:name` stop for Tab to walk from
-    (`tab_stops.rs`), or with none puts the caret after the body, as the effect used to itself. The
+    (`tab_stops.rs`), or with none puts the caret after the body, as the effect used to itself — and
+    then asks focus back for the editor, as the jump-to-offset effect does: the click leaves it on
+    the panel, where the typing meant for the first stop went nowhere and Tab walked the window's
+    focus ring instead of the stops. The
     parameter chips under a body are read live from `params::names`, never stored, so they cannot
     disagree with the body above them. **The body preview is syntax-coloured** (`highlight_sql_mono`,
     over the editor's own `sql_highlight::highlight_spans`, with the search match added last so it

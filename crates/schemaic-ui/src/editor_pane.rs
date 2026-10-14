@@ -4962,6 +4962,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             ) {
                 crate::completion::begin_snippet(&ed_ins, comp, &body, lo, dialect.get_untracked());
             }
+            // The keyboard comes back with the text, as the jump above brings it:
+            // an insert from the library panel left focus there, so the typing
+            // meant for the first `:name` stop went nowhere and Tab walked the
+            // window's focus ring instead of the snippet's stops.
+            if let Some(Some(vid)) = ed_ins.editor_view_id.try_get_untracked() {
+                vid.request_focus();
+            }
         });
     }
 
