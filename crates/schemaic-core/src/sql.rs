@@ -164,6 +164,17 @@ impl SqlDialect {
     pub fn read_only_is_a_rollback(self) -> bool {
         matches!(self, SqlDialect::MsSql)
     }
+
+    /// Does a row limit read `LIMIT n [OFFSET m]`? Not on SQL Server, which
+    /// spells it `TOP (n)` or `OFFSET m ROWS FETCH … n ROWS ONLY` (the
+    /// latter needing an `ORDER BY`) — what `filter::with_page` writes.
+    /// Exhaustive, so a fifth engine answers here rather than defaulting.
+    pub fn has_limit_clause(self) -> bool {
+        match self {
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+            SqlDialect::MsSql => false,
+        }
+    }
 }
 
 /// Does `text` hold anything but whitespace, punctuation and comments — a

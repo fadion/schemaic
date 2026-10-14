@@ -2287,7 +2287,8 @@ existing prose was left alone.
     **`simple_select_source` is the one definition of "structurally simple enough to aim a write
     at"** — one statement, a `SELECT` body, no CTE, one `FROM` entry, no joins, a plain named table
     — shared by `filter::build_query` (which needs to know it may splice a `WHERE` into the
-    statement that produced a result) and by SQLite's write-back, which reaches it through
+    statement that produced a result), by `filter::page_size`/`with_page` (so a statement the pager
+    turns is one the filter bar could also rewrite) and by SQLite's write-back, which reaches it through
     `projection_of` and — now that the driver's own provenance does the attributing — needs it only
     to recover the *spelling* a projected `rowid` was written with. Two predicates that agreed on the day they were written is the
     arrangement `ident_sql` exists to rule out, and a test pins that the two callers still agree.
@@ -3421,13 +3422,38 @@ existing prose was left alone.
     asks, rather than answering inline.
     **`rerun_statement` is what the two affordances that re-run a result on screen ask** — the
     capped notice's "read N rows" and the export's `All rows` — and it composes *what* would run
-    (`build_query`, or the base verbatim when the filter bar and the sort are both empty) with
+    (`compose`, or the base verbatim when the filter bar, the sort and the page are all at rest) with
     *whether it may* (`sql::rerunnable_for_export`), so the write guard sees the exact string that
-    would be dispatched. It lives here rather than at either call site because a term a caller can
+    would be dispatched — and both affordances re-run the page on screen, not the first one. It lives here rather than at either call site because a term a caller can
     delete is a term the suite cannot hold: the export menu's copy of the guard was deletable with
     everything green, and the read-more link had no copy at all (*Architecture invariants*, the write
     guard). An empty or whitespace base is `None` too, since `contains_write("")` is `false` and a
     bare "is it a write?" gate therefore says yes to nothing at all.
+    **A statement with a constant row limit pages by it**, and a table tab's always has one.
+    `GridQuery::page` counts from 0, the base as written, and `is_empty` holds only on page 0 — a
+    page past the first is a view like a filter or a sort, so nothing that asks `is_empty` mistakes
+    it for the base. `compose` is the one composition both the filter row and a re-run ask for:
+    the filter and sort through `build_query` (skipped when both are empty, so an unfiltered base
+    `build_query` could not rewrite is still itself), then `with_page` past page 0. `page_size`
+    decides whether there are pages at all — the constant `LIMIT n`, MySQL's `LIMIT o, n`, or SQL
+    Server's `TOP (n)` / `FETCH … n ROWS` (all read by the private `limit_of`) of a statement
+    `intel::simple_select_source` accepts, and `None` for a parameter, `PERCENT`, `WITH TIES` or a
+    join (`a_statement_without_a_constant_limit_does_not_page`). `with_page` moves the offset on by
+    `page × n` from the statement's **own** offset, not from zero
+    (`a_page_moves_on_from_the_statements_own_offset`). SQL Server has no `LIMIT`, so there the
+    `TOP` comes off and the query takes `OFFSET m ROWS FETCH FIRST n ROWS ONLY` — which the server
+    refuses without an `ORDER BY`, so a statement with none gets `ORDER BY (SELECT NULL)`, an order
+    the server picks, since a keyless table has no other (`sql_server_pages_with_offset_fetch`; the
+    rewritten form was run on SQL Server 2022). Which spelling to write is asked of
+    `SqlDialect::has_limit_clause`, a capability of its own, exhaustive over the engines.
+    **A page past the first on a statement
+    with no limit is `Ok(None)`, never the base**: it refuses rather than running the whole table
+    (`a_page_composes_with_the_filter_and_sort`). `page_caption` is the pager's words — *Rows
+    101–200* in exact figures, not `text::human_count`'s, because a range whose two ends round to
+    the same `1.2k` says nothing about where the page is — and offers a next page only after a full
+    one, since a short page is the last; a table holding an exact multiple of `n` rows therefore
+    ends on a *No rows after N* page, a full page being unable to say whether another follows
+    (`the_pager_names_the_rows_and_ends_after_a_short_page`).
     `eq_condition` is the right-click "Filter by / Exclude" fragment, its literal written for the
     column's type (`export::typed_literal`: a SQL Server `datetime` reads the cell's text by the
     login's language otherwise). `table_query` is what opening
@@ -3437,6 +3463,11 @@ existing prose was left alone.
     names a SQLite table **alone**: a connection *is* one file, so there is no server-level
     qualifier to add, and `main.t` would be noise on every generated query and wrong the moment the
     statement is copied somewhere the file is attached under another name.
+    Its row limit is the caller's — `spawn_table_tab` passes `schemaic-app`'s `TABLE_TAB_ROWS`,
+    100 — and it is the limit the grid's pager turns (`a_table_tabs_statement_pages_by_its_own_limit`
+    holds that for every engine), which leans on the PK order harder than one capped page did: with
+    no order to page through, nothing promises page two is disjoint from page one, and a keyless
+    table on an engine with no implicit key is opened unordered.
     What it keys and orders on arrives as a **`BrowseKey`**, and the two keyed variants are separate
     because they do different things to the projection: `Columns` is the table's own key, already
     returned by the `*`, while `Implicit` is a row identity that is **none of the table's columns**
@@ -30231,7 +30262,9 @@ existing prose was left alone.
   **number** on purpose: the cap is a client-side cutoff of the result stream (`db::collect_rows`),
   not a `LIMIT`/`OFFSET`, so there is no cursor to advance, "load more" would be a lie, and the
   action re-runs the whole statement at a bigger ceiling — on an unordered query the second read
-  can legitimately disagree with the first. `stats::next_row_cap` picks that number: five times the
+  can legitimately disagree with the first. (The grid's pager, beside it on the strip, *is* a
+  `LIMIT`/`OFFSET`, and a different thing: it turns the statement's own row limit, never the cap —
+  `filter::with_page`, under *Data grid*.) `stats::next_row_cap` picks that number: five times the
   rows actually **read** (not the configured cap, which differs whenever a filter or a small table
   stopped the read short), floored at a thousand so a three-row result still offers something worth
   pressing, and rounded up to two significant figures so the offer reads as a figure rather than as
@@ -34095,7 +34128,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   connection and `None` otherwise, an id no connection has counting as writable, as
   `read_only_of` answers it (`only_a_read_only_connection_asks_for_a_read_only_session`). Five
   closures ask it: `run_query_core`'s auto-commit arm takes `Db::fetch_query_enforced` — which
-  carries every `apply_view` re-run with it (filter/sort, the capped notice's read-more, the
+  carries every `apply_view` re-run with it (filter/sort and a page, the capped notice's read-more, the
   post-commit re-fetch) and `open_table_filtered`, since they all end there; `run_all`'s auto-commit
   arm takes `Db::run_batch_enforced`; `open_session` pins a Manual tab's connection through
   `Session::open_enforced`, which is what both runs use in Manual mode; `run_plan` hands
@@ -34261,7 +34294,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `a_read_only_session_with_init_sql_still_refuses_a_write` in the live tier).
   **One tested function is asked by everything that re-runs**, and that is the shape of the fix
   rather than a tidy-up. `filter::rerun_statement(base, &GridQuery, dialect)` composes *what* would
-  run (`build_query`, or the base verbatim when there is no filter or sort) with *whether it may*
+  run (`filter::compose`, or the base verbatim when there is no filter, sort or page) with *whether it may*
   (`rerunnable_for_export`), so the guard is asked about the string that would actually be
   dispatched and there is no arrangement of base and filter that gets a write past it.
   `GridState::current_statement` is a two-line wrapper over it, and the read-more link's predicate
@@ -39056,9 +39089,9 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
   is asked by exactly two things, and everything else follows from them. It empties the **edit
   model** (the same way a read-only connection does), which stops cell editing, row insert/delete,
   the commit *and* server-side filter/sort in one move, since all four are gated on that model. And
-  it makes `GridState::current_statement` return `None`, which withdraws the two affordances that
-  re-run without going near the edit model — the capped notice's "read all rows" and the export
-  menu's "All rows". The write half is the one that would have cost data: a grid write's `WHERE` is
+  it makes `GridState::current_statement` return `None`, which withdraws the affordances that
+  re-run without going near the edit model — the capped notice's "read all rows", the export
+  menu's "All rows" and the pager. The write half is the one that would have cost data: a grid write's `WHERE` is
   the key columns and their **original** values (`model::RowEdit`) with no guard on the columns being
   set, so a commit from a twenty-minute-old snapshot is a well-formed `UPDATE` that overwrites
   whatever landed in between — and the 1-row safety net cannot see it, because exactly one row *is*
@@ -40149,6 +40182,27 @@ this bundle's.
   agrees with — belongs to `stats::rows_read_clause`, not to the view; the view supplies
   `truncated` and the total and prints what comes back. The cap itself is unchanged and is still a
   **client-side stream cutoff**, not a `LIMIT`; this only says how much of the table went past it.
+- **A table tab pages; the pager is the `LIMIT`/`OFFSET` the cap is not.** `grid_toolbar`'s
+  `pager` sits after the read-more offer — `· ‹ Rows 101–200 ›`, the words from
+  `filter::page_caption` — and is drawn when `filter::page_size` answers for `base_sql` **and**
+  `GridState::rerunnable` holds. So it is not a table tab's alone: any single-table `SELECT` with a
+  constant limit gets one, a table tab's `table_query` simply always qualifies. The second term is
+  the frozen rule and the write guard at once, through the funnel everything that re-runs already
+  asks — a kept result draws no pager, since turning a page re-runs into the very panel that was
+  pinned. A chevron's click writes `grid_query.page` and calls `apply_grid_query`, so a page is
+  minted through `RerunRequest` like a filter, and composed after the filter and sort
+  (`filter::compose`, whose entry has the SQL each engine gets). **Every other write to
+  `grid_query` sets `page` back to 0** — filter-by-value, `cycle_server_sort`, the filter bar's
+  apply and its clear ✕ — so a new filter or order starts again at its first page. The clear's
+  block spelling is what
+  `no_view_code_clears_or_retains_a_signal_unguarded`'s exemption for that site names, so a reflow
+  of it means updating the `EXEMPT` fragment too
+  (`every_clear_exemption_still_names_a_real_write` fails on one that matches nothing). The click
+  is refused while `Tab::view_busy` holds,
+  and both chevrons drop to `text_faint` then, as they do when there is no page that way —
+  *Previous* on page 0, *Next* after a short page. They carry *Previous page*/*Next page* tooltips,
+  and they are plain clickable containers rather than `in_strip_button`s, so F6's ring does not
+  reach them.
 - **The Download menu names the scope, and only when there is a choice to make.** `export_menu`
   normally opens the flat six formats — all of them, unlike the **Copy** menu beside it, which
   filters on `export::ExportFormat::is_text` and so has no Excel entry: a file can hold bytes and a
@@ -40402,13 +40456,13 @@ this bundle's.
   and writer is bounded, so a reader-side count would run two blocks ahead of the file, reporting
   rows that are not in it yet and being two blocks wrong about what survived a cancel.
 - **The results strip shrinks its prose, never its controls.** It is one flex row — stats, the
-  read-more offer, the two red notes, a spacer, then the commit/row/AI/copy/save cluster — and a
+  read-more offer, the pager, the two red notes, a spacer, then the commit/row/AI/copy/save cluster — and a
   flex row squeezes its children before it overflows, so whichever child refuses to shrink is the
   one that wins. The description lost that fight by default: at a 200k cap on a ~292k table the
   line was long enough to push the icon cluster off the right edge of a narrow panel, and the user
   saw a sentence where the export button should be. The rule is now explicit — `min_width(0)` +
   `text_ellipsis` on the stats label and on both warnings, `flex_shrink(0)` on the icon cluster and
-  on the read-more label. A control clipped in half is not a control, while a description ending in
+  on the read-more label and the pager. A control clipped in half is not a control, while a description ending in
   `…` is still one; and the read-more offer counts as a control, not as prose, even though it is
   made of words. The `dyn_container` wrapping the sort caveat needs the `min_width(0)` too — a
   wrapper sitting at its min-content width holds the text at full size however the child is styled.
@@ -40526,7 +40580,8 @@ this bundle's.
   `on_move`/`on_resize` stay on the padded container inside — and that box is what the dropdown
   hangs off.
 - **Every control on the results toolbar carries a tooltip**, and where it sits is a correctness
-  rule. The eight are commit ✓, discard ✗, ＋, －, clone, ✦ AI, copy and save; before they were added
+  rule. The eight are commit ✓, discard ✗, ＋, －, clone, ✦ AI, copy and save (the pager's two
+  chevrons, outside the ring, carry one each as well); before they were added
   nothing in the strip was labelled but the commit count, which is a bare number saying neither what
   it counts nor what pressing it does, and the glyphs doing the least reversible work (discard,
   delete, AI) are among the least self-describing. The tip goes on the **face, before

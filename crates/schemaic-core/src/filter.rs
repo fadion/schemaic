@@ -34,12 +34,16 @@ pub struct GridQuery {
     /// Ordering as `(real column name, ascending)` pairs, applied as `ORDER BY`
     /// (replacing the base statement's). Empty = keep the base `ORDER BY`.
     pub sort: Vec<(String, bool)>,
+    /// Which page of the base statement's `LIMIT` is shown, from 0 — a table
+    /// tab's *Next*/*Previous* ([`with_page`]). 0 is the base as written.
+    pub page: u64,
 }
 
 impl GridQuery {
-    /// No filter and no sort — the grid shows the base result untouched.
+    /// No filter, no sort and the first page — the grid shows the base result
+    /// untouched.
     pub fn is_empty(&self) -> bool {
-        self.filter.trim().is_empty() && self.sort.is_empty()
+        self.filter.trim().is_empty() && self.sort.is_empty() && self.page == 0
     }
 }
 
@@ -164,12 +168,181 @@ pub fn build_query(
     Ok(Some(stmts[0].to_string()))
 }
 
+/// The statement a grid's view runs: `base` with its filter and sort
+/// ([`build_query`]) and then its page ([`with_page`]). The one composition
+/// both the filter row and a re-run ask for, so a page is never lost to one
+/// of them. `Ok(None)` when a filter or sort cannot be applied, or a page past
+/// the first is asked of a statement with no row limit to page by.
+pub fn compose(
+    base: &str,
+    gq: &GridQuery,
+    dialect: SqlDialect,
+) -> Result<Option<String>, FilterError> {
+    let filtered = if gq.filter.trim().is_empty() && gq.sort.is_empty() {
+        base.to_string()
+    } else {
+        match build_query(base, &gq.filter, &gq.sort, dialect)? {
+            Some(sql) => sql,
+            None => return Ok(None),
+        }
+    };
+    if gq.page == 0 {
+        return Ok(Some(filtered));
+    }
+    Ok(with_page(&filtered, gq.page, dialect))
+}
+
+/// The page size of a single-table `SELECT` — its constant `LIMIT n` (or
+/// `LIMIT o, n`, or SQL Server's `TOP (n)` / `FETCH … n ROWS`) — or `None`
+/// when it has none, or is not such a statement. A table tab's
+/// `filter::table_query` always has one; whether this answers is whether the
+/// grid offers *Next*/*Previous*.
+pub fn page_size(sql: &str, dialect: SqlDialect) -> Option<u64> {
+    let stmts = Parser::parse_sql(&*dialect.parser(), sql).ok()?;
+    let [Statement::Query(query)] = stmts.as_slice() else {
+        return None;
+    };
+    crate::intel::simple_select_source(query)?;
+    limit_of(query).map(|(n, _)| n).filter(|n| *n > 0)
+}
+
+/// `sql` showing page `page` (from 0) of its own row limit: the offset moves
+/// on by `page × n` from wherever the statement started. On SQL Server a
+/// `TOP (n)` becomes `OFFSET … ROWS FETCH FIRST n ROWS ONLY`, which needs an
+/// `ORDER BY` — the statement's own, or `ORDER BY (SELECT NULL)` where it
+/// has none (an order the server picks: a table without a key has no other).
+pub fn with_page(sql: &str, page: u64, dialect: SqlDialect) -> Option<String> {
+    use sqlparser::ast::{Fetch, LimitClause, Offset, OffsetRows};
+    let mut stmts = Parser::parse_sql(&*dialect.parser(), sql).ok()?;
+    let [Statement::Query(query)] = stmts.as_mut_slice() else {
+        return None;
+    };
+    crate::intel::simple_select_source(query)?;
+    let (n, start) = limit_of(query)?;
+    if n == 0 {
+        return None;
+    }
+    let offset = start.checked_add(page.checked_mul(n)?)?;
+    let number = |v: u64| Expr::value(Value::Number(v.to_string(), false));
+    if !dialect.has_limit_clause() {
+        // SQL Server's spelling: no `LIMIT`.
+        if let SetExpr::Select(select) = query.body.as_mut() {
+            select.top = None;
+        }
+        if query.order_by.is_none() {
+            let null = Parser::new(&*dialect.parser())
+                .try_with_sql("(SELECT NULL)")
+                .ok()?
+                .parse_expr()
+                .ok()?;
+            query.order_by = Some(OrderBy {
+                kind: OrderByKind::Expressions(vec![OrderByExpr {
+                    expr: null,
+                    options: OrderByOptions {
+                        asc: None,
+                        nulls_first: None,
+                    },
+                    with_fill: None,
+                }]),
+                interpolate: None,
+            });
+        }
+        query.limit_clause = Some(LimitClause::LimitOffset {
+            limit: None,
+            offset: Some(Offset {
+                value: number(offset),
+                rows: OffsetRows::Rows,
+            }),
+            limit_by: vec![],
+        });
+        query.fetch = Some(Fetch {
+            with_ties: false,
+            percent: false,
+            quantity: Some(number(n)),
+        });
+    } else {
+        query.limit_clause = Some(LimitClause::LimitOffset {
+            limit: Some(number(n)),
+            offset: (offset > 0).then(|| Offset {
+                value: number(offset),
+                rows: OffsetRows::None,
+            }),
+            limit_by: vec![],
+        });
+    }
+    Some(stmts[0].to_string())
+}
+
+/// The pager's words for page `page` of `size` rows with `shown` on screen —
+/// *Rows 101–200* — and whether there can be a next page: only after a full
+/// one, since a short page is the last.
+pub fn page_caption(page: u64, size: u64, shown: u64) -> (String, bool) {
+    let from = page.saturating_mul(size);
+    // Exact, not `text::human_count`'s `1.2k`: a range that rounds both ends
+    // to the same figure says nothing about where the page is.
+    let caption = if shown == 0 {
+        format!("No rows after {from}")
+    } else {
+        format!("Rows {}–{}", from + 1, from + shown)
+    };
+    (caption, shown >= size && size > 0)
+}
+
+/// A query's constant row limit and the offset it starts at, in any of the
+/// spellings [`page_size`] reads; `None` for a limit that is not a plain
+/// number (a parameter, `PERCENT`, `WITH TIES`).
+fn limit_of(query: &sqlparser::ast::Query) -> Option<(u64, u64)> {
+    use sqlparser::ast::{LimitClause, TopQuantity};
+    let num = |e: &Expr| match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) => s.parse::<u64>().ok(),
+            _ => None,
+        },
+        _ => None,
+    };
+    let offset = match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            offset: Some(o), ..
+        }) => num(&o.value)?,
+        Some(LimitClause::OffsetCommaLimit { offset, .. }) => num(offset)?,
+        _ => 0,
+    };
+    match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit: Some(l),
+            limit_by,
+            ..
+        }) if limit_by.is_empty() => return num(l).map(|n| (n, offset)),
+        Some(LimitClause::OffsetCommaLimit { limit, .. }) => {
+            return num(limit).map(|n| (n, offset));
+        }
+        _ => {}
+    }
+    if let Some(f) = &query.fetch
+        && !f.percent
+        && !f.with_ties
+    {
+        return f.quantity.as_ref().and_then(num).map(|n| (n, offset));
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let top = select.top.as_ref()?;
+    if top.percent || top.with_ties {
+        return None;
+    }
+    match top.quantity.as_ref()? {
+        TopQuantity::Constant(n) => Some((*n, offset)),
+        TopQuantity::Expr(e) => num(e).map(|n| (n, offset)),
+    }
+}
+
 /// The statement to **re-run** for a result already on screen, or `None` when
 /// there isn't one — the capped notice's "read N rows" and the whole-table
 /// export's "All rows".
 ///
 /// Composes the two halves the callers used to hold apart: *what* would run
-/// ([`build_query`], or the base verbatim when the grid has no filter or sort)
+/// ([`compose`], or the base verbatim when the grid has no filter, sort or page)
 /// and *whether it may* ([`crate::sql::rerunnable_for_export`]). The write guard
 /// is asked about the string that would actually be dispatched, so there is no
 /// arrangement of base and filter that gets a write past it.
@@ -191,9 +364,7 @@ pub fn rerun_statement(base: &str, gq: &GridQuery, dialect: SqlDialect) -> Optio
     let sql = if gq.is_empty() {
         base.to_string()
     } else {
-        build_query(base, &gq.filter, &gq.sort, dialect)
-            .ok()
-            .flatten()?
+        compose(base, gq, dialect).ok().flatten()?
     };
     if sql.trim().is_empty() {
         return None;
@@ -657,6 +828,117 @@ mod tests {
 
     const EVERY_DIALECT: [SqlDialect; 4] = SqlDialect::ALL;
 
+    // ── Paging ───────────────────────────────────────────────────────────────
+
+    /// A table tab's own statement pages by its row cap, on every engine.
+    #[test]
+    fn a_table_tabs_statement_pages_by_its_own_limit() {
+        for d in EVERY_DIALECT {
+            let base = table_query(d, "db", None, "t", BrowseKey::None, Order::Asc, 100);
+            assert_eq!(page_size(&base, d), Some(100), "{d:?}: {base}");
+        }
+        let my = "SELECT * FROM `t` ORDER BY `id` ASC LIMIT 100";
+        assert_eq!(
+            with_page(my, 2, SqlDialect::MySql).unwrap(),
+            "SELECT * FROM `t` ORDER BY `id` ASC LIMIT 100 OFFSET 200"
+        );
+        assert_eq!(
+            with_page("SELECT * FROM t LIMIT 50", 0, SqlDialect::Postgres).unwrap(),
+            "SELECT * FROM t LIMIT 50"
+        );
+    }
+
+    /// SQL Server has no `LIMIT`: a `TOP (n)` page becomes `OFFSET … FETCH`,
+    /// which needs an order — the statement's own, or `(SELECT NULL)`.
+    #[test]
+    fn sql_server_pages_with_offset_fetch() {
+        let ms = SqlDialect::MsSql;
+        let keyed = "SELECT TOP (100) * FROM [t] ORDER BY [id] ASC";
+        assert_eq!(page_size(keyed, ms), Some(100));
+        assert_eq!(
+            with_page(keyed, 1, ms).unwrap(),
+            "SELECT * FROM [t] ORDER BY [id] ASC OFFSET 100 ROWS FETCH FIRST 100 ROWS ONLY"
+        );
+        let unkeyed = with_page("SELECT TOP (10) * FROM [t]", 3, ms).unwrap();
+        assert!(
+            unkeyed.contains("ORDER BY (SELECT NULL) OFFSET 30 ROWS"),
+            "{unkeyed}"
+        );
+    }
+
+    /// Paging starts from the offset the statement already had, and reads
+    /// MySQL's `LIMIT o, n` too.
+    #[test]
+    fn a_page_moves_on_from_the_statements_own_offset() {
+        assert_eq!(
+            with_page("SELECT * FROM t LIMIT 10 OFFSET 5", 1, SqlDialect::Postgres).unwrap(),
+            "SELECT * FROM t LIMIT 10 OFFSET 15"
+        );
+        assert_eq!(
+            page_size("SELECT * FROM t LIMIT 5, 20", SqlDialect::MySql),
+            Some(20)
+        );
+        assert_eq!(
+            with_page("SELECT * FROM t LIMIT 5, 20", 1, SqlDialect::MySql).unwrap(),
+            "SELECT * FROM t LIMIT 20 OFFSET 25"
+        );
+    }
+
+    #[test]
+    fn the_pager_names_the_rows_and_ends_after_a_short_page() {
+        assert_eq!(page_caption(0, 100, 100), ("Rows 1–100".to_string(), true));
+        assert_eq!(
+            page_caption(2, 100, 37),
+            ("Rows 201–237".to_string(), false)
+        );
+        assert!(!page_caption(3, 100, 0).1);
+        assert!(page_caption(3, 100, 0).0.starts_with("No rows after"));
+    }
+
+    /// Nothing to page by: no limit, a join, a parameter for a limit.
+    #[test]
+    fn a_statement_without_a_constant_limit_does_not_page() {
+        let pg = SqlDialect::Postgres;
+        assert_eq!(page_size("SELECT * FROM t", pg), None);
+        assert_eq!(
+            page_size("SELECT * FROM a JOIN b ON a.id = b.id LIMIT 10", pg),
+            None
+        );
+        assert_eq!(page_size("SELECT * FROM t LIMIT $1", pg), None);
+        assert_eq!(
+            page_size("SELECT TOP (10) PERCENT * FROM t", SqlDialect::MsSql),
+            None
+        );
+        assert_eq!(with_page("SELECT * FROM t", 1, pg), None);
+    }
+
+    /// The page composes with the filter and the sort, in that order, and a
+    /// page past the first on a statement with no limit refuses rather than
+    /// running the whole table.
+    #[test]
+    fn a_page_composes_with_the_filter_and_sort() {
+        let gq = GridQuery {
+            filter: "a > 1".into(),
+            sort: vec![("b".into(), false)],
+            page: 2,
+        };
+        assert_eq!(
+            compose("SELECT * FROM t LIMIT 10", &gq, SqlDialect::Postgres)
+                .unwrap()
+                .unwrap(),
+            "SELECT * FROM t WHERE a > 1 ORDER BY \"b\" DESC LIMIT 10 OFFSET 20"
+        );
+        let unlimited = GridQuery {
+            page: 1,
+            ..GridQuery::default()
+        };
+        assert_eq!(
+            compose("SELECT * FROM t", &unlimited, SqlDialect::Postgres).unwrap(),
+            None
+        );
+        assert!(!unlimited.is_empty(), "a page past the first is a view");
+    }
+
     /// A bare name reaches the default namespace's tables — PostgreSQL's
     /// `public`, SQL Server's `dbo` — and every table where the database is
     /// the namespace.
@@ -827,6 +1109,7 @@ mod tests {
         let gq = GridQuery {
             filter: filter.to_string(),
             sort: sort.iter().map(|(c, a)| (c.to_string(), *a)).collect(),
+            ..Default::default()
         };
         rerun_statement(base, &gq, d)
     }
@@ -935,6 +1218,7 @@ mod tests {
             let filtered = GridQuery {
                 filter: "id > 1".to_string(),
                 sort: Vec::new(),
+                ..Default::default()
             };
             assert!(rerun_of(false, Some("SELECT * FROM rental"), &filtered, d).is_some());
             assert_eq!(
@@ -1706,21 +1990,24 @@ mod tests {
         assert!(
             GridQuery {
                 filter: "   ".to_string(),
-                sort: vec![]
+                sort: vec![],
+                ..Default::default()
             }
             .is_empty()
         );
         assert!(
             !GridQuery {
                 filter: "a = 1".to_string(),
-                sort: vec![]
+                sort: vec![],
+                ..Default::default()
             }
             .is_empty()
         );
         assert!(
             !GridQuery {
                 filter: String::new(),
-                sort: vec![("a".to_string(), true)]
+                sort: vec![("a".to_string(), true)],
+                ..Default::default()
             }
             .is_empty()
         );

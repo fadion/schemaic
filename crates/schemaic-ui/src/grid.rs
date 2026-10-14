@@ -37,7 +37,7 @@ use schemaic_core::edit::{
     refetch_template, row_key,
 };
 use schemaic_core::export::{ExportFormat, suggested_filename};
-use schemaic_core::filter::{FilterError, build_query, eq_condition, rerun_of};
+use schemaic_core::filter::{FilterError, eq_condition, rerun_of};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::jsontree::{JsonNode, PathSeg, RowKind, TreeRow};
@@ -838,7 +838,8 @@ impl GridState {
             return;
         };
         let gq = self.grid_query.get_untracked();
-        match build_query(&base, &gq.filter, &gq.sort, self.dialect) {
+        // Filter, sort and page, composed in one place (`filter::compose`).
+        match schemaic_core::filter::compose(&base, &gq, self.dialect) {
             // **Two refusals, and they are different questions.** `Ok(None)` is
             // `build_query` saying it cannot *rewrite* the base; `approved`
             // returning `None` is the write guard, which lives on the action
@@ -991,6 +992,8 @@ impl GridState {
             } else {
                 gq.filter = format!("{} AND {}", gq.filter.trim(), cond);
             }
+            // A new filter starts again at its first page.
+            gq.page = 0;
         });
         self.apply_grid_query();
     }
@@ -1009,6 +1012,8 @@ impl GridState {
                 _ => Some((col.clone(), true)),                             // → ASC
             };
             gq.sort = next.into_iter().collect();
+            // A new order starts again at its first page.
+            gq.page = 0;
         });
         self.apply_grid_query();
     }
@@ -8662,7 +8667,10 @@ fn filter_bar(gs: GridState) -> impl IntoView {
             let buf = RwSignal::new(gs.grid_query.with_untracked(|q| q.filter.clone()));
             let apply = move || {
                 let text = buf.get_untracked().trim().to_string();
-                gs.grid_query.update(|q| q.filter = text);
+                gs.grid_query.update(|q| {
+                    q.filter = text;
+                    q.page = 0;
+                });
                 gs.apply_grid_query();
             };
             let field = edit_field(
@@ -8691,7 +8699,10 @@ fn filter_bar(gs: GridState) -> impl IntoView {
                     container(icons::icon(icons::X, 16.0).style(|s| s.color(theme::text())))
                         .on_click_stop(move |_| {
                             buf.set(String::new());
-                            gs.grid_query.update(|q| q.filter.clear());
+                            gs.grid_query.update(|q| {
+                                q.filter.clear();
+                                q.page = 0;
+                            });
                             gs.view_err.set(None);
                             gs.apply_grid_query();
                         })
@@ -9102,6 +9113,80 @@ fn grid_toolbar(
     // The one piece of prose on this line that is a *control*: it keeps its full
     // width while `stats` gives way, because a half-word offer is not one, and
     // clipping the click target is worse than clipping the description.
+    .style(|s| s.flex_shrink(0.0_f32));
+
+    // **Paging, for a statement that has a page to turn** — a table tab's
+    // `SELECT … LIMIT 100` (`filter::table_query`), or any single-table
+    // `SELECT` with a constant row limit (`filter::page_size`). Unlike the
+    // capped notice beside it this is a real `OFFSET`: each page is its own
+    // statement (`filter::compose`, after the filter and the sort), re-run
+    // through the same `RerunRequest` mint. Shown only where a re-run may
+    // happen at all (`rerunnable`, which a kept result is not).
+    let pager = dyn_container(
+        move || {
+            let size = gs.base_sql.with(|b| {
+                b.as_deref()
+                    .and_then(|b| schemaic_core::filter::page_size(b, gs.dialect))
+            });
+            size.filter(|_| gs.rerunnable())
+                .map(|size| (size, gs.grid_query.with(|q| q.page)))
+        },
+        move |paged| {
+            let Some((size, page)) = paged else {
+                return empty().into_any();
+            };
+            let (caption, more) = schemaic_core::filter::page_caption(page, size, nrows as u64);
+            let busy = gs.view_busy;
+            let go = move |to: u64| {
+                if busy.get_untracked() {
+                    return;
+                }
+                gs.grid_query.update(|q| q.page = to);
+                gs.apply_grid_query();
+            };
+            let arrow = move |glyph: &'static str, enabled: bool, to: u64, tip: &'static str| {
+                let hov = RwSignal::new(false);
+                container(
+                    icons::icon(glyph, crate::consts::TOOLBAR_ICON_BASE).style(move |s| {
+                        let c = if !enabled || busy.get() {
+                            theme::text_faint()
+                        } else if hov.get() {
+                            theme::accent_hover()
+                        } else {
+                            theme::accent()
+                        };
+                        s.color(c).flex_shrink(0.0_f32)
+                    }),
+                )
+                .on_event_cont(EventListener::PointerEnter, move |_| hov.set(true))
+                .on_event_cont(EventListener::PointerLeave, move |_| hov.set(false))
+                .on_click_stop(move |_| {
+                    if enabled {
+                        go(to);
+                    }
+                })
+                .style(|s| {
+                    s.padding_horiz(theme::scaled(2.0))
+                        .cursor(CursorStyle::Default)
+                })
+                .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
+            };
+            h_stack((
+                text("·").style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
+                arrow(
+                    icons::CHEVRON_LEFT,
+                    page > 0,
+                    page.saturating_sub(1),
+                    "Previous page",
+                ),
+                text(caption).style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
+                arrow(icons::CHEVRON_RIGHT, more, page + 1, "Next page"),
+            ))
+            .style(|s| s.flex_row().items_center().gap(theme::scaled(4.0)))
+            .into_any()
+        },
+    )
+    // A control, like `read_more`: it keeps its width while `stats` gives way.
     .style(|s| s.flex_shrink(0.0_f32));
 
     // Commit / discard, shown only when there are staged changes (cell edits +
@@ -9744,6 +9829,7 @@ fn grid_toolbar(
         stats,
         kept_note,
         read_more,
+        pager,
         arena_note,
         caveat,
         // Shrinks to nothing before anything else does — it is only here to
@@ -15725,7 +15811,7 @@ mod clear_tests {
     const EXEMPT: &[(&str, &str, &str)] = &[
         (
             "grid.rs",
-            "gs.grid_query.update(|q| q.filter.clear())",
+            "gs.grid_query.update(|q| { q.filter.clear(); q.page = 0; })",
             "Not a collection signal: `q` is the query struct and `filter` is a              `String` field on it. `Clearable` is over the signal's own value,              and a guard here would have to ask about a field — a different              question, and one the caller can see the answer to (this runs from              the filter bar's clear button, where the filter is non-empty).",
         ),
         (
