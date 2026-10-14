@@ -2142,6 +2142,25 @@ existing prose was left alone.
     `diagnostics`' `Ok(asts)` arm, so an AST is always in hand and the `Err` arm never reached this
     function at all — `statement_scope`'s lexer fallback is not lost, only unreachable from here,
     and it yields the same empty CTE list a `len() != 1` parse gives.
+    **The column resolver turns a span into bytes per expression, so that conversion is indexed.**
+    `colres::check` builds a `LineIndex` of the statement once — where each line starts, and
+    whether it is all ASCII — and every span the `Collector` places goes through
+    `Collector::range` → `colres::to_range_in`: a table read, plus a character walk only on a line
+    that holds a multi-byte character. `to_range` calls `offset_of_line_col`, which walks from the
+    text's first line on every call, so the pass was quadratic in the statement. Measured in a
+    release build, MySQL, empty catalog: a 4,000-row `INSERT … VALUES`, one row per line, went from
+    400 ms to 16 ms; one full `DiagnosticsCache::diagnostics` pass over a 7.5 MB script of 350 such
+    1,000-row `INSERT`s (350k lines) from 11–12 s to 1.4 s; and a 1.1 MB, 50,000-row `INSERT` on a
+    single line, as mysqldump writes them, from 113 s to 0.2 s — there the column walk inside the
+    line was linear too, and the ASCII flag is what removes it. `alias_refs::Walk` places its names
+    through `Walk::span_range` on the same index. The CTE walk (`Ctes`) and the free functions that
+    still call `to_range` keep it, since they convert a span per query or table rather than per
+    expression; a per-expression walk that reaches for `to_range` brings the quadratic back.
+    `the_line_index_answers_what_offset_of_line_col_does` holds the two to one answer. It was found
+    chasing a report of a 7 MB script taking the app to 3 GB: on main, a sandboxed release run over
+    the 350k-line script — Ctrl+End and an edit issued programmatically, wrap on and off, a live
+    connection — stayed near 400 MB with floem building under 1,000 text layouts. The memory half
+    did not reproduce; the CPU half was this.
     **`DiagnosticsCache` is `diagnostics` remembered statement by statement**, so a keystroke
     re-checks the statement it changed and reads the rest back; the editor keeps one per pane and
     runs it on a worker thread (`editor_pane.rs`). Off T-SQL a range's answer is a function of its

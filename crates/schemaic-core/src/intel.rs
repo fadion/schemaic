@@ -6570,6 +6570,64 @@ pub fn offset_of_line_col(text: &str, line: u64, col: u64) -> usize {
     off.min(text.len())
 }
 
+/// [`offset_of_line_col`] for many positions in one text: where each line
+/// starts, and whether it is all ASCII (where a column is a byte), read once.
+///
+/// **The column resolver turns every expression's span into bytes**, and
+/// `offset_of_line_col` walks from the text's first line each time — so a
+/// dump-shaped `INSERT … VALUES` of 4,000 rows took 400 ms in a release build
+/// and a script of 350 such statements twelve seconds a pass, time quadratic
+/// in the statement. A lookup here is a table read, plus a character walk
+/// only on a line that holds a multi-byte character.
+pub(crate) struct LineIndex {
+    /// The byte each line starts at; `starts[0]` is 0.
+    starts: Vec<usize>,
+    /// Each line holds only ASCII, up to its `\n`.
+    ascii: Vec<bool>,
+}
+
+impl LineIndex {
+    pub(crate) fn new(text: &str) -> LineIndex {
+        let mut starts = vec![0];
+        let mut ascii = Vec::new();
+        let mut plain = true;
+        for (i, b) in text.bytes().enumerate() {
+            if b == b'\n' {
+                starts.push(i + 1);
+                ascii.push(plain);
+                plain = true;
+            } else if b >= 0x80 {
+                plain = false;
+            }
+        }
+        ascii.push(plain);
+        LineIndex { starts, ascii }
+    }
+
+    /// The byte `offset_of_line_col(text, line, col)` answers — `text` being
+    /// the one this index was built from.
+    pub(crate) fn offset(&self, text: &str, line: u64, col: u64) -> usize {
+        if line == 0 {
+            return 0;
+        }
+        let at = (line - 1) as usize;
+        let Some(&start) = self.starts.get(at) else {
+            return text.len();
+        };
+        // Where the line ends: its `\n`, or the text's end.
+        let end = self.starts.get(at + 1).map_or(text.len(), |next| next - 1);
+        let steps = col.saturating_sub(1) as usize;
+        if self.ascii[at] {
+            return (start + steps).min(end);
+        }
+        let mut off = start;
+        for ch in text[start..end].chars().take(steps) {
+            off += ch.len_utf8();
+        }
+        off
+    }
+}
+
 /// Pull the ` at Line: L, Column: C` suffix `sqlparser` appends to its error
 /// messages, returning `(line, col)` and the message with the suffix stripped.
 fn split_error_location(msg: &str) -> (Option<(u64, u64)>, String) {
@@ -11622,6 +11680,7 @@ mod colres {
         let stmt = &sql[lo..hi];
         let mut c = Collector {
             stmt,
+            lines: super::LineIndex::new(stmt),
             lo,
             catalog,
             // Resolved once here rather than carried as a dialect: what the deeper
@@ -11676,6 +11735,9 @@ mod colres {
 
     struct Collector<'a> {
         stmt: &'a str,
+        /// `stmt`'s lines, read once — every span the walk meets goes through
+        /// [`Collector::range`].
+        lines: super::LineIndex,
         lo: usize,
         catalog: &'a Catalog,
         /// The engine's undeclared columns ([`super::SqlDialect::implicit_columns`]),
@@ -11747,8 +11809,7 @@ mod colres {
                     // squiggles on it. `RECURSIVE` marks the whole `WITH` list
                     // in the standard, not one CTE, so that is the granularity
                     // the exception is taken at.
-                    let range =
-                        (!with.recursive).then(|| to_range(self.stmt, self.lo, cte.query.span()));
+                    let range = (!with.recursive).then(|| self.range(cte.query.span()));
                     let key = cte.alias.name.value.to_ascii_lowercase();
                     let displaced = self.ctes.insert(key.clone(), (cols, range));
                     frame.push((key, displaced));
@@ -11760,7 +11821,7 @@ mod colres {
                 // ORDER BY / LIMIT (which hang off the Query, not the Select) are
                 // covered, with the SELECT's sources.
                 SetExpr::Select(sel) => {
-                    let range = to_range(self.stmt, self.lo, q.span());
+                    let range = self.range(q.span());
                     self.push_scope(range, sel);
                 }
                 // A set operation (UNION/EXCEPT/INTERSECT): each branch SELECT is its
@@ -11771,7 +11832,7 @@ mod colres {
                     collect_selects(body, &mut selects);
                     let mut last_end = self.lo;
                     for sel in &selects {
-                        let range = to_range(self.stmt, self.lo, sel.span());
+                        let range = self.range(sel.span());
                         last_end = last_end.max(range.1);
                         self.push_scope(range, sel);
                     }
@@ -11784,7 +11845,7 @@ mod colres {
                     if q.order_by.is_some()
                         && let Some(first) = selects.first()
                     {
-                        let qrange = to_range(self.stmt, self.lo, q.span());
+                        let qrange = self.range(q.span());
                         self.scopes.push(Scope {
                             range: (last_end, qrange.1),
                             sources: vec![Src {
@@ -11833,15 +11894,15 @@ mod colres {
         fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
             if let TableFactor::Table { with_hints, .. } = t {
                 for h in with_hints {
-                    self.not_columns
-                        .push(to_range(self.stmt, self.lo, h.span()));
+                    let at = self.range(h.span());
+                    self.not_columns.push(at);
                 }
             }
             ControlFlow::Continue(())
         }
 
         fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
-            let at = to_range(self.stmt, self.lo, e.span());
+            let at = self.range(e.span());
             if self.not_columns.iter().any(|h| h.0 <= at.0 && at.1 <= h.1) {
                 return ControlFlow::Continue(());
             }
@@ -11859,7 +11920,7 @@ mod colres {
                 Expr::Identifier(id) => self.refs.push(Ref {
                     qualifier: None,
                     col: id.value.to_ascii_lowercase(),
-                    range: to_range(self.stmt, self.lo, id.span),
+                    range: self.range(id.span),
                 }),
                 // A datepart function's first argument is a keyword: record it
                 // before the visitor reaches it.
@@ -11873,8 +11934,8 @@ mod colres {
                     if let FunctionArguments::List(list) = &f.args
                         && let Some(first) = list.args.first()
                     {
-                        self.not_columns
-                            .push(to_range(self.stmt, self.lo, first.span()));
+                        let at = self.range(first.span());
+                        self.not_columns.push(at);
                     }
                 }
                 Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
@@ -11883,7 +11944,7 @@ mod colres {
                     self.refs.push(Ref {
                         qualifier: Some(qual.value.to_ascii_lowercase()),
                         col: col.value.to_ascii_lowercase(),
-                        range: to_range(self.stmt, self.lo, col.span),
+                        range: self.range(col.span),
                     });
                 }
                 _ => {}
@@ -11893,6 +11954,12 @@ mod colres {
     }
 
     impl Collector<'_> {
+        /// `s` as a byte range in the buffer — [`to_range_in`] off this
+        /// statement's [`Collector::lines`].
+        fn range(&self, s: Span) -> (usize, usize) {
+            to_range_in(&self.lines, self.stmt, self.lo, s)
+        }
+
         /// Record a scope for `sel` covering byte `range`, resolving its FROM sources
         /// against the catalog + the CTEs registered so far.
         fn push_scope(&mut self, range: (usize, usize), sel: &Select) {
@@ -11918,7 +11985,7 @@ mod colres {
             let clause = |e: &Option<Expr>, visible: bool| {
                 e.as_ref()
                     .filter(|_| !visible)
-                    .map(|e| to_range(self.stmt, self.lo, e.span()))
+                    .map(|e| self.range(e.span()))
             };
             let alias_blind = [
                 clause(&sel.selection, self.alias_in_where),
@@ -12056,7 +12123,7 @@ mod colres {
                         qualifier: (parts.len() >= 2)
                             .then(|| parts[parts.len() - 2].value.to_ascii_lowercase()),
                         col: col.value.to_ascii_lowercase(),
-                        range: to_range(self.stmt, self.lo, col.span),
+                        range: self.range(col.span),
                     })
                 })
                 .collect();
@@ -12850,6 +12917,21 @@ mod colres {
             lo + offset_of_line_col(stmt, s.end.line, s.end.column),
         )
     }
+
+    /// [`to_range`] off a [`super::LineIndex`] of `stmt` — for a walk that
+    /// converts a span per expression, where `to_range`'s scan from the first
+    /// line made the walk quadratic in the statement.
+    pub(super) fn to_range_in(
+        lines: &super::LineIndex,
+        stmt: &str,
+        lo: usize,
+        s: Span,
+    ) -> (usize, usize) {
+        (
+            lo + lines.offset(stmt, s.start.line, s.start.column),
+            lo + lines.offset(stmt, s.end.line, s.end.column),
+        )
+    }
 }
 
 /// Every place the table alias at `caret` is written — its definition and each
@@ -13171,6 +13253,9 @@ mod alias_refs {
 
     struct Walk<'a> {
         stmt: &'a str,
+        /// `stmt`'s lines, read once — every name the walk places goes
+        /// through [`Walk::span_range`] (see `colres::Collector::lines`).
+        lines: super::LineIndex,
         lo: usize,
         /// Every query's byte range, and the statement's own, outermost.
         scopes: Vec<(usize, usize)>,
@@ -13190,11 +13275,12 @@ mod alias_refs {
     }
 
     impl Walk<'_> {
+        fn span_range(&self, s: sqlparser::tokenizer::Span) -> (usize, usize) {
+            super::colres::to_range_in(&self.lines, self.stmt, self.lo, s)
+        }
+
         fn place(&self, id: &Ident) -> (String, (usize, usize)) {
-            (
-                id.value.to_ascii_lowercase(),
-                to_range(self.stmt, self.lo, id.span),
-            )
+            (id.value.to_ascii_lowercase(), self.span_range(id.span))
         }
 
         /// The qualifier of a dotted name: its second part from the end.
@@ -13285,7 +13371,7 @@ mod alias_refs {
         type Break = ();
 
         fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
-            let mut range = to_range(self.stmt, self.lo, q.span());
+            let mut range = self.span_range(q.span());
             // A lock clause's `OF o` is the query's, though sqlparser leaves
             // it out of the query's span.
             for of in q.locks.iter().filter_map(|l| l.of.as_ref()) {
@@ -13399,6 +13485,7 @@ mod alias_refs {
     ) -> Option<(Walk<'a>, usize)> {
         let mut w = Walk {
             stmt,
+            lines: super::LineIndex::new(stmt),
             lo,
             scopes: vec![(lo, lo + stmt.len())],
             defs: Vec::new(),
@@ -13656,6 +13743,7 @@ mod alias_refs {
         let c = Ctes::of(stmt, lo, ast);
         let mut w = Walk {
             stmt,
+            lines: super::LineIndex::new(stmt),
             lo,
             scopes: vec![(lo, lo + stmt.len())],
             defs: Vec::new(),
@@ -29652,6 +29740,35 @@ mod tests {
         assert_eq!(&sql[offset_of_line_col(sql, 2, 1)..][..4], "FROM");
         assert_eq!(offset_of_line_col(sql, 3, 7), sql.len() - 1); // the `x`
         assert_eq!(offset_of_line_col(sql, 3, 99), sql.len()); // past EOL clamps
+    }
+
+    /// `LineIndex` is `offset_of_line_col` answered from a table, so it must
+    /// give the same byte for every position — inside a line, at and past its
+    /// end, on a line past the last, on line 0, across `\r\n`, and on a line
+    /// holding multi-byte characters (where a column counts characters).
+    #[test]
+    fn the_line_index_answers_what_offset_of_line_col_does() {
+        for text in [
+            "",
+            "SELECT 1",
+            "SELECT 1\nFROM t\nWHERE x",
+            "SELECT 1\r\nFROM t\r\n",
+            "\n\n\nx\n",
+            "SELECT 'café', 'naïve'\nFROM t WHERE n = 'ü'\nAND 1",
+            "a\nü\n\nend",
+        ] {
+            let idx = LineIndex::new(text);
+            let lines = text.split('\n').count() as u64;
+            for line in 0..=lines + 2 {
+                for col in 0..=30 {
+                    assert_eq!(
+                        idx.offset(text, line, col),
+                        offset_of_line_col(text, line, col),
+                        "{text:?} at line {line}, column {col}"
+                    );
+                }
+            }
+        }
     }
 
     // ── FK-aware JOIN … ON ────────────────────────────────────────────────────
