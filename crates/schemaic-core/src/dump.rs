@@ -5244,23 +5244,18 @@ mod tests {
             DumpOptions::default(),
             SqlDialect::Postgres,
         ));
-        for leaf in ["aa_2024"] {
-            let rows = pos(&file, &format!("<<rows {leaf}"));
-            let off = file[..rows]
-                .rfind(&format!("ALTER TABLE \"{leaf}\" DISABLE TRIGGER USER;"))
-                .unwrap_or_else(|| panic!("{leaf}'s clones fire on its rows:\n{file}"));
-            assert!(
-                pos(&file, &format!("CREATE TABLE \"{leaf}\"")) < off,
-                "{file}"
-            );
-            // Set back, from each parent trigger's state, straight after.
-            let back = &file[rows..];
-            let back = &back[..back.find("$schemaic$;").expect("the DO block's end")];
-            assert!(
-                back.contains("tgparentid") && back.contains(&format!("'\"{leaf}\"'::regclass")),
-                "{leaf}'s clones stay off:\n{file}"
-            );
-        }
+        let rows = pos(&file, "<<rows aa_2024");
+        let off = file[..rows]
+            .rfind("ALTER TABLE \"aa_2024\" DISABLE TRIGGER USER;")
+            .unwrap_or_else(|| panic!("the partition's clones fire on its rows:\n{file}"));
+        assert!(pos(&file, "CREATE TABLE \"aa_2024\"") < off, "{file}");
+        // Set back, from each parent trigger's state, straight after.
+        let back = &file[rows..];
+        let back = &back[..back.find("$schemaic$;").expect("the DO block's end")];
+        assert!(
+            back.contains("tgparentid") && back.contains("'\"aa_2024\"'::regclass"),
+            "the partition's clones stay off:\n{file}"
+        );
         // Choosing the parent too: it is recreated, and nothing is cloned yet.
         let s = partitioned_twice();
         let file = file_of(&plan(

@@ -22004,13 +22004,15 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **388 tests** as this is written — 123 suite functions
-  expanded across the three legs by `main.rs`'s macro (369), the thirteen in the two catalog oracles
-  outside it (`pg_catalog`'s six and `mariadb_catalog`'s seven), and the six that need no server
-  (the four name-guard cases, `endpoint.rs`'s declared-case count, and the skip-notice source gate).
-  The figure this sentence carried for a while was 306, a count that had never included the oracles
-  and went stale as the suite grew; `cargo test -p schemaic-db --features live-tests --test live --
-  --list` is where to re-derive it rather than adjust it by hand. It
+  tier stays pure by construction. It is **636 tests** as this is written — 149 suite functions
+  expanded across the three legs by `main.rs`'s macro (447), SQL Server's own 166 in `mssql.rs`,
+  the seventeen in the two catalog oracles outside the macro (`pg_catalog`'s ten and
+  `mariadb_catalog`'s seven), and the six that need no server (the four name-guard cases,
+  `endpoint.rs`'s declared-case count, and the skip-notice source gate). The figure this sentence
+  carried for a while was 306, a count that had never included the oracles, and then 388, which had
+  never included SQL Server's leg; both went stale as the suite grew, so `cargo test -p schemaic-db
+  --features live-tests --test live -- --list` is where to re-derive it rather than adjust it by
+  hand. It
   is reachable from this Windows environment again,
   which several fixes in the same range were measured against after being written blind. With the feature on, an unreachable server is a **failure** —
   a harness that noticed a missing endpoint and returned would report a green suite that asserted
