@@ -1860,13 +1860,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(export_submenu(&dump_ctx, &menu.name, None, None));
                     // The engine's own backup beside Export, and its restore:
                     // in the terminal, through the engine's tools (`core::launch`).
-                    // A backup writes a file and never the server, so a
-                    // read-only connection may take one, as it may export; a
-                    // restore writes the whole database, so it is dimmed there.
+                    // A backup is a file on this machine, so a read-only
+                    // connection may take one, as it may export — except
+                    // where the server writes it (`launch::backup_writes_server`,
+                    // SQL Server's `BACKUP DATABASE`), and there it is dimmed; a
+                    // restore writes the whole database, so it is dimmed too.
                     {
                         let backup = backup_db.clone();
                         let db = menu.name.clone();
-                        entries.push(MenuEntry::action("Back up", move || (backup)(db.clone())));
+                        let writes = schemaic_core::launch::backup_writes_server(
+                            crate::table_designer::edit_ctx(import_ui.conn).dialect,
+                        );
+                        entries.push(
+                            MenuEntry::action("Back up", move || (backup)(db.clone()))
+                                .disabled(writes && conn_read_only(&connections, active_conn)),
+                        );
                     }
                     if schemaic_core::launch::restore_offered(
                         crate::table_designer::edit_ctx(import_ui.conn).dialect,

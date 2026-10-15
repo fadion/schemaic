@@ -692,7 +692,8 @@ pub fn docker_inspect_args(ps_output: &str) -> Result<Vec<String>, &'static str>
 /// A backup or restore file the user picked, or why it cannot be handed to a
 /// client: a line break, which no file name holds and which `mysql`'s
 /// `source` would read as the end of its argument and the start of a second
-/// command.
+/// command. Not the only such character for that client — its own rule is
+/// [`mysql_source_path`]'s.
 pub fn backup_file_target(file: &str) -> Result<&str, &'static str> {
     const LINE_BREAK: &str = "That file name contains a line break, which the client would read \
         as two arguments. Choose another name.";
@@ -710,10 +711,11 @@ pub fn pg_dump_args(
     user: &str,
     db: &str,
     file: &str,
+    role: Option<&str>,
 ) -> Result<Vec<String>, &'static str> {
     let db = psql_target(db)?;
     let file = backup_file_target(file)?;
-    Ok(vec![
+    let mut args: Vec<String> = vec![
         "-h".into(),
         host.into(),
         "-p".into(),
@@ -724,9 +726,22 @@ pub fn pg_dump_args(
         "c".into(),
         "-f".into(),
         file.into(),
-        "-d".into(),
-        db.into(),
-    ])
+    ];
+    args.extend(role_arg(role)?);
+    args.extend(["-d".into(), db.into()]);
+    Ok(args)
+}
+
+/// `--role=<role>` for `pg_dump` and `pg_restore` — the role init SQL takes
+/// ([`init_role`]) — or nothing.
+fn role_arg(role: Option<&str>) -> Result<Option<String>, &'static str> {
+    match role {
+        None => Ok(None),
+        Some(r) if r.is_empty() || r.starts_with('-') || r.contains(['\n', '\r', '\0']) => {
+            Err("The role in this connection's init SQL cannot be handed to the tool as it is.")
+        }
+        Some(r) => Ok(Some(format!("--role={r}"))),
+    }
 }
 
 /// The client and argv that restore `file` into `db`: `psql -f` for a plain
@@ -740,9 +755,11 @@ pub fn pg_restore_args(
     user: &str,
     db: &str,
     file: &str,
+    role: Option<&str>,
 ) -> Result<(&'static str, Vec<String>), &'static str> {
     let db = psql_target(db)?;
     let file = backup_file_target(file)?;
+    let role_flag = role_arg(role)?;
     let mut args: Vec<String> = vec![
         "-h".into(),
         host.into(),
@@ -754,14 +771,22 @@ pub fn pg_restore_args(
         db.into(),
     ];
     if ends_with_ignore_ascii_case(file, ".sql") {
-        args.extend([
-            "-v".into(),
-            "ON_ERROR_STOP=1".into(),
-            "-f".into(),
-            file.into(),
-        ]);
+        args.extend(["-v".into(), "ON_ERROR_STOP=1".into()]);
+        // psql has no `--role`: the role is set first, in the session the
+        // script then runs in (`-c` and `-f` run in order).
+        if let Some(r) = role {
+            args.extend([
+                "-c".into(),
+                format!(
+                    "SET ROLE {}",
+                    crate::export::ident_sql(r, crate::intel::SqlDialect::Postgres)
+                ),
+            ]);
+        }
+        args.extend(["-f".into(), file.into()]);
         Ok(("psql", args))
     } else {
+        args.extend(role_flag);
         // `--` before a file the user named, as before a server-supplied name.
         args.extend(["--no-owner".into(), "--".into(), file.into()]);
         Ok(("pg_restore", args))
@@ -814,7 +839,7 @@ pub fn mysql_restore_args(
     db: &str,
     file: &str,
 ) -> Result<Vec<String>, &'static str> {
-    let file = backup_file_target(file)?;
+    let file = mysql_source_path(file, cfg!(windows))?;
     let mut args: Vec<String> = vec![
         "-h".into(),
         host.into(),
@@ -845,6 +870,127 @@ pub fn mssql_backup_sql(db: &str, file: &str) -> String {
             SqlDialect::MsSql
         )
     )
+}
+
+/// The MySQL-family dump tools *Back up* looks for, in order. **MariaDB's
+/// name first**: where MariaDB's clients are installed (Debian's and Ubuntu's
+/// default) `mysqldump` is a symlink to `mariadb-dump`, so found by that name
+/// it read as Oracle's tool ([`MysqlClient::of`]) and was handed
+/// `--ssl-mode`, which it refuses — every backup failed. No Oracle install
+/// ships a `mariadb-dump`, so asking for it first costs nothing.
+pub const MYSQL_DUMP_TOOLS: [&str; 2] = ["mariadb-dump", "mysqldump"];
+
+/// The clients *Restore from file* looks for, in order — `mariadb` before
+/// `mysql`, for [`MYSQL_DUMP_TOOLS`]' reason.
+pub const MYSQL_RESTORE_TOOLS: [&str; 2] = ["mariadb", "mysql"];
+
+/// Does *Back up* on `dialect` write **on the server**, so that a read-only
+/// connection may not take one? SQL Server's is a `BACKUP DATABASE` the
+/// server runs ([`mssql_backup_sql`]) — a file in its own folder, overwritten
+/// by `INIT`, and history rows in `msdb`. Every other engine's is a read the
+/// tool writes to a file on this machine, as an export is. Exhaustive, so a
+/// fifth engine answers here.
+pub fn backup_writes_server(dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect;
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// The role a connection's init SQL takes with a plain `SET ROLE <name>` —
+/// the last such statement — for the PostgreSQL tools' `--role`, or `None`.
+///
+/// **Backup and restore run outside the app's own connections**, so the init
+/// SQL every one of those runs never reaches `pg_dump`, `pg_restore` or
+/// `psql`: a login with no grants of its own and `SET ROLE app_owner` in its
+/// init SQL backed up as itself (permission denied) and restored objects
+/// owned by itself. The role is the one setting there that decides *whose*
+/// the work is, and the tools take it as an option. Only PostgreSQL's tools
+/// have one; `SET ROLE NONE` is no role, and a statement init SQL refuses is
+/// not read.
+pub fn init_role(init_sql: &str, dialect: crate::intel::SqlDialect) -> Option<String> {
+    use crate::intel::SqlDialect;
+    match dialect {
+        SqlDialect::Postgres => {}
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::Sqlite => return None,
+    }
+    let statements = crate::init_sql::check(init_sql, dialect).ok()?;
+    let mut role = None;
+    for s in &statements {
+        let words = crate::sql::leading_words(s, 2, dialect);
+        if words.first().map(String::as_str) != Some("SET")
+            || words.get(1).map(String::as_str) != Some("ROLE")
+        {
+            continue;
+        }
+        let mut end = 0usize;
+        for _ in 0..2 {
+            end += crate::sql::leading_keyword_end(&s[end..], dialect)?;
+        }
+        let (name, after) = crate::sql::ident_at(s, end, dialect);
+        // Nothing but the name after it, bar the terminator.
+        let rest = s[after..].trim().trim_end_matches(';').trim();
+        role = match name {
+            Some(n) if rest.is_empty() && !n.eq_ignore_ascii_case("NONE") => Some(n),
+            _ => None,
+        };
+    }
+    role
+}
+
+/// The restore file as the `mysql` client's `source` command takes it, or
+/// why it cannot.
+///
+/// **The path is spliced into the client's command line**, and the client
+/// reads `source …` as a command only when the line holds neither its
+/// delimiter `;` nor `\g`; otherwise the line goes to its parser, where `;`
+/// ends the path, `\g` sends what came before to the server as SQL, and on
+/// Unix `\!` runs a shell command — measured on MariaDB 10.11's client with
+/// a name holding `\! touch …;`. So a path with either is refused, and so is
+/// one with space at an end, which the client trims. On `windows` every path
+/// is backslashed (and `C:\Users\me\git\` holds a `\g`); the client takes `/`
+/// there, so the separators are turned round first.
+pub fn mysql_source_path(file: &str, windows: bool) -> Result<String, &'static str> {
+    let file = backup_file_target(file)?;
+    let path = if windows {
+        file.replace('\\', "/")
+    } else {
+        file.to_string()
+    };
+    if path.contains([';', '\\']) || path.trim() != path {
+        return Err(
+            "The mysql client would read that file's path as commands of its own \
+            (a ';' or a '\\' in it, or a space at an end). Move or rename it, then restore it.",
+        );
+    }
+    Ok(path)
+}
+
+/// Does restoring `file` on `dialect` hand it to a client **as a script** —
+/// one whose `USE` or `\connect` can move it off the database it was pointed
+/// at, so it is read first (`script::database_switches`)? MySQL's restore
+/// always `source`s the file; PostgreSQL's runs a `.sql` through `psql` and
+/// anything else through `pg_restore`, which restores into `-d` whatever the
+/// archive says unless asked to create its database ([`pg_restore_args`]).
+pub fn restore_runs_a_script(file: &str, dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect;
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres => ends_with_ignore_ascii_case(file, ".sql"),
+        SqlDialect::MsSql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// The write-log line *Restore from file* writes as it launches the client:
+/// the file and the database in `detail`, the outcome
+/// [`Unknown`](crate::write_log::Outcome::Unknown) — the terminal's client, not
+/// Schemaic, sees how it ends. Without it the largest write the app can start
+/// left nothing in a log that claims every write.
+pub fn restore_log_entry(connection: &str, db: &str, file: &str) -> crate::write_log::Entry {
+    crate::write_log::Entry::now(crate::write_log::Source::Restore, connection, Some(db), "")
+        .with_detail(format!("restore {file} into {db}, run in the terminal"))
+        .ended_as(crate::write_log::Outcome::Unknown, None)
 }
 
 /// Is *Restore from file* offered on `dialect`? Where a client restores a
@@ -889,20 +1035,20 @@ mod tests {
 
     #[test]
     fn pg_dump_writes_the_custom_format_to_the_picked_file() {
-        let args = pg_dump_args("h", 5432, "u", "shop", "C:/b/shop.dump").unwrap();
+        let args = pg_dump_args("h", 5432, "u", "shop", "C:/b/shop.dump", None).unwrap();
         assert_eq!(
             args.join(" "),
             "-h h -p 5432 -U u -F c -f C:/b/shop.dump -d shop"
         );
         assert!(
-            pg_dump_args("h", 5432, "u", "host=evil", "f").is_err(),
+            pg_dump_args("h", 5432, "u", "host=evil", "f", None).is_err(),
             "psql_target's rule"
         );
     }
 
     #[test]
     fn a_sql_script_restores_through_psql_and_a_dump_through_pg_restore() {
-        let (prog, args) = pg_restore_args("h", 1, "u", "shop", "x.SQL").unwrap();
+        let (prog, args) = pg_restore_args("h", 1, "u", "shop", "x.SQL", None).unwrap();
         assert_eq!(prog, "psql");
         assert!(args.ends_with(&[
             "-v".into(),
@@ -910,7 +1056,7 @@ mod tests {
             "-f".into(),
             "x.SQL".into()
         ]));
-        let (prog, args) = pg_restore_args("h", 1, "u", "shop", "-x.dump").unwrap();
+        let (prog, args) = pg_restore_args("h", 1, "u", "shop", "-x.dump", None).unwrap();
         assert_eq!(prog, "pg_restore");
         assert!(
             args.ends_with(&["--no-owner".into(), "--".into(), "-x.dump".into()]),
@@ -945,6 +1091,137 @@ mod tests {
             mysql_restore_args("h", 1, "u", vec![], "shop", "x.sql\nDROP DATABASE shop").is_err()
         );
         assert!(backup_file_target("  ").is_err());
+    }
+
+    /// **The path is spliced into the `mysql` client's command line**, and
+    /// the client reads `source` as a named command only when the line holds
+    /// neither its delimiter nor `\g`: past either, the line goes to its
+    /// parser, where `;` ends the path, `\g` sends what came before it to the
+    /// server, and on Unix `\!` runs a shell (all three measured on MariaDB
+    /// 10.11's client). On Windows every path has backslashes, and `C:\…\git\`
+    /// is a `\g`; the client takes `/` there, so they are turned round.
+    #[test]
+    fn a_mysql_restore_refuses_a_path_its_client_would_parse() {
+        for bad in [
+            "/tmp/a;b/x.sql",
+            "/tmp/x\\git/y.sql",
+            "/tmp/\\! id;.sql",
+            " x.sql",
+        ] {
+            assert!(mysql_source_path(bad, false).is_err(), "{bad:?}");
+        }
+        assert!(mysql_restore_args("h", 1, "u", vec![], "shop", "/tmp/a;b/x.sql").is_err());
+        assert!(mysql_restore_args("h", 1, "u", vec![], "shop", "\\! id;.sql").is_err());
+        assert_eq!(
+            mysql_source_path("C:\\Users\\me\\git\\x.sql", true).as_deref(),
+            Ok("C:/Users/me/git/x.sql")
+        );
+        assert!(mysql_source_path("C:\\a;b\\x.sql", true).is_err());
+        assert_eq!(
+            mysql_source_path("/srv/a b/x.sql", false).as_deref(),
+            Ok("/srv/a b/x.sql")
+        );
+    }
+
+    /// **`mariadb-dump` and `mariadb` first.** On a machine with MariaDB's
+    /// clients (Debian's and Ubuntu's default) `mysqldump` and `mysql` are
+    /// symlinks to them, so the name read as Oracle's and the argv carried
+    /// `--ssl-mode`, which they refuse — every backup and restore failed at
+    /// once (measured with 10.11). No Oracle install ships a `mariadb-dump`,
+    /// so trying it first breaks nothing.
+    #[test]
+    fn mariadbs_tools_are_tried_before_the_names_they_share() {
+        assert_eq!(MYSQL_DUMP_TOOLS[0], "mariadb-dump");
+        assert_eq!(MYSQL_RESTORE_TOOLS[0], "mariadb");
+        assert_eq!(MysqlClient::of(MYSQL_DUMP_TOOLS[0]), MysqlClient::MariaDb);
+        assert_eq!(
+            MysqlClient::of(MYSQL_RESTORE_TOOLS[0]),
+            MysqlClient::MariaDb
+        );
+        assert!(MYSQL_DUMP_TOOLS.contains(&"mysqldump") && MYSQL_RESTORE_TOOLS.contains(&"mysql"));
+    }
+
+    /// SQL Server's backup is a `BACKUP DATABASE` the server runs and writes —
+    /// a file in its folder and rows in `msdb` — so a read-only connection may
+    /// not take one; every other engine's is a file on this machine.
+    #[test]
+    fn only_sql_servers_backup_writes_on_the_server() {
+        use crate::intel::SqlDialect;
+        assert!(backup_writes_server(SqlDialect::MsSql));
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert!(!backup_writes_server(d), "{d:?}");
+        }
+    }
+
+    /// **The role init SQL assumes is the tools' too.** A login with no grants
+    /// of its own and `SET ROLE app_owner` in its init SQL backed up as itself
+    /// (permission denied) and restored objects owned by itself.
+    #[test]
+    fn a_plain_set_role_in_init_sql_is_the_tools_role() {
+        use crate::intel::SqlDialect::{MySql, Postgres};
+        assert_eq!(
+            init_role("SET ROLE app_owner", Postgres).as_deref(),
+            Some("app_owner")
+        );
+        assert_eq!(
+            init_role("SET search_path = app;\nSET ROLE \"App Owner\";", Postgres).as_deref(),
+            Some("App Owner")
+        );
+        assert_eq!(init_role("SET ROLE NONE", Postgres), None);
+        assert_eq!(init_role("SET search_path = app", Postgres), None);
+        assert_eq!(init_role("", Postgres), None);
+        assert_eq!(
+            init_role("SET ROLE r", MySql),
+            None,
+            "the PostgreSQL tools' option"
+        );
+
+        let args = pg_dump_args("h", 1, "u", "shop", "f.dump", Some("app_owner")).unwrap();
+        assert!(args.contains(&"--role=app_owner".to_string()), "{args:?}");
+        let (_, args) = pg_restore_args("h", 1, "u", "shop", "f.dump", Some("app_owner")).unwrap();
+        assert!(args.contains(&"--role=app_owner".to_string()), "{args:?}");
+        // psql has no `--role`: the role is set first, in the same session.
+        let (_, args) = pg_restore_args("h", 1, "u", "shop", "f.sql", Some("App Owner")).unwrap();
+        let at = args.iter().position(|a| a == "-c").expect("a -c");
+        assert_eq!(args[at + 1], "SET ROLE \"App Owner\"");
+        assert!(at < args.iter().position(|a| a == "-f").unwrap());
+        assert!(pg_dump_args("h", 1, "u", "shop", "f", Some("-x")).is_err());
+    }
+
+    /// A restore is logged as it launches — its file and database said, and
+    /// its outcome not claimed, since the terminal's client is what sees it.
+    /// Every file `mysql` sources and every `.sql` psql runs is read for a
+    /// database switch; a PostgreSQL archive goes to `pg_restore`, which the
+    /// same rule in `pg_restore_args` decides.
+    #[test]
+    fn the_restores_that_run_a_script_are_the_ones_read_first() {
+        use crate::intel::SqlDialect;
+        assert!(restore_runs_a_script("x.dump", SqlDialect::MySql));
+        assert!(restore_runs_a_script("x.SQL", SqlDialect::Postgres));
+        assert!(!restore_runs_a_script("x.dump", SqlDialect::Postgres));
+        for f in ["x.sql", "x.dump"] {
+            let (tool, _) = pg_restore_args("h", 1, "u", "d", f, None).unwrap();
+            assert_eq!(
+                tool == "psql",
+                restore_runs_a_script(f, SqlDialect::Postgres),
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restore_is_logged_as_launched_with_its_outcome_unknown() {
+        use crate::write_log::{Outcome, Source};
+        let e = restore_log_entry("prod", "shop", "/b/shop.sql");
+        assert_eq!(e.source, Source::Restore);
+        assert_eq!(e.outcome, Outcome::Unknown);
+        assert_eq!(e.database.as_deref(), Some("shop"));
+        assert_eq!(e.connection, "prod");
+        let detail = e.detail.unwrap_or_default();
+        assert!(
+            detail.contains("/b/shop.sql") && detail.contains("shop"),
+            "{detail}"
+        );
     }
 
     #[test]

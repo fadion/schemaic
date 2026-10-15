@@ -779,7 +779,8 @@ fn pg_dump_shell(
 ) -> Result<schemaic_term::ShellConfig, String> {
     tool_tunnel_check(conn)?;
     let prog = native_tool(&["pg_dump"], "No pg_dump found on PATH.")?;
-    let args = launch::pg_dump_args(&conn.host, conn.port, &conn.user, db, file)?;
+    let role = launch::init_role(&conn.init_sql, SqlDialect::from_db_type(&conn.db_type));
+    let args = launch::pg_dump_args(&conn.host, conn.port, &conn.user, db, file, role.as_deref())?;
     let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
     env.extend(launch::psql_cli_tls_env(&conn.tls));
     Ok(wrap_launcher(CliLauncher::Native(prog), args, env))
@@ -793,7 +794,9 @@ fn pg_restore_shell(
     file: &str,
 ) -> Result<schemaic_term::ShellConfig, String> {
     tool_tunnel_check(conn)?;
-    let (tool, args) = launch::pg_restore_args(&conn.host, conn.port, &conn.user, db, file)?;
+    let role = launch::init_role(&conn.init_sql, SqlDialect::from_db_type(&conn.db_type));
+    let (tool, args) =
+        launch::pg_restore_args(&conn.host, conn.port, &conn.user, db, file, role.as_deref())?;
     let prog = native_tool(&[tool], &format!("No {tool} found on PATH."))?;
     let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
     env.extend(launch::psql_cli_tls_env(&conn.tls));
@@ -809,8 +812,8 @@ fn mysqldump_shell(
 ) -> Result<schemaic_term::ShellConfig, String> {
     tool_tunnel_check(conn)?;
     let prog = native_tool(
-        &["mysqldump", "mariadb-dump"],
-        "No mysqldump or mariadb-dump found on PATH.",
+        &launch::MYSQL_DUMP_TOOLS,
+        "No mariadb-dump or mysqldump found on PATH.",
     )?;
     let tls = launch::mysql_cli_tls_args(&conn.tls, launch::MysqlClient::of(prog));
     let args = launch::mysqldump_args(&conn.host, conn.port, &conn.user, tls, db, file)?;
@@ -829,8 +832,8 @@ fn mysql_restore_shell(
 ) -> Result<schemaic_term::ShellConfig, String> {
     tool_tunnel_check(conn)?;
     let prog = native_tool(
-        &["mysql", "mariadb"],
-        "No mysql or mariadb client found on PATH.",
+        &launch::MYSQL_RESTORE_TOOLS,
+        "No mariadb or mysql client found on PATH.",
     )?;
     let tls = launch::mysql_cli_tls_args(&conn.tls, launch::MysqlClient::of(prog));
     let args = launch::mysql_restore_args(&conn.host, conn.port, &conn.user, tls, db, file)?;
@@ -14090,6 +14093,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let Some(conn) = active_connection() else {
                 return;
             };
+            // **The launch guards itself**, read live: where the backup is
+            // the server's own write (SQL Server's `BACKUP DATABASE`), a
+            // read-only connection may not take one — the menu's dimming is
+            // not the guard.
+            if launch::backup_writes_server(SqlDialect::from_db_type(&conn.db_type))
+                && connections
+                    .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn.id))
+            {
+                (run_in_panel)(
+                    Err(
+                        "This connection is read-only in Schemaic, and this engine's backup \
+                         is written by the server, so none was taken."
+                            .to_string(),
+                    ),
+                    "read-only refusal message shell",
+                );
+                return;
+            }
             let stamp = launch::backup_stamp_now();
             let engine = schemaic_db::Engine::from_db_type(&conn.db_type);
             if engine == schemaic_db::Engine::MsSql {
@@ -14173,6 +14194,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let restore_db: Rc<dyn Fn(String)> = {
         let reach = reach_for_cli.clone();
         let run_in_panel = run_in_panel.clone();
+        let (handle, log_write) = (handle.clone(), log_write.clone());
         Rc::new(move |db: String| {
             use floem::file::FileDialogOptions;
             let Some(conn) = active_connection() else {
@@ -14192,6 +14214,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             }
             let (reach, run_in_panel) = (reach.clone(), run_in_panel.clone());
+            let (handle, log_write) = (handle.clone(), log_write.clone());
             let db = db.clone();
             floem::file_action::open_file(
                 FileDialogOptions::new().title("Restore from file"),
@@ -14200,11 +14223,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         return; // cancelled
                     };
                     let path = path.display().to_string();
+                    let dialect = SqlDialect::from_db_type(&conn.db_type);
                     let (reach, run_in_panel) = (reach.clone(), run_in_panel.clone());
                     let (db_c, path_c, conn) = (db.clone(), path.clone(), conn.clone());
+                    let refused = run_in_panel.clone();
+                    let log_write = log_write.clone();
                     // **Asked first**: a restore writes over what is there, and
                     // nothing undoes it.
-                    confirm.set(Some(Confirm {
+                    let ask: Rc<dyn Fn()> =
+                        Rc::new(move || {
+                            let (reach, run_in_panel, log_write) =
+                                (reach.clone(), run_in_panel.clone(), log_write.clone());
+                            let (db_c, path_c, conn) = (db_c.clone(), path_c.clone(), conn.clone());
+                            let (path, db) = (path_c.clone(), db_c.clone());
+                            confirm.set(Some(Confirm {
                         title: "Restore from file".to_string(),
                         message: format!(
                             "Run {path} into {db} on {}? What it creates or replaces cannot \
@@ -14243,9 +14275,59 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     }
                                 }
                             });
+                            // Logged as it launches: the terminal's client,
+                            // not Schemaic, sees how it ends.
+                            if built.is_ok() {
+                                (log_write)(
+                                    conn.id,
+                                    dialect,
+                                    launch::restore_log_entry(&conn.name, &db_c, &path_c),
+                                );
+                            }
                             (run_in_panel)(built, "restore");
                         }),
                     }));
+                        });
+                    if !launch::restore_runs_a_script(&path, dialect) {
+                        return ask();
+                    }
+                    // **Read whole before asking**: a script's `USE` or
+                    // `\connect` takes the restore to another database than
+                    // the one the question names (`script::restore_refusal`).
+                    // Off the UI thread — a dump can be gigabytes.
+                    let shown = path.clone();
+                    let target = db.clone();
+                    let report = create_ext_action(
+                        cx,
+                        move |read: Result<Vec<schemaic_core::script::DatabaseSwitch>, String>| {
+                            match read {
+                                Err(e) => (refused)(
+                                    Err(format!(
+                                        "{shown} could not be read before restoring it, so \
+                                         nothing was run: {e}"
+                                    )),
+                                    "restore refusal",
+                                ),
+                                Ok(switches) => match schemaic_core::script::restore_refusal(
+                                    &shown, &target, &switches,
+                                ) {
+                                    Some(why) => (refused)(Err(why), "restore refusal"),
+                                    None => ask(),
+                                },
+                            }
+                        },
+                    );
+                    handle.spawn_blocking(move || {
+                        let read = std::fs::File::open(&path)
+                            .and_then(|f| {
+                                schemaic_core::script::database_switches(
+                                    std::io::BufReader::new(f),
+                                    dialect,
+                                )
+                            })
+                            .map_err(|e| e.to_string());
+                        report(read);
+                    });
                 },
             );
         })

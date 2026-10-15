@@ -41,7 +41,7 @@ behind it is one engine's alone:
 `routine_takes_language`, `takes_table_options`, `supports_column_on_update`,
 `supports_unenforced_check`, `supports_view_security`, `view_replace_can_refuse`,
 `supports_fk_set_default`, `supports_fk_restrict`, `supports_extensions`,
-`users::accounts_have_hosts` — and, for the *comparison* rather than any editor,
+`users::accounts_have_hosts`, `launch::backup_writes_server` — and, for the *comparison* rather than any editor,
 `ddl::ref_schema_is_database` and `view_definition_is_qualified`, which ask whether a field the
 differ reads names the object or the database it was read from, and
 `namespace_comes_with_every_database`, which keeps a schema the target already has out of the

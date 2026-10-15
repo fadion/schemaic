@@ -17,12 +17,14 @@
 //! `sql::contains_write` calls a write, or one the read-only gate will not
 //! call a read, so a `SELECT` of a writing function is logged too — and the
 //! grid commit, the DDL preview, the import and a `.sql` file run log
-//! whatever they ran. The MCP server has no write tool, so it has nothing to
-//! log. **How a statement ended** is [`Entry::landed`]'s, from a [`Ran`] each
-//! front end maps its own state onto, and which statements of a Run All get a
-//! line is [`batch_logged`]'s — decisions that lived in an app closure and a
-//! CLI function, untested, until a typed `COMMIT` of an aborted PostgreSQL
-//! transaction was logged `ok`.
+//! whatever they ran. *Restore from file* hands the file to the engine's own
+//! client in the terminal, so it is logged as it is launched, its outcome
+//! unknown ([`Source::Restore`]). The MCP server has no write tool, so it has
+//! nothing to log. **How a statement ended** is [`Entry::landed`]'s, from a
+//! [`Ran`] each front end maps its own state onto, and which statements of a
+//! Run All get a line is [`batch_logged`]'s — decisions that lived in an app
+//! closure and a CLI function, untested, until a typed `COMMIT` of an aborted
+//! PostgreSQL transaction was logged `ok`.
 //!
 //! **Values are masked by default, because the SQL is the user's data.** An
 //! `UPDATE … SET email = 'ann@example.com'` carries the very value a log should
@@ -61,6 +63,11 @@ pub enum Source {
     Copy,
     /// `schemaic exec`.
     Cli,
+    /// *Restore from file*, launched in the terminal by the engine's own
+    /// client (`psql`, `pg_restore`, `mysql`). Logged when it starts, with
+    /// the file in `detail`: the client, not Schemaic, sees how it ends, so
+    /// its outcome is [`Outcome::Unknown`].
+    Restore,
 }
 
 /// How the write ended, as far as the client can tell.

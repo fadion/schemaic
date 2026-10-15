@@ -1077,6 +1077,296 @@ pub fn run_outcome(read: ReadEnd, exec: ExecEnd, ran: usize) -> RunOutcome {
     }
 }
 
+/// A line of a script that takes a restore **off the database it was pointed
+/// at** — `USE shop`, psql's `\connect shop`, a `CREATE` or `DROP DATABASE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatabaseSwitch {
+    /// The database it names, or `None` where it names one this cannot read
+    /// (a psql connection string it does not parse).
+    pub database: Option<String>,
+    /// What does it, as the refusal names it: `USE`, `\connect`,
+    /// `CREATE DATABASE`.
+    pub how: String,
+    /// 1-based line it is on.
+    pub line: u64,
+}
+
+/// Every [`DatabaseSwitch`] in a whole script — **the whole of it**, unlike
+/// [`probe`]: `mysqldump --databases a b` writes `USE b` half-way down, and a
+/// look at the first megabytes would pass it. Read a block at a time through
+/// the [`Splitter`], so a large dump is never held whole; the caller runs it
+/// off the UI thread.
+///
+/// `InvalidData` when one statement outgrows [`MAX_PENDING_BYTES`] — a file
+/// with no terminator, which the client could not run as a script either.
+pub fn database_switches<R: std::io::Read>(
+    mut r: R,
+    dialect: SqlDialect,
+) -> std::io::Result<Vec<DatabaseSwitch>> {
+    let mut splitter = Splitter::new(dialect);
+    let mut found = Vec::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = r.read(&mut buf)?;
+        let stmts = if n == 0 {
+            splitter.finish()
+        } else {
+            splitter.push(&buf[..n])
+        };
+        for s in &stmts {
+            found.extend(statement_switches(&s.sql, s.line, dialect));
+        }
+        if n == 0 {
+            return Ok(found);
+        }
+        if splitter.pending() > MAX_PENDING_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "it holds no statement terminator, so it is not a SQL script",
+            ));
+        }
+    }
+}
+
+/// The client commands that change the database, as `\<word>` at the start of
+/// a line: psql's `\c`/`\connect`, the `mysql` client's `\u` (use) and `\r`
+/// (connect). Exhaustive, so a fifth engine answers here.
+fn switch_commands(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::Postgres => &["c", "connect"],
+        SqlDialect::MySql => &["u", "r"],
+        SqlDialect::Sqlite | SqlDialect::MsSql => &[],
+    }
+}
+
+/// The switches in one statement of a script, `line` being the line it
+/// starts on: client commands at the start of a line outside any string or
+/// comment ([`switch_commands`]), then the statement's own head — `USE` and
+/// the `mysql` client's bare `connect` where the engine has them, and a
+/// `CREATE`/`DROP DATABASE` (or MySQL's `SCHEMA`, the same thing) anywhere.
+fn statement_switches(sql: &str, line: u64, dialect: SqlDialect) -> Vec<DatabaseSwitch> {
+    let b = sql.as_bytes();
+    let line_of = |at: usize| line + b[..at].iter().filter(|&&c| c == b'\n').count() as u64;
+    let mut out = Vec::new();
+    // Where the SQL after the last client command starts.
+    let mut sql_from = 0usize;
+    let mut i = 0usize;
+    let mut line_start = true;
+    while i < b.len() {
+        match b[i] {
+            b'\n' => {
+                line_start = true;
+                i += 1;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' => {
+                i += 1;
+                continue;
+            }
+            b'\\' if line_start => {
+                let end = sql[i..].find('\n').map_or(b.len(), |n| i + n);
+                let command = &sql[i + 1..end];
+                let word: String = command
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .collect();
+                if switch_commands(dialect).contains(&word.as_str()) {
+                    out.push(DatabaseSwitch {
+                        database: command_database(&command[word.len()..], dialect),
+                        how: format!("\\{word}"),
+                        line: line_of(i),
+                    });
+                }
+                sql_from = end;
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        line_start = false;
+        match crate::sql::skip_noncode(b, i, dialect) {
+            Some(j) => {
+                line_start = j > 0 && b[j - 1] == b'\n';
+                i = j.max(i + 1);
+            }
+            None => i += 1,
+        }
+    }
+    let rest = &sql[sql_from..];
+    let words = crate::sql::leading_words(rest, 2, dialect);
+    let head = words.first().map(String::as_str);
+    let object = words.get(1).map(String::as_str);
+    let at = |n: usize| {
+        // Past the first `n` words of `rest`, through the one lexer.
+        let mut end = 0usize;
+        for _ in 0..n {
+            end += crate::sql::leading_keyword_end(&rest[end..], dialect)?;
+        }
+        Some(end)
+    };
+    let switch = match (head, object) {
+        (Some("USE"), _) if uses_databases(dialect) => Some((1, "USE".to_string())),
+        (Some("CONNECT"), _) if client_connect_is_a_command(dialect) => {
+            Some((1, "connect".to_string()))
+        }
+        (Some(verb @ ("CREATE" | "DROP")), Some("DATABASE")) => {
+            Some((2, format!("{verb} DATABASE")))
+        }
+        (Some(verb @ ("CREATE" | "DROP")), Some("SCHEMA")) if schema_is_database(dialect) => {
+            Some((2, format!("{verb} SCHEMA")))
+        }
+        _ => None,
+    };
+    if let Some((n, how)) = switch
+        && let Some(end) = at(n)
+    {
+        // The head keyword's own line, past any comment before it.
+        let first = at(1).unwrap_or(0) - head.map_or(0, str::len);
+        out.push(DatabaseSwitch {
+            database: name_after(rest, end, dialect),
+            how,
+            line: line_of(sql_from + first),
+        });
+    }
+    out
+}
+
+/// Does `USE <name>` switch the database on `dialect`?
+fn uses_databases(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does the engine's script client read a bare `connect <db>` at the start of
+/// a line as its own command — the `mysql` client's?
+fn client_connect_is_a_command(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Is a `SCHEMA` a database on `dialect` — MySQL's synonym?
+fn schema_is_database(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// The name after `from` in `sql`, past comments and an `IF [NOT] EXISTS`.
+fn name_after(sql: &str, from: usize, dialect: SqlDialect) -> Option<String> {
+    let b = sql.as_bytes();
+    let mut i = from;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if crate::sql::is_word_start(b[i]) || matches!(b[i], b'`' | b'"' | b'[') {
+            let (name, end) = crate::sql::ident_at(sql, i, dialect);
+            let bare = crate::sql::is_word_start(b[i]);
+            match name {
+                Some(n)
+                    if bare
+                        && ["IF", "NOT", "EXISTS"]
+                            .iter()
+                            .any(|w| n.eq_ignore_ascii_case(w)) =>
+                {
+                    i = end.max(i + 1);
+                    continue;
+                }
+                other => return other,
+            }
+        }
+        // A comment is passed, and so is punctuation: MySQL's conditional
+        // `/*!32312 IF NOT EXISTS*/` is code to it, so its words are read
+        // (and the `IF NOT EXISTS` passed) rather than skipped.
+        i = crate::sql::skip_noncode(b, i, dialect)
+            .unwrap_or(i + 1)
+            .max(i + 1);
+    }
+    None
+}
+
+/// The database a client's switch command names — what follows `\c`, `\u`,
+/// `\r`. psql's may be a connection string, `"dbname='shop'"`, behind options
+/// such as `-reuse-previous=on`; anything this does not read is `None`.
+fn command_database(args: &str, dialect: SqlDialect) -> Option<String> {
+    let unquote = |t: &str| -> String {
+        let t = t.trim();
+        for (o, c) in [('"', '"'), ('\'', '\''), ('`', '`')] {
+            if t.len() >= 2 && t.starts_with(o) && t.ends_with(c) {
+                return t[1..t.len() - 1].to_string();
+            }
+        }
+        t.to_string()
+    };
+    // The terminator a `mysql` command may carry.
+    let args = args.trim().trim_end_matches(';');
+    let token = match dialect {
+        SqlDialect::Postgres => args.split_whitespace().find(|t| !t.starts_with('-'))?,
+        _ => args.split_whitespace().next()?,
+    };
+    let token = unquote(token);
+    if token.contains('=') {
+        // A connection string: only its `dbname` is the database, and one
+        // without it (or with a host) names nothing this can compare.
+        let pairs: Vec<(&str, String)> = token
+            .split_whitespace()
+            .filter_map(|p| p.split_once('=').map(|(k, v)| (k, unquote(v))))
+            .collect();
+        if pairs.iter().any(|(k, _)| *k != "dbname") {
+            return None;
+        }
+        return pairs.into_iter().map(|(_, v)| v).next();
+    }
+    (!token.is_empty()).then_some(token)
+}
+
+/// Why *Restore from file* must not run `file` into `target`, or `None`.
+///
+/// **The confirm names a database the file can override.** `mysql`'s
+/// `-- db` and psql's `-d db` only choose where the script *starts*: a
+/// `USE shop` or `\connect shop` in it moves every statement after to
+/// `shop`, and a `--databases` dump drops and recreates each of its tables
+/// there, under a question that named `shop_copy`. A switch to the target
+/// itself is no move; any other — or one whose database cannot be read — is
+/// refused, the lines named, so the user can restore into the database the
+/// file names or edit them out.
+pub fn restore_refusal(file: &str, target: &str, switches: &[DatabaseSwitch]) -> Option<String> {
+    let elsewhere: Vec<&DatabaseSwitch> = switches
+        .iter()
+        .filter(|s| s.database.as_deref() != Some(target))
+        .collect();
+    if elsewhere.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = elsewhere
+        .iter()
+        .take(3)
+        .map(|s| match &s.database {
+            Some(db) => format!("{} `{db}` on line {}", s.how, s.line),
+            None => format!(
+                "a {} on line {} that names no database Schemaic can read",
+                s.how, s.line
+            ),
+        })
+        .collect();
+    let more = match elsewhere.len() {
+        n if n > 3 => format!(", and {} more", n - 3),
+        _ => String::new(),
+    };
+    Some(format!(
+        "{file} moves to another database as it runs — {}{more} — so restored into {target} it \
+         would write there instead. Nothing was run. Restore it into the database it names, or \
+         remove those lines from a copy of the file.",
+        shown.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1385,117 @@ mod tests {
         }
         out.extend(s.finish().into_iter().map(|st| st.sql));
         out
+    }
+
+    fn switches(script: &str, d: SqlDialect) -> Vec<(Option<String>, String, u64)> {
+        database_switches(script.as_bytes(), d)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.database, s.how, s.line))
+            .collect()
+    }
+
+    /// **`mysqldump --databases`** — what HeidiSQL and most "export database"
+    /// tools write — names its database twice: a `CREATE DATABASE` and a `USE`,
+    /// behind conditional comments. Run as a restore into `shop_copy`, the
+    /// `USE` sent every `DROP TABLE` into `shop` (measured on MariaDB 10.11).
+    #[test]
+    fn a_databases_dump_names_the_database_it_switches_to() {
+        let dump = "-- MariaDB dump 10.19\n\
+            /*!40101 SET NAMES utf8mb4 */;\n\
+            --\n-- Current Database: `shop`\n--\n\n\
+            CREATE DATABASE /*!32312 IF NOT EXISTS*/ `shop` /*!40100 DEFAULT CHARACTER SET utf8mb4 */;\n\n\
+            USE `shop`;\n\
+            DROP TABLE IF EXISTS `orders`;\n\
+            INSERT INTO `orders` VALUES (1,'USE other; \\\\u other');\n";
+        assert_eq!(
+            switches(dump, SqlDialect::MySql),
+            vec![
+                (Some("shop".into()), "CREATE DATABASE".into(), 7),
+                (Some("shop".into()), "USE".into(), 9),
+            ]
+        );
+        let refusal = restore_refusal(
+            "shop.sql",
+            "shop_copy",
+            &database_switches(dump.as_bytes(), SqlDialect::MySql).unwrap(),
+        )
+        .expect("refused");
+        assert!(
+            refusal.contains("shop_copy") && refusal.contains("USE `shop`"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("line 9"), "{refusal}");
+    }
+
+    /// A single-database dump names none, and one that names only the target
+    /// itself is restored where the user said.
+    #[test]
+    fn a_dump_of_one_database_or_of_the_target_itself_is_not_refused() {
+        let plain = "DROP TABLE IF EXISTS `orders`;\nCREATE TABLE `orders` (id int);\n";
+        assert!(switches(plain, SqlDialect::MySql).is_empty());
+        let own = "USE `shop_copy`;\nCREATE TABLE t (id int);\n";
+        let found = database_switches(own.as_bytes(), SqlDialect::MySql).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(restore_refusal("own.sql", "shop_copy", &found), None);
+        // Case is part of a MySQL database's name on Linux.
+        assert!(restore_refusal("own.sql", "Shop_Copy", &found).is_some());
+    }
+
+    /// The `mysql` client's own commands switch too, without a terminator:
+    /// `use db`, `\u db`, `connect db`, `\r db`.
+    #[test]
+    fn the_mysql_clients_own_switches_are_found() {
+        let script = "use shop\nSELECT 1;\n\\u other\nSELECT 2;\nconnect third\nSELECT 3;\n";
+        let found: Vec<Option<String>> = switches(script, SqlDialect::MySql)
+            .into_iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                Some("shop".into()),
+                Some("other".into()),
+                Some("third".into())
+            ]
+        );
+    }
+
+    /// **`pg_dump -C`'s script** creates its database and `\connect`s to it —
+    /// in the `-reuse-previous=on "dbname='shop'"` form PostgreSQL 12 and later
+    /// write, and the bare one older versions did.
+    #[test]
+    fn a_pg_dump_create_script_names_its_connect() {
+        let dump = "SET statement_timeout = 0;\n\
+            CREATE DATABASE shop WITH TEMPLATE = template0 ENCODING = 'UTF8';\n\
+            ALTER DATABASE shop OWNER TO app;\n\
+            \\connect -reuse-previous=on \"dbname='shop'\"\n\n\
+            SET statement_timeout = 0;\n\
+            CREATE TABLE public.t (v text DEFAULT '\\connect other');\n\
+            \\c legacy\n\
+            SELECT 1;\n";
+        assert_eq!(
+            switches(dump, SqlDialect::Postgres),
+            vec![
+                (Some("shop".into()), "CREATE DATABASE".into(), 2),
+                (Some("shop".into()), "\\connect".into(), 4),
+                (Some("legacy".into()), "\\c".into(), 8),
+            ]
+        );
+    }
+
+    /// A `\connect` whose target cannot be read is still a switch, and still
+    /// refused — it is a database other than the one the user picked.
+    #[test]
+    fn an_unreadable_connect_is_refused_rather_than_trusted() {
+        let found = database_switches(
+            "\\connect \"host=db2 port=5433\"\nSELECT 1;\n".as_bytes(),
+            SqlDialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].database, None);
+        assert!(restore_refusal("x.sql", "shop", &found).is_some());
     }
 
     /// **A UTF-16 script runs as the text it is.** Read as UTF-8 it was a NUL

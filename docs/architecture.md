@@ -10882,11 +10882,14 @@ existing prose was left alone.
     appending at once do not interleave inside a line. Its error is the caller's to report or drop
     and never to turn into the write failing: the write it records has already happened.
     `Entry { ts, source, connection, database, sql, detail, rows, outcome, error, masked }` — `ts`
-    in Unix milliseconds, `Source` one of `editor`/`script`/`grid`/`ddl`/`import`/`copy`/`cli`,
-    `connection` the name the user saved. `Outcome` is `ok`/`failed`/`cancelled` and **`unknown`,
-    for a write the client lost track of** — `schemaic exec`'s deadline passing after the
-    statement was sent, which may or may not have taken effect (exit 5, under `cli/exec.rs`). `sql`
-    is empty where a path has no statement to name — an import, a file that ran to the end — and
+    in Unix milliseconds, `Source` one of `editor`/`script`/`grid`/`ddl`/`import`/`copy`/`cli`/
+    `restore`, `connection` the name the user saved. `Outcome` is `ok`/`failed`/`cancelled` and
+    **`unknown`, for a write the client lost track of** — `schemaic exec`'s deadline passing after the
+    statement was sent, which may or may not have taken effect (exit 5, under `cli/exec.rs`), and
+    every *Restore from file*, which is logged as it launches and ends in the terminal's client,
+    out of Schemaic's sight (`launch::restore_log_entry`). `sql`
+    is empty where a path has no statement to name — an import, a restore, a file that ran to the
+    end — and
     `detail` says what happened instead, in Schemaic's own words over a path and a table name, so
     it is never masked. `now` stamps an entry (an empty database is `None`,
     `an_empty_database_is_no_database`), `with_detail` adds the detail, and `ended` (`Ok(rows)` or
@@ -15829,6 +15832,25 @@ existing prose was left alone.
     file the panel deliberately does not read whole.
     **The write guard for this path is `sql::script_verdict`**, not `run_verdict` — see the
     invariant.
+    **`database_switches` reads a script for the lines that take it off its database**, for
+    *Restore from file*, and reads **all** of it where `probe` stops at a prefix: `mysqldump
+    --databases a b` writes `USE b` half-way down. It feeds the `Splitter` a block at a time, so a
+    dump is never held whole, and answers a `DatabaseSwitch { database, how, line }` for each
+    client command at the start of a line outside any string or comment — psql's `\c`/`\connect`,
+    the `mysql` client's `\u` and `\r` (`switch_commands`) — and each statement headed `USE` (MySQL,
+    SQL Server), the `mysql` client's bare `connect`, `CREATE`/`DROP DATABASE`, or on MySQL
+    `CREATE`/`DROP SCHEMA`, its synonym. A psql target may be a connection string — `pg_dump -C`
+    writes `\connect -reuse-previous=on "dbname='shop'"` on PostgreSQL 12 and later — and only a lone
+    `dbname` in one is read; a host or anything else beside it is `database: None`
+    (`a_pg_dump_create_script_names_its_connect`). A statement outgrowing `MAX_PENDING_BYTES` is
+    `InvalidData`: a file with no terminator, which the client could not run as a script either.
+    `restore_refusal(file, target, switches)` is the decision: a switch naming another database, or
+    one it cannot read, refuses, naming up to three of the lines and saying nothing was run
+    (`a_databases_dump_names_the_database_it_switches_to`,
+    `an_unreadable_connect_is_refused_rather_than_trusted`); a switch to the target itself is no
+    move, compared case-sensitively, case being part of a MySQL database's name on Linux
+    (`a_dump_of_one_database_or_of_the_target_itself_is_not_refused`). Why it exists is the
+    write-guard invariant's restore paragraph.
   - `sqlfile.rs` — the pure half of opening and saving a tab's SQL as a `.sql` file on disk: what a
     file's bytes become in the editor (`decode`), what the editor's text becomes on the way back
     (`encode`), what the tab is called once it has a file (`tab_title` — the file name *with* its
@@ -16103,7 +16125,17 @@ existing prose was left alone.
     server-supplied, but a CR, LF or NUL (or a blank name) is refused, because `mysql`'s `source`
     reads to the end of its line and what follows a break would be a second command —
     `x.sql\nDROP DATABASE shop` is the test's case
-    (`a_mysql_restore_sources_the_file_and_refuses_a_line_break`). `pg_dump_args` writes the custom
+    (`a_mysql_restore_sources_the_file_and_refuses_a_line_break`). **A line break is not `mysql`'s only
+    hazard, so its restore asks `mysql_source_path` too**: the path is spliced into the client's own
+    command line, which reads `source …` as a command only when the line holds neither its
+    delimiter `;` nor `\g` — otherwise the line goes to its parser, where `;` cuts the path, `\g`
+    sends what came before it to the server as SQL, and on Unix `\!` runs a shell command (measured
+    on MariaDB 10.11's client with a name holding `\! touch …;`). So a path with a `;` or a `\` is
+    refused, and so is one with space at either end, which the client trims
+    (`a_mysql_restore_refuses_a_path_its_client_would_parse`). On Windows every path is backslashed
+    — `C:\Users\me\git\` holds a `\g` — so `mysql_restore_args` passes `cfg!(windows)` and the
+    separators are turned to `/` first, which the client takes there; that arm has not been run
+    against a Windows client, none being installed when it landed. `pg_dump_args` writes the custom
     format (`-F c -f <file> -d <db>`), which `pg_restore` reads selectively, and the database still
     goes through `psql_target`, `pg_dump`'s `-d` being libpq's and re-read as a conninfo string by the
     same rule (`pg_dump_writes_the_custom_format_to_the_picked_file`). **`pg_restore_args` returns
@@ -16112,6 +16144,18 @@ existing prose was left alone.
     error rather than being reported done; anything else is `pg_restore --no-owner -- <file>`, the
     `--` ahead of a name that may begin with `-`, and `--no-owner` because a dump names roles this
     server may not have (`a_sql_script_restores_through_psql_and_a_dump_through_pg_restore`).
+    **Both PostgreSQL builders take the role init SQL sets**, because the tools run outside the
+    app's connections and the init SQL every one of those runs never reaches them: a `NOINHERIT`
+    login with `SET ROLE` in its init SQL got *permission denied* from `pg_dump` without `--role`
+    and succeeded with it, and with it both restore paths create objects owned by the role
+    (verified on PostgreSQL 16). `init_role(init_sql, dialect)` reads a plain `SET ROLE <name>` —
+    the last one, `NONE` being none — from `init_sql::check`'s statements, so a statement init SQL
+    refuses is never read, and answers `None` on every other engine
+    (`a_plain_set_role_in_init_sql_is_the_tools_role`). `pg_dump` and `pg_restore` take it as
+    `--role=<r>`, and a role that is empty, leads with `-` or holds a line break refuses the launch
+    instead; `psql` has no `--role`, so a `.sql` restore runs `-c "SET ROLE <quoted>"` before its
+    `-f`, `psql` running the two in order in one session. The role is the one setting there that
+    decides *whose* the work is; the rest of init SQL still reaches no tool here.
     `mysqldump_args` is `--single-transaction --routines --triggers --events --result-file=<file> --
     <db>` — one consistent snapshot of the transactional tables with no lock held, the database name
     behind `--` for `mysql_shell_config`'s reason, and the TLS flags handed in from
@@ -16120,7 +16164,14 @@ existing prose was left alone.
     `--execute=source <file> -- <db>`, there being no shell to redirect a file into the client. Which
     tool was found is why **`MysqlClient::of` reads `mariadb-dump` as MariaDB too**: the dump tool
     spells TLS as its client does, and taken for Oracle's it would be handed an `--ssl-mode` it does
-    not know (`mariadbs_dump_tool_spells_tls_as_its_client_does`). `mssql_backup_sql` is T-SQL
+    not know (`mariadbs_dump_tool_spells_tls_as_its_client_does`). **And it is why MariaDB's names are
+    asked for first** — `MYSQL_DUMP_TOOLS` is `mariadb-dump` then `mysqldump`, `MYSQL_RESTORE_TOOLS`
+    `mariadb` then `mysql`. Where MariaDB's clients are installed (Debian's and Ubuntu's default)
+    `mysqldump` and `mysql` are symlinks to them; found by those names they read as Oracle's to
+    `MysqlClient::of`, were handed `--ssl-mode`, which they refuse, and every backup and restore
+    failed. No Oracle install ships `mariadb-dump`, so the order costs nothing there
+    (`mariadbs_tools_are_tried_before_the_names_they_share`); *Open in CLI*'s own `mysql`-symlink
+    residual, on `MysqlClient::of`, is unchanged. `mssql_backup_sql` is T-SQL
     rather than an argv — `BACKUP DATABASE [db] TO DISK = N'<file>' WITH COPY_ONLY, INIT`, quoted
     through `export::ident_sql` and `sql_literal`
     (`a_sql_server_backup_is_quoted_and_leaves_the_backup_chain_alone`). The server writes the file,
@@ -16134,7 +16185,20 @@ existing prose was left alone.
     **`restore_offered(dialect)` is an exhaustive capability**, so a fifth engine answers it: MySQL
     and PostgreSQL yes; SQL Server no, its `RESTORE` reading a file *on the server* and needing the
     database to itself; SQLite no, a backup there being a database file one opens as a connection
-    (`restore_is_offered_where_a_client_restores_a_local_file`).
+    (`restore_is_offered_where_a_client_restores_a_local_file`). `backup_writes_server(dialect)` is
+    the other exhaustive capability on this path: true for SQL Server alone, whose backup is a
+    `BACKUP DATABASE` the server runs and writes — a file in its own folder, replaced by `INIT`, and
+    history rows in `msdb` — and false where the tool reads the server into a file on this machine
+    (`only_sql_servers_backup_writes_on_the_server`); the write-guard invariant's backup paragraph
+    is what asks it. `restore_runs_a_script(file, dialect)` says whether the restore hands the file
+    to a client **as a script**, whose `USE` or `\connect` can carry it to another database, so that
+    it is read first (`script::database_switches`): on MySQL always, on PostgreSQL a `.sql` —
+    `pg_restore_args`' own rule — and never a `pg_restore` archive, which restores into `-d` unless
+    asked to create its database (`the_restores_that_run_a_script_are_the_ones_read_first`).
+    `restore_log_entry(connection, db, file)` is the write-log line a restore writes as it launches —
+    `Source::Restore`, no `sql`, the detail `restore <file> into <db>, run in the terminal`, its
+    outcome `Unknown`, because the client in the terminal and not Schemaic sees how it ends
+    (`a_restore_is_logged_as_launched_with_its_outcome_unknown`).
   - `core/entra.rs` — **signing in to SQL Server with a Microsoft Entra token from the Azure CLI**:
     the pure half of `AuthMode::AzureCli`, `db/entra.rs` being the half that runs it. The token is
     the CLI's to mint and refresh — `az account get-access-token --resource
@@ -20711,7 +20775,10 @@ existing prose was left alone.
   read-only guard**: every `Enforce` statement is the caller's, issued afterwards (under
   `fetch_query_enforced`, above). The one connection it skips is `pg::cancel_query`'s, a
   `CancelToken` that runs no SQL; the terminal's database client is opened by none of these and
-  does not run it either. Without a server, `sqlite.rs`'s
+  does not run it either, and nor do *Back up*'s and *Restore from file*'s tools — bar a PostgreSQL
+  init SQL's `SET ROLE`, which `pg_dump`, `pg_restore` and `psql` are handed as a role
+  (`core::launch::init_role`); MySQL's tools and `sqlcmd` get none of it, no equivalent option
+  being wired. Without a server, `sqlite.rs`'s
   `the_init_sql_runs_on_every_connection_an_operation_opens` and
   `a_refused_init_sql_refuses_the_connect_before_any_of_it_runs` pin both halves; the server legs
   are the live tier's `init_sql.rs` and `mssql::the_init_sql_is_in_force_and_a_refused_one_fails_the_operation`,
@@ -32529,8 +32596,15 @@ existing prose was left alone.
   committed but whose PostgreSQL settle failed is logged `failed` **with the committed count** in
   `rows` — the report's payload is `Result<u64, (Option<u64>, Option<String>)>`, its `Option<u64>`
   `Some` only for that case — so the line does not read as a copy that wrote nothing.
+  *Restore from file* is `Source::Restore` (`launch::restore_log_entry`), logged by `restore_db` once
+  the confirmed restore's client argv is built and just before it goes to the panel — so its
+  outcome is `unknown`, the terminal's client and not Schemaic seeing how it ends, and its detail
+  `restore <file> into <db>, run in the terminal`, with no `sql`.
   **Not logged**: EXPLAIN ANALYZE, which `Db::explain` always rolls back or never executes; a view
-  re-run, a read Schemaic built; and the MCP server, which has no write tool. The setting is
+  re-run, a read Schemaic built; the MCP server, which has no write tool; and SQL Server's *Back
+  up*, whose `BACKUP DATABASE … WITH COPY_ONLY` writes a file and `msdb`'s history on the server
+  (`launch::backup_writes_server`, which is why read-only refuses it) but changes no data in any
+  database. The setting is
   Settings → Query's *Keep values in the write log* (`LayoutUi::write_log_values`, tabindex 250
   after the notify row's 240), `serde`-defaulted off and autosaved as `confirm_writes` is; its
   hint says the log is never cleared and a password is masked either way.
@@ -36478,16 +36552,33 @@ Re-introducing the anti-patterns these guard against is a regression:
   span and asserts both halves, because either alone is the bug: the launch has to refuse, and the
   refusal has to be about the connection being launched.
   **The database menu's *Back up* and *Restore from file* are two more doors onto the same tools,
-  and only the second writes.** A restore hands a whole file of statements to `psql`, `pg_restore`
+  and the second always writes.** A restore hands a whole file of statements to `psql`, `pg_restore`
   or `mysql` — user SQL that never meets `run_verdict` — so its entry is dimmed on a read-only
   connection and `restore_db` refuses at the click as well, on `read_only_of` read live, with the
   message in the panel; after the open dialog it asks the shared `Confirm` (*"… cannot be undone. It
   runs in the terminal, where Ctrl+C stops it."*) before anything spawns. The `yes` arm reads
   `read_only_of` **again**, as the destructive-launch rule asks of a guard behind a confirm — the
-  flag can move from the status bar while the dialog and the question stood open. A backup is offered on a
-  read-only connection, as Export is: `pg_dump` and `mysqldump` read the server and write a local
-  file, SQLite's `VACUUM INTO` writes nothing to its source, and SQL Server's is one statement of
-  Schemaic's own through `sqlcmd -Q`, which runs it and exits rather than leaving a session open.
+  flag can move from the status bar while the dialog and the question stood open.
+  **That question names a database the file can override, so a script is read before it is
+  asked.** `mysql --execute=source f -- db` and `psql -d db -f f` only choose where the script
+  *starts*: the `USE shop` a `mysqldump --databases` dump carries — as do most third-party "export
+  database" tools — or the `\connect shop` of a `pg_dump -C` script moved every statement after it
+  into `shop` under a question that named `shop_copy`. Seen on MariaDB 10.11, and on PostgreSQL 16,
+  where a `pg_dump -C` script restored "into" a copy created and wrote the original and left the
+  copy untouched. So where the restore runs a script (`launch::restore_runs_a_script`) `restore_db`
+  reads the **whole** file on `handle.spawn_blocking` (`script::database_switches`) and refuses in
+  the panel, nothing run and no question asked, when a line names another database or one it
+  cannot read (`script::restore_refusal`); a file it cannot read, or one with no terminator, is
+  refused the same way. **What this does not cover**: the client re-reads the file at the yes, so
+  one replaced between the scan and the run is not re-checked — the question the script runner's
+  `FileStamp` answers (`core/script.rs`), left open here.
+  A backup is offered on a read-only connection where it is a file on this machine, as Export is:
+  `pg_dump` and `mysqldump` read the server and write a local file, and SQLite's `VACUUM INTO`
+  writes nothing to its source. **SQL Server's is not**: its `BACKUP DATABASE` is the server's own
+  write — a file in its folder, replaced by `INIT`, and history rows in `msdb` — so where
+  `launch::backup_writes_server` answers yes the entry is dimmed on a read-only connection and
+  `backup_db` refuses at the launch as well, on `read_only_of` read live, the dimming not being the
+  guard.
 - **A row reaches the model only where `AiData` says it may, and the level is the connection's.**
   Every path that can put a cell value in a prompt — `run_query`, the `explain` tool (whose MySQL
   plan says whether a key exists, `cli/mcp.rs`'s entry), `describe_table`'s samples, the
@@ -36678,8 +36769,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   see `core::launch`.) `mssql_shell` is the fourth arm, and takes the WSL fallback — a host and a
   port again.
   **The backup and restore tools split the same way, on their *file* rather than their database.**
-  `native_tool` resolves `pg_dump`, `pg_restore`/`psql`, `mysqldump`/`mariadb-dump` and
-  `mysql`/`mariadb` through `resolve_native_cli` only, because the file is a path this machine's
+  `native_tool` resolves `pg_dump`, `pg_restore`/`psql`, `mariadb-dump`/`mysqldump` and
+  `mariadb`/`mysql` — MariaDB's names first, for `launch::MYSQL_DUMP_TOOLS`' reason — through
+  `resolve_native_cli` only, because the file is a path this machine's
   dialog gave and a tool inside WSL would read it as somewhere else; like `resolve_cli` it skips a
   refused candidate and keeps the first refusal as the answer of last resort. `mssql_backup_shell`
   is `mssql_shell` with `-Q <launch::mssql_backup_sql>` appended, WSL fallback included, since the
@@ -36699,7 +36791,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `backup_db` asks no dialog on SQL Server (the bare `backup_file_name` goes straight to `sqlcmd`)
   and a save dialog elsewhere, defaulting to `<db>_<stamp>.dump`, `.sql` or `.db`; SQLite's is the
   one backup that runs in-process, `Db::backup_to_file` off the UI thread, its "Backed up to …" or
-  "The backup failed: …" shown as a message in the same panel.
+  "The backup failed: …" shown as a message in the same panel. `restore_db` reads a script before
+  its confirm (the write-guard invariant's restore paragraph) and logs the launch through
+  `log_write` once the client's argv is built (`launch::restore_log_entry`).
   **The search in front of that `match` had a `?` where it wanted a `continue`.** `resolve_cli` takes
   a list of candidate names and `direct_spawn_verdict` refuses a `.cmd`/`.bat` image, which `cmd.exe`
   runs and which does not know what the `--` terminator in front of a server-supplied database name
@@ -40768,7 +40862,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   and the table arm's write group is `Import` → `Edit table` → `Triggers` where the skeleton lists
   Create/Edit/Import/Triggers. Order *within* group 4 is not checked; `Drop` being last is.
   `Back up` and `Restore from file` are group 4 beside `Import`. The restore is a write; `Back up`
-  writes a file and never the server, like `Export` beside it, but sits with the node's round trips
+  writes a file, like `Export` beside it, and the server only on SQL Server
+  (`launch::backup_writes_server`), but sits with the node's round trips
   rather than taking `Export`'s skip, so an unknown-label failure still covers it.
   **The near-collision the table is load-bearing for is `Refresh` (group 2) beside
   `Refresh view` (group 4)**, which a materialized view's menu carries both of: the first
