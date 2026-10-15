@@ -8,12 +8,16 @@
 //! the preview closes and this modal comes back counting them, then says how
 //! it ended. A copy whose rows fail leaves the new table in place and empty —
 //! the rows are one transaction (`Db::copy_rows`), the `CREATE` was its own.
+//! With *Copy data* off there are no rows to follow: the copy is the
+//! `CREATE` alone, the preview's *Applied* is its report, and this modal
+//! closes behind it.
 
 use std::rc::Rc;
 
 use floem::AnyView;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
+use floem::reactive::{create_effect, create_memo};
 
 use schemaic_core::copy_table::{self, CopyTarget};
 use schemaic_core::schema::display_name;
@@ -123,6 +127,24 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
     let ns = RwSignal::new(src.schema.clone().unwrap_or_default());
     let refusal: RwSignal<Option<String>> = RwSignal::new(None);
     let picking = RwSignal::new(true);
+    // On by default: a copy is the rows too unless asked otherwise. Off makes
+    // it the structure alone — the `CREATE TABLE` and nothing after it.
+    let copy_data = RwSignal::new(true);
+    // *Preview SQL* is offered once there is somewhere to copy to and a name
+    // to copy as. A memo, so the footer rebuilds when that flips and not on
+    // every keystroke in Name. `preview` still refuses both itself.
+    let ready =
+        create_memo(move |_| dst.with(Option::is_some) && name.with(|n| !n.trim().is_empty()));
+    // A refusal answers the form as it was when Preview was pressed; any
+    // change to what it was about makes it stale, so it goes.
+    create_effect(move |first: Option<()>| {
+        dst.track();
+        name.track();
+        ns.track();
+        if first.is_some() {
+            refusal.set(None);
+        }
+    });
     o.compare_dbs.set(None);
     o.copy_progress.set(0);
 
@@ -154,21 +176,38 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 None => db,
             }
         }
-        None => "Choose a database".to_string(),
+        None => String::new(),
     };
-    let chosen = in_ring_button(
-        container(label(target_label).style(|s| {
-            s.font_family(crate::consts::MONO_FAMILY.to_string())
-                .font_size(theme::font_body())
-        }))
-        .on_click_stop(move |_| picking.update(|p| *p = !*p)),
-        ring.clone(),
-        10,
-        true,
-        4.0,
-        move || picking.update(|p| *p = !*p),
-    )
-    .style(|s| s.color(theme::accent()).hover(|s| s.color(theme::text())));
+    // The choice, once there is one: pressing it opens the list again, or
+    // folds it back up. Before a choice there is nothing to show and nothing
+    // to fold — the list is the whole question — so there is no button, and
+    // the list cannot be closed into an empty field.
+    let has_dst = create_memo(move |_| dst.with(Option::is_some));
+    let chosen = {
+        let ring = ring.clone();
+        dyn_container(
+            move || has_dst.get(),
+            move |shown| {
+                if !shown {
+                    return empty().into_any();
+                }
+                in_ring_button(
+                    container(label(target_label).style(|s| {
+                        s.font_family(crate::consts::MONO_FAMILY.to_string())
+                            .font_size(theme::font_body())
+                    }))
+                    .on_click_stop(move |_| picking.update(|p| *p = !*p)),
+                    ring.clone(),
+                    10,
+                    true,
+                    4.0,
+                    move || picking.update(|p| *p = !*p),
+                )
+                .style(|s| s.color(theme::accent()).hover(|s| s.color(theme::text())))
+                .into_any()
+            },
+        )
+    };
     let list = {
         let list_dbs = ctx.list_dbs.clone();
         let src_type = src_type.clone();
@@ -218,10 +257,12 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                     }
                 };
                 autohide(scroll(inner).style(|s| s.width_full()))
-                    .style(|s| {
+                    .style(move |s| {
+                        // Clear of the chosen target above it; with none shown,
+                        // the label's own gap is all the list sits under.
                         s.width_full()
                             .max_height(theme::scaled(180.0))
-                            .margin_top(theme::scaled(6.0))
+                            .apply_if(has_dst.get(), |s| s.margin_top(theme::scaled(6.0)))
                             .padding(theme::scaled(4.0))
                             .background(theme::bg_deepest())
                             .border(1.0)
@@ -239,7 +280,13 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
             Some(e) => fact_note(icons::TRIANGLE_ALERT, theme::error, e),
             None => empty().into_any(),
         },
-    );
+    )
+    // Off the list it explains, as the list is off the target above it.
+    .style(move |s| {
+        s.apply_if(o.compare_dbs_err.with(Option::is_some), |s| {
+            s.margin_top(theme::scaled(6.0))
+        })
+    });
 
     // ── Preview SQL: the plan, into the preview, with the rows to follow ────
     let preview: Rc<dyn Fn()> = {
@@ -308,6 +355,18 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 &cs,
                 read_only,
             );
+            if !copy_data.get_untracked() {
+                // The structure alone: the preview's own *Applied* is the
+                // whole report, so this modal goes rather than coming back to
+                // count rows that are not coming.
+                p.then = Some(Rc::new(move || o.copy_table.set(None)));
+                crate::ddl_preview::open_preview(ctx.ddl, p);
+                return;
+            }
+            // The rows are no statement in the script, so the change list
+            // carries them as a line of their own — without it, the preview
+            // read as a structure-only copy.
+            p.changes.push(copy_table::rows_change(&info));
             let (copy_rows, d) = (ctx.copy_rows.clone(), ctx.ddl);
             p.then = Some(Rc::new(move || {
                 // The table is there; the preview has nothing more to say,
@@ -360,12 +419,28 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 )
                 .style(|s| s.width_full()),
             ),
-            fact_note(
-                icons::CIRCLE_DOT,
-                theme::text_dim,
-                "The structure and the rows. Foreign keys and triggers are not copied, \
-                 and a generated column is computed afresh."
-                    .to_string(),
+            crate::settings::focusable_toggle_row(
+                "Copy data",
+                "Copy the rows once the table is created. Off copies the structure only.",
+                copy_data,
+                ring.clone(),
+                40,
+            ),
+            dyn_container(
+                move || copy_data.get(),
+                |rows| {
+                    fact_note(
+                        icons::CIRCLE_DOT,
+                        theme::text_dim,
+                        if rows {
+                            "The structure and the rows. Foreign keys and triggers are not \
+                             copied, and a generated column is computed afresh."
+                        } else {
+                            "The structure only. Foreign keys and triggers are not copied."
+                        }
+                        .to_string(),
+                    )
+                },
             ),
             dyn_container(
                 move || refusal.get(),
@@ -422,8 +497,8 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
         let close = close.clone();
         let cancel = ctx.cancel.clone();
         modal_footer(dyn_container(
-            move || stage.get(),
-            move |st| {
+            move || (stage.get(), ready.get()),
+            move |(st, ready)| {
                 let close = close.clone();
                 let actions: AnyView = match st {
                     Stage::Choosing => {
@@ -440,7 +515,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                             action_button(
                                 "Preview SQL",
                                 ActionKind::Primary,
-                                true,
+                                ready,
                                 ring.clone(),
                                 ACTION_TAB + 10,
                                 move || preview(),

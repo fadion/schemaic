@@ -190,6 +190,17 @@ pub fn settle_sql(to: &CopyTarget, src: &TableInfo, dialect: SqlDialect) -> Vec<
         .collect()
 }
 
+/// The change-list line for the rows half, beside the `CREATE TABLE`'s own.
+/// The rows are streamed once the table has committed, not run from the
+/// preview's script, so the line says so — without it the preview read as a
+/// structure-only copy while Apply went on to write every row.
+pub fn rows_change(src: &TableInfo) -> String {
+    format!(
+        "Then copy every row of {} into it (not shown as SQL)",
+        crate::schema::display_name(src.schema.as_deref(), &src.name)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +396,30 @@ mod tests {
         for d in [SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Sqlite] {
             assert!(settle_sql(&to("o"), &t, d).is_empty(), "{d:?}");
         }
+    }
+
+    #[test]
+    fn the_rows_step_names_its_source_and_says_it_is_not_in_the_sql() {
+        let t = TableInfo {
+            schema: Some("sales".into()),
+            ..orders()
+        };
+        assert_eq!(
+            rows_change(&t),
+            "Then copy every row of sales.orders into it (not shown as SQL)"
+        );
+    }
+
+    #[test]
+    fn the_rows_step_names_a_schemaless_source_bare() {
+        let t = TableInfo {
+            schema: None,
+            ..orders()
+        };
+        assert_eq!(
+            rows_change(&t),
+            "Then copy every row of orders into it (not shown as SQL)"
+        );
     }
 
     #[test]
