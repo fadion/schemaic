@@ -694,6 +694,12 @@ pub fn needs_fk_section(t: &TableInfo) -> bool {
 /// the file as well**, each only where it is missing ([`unless_present_sql`]).
 /// It once restated only the keys between the file's own tables, so a replay
 /// onto the source left an outside table's key onto a dumped one gone, silently.
+///
+/// **And right only there.** `CASCADE` takes whatever else depends on a
+/// dropped table too — a view or materialized view outside the file, a table
+/// inheriting from it — which the file does not put back, so where it would,
+/// the replay stops before its first `DROP` and names them
+/// ([`cascade_guard_sql`]).
 pub fn drop_cascade(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::Postgres => " CASCADE",
@@ -1268,16 +1274,152 @@ pub fn unless_present_sql(dialect: SqlDialect, present: Present<'_>, body: &str)
                     lit(name)
                 ),
             };
-            let mut tag = "$schemaic$".to_string();
-            let mut n = 0;
-            while body.contains(&tag) || absent.contains(&tag) {
-                n += 1;
-                tag = format!("$schemaic{n}$");
-            }
+            let tag = dollar_tag(&[body, &absent]);
             Some(format!(
                 "DO {tag}\nBEGIN\nIF {absent} THEN\n{}\nEND IF;\nEND\n{tag};",
                 body.trim_end()
             ))
+        }
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+    }
+}
+
+/// A PostgreSQL dollar quote — `$schemaic$`, or `$schemaicN$` — that none of
+/// `parts` contains, so a name inside a `DO` block cannot end it.
+fn dollar_tag(parts: &[&str]) -> String {
+    let mut tag = "$schemaic$".to_string();
+    let mut n = 0;
+    while parts.iter().any(|p| p.contains(&tag)) {
+        n += 1;
+        tag = format!("$schemaic{n}$");
+    }
+    tag
+}
+
+/// The statement that stops a replay **before its first `DROP … CASCADE`**
+/// where those drops would take an object the file does not put back — or
+/// `None` where the file's `DROP` cascades to nothing ([`drop_cascade`]), or
+/// drops nothing.
+///
+/// `dropped` is every table and view the file drops, quoted and qualified;
+/// `restated_keys` each foreign key the closing section puts back where it is
+/// missing, as `(quoted qualified table, constraint name)`; `routines` each
+/// function or procedure the file recreates, as `(namespace, name)`.
+///
+/// **Why it exists.** `CASCADE` is on the drop for the file's own
+/// dependants ([`drop_cascade`]), and it does not stop at them: a view or
+/// materialized view outside the dump that reads a dumped table went with
+/// it — the materialized view's rows too — as did a table inheriting from
+/// one, a column typed with its row type, or a default drawing on the
+/// sequence it owns; and the replay reported success. Restating them from the
+/// dump-time model was the other answer, and the wrong one: the model holds
+/// no grants, owners or comments, a view in a schema it did not read is not
+/// in it at all, and one changed since the dump would come back as it was.
+///
+/// **PostgreSQL's** is a `DO` block that walks `pg_depend` from the dropped
+/// tables as `DROP … CASCADE` does — every dependant, and the owner of
+/// anything internal to one (a view, from its rule; a key, from a
+/// partition's clone of it) — and takes away what is the dropped tables' own
+/// (reached through their auto, internal and partition dependencies only),
+/// the restated keys and the recreated routines, and what is part of anything
+/// already counted. Whatever remains is named in the error, which ends the
+/// run there — inside the file's transaction where it has one, and either way
+/// before anything is dropped. Measured on PostgreSQL 16: a one-partition
+/// dump's walk counts the key a table outside the file holds on the parent
+/// (the partition's clone of it is internal to that key), and nothing of the
+/// parent's own.
+pub fn cascade_guard_sql(
+    dialect: SqlDialect,
+    dropped: &[String],
+    restated_keys: &[(String, String)],
+    routines: &[(String, String)],
+) -> Option<String> {
+    if dropped.is_empty() {
+        return None;
+    }
+    match dialect {
+        SqlDialect::Postgres => {
+            let lit = |s: &str| crate::schema::ddl_string(s, dialect);
+            let seeds = dropped
+                .iter()
+                .map(|t| format!("to_regclass({})", lit(t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // An empty `VALUES` is not SQL; an empty set of the right shape is.
+            let pairs = |rows: Vec<String>, empty: &str| {
+                if rows.is_empty() {
+                    format!("SELECT {empty} WHERE false")
+                } else {
+                    format!("VALUES {}", rows.join(", "))
+                }
+            };
+            let keys = pairs(
+                restated_keys
+                    .iter()
+                    .map(|(t, n)| format!("(to_regclass({})::oid, {})", lit(t), lit(n)))
+                    .collect(),
+                "NULL::oid, NULL::text",
+            );
+            let procs = pairs(
+                routines
+                    .iter()
+                    .map(|(ns, n)| format!("({}, {})", lit(ns), lit(n)))
+                    .collect(),
+                "NULL::text, NULL::text",
+            );
+            let body = format!(
+                "DECLARE\n  lost text;\nBEGIN\n  WITH RECURSIVE\n  \
+                 seed(oid) AS (\n    SELECT c::oid FROM unnest(ARRAY[{seeds}]::regclass[]) AS c \
+                 WHERE c IS NOT NULL\n  ),\n  \
+                 keys(rel, name) AS ({keys}),\n  \
+                 procs(ns, name) AS ({procs}),\n  \
+                 gone(classid, objid, objsubid) AS (\n    \
+                 SELECT 'pg_class'::regclass::oid, oid, 0 FROM seed\n    UNION\n    \
+                 SELECT x.* FROM gone g, LATERAL (\n      \
+                 SELECT d.classid, d.objid, d.objsubid FROM pg_depend d\n       \
+                 WHERE d.refclassid = g.classid AND d.refobjid = g.objid\n         \
+                 AND (g.objsubid = 0 OR d.refobjsubid = g.objsubid)\n         \
+                 AND d.deptype IN ('n', 'a', 'i', 'P', 'S')\n      UNION ALL\n      \
+                 SELECT d.refclassid, d.refobjid, 0 FROM pg_depend d\n       \
+                 WHERE d.classid = g.classid AND d.objid = g.objid\n         \
+                 AND d.objsubid = g.objsubid AND d.deptype = 'i'\n    ) x\n  ),\n  \
+                 own(classid, objid, objsubid) AS (\n    \
+                 SELECT 'pg_class'::regclass::oid, oid, 0 FROM seed\n    UNION\n    \
+                 SELECT d.classid, d.objid, d.objsubid FROM own o JOIN pg_depend d\n      \
+                 ON d.refclassid = o.classid AND d.refobjid = o.objid\n     \
+                 AND (o.objsubid = 0 OR d.refobjsubid = o.objsubid)\n     \
+                 AND d.deptype IN ('a', 'i', 'P', 'S')\n  ),\n  \
+                 cand AS (\n    SELECT * FROM gone g WHERE NOT EXISTS (SELECT 1 FROM own o\n      \
+                 WHERE o.classid = g.classid AND o.objid = g.objid\n        \
+                 AND (o.objsubid = 0 OR o.objsubid = g.objsubid))\n  ),\n  \
+                 lost_rows AS (\n    SELECT c.* FROM cand c\n     \
+                 WHERE NOT EXISTS (SELECT 1 FROM pg_constraint k JOIN keys u\n             \
+                 ON k.conrelid = u.rel AND k.conname = u.name\n             \
+                 WHERE c.classid = 'pg_constraint'::regclass AND k.oid = c.objid)\n       \
+                 AND NOT EXISTS (SELECT 1 FROM pg_proc p\n             \
+                 JOIN pg_namespace s ON s.oid = p.pronamespace\n             \
+                 JOIN procs u ON s.nspname = u.ns AND p.proname = u.name\n             \
+                 WHERE c.classid = 'pg_proc'::regclass AND p.oid = c.objid)\n       \
+                 AND NOT EXISTS (SELECT 1 FROM cand o\n             \
+                 WHERE c.objsubid <> 0 AND o.classid = c.classid\n               \
+                 AND o.objid = c.objid AND o.objsubid = 0)\n       \
+                 AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN cand o\n             \
+                 ON d.refclassid = o.classid AND d.refobjid = o.objid\n            \
+                 AND (o.objsubid = 0 OR d.refobjsubid = o.objsubid)\n             \
+                 WHERE d.classid = c.classid AND d.objid = c.objid\n               \
+                 AND d.objsubid = c.objsubid AND d.deptype IN ('a', 'i'))\n  )\n  \
+                 SELECT string_agg(what, ', ' ORDER BY what) INTO lost\n    \
+                 FROM (SELECT pg_describe_object(classid, objid, objsubid) AS what \
+                 FROM lost_rows) l;\n  \
+                 IF lost IS NOT NULL THEN\n    \
+                 RAISE EXCEPTION 'Schemaic: replaying this file would drop % along with the tables \
+                 it replaces, and does not put them back. The replay stopped here, before dropping \
+                 anything.', lost\n      \
+                 USING HINT = 'Add them to the export, or drop them yourself first.';\n  \
+                 END IF;\nEND"
+            );
+            let tag = dollar_tag(&[&body]);
+            Some(format!("DO {tag}\n{body}\n{tag};"))
         }
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
     }
@@ -2421,6 +2563,9 @@ pub fn plan(
     // is dropped and the header says so, which is the honest half of the trade:
     // silently emitting a statement that cannot succeed is not the alternative.
     let mut fks: Vec<String> = Vec::new();
+    // Each key put back where missing, `(table, name)` — what a `CASCADE`
+    // drop may take, for `cascade_guard_sql`.
+    let mut restated_keys: Vec<(String, String)> = Vec::new();
     let mut dropped_fks = 0usize;
     // **The other half of the same accounting, and it had none.** A table whose
     // DDL is the engine's own captured text carries its keys *inside* the
@@ -2545,6 +2690,7 @@ pub fn plan(
                         continue;
                     };
                     let name = fk.name.clone();
+                    restated_keys.push((table.clone(), name.clone()));
                     let one = ChangeSet {
                         table: t.name.clone(),
                         schema: t.schema.clone(),
@@ -2601,6 +2747,7 @@ pub fn plan(
                         &crate::ddl::client_script(&one.emit(), dialect),
                     ) {
                         fks.push(sql);
+                        restated_keys.push((table.clone(), fk.name.clone()));
                     }
                 }
             }
@@ -2909,6 +3056,8 @@ pub fn plan(
     // Carried with their names so the dependency walk below can edge one to
     // another; the strings alone said nothing about what they call.
     let mut routines: Vec<Emitted> = Vec::new();
+    // `(namespace, name)` of each routine among them, for `cascade_guard_sql`.
+    let mut recreated: Vec<(String, String)> = Vec::new();
     let mut objects: Vec<Emitted> = Vec::new();
     // The file drops what it recreates in one section before any `CREATE` —
     // see `drops_up_front`. Asked once; the table loop and the routines both
@@ -3064,6 +3213,9 @@ pub fn plan(
                         function: kind == ObjectKind::Function,
                     };
                     if after_tables {
+                        if let Some(r) = o.routine() {
+                            recreated.push((r.schema.clone().unwrap_or_default(), r.name.clone()));
+                        }
                         routines.push(item);
                     } else {
                         objects.push(item);
@@ -3177,6 +3329,28 @@ pub fn plan(
         );
         for s in stops {
             text!(s);
+        }
+    }
+
+    // ── What a `DROP … CASCADE` would take beyond the file, refused likewise ─
+    //
+    // The tables and views are each dropped beside their `CREATE`, and where
+    // that drop cascades it took whatever outside the file depends on them —
+    // a view or materialized view over a dumped table, with its rows —
+    // silently. Asked here, ahead of the first drop: see `cascade_guard_sql`.
+    if opts.structure && opts.drop_if_exists && !up_front {
+        let dropped: Vec<String> = order
+            .iter()
+            .filter(|&i| file_creates(&schema.tables[*i]) && !held.contains(i))
+            .map(|&i| qname(&schema.tables[i]))
+            .collect();
+        if let Some(sql) = cascade_guard_sql(dialect, &dropped, &restated_keys, &recreated) {
+            text!(
+                "-- Not dropped: a replay stops here, before it drops anything, where a drop \
+                 below would take something this file does not put back"
+                    .to_string()
+            );
+            text!(sql);
         }
     }
 
@@ -5227,6 +5401,58 @@ mod tests {
         }
     }
 
+    /// **A replay stops before its first `DROP … CASCADE` where that would
+    /// take something the file does not put back.** `CASCADE` does not stop
+    /// at the file's own objects: a view or materialized view outside the
+    /// dump that reads a chosen table went with it — the matview's rows too —
+    /// and the replay reported success. So ahead of every drop the file asks
+    /// the catalogue what the drops would take, and refuses with their names
+    /// unless each is the file's own, a key the closing section restates, or
+    /// a routine it recreates.
+    #[test]
+    fn a_replay_stops_before_a_cascade_would_drop_what_the_file_does_not_put_back() {
+        let s = schema_of(vec![table("customers"), refs(table("orders"), "customers")]);
+        let chosen = ["customers".to_string()];
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &chosen,
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let guard = pos(&file, "FROM pg_depend");
+        assert!(guard < pos(&file, "DROP TABLE IF EXISTS"), "{file}");
+        assert!(pos(&file, "BEGIN;") < guard, "{file}");
+        let block = &file[file[..guard].rfind("DO $").expect("a DO block")..];
+        let block = &block[..block.find("\n$schemaic$;").expect("its end")];
+        // What the file drops is what the walk starts from…
+        assert!(block.contains("to_regclass('\"customers\"')"), "{block}");
+        // …the outside key it restates is not counted as lost…
+        assert!(block.contains("'fk_orders_customers'"), "{block}");
+        assert!(block.contains("to_regclass('\"orders\"')"), "{block}");
+        // …and anything else stops the run, before a drop.
+        assert!(block.contains("RAISE EXCEPTION"), "{block}");
+        // Not where nothing is dropped.
+        for opts in [
+            DumpOptions {
+                drop_if_exists: false,
+                ..DumpOptions::default()
+            },
+            DumpOptions {
+                structure: false,
+                ..DumpOptions::default()
+            },
+        ] {
+            let file = file_of(&plan(&s, "shop", &chosen, opts, SqlDialect::Postgres));
+            assert!(!file.contains("pg_depend"), "{opts:?}: {file}");
+        }
+        // Nor on the engines whose `DROP` cascades to nothing.
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            let file = file_of(&plan(&s, "shop", &chosen, DumpOptions::default(), d));
+            assert!(!file.contains("pg_depend"), "{d:?}: {file}");
+        }
+    }
+
     /// **A partition created `OF` a parent the file leaves standing fires
     /// none of the parent's row triggers on its restored rows.** It takes a
     /// clone of each at its `CREATE`, so on a replay onto the source an audit
@@ -5286,7 +5512,9 @@ mod tests {
             file.contains("DROP TABLE IF EXISTS \"zz_events\" CASCADE;"),
             "{file}"
         );
-        assert!(!file.contains("to_regclass"), "{file}");
+        // Nothing created only where missing. (`to_regclass` alone is no
+        // longer the tell: the cascade guard names every dropped table with it.)
+        assert!(!file.contains("') IS NULL"), "{file}");
         assert!(file.contains("<<rows bb_2025"), "{file}");
     }
 
@@ -7991,6 +8219,75 @@ mod tests {
         assert!(file.contains("FOLLOWS `t_a`"), "{file}");
     }
 
+    /// **The cascade guard is written exactly where the drop cascades** —
+    /// asked of `drop_cascade`, so an engine that gains or loses `CASCADE`
+    /// gains or loses the guard with it — and not at all for a file that
+    /// drops nothing.
+    #[test]
+    fn the_cascade_guard_is_written_where_the_drop_cascades() {
+        let dropped = ["\"public\".\"customers\"".to_string()];
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert_eq!(
+                cascade_guard_sql(d, &dropped, &[], &[]).is_some(),
+                !drop_cascade(d).is_empty(),
+                "{d:?}"
+            );
+            assert_eq!(cascade_guard_sql(d, &[], &[], &[]), None, "{d:?}");
+        }
+    }
+
+    /// Every name reaches the block as a string literal, never as SQL, and
+    /// the dollar quote is one no name contains — a table called
+    /// `$schemaic$` cannot end the block early.
+    #[test]
+    fn the_cascade_guard_quotes_every_name_it_carries() {
+        let sql = cascade_guard_sql(
+            SqlDialect::Postgres,
+            &[
+                "\"public\".\"it's\"".to_string(),
+                "\"$schemaic$\"".to_string(),
+            ],
+            &[("\"public\".\"orders\"".to_string(), "o'k".to_string())],
+            &[("public".to_string(), "f'n".to_string())],
+        )
+        .expect("a guard");
+        assert!(sql.starts_with("DO $schemaic1$\n"), "{sql}");
+        assert!(sql.ends_with("\n$schemaic1$;"), "{sql}");
+        assert!(sql.contains("to_regclass('\"public\".\"it''s\"')"), "{sql}");
+        assert!(
+            sql.contains("(to_regclass('\"public\".\"orders\"')::oid, 'o''k')"),
+            "{sql}"
+        );
+        assert!(sql.contains("('public', 'f''n')"), "{sql}");
+    }
+
+    /// With no key restated and no routine recreated, each list is an empty
+    /// set of the right shape — `VALUES` with no rows is not SQL.
+    #[test]
+    fn the_cascade_guard_takes_empty_lists() {
+        let sql = cascade_guard_sql(
+            SqlDialect::Postgres,
+            &["\"public\".\"customers\"".to_string()],
+            &[],
+            &[],
+        )
+        .expect("a guard");
+        assert!(
+            sql.contains("keys(rel, name) AS (SELECT NULL::oid, NULL::text WHERE false)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("procs(ns, name) AS (SELECT NULL::text, NULL::text WHERE false)"),
+            "{sql}"
+        );
+        assert!(!sql.contains("VALUES"), "{sql}");
+    }
+
     /// PostgreSQL has no FK guard an ordinary role can throw, so a bare `DROP`
     /// stopped the very case a dump is most often tested with — replaying onto
     /// the database it came from.
@@ -9317,6 +9614,42 @@ mod tests {
             body: "SELECT 1".to_string(),
             ..Default::default()
         })
+    }
+
+    /// **A routine the file recreates is no refusal of the cascade guard.**
+    /// One typed with a dumped table's row type goes with that table's
+    /// `DROP … CASCADE`, and the file's own `CREATE OR REPLACE` puts it back.
+    #[test]
+    fn a_cascade_may_take_a_routine_the_file_recreates() {
+        let mut t = table("t");
+        t.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t]);
+        s.routines.push(one_function(Some("public")));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        // A function `RETURNS SETOF t` goes with `t`'s `DROP … CASCADE` and is
+        // back by the file's own `CREATE OR REPLACE`, so it is no refusal.
+        assert!(
+            file.contains("procs(ns, name) AS (VALUES ('public', 'f_one'))"),
+            "{file}"
+        );
+        // Not without the routines.
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions {
+                other_objects: false,
+                ..DumpOptions::default()
+            },
+            SqlDialect::Postgres,
+        ));
+        assert!(!file.contains("'f_one'"), "{file}");
     }
 
     /// **A replay onto the database the file came from replaces each routine

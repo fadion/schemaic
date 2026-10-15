@@ -73,6 +73,95 @@ pub async fn a_replay_keeps_the_key_a_table_outside_the_file_holds(target: &'sta
     s.teardown().await;
 }
 
+/// The single value `sql` selects, as text.
+async fn scalar(s: &Scratch, sql: &str) -> String {
+    let rs = s.exec(sql).await;
+    rs.cell(0, 0).expect("a value").display().to_string()
+}
+
+/// **A replay never drops a view outside the file.** On PostgreSQL the
+/// file's `DROP TABLE … CASCADE` took every view and materialized view over a
+/// dumped table — the materialized view's rows with it — and the replay
+/// reported success with them gone. Where the drop would take one, the replay
+/// now stops before dropping anything and names it; where the views are in
+/// the file, it replays. On the engines whose drop takes no view, it replays
+/// and they stand.
+pub async fn a_replay_leaves_the_views_outside_the_file_standing(target: &'static Target) {
+    let s = Scratch::create(target, "replay_outside_view").await;
+    let (customers, v_out, v_chain, mv) = (
+        s.qualified("customers"),
+        s.qualified("v_out"),
+        s.qualified("v_chain"),
+        s.qualified("mv_out"),
+    );
+    s.exec(&format!(
+        "CREATE TABLE {customers} (id INTEGER PRIMARY KEY)"
+    ))
+    .await;
+    s.exec(&format!("INSERT INTO {customers} VALUES (1), (2)"))
+        .await;
+    s.exec(&format!(
+        "CREATE VIEW {v_out} AS SELECT id FROM {customers}"
+    ))
+    .await;
+    s.exec(&format!("CREATE VIEW {v_chain} AS SELECT id FROM {v_out}"))
+        .await;
+    // Where the engine has them: its rows are a snapshot, so a third
+    // customer added after it tells a survivor from a recomputed copy.
+    let matview = s
+        .try_exec(&format!(
+            "CREATE MATERIALIZED VIEW {mv} AS SELECT COUNT(*) AS n FROM {customers}"
+        ))
+        .await
+        .is_ok();
+    s.exec(&format!("INSERT INTO {customers} VALUES (3)")).await;
+
+    let file = dump_of(&s, &["customers"]).await;
+    let end = run_file(&s, &file).await;
+    if let ExecEnd::Failed { message, .. } = &end {
+        assert!(
+            message.contains("v_out"),
+            "{}: the refusal does not name the view:\n{message}",
+            target.name
+        );
+    } else {
+        assert_eq!(end, ExecEnd::Done, "{}:\n{file}", target.name);
+    }
+    assert_eq!(count(&s, "customers").await, "3", "{}", target.name);
+    assert_eq!(
+        scalar(&s, &format!("SELECT COUNT(*) FROM {v_chain}")).await,
+        "3",
+        "{}: a view outside the file is gone:\n{file}",
+        target.name
+    );
+    if matview {
+        assert_eq!(
+            scalar(&s, &format!("SELECT n FROM {mv}")).await,
+            "2",
+            "{}: the materialized view outside the file was dropped:\n{file}",
+            target.name
+        );
+        s.exec(&format!("DROP MATERIALIZED VIEW {mv}")).await;
+    }
+
+    // With the views in the file, nothing outside it depends on the drops,
+    // and the replay goes through.
+    let file = dump_of(&s, &["customers", "v_out", "v_chain"]).await;
+    assert_eq!(
+        run_file(&s, &file).await,
+        ExecEnd::Done,
+        "{}: the dump did not replay onto its source:\n{file}",
+        target.name
+    );
+    assert_eq!(
+        scalar(&s, &format!("SELECT COUNT(*) FROM {v_chain}")).await,
+        "3",
+        "{}",
+        target.name
+    );
+    s.teardown().await;
+}
+
 /// **A dump carrying a routine replays onto the database it came from.** The
 /// routine was written as a bare `CREATE FUNCTION` and dropped first only where
 /// the file drops up front, so on every other engine the replay stopped at a

@@ -5365,7 +5365,9 @@ existing prose was left alone.
     which the grid's export does not write. **SQL Server has emitters of the dump's own**, for
     what nothing else here scripts: `TsqlObject::create_sql`, `create_if_absent_sql`, `drop_sql`
     and `restart_sql` for its sequences, alias types, XML schema collections and synonyms, and the
-    up-front `DROP … IF EXISTS` and `refuse_if_present_sql` statements of a replay. Triggers are
+    up-front `DROP … IF EXISTS` and `refuse_if_present_sql` statements of a replay; PostgreSQL's
+    refusal ahead of the drops is `cascade_guard_sql`, a `DO` block that stops a replay whose
+    `DROP … CASCADE` would take what the file does not put back (under `drop_cascade` below). Triggers are
     `TriggerInfo::create_set_sql`, the **whole-set** form and not one `create_sql` per trigger: the
     catalogue gives a group's leader `PRECEDES <successor>` and a restore reads the file top to
     bottom, so the first `CREATE TRIGGER` named a trigger the file had not created yet and both
@@ -5699,8 +5701,8 @@ existing prose was left alone.
     for the whole load, PostgreSQL's is superuser-only and `fk_guard_sql` returns `None` there, so
     nothing else in the file protects the `DROP` — replaying a default dump onto the database it came
     from, which is how anyone tests a dump, stopped at the first parent table with *cannot drop table
-    customers because other objects depend on it* and never reached the rest. Dropping the dependants
-    is right precisely here, because the section below is their `CREATE` and the closing constraints
+    customers because other objects depend on it* and never reached the rest. Dropping the file's own
+    dependants is right precisely here, because the section below is their `CREATE` and the closing constraints
     section puts the keys back — **those from tables outside the file as well**, onto any table in
     it, each through `unless_present_sql` (`Present::Constraint`) so it is added only where it is
     missing. That section once restated only the keys between the file's own tables, and `CASCADE`
@@ -5714,7 +5716,42 @@ existing prose was left alone.
     on all three — unguarded, a replay that took nothing would stop at a name already taken
     (`a_key_from_outside_onto_a_chosen_table_is_put_back_where_missing`; live, on each
     `live_suite!` leg, `a_replay_keeps_the_key_a_table_outside_the_file_holds`, which also checks
-    the restored key refuses an orphan). **SQL Server has neither answer**, so it drops everything the file
+    the restored key refuses an orphan). **And right only there: `CASCADE` does not stop at the
+    file's own dependants.** It also took a view or materialized view outside the file that reads a
+    dumped table — the materialized view with its rows — a table inheriting from one, a column typed
+    with its row type, a default on a sequence it owns and keys the introspection never read, and
+    the replay reported success (live on PostgreSQL 16, per the change's author, the view over a
+    view outside the file was gone: *relation "public.v_chain" does not exist*). So ahead of the
+    first `DROP`, inside the file's transaction where it has one, `cascade_guard_sql` writes a `DO`
+    block that walks `pg_depend` from every table and view the file drops the way `CASCADE` does —
+    every dependant, and up through an internal dependency to its owner (a view from its rule, an
+    outside key from a partition's clone of it) — then takes away what the dropped tables own
+    (reached through their auto, internal and partition dependencies alone), the keys the closing
+    section restates, the routines the file recreates with `CREATE OR REPLACE`, and any part of
+    something already counted. Whatever is left is named in one error — *replaying this file would
+    drop … along with the tables it replaces, and does not put them back*, with the hint *Add them
+    to the export, or drop them yourself first* — before anything is dropped. A relation the target
+    does not have seeds nothing (`to_regclass` is `NULL`), so a restore into an empty database walks
+    nothing. Measured on PostgreSQL 16 by the same author: a one-partition dump's walk reaches the
+    key an outside table holds on the parent, through the partition's internal clone of it, and
+    accepts it only because the closing section restates it. **Refusing is the answer, not putting
+    them back from the model** — the tempting "fix": the model holds no grants, owners, comments,
+    `INSTEAD OF` triggers or rules; a view in a schema the dump did not read is not in it at all; one
+    changed since the dump would come back stale; and a materialized view recreated `WITH DATA` is a
+    new snapshot, not the one the user had. The trade is that a replay onto a source holding a view
+    outside the file over a dumped table, which used to "succeed" with the view gone, now stops
+    loudly with nothing dropped. A routine the file recreates is accepted although `CASCADE` drops
+    it — the status quo before the guard, left as a known gap rather than judged sound
+    (`a_cascade_may_take_a_routine_the_file_recreates`). The block is asked of `drop_cascade`, so it
+    is written only where that is non-empty and the file drops something — MySQL, SQLite and SQL
+    Server files are byte-identical to before — and never with *Drop before create* or Structure off
+    (`a_replay_stops_before_a_cascade_would_drop_what_the_file_does_not_put_back`,
+    `the_cascade_guard_is_written_where_the_drop_cascades`; every name a string literal and the
+    dollar tag one no name contains, `the_cascade_guard_quotes_every_name_it_carries`; an empty list
+    a typed empty set, since `VALUES` with no rows is not SQL, `the_cascade_guard_takes_empty_lists`;
+    live, on each `live_suite!` leg, `a_replay_leaves_the_views_outside_the_file_standing`, red on
+    PostgreSQL 16 before the fix, which also replays the same table with its views in the file).
+    **SQL Server has neither answer**, so it drops everything the file
     recreates up front (`drops_up_front`, computed from the two: no guard and no `CASCADE`): a
     `-- Dropped first` section before any `CREATE` drops each key between the dumped tables that
     is there (`IF OBJECT_ID(…, N'F') IS NOT NULL ALTER TABLE … DROP CONSTRAINT`), then everything
@@ -5906,7 +5943,10 @@ existing prose was left alone.
     exists, since unguarded a replay that took nothing would stop at the name — the same
     restatement, by the same loop, that a chosen table's own `CASCADE` needs (`drop_cascade`,
     above); it was written for the named parent first, and a chosen table went without it until a
-    plain `customers` dump was replayed. **Leaving the parent standing has a third cost: its
+    plain `customers` dump was replayed. The cascade guard (`cascade_guard_sql`, above) reaches that
+    key through the partition's clone and lets it pass on that restatement alone; anything else the
+    partition's `CASCADE` would take stops the replay before it drops anything, and the held parent,
+    being dropped by nothing, is no seed of the walk. **Leaving the parent standing has a third cost: its
     triggers.** A partition created `PARTITION OF` a parent that exists takes a clone of each of the
     parent's row triggers at that `CREATE`, so the trailing `-- Triggers` section, which keeps a
     chosen table's own triggers off its rows, was no help — on a replay onto the source every
