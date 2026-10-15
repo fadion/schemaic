@@ -65,6 +65,22 @@ impl Tok {
             Tok::Bracket(depth) => [t.type_, t.keyword, t.function][depth % 3],
         }
     }
+
+    /// The colour outside the editor — a form field, a panel's preview — from
+    /// the **interface** theme's short palette (`UiTheme::sql_*`), or `None`
+    /// to leave the token in the base colour. Coarser than [`Tok::color`] on
+    /// purpose: five colours, folding the rest onto them.
+    fn ui_color(self) -> Option<Color> {
+        let t = crate::themes::ui();
+        match self {
+            Tok::Keyword | Tok::Type => Some(t.sql_keyword),
+            Tok::Str => Some(t.sql_string),
+            Tok::Number | Tok::Constant => Some(t.sql_number),
+            Tok::Function | Tok::Variable => Some(t.sql_function),
+            Tok::Comment => Some(t.sql_comment),
+            Tok::Bracket(_) => None,
+        }
+    }
 }
 
 /// Editor styling that applies SQL highlighting. Holds a handle to the document
@@ -165,11 +181,12 @@ fn carry_at_cached(
         .and_then(|(_, _, carries)| carries.get(line).copied().flatten())
 }
 
-/// The SQL editor's colouring for an `edit_field` that holds SQL — the DDL
-/// preview and the view, trigger and routine bodies — through the same lexer
-/// and the same cross-line state ([`carried_lines`]), without the tab editor's zoom,
-/// inline diff or rainbow brackets. Its field sits on the preview surface
-/// (`theme::preview_bg`), which is the one the editor palette is measured on.
+/// The colouring for an `edit_field` that holds SQL — Init SQL, the DDL
+/// preview, the view, trigger, routine and snippet bodies — through the
+/// editor's lexer and the same cross-line state ([`carried_lines`]), without
+/// the tab editor's zoom, inline diff or rainbow brackets. **In the interface
+/// theme's palette** ([`Tok::ui_color`]), not the editor's: the field sits on
+/// a field's own surface among the form's other fields.
 pub(crate) struct FieldSql {
     doc: Rc<dyn Document>,
     dialect: SqlDialect,
@@ -185,12 +202,6 @@ impl FieldSql {
         }
     }
 
-    /// What the field's layout cache key must also follow: the editor theme,
-    /// whose palette these colours are.
-    pub(crate) fn generation(&self) -> u64 {
-        crate::theme::editor_generation()
-    }
-
     /// Colour `line` — `Styling::apply_attr_styles`' body.
     pub(crate) fn apply(&self, line: usize, default: Attrs, attrs: &mut AttrsList) {
         let rope = self.doc.rope_text();
@@ -200,7 +211,9 @@ impl FieldSql {
         let content = rope.line_content(line);
         let carry = carry_at_cached(&*self.doc, self.dialect, &self.block_lines, line);
         for (start, end, tok) in lex_line_with(&content, self.dialect, carry, None) {
-            attrs.add_span(start..end, default.color(tok.color()));
+            if let Some(c) = tok.ui_color() {
+                attrs.add_span(start..end, default.color(c));
+            }
         }
     }
 }
@@ -799,10 +812,10 @@ pub(crate) fn carried_lines(text: &str, dialect: SqlDialect) -> Vec<Option<LineC
     carries
 }
 
-/// Public: color spans for a standalone SQL line (byte ranges + color), for
-/// callers outside the editor — e.g. the Ctrl+K diff, which renders each line as
-/// colored segments rather than through the editor's `Styling` hook. Same lexer
-/// as the editor, so highlighting matches exactly.
+/// Public: color spans for a standalone SQL line (byte ranges + color), in the
+/// **editor's** palette — for what is drawn on the editor's own surface without
+/// its `Styling` hook, the Ctrl+K diff. Same lexer as the editor, so
+/// highlighting matches exactly. SQL on a UI surface takes [`ui_spans`].
 pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Color)> {
     // Standalone line (Ctrl+K diff) — no document context, so no cross-line block
     // state; a multi-line comment there stays coloured per-line.
@@ -810,6 +823,17 @@ pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Co
     lex_line_with(line, dialect, None, brackets)
         .into_iter()
         .map(|(s, e, tok)| (s, e, tok.color()))
+        .collect()
+}
+
+/// [`highlight_spans`] in the interface theme's palette ([`Tok::ui_color`]) —
+/// for SQL a panel shows rather than the editor: the history, snippet and
+/// AI-chat previews and the GRANT block. One line, no cross-line state, and
+/// no rainbow brackets, which that palette has no colours for.
+pub(crate) fn ui_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Color)> {
+    lex_line_with(line, dialect, None, None)
+        .into_iter()
+        .filter_map(|(s, e, tok)| tok.ui_color().map(|c| (s, e, c)))
         .collect()
 }
 
@@ -1505,6 +1529,45 @@ mod tests {
         assert_eq!(of("TRUE"), Some(Tok::Constant));
         assert_eq!(of("LEFT"), Some(Tok::Keyword));
         assert_eq!(of("x"), None);
+    }
+
+    /// SQL outside the editor — a form field, a panel's preview — takes the
+    /// *interface* theme's palette, whatever the editor theme is: it sits on a
+    /// UI surface, and a dark editor palette on the Light UI's fields was the
+    /// mismatch this replaced. A bracket stays in the base colour.
+    #[test]
+    fn sql_outside_the_editor_takes_the_interface_palette() {
+        use crate::themes::{EditorThemeKind, UiThemeKind};
+        struct RestoreTheme;
+        impl Drop for RestoreTheme {
+            fn drop(&mut self) {
+                crate::theme::set_ui(UiThemeKind::Dark);
+                crate::theme::set_editor(EditorThemeKind::ALL[0]);
+            }
+        }
+        let _restore = RestoreTheme;
+        let line = "SELECT 'a', 7, COUNT(x) -- c";
+        let at = |w: &str| line.find(w).unwrap();
+        for ui_kind in UiThemeKind::ALL {
+            let ui = ui_kind.build();
+            for ed_kind in EditorThemeKind::ALL {
+                crate::theme::set_ui(ui_kind);
+                crate::theme::set_editor(ed_kind);
+                let spans = ui_spans(line, SqlDialect::MySql);
+                let colour = |w: &str| {
+                    spans
+                        .iter()
+                        .find(|(s, _, _)| *s == at(w))
+                        .map(|(_, _, c)| *c)
+                };
+                assert_eq!(colour("SELECT"), Some(ui.sql_keyword));
+                assert_eq!(colour("'a'"), Some(ui.sql_string));
+                assert_eq!(colour("7"), Some(ui.sql_number));
+                assert_eq!(colour("COUNT"), Some(ui.sql_function));
+                assert_eq!(colour("-- c"), Some(ui.sql_comment));
+                assert_eq!(colour("("), None, "a bracket keeps the base colour");
+            }
+        }
     }
 
     /// With rainbow brackets on, a code bracket is coloured by its nesting —

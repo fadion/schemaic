@@ -316,6 +316,19 @@ pub struct UiTheme {
     pub toggle_handle_off: Color,
     pub scrollbar: Color,
     pub scrollbar_hover: Color,
+    // ── SQL outside the editor ──────────────────────────────────────────────
+    // A short syntax palette for SQL a form or a panel shows — Init SQL, the
+    // view, trigger, routine and snippet bodies, the DDL preview, GRANT, the
+    // history, snippet and AI-chat previews. A beautifier rather than the
+    // editor's full highlighting: types read as keywords, `TRUE`/`NULL` as
+    // numbers, a `:name` as a function, brackets in the base colour. Of the
+    // UI axis on purpose: these sit on UI surfaces, and the editor's palette
+    // there was a dark block in a light form under a dark editor theme.
+    pub sql_keyword: Color,
+    pub sql_string: Color,
+    pub sql_number: Color,
+    pub sql_function: Color,
+    pub sql_comment: Color,
 }
 
 impl UiTheme {
@@ -459,6 +472,15 @@ impl UiTheme {
             toggle_handle_off: c("#525765"),
             scrollbar: c("#232431"),
             scrollbar_hover: c("#2F3243"),
+            // Soft, a step under the editor palettes' saturation, so a form's
+            // SQL reads as tinted text rather than a lit block. The keyword is
+            // a lavender rather than the accent blue: a search match is drawn
+            // bold in `match_highlight`, which *is* that blue.
+            sql_keyword: c("#B39DF2"),
+            sql_string: c("#9CC98A"),
+            sql_number: c("#E0A877"),
+            sql_function: c("#6CC4D8"),
+            sql_comment: c("#6E7385"),
         }
     }
 
@@ -617,6 +639,13 @@ impl UiTheme {
             toggle_handle_off: c("#FFFFFF"),
             scrollbar: c("#CDD1DC"),
             scrollbar_hover: c("#B4B9C8"),
+            // The same hues, deepened to clear AA on `bg_deepest` (#DCDFE6), the
+            // darker of the two surfaces they sit on here.
+            sql_keyword: c("#6B3FC4"),
+            sql_string: c("#2A682D"),
+            sql_number: c("#8A4E0B"),
+            sql_function: c("#1F6680"),
+            sql_comment: c("#6A6F7E"),
         }
     }
 }

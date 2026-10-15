@@ -501,6 +501,21 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(diff_del_marker on diff_del_bg, Body, "Ctrl+K diff: the − gutter marker"),
     pair!(toggle_handle_on on toggle_on, Icon, "settings: an on toggle's knob"),
     pair!(toggle_handle_off on toggle_off, Icon, "settings: an off toggle's knob"),
+    // ── SQL read and written outside the editor, in the UI theme's own syntax
+    // palette. Fields (Init SQL, the view/trigger/routine and snippet bodies,
+    // the DDL preview) and the GRANT block sit on the field surface; history,
+    // snippet and AI-chat SQL sit straight on the panel. The comment is the one
+    // token allowed to recede.
+    pair!(sql_keyword on bg_deepest, Body, "a SQL field: a keyword"),
+    pair!(sql_string on bg_deepest, Body, "a SQL field: a string"),
+    pair!(sql_number on bg_deepest, Body, "a SQL field: a number"),
+    pair!(sql_function on bg_deepest, Body, "a SQL field: a function"),
+    pair!(sql_comment on bg_deepest, Icon, "a SQL field: a comment"),
+    pair!(sql_keyword on bg_panel, Body, "history / snippets / chat SQL: a keyword"),
+    pair!(sql_string on bg_panel, Body, "history / snippets / chat SQL: a string"),
+    pair!(sql_number on bg_panel, Body, "history / snippets / chat SQL: a number"),
+    pair!(sql_function on bg_panel, Body, "history / snippets / chat SQL: a function"),
+    pair!(sql_comment on bg_panel, Icon, "history / snippets / chat SQL: a comment"),
 ];
 
 /// The editor surface. Only the roles Schemaic *chose* are gated.
@@ -899,8 +914,7 @@ mod tests {
         for (name, hex, _) in crate::CONN_COLOR_PRESETS {
             let fill = crate::theme::parse_hex(hex).expect("a preset is a valid hex");
             // Through the accessor, so this measures the decision rather than a
-            // copy of it — the same reason the preview test below asks
-            // `theme::preview_fg`.
+            // copy of it.
             let r = contrast_ratio(crate::theme::env_badge_text_on(fill), fill);
             if r < Legibility::Body.floor() {
                 bad.push(format!(
@@ -917,83 +931,6 @@ mod tests {
                 "
   "
             )
-        );
-    }
-
-    /// **The cross axis.** Every pairing table above measures one theme against
-    /// itself, so neither could ever see the one combination the app actually
-    /// paints in two panels: the *editor* theme's token palette on whatever
-    /// surface the preview chooses, with the UI theme picked independently.
-    ///
-    /// This asks `theme::preview_bg` / `theme::preview_fg` — the accessors both
-    /// previews call — over the whole `(UiThemeKind, EditorThemeKind)` product,
-    /// so it measures the decision rather than a copy of it. Point them back at
-    /// `bg_editor` and it fails on 6 of the 12 combinations, including the
-    /// shipped default pair (Light UI + Tokyo Night, where `string` sits at
-    /// 1.70:1).
-    ///
-    /// The floors follow the same reasoning as `EDITOR_PAIRINGS`: a token colour
-    /// is a reproduction of a published palette, so it is held to *Recessive*
-    /// rather than Body — the assertion is that it is a colour and not a stain,
-    /// which is what 1.70:1 fails. The uncoloured base is the panel's real body
-    /// text and is held to Body.
-    #[test]
-    fn a_coloured_preview_is_legible_in_every_ui_and_editor_theme_pair() {
-        // The theme is process state, so it is restored on the way out of the
-        // loop **whatever happens inside it** — an unwinding panic that left the
-        // thread on Light + Latte would surface as some unrelated later test
-        // failing, which is the hardest kind to trace.
-        struct RestoreTheme;
-        impl Drop for RestoreTheme {
-            fn drop(&mut self) {
-                crate::theme::set_ui(UiThemeKind::Dark);
-                crate::theme::set_editor(EditorThemeKind::ALL[0]);
-            }
-        }
-        let _restore = RestoreTheme;
-
-        let mut bad = Vec::new();
-        for ui_kind in UiThemeKind::ALL {
-            for ed_kind in EditorThemeKind::ALL {
-                crate::theme::set_ui(ui_kind);
-                crate::theme::set_editor(ed_kind);
-                let bg = crate::theme::preview_bg();
-                let ed = crate::theme::editor_theme();
-                let tokens: [(&str, Color, Legibility); 8] = [
-                    ("keyword", ed.keyword, Legibility::Recessive),
-                    ("string", ed.string, Legibility::Recessive),
-                    ("number", ed.number, Legibility::Recessive),
-                    ("comment", ed.comment, Legibility::Recessive),
-                    ("variable", ed.variable, Legibility::Recessive),
-                    // Rainbow brackets take these two, beside the keyword's.
-                    ("type", ed.type_, Legibility::Recessive),
-                    ("function", ed.function, Legibility::Recessive),
-                    // The identifiers — most of the text, and the panel's body.
-                    (
-                        "the base text",
-                        crate::theme::preview_fg(),
-                        Legibility::Body,
-                    ),
-                ];
-                for (what, fg, role) in tokens {
-                    let r = contrast_ratio(fg, bg);
-                    if r < role.floor() {
-                        bad.push(format!(
-                            "[UI {} + editor {}] {what} on the preview surface = \
-                             {r:.2}:1 (needs {:.1}:1)",
-                            ui_kind.label(),
-                            ed_kind.label(),
-                            role.floor(),
-                        ));
-                    }
-                }
-            }
-        }
-        assert!(
-            bad.is_empty(),
-            "a syntax-coloured preview is unreadable on some theme pairs — the \
-             surface and the token palette have to come from the same axis:\n  {}",
-            bad.join("\n  ")
         );
     }
 

@@ -24681,9 +24681,9 @@ existing prose was left alone.
     currently reachable**: `v_resize_handle` is called once from `center`, itself built once in the
     workspace shell, and the per-tab `dyn_container`s are its siblings rather than its parents, so
     these signals live as long as the app does.
-  - `history_panel.rs` — Query History right-column panel; its row preview is syntax-coloured on
-    `theme::preview_bg` like the snippet library's, for the `contrast.rs` reason `snippet_panel.rs`
-    gives below. Its **dialect comes from the active connection**, same memo and same reasoning as the
+  - `history_panel.rs` — Query History right-column panel; its row preview is syntax-coloured in
+    the interface theme's SQL palette with no surface of its own, like the snippet library's, for
+    the reason `snippet_panel.rs` gives below. Its **dialect comes from the active connection**, same memo and same reasoning as the
     library's: the list is filtered to that connection, so every row on screen ran against it. That
     memo is tracked in the row `dyn_container`'s trigger tuple alongside `visible` and `search` —
     two connections that both have no history yield the same empty `visible`, and without it the
@@ -25118,22 +25118,24 @@ existing prose was left alone.
     focus ring instead of the stops. The
     parameter chips under a body are read live from `params::names`, never stored, so they cannot
     disagree with the body above them. **The body preview is syntax-coloured** (`highlight_sql_mono`,
-    over the editor's own `sql_highlight::highlight_spans`, with the search match added last so it
-    still wins the overlap) and sits on **the editor's own surface, not the panel's** — the token
-    colours reproduce published palettes tuned against the *editor* background, which is the pairing
-    `contrast.rs` gates and the only one it vouches for, and the editor theme is chosen
-    independently of the light/dark UI theme (Catppuccin Latte's dark-on-light tokens can be live
-    while the panel is dark). That surface is `theme::preview_bg` and the uncoloured base beside it
-    `theme::preview_fg`, both named there rather than spelled here so the cross-axis gate measures
-    what the panel paints. It was `bg_editor` — the UI theme's inset surface, chosen off the
-    *other* axis — which is the pairing `contrast.rs`'s entry records at 1.70:1. The Query History
-    panel's preview runs through the same `highlight_sql_mono` onto the same two colours (a long
-    list of past runs read as the same wall of grey this one did); and the AI panel's fenced blocks
-    take the same two accessors, a **third instance rather than the exception** they were once
-    recorded as here — a SQL block goes through the same `highlight_sql_mono` once the turn has
-    settled, and a block that stays plain (non-SQL, or still streaming) keeps `preview_bg` and
-    `preview_fg` regardless, a second background for it being two kinds of block in one
-    conversation. The two previews are the same treatment
+    over `sql_highlight::ui_spans` — the editor's own lexer in the *interface* theme's SQL palette,
+    `UiTheme::sql_*` — with the search match added last so it still wins the overlap) and has **no
+    surface of its own**: base `theme::text_dim`, straight on the row, its vertical spacing kept and
+    its background, side padding and radius gone. It has been on two surfaces before, both of them
+    the wrong axis. First `bg_editor` — the UI theme's inset surface under the *editor* theme's
+    tokens — which is the pairing `contrast.rs`'s entry records at 1.70:1. Then the editor's own
+    surface and base (`theme::preview_bg`/`preview_fg`), on the reasoning that those token colours
+    reproduce published palettes tuned against the editor background; that was legible, but the
+    editor theme is chosen independently of the light/dark UI theme, so a Light UI under a dark
+    editor theme drew a dark block in a light panel. The palette moved to the UI axis instead, and
+    `contrast.rs` measures it on `bg_panel`. The Query History panel's preview runs through the same
+    `highlight_sql_mono` with the same base and no surface either (a long list of past runs read as
+    the same wall of grey this one did); and the AI panel's fenced blocks take the same treatment, a
+    **third instance rather than the exception** they were once recorded as here — a SQL block goes
+    through the same `highlight_sql_mono` once the turn has settled, base `theme::text`, and a block
+    that stays plain (non-SQL, or still streaming) takes the same base; `markdown::code_block`'s
+    wrapper lost its fill and keeps its border and header, a second look for a plain block being two
+    kinds of block in one conversation. The two previews are the same treatment
     down to the base the uncoloured identifiers take: the panels share a column and are read the
     same way, and a brighter base in one of them spent on identifiers the contrast the keywords are
     there to carry.
@@ -25575,18 +25577,19 @@ existing prose was left alone.
     the same bargain the properties modal's Copy makes: the alternative is a button whose enabled state is a
     `dyn_container` over the fetch, rebuilding its focus-ring registration on every click. It copies
     what the pane shows, which is already redacted, because redaction happens at the fetch.
-    **Each `GRANT` is rendered with `widgets::highlight_sql_mono`** — `theme::preview_fg` on a
-    `theme::preview_bg` block, the same call Query History, the snippet library and the AI chat's
-    fenced SQL make, with the dialect read off **`UsersTarget::dialect`** — captured at open beside
-    `conn_id` and for its reason, since the statements being highlighted belong to the server the
-    browser was opened on rather than to whichever connection the switcher has since moved to. Its
-    two sibling targets (`AccountTarget`, `GrantTarget`) carry one for the same reason. It was a
-    plain monospace `text()` on `code_bg`. The
-    two preview colours are the **editor's** axis and are paired deliberately — `contrast.rs`
-    measures them against each other — so the base has to be `preview_fg` and the surface has to be
-    named `preview_bg`, even though that accessor resolves to `code_bg` today: a coloured block
-    taking `preview_fg` onto anything the cross-axis gate does not read would be untested for
-    legibility. And a `GRANT` now reads the same here as in the tab it would be pasted into.
+    **Each `GRANT` is rendered with `widgets::highlight_sql_mono`** — base `theme::text` on a
+    `bg_deepest` block (`statement_row`), the same call Query History, the snippet library and the
+    AI chat's fenced SQL make, with the dialect read off **`UsersTarget::dialect`** — captured at
+    open beside `conn_id` and for its reason, since the statements being highlighted belong to the
+    server the browser was opened on rather than to whichever connection the switcher has since
+    moved to. Its two sibling targets (`AccountTarget`, `GrantTarget`) carry one for the same
+    reason. It was a plain monospace `text()` on `code_bg`, and then the editor theme's palette on
+    the editor's surface (`theme::preview_bg`/`preview_fg`) — an editor-coloured block in a
+    UI-themed form. It now takes the interface theme's SQL palette on the **field surface**, as the
+    DDL preview's SQL box does, since it sits in a form among fields; `contrast.rs`'s `UI_PAIRINGS`
+    measures the five `sql_*` roles on `bg_deepest`. The trade is that a `GRANT` no longer reads
+    exactly as in the tab it would be pasted into: the same lexer, but five colours folded from the
+    editor theme's full set, and no bracket colouring.
     **Each write action sits beside the thing it acts on**, not in the footer: `+ New account` at the
     foot of the list column, under the list it adds to rather than beside the box that searches it,
     so the column reads top to bottom as *find one, or make one*; and a `Privileges` /
@@ -26088,8 +26091,8 @@ existing prose was left alone.
     and an `edit_field` has no wheel to scroll sideways (only the editor pane wires Shift+wheel, see
     the Floem gotchas), so the end of a long statement — a selective XML index's paths, a rebuild's
     column list — ran past the box's edge and could not be read before Apply. It is syntax-coloured
-    in the plan's dialect (`FieldCfg::sql`, `p.dialect`), and so sits on the preview surface rather
-    than a field's — under `lib.rs`.
+    in the plan's dialect (`FieldCfg::sql`, `p.dialect`) and sits on a field's own surface, as every
+    SQL field now does — under `lib.rs`.
     `preview_proposal` is the AI's way in, beside `preview_change`'s: it seeds from `loaded_table`
     like every editor, applies the ops with `propose::apply`, diffs against
     `Target::new(dialect, db_flavour(…))` — the flavour matters, or the same change would preview
@@ -26390,7 +26393,7 @@ existing prose was left alone.
     open; only the footer is keyed on the draft). The options are shown because they're
     *carried* through a replace, and the PG "re-create instead of replacing" toggle is the
     override for the cases `ddl::pg_replaceable` can't read off the statement. The `SELECT` body is
-    coloured as the SQL editor colours it, in the target's dialect (`FieldCfg::sql`, under `lib.rs`).
+    SQL-coloured in the target's dialect (`FieldCfg::sql`, under `lib.rs`).
     The form is built **per engine** — check option for MySQL and PostgreSQL, the security/definer
     block for MySQL, the re-create toggle for PostgreSQL, and a "Column names" field for
     `ViewOptions::column_list` on SQLite and SQL Server. The first and last ask
@@ -30330,8 +30333,9 @@ existing prose was left alone.
     A merged front and back longer than the text, or an answer whose line count is not the text's,
     falls back to the whole `carried_lines` — the second being what a log that missed an edit would
     produce.
-    `highlight_spans` still lexes one line with no carry — it has no document — so a string or
-    comment spanning a preview's lines is coloured line by line there. The Ctrl+K diff's added
+    `highlight_spans` and its interface-palette sibling `ui_spans` still lex one line with no carry —
+    neither has a document — so a string or comment spanning a preview's lines is coloured line by
+    line there. The Ctrl+K diff's added
     rows go through `highlight_lines_in`, which takes each row's carry from the document the rows
     land in (`inline_diff::HunkCarries`, under `inline_diff.rs`), so a hunk that starts inside a
     string or comment the lines above opened is coloured as one. A context that is not one carry
@@ -30363,10 +30367,10 @@ existing prose was left alone.
     runs per visible line on every relayout, and re-walking the document before each line is the Θ(visible × document) cost `block_lines` was added to remove.
     It is computed only while the setting is on. `set_editor_rainbow_brackets` bumps `editor_gen`,
     which `SqlStyling::id()` folds into the layout cache key, so a flip re-colours lines already laid
-    out. `highlight_spans` has no document, so each standalone line of the Ctrl+K diff or a preview
-    starts at depth 0 and a bracket opened on an earlier line is unknown there; and since that puts
-    `type_` and `function` on previews, `contrast.rs`'s cross-axis preview test now holds both to
-    *Recessive* as well. In the editor a bracket inside a string continued from an earlier line is
+    out. `highlight_spans` has no document, so each standalone line of the Ctrl+K diff starts at
+    depth 0 and a bracket opened on an earlier line is unknown there. The previews outside the editor
+    took the same path until they moved to `ui_spans`, which colours no bracket at all (under
+    `FieldSql` below). In the editor a bracket inside a string continued from an earlier line is
     part of the carried lead and goes uncoloured; it was coloured as code while only block comments
     carried, though the depth each later line starts at never moved, the cached count having
     skipped the string whole.
@@ -30416,9 +30420,9 @@ existing prose was left alone.
     `editor_gen`, because nothing is drawn from it: Format Code (`format_editor`'s `format_range`)
     and both *Format statement* sites — the key/palette request and the right-click menu — ask for
     it at the moment they run.
-    **`FieldSql` carries the same colouring into an `edit_field`** — the DDL preview's SQL box and
-    the view, trigger, routine and snippet bodies, each of which sets `FieldCfg::sql` (under
-    `lib.rs`). It
+    **`FieldSql` carries the same lexing into an `edit_field`** — the connection form's Init SQL, the
+    DDL preview's SQL box and the view, trigger, routine and snippet bodies, each of which sets
+    `FieldCfg::sql` (under `lib.rs`). It
     is the same `lex_line_with` with the same cross-line state: the per-revision `CarryCache` is
     filled by `carry_at_cached` — keyed on `cache_rev` and keeping a copy of the text, since a field
     has no edit log, which is the path `SqlStyling::carry_at` takes only without one — and both
@@ -30426,19 +30430,31 @@ existing prose was left alone.
     re-lex is one piece of code rather than two copies of it. It leaves out what only the tab editor has — the zoom, the inline
     diff and rainbow brackets (`lex_line_with` is handed `None` for the depth) — and its dialect is a
     plain `SqlDialect` fixed when the field is built, where `SqlStyling`'s is a memo.
-    `FieldSql::generation` is `theme::editor_generation()`, which `FieldStyling::id` adds to its key
-    so an editor-theme switch re-lays out lines already coloured. **No test covers `FieldSql`** — it needs a
-    floem `Document`, and there is no fixture for one.
-    `theme::preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**,
-    and they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
-    measures the surface the previews actually paint — the SQL-holding `edit_field`s are the latest
-    callers (`FieldCfg::sql`), and the account browser's `GRANT` block the one before them, whose
-    move off `code_bg` is exactly that distinction and nothing else:
-    `preview_bg()` *is* `code_bg()`, the same pixel, but spelled through the accessor the gate reads
-    rather than through one it does not. Both come from the *editor* axis, which is the
-    whole point: the token colours are reproductions of palettes tuned against their own background,
-    the editor theme is chosen independently of the light/dark UI theme, and pairing them with a UI
-    surface is a combination nobody chose — see `contrast.rs` for the ratios that cost.
+    **Its colours are not the editor's.** `FieldSql::apply` paints through `Tok::ui_color`, the
+    interface theme's short SQL palette (`UiTheme::sql_keyword`/`sql_string`/`sql_number`/
+    `sql_function`/`sql_comment`), and `ui_spans` does the same for the read-only SQL a panel shows
+    through `widgets::highlight_sql_mono` — the History, snippet-library and AI-chat previews and
+    the account browser's `GRANT` block — one line at a time, with no cross-line state and no
+    rainbow brackets. It is a beautifier, not full highlighting: a type folds onto the keyword
+    colour, a constant onto the number, a variable onto the function, and a bracket answers `None`
+    and keeps the base colour. The keyword is a lavender rather than the accent blue because a
+    search match is drawn bold in `match_highlight`, which *is* the accent. All of this used to be
+    the editor theme's palette on the editor's surface (`theme::preview_bg`/`preview_fg`, the editor
+    background and foreground, both now deleted), on the reasoning that the tokens reproduce
+    palettes tuned against their own background — and it put editor-coloured blocks inside
+    UI-themed forms and panels: a Light UI under a dark editor theme showed dark blocks in light
+    forms. Now each sits on its placement's own surface, which is under `lib.rs` (`FieldCfg::sql`)
+    and under each panel's entry. Since the palette is the UI theme's, `FieldStyling::id` keys on
+    `theme::ui_generation()` alone; `FieldSql::generation` (the editor generation) went with the
+    move, and an editor-theme switch no longer touches a field. **The editor theme now colours the
+    editor and nothing else** — the Ctrl+K inline diff included, which is drawn on the editor's own
+    surface and so keeps `highlight_spans`/`highlight_lines`/`highlight_lines_in` on the editor
+    palette, and the completion popup's `theme::suggest_*`.
+    `sql_outside_the_editor_takes_the_interface_palette` pins the palette across every UI × editor
+    theme combination — each token takes its `UiTheme::sql_*` role whatever the editor theme is, a
+    bracket stays uncoloured. It asks `ui_spans`; **no test covers `FieldSql`** itself — it needs a
+    floem `Document`, and there is no fixture for one — so what reaches its `apply` is only that
+    the two share `Tok::ui_color`.
   - `contrast.rs` — the **legibility gate** over `themes.rs`: WCAG relative-luminance maths plus
     `UI_PAIRINGS`/`EDITOR_PAIRINGS`, one row per (foreground, background) combination the UI really
     paints, each with the floor its role earns. The unit is the **pairing**, not the literal — a
@@ -30480,27 +30496,28 @@ existing prose was left alone.
     asserted here, because a border carries no text and a legibility floor on it would mean nothing;
     `erd_view::tests::a_tinted_border_is_never_fainter_than_the_plain_one` holds it to the plain
     `border` it replaces instead.
-    The other thing the tables cannot express is a **cross-axis** pairing, and
-    `a_coloured_preview_is_legible_in_every_ui_and_editor_theme_pair` is where that one is measured.
-    Every row above holds one theme against itself, so neither table could ever see the combination
-    two panels really paint: the *editor* theme's token palette on a surface the **UI** theme chose.
-    The History and Snippet previews took their token colours from the editor theme and their
+    **The tables cannot express a cross-axis pairing — and nothing paints one any more.** Every row
+    above holds one theme against itself, so neither table could see the combination two panels
+    once painted: the *editor* theme's token palette on a surface the **UI** theme chose. The
+    History and Snippet previews took their token colours from the editor theme and their
     background from `bg_editor` — the UI theme's inset surface (the SQL editor's backdrop, the blob
     viewer, the record editor's value fields; form fields default to `bg_deepest`, whatever the
     table's first labels said) — and on the Light UI theme with the shipped-default Tokyo Night that put `string` at 1.70:1 and
     `number` at 1.90:1, under even the *Recessive* floor of 2.0, while the uncoloured text beside
     them sat at 5.70:1. The text the colour was added to make stand out was the only text made
-    unreadable. The test walks the whole `(UiThemeKind, EditorThemeKind)` product asking
-    `theme::preview_bg`/`preview_fg` — the accessors both previews call, so it measures the decision
-    rather than a copy of it — and pointed back at `bg_editor` it fails on 6 of the 12 pairs. Tokens
-    are held to *Recessive* for `EDITOR_PAIRINGS`' reason (each is a reproduction of a published
-    palette, so the assertion is that it is a colour and not a stain) and the uncoloured base to
-    *Body*, being the panel's real body text. The SQL fields `edit_field` colours (`FieldCfg::sql`)
-    sit on the same two accessors, so this test is their gate as well — their placeholder included,
-    which takes the palette's `comment` (`sql_placeholder`) rather than the UI axis's
-    `theme::placeholder`, a pairing nothing would measure. The active theme is process state, so the loop restores
-    it through a `Drop` guard: a panic inside it would otherwise leave the thread on Light + Latte
-    and surface as some unrelated later test failing.
+    unreadable. The first fix moved those previews, then the SQL `edit_field`s and the `GRANT`
+    block, onto the editor's own surface and base (`theme::preview_bg`/`preview_fg`) and gated them
+    with `a_coloured_preview_is_legible_in_every_ui_and_editor_theme_pair`, a walk of the whole
+    `(UiThemeKind, EditorThemeKind)` product. That made them legible and left them editor-coloured
+    blocks inside UI-themed forms and panels, so the second fix moved the palette instead: SQL
+    outside the editor takes the UI theme's own `sql_*` roles (under `sql_highlight.rs`), the
+    cross-axis test was deleted with nothing left crossing axes for it to measure, and those roles
+    are ordinary `UI_PAIRINGS` rows — `sql_keyword`, `sql_string`, `sql_number` and `sql_function`
+    at *Body* and `sql_comment` at *Icon*, each on `bg_deepest` (the SQL fields, the DDL preview's
+    box, the `GRANT` block) and on `bg_panel` (the History, snippet and AI-chat SQL), all passing
+    with no `UI_SHORTFALL` entry. A SQL field's placeholder is the field's own `theme::placeholder`,
+    as on any other field. Should a colour from one axis ever be painted on the other's surface
+    again, it needs a cross-axis test back: neither table can see it.
   - `lib.rs` (with `grid.rs`, one of the crate's two largest modules) — the `Ui` struct + bundles,
     shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, `edit_field`/`FieldCfg`,
@@ -31136,19 +31153,21 @@ existing prose was left alone.
     the common prefix, which leaves it mid-text whenever the typed head already matched the
     option's case. Every caller reaches it through `table_designer::suggest_field`; Tab's precedence
     is under *Floem 0.2 gotchas*.
-    **`FieldCfg::sql` colours a field holding SQL as the editor colours it** —
+    **`FieldCfg::sql` colours a field holding SQL in the interface theme's SQL palette** —
     `sql_highlight::FieldSql`, built over the field's own `ed.doc()` and driven from
-    `FieldStyling::apply_attr_styles`. Setting it **overrides `background` and `text_color`** with
-    `theme::preview_bg` and `preview_fg`: the token colours are the *editor* theme's, a field's usual
-    surface is the *UI* theme's, and the two are chosen independently, so the editor palette on a
-    field surface is a pairing nothing measures — while
-    `a_coloured_preview_is_legible_in_every_ui_and_editor_theme_pair` measures exactly this one in
-    every UI × editor theme combination. A caller's `background` is therefore ignored on a SQL field,
-    deliberately. `FieldStyling::id` adds `FieldSql::generation` (the editor generation) to the UI
-    generation in its key, so an editor-theme switch re-lays the lines out rather than leaving them
-    in the old palette, the hazard `SqlStyling::id` documents. The callers are the DDL preview's SQL
-    box, the view editor's `SELECT`, the trigger and routine bodies, and the snippet editor's body —
-    a snippet carries a scope rather than a dialect, so `snippet::body_dialect` picks one for it.
+    `FieldStyling::apply_attr_styles`: the editor's lexer, `UiTheme::sql_*`'s colours (under
+    `sql_highlight.rs`). **It changes nothing else about the field** — the background, text and
+    placeholder stay the field's own (`bg_deepest`, `theme::text` and `theme::placeholder` by
+    default), so a SQL field matches the fields around it, and a caller's `background` is honoured.
+    It used to override all three with the editor's surface, base and comment colour
+    (`theme::preview_bg`/`preview_fg`/`sql_placeholder`, all three now deleted) to keep the editor
+    palette on the background it was tuned for, which made every SQL field a dark block in a light
+    form whenever the two themes disagreed. `FieldStyling::id` keys on `theme::ui_generation()` with
+    the size, so a UI-theme switch re-lays the lines out rather than leaving them in the old palette,
+    the hazard `SqlStyling::id` documents; an editor-theme switch leaves a field alone. The callers
+    are the connection form's Init SQL, the DDL preview's SQL box, the view editor's `SELECT`, the
+    trigger and routine bodies, and the snippet editor's body — a snippet carries a scope rather
+    than a dialect, so `snippet::body_dialect` picks one for it.
     **`FieldCfg::button` is a labelled button inside a single-line field**, right-aligned — Import
     Connections' *Add* and `connection_form::path_field`'s *Browse…* (GitHub #19), each built with
     `widgets::field_button`. Beside the field, as a `control_button`, it stood shorter than the box
@@ -37688,8 +37707,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     should always change together). Otherwise extract a separate named fn — even if it starts at the
     same hex — so each can be retuned independently (e.g. `seed_button()` alongside the identical
     `status_ok()`).
-- **Theming (`themes.rs`)**: three independent axes — `UiTheme` (chrome: dark/light), `EditorTheme`
-  (editor surface + syntax tokens: One Dark Pro / Tokyo Night / Catppuccin Latte) and `UiScale`
+- **Theming (`themes.rs`)**: three independent axes — `UiTheme` (chrome: dark/light, including the
+  short `sql_*` palette for SQL shown outside the editor), `EditorTheme` (the editor's surface and
+  syntax tokens, and nothing outside the editor: One Dark Pro / Tokyo Night / Catppuccin Latte) and
+  `UiScale`
   (how large the chrome is drawn). A theme is a flat struct of named colour roles (hex). All three
   live in `Scope`-owned global `RwSignal`s; `theme::set_ui`/`set_editor`/`set_ui_scale` swap them,
   and all three are **idempotent** — a re-pick of the value already in effect does nothing, which is

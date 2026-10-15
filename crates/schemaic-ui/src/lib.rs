@@ -10822,13 +10822,6 @@ fn field_line_h(px: f32) -> f64 {
     (px as f64 * 1.46).round()
 }
 
-/// A SQL field's placeholder colour: the editor palette's comment colour, which
-/// `a_coloured_preview_is_legible_in_every_ui_and_editor_theme_pair` holds
-/// legible on `theme::preview_bg` in every theme pair.
-fn sql_placeholder() -> floem::peniko::Color {
-    theme::editor_theme().comment
-}
-
 /// [`edit_field`]'s editor styling.
 ///
 /// A hand-written `Styling` rather than floem's `SimpleStyling` for one reason:
@@ -10847,13 +10840,12 @@ struct FieldStyling {
 impl floem::views::editor::text::Styling for FieldStyling {
     /// The editor caches its laid-out lines against this id, so the size has to
     /// be *in* it: reporting a new `font_size` while the id stood still would
-    /// leave the old layout on screen. Same shape as `SqlStyling::id` — which
-    /// is why a SQL field's id follows the editor theme too: its colours are
-    /// that palette's, and a theme switch must re-lay the lines out.
+    /// leave the old layout on screen. Same shape as `SqlStyling::id`. The
+    /// interface theme's generation is in it for a SQL field's sake: its token
+    /// colours are that theme's palette (`UiTheme::sql_*`), so a theme switch
+    /// must re-lay the lines out.
     fn id(&self) -> u64 {
-        let generation =
-            theme::ui_generation().wrapping_add(self.sql.as_ref().map_or(0, |s| s.generation()));
-        (generation << 8) | ((self.size)().round() as u64 & 0xFF)
+        (theme::ui_generation() << 8) | ((self.size)().round() as u64 & 0xFF)
     }
 
     fn apply_attr_styles(
@@ -10919,11 +10911,10 @@ pub(crate) struct FieldCfg {
     /// (the DDL preview's generated SQL). Doesn't change the line height, so the
     /// auto-grow box math is unaffected.
     pub mono: bool,
-    /// The field holds SQL of this dialect: colour it as the SQL editor does
-    /// ([`sql_highlight::FieldSql`]), on the preview surface and in its text
-    /// colour (`theme::preview_bg`/`preview_fg`) — the pair the editor palette
-    /// is measured against in every theme combination — overriding
-    /// [`FieldCfg::background`] and [`FieldCfg::text_color`].
+    /// The field holds SQL of this dialect: colour its tokens with the editor's
+    /// lexer in the interface theme's SQL palette ([`sql_highlight::FieldSql`],
+    /// `UiTheme::sql_*`). The surface, text and placeholder stay the field's
+    /// own, so a SQL field matches the fields around it.
     pub sql: Option<SqlDialect>,
     pub border_radius: f32,
     /// Read-only: no text edits (still handles Enter/Escape). Suppresses autofocus.
@@ -11344,18 +11335,6 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         button.is_none() || (trailing.is_none() && !clearable && !multiline),
         "FieldCfg::button takes the corner trailing and clearable use, on one line"
     );
-    // A SQL field is coloured with the editor palette, so it sits on the
-    // surface that palette is measured on — see `FieldCfg::sql`.
-    // Its placeholder too: the UI theme's placeholder colour is measured on
-    // no editor-theme surface, the palette's comment colour on this one.
-    let (background, text_color, placeholder_color) = match sql {
-        Some(_) => (
-            theme::preview_bg as fn() -> floem::peniko::Color,
-            Some(theme::preview_fg as fn() -> floem::peniko::Color),
-            Some(sql_placeholder as fn() -> floem::peniko::Color),
-        ),
-        None => (background, text_color, placeholder_color),
-    };
     // Set while the signal→doc reconcile below is writing, so the field's own
     // re-mask is not reported back to it as a user edit. `on_update` runs
     // synchronously inside `edit_single`, which is what makes a plain flag

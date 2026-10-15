@@ -337,15 +337,15 @@ fn snippet_row(
     // face the editor it came from uses.
     // Syntax-coloured, as the history panel's preview is: this is the panel's
     // one large block of text, and colouring it is what stops a list of saved
-    // queries reading as a wall of grey. The colours are the editor's own
-    // (`sql_highlight`), so a snippet looks in the library the way it will once
-    // it is inserted — the identifiers, which are most of the text, stay in the
-    // quiet base and only keywords, strings and numbers carry colour.
+    // queries reading as a wall of grey. The lexer is the editor's own
+    // (`sql_highlight`), in the interface theme's SQL palette — the
+    // identifiers, which are most of the text, stay in the quiet base and only
+    // keywords, strings and numbers carry colour.
     let body_view = highlight_sql_mono(
         snippet::collapsed_for_highlight(&snip.body, dialect),
         term.clone(),
         font_body,
-        theme::preview_fg,
+        theme::text_dim,
         1.4,
         dialect,
     )
@@ -370,18 +370,13 @@ fn snippet_row(
     // the row, which is why the same text wrapped there without being asked.
     .clip()
     .style(|s| s.width_full().min_width(0.0));
-    // **On the editor's surface, not the panel's** — `theme::preview_bg`, which
-    // holds the reason and the ratios. The history panel's preview takes the
-    // same surface and the same base, and `contrast.rs`'s cross-axis test is
-    // what keeps both there.
+    // **No surface of its own**, as the history panel's preview: the body sits
+    // straight on the row, in line with the name above it.
     let body_view = container(body_view).style(|s| {
         s.width_full()
             .min_width(0.0)
             .margin_top(theme::scaled(5.0))
-            .padding_horiz(theme::scaled(7.0))
             .padding_vert(theme::scaled(5.0))
-            .background(theme::preview_bg())
-            .border_radius(5.0)
     });
 
     // A chip per `:name` the body holds — read live, never stored, so they can't

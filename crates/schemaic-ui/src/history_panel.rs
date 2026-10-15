@@ -338,17 +338,16 @@ fn history_row(
     // are most of a statement, stay in the base colour — only keywords, strings
     // and numbers carry colour, so the list still scans as a list.
     //
-    // `theme::preview_fg` is that base, the same one the library's previews
-    // take: the two panels sit in the same column and are read the same way, so
-    // a brighter base here would make the colour that *is* meaningful — the
-    // keywords — carry less of the difference than it does one panel over. It
-    // comes from the editor axis because the token colours beside it do; a UI
-    // colour on this surface is the mismatch `theme::preview_bg` describes.
+    // `theme::text_dim` is that base, the same one the library's previews
+    // take: the two panels sit in the same column and are read the same way,
+    // and a quiet base is what lets the keywords carry the difference. The
+    // tokens are the interface theme's SQL palette (`UiTheme::sql_*`), measured
+    // on `bg_panel` by `contrast.rs`.
     let preview_view = highlight_sql_mono(
         preview,
         term.clone(),
         font_body,
-        theme::preview_fg,
+        theme::text_dim,
         1.4,
         dialect,
     )
@@ -369,21 +368,19 @@ fn history_row(
     })
     .clip()
     .style(|s| s.width_full().min_width(0.0));
-    // On the **editor's** surface, not the panel's — `theme::preview_bg`, which
-    // is where the reason lives. The snippet library takes the same one, and the
-    // gate that keeps both there is `contrast.rs`'s cross-axis test.
+    // **No surface of its own**: the SQL sits straight on the row, in line with
+    // the labels above and below it, so the panel keeps its own look whatever
+    // either theme is. The snippet library does the same.
     //
-    // The padding replaces the 3px the text used to carry above and below, on
-    // top of the stack's own 4px gap: the SQL was sitting tight against the two
-    // label lines, which made consecutive rows read as one block.
+    // The vertical padding replaces the 3px the text used to carry above and
+    // below, on top of the stack's own 4px gap: the SQL was sitting tight
+    // against the two label lines, which made consecutive rows read as one
+    // block.
     let preview_view = container(preview_view).style(|s| {
         s.width_full()
             .min_width(0.0)
             .margin_vert(theme::scaled(3.0))
-            .padding_horiz(theme::scaled(7.0))
             .padding_vert(theme::scaled(5.0))
-            .background(theme::preview_bg())
-            .border_radius(5.0)
     });
 
     // Database name + its identity dot as a tight group, so the footer's `gap(8)`

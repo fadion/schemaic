@@ -829,10 +829,11 @@ fn code_block(
     settled: bool,
 ) -> impl IntoView {
     let shown = code.trim_end().to_string();
-    // **Syntax-coloured, on the editor's own surface** — the same pairing the
-    // History and Snippet previews take, through the same two accessors, because
-    // this is the same thing: SQL, read outside the editor. `theme::preview_bg`
-    // holds why both come off the editor axis rather than the UI one.
+    // **Syntax-coloured, with no surface of its own** — the History and Snippet
+    // previews' treatment, because this is the same thing: SQL, read outside
+    // the editor, in the interface theme's SQL palette on the panel's own
+    // background. The block keeps its frame and header; only the fill went, so
+    // the conversation keeps its look whatever the editor theme is.
     //
     // **Only once the turn has settled**, and that is not a perf hedge. The
     // bubbles rebuild on every streamed token, and mid-stream the block is
@@ -842,8 +843,8 @@ fn code_block(
     // coloured — and the per-token lex goes with it.
     //
     // A non-SQL block (shell, json) stays plain in any case, but takes the same
-    // surface and the same base: it is still code, and a second background for
-    // it would be two kinds of block in one conversation.
+    // base: it is still code, and a second look for it would be two kinds of
+    // block in one conversation.
     let base_style = |s: floem::style::Style| {
         s.width_full()
             .font_size(theme::font_body())
@@ -855,7 +856,7 @@ fn code_block(
             shown,
             None,
             theme::font_body,
-            theme::preview_fg,
+            theme::text,
             CODE_LINE_H,
             actions.dialect.get_untracked(),
         )
@@ -868,7 +869,7 @@ fn code_block(
                 base_style(s)
                     .font_family(crate::consts::MONO_FAMILY.to_string())
                     .line_height(CODE_LINE_H)
-                    .color(theme::preview_fg())
+                    .color(theme::text())
             })
             .into_any(),
     };
@@ -964,7 +965,6 @@ fn code_block(
     v_stack((header, body)).style(|s| {
         s.flex_col()
             .width_full()
-            .background(theme::preview_bg())
             .border(1.0)
             .border_color(theme::border())
             .border_radius(CODE_RADIUS)

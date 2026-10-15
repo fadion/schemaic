@@ -737,19 +737,17 @@ fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
 /// read rather than edited.
 ///
 /// **The same call query history and the snippet library make** —
-/// `widgets::highlight_sql_mono` over the editor's own lexer, `theme::preview_fg`
-/// on a `theme::preview_bg` block. Those two colours are from the *editor's*
-/// axis rather than the UI's, and are paired deliberately: `contrast.rs` tests
-/// them against each other, so a block that took `preview_fg` on a UI background
-/// would be untested for legibility. It also means a `GRANT` reads the same here
-/// as it does in the tab it would be pasted into.
+/// `widgets::highlight_sql_mono`, the interface theme's SQL palette — but on a
+/// block of the **field surface** (`bg_deepest`), since it sits in a form among
+/// fields, as the DDL preview's SQL box does. `contrast.rs` measures the palette
+/// on that surface.
 fn statement_row(sql: &str, dialect: SqlDialect) -> AnyView {
     container(
         crate::widgets::highlight_sql_mono(
             sql.to_string(),
             None,
             font_body,
-            theme::preview_fg,
+            theme::text,
             1.4,
             dialect,
         )
@@ -761,7 +759,7 @@ fn statement_row(sql: &str, dialect: SqlDialect) -> AnyView {
             .padding_horiz(theme::scaled(8.0))
             .padding_vert(theme::scaled(6.0))
             .border_radius(theme::scaled(4.0))
-            .background(theme::preview_bg())
+            .background(theme::bg_deepest())
     })
     .into_any()
 }

@@ -5907,11 +5907,10 @@ pub(crate) fn highlight_mono(
 /// highlight — for a panel that shows a saved statement rather than a line of
 /// prose.
 ///
-/// The colours are `sql_highlight::highlight_spans`, the editor's own lexer, so
-/// a snippet reads the same in the library as it will once inserted; the Ctrl+K
-/// diff renders its lines through the same call for the same reason. It takes
-/// **one line**, which is what a collapsed preview is — `highlight_spans` carries
-/// no cross-line block-comment state.
+/// The colours are `sql_highlight::ui_spans` — the editor's own lexer, in the
+/// **interface** theme's SQL palette (`UiTheme::sql_*`), since the text sits on
+/// a UI surface (a panel, a form). It takes **one line**, which is what a
+/// collapsed preview is — `ui_spans` carries no cross-line block-comment state.
 ///
 /// A search match still wins where the two overlap: its span is added last, and
 /// it is bold as well as coloured, so the thing you typed is never the quietest
@@ -5975,7 +5974,7 @@ fn highlight_text_in(
         // Syntax first, the search term second: a later span wins the overlap,
         // and what the user typed has to be the thing that stands out.
         if let Some(dialect) = syntax {
-            for (lo, hi, color) in crate::sql_highlight::highlight_spans(&full, dialect) {
+            for (lo, hi, color) in crate::sql_highlight::ui_spans(&full, dialect) {
                 list.add_span(
                     lo..hi,
                     Attrs::new()
