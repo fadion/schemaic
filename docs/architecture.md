@@ -9796,8 +9796,12 @@ existing prose was left alone.
     `log_columns(entries, cols)` is the union of names `log_result_set` used to compute inline —
     factored out, and called by both, so the screen and the file cannot disagree about which value
     sits under which heading after an `ALTER` (`a_change_shows_under_the_names_it_was_recorded_with`
-    asserts the two lists equal). The modal asks it after every poll that lands, so it skips a run
-    of entries sharing one `Arc` column list and one width rather than re-walking each.
+    asserts the two lists equal). The modal asks it after every poll that lands, so it walks each
+    run of entries naming their columns alike once (`shapes`) rather than re-walking each — alike
+    by **content** and width, the pointer only settling the common case first: each poll records
+    under a fresh `Arc` of the same list, so a pointer key split a log of one-change polls into a
+    run per entry, 6–18 ms on the UI thread per landing poll at 60–120 columns
+    (`equal_column_lists_under_fresh_arcs_are_one_run`).
     `table_cells(entry, headings, cols)` is one row of it as `LogCell`s: `Value` (an insert's new
     value, a delete's last-seen one, a value an update left alone), `Changed(old, new)`, or
     `Missing` for a column the entry was not recorded with — rendered empty, not borrowed from a

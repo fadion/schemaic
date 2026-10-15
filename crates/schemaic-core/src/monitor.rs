@@ -531,17 +531,9 @@ pub fn log_columns(entries: &[MonitorEntry], cols: &[String]) -> Vec<String> {
     for i in 0..cols.len() {
         push(&mut headings, name_at(cols, i));
     }
-    // The entries of one poll share one list, so a run of them names the same
-    // columns — the modal asks this after every poll that lands.
-    let mut last: Option<(*const Vec<String>, usize)> = None;
-    for e in entries {
-        let shape = (std::sync::Arc::as_ptr(&e.cols), width_of(e, cols));
-        if last == Some(shape) {
-            continue;
-        }
-        last = Some(shape);
-        for i in 0..width_of(e, cols) {
-            push(&mut headings, name_at(names_of(e, cols), i));
+    for (names, width) in shapes(entries, cols) {
+        for i in 0..width {
+            push(&mut headings, name_at(names, i));
         }
     }
     // An index nobody named — a log wider than every list it carries.
@@ -549,6 +541,29 @@ pub fn log_columns(entries: &[MonitorEntry], cols: &[String]) -> Vec<String> {
         push(&mut headings, unnamed_column(i));
     }
     headings
+}
+
+/// The runs of `entries` that name their columns alike, as each run's list
+/// and width — what [`log_columns`] has to walk, once a run.
+///
+/// **Alike by content, not by `Arc`.** The modal asks `log_columns` after
+/// every poll that lands, and each poll records under a fresh `Arc` of the
+/// same list, so a pointer key split a log of one-change polls into as many
+/// runs as entries: every index of every entry was cloned and checked again,
+/// 6–18 ms on the UI thread per landing poll at 60–120 columns. Equal lists
+/// compare cheaply, and the pointer still settles the common case first.
+fn shapes<'a>(entries: &'a [MonitorEntry], cols: &'a [String]) -> Vec<(&'a [String], usize)> {
+    let mut runs: Vec<(&[String], usize)> = Vec::new();
+    for e in entries {
+        let shape = (names_of(e, cols), width_of(e, cols));
+        let same = runs.last().is_some_and(|(names, width)| {
+            *width == shape.1 && (std::ptr::eq(*names, shape.0) || *names == shape.0)
+        });
+        if !same {
+            runs.push(shape);
+        }
+    }
+    runs
 }
 
 /// `e`'s row of the change table: a cell per heading of [`log_columns`],
@@ -1856,6 +1871,36 @@ mod tests {
                 LogCell::Changed("Ken K".to_string(), "Donald".to_string())
             ]
         );
+    }
+
+    /// **A log of one-change polls is one run of columns, not one per entry.**
+    /// Each poll records under a fresh `Arc` of the same list; keyed on the
+    /// pointer, a thousand such polls were a thousand runs for `log_columns`
+    /// to walk on every landing poll. An `ALTER` between them still starts
+    /// a run of its own.
+    #[test]
+    fn equal_column_lists_under_fresh_arcs_are_one_run() {
+        let list = vec!["id".to_string(), "name".to_string()];
+        let mut log = Vec::new();
+        for i in 0..1000 {
+            let cols = std::sync::Arc::new(list.clone());
+            append_changes(
+                &mut log,
+                &format!("t{i}"),
+                vec![change(ChangeKind::Insert, &[Some("1"), Some("a")], vec![])],
+                &cols,
+            );
+        }
+        assert_eq!(shapes(&log, &list).len(), 1);
+        let altered = std::sync::Arc::new(vec!["id".to_string(), "title".to_string()]);
+        append_changes(
+            &mut log,
+            "t1000",
+            vec![change(ChangeKind::Insert, &[Some("2"), Some("b")], vec![])],
+            &altered,
+        );
+        assert_eq!(shapes(&log, &list).len(), 2);
+        assert_eq!(log_columns(&log, &list), ["id", "name", "title"]);
     }
 
     /// **The screen heads its columns as the file does**: after an `ALTER`
