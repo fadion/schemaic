@@ -1575,9 +1575,12 @@ existing prose was left alone.
     **A select-list alias
     resolves an unqualified name except in the clauses the engine reads before it**
     (`Scope::alias_blind`): `WHERE` everywhere but SQLite, which resolves one there
-    (`select_alias_in_where`), and `HAVING` on PostgreSQL and SQL Server, which do not
-    (`select_alias_in_having`); the resolver used to know only `WHERE`, for every engine
-    (`a_select_list_alias_is_judged_by_the_engines_scope`). **On PostgreSQL a bare table name or
+    (`select_alias_in_where`), a join's `ON` likewise (`select_alias_in_join_on`, its ranges from
+    `output_alias::join_ons`, which the rename already read), and `HAVING` on PostgreSQL and SQL
+    Server, which do not (`select_alias_in_having`); the resolver used to know only `WHERE`, for
+    every engine (`a_select_list_alias_is_judged_by_the_engines_scope`), and then let an alias
+    answer a name in `ON` everywhere, where MySQL says *Unknown column 'k' in 'on clause'*
+    (`diag_alias_in_join_on_flagged_where_the_engine_rejects_it`). **On PostgreSQL a bare table name or
     alias is the whole row** (`names_whole_rows`): `row_to_json(u)`, `SELECT u FROM users u` —
     `resolve` accepts one naming a visible source once no column of that name has claimed it,
     where it used to report ``Column `u` not found``

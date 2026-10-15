@@ -11756,8 +11756,9 @@ mod colres {
         proj_aliases: HashSet<String>,
         /// Byte ranges of this scope's clauses where a projection alias is **not**
         /// in scope on this engine ([`super::select_alias_in_where`],
-        /// [`super::select_alias_in_having`]), so an alias-only match inside one is
-        /// an error, not a resolution: `WHERE` everywhere but SQLite, `HAVING` on
+        /// [`super::select_alias_in_having`], [`super::select_alias_in_join_on`]),
+        /// so an alias-only match inside one is an error, not a resolution:
+        /// `WHERE` and a join's `ON` everywhere but SQLite, `HAVING` on
         /// PostgreSQL and SQL Server.
         alias_blind: Vec<(usize, usize)>,
         /// Columns coalesced by a `USING(...)` join — an unqualified reference to
@@ -11799,6 +11800,7 @@ mod colres {
             dateparts: super::datepart_functions(dialect),
             alias_in_where: super::select_alias_in_where(dialect),
             alias_in_having: super::select_alias_in_having(dialect),
+            alias_in_join_on: super::select_alias_in_join_on(dialect),
             group_by: GroupByRules {
                 judged: super::rejects_ungrouped_columns(dialect, catalog.flavour),
                 unique_keys: super::unique_key_determines_row(dialect),
@@ -11859,10 +11861,11 @@ mod colres {
         /// The engine's datepart-taking functions
         /// ([`super::datepart_functions`]), whose first argument is a keyword.
         dateparts: &'static [&'static str],
-        /// Whether a projection alias is in scope in `WHERE` and in `HAVING` on
-        /// this engine — see [`Scope::alias_blind`].
+        /// Whether a projection alias is in scope in `WHERE`, in `HAVING` and
+        /// in a join's `ON` on this engine — see [`Scope::alias_blind`].
         alias_in_where: bool,
         alias_in_having: bool,
+        alias_in_join_on: bool,
         /// What this engine's `GROUP BY` accepts — see [`GroupByRules`].
         group_by: GroupByRules,
         /// Populated as queries are visited. See [`Ctes`].
@@ -12095,12 +12098,17 @@ mod colres {
                     .filter(|_| !visible)
                     .map(|e| self.range(e.span()))
             };
+            let ons = super::output_alias::join_ons(sel)
+                .into_iter()
+                .filter(|_| !self.alias_in_join_on)
+                .map(|e| self.range(e.span()));
             let alias_blind = [
                 clause(&sel.selection, self.alias_in_where),
                 clause(&sel.having, self.alias_in_having),
             ]
             .into_iter()
             .flatten()
+            .chain(ons)
             .collect();
             self.scopes.push(Scope {
                 range,
@@ -14746,7 +14754,8 @@ mod output_alias {
 
     /// The `ON` conditions of `sel`'s own joins, those of a parenthesised
     /// nested join included — not a derived table's, whose `SELECT` is its own.
-    fn join_ons(sel: &Select) -> Vec<&Expr> {
+    /// The column resolver's `alias_blind` reads them too.
+    pub(super) fn join_ons(sel: &Select) -> Vec<&Expr> {
         fn walk<'a>(twj: &'a TableWithJoins, out: &mut Vec<&'a Expr>) {
             factor(&twj.relation, out);
             for j in &twj.joins {
@@ -28007,6 +28016,27 @@ mod tests {
         ] {
             assert!(col_errors(sql).is_empty(), "false positive: {sql}");
         }
+    }
+
+    /// **A join's `ON` sees no output alias on MySQL, PostgreSQL or SQL
+    /// Server** (`select_alias_in_join_on`) — MySQL answers *Unknown column
+    /// 'k' in 'on clause'* — so a name only the select list gives is flagged
+    /// there, as in `WHERE`. The resolver let the alias answer it on every
+    /// engine. SQLite resolves it, so stays quiet; a real column still wins.
+    #[test]
+    fn diag_alias_in_join_on_flagged_where_the_engine_rejects_it() {
+        let sql = "SELECT e.salary AS k FROM employees e JOIN employees m ON m.id = k";
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
+            let e = col_errors_d(sql, d);
+            assert_eq!(e.len(), 1, "{d:?}: {e:?}");
+            assert!(e[0].contains("`k`"), "{d:?}: {e:?}");
+        }
+        assert!(col_errors_d(sql, SqlDialect::Sqlite).is_empty());
+        // A real column in `ON` is unaffected, and the alias still resolves
+        // in `ORDER BY` of the same query.
+        let fine =
+            "SELECT e.salary AS k FROM employees e JOIN employees m ON m.id = e.id ORDER BY k";
+        assert!(col_errors_d(fine, SqlDialect::MySql).is_empty());
     }
 
     /// A derived table's column list names its columns: `d.x` resolves, and
