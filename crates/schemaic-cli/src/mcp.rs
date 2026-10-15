@@ -1423,31 +1423,12 @@ fn format_database_schema(database: &str, schema: &DbSchema) -> String {
         .filter(|t| !schema.lists_under_parent(t))
     {
         let view = if t.is_view { " (view)" } else { "" };
-        let by = t
-            .partitioning
-            .as_ref()
-            .map(|p| format!(" (partitioned by {})", p.key))
-            .unwrap_or_default();
-        out.push_str(&format!("### {}{view}{by}\n", table_label(t, qualify)));
-        // Its partitions: tables of their own (PostgreSQL), or else storage
-        // the table itself declares (MySQL, SQL Server).
-        let tables = schema.partitions_of(t);
-        if tables.is_empty() {
-            for p in t.partitioning.iter().flat_map(|p| &p.partitions) {
-                // A hash or key partition has no bound to name.
-                match p.bound.as_str() {
-                    "" => out.push_str(&format!("  partition {}\n", p.name)),
-                    bound => out.push_str(&format!("  partition {}: {bound}\n", p.name)),
-                }
-            }
-        }
-        for p in tables {
-            let bound = p.partition_of.as_ref().map_or("", |o| o.bound.as_str());
-            out.push_str(&format!(
-                "  partition {}: {bound}\n",
-                table_label(p, qualify)
-            ));
-        }
+        out.push_str(&format!(
+            "### {}{view}{}\n",
+            table_label(t, qualify),
+            partitioned_by(t)
+        ));
+        partition_lines(schema, t, qualify, 1, &mut out);
         for c in &t.columns {
             let pk = if c.primary_key { " PK" } else { "" };
             // Nullable is the default; only the constraint is worth the tokens.
@@ -1459,6 +1440,58 @@ fn format_database_schema(database: &str, schema: &DbSchema) -> String {
         }
     }
     out
+}
+
+/// ` (partitioned by …)` for a partitioned table, with MySQL's
+/// `SUBPARTITION BY` clause beside the key — it keeps no subpartition names,
+/// so the clause is all there is to say the second level exists.
+fn partitioned_by(t: &TableInfo) -> String {
+    let Some(p) = &t.partitioning else {
+        return String::new();
+    };
+    match &p.subpartition {
+        Some(sub) => format!(" (partitioned by {}, subpartitioned by {sub})", p.key),
+        None => format!(" (partitioned by {})", p.key),
+    }
+}
+
+/// `t`'s partitions, `depth` levels in: tables of their own (PostgreSQL), each
+/// followed by its own partitions where it is partitioned in turn, or else
+/// storage the table itself declares (MySQL, SQL Server). Only the top level
+/// was listed, so a sub-partition was nowhere in the assistant's view.
+fn partition_lines(
+    schema: &DbSchema,
+    t: &TableInfo,
+    qualify: bool,
+    depth: usize,
+    out: &mut String,
+) {
+    let pad = "  ".repeat(depth);
+    let tables = schema.partitions_of(t);
+    if tables.is_empty() {
+        for p in t.partitioning.iter().flat_map(|p| &p.partitions) {
+            // A hash or key partition has no bound to name.
+            match p.bound.as_str() {
+                "" => out.push_str(&format!("{pad}partition {}\n", p.name)),
+                bound => out.push_str(&format!("{pad}partition {}: {bound}\n", p.name)),
+            }
+        }
+        return;
+    }
+    // Bounded like `DbSchema::listed_as`: a catalogue cannot hold a cycle,
+    // but a model built by hand could.
+    if depth > schema.tables.len() {
+        return;
+    }
+    for p in tables {
+        let bound = p.partition_of.as_ref().map_or("", |o| o.bound.as_str());
+        out.push_str(&format!(
+            "{pad}partition {}: {bound}{}\n",
+            table_label(p, qualify),
+            partitioned_by(p)
+        ));
+        partition_lines(schema, p, qualify, depth + 1, out);
+    }
 }
 
 /// One table in depth: the `CREATE TABLE` skeleton (columns, PK, indexes) plus a
@@ -3208,6 +3241,74 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("### events_2024"), "{out}");
+    }
+
+    /// **A partition that is itself partitioned names its own partitions**,
+    /// one level further in. Only the top level's children were listed, so
+    /// PostgreSQL's sub-partitions were nowhere in the assistant's view.
+    #[test]
+    fn database_schema_names_sub_partitions_under_their_partition() {
+        let part_of = |parent: &str, bound: &str| schemaic_core::schema::PartitionOf {
+            schema: None,
+            parent: parent.into(),
+            bound: bound.into(),
+        };
+        let mut events = tbl("events", vec![c("id", "int", false, true)]);
+        events.partitioning = Some(schemaic_core::schema::Partitioning {
+            key: "RANGE (id)".into(),
+            ..Default::default()
+        });
+        let mut y2024 = tbl("events_2024", vec![c("id", "int", false, true)]);
+        y2024.partition_of = Some(part_of("events", "FOR VALUES FROM (1) TO (10)"));
+        y2024.partitioning = Some(schemaic_core::schema::Partitioning {
+            key: "HASH (id)".into(),
+            ..Default::default()
+        });
+        let mut h0 = tbl("events_2024_h0", vec![c("id", "int", false, true)]);
+        h0.partition_of = Some(part_of(
+            "events_2024",
+            "FOR VALUES WITH (modulus 2, remainder 0)",
+        ));
+        let out = format_database_schema(
+            "shop",
+            &DbSchema {
+                tables: vec![events, y2024, h0],
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.contains(
+                "  partition events_2024: FOR VALUES FROM (1) TO (10) (partitioned by HASH (id))\n    \
+                 partition events_2024_h0: FOR VALUES WITH (modulus 2, remainder 0)\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("### events_2024"), "{out}");
+    }
+
+    /// MySQL keeps no subpartition names, only the clause; it is named with
+    /// the key, so the assistant knows the second level exists.
+    #[test]
+    fn database_schema_names_a_mysql_subpartition_clause() {
+        let mut r = tbl("r", vec![c("y", "int", false, false)]);
+        r.partitioning = Some(schemaic_core::schema::Partitioning {
+            key: "RANGE (`y`)".into(),
+            partitions: Vec::new(),
+            subpartition: Some("HASH (`y`) SUBPARTITIONS 2".into()),
+        });
+        let out = format_database_schema(
+            "shop",
+            &DbSchema {
+                tables: vec![r],
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.contains(
+                "### r (partitioned by RANGE (`y`), subpartitioned by HASH (`y`) SUBPARTITIONS 2)\n"
+            ),
+            "{out}"
+        );
     }
 
     /// Where a partition is storage inside its table (MySQL), the table's

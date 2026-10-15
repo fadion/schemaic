@@ -36362,7 +36362,13 @@ existing prose was left alone.
     lines come from `DbSchema::partitions_of`, which only a partition that is a table answers; where
     it finds none — a MySQL or SQL Server table, whose partitions are storage it declares — the
     lines are the table's own `Partitioning::partitions` instead, name and bound
-    (`database_schema_names_a_mysql_tables_partitions`).
+    (`database_schema_names_a_mysql_tables_partitions`). **Every level is named**
+    (`partition_lines`, recursive): a PostgreSQL partition partitioned in turn carries its own
+    ` (partitioned by …)` and its partitions one indent further in, where only the top level's
+    children used to be listed and a sub-partition was nowhere in the assistant's view
+    (`database_schema_names_sub_partitions_under_their_partition`); MySQL, which keeps no
+    subpartition names, has its `SUBPARTITION BY` clause beside the key — `(partitioned by …,
+    subpartitioned by …)` (`database_schema_names_a_mysql_subpartition_clause`).
     `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
     `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
     and hands the model back the change list in the *preview's own words* plus the SQL and anything
