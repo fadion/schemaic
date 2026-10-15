@@ -10545,7 +10545,10 @@ existing prose was left alone.
     the previous, staying on the first. `shift(start, end, inserted)` carries every stop **and the
     end** through one edit by `text_ops::shift_range`, the function the find bar's *in selection*
     scope follows edits with, so typing over a selected stop makes the stop *what was typed* and
-    typing at its end grows it (`typing_over_a_stop_makes_the_stop_what_was_typed`). `holds(offset)`
+    typing at its end grows it (`typing_over_a_stop_makes_the_stop_what_was_typed`); it answers
+    `false` — and the editor ends the walk — when the edit enclosed a stop or the end
+    (`shift_range`'s `None`), since after a whole-document Format the next Tab would otherwise
+    select every line (`an_edit_enclosing_the_stops_ends_the_walk`). `holds(offset)`
     is whether the caret is still in the walk — inside a stop or at either edge of one, the edge
     being where typing into it goes on. The UI half (`Completion::stops`,
     `completion::begin_snippet`, the `StopNext`/`StopPrev`/`StopEnd` key actions) is under
@@ -14425,7 +14428,9 @@ existing prose was left alone.
     and in plain mode is `find_matches_between`, the ranged scan `find_matches_in` now delegates to,
     which starts at the scope's start while whole word still reads its boundaries from all of
     `hay`. In regex mode it compiles through `find_regex` — case-insensitive unless Match case,
-    `multi_line` so `^`/`$` are line ends, and a compile error turned into one line,
+    `multi_line` so `^`/`$` are line ends, `crlf` so a `\r\n` is one too — a paste from the
+    Windows clipboard keeps its `\r`, where `$` alone would never match and `.` would swallow it
+    (`a_crlf_line_end_is_a_line_end_to_a_regex`) — and a compile error turned into one line,
     `Not a valid pattern: …`, from the last line of the crate's message, which otherwise draws a
     caret under the pattern over several (`a_pattern_that_does_not_compile_says_so_in_one_line`) —
     and walks `find_at` over `hay[..hi]`, so `\b` and `^` at the scope's start see the text before
@@ -14449,7 +14454,13 @@ existing prose was left alone.
     text lands at the start of what replaced it (the scope's start) or its end (the scope's end),
     so an edit inside the scope grows or shrinks it rather than losing it — and **an insertion
     exactly at the scope's start counts as inside**, so typing at the head of the block grows it
-    instead of pushing it along (`a_scope_follows_the_edits_around_and_inside_it`).
+    instead of pushing it along (`a_scope_follows_the_edits_around_and_inside_it`). **An edit that
+    encloses the scope loses it** — `None`, when the edit replaces all of it and more, as a
+    whole-document Format does in one delta: where the scope sat inside the replacement is gone,
+    and mapping its bounds to the replacement's edges would widen it to the whole edit, so that
+    *Sel*'s Replace All rewrote the document. An edit over exactly the scope is still what
+    replaced it, and a point at the edit's edge is where it began or ended
+    (`an_edit_enclosing_the_scope_loses_it_rather_than_widening_to_it`).
     `find_seed` and `first_hit_from` are how the editor's find bar opens: Ctrl+F/Ctrl+H seed the
     field from the selection only when it is non-empty and on one line — a multi-line selection is
     a block being worked on, not a needle, and the field is one line, so it seeds nothing and the
@@ -29522,17 +29533,24 @@ existing prose was left alone.
     **The *in selection* scope** is `find_scope: RwSignal<Option<(usize, usize)>>`, held apart from
     the editor's selection, which revealing a hit replaces, and carried through each delta in
     `.update(…)` by `text_ops::shift_range`, beside the inlay hints' `shift_inlay_hints` and a
-    snippet's tab stops' `TabStops::shift` (`Completion::stops`, under `tab_stops.rs`). *When* the
+    snippet's tab stops' `TabStops::shift` (`Completion::stops`, under `tab_stops.rs`). A delta that
+    encloses the scope drops it — set straight to `None`, not through `set_find_scope`, so *Sel*
+    goes out and the find effect's debounced edit path rescans the whole text without a new
+    query's reveal moving the caret — and one that encloses a stop ends the walk. *When* the
     stops are set is load-bearing: floem calls the update callbacks
     synchronously inside the edit (`on_update` in its `text_document.rs`), so a snippet's own
     splice runs the hook before `begin_snippet` has set the stops it creates, and never shifts
     them by the body's own length — setting the stops ahead of the splice would. Ctrl+F and
     Ctrl+H make a multi-line selection the scope (`find_scope_seed`); anything else clears it on a
     bar being opened but **keeps it on one already open**, since there — Ctrl+H over Ctrl+F — the
-    selection is the hit a step revealed, not a new block. Closing (× or Escape's `CloseFind`)
+    selection is the hit a step revealed, not a new block. **That hit is not read at all**
+    (`text_ops::selection_seeds_find`, given the bar's open state, the selection and
+    `find_hits[find_idx]`): a regex hit can span lines, so it would otherwise become the scope —
+    "Sel" lit, the count `1/1`, All replacing one hit — or, on one line, its text would replace the
+    pattern that found it. Closing (× or Escape's `CloseFind`)
     clears it. **Replace All in a scope edits only the scope's span**, `new_text` cut to it by the
     unchanged tail's length: an edit over the whole document, the ordinary Replace All's, would
-    carry the scope out through `shift_range` to all of it. The toggles are four text glyphs right
+    enclose the scope and lose it through `shift_range`. The toggles are four text glyphs right
     of the find field, `Aa`, `W`, `.*` and `Sel` (tooltips *Match case*, *Whole word*, *Regular
     expression*, *Find in selection*), lit `chip_active` when on and `chip_idle` when off — the
     status bar's toggle colours — which is what took the bar's content width from 283 to 331 with

@@ -756,6 +756,18 @@ pub fn find_scope_seed(text: &str, sel: (usize, usize)) -> Option<(usize, usize)
         .then_some((a, b))
 }
 
+/// Whether Ctrl+F / Ctrl+H read the selection at all — as the needle
+/// ([`find_seed`]) or the scope ([`find_scope_seed`]). Always on a bar being
+/// opened; on one already open, not when the selection is `current`, the hit a
+/// step revealed: a regex hit can span lines, and seeding from it would make
+/// that one hit the *in selection* scope (or its text the needle, in place of
+/// the pattern that found it). `sel` is `(start, end)` in either order; a hit
+/// is `(offset, len)`.
+pub fn selection_seeds_find(open: bool, sel: (usize, usize), current: Option<Hit>) -> bool {
+    let (a, b) = (sel.0.min(sel.1), sel.0.max(sel.1));
+    !open || current != Some((a, b - a))
+}
+
 /// The hit a new find query starts at: the first at or after `from` (the
 /// selection's start, or the caret), wrapping to the first in the document —
 /// so a needle seeded from the selection, or typed one character at a time,
@@ -816,11 +828,14 @@ fn word_bounded(hay: &str, off: usize, end: usize, opts: FindOptions) -> bool {
 }
 
 /// The find bar's pattern, compiled — case-insensitive unless match case says
-/// otherwise, `^`/`$` at line ends — or the one-line sentence the bar shows.
+/// otherwise, `^`/`$` at line ends, a `\r\n` one included (`crlf`: a paste
+/// from the Windows clipboard keeps its `\r`, and `.` must not swallow it) —
+/// or the one-line sentence the bar shows.
 fn find_regex(needle: &str, opts: FindOptions) -> Result<regex::Regex, String> {
     regex::RegexBuilder::new(needle)
         .case_insensitive(!opts.match_case)
         .multi_line(true)
+        .crlf(true)
         .build()
         .map_err(|e| {
             // The crate's message draws a caret under the pattern over several
@@ -1079,14 +1094,27 @@ pub fn replace_hits(
 /// and one inside the replaced text lands at the start of what replaced it
 /// (the range's start) or its end (the range's end), so an edit inside the
 /// scope grows or shrinks it rather than losing it.
+///
+/// `None` when the edit **encloses** the range — replaces all of it and more
+/// (a whole-document Format, one delta spanning carets either side of it):
+/// where the range sat inside what replaced it is gone, and mapping its
+/// bounds to the replacement's edges would widen it to the whole edit — the
+/// find scope to the document, a tab stop to every line. An edit over
+/// exactly the range is what replaced it, and a point at the edit's edge is
+/// where the edit began or ended; neither is lost.
 pub fn shift_range(
     range: (usize, usize),
     start: usize,
     end: usize,
     inserted: usize,
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     let moved = |p: usize| p - end + start + inserted;
     let (a, b) = range;
+    let encloses = start < end && start <= a && b <= end && (start < a || b < end);
+    let at_an_edge = a == b && (a == start || a == end);
+    if encloses && !at_an_edge {
+        return None;
+    }
     // Typed *at* the start is typed inside the scope, so that one insertion
     // leaves the start where it is.
     let a = if a < start || (a == start && end == start) {
@@ -1103,7 +1131,7 @@ pub fn shift_range(
     } else {
         start + inserted
     };
-    (a, b)
+    Some((a, b))
 }
 
 /// Whether `hay` contains `needle`, ASCII-case-insensitively. Allocation-free
@@ -3287,6 +3315,26 @@ mod tests {
     }
 
     #[test]
+    fn a_crlf_line_end_is_a_line_end_to_a_regex() {
+        // Pasted from the Windows clipboard, nothing normalises the `\r\n`:
+        // `$` still ends the line before it, and `.` stops short of the `\r`.
+        let hay = "a;\r\nb;";
+        assert_eq!(
+            spans(hay, &find_hits(hay, ";$", re(), None).unwrap()),
+            [";", ";"]
+        );
+        let hay = "x, y\r\nz";
+        assert_eq!(
+            spans(hay, &find_hits(hay, ",.*$", re(), None).unwrap()),
+            [", y"]
+        );
+        assert_eq!(
+            spans(hay, &find_hits(hay, "^z", re(), None).unwrap()),
+            ["z"]
+        );
+    }
+
+    #[test]
     fn an_empty_regex_match_is_not_a_hit() {
         assert!(find_hits("bcd", "a*", re(), None).unwrap().is_empty());
         let hay = "baab";
@@ -3450,20 +3498,47 @@ mod tests {
     }
 
     #[test]
+    fn a_revealed_hit_seeds_nothing_on_a_bar_already_open() {
+        // `;\s*SELECT` revealed a hit across a line break at 8..17.
+        let hit = Some((8, 9));
+        assert!(!selection_seeds_find(true, (8, 17), hit));
+        assert!(!selection_seeds_find(true, (17, 8), hit), "either order");
+        // Any other selection on an open bar is the user's own.
+        assert!(selection_seeds_find(true, (0, 17), hit));
+        assert!(selection_seeds_find(true, (8, 17), None));
+        // A bar being opened reads the selection whatever it is.
+        assert!(selection_seeds_find(false, (8, 17), hit));
+    }
+
+    #[test]
     fn a_scope_follows_the_edits_around_and_inside_it() {
         // Before it: both bounds move.
-        assert_eq!(shift_range((10, 20), 0, 2, 5), (13, 23));
+        assert_eq!(shift_range((10, 20), 0, 2, 5), Some((13, 23)));
         // After it: nothing moves.
-        assert_eq!(shift_range((10, 20), 25, 26, 0), (10, 20));
+        assert_eq!(shift_range((10, 20), 25, 26, 0), Some((10, 20)));
         // Inside it: the end moves, the scope grows or shrinks.
-        assert_eq!(shift_range((10, 20), 12, 14, 0), (10, 18));
-        assert_eq!(shift_range((10, 20), 15, 15, 4), (10, 24));
+        assert_eq!(shift_range((10, 20), 12, 14, 0), Some((10, 18)));
+        assert_eq!(shift_range((10, 20), 15, 15, 4), Some((10, 24)));
         // Typed at its very start: inside, not before.
-        assert_eq!(shift_range((10, 20), 10, 10, 1), (10, 21));
+        assert_eq!(shift_range((10, 20), 10, 10, 1), Some((10, 21)));
         // Over its whole extent: what replaced it.
-        assert_eq!(shift_range((10, 20), 10, 20, 3), (10, 13));
+        assert_eq!(shift_range((10, 20), 10, 20, 3), Some((10, 13)));
         // Over its start from before it.
-        assert_eq!(shift_range((10, 20), 5, 12, 1), (5, 14));
+        assert_eq!(shift_range((10, 20), 5, 12, 1), Some((5, 14)));
+    }
+
+    #[test]
+    fn an_edit_enclosing_the_scope_loses_it_rather_than_widening_to_it() {
+        // A whole-document Format replaces `0..len` in one edit: where the
+        // scope was inside it is gone, and it must not become all of it.
+        assert_eq!(shift_range((10, 20), 0, 30, 40), None);
+        // Sharing one edge with an edit that runs past the other is the same.
+        assert_eq!(shift_range((0, 20), 0, 30, 40), None);
+        assert_eq!(shift_range((10, 30), 0, 30, 40), None);
+        // A point strictly inside the edit is lost too…
+        assert_eq!(shift_range((15, 15), 10, 20, 3), None);
+        // …but one at its edge is where the edit began or ended.
+        assert_eq!(shift_range((20, 20), 19, 20, 0), Some((19, 19)));
     }
 
     #[test]

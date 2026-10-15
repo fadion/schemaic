@@ -66,12 +66,27 @@ impl TabStops {
     }
 
     /// Carry every stop, and the snippet's end, through one edit:
-    /// `start..end` of the old text replaced by `inserted` bytes.
-    pub fn shift(&mut self, start: usize, end: usize, inserted: usize) {
-        for s in &mut self.stops {
-            *s = shift_range(*s, start, end, inserted);
+    /// `start..end` of the old text replaced by `inserted` bytes. `false` —
+    /// the walk is over, and the stops are left as they were — when the edit
+    /// enclosed a stop or the end ([`shift_range`]'s `None`): a whole-document
+    /// Format, say, after which the stop is nowhere the walk could still
+    /// select, and mapping it to the edit's edges would select every line.
+    #[must_use = "a `false` ends the walk"]
+    pub fn shift(&mut self, start: usize, end: usize, inserted: usize) -> bool {
+        let stops: Option<Vec<_>> = self
+            .stops
+            .iter()
+            .map(|&s| shift_range(s, start, end, inserted))
+            .collect();
+        let snippet_end = shift_range((self.end, self.end), start, end, inserted);
+        match (stops, snippet_end) {
+            (Some(stops), Some((_, e))) => {
+                self.stops = stops;
+                self.end = e;
+                true
+            }
+            _ => false,
         }
-        self.end = shift_range((self.end, self.end), start, end, inserted).1;
     }
 
     /// Tab: the next stop, or past the last one the snippet's end.
@@ -141,9 +156,9 @@ mod tests {
         let body = "x = :a, y = :b";
         let mut s = TabStops::new(body, 0, PG).unwrap();
         // `:a` (4..6) replaced by `42`, then `0` appended inside it.
-        s.shift(4, 6, 2);
+        assert!(s.shift(4, 6, 2));
         assert_eq!(s.current(), (4, 6));
-        s.shift(6, 6, 1);
+        assert!(s.shift(6, 6, 1));
         assert_eq!(s.current(), (4, 7), "typed at the stop's end grows it");
         // The later stop and the end moved by the net change, +1.
         let b = body.find(":b").unwrap() + 1;
@@ -154,9 +169,27 @@ mod tests {
     #[test]
     fn an_edit_before_the_snippet_moves_every_stop() {
         let mut s = TabStops::new(":a", 5, PG).unwrap();
-        s.shift(0, 0, 3);
+        assert!(s.shift(0, 0, 3));
         assert_eq!(s.current(), (8, 10));
         assert_eq!(s.forward(), Step::Finish(10));
+    }
+
+    #[test]
+    fn an_edit_enclosing_the_stops_ends_the_walk() {
+        // The snippet sits inside other SQL; `orders` was typed over `:table`,
+        // then a whole-document Format replaced `0..len` in one edit.
+        let body = "SELECT * FROM :table WHERE id = :id";
+        let mut s = TabStops::new(body, 10, PG).unwrap();
+        let t = body.find(":table").unwrap() + 10;
+        assert!(s.shift(t, t + 6, 6));
+        let len = 10 + body.len() + 10;
+        assert!(
+            !s.shift(0, len, len + 4),
+            "the stops are lost, not the whole edit"
+        );
+        // An edit over exactly a stop is still typing over it.
+        let mut s = TabStops::new(body, 10, PG).unwrap();
+        assert!(s.shift(t, t + 6, 1));
     }
 
     #[test]

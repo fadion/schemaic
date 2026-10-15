@@ -49,8 +49,8 @@ use schemaic_core::sql::statement_range;
 use schemaic_core::text_ops::{
     FindOptions, Hit, find_hits as hits_in, find_scope_seed, find_seed, first_hit_from, hit_holds,
     join_lines, move_line, newline_indent, offset_of_line, replace_hits, replacement_for,
-    shift_range, soft_tab_indent, soft_tab_outdent, toggle_block_comment, toggle_case,
-    toggle_line_comment,
+    selection_seeds_find, shift_range, soft_tab_indent, soft_tab_outdent, toggle_block_comment,
+    toggle_case, toggle_line_comment,
 };
 
 use crate::completion::{
@@ -4208,16 +4208,23 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // several lines becomes the *in selection* scope instead
             // (`text_ops::find_scope_seed`). Anything else, on a bar being
             // opened, clears it; on one already open (Ctrl+H over Ctrl+F) it
-            // stays, since the selection there is the hit a step revealed.
+            // stays. A selection that *is* the hit a step revealed, on an open
+            // bar, is not read at all (`text_ops::selection_seeds_find`): a
+            // regex hit can span lines, and it would become the scope.
             let seed_find = || {
-                let sel = editor_sig.with_untracked(|e| e.cursor.get_untracked().get_selection());
+                let open = find_open.get_untracked();
+                let current =
+                    find_hits.with_untracked(|h| h.get(find_idx.get_untracked()).copied());
+                let sel = editor_sig
+                    .with_untracked(|e| e.cursor.get_untracked().get_selection())
+                    .filter(|&sel| selection_seeds_find(open, sel, current));
                 let seed = sel
                     .and_then(|sel| query.with_untracked(|t| find_seed(t, sel).map(str::to_owned)));
                 if let Some(seed) = seed {
                     find_query.set(seed);
                 }
                 let scope = sel.and_then(|sel| query.with_untracked(|t| find_scope_seed(t, sel)));
-                if scope.is_some() || !find_open.get_untracked() {
+                if scope.is_some() || !open {
                     set_find_scope(scope);
                 }
             };
@@ -5952,25 +5959,34 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 inline_diff::set_hints(hints, next);
             }
             // The find bar's *in selection* scope, the same way: an edit inside
-            // it — a Replace, typing — grows or shrinks it.
-            if let Some(mut scope) = find_scope.get_untracked() {
-                for d in upd.deltas() {
+            // it — a Replace, typing — grows or shrinks it. One that encloses
+            // it (a whole-document Format) loses it, and "Sel" goes out rather
+            // than the scope widening to the whole edit. Set, not
+            // `set_find_scope`: it is the edit that dropped it, so the find
+            // effect's debounced edit path rescans the whole text and reveals
+            // nothing, rather than a new query moving the caret.
+            if let Some(scope) = find_scope.get_untracked() {
+                let carried = upd.deltas().try_fold(scope, |scope, d| {
                     let (iv, inserted) = d.summary();
-                    scope = shift_range(scope, iv.start, iv.end, inserted);
-                }
-                find_scope.set(Some(scope));
+                    shift_range(scope, iv.start, iv.end, inserted)
+                });
+                find_scope.set(carried);
             }
             // A snippet's tab stops, the same way: typing over a selected stop
-            // makes the stop what was typed (`tab_stops::TabStops::shift`).
-            // The snippet's own splice reaches here before `begin_snippet`
-            // sets them, so it never shifts the stops it creates.
+            // makes the stop what was typed (`tab_stops::TabStops::shift`), and
+            // an edit enclosing one ends the walk. The snippet's own splice
+            // reaches here before `begin_snippet` sets them, so it never
+            // shifts the stops it creates.
             if comp.stops.with_untracked(Option::is_some) {
-                comp.stops.update(|s| {
-                    if let Some(s) = s {
-                        for d in upd.deltas() {
+                comp.stops.update(|stops| {
+                    let held = stops.as_mut().is_some_and(|s| {
+                        upd.deltas().all(|d| {
                             let (iv, inserted) = d.summary();
-                            s.shift(iv.start, iv.end, inserted);
-                        }
+                            s.shift(iv.start, iv.end, inserted)
+                        })
+                    });
+                    if !held {
+                        *stops = None;
                     }
                 });
             }
@@ -8079,7 +8095,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
             // In a scope, the edit is the scope's own span and no wider — the
             // text outside it is unchanged, and an edit over the whole document
-            // would carry the scope (`text_ops::shift_range`) out to all of it.
+            // would enclose the scope and lose it (`text_ops::shift_range`).
             let (lo, hi) = scope.map_or((0, text.len()), |(a, b)| (a, b.min(text.len())));
             let tail = text.len() - hi;
             let (edit_range, written) = (lo..hi, &new_text[lo..new_text.len() - tail]);
