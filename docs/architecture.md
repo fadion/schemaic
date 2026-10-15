@@ -3115,11 +3115,16 @@ existing prose was left alone.
     (`order_by_expression_sees_output_aliases`, the predicate completion already asks, so the two
     cannot drift) — PostgreSQL 16 and SQL Server 2022 refuse that statement
     and MariaDB takes it, checked live through `schemaic query`
-    (`an_alias_inside_an_order_by_expression_is_mysql_and_sqlites`). `GROUP BY`, `HAVING` and
-    `WHERE` see it only where `group_by_sees_output_aliases`, `select_alias_in_having` and
-    `select_alias_in_where` say — SQL Server refuses a `GROUP BY` of an alias, checked the same way
-    — and there **a column wins**: on PostgreSQL and MariaDB, `GROUP BY name` beside a column `name`
-    groups by the column. So a name in one of those clauses is the alias only where the sources
+    (`an_alias_inside_an_order_by_expression_is_mysql_and_sqlites`). `GROUP BY`, `HAVING`, `WHERE`
+    and a join's `ON` see it only where `group_by_sees_output_aliases`, `select_alias_in_having`,
+    `select_alias_in_where` and `select_alias_in_join_on` say — SQL Server refuses a `GROUP BY` of an
+    alias, checked the same way, and `ON` sees one on SQLite alone, measured on 3.53.2 in memory:
+    `SELECT a.id*2 AS k FROM a JOIN b ON b.id = k` binds the alias, and `ON (SELECT k) > 0` does
+    too, where MySQL, PostgreSQL and SQL Server read only input columns there
+    (`a_join_on_reads_the_alias_on_sqlite_alone`) — and there **a column wins**: on PostgreSQL and
+    MariaDB, `GROUP BY name` beside a column `name` groups by the column, and SQLite's `SELECT a.x AS
+    id FROM a JOIN b ON b.y = id` answers *ambiguous column name* rather than reading the alias —
+    the columns are tried first, as in its `WHERE`. So a name in one of those clauses is the alias only where the sources
     prove no column has it — a table's columns through `colres::table_columns`, `None` where the
     catalogue cannot enumerate them, and a derived table's or a CTE's through the walk's own
     outputs. Where they cannot, the reference is *unsure* and `output_alias_rename` refuses with
@@ -3134,15 +3139,18 @@ existing prose was left alone.
     MariaDB 10.11, MySQL 8.4 and SQLite 3.50, where `ORDER BY (SELECT t)` beside a column `t` reads
     the column. `Tree::nested` takes each block inside the alias's through opaque subqueries alone
     (a derived table's or a CTE's body on the way sees no enclosing alias — `nested_spot`), places
-    the subquery in the alias block's clauses by span (`Block::spots`), and asks that clause's own
+    the subquery in the alias block's clauses by span (`Block::spots`, whose `Spot::On` covers the
+    block's own join conditions, a nested join's included — `join_ons`), and asks that clause's own
     predicate, the select list's being `select_list_subquery_sees_earlier_aliases` (MySQL, and only
     for an alias written before the subquery — after it is error 1247). A bare name there that
     `resolve_bare` finds no source for is the alias; one a source inside or the alias's own `FROM`
     has is the column; anything else — an unknowable source, an outer query's column, a clause the
-    walk does not place such as a join's `ON`, a same-named alias on the way in — is `Unsure`
+    walk does not place, a same-named alias on the way in — is `Unsure`
     (`a_subquerys_names_are_left_alone`,
-    `an_alias_read_inside_a_subquery_is_renamed_where_the_engine_binds_it`). Each subquery renamed
-    adds a `Reach` whose rivals are its own sources' columns. **A window's `ORDER BY` and
+    `an_alias_read_inside_a_subquery_is_renamed_where_the_engine_binds_it`). A join's `ON` was
+    once such a clause, so a subquery there refused the rename as unsure even on MySQL, which never
+    reads the alias there; placed, it is renamed on SQLite and left alone on MySQL. Each subquery
+    renamed adds a `Reach` whose rivals are its own sources' columns. **A window's `ORDER BY` and
     `PARTITION BY`** (`Block::windows`, from `window_idents`) read the alias ahead of a column on
     MariaDB alone — MySQL 8.4 answers *Unknown column 't' in 'window order by'* — so
     `window_sees_output_aliases` asks `Catalog::flavour`, and a MySQL-family server it cannot name
@@ -3191,9 +3199,13 @@ existing prose was left alone.
     (`a_name_that_would_capture_is_a_conflict`). Each reader adds its own, one `Reach` apiece in
     `Context::outer`: a name written bare there, another of its outputs, and — where a bare
     reference there is renamed — another source's column, an unknowable one being `Unsure`
-    (`a_name_the_outer_query_already_uses_is_a_conflict`). A change of case alone skips the bare
-    names and the rival columns, every bare name there already reading the same folded name; the
-    readers' outputs are still checked. **Names compare as the engine compares column names**
+    (`a_name_the_outer_query_already_uses_is_a_conflict`). A respelling skips the bare names and
+    the rival columns only where `names_match` says the new name is the old one — every bare name
+    there already reads it; the readers' outputs are still checked. It used to skip them on any
+    change of case alone, which on PostgreSQL let a quoted `"Total"` become `total` beside a bare
+    `total` outside already bound to another column — ambiguous after the rename. Each
+    `Reach::bare` name keeps whether it was quoted, so the alias's own quoted reader is no rival
+    to its own respelling (`a_case_only_rename_collides_where_quoting_keeps_case`). **Names compare as the engine compares column names**
     (`output_alias::names_match`, which `Name::same`, the qualifiers' `own_source` and
     `conflicts` all ask): where `SqlDialect::folds_unquoted_names` (PostgreSQL) a bare side folds to
     lower case and the two then compare exactly, and elsewhere quoting changes nothing — MySQL's

@@ -3117,6 +3117,18 @@ fn select_alias_in_where(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Is a select-list alias in scope in a join's `ON` on this engine? SQLite
+/// resolves one there, behind a column of the same name, as in its `WHERE` —
+/// `SELECT a.id * 2 AS k FROM a JOIN b ON b.id = k` runs on 3.53, a subquery
+/// there (`ON (SELECT k) > 0`) seeing it too. MySQL (*Unknown column 'k' in
+/// 'on clause'*), PostgreSQL and SQL Server read input columns alone there.
+fn select_alias_in_join_on(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
+}
+
 /// Is a select-list alias in scope in this engine's `HAVING`? MySQL and SQLite
 /// resolve one; PostgreSQL (`column "c" does not exist`) and SQL Server (Msg
 /// 207, `Invalid column name`) read `HAVING` before the select list names
@@ -12730,7 +12742,7 @@ mod colres {
 
     /// The `JoinConstraint` carried by a join operator, if any (the `APPLY`/`ARRAY
     /// JOIN` forms carry none).
-    fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+    pub(super) fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
         use JoinOperator::*;
         match op {
             Join(c) | Inner(c) | Left(c) | LeftOuter(c) | Right(c) | RightOuter(c)
@@ -14182,9 +14194,10 @@ mod alias_refs {
 ///   doubled + 1`) on MySQL and SQLite alone
 ///   ([`order_by_expression_sees_output_aliases`], completion's predicate, with
 ///   the versions measured).
-/// - `GROUP BY`, `HAVING` and `WHERE` see it where
-///   [`group_by_sees_output_aliases`], [`select_alias_in_having`] and
-///   [`select_alias_in_where`] say, and **behind** a column of the same name:
+/// - `GROUP BY`, `HAVING`, `WHERE` and a join's `ON` see it where
+///   [`group_by_sees_output_aliases`], [`select_alias_in_having`],
+///   [`select_alias_in_where`] and [`select_alias_in_join_on`] say, and
+///   **behind** a column of the same name:
 ///   MySQL and PostgreSQL both document the input column winning there. So a
 ///   name in one of those clauses is the alias only where no `FROM` source
 ///   has that column — which the loaded catalogue must prove
@@ -14208,9 +14221,9 @@ mod output_alias {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        Expr, GroupByExpr, Ident, NamedWindowExpr, OrderByKind, Query, Select, SelectItem,
-        SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, TableObject,
-        TableWithJoins, Visit, Visitor, WindowSpec, WindowType,
+        Expr, GroupByExpr, Ident, JoinConstraint, NamedWindowExpr, OrderByKind, Query, Select,
+        SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor,
+        TableObject, TableWithJoins, Visit, Visitor, WindowSpec, WindowType,
     };
 
     use super::{Catalog, LineIndex, SqlDialect, colres};
@@ -14225,7 +14238,7 @@ mod output_alias {
         /// Every reference the server binds to it, whole spellings.
         pub refs: Vec<Span>,
         /// A reference whose binding the catalogue could not settle — a name
-        /// in `GROUP BY`/`HAVING`/`WHERE` with an unknowable source beside it
+        /// in `GROUP BY`/`HAVING`/`WHERE`/`ON` with an unknowable source beside it
         /// — or a reader the walk cannot see whole.
         pub unsure: bool,
         /// Where the unsettled references stand, so a caret on one finds the
@@ -14256,9 +14269,10 @@ mod output_alias {
     /// What a rename must not collide with in one query that reads the alias
     /// through a derived table or a CTE.
     struct Reach {
-        /// Every bare name written there, folded: once the source has the new
-        /// name too, one of them would be ambiguous or bind to it instead.
-        bare: HashSet<String>,
+        /// Every bare name written there, as written with its quoting: once
+        /// the source has the new name too, one of them would be ambiguous
+        /// or bind to it instead.
+        bare: Vec<(String, bool)>,
         /// A bare reference there is renamed, so the other sources' columns
         /// compete with the new name.
         renamed_bare: bool,
@@ -14323,6 +14337,8 @@ mod output_alias {
         Group,
         Having,
         Where,
+        /// A join's `ON`, a nested join's included.
+        On,
         Other,
     }
 
@@ -14411,6 +14427,8 @@ mod output_alias {
         Group,
         Having,
         Order,
+        /// A join's `ON`.
+        On,
     }
 
     /// One `SELECT`.
@@ -14726,6 +14744,33 @@ mod output_alias {
         v.out.into_iter().map(|id| (id, false)).collect()
     }
 
+    /// The `ON` conditions of `sel`'s own joins, those of a parenthesised
+    /// nested join included — not a derived table's, whose `SELECT` is its own.
+    fn join_ons(sel: &Select) -> Vec<&Expr> {
+        fn walk<'a>(twj: &'a TableWithJoins, out: &mut Vec<&'a Expr>) {
+            factor(&twj.relation, out);
+            for j in &twj.joins {
+                factor(&j.relation, out);
+                if let Some(JoinConstraint::On(e)) = colres::join_constraint(&j.join_operator) {
+                    out.push(e);
+                }
+            }
+        }
+        fn factor<'a>(f: &'a TableFactor, out: &mut Vec<&'a Expr>) {
+            if let TableFactor::NestedJoin {
+                table_with_joins, ..
+            } = f
+            {
+                walk(table_with_joins, out);
+            }
+        }
+        let mut out = Vec::new();
+        for twj in &sel.from {
+            walk(twj, &mut out);
+        }
+        out
+    }
+
     /// Bare identifiers in the `ORDER BY` and `PARTITION BY` of `sel`'s own
     /// windows — an `OVER (…)` in its select list, outside any subquery, and
     /// its `WINDOW w AS (…)` definitions.
@@ -14938,6 +14983,8 @@ mod output_alias {
                 }
                 GroupByExpr::All(_) => HashSet::new(),
             };
+            let ons_exprs = join_ons(sel);
+            let ons: HashSet<Span> = ons_exprs.iter().flat_map(|e| spans(Some(e))).collect();
             let mut refs: Vec<ColRef> = self
                 .col_refs(refs_in(sel), Place::Other)
                 .into_iter()
@@ -14948,6 +14995,8 @@ mod output_alias {
                         Place::Group
                     } else if havings.contains(&r.col.at) {
                         Place::Having
+                    } else if ons.contains(&r.col.at) {
+                        Place::On
                     } else {
                         Place::Other
                     };
@@ -14975,6 +15024,7 @@ mod output_alias {
                 if let Some(h) = &sel.having {
                     spots.push((at(h), Spot::Having));
                 }
+                spots.extend(ons_exprs.iter().map(|e| (at(e), Spot::On)));
                 windows = window_idents(sel).iter().map(|id| self.name(id)).collect();
                 let q = &mut self.tree.queries[query];
                 refs.append(&mut q.order_refs);
@@ -14997,6 +15047,9 @@ mod output_alias {
                 }
                 if let Some(w) = &sel.selection {
                     behind(w, super::select_alias_in_where(self.dialect));
+                }
+                for e in &ons_exprs {
+                    behind(e, super::select_alias_in_join_on(self.dialect));
                 }
             }
             let (using, natural) = colres::coalesced_cols(sel);
@@ -15345,8 +15398,8 @@ mod output_alias {
         /// no source on the way out to `b` — nor `b`'s own, a column beating
         /// the alias here too — has is the alias, in a clause whose own
         /// predicate says the alias is visible there. One the catalogue
-        /// cannot settle, one in a clause the walk does not place (a join's
-        /// `ON`), one an outer query's column would take, and one beside a
+        /// cannot settle, one in a clause the walk does not place, one an
+        /// outer query's column would take, and one beside a
         /// same-named alias on the way in are `unsure`. Each subquery whose
         /// name is renamed adds a [`Reach`] whose rivals are its own sources'
         /// columns, which a rename to one of them would hand the name to.
@@ -15375,6 +15428,7 @@ mod output_alias {
                     Spot::Group => super::group_by_sees_output_aliases(dialect),
                     Spot::Having => super::select_alias_in_having(dialect),
                     Spot::Order => super::order_by_expression_sees_output_aliases(dialect),
+                    Spot::On => super::select_alias_in_join_on(dialect),
                 });
                 if visible == Some(false) {
                     continue;
@@ -15427,7 +15481,7 @@ mod output_alias {
                         }
                     }
                     outer.push(Reach {
-                        bare: HashSet::new(),
+                        bare: Vec::new(),
                         renamed_bare: true,
                         rivals,
                         outputs: Vec::new(),
@@ -15438,7 +15492,7 @@ mod output_alias {
 
         /// Where block `d`, inside block `b`, stands in `b`: the clause
         /// holding the subquery of `b`'s that `d` is or is inside — `None`
-        /// for one written elsewhere (a join's `ON`) — with that subquery's
+        /// for one written in a clause the walk does not place — with that subquery's
         /// start. `None` altogether where a derived table's or a CTE's body
         /// is on the way, which sees no enclosing alias.
         fn nested_spot(&self, d: usize, b: usize) -> Option<(Option<Spot>, usize)> {
@@ -15520,7 +15574,7 @@ mod output_alias {
             for (c, s) in readers {
                 let cb = &self.blocks[c];
                 let mut reach = Reach {
-                    bare: HashSet::new(),
+                    bare: Vec::new(),
                     renamed_bare: false,
                     rivals: Some(HashSet::new()),
                     outputs: Vec::new(),
@@ -15534,7 +15588,7 @@ mod output_alias {
                     }
                     for r in &db.refs {
                         if r.qual.is_none() {
-                            reach.bare.insert(r.col.folded());
+                            reach.bare.push((r.col.value.clone(), r.col.quoted));
                         }
                         if !r.col.same(name, dialect) {
                             continue;
@@ -15555,6 +15609,7 @@ mod output_alias {
                             Place::Group => super::group_by_sees_output_aliases(dialect),
                             Place::Having => super::select_alias_in_having(dialect),
                             Place::Where => super::select_alias_in_where(dialect),
+                            Place::On => super::select_alias_in_join_on(dialect),
                             Place::Other => false,
                         };
                         // `ORDER BY` reads an output alias ahead of a column.
@@ -15624,7 +15679,7 @@ mod output_alias {
     enum Clause {
         OrderWhole,
         OrderInside,
-        /// `GROUP BY`, `HAVING`, `WHERE` — a column wins there.
+        /// `GROUP BY`, `HAVING`, `WHERE`, a join's `ON` — a column wins there.
         BehindColumns,
     }
 
@@ -15681,17 +15736,20 @@ mod output_alias {
                 None => unknown = true,
             }
         }
-        // A change of case alone collides with nothing outside: every bare
-        // name there already reads the same folded one.
-        let recase = folded == ctx.own.0.to_ascii_lowercase();
+        // The same name respelled — a change of case where the engine
+        // compares names without it — collides with nothing outside: every
+        // bare name there already reads it. Where a quoted name keeps its
+        // case ([`SqlDialect::folds_unquoted_names`]), `"Total"` → `total` is
+        // a new name, and is checked as one.
+        let respelled = names_match((&ctx.own.0, ctx.own.1), (new, true), ctx.dialect);
         for r in &ctx.outer {
             if r.outputs.iter().any(eq) {
                 return Some(true);
             }
-            if recase {
+            if respelled {
                 continue;
             }
-            if r.bare.contains(&folded) {
+            if r.bare.iter().any(eq) {
                 return Some(true);
             }
             if r.renamed_bare {
@@ -37600,6 +37658,93 @@ mod output_alias_tests {
         assert_eq!(
             renamed(sql, "x", MY),
             Ok("SELECT total AS x FROM orders WHERE t > 1".to_string())
+        );
+    }
+
+    /// **A join's `ON` reads an output alias on SQLite alone** — measured on
+    /// 3.53: `SELECT a.id * 2 AS k FROM a JOIN b ON b.id = k` binds `k` to
+    /// the alias, and `(SELECT k)` there does too — behind a column of the
+    /// same name, as its `WHERE` does. Elsewhere the name stays, and a
+    /// subquery in `ON` is no reason to refuse.
+    #[test]
+    fn a_join_on_reads_the_alias_on_sqlite_alone() {
+        let sql = "SELECT o.qty * 2 AS k| FROM orders o JOIN orders p ON p.id = k";
+        assert_eq!(
+            renamed(sql, "x", LITE),
+            Ok("SELECT o.qty * 2 AS x FROM orders o JOIN orders p ON p.id = x".to_string())
+        );
+        for d in [MY, PG, MS] {
+            assert_eq!(
+                renamed(sql, "x", d),
+                Ok("SELECT o.qty * 2 AS x FROM orders o JOIN orders p ON p.id = k".to_string()),
+                "{d:?}"
+            );
+        }
+        let sub = "SELECT o.qty AS k| FROM orders o JOIN orders p ON (SELECT k) > 0";
+        assert_eq!(
+            renamed(sub, "x", LITE),
+            Ok("SELECT o.qty AS x FROM orders o JOIN orders p ON (SELECT x) > 0".to_string())
+        );
+        assert_eq!(
+            renamed(sub, "x", MY),
+            Ok("SELECT o.qty AS x FROM orders o JOIN orders p ON (SELECT k) > 0".to_string())
+        );
+        // A column of the name wins there, as in `WHERE`.
+        assert_eq!(
+            renamed(
+                "SELECT o.qty AS total| FROM orders o JOIN orders p ON p.total = total",
+                "x",
+                LITE
+            ),
+            Ok("SELECT o.qty AS x FROM orders o JOIN orders p ON p.total = total".to_string())
+        );
+        // Beside a source the catalogue does not hold, it may be a column.
+        assert_eq!(
+            renamed(
+                "SELECT o.qty AS k| FROM orders o JOIN nowhere n ON n.id = k",
+                "x",
+                LITE
+            ),
+            Err(AliasRenameRefusal::Unsure)
+        );
+        let (_, spans) = usages_at(sql.replace('|', "").as_str(), 20, LITE, &catalog()).unwrap();
+        assert_eq!(spans.len(), 2);
+    }
+
+    /// **A change of case is a rename where a quoted name keeps its case.**
+    /// On PostgreSQL `"Total"` → `total` hands the derived table the name a
+    /// bare `total` outside already binds to `o.total` — ambiguous after —
+    /// so it refuses; a quoted `"Total"` outside is the alias's own reader
+    /// and refuses nothing. Where case never mattered, nothing collides.
+    #[test]
+    fn a_case_only_rename_collides_where_quoting_keeps_case() {
+        assert_eq!(
+            renamed(
+                "SELECT d.\"Total\" FROM (SELECT qty AS \"To|tal\" FROM orders) d \
+                 JOIN orders o ON total > 1",
+                "total",
+                PG
+            ),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        assert_eq!(
+            renamed(
+                "SELECT \"Total\" FROM (SELECT qty AS \"To|tal\" FROM orders) d",
+                "total",
+                PG
+            ),
+            Ok("SELECT total FROM (SELECT qty AS total FROM orders) d".to_string())
+        );
+        assert_eq!(
+            renamed(
+                "SELECT d.Total FROM (SELECT qty AS To|tal FROM orders) d \
+                 JOIN orders o ON o.qty > 1",
+                "TOTAL",
+                MY
+            ),
+            Ok("SELECT d.TOTAL FROM (SELECT qty AS TOTAL FROM orders) d \
+                JOIN orders o ON o.qty > 1"
+                .to_string())
         );
     }
 
