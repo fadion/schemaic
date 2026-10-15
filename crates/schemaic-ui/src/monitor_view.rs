@@ -1368,7 +1368,8 @@ mod tests {
         for paused in [false, true] {
             let (word, color) = badge_state(paused, true);
             assert_eq!(word, "Stopped");
-            assert!(color == theme::error as fn() -> Color);
+            assert_eq!(color(), theme::error());
+            assert_ne!(color(), new_color(), "never the live green");
         }
     }
 
