@@ -1457,8 +1457,12 @@ fn params_bar(
         if names.with(Vec::is_empty) {
             return s.height(0.0).width_full();
         }
+        // The field's height plus an even margin, plus the 1px top border, so
+        // centring leaves a whole-pixel offset. A flat 36 left 35 inside the
+        // border, which put the 26px field at y = 4.5 and blurred every
+        // horizontal border in the bar.
         s.width_full()
-            .height(theme::scaled(36.0))
+            .height(field_input_h() + 2.0 * theme::scaled(5.0) + 1.0)
             .flex_shrink(0.0_f32)
             .items_center()
             .padding_horiz(theme::scaled(13.0))
@@ -1503,10 +1507,18 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
         now
     });
 
-    let name_label = text(format!(":{name}")).style(|s| {
+    // The name and the chip are sized to their text rounded *up* to a whole
+    // pixel. Left to their measured width — a mono advance is fractional — every
+    // view after them starts between two pixel columns, and the chip's and the
+    // field's 1px side borders are each smeared across two of them.
+    let shown = format!(":{name}");
+    let name_w =
+        move || crate::widgets::measure_field_text_px(&shown, theme::font_body(), true).ceil();
+    let name_label = text(format!(":{name}")).style(move |s| {
         s.font_family(MONO_FAMILY.to_string())
             .font_size(theme::font_body())
             .color(theme::text_dim())
+            .width(name_w())
             .flex_shrink(0.0_f32)
     });
 
@@ -1549,13 +1561,28 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
 
     let chip = label(move || kind.get().label().to_string())
         .on_click_stop(move |_| kind.update(|k| *k = k.next()))
-        .style(|s| {
+        .style(move |s| {
+            let pad = theme::scaled(6.0);
+            let text_w = crate::widgets::measure_field_text_px(
+                kind.get().label(),
+                theme::font_label(),
+                true,
+            )
+            .ceil();
             s.font_family(MONO_FAMILY.to_string())
                 .font_size(theme::font_label())
                 .color(theme::text_muted())
-                .padding_horiz(theme::scaled(6.0))
-                .height(theme::scaled(18.0))
+                .padding_horiz(pad)
+                // Text, padding and border: all whole, so the field after it
+                // starts on a pixel edge too.
+                .width(text_w + 2.0 * pad + 2.0)
+                .flex_shrink(0.0_f32)
+                // The field's height less an even inset (18 at 100%), so
+                // centred beside it the chip lands on a whole pixel at any
+                // scale.
+                .height(field_input_h() - 2.0 * theme::scaled(4.0))
                 .items_center()
+                .justify_center()
                 .border(1.0)
                 .border_color(theme::border())
                 .border_radius(4.0)
