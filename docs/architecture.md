@@ -5042,8 +5042,16 @@ existing prose was left alone.
     value: 'NaN'` and rolls back whichever batch it landed in, while PostgreSQL 16.15 **accepts**
     `'NaN'::numeric`, so the file imports clean and leaves a NaN in an exact column, where it
     changes every `SUM`, `AVG` and comparison over it from then on. The arm now carries `is_finite`,
-    the term the `Float` arm beside it always had (there for a different reason — `sql_literal`
-    renders a non-finite as NULL, which drops the value instead of reporting it).
+    the term the `Float` arm beside it had. **The `Float` arm admits a non-finite where the engine
+    keeps one** (`keeps_non_finite`, exhaustive): PostgreSQL's `float8` stores NaN and ±Infinity,
+    SQLite's `REAL` ±infinity but no NaN — `non_finite_literal` writes `NULL` for one, right for a
+    copy that read a `NULL` and a dropped value for a file that says `NaN` — and MySQL and SQL
+    Server neither. Admitted only when *spelled* as one (no digit in the text), since `1e400` is an
+    overflowing numeral PostgreSQL refuses as out of range, not an infinity; what is admitted is
+    written through `import_literal` as the engine's own literal. It refused all of them on every
+    engine, while a copy already wrote them (`a_postgres_float_takes_nan_and_infinity`,
+    `an_overflowing_numeral_is_still_refused_on_postgres`,
+    `non_finite_floats_import_only_where_the_engine_keeps_them`).
     **The problem list has two caps, and the line under it names both** (`issue_tail(shown, total,
     capped)`): `validate` stops *collecting* at `max_issues` (200) and the modal stops *rendering*
     at `ISSUE_LINES` (50, in `ui/import_view.rs`). The disclosure was wired to the first only, so a

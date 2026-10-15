@@ -733,9 +733,14 @@ pub fn coerce(
             .map(Value::UInt)
             .map_err(|_| IssueKind::NotAnInteger),
         ColKind::Float => match t.parse::<f64>() {
-            // A non-finite has no SQL literal — `sql_literal` renders it NULL,
-            // which would silently drop the value rather than report it.
             Ok(f) if f.is_finite() => Ok(Value::Float(f)),
+            // A non-finite *spelled as one* (`NaN`, `inf`, `-Infinity`), where
+            // the engine keeps it as itself — `import_literal` writes the
+            // engine's literal. An overflowing numeral (`1e400`) is not one:
+            // it carries digits, and PostgreSQL refuses it as out of range.
+            Ok(f) if !t.bytes().any(|b| b.is_ascii_digit()) && keeps_non_finite(f, dialect) => {
+                Ok(Value::Float(f))
+            }
             _ => Err(IssueKind::NotANumber),
         },
         // Shape-checked only; the text is what gets inserted, so no precision is
@@ -2924,6 +2929,21 @@ pub fn import_literal(v: &Value, dialect: SqlDialect) -> String {
     }
 }
 
+/// Does a `dialect` float column store the non-finite `f` as itself, so a file
+/// carrying it can be imported rather than refused?
+///
+/// PostgreSQL keeps NaN and ±Infinity. SQLite keeps ±infinity but has no NaN —
+/// [`non_finite_literal`] writes `NULL` for one, the right answer for a copy
+/// that read a `NULL`, and a silently dropped value for a file that says
+/// `NaN`. MySQL and SQL Server keep neither.
+fn keeps_non_finite(f: f64, dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::Sqlite => !f.is_nan(),
+        SqlDialect::MySql | SqlDialect::MsSql => false,
+    }
+}
+
 /// The literal `dialect` reads back as the non-finite float `f`, or `None`
 /// where a column cannot hold one at all — MySQL and SQL Server refuse every
 /// non-finite value, so none can be read from them to write.
@@ -3366,7 +3386,7 @@ mod tests {
 
     // ── coercion ────────────────────────────────────────────────────────────
 
-    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
+    use crate::intel::SqlDialect::{MsSql, MySql, Postgres, Sqlite};
 
     #[test]
     fn classify_recognizes_the_families_we_validate() {
@@ -3536,6 +3556,71 @@ mod tests {
             coerce("NaN", ColKind::Float, true, &n, MySql),
             Err(IssueKind::NotANumber)
         );
+    }
+
+    /// **PostgreSQL's float stores NaN and ±Infinity, so a file carrying them
+    /// imports.** It was refused as "not a number" on every engine, while a
+    /// copy (`non_finite_literal`) already wrote them — and the import's own
+    /// writer, `import_literal`, renders them as the engine's literal.
+    #[test]
+    fn a_postgres_float_takes_nan_and_infinity() {
+        let n = NullRule::default();
+        for (text, check) in [
+            ("NaN", f64::is_nan as fn(f64) -> bool),
+            ("nan", f64::is_nan),
+            ("Infinity", |f: f64| f == f64::INFINITY),
+            ("inf", |f: f64| f == f64::INFINITY),
+            ("-Infinity", |f: f64| f == f64::NEG_INFINITY),
+            ("-inf", |f: f64| f == f64::NEG_INFINITY),
+        ] {
+            match coerce(text, ColKind::Float, true, &n, Postgres) {
+                Ok(Value::Float(f)) => assert!(check(f), "{text:?} read as {f}"),
+                other => panic!("{text:?}: {other:?}"),
+            }
+        }
+        // And the literal that value is written as is the engine's own.
+        let v = coerce("NaN", ColKind::Float, true, &n, Postgres).unwrap();
+        assert_eq!(import_literal(&v, Postgres), "'NaN'::float8");
+    }
+
+    /// An overflowing numeral is not an infinity: PostgreSQL refuses `1e400`
+    /// for a `float8` as out of range, so validation still reports it rather
+    /// than writing `'Infinity'` in its place.
+    #[test]
+    fn an_overflowing_numeral_is_still_refused_on_postgres() {
+        let n = NullRule::default();
+        for bad in ["1e400", "-1e400"] {
+            assert_eq!(
+                coerce(bad, ColKind::Float, true, &n, Postgres),
+                Err(IssueKind::NotANumber),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// SQLite stores ±infinity but has no NaN — it reads one as `NULL`, which
+    /// for a file would be a value silently dropped, so NaN stays refused
+    /// there. MySQL and SQL Server store neither.
+    #[test]
+    fn non_finite_floats_import_only_where_the_engine_keeps_them() {
+        let n = NullRule::default();
+        assert!(matches!(
+            coerce("-Infinity", ColKind::Float, true, &n, Sqlite),
+            Ok(Value::Float(f)) if f == f64::NEG_INFINITY
+        ));
+        assert_eq!(
+            coerce("NaN", ColKind::Float, true, &n, Sqlite),
+            Err(IssueKind::NotANumber)
+        );
+        for d in [MySql, MsSql] {
+            for bad in ["NaN", "Infinity", "-inf"] {
+                assert_eq!(
+                    coerce(bad, ColKind::Float, true, &n, d),
+                    Err(IssueKind::NotANumber),
+                    "{bad:?} on {d:?}"
+                );
+            }
+        }
     }
 
     /// Booleans are the one place the engines genuinely disagree: MySQL's BOOLEAN
