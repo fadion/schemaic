@@ -378,6 +378,35 @@ pub fn page_turns(page: u64, more: bool, staged: bool) -> [PageTurn; 2] {
     ]
 }
 
+/// Why the grid will not re-read its rows while it holds staged work — the
+/// filter bar's apply and ✕, a header sort, *Filter by* / *Exclude*, and the
+/// capped notice's read-more, all of which land in the bottom error bar.
+pub const STAGED_REQUERY_MSG: &str =
+    "Commit or discard your changes first — re-reading the rows would throw them away";
+
+/// The query a filter, sort or page change asks for — `current` with `change`
+/// applied — or, **over staged work, a refusal and no change at all**.
+///
+/// Every such change is a re-run, and a re-run's landing replaces the rows the
+/// grid's staged edits, new rows and deletions sit on (they are indexed by data
+/// row, so they cannot be carried across). The pager already refused
+/// ([`page_turns`]); the filter bar, the header sort and *Filter by* re-ran
+/// regardless and threw the work away without a word. Answered **before** the
+/// change is made, so a refused filter does not leave the bar's ✕ or a
+/// header's chevron describing a query that never ran.
+pub fn requery(
+    current: &GridQuery,
+    change: impl FnOnce(&mut GridQuery),
+    staged: bool,
+) -> Result<GridQuery, &'static str> {
+    if staged {
+        return Err(STAGED_REQUERY_MSG);
+    }
+    let mut next = current.clone();
+    change(&mut next);
+    Ok(next)
+}
+
 /// The statement the grid re-reads after a commit it cannot splice (one that
 /// inserted or deleted rows): **what it was showing** — `base` with its
 /// filter, sort and page ([`compose`]), or the base itself at rest — and only
@@ -1199,6 +1228,42 @@ mod tests {
         assert_eq!((prev.tip, next.tip), ("Previous page", "Next page"));
         let [prev, _] = page_turns(0, true, false);
         assert_eq!(prev.to, None, "no page before the first");
+    }
+
+    /// A filter, a sort or a page is a re-run, and a re-run replaces the rows
+    /// the grid's staged work sits on — so over staged work the change is
+    /// refused **before** it is made, leaving the query as it was, and the
+    /// refusal says what to do about it.
+    #[test]
+    fn a_requery_does_not_run_over_staged_changes() {
+        let gq = GridQuery {
+            filter: "qty > 0".into(),
+            sort: vec![("name".into(), true)],
+            page: 3,
+        };
+        let filter = |q: &mut GridQuery| {
+            q.filter = "id = 5".into();
+            q.page = 0;
+        };
+        assert_eq!(
+            requery(&gq, filter, false),
+            Ok(GridQuery {
+                filter: "id = 5".into(),
+                sort: vec![("name".into(), true)],
+                page: 0,
+            })
+        );
+        assert_eq!(requery(&gq, filter, true), Err(STAGED_REQUERY_MSG));
+        // Not even a change that changes nothing: pressing Enter on the same
+        // filter re-runs it all the same.
+        assert_eq!(requery(&gq, |_| {}, true), Err(STAGED_REQUERY_MSG));
+        assert_eq!(requery(&gq, |_| {}, false), Ok(gq.clone()));
+        // Clearing the filter is a re-run too.
+        assert_eq!(
+            requery(&gq, |q| q.filter.clear(), true),
+            Err(STAGED_REQUERY_MSG)
+        );
+        assert!(STAGED_REQUERY_MSG.starts_with("Commit or discard your changes"));
     }
 
     /// After a commit that inserted or deleted rows, the grid re-reads **what

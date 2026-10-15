@@ -3748,6 +3748,12 @@ existing prose was left alone.
     (`the_pager_names_the_rows_and_ends_after_a_short_page`). It counts from `page_offset`, the
     offset the statement itself starts at, since that is where `with_page` moves on from — `LIMIT 10
     OFFSET 5` shows *Rows 6–15* (`the_pager_counts_from_the_statements_own_offset`).
+    **`requery` is the question every filter, sort and page change asks first** — `current` with
+    the caller's `change` applied, or, over staged work, `Err(STAGED_REQUERY_MSG)` with the change
+    never made, since the re-run's landing would replace the rows the staged edits are indexed by.
+    It is answered before the change rather than after it so that a refused filter cannot leave the
+    bar or a header describing a query that never ran; `page_turns` is the same rule for the
+    pager's chevrons, which dim rather than refuse (the grid's side of both is under *Data grid*).
     `eq_condition` is the right-click "Filter by / Exclude" fragment, its literal written for the
     column's type (`export::typed_literal`: a SQL Server `datetime` reads the cell's text by the
     login's language otherwise). `table_query` is what opening
@@ -32254,7 +32260,10 @@ existing prose was left alone.
   call is the write guard**: `current_statement` wraps `filter::rerun_statement`, so a statement that
   may not be executed a second time draws no link at all — the offer's predicate and its click ask
   the one function, where they used to ask only whether `base_sql` was `Some` (*Architecture
-  invariants*, the write guard). Clearing the
+  invariants*, the write guard). **Nor does the click run over staged work**: it re-runs into the
+  same panel, whose landing clears the staged edits, new rows and deletions with the rows they sat
+  on, so it asks `GridState::has_staged` first and refuses with `filter::STAGED_REQUERY_MSG` in the
+  bottom bar, as `apply_grid_query` does (the pager's entry under *Data grid* has why). Clearing the
   override on a fresh manual run is the other half: a raised cap belongs to the result it was
   raised for, and carrying it forward would be the global setting the user didn't change.
   **The export is the other way past the cap, and it is a different shape.** `export_file` branches
@@ -39391,8 +39400,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `no_view_code_clears_or_retains_a_signal_unguarded` scans both view crates for the two spellings
   it names, floored on finding the guarded sites so a rename or a moved `src` cannot make it pass by
   matching nothing. Its `EXEMPT` allowlist is `(file, line fragment, why)` — writes that always
-  change something, so the notification is the point: a `String` field on a query struct, a
-  dismissed error message, and the three `retain`s that delete a tab or a connection by an id that
+  change something, so the notification is the point: a dismissed error message, and the three
+  `retain`s that delete a tab or a connection by an id that
   came out of the list being filtered. `every_clear_exemption_still_names_a_real_write` is the floor
   under *that*, `scaled_arg_gate`'s instrument applied a second time, because an exemption matching
   nothing is a hole and not a permission.
@@ -41554,6 +41563,11 @@ read **once, when the menu opens**, and each entry captures its pair of `DiffSid
   that means "these rows are being replaced", `Tab::bump_panel_load`, calling
   `PanelView::clear_staged`. A fresh run needs no clear (`begin_run` builds new panels, empty by
   construction) and a commit splice deliberately bumps nothing, which is why it keeps its state.
+  The clear is right once the rows are replaced, and it is the *re-reads* the user starts from the
+  grid — a filter, a sort, *Filter by*, a page, the capped notice's read-more — that must not reach
+  it while anything is staged: each refuses instead (`filter::requery`, `filter::page_turns`, and
+  the pager's entry under *Data grid*), since every one of them used to land here and drop the
+  trio without a word.
   The frozen columns are `frozen_cols`, spelled out because a *frozen column* and a *frozen result* are
   different things one field apart (`gctx.panel.frozen_cols` is a set of indices, `gctx.panel_frozen` is
   whether the result is pinned), and two `.frozen`s in one data path is a wrong-variable bug waiting
@@ -42601,23 +42615,40 @@ this bundle's.
   constant limit gets one, a table tab's `table_query` simply always qualifies. The second term is
   the frozen rule and the write guard at once, through the funnel everything that re-runs already
   asks — a kept result draws no pager, since turning a page re-runs into the very panel that was
-  pinned. A chevron's click writes `grid_query.page` and calls `apply_grid_query`, so a page is
+  pinned. A chevron's click hands `apply_grid_query` the change `|q| q.page = to`, so a page is
   minted through `RerunRequest` like a filter, and composed after the filter and sort
-  (`filter::compose`, whose entry has the SQL each engine gets). **Every other write to
+  (`filter::compose`, whose entry has the SQL each engine gets). **Every other change to
   `grid_query` sets `page` back to 0** — filter-by-value, `cycle_server_sort`, the filter bar's
-  apply and its clear ✕ — so a new filter or order starts again at its first page. The clear's
-  block spelling is what
-  `no_view_code_clears_or_retains_a_signal_unguarded`'s exemption for that site names, so a reflow
-  of it means updating the `EXEMPT` fragment too
-  (`every_clear_exemption_still_names_a_real_write` fails on one that matches nothing). The click
-  is refused while `Tab::view_busy` holds,
+  apply and its clear ✕ — so a new filter or order starts again at its first page. **None of them
+  writes `grid_query` itself**: each passes its change to `apply_grid_query` as a closure, and that
+  action is the one writer (`the_grid_query_is_written_only_by_the_guarded_action`, a source gate
+  in `header_sort_tests`). The callers used to write the query and then call the re-run, so a
+  refusal inside it would still have left the bar's ✕, a header's chevron or the page caption
+  describing a query that never ran — and a fifth caller written later could skip the guard
+  outright. The click is refused while `Tab::view_busy` holds,
   and both chevrons drop to `text_faint` then, as they do when there is no page that way —
   *Previous* on page 0, *Next* after a short page. **Neither turns over staged work**
   (`filter::page_turns`, `a_page_does_not_turn_over_staged_changes`): a page is a re-run, and its
   landing clears the grid's staged edits, new rows and deletions with the rows they sat on, so
   turning used to throw them away without a word. While any are staged both chevrons are dimmed
   and their tooltip reads *Commit or discard your changes to change page*; whether anything is
-  staged is in the pager's rebuild key as a bool. They carry *Previous page*/*Next page* tooltips
+  staged is in the pager's rebuild key as a bool. **The pager was the only one guarded, and every
+  other re-read had the same hole**: the filter bar's apply and ✕, a header sort and *Filter by* /
+  *Exclude* all re-ran regardless, and the landing (`Tab::bump_panel_load` →
+  `PanelView::clear_staged`) dropped the staged trio without a word. So the guard is now on the
+  action as well: `apply_grid_query` asks `filter::requery(current, change, staged)` **before**
+  making the change, and over staged work leaves `grid_query` untouched, puts
+  `filter::STAGED_REQUERY_MSG` — *Commit or discard your changes first — re-reading the rows would
+  throw them away* — in the bottom error bar (`view_err`), and returns `false`
+  (`a_requery_does_not_run_over_staged_changes`). The ✕ empties the field only on `true`, so a
+  refused clear does not show an empty bar over a filter that is still applied; a refused apply
+  leaves the typed text in the field for after the commit. Those controls refuse rather than
+  dim, unlike the chevrons, because the filter field is where the user types the next filter and
+  a header click is also the client-side sort's control on every other result.
+  `GridState::has_staged` is the one spelling of "is
+  anything staged" for the pager's key, the action and the capped notice's read-more; it reads
+  tracked, because the pager's key has to see the first staged edit, and the other two ask from
+  click handlers where there is nothing to subscribe. The chevrons carry *Previous page*/*Next page* tooltips
   otherwise, and they are plain clickable containers rather than `in_strip_button`s, so F6's ring does not
   reach them.
 - **The Download menu names the scope, and only when there is a choice to make.** `export_menu`
@@ -43118,10 +43149,13 @@ this bundle's.
   `gs.server_sort_dir(ci)` tracks `grid_query` while `header_cell` is called from the body's builder
   and again from the virtualised header row's, and neither key mentions `grid_query` — a builder is
   not a tracking scope, so the value computed there subscribed to nothing and the chevron froze.
-  **It is reachable, not theoretical**: `cycle_server_sort` writes the new order and *then* calls
-  `apply_grid_query`, which has three exits that set `view_err` and re-run nothing — `build_query`
+  **It is reachable, not theoretical**: `cycle_server_sort` hands its new order to
+  `apply_grid_query`, which writes it to `grid_query` and *then* has three exits that set
+  `view_err` and re-run nothing — `build_query`
   answering `Ok(None)` on a statement it cannot rewrite, a `BadCondition`, and the write guard's
-  `RerunRequest::approved` refusing. `filterable()` only asks that `base_sql` and
+  `RerunRequest::approved` refusing. The staged-work refusal (`filter::requery`) is not a fourth:
+  it comes **before** the write, so a sort refused over staged edits leaves the chevron on the order
+  that is still on screen. `filterable()` only asks that `base_sql` and
   `insert_target()` are both `Some`, never whether an `ORDER BY` can actually be spliced in, so the
   gap is the join shape `edit::insert_target`'s own doc is written around —
   `SELECT o.* FROM orders o JOIN order_lines l ON l.order_id = o.id`, where every column has an

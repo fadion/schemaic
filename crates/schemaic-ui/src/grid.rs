@@ -832,15 +832,49 @@ impl GridState {
             .map(|o| o.column.clone())
     }
 
-    /// Rebuild the tab's statement from `base_sql` + the current `grid_query` and
-    /// re-run it (server-side filter/sort). A bad-condition / un-rewritable message
-    /// goes to the bottom error bar (`view_err`), same place as a live DB error; a
-    /// successful re-run clears it (via `apply_view`).
-    fn apply_grid_query(&self) {
-        let Some(base) = self.base_sql.get_untracked() else {
-            return;
+    /// Does this grid hold staged work — a cell edit, a new row or a row marked
+    /// for deletion — that a re-run of its statement would throw away?
+    ///
+    /// **One spelling of the question for everything that re-reads the rows**:
+    /// the pager's key, [`GridState::apply_grid_query`] and the capped notice's
+    /// read-more. Tracked, because the pager's chevrons have to grey out on the
+    /// first staged edit; the other two ask from click handlers, where there is
+    /// no effect to subscribe.
+    fn has_staged(&self) -> bool {
+        self.dirty.with(|d| !d.is_empty())
+            || self.new_rows.with(|v| !v.is_empty())
+            || self.del_rows.with(|d| !d.is_empty())
+    }
+
+    /// Change the tab's `grid_query` by `change`, then rebuild the statement from
+    /// `base_sql` + the new query and re-run it (server-side filter/sort/page).
+    /// A bad-condition / un-rewritable message goes to the bottom error bar
+    /// (`view_err`), same place as a live DB error; a successful re-run clears
+    /// it (via `apply_view`).
+    ///
+    /// **Refused over staged work, before `change` is made** (`filter::requery`):
+    /// the re-run's landing replaces the rows the staged edits sit on, and every
+    /// caller of this — the filter bar's apply and ✕, a header sort, *Filter
+    /// by* / *Exclude*, the pager — used to drop them without a word. The
+    /// change is taken as a closure so that no caller can write `grid_query`
+    /// first and leave the bar, the header or the page caption describing a
+    /// query that never ran (`the_grid_query_is_written_only_by_the_guarded_action`).
+    /// Returns whether the change was made.
+    fn apply_grid_query(&self, change: impl FnOnce(&mut schemaic_core::filter::GridQuery)) -> bool {
+        let next = self
+            .grid_query
+            .with_untracked(|gq| schemaic_core::filter::requery(gq, change, self.has_staged()));
+        let gq = match next {
+            Ok(gq) => gq,
+            Err(why) => {
+                self.view_err.set(Some(ModalError::app(why)));
+                return false;
+            }
         };
-        let gq = self.grid_query.get_untracked();
+        self.grid_query.set(gq.clone());
+        let Some(base) = self.base_sql.get_untracked() else {
+            return true;
+        };
         // Filter, sort and page, composed in one place (`filter::compose`).
         match schemaic_core::filter::compose(&base, &gq, self.dialect) {
             // **Two refusals, and they are different questions.** `Ok(None)` is
@@ -867,6 +901,7 @@ impl GridState {
             ))),
             Err(FilterError::BadCondition(msg)) => self.view_err.set(Some(ModalError::app(msg))),
         }
+        true
     }
 
     /// The statement that produced the result currently on screen and **may be
@@ -989,7 +1024,7 @@ impl GridState {
             .with_untracked(|rs| rs.columns.get(ci).map(|c| c.type_name.clone()))
             .unwrap_or_default();
         let cond = eq_condition(&col, &type_name, value, negate, self.dialect);
-        self.grid_query.update(|gq| {
+        self.apply_grid_query(|gq| {
             if gq.filter.trim().is_empty() {
                 gq.filter = cond;
             } else {
@@ -998,7 +1033,6 @@ impl GridState {
             // A new filter starts again at its first page.
             gq.page = 0;
         });
-        self.apply_grid_query();
     }
 
     /// Cycle server-side sort on display column `ci` (unsorted/other → ASC → DESC →
@@ -1008,7 +1042,7 @@ impl GridState {
         let Some(col) = self.real_col(ci) else {
             return;
         };
-        self.grid_query.update(|gq| {
+        self.apply_grid_query(|gq| {
             let next = match gq.sort.first() {
                 Some((c, true)) if *c == col => Some((col.clone(), false)), // ASC → DESC
                 Some((c, false)) if *c == col => None,                      // DESC → off
@@ -1018,7 +1052,6 @@ impl GridState {
             // A new order starts again at its first page.
             gq.page = 0;
         });
-        self.apply_grid_query();
     }
 
     /// The active server-side sort direction for display column `ci`, if any —
@@ -8680,11 +8713,12 @@ fn filter_bar(gs: GridState) -> impl IntoView {
             let buf = RwSignal::new(gs.grid_query.with_untracked(|q| q.filter.clone()));
             let apply = move || {
                 let text = buf.get_untracked().trim().to_string();
-                gs.grid_query.update(|q| {
+                // Refused over staged work, with the reason in the error bar;
+                // the typed text stays in the field for after the commit.
+                gs.apply_grid_query(|q| {
                     q.filter = text;
                     q.page = 0;
                 });
-                gs.apply_grid_query();
             };
             let field = edit_field(
                 buf,
@@ -8711,13 +8745,16 @@ fn filter_bar(gs: GridState) -> impl IntoView {
                     }
                     container(icons::icon(icons::X, 16.0).style(|s| s.color(theme::text())))
                         .on_click_stop(move |_| {
-                            buf.set(String::new());
-                            gs.grid_query.update(|q| {
+                            gs.view_err.set(None);
+                            // The field empties only if the filter it shows
+                            // really went: over staged work the re-run is
+                            // refused, and the filter is still applied.
+                            if gs.apply_grid_query(|q| {
                                 q.filter.clear();
                                 q.page = 0;
-                            });
-                            gs.view_err.set(None);
-                            gs.apply_grid_query();
+                            }) {
+                                buf.set(String::new());
+                            }
                         })
                         // Match the Schema search field's clear ×.
                         .style(|s| {
@@ -9099,6 +9136,15 @@ fn grid_toolbar(
                 if busy.get_untracked() {
                     return;
                 }
+                // **Not over staged work**, for `apply_grid_query`'s reason: this
+                // re-run lands in the same panel, and the landing clears the
+                // staged edits with the rows they were made on.
+                if gs.has_staged() {
+                    gs.view_err.set(Some(ModalError::app(
+                        schemaic_core::filter::STAGED_REQUERY_MSG,
+                    )));
+                    return;
+                }
                 let Some(sql) = gs.current_statement() else {
                     return;
                 };
@@ -9147,9 +9193,7 @@ fn grid_toolbar(
             // Whether anything is staged is part of the key, as a bool, so a
             // chevron greys out on the first staged edit without a rebuild
             // per keystroke after it.
-            let staged = gs.dirty.with(|d| !d.is_empty())
-                || gs.new_rows.with(|v| !v.is_empty())
-                || gs.del_rows.with(|d| !d.is_empty());
+            let staged = gs.has_staged();
             size.filter(|_| gs.rerunnable())
                 .map(|(size, start)| (size, start, gs.grid_query.with(|q| q.page), staged))
         },
@@ -9169,8 +9213,7 @@ fn grid_toolbar(
                 if busy.get_untracked() {
                     return;
                 }
-                gs.grid_query.update(|q| q.page = to);
-                gs.apply_grid_query();
+                gs.apply_grid_query(|q| q.page = to);
             };
             let arrow = move |glyph: &'static str, turn: schemaic_core::filter::PageTurn| {
                 let enabled = turn.to.is_some();
@@ -10512,9 +10555,9 @@ fn header_cell(
     // `dyn_container` builder and again from the virtualised header row's —
     // neither of which floem 0.2 wraps in a tracking effect, and neither of
     // whose keys mentions `grid_query`. So a value computed here subscribed to
-    // nothing: `cycle_server_sort` writes the new order and *then* calls
-    // `apply_grid_query`, which has three exits that set `view_err` and re-run
-    // nothing, and on any of them the bar said the query could not be sorted
+    // nothing: `apply_grid_query` writes the new order and *then* has three
+    // exits that set `view_err` and re-run nothing (its staged-work refusal
+    // comes before the write, and is not one of them), and on any of them the bar said the query could not be sorted
     // while the header went on drawing the order before last. A successful
     // re-run hid it by rebuilding the grid from a new `ResultSet`.
     let indicator = move || header_sort_indicator(gs.server_sort_dir(ci), sort_val, ci);
@@ -13098,8 +13141,8 @@ mod header_sort_tests {
     /// neither of whose keys mentions `grid_query`. Computed once at build, the
     /// chevron froze.
     ///
-    /// Not a theoretical freeze: `cycle_server_sort` mutates `grid_query` and
-    /// *then* calls `apply_grid_query`, which has three exits that set
+    /// Not a theoretical freeze: `apply_grid_query` (which `cycle_server_sort`
+    /// calls) mutates `grid_query` and *then* has three exits that set
     /// `view_err` and re-run nothing — an un-rewritable base statement, a bad
     /// condition, and the write guard's refusal. `filterable()` does not ask
     /// whether `build_query` can actually splice an `ORDER BY` in, so clicking a
@@ -13134,6 +13177,46 @@ mod header_sort_tests {
             );
         }
         assert_eq!(checked, 1, "this gate is stale — it found {checked}");
+    }
+
+    /// **`grid_query` is written only inside `apply_grid_query`.**
+    ///
+    /// Every filter, sort and page change is a re-run, and a re-run's landing
+    /// replaces the rows the staged edits, new rows and deletions sit on — so
+    /// the guard that refuses one over staged work has to sit where the query
+    /// is *changed*, not only where it is run. The four callers used to write
+    /// `grid_query` themselves and then call the re-run: a refusal there would
+    /// still have left the filter bar's ✕, the header's chevron and the next
+    /// page number describing a query that never ran. With the write inside the
+    /// action, a caller cannot change the query without passing the guard, and
+    /// a fifth caller written later cannot either.
+    #[test]
+    fn the_grid_query_is_written_only_by_the_guarded_action() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/grid.rs"))
+            .expect("this module's own source");
+        let body = crate::source_gate::production_code(&src);
+        let start = body
+            .find("fn apply_grid_query(")
+            .expect("`apply_grid_query` is gone — this gate is stale");
+        let end = crate::source_gate::item_end(&body, start).expect("its body");
+        let mut inside = 0;
+        let mut outside = Vec::new();
+        for needle in ["grid_query.update(", "grid_query.set("] {
+            for (at, _) in body.match_indices(needle) {
+                if (start..end).contains(&at) {
+                    inside += 1;
+                } else {
+                    outside.push(body[..at].matches('\n').count() + 1);
+                }
+            }
+        }
+        assert!(
+            outside.is_empty(),
+            "`grid_query` is written outside `apply_grid_query` at line(s) \
+             {outside:?} — a filter, sort or page change that skips the \
+             staged-work guard drops the user's uncommitted edits"
+        );
+        assert_eq!(inside, 1, "this gate is stale — it found {inside} writes");
     }
 }
 
@@ -15883,11 +15966,6 @@ mod clear_tests {
     /// The rule is "do not notify for nothing". Every entry here notifies for
     /// something.
     const EXEMPT: &[(&str, &str, &str)] = &[
-        (
-            "grid.rs",
-            "gs.grid_query.update(|q| { q.filter.clear(); q.page = 0; })",
-            "Not a collection signal: `q` is the query struct and `filter` is a              `String` field on it. `Clearable` is over the signal's own value,              and a guard here would have to ask about a field — a different              question, and one the caller can see the answer to (this runs from              the filter bar's clear button, where the filter is non-empty).",
-        ),
         (
             "object_editor.rs",
             "errs.update(|e| e.retain(|m| m != &msg))",
