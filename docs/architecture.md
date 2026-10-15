@@ -24508,8 +24508,9 @@ existing prose was left alone.
     The label is **hidden**, not merely empty, when the note is `None`: an empty label still takes
     a line and the column's gap.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
-    app's `conn_sources`. Raised from the Manage Connections list ("Import from another client",
-    below New connection and quieter than it: it is the first-run action, and the one nobody
+    app's `conn_sources`. Raised from the Manage Connections list ("Import connections" — it was
+    "Import from another client", which misled once the modal read Schemaic's own exports and
+    Docker's containers too — below New connection and quieter than it: it is the first-run action, and the one nobody
     presses twice), and painted *directly above* that modal in `modals.rs` — the question is about
     the list behind it, so closing returns to it. Its own term in `modal_backdrop_up`, like
     `manage_open`'s, because it is a loose child of the layer and can outlive the modal that raised
@@ -24535,10 +24536,11 @@ existing prose was left alone.
     (`FieldCfg::button`, under `lib.rs`) — beside it, as a `control_button`, it stood shorter than
     the field — and sits on the default field surface, `bg_deepest`: it wore `bg_editor`, with no
     recorded reason since the dialog arrived in cc1af200, and was the one lighter form field in the
-    app (GitHub #19). *Scan installed clients* wears the `Primary` fill beside
-    the file button's `Quiet` one, since it is what most people come for (GitHub #18); the footer's
-    Import, the other `Primary`, stays disabled until something is chosen, so the two never compete
-    on an empty dialog. Opening does **not** scan: the walk reads the user's home
+    app (GitHub #19). **All three source buttons wear the `Quiet` fill.** *Scan installed clients*
+    wore `Primary` while it stood beside *Choose a file…* alone, since it is what most people come
+    for (GitHub #18); once *Docker containers* made a third source, one lit button among three read
+    as the odd one out rather than the obvious one, so it went `Quiet` with the others. The footer's
+    Import is now the dialog's one `Primary`. Opening does **not** scan: the walk reads the user's home
     directory, and a dialog that goes through it because it was opened is doing something nobody
     asked for. The four sources all append through the app's one `add_import_result`, so a scan
     cannot discard a URL pasted before it and the four cannot disagree about ticking or about
@@ -24558,7 +24560,7 @@ existing prose was left alone.
     state; anything about a row the walk actually produced has to be read off the pure half
     (`core::conn_import`) or checked by hand on an unredirected profile.
     *Docker containers* (`ConnActions::scan_docker`, over `conn_sources::docker_source`) is `Quiet`
-    beside the scan's `Primary` — one source among several, and the only one that starts a program
+    like the other two — one source among several, and the only one that starts a program
     — at tab stop 45 after the scan's 40, and reads *Asking Docker…*, disabled, while
     `ConnImportUi::docker_busy` is set, for the reason the scan button is disabled while it runs.
     That is its own flag rather than `scanning` because the two buttons are independent and either

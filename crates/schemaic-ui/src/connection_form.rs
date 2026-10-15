@@ -1046,8 +1046,9 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 container(
                     h_stack((
                         icons::icon(icons::DOWNLOAD, 15.0),
-                        text("Import from another client")
-                            .style(|s| s.font_size(theme::font_label())),
+                        // Not "from another client": the modal reads Schemaic's
+                        // own exports and Docker's containers as well.
+                        text("Import connections").style(|s| s.font_size(theme::font_label())),
                     ))
                     .style(|s| {
                         s.flex_row()

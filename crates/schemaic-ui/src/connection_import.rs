@@ -266,10 +266,10 @@ fn row_of_buttons(
         // Disabled *while* a scan is out, so a second press can't queue a second
         // walk whose result would land on top of the first's.
         //
-        // **Primary, not Quiet like Choose a file** (GitHub #18): finding the
-        // clients already installed is what most people open this dialog for,
-        // so it wears the accent fill. It does not compete with the footer's
-        // Import, which is disabled until something has been chosen.
+        // **Quiet, like the other two.** It wore the accent fill (GitHub #18)
+        // while it stood beside Choose a file alone; with Docker containers as
+        // a third source, one lit button among three read as the odd one out
+        // rather than the obvious one.
         dyn_container(
             move || scanning.get(),
             move |busy| {
@@ -281,7 +281,7 @@ fn row_of_buttons(
                         "Scan installed clients"
                     },
                     icons::SEARCH,
-                    ActionKind::Primary,
+                    ActionKind::Quiet,
                     !busy,
                     ring,
                     TAB_SCAN,
@@ -289,9 +289,8 @@ fn row_of_buttons(
                 )
             },
         ),
-        // Quiet, beside Choose a file: one source among several, and the only
-        // one that starts a program — disabled while it is out for the reason
-        // the scan is.
+        // One source among several, and the only one that starts a program —
+        // disabled while it is out for the reason the scan is.
         dyn_container(
             move || docker_busy.get(),
             move |busy| {
