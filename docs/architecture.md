@@ -18401,6 +18401,19 @@ existing prose was left alone.
   author): `RANGE`, `LIST COLUMNS`, `HASH`, `KEY`, `RANGE COLUMNS` and `RANGE` +
   `SUBPARTITION BY HASH` tables read back as these clauses; the dump and restore are under
   `dump.rs`.
+  **A database that is not there is an error, not an empty schema.** Every catalogue read above
+  runs over a connection to *no* database and filters `WHERE TABLE_SCHEMA = ?`, so a missing
+  database is not a failure there — it matches no rows and reads as a database with nothing in it.
+  `schemaic compare -c prod -d shop --source-database shop_stagin` (a typo) took that empty side
+  at its word and printed a script dropping every table in `shop`, exit 0, where PostgreSQL and
+  SQL Server, which connect *to* the database, failed with exit 4 (review finding S3-L1-01).
+  `require_database` asks `information_schema.SCHEMATA` first and answers
+  `DbError::Query("Unknown database '<name>'")` — the server's own text for a `USE` of one — when
+  the name is absent **or invisible to the login**, and both `collect_schema` (so `fetch_schema`)
+  and `fetch_table_list` call it before anything else, so the dump, the MCP server's
+  `list_schema` and the app's tree fail the same way the comparison does. The live tier's
+  `suite::a_database_that_is_not_there_is_an_error_not_an_empty_schema` holds both reads to an
+  error on every leg the suite runs; it was red on both MySQL-family legs before the fix.
   **`sqlite.rs` is the third engine**, and five things make it unlike the other two rather than a
   third set of catalogue queries. **There is no server**: a connection is a *file*
   (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` has nothing
@@ -35040,7 +35053,12 @@ existing prose was left alone.
     `query::DEFAULT_TIMEOUT`, and the two schemas read **concurrently** — `tokio::join!` over
     `read_schema`, each `Db::fetch_schema` under `deadline::with_deadline` — a failure or a
     deadline on either side being its `reading <db>: …` line and `Exit::Failed` (the target's,
-    when both fail). Then `SchemaComparison::of(&target, &source, dialect)`, the target's dialect,
+    when both fail). **A side naming a database that is not there is such a failure on every
+    engine** — on MySQL/MariaDB only since `mysql::require_database` (under `mysql.rs`'s
+    `collect_schema`), before which a typo read as an empty schema and the script dropped every
+    table in the target, exit 0. Verified through the built CLI against MariaDB 10.11 (per the
+    change's author): `reading shop_stagin: query failed: Unknown database 'shop_stagin'`, exit 4.
+    Then `SchemaComparison::of(&target, &source, dialect)`, the target's dialect,
     and `cli::compare::report`, whose `Err` is a `warn` and `Exit::Usage`. **The script goes to
     stdout, the notes after it to stderr**, and the exit is 0 whether or not the two differ.
     `side_label` names each side by its

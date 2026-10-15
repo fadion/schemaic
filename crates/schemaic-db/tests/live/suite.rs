@@ -211,6 +211,33 @@ pub async fn introspection_finds_the_seeded_table(target: &'static Target) {
     scratch.teardown().await;
 }
 
+/// A database that is not there — a typo, or one the login cannot see — is an
+/// **error**, not a schema with nothing in it.
+///
+/// PostgreSQL connects *to* the database and fails there. MySQL and MariaDB
+/// read the catalogue `WHERE TABLE_SCHEMA = ?` over a connection to no
+/// database, and a missing one simply matched no rows: `schemaic compare
+/// --source-database shop_stagin` read the source as empty and printed a
+/// script dropping every table in the target, exit 0.
+pub async fn a_database_that_is_not_there_is_an_error_not_an_empty_schema(target: &'static Target) {
+    let db = target.base_db();
+    let absent = "schemaic_it_no_such_database";
+    let schema = db.fetch_schema(absent, CancellationToken::new()).await;
+    assert!(
+        schema.is_err(),
+        "{}: fetch_schema of a missing database answered {:?} tables",
+        target.name,
+        schema.map(|s| s.tables.len())
+    );
+    let list = db.fetch_table_list(absent).await;
+    assert!(
+        list.is_err(),
+        "{}: fetch_table_list of a missing database answered {:?} tables",
+        target.name,
+        list.map(|s| s.tables.len())
+    );
+}
+
 /// Every type this server can hand back renders as the text the grid shows —
 /// and a NULL in that column is a NULL, not an empty string.
 ///

@@ -100,6 +100,7 @@ live_suite!(
         server_variables_list_the_servers_settings,
         a_seeded_table_round_trips_through_a_query,
         introspection_finds_the_seeded_table,
+        a_database_that_is_not_there_is_an_error_not_an_empty_schema,
         a_scratch_database_is_gone_once_torn_down,
         every_type_renders_as_the_grid_shows_it,
         the_text_the_grid_shows_writes_back_unchanged,

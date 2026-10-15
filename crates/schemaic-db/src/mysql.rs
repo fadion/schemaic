@@ -1409,6 +1409,10 @@ pub(crate) async fn fetch_schema(
 /// why a name-listing caller must not reach [`fetch_schema`].
 pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema, DbError> {
     let mut conn = db.open(None, false).await?;
+    if let Err(e) = require_database(&mut conn, database).await {
+        let _ = conn.disconnect().await;
+        return Err(e);
+    }
     let out = conn
         .exec_map(
             "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(TABLE_TYPE AS CHAR) AS ty \
@@ -1521,8 +1525,34 @@ fn mysql_fold_partitions(tables: &mut [TableInfo], rows: &[MyPartitionRow]) {
     }
 }
 
+/// Refuse a `database` the server does not list in
+/// `information_schema.SCHEMATA` — absent, or invisible to this login.
+///
+/// The catalogue reads below run over a connection to *no* database and
+/// filter `WHERE TABLE_SCHEMA = ?`, so a missing database is not an error
+/// there: it matches no rows, and reads as a database with nothing in it.
+/// `schemaic compare --source-database shop_stagin` (a typo) took that empty
+/// side at its word and printed a script dropping every table in the target,
+/// exit 0 — where PostgreSQL and SQL Server, which connect *to* the database,
+/// failed. The text is the server's own for `USE` of such a database.
+async fn require_database(conn: &mut Conn, database: &str) -> Result<(), DbError> {
+    let found: Option<String> = conn
+        .exec_first(
+            "SELECT CAST(SCHEMA_NAME AS CHAR) FROM information_schema.SCHEMATA \
+             WHERE SCHEMA_NAME = ?",
+            (database,),
+        )
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    match found {
+        Some(_) => Ok(()),
+        None => Err(DbError::Query(format!("Unknown database '{database}'"))),
+    }
+}
+
 async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbError> {
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    require_database(conn, database).await?;
 
     // Tables, ordered. `TABLE_TYPE` separates base tables from views ('VIEW')
     // and, on MariaDB, from sequences ('SEQUENCE'), so the tree can render them
