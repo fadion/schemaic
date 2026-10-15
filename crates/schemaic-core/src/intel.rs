@@ -37398,6 +37398,52 @@ mod output_alias_tests {
         );
     }
 
+    /// **Two outputs of one name offer nothing**: which one a reference
+    /// means is the engine's business, and a rename of either would settle
+    /// it. Neither the rename's starting name nor *Find usages* answers.
+    #[test]
+    fn duplicate_output_names_offer_nothing() {
+        let sql = "SELECT qty AS t, id AS t FROM orders ORDER BY t";
+        let cat = catalog();
+        for at in [sql.find("AS t").unwrap() + 3, sql.len()] {
+            for d in ALL {
+                assert_eq!(output_alias_name_at(sql, at, d, &cat), None, "{d:?} {at}");
+                assert_eq!(usages_at(sql, at, d, &cat), None, "{d:?} {at}");
+            }
+        }
+    }
+
+    /// **A chain deeper than the walk follows is `Unsure`**, never a rename
+    /// that stops part way: ten CTEs each passing `t` on through `*`, read at
+    /// the top, are past the walk's depth of eight, so the rename refuses
+    /// and *Find usages* offers nothing — where three are followed whole.
+    #[test]
+    fn a_chain_deeper_than_the_walk_refuses() {
+        let chain = |n: usize| {
+            let mut ctes = vec!["c0 AS (SELECT total AS t| FROM orders)".to_string()];
+            for i in 1..n {
+                ctes.push(format!("c{i} AS (SELECT * FROM c{})", i - 1));
+            }
+            format!("WITH {} SELECT t FROM c{}", ctes.join(", "), n - 1)
+        };
+        for d in ALL {
+            let deep = chain(10);
+            assert_eq!(
+                renamed(&deep, "x", d),
+                Err(AliasRenameRefusal::Unsure),
+                "{d:?}"
+            );
+            let plain = deep.replace('|', "");
+            let at = plain.find("AS t").unwrap() + 3;
+            assert_eq!(usages_at(&plain, at, d, &catalog()), None, "{d:?}");
+            let shallow = chain(3);
+            let want = shallow
+                .replace("AS t|", "AS x")
+                .replace("SELECT t FROM c2", "SELECT x FROM c2");
+            assert_eq!(renamed(&shallow, "x", d), Ok(want), "{d:?}");
+        }
+    }
+
     /// A union's names are the first branch's, so a branch's alias is not
     /// offered; nor is a column that has no alias.
     #[test]
