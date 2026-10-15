@@ -644,6 +644,59 @@ impl ClosedTabsFile {
         self.tabs.truncate(CLOSED_TABS_CAP);
         self
     }
+
+    /// The ring as `closed_tabs.json` may hold it: nothing while "restore
+    /// tabs" (`restore`) is off, and never an entry whose text carries a
+    /// credential (`sql::carries_credential`) — the rule `history.json` keeps,
+    /// since this too is text the user is done with, and closing a tab that
+    /// ran `ALTER USER … IDENTIFIED BY` must not leave the password on disk
+    /// until ten more tabs are closed. The entry stays in the in-memory ring.
+    /// Asked under every dialect, because the entry names a connection rather
+    /// than an engine and a flagged statement is one to omit under any of them.
+    pub fn for_disk(
+        restore: bool,
+        ring: impl IntoIterator<Item = ClosedTabEntry>,
+    ) -> ClosedTabsFile {
+        if !restore {
+            return ClosedTabsFile::default();
+        }
+        ClosedTabsFile {
+            tabs: ring
+                .into_iter()
+                .filter(|e| {
+                    !crate::intel::SqlDialect::ALL
+                        .iter()
+                        .any(|d| crate::sql::carries_credential(&e.tab.query, *d))
+                })
+                .collect(),
+        }
+    }
+}
+
+/// How a write of the recently-closed ring is saved, or `None` when it need
+/// not be: `file_empty` is whether the file to write holds nothing, `emptied`
+/// whether the last write already left it empty, `erasing` the connection
+/// delete's spelling, `restore` the "restore tabs" setting.
+///
+/// An ordinary write of a file already left empty is skipped — with the
+/// setting off every close would otherwise be an erasing save, each paying
+/// its fsync — but **an erasing one never is**: the ordinary write that
+/// emptied the file kept the ring before it as `.bak`, and the connection
+/// delete's erasure is what removes it.
+pub fn closed_ring_saving(
+    file_empty: bool,
+    emptied: bool,
+    erasing: bool,
+    restore: bool,
+) -> Option<Saving> {
+    if file_empty && emptied && !erasing {
+        return None;
+    }
+    Some(if erasing || !restore {
+        Saving::Erasing
+    } else {
+        Saving::Replacing
+    })
 }
 
 /// The set of open tabs at last save, plus which one was active (its index).
@@ -3749,6 +3802,68 @@ mod tests {
         .capped();
         assert_eq!(file.tabs.len(), super::CLOSED_TABS_CAP);
         assert_eq!(file.tabs[0].tab.query, "0", "most recent kept");
+    }
+
+    /// **A closed tab whose text carries a credential is not written** — the
+    /// rule `history.json` keeps — while the rest of the ring is, in order;
+    /// with "restore tabs" off nothing is.
+    #[test]
+    fn a_closed_tab_carrying_a_credential_stays_off_disk() {
+        let entry = |q: &str| super::ClosedTabEntry {
+            tab: saved(None, false, q),
+            label: 1,
+        };
+        let ring = || {
+            vec![
+                entry("select 1"),
+                entry("ALTER USER 'app'@'%' IDENTIFIED BY 'S3cret'"),
+                entry("CREATE LOGIN app WITH PASSWORD = 'S3cret!'"),
+                entry("select 2"),
+            ]
+        };
+        let file = super::ClosedTabsFile::for_disk(true, ring());
+        let kept: Vec<&str> = file.tabs.iter().map(|e| e.tab.query.as_str()).collect();
+        assert_eq!(kept, ["select 1", "select 2"]);
+        let json = serde_json::to_string(&file).unwrap();
+        assert!(!json.contains("S3cret"), "{json}");
+        assert!(
+            super::ClosedTabsFile::for_disk(false, ring())
+                .tabs
+                .is_empty()
+        );
+    }
+
+    /// **The connection delete's erasing write is never skipped** — not even
+    /// when the ring is empty and the last write already emptied the file,
+    /// since that ordinary write left the previous ring in `.bak`.
+    #[test]
+    fn an_erasing_ring_write_happens_even_when_the_file_is_already_empty() {
+        use super::{Saving, closed_ring_saving};
+        assert_eq!(
+            closed_ring_saving(true, true, true, true),
+            Some(Saving::Erasing)
+        );
+        assert_eq!(
+            closed_ring_saving(true, true, true, false),
+            Some(Saving::Erasing)
+        );
+        // An ordinary write of an already-empty file is skipped: with the
+        // setting off it would otherwise pay an erasing save per close.
+        assert_eq!(closed_ring_saving(true, true, false, false), None);
+        assert_eq!(closed_ring_saving(true, true, false, true), None);
+        // The first empty write still happens, erasing when the setting is off.
+        assert_eq!(
+            closed_ring_saving(true, false, false, false),
+            Some(Saving::Erasing)
+        );
+        assert_eq!(
+            closed_ring_saving(false, false, false, true),
+            Some(Saving::Replacing)
+        );
+        assert_eq!(
+            closed_ring_saving(false, true, true, true),
+            Some(Saving::Erasing)
+        );
     }
 
     /// A fresh directory under the system temp dir, removed by `Dir`'s drop.

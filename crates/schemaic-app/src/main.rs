@@ -2648,45 +2648,84 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let editor_predictions = RwSignal::new(ui_state.editor_predictions);
     let editor_remembered_predictions = RwSignal::new(ui_state.editor_remembered_predictions);
     let restore_tabs = RwSignal::new(ui_state.restore_tabs);
-    // Write the reopen ring to `closed_tabs.json` — after every change to it,
-    // since it is a handful of entries and changes once per close or reopen.
+    // Write the reopen ring to `closed_tabs.json` after a change to it.
     // **Only while "restore tabs" is on**: off, the file is emptied with no
     // `.bak`, because it is the text of tabs the user closed and they asked
-    // not to have their session kept. `erasing` is the connection delete's
-    // spelling, which must leave no copy of a deleted connection's queries.
+    // not to have their session kept; and never a closed tab whose text
+    // carries a credential (`ClosedTabsFile::for_disk`). `erasing` is the
+    // connection delete's spelling, which must leave no copy of a deleted
+    // connection's queries.
     //
     // **An empty file is written once, not per change**: with the setting off
     // every close would otherwise be an erasing save, and each pays the fsync
     // `Saving::Erasing` takes — one per *deletion* is what that cost is for.
-    // `emptied` remembers that the file already says nothing.
-    let save_closed: Rc<dyn Fn(bool)> = {
+    // `emptied` remembers that the file already says nothing; an erasing write
+    // goes ahead regardless (`persist::closed_ring_saving`).
+    let write_closed: Rc<dyn Fn(bool)> = {
         let recently_closed = recently_closed.clone();
         let emptied = Rc::new(Cell::new(false));
         Rc::new(move |erasing: bool| {
-            let empty = !restore_tabs.get_untracked() || recently_closed.borrow().is_empty();
-            if empty && emptied.get() {
+            let restore = restore_tabs.get_untracked();
+            let file = schemaic_core::persist::ClosedTabsFile::for_disk(
+                restore,
+                recently_closed.borrow().iter().map(ClosedTab::to_entry),
+            );
+            let empty = file.tabs.is_empty();
+            let Some(saving) =
+                schemaic_core::persist::closed_ring_saving(empty, emptied.get(), erasing, restore)
+            else {
                 return;
-            }
-            emptied.set(empty);
-            let file = if restore_tabs.get_untracked() {
-                schemaic_core::persist::ClosedTabsFile {
-                    tabs: recently_closed
-                        .borrow()
-                        .iter()
-                        .map(ClosedTab::to_entry)
-                        .collect(),
-                }
-            } else {
-                schemaic_core::persist::ClosedTabsFile::default()
             };
+            emptied.set(empty);
             let name = schemaic_core::persist::CLOSED_TABS_FILE;
-            if erasing || !restore_tabs.get_untracked() {
-                persist::save_json_erasing(name, &file);
-            } else {
-                persist::save_json(name, &file);
+            match saving {
+                schemaic_core::persist::Saving::Erasing => persist::save_json_erasing(name, &file),
+                schemaic_core::persist::Saving::Replacing => persist::save_json(name, &file),
             }
         })
     };
+    // **An ordinary write is debounced, as `tabs.json`'s is**: the ring holds
+    // up to ten whole tab texts, and *Close All* over twenty tabs rewrote it —
+    // serialise, `.tmp`, `.bak`, rename — twenty times on the UI thread. A
+    // change bumps the generation and schedules the write; a later one
+    // supersedes it, so a burst touches disk once. The connection delete's
+    // erasing write is never deferred — it cancels any pending one and writes
+    // now — and `flush_closed` writes a pending one when the window closes.
+    let closed_gen = Rc::new(Cell::new(0u64));
+    let closed_pending = Rc::new(Cell::new(false));
+    let save_closed: Rc<dyn Fn(bool)> = {
+        let write_closed = write_closed.clone();
+        let closed_gen = closed_gen.clone();
+        let closed_pending = closed_pending.clone();
+        Rc::new(move |erasing: bool| {
+            let g = closed_gen.get() + 1;
+            closed_gen.set(g);
+            if erasing {
+                closed_pending.set(false);
+                write_closed(true);
+                return;
+            }
+            closed_pending.set(true);
+            let (gen_at, pending, write_closed) = (
+                closed_gen.clone(),
+                closed_pending.clone(),
+                write_closed.clone(),
+            );
+            exec_after(Duration::from_millis(600), move |_| {
+                if gen_at.get() != g {
+                    return; // superseded by a newer change
+                }
+                pending.set(false);
+                write_closed(false);
+            });
+        })
+    };
+    let flush_closed: Rc<dyn Fn()> = Rc::new(move || {
+        if closed_pending.replace(false) {
+            closed_gen.set(closed_gen.get() + 1);
+            write_closed(false);
+        }
+    });
     // Turning the setting off empties the file at once, and on writes the
     // ring as it stands — the effect's first run writes what was just read.
     {
@@ -14880,6 +14919,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             move |_| {
                 flush_session();
                 flush_filter();
+                flush_closed();
             },
         )
     }

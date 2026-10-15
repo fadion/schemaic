@@ -13616,8 +13616,17 @@ existing prose was left alone.
     hand-edited or future file to the ring's length on read
     (`a_closed_tabs_file_reads_no_longer_than_the_ring`). **It is written only while *restore
     tabs* is on**, and emptied with no `.bak` while it is off: it is the text of tabs the user
-    *closed*, and keeping it against their wish to start fresh is the wrong default. The writer is
-    the app's `save_closed`, under the session-restore passage in *app/main.rs*.
+    *closed*, and keeping it against their wish to start fresh is the wrong default.
+    `ClosedTabsFile::for_disk(restore, ring)` is what may be written: nothing while the setting is
+    off, and **never an entry whose text `sql::carries_credential` flags** under any dialect — the
+    rule `history.json` keeps, so closing a tab that ran `ALTER USER … IDENTIFIED BY` does not leave
+    the password on disk until ten more closes push it out; the entry stays in the in-memory ring
+    (`a_closed_tab_carrying_a_credential_stays_off_disk`). `closed_ring_saving(file_empty, emptied,
+    erasing, restore)` decides how a write is saved, or that it is skipped: an ordinary write of a
+    file the last write already emptied is, an **erasing one never is**, because the ordinary write
+    that emptied it kept the ring before it as `.bak`
+    (`an_erasing_ring_write_happens_even_when_the_file_is_already_empty`). The writer is the app's
+    `save_closed`, under the session-restore passage in *app/main.rs*.
     **`ai_harness` has two defaults, and the difference between them is the point.** A file *without*
     the key takes the serde default, `default_ai_harness` — `"claude"`, which is what every file
     written before multiple harnesses meant, since that was the one CLI the app drove; an upgrade must
@@ -32425,16 +32434,24 @@ existing prose was left alone.
   (`core/persist.rs`'s entry) seeds `recently_closed` at startup only when *restore tabs* is on,
   less any entry whose connection no longer exists — the delete prunes the ring, but a file from
   before that rule, or edited by hand, may still hold one. `save_closed(erasing)`, defined beside
-  the `restore_tabs` signal, writes the ring after every change to it — each push in
+  the `restore_tabs` signal, is called after every change to the ring — each push in
   `close_tab_now`'s `record` (capped at `CLOSED_TABS_CAP`), each reopen, and the connection delete
-  straight after its `retain` — so it needs no `WindowClosed` flush. With the setting off it
-  writes an empty file instead, erasing; the delete passes `erasing = true` whatever the setting,
-  so no `.bak` keeps a deleted connection's closed queries. An effect on `restore_tabs` calls it,
-  so turning the setting off empties the file at once rather than at the next close; its first
-  run, at startup, rewrites the file as just filtered. **An empty file is written once, not per
-  change**: `save_closed` keeps an `emptied` flag and skips a write that would leave the file
-  saying nothing again, so with the setting off a close is not an erasing save paying the fsync
-  `persist.rs` budgets one per deletion. What this does not
+  straight after its `retain`. **An ordinary call is debounced 600 ms, as `tabs.json`'s save is**:
+  the ring holds up to ten whole tab texts, and *Close All* over twenty tabs used to rewrite it —
+  serialise, `.tmp`, `.bak`, rename — twenty times on the UI thread. A call bumps a generation and
+  schedules `write_closed`; a later one supersedes it, and `flush_closed` writes a pending one from
+  the `WindowClosed` handler beside `flush_session`. **The delete's `(save_closed)(true)` is never
+  deferred**: it cancels any pending write and erases at once. With the setting off the write is an
+  empty file, erasing; the delete passes `erasing = true` whatever the setting, so no `.bak` keeps a
+  deleted connection's closed queries. What is written is `ClosedTabsFile::for_disk`'s, so a closed
+  tab carrying a credential stays off disk. An effect on `restore_tabs` calls it, so turning the
+  setting off empties the file within the debounce rather than at the next close; its first run,
+  at startup, rewrites the file as just filtered. **An empty file is written once, not per
+  change**: `write_closed` keeps an `emptied` flag and skips an ordinary write that would leave
+  the file saying nothing again, so with the setting off a close is not an erasing save paying the
+  fsync `persist.rs` budgets one per deletion — but not an erasing one
+  (`persist::closed_ring_saving`): the ordinary write that emptied the file kept the ring before it
+  as `.bak`, which only the delete's erasure removes. What this does not
   keep, stated rather than implied: with the setting off, a closed file tab's unsaved text in the
   ring does not survive a restart, unlike an open one's.
   **What the assistant knows about the result on screen, and how rows reach it.** `TurnContext`
