@@ -502,6 +502,37 @@ async fn the_init_sql_is_in_force_and_a_refused_one_fails_the_operation() {
     assert!(err.to_string().contains("init SQL"), "{err}");
 }
 
+/// **An init SQL never leaves the operation in implicit transactions** — under
+/// them every auto-commit write rolls back at the disconnect while the app
+/// reports it done. `ANSI_DEFAULTS ON`, which turns them on, is refused before
+/// the connect, and after an init that passes, `@@OPTIONS`' implicit-
+/// transactions bit (2) is off.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_init_sql_never_leaves_implicit_transactions_on() {
+    if !enabled() {
+        return;
+    }
+    let err = base_db()
+        .with_init_sql("SET ANSI_DEFAULTS ON")
+        .fetch_query(None, "SELECT 1", 10, CancellationToken::new())
+        .await
+        .expect_err("ANSI_DEFAULTS ran as init SQL");
+    assert!(err.to_string().contains("init SQL"), "{err}");
+    let rs = base_db()
+        .with_init_sql("SET XACT_ABORT ON")
+        .fetch_query(
+            None,
+            "SELECT CAST(@@OPTIONS & 2 AS int), CAST(@@OPTIONS & 16384 AS int)",
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the read runs");
+    assert_eq!(rs.cell(0, 0).expect("bit").display().to_string(), "0");
+    // The init itself took (XACT_ABORT is 16384).
+    assert_eq!(rs.cell(0, 1).expect("bit").display().to_string(), "16384");
+}
+
 /// **The server's settings are `sys.configurations`**, each with the value in
 /// use and its description — and SQL Server has no status list, which is an
 /// error that says so rather than an empty one.

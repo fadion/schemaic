@@ -675,7 +675,14 @@ existing prose was left alone.
     apart from the quote survives as the flags the server lists beside it.
     `mysql_mode_is_lexed_like_the_gate` is the read-back check the session makes *after* the `SET`,
     matching whole names so `NO_BACKSLASH_ESCAPES_X` is not a hazard
-    (`a_mode_name_is_matched_whole_not_by_substring`).
+    (`a_mode_name_is_matched_whole_not_by_substring`). **The client character set moves a string's
+    end the same way**, and `mysql_charset_is_lexed_like_the_gate` is the session's read-back of
+    it: it refuses the five multibyte sets whose second byte can be `0x5C` (`big5`, `cp932`, `gbk`,
+    `sjis`, `gb18030` — MySQL's own escaping documentation's list), where `丁\'` reads as two
+    characters and a closing quote, the wide sets that are no client set at all (`ucs2`, `utf16`,
+    `utf16le`, `utf32`), and an empty answer. Naming the hazards rather than the safe sets is
+    complete because the server's list of character sets is closed
+    (`a_client_charset_is_lexed_like_the_gate_unless_a_quote_hides_in_a_character`).
     **A quoted name in front of a `(` is a function call, and the deny scan has to see it.**
     PostgreSQL resolves a double-quoted identifier against the stored lower-case `pg_proc.proname`,
     so `SELECT "pg_read_file"('/etc/passwd')` is the same call as the unquoted one — while
@@ -12081,34 +12088,76 @@ existing prose was left alone.
     stronger than `run_verdict` that the write-guard invariant names. `check` answers the
     statements, each trimmed and without its `;`, or the first refusal in words the connection form
     shows; empty SQL and a comment alone are no statements (`nothing_is_nothing_to_run`). A
-    statement passes only as a `SET` — on SQLite, a `PRAGMA` named in `SQLITE_PRAGMAS`, which lists
-    the per-connection ones and leaves out what writes the file (`journal_mode`, `user_version`,
-    `auto_vacuum`) or lifts the read-only guard (`query_only`, `writable_schema`) — and then only
-    with no `(` at code level, since `SET @x = f()` on MySQL or SQL Server calls a function and a
-    function can write; with none of the `DENIED` words; not as `SET DEFAULT …`, which changes an
-    account rather than the session; and naming no `TRANSACTION` except where the read-only guard
-    is a rollback (`SqlDialect::read_only_is_a_rollback` — SQL Server), which an isolation level
-    cannot lift. Which engine's settings are `PRAGMA`s is the capability `settings_are_pragmas`,
-    which the form's hint asks too, never an engine comparison. **`USE` is
-    refused with every other non-`SET`**, because it would move each operation off the database it
-    asked for — the tab's, the tree node's — and an `INSERT` would be a write on every ping. The
-    deny list has two halves: what is server-wide or durable (`GLOBAL`, `PERSIST`, `PERSIST_ONLY`,
-    `PASSWORD`), and **what the read-only guard and the write path rest on** — the transaction
-    characteristics and read-only flags (`CHARACTERISTICS`, `TRANSACTION_READ_ONLY`,
-    `TX_READ_ONLY`, `DEFAULT_TRANSACTION_READ_ONLY`, SQLite's `QUERY_ONLY`), `AUTOCOMMIT` (a write
-    would never commit), `IMPLICIT_TRANSACTIONS`, `NOCOUNT` and `ROWCOUNT` (the row counts the
-    one-row safety net reads), and the two settings the literals Schemaic writes are lexed by:
-    PostgreSQL's `STANDARD_CONFORMING_STRINGS`, the one `pg::connect_probe` pins on the startup
-    packet, and MySQL's `SQL_MODE` (`what_the_guards_rest_on_cannot_be_moved`). SQL Server keeps
-    `SET TRANSACTION ISOLATION LEVEL`, because its read-only guard is a rollback, which no
-    isolation level lifts. Words are read over `sql::statement_ranges` and `skip_noncode`, the one
-    boundary lexer, so a denied word or a parenthesis inside a literal is only a value
-    (`a_denied_word_inside_a_value_is_only_a_value`, and `SET application_name = 'a (b)'` in
-    `a_setting_that_calls_a_function_is_refused`). **The list is not the last line**: a read-only
-    connection's enforcement statements run *after* the init SQL, inside each operation, so even a
-    setting it missed is overridden there; the list is what keeps such a setting from mattering on
-    the paths that are not enforced. Where and when the statements run is under `schemaic-db`'s
-    init SQL paragraph, beside the PostgreSQL probe.
+    statement passes only as a `SET` — on SQLite, a `PRAGMA` — with no `(` at code level, since
+    `SET @x = f()` on MySQL or SQL Server calls a function and a function can write, and then **only
+    if the setting it names is on this engine's list**. Which engine's settings are `PRAGMA`s is the
+    capability `settings_are_pragmas`, which the form's hint asks too, never an engine comparison.
+    **`USE` is refused with every other non-`SET`**, because it would move each operation off the
+    database it asked for — the tab's, the tree node's — and an `INSERT` would be a write on every
+    ping.
+    **The lists name what may be set, not what may not.** The gate was `SET` plus a `DENIED` list
+    of the words a guard rests on, and every setting nobody had thought of went through. `SET
+    ANSI_DEFAULTS ON` turns `IMPLICIT_TRANSACTIONS` on, so on SQL Server every auto-commit write
+    rolled back at the disconnect under an `ok` report; `FMTONLY`, `NOEXEC` and `PARSEONLY` make
+    every statement a successful no-op; MySQL's `sql_select_limit` and T-SQL's `TEXTSIZE` left a
+    dump, copy or export silently short; `ANSI_WARNINGS OFF` stores an over-long value truncated
+    instead of failing the write; `QUOTED_IDENTIFIER OFF` makes `"x"` a string; a non-UTF-8 client
+    character set — `SET NAMES gbk` — moved where the server ends a string away from where
+    `skip_noncode` does, so the read-only text gate passed as one read what the server ran as more,
+    and MCP `run_query` deleted rows on a live server; and any denied name written quoted
+    (`` SET `autocommit` = 0 ``) went through, because the word scan skipped a quoted name as a
+    literal. A name on no list is refused now (`a_setting_nobody_has_weighed_is_refused`), so a
+    setting gets in only once someone has weighed it — the cost being that a harmless setting
+    nobody listed is refused until someone adds it.
+    `MYSQL_SETTINGS` is time zone, locale, timeouts, buffer sizes, optimiser knobs and an isolation
+    level (which cannot lift `SET SESSION TRANSACTION READ ONLY`). A MySQL user variable (`SET @x =
+    1`) passes, since it sets nothing Schemaic reads; the `SESSION` and `LOCAL` scopes, bare or as
+    `@@session.`, pass; `GLOBAL`, `PERSIST` and `PERSIST_ONLY`, bare or as `@@global.`, are refused
+    as changing the server rather than the session, and `SET PASSWORD` and `SET DEFAULT ROLE` fall
+    to the list, naming nothing on it. `POSTGRES_SETTINGS` is the same kind of list, plus the
+    planner's `enable_*` switches (`POSTGRES_SETTING_PREFIX`), any custom dotted `prefix.name` (an
+    application's or an extension's — the usual carrier of a row-level-security tenant) and `SET
+    TIME ZONE`. SQL Server's is three: `MSSQL_VALUE_SETTINGS` (`LANGUAGE`, `DATEFORMAT`,
+    `LOCK_TIMEOUT`, …), `MSSQL_SWITCHES`, which may go either way, and `MSSQL_ON_ONLY` —
+    `ANSI_NULLS`, `ANSI_PADDING`, `ANSI_WARNINGS`, `QUOTED_IDENTIFIER`, `ARITHABORT`,
+    `CONCAT_NULL_YIELDS_NULL`, the ISO switches whose default Schemaic's SQL is written for, which
+    pass only `ON`. A T-SQL `@x` is refused: a variable ends with its batch and sets nothing.
+    `SQLITE_PRAGMAS` lists the per-connection pragmas, unqualified and with an `=` value or none,
+    and leaves out what writes the file (`journal_mode`, `user_version`, `auto_vacuum`) or lifts
+    the read-only guard (`query_only`, `writable_schema`). **Left off on purpose**, each list's doc
+    comment saying which: the transaction characteristics and read-only flags, `autocommit`,
+    `IMPLICIT_TRANSACTIONS`/`ANSI_DEFAULTS`, `NOCOUNT`/`ROWCOUNT` (the row counts the one-row
+    safety net reads), `foreign_key_checks`, PostgreSQL's `session_replication_role` (it switches
+    triggers and foreign keys off) and `bytea_output`/`extra_float_digits` (how values the app reads
+    are spelt), and the settings the literals Schemaic writes are lexed by — PostgreSQL's
+    `standard_conforming_strings`, the one `pg::connect_probe` pins on the startup packet, and
+    MySQL's `sql_mode` (`what_the_guards_rest_on_cannot_be_moved`,
+    `settings_that_make_an_operation_deliver_less_are_refused`). The client character set is a
+    check of the value, not the name: MySQL's `SET NAMES` (with an optional `COLLATE utf8…`),
+    `CHARACTER SET` and `CHARSET`, and PostgreSQL's `NAMES` and `client_encoding`, pass with a
+    UTF-8 value only, and MySQL's `character_set_*` variables are on no list
+    (`a_client_character_set_other_than_utf8_is_refused`). `SET TRANSACTION` passes only as
+    `ISOLATION LEVEL`, and only where the read-only guard is a rollback
+    (`SqlDialect::read_only_is_a_rollback` — SQL Server), which an isolation level cannot lift;
+    elsewhere the transaction characteristics *are* the guard.
+    **Each statement is tokenised, not word-scanned** — `tokens`, over `sql::statement_ranges` and
+    `skip_noncode`, the one boundary lexer, with a quoted name told from a string by
+    `intel::ident_quote` and **kept as a `Tok::Quoted` token rather than skipped**. Don't tidy that
+    token away: skipping a quoted name is exactly how `` `autocommit` `` got through, and a quoted
+    name is refused wherever a setting's name would stand, since it is the same setting to the
+    server and no setting needs the quotes (`a_quoted_setting_name_is_still_denied`). A word or a
+    parenthesis inside a string is only a value (`a_denied_word_inside_a_value_is_only_a_value`, and
+    `SET application_name = 'a (b)'` in `a_setting_that_calls_a_function_is_refused`), and the
+    settings people write keep passing (`everyday_session_settings_pass`). **The list is not the
+    last line, but the ordering is not the only one either.** A read-only connection's enforcement
+    statements run *after* the init SQL, inside each operation, so a transaction setting the list
+    missed is overridden there, and SQL Server's connect turns `IMPLICIT_TRANSACTIONS` off after
+    any init. But the lexing the text gate rests on is in place *before* enforcement runs, and no
+    enforcement statement re-sets the client character set — which is what `SET NAMES gbk`
+    showed. MySQL's `enforce_session` now reads `character_set_client` back; on PostgreSQL, where
+    tokio-postgres asks for `UTF8` on the startup packet and nothing reads it back, the list is
+    what keeps it there. Where and when the statements run is under `schemaic-db`'s init SQL
+    paragraph, beside the PostgreSQL probe.
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
     (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
@@ -17588,7 +17637,8 @@ existing prose was left alone.
   `Query` once), `Session::open`'s SQLite manual-mode backstop (a `Connect` once) and
   `Session::open_enforced`'s refusal of a read-only SQL Server connection (under `mssql.rs`),
   `mysql::unpinnable_mode` — `enforce_session`'s refusal when the server puts a quote-moving
-  `sql_mode` back — `session::aborted_commit`, which `Session::commit` answers over a block that was
+  `sql_mode` back — and its refusal of a client character set that can hide a quote,
+  `session::aborted_commit`, which `Session::commit` answers over a block that was
   already aborted, and the non-`Complete` arms of `mysql::cancelled_import`/`cancelled_write`
   ("Import/Commit cancelled — …"). It renders **as written**, `#[error("{0}")]` with no prefix:
   each is already the whole sentence, and "query failed:" in front of "Commit cancelled — …" named
@@ -17897,8 +17947,13 @@ existing prose was left alone.
   through `core::sql::mysql_mode_lexed_like_the_gate`, sets the result as a **bound parameter** so
   nothing the server listed is spliced into SQL text, and **reads it back** through
   `mysql_mode_is_lexed_like_the_gate` rather than trusting the `SET` — a combination mode the list
-  does not know must fail the statement, not run it under a lexer the gate did not use — before
-  `ReadOnly` adds its `SET SESSION TRANSACTION READ ONLY`. PostgreSQL's `AsJudged` asks nothing,
+  does not know must fail the statement, not run it under a lexer the gate did not use. It then
+  **reads `@@SESSION.character_set_client` back** and refuses, as a `DbError::Refused`, a set
+  `core::sql::mysql_charset_is_lexed_like_the_gate` rejects: under `gbk` a backslash can be half
+  of a character, so the gate's `\'` is the server's closing quote. The handshake asks for
+  `utf8mb4`, but a server's `init_connect` or a skipped handshake can say otherwise, and `SET NAMES
+  gbk` as a connection's init SQL had MCP `run_query` delete rows until the init list refused it.
+  Only then does `ReadOnly` add its `SET SESSION TRANSACTION READ ONLY`. PostgreSQL's `AsJudged` asks nothing,
   because the one setting that moves a quote there, `standard_conforming_strings`, is already pinned
   on the startup packet by `connect_probe` (above) — the same hazard, closed earlier — and SQLite's
   asks nothing because it has no backslash escape to disagree about. SQL Server's asks nothing
@@ -17909,9 +17964,11 @@ existing prose was left alone.
   (`main.rs`'s `session_enforce`), so a writable connection's run is plain `fetch_query` as it always
   was. **A connection's init SQL runs before all of this**, inside the connect and before the
   caller sees the connection, so every enforcement statement here — and SQL Server's `BEGIN
-  TRANSACTION` — is issued after it and overrides whatever it set; that ordering, not the init
-  SQL's own allowlist, is why it cannot lift the guard (the init SQL paragraph below, and the live
-  tier's `a_read_only_session_with_init_sql_still_refuses_a_write`). `sqlite.rs` carries
+  TRANSACTION` — is issued after it and overrides whatever it set; that ordering is why it cannot
+  lift the transaction guard (the init SQL paragraph below, and the live tier's
+  `a_read_only_session_with_init_sql_still_refuses_a_write`). It is not why it cannot move the
+  lexing: no statement here re-sets PostgreSQL's `client_encoding`, so there the init SQL's own
+  allowlist is what keeps it UTF-8, and on MySQL the list and the character-set read-back both do. `sqlite.rs` carries
   `a_read_only_fetch_refuses_a_write_and_still_reads` (the row count afterwards, not just the error,
   and a read beside it so a session that refuses everything fails) and
   `only_the_read_only_enforcement_refuses_a_write`, which holds `AsJudged` and plain `fetch_query` to
@@ -20321,7 +20378,13 @@ existing prose was left alone.
   `mssql::connect`**, now the check, then `login` (the old body, up to the login), then each
   statement through `simple_query` — **not `execute`**, which sends an RPC, and a `SET` inside
   `sp_executesql` lasts only as long as that call, so the setting would be gone before the
-  operation began. **Running before the caller sees the connection is what keeps it below the
+  operation began. After a non-empty init it sends **`SET IMPLICIT_TRANSACTIONS OFF`**, belt and
+  braces behind `init_sql::check`: under implicit transactions every auto-commit write is rolled
+  back at the disconnect while the app reports it done, and `ANSI_DEFAULTS ON` once turned them on
+  from an init the old deny list let through. Whatever the init set, the operation starts in
+  auto-commit; a refusal of that statement is `Db::init_failed` like any other
+  (`mssql::an_init_sql_never_leaves_implicit_transactions_on`, which also has `ANSI_DEFAULTS ON`
+  refused before the connect). **Running before the caller sees the connection is what keeps it below the
   read-only guard**: every `Enforce` statement is the caller's, issued afterwards (under
   `fetch_query_enforced`, above). The one connection it skips is `pg::cancel_query`'s, a
   `CancelToken` that runs no SQL; the terminal's database client is opened by none of these and
@@ -21265,8 +21328,10 @@ existing prose was left alone.
   the init; `a_read_only_session_with_init_sql_still_refuses_a_write` reads it back through
   `fetch_query_enforced` with `Enforce::ReadOnly` and then has the same enforced path refuse an
   `INSERT`, the count afterwards still `0` — the ordering half, which no pure test can hold; and
-  `a_refused_init_statement_fails_the_operation` sets a setting no server has and asserts the
-  operation fails with an error naming the init SQL. SQL Server is not a leg of the macro, so its
+  `a_refused_init_statement_fails_the_operation` sets a listed setting to a value the server
+  refuses — `SET statement_timeout = 'banana'` on PostgreSQL, `SET time_zone = 'Nowhere/Nope'` on
+  the MySQL family, since a name on no list is now refused before the connect and would never
+  reach the server — and asserts the operation fails with an error naming the init SQL. SQL Server is not a leg of the macro, so its
   case is `mssql.rs`'s `the_init_sql_is_in_force_and_a_refused_one_fails_the_operation` — `SET
   LANGUAGE British; SET DATEFIRST 3` read back, which is also what proves the batch-not-RPC send,
   and `SET LANGUAGE NoSuchLanguage` failing the operation — passing on 2022 and 2025 by the
@@ -35900,17 +35965,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   **A connection's init SQL is the fourth refusal, and the one guarding SQL the user never ran.**
   `Connection::init_sql` runs at every connect, so on every operation — a run, a listing, a ping, a
   `KILL` — with nobody at the keyboard and no moment to confirm anything. `core::init_sql::check`
-  is its gate, with no `Confirm` arm: an allowlist of session `SET`s (on SQLite, named `PRAGMA`s),
-  no `(` at code level, `USE` refused because it would move operations off the database they asked
-  for, and a deny list of what is server-wide or what a guard rests on — the transaction and
-  read-only settings, `autocommit`, the row counts the one-row net reads, the literal lexing
-  (`core::init_sql`'s entry has the list and each reason). It has **no minted request**, as
+  is its gate, with no `Confirm` arm: a session `SET` (on SQLite, a `PRAGMA`), no `(` at code
+  level, `USE` refused because it would move operations off the database they asked for, and the
+  setting's **name on that engine's allowlist** — it was a deny list of what a guard rests on, and
+  `ANSI_DEFAULTS`, `FMTONLY`, `sql_select_limit`, `TEXTSIZE`, a non-UTF-8 client character set and
+  any denied name written quoted all went through it (`core::init_sql`'s entry has the lists and
+  each reason). It has **no minted request**, as
   `read_only_reason` has none: it is asked inside the connect, by `Db::init_statements`, in each
   engine's one connect function and before any of it runs, so there is no launcher to forget it.
-  And it cannot weaken the guards beside it, because it runs before the caller sees the
-  connection and so before every `Enforce` statement — the ordering, not the list, is what holds
-  a read-only connection (`schemaic-db`'s init SQL paragraph;
-  `a_read_only_session_with_init_sql_still_refuses_a_write` in the live tier).
+  It runs before the caller sees the connection and so before every `Enforce` statement, which
+  overrides any transaction setting it made (`schemaic-db`'s init SQL paragraph;
+  `a_read_only_session_with_init_sql_still_refuses_a_write` in the live tier) — **but the ordering
+  alone does not hold a read-only connection.** The lexing the text gate rests on is in place
+  before enforcement runs and no enforcement statement re-sets it: `SET NAMES gbk` as init SQL
+  had MCP `run_query` delete rows on a live server. The list is what refuses that, backed on
+  MySQL by `enforce_session`'s read-back of `character_set_client`.
   **One tested function is asked by everything that re-runs**, and that is the shape of the fix
   rather than a tidy-up. `filter::rerun_statement(base, &GridQuery, dialect)` composes *what* would
   run (`filter::compose`, or the base verbatim when there is no filter, sort or page) with *whether it may*

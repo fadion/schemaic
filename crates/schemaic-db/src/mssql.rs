@@ -213,6 +213,18 @@ pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient,
         };
         ran.map_err(|e| Db::init_failed(stmt, ms_text(&e)))?;
     }
+    // Belt and braces behind `init_sql::check`: under implicit transactions
+    // every auto-commit write would be rolled back at the disconnect while the
+    // app reported it done, and `ANSI_DEFAULTS ON` once turned them on from an
+    // init the old deny list let through. Whatever the init set, the
+    // operation starts in auto-commit.
+    if !init.is_empty() {
+        let off = match client.simple_query("SET IMPLICIT_TRANSACTIONS OFF").await {
+            Ok(stream) => stream.into_results().await.map(drop),
+            Err(e) => Err(e),
+        };
+        off.map_err(|e| Db::init_failed("SET IMPLICIT_TRANSACTIONS OFF", ms_text(&e)))?;
+    }
     Ok(client)
 }
 

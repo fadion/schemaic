@@ -5706,6 +5706,22 @@ pub(crate) async fn enforce_session(
     if !schemaic_core::sql::mysql_mode_is_lexed_like_the_gate(&back) {
         return Err(unpinnable_mode(&back));
     }
+    // The client character set moves string ends as the mode does: under
+    // `gbk` a backslash can be half of a character, and the gate's `\'` is
+    // the server's closing quote. The handshake asks for utf8mb4, but a
+    // server's `init_connect` or a skipped handshake can say otherwise, so it
+    // is read back rather than trusted.
+    let charset: Option<String> = conn
+        .query_first("SELECT @@SESSION.character_set_client")
+        .await
+        .map_err(qerr)?;
+    let charset = charset.unwrap_or_default();
+    if !schemaic_core::sql::mysql_charset_is_lexed_like_the_gate(&charset) {
+        return Err(DbError::Refused(format!(
+            "refused: the session's client character set ({charset}) can hide a quote inside \
+             a character, so the statement check cannot read it the way the server would"
+        )));
+    }
     if enforce == crate::Enforce::ReadOnly {
         conn.query_drop("SET SESSION TRANSACTION READ ONLY")
             .await

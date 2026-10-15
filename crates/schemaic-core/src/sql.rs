@@ -6143,6 +6143,29 @@ pub fn mysql_mode_is_lexed_like_the_gate(mode: &str) -> bool {
     })
 }
 
+/// Does a MySQL/MariaDB session whose `character_set_client` is `charset`
+/// end its strings where [`skip_noncode`] does?
+///
+/// Not in the five multibyte sets whose second byte can be `0x5C` (`\`) —
+/// `big5`, `cp932`, `gbk`, `sjis`, `gb18030`, the list MySQL's own escaping
+/// documentation gives — where `丁\'` reads as two characters and a closing
+/// quote, and not in a wide set (`ucs2`, `utf16*`, `utf32`) that is no client
+/// set at all. Everything else is ASCII-compatible byte for byte at a quote
+/// or a backslash. The set of character sets is the server's closed list, so
+/// naming the hazards is complete; an empty answer (none read back) is not
+/// one. Asked by the enforced session after its `sql_mode` read-back, since
+/// a server's `init_connect` or a skipped client handshake can set it before
+/// Schemaic's first statement.
+pub fn mysql_charset_is_lexed_like_the_gate(charset: &str) -> bool {
+    const HIDES_A_QUOTE: &[&str] = &[
+        "big5", "cp932", "gbk", "sjis", "gb18030", "ucs2", "utf16", "utf16le", "utf32",
+    ];
+    !charset.is_empty()
+        && !HIDES_A_QUOTE
+            .iter()
+            .any(|c| charset.eq_ignore_ascii_case(c))
+}
+
 /// Keywords that make a statement a write *wherever* they appear in it, not just
 /// at its head — the set that survives the read-head allowlist below.
 ///
@@ -10388,6 +10411,22 @@ mod tests {
         assert!(!ok("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"));
         assert!(!ok("ansi_quotes"));
         assert!(!ok("MSSQL"));
+    }
+
+    /// S1.1-L5-02's read-back: a client character set in which a backslash
+    /// or a quote byte can be the second byte of a character ends a string
+    /// where the server does not, so the enforced session refuses it.
+    #[test]
+    fn a_client_charset_is_lexed_like_the_gate_unless_a_quote_hides_in_a_character() {
+        use super::mysql_charset_is_lexed_like_the_gate as ok;
+        for cs in [
+            "utf8mb4", "UTF8MB3", "utf8", "latin1", "ascii", "cp1252", "ujis",
+        ] {
+            assert!(ok(cs), "{cs}");
+        }
+        for cs in ["gbk", "SJIS", "big5", "cp932", "gb18030", "utf16", ""] {
+            assert!(!ok(cs), "{cs}");
+        }
     }
 
     /// The other engine's spelling is *not* refused — over-blocking is the safe

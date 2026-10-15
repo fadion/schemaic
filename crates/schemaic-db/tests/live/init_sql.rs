@@ -93,10 +93,14 @@ pub async fn a_read_only_session_with_init_sql_still_refuses_a_write(target: &'s
 /// SQL — the operation does not go on without a setting the user asked for.
 pub async fn a_refused_init_statement_fails_the_operation(target: &'static Target) {
     let scratch = Scratch::create(target, "init_sql_bad").await;
-    let db = scratch
-        .db
-        .clone()
-        .with_init_sql("SET no_such_setting_here = 1");
+    // A setting `init_sql::check` lets through with a value only the server
+    // can refuse — an unknown name is refused before the connect now.
+    let bad = match scratch.dialect() {
+        SqlDialect::Postgres => "SET statement_timeout = 'banana'",
+        SqlDialect::MySql => "SET time_zone = 'Nowhere/Nope'",
+        SqlDialect::MsSql | SqlDialect::Sqlite => unreachable!("not a leg of this suite"),
+    };
+    let db = scratch.db.clone().with_init_sql(bad);
     let err = db
         .fetch_query(
             Some(&scratch.database),
