@@ -8770,9 +8770,10 @@ existing prose was left alone.
     statements and the only change it would take does damage the comparison may not choose for the
     user, or where the difference needs a statement the comparison does not write at all;
     `unplannable` is true whenever it is set, and `omission_note` reads it ahead of its other
-    three arms, so the omitted line is that sentence. Two producers set it — `tsql_entry`, through
-    `held_back_sequence`, for a SQL Server sequence's range, and `table_entry` for a table whose
-    partitioning differs or a partitioned one no `CREATE TABLE` can restate (both below) — and every other entry is built with `None`. `is_planned` carries the same term, so counting and building cannot answer
+    three arms, so the omitted line is that sentence. Three producers set it — `tsql_entry`, through
+    `held_back_sequence`, for a SQL Server sequence's range, `table_entry` for a table whose
+    partitioning differs or a partitioned one no `CREATE TABLE` can restate, and
+    `hold_partitions_of_held_tables` for a partition of a table so held (all below) — and every other entry is built with `None`. `is_planned` carries the same term, so counting and building cannot answer
     differently.
     It is a second list rather than more lines in
     `unsupported()` because the two ask different things of the reader: `unsupported` means this plan
@@ -8950,6 +8951,28 @@ existing prose was left alone.
     it would have read as done
     (`a_missing_partitioned_sql_server_table_is_held_back_not_created_plain`, which asserts the
     plan writes no `CREATE TABLE` and no `PARTITION`).
+    **A held table holds its partitions back with it.** Each PostgreSQL partition is an entry of its
+    own, so the parent's hold reached only the parent, and each partition was planned alone: a
+    source's created `PARTITION OF` a table the target holds plain, which the server refuses, or a
+    target's dropped — every row of the table the omission note said was left alone.
+    `hold_partitions_of_held_tables`, run in `SchemaComparison::of` right after the table entries,
+    sets `held_back` to *"it is a partition of <parent>, which is held back — recreate them
+    together, by hand"* on every table entry that is a difference, is not already held and is a
+    partition, on either side, of a held table — repeated until nothing changes, so a
+    sub-partition follows its partition (`a_held_back_partitioned_table_holds_back_its_partitions`).
+    **A two-sided table is diffed on what is its own** (`own_parts`, on both sides before
+    `ddl::diff`): every `inherited` index and foreign key goes, and on a partition
+    (`partition_of`) every column, all of which are its parent's. PostgreSQL clones a parent's
+    columns, indexes and keys onto each partition, and onto a table referencing a partitioned one a
+    clone of its key per partition; diffed as the table's own, a column or index added to the
+    parent was restated on every partition — *cannot add column to a partition*, *relation …
+    already exists* — and a new partition's key clone was added beside the one the server makes
+    (*constraint … already exists*), each refusing the whole plan. The parent's change is planned
+    once, on the parent, and the clones follow it on the server
+    (`a_column_added_to_a_partitioned_table_is_not_restated_on_its_partitions`,
+    `an_index_added_to_a_partitioned_table_is_not_restated_on_its_partitions`,
+    `a_new_partitions_cloned_key_is_not_restated`). It is the comparison's and not `ddl::diff`'s
+    because the designer shares the differ and never drafts a clone, so has none to strip.
     **Extensions are not compared at all**:
     installing one is a server-side act — its control files must be on the target's disk — rather
     than a definition a plan can restate, and the comparison does not read the two sides' lists.
@@ -30204,7 +30227,8 @@ existing prose was left alone.
     `EverythingAgrees` (under `compare.rs`). The banner reads `SchemaComparison::standing_notes()`
     rather than `notes`, which puts each **held-back** entry's omission line first
     (`CompareEntry::held_back` — a SQL Server sequence range the target's counter has left, a
-    table whose partitioning differs, or a partitioned SQL Server table the target lacks): that
+    table whose partitioning differs, a partitioned SQL Server table the target lacks, or a
+    partition of a held table): that
     line is the instruction for the one difference no plan carries, and a comparison holding only
     that difference plans nothing, so Preview is never enabled and the omitted list it would have
     been read in is never shown.

@@ -752,6 +752,7 @@ impl SchemaComparison {
         ) {
             entries.push(table_entry(l, r, target, dialect));
         }
+        hold_partitions_of_held_tables(&mut entries, left, right);
 
         // ── triggers ────────────────────────────────────────────────────────
         //
@@ -2629,6 +2630,73 @@ fn empty_set(name: &str, schema: Option<&str>, dialect: SqlDialect) -> ChangeSet
     }
 }
 
+/// **`t` as the comparison diffs it: only what is its own.** The server
+/// clones onto each partition the columns, indexes and keys of its parent,
+/// and onto a table referencing a partitioned one a clone of its key per
+/// partition; the reader marks each clone `inherited`, and a partition's
+/// columns are all its parent's. Diffed as the table's own, a column or index
+/// added to the parent was restated on every partition, and a new
+/// partition's key clone added beside the one the server makes — PostgreSQL
+/// refused each, and with it the whole plan. They follow the parent's own
+/// change, which is planned once, on it.
+///
+/// Here rather than in `ddl::diff`, which the designer shares: an editor
+/// never drafts a clone, so it has none to strip.
+fn own_parts(t: &TableInfo) -> TableInfo {
+    let mut own = t.clone();
+    if own.partition_of.is_some() {
+        own.columns.clear();
+    }
+    own.indexes.retain(|ix| !ix.inherited);
+    own.foreign_keys.retain(|fk| !fk.inherited);
+    own
+}
+
+/// **A table held back holds back its partitions**, on either side and at
+/// any depth. Each partition is an entry of its own, so the parent's hold
+/// never reached them: a source partition was created `PARTITION OF` a
+/// table the target holds plain, which the server refuses, and a target's
+/// partitions were dropped — every row of the table the note said was left
+/// for the user to recreate.
+fn hold_partitions_of_held_tables(entries: &mut [CompareEntry], left: &DbSchema, right: &DbSchema) {
+    let is_table = |e: &CompareEntry| e.kind == CompareKind::Table;
+    loop {
+        let held: Vec<(Option<String>, String)> = entries
+            .iter()
+            .filter(|e| is_table(e) && e.held_back.is_some())
+            .map(|e| (e.schema.clone(), e.name.clone()))
+            .collect();
+        // The parent each side's partitions name, by the partition.
+        let parent_of = |schema: &Option<String>, name: &str| {
+            left.tables
+                .iter()
+                .chain(&right.tables)
+                .filter(|t| &t.schema == schema && t.name == name)
+                .find_map(|t| t.partition_of.as_ref())
+                .map(|of| (of.schema.clone(), of.parent.clone()))
+        };
+        let mut changed = false;
+        for e in entries.iter_mut() {
+            if !is_table(e) || e.held_back.is_some() || !e.status.is_difference() {
+                continue;
+            }
+            if let Some((schema, parent)) = parent_of(&e.schema, &e.name)
+                && held.contains(&(schema.clone(), parent.clone()))
+            {
+                e.held_back = Some(format!(
+                    "it is a partition of {}, which is held back — recreate them together, \
+                     by hand",
+                    display_name(schema.as_deref(), &parent)
+                ));
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
 fn table_entry(
     l: Option<&TableInfo>,
     r: Option<&TableInfo>,
@@ -2680,7 +2748,10 @@ fn table_entry(
                     Some(d) => ddl::diff_view(l, &d, dialect),
                     None => empty_set(&any.name, any.schema.as_deref(), dialect),
                 },
-                (Some(l), Some(r)) => ddl::diff(l, &TableDraft::from_table(r), target),
+                (Some(l), Some(r)) => {
+                    let (l, r) = (own_parts(l), own_parts(r));
+                    ddl::diff(&l, &TableDraft::from_table(&r), target)
+                }
                 (None, Some(r)) if is_view => match ViewDraft::from_table(r) {
                     Some(d) => ddl::create_view(&d, dialect),
                     None => empty_set(&any.name, any.schema.as_deref(), dialect),
@@ -3495,6 +3566,149 @@ mod tests {
             );
         }
         assert!(!plan.emit().join("\n").contains("ALTER"));
+    }
+
+    /// **A partition takes its columns from its parent**: a column added to
+    /// the partitioned table is added once, to it — PostgreSQL refuses `ADD
+    /// COLUMN` on a partition ("cannot add column to a partition"), which
+    /// failed the whole plan.
+    #[test]
+    fn a_column_added_to_a_partitioned_table_is_not_restated_on_its_partitions() {
+        let (parent, child) = partitioned_events();
+        let (mut wider, mut wider_child) = (parent.clone(), child.clone());
+        wider.columns.push(col("note", "text"));
+        wider_child.columns.push(col("note", "text"));
+        let sql = SchemaComparison::of(
+            &schema_of(vec![parent, child]),
+            &schema_of(vec![wider, wider_child]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true)
+        .emit()
+        .join("\n");
+        assert_eq!(sql.matches("ADD COLUMN").count(), 1, "{sql}");
+        assert!(!sql.contains("a_2024"), "{sql}");
+    }
+
+    /// **An index made on the parent is cloned onto each partition by the
+    /// server**, so the clone is not created a second time
+    /// ("relation … already exists").
+    #[test]
+    fn an_index_added_to_a_partitioned_table_is_not_restated_on_its_partitions() {
+        let (parent, child) = partitioned_events();
+        let index = |name: &str, inherited: bool| crate::schema::IndexInfo {
+            name: name.to_string(),
+            columns: vec![crate::schema::IndexColumn::plain("at")],
+            inherited,
+            ..Default::default()
+        };
+        let (mut indexed, mut indexed_child) = (parent.clone(), child.clone());
+        indexed.indexes.push(index("events_at_idx", false));
+        indexed_child.indexes.push(index("a_2024_at_idx", true));
+        let sql = SchemaComparison::of(
+            &schema_of(vec![parent, child]),
+            &schema_of(vec![indexed, indexed_child]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true)
+        .emit()
+        .join("\n");
+        assert_eq!(sql.matches("CREATE INDEX").count(), 1, "{sql}");
+        assert!(!sql.contains("a_2024_at_idx"), "{sql}");
+    }
+
+    /// **A key onto a partitioned table is cloned onto each partition**, on the
+    /// referencing table: a new partition brings its clone with it, so the
+    /// plan does not add one beside it ("constraint … already exists").
+    #[test]
+    fn a_new_partitions_cloned_key_is_not_restated() {
+        use crate::schema::PartitionOf;
+        let (parent, child) = partitioned_events();
+        let mut newer = child.clone();
+        newer.name = "b_2025".into();
+        newer.partition_of = Some(PartitionOf {
+            schema: Some("public".into()),
+            parent: "events".into(),
+            bound: "FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')".into(),
+        });
+        let key = |name: &str, to: &str, inherited: bool| ForeignKeyInfo {
+            name: name.to_string(),
+            columns: vec!["event_id".to_string()],
+            ref_schema: Some("public".to_string()),
+            ref_table: to.to_string(),
+            ref_columns: vec!["id".to_string()],
+            inherited,
+            ..Default::default()
+        };
+        let orders = |keys: Vec<ForeignKeyInfo>| TableInfo {
+            name: "orders".to_string(),
+            schema: Some("public".to_string()),
+            columns: vec![col("id", "integer"), col("event_id", "integer")],
+            foreign_keys: keys,
+            ..Default::default()
+        };
+        let before = orders(vec![
+            key("orders_event_id_fkey", "events", false),
+            key("orders_event_id_fkey1", "a_2024", true),
+        ]);
+        let mut after = before.clone();
+        after
+            .foreign_keys
+            .push(key("orders_event_id_fkey2", "b_2025", true));
+        let sql = SchemaComparison::of(
+            &schema_of(vec![parent.clone(), child.clone(), before]),
+            &schema_of(vec![parent, child, newer, after]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true)
+        .emit()
+        .join("\n");
+        assert!(sql.contains("PARTITION OF"), "{sql}");
+        assert!(!sql.contains("ADD CONSTRAINT"), "{sql}");
+        assert!(!sql.contains("orders"), "{sql}");
+    }
+
+    /// **A partitioned table held back holds its partitions back with it**,
+    /// on either side. Planned on their own they were created `PARTITION OF` a
+    /// table the target holds plain — which the server refuses — or, the other
+    /// way round, dropped with every row of the table the note said was being
+    /// left alone.
+    #[test]
+    fn a_held_back_partitioned_table_holds_back_its_partitions() {
+        let (parent, child) = partitioned_events();
+        let plain = TableInfo {
+            partitioning: None,
+            ..parent.clone()
+        };
+        // The source partitioned, the target plain: nothing created `OF` it.
+        let plan = SchemaComparison::of(
+            &schema_of(vec![plain.clone()]),
+            &schema_of(vec![parent.clone(), child.clone()]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true);
+        let sql = plan.emit().join("\n");
+        assert!(!sql.contains("PARTITION OF"), "{sql}");
+        assert!(!sql.contains("a_2024"), "{sql}");
+        assert!(
+            plan.omitted.iter().any(|o| o.contains("a_2024")),
+            "{:?}",
+            plan.omitted
+        );
+        // The target partitioned, the source plain: nothing dropped.
+        let plan = SchemaComparison::of(
+            &schema_of(vec![parent, child]),
+            &schema_of(vec![plain]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true);
+        let sql = plan.emit().join("\n");
+        assert!(!sql.contains("DROP"), "{sql}");
+        assert!(
+            plan.omitted.iter().any(|o| o.contains("a_2024")),
+            "{:?}",
+            plan.omitted
+        );
     }
 
     /// **A `Same` row can still have two different texts under it.** On SQLite

@@ -190,6 +190,7 @@ live_suite!(
         a_partitioned_table_reads_back_partitioned,
         a_partitioned_dump_restores_with_every_partitions_rows,
         a_dumped_partition_replays_beside_its_siblings,
+        a_compared_partitioned_table_plans_what_the_server_takes,
     ],
     streaming: [
         a_streamed_export_delivers_every_row,

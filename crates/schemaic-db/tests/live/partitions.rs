@@ -381,3 +381,60 @@ pub async fn a_dumped_partition_replays_beside_its_siblings(target: &'static Tar
     dst.teardown().await;
     s.teardown().await;
 }
+
+/// **A comparison of a partitioned table plans what the server takes**: a
+/// new partition, a column and an index added to the parent. The plan
+/// restated each on every partition, and added the new partition's key
+/// clone beside the one the server makes, and the server refused it whole.
+pub async fn a_compared_partitioned_table_plans_what_the_server_takes(target: &'static Target) {
+    let dst = Scratch::create(target, "part_cmp_dst").await;
+    if !partitions_are_tables(dst.dialect()) {
+        crate::endpoint::note_no_op(target, "a partition is not a table to compare here");
+        dst.teardown().await;
+        return;
+    }
+    seed(&dst).await;
+    let src = Scratch::create(target, "part_cmp_src").await;
+    seed(&src).await;
+    let events = src.qualified("events");
+    src.exec(&format!(
+        "CREATE TABLE {} PARTITION OF {events} \
+         FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+        src.qualified("events_2025")
+    ))
+    .await;
+    src.exec(&format!("ALTER TABLE {events} ADD COLUMN note TEXT"))
+        .await;
+    src.exec(&format!(
+        "CREATE INDEX events_cust_idx ON {events} (cust_id)"
+    ))
+    .await;
+    let plan = schemaic_core::compare::SchemaComparison::of(
+        &schema_of(&dst).await,
+        &schema_of(&src).await,
+        dst.dialect(),
+    )
+    .plan(|_| true);
+    let sql = plan
+        .emit()
+        .iter()
+        .map(|s| format!("{s}\n"))
+        .collect::<String>();
+    assert_eq!(
+        run_file(&dst, &sql).await,
+        ExecEnd::Done,
+        "{}: the plan was refused:\n{sql}",
+        target.name
+    );
+    // And the target now compares the same.
+    let again = schemaic_core::compare::SchemaComparison::of(
+        &schema_of(&dst).await,
+        &schema_of(&src).await,
+        dst.dialect(),
+    )
+    .plan(|_| true)
+    .emit();
+    assert!(again.is_empty(), "{}: still to do: {again:?}", target.name);
+    src.teardown().await;
+    dst.teardown().await;
+}
