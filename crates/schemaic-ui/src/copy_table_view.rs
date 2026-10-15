@@ -23,10 +23,15 @@ use schemaic_core::copy_table::{self, CopyTarget};
 use schemaic_core::schema::display_name;
 
 use crate::widgets::{
-    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, fact_note,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, cursor_row, fact_note,
     focus_root_with_ring, form_gap, form_setting, in_ring_button, modal_footer, modal_pad_h,
-    modal_title_owned, modal_w, panel_style,
+    modal_title_owned, modal_w, panel_style, pick_group,
 };
+
+/// The chosen target's button, and the list under it — one stop, the
+/// arrows moving inside it — ahead of the Schema (20) and Name (30) fields.
+const CHOSEN_TAB: u32 = 10;
+const LIST_TAB: u32 = 15;
 use crate::{ConnUi, DdlUi, FieldCfg, OverlayUi, SchemaUi, edit_field, icons, theme};
 
 /// The table *Copy to* was raised on — always the active connection's, since
@@ -198,7 +203,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                     }))
                     .on_click_stop(move |_| picking.update(|p| *p = !*p)),
                     ring.clone(),
-                    10,
+                    CHOSEN_TAB,
                     true,
                     4.0,
                     move || picking.update(|p| *p = !*p),
@@ -208,68 +213,102 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
             },
         )
     };
+    // **The list is one Tab stop** (`widgets::pick_group`): Up/Down move a
+    // cursor over its rows, Enter or Space picks the one under it. Each step
+    // of the picker rebuilds the list, removing the view that held the
+    // keyboard, so a pick made from the keyboard hands it on — to the new
+    // list, or, once a database is chosen, to the choice above it.
+    let cursor: RwSignal<Option<usize>> = RwSignal::new(None);
+    let keyed = RwSignal::new(false);
     let list = {
         let list_dbs = ctx.list_dbs.clone();
         let src_type = src_type.clone();
+        let ring = ring.clone();
         dyn_container(
             move || (picking.get(), o.compare_dbs.get()),
             move |(up, listed)| {
+                cursor.set(None);
+                if keyed.get_untracked() {
+                    keyed.set(false);
+                    let ring = ring.clone();
+                    let tab = if up { LIST_TAB } else { CHOSEN_TAB };
+                    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                        ring.focus_at(tab)
+                    });
+                }
                 if !up {
                     return empty().into_any();
                 }
-                let inner = match listed {
-                    Some((cid, dbs)) => v_stack((
-                        crate::compare_view::pick_row(
+                // Each row's label, colour and pick, in the order drawn.
+                let mut picks: Vec<(String, fn() -> floem::peniko::Color, Rc<dyn Fn()>)> =
+                    Vec::new();
+                match listed {
+                    Some((cid, dbs)) => {
+                        picks.push((
                             "‹ back".to_string(),
                             theme::text_muted,
-                            move || o.compare_dbs.set(None),
-                        ),
-                        v_stack_from_iter(dbs.into_iter().map(move |db| {
-                            crate::compare_view::pick_row(db.clone(), theme::text, move || {
-                                dst.set(Some((cid, db.clone())));
-                                picking.set(false);
-                            })
-                        }))
-                        .style(|s| s.flex_col().width_full()),
-                    ))
-                    .style(|s| s.flex_col().width_full())
-                    .into_any(),
+                            Rc::new(move || o.compare_dbs.set(None)),
+                        ));
+                        for db in dbs {
+                            picks.push((
+                                db.clone(),
+                                theme::text,
+                                Rc::new(move || {
+                                    dst.set(Some((cid, db.clone())));
+                                    picking.set(false);
+                                }),
+                            ));
+                        }
+                    }
                     None => {
-                        let list_dbs = list_dbs.clone();
-                        let same: Vec<_> = conns
-                            .get()
-                            .into_iter()
-                            .filter(|c| {
-                                src_type.as_ref().is_some_and(|t| {
-                                    schemaic_core::connection::same_engine(&c.db_type, t)
-                                })
+                        let same = conns.get().into_iter().filter(|c| {
+                            src_type.as_ref().is_some_and(|t| {
+                                schemaic_core::connection::same_engine(&c.db_type, t)
                             })
-                            .collect();
-                        v_stack_from_iter(same.into_iter().map(move |c| {
+                        });
+                        for c in same {
                             let list_dbs = list_dbs.clone();
                             let id = c.id;
-                            crate::compare_view::pick_row(c.name.clone(), theme::text, move || {
-                                (list_dbs)(id)
-                            })
-                        }))
-                        .style(|s| s.flex_col().width_full())
-                        .into_any()
+                            picks.push((c.name, theme::text, Rc::new(move || (list_dbs)(id))));
+                        }
                     }
-                };
-                autohide(scroll(inner).style(|s| s.width_full()))
-                    .style(move |s| {
-                        // Clear of the chosen target above it; with none shown,
-                        // the label's own gap is all the list sits under.
-                        s.width_full()
-                            .max_height(theme::scaled(180.0))
-                            .apply_if(has_dst.get(), |s| s.margin_top(theme::scaled(6.0)))
-                            .padding(theme::scaled(4.0))
-                            .background(theme::bg_deepest())
-                            .border(1.0)
-                            .border_color(theme::border())
-                            .border_radius(5.0)
-                    })
-                    .into_any()
+                }
+                let actions: Rc<Vec<Rc<dyn Fn()>>> =
+                    Rc::new(picks.iter().map(|(_, _, f)| f.clone()).collect());
+                let inner = v_stack_from_iter(picks.into_iter().enumerate().map(
+                    |(i, (text, color, f))| {
+                        cursor_row(
+                            crate::compare_view::pick_row(text, color, move || f()),
+                            cursor,
+                            i,
+                        )
+                    },
+                ))
+                .style(|s| s.flex_col().width_full());
+                let len = actions.len();
+                let body = autohide(scroll(inner).style(|s| s.width_full())).style(move |s| {
+                    // Clear of the chosen target above it; with none shown,
+                    // the label's own gap is all the list sits under.
+                    s.width_full()
+                        .max_height(theme::scaled(180.0))
+                        .apply_if(has_dst.get(), |s| s.margin_top(theme::scaled(6.0)))
+                        .padding(theme::scaled(4.0))
+                        .background(theme::bg_deepest())
+                        .border(1.0)
+                        .border_color(theme::border())
+                        .border_radius(5.0)
+                });
+                pick_group(
+                    body,
+                    ring.clone(),
+                    LIST_TAB,
+                    cursor,
+                    move || len,
+                    move |i| {
+                        keyed.set(true);
+                        (actions[i])();
+                    },
+                )
             },
         )
         .style(|s| s.flex_col().width_full())

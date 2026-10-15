@@ -25305,7 +25305,10 @@ existing prose was left alone.
     Close button. The rows are `intel::usage_lines` over `intel::usages_at`'s answer (under
     `intel.rs`), so it lists exactly the places the matching rename would write, and it knows no
     buffer: `UsagesRequest::jump` is the editor's own, as `AliasRenameRequest::apply` is. Clicking a
-    row closes the list and then jumps. Close, Escape, ✕ and **a click on the backdrop** close it —
+    row closes the list and then jumps; so does Enter or Space on the row under the cursor, the rows
+    being one Tab stop (`widgets::pick_group` at `NAV_TAB`, ahead of ✕ and Close) that Up/Down move
+    through — they were pointer-only, so the keyboard reached ✕ and Close and nothing the modal is
+    for. Close, Escape, ✕ and **a click on the backdrop** close it —
     unlike *Rename alias*, it has a click-away. However it closes, it calls `UsagesRequest::back`,
     for the reason `alias_rename.rs` gives. As the tuple element's third member it is in
     `ddl_modals_up` (its `usages` arm) and on `PAINTS_A_BACKDROP`, for the reason the snippet
@@ -30832,7 +30835,14 @@ existing prose was left alone.
     reading `connection · database`, toggling the list open and shut) is built only once a
     database is chosen — a `dyn_container` on a `has_dst` memo. It used to be there from the start,
     reading *"Choose a database"*, and pressing it folded the list away into an empty field whose
-    only way back was to press it again. The modal clears `compare_dbs` and
+    only way back was to press it again. **The list is one Tab stop**, `widgets::pick_group` at
+    `LIST_TAB` (15, between the button's `CHOSEN_TAB` 10 and Schema's 20): Up/Down move a cursor
+    over its rows (`widgets::cursor_row`), Enter or Space picks the one under it — the modal's first
+    question had been pointer-only, its rows plain `pick_row` clicks, so *Preview SQL* was
+    unreachable without a mouse. Each step of the picker rebuilds the list and with it the view
+    that held the keyboard, so a pick made from the keyboard (`keyed`) hands it on, deferred, to
+    the new list or — once a database is chosen — to the button above it (`FocusRing::focus_at`).
+    The modal clears `compare_dbs` and
     `copy_progress` when it opens. Below the picker are **Schema**, hidden when the source has
     none, defaulting to the source's, **Name**, defaulting to `<table>_copy`, and **Copy data**, a
     `settings::focusable_toggle_row` on by default at ring tabindex 40, after Name. Under them a
@@ -40301,7 +40311,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   strip, and the designer/trigger item list (`table_designer::list_pane`) each take a single ring
   slot: Tab reaches the group, Left/Right or Up/Down move inside it, Tab leaves. `widgets::nav_group`
   is the shared one (the swatches and `list_pane` predate it and carry their own scrolling and
-  chrome). Eight swatches or twenty columns as individual stops would
+  chrome). **A list whose rows act when chosen** — *Copy to*'s target picker, *Find usages*' rows —
+  is `widgets::pick_group` over it: the arrows move a cursor (`cursor_row`, `row_selected`,
+  scrolled into view a tick later) rather than a selection, Enter or Space picks the row under it,
+  the first arrow lands on the near end as `ring_step` enters a ring, and `FocusLost` drops the
+  cursor. Eight swatches or twenty columns as individual stops would
   make crossing a pane the user is only passing through cost twenty keypresses.
   **A `nav_group` paints no focus indication**, unlike a button: it wraps a whole bar or pane, so
   an outline around it reads as a stray border — and it doesn't need one, because what the arrows

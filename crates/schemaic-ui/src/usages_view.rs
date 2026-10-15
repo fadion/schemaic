@@ -12,8 +12,9 @@ use floem::prelude::*;
 
 use crate::theme;
 use crate::widgets::{
-    ACTION_TAB, ActionKind, FocusRing, action_button, dismiss_layer, focus_root_with_ring,
-    modal_footer, modal_pad_h, modal_title_owned, modal_w, panel_style,
+    ACTION_TAB, ActionKind, FocusRing, NAV_TAB, action_button, cursor_row, dismiss_layer,
+    focus_root_with_ring, modal_footer, modal_pad_h, modal_title_owned, modal_w, panel_style,
+    pick_group,
 };
 
 /// What raises the list.
@@ -51,20 +52,30 @@ pub(crate) fn usages_overlay(open: RwSignal<Option<UsagesRequest>>) -> impl Into
                 }
             });
             let n = req.rows.len();
-            let rows = v_stack_from_iter(req.rows.iter().cloned().map({
-                let jump = req.jump.clone();
-                let close = close.clone();
-                move |(a, b, line, text)| {
-                    let (jump, close) = (jump.clone(), close.clone());
-                    h_stack((
+            // A row jumps the editor to its usage — by click, or as the row
+            // under the cursor of the one Tab stop the list is
+            // (`widgets::pick_group`).
+            let go: Rc<dyn Fn(usize)> = {
+                let (jump, close) = (req.jump.clone(), close.clone());
+                let spans: Vec<(usize, usize)> = req.rows.iter().map(|r| (r.0, r.1)).collect();
+                Rc::new(move |i| {
+                    if let Some(&(a, b)) = spans.get(i) {
+                        close();
+                        jump(a, b);
+                    }
+                })
+            };
+            let cursor: RwSignal<Option<usize>> = RwSignal::new(None);
+            let rows = v_stack_from_iter(req.rows.iter().cloned().enumerate().map({
+                let go = go.clone();
+                move |(i, (_, _, line, text))| {
+                    let go = go.clone();
+                    let row = h_stack((
                         text_line(format!("{line}"))
                             .style(|s| s.color(theme::text_dim()).min_width(theme::scaled(44.0))),
                         text_line(text).style(|s| s.color(theme::text()).min_width(0.0)),
                     ))
-                    .on_click_stop(move |_| {
-                        close();
-                        jump(a, b);
-                    })
+                    .on_click_stop(move |_| go(i))
                     .style(|s| {
                         s.width_full()
                             .items_center()
@@ -73,16 +84,24 @@ pub(crate) fn usages_overlay(open: RwSignal<Option<UsagesRequest>>) -> impl Into
                             .padding_vert(theme::scaled(4.0))
                             .border_radius(4.0)
                             .hover(|s| s.background(theme::row_hover_soft()))
-                    })
+                    });
+                    cursor_row(row, cursor, i)
                 }
             }))
             .style(|s| s.flex_col().width_full());
-            let body = scroll(rows).style(|s| {
-                s.width_full()
-                    .max_height(theme::scaled(360.0))
-                    .padding_horiz(modal_pad_h())
-                    .padding_vert(theme::scaled(12.0))
-            });
+            let body = pick_group(
+                scroll(rows).style(|s| {
+                    s.width_full()
+                        .max_height(theme::scaled(360.0))
+                        .padding_horiz(modal_pad_h())
+                        .padding_vert(theme::scaled(12.0))
+                }),
+                ring.clone(),
+                NAV_TAB,
+                cursor,
+                move || n,
+                move |i| go(i),
+            );
             let done = close.clone();
             let footer = modal_footer(action_button(
                 "Close",

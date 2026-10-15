@@ -936,6 +936,72 @@ pub(crate) fn nav_group<V: IntoView + 'static>(
         .into_any()
 }
 
+/// A [`nav_group`] over rows the user **picks** from — a list whose rows act
+/// when chosen rather than select as the arrows pass (*Copy to*'s target
+/// picker, *Find usages*' rows). One Tab stop; Up/Down move `cursor`, which
+/// the rows paint through [`cursor_row`]; Enter or Space picks the row under
+/// it through `pick`. The first arrow into the list lands on its near end, as
+/// [`ring_step`] enters a ring, and the cursor is dropped when the group loses
+/// the keyboard, so it never outlives the focus it stands for.
+///
+/// `len` is read at each press, so a list rebuilt under the cursor — the
+/// picker's databases replacing its connections — is stepped as it now is.
+pub(crate) fn pick_group<V: IntoView + 'static>(
+    body: V,
+    ring: FocusRing,
+    tabindex: u32,
+    cursor: RwSignal<Option<usize>>,
+    len: impl Fn() -> usize + 'static,
+    pick: impl Fn(usize) + 'static,
+) -> AnyView {
+    nav_group(body, ring, tabindex, NavAxis::Vertical, move |delta| {
+        let n = len();
+        let next = match cursor.get_untracked() {
+            Some(cur) if cur < n => list_step(n, cur, delta),
+            _ => ring_step(n, None, delta < 0),
+        };
+        if next.is_some() {
+            cursor.set(next);
+        }
+    })
+    .on_event(EventListener::KeyDown, move |e| {
+        let Event::KeyDown(ke) = e else {
+            return EventPropagation::Continue;
+        };
+        match cursor.get_untracked() {
+            Some(i) if presses(&ke.key.logical_key, ke.modifiers) => {
+                pick(i);
+                EventPropagation::Stop
+            }
+            _ => EventPropagation::Continue,
+        }
+    })
+    .on_event_cont(EventListener::FocusLost, move |_| cursor.set(None))
+    .into_any()
+}
+
+/// Row `i` of a [`pick_group`]: painted [`theme::row_selected`] while the
+/// cursor is on it, and scrolled into view as it arrives — deferred a tick,
+/// as the schema tree's cursor is, so the scroll reads this layout.
+pub(crate) fn cursor_row<V: IntoView + 'static>(
+    row: V,
+    cursor: RwSignal<Option<usize>>,
+    i: usize,
+) -> impl IntoView {
+    let row = row.into_view();
+    let id = row.id();
+    create_effect(move |_| {
+        if cursor.get() == Some(i) {
+            floem::action::exec_after(std::time::Duration::ZERO, move |_| id.scroll_to(None));
+        }
+    });
+    row.style(move |s| {
+        s.apply_if(cursor.get() == Some(i), |s| {
+            s.background(theme::row_selected())
+        })
+    })
+}
+
 /// The corner radius of a filled [`action_button`], and of the
 /// [`control_surface`] family ([`control_button_enabled`], [`field_button`]).
 ///
