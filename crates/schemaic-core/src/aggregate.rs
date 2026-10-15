@@ -183,6 +183,28 @@ pub struct Aggregates {
     /// characters. `None` for a numeric column, an all-NULL selection, a
     /// truncated one, or one over bytes.
     pub length: Option<(usize, usize)>,
+    /// Cells counted in `rows` that are neither a value nor a NULL — a new
+    /// row's unset cell, a cell staged to `DEFAULT` ([`Counted::Unset`]) —
+    /// so the NULL count leaves them out.
+    pub unset: usize,
+}
+
+/// One selected cell as the summary counts it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Counted<S> {
+    /// A value, as the grid draws it.
+    Value(S),
+    /// A NULL.
+    Null,
+    /// Neither yet: the server will decide — a pending row's unset cell, or
+    /// a cell staged to `DEFAULT`. Counted as a row, never as a null.
+    Unset,
+}
+
+impl<S> From<Option<S>> for Counted<S> {
+    fn from(cell: Option<S>) -> Counted<S> {
+        cell.map_or(Counted::Null, Counted::Value)
+    }
 }
 
 /// The arithmetic half, present only when the column is numeric and at least one
@@ -269,6 +291,16 @@ pub fn aggregate_capped<S: AsRef<str>>(
     cells: impl Iterator<Item = Option<S>>,
     budget: usize,
 ) -> Aggregates {
+    aggregate_counted(column, cells.map(Counted::from), budget)
+}
+
+/// [`aggregate_capped`] over cells that may be neither a value nor a NULL
+/// ([`Counted::Unset`]) — what the grid's selection summary hands it.
+pub fn aggregate_counted<S: AsRef<str>>(
+    column: &Column,
+    cells: impl Iterator<Item = Counted<S>>,
+    budget: usize,
+) -> Aggregates {
     let numeric_column = column.is_numeric();
     let mut agg = Aggregates::default();
     // `None` once anything has overflowed: there is then no honest number to
@@ -294,8 +326,13 @@ pub fn aggregate_capped<S: AsRef<str>>(
         if agg.rows > KEPT_VALUE_BUDGET {
             kept = None;
         }
-        let Some(text) = cell else {
-            continue;
+        let text = match cell {
+            Counted::Value(text) => text,
+            Counted::Null => continue,
+            Counted::Unset => {
+                agg.unset += 1;
+                continue;
+            }
         };
         let text = text.as_ref();
         agg.non_null += 1;
@@ -556,7 +593,7 @@ impl Aggregates {
             ),
             format!("{}{more}", self.rows),
         )];
-        let nulls = self.rows - self.non_null;
+        let nulls = self.rows - self.non_null - self.unset;
         if nulls > 0 {
             parts.push(fig(format!("{nulls}{more} null"), format!("{nulls}{more}")));
         }

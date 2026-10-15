@@ -389,15 +389,23 @@ existing prose was left alone.
     The fifth is the median's, an `Option` beside it for the same reason: the two middles'
     `checked_add`, or the odd pair's `checked_mul(5)`, answers `None` for the median alone and
     leaves the rest standing (`an_unrepresentable_median_costs_only_the_median`, one case for each).
-    The grid enters through the *text*-taking form — `aggregate_texts`' signature, which
-    `aggregate_capped` (what it actually calls) shares — not `aggregate` over stored cells: a staged
-    (green) edit and a pending new row are both on screen and neither is in the `ResultSet`, and a
-    total under an edit it doesn't include is the same defect as a stale one. The fold keeps no `Vec` — it raises its own
+    The grid enters through the *text*-taking form — `aggregate_counted`, of which
+    `aggregate_capped` and `aggregate_texts` are the `Option`-shaped wrappers — not `aggregate` over
+    stored cells: a staged (green) edit and a pending new row are both on screen and neither is in
+    the `ResultSet`, and a total under an edit it doesn't include is the same defect as a stale one.
+    **A cell is a `Counted`, not an `Option`, because there are three answers and an `Option` has
+    two**: `Value`, `Null`, and `Unset` — a pending row's unset cell or a staged `DEFAULT`, whose
+    value the server has not yet decided. An `Unset` is a row and never a null: it raises
+    `Aggregates::unset`, and the printed null count is `rows - non_null - unset`. Carried as an
+    `Option`, both were `None` and printed as nulls, while this document said they counted as
+    neither (`a_staged_default_is_counted_as_a_row_and_not_as_a_null`, in `edit.rs`).
+    `From<Option<S>>` maps `None` to `Null`, which is what the wrappers rely on. The fold keeps no `Vec` — it raises its own
     accumulators when it meets a wider scale — because the vector was 32 bytes per selected cell,
     allocated and freed on **every** recompute (6.4 MB for a Ctrl+A over 200k rows, once per
     auto-repeat and once per cell crossed in a drag).
-    **And the scan is now bounded**: `aggregate_capped` is the real body, `aggregate_texts` calls
-    it with `usize::MAX`, and the grid passes `AGGREGATE_CELL_BUDGET` (100,000). The selection
+    **And the scan is now bounded**: `aggregate_counted` is the real body (`aggregate_capped` maps
+    its cells through `Counted::from` into it), `aggregate_texts` calls `aggregate_capped` with
+    `usize::MAX`, and the grid passes `AGGREGATE_CELL_BUDGET` (100,000). The selection
     aggregate is undebounced and was uncapped, unlike the find-count effect fifty lines below it in
     the same function — 150 ms debounced *and* budgeted at two million cells "so a big grid doesn't
     stutter typing" — though both are per-cell scans over the same result feeding a small readout
@@ -4100,21 +4108,30 @@ existing prose was left alone.
     counted as a value. That was fixed once for the staged-over-a-real-row arm and the
     pending-new-row arm four lines below reproduced it verbatim, which is why the rule now lives
     beside the painter's own resolution and there is one of it. An **unset** cell of a pending new
-    row stays `None` and is deliberately not the same thing as a NULL of the same shape: what it
-    will hold is a server default, previewed as `<auto>`, and it counts as neither a value nor a
-    null. A staged `CellEdit::Default` on a real row is that same case and is counted the same way —
-    the server has not yet said which it is. It returns a `Cow`, for `with_text`'s reason — a Ctrl+A over a 200,000-row column
+    row is deliberately not the same thing as a NULL: what it will hold is a server default,
+    previewed as `<auto>`, and a staged `CellEdit::Default` on a real row is that same case — the
+    server has not yet said which it is. **`summary_text` cannot say so**, its `None` being both,
+    and for as long as it was what the summary counted, both printed as nulls while this paragraph
+    said they counted as neither. **`summary_cell` is the reader underneath it**, answering an
+    `aggregate::Counted` — `Value`, `Null`, or `Unset` for those two — and `summary_text` is now
+    `summary_cell` collapsed to an `Option`. The selection summary hands `summary_cell` straight to
+    `aggregate::aggregate_counted`, which counts an `Unset` as a row and never as a null
+    (`a_staged_default_is_counted_as_a_row_and_not_as_a_null`); keep it off `summary_text`, which
+    would quietly bring the old count back. It returns a `Cow`, for `with_text`'s reason — a Ctrl+A over a 200,000-row column
     resolves every cell and only a staged blob's `<n bytes>` has to be built.
     **`fill_plan(rect, layout, editable, fill)` is the cell menu's *Fill down* / *Fill up*, and it
-    reads its source through `summary_text` because both of that reader's distinctions are the
-    ones a fill needs.** For each selected *drawn* column (`selected_cols`, hidden ones out) it
+    reads its source through `summary_cell` because all three of that reader's answers are ones a
+    fill has to tell apart.** For each selected *drawn* column (`selected_cols`, hidden ones out) it
     takes the selection's top cell (`Fill::Down`) or bottom cell (`Fill::Up`) and plans it into
     every other row of the selection, as `(display row, column, Option<String>)` for the grid to
     stage as it stages a paste. The value is what the grid shows less the formatter — a staged
     edit wins over the stored cell, a NULL is `None` and so fills as SQL NULL rather than the
-    string `NULL` — which is the paste round-trip's reading of the same cell. The **unset** cell
-    of a pending row is the other distinction: it will take a server default, so a column whose
-    source is one plans nothing at all rather than writing NULLs over the rows below it. A column
+    string `NULL` — which is the paste round-trip's reading of the same cell. `Unset` is the other
+    distinction: a pending row's unset cell and a staged `DEFAULT` will both take a server
+    default, so a column whose source is either plans nothing at all rather than writing NULLs
+    over the rows below it. The staged `DEFAULT` was read through `summary_text` as a NULL and
+    filled as one — a NOT NULL column then failed the commit, and a nullable one wrote NULLs where
+    the user had asked for the default (`fill_down_from_a_staged_default_fills_nothing_in_its_column`). A column
     `editable` refuses is skipped in place, as a paste's is, and so is a column past the arena
     ceiling, whose blank cells hold text the result never carried — filling with their `''` is
     what Commit would then write (`fill_skips_a_column_the_arena_blanked`); a selection of one
@@ -17859,8 +17876,16 @@ existing prose was left alone.
   staged column's `dflt_value` and `hidden` out of `pragma_table_xinfo` **on the write transaction
   itself**, before the first step, and `statement_for(step, &defaults)` writes the declared default
   expression parenthesised — `(CURRENT_TIMESTAMP)`, `('new')` and `((6 * 7))` are each one operand
-  in `SET` — or `NULL` for a column declaring none, which is SQLite's own default for it. A
-  generated column (`hidden` 2 or 3) and a column the table does not have are `DbError::Refused`
+  in `SET` — or `NULL` for a column declaring none, which is SQLite's own default for it.
+  **Except a name, which `default_operand` writes as a string literal** (`export::sql_literal`):
+  SQLite stores a bare word after `DEFAULT` as its text, and `dflt_value` hands it back as
+  written, so spliced in as an expression it became a column reference — `DEFAULT active` failed
+  the commit with *no such column*, and `DEFAULT "status"` beside a `status` column wrote that
+  column's value. A lone identifier token — a bare word, or one whole `"…"`, `` `…` `` or `[…]`
+  token — is a name; `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `NULL`, `TRUE` and
+  `FALSE` are values and are not, and every other form goes in parenthesised as before
+  (`a_staged_default_written_as_a_name_is_the_string_an_insert_stores`, which asserts the
+  committed row equals what `INSERT … DEFAULT VALUES` stored). A generated column (`hidden` 2 or 3) and a column the table does not have are `DbError::Refused`
   before anything runs, rather than an `UPDATE` SQLite refuses in words about something else
   (`a_staged_default_writes_the_declared_default`,
   `a_staged_default_on_a_generated_column_is_refused` — both red against a writer that sent the
@@ -41274,8 +41299,8 @@ this bundle's.
   updates for the lot. Unlike `paste_selection` it does not return on an open in-cell editor: it
   commits the edit first, so the value being typed is in `dirty` before the plan reads it — a
   source cell mid-edit fills with what the user is looking at. An empty plan is a `commit_err`
-  naming both of its causes — no writable column, or a source that is a new row's unset cell —
-  since `fill_plan` cannot say which. Unlike a paste, a fill does not report the read-only
+  naming both of its causes — no writable column, or a source that is a new row's unset cell or a
+  staged DEFAULT — since `fill_plan` cannot say which. Unlike a paste, a fill does not report the read-only
   columns it skipped: they are the selection's own, not cells a clipboard aimed at them.
 - **What a cell *says* is resolved in one place, and it isn't the view.** `copy_selection` and
   `attached_rows` read the signals once into `grid_cells` — a `core::edit::GridCells` borrow over
@@ -41840,8 +41865,10 @@ this bundle's.
   `None` for `Bytes`, which is what every *text* caller wants and what this one read as absence, so
   loading a file into a selected cell turned `3 rows` into `3 rows · 1 null` while the stored blob it
   replaced counted as a value — the grid holds `<n bytes>` for that one, and that is a text. A
-  staged `DEFAULT` is neither, counted as a pending row's unset cell is
-  (`edit::GridCells::summary_text`).
+  staged `DEFAULT` is neither, counted as a pending row's unset cell is: the effect reads
+  `edit::GridCells::summary_cell` and folds with `aggregate::aggregate_counted`, whose
+  `Counted::Unset` is a row and never a null. Through `summary_text` both were `None` and printed
+  as nulls, while this sentence already said otherwise.
   `grid_selection_bar` renders at panel level (like the find bar, so it can sit at the panel's
   edge) while `grid_view` computes it, and it lifts itself above `grid_error_bar` when that one is
   up: they coincide exactly when a bulk delete fails, which is when both have something to say.

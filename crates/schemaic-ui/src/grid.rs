@@ -2637,7 +2637,7 @@ fn fill_selection(gs: GridState, fill: schemaic_core::edit::Fill) {
     if plan.is_empty() {
         gs.commit_err.set(Some(ModalError::app(
             "Nothing to fill: the selected columns can't be written, or the cell to copy is a new \
-             row's unset value."
+             row's unset value or a staged DEFAULT."
                 .to_string(),
         )));
         return;
@@ -5624,11 +5624,14 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                         // a number. `summary_text` reads none, and handing it
                         // an empty slice says so at the call site.
                         let cells = grid_cells(&rs, &order, &[], dirty, pending);
-                        let texts = (r0..=r1).map(|d| cells.summary_text(d, ci));
+                        // `summary_cell`, not `summary_text`: a cell staged
+                        // to DEFAULT or left unset is neither a value nor a
+                        // null, and only the three-way answer can say so.
+                        let texts = (r0..=r1).map(|d| cells.summary_cell(d, ci));
                         // **Capped**, because this effect is undebounced and a
                         // drag re-scans the range-so-far on every row it
                         // enters — see `AGGREGATE_CELL_BUDGET`.
-                        schemaic_core::aggregate::aggregate_capped(
+                        schemaic_core::aggregate::aggregate_counted(
                             column,
                             texts,
                             schemaic_core::aggregate::AGGREGATE_CELL_BUDGET,
@@ -5645,6 +5648,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 numeric: None,
                 distinct: None,
                 length: None,
+                unset: 0,
             },
         };
         sel_summary.set(Some(SelReadout {

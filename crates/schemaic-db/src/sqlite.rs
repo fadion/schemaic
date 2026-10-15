@@ -1293,13 +1293,58 @@ fn staged_defaults(conn: &SqliteConn, write: &GridWrite) -> Result<StagedDefault
                          and SQLite computes it from the row"
                     )));
                 }
-                Some((Some(expr), _)) => format!("({expr})"),
+                Some((Some(expr), _)) => default_operand(&expr),
                 Some((None, _)) => "NULL".to_string(),
             };
             out.insert((u.table.clone(), col.clone()), sql);
         }
     }
     Ok(out)
+}
+
+/// A column's `dflt_value` as one operand of a `SET`, meaning what an
+/// `INSERT` that leaves the column out would store.
+///
+/// **A name after `DEFAULT` is a string to SQLite** — `DEFAULT active`,
+/// `DEFAULT "status"`, `DEFAULT [x]`, `` DEFAULT `x` `` all store the name's
+/// text — and `dflt_value` hands the token back as written. Spliced as an
+/// expression it is a column reference: an unknown column fails the commit,
+/// and `"status"` beside a `status` column writes that column's value. So a
+/// lone identifier token becomes a string literal; the keywords that are
+/// values (`CURRENT_TIMESTAMP`, `NULL`, `TRUE`, …) and every other form — a
+/// literal, a number, a parenthesised expression — go in parenthesised as
+/// they are.
+fn default_operand(dflt: &str) -> String {
+    const VALUE_KEYWORDS: &[&str] = &[
+        "CURRENT_TIMESTAMP",
+        "CURRENT_DATE",
+        "CURRENT_TIME",
+        "NULL",
+        "TRUE",
+        "FALSE",
+    ];
+    use schemaic_core::intel::SqlDialect;
+    let text = dflt.trim();
+    let bare = text
+        .bytes()
+        .next()
+        .is_some_and(schemaic_core::sql::is_word_start)
+        && text.bytes().all(schemaic_core::sql::is_word_byte);
+    let name = if bare {
+        (!VALUE_KEYWORDS.iter().any(|k| text.eq_ignore_ascii_case(k))).then(|| text.to_string())
+    } else if text.starts_with(['"', '`', '[']) {
+        // The whole token a quoted name, and nothing after it.
+        match schemaic_core::sql::ident_at(text, 0, SqlDialect::Sqlite) {
+            (Some(name), end) if end == text.len() => Some(name),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    match name {
+        Some(n) => schemaic_core::export::sql_literal(&Value::Str(n), SqlDialect::Sqlite),
+        None => format!("({text})"),
+    }
 }
 
 /// The SQL and bound parameters for one step of a [`GridWrite`].
@@ -5331,6 +5376,52 @@ mod tests {
         };
         assert_eq!(row(1), ("new".to_string(), 42, true, None));
         assert_eq!(row(2).0, "new");
+    }
+
+    /// S1.1-L1-01: SQLite reads a bare identifier or a double-quoted token
+    /// after `DEFAULT` as a **string**, and `dflt_value` hands back the token
+    /// as written. Spliced as an expression, `active` failed the commit as an
+    /// unknown column and `"status"` wrote the `status` column's value. Each
+    /// column must end equal to what `INSERT … DEFAULT VALUES` stores.
+    #[tokio::test]
+    async fn a_staged_default_written_as_a_name_is_the_string_an_insert_stores() {
+        let (keeper, db) = shared_memory("default_names");
+        keeper
+            .execute_batch(
+                "CREATE TABLE d (id INTEGER PRIMARY KEY, status TEXT DEFAULT active, \
+                     kind TEXT DEFAULT \"status\", b TEXT DEFAULT [br], k TEXT DEFAULT `bt`, \
+                     note TEXT DEFAULT 'x)y', at TEXT DEFAULT CURRENT_DATE, f INT DEFAULT TRUE, \
+                     neg INT DEFAULT -1);
+                 INSERT INTO d DEFAULT VALUES;
+                 INSERT INTO d (id, status, kind, b, k, note, at, f, neg) \
+                     VALUES (2, 'done', 'done', 'z', 'z', 'z', 'z', 0, 5);",
+            )
+            .unwrap();
+        let set = |c: &str| (c.to_string(), CellEdit::Default);
+        let cols = ["status", "kind", "b", "k", "note", "at", "f", "neg"];
+        let write = GridWrite {
+            updates: vec![RowEdit {
+                set: cols.iter().map(|c| set(c)).collect(),
+                ..edit("d", &[], &[("id", Value::Int(2))])
+            }],
+            ..Default::default()
+        };
+        commit_writes(&db, &write, CancellationToken::new())
+            .await
+            .expect("commit");
+        let row = |id: i64| -> Vec<Option<String>> {
+            keeper
+                .query_row(
+                    "SELECT status, kind, b, k, note, at, CAST(f AS TEXT), CAST(neg AS TEXT) \
+                     FROM d WHERE id = ?1",
+                    [id],
+                    |r| (0..8).map(|i| r.get(i)).collect(),
+                )
+                .unwrap()
+        };
+        assert_eq!(row(2), row(1));
+        assert_eq!(row(2)[0].as_deref(), Some("active"));
+        assert_eq!(row(2)[1].as_deref(), Some("status"));
     }
 
     /// A generated column has no default to write back to, so the edit is

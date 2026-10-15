@@ -15,6 +15,7 @@
 //! (a wrong key misdirects an UPDATE), so it lives here with tests rather than
 //! welded to Floem signals in the UI.
 
+use crate::aggregate::Counted;
 use crate::intel::SqlDialect;
 use crate::model::{CellEdit, Column, RefetchTemplate, ResultSet, RowEdit, Value};
 use crate::schema::TableInfo;
@@ -1512,22 +1513,37 @@ impl GridCells<'_> {
     /// summary — so the rule lives here now, beside the painter's own
     /// resolution, and there is one.
     ///
-    /// An **unset** cell of a pending new row is `None` on purpose and is not
-    /// the same thing as a NULL of the same shape: what it will hold is a
-    /// server default, previewed as `<auto>`. It counts as neither a value nor
-    /// a null, exactly as it did before.
+    /// An **unset** cell of a pending new row is `None` here and is not the
+    /// same thing as a NULL of the same shape: what it will hold is a server
+    /// default, previewed as `<auto>`, and a cell staged to `DEFAULT` is the
+    /// same case. [`GridCells::summary_cell`] tells the three apart, and is
+    /// what the selection summary counts.
     pub fn summary_text(&self, i: usize, ci: usize) -> Option<std::borrow::Cow<'_, str>> {
+        match self.summary_cell(i, ci) {
+            Counted::Value(t) => Some(t),
+            Counted::Null | Counted::Unset => None,
+        }
+    }
+
+    /// [`GridCells::summary_text`] with its `None` split in two: a NULL, and
+    /// a cell that is **neither** a value nor a NULL yet — a pending row's
+    /// unset cell, or one staged to `DEFAULT` — whose value the server will
+    /// decide. The summary counts that one as a row and never as a null
+    /// (`aggregate::aggregate_counted`), and Fill Down / Up copies nothing
+    /// from it ([`GridCells::fill_plan`]).
+    pub fn summary_cell(&self, i: usize, ci: usize) -> Counted<std::borrow::Cow<'_, str>> {
         use std::borrow::Cow;
         // Borrowed wherever there is text to borrow — a Ctrl+A over a
         // 200,000-row column resolves every cell, and only a staged blob's
         // `<n bytes>` has to be built.
-        fn staged(v: &CellEdit) -> Option<Cow<'_, str>> {
+        fn staged(v: &CellEdit) -> Counted<Cow<'_, str>> {
             match v {
-                // A default is neither a value nor a null until the server says
-                // which — counted as a pending row's unset cell is, below.
-                CellEdit::Null | CellEdit::Default => None,
-                CellEdit::Text(t) => Some(Cow::Borrowed(t.as_str())),
-                CellEdit::Bytes(b) => Some(Cow::Owned(crate::model::binary_display(b.len()))),
+                CellEdit::Null => Counted::Null,
+                CellEdit::Default => Counted::Unset,
+                CellEdit::Text(t) => Counted::Value(Cow::Borrowed(t.as_str())),
+                CellEdit::Bytes(b) => {
+                    Counted::Value(Cow::Owned(crate::model::binary_display(b.len())))
+                }
             }
         }
         let nreal = self.rs.row_count();
@@ -1536,15 +1552,15 @@ impl GridCells<'_> {
                 .new_rows
                 .get(i - nreal)
                 .and_then(|r| r.get(&ci))
-                .and_then(staged);
+                .map_or(Counted::Unset, staged);
         }
         let di = self.order.get(i).copied().unwrap_or(i);
         match self.dirty.get(&(di, ci)) {
             Some(v) => staged(v),
-            None => self
-                .rs
-                .cell(di, ci)
-                .and_then(|c| (!c.is_null()).then(|| Cow::Borrowed(c.text()))),
+            None => match self.rs.cell(di, ci) {
+                Some(c) if !c.is_null() => Counted::Value(Cow::Borrowed(c.text())),
+                _ => Counted::Null,
+            },
         }
     }
 
@@ -1904,7 +1920,8 @@ impl GridCells<'_> {
     /// Columns are the **drawn** ones of the selection (`selected_cols`, hidden
     /// ones out), and one `editable` refuses is skipped in place. A pending
     /// row's **unset** cell is not a NULL — it will take the server's default —
-    /// so a column whose source is one fills nothing rather than NULLs. Nor
+    /// and nor is a cell staged to `DEFAULT`, so a column whose source is
+    /// either fills nothing rather than NULLs ([`GridCells::summary_cell`]). Nor
     /// does a column past the arena ceiling ([`ResultSet::capped_columns`]):
     /// its blank cells hold text the result never carried, and filling with
     /// their `''` is what Commit would then write.
@@ -1925,20 +1942,19 @@ impl GridCells<'_> {
             Fill::Down => r0,
             Fill::Up => r1,
         };
-        let unset = |ci: usize| {
-            source >= nreal
-                && self
-                    .new_rows
-                    .get(source - nreal)
-                    .is_none_or(|r| !r.contains_key(&ci))
-        };
         let ncols = self.rs.col_count();
         let mut plan = Vec::new();
         for ci in selected_cols((c0, c1), ncols, &layout.into()) {
-            if ci >= ncols || !editable(ci) || unset(ci) || self.rs.capped_columns.contains(&ci) {
+            if ci >= ncols || !editable(ci) || self.rs.capped_columns.contains(&ci) {
                 continue;
             }
-            let value = self.summary_text(source, ci).map(|v| v.into_owned());
+            let value = match self.summary_cell(source, ci) {
+                Counted::Value(v) => Some(v.into_owned()),
+                Counted::Null => None,
+                // The server's value-to-be — an unset cell or a staged
+                // DEFAULT — is no value to copy, and certainly not a NULL.
+                Counted::Unset => continue,
+            };
             plan.extend(
                 (r0..=r1)
                     .filter(|&d| d != source)
@@ -4963,6 +4979,23 @@ mod tests {
         assert_eq!(up, vec![(2, 2, Some("typed".to_string()))], "{up:?}");
     }
 
+    /// R2-L6-01: a cell staged to DEFAULT is the server's value-to-be, the
+    /// same as a new row's unset cell — not a NULL. Filling from it staged
+    /// NULL into every other row (a NOT NULL commit failed; a nullable one
+    /// wrote NULLs). Its column fills nothing, as an unset cell's does.
+    #[test]
+    fn fill_down_from_a_staged_default_fills_nothing_in_its_column() {
+        let (r, m) = keyed_people();
+        let mut dirty = HashMap::new();
+        dirty.insert((0, 1), CellEdit::Default);
+        let (order, formats, new) = (vec![0, 1, 2], vec![], vec![]);
+        let c = cells(&r, &order, &formats, &dirty, &new);
+        let plan = c.fill_plan((0, 1, 2, 2), None, |ci| m.text_editable(ci), Fill::Down);
+        assert!(plan.iter().all(|&(_, ci, _)| ci != 1), "{plan:?}");
+        // The column beside it still fills.
+        assert!(plan.iter().any(|&(_, ci, _)| ci == 2), "{plan:?}");
+    }
+
     // ── The staged changes as SQL ─────────────────────────────────────────────
 
     fn staged_write() -> crate::model::GridWrite {
@@ -5944,6 +5977,32 @@ mod tests {
             None,
             "an unset pending cell takes a server default — neither value nor null"
         );
+    }
+
+    /// R2-L8-02: a staged DEFAULT, like a pending row's unset cell, is
+    /// neither a value nor a null — the summary counts its row and no null.
+    /// It used to read `3 rows · 2 null`.
+    #[test]
+    fn a_staged_default_is_counted_as_a_row_and_not_as_a_null() {
+        let rs = ResultSet::from_rows(
+            vec![col("n", "INT", "t", false, false)],
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+        );
+        let (order, formats) = (vec![0usize, 1], Vec::new());
+        let mut dirty = HashMap::new();
+        dirty.insert((1, 0), CellEdit::Default);
+        let pending = vec![HashMap::new()];
+        let g = cells(&rs, &order, &formats, &dirty, &pending);
+        assert_eq!(g.summary_cell(1, 0), Counted::Unset);
+        assert_eq!(g.summary_cell(2, 0), Counted::Unset);
+        let agg = crate::aggregate::aggregate_counted(
+            &rs.columns[0],
+            (0..3).map(|d| g.summary_cell(d, 0)),
+            usize::MAX,
+        );
+        assert_eq!((agg.rows, agg.non_null, agg.unset), (3, 1, 2));
+        assert!(!agg.summary().contains("null"), "{}", agg.summary());
+        assert!(agg.summary().starts_with("3 rows"), "{}", agg.summary());
     }
 
     /// A stored SQL `NULL` is a null and its text is not `\"NULL\"` — the one
