@@ -5697,7 +5697,35 @@ existing prose was left alone.
     `order_tables` expands what was chosen before it sorts: a chosen table brings its partitions,
     and theirs, because they hold its rows; a chosen partition brings the tables it is a partition
     of, up to the root, because its `CREATE` names them — but **not its siblings**, which nothing in
-    it needs (`choosing_one_side_of_a_partition_brings_the_other`). The comparison's `fk_rank`
+    it needs (`choosing_one_side_of_a_partition_brings_the_other`). **A parent brought that way is
+    named, never owned** (`named_parents`: each ancestor of a chosen partition that was neither
+    chosen nor itself a partition of a chosen table). It used to be dropped beside its `CREATE` like
+    any chosen table, and PostgreSQL drops a partitioned table's partitions with it — so a
+    one-partition dump replayed onto the database it came from destroyed every sibling partition and
+    its rows, and the file put back only the one it carried. Now `plan` puts a named parent in
+    `held`, out of both drop sites, and writes all of it through `unless_present_sql`: a
+    `DO $schemaic$ … IF <absent> THEN … END IF … $schemaic$;` block over the catalogue
+    (`to_regclass`, `pg_constraint`, `pg_trigger`, as `Present` says) around its `CREATE` and
+    indexes, and one more around each held check, trigger and foreign key, each looking for its own
+    name — `CREATE TABLE IF NOT EXISTS` covers the table alone, and every piece after it would stop a
+    replay at a name already taken. A constraint or trigger on a table that is not there counts as
+    present, there being nothing to put it on, and the dollar tag is one the body does not contain
+    (`a_guard_never_shares_its_dollar_quote_with_the_body`). **The chosen partition's own
+    `DROP … CASCADE` is the second half of the bug**: it takes a key from a table *outside* the file
+    onto the parent whole, not just that key's clone onto the partition — seen live, `orders` lost
+    its key onto `events` entirely, and nothing said so. So every such key is restated in the closing
+    constraints section, after the rows and so validated against them, and only where a guard
+    exists, since unguarded a replay that took nothing would stop at the name. The header names the
+    parents and says the file never drops them and creates them only where missing. The trade is
+    that a parent already there is left exactly as it is, whatever shape it has
+    (`dumping_one_partition_drops_neither_its_parent_nor_its_siblings`,
+    `a_parent_brought_for_its_partition_restates_its_key_only_where_missing`,
+    `a_key_from_outside_onto_the_parent_is_put_back_where_missing`,
+    `every_ancestor_of_a_chosen_partition_is_only_named`); choosing the partitioned table itself
+    still replaces it whole, every partition being in the file then
+    (`dumping_a_partitioned_table_still_replaces_it`). `unless_present_sql` is `None` on the other
+    three engines, where a partition is no table (`partitions_are_tables`) and no dump has a named
+    parent to write. The comparison's `fk_rank`
     passes every table on a side as chosen, so the widening adds nothing there. **A table whose
     rows live in its partitions gets no data step** (`TableInfo::rows_live_in_partitions`): its
     `SELECT` reads every partition's rows, so dumped beside them each row went back twice — once
@@ -5710,7 +5738,17 @@ existing prose was left alone.
     fixture with range partitions across two schemas, a sub-partitioned partition, two `DEFAULT`
     partitions, a parent index, a partition's own index and a foreign key, dumped as
     `events` + `customers` and restored into a fresh database with the same per-partition row
-    counts (641/546/552/261), 13 indexes and 6 foreign-key constraints. **None of this touches
+    counts (641/546/552/261), 13 indexes and 6 foreign-key constraints. The live tier now holds it
+    on each `live_suite!` leg (`tests/live/partitions.rs`): `a_partitioned_table_reads_back_partitioned`
+    over the catalogue reads — the key, a partition's bound, and `inherited` on the partition's
+    index and key and on `orders`' clones onto each partition, which a broken read loses with
+    nothing failing, the dump then writing the parent's rows twice and restating the clones;
+    `a_partitioned_dump_restores_with_every_partitions_rows`, into an empty database and replayed
+    onto itself, counting each partition's rows; and `a_dumped_partition_replays_beside_its_siblings`,
+    the bug above, replaying a one-partition dump onto its source and asserting the sibling's rows
+    and `orders`' key with both clones, then restoring it into an empty database with the parent
+    and its trigger (a no-op on the MySQL legs, where a partition is not a table to dump). SQL
+    Server's read is `mssql.rs`'s `a_partitioned_table_reads_back_partitioned`. **None of this touches
     MySQL**, where a partition is no table: `partition_of` stays `None`, so nothing waits on
     anything, and `rows_live_in_partitions` answers no, so the partitioned table keeps its data
     step — its partitions coming back inside its own `CREATE TABLE`, through

@@ -43,6 +43,7 @@ mod init_sql;
 mod mariadb_catalog;
 mod mssql;
 mod namespaces;
+mod partitions;
 mod pg_catalog;
 mod routines;
 mod runtime;
@@ -184,6 +185,11 @@ live_suite!(
         a_refused_write_says_which_value_the_server_refused,
         a_dump_with_compound_bodies_restores_through_run_file,
         a_not_valid_constraint_restores_over_the_rows_it_spares,
+    ],
+    partitions: [
+        a_partitioned_table_reads_back_partitioned,
+        a_partitioned_dump_restores_with_every_partitions_rows,
+        a_dumped_partition_replays_beside_its_siblings,
     ],
     streaming: [
         a_streamed_export_delivers_every_row,

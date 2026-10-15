@@ -1149,6 +1149,125 @@ fn fk_targets<'a>(
         }
 }
 
+/// The indices of `tables` whose display name is in `chosen`.
+fn chosen_indices(tables: &[TableInfo], chosen: &[String]) -> Vec<usize> {
+    (0..tables.len())
+        .filter(|&i| {
+            let key = display_name(tables[i].schema.as_deref(), &tables[i].name);
+            chosen.iter().any(|c| *c == key)
+        })
+        .collect()
+}
+
+/// `from` and every table it is a partition of, transitively (`up`), or every
+/// partition of it, transitively (`!up`) — never a sibling.
+fn partition_relatives(tables: &[TableInfo], from: &[usize], up: bool) -> Vec<usize> {
+    let mut out = from.to_vec();
+    let mut k = 0;
+    while k < out.len() {
+        let t = &tables[out[k]];
+        for (j, other) in tables.iter().enumerate() {
+            let next = if up {
+                t.is_partition_of(other)
+            } else {
+                other.is_partition_of(t)
+            };
+            if next && !out.contains(&j) {
+                out.push(j);
+            }
+        }
+        k += 1;
+    }
+    out
+}
+
+/// **The tables a dump carries only as what a chosen partition is created
+/// `OF`** — its parent and the parent's parent, where neither was chosen nor
+/// is itself a partition of a chosen table. By index into `tables`.
+///
+/// [`order_tables`] brings them so the partition's `CREATE … PARTITION OF`
+/// has something to name, **but the file does not own them**: it carries
+/// only the chosen partition, not its siblings, and a partitioned table's
+/// `DROP` takes every partition with it. Dropped beside its `CREATE` as a
+/// chosen table is, a replay onto the database the dump came from destroyed
+/// every sibling partition and its rows and put back only the one it
+/// carries. So [`plan`] never drops one, and creates it — and each of its
+/// keys, checks and triggers — only where it is missing
+/// ([`unless_present_sql`]).
+pub fn named_parents(tables: &[TableInfo], chosen: &[String]) -> Vec<usize> {
+    let picked = chosen_indices(tables, chosen);
+    let owned = partition_relatives(tables, &picked, false);
+    partition_relatives(tables, &picked, true)
+        .into_iter()
+        .filter(|j| !owned.contains(j))
+        .collect()
+}
+
+/// What a statement written by [`unless_present_sql`] looks for first. Each
+/// name is already quoted and qualified where it names a table, and bare where
+/// it names a constraint or trigger (the catalogue's spelling).
+#[derive(Clone, Copy, Debug)]
+pub enum Present<'a> {
+    /// The table itself.
+    Table(&'a str),
+    /// A constraint `name` on `table` — a key or a check. **A missing
+    /// `table` counts as present**: there is nothing to put it on — a key
+    /// from a table outside the file, restored into a database without it.
+    Constraint { table: &'a str, name: &'a str },
+    /// A trigger `name` on `table`; a missing `table` likewise.
+    Trigger { table: &'a str, name: &'a str },
+}
+
+/// `body` — one or more statements — wrapped so a replay runs it **only where
+/// `present` is not there yet**, or `None` where the engine has no way to say
+/// so in a script.
+///
+/// For what a dump creates but must not replace — see [`named_parents`]: on
+/// a fresh database it is created as it was, on the database the file came
+/// from it is left exactly as it is.
+///
+/// **PostgreSQL's** is a `DO` block over the catalogue: its `CREATE TABLE IF
+/// NOT EXISTS` covers only the table, and the indexes, keys and triggers that
+/// follow it would each stop the replay at a name already taken. The block's
+/// dollar quote is one the body does not contain. The other engines answer
+/// `None` — on them a partition is not a table ([`partitions_are_tables`]),
+/// so no dump has such a table to write.
+///
+/// [`partitions_are_tables`]: crate::schema::partitions_are_tables
+pub fn unless_present_sql(dialect: SqlDialect, present: Present<'_>, body: &str) -> Option<String> {
+    match dialect {
+        SqlDialect::Postgres => {
+            let lit = |s: &str| crate::schema::ddl_string(s, dialect);
+            let absent = match present {
+                Present::Table(t) => format!("to_regclass({}) IS NULL", lit(t)),
+                Present::Constraint { table, name } => format!(
+                    "to_regclass({0}) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_constraint \
+                     WHERE conrelid = to_regclass({0}) AND conname = {1})",
+                    lit(table),
+                    lit(name)
+                ),
+                Present::Trigger { table, name } => format!(
+                    "to_regclass({0}) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_trigger \
+                     WHERE tgrelid = to_regclass({0}) AND tgname = {1})",
+                    lit(table),
+                    lit(name)
+                ),
+            };
+            let mut tag = "$schemaic$".to_string();
+            let mut n = 0;
+            while body.contains(&tag) || absent.contains(&tag) {
+                n += 1;
+                tag = format!("$schemaic{n}$");
+            }
+            Some(format!(
+                "DO {tag}\nBEGIN\nIF {absent} THEN\n{}\nEND IF;\nEND\n{tag};",
+                body.trim_end()
+            ))
+        }
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+    }
+}
+
 /// The chosen tables in the order they can be created and filled: a referenced
 /// table before the table referencing it, views after every base table, ties by
 /// name so two dumps of one schema are the same file.
@@ -1170,33 +1289,15 @@ pub fn order_tables(
     home: Option<&str>,
 ) -> (Vec<usize>, bool) {
     let key = |i: usize| display_name(tables[i].schema.as_deref(), &tables[i].name);
-    let mut picked: Vec<usize> = (0..tables.len())
-        .filter(|&i| chosen.iter().any(|c| *c == key(i)))
-        .collect();
+    let mut picked = chosen_indices(tables, chosen);
     // **A partitioned table comes with its partitions, and a partition with
     // the tables it is created `OF`** — the first hold the rows, the second
     // are what its `CREATE` names — but not with its siblings.
-    let relatives = |from: &[usize], up: bool| -> Vec<usize> {
-        let mut out = from.to_vec();
-        let mut k = 0;
-        while k < out.len() {
-            let t = &tables[out[k]];
-            for (j, other) in tables.iter().enumerate() {
-                let next = if up {
-                    t.is_partition_of(other)
-                } else {
-                    other.is_partition_of(t)
-                };
-                if next && !out.contains(&j) {
-                    out.push(j);
-                }
-            }
-            k += 1;
-        }
-        out
-    };
-    let down = relatives(&picked, false);
-    for j in relatives(&picked, true).into_iter().chain(down) {
+    let down = partition_relatives(tables, &picked, false);
+    for j in partition_relatives(tables, &picked, true)
+        .into_iter()
+        .chain(down)
+    {
         if !picked.contains(&j) {
             picked.push(j);
         }
@@ -2119,6 +2220,13 @@ pub fn plan(
     // the engine that reports a key's target as a database — see `fk_targets`.
     let home = crate::ddl::ref_schema_is_database(dialect).then_some(database);
     let (order, cycles) = order_tables(&schema.tables, chosen, dialect, home);
+    // What the file carries only for a chosen partition to be created `OF`:
+    // never dropped, and created only where missing — see `named_parents`.
+    let parents = named_parents(&schema.tables, chosen);
+    // `body` run only where `present` is not there yet, on such a table.
+    let unless_present = |present: Present<'_>, body: String| -> String {
+        unless_present_sql(dialect, present, &body).unwrap_or(body)
+    };
     // Everything ticked that this introspection could not resolve. Computed even
     // when nothing resolved, so the empty-plan arm can carry it too.
     let missing: Vec<String> = chosen
@@ -2318,7 +2426,72 @@ pub fn plan(
                     })
                     .collect(),
             };
+            if parents.contains(&i) {
+                // One key at a time, each only where it is missing: a replay
+                // onto the source finds the parent's keys standing, except one
+                // onto a table the file dropped (`CASCADE` took it).
+                let table = qname(t);
+                for change in set.changes {
+                    let Change::AddForeignKey(fk) = &change else {
+                        continue;
+                    };
+                    let name = fk.name.clone();
+                    let one = ChangeSet {
+                        table: t.name.clone(),
+                        schema: t.schema.clone(),
+                        dialect,
+                        flavour: ServerFlavour::Unknown,
+                        changes: vec![change],
+                    };
+                    fks.push(unless_present(
+                        Present::Constraint {
+                            table: &table,
+                            name: &name,
+                        },
+                        crate::ddl::client_script(&one.emit(), dialect),
+                    ));
+                }
+                continue;
+            }
             fks.extend(set.emit());
+        }
+        // **A key from outside the file onto a parent it only names**, put back
+        // where missing. The chosen partition's `DROP … CASCADE` takes such a
+        // key whole — the parent's, not just its clone onto that partition —
+        // so a replay onto the source left `orders` keyed onto nothing, and
+        // said nothing. Restated after the rows, it is validated against them.
+        for &p in &parents {
+            for (j, other) in schema.tables.iter().enumerate() {
+                if order.contains(&j) || other.is_view {
+                    continue;
+                }
+                let table = qname(other);
+                for fk in other.foreign_keys.iter().filter(|fk| {
+                    !fk.inherited
+                        && !fk.name.is_empty()
+                        && fk_targets(fk, other, &schema.tables[p], home)
+                }) {
+                    let one = ChangeSet {
+                        table: other.name.clone(),
+                        schema: other.schema.clone(),
+                        dialect,
+                        flavour: ServerFlavour::Unknown,
+                        changes: vec![Change::AddForeignKey(Box::new(fk.clone()))],
+                    };
+                    // Only where it can be guarded: unguarded, a replay that
+                    // took nothing would stop at a name already taken.
+                    if let Some(sql) = unless_present_sql(
+                        dialect,
+                        Present::Constraint {
+                            table: &table,
+                            name: &fk.name,
+                        },
+                        &crate::ddl::client_script(&one.emit(), dialect),
+                    ) {
+                        fks.push(sql);
+                    }
+                }
+            }
         }
     }
 
@@ -2651,11 +2824,15 @@ pub fn plan(
         Hold::Keep => kept.push(name),
         Hold::Refuse { object, why } => refused.push((object, format!("{name} ({why})"))),
     };
-    // The tables and views no `DROP` may name, by index into `schema.tables`.
+    // The tables and views no `DROP` may name, by index into `schema.tables`
+    // — a parent carried only for its partition among them (`named_parents`).
     let held: std::collections::HashSet<usize> = order
         .iter()
         .copied()
         .filter(|&i| {
+            if parents.contains(&i) {
+                return true;
+            }
             let t = &schema.tables[i];
             let h = (opts.structure && opts.drop_if_exists)
                 .then(|| table_hold(t, any_edge, dialect))
@@ -3005,8 +3182,49 @@ pub fn plan(
             // and PostgreSQL's `NOT VALID` one, which inline would refuse
             // them — is held for the section after the data.
             let (create, held) = t.create_ddl_holding(dialect);
-            text!(create);
-            held_checks.extend(held);
+            if parents.contains(&i) {
+                // **A parent carried only for its partition is created where
+                // it is missing and otherwise left exactly as it is** — see
+                // `named_parents`. So is each of its held checks.
+                let table = qname(t);
+                text!(unless_present(Present::Table(&table), create));
+                for ck in t
+                    .check_constraints
+                    .iter()
+                    .filter(|ck| !(ck.enforced && ck.validated))
+                {
+                    let one = ChangeSet {
+                        table: t.name.clone(),
+                        schema: t.schema.clone(),
+                        dialect,
+                        flavour: ServerFlavour::Unknown,
+                        changes: vec![Change::AddCheck(Box::new(ck.clone()))],
+                    };
+                    held_checks.push(unless_present(
+                        Present::Constraint {
+                            table: &table,
+                            name: &ck.name,
+                        },
+                        crate::ddl::client_script(&one.emit(), dialect),
+                    ));
+                }
+                for tr in &t.triggers {
+                    let bodies = crate::schema::TriggerInfo::create_set_sql(
+                        std::slice::from_ref(tr),
+                        dialect,
+                    );
+                    triggers.push(unless_present(
+                        Present::Trigger {
+                            table: &table,
+                            name: &tr.name,
+                        },
+                        crate::ddl::client_script(&bodies, dialect),
+                    ));
+                }
+            } else {
+                text!(create);
+                held_checks.extend(held);
+            }
             // **Through the shared client wrapper**, which is what puts
             // `DELIMITER` around a compound body on MySQL. Written raw, the file
             // died at the first `BEGIN … END` trigger with ERROR 1064 — after the
@@ -3021,7 +3239,7 @@ pub fn plan(
             // `TriggerInfo::with_resolvable_order`.
             // **Held for the trailing section, not written here** — see
             // `triggers` above.
-            if !t.triggers.is_empty() {
+            if !t.triggers.is_empty() && !parents.contains(&i) {
                 let bodies = crate::schema::TriggerInfo::create_set_sql(&t.triggers, dialect);
                 triggers.push(crate::ddl::client_script(&bodies, dialect));
             }
@@ -3197,6 +3415,23 @@ pub fn plan(
             crate::text::plural(n, "it is", "they are"),
             crate::text::plural(n, "it", "them"),
             crate::export::comment_text(&kept.join(", ")),
+        ));
+    }
+    if opts.structure && !parents.is_empty() {
+        let names: Vec<String> = parents
+            .iter()
+            .map(|&i| display_name(schema.tables[i].schema.as_deref(), &schema.tables[i].name))
+            .collect();
+        let n = names.len();
+        header.push_str(&format!(
+            "\n--\n-- Carried only so the chosen partitions can be created in {}, this file\n\
+             -- never drops {} and creates {} only where missing; {} other partitions\n\
+             -- are not in it: {}.",
+            crate::text::plural(n, "it", "them"),
+            crate::text::plural(n, "it", "them"),
+            crate::text::plural(n, "it", "them"),
+            crate::text::plural(n, "its", "their"),
+            crate::export::comment_text(&names.join(", ")),
         ));
     }
     // **`sqlcmd` rewrites `$(name)` even inside a string literal**, from its
@@ -4717,6 +4952,178 @@ mod tests {
             assert!(file.contains("PARTITION BY RANGE (id)"), "{chosen}: {file}");
             assert!(file.contains("<<rows aa_2024"), "{chosen}: {file}");
             assert!(!file.contains("<<rows customers"), "{chosen}: {file}");
+        }
+    }
+
+    /// [`partitioned`] with a second partition, `bb_2025`, beside `aa_2024`.
+    fn partitioned_twice() -> DbSchema {
+        let mut s = partitioned();
+        let mut sibling = refs(table("bb_2025"), "customers");
+        sibling.foreign_keys[0].inherited = true;
+        sibling.partition_of = Some(crate::schema::PartitionOf {
+            schema: None,
+            parent: "zz_events".into(),
+            bound: "FOR VALUES FROM (10) TO (20)".into(),
+        });
+        s.tables.push(sibling);
+        s
+    }
+
+    /// **Dumping one partition must not drop its parent.** The parent comes
+    /// into the file only so the partition's `CREATE … PARTITION OF` has
+    /// something to name; dropped beside its `CREATE`, a replay onto the
+    /// database the file came from took every sibling partition and its rows
+    /// with it (PostgreSQL drops a partitioned table's partitions with it), and
+    /// the file put back only the one it carries. So the parent is created
+    /// only where it is absent, and nothing else of it is touched.
+    #[test]
+    fn dumping_one_partition_drops_neither_its_parent_nor_its_siblings() {
+        let s = partitioned_twice();
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &["aa_2024".to_string()],
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            !file
+                .lines()
+                .any(|l| l.starts_with("DROP") && l.contains("zz_events")),
+            "{file}"
+        );
+        assert!(!file.contains("bb_2025"), "{file}");
+        // The partition the user chose is still replaced, as before.
+        assert!(
+            file.contains("DROP TABLE IF EXISTS \"aa_2024\" CASCADE;"),
+            "{file}"
+        );
+        // And the parent is created where it is missing, before the partition.
+        let guard = pos(&file, "to_regclass('\"zz_events\"') IS NULL");
+        let create = pos(&file, "CREATE TABLE \"zz_events\"");
+        assert!(guard < create, "{file}");
+        assert!(create < pos(&file, "PARTITION OF"), "{file}");
+    }
+
+    /// The parent's own pieces a replay may find already there — a key onto a
+    /// table the file also carries — are put back only where missing: the
+    /// `CASCADE` on that table's drop is what takes such a key away.
+    #[test]
+    fn a_parent_brought_for_its_partition_restates_its_key_only_where_missing() {
+        let s = partitioned_twice();
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &["aa_2024".to_string(), "customers".to_string()],
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let key = pos(&file, "ADD CONSTRAINT \"fk_zz_events_customers\"");
+        let guard = file[..key]
+            .rfind("conname = 'fk_zz_events_customers'")
+            .unwrap_or_else(|| panic!("the key is not guarded:\n{file}"));
+        assert!(guard < key, "{file}");
+    }
+
+    /// **A key from a table outside the file onto the parent comes back** —
+    /// the partition's `DROP … CASCADE` takes it whole on PostgreSQL (seen
+    /// live: `orders` was left with no key at all) — where it is missing.
+    #[test]
+    fn a_key_from_outside_onto_the_parent_is_put_back_where_missing() {
+        let mut s = partitioned_twice();
+        s.tables.push(refs(table("orders"), "zz_events"));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &["aa_2024".to_string()],
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let key = pos(&file, "ADD CONSTRAINT \"fk_orders_zz_events\"");
+        let guard = file[..key]
+            .rfind("conname = 'fk_orders_zz_events'")
+            .unwrap_or_else(|| panic!("the key is not guarded:\n{file}"));
+        assert!(pos(&file, "<<rows aa_2024") < guard, "{file}");
+        // Nothing else of `orders` is in the file.
+        assert!(!file.contains("CREATE TABLE \"orders\""), "{file}");
+    }
+
+    /// Choosing the partitioned table itself still replaces it whole — the
+    /// file carries every partition then.
+    #[test]
+    fn dumping_a_partitioned_table_still_replaces_it() {
+        let s = partitioned_twice();
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &["zz_events".to_string()],
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            file.contains("DROP TABLE IF EXISTS \"zz_events\" CASCADE;"),
+            "{file}"
+        );
+        assert!(!file.contains("to_regclass"), "{file}");
+        assert!(file.contains("<<rows bb_2025"), "{file}");
+    }
+
+    /// A sub-partition's parent and grandparent are both only named.
+    #[test]
+    fn every_ancestor_of_a_chosen_partition_is_only_named() {
+        let mut s = partitioned_twice();
+        let mut leaf = table("aa_2024_q1");
+        leaf.partition_of = Some(crate::schema::PartitionOf {
+            schema: None,
+            parent: "aa_2024".into(),
+            bound: "FOR VALUES FROM (1) TO (4)".into(),
+        });
+        s.tables.push(leaf);
+        let named: Vec<&str> = named_parents(&s.tables, &["aa_2024_q1".to_string()])
+            .into_iter()
+            .map(|i| s.tables[i].name.as_str())
+            .collect();
+        assert_eq!(named, vec!["aa_2024", "zz_events"]);
+        // Choosing the middle one owns it and its partition; only the top
+        // is named.
+        let named: Vec<&str> = named_parents(&s.tables, &["aa_2024".to_string()])
+            .into_iter()
+            .map(|i| s.tables[i].name.as_str())
+            .collect();
+        assert_eq!(named, vec!["zz_events"]);
+        assert!(named_parents(&s.tables, &all(&s)).is_empty());
+    }
+
+    #[test]
+    fn a_guard_never_shares_its_dollar_quote_with_the_body() {
+        let body = "COMMENT ON TABLE t IS $schemaic$x$schemaic$;";
+        let sql = unless_present_sql(SqlDialect::Postgres, Present::Table("\"t\""), body).unwrap();
+        assert!(sql.starts_with("DO $schemaic1$\n"), "{sql}");
+        assert!(sql.ends_with("\n$schemaic1$;"), "{sql}");
+        assert!(sql.contains(body), "{sql}");
+        let sql = unless_present_sql(
+            SqlDialect::Postgres,
+            Present::Trigger {
+                table: "\"it's\"",
+                name: "tr",
+            },
+            "CREATE TRIGGER tr;",
+        )
+        .unwrap();
+        assert!(
+            sql.contains("tgrelid = to_regclass('\"it''s\"') AND tgname = 'tr'"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn only_postgres_can_guard_a_statement_on_presence() {
+        for d in [SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Sqlite] {
+            assert_eq!(
+                unless_present_sql(d, Present::Table("t"), "x;"),
+                None,
+                "{d:?}"
+            );
         }
     }
 

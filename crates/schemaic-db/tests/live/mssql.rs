@@ -997,6 +997,70 @@ async fn restore_batches(dst: &Scratch, file: &str) -> schemaic_core::script::Ex
     end
 }
 
+/// **A partitioned table reads back partitioned** — its function's direction,
+/// the column and the scheme, and one partition per boundary plus one, each
+/// with its bound — from `PARTITION_LISTING` and `PARTITION_BOUNDARY_LISTING`,
+/// SQL no pure test reaches. The PostgreSQL and MySQL legs are in
+/// `partitions.rs`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_table_reads_back_partitioned() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("part_read").await;
+    s.exec(
+        "CREATE PARTITION FUNCTION pf_events (date) AS RANGE RIGHT \
+         FOR VALUES ('2024-01-01', '2025-01-01')",
+    )
+    .await;
+    s.exec("CREATE PARTITION SCHEME ps_events AS PARTITION pf_events ALL TO ([PRIMARY])")
+        .await;
+    s.exec(
+        "CREATE TABLE dbo.events (id int NOT NULL, at date NOT NULL, \
+         CONSTRAINT pk_events PRIMARY KEY CLUSTERED (id, at)) ON ps_events (at)",
+    )
+    .await;
+    let schema = Box::pin(s.db.fetch_schema(&s.name, CancellationToken::new()))
+        .await
+        .expect("the schema");
+    let events = schema
+        .tables
+        .iter()
+        .find(|t| t.name == "events")
+        .expect("events was read");
+    let p = events
+        .partitioning
+        .as_ref()
+        .expect("events read as unpartitioned");
+    assert_eq!(p.key, "RANGE RIGHT ([at]) ON [ps_events]");
+    let parts: Vec<(&str, &str)> = p
+        .partitions
+        .iter()
+        .map(|x| (x.name.as_str(), x.bound.as_str()))
+        .collect();
+    assert_eq!(parts.len(), 3, "{parts:?}");
+    assert_eq!(
+        parts.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        ["1", "2", "3"]
+    );
+    assert!(
+        parts[0].1.starts_with('<') && parts[0].1.contains("2024-01-01"),
+        "{parts:?}"
+    );
+    assert!(
+        parts[1].1.starts_with(">=")
+            && parts[1].1.contains("2024-01-01")
+            && parts[1].1.contains("2025-01-01"),
+        "{parts:?}"
+    );
+    assert!(
+        parts[2].1.starts_with(">=") && parts[2].1.contains("2025-01-01"),
+        "{parts:?}"
+    );
+    // A partition is storage here, not a table of its own.
+    assert!(schema.tables.iter().all(|t| t.partition_of.is_none()));
+}
+
 /// **A dump restores into an empty database as the one it was taken from**:
 /// `core::dump`'s file, its rows rendered by the export renderer as the app's
 /// writer renders them, cut at its `GO` lines by the script splitter and run by
