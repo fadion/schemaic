@@ -14202,6 +14202,8 @@ mod output_alias {
         refs_behind_columns: bool,
         /// One per query reading the alias from outside its own.
         outer: Vec<Reach>,
+        /// Whose rules the names are compared by ([`names_match`]).
+        dialect: SqlDialect,
     }
 
     /// What a rename must not collide with in one query that reads the alias
@@ -14227,15 +14229,35 @@ mod output_alias {
         at: Span,
     }
 
-    impl Name {
-        /// Do the two name the same thing? A quoted side is that spelling
-        /// exactly; a bare pair compares as the server folds it.
-        fn same(&self, other: &Name) -> bool {
-            if self.quoted || other.quoted {
-                self.value == other.value
+    /// Do two names, `(value, quoted)` as written, name the same column or
+    /// output — compared as `dialect` compares them? Where the engine folds a
+    /// bare name ([`SqlDialect::folds_unquoted_names`], PostgreSQL) a bare
+    /// side is folded to lower case and the two then compared exactly, a
+    /// quoted side being that spelling. Elsewhere quoting changes nothing:
+    /// MySQL's column names and aliases, SQL Server's (by a case-insensitive
+    /// collation) and SQLite's match whatever the case.
+    fn names_match(a: (&str, bool), b: (&str, bool), dialect: SqlDialect) -> bool {
+        if !dialect.folds_unquoted_names() {
+            return a.0.eq_ignore_ascii_case(b.0);
+        }
+        fn fold((v, quoted): (&str, bool)) -> std::borrow::Cow<'_, str> {
+            if quoted {
+                std::borrow::Cow::Borrowed(v)
             } else {
-                self.value.eq_ignore_ascii_case(&other.value)
+                std::borrow::Cow::Owned(v.to_ascii_lowercase())
             }
+        }
+        fold(a) == fold(b)
+    }
+
+    impl Name {
+        /// Do the two name the same thing on `dialect` ([`names_match`])?
+        fn same(&self, other: &Name, dialect: SqlDialect) -> bool {
+            names_match(
+                (&self.value, self.quoted),
+                (&other.value, other.quoted),
+                dialect,
+            )
         }
 
         fn folded(&self) -> String {
@@ -14388,6 +14410,8 @@ mod output_alias {
         /// One-part names that may be a CTE read where the walk sees no
         /// `FROM`: `TABLE c`, an `INSERT`'s target, a write's own tables.
         blind: HashSet<String>,
+        /// Whose rules names are compared by ([`Name::same`]).
+        dialect: SqlDialect,
     }
 
     /// A node's address: what the visitor's callbacks can share about a node,
@@ -14889,6 +14913,7 @@ mod output_alias {
                     blocks: Vec::new(),
                     decls: Vec::new(),
                     blind: HashSet::new(),
+                    dialect,
                 },
                 stack: Vec::new(),
                 tops: HashSet::new(),
@@ -14997,7 +15022,7 @@ mod output_alias {
             self.blocks[b]
                 .sources
                 .iter()
-                .position(|s| s.qual.as_ref().is_some_and(|x| x.same(qual)))
+                .position(|s| s.qual.as_ref().is_some_and(|x| x.same(qual, self.dialect)))
         }
 
         /// Every column block `b`'s sources expose — `None` where one cannot
@@ -15066,7 +15091,7 @@ mod output_alias {
             let twins = blk
                 .outs
                 .iter()
-                .filter(|o| matches!(o, Out::Alias(a) if a.same(target)))
+                .filter(|o| matches!(o, Out::Alias(a) if a.same(target, dialect)))
                 .count();
             // Two outputs of one name: which one a reference means is the
             // engine's business, and not a rename's to settle.
@@ -15087,7 +15112,7 @@ mod output_alias {
             let mut refs_behind_columns = false;
             let mut order_names = Vec::new();
             for (id, clause) in &blk.cands {
-                let named = id.same(target);
+                let named = id.same(target, dialect);
                 match clause {
                     Clause::OrderWhole => {
                         if named {
@@ -15135,6 +15160,7 @@ mod output_alias {
                 columns,
                 refs_behind_columns,
                 outer: Vec::new(),
+                dialect,
             };
             self.reach(blk.query, target, dialect, &mut found, &mut ctx, 0);
             found.refs.sort_unstable();
@@ -15216,7 +15242,7 @@ mod output_alias {
                         if r.qual.is_none() {
                             reach.bare.insert(r.col.folded());
                         }
-                        if !r.col.same(name) {
+                        if !r.col.same(name, dialect) {
                             continue;
                         }
                         if let Some(qual) = &r.qual {
@@ -15229,7 +15255,7 @@ mod output_alias {
                             && db
                                 .outs
                                 .iter()
-                                .any(|o| matches!(o, Out::Alias(a) if a.same(name)));
+                                .any(|o| matches!(o, Out::Alias(a) if a.same(name, dialect)));
                         let sees_alias = match r.place {
                             Place::Order { whole } => whole || order_inside,
                             Place::Group => super::group_by_sees_output_aliases(dialect),
@@ -15346,13 +15372,9 @@ mod output_alias {
     /// to? `Some(true)` for a capture, `None` where a column the catalogue
     /// cannot rule out would decide it.
     pub(super) fn conflicts(ctx: &Context, new: &str) -> Option<bool> {
-        let eq = |(n, quoted): &(String, bool)| {
-            if *quoted {
-                n == new
-            } else {
-                n.eq_ignore_ascii_case(new)
-            }
-        };
+        // `new` is written through `ident_if_needed`, which quotes it where the
+        // engine would fold it, so it is that spelling exactly.
+        let eq = |(n, quoted): &(String, bool)| names_match((n, *quoted), (new, true), ctx.dialect);
         if ctx.others.iter().any(eq) || ctx.order_names.iter().any(eq) {
             return Some(true);
         }
@@ -37339,6 +37361,40 @@ mod output_alias_tests {
         assert_eq!(
             renamed("SELECT total AS \"Big|\" FROM orders ORDER BY big", "x", PG),
             Ok("SELECT total AS x FROM orders ORDER BY big".to_string())
+        );
+    }
+
+    /// **An output name matches as the engine compares column names**, not
+    /// byte for byte wherever one side is quoted: MySQL, SQL Server and
+    /// SQLite whatever the case or the quoting, PostgreSQL once a bare side is
+    /// folded to lower case. Byte-exact, the rename left `ORDER BY dbl`
+    /// behind `` AS `Dbl` `` — MariaDB then refused it, 1054 — and a reference
+    /// that bound to the alias was missing from *Find usages*.
+    #[test]
+    fn a_quoted_side_matches_as_the_engine_compares_names() {
+        let want = "SELECT total * 2 AS twice FROM orders ORDER BY twice".to_string();
+        for (d, sql) in [
+            (MY, "SELECT total * 2 AS `Dbl|` FROM orders ORDER BY dbl"),
+            (MS, "SELECT total * 2 AS [Dbl|] FROM orders ORDER BY dbl"),
+            (
+                LITE,
+                "SELECT total * 2 AS \"Dbl|\" FROM orders ORDER BY dbl",
+            ),
+            (MY, "SELECT total * 2 AS dbl| FROM orders ORDER BY `DBL`"),
+            (PG, "SELECT total * 2 AS \"dbl|\" FROM orders ORDER BY DBL"),
+        ] {
+            assert_eq!(renamed(sql, "twice", d), Ok(want.clone()), "{d:?} {sql}");
+        }
+        // On MySQL `X` is the same output name as `x`, quoted or not, so a
+        // rename to it would leave two outputs the engine treats as one.
+        assert_eq!(
+            renamed("SELECT total AS t|, qty AS `X` FROM orders", "x", MY),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        // On PostgreSQL `"X"` is not `x`.
+        assert_eq!(
+            renamed("SELECT total AS t|, qty AS \"X\" FROM orders", "x", PG),
+            Ok("SELECT total AS x, qty AS \"X\" FROM orders".to_string())
         );
     }
 

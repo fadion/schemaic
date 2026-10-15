@@ -3175,7 +3175,14 @@ existing prose was left alone.
     reference there is renamed — another source's column, an unknowable one being `Unsure`
     (`a_name_the_outer_query_already_uses_is_a_conflict`). A change of case alone skips the bare
     names and the rival columns, every bare name there already reading the same folded name; the
-    readers' outputs are still checked. The edit is `rename_edit`'s, quoting through
+    readers' outputs are still checked. **Names compare as the engine compares column names**
+    (`output_alias::names_match`, which `Name::same`, the qualifiers' `own_source` and
+    `conflicts` all ask): where `SqlDialect::folds_unquoted_names` (PostgreSQL) a bare side folds to
+    lower case and the two then compare exactly, and elsewhere quoting changes nothing — MySQL's
+    aliases, SQL Server's (by its collation) and SQLite's match whatever their case. Byte-exact
+    wherever one side was quoted, the rename left `ORDER BY dbl` behind `` AS `Dbl` ``, which
+    MariaDB then refused (1054), and missed a MySQL capture by `` `X` ``
+    (`a_quoted_side_matches_as_the_engine_compares_names`). The edit is `rename_edit`'s, quoting through
     `ident_if_needed` as the other two renames do (`a_quoted_alias_is_renamed_where_it_is_written_quoted`);
     the dialog's starting name is `output_alias_name_at`'s, and the catalogue is the caller's — the
     editor builds it from the loaded schema when asked (under `editor_pane.rs`).
