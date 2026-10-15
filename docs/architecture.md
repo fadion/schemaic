@@ -32592,7 +32592,8 @@ existing prose was left alone.
   db.schema.table` and it has no `sql`, the rows being the file's. *Copy to*'s rows are
   `Source::Copy`, logged against the **target** connection in `copy_rows`' report with no `sql`
   and the detail `copy <SELECT> into db.schema.table` — the `SELECT` being `copy_table::select_sql`,
-  identifiers only; its `CREATE` is the DDL preview's entry like any plan's. A copy whose rows
+  identifiers and the engine's own read-as-text wrappers for binary columns (`HEX()`, `encode(…, 'hex')`, `quote()`)
+  but never a value; its `CREATE` is the DDL preview's entry like any plan's. A copy whose rows
   committed but whose PostgreSQL settle failed is logged `failed` **with the committed count** in
   `rows` — the report's payload is `Result<u64, (Option<u64>, Option<String>)>`, its `Option<u64>`
   `Some` only for that case — so the line does not read as a copy that wrote nothing.
