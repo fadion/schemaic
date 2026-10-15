@@ -34173,7 +34173,8 @@ existing prose was left alone.
     table can legitimately take that long to stream; it still refuses `0`.
     **`dump` is the app's SQL dump, and takes no statement**: `Target`, `-o`/`--output <PATH>`
     required, `-t`/`--table` repeatable — a display name, `orders` or `sales.orders` outside the
-    default schema, and every table and view when absent — and `--schema-only`/`--data-only`, which
+    default schema (or `public.orders`, or a bare name one schema alone has — `run.rs` resolves
+    it), and every table and view when absent — and `--schema-only`/`--data-only`, which
     `conflicts_with` makes a parse error together. Its `--timeout` is `export`'s
     `EXPORT_TIMEOUT_SECS`. It has no `--format`, the file being `.sql` by definition, and is the
     fourth `None` of `output_args()`.
@@ -35020,25 +35021,40 @@ existing prose was left alone.
     The usage errors come first, before anything is dialled: an output whose folder does not exist,
     as `run_export` refuses it, then `select_conn`, then a database — `database_for`, so `-d` or the
     connection's own, and neither is a `warn` that a dump needs one and `Exit::Usage`. Then
-    `connect` under `query::DEFAULT_TIMEOUT`. **With no `-t` it names every table itself**: it lists
-    the database through `Db::fetch_table_list`, under `deadline::with_deadline` and
-    `query::DEFAULT_TIMEOUT`, and passes all of their display names (a failed or timed-out listing
-    is `Exit::Failed`). That is the command's default and not the request's
+    `connect` under `query::DEFAULT_TIMEOUT`. Then it always lists the database through
+    `Db::fetch_table_list`, under `deadline::with_deadline` and `query::DEFAULT_TIMEOUT` (a failed
+    or timed-out listing is `Exit::Failed`). **With no `-t` it names every table itself**, passing
+    all of their display names. That is the command's default and not the request's
     — to `core::dump::plan` an empty list still means nothing was chosen, and the modal's empty
     selection is unchanged; the order is not taken from the listing either, the driver's own fresh
-    introspection deciding it. A `-t` name only *selects*: `plan` matches it against the
-    introspected display names, so it never reaches the SQL, and one that matches nothing comes back
-    in `missing`. `--schema-only` and `--data-only` are `DumpOptions::structure`/`data` turned off,
-    and clap makes them a conflict. **The whole driver runs under `with_deadline`**, the dump's own
-    `--timeout` (an hour by default, `export`'s figure) rather than the login's, and its token is the
+    introspection deciding it. **A `-t` name is resolved against that listing before it reaches
+    `plan`** — the pure `resolve_dump_tables`, the way `cli::compare::resolve` resolves `compare -t`:
+    by label (`schema::display_name`), else `schema.name` (PostgreSQL's `public.orders`, which the
+    label leaves bare), else a bare name only one schema has (SQL Server's `orders` for
+    `dbo.orders`), exactly or ignoring case where `DbSchema::names_ignore_case`. A name that is not
+    there, or one two schemas share, is a `warn` and `Exit::Usage` before any file is written.
+    `plan` used to take `-t` at its word, matching display names exactly: SQL Server's documented
+    `-t orders` and PostgreSQL's `-t public.orders` found nothing (exit 4, "Nothing to export"), and
+    one missing name beside a found one wrote a dump a table short with exit 0
+    (`a_dump_table_is_found_by_label_qualified_or_bare_name`,
+    `a_dump_table_that_is_not_there_or_is_ambiguous_is_refused`). The resolved name only *selects*
+    — it never reaches the SQL — and one that has gone between the listing and the driver's
+    introspection still comes back in `missing`. `--schema-only` and `--data-only` are
+    `DumpOptions::structure`/`data` turned off, and clap makes them a conflict. **The whole driver
+    runs under `with_deadline`**, the dump's own `--timeout` (an hour by default, `export`'s figure) rather than the login's, and its token is the
     run's, so the deadline is a cancel the driver honours and not a dropped future. Progress is a
     `dump::Progress` that prints `i of n — table` to stderr, a line per streamed table. A finished
     dump prints `dump::done_note`, the modal's own sentence, over `export::export_note`'s tally
-    clause, and exits 0; a failure prints `export::export_failure_note`, naming the `.part` only
-    where `partial` says one exists, and a deadline says it was exceeded and adds
+    clause, and exits 0 — unless `missing` is not empty, which `exit_for_dump_done` makes
+    `Exit::Failed`, since a file a table short looks like a whole one to a script reading `$?`
+    (`a_dump_that_left_a_named_table_out_does_not_exit_ok`); a failure prints
+    `export::export_failure_note`, naming the `.part` only where `partial` says one exists, and a deadline says it was exceeded and adds
     `dump::cancel_note` — both `Exit::Failed`. It asks no read gate and runs no `Enforce` session:
     every statement it sends is one `core::dump::plan` built, through the driver's plain
-    `fetch_schema` and `stream_query`, exactly as the modal's dump does.
+    `fetch_schema` and `stream_query`, exactly as the modal's dump does. Verified through the built
+    CLI (per the change's author): on SQL Server 2022 `-t orders -t customers` wrote `dbo.orders`
+    and `sales.customers`, exit 0, and `-t orders -t nope` exited 2 with no file; on PostgreSQL
+    `-t public.zz_d_orders` dumped it.
     **`compare` is `run_compare`, the app's *Compare with* without the window**, and every refusal
     comes before anything is dialled. `CompareSides` carries the two databases as typed, the
     source connection already defaulted to `-c`'s. Each side is `select_conn` over a `ConnArgs`

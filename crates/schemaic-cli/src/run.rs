@@ -586,31 +586,39 @@ async fn run_dump(
         Ok(v) => v,
         Err(exit) => return exit,
     };
+    // The server's list either way: every table when none is named, and the
+    // names a `-t` is resolved against when some are.
+    let token = tokio_util::sync::CancellationToken::new();
+    let list = match crate::deadline::with_deadline(
+        db.fetch_table_list(&database),
+        token,
+        query::DEFAULT_TIMEOUT,
+    )
+    .await
+    {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
+            warn(&format!("could not list the tables of {database}: {e}"));
+            return Exit::Failed;
+        }
+        None => {
+            warn(&format!("listing the tables of {database} timed out"));
+            return Exit::Failed;
+        }
+    };
     let tables = if tables.is_empty() {
-        let token = tokio_util::sync::CancellationToken::new();
-        match crate::deadline::with_deadline(
-            db.fetch_table_list(&database),
-            token,
-            query::DEFAULT_TIMEOUT,
-        )
-        .await
-        {
-            Some(Ok(s)) => s
-                .tables
-                .iter()
-                .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
-                .collect(),
-            Some(Err(e)) => {
-                warn(&format!("could not list the tables of {database}: {e}"));
-                return Exit::Failed;
-            }
-            None => {
-                warn(&format!("listing the tables of {database} timed out"));
-                return Exit::Failed;
+        list.tables
+            .iter()
+            .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+            .collect()
+    } else {
+        match resolve_dump_tables(&list, &tables) {
+            Ok(t) => t,
+            Err(e) => {
+                warn(&e);
+                return Exit::Usage;
             }
         }
-    } else {
-        tables
     };
     let name = output
         .file_name()
@@ -659,7 +667,7 @@ async fn run_dump(
                 &rows_left_out,
                 &refused,
             ));
-            Exit::Ok
+            exit_for_dump_done(&missing)
         }
         Some(DumpOutcome::Failed { message, partial }) => {
             warn(&schemaic_core::export::export_failure_note(
@@ -676,6 +684,74 @@ async fn run_dump(
             ));
             Exit::Failed
         }
+    }
+}
+
+/// The tables `dump -t` names, spelled as the dump's plan matches them
+/// (`schema::display_name`), resolved against the server's `list` the way
+/// `compare -t` resolves one: as the tree labels it (`orders`,
+/// `sales.orders`), else spelled with its schema (`public.orders`, which a
+/// label leaves bare), else by a bare name only one schema has
+/// (`orders` for SQL Server's `dbo.orders`). Matched exactly, or ignoring
+/// case where the server's names do (`DbSchema::names_ignore_case`).
+///
+/// A name the list does not have, or one two schemas share, is the command
+/// line's to fix — an `Err` naming it, before any file is written. The plan
+/// used to take `-t` at its word: SQL Server's documented `-t orders` found
+/// nothing (exit 4, "retrying may work"), and one missing name beside a
+/// found one wrote a dump a table short with exit 0.
+fn resolve_dump_tables(
+    list: &schemaic_core::schema::DbSchema,
+    names: &[String],
+) -> Result<Vec<String>, String> {
+    use schemaic_core::schema::display_name;
+    let same = |a: &str, b: &str| {
+        if list.names_ignore_case {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let label = |t: &schemaic_core::schema::TableInfo| display_name(t.schema.as_deref(), &t.name);
+    names
+        .iter()
+        .map(|name| {
+            if let Some(t) = list.tables.iter().find(|t| same(&label(t), name)) {
+                return Ok(label(t));
+            }
+            if let Some(t) = list.tables.iter().find(|t| {
+                t.schema
+                    .as_deref()
+                    .is_some_and(|s| same(&format!("{s}.{}", t.name), name))
+            }) {
+                return Ok(label(t));
+            }
+            let bare: Vec<String> = list
+                .tables
+                .iter()
+                .filter(|t| same(&t.name, name))
+                .map(label)
+                .collect();
+            match bare.as_slice() {
+                [one] => Ok(one.clone()),
+                [] => Err(format!("no table or view named '{name}' to dump")),
+                several => Err(format!(
+                    "'{name}' names a table in more than one schema ({}); qualify it",
+                    several.join(", ")
+                )),
+            }
+        })
+        .collect()
+}
+
+/// The exit for a dump that finished: a table it was asked for and did not
+/// find (gone between the list and the dump) leaves the file a table short,
+/// which a script checking `$?` must not take for a whole dump.
+fn exit_for_dump_done(missing: &[String]) -> Exit {
+    if missing.is_empty() {
+        Exit::Ok
+    } else {
+        Exit::Failed
     }
 }
 
@@ -1661,6 +1737,75 @@ fn default_database(flag: Option<&str>, conn: &Connection) -> Option<String> {
 mod tests {
     use super::*;
     use crate::args::Cli;
+
+    fn listed(tables: &[(Option<&str>, &str)]) -> schemaic_core::schema::DbSchema {
+        schemaic_core::schema::DbSchema {
+            tables: tables
+                .iter()
+                .map(|(s, n)| schemaic_core::schema::TableInfo {
+                    schema: s.map(str::to_string),
+                    name: n.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `-t orders` is the help's own example, and on SQL Server the dump's
+    /// plan spells that table `dbo.orders`, as PostgreSQL's `-t public.orders`
+    /// is `orders` there — so each `-t` is resolved against the server's list
+    /// as `compare -t` resolves one: by label, by `schema.name`, or by a bare
+    /// name only one schema has.
+    #[test]
+    fn a_dump_table_is_found_by_label_qualified_or_bare_name() {
+        let mssql = listed(&[(Some("dbo"), "orders"), (Some("sales"), "customers")]);
+        assert_eq!(
+            resolve_dump_tables(&mssql, &names(&["orders", "sales.customers"])),
+            Ok(names(&["dbo.orders", "sales.customers"]))
+        );
+        assert_eq!(
+            resolve_dump_tables(&mssql, &names(&["dbo.orders", "customers"])),
+            Ok(names(&["dbo.orders", "sales.customers"]))
+        );
+        let pg = listed(&[(Some("public"), "orders")]);
+        assert_eq!(
+            resolve_dump_tables(&pg, &names(&["public.orders"])),
+            Ok(names(&["orders"]))
+        );
+        let mysql = listed(&[(None, "orders")]);
+        assert_eq!(
+            resolve_dump_tables(&mysql, &names(&["orders"])),
+            Ok(names(&["orders"]))
+        );
+    }
+
+    /// A name the server does not have, or one two schemas share, is the
+    /// command line's to fix — refused before a file is written, rather than
+    /// a dump a table short that exits 0.
+    #[test]
+    fn a_dump_table_that_is_not_there_or_is_ambiguous_is_refused() {
+        let list = listed(&[(Some("dbo"), "orders"), (Some("sales"), "orders")]);
+        let missing = resolve_dump_tables(&list, &names(&["dbo.orders", "nope"])).unwrap_err();
+        assert!(missing.contains("'nope'"), "{missing}");
+        let ambiguous = resolve_dump_tables(&list, &names(&["orders"])).unwrap_err();
+        assert!(
+            ambiguous.contains("dbo.orders") && ambiguous.contains("sales.orders"),
+            "{ambiguous}"
+        );
+    }
+
+    /// A table that went missing between the list and the dump leaves a file
+    /// a table short: not a success a backup script can trust.
+    #[test]
+    fn a_dump_that_left_a_named_table_out_does_not_exit_ok() {
+        assert_eq!(exit_for_dump_done(&[]), Exit::Ok);
+        assert_eq!(exit_for_dump_done(&names(&["orders"])), Exit::Failed);
+    }
 
     /// **A future larger than the calling thread's stack still runs.** The
     /// headless front ends used to `block_on` on the main thread, which on
