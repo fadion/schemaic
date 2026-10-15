@@ -481,6 +481,18 @@ impl Engine {
         schemaic_core::connection::is_networked(self.as_str())
     }
 
+    /// [`Db::implied_database`]'s answer, asked of the engine alone — for a
+    /// caller holding a saved connection and no handle yet: the CLI resolves
+    /// its `-d` before it connects.
+    pub fn implied_database(self) -> Option<&'static str> {
+        match self {
+            Engine::Sqlite => Some(sqlite::MAIN),
+            // A SQL Server login lands in its default database, which is the
+            // server's to name — `DB_NAME()` — not ours to assume.
+            Engine::MySql | Engine::Postgres | Engine::MsSql => None,
+        }
+    }
+
     /// Map a saved connection's `db_type` label to an engine. Anything that isn't
     /// recognizably Postgres or SQLite falls back to MySQL (the historical
     /// default), so old saved connections and the "MySQL"/"MariaDB" labels keep
@@ -802,12 +814,7 @@ impl Db {
     /// `describe_table` asked for a `database` on a SQLite file that has one.
     /// Exhaustive, so a fourth engine answers here rather than defaulting.
     pub fn implied_database(&self) -> Option<&'static str> {
-        match self.engine {
-            Engine::Sqlite => Some(sqlite::MAIN),
-            // A SQL Server login lands in its default database, which is the
-            // server's to name — `DB_NAME()` — not ours to assume.
-            Engine::MySql | Engine::Postgres | Engine::MsSql => None,
-        }
+        self.engine.implied_database()
     }
 
     /// Attach a default database to a handle built by [`Self::from_parts`] —

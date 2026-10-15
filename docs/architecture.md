@@ -35224,7 +35224,10 @@ existing prose was left alone.
     the connect leaves and which is then removed), as the app's export does
     (`export_verdict_tests`). A rename that fails says the
     export is complete in the `.part` rather than that it failed. `run_export` also refuses an
-    output whose folder does not exist, as a usage error before anything is read. Verified live:
+    output whose folder does not exist, or that is itself a folder, as a usage error before
+    anything is read — `run.rs`'s `output_problem`, which `run_dump` shares; a folder used to get
+    through and fail only at the final rename, after the whole query had run
+    (`an_output_that_is_a_folder_is_the_command_lines_mistake`). Verified live:
     25,000 rows from PostgreSQL to CSV across three chunks, a `DELETE` refused with exit 3, and an
     XLSX from SQL Server; the read itself has no unit test.
   - `cli/catalog.rs` — the canned SQL behind `schemaic tables` and `schemaic describe <table>`: two
@@ -35752,10 +35755,20 @@ existing prose was left alone.
     baffling one without it. **Nothing saved at all is a different sentence** — add one in
     Schemaic, no `--all` advice — because the old single hint told a user with no connections to
     turn CLI access on (`list_counts_what_it_hid`, `list_is_quiet_when_it_hid_nothing`,
-    `an_empty_list_says_whether_anything_is_saved`). stdout stays the rows alone. `database_for` is the flag, else the connection's own, else `None` —
-    an empty string there would read as a real database name to the guard's `no_database` arm. The
-    rule itself is `default_database(flag, conn)`, factored out for `mcp`, whose `-d` is not in a
-    `Target` (`mcp_defaults_to_the_connections_database`).
+    `an_empty_list_says_whether_anything_is_saved`). stdout stays the rows alone. `database_for` is
+    the engine's implied database first (`schemaic_db::Engine::implied_database`, `main` on
+    SQLite), then the flag, then the connection's own through `Connection::default_database`, else
+    `None` — an empty string there would read as a real database name to the guard's `no_database`
+    arm, which is why the saved name is read blank-as-none (`a_blank_saved_database_is_none`).
+    *First*, not a fallback, is `mcp::Endpoint::standalone`'s rule for its reason: a SQLite file has
+    exactly one database, so a `-d` there names nothing else. It was the flag, else the raw
+    `conn.database`, so `dump` and `compare` on a SQLite file demanded a `-d` that any value
+    satisfied. `Engine::implied_database` is `Db::implied_database`'s answer asked of the engine
+    alone, and the `Db` method now delegates to it, because the CLI resolves its database before it
+    has connected. The rule itself is `default_database(flag, conn)`, factored out for `mcp` and
+    `compare`, whose `-d` is not in a `Target` (`mcp_defaults_to_the_connections_database`, which
+    covers the flag and the saved name; `a_sqlite_file_defaults_to_main` pins the implied-first
+    half, a `-d` and a stale saved name both losing to `main`).
     **`version` is answered at the top of `dispatch`, before `load_connections_readonly` runs**: it
     needs no saved connection, and a damaged `connections.json` must not stop anyone learning which
     build they have — the first thing asked of someone reporting it damaged. Checked by hand with a
@@ -35831,9 +35844,10 @@ existing prose was left alone.
     own: the whole plan the server read returned is printed.
     **`dump` is `run_dump`, and it is the app's Export ▸ SQL dump, not a second one** — it builds a
     `core::dump::DumpRequest` and calls `dump::run`, the driver the modal calls (`cli/dump.rs`).
-    The usage errors come first, before anything is dialled: an output whose folder does not exist,
-    as `run_export` refuses it, then `select_conn`, then a database — `database_for`, so `-d` or the
-    connection's own, and neither is a `warn` that a dump needs one and `Exit::Usage`. Then
+    The usage errors come first, before anything is dialled: an output whose folder does not exist
+    or that is itself a folder, `output_problem` as `run_export` refuses it, then `select_conn`,
+    then a database — `database_for`, so SQLite's `main`, else `-d` or the connection's own, and
+    none is a `warn` that a dump needs one and `Exit::Usage`. Then
     `connect` under `query::DEFAULT_TIMEOUT`. Then it always lists the database through
     `Db::fetch_table_list`, under `deadline::with_deadline` and `query::DEFAULT_TIMEOUT` (a failed
     or timed-out listing is `Exit::Failed`). **With no `-t` it names every table itself**, passing
@@ -35862,7 +35876,12 @@ existing prose was left alone.
     `Exit::Failed`, since a file a table short looks like a whole one to a script reading `$?`
     (`a_dump_that_left_a_named_table_out_does_not_exit_ok`); a failure prints
     `export::export_failure_note`, naming the `.part` only where `partial` says one exists, and a deadline says it was exceeded and adds
-    `dump::cancel_note` — both `Exit::Failed`. It asks no read gate and runs no `Enforce` session:
+    `dump::cancel_note` — both `Exit::Failed`. **The deadline's note names the `.part` only where
+    there is one** (`dump_timeout_note`): the run's own `DumpOutcome::Cancelled { partial }` when it
+    unwound in time, and past the unwind grace, where `with_deadline` returns `None` and the run has
+    no answer, whether `dump::part_of(output)` exists on disk. It always passed `true`, so a dump
+    timed out during its schema read — before any file is created — sent the user to look for a
+    fragment that was never opened (`a_timed_out_dump_names_a_fragment_only_when_there_is_one`). It asks no read gate and runs no `Enforce` session:
     every statement it sends is one `core::dump::plan` built, through the driver's plain
     `fetch_schema` and `stream_query`, exactly as the modal's dump does. Verified through the built
     CLI (per the change's author): on SQL Server 2022 `-t orders -t customers` wrote `dbo.orders`

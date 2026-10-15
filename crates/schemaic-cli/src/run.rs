@@ -567,10 +567,8 @@ async fn run_dump(
     opts: schemaic_core::dump::DumpOptions,
     timeout: Duration,
 ) -> Exit {
-    if let Some(dir) = output.parent().filter(|d| !d.as_os_str().is_empty())
-        && !dir.is_dir()
-    {
-        warn(&format!("no folder {} to write the dump in", dir.display()));
+    if let Some(why) = output_problem(output, "dump") {
+        warn(&why);
         return Exit::Usage;
     }
     let conn = match select_conn(conns, &target.conn) {
@@ -676,15 +674,46 @@ async fn run_dump(
             ));
             Exit::Failed
         }
-        Some(DumpOutcome::Cancelled { .. }) | None => {
-            warn(&format!(
-                "the dump exceeded {}s and was stopped — {}",
-                timeout.as_secs(),
-                schemaic_core::dump::cancel_note(&name, true)
-            ));
+        // The run's own answer where it unwound in time; past the grace there
+        // is none, and the disk is the only witness left.
+        Some(DumpOutcome::Cancelled { partial }) => {
+            warn(&dump_timeout_note(timeout, &name, partial));
+            Exit::Failed
+        }
+        None => {
+            let partial = crate::dump::part_of(output).exists();
+            warn(&dump_timeout_note(timeout, &name, partial));
             Exit::Failed
         }
     }
+}
+
+/// Why `-o` cannot be written, before anything is read: a folder that is not
+/// there, or a path that is itself a folder — which used to fail only at the
+/// final rename, after the whole `what` had run.
+fn output_problem(output: &std::path::Path, what: &str) -> Option<String> {
+    if output.is_dir() {
+        return Some(format!(
+            "{} is a folder: name the file to write the {what} to",
+            output.display()
+        ));
+    }
+    output
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty() && !d.is_dir())
+        .map(|dir| format!("no folder {} to write the {what} in", dir.display()))
+}
+
+/// What a dump stopped by `--timeout` says: the fragment is named only when
+/// one was made (`dump::cancel_note`'s `partial`). A dump timed out during its
+/// schema read has created nothing, and the note sent the user to look for a
+/// `.part` that did not exist.
+fn dump_timeout_note(timeout: Duration, name: &str, partial: bool) -> String {
+    format!(
+        "the dump exceeded {}s and was stopped — {}",
+        timeout.as_secs(),
+        schemaic_core::dump::cancel_note(name, partial)
+    )
 }
 
 /// The tables `dump -t` names, spelled as the dump's plan matches them
@@ -782,13 +811,8 @@ async fn run_export(
     };
     // A folder that is not there is the command line's mistake too — told
     // before anything is read, rather than after a whole query has run.
-    if let Some(dir) = output.parent().filter(|d| !d.as_os_str().is_empty())
-        && !dir.is_dir()
-    {
-        warn(&format!(
-            "no folder {} to write the export in",
-            dir.display()
-        ));
+    if let Some(why) = output_problem(output, "export") {
+        warn(&why);
         return Exit::Usage;
     }
     let conn = match select_conn(conns, &target.conn) {
@@ -1735,15 +1759,27 @@ fn exec_ran(
     }
 }
 
-/// Which database to run in: the flag if given, else the connection's own.
+/// Which database to run in — [`default_database`]'s rule over the target's
+/// `-d`: the engine's implied one, else the flag, else the connection's own.
 fn database_for(target: &Target, conn: &Connection) -> Option<String> {
     default_database(target.database.as_deref(), conn)
 }
 
 /// [`database_for`]'s rule, for a `-d` that is not in a [`Target`].
+///
+/// **The engine's implied database comes first**
+/// ([`schemaic_db::Engine::implied_database`], `main` on SQLite) — the rule
+/// `mcp::Endpoint::standalone` keeps, for its reason: a file has exactly one
+/// database, so a `-d` there names nothing else. Then the flag, then the
+/// connection's own through [`Connection::default_database`], which reads a
+/// blank name as none. Reading `conn.database` raw made `dump` and `compare`
+/// demand a `-d` of a SQLite file that any value satisfied.
 fn default_database(flag: Option<&str>, conn: &Connection) -> Option<String> {
-    flag.map(str::to_string)
-        .or_else(|| (!conn.database.is_empty()).then(|| conn.database.clone()))
+    schemaic_db::Engine::from_db_type(&conn.db_type)
+        .implied_database()
+        .or(flag)
+        .or_else(|| conn.default_database())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -2247,7 +2283,9 @@ mod tests {
         assert_eq!(serve_mcp(&[], &target).await, Exit::Usage);
     }
 
-    /// `-d` wins, else the connection's own, else none — `query`'s rule.
+    /// On a server engine `-d` wins, else the connection's own, else none —
+    /// `query`'s rule (SQLite's implied `main` comes first:
+    /// `a_sqlite_file_defaults_to_main`).
     #[test]
     fn mcp_defaults_to_the_connections_database() {
         assert_eq!(
@@ -2415,5 +2453,74 @@ mod tests {
     #[test]
     fn no_database_anywhere_is_none_not_an_empty_name() {
         assert_eq!(database_for(&target(None), &conn("")), None);
+    }
+
+    /// **SQLite's file is its database, so it always has one** — `main`, the
+    /// name the tree shows. `dump` and `compare` demanded a `-d` that any value
+    /// satisfied.
+    #[test]
+    fn a_sqlite_file_defaults_to_main() {
+        let mut lite = conn("");
+        lite.db_type = "sqlite".to_string();
+        assert_eq!(database_for(&target(None), &lite).as_deref(), Some("main"));
+        // A name left over from an engine switch is not the file's database.
+        lite.database = "shop".to_string();
+        assert_eq!(database_for(&target(None), &lite).as_deref(), Some("main"));
+        // Nor is a flag: nothing else is ever attached (`mcp`'s rule too).
+        assert_eq!(
+            database_for(&target(Some("other")), &lite).as_deref(),
+            Some("main")
+        );
+    }
+
+    /// **`-o` naming a folder is refused before anything is read**, not at
+    /// the rename after a whole dump. The crate's own directory stands in for
+    /// one — the repository's source, the exempt kind of filesystem read.
+    #[test]
+    fn an_output_that_is_a_folder_is_the_command_lines_mistake() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let why = output_problem(dir, "dump").expect("a folder is refused");
+        assert!(why.contains("is a folder"), "{why}");
+        assert!(why.contains("dump"), "{why}");
+    }
+
+    #[test]
+    fn an_output_in_a_missing_folder_is_refused() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = dir.join("no-such-folder").join("x.sql");
+        let why = output_problem(&out, "export").expect("refused");
+        assert!(why.starts_with("no folder"), "{why}");
+    }
+
+    #[test]
+    fn a_new_file_in_an_existing_folder_or_a_bare_name_passes() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(output_problem(&dir.join("not-there.sql"), "dump"), None);
+        assert_eq!(
+            output_problem(std::path::Path::new("not-there.sql"), "dump"),
+            None
+        );
+    }
+
+    /// **A stopped dump names a `.part` only where one was made.** It said
+    /// "what had been written is in x.sql.part" for a dump timed out during
+    /// its schema read, before any file existed.
+    #[test]
+    fn a_timed_out_dump_names_a_fragment_only_when_there_is_one() {
+        let t = Duration::from_secs(5);
+        let none = dump_timeout_note(t, "x.sql", false);
+        // Through `part_path`: the crate's source gate refuses the suffix spelt.
+        let fragment = schemaic_core::export::part_path("x.sql");
+        assert!(!none.contains(&fragment), "{none}");
+        assert!(none.contains("5s"), "{none}");
+        let some = dump_timeout_note(t, "x.sql", true);
+        assert!(some.contains(&fragment), "{some}");
+    }
+
+    /// The saved name is read the way the connection reads it: a blank one
+    /// is none, not a database named by whitespace.
+    #[test]
+    fn a_blank_saved_database_is_none() {
+        assert_eq!(database_for(&target(None), &conn("  ")), None);
     }
 }
