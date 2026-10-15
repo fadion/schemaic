@@ -3883,7 +3883,7 @@ pub(crate) async fn run_server_ddl(
 /// rows, each required to insert exactly its own rows.
 ///
 /// **Literal statements, from the builder every engine shares**
-/// (`import::build_insert`), not bound ones as [`commit_writes`] uses: a
+/// (`import::build_insert_as`), not bound ones as [`commit_writes`] uses: a
 /// bound batch would spend a parameter per cell, and SQL Server takes at most
 /// 2,100 per request — 500 rows of five columns is past it. The literal form
 /// has no such ceiling, and its 500 rows are under T-SQL's 1,000-row limit on
@@ -3909,7 +3909,6 @@ pub(crate) async fn import_rows(
     }
     let mut client = connect(db, Some(target.database)).await?;
     let facts = column_facts(&mut client, target.database, target.schema, target.table).await?;
-    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
     let identity =
         import_sets_identity(target.columns, &facts).then(|| qname(target.schema, target.table));
     drain(&mut client, "BEGIN TRANSACTION").await?;
@@ -3956,15 +3955,16 @@ pub(crate) async fn import_rows(
             return Err(DbError::Refused(format!("{msg}{}", undone.note())));
         }
         let batch = language_safe_batch(target.columns, &facts, batch);
-        let Some(sql) = schemaic_core::import::build_insert(
-            target.database,
-            target.schema,
-            target.table,
-            &cols,
-            &batch,
-            MS,
-        ) else {
-            continue;
+        let sql = match target.insert_sql(&batch, MS) {
+            Ok(Some(sql)) => sql,
+            Ok(None) => continue,
+            Err(e) => {
+                let msg = match e {
+                    DbError::Query(msg) => msg,
+                    e => e.to_string(),
+                };
+                return Err(failed(&mut client, msg).await);
+            }
         };
         let bound = Bound {
             sql,

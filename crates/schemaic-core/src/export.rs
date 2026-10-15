@@ -3095,8 +3095,9 @@ pub enum ServerLiteral {
 }
 
 /// The literal a server-rendered cell becomes, or `None` when the text is not
-/// the shape its [`ServerLiteral`] form promises.
-fn server_literal(form: ServerLiteral, text: &str) -> Option<String> {
+/// the shape its [`ServerLiteral`] form promises. The dump's renderer, and
+/// *Copy to*'s writer for the same SQL Server reads (`import::CellForm`).
+pub fn server_literal(form: ServerLiteral, text: &str) -> Option<String> {
     let hex = |s: &str| {
         s.strip_prefix("0x")
             .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))

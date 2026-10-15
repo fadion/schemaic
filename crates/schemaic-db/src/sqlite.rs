@@ -1564,7 +1564,7 @@ pub(crate) async fn refetch_rows(
 /// each batch must affect exactly as many rows as it carried, or the whole thing
 /// rolls back.
 ///
-/// The statement text comes from [`schemaic_core::import::build_insert`], so the
+/// The statement text comes from [`schemaic_core::import::build_insert_as`], so the
 /// quoting and literal escaping are the ones the SQL *export* is tested for
 /// rather than a second set written here.
 ///
@@ -1584,11 +1584,10 @@ pub(crate) async fn import_rows(
     rows: crate::RowSource<'_>,
     cancel: CancellationToken,
 ) -> Result<u64, DbError> {
-    use schemaic_core::import::{INSERT_BATCH_ROWS, build_insert};
+    use schemaic_core::import::INSERT_BATCH_ROWS;
     use schemaic_core::intel::SqlDialect;
 
     let conn = tokio::task::block_in_place(|| open(db))?;
-    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
 
     tokio::task::block_in_place(|| {
         let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
@@ -1600,14 +1599,7 @@ pub(crate) async fn import_rows(
             let mut total = 0u64;
             let mut batch: Vec<Vec<Value>> = Vec::with_capacity(INSERT_BATCH_ROWS);
             let flush = |batch: &mut Vec<Vec<Value>>| -> Result<u64, DbError> {
-                let Some(sql) = build_insert(
-                    target.database,
-                    target.schema,
-                    target.table,
-                    &cols,
-                    batch,
-                    SqlDialect::Sqlite,
-                ) else {
+                let Some(sql) = target.insert_sql(batch, SqlDialect::Sqlite)? else {
                     return Ok(0);
                 };
                 let affected = conn.execute(&sql, []).map_err(query_err)? as u64;
@@ -7422,6 +7414,7 @@ mod tests {
             schema: None,
             table: "t",
             columns: &cols,
+            ..Default::default()
         };
         let loaded = import_rows(&db, target, &mut rows, CancellationToken::new())
             .await
@@ -7468,6 +7461,7 @@ mod tests {
                     schema: None,
                     table: "t2",
                     columns: &cols,
+                    ..Default::default()
                 },
                 CancellationToken::new(),
                 &move |rows| seen2.store(rows, std::sync::atomic::Ordering::Relaxed),
@@ -7521,6 +7515,7 @@ mod tests {
                     schema: None,
                     table: "t2",
                     columns: &cols,
+                    ..Default::default()
                 },
                 CancellationToken::new(),
                 &|_| {},
@@ -7528,6 +7523,159 @@ mod tests {
             .await
             .expect_err("the read fails");
         assert!(err.to_string().contains("overflow"), "{err}");
+        let count: i64 = dst_keeper
+            .query_row("SELECT count(*) FROM t2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// The copy as *Copy to* composes it — `core::copy_table`'s columns and
+    /// read, then `Db::copy_rows` — from table `t` of `src` into table `t2` of
+    /// `dst`, both already there with the same columns.
+    async fn copy_as_the_app_does(
+        src: &Db,
+        dst: &Db,
+        columns: &[(&str, &str)],
+    ) -> Result<u64, DbError> {
+        use schemaic_core::copy_table;
+        use schemaic_core::intel::SqlDialect;
+        let info = schemaic_core::schema::TableInfo {
+            name: "t".into(),
+            columns: columns
+                .iter()
+                .map(|(name, ty)| schemaic_core::schema::ColumnInfo {
+                    name: (*name).into(),
+                    type_name: (*ty).into(),
+                    nullable: true,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let read = copy_table::rows_read(MAIN, &info, SqlDialect::Sqlite);
+        src.copy_rows(
+            Some(MAIN),
+            &read.select,
+            dst,
+            crate::ImportTarget {
+                database: MAIN,
+                schema: None,
+                table: "t2",
+                columns: &read.columns,
+                forms: &read.forms,
+                overriding: read.overriding,
+            },
+            CancellationToken::new(),
+            &|_| {},
+        )
+        .await
+    }
+
+    /// **A blob is copied as its bytes** — not as the `<3 bytes>` the grid
+    /// shows for it, which every engine's read renders a raw-bytes cell as and
+    /// which the copy used to write into the target as the value. A blob in a
+    /// column declared `TEXT` is SQLite's too: a declared type is an affinity.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_carries_a_blob_byte_for_byte() {
+        let (src_keeper, src) = shared_memory("copy_blob_src");
+        let (dst_keeper, dst) = shared_memory("copy_blob_dst");
+        let ddl = |t: &str| format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, b BLOB, s TEXT);");
+        src_keeper.execute_batch(&ddl("t")).unwrap();
+        src_keeper
+            .execute_batch(
+                "INSERT INTO t VALUES (1, x'00ff10', 'it''s'), (2, x'', x'cafe'), \
+                 (3, NULL, NULL), (4, 7, 2.5);",
+            )
+            .unwrap();
+        dst_keeper.execute_batch(&ddl("t2")).unwrap();
+        let copied = copy_as_the_app_does(
+            &src,
+            &dst,
+            &[("id", "INTEGER"), ("b", "BLOB"), ("s", "TEXT")],
+        )
+        .await
+        .expect("copy");
+        assert_eq!(copied, 4);
+        let rows: Vec<String> = dst_keeper
+            .prepare(
+                "SELECT id || ':' || typeof(b) || ':' || coalesce(hex(b), '-') || ':' \
+                 || typeof(s) || ':' || coalesce(hex(s), '-') FROM t2 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "1:blob:00FF10:text:69742773",
+                "2:blob::blob:CAFE",
+                // `hex(NULL)` is `''` in SQLite.
+                "3:null::null:",
+                // A `TEXT` column's affinity made the source's 2.5 text.
+                "4:integer:37:text:322E35",
+            ]
+        );
+    }
+
+    /// **An infinite `REAL` is copied infinite**, not as the `NULL` a file
+    /// export writes for it. SQLite has no NaN to store — it reads one back as
+    /// `NULL` — so ±infinity is the whole of the case.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_keeps_an_infinite_real() {
+        let (src_keeper, src) = shared_memory("copy_inf_src");
+        let (dst_keeper, dst) = shared_memory("copy_inf_dst");
+        let ddl = |t: &str| format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, x REAL NOT NULL);");
+        src_keeper.execute_batch(&ddl("t")).unwrap();
+        src_keeper
+            .execute_batch("INSERT INTO t VALUES (1, 9e999), (2, -9e999), (3, 0.1);")
+            .unwrap();
+        dst_keeper.execute_batch(&ddl("t2")).unwrap();
+        copy_as_the_app_does(&src, &dst, &[("id", "INTEGER"), ("x", "REAL")])
+            .await
+            .expect("copy");
+        let xs: Vec<f64> = dst_keeper
+            .prepare("SELECT x FROM t2 ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, f64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(xs, vec![f64::INFINITY, f64::NEG_INFINITY, 0.1]);
+    }
+
+    /// **The safety net under the read**: a blob that still arrives as its
+    /// `<n bytes>` placeholder — a read that did not ask for it as text —
+    /// stops the copy, and the target keeps nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_never_writes_a_bytes_placeholder() {
+        let (src_keeper, src) = shared_memory("copy_placeholder_src");
+        let (dst_keeper, dst) = shared_memory("copy_placeholder_dst");
+        src_keeper
+            .execute_batch("CREATE TABLE t (b BLOB); INSERT INTO t VALUES ('ok'), (x'00ff10');")
+            .unwrap();
+        dst_keeper
+            .execute_batch("CREATE TABLE t2 (b BLOB);")
+            .unwrap();
+        let cols = vec!["b".to_string()];
+        let err = src
+            .copy_rows(
+                Some(MAIN),
+                "SELECT b FROM t",
+                &dst,
+                crate::ImportTarget {
+                    database: MAIN,
+                    table: "t2",
+                    columns: &cols,
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+                &|_| {},
+            )
+            .await
+            .expect_err("a placeholder is not the value");
+        assert!(err.to_string().contains("holds bytes"), "{err}");
         let count: i64 = dst_keeper
             .query_row("SELECT count(*) FROM t2", [], |r| r.get(0))
             .unwrap();
@@ -7579,6 +7727,7 @@ mod tests {
             schema: None,
             table: "t",
             columns: &cols,
+            ..Default::default()
         };
         import_rows(&db, target, &mut rows, CancellationToken::new())
             .await
@@ -7635,6 +7784,7 @@ mod tests {
             schema: None,
             table: "t",
             columns: &cols,
+            ..Default::default()
         };
         let err = import_rows(&db, target, &mut rows, CancellationToken::new())
             .await

@@ -58,6 +58,11 @@ pub struct CopyRowsRequest {
     pub target: CopyTarget,
     /// The columns `select` reads, in its order — `copy_table::columns`.
     pub columns: Vec<String>,
+    /// How each of them arrives — `copy_table::RowsRead::forms`.
+    pub forms: Vec<schemaic_core::import::CellForm>,
+    /// Whether the write overrides a server-numbered identity —
+    /// `copy_table::RowsRead::overriding`.
+    pub overriding: bool,
     /// What runs on the target after the rows — `copy_table::settle_sql`.
     pub settle: Vec<String>,
 }
@@ -376,15 +381,17 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 .conn
                 .connections
                 .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, dst_conn));
-            let columns = copy_table::columns(&info);
+            let read = copy_table::rows_read(&src.database, &info, dialect);
             let req = CopyRowsRequest {
                 src_conn: src.conn_id,
                 src_database: src.database.clone(),
-                select: copy_table::select_sql(&src.database, &info, &columns, dialect),
+                select: read.select,
                 dst_conn,
                 settle: copy_table::settle_sql(&to, &info, dialect),
                 target: to.clone(),
-                columns,
+                columns: read.columns,
+                forms: read.forms,
+                overriding: read.overriding,
             };
             let mut p = crate::ddl_preview::preview_of(
                 dst_conn,

@@ -291,6 +291,7 @@ async fn seed(scratch: &Scratch) {
                 schema: scratch.namespace,
                 table: "big",
                 columns: &columns,
+                ..Default::default()
             },
             &mut rows,
             CancellationToken::new(),

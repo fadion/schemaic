@@ -6387,7 +6387,6 @@ async fn import_on(
     cancel: &CancellationToken,
 ) -> Result<u64, DbError> {
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
-    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
     conn.query_drop("BEGIN").await.map_err(qerr)?;
 
     let mut total: u64 = 0;
@@ -6420,15 +6419,19 @@ async fn import_on(
                 });
             }
         };
-        let Some(sql) = schemaic_core::import::build_insert(
-            target.database,
-            target.schema,
-            target.table,
-            &cols,
-            &batch,
-            dialect,
-        ) else {
-            continue;
+        let sql = match target.insert_sql(&batch, dialect) {
+            Ok(Some(sql)) => sql,
+            Ok(None) => continue,
+            Err(e) => {
+                let undone = rollback(conn, "ROLLBACK").await;
+                return Err(match (e, undone) {
+                    (e, Rollback::Complete) => e,
+                    (DbError::Query(msg), undone) => {
+                        DbError::Query(format!("{msg}{}", undone.note()))
+                    }
+                    (e, _) => e,
+                });
+            }
         };
         // **The killed statement is awaited, not dropped** — the same rule
         // `run_script_mysql` states, and for a sharper reason here: dropping it

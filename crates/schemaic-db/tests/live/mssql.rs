@@ -7046,6 +7046,7 @@ async fn import_into(
             schema: Some("dbo"),
             table: "imp",
             columns: &columns,
+            ..Default::default()
         },
         rows,
         cancel,
@@ -7100,7 +7101,13 @@ async fn an_import_loads_every_row_across_batches() {
 /// SQL Server leg (the other engines' is `runtime.rs`'s): the identity values
 /// go in under the import's `IDENTITY_INSERT`, and the engine moves its
 /// counter past them itself, so `settle_sql` is empty and the closing insert
-/// takes 4.
+/// takes 5.
+///
+/// **The ids have a gap (1, 3, 4)**, which is what shows they were copied: the
+/// identity used to be left out of the copied columns (every SQL Server
+/// identity reads as server-assigned) and the copy renumbered 1, 2, 3. The
+/// bytes columns — `varbinary`, a CLR `geography`, a `sql_variant` — used to
+/// arrive as the `<n bytes>` placeholder, which Msg 257 refused, or as text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_copied_table_has_every_row_and_numbers_on_past_them() {
     use schemaic_core::copy_table::{self, CopyTarget};
@@ -7108,10 +7115,20 @@ async fn a_copied_table_has_every_row_and_numbers_on_past_them() {
         return;
     }
     let s = Scratch::create("copy_table").await;
-    s.exec("CREATE TABLE dbo.src (id int IDENTITY(1,1) PRIMARY KEY, v nvarchar(20) NOT NULL)")
-        .await;
-    s.exec("INSERT dbo.src (v) VALUES (N'a'), (N'b'), (N'c')")
-        .await;
+    s.exec(
+        "CREATE TABLE dbo.src (id int IDENTITY(1,1) PRIMARY KEY, v nvarchar(20) NOT NULL, \
+         b varbinary(max) NULL, g geography NULL, sv sql_variant NULL)",
+    )
+    .await;
+    s.exec(
+        "INSERT dbo.src (v, b, g, sv) VALUES \
+         (N'a', 0x00FF10, geography::Point(47.65, -122.35, 4326), \
+         CAST(CAST('2026-01-02' AS date) AS sql_variant)), (N'b', NULL, NULL, NULL), \
+         (N'c', 0x, NULL, CAST(CAST(1.5 AS decimal(5,2)) AS sql_variant)), \
+         (N'd', NULL, NULL, NULL)",
+    )
+    .await;
+    s.exec("DELETE dbo.src WHERE v = N'b'").await;
     s.exec("CREATE INDEX src_v_idx ON dbo.src (v)").await;
     let schema =
         s.db.fetch_schema(&s.name, CancellationToken::new())
@@ -7132,17 +7149,19 @@ async fn a_copied_table_has_every_row_and_numbers_on_past_them() {
     s.db.run_ddl(&s.name, &plan.emit(), CancellationToken::new())
         .await
         .expect("the copy's CREATE");
-    let columns = copy_table::columns(&info);
+    let read = copy_table::rows_read(&s.name, &info, SqlDialect::MsSql);
     let copied =
         s.db.copy_rows(
             Some(&s.name),
-            &copy_table::select_sql(&s.name, &info, &columns, SqlDialect::MsSql),
+            &read.select,
             &s.db,
             schemaic_db::ImportTarget {
                 database: &s.name,
                 schema: to.schema.as_deref(),
                 table: "dst",
-                columns: &columns,
+                columns: &read.columns,
+                forms: &read.forms,
+                overriding: read.overriding,
             },
             CancellationToken::new(),
             &|_| {},
@@ -7151,10 +7170,27 @@ async fn a_copied_table_has_every_row_and_numbers_on_past_them() {
         .expect("the copy");
     assert_eq!(copied, 3);
     assert!(copy_table::settle_sql(&to, &info, SqlDialect::MsSql).is_empty());
-    s.exec("INSERT dbo.dst (v) VALUES (N'd')").await;
+    let rows = |t: &str| {
+        format!(
+            "SELECT STRING_AGG(CONCAT(id, '|', v, '|', CONVERT(varchar(max), b, 2), '|', \
+             ISNULL(CAST(b AS varchar(1)), 'n'), '|', g.STAsText(), '|', g.STSrid, '|', \
+             CAST(SQL_VARIANT_PROPERTY(sv, 'BaseType') AS sysname), '|', \
+             CAST(sv AS nvarchar(40))), ';') WITHIN GROUP (ORDER BY id) FROM dbo.{t}"
+        )
+    };
+    let from = s.scalar(&rows("src")).await;
+    assert!(
+        from.starts_with("1|a|00FF10|") && from.contains(";3|c|") && from.contains(";4|d|"),
+        "the premise — gapped ids and the bytes: {from}"
+    );
+    assert_eq!(
+        s.scalar(&rows("dst")).await,
+        from,
+        "the copy's rows are the source's"
+    );
+    s.exec("INSERT dbo.dst (v) VALUES (N'e')").await;
     assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.dst").await, "4");
-    assert_eq!(s.scalar("SELECT MAX(id) FROM dbo.dst").await, "4");
-    assert_eq!(s.scalar("SELECT v FROM dbo.dst WHERE id = 2").await, "b");
+    assert_eq!(s.scalar("SELECT MAX(id) FROM dbo.dst").await, "5");
 }
 
 /// **A row the server refuses rolls the whole import back**, batches already
@@ -9775,6 +9811,7 @@ async fn a_datetime_key_finds_its_row_under_a_day_first_login() {
             schema: Some("dbo"),
             table: "d",
             columns: &columns,
+            ..Default::default()
         },
         &mut rows,
         CancellationToken::new(),

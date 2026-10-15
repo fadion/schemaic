@@ -2858,6 +2858,7 @@ impl Db {
 /// `columns` are bare names (unquoted); the quoting is the export path's, applied
 /// when the statement is built, so it can't drift from the SQL export that reads
 /// the same table back out.
+#[derive(Default)]
 pub struct ImportTarget<'a> {
     pub database: &'a str,
     /// The PostgreSQL namespace, when the table has one. On MySQL a database *is*
@@ -2865,6 +2866,38 @@ pub struct ImportTarget<'a> {
     pub schema: Option<&'a str>,
     pub table: &'a str,
     pub columns: &'a [String],
+    /// How each column's cells arrive, in `columns`' order — empty for a
+    /// file's rows, which are all values. A copy's read carries a blob as
+    /// text (`core::copy_table::rows_read`), and this says which.
+    pub forms: &'a [schemaic_core::import::CellForm],
+    /// Write an identity the server numbers itself, through
+    /// `import::overriding_clause` — a copy keeping a PostgreSQL
+    /// `GENERATED ALWAYS` key.
+    pub overriding: bool,
+}
+
+impl ImportTarget<'_> {
+    /// One batch's `INSERT` into this target, in `dialect` —
+    /// `import::build_insert_as` over the target's columns and forms, its
+    /// refusal of a cell that is not its form's shape as a `DbError`.
+    pub(crate) fn insert_sql(
+        &self,
+        rows: &[Vec<Value>],
+        dialect: schemaic_core::intel::SqlDialect,
+    ) -> Result<Option<String>, DbError> {
+        let cols: Vec<&str> = self.columns.iter().map(String::as_str).collect();
+        schemaic_core::import::build_insert_as(
+            self.database,
+            self.schema,
+            self.table,
+            &cols,
+            rows,
+            dialect,
+            self.forms,
+            self.overriding,
+        )
+        .map_err(DbError::Query)
+    }
 }
 
 /// A source of rows to import. Errors are the reader's — a malformed record or a
@@ -3023,6 +3056,14 @@ impl Iterator for ChunkRows<'_> {
                 let r = self.at;
                 self.at += 1;
                 self.handed += 1;
+                // **A value the read does not have is never written**: a cell
+                // still the `<n bytes>` placeholder, or blank past an arena's
+                // cap. Asked once per chunk, at its first row.
+                if r == 0
+                    && let Some(why) = schemaic_core::copy_table::chunk_refusal(rs)
+                {
+                    return Some(Err(why));
+                }
                 let row = (0..rs.columns.len())
                     .map(|c| rs.cell(r, c).map_or(Value::Null, |v| v.to_value()))
                     .collect();

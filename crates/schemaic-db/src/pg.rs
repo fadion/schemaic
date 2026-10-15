@@ -4282,7 +4282,6 @@ async fn import_on(
 ) -> Result<u64, DbError> {
     // `db_err`, not `to_string()`: the driver's own Display for a server error is
     // the literal text "db error" — a duplicate-key import has to say so.
-    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
     client
         .batch_execute("BEGIN")
         .await
@@ -4305,15 +4304,13 @@ async fn import_on(
                 return Err(e);
             }
         };
-        let Some(sql) = schemaic_core::import::build_insert(
-            target.database,
-            target.schema,
-            target.table,
-            &cols,
-            &batch,
-            schemaic_core::intel::SqlDialect::Postgres,
-        ) else {
-            continue;
+        let sql = match target.insert_sql(&batch, schemaic_core::intel::SqlDialect::Postgres) {
+            Ok(Some(sql)) => sql,
+            Ok(None) => continue,
+            Err(e) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                return Err(e);
+            }
         };
         let affected = match client.execute(sql.as_str(), &[]).await {
             Ok(n) => n,

@@ -5040,7 +5040,27 @@ existing prose was left alone.
     `build_insert` reuses `export::ident_sql`/`sql_literal`, so quoting can't drift
     from the SQL export; it is the statement every engine's load runs, SQL Server's included, which
     renders its batches as literals rather than binding them for a parameter ceiling (under
-    `db::mssql`). **Two capabilities decide what reaches it, and both are exhaustive `match`es.**
+    `db::mssql`). It is now a thin wrapper over **`build_insert_as`**, which every engine's writer
+    reaches through `db::ImportTarget::insert_sql`: that takes a `CellForm` per column (empty for a
+    file, whose cells are all `Value`) and `overriding`, which puts `overriding_clause` —
+    `OVERRIDING SYSTEM VALUE`, PostgreSQL's alone — before `VALUES`. The other forms are what
+    *Copy to* reads a raw-bytes cell as (under `copy_table.rs`): `Hex` is written as `X'…'` on
+    MySQL and SQLite and as `decode('…', 'hex')` on PostgreSQL — not `'\x…'`, which reads
+    differently under `standard_conforming_strings` — `Server` through `export::server_literal`, and
+    `Quoted` as-is. **Each is checked to be its form's shape first** — even-length hex digits,
+    the dump's own checks, one of the shapes SQLite's `quote()` writes — and a cell that is not
+    makes the whole call an `Err`, so the batch is never written and the load's transaction rolls
+    back: these texts go into the statement as SQL, nothing else may, and a wrong shape written
+    would be a wrong value rather than a refusal
+    (`a_carried_cell_is_written_as_its_form_and_checked_first`,
+    `overriding_puts_the_clause_before_values_where_the_engine_has_one`). **A `Value` cell goes
+    through `import_literal`**, which is `sql_literal` except for a non-finite float: the export
+    writes that `NULL`, a stated rule for a file and a silent loss in a table being reproduced, so
+    here `non_finite_literal` writes the engine's own — `'NaN'::float8`, `'Infinity'::float8`,
+    `'-Infinity'::float8` on PostgreSQL; `9e999`/`-9e999` on SQLite, and `NULL` for its NaN, which
+    SQLite stores as `NULL` anyway — while MySQL and SQL Server, which cannot hold one, keep the
+    `NULL` (`a_non_finite_float_is_written_as_the_engines_own_literal`; SQLite's
+    `a_copy_keeps_an_infinite_real`). **Two capabilities decide what reaches it, and both are exhaustive `match`es.**
     `supports_import` is the table menu's *Import* entry, so an engine without a load has the entry
     absent rather than a wizard whose last step is a refusal; it answers yes for all four since
     `db::mssql::import_rows` was written. `bool_literal_is_integer` is whether a coerced boolean
@@ -9299,13 +9319,46 @@ existing prose was left alone.
     another database, or `refusal` stopped it — and SQLite's `sqlite_autoindex_*` stay as they are,
     being the engine's, re-declared as `UNIQUE` rather than created by name
     (`sqlites_own_indexes_are_not_renamed`). The substitution is a plain case-sensitive `find`.
-    `columns` is every column but those `ColumnInfo::is_server_assigned` names — a generated column
-    and PostgreSQL's `GENERATED ALWAYS AS IDENTITY`, the import's own rule — so those are neither
-    read nor written, and take fresh values on the target
-    (`a_generated_column_is_not_read_or_written`, `an_always_identity_takes_fresh_values`).
-    `select_sql` is the read on the source, those columns in table order through
-    `export::ident_sql`, qualified by `export::qualified_table` and unsorted, since an insert needs
-    no order.
+    `columns(src, dialect)` is every column but those `ColumnInfo::is_server_assigned` names — the
+    import's own rule, so a generated column is neither read nor written and is computed again on
+    the target (`a_generated_column_is_not_read_or_written`) — **except an identity the write can
+    carry** (`carries_identity`), because its values are the table's keys. That is SQL Server's,
+    `dump::carries_identity` as the dump asks it, written under the import's `IDENTITY_INSERT`; and
+    PostgreSQL's `GENERATED ALWAYS`, written through `INSERT … OVERRIDING SYSTEM VALUE`
+    (`import::overriding_clause`, `Some` on PostgreSQL alone) and its counter then settled like a
+    `BY DEFAULT` one's. Both used to be left out to take fresh values, and SQL Server reads *every*
+    identity as `identity_always`, so the copy renumbered `1..n` in whatever order the read
+    streamed under a success report — ids 2 and 4 came out 1 and 2 on a live server (per the
+    change's author). A `rowversion` is `identity_always` with no `auto_increment` and stays the
+    server's (`an_always_identity_is_copied_with_its_values`, `a_rowversion_is_not_copied`).
+    **The dump keeps its own rule**: it still renumbers a PostgreSQL `GENERATED ALWAYS` identity,
+    its shared renderer having no way to write the clause (under `dump.rs`), so the two differ on
+    exactly that column.
+    **`rows_read(database, src, dialect)` is everything the rows half needs** — `RowsRead { columns,
+    forms, select, overriding }`, `overriding` being whether a carried identity needs the clause —
+    and the UI's `CopyRowsRequest` carries it to `db::ImportTarget`. **A raw-bytes value is read as
+    text the server makes of it, never as the cell the grid shows.** Every engine's streamed read
+    renders one as `model::binary_display`'s `<n bytes>`, and the copy wrote that placeholder into
+    the target as the value: SQL Server refused it (Msg 257), the other three stored the nine
+    characters. `read_form(column, dialect)` picks the expression and the `import::CellForm` it
+    arrives in: MySQL/MariaDB binary and spatial types as `HEX(col)` and PostgreSQL `bytea` as
+    `encode(col, 'hex')` (`Hex`); SQL Server through the dump's own `dump::literal_select`
+    (`Server` — `varbinary`/`image`/CLR types as `0x…`, a `sql_variant` as its base type); and on
+    SQLite **every** column as `quote(col)` (`Quoted`), since a declared type there is only an
+    affinity and a blob can sit in any column — `quote()` is lossless for every storage class,
+    ±infinity included. Everything else is `Value`. `select_sql` is the read on the source: those
+    columns in table order, each as `read_form` reads it, qualified by `export::qualified_table`
+    and unsorted, since an insert needs no order
+    (`a_blob_is_read_as_text_the_write_turns_back_into_bytes`; SQLite's
+    `a_copy_carries_a_blob_byte_for_byte`).
+    **`chunk_refusal` is the net under `read_form`**, asked by `db`'s `ChunkRows` at the first row
+    of every streamed chunk: it fails the copy when a cell in a bytes column (`binary_columns` or
+    `Column::is_binary`) is still a placeholder (`model::is_binary_display`), or when any column hit
+    the chunk's arena cap (`capped_columns`), whose cells read blank past it. A type `read_form`
+    does not know — a SQL Server alias over `varbinary`, since the copy passes `literal_select` no
+    alias list — therefore stops the copy loudly instead of writing the placeholder
+    (`a_chunk_holding_a_bytes_placeholder_is_refused`, which also holds that prose reading
+    `<3 bytes>` in a text column passes; SQLite's `a_copy_never_writes_a_bytes_placeholder`).
     `rows_change(src)` is the preview's change-list line for the rows — *"Then copy every row of
     `<source>` into it (not shown as SQL)"*, the source through `schema::display_name`, so bare
     where it has no schema. The rows are no statement in the plan: `Db::copy_rows` streams them once
@@ -9319,14 +9372,18 @@ existing prose was left alone.
     identity under the import's `IDENTITY_INSERT` and SQLite's rowid do; a PostgreSQL identity's
     sequence does not, and would hand out `1` next on a table that already holds it. `settle_sql` is
     what runs on the target after the rows where it is `false` — per auto-increment column whose
-    values were copied, `SELECT setval(pg_get_serial_sequence('<qualified>', '<col>'),
+    values were copied, a carried `GENERATED ALWAYS` one included,
+    `SELECT setval(pg_get_serial_sequence('<qualified>', '<col>'),
     COALESCE(MAX(col), 0) + 1, false) FROM <qualified>`, the table name quoted inside the string so
     case and schema survive `pg_get_serial_sequence`'s parse, and `is_called = false` so the next
     value is exactly `MAX + 1`, and `1` on an empty table
     (`only_postgres_settles_its_counter_after_the_rows`). The live tier's
     `a_copied_table_has_every_row_and_numbers_on_past_them` is what proves it moved: it seeds ids
-    1–3, copies, settles and inserts one more row expecting id 4, and with PostgreSQL's settle
-    skipped it fails on a duplicate key at 1 (per the change's author).
+    1, 3 and 4 — the gap is what shows they were copied rather than renumbered — beside a blob and
+    the floats each engine can hold (PostgreSQL's NaN and infinities, SQLite's infinities), asserts
+    the copy's rows equal the source's with the bytes compared as hex, settles, and inserts one more
+    row expecting id 5; with PostgreSQL's settle skipped it fails on a duplicate key at 1 (per the
+    change's author, measured when the seed was ids 1–3).
   - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
     introspected `DbSchema` into a `DiagramGraph` — nodes = tables, edges = FKs — seeded either by
     `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one
@@ -19845,7 +19902,8 @@ existing prose was left alone.
   (`Db::import_rows`, under `lib.rs` below): one `BEGIN TRANSACTION`, batches pulled through the
   shared `next_batch_off_executor`, each required to insert exactly its own rows or the whole
   import rolls back. **The batches are literal SQL, not bound parameters** — the shared
-  `import::build_insert`, `N'…'` for text — where `commit_writes` binds: a bound batch spends a
+  `import::build_insert_as` through `ImportTarget::insert_sql`, `N'…'` for text — where
+  `commit_writes` binds: a bound batch spends a
   parameter per cell, SQL Server takes at most 2,100 per request, and 500 rows of five columns is
   already past it. The literal form has no such ceiling, and `INSERT_BATCH_ROWS`' 500 is under
   T-SQL's 1,000-row limit on a `VALUES` list — and the constant is shared with three engines that
@@ -20879,7 +20937,15 @@ existing prose was left alone.
   3,000 so it stays after one — and it was seen to fail with 2,000 rows committed when that send
   was removed (per the change's author). After the write, whatever it did, the read's child token
   is cancelled and the task awaited; the write's error wins over the read's. `progress` is called
-  with the rows handed to the writer so far, once per chunk.
+  with the rows handed to the writer so far, once per chunk. **`ChunkRows` vets each chunk before
+  handing over its first row**: when `copy_table::chunk_refusal` answers — a `<n bytes>`
+  placeholder in a bytes column, or a column past the chunk's arena cap — that is the reader's
+  error, and the write rolls back as it does on a bad record in a file, rather than writing a
+  value the read never had (`a_copy_never_writes_a_bytes_placeholder`). `ImportTarget` carries
+  the copy's `forms` and `overriding` (`copy_table::rows_read`) and derives `Default`, a file
+  import passing neither; its `insert_sql` is how all four engines' writers build a batch,
+  through `import::build_insert_as`, whose refusal of a cell not in its form's shape comes back
+  as a `DbError::Query`.
   `a_copy_moves_every_row_from_one_database_to_another` is the SQLite happy path; the live tier's
   `a_copied_table_has_every_row_and_numbers_on_past_them` runs it end to end — plan, rows, settle —
   in `runtime.rs` on MariaDB, MySQL 8 and PostgreSQL and under the same name in `mssql.rs`.
@@ -30810,7 +30876,8 @@ existing prose was left alone.
     `changes`, so the heading counts the rows as a change of their own — they are no statement in
     the script, and without the line the preview read as a structure-only copy while Apply went on
     to write every row — and sets a `then` (`DdlPreview::then`, under `ddl_preview.rs`) carrying a
-    `CopyRowsRequest` built at that moment — the `select_sql`, the `columns` and the `settle_sql`.
+    `CopyRowsRequest` built at that moment — `copy_table::rows_read`'s `select`, `columns`, `forms`
+    and `overriding`, and the `settle_sql`.
     So the write guard and the target's read-only flag are the preview's, asked at Apply, and a
     `CREATE` that fails, is declined or is superseded copies no rows. `then` closes the preview
     through `ddl_preview::close_preview` — the one door, so the SQL box is cleared with it —

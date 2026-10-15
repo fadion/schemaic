@@ -4624,6 +4624,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 schema: req.target.schema.as_deref(),
                                 table: &req.target.table.name,
                                 columns: &columns,
+                                ..Default::default()
                             },
                             &mut rows,
                             token,
@@ -9901,7 +9902,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // — and `settle` moves a PostgreSQL identity's counter past the copied
     // values afterwards. Progress is a channel, the dump's way, because
     // `create_ext_action` answers once.
-    let copy_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+    // The running copy's launch number beside its token: a superseded copy's
+    // report releases the slot only while it is still its own
+    // (`copy_table::release`).
+    let copy_token: Rc<RefCell<Option<(u64, CancellationToken)>>> = Rc::new(RefCell::new(None));
     let (copy_tx, copy_rx) = crossbeam_channel::unbounded::<u64>();
     {
         let stream = create_signal_from_channel(copy_rx);
@@ -9948,7 +9952,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                 };
                 let token = CancellationToken::new();
-                *copy_token.borrow_mut() = Some(token.clone());
+                let launch =
+                    schemaic_core::copy_table::launch(&mut copy_token.borrow_mut(), token.clone());
                 let target_label = [
                     Some(req.target.database.as_str()),
                     req.target.schema.as_deref(),
@@ -9973,7 +9978,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         cx,
                         move |res: Result<u64, (Option<u64>, Option<String>)>| {
                             use schemaic_core::write_log::Outcome;
-                            *copy_token.borrow_mut() = None;
+                            schemaic_core::copy_table::release(
+                                &mut copy_token.borrow_mut(),
+                                launch,
+                            );
                             // `(committed, message)`: the rows that were in before
                             // what failed — the settle runs after they committed —
                             // and what did.
@@ -10020,6 +10028,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 schema: req.target.schema.as_deref(),
                                 table: &req.target.name,
                                 columns: &req.columns,
+                                forms: &req.forms,
+                                overriding: req.overriding,
                             },
                             token.clone(),
                             &progress,
@@ -10044,7 +10054,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let copy_cancel: Rc<dyn Fn()> = {
         let copy_token = copy_token.clone();
         Rc::new(move || {
-            if let Some(t) = copy_token.borrow().as_ref() {
+            if let Some((_, t)) = copy_token.borrow().as_ref() {
                 t.cancel();
             }
         })

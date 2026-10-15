@@ -2770,8 +2770,63 @@ pub fn build_insert(
     rows: &[Vec<Value>],
     dialect: SqlDialect,
 ) -> Option<String> {
+    // Every cell is a plain value here, and only another form can be refused.
+    build_insert_as(database, schema, table, columns, rows, dialect, &[], false)
+        .ok()
+        .flatten()
+}
+
+/// How a cell reached the writer: as the value itself, or as a lossless text
+/// form the read asked the server for, because the value has none of its own
+/// in [`Value`] — the bytes of a blob, above all, which every engine's read
+/// otherwise renders as the `<n bytes>` placeholder (`model::binary_display`).
+///
+/// What *Copy to* reads (`copy_table::rows_read`); a file import's cells are
+/// all [`CellForm::Value`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CellForm {
+    /// The value — [`import_literal`].
+    #[default]
+    Value,
+    /// The bytes as hex digits (MySQL's `HEX()`, PostgreSQL's
+    /// `encode(…, 'hex')`), written as the engine's bytes literal.
+    Hex,
+    /// The SQL text SQL Server rendered the cell as
+    /// ([`crate::dump::literal_select`]), checked to its form's shape.
+    Server(crate::export::ServerLiteral),
+    /// SQLite's `quote()` of the cell — lossless for every storage class, a
+    /// blob in a `TEXT` column included — checked to be one of its shapes.
+    Quoted,
+}
+
+/// The clause that lets an `INSERT` write a value into an identity column the
+/// server otherwise numbers itself — PostgreSQL's `GENERATED ALWAYS AS
+/// IDENTITY` — or `None` where the engine has none (SQL Server's switch is a
+/// session setting, `dump::identity_insert_sql`, not a clause).
+pub fn overriding_clause(dialect: SqlDialect) -> Option<&'static str> {
+    match dialect {
+        SqlDialect::Postgres => Some("OVERRIDING SYSTEM VALUE"),
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+    }
+}
+
+/// [`build_insert`] with each column's [`CellForm`] (`forms` empty: every one a
+/// value), and `overriding` asking for [`overriding_clause`]. `Err` names a
+/// cell whose text is not the shape its form promises — written, it would be
+/// a wrong value rather than a refusal, so nothing is.
+#[allow(clippy::too_many_arguments)]
+pub fn build_insert_as(
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    columns: &[&str],
+    rows: &[Vec<Value>],
+    dialect: SqlDialect,
+    forms: &[CellForm],
+    overriding: bool,
+) -> Result<Option<String>, String> {
     if rows.is_empty() || columns.is_empty() {
-        return None;
+        return Ok(None);
     }
     let q = |s: &str| crate::export::ident_sql(s, dialect);
     // How a table is addressed per engine is `export::qualified_table`'s rule —
@@ -2779,19 +2834,126 @@ pub fn build_insert(
     // reach one and not the other.
     let target = crate::export::qualified_table(database, schema, table, dialect);
     let cols = columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
-    let values = rows
-        .iter()
-        .map(|r| {
-            let cells = r
-                .iter()
-                .map(|v| crate::export::sql_literal(v, dialect))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({cells})")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!("INSERT INTO {target} ({cols}) VALUES {values}"))
+    let mut values = Vec::with_capacity(rows.len());
+    for r in rows {
+        let mut cells = Vec::with_capacity(r.len());
+        for (i, v) in r.iter().enumerate() {
+            let form = forms.get(i).copied().unwrap_or_default();
+            cells.push(cell_literal(v, form, dialect).ok_or_else(|| {
+                format!(
+                    "the value read for {} is not the form the copy asked for, so nothing was written",
+                    columns.get(i).copied().unwrap_or("a column")
+                )
+            })?);
+        }
+        values.push(format!("({})", cells.join(", ")));
+    }
+    let overriding = match overriding.then(|| overriding_clause(dialect)).flatten() {
+        Some(clause) => format!(" {clause}"),
+        None => String::new(),
+    };
+    Ok(Some(format!(
+        "INSERT INTO {target} ({cols}){overriding} VALUES {}",
+        values.join(", ")
+    )))
+}
+
+/// One cell of an `INSERT` this module writes, in its [`CellForm`] — `None`
+/// when a server-rendered text is not that form's shape. `NULL` is `NULL` in
+/// every form.
+fn cell_literal(v: &Value, form: CellForm, dialect: SqlDialect) -> Option<String> {
+    let text = match (form, v) {
+        (CellForm::Value, v) => return Some(import_literal(v, dialect)),
+        (_, Value::Null) => return Some("NULL".to_string()),
+        (_, Value::Str(s)) => s.as_str(),
+        // A form's read is text by construction; a number here is not its
+        // answer.
+        (_, _) => return None,
+    };
+    match form {
+        CellForm::Value => None,
+        CellForm::Hex => {
+            if !text.bytes().all(|b| b.is_ascii_hexdigit()) || text.len() % 2 != 0 {
+                return None;
+            }
+            Some(match dialect {
+                SqlDialect::MySql | SqlDialect::Sqlite => format!("X'{text}'"),
+                // `decode`, not `'\x…'`: it reads the same whatever the
+                // session's `standard_conforming_strings`.
+                SqlDialect::Postgres => format!("decode('{text}', 'hex')"),
+                SqlDialect::MsSql => format!("0x{text}"),
+            })
+        }
+        CellForm::Server(f) => crate::export::server_literal(f, text),
+        CellForm::Quoted => sqlite_quoted(text).then(|| text.to_string()),
+    }
+}
+
+/// Is `s` one of the shapes SQLite's `quote()` writes — `NULL`, an integer, a
+/// real (`1.5`, `9.0e+999`), a string literal with its quotes doubled, or a
+/// blob `X'…'`? Nothing else may reach the statement as SQL.
+fn sqlite_quoted(s: &str) -> bool {
+    if s == "NULL" {
+        return true;
+    }
+    if let Some(hex) = s.strip_prefix("X'").and_then(|h| h.strip_suffix('\'')) {
+        return hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    if let Some(body) = s.strip_prefix('\'').and_then(|b| b.strip_suffix('\'')) {
+        // Every quote inside is one of a doubled pair.
+        return body.split("''").all(|part| !part.contains('\''));
+    }
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    !digits.is_empty()
+        && digits.as_bytes()[0].is_ascii_digit()
+        && digits
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+        && s.parse::<f64>().is_ok()
+}
+
+/// A value as an import writes it: [`crate::export::sql_literal`], except a
+/// **non-finite float**, which the export writes `NULL` — a stated rule for a
+/// file, and a silent loss in a table being reproduced. Here it is the
+/// engine's own literal where it has one ([`non_finite_literal`]).
+pub fn import_literal(v: &Value, dialect: SqlDialect) -> String {
+    match v {
+        Value::Float(f) if !f.is_finite() => non_finite_literal(*f, dialect)
+            .unwrap_or_else(|| crate::export::sql_literal(v, dialect)),
+        v => crate::export::sql_literal(v, dialect),
+    }
+}
+
+/// The literal `dialect` reads back as the non-finite float `f`, or `None`
+/// where a column cannot hold one at all — MySQL and SQL Server refuse every
+/// non-finite value, so none can be read from them to write.
+///
+/// SQLite stores ±infinity (`9e999` overflows to it) but no NaN: it reads one
+/// as `NULL`, so `NULL` *is* its NaN.
+pub fn non_finite_literal(f: f64, dialect: SqlDialect) -> Option<String> {
+    match dialect {
+        SqlDialect::Postgres => Some(
+            if f.is_nan() {
+                "'NaN'::float8"
+            } else if f > 0.0 {
+                "'Infinity'::float8"
+            } else {
+                "'-Infinity'::float8"
+            }
+            .to_string(),
+        ),
+        SqlDialect::Sqlite => Some(
+            if f.is_nan() {
+                "NULL"
+            } else if f > 0.0 {
+                "9e999"
+            } else {
+                "-9e999"
+            }
+            .to_string(),
+        ),
+        SqlDialect::MySql | SqlDialect::MsSql => None,
+    }
 }
 
 #[cfg(test)]
@@ -3581,6 +3743,142 @@ mod tests {
         let rows = vec![vec![Value::Str("x'; DROP TABLE t; --".into())]];
         let sql = build_insert("db", None, "t", &["c"], &rows, MySql).unwrap();
         assert!(sql.contains("'x''; DROP TABLE t; --'"), "{sql}");
+    }
+
+    /// **A non-finite float is written as the engine reads one** — the export's
+    /// `NULL` for it is a file's rule, and an import or a copy writing it lost
+    /// the value without a word, or failed a `NOT NULL` column naming no float.
+    #[test]
+    fn a_non_finite_float_is_written_as_the_engines_own_literal() {
+        let rows = vec![vec![
+            Value::Float(f64::NAN),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Float(0.5),
+        ]];
+        let cols = ["a", "b", "c", "d"];
+        assert_eq!(
+            build_insert("db", None, "t", &cols, &rows, Postgres).unwrap(),
+            "INSERT INTO \"db\".\"t\" (\"a\", \"b\", \"c\", \"d\") VALUES \
+             ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8, 0.5)"
+        );
+        assert!(
+            build_insert("main", None, "t", &cols, &rows, SqlDialect::Sqlite)
+                .unwrap()
+                .ends_with("VALUES (NULL, 9e999, -9e999, 0.5)")
+        );
+        // The export keeps its own rule.
+        assert_eq!(
+            crate::export::sql_literal(&Value::Float(f64::INFINITY), Postgres),
+            "NULL"
+        );
+    }
+
+    /// Each form's text becomes the engine's literal, and a text that is not
+    /// the shape its form promises refuses the batch rather than being written.
+    #[test]
+    fn a_carried_cell_is_written_as_its_form_and_checked_first() {
+        let hex = |d: SqlDialect, v: &str| {
+            build_insert_as(
+                "db",
+                None,
+                "t",
+                &["b"],
+                &[vec![Value::Str(v.into())]],
+                d,
+                &[CellForm::Hex],
+                false,
+            )
+        };
+        assert!(
+            hex(MySql, "00FF10")
+                .unwrap()
+                .unwrap()
+                .ends_with("VALUES (X'00FF10')")
+        );
+        assert!(hex(MySql, "").unwrap().unwrap().ends_with("VALUES (X'')"));
+        assert!(
+            hex(Postgres, "00ff")
+                .unwrap()
+                .unwrap()
+                .ends_with("VALUES (decode('00ff', 'hex'))")
+        );
+        assert!(hex(MySql, "<3 bytes>").is_err(), "a placeholder is not hex");
+        assert!(hex(MySql, "0'); DROP TABLE t; --").is_err());
+        let null = build_insert_as(
+            "db",
+            None,
+            "t",
+            &["b"],
+            &[vec![Value::Null]],
+            MySql,
+            &[CellForm::Hex],
+            false,
+        );
+        assert!(null.unwrap().unwrap().ends_with("VALUES (NULL)"));
+
+        let quoted = |v: &str| {
+            build_insert_as(
+                "main",
+                None,
+                "t",
+                &["c"],
+                &[vec![Value::Str(v.into())]],
+                SqlDialect::Sqlite,
+                &[CellForm::Quoted],
+                false,
+            )
+        };
+        for ok in [
+            "NULL", "42", "-7", "0.1", "9.0e+999", "-1.5e-07", "'it''s'", "''", "X'00FF'", "X''",
+        ] {
+            assert!(
+                quoted(ok)
+                    .unwrap()
+                    .unwrap()
+                    .ends_with(&format!("VALUES ({ok})")),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "'a'); DROP TABLE t; --'",
+            "'unclosed",
+            "abc",
+            "X'0'",
+            "1; DROP TABLE t",
+            "-",
+            "",
+        ] {
+            assert!(quoted(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// PostgreSQL's `GENERATED ALWAYS` takes a written value only under the
+    /// clause; asked of an engine that has none, nothing is added.
+    #[test]
+    fn overriding_puts_the_clause_before_values_where_the_engine_has_one() {
+        let rows = vec![vec![Value::Int(5)]];
+        assert_eq!(
+            build_insert_as(
+                "db",
+                Some("public"),
+                "t",
+                &["id"],
+                &rows,
+                Postgres,
+                &[],
+                true
+            )
+            .unwrap()
+            .unwrap(),
+            "INSERT INTO \"public\".\"t\" (\"id\") OVERRIDING SYSTEM VALUE VALUES (5)"
+        );
+        assert_eq!(
+            build_insert_as("db", None, "t", &["id"], &rows, MySql, &[], true)
+                .unwrap()
+                .unwrap(),
+            "INSERT INTO `db`.`t` (`id`) VALUES (5)"
+        );
     }
 
     // ── reading + validating ────────────────────────────────────────────────

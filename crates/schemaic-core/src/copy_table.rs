@@ -19,9 +19,16 @@
 //! - **Triggers**, which are not part of a table's draft and run code the
 //!   target may not have.
 //! - **The values of a column the server assigns and refuses** — a generated
-//!   column, recomputed from its expression, and PostgreSQL's `GENERATED ALWAYS
-//!   AS IDENTITY`, which takes fresh numbers ([`crate::schema::ColumnInfo::is_server_assigned`],
-//!   the import's own rule).
+//!   column, recomputed from its expression, and a SQL Server `rowversion`
+//!   ([`crate::schema::ColumnInfo::is_server_assigned`], the import's own rule).
+//!   **An identity is not one of them**, though the server numbers it: its
+//!   values are the table's keys, so SQL Server's and PostgreSQL's
+//!   `GENERATED ALWAYS` are written as they are ([`carries_identity`]).
+//!
+//! **Every value comes as it is**, bytes included: a blob is read as text the
+//! server makes of it and written back as bytes ([`read_form`]), and a cell
+//! the read could not carry stops the copy rather than reaching the target
+//! ([`chunk_refusal`]).
 
 use crate::ddl::{self, ChangeSet, CheckDraft, ColumnDraft, IndexDraft, TableDraft};
 use crate::export::{ident_sql, qualified_table};
@@ -122,18 +129,136 @@ pub fn plan(src: &TableInfo, to: &CopyTarget, dialect: SqlDialect) -> ChangeSet 
 }
 
 /// The columns whose values are copied, in table order: every one but those
-/// the server assigns and refuses a value for.
-pub fn columns(src: &TableInfo) -> Vec<String> {
+/// the server assigns and refuses a value for — **except an identity the
+/// write can carry** ([`carries_identity`]), whose values are the table's
+/// keys.
+pub fn columns(src: &TableInfo, dialect: SqlDialect) -> Vec<String> {
     src.columns
         .iter()
-        .filter(|c| !c.is_server_assigned())
+        .filter(|c| copies(c, dialect))
         .map(|c| c.name.clone())
         .collect()
 }
 
-/// The read on the source: `columns` of the table, in that order, unsorted —
-/// the rows arrive in whatever order the server streams them, which is all an
-/// insert needs.
+/// Is `c`'s value read and written by the copy?
+fn copies(c: &crate::schema::ColumnInfo, dialect: SqlDialect) -> bool {
+    !c.is_server_assigned() || carries_identity(c, dialect)
+}
+
+/// Is `c` an identity the server numbers itself and refuses a value for, which
+/// the copy writes anyway — so that the copy keeps the source's keys rather
+/// than numbering its rows `1..n` in whatever order the read streamed them?
+///
+/// SQL Server's, under the import's `IDENTITY_INSERT` (the dump's own rule,
+/// [`crate::dump::carries_identity`]), and PostgreSQL's `GENERATED ALWAYS`,
+/// through an `INSERT … OVERRIDING SYSTEM VALUE`
+/// ([`crate::import::overriding_clause`]) — which the dump has no way to write,
+/// and so renumbers. A `rowversion` is no identity, and stays the server's.
+pub fn carries_identity(c: &crate::schema::ColumnInfo, dialect: SqlDialect) -> bool {
+    crate::dump::carries_identity(c, dialect)
+        || (c.auto_increment
+            && c.generated.is_none()
+            && crate::import::overriding_clause(dialect).is_some())
+}
+
+/// Everything the rows half needs to read the source and write the target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowsRead {
+    /// [`columns`], in table order.
+    pub columns: Vec<String>,
+    /// How each of them arrives, in the same order — [`read_form`].
+    pub forms: Vec<crate::import::CellForm>,
+    /// The read on the source — [`select_sql`].
+    pub select: String,
+    /// Whether the write needs [`crate::import::overriding_clause`]: a carried
+    /// identity is among `columns` on an engine that asks for it per `INSERT`.
+    pub overriding: bool,
+}
+
+/// The read *Copy to* runs on `database`'s `src`, and how its cells are
+/// written.
+pub fn rows_read(database: &str, src: &TableInfo, dialect: SqlDialect) -> RowsRead {
+    let columns = columns(src, dialect);
+    let forms = columns
+        .iter()
+        .map(|name| {
+            src.columns
+                .iter()
+                .find(|c| &c.name == name)
+                .map_or(crate::import::CellForm::Value, |c| read_form(c, dialect).1)
+        })
+        .collect();
+    let overriding = crate::import::overriding_clause(dialect).is_some()
+        && src
+            .columns
+            .iter()
+            .any(|c| c.is_server_assigned() && carries_identity(c, dialect));
+    RowsRead {
+        select: select_sql(database, src, &columns, dialect),
+        columns,
+        forms,
+        overriding,
+    }
+}
+
+/// How the copy reads `c`: the expression in the `SELECT` and the form the
+/// value arrives in.
+///
+/// **A raw-bytes value has no text of its own** — every engine's read renders
+/// it as the `<n bytes>` placeholder, which the copy wrote into the target as
+/// the data — so it is read as text the server makes of it, and written back
+/// as bytes: hex on MySQL and PostgreSQL, SQL Server's own literal (as its
+/// dump reads it, `dump::literal_select`, a `sql_variant` too), and on SQLite
+/// `quote()` of *every* column, since a declared type there is only an
+/// affinity and a blob can sit in any of them. A column this misses still
+/// arrives as the placeholder, and [`chunk_refusal`] stops the copy on it.
+pub fn read_form(
+    c: &crate::schema::ColumnInfo,
+    dialect: SqlDialect,
+) -> (String, crate::import::CellForm) {
+    use crate::import::CellForm;
+    let col = ident_sql(&c.name, dialect);
+    let head = c
+        .type_name
+        .split(|ch: char| ch == '(' || ch.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match dialect {
+        SqlDialect::MySql
+            if crate::model::type_is_binary(&head) || MYSQL_SPATIAL.contains(&head.as_str()) =>
+        {
+            (format!("HEX({col}) AS {col}"), CellForm::Hex)
+        }
+        SqlDialect::Postgres if head == "bytea" => {
+            (format!("encode({col}, 'hex') AS {col}"), CellForm::Hex)
+        }
+        SqlDialect::MsSql => match crate::dump::literal_select(c, &[], dialect) {
+            Some((expr, form)) => (expr, CellForm::Server(form)),
+            None => (col, CellForm::Value),
+        },
+        SqlDialect::Sqlite => (format!("quote({col}) AS {col}"), CellForm::Quoted),
+        SqlDialect::MySql | SqlDialect::Postgres => (col, CellForm::Value),
+    }
+}
+
+/// MySQL's and MariaDB's spatial types, which the server sends as their
+/// internal bytes and takes back as the same.
+const MYSQL_SPATIAL: &[&str] = &[
+    "geometry",
+    "point",
+    "linestring",
+    "polygon",
+    "multipoint",
+    "multilinestring",
+    "multipolygon",
+    "geometrycollection",
+    "geomcollection",
+];
+
+/// The read on the source: `columns` of the table, in that order, each as
+/// [`read_form`] reads it, unsorted — the rows arrive in whatever order the
+/// server streams them, which is all an insert needs.
 pub fn select_sql(
     database: &str,
     src: &TableInfo,
@@ -142,13 +267,49 @@ pub fn select_sql(
 ) -> String {
     let list = columns
         .iter()
-        .map(|c| ident_sql(c, dialect))
+        .map(|name| match src.columns.iter().find(|c| &c.name == name) {
+            Some(c) => read_form(c, dialect).0,
+            None => ident_sql(name, dialect),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
         "SELECT {list} FROM {}",
         qualified_table(database, src.schema.as_deref(), &src.name, dialect)
     )
+}
+
+/// Why a chunk of the copy's read must not be written, or `None`.
+///
+/// The safety net under [`read_form`]: a cell that still arrived as the
+/// `<n bytes>` placeholder in a column holding bytes (`model::is_binary_display`
+/// — a type `read_form` does not know, a SQL Server alias over `varbinary`) is
+/// a value the copy does not have, and so is every cell of a column whose text
+/// outgrew the chunk's arena (`ResultSet::capped_columns`), which reads blank
+/// past that point. Written, either is a wrong value under a success report.
+pub fn chunk_refusal(rs: &crate::model::ResultSet) -> Option<String> {
+    if let Some(&c) = rs.capped_columns.first() {
+        let name = rs.columns.get(c).map_or("a column", |c| c.name.as_str());
+        return Some(format!(
+            "{name} holds more text than one read can carry, so the copy stopped before writing it"
+        ));
+    }
+    for (c, col) in rs.columns.iter().enumerate() {
+        if !(rs.binary_columns.contains(&c) || col.is_binary()) {
+            continue;
+        }
+        let placeholder = (0..rs.row_count()).any(|r| {
+            rs.cell(r, c)
+                .is_some_and(|v| !v.is_null() && crate::model::is_binary_display(v.text()))
+        });
+        if placeholder {
+            return Some(format!(
+                "{} holds bytes the copy cannot read as they are, so it stopped before writing them",
+                col.name
+            ));
+        }
+    }
+    None
 }
 
 /// Does an explicit value written into an auto-numbered column move the
@@ -174,7 +335,7 @@ pub fn settle_sql(to: &CopyTarget, src: &TableInfo, dialect: SqlDialect) -> Vec<
     let table = qualified_table(&to.database, to.schema.as_deref(), &to.name, dialect);
     src.columns
         .iter()
-        .filter(|c| c.auto_increment && !c.is_server_assigned())
+        .filter(|c| c.auto_increment && copies(c, dialect))
         .map(|c| {
             let col = ident_sql(&c.name, dialect);
             // `pg_get_serial_sequence` parses its first argument as a name —
@@ -188,6 +349,27 @@ pub fn settle_sql(to: &CopyTarget, src: &TableInfo, dialect: SqlDialect) -> Vec<
             )
         })
         .collect()
+}
+
+/// Put a running copy's cancel handle in the one slot Stop and ✕ read,
+/// returning the launch's number for [`release`].
+pub fn launch<T>(slot: &mut Option<(u64, T)>, handle: T) -> u64 {
+    let n = LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *slot = Some((n, handle));
+    n
+}
+
+/// Every launch's number is new, the slot emptied or not.
+static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A finished copy's report: empty the slot **only if it still holds this
+/// launch's handle**. A copy closed mid-way can still be rolling back when the
+/// next one starts, and its report clearing the slot left the newer copy's
+/// Stop and ✕ cancelling nothing.
+pub fn release<T>(slot: &mut Option<(u64, T)>, launch: u64) {
+    if slot.as_ref().is_some_and(|(n, _)| *n == launch) {
+        *slot = None;
+    }
 }
 
 /// The change-list line for the rows half, beside the `CREATE TABLE`'s own.
@@ -347,25 +529,60 @@ mod tests {
 
     #[test]
     fn a_generated_column_is_not_read_or_written() {
+        for d in [PG, SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Sqlite] {
+            assert_eq!(
+                columns(&orders(), d),
+                vec!["id".to_string(), "total".to_string()],
+                "{d:?}"
+            );
+        }
+    }
+
+    /// **A copy keeps the source's keys.** SQL Server reads every identity as
+    /// one the server assigns (`identity_always`), and leaving it out of the
+    /// copied columns numbered the copy's rows `1..n` in the order the read
+    /// streamed them — ids 5, 10, 42 became 1, 2, 3 under a success report.
+    /// PostgreSQL's `GENERATED ALWAYS` was renumbered the same way; it is
+    /// written through `OVERRIDING SYSTEM VALUE`, and its counter settled.
+    #[test]
+    fn an_always_identity_is_copied_with_its_values() {
+        let mut t = orders();
+        t.columns[0].identity_always = true;
+        for d in [PG, SqlDialect::MsSql] {
+            assert_eq!(
+                columns(&t, d),
+                vec!["id".to_string(), "total".to_string()],
+                "{d:?}"
+            );
+        }
+        assert!(rows_read("shop", &t, PG).overriding);
+        assert!(!rows_read("shop", &t, SqlDialect::MsSql).overriding);
         assert_eq!(
-            columns(&orders()),
-            vec!["id".to_string(), "total".to_string()]
+            settle_sql(&to("o"), &t, PG).len(),
+            1,
+            "the counter moves past them"
         );
     }
 
+    /// A `rowversion` is the server's and no identity: it stays out, and
+    /// nothing asks for an override on its account.
     #[test]
-    fn an_always_identity_takes_fresh_values() {
+    fn a_rowversion_is_not_copied() {
         let mut t = orders();
-        t.columns[0].identity_always = true;
-        assert_eq!(columns(&t), vec!["total".to_string()]);
-        assert!(settle_sql(&to("o"), &t, PG).is_empty());
+        t.columns[1].identity_always = true;
+        assert_eq!(
+            columns(&t, SqlDialect::MsSql),
+            vec!["id".to_string()],
+            "total stood in for a rowversion"
+        );
+        assert!(!rows_read("shop", &t, PG).overriding);
     }
 
     #[test]
     fn the_read_names_the_source_and_its_columns_in_order() {
         let t = orders();
         assert_eq!(
-            select_sql("shop", &t, &columns(&t), PG),
+            select_sql("shop", &t, &columns(&t, PG), PG),
             "SELECT \"id\", \"total\" FROM \"public\".\"orders\""
         );
         assert_eq!(
@@ -375,11 +592,86 @@ mod tests {
                     schema: None,
                     ..t.clone()
                 },
-                &columns(&t),
+                &columns(&t, SqlDialect::MySql),
                 SqlDialect::MySql
             ),
             "SELECT `id`, `total` FROM `shop`.`orders`"
         );
+    }
+
+    fn blob_table(ty: &str) -> TableInfo {
+        let mut t = orders();
+        t.columns[1].type_name = ty.into();
+        t.columns[1].name = "body".into();
+        t
+    }
+
+    /// **A blob is read as text the server makes of it**, never as the
+    /// `<n bytes>` the grid shows, and written back as bytes.
+    #[test]
+    fn a_blob_is_read_as_text_the_write_turns_back_into_bytes() {
+        use crate::export::ServerLiteral;
+        use crate::import::CellForm;
+        let my = rows_read("shop", &blob_table("longblob"), SqlDialect::MySql);
+        assert_eq!(
+            my.select,
+            "SELECT `id`, HEX(`body`) AS `body` FROM `public`.`orders`"
+        );
+        assert_eq!(my.forms, vec![CellForm::Value, CellForm::Hex]);
+        let pg = rows_read("shop", &blob_table("bytea"), PG);
+        assert!(
+            pg.select.contains("encode(\"body\", 'hex') AS \"body\""),
+            "{}",
+            pg.select
+        );
+        assert_eq!(pg.forms[1], CellForm::Hex);
+        let ms = rows_read("shop", &blob_table("varbinary(max)"), SqlDialect::MsSql);
+        assert!(ms.select.contains("CONVERT(varchar(max)"), "{}", ms.select);
+        assert_eq!(ms.forms[1], CellForm::Server(ServerLiteral::Hex));
+        // SQLite: every column, since any of them can hold a blob.
+        let lite = rows_read("main", &blob_table("TEXT"), SqlDialect::Sqlite);
+        assert_eq!(lite.forms, vec![CellForm::Quoted, CellForm::Quoted]);
+        assert!(
+            lite.select.contains("quote(\"body\") AS \"body\""),
+            "{}",
+            lite.select
+        );
+        // A MySQL spatial value is bytes on the wire as well.
+        assert_eq!(
+            rows_read("shop", &blob_table("point"), SqlDialect::MySql).forms[1],
+            CellForm::Hex
+        );
+        // And text stays text.
+        assert_eq!(
+            rows_read("shop", &blob_table("text"), PG).forms[1],
+            CellForm::Value
+        );
+    }
+
+    fn chunk(ty: &str, cells: Vec<crate::model::Value>) -> crate::model::ResultSet {
+        let col = crate::model::Column {
+            name: "body".into(),
+            type_name: ty.into(),
+            origin: None,
+        };
+        crate::model::ResultSet::from_rows(vec![col], cells.into_iter().map(|v| vec![v]).collect())
+    }
+
+    /// **The safety net**: a placeholder that reached the read anyway stops
+    /// the copy before it is written — and a row of prose that merely looks
+    /// like one in a text column does not.
+    #[test]
+    fn a_chunk_holding_a_bytes_placeholder_is_refused() {
+        use crate::model::Value;
+        let blob = chunk("varbinary", vec![Value::Str("<3 bytes>".into())]);
+        assert!(chunk_refusal(&blob).is_some_and(|w| w.contains("body")));
+        let text = chunk("text", vec![Value::Str("<3 bytes>".into())]);
+        assert_eq!(chunk_refusal(&text), None);
+        let hex = chunk("varbinary", vec![Value::Str("00ff".into()), Value::Null]);
+        assert_eq!(chunk_refusal(&hex), None);
+        let mut capped = chunk("text", vec![Value::Str("x".into())]);
+        capped.capped_columns = vec![0];
+        assert!(chunk_refusal(&capped).is_some());
     }
 
     #[test]
@@ -420,6 +712,26 @@ mod tests {
             rows_change(&t),
             "Then copy every row of orders into it (not shown as SQL)"
         );
+    }
+
+    /// **A finished copy releases only its own cancel handle.** Copy A, closed
+    /// mid-copy, can still be rolling back when copy B starts; A's report
+    /// landing then cleared the one shared slot, and B's Stop and ✕ cancelled
+    /// nothing.
+    #[test]
+    fn a_finished_copy_does_not_clear_a_newer_copys_token() {
+        let mut slot = None;
+        let a = launch(&mut slot, "A");
+        let b = launch(&mut slot, "B");
+        release(&mut slot, a);
+        assert_eq!(
+            slot.as_ref().map(|(_, t)| *t),
+            Some("B"),
+            "B can still be stopped"
+        );
+        release(&mut slot, b);
+        assert_eq!(slot, None);
+        assert_ne!(a, b);
     }
 
     #[test]

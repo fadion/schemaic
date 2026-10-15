@@ -354,7 +354,7 @@ pub fn identity_insert_sql(dialect: SqlDialect, table: &str) -> Option<(String, 
 
 /// Is `c` an identity a dump in `dialect` writes back under
 /// [`identity_insert_sql`], though the server would otherwise assign it?
-fn carries_identity(c: &crate::schema::ColumnInfo, dialect: SqlDialect) -> bool {
+pub(crate) fn carries_identity(c: &crate::schema::ColumnInfo, dialect: SqlDialect) -> bool {
     c.auto_increment && c.generated.is_none() && identity_insert_sql(dialect, "").is_some()
 }
 
