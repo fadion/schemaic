@@ -9244,6 +9244,13 @@ existing prose was left alone.
     parent's cloned, so drawn, every partition repeated the parent's card and drew one more edge into
     the same table. A `DiagramSeed::Table` naming a partition seeds its topmost ancestor's diagram
     instead (`DbSchema::listed_as`) (`a_partition_is_drawn_as_its_parent`).
+    **Nor is a key the server cloned an edge** (`ForeignKeyInfo::inherited`, skipped in the seed's
+    referenced sweep, its referencing sweep and the edge loop alike). PostgreSQL clones a key onto
+    a partitioned table once per partition on the *referencing* table, each clone pointing at a
+    partition — and a partition is no card, so every clone became a `NodeKind::Stub` for a table
+    the schema holds, one per partition per referencing table. The original key is the edge drawn;
+    on a partition the clone is its parent's, whose card already carries it
+    (`a_key_cloned_onto_each_partition_draws_no_stub`).
     `fit_toolbar` is the diagram **toolbar's responsive rule**, and it is here rather than in the
     view because it is arithmetic over widths: given the room available and what each optional
     group costs, it drops them in a fixed priority order — the count pills, then the zoom stepper,

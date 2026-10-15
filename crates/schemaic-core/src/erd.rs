@@ -229,7 +229,7 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
             let mut set: HashSet<String> = HashSet::new();
             set.insert(node_id(seed_t));
             // Tables the seed references (same-database targets only).
-            for fk in &seed_t.foreign_keys {
+            for fk in seed_t.foreign_keys.iter().filter(|fk| !fk.inherited) {
                 let (to, cross) = target_id(seed_t, fk, current_db);
                 if !cross && by_id.contains_key(&to) {
                     set.insert(to);
@@ -239,7 +239,7 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
             for t in schema.tables.iter().filter(drawable) {
                 if t.foreign_keys.iter().any(|fk| {
                     let (to, cross) = target_id(t, fk, current_db);
-                    !cross && to == *seed_id
+                    !fk.inherited && !cross && to == *seed_id
                 }) {
                     set.insert(node_id(t));
                 }
@@ -262,7 +262,12 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
     let mut stubs: Vec<String> = Vec::new();
     for child in &included {
         let from_id = node_id(child);
-        for fk in &child.foreign_keys {
+        // **A key the server cloned is not an edge of its own** — the
+        // original is drawn. On a partition that is its parent's key; on a
+        // table referencing a partitioned one it is a clone onto each
+        // partition, whose target is no card, and each drew a stub for a
+        // table that is in the schema.
+        for fk in child.foreign_keys.iter().filter(|fk| !fk.inherited) {
             // The `cross` half is no longer read: what an unresolvable target
             // means is decided by the seed and by whose edge it is, not by
             // which database it points into — see the `Table` arm below.
@@ -1723,6 +1728,57 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+    }
+
+    /// **A key onto a partitioned table is cloned onto each partition, on the
+    /// referencing table** — and those clones are not edges. The partitions
+    /// are not cards, so each clone's target became a stub: a "not in this
+    /// schema" card for a table that is, one per partition per referencing
+    /// table.
+    #[test]
+    fn a_key_cloned_onto_each_partition_draws_no_stub() {
+        let mut s = shop();
+        let mut part = s
+            .tables
+            .iter()
+            .find(|t| t.name == "orders")
+            .unwrap()
+            .clone();
+        part.name = "orders_2024".into();
+        for fk in &mut part.foreign_keys {
+            fk.inherited = true;
+        }
+        part.partition_of = Some(crate::schema::PartitionOf {
+            schema: None,
+            parent: "orders".into(),
+            bound: "DEFAULT".into(),
+        });
+        s.tables.push(part);
+        let details = s
+            .tables
+            .iter_mut()
+            .find(|t| t.name == "orderdetails")
+            .unwrap();
+        details.foreign_keys.push(ForeignKeyInfo {
+            inherited: true,
+            ..fk(&["order_id"], "orders_2024", &["id"])
+        });
+        for seed in [
+            DiagramSeed::Database,
+            DiagramSeed::Table("orderdetails".into()),
+        ] {
+            let g = build_graph(&s, "shop", &seed);
+            assert!(
+                g.nodes.iter().all(|n| n.kind != NodeKind::Stub),
+                "{seed:?}: {:?}",
+                g.nodes
+            );
+            assert!(
+                g.edges.iter().all(|e| e.to != "orders_2024"),
+                "{seed:?}: {:?}",
+                g.edges
+            );
+        }
     }
 
     #[test]
