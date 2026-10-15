@@ -6556,11 +6556,9 @@ mod tests {
             upto_clock(&chunked),
             "the two paths must write one workbook"
         );
-        assert_eq!(
-            whole.len(),
-            chunked.len(),
-            "and the timestamped tail is the same size either way"
-        );
+        // No length comparison of the whole files: the tail is the clock too.
+        // Two different timestamps deflate to different sizes, and a full
+        // `cargo test --workspace` measured 5202 bytes against 5203 and 5204.
         assert!(
             whole.len() > 1000,
             "an empty result is still a whole workbook, not a stub: {} bytes",
