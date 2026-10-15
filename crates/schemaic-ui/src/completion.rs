@@ -245,12 +245,37 @@ fn word_start(text: &str, offset: usize, dialect: SqlDialect) -> usize {
 }
 
 /// Is `prefix`, the word starting at `word_lo`, a numeric literal rather than a
-/// name — does it begin with a digit, with no quote or `.` in front to make it
-/// a name that happens to (`` `7days` ``, `t.1col`)?
+/// name — does it still read as a number ([`reads_as_number`]), with no quote
+/// or `.` in front to make it a name that happens to begin with a digit
+/// (`` `7days` ``, `t.1col`)? An unquoted name may begin with one too on
+/// MySQL, as long as it is not all digits — `2fa_codes` — so a word whose
+/// tail no number has (`2f`) is a name being typed.
 fn numeric_literal_at(text: &str, word_lo: usize, prefix: &str) -> bool {
-    let starts_with_digit = prefix.as_bytes().first().is_some_and(u8::is_ascii_digit);
     let before = word_lo.checked_sub(1).and_then(|i| text.as_bytes().get(i));
-    starts_with_digit && !matches!(before, Some(b'`' | b'"' | b'[' | b'.'))
+    reads_as_number(prefix) && !matches!(before, Some(b'`' | b'"' | b'[' | b'.'))
+}
+
+/// Does `word` — word bytes only, so no `.` or sign — read as a number, or the
+/// way to one: digits, then an exponent (`1e`, `1e5`); or `0x` and hex digits,
+/// `0b` and binary ones (`0x`, `0x1F`, `0b101`).
+fn reads_as_number(word: &str) -> bool {
+    let b = word.as_bytes();
+    if !b.first().is_some_and(u8::is_ascii_digit) {
+        return false;
+    }
+    if let [b'0', radix, rest @ ..] = b {
+        match radix {
+            b'x' | b'X' => return rest.iter().all(u8::is_ascii_hexdigit),
+            b'b' | b'B' => return rest.iter().all(|c| matches!(c, b'0' | b'1')),
+            _ => {}
+        }
+    }
+    let digits = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    match &b[digits..] {
+        [] => true,
+        [b'e' | b'E', exp @ ..] => exp.iter().all(u8::is_ascii_digit),
+        _ => false,
+    }
 }
 
 /// Byte offset where the identifier the caret is in ends — [`word_start`]'s
@@ -3727,5 +3752,28 @@ mod numeric_literal_tests {
         assert!(!at("SELECT t.1col", "1col"));
         assert!(!at("SELECT uuid_v7", "uuid_v7"));
         assert!(!at("SELECT ", ""));
+    }
+
+    /// **A word that begins with a digit is a number only while it still
+    /// reads as one.** MySQL takes an unquoted name that begins with a digit
+    /// and is not all digits — `2fa_codes` — and typing `2f` offered it until
+    /// the number gate closed the list on any leading digit. `1e5`, `0x1F`
+    /// and `0b101` (and the way to them, `1e`, `0x`) are still numbers.
+    #[test]
+    fn a_name_that_begins_with_a_digit_is_still_offered() {
+        let t = schemaic_core::schema::TableInfo {
+            name: "2fa_codes".into(),
+            ..Default::default()
+        };
+        let got = offered_with("SELECT * FROM 2f", vec![t]);
+        assert!(got.iter().any(|s| s.contains("2fa_codes")), "{got:?}");
+        use super::numeric_literal_at;
+        let at = |text: &str, word: &str| numeric_literal_at(text, text.rfind(word).unwrap(), word);
+        for n in ["7", "1e", "1e5", "1E10", "0x", "0x1F", "0b101", "0X"] {
+            assert!(at(&format!("SELECT {n}"), n), "{n}");
+        }
+        for name in ["2f", "2fa_codes", "1col", "0xg", "1e5x", "0b2"] {
+            assert!(!at(&format!("SELECT {name}"), name), "{name}");
+        }
     }
 }

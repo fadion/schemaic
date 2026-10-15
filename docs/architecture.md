@@ -28409,7 +28409,9 @@ existing prose was left alone.
     selection 0, `give_way(true)`) instead of closing. Any other literal or comment still closes
     it. `SchemaIndex::build` fills `enum_types` from the in-scope databases' `DbSchema::enums`.
     **Nor does one open on a number**: `numeric_literal_at` closes the popup where the word before
-    the caret begins with an ASCII digit, straight after the literal gate above, and on Ctrl+Space
+    the caret still reads as a number (`reads_as_number`: digits, then an optional exponent, or
+    `0x`/`0b` and their digits — `1e` and `0x` included, being the way to one), straight after the
+    literal gate above, and on Ctrl+Space
     too. **After that gate, not ahead of it**: inside a string a digit is no number, and the enum
     members it lets through may begin with one — placed first, it closed the list on `size = '7`
     against `ENUM('7x','10x')`
@@ -28420,7 +28422,10 @@ existing prose was left alone.
     `sql::is_word_start` excludes digits for the same reason. The exception is load-bearing: a
     word after `` ` ``, `"`, `[` or `.` is a name that happens to start with a digit — MySQL's
     `` `7days` ``, `t.1col` — and still completes
-    (`a_quoted_or_qualified_name_may_begin_with_a_digit`).
+    (`a_quoted_or_qualified_name_may_begin_with_a_digit`). **So is a word no number has the tail
+    of**: MySQL takes an unquoted name that begins with a digit and is not all digits, and a gate
+    on the leading digit alone closed the list on `2f` over a table `2fa_codes`
+    (`a_name_that_begins_with_a_digit_is_still_offered`).
     **`Completion::word_complete` carries `rank::Ranked::completes_a_word` to the key handler**
     (under `editor_pane.rs`). `set_items` resets it to `false` — every path that fills the list goes
     through there, so the FK join row or an emptied list never inherits the last ranked list's
