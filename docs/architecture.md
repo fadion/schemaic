@@ -36674,7 +36674,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   applied its own plan without the preview would be the path this rule forbids, and the aggregate is
   where doing so would be cheapest: it already holds every statement in order. **`schemaic compare`
   is on the written side as `cli::dump` is**: it prints the same plan's `export_script()` to stdout
-  and runs none of it, so its servers see catalogue reads alone (`cli/compare.rs`, `run_compare`).
+  and runs none of it, so its servers see catalogue reads alone (`cli/run.rs`'s `run_compare`, which
+  prints `cli::compare::report`).
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
   the preview names each one and Apply refuses while it does — on the action, not only on the
   disabled button. The "INCOMPLETE" preamble that carries the same omission *out* through Copy and
