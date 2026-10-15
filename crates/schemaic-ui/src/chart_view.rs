@@ -60,7 +60,15 @@ pub(crate) fn chart_overlay(overlay: OverlayUi) -> impl IntoView {
             let ring = FocusRing::new();
             let rs = t.rs.clone();
             let numeric = chart::numeric_columns(&rs);
-            let names: Vec<String> = rs.columns.iter().map(|c| c.name.clone()).collect();
+            // The pickers' names, distinct (`chart::picker_labels`): they map
+            // a choice back to its column by name.
+            let names = chart::picker_labels(
+                &rs.columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+                &[ROW_NUMBER],
+            );
 
             // The choices. The value column starts on the last numeric one —
             // the measure usually follows its labels — and the label column on
@@ -141,8 +149,8 @@ fn controls(
 ) -> AnyView {
     let caption = |s: &'static str| text(s).style(crate::widgets::form_label_style);
     let col_w = || theme::scaled(200.0);
-    // A picked name → the first column of that name; two columns sharing a
-    // name pick the first.
+    // A picked name → its column; `names` are distinct, so two columns the
+    // result names alike are two choices.
     let lookup = {
         let names = names.to_vec();
         move |picked: &str| names.iter().position(|n| n == picked)

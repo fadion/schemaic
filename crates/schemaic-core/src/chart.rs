@@ -74,6 +74,30 @@ pub fn numeric_columns(rs: &ResultSet) -> Vec<usize> {
         .collect()
 }
 
+/// The pickers' name for each column, one per column and no two alike — the
+/// pickers map a chosen name back to its column, so a self-join's two `id`s
+/// both answered the first. A repeated name, or one equal to a `reserved`
+/// option the picker also offers (*Row number*), takes its 1-based position:
+/// `id (3)`. The first of a name keeps it bare, so an ordinary result reads
+/// as it always did.
+pub fn picker_labels(names: &[String], reserved: &[&str]) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> =
+        reserved.iter().map(|r| r.to_string()).collect();
+    let mut out = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let mut label = name.clone();
+        let mut n = i + 1;
+        while taken.contains(&label) {
+            label = format!("{name} ({n})");
+            // A column already spelt `id (3)` pushes the next one along.
+            n += names.len();
+        }
+        taken.insert(label.clone());
+        out.push(label);
+    }
+    out
+}
+
 /// Labelled values to draw as bars or a line.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Series {
@@ -395,6 +419,43 @@ mod tests {
 
     fn s(v: &str) -> Value {
         Value::Str(v.into())
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **Two columns of one name are two choices.** A self-join's `id`s
+    /// shared a label, and the picker's lookup by name chose the first
+    /// whichever was picked.
+    #[test]
+    fn repeated_column_names_get_distinct_picker_labels() {
+        let got = picker_labels(&names(&["id", "name", "id"]), &[]);
+        assert_eq!(got, ["id", "name", "id (3)"]);
+    }
+
+    #[test]
+    fn distinct_names_are_left_as_they_are() {
+        assert_eq!(
+            picker_labels(&names(&["a", "b"]), &["Row number"]),
+            ["a", "b"]
+        );
+        assert!(picker_labels(&[], &[]).is_empty());
+    }
+
+    /// A column named like a picker's own option, or like the label another
+    /// duplicate would take, still comes out unique.
+    #[test]
+    fn a_label_never_collides_with_a_reserved_option_or_another_label() {
+        let got = picker_labels(
+            &names(&["Row number", "id", "id (3)", "id"]),
+            &["Row number"],
+        );
+        assert_eq!(got.len(), 4);
+        let unique: std::collections::HashSet<&String> = got.iter().collect();
+        assert_eq!(unique.len(), 4, "{got:?}");
+        assert!(!got.iter().any(|l| l == "Row number"), "{got:?}");
+        assert_eq!(got[1], "id");
     }
 
     #[test]

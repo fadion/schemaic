@@ -432,7 +432,9 @@ existing prose was left alone.
     plain `f64`, not fixed-point — nothing here prints a cell's value back, only a position and a
     tick. `numeric_columns(rs)` is every column whose non-NULL cells all read as numbers, with at
     least one non-NULL (`a_column_is_numeric_when_every_value_reads_as_a_number`), so a column of
-    nothing but NULLs is not offered.
+    nothing but NULLs is not offered. `picker_labels(names, reserved)` is the modal's pickers' name
+    per column, no two alike and none equal to a reserved option: the first of a name stays bare, a
+    repeat takes its 1-based position (`id (3)`).
     `ChartKind::{Bar, Line, Histogram}` (`ALL`, `label`). `series(rs, x: Option<usize>, y)` →
     `Series { labels, values, skipped }`, in row order: `y`'s numbers labelled by `x`'s text,
     `"NULL"` for a NULL label, and the 1-based row number with no `x`; `skipped` counts the rows left
@@ -26240,8 +26242,10 @@ existing prose was left alone.
     *Labels* — *Row number* or any column, tab 30, starting on the first column that is not the
     value, and not built at all for a histogram, whose labels are its bins — a `dyn_container` on the
     kind rather than `s.hide()`, since a hidden picker would still be a Tab stop. A picked name maps
-    back to the first column of that name, so of two columns sharing a name the second cannot be
-    picked. The body is a `dyn_container` keyed on `(kind, value, label)`: *"No column of numbers to
+    back to its column by name, so the names are `chart::picker_labels`' — distinct, a repeated
+    name or one equal to *Row number* taking its 1-based position (`id (3)`); with the result's
+    raw names a self-join's second `id` could not be picked, the lookup answering the first
+    (`repeated_column_names_get_distinct_picker_labels`). The body is a `dyn_container` keyed on `(kind, value, label)`: *"No column of numbers to
     chart in this result."* where there is none, *"Every value in that column is NULL."* where the
     series or the bins came back empty, and otherwise the canvas, 360 high, with one faint line under
     it, `chart::caption` — *"N rows · K not drawn (NULL, or past 2000) · the rows read, not the whole
