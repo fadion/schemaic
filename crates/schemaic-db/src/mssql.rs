@@ -280,7 +280,15 @@ async fn connect_with(mut cfg: tiberius::Config, named: bool) -> tiberius::Resul
         tcp.set_nodelay(true)?;
         tcp
     };
-    tiberius::Client::connect(cfg, tcp.compat_write()).await
+    // **Boxed, because every SQL Server future would otherwise carry it.**
+    // The driver's login — prelogin, TLS, the handshake — is a ~20 KiB future,
+    // and inline it made every `Db` call against SQL Server about 24 KiB where
+    // PostgreSQL's is under 5. A debug build gives each `.await` of such a
+    // future its own stack slot in the caller's poll frame, so a live test
+    // awaiting a few dozen of them overflowed the 2 MiB test thread
+    // (`a_sequence_restart_is_honoured_and_not_compared`). One allocation per
+    // connection is nothing beside the round trips it makes.
+    Box::pin(tiberius::Client::connect(cfg, tcp.compat_write())).await
 }
 
 /// A named connect's error, with the Browser's silence on Windows made the
@@ -6056,6 +6064,36 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A SQL Server future does not carry the driver's login inline.**
+    /// Inline, `connect` was ~22 KiB in a debug build and every `Db` call
+    /// against SQL Server ~24 KiB; a debug poll frame gives each `.await` of
+    /// one its own slot, so the live leg's longer tests overflowed the 2 MiB
+    /// test thread. The ceiling has room for the rest of `connect`, not for the
+    /// login.
+    #[test]
+    fn a_sql_server_future_does_not_carry_the_drivers_login() {
+        let db = Db::from_parts(
+            crate::Engine::MsSql,
+            String::new(),
+            1433,
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        let connect = std::mem::size_of_val(&connect(&db, None));
+        assert!(connect < 12 * 1024, "connect's future is {connect} bytes");
+        let mut dest = crate::RowDest::Capped(1);
+        let query = std::mem::size_of_val(&fetch_query(
+            &db,
+            None,
+            "",
+            &mut dest,
+            CancellationToken::new(),
+            None,
+        ));
+        assert!(query < 12 * 1024, "fetch_query's future is {query} bytes");
+    }
 
     /// The rows SQL Server 2022 gave for a `RANGE RIGHT` date function and a
     /// `RANGE LEFT` int one, folded into each table's key and its numbered

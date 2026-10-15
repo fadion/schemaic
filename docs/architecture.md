@@ -19031,6 +19031,15 @@ existing prose was left alone.
   `browser` in the rewritten message is what `is_browser_silence` reads, so it is load-bearing
   for the same reason the driver's is (`a_reset_browser_query_is_the_browsers_silence`, which
   composes the two functions rather than testing either alone, and was red before the mapping).
+  **That login is awaited `Box::pin`ned**, which a tidy-up would undo: tiberius's
+  `Client::connect` — prelogin, TLS, the handshake — is a ~20 KiB future, and inline it rode in
+  every SQL Server future, measured in a debug build at 22,896 bytes for `connect` and 24,448 for
+  `fetch_query`, against PostgreSQL's `fetch_query` at 4,848, MySQL's at 2,976 and SQLite's at
+  176. Since a debug poll frame gives each `.await` site its own slot, a live test awaiting a few
+  dozen `Db` calls overflowed the 2 MiB test thread (the live tier's entry has the case). Boxed,
+  they are 6,080 and 7,632, for one allocation per connection beside the round trips it makes.
+  `a_sql_server_future_does_not_carry_the_drivers_login` holds both under 12 KiB — room for the
+  rest of `connect`, not for the login — and fails at 22,896 against the inline await.
   Live,
   `a_named_instance_is_reached_through_sql_server_browser` puts a stand-in responder on UDP
   `127.0.0.1:1434`, since no container runs the Browser, answering MS-SQLR's `SVR_RESP` with the
@@ -21405,10 +21414,15 @@ existing prose was left alone.
   (generous against a cold service container — the whole tier runs in ~10 s locally). The lint job
   compiles it via `--features schemaic-db/live-tests`, since otherwise it
   would be the one code in the repository no push compiles.
-  **On Windows the SQL Server legs, 2022's and 2025's, need a larger test-thread stack** —
-  `RUST_MIN_STACK=16777216` — because `mssql::a_sequence_restart_is_honoured_and_not_compared`
-  overflows the default one. It already did on the commit before SQL Server's partitioning was
-  read, so it is not that change's (per its author).
+  **The SQL Server legs, 2022's and 2025's, run on the default 2 MiB test thread** — no
+  `RUST_MIN_STACK` — because `mssql::connect_with` boxes the driver's login (see `mssql.rs`).
+  Before it did, `mssql::a_sequence_restart_is_honoured_and_not_compared` overflowed that thread on
+  Windows, and the cause was never the compare or the differ recursing: every `Db` call against
+  SQL Server carried the ~20 KiB login future inline, and a debug poll frame gives each `.await`
+  site its own slot for the future it builds, so a test with a few dozen awaits had a ~1.4 MB poll
+  frame. Boxed, that test's body starts with 1.62 MB of stack left where it had 676 KB, and the
+  whole leg passes on both servers unaided (measured by the change's author). The pin is
+  `mssql::tests::a_sql_server_future_does_not_carry_the_drivers_login`.
 - `schemaic-ai` — agent-CLI sessions (stream-json) and turn parsing, for whichever CLI the user has
   installed. `harness.rs` and `stream.rs` model six of them (`claude`, `codex`, `antigravity`,
   `opencode`, `copilot`, `cursor`), and **all six are driven, with database tools**. Each is
