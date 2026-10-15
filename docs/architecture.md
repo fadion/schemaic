@@ -12387,7 +12387,9 @@ existing prose was left alone.
     override (`a_jump_hop_takes_its_hostname_and_a_port_left_at_22`). Nor does it read a jump host's
     own `ProxyJump` or `IdentityFile`, or its `unread_route`: a route is not followed recursively as
     `ssh` follows it, and every hop signs in with the tunnel's credentials anyway — under password
-    sign-in, only a hop the connection names (`SshTunnel::jump`, under `connection.rs`).
+    sign-in, only a hop the connection names (`SshTunnel::jump`, under `connection.rs`). The
+    **first** jump host's own route is not ignored, though — `resolve_route` refuses it, below,
+    rather than following it or dialling around it.
     **`resolve_route(tunnel, config)` is the composition `open_tunnel` connects by** — moved out of
     it verbatim, so that it could be tested, answering a `Route { tunnel, hops }`. With no config
     it is `route()` as typed (`a_route_without_a_config_is_the_route_as_typed`); otherwise the SSH
@@ -12396,7 +12398,7 @@ existing prose was left alone.
     last is the SSH host, whose `HostName` is a resolved name and not an alias to look up again —
     and a hop naming no user takes the resolved tunnel's
     (`an_alias_and_its_config_jump_resolve_hop_by_hop`,
-    `the_last_hop_is_not_looked_up_a_second_time`). **It refuses twice, before anything is
+    `the_last_hop_is_not_looked_up_a_second_time`). **It refuses three ways, before anything is
     dialled.** An `unread_route` where the connection names no jump hosts is refused with
     *~/.ssh/config reaches <alias> through a ProxyCommand, which Schemaic cannot run. Give the
     route as Jump hosts instead.* (or *may route <alias> through a Match block, which Schemaic
@@ -12409,7 +12411,21 @@ existing prose was left alone.
     for the whole route was a decision about the jump hosts the user typed, and a host the config
     alone supplies, trusted on first sight, would otherwise receive the target's password. Key and
     agent sign-in send no secret and are unaffected
-    (`a_password_is_offered_only_to_hosts_the_connection_names`).
+    (`a_password_is_offered_only_to_hosts_the_connection_names`). And **the first jump host's own
+    route** — an `unread_route`, or a non-empty `ProxyJump` of its own — refuses the whole route
+    (`first_hop_route_sentence`), with the unread-route sentence about *jump host <alias>* or
+    *~/.ssh/config reaches jump host <alias> through <jump>, and Schemaic does not follow a jump
+    host's own ProxyJump. Give the route as Jump hosts instead, <jump> first.* It is the first hop
+    alone because of how `ssh` builds the chain: `ssh -J a,b host` reaches `b` as `ssh -J a -W … b`,
+    so the chain claims every later hop's route slot and `ssh` never takes a later hop's own route
+    either — the route stands as typed (`a_later_jump_hosts_own_route_is_the_chain_before_it`). But
+    `a` is dialled as `ssh a` would be, by `a`'s own route, and Schemaic used to skip that silently
+    and dial `a` directly — a route the user never configured. Its own `ProxyJump` is refused
+    rather than followed, so nothing is followed recursively, and `apply_to_hop` is unchanged. An
+    explicit `ProxyJump none` is still a direct dial. It applies whether the jump hosts were typed
+    or came from the SSH host's config `ProxyJump` — typing them is no way past it, unlike the
+    first refusal; putting that hop's route in front of it in Jump hosts is
+    (`a_route_the_config_hides_for_the_first_jump_host_is_refused`).
     **`describe(tunnel, cfg)` is what the connection form says the file made of the tunnel** —
     `~/.ssh/config: user@hostname:port`, the user left off when neither the connection nor the file
     names one, then `, key <path>` and `, through <jump>` **only where the config supplied them**,
@@ -12425,7 +12441,9 @@ existing prose was left alone.
     line — the unread route where the connection names no jump hosts, the password one where
     password sign-in would go through a config-supplied jump — so the form says so before anyone
     connects (`the_form_says_when_the_config_routes_the_host_unreadably`). It reaches them through
-    the same sentence functions and `may_offer_password`, not by calling `resolve_route`.
+    the same sentence functions and `may_offer_password`, not by calling `resolve_route`. It speaks
+    only of the SSH host, so the first jump host's refusal is not among them: that one shows at
+    connect, not under the field.
   - `init_sql.rs` — **a connection's init SQL**: the session settings `Connection::init_sql` runs on
     every connection Schemaic opens for it — a `search_path`, a time zone, a role — and `check(sql,
     dialect)`, the gate they pass first. **It is user SQL that runs with nobody confirming it, on
@@ -20778,8 +20796,10 @@ existing prose was left alone.
   supplies is parsed by the same reader as a typed one — and one it cannot read is refused with the
   same *Jump host N: …*, about a string the form never showed — then each jump hop, all but the
   last, through `apply_to_hop`; the last is the SSH host, already resolved. It also refuses,
-  before any I/O, a route the file hides in a `ProxyCommand` or a `Match` block and a password
-  bound for a jump host only the file names — both under that entry. Known-hosts entries
+  before any I/O, a route the file hides in a `ProxyCommand` or a `Match` block for the SSH host
+  or its first jump host (whose own `ProxyJump` refuses too), and a password bound for a jump host
+  only the file names — all under that entry; the first jump host's refusal shows at connect
+  only, since the form's hint speaks of the SSH host alone. Known-hosts entries
   are therefore keyed by the **resolved** `host:port`, not the alias. The connection form keeps the
   alias in its field and says what it became on a line under it (`ssh_config_hint`, under
   `connection_form.rs`) — from its own read of the file, taken when the tunnel's fields are built,
@@ -25161,7 +25181,8 @@ existing prose was left alone.
     **Under the SSH host/port row, `ssh_config_hint` says what `~/.ssh/config` makes of the tunnel**
     — `core::ssh_config::describe`'s line, so a host typed as an alias shows the `HostName`, port,
     user, key and jump hosts the connect will actually use — or, where the connect would refuse
-    the route the file gives it, that refusal's sentence. The row and the hint share an inner
+    the route the file gives it, that refusal's sentence. Only the SSH host's, though: a route the
+    file gives the first jump host is refused at connect, not under the field. The row and the hint share an inner
     `v_stack` at 6px, as the Database field's hint sits under its field, rather than standing in the
     SSH box's 20px gap. **The file is read once, when the tunnel's fields are built** — the `on`
     arm of `network_fields`' `dyn_container`, so reopening the form or toggling the tunnel off and on

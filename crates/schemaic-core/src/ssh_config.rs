@@ -20,7 +20,11 @@
 //! ([`SshConfigHost::unread_route`]): a `ProxyCommand` that takes the route
 //! slot, or a `ProxyJump`/`ProxyCommand` in a `Match` block whose `host` and
 //! `originalhost` conditions do not rule this host out. [`resolve_route`] then
-//! refuses, saying so, unless the connection names its own jump hosts.
+//! refuses, saying so, unless the connection names its own jump hosts. The
+//! **first jump host** is refused the same way when its own block routes it
+//! (a `ProxyCommand`, a `Match`, or a `ProxyJump` — `ssh` reaches it by that
+//! route, and nothing here follows one); a later hop's own route is the chain
+//! before it, for `ssh` too.
 //!
 //! **A password goes only to hosts the connection names**
 //! ([`may_offer_password`]): a jump host only the config's `ProxyJump` supplies
@@ -293,8 +297,13 @@ pub fn resolve_route(
     {
         return Err(config_jump_password_sentence(&tunnel.host, &resolved.jump));
     }
-    for hop in hops.iter_mut().take(jumps) {
+    for (i, hop) in hops.iter_mut().take(jumps).enumerate() {
         let found = resolve(text, &hop.host, home);
+        if i == 0
+            && let Some(why) = first_hop_route_sentence(&hop.host, &found)
+        {
+            return Err(why);
+        }
         *hop = apply_to_hop(hop.clone(), &found);
     }
     Ok(Route {
@@ -329,6 +338,27 @@ fn config_jump_password_sentence(alias: &str, jump: &str) -> String {
          hosts this connection names. Add the jump host to Jump hosts if it takes the same \
          password, or sign in with a key or the SSH agent."
     )
+}
+
+/// Why the first jump host cannot be dialled directly, or `None` when it can.
+///
+/// `ssh -J a,b host` reaches `b` as `ssh -J a b`, so the chain claims every
+/// later hop's route slot and their own `ProxyJump`/`ProxyCommand` are never
+/// taken; but it dials `a` as `ssh a` would, by `a`'s own route. That route is
+/// not followed here — so one the config gives (an explicit `none` aside) is
+/// refused rather than dialled around.
+fn first_hop_route_sentence(alias: &str, cfg: &SshConfigHost) -> Option<String> {
+    let alias = format!("jump host {alias}");
+    if let Some(unread) = cfg.unread_route {
+        return Some(unread_route_sentence(&alias, unread));
+    }
+    let jump = cfg.proxy_jump.as_deref().map(str::trim).unwrap_or("");
+    (!jump.is_empty()).then(|| {
+        format!(
+            "~/.ssh/config reaches {alias} through {jump}, and Schemaic does not follow a jump \
+             host's own ProxyJump. Give the route as Jump hosts instead, {jump} first."
+        )
+    })
 }
 
 /// Why a host whose route `~/.ssh/config` hides cannot be dialled — the
@@ -939,6 +969,70 @@ Host *
             r.hops,
             vec![hop("me", "edge", 22), hop("me", "10.1.2.3", 22)]
         );
+    }
+
+    #[test]
+    fn a_route_the_config_hides_for_the_first_jump_host_is_refused() {
+        use crate::connection::SshAuth;
+        // `ssh -J edge db` dials edge as `ssh edge` would, so edge's own
+        // ProxyCommand, Match or ProxyJump is how ssh reaches it — and
+        // dialling it directly is a route the user never configured.
+        let cases = [
+            ("Host edge\n  ProxyCommand nc %h %p\n", "ProxyCommand"),
+            ("Match host edge\n  ProxyJump outer\n", "Match"),
+            ("Host edge\n  ProxyJump outer\n", "outer"),
+        ];
+        for (text, says) in cases {
+            for jump in ["edge", "edge,inner"] {
+                // Typed, or supplied by the host's own config: the same hop.
+                let mut typed = tunnel("db", SshAuth::KeyPair);
+                typed.jump = jump.into();
+                let config = format!("Host db\n  ProxyJump {jump}\n{text}");
+                for (t, text) in [
+                    (typed, text.to_string()),
+                    (tunnel("db", SshAuth::KeyPair), config),
+                ] {
+                    let why = resolve_route(&t, Some((&text, None))).unwrap_err();
+                    assert!(why.contains("jump host edge"), "{text}: {why}");
+                    assert!(why.contains(says), "{text}: {why}");
+                    assert!(why.contains("Jump hosts"), "{text}: {why}");
+                }
+            }
+        }
+        // An explicit `none` is a direct connection, as ssh reads it.
+        let mut t = tunnel("db", SshAuth::KeyPair);
+        t.jump = "edge".into();
+        let none = "Host edge\n  ProxyJump none\nHost *\n  ProxyJump edge\n";
+        assert_eq!(
+            resolve_route(&t, Some((none, None))).unwrap().hops,
+            vec![hop("me", "edge", 22), hop("me", "db", 22)]
+        );
+    }
+
+    #[test]
+    fn a_later_jump_hosts_own_route_is_the_chain_before_it() {
+        use crate::connection::SshAuth;
+        // `ssh -J a,b db` reaches b as `ssh -J a b`: the chain claims b's route
+        // slot, so b's own ProxyCommand, Match or ProxyJump is never taken —
+        // by ssh either — and the route stands as typed.
+        for text in [
+            "Host b\n  HostName 10.0.0.2\n  ProxyCommand nc %h %p\n",
+            "Host b\n  HostName 10.0.0.2\nMatch host 10.0.0.2\n  ProxyJump c\n",
+            "Host b\n  HostName 10.0.0.2\n  ProxyJump c\n",
+        ] {
+            let mut t = tunnel("db", SshAuth::KeyPair);
+            t.jump = "a,b".into();
+            let r = resolve_route(&t, Some((text, None))).unwrap();
+            assert_eq!(
+                r.hops,
+                vec![
+                    hop("me", "a", 22),
+                    hop("me", "10.0.0.2", 22),
+                    hop("me", "db", 22)
+                ],
+                "{text}"
+            );
+        }
     }
 
     #[test]
