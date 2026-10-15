@@ -89,15 +89,26 @@ pub(crate) fn history_panel(
 
     // The active connection's entries — or every connection's, while the
     // toggle is on — newest-first (already stored that way), narrowed to the
-    // search filter (`history::in_view`).
-    let visible = create_memo(move |_| {
+    // search filter and cut at one connection's worth (`history::panel_view`):
+    // every row is a highlighted view built afresh on each run and keystroke,
+    // and *All* over ten connections was ten times what the cap was sized for.
+    let view = create_memo(move |_| {
         let scope = (!all_conns.get()).then(|| active_conn.get());
         let q = search.get();
-        entries.with(|v| {
-            v.iter()
-                .filter(|e| history::in_view(e, scope, &q))
-                .cloned()
-                .collect::<Vec<_>>()
+        entries.with(|v| history::panel_view(v, scope, &q, history::MAX_PER_CONN))
+    });
+    let visible = create_memo(move |_| view.with(|v| v.rows.clone()));
+    // Said above the list when the cut left rows out, so a missing old query
+    // reads as "search for it", not as gone.
+    let cut_note = create_memo(move |_| {
+        view.with(|v| {
+            (v.matched > v.rows.len()).then(|| {
+                format!(
+                    "Showing the newest {} of {} — search to narrow.",
+                    v.rows.len(),
+                    v.matched
+                )
+            })
         })
     });
 
@@ -257,6 +268,16 @@ pub(crate) fn history_panel(
         empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
         history_search(search_input),
         empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
+        label(move || cut_note.get().unwrap_or_default()).style(move |s| {
+            crate::widgets::collapse_unless(
+                s.font_size(font_label())
+                    .color(theme::text_muted())
+                    .padding_horiz(theme::scaled(12.0))
+                    .padding_bottom(theme::scaled(6.0))
+                    .flex_shrink(0.0_f32),
+                cut_note.with(Option::is_some),
+            )
+        }),
         scrolled,
     ))
     .style(move |s| {

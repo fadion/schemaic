@@ -10730,8 +10730,14 @@ existing prose was left alone.
     shows, `None` every connection (its *All* tab), and then `matches_query` — so
     the switch widens which connections are listed and never what the search box matches
     (`the_panel_shows_one_connection_or_every_one_under_the_same_search`). With it on, the panel
-    walks every connection's entries, so `MAX_PER_CONN` bounds that list per connection and not in
-    total.
+    walks every connection's entries, so `MAX_PER_CONN` alone bounds that list per connection and
+    not in total — which is why **`panel_view(entries, scope, query, cap)` is what the panel
+    lists**: `in_view`'s entries, newest first as stored, cut at `cap` (the panel passes
+    `MAX_PER_CONN`), and `matched`, how many there were in all. One connection's view is never cut;
+    *All* over ten full connections was 2,000 highlighted rows rebuilt on every run and search
+    keystroke, ten times what the cap was sized for. The search narrows before the cut, so an old
+    statement past it is still found by searching
+    (`the_all_tab_is_cut_at_the_cap_newest_first`).
     **`palette_hits(entries, conn_id, visible, needle, cap)` is Find Anywhere's seventh tier through
     that same filter**, so the palette finds a past statement exactly when the panel would: the
     indices of `conn_id`'s entries that `matches_query` accepts, newest first as the log is kept, at
@@ -25148,8 +25154,11 @@ existing prose was left alone.
     (`scaled(12)` side padding, `scaled(4)` from the title, `scaled(10)` spacers either side of the
     search box). It replaced a `widgets::toggle_icon(icons::DATABASE, …)` beside the trash: an
     unlabelled icon was poor at saying what it switched, and the monitor already had the tab bar
-    for exactly this. `visible` asks `history::in_view` with scope
-    `(!all_conns).then(active_conn)`, and `all_conns` joins the trigger tuple. With it on, the
+    for exactly this. `visible` is the rows of `history::panel_view` with scope
+    `(!all_conns).then(active_conn)` and cap `MAX_PER_CONN`, and `all_conns` joins the trigger
+    tuple; where the cut left rows out, a muted line between the search box and the list says
+    *Showing the newest N of M — search to narrow.* — outside the scroll, so `banded_list`'s sticky
+    headers keep measuring from the list's own top. With it on, the
     reasoning above no longer holds — the rows on screen ran against several engines — so each row
     is lexed in its own connection's dialect (`SqlDialect::from_db_type` of that connection in
     `conn.connections`, falling back to the active memo's for one the list no longer has) and its
@@ -25158,7 +25167,8 @@ existing prose was left alone.
     rebuild, not at once. **The trash keeps to the active connection either way** — its count is
     still `count_conn` of the active connection, and its tooltip and confirm say *this connection*
     — so *All* left on never widens what a click deletes. Opening another connection's row
-    switches to it first (`open_history`, under `history_store.rs`).
+    switches to it first (`open_history`, in *app/main.rs*'s `app_view` — `history_store.rs` says
+    why it is not there).
     Its TODAY / THIS WEEK / EARLIER bands (`history::group_by_recency`, titled by `bucket.label()`)
     are laid out by `widgets::banded_list`, so their headers stick while their rows scroll. The
     `viewport` signal that list reads is created at panel level, outside that `dyn_container`: it

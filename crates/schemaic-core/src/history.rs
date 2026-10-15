@@ -682,6 +682,40 @@ pub fn in_view(entry: &HistoryEntry, scope: Option<u64>, query: &str) -> bool {
     scope.is_none_or(|conn| entry.conn_id == conn) && matches_query(entry, query)
 }
 
+/// What the history panel lists: the entries [`in_view`] takes, newest first
+/// as stored, at most `cap` of them — and how many matched in all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PanelView {
+    pub rows: Vec<HistoryEntry>,
+    /// Every entry that matched, listed or not; above `rows.len()` the list
+    /// was cut at the cap.
+    pub matched: usize,
+}
+
+/// The panel's list for `scope` and the search box's `query`, cut at `cap`.
+///
+/// **The cap is what keeps the *All* tab inside the bound [`MAX_PER_CONN`] was
+/// sized for**: the panel builds a highlighted row for every entry it shows,
+/// with no virtual list, on each run and each search keystroke — and with
+/// every connection listed that was ten connections' 200 apiece. One
+/// connection's view never reaches it.
+pub fn panel_view(
+    entries: &[HistoryEntry],
+    scope: Option<u64>,
+    query: &str,
+    cap: usize,
+) -> PanelView {
+    let mut rows = Vec::new();
+    let mut matched = 0;
+    for e in entries.iter().filter(|e| in_view(e, scope, query)) {
+        matched += 1;
+        if rows.len() < cap {
+            rows.push(e.clone());
+        }
+    }
+    PanelView { rows, matched }
+}
+
 /// Whether a history entry matches a free-text filter (ASCII case-insensitive),
 /// checking the SQL, the database name, and the originating tab name. An empty
 /// (or whitespace-only) query matches everything. The SQL is matched against its
@@ -873,6 +907,34 @@ mod tests {
         assert!(!in_view(&b, Some(1), "orders"), "another connection's row");
         assert!(in_view(&b, None, "orders"), "every connection");
         assert!(!in_view(&b, None, "customers"), "the search still narrows");
+    }
+
+    /// **The *All* tab lists no more than one connection's worth**, newest
+    /// first across every connection, and says how many it left out; one
+    /// connection's full history is never cut.
+    #[test]
+    fn the_all_tab_is_cut_at_the_cap_newest_first() {
+        let mut entries = Vec::new();
+        let mut ts = 0;
+        for round in 0..MAX_PER_CONN {
+            for conn in 1..=10u64 {
+                ts += 1;
+                let sql = format!("SELECT {round} FROM t{conn}_");
+                push(&mut entries, entry(conn, &sql, ts));
+            }
+        }
+        let all = panel_view(&entries, None, "", MAX_PER_CONN);
+        assert_eq!(all.rows.len(), MAX_PER_CONN);
+        assert_eq!(all.matched, 10 * MAX_PER_CONN);
+        assert_eq!(all.rows[0].ts, ts, "the newest run comes first");
+        assert!(all.rows.windows(2).all(|w| w[0].ts > w[1].ts));
+        let one = panel_view(&entries, Some(3), "", MAX_PER_CONN);
+        assert_eq!((one.rows.len(), one.matched), (MAX_PER_CONN, MAX_PER_CONN));
+        assert!(one.rows.iter().all(|e| e.conn_id == 3));
+        // The search narrows before the cap, so a match past it is reachable.
+        let found = panel_view(&entries, None, "SELECT 0 FROM t1_", MAX_PER_CONN);
+        assert_eq!(found.matched, 1);
+        assert_eq!(found.rows[0].sql, "SELECT 0 FROM t1_");
     }
 
     fn entry(conn_id: u64, sql: &str, ts: u64) -> HistoryEntry {
