@@ -36050,7 +36050,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ScriptRequest::approved` has, and for the same stated reason: *the guard being a step the
   launcher had to remember is how one `return` came to be all that stood between a read-only
   connection and a file.* The type covers the two fields; `main.rs`'s
-  `the_unguarded_run_has_only_its_three_stated_callers` covers what a type cannot — a *fourth*
+  `the_unguarded_run_has_only_its_two_stated_callers` covers what a type cannot — another
   closure calling the raw `run` with a bare `String`, which is exactly how `open_table_filtered`
   came to be unguarded. `spawn_table_tab`'s own generated `table_query` `SELECT` goes through the
   mint too, because a caller that happens to generate only reads is a property of the caller.
@@ -36069,6 +36069,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   at two. `raw_run_calls` is a token scan over whole calls — `(run)(` normalised to `run(`, a
   preceding word byte, `.` or `:` marking some other function, parens balanced — so a call rustfmt
   has wrapped is counted too.
+  **It re-reads the view on screen, through `apply_view`, and so left the census** (S6.1-L1-04).
+  Replaying the bare `base_sql` through the manual `run` meant `Tab::start_manual_run`: a commit
+  with an insert or a delete on page 3 of a filtered, sorted table tab came back on page 1 of the
+  unfiltered, unsorted table, with a history entry for a run nobody made. The statement is now
+  `filter::post_commit_statement(base, grid_query, dialect)` — `compose`'s filter, sort and page, or
+  the base at rest — with `read_only_reason` asked *inside* it of the composed string
+  (`a_commit_rereads_the_page_on_screen`), minted as before and dispatched through `apply_view`,
+  which keeps `grid_query`; `settle_after_switch` still decides whether it runs at all. The raw
+  `run` is left with two callers.
   **Running a `.sql` script is the third such path, and it is refused the other way round.**
   `sql::script_verdict` gates `script.rs`'s runner. `run_verdict` takes the statements; a script has
   tens of thousands of them, arriving a block at a time, and *none of them read* at the moment the
@@ -38100,7 +38109,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ui_state` shape again: a module that takes a giant parameter list or re-invents the struct.
   **The third reason is the one to state most plainly**: the invariant genuinely worth protecting
   here is already owned, by a source-scanning test *inside* `main.rs` —
-  `the_unguarded_run_has_only_its_three_stated_callers` reads `main.rs`'s own text and asserts the
+  `the_unguarded_run_has_only_its_two_stated_callers` reads `main.rs`'s own text and asserts the
   exact list of raw `run(...)` call sites. Moving `run`/`run_query_core`/`run_all` out would
   silently zero that gate's count unless the test moved with them and was rewritten to read the new
   file, which is precisely the *gate left pointing at the old file* failure the third entry above
@@ -42158,8 +42167,13 @@ this bundle's.
   (`every_clear_exemption_still_names_a_real_write` fails on one that matches nothing). The click
   is refused while `Tab::view_busy` holds,
   and both chevrons drop to `text_faint` then, as they do when there is no page that way —
-  *Previous* on page 0, *Next* after a short page. They carry *Previous page*/*Next page* tooltips,
-  and they are plain clickable containers rather than `in_strip_button`s, so F6's ring does not
+  *Previous* on page 0, *Next* after a short page. **Neither turns over staged work**
+  (`filter::page_turns`, `a_page_does_not_turn_over_staged_changes`): a page is a re-run, and its
+  landing clears the grid's staged edits, new rows and deletions with the rows they sat on, so
+  turning used to throw them away without a word. While any are staged both chevrons are dimmed
+  and their tooltip reads *Commit or discard your changes to change page*; whether anything is
+  staged is in the pager's rebuild key as a bool. They carry *Previous page*/*Next page* tooltips
+  otherwise, and they are plain clickable containers rather than `in_strip_button`s, so F6's ring does not
   reach them.
 - **The Download menu names the scope, and only when there is a choice to make.** `export_menu`
   normally opens the flat six formats — all of them, unlike the **Copy** menu beside it, which

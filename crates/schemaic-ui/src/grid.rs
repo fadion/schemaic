@@ -9144,15 +9144,26 @@ fn grid_toolbar(
                         .map(|n| (n, schemaic_core::filter::page_offset(b, gs.dialect)))
                 })
             });
+            // Whether anything is staged is part of the key, as a bool, so a
+            // chevron greys out on the first staged edit without a rebuild
+            // per keystroke after it.
+            let staged = gs.dirty.with(|d| !d.is_empty())
+                || gs.new_rows.with(|v| !v.is_empty())
+                || gs.del_rows.with(|d| !d.is_empty());
             size.filter(|_| gs.rerunnable())
-                .map(|(size, start)| (size, start, gs.grid_query.with(|q| q.page)))
+                .map(|(size, start)| (size, start, gs.grid_query.with(|q| q.page), staged))
         },
         move |paged| {
-            let Some((size, start, page)) = paged else {
+            let Some((size, start, page, staged)) = paged else {
                 return empty().into_any();
             };
             let (caption, more) =
                 schemaic_core::filter::page_caption(start, page, size, nrows as u64);
+            // **A page does not turn over staged work** (`filter::page_turns`):
+            // the re-run replaces the rows the staged edits, new rows and
+            // deletions sit on, and landing the page cleared them all without
+            // a word.
+            let [prev, next] = schemaic_core::filter::page_turns(page, more, staged);
             let busy = gs.view_busy;
             let go = move |to: u64| {
                 if busy.get_untracked() {
@@ -9161,7 +9172,10 @@ fn grid_toolbar(
                 gs.grid_query.update(|q| q.page = to);
                 gs.apply_grid_query();
             };
-            let arrow = move |glyph: &'static str, enabled: bool, to: u64, tip: &'static str| {
+            let arrow = move |glyph: &'static str, turn: schemaic_core::filter::PageTurn| {
+                let enabled = turn.to.is_some();
+                let to = turn.to.unwrap_or(page);
+                let tip = turn.tip;
                 let hov = RwSignal::new(false);
                 container(
                     icons::icon(glyph, crate::consts::TOOLBAR_ICON_BASE).style(move |s| {
@@ -9190,14 +9204,9 @@ fn grid_toolbar(
             };
             h_stack((
                 text("·").style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
-                arrow(
-                    icons::CHEVRON_LEFT,
-                    page > 0,
-                    page.saturating_sub(1),
-                    "Previous page",
-                ),
+                arrow(icons::CHEVRON_LEFT, prev),
                 text(caption).style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
-                arrow(icons::CHEVRON_RIGHT, more, page + 1, "Next page"),
+                arrow(icons::CHEVRON_RIGHT, next),
             ))
             .style(|s| s.flex_row().items_center().gap(theme::scaled(4.0)))
             .into_any()

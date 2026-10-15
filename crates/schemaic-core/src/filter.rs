@@ -347,6 +347,55 @@ pub fn page_offset(sql: &str, dialect: SqlDialect) -> u64 {
     limit_of(query).map_or(0, |(_, start)| start)
 }
 
+/// One of the pager's chevrons: the page it turns to, if it turns at all, and
+/// its tooltip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageTurn {
+    pub to: Option<u64>,
+    pub tip: &'static str,
+}
+
+/// Why a chevron will not turn while the grid holds staged work.
+pub const STAGED_PAGE_TIP: &str = "Commit or discard your changes to change page";
+
+/// The pager's ‹ and › for page `page`, `more` saying a next page may exist
+/// ([`page_caption`]'s second half). **Neither turns over staged work**: a
+/// page is a re-run, and a re-run replaces the rows the grid's staged edits,
+/// new rows and deletions sit on, so turning used to throw them all away
+/// without a word — on the very move someone editing a table makes before
+/// coming back to commit.
+pub fn page_turns(page: u64, more: bool, staged: bool) -> [PageTurn; 2] {
+    let turn = |to: Option<u64>, tip: &'static str| match to {
+        Some(_) if staged => PageTurn {
+            to: None,
+            tip: STAGED_PAGE_TIP,
+        },
+        to => PageTurn { to, tip },
+    };
+    [
+        turn(page.checked_sub(1), "Previous page"),
+        turn(more.then(|| page.saturating_add(1)), "Next page"),
+    ]
+}
+
+/// The statement the grid re-reads after a commit it cannot splice (one that
+/// inserted or deleted rows): **what it was showing** — `base` with its
+/// filter, sort and page ([`compose`]), or the base itself at rest — and only
+/// if that is a read ([`crate::sql::read_only_reason`]), since the replay has
+/// no moment at which to ask about anything else. It re-ran the bare base,
+/// through the manual run, which landed the grid on page 1 of the unfiltered,
+/// unsorted table and recorded a run in history.
+pub fn post_commit_statement(base: &str, gq: &GridQuery, dialect: SqlDialect) -> Option<String> {
+    let sql = if gq.is_empty() {
+        base.to_string()
+    } else {
+        compose(base, gq, dialect).ok().flatten()?
+    };
+    crate::sql::read_only_reason(&sql, dialect)
+        .is_ok()
+        .then_some(sql)
+}
+
 /// A query's constant row limit and the offset it starts at, in any of the
 /// spellings [`page_size`] reads; `None` for a limit that is not a plain
 /// number (a parameter, `PERCENT`, `WITH TIES`).
@@ -1129,6 +1178,58 @@ mod tests {
         assert_eq!(page_caption(5, 0, 10, 10).0, "Rows 6–15");
         assert_eq!(page_caption(5, 1, 10, 10).0, "Rows 16–25");
         assert_eq!(page_caption(5, 2, 10, 0).0, "No rows after 25");
+    }
+
+    /// Turning a page re-runs the statement and throws the grid's staged
+    /// edits, new rows and deletions away with the old rows — so while any
+    /// are staged, neither chevron turns, and each says why.
+    #[test]
+    fn a_page_does_not_turn_over_staged_changes() {
+        let [prev, next] = page_turns(2, true, false);
+        assert_eq!(prev.to, Some(1));
+        assert_eq!(next.to, Some(3));
+        assert_eq!((prev.tip, next.tip), ("Previous page", "Next page"));
+        let [prev, next] = page_turns(2, true, true);
+        assert_eq!((prev.to, next.to), (None, None));
+        assert_eq!(prev.tip, STAGED_PAGE_TIP);
+        assert_eq!(next.tip, STAGED_PAGE_TIP);
+        // Where there is no page that way, staged work changes nothing.
+        let [prev, next] = page_turns(0, false, true);
+        assert_eq!((prev.to, next.to), (None, None));
+        assert_eq!((prev.tip, next.tip), ("Previous page", "Next page"));
+        let [prev, _] = page_turns(0, true, false);
+        assert_eq!(prev.to, None, "no page before the first");
+    }
+
+    /// After a commit that inserted or deleted rows, the grid re-reads **what
+    /// it was showing** — the filtered, sorted page — not the bare base, which
+    /// landed it on page 1 of the unfiltered table.
+    #[test]
+    fn a_commit_rereads_the_page_on_screen() {
+        let pg = SqlDialect::Postgres;
+        let gq = GridQuery {
+            filter: "qty > 0".into(),
+            sort: vec![("name".into(), true)],
+            page: 2,
+        };
+        assert_eq!(
+            post_commit_statement("SELECT * FROM t ORDER BY id ASC LIMIT 10", &gq, pg).as_deref(),
+            Some("SELECT * FROM t WHERE qty > 0 ORDER BY \"name\" ASC, id ASC LIMIT 10 OFFSET 20")
+        );
+        // At rest, the base as it ran.
+        assert_eq!(
+            post_commit_statement("SELECT * FROM t LIMIT 10", &GridQuery::default(), pg).as_deref(),
+            Some("SELECT * FROM t LIMIT 10")
+        );
+        // Only ever a read: the replay has no confirm to ask.
+        assert_eq!(
+            post_commit_statement("DELETE FROM t", &GridQuery::default(), pg),
+            None
+        );
+        assert_eq!(
+            post_commit_statement("SELECT 1; DELETE FROM t", &GridQuery::default(), pg),
+            None
+        );
     }
 
     /// A bare name reaches the default namespace's tables — PostgreSQL's

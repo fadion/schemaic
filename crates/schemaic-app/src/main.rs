@@ -5814,10 +5814,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // spliceable single-table UPDATE-only result), we re-`SELECT` just the edited
     // rows and hand them back so the grid splices them in place — no re-run,
     // scroll/selection preserved. Otherwise (inserts, or not spliceable) we re-run
-    // the whole query. On failure the message goes back and the grid keeps its edits.
+    // the view on screen — its filter, sort and page — through `apply_view`. On failure the message goes back and the grid keeps its edits.
     let commit_edits: schemaic_ui::CommitFn = {
         let handle = handle.clone();
-        let run = run.clone();
+        let apply_view = apply_view.clone();
         let db_for = db_for.clone();
         let log_write = log_write.clone();
         Rc::new(
@@ -5859,9 +5859,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // be made twice. `base_sql` is what actually ran: substituted, and
                 // already judged by `run_verdict` when it did.
                 //
-                // The read check is the other half. This site takes the *raw*
-                // run — `guarded_run` is built much later in this function and
-                // cannot be reached from here — so whatever it replays executes
+                // The read check is the other half. This site re-runs past
+                // `run_verdict` (`apply_view`, as the raw run it once took did —
+                // `guarded_run` is built much later in this function and cannot
+                // be reached from here) — so whatever it replays executes
                 // with the missing-`WHERE` net and `confirm_writes` both bypassed.
                 // A grid is only editable when it came from a read, so refusing to
                 // replay anything else costs nothing real and closes the hole
@@ -5872,7 +5873,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // is this site's own history: a refusal written as a step the
                 // launcher had to remember is one `return` away from being
                 // forgotten, and the census that was supposed to notice could
-                // not see this call at all — it read `(run)(sql);`, which does
+                // not see this call at all — it read `(run)(sql);`, which did
                 // not begin with `run(`. A `RerunRequest` cannot be forgotten,
                 // because without one there is no SQL to pass.
                 //
@@ -5886,12 +5887,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // `WRITE_KEYWORDS` and, outside MySQL, in no deny list. So the
                 // filter narrows and the mint guards, and the composition is
                 // stronger than either alone.
+                //
+                // **And it is the view on screen, not the bare base**
+                // (`filter::post_commit_statement`): the base re-run through
+                // the manual `run` reset the grid to page 1 of the unfiltered,
+                // unsorted table and logged a history entry, so a commit on
+                // page 3 of a filtered view lost all three. It re-runs through
+                // `apply_view`, which keeps `grid_query`; the `read_only_reason`
+                // check above lives inside that function now, asked of the
+                // composed statement, and the mint is unchanged.
                 let refetch_req = tab
                     .base_sql
                     .get_untracked()
-                    .filter(|s| schemaic_core::sql::read_only_reason(s, dialect_of(&db)).is_ok())
+                    .and_then(|s| {
+                        tab.grid_query.with_untracked(|gq| {
+                            schemaic_core::filter::post_commit_statement(&s, gq, dialect_of(&db))
+                        })
+                    })
                     .and_then(|s| schemaic_ui::RerunRequest::approved(s, dialect_of(&db)));
-                let run = run.clone();
+                let apply_view = apply_view.clone();
                 let engine = tx_engine(&db);
                 let fold = create_ext_action(cx, move |stmt: StmtOutcome| {
                     // A write batch is one unit as far as the transaction is
@@ -5937,7 +5951,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         outcome,
                     );
                     if refetch && let Some(req) = refetch_req.clone() {
-                        run(req.into_sql());
+                        apply_view(req);
                     }
                     (done)(outcome);
                 });
@@ -16027,8 +16041,12 @@ mod app_tests {
         out
     }
 
+    /// **Two now, not three**: the post-commit re-read goes through
+    /// `apply_view` — a view re-run that keeps the page, filter and sort on
+    /// screen — rather than this manual run, which reset all three and
+    /// recorded a history entry for a statement nobody ran (S6.1-L1-04).
     #[test]
-    fn the_unguarded_run_has_only_its_three_stated_callers() {
+    fn the_unguarded_run_has_only_its_two_stated_callers() {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src")
@@ -16041,7 +16059,7 @@ mod app_tests {
         let calls = raw_run_calls(&body);
         assert_eq!(
             calls,
-            ["run(req.into_sql())", "run(req.into_sql())", "run(sql)"],
+            ["run(req.into_sql())", "run(sql)"],
             "the raw `run` gained or lost a caller: every one must take its SQL \
              from a `RerunRequest`, which only `sql::rerunnable_for_export` mints"
         );
