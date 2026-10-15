@@ -26762,7 +26762,11 @@ existing prose was left alone.
     drops: on SQL Server (`drops_up_front`) the toggle also replaces every routine in the dumped
     schemas, used by the tables or not, while the hint spoke of tables alone — so a replay of an
     older dump silently put older routine code in place of newer. The file's header names those
-    routines too (`the_drop_toggle_and_the_header_name_the_routines_a_replay_replaces`). Every
+    routines too (`the_drop_toggle_and_the_header_name_the_routines_a_replay_replaces`). It also
+    says the other side: **without *One transaction*** no routine is dropped (the up-front section
+    is safe to fail in only inside the transaction), so a replay onto a database that still holds
+    one stops at its `CREATE` — a choice the hint once left unsaid
+    (`the_drop_hint_says_what_a_replay_does_without_one_transaction`). Every
     other engine with routines (`ddl::supports_routine_editing`) gets a hint that says so as well,
     since there the file replaces each routine it carries beside its `CREATE` (`dump::replay_create`,
     under `core/dump.rs`); SQLite's still speaks of tables alone.

@@ -762,7 +762,11 @@ pub fn refuse_if_present_sql(dialect: SqlDialect, object: &str, why: &str) -> Op
 /// routines too.** There the toggle also drops and replaces every function
 /// and procedure in the dumped schemas, used by the tables or not, so a
 /// replay of an older dump puts older routine code in place of newer — and
-/// the hint spoke of tables alone.
+/// the hint spoke of tables alone. **And what it does without one**: no
+/// routine is dropped there — the up-front section is safe to fail in only
+/// inside the transaction — so a replay onto a database that still holds one
+/// stops at its `CREATE`. A choice, and the hint once stated only its other
+/// side.
 ///
 /// **Everywhere else it replaces them too, where there are any** — each
 /// beside its `CREATE` ([`plan`]'s `replay_create`), since a replay that met
@@ -771,7 +775,9 @@ pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
     if drops_up_front(dialect) {
         "Drop each table and view before its CREATE, so the file loads onto a database that \
          already holds them. With One transaction it also replaces every routine in their \
-         schemas, and stops before dropping anything it cannot put back as it is."
+         schemas, and stops before dropping anything it cannot put back as it is. Without One \
+         transaction it leaves routines as they are, so a replay onto a database that still \
+         has them stops at the first one."
     } else if crate::ddl::supports_routine_editing(dialect) {
         "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
          that already holds these tables. It also replaces every routine in their schemas."
@@ -8380,6 +8386,27 @@ mod tests {
             let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), d));
             assert!(!file.contains("DROP CONSTRAINT"), "{d:?}: {file}");
             assert!(!file.contains("DROP FUNCTION"), "{d:?}: {file}");
+        }
+    }
+
+    /// **The hint says what the toggle does without *One transaction* too.**
+    /// There no routine is dropped (see the test below), so a replay onto a
+    /// database that still holds one stops at its `CREATE` — a choice, and
+    /// one the hint stated only the other side of.
+    #[test]
+    fn the_drop_hint_says_what_a_replay_does_without_one_transaction() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            let hint = drop_before_create_hint(d);
+            assert_eq!(
+                hint.contains("Without One transaction"),
+                drops_up_front(d),
+                "{d:?}: {hint}"
+            );
         }
     }
 
