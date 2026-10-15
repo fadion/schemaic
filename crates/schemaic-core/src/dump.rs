@@ -1331,6 +1331,52 @@ fn replay_create(
     }
 }
 
+/// The statements that switch off the triggers a partition `table` (quoted,
+/// qualified) cloned from its parent **before its rows go in**, and set each
+/// back to its parent's state after — or `None` where the engine has no such
+/// partition.
+///
+/// A partition created `OF` a parent the file leaves standing
+/// ([`named_parents`]) takes a clone of each of the parent's row triggers at
+/// its `CREATE`, so a replay onto the source fired every one on every restored
+/// row: an audit trigger wrote a second audit row for each. A chosen table's
+/// own triggers are written after its rows for exactly that reason, and the
+/// file has no say over when a clone is made.
+///
+/// **PostgreSQL's**: `DISABLE TRIGGER USER` before — the owner may, where
+/// `ALL` would need a superuser for the internal key triggers it leaves alone
+/// — and after, each clone set to its parent trigger's state (`tgparentid`),
+/// in a `DO` block: a clone takes its parent's state, so one switched off on
+/// the parent stays off, and blanket `ENABLE` would have switched it on. The
+/// partition has no triggers of its own yet; those follow the rows.
+pub fn cloned_triggers_held_sql(dialect: SqlDialect, table: &str) -> Option<(String, String)> {
+    match dialect {
+        SqlDialect::Postgres => {
+            let rel = format!("{}::regclass", crate::schema::ddl_string(table, dialect));
+            let body = format!(
+                "DECLARE r record;\nBEGIN\nFOR r IN SELECT c.tgname, p.tgenabled FROM pg_trigger c \
+                 JOIN pg_trigger p ON p.oid = c.tgparentid WHERE c.tgrelid = {rel} \
+                 AND NOT c.tgisinternal LOOP\n\
+                 EXECUTE format('ALTER TABLE %s %s TRIGGER %I', {rel}, CASE r.tgenabled \
+                 WHEN 'D' THEN 'DISABLE' WHEN 'R' THEN 'ENABLE REPLICA' \
+                 WHEN 'A' THEN 'ENABLE ALWAYS' ELSE 'ENABLE' END, r.tgname);\n\
+                 END LOOP;\nEND"
+            );
+            let mut tag = "$schemaic$".to_string();
+            let mut n = 0;
+            while body.contains(&tag) {
+                n += 1;
+                tag = format!("$schemaic{n}$");
+            }
+            Some((
+                format!("ALTER TABLE {table} DISABLE TRIGGER USER;"),
+                format!("DO {tag}\n{body}\n{tag};"),
+            ))
+        }
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+    }
+}
+
 /// The chosen tables in the order they can be created and filled: a referenced
 /// table before the table referencing it, views after every base table, ties by
 /// name so two dumps of one schema are the same file.
@@ -3356,6 +3402,17 @@ pub fn plan(
             if let Some((on, _)) = &identity {
                 text!(on.clone());
             }
+            // A partition of a parent the file leaves standing holds the
+            // parent's triggers already — see `cloned_triggers_held_sql`.
+            let clones = (opts.structure
+                && partition_relatives(&schema.tables, &[i], true)
+                    .iter()
+                    .any(|a| parents.contains(a)))
+            .then(|| cloned_triggers_held_sql(dialect, &qname(t)))
+            .flatten();
+            if let Some((off, _)) = &clones {
+                text!(off.clone());
+            }
             // What a text cell cannot carry, read as SQL the server renders.
             let read_as: Vec<(&str, (String, crate::export::ServerLiteral))> = cols
                 .iter()
@@ -3392,6 +3449,9 @@ pub fn plan(
                     .map(|(n, (_, form))| (n.to_string(), *form))
                     .collect(),
             });
+            if let Some((_, back)) = clones {
+                text!(back);
+            }
             if let Some((_, off)) = identity {
                 text!(off);
             }
@@ -5165,6 +5225,54 @@ mod tests {
             let file = file_of(&plan(&s, "shop", &chosen, DumpOptions::default(), d));
             assert!(!file.contains("fk_orders_customers"), "{d:?}: {file}");
         }
+    }
+
+    /// **A partition created `OF` a parent the file leaves standing fires
+    /// none of the parent's row triggers on its restored rows.** It takes a
+    /// clone of each at its `CREATE`, so on a replay onto the source an audit
+    /// trigger on the parent wrote a second audit row for every restored row
+    /// (seen live). They are switched off around the rows and then set back
+    /// to the parent's own state — a chosen table's triggers are written
+    /// after its rows for the same reason. Not for a partition whose parent
+    /// the file recreates: that parent's triggers come after the rows anyway.
+    #[test]
+    fn a_partitions_cloned_triggers_are_off_while_its_rows_go_in() {
+        let file = file_of(&plan(
+            &partitioned_twice(),
+            "shop",
+            &["aa_2024".to_string()],
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        for leaf in ["aa_2024"] {
+            let rows = pos(&file, &format!("<<rows {leaf}"));
+            let off = file[..rows]
+                .rfind(&format!("ALTER TABLE \"{leaf}\" DISABLE TRIGGER USER;"))
+                .unwrap_or_else(|| panic!("{leaf}'s clones fire on its rows:\n{file}"));
+            assert!(
+                pos(&file, &format!("CREATE TABLE \"{leaf}\"")) < off,
+                "{file}"
+            );
+            // Set back, from each parent trigger's state, straight after.
+            let back = &file[rows..];
+            let back = &back[..back.find("$schemaic$;").expect("the DO block's end")];
+            assert!(
+                back.contains("tgparentid") && back.contains(&format!("'\"{leaf}\"'::regclass")),
+                "{leaf}'s clones stay off:\n{file}"
+            );
+        }
+        // Choosing the parent too: it is recreated, and nothing is cloned yet.
+        let s = partitioned_twice();
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(!file.contains("DISABLE TRIGGER"), "{file}");
+        // Nor where a partition is not a table.
+        assert_eq!(cloned_triggers_held_sql(SqlDialect::MySql, "t"), None);
     }
 
     /// Choosing the partitioned table itself still replaces it whole — the

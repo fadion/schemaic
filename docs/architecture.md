@@ -5360,7 +5360,10 @@ existing prose was left alone.
     After the routines because a PostgreSQL trigger names its function, which must exist first.
     `mysqldump` writes triggers after the data for the same reason
     (`triggers_are_created_after_the_rows_they_would_fire_on`, over all four engines; the live
-    round trip's audit trigger restores an audit table of the source's size). Identifiers go through
+    round trip's audit trigger restores an audit table of the source's size). That ordering cannot
+    reach a trigger the server makes itself: a PostgreSQL partition of a parent the file leaves
+    standing clones the parent's row triggers at its `CREATE`, so its rows are written with them
+    switched off (`cloned_triggers_held_sql`, under the named parent below). Identifiers go through
     `export::ident_sql`/`qualified_table`, so a dump cannot quote differently from the SQL export.
     **The header's own comment lines are *escaped*, not quoted** — `export::comment_text`, and the
     two are different guarantees. Four lines here interpolate a schema-fetched name: the
@@ -5885,7 +5888,28 @@ existing prose was left alone.
     exists, since unguarded a replay that took nothing would stop at the name — the same
     restatement, by the same loop, that a chosen table's own `CASCADE` needs (`drop_cascade`,
     above); it was written for the named parent first, and a chosen table went without it until a
-    plain `customers` dump was replayed. The header names the
+    plain `customers` dump was replayed. **Leaving the parent standing has a third cost: its
+    triggers.** A partition created `PARTITION OF` a parent that exists takes a clone of each of the
+    parent's row triggers at that `CREATE`, so the trailing `-- Triggers` section, which keeps a
+    chosen table's own triggers off its rows, was no help — on a replay onto the source every
+    restored row fired the clones, and an `AFTER INSERT` audit trigger on the parent wrote a
+    duplicate audit row per restored row (measured live on PostgreSQL 16 by the change's author:
+    the audit table went 3 → 5 for 2 restored rows). This arrived with the fix above; while the
+    parent was dropped, its triggers were written after the rows like any chosen table's. So,
+    with Structure on, a partition any of whose ancestors is in `named_parents` has its rows
+    bracketed by `cloned_triggers_held_sql`: `ALTER TABLE <p> DISABLE TRIGGER USER;` before —
+    the owner may, where `ALL` would need a superuser for the internal key triggers `USER` leaves
+    alone — and after, a `DO` block that sets each clone back to **its parent trigger's own state**
+    through `tgparentid` (`D` → `DISABLE`, `R` → `ENABLE REPLICA`, `A` → `ENABLE ALWAYS`, otherwise
+    `ENABLE`). Not a blanket `ENABLE`: a clone takes its parent's state, so a trigger switched off
+    on the parent is off on the partition too, and `ENABLE` would have switched it on (verified
+    live). The partition's own triggers still come in the trailing section. Nothing is written
+    when the parent is chosen as well — it is recreated, and its triggers follow the rows anyway —
+    nor in a data-only file, where every table's existing triggers fire, consistently, nor on the other three engines (`None`), where a partition is no
+    table (`a_partitions_cloned_triggers_are_off_while_its_rows_go_in`; live,
+    `a_partition_replay_fires_no_parent_trigger_on_its_rows` in `tests/live/dump_replay.rs`,
+    which asserts no audit rows on the replay, the clones' states `O`/`D` afterwards, and that a
+    clone fires on the next insert). The header names the
     parents and says the file never drops them and creates them only where missing. The trade is
     that a parent already there is left exactly as it is, whatever shape it has
     (`dumping_one_partition_drops_neither_its_parent_nor_its_siblings`,

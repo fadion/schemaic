@@ -197,6 +197,7 @@ live_suite!(
         a_replay_keeps_the_key_a_table_outside_the_file_holds,
         a_replay_replaces_the_routines_it_carries,
         a_replay_keeps_the_types_and_sequences_it_carries,
+        a_partition_replay_fires_no_parent_trigger_on_its_rows,
     ],
     streaming: [
         a_streamed_export_delivers_every_row,
