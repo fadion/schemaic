@@ -5562,6 +5562,12 @@ pub struct Catalog {
     /// [`Catalog::insert_columns_of`].
     insert_skips: HashSet<(String, String, String)>,
     /// `(qualifier_lower, table_lower, column_lower)` for each column that
+    /// **refuses** a value ([`crate::schema::ColumnInfo::is_server_assigned`]:
+    /// a generated column, an always-identity), keyed as
+    /// [`Catalog::insert_skips`] is — the narrower set SQLite's implicit
+    /// column list leaves out ([`Catalog::bare_insert_columns_of`]).
+    refuses_value: HashSet<(String, String, String)>,
+    /// `(qualifier_lower, table_lower, column_lower)` for each column that
     /// can hold a NULL, keyed as [`Catalog::insert_skips`] is — for
     /// [`Catalog::column_nullable`].
     nullable: HashSet<(String, String, String)>,
@@ -5735,6 +5741,7 @@ impl Catalog {
         let mut opaque_qualified = HashSet::new();
         let mut opaque_unqualified = HashSet::new();
         let mut insert_skips = HashSet::new();
+        let mut refuses_value = HashSet::new();
         let mut nullable = HashSet::new();
         let mut invisible = HashSet::new();
         let mut pk_shared = HashSet::new();
@@ -5813,12 +5820,19 @@ impl Catalog {
                 spelling
                     .entry(table_lower.clone())
                     .or_insert_with(|| t.name.clone());
-                for c in t.columns.iter().filter(|c| c.nullable || c.invisible) {
+                for c in t
+                    .columns
+                    .iter()
+                    .filter(|c| c.nullable || c.invisible || c.is_server_assigned())
+                {
                     let col_lower = c.name.to_ascii_lowercase();
                     let mut note = |qualifier: String| {
                         let key = (qualifier, table_lower.clone(), col_lower.clone());
                         if c.invisible {
                             invisible.insert(key.clone());
+                        }
+                        if c.is_server_assigned() {
+                            refuses_value.insert(key.clone());
                         }
                         if c.nullable {
                             nullable.insert(key);
@@ -5998,6 +6012,7 @@ impl Catalog {
             opaque_qualified,
             opaque_unqualified,
             insert_skips,
+            refuses_value,
             nullable,
             invisible,
             pk_shared,
@@ -6053,6 +6068,38 @@ impl Catalog {
             cols.iter()
                 .filter(|c| {
                     !self.insert_skips.contains(&(
+                        qualifier.clone(),
+                        table.clone(),
+                        c.to_ascii_lowercase(),
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    /// The columns a bare `INSERT`'s row is measured against where the
+    /// engine's implicit list leaves some out ([`lints::implicit_list_skips`]):
+    /// on SQLite, [`columns_of`] less only the columns that **refuse** a
+    /// value ([`Catalog::refuses_value`]) — its list counts a rowid key, which
+    /// merely generates a value when omitted; elsewhere
+    /// [`Catalog::insert_columns_of`], less every column the server assigns.
+    /// `None` as `insert_columns_of` is.
+    ///
+    /// [`columns_of`]: Catalog::columns_of
+    fn bare_insert_columns_of(&self, r: &TableRef, dialect: SqlDialect) -> Option<Vec<&String>> {
+        if lints::implicit_list_skips(dialect) != Some(lints::ImplicitSkip::Refused) {
+            return self.insert_columns_of(r);
+        }
+        if self.is_union(r) {
+            return None;
+        }
+        let qualifier = r.db.as_deref().unwrap_or("").to_ascii_lowercase();
+        let table = r.name.to_ascii_lowercase();
+        let cols = self.columns_of(r)?;
+        Some(
+            cols.iter()
+                .filter(|c| {
+                    !self.refuses_value.contains(&(
                         qualifier.clone(),
                         table.clone(),
                         c.to_ascii_lowercase(),
@@ -6368,8 +6415,10 @@ pub fn insert_value_hints(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> 
             let Some(r) = lints::local_table(name) else {
                 continue;
             };
-            let (Some(all), Some(needed)) = (catalog.columns_of(&r), catalog.insert_columns_of(&r))
-            else {
+            let (Some(all), Some(needed)) = (
+                catalog.columns_of(&r),
+                catalog.bare_insert_columns_of(&r, dialect),
+            ) else {
                 continue;
             };
             let visible = |c: &&String| !catalog.column_invisible(&r, c);
@@ -6386,7 +6435,7 @@ pub fn insert_value_hints(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> 
                 None => continue,
                 Some((all, _)) if m == all.len() => all,
                 Some((_, needed))
-                    if m == needed.len() && lints::implicit_list_skips_assigned(dialect) =>
+                    if m == needed.len() && lints::implicit_list_skips(dialect).is_some() =>
                 {
                     needed
                 }
@@ -15445,16 +15494,31 @@ mod lints {
         }
     }
 
+    /// Which columns a bare `INSERT`'s implicit column list leaves out, so a
+    /// row of just the others names them — see [`implicit_list_skips`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum ImplicitSkip {
+        /// Every column the server assigns: SQL Server's identity and
+        /// computed columns, the ones a skeleton leaves out
+        /// (`Catalog::insert_skips`).
+        Assigned,
+        /// Only a column that refuses a value — SQLite's generated one. A
+        /// rowid key (`INTEGER PRIMARY KEY`, `auto_increment` in the
+        /// catalogue) generates a value when omitted but is still counted:
+        /// `table events has 3 columns but 2 values were supplied`.
+        Refused,
+    }
+
     /// Does `dialect`'s implicit column list — a bare `INSERT`'s — **leave out
-    /// the columns the server assigns**, so a row of just the others names
-    /// them? SQL Server leaves out an identity or computed column, SQLite a
-    /// generated one. MySQL lists every column, `AUTO_INCREMENT` included,
-    /// and PostgreSQL's list is the table's in order, a short row naming its
+    /// columns the server assigns**, and which ([`ImplicitSkip`])? `None` for
+    /// MySQL, which lists every column, `AUTO_INCREMENT` included, and
+    /// PostgreSQL, whose list is the table's in order, a short row naming its
     /// first columns ([`short_row_takes_defaults`]).
-    pub(super) fn implicit_list_skips_assigned(dialect: SqlDialect) -> bool {
+    pub(super) fn implicit_list_skips(dialect: SqlDialect) -> Option<ImplicitSkip> {
         match dialect {
-            SqlDialect::MsSql | SqlDialect::Sqlite => true,
-            SqlDialect::MySql | SqlDialect::Postgres => false,
+            SqlDialect::MsSql => Some(ImplicitSkip::Assigned),
+            SqlDialect::Sqlite => Some(ImplicitSkip::Refused),
+            SqlDialect::MySql | SqlDialect::Postgres => None,
         }
     }
 
@@ -15632,8 +15696,10 @@ mod lints {
         let Some(r) = local_table(name) else {
             return;
         };
-        let (Some(all), Some(needed)) = (catalog.columns_of(&r), catalog.insert_columns_of(&r))
-        else {
+        let (Some(all), Some(needed)) = (
+            catalog.columns_of(&r),
+            catalog.bare_insert_columns_of(&r, dialect),
+        ) else {
             return;
         };
         // The implicit column list leaves an `INVISIBLE` column out
@@ -28152,8 +28218,15 @@ mod tests {
                 .collect()
         };
         for d in [SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Sqlite] {
-            assert!(
-                errs("INSERT INTO events VALUES ('a', now());", d).is_empty(),
+            // SQLite's implicit list counts a rowid key — `auto_increment` on
+            // an `INTEGER PRIMARY KEY` — and refuses the row a value short.
+            let want: &[&str] = match d {
+                SqlDialect::Sqlite => &["('a', now())"],
+                _ => &[],
+            };
+            assert_eq!(
+                errs("INSERT INTO events VALUES ('a', now());", d),
+                want,
                 "{d:?}"
             );
             assert_eq!(
@@ -28162,6 +28235,36 @@ mod tests {
                 "{d:?}"
             );
         }
+    }
+
+    /// SQLite's implicit column list leaves out a **generated** column — the
+    /// one kind that refuses a value — and nothing else: `INSERT INTO g
+    /// VALUES (1, 3)` into `(a, b GENERATED, c)` is whole there, labelled `a`
+    /// and `c`, while the rowid key beside it is still counted.
+    #[test]
+    fn a_sqlite_bare_insert_leaves_out_only_a_generated_column() {
+        let mut g = tbl("g", &["id", "a", "b", "c"]);
+        g.columns[0].auto_increment = true;
+        g.columns[2].generated = Some("a * 2".into());
+        let schema = DbSchema {
+            tables: vec![g],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("main", &schema)], Some("main"));
+        let d = SqlDialect::Sqlite;
+        assert_eq!(
+            hints("INSERT INTO g VALUES (7, 1, 3);", &cat, d),
+            ["id@7", "a@1", "c@3"]
+        );
+        assert!(hints("INSERT INTO g VALUES (1, 3);", &cat, d).is_empty());
+        let errs = |sql: &str| -> usize {
+            diagnostics(sql, &cat, d)
+                .into_iter()
+                .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
+                .count()
+        };
+        assert_eq!(errs("INSERT INTO g VALUES (7, 1, 3);"), 0);
+        assert_eq!(errs("INSERT INTO g VALUES (1, 3);"), 1);
     }
 
     /// A bare `INSERT`'s implicit column list leaves an `INVISIBLE` column
@@ -28265,13 +28368,15 @@ mod tests {
             );
             // As long as what the server does not assign: those columns where
             // the engine's implicit list leaves the assigned one out (SQL
-            // Server, SQLite); the first columns where a short row takes
+            // Server's identity); the first columns where a short row takes
             // defaults (PostgreSQL, which puts 'a' in `id`); nothing where the
-            // row is refused (MySQL).
+            // row is refused — MySQL, and SQLite, whose implicit list leaves
+            // out only a generated column and still counts the rowid key
+            // (`table events has 3 columns but 2 values were supplied`).
             let want: &[&str] = match d {
-                SqlDialect::MsSql | SqlDialect::Sqlite => &["Name@'a'", "at@2"],
+                SqlDialect::MsSql => &["Name@'a'", "at@2"],
                 SqlDialect::Postgres => &["id@'a'", "Name@2"],
-                SqlDialect::MySql => &[],
+                SqlDialect::MySql | SqlDialect::Sqlite => &[],
             };
             assert_eq!(
                 hints("INSERT INTO events VALUES ('a', 2);", &cat, d),

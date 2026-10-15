@@ -1196,12 +1196,17 @@ existing prose was left alone.
     engines do not agree on that count. A row longer than the table is refused everywhere; a
     shorter one PostgreSQL fills with the remaining columns' defaults, and the others differ over
     the columns the server assigns — MySQL wants every column, `AUTO_INCREMENT` and generated ones
-    included, SQL Server leaves out an identity or computed one, SQLite a generated one. So a row
-    is short, on every engine but PostgreSQL, only when it is short of the columns *no* engine
-    leaves out (`Catalog::insert_columns_of`): exact for a table with no server-assigned column,
-    and silent where the engines disagree — a MySQL row that leaves out its `AUTO_INCREMENT` key
-    is refused there and passes here (`a_bare_insert_row_is_measured_against_the_table`,
-    `a_bare_insert_may_leave_out_what_the_server_assigns`). A MySQL/MariaDB `INVISIBLE` column is
+    included, SQL Server leaves out an identity or computed one, SQLite **only** a generated one —
+    its rowid key (`INTEGER PRIMARY KEY`, `auto_increment` in the catalogue) generates a value when
+    omitted but is still counted. So a row is short, on every engine but PostgreSQL, only when it
+    is short of `Catalog::bare_insert_columns_of`: on SQLite the columns less those that refuse a
+    value (`Catalog::refuses_value`, from `ColumnInfo::is_server_assigned`), elsewhere the columns
+    *no* engine leaves out (`Catalog::insert_columns_of`) — exact for a table with no
+    server-assigned column, and silent where MySQL disagrees: a MySQL row that leaves out its
+    `AUTO_INCREMENT` key is refused there and passes here
+    (`a_bare_insert_row_is_measured_against_the_table`,
+    `a_bare_insert_may_leave_out_what_the_server_assigns`,
+    `a_sqlite_bare_insert_leaves_out_only_a_generated_column`). A MySQL/MariaDB `INVISIBLE` column is
     out of the count altogether — the implicit column list leaves it out, so counted, the correct
     row was the short one and a row naming it the whole one (`Catalog::column_invisible`, keyed as
     `insert_skips` is; `a_bare_insert_row_does_not_count_an_invisible_column`, S8.2-L1-01, red
@@ -1234,14 +1239,16 @@ existing prose was left alone.
     which columns a row names is the engine's question**, asked more exactly than
     `bare_insert_row_lengths` above asks it, since a label names a column where a length check only
     counts: the visible columns (`columns_of` less `column_invisible`) for a row as long as all of
-    them; the visible `insert_columns_of` for a row as long as those **only where
-    `lints::implicit_list_skips_assigned`** — SQL Server, which leaves an identity or computed column
-    out of the implicit list, and SQLite a generated one; the first m where
+    them; the visible `bare_insert_columns_of` for a row as long as those **only where
+    `lints::implicit_list_skips`** answers which — SQL Server, which leaves an identity or computed
+    column out of the implicit list (`ImplicitSkip::Assigned`), and SQLite only a generated one
+    (`ImplicitSkip::Refused`), never its rowid key; the first m where
     `lints::short_row_takes_defaults` (PostgreSQL, whose list is the table's in order) for any
     shorter row; and nothing for any other length — MySQL lists every column, `AUTO_INCREMENT`
     included, and refuses a short row. So `INSERT INTO events VALUES ('a', 2)` over a
-    server-assigned `id` is `Name`, `at` on SQL Server and SQLite, `id`, `Name` on PostgreSQL (where
-    the server does put `'a'` in `id`) and unlabelled on MySQL
+    server-assigned `id` is `Name`, `at` on SQL Server, `id`, `Name` on PostgreSQL (where the server
+    does put `'a'` in `id`) and unlabelled on MySQL and on SQLite, which refuses it — *table events
+    has 3 columns but 2 values were supplied*; labelling it there was the guess this rules out
     (`a_bare_insert_takes_its_labels_from_the_catalogue`). A hint on a row the engine refuses would
     be a guess. A table the catalogue does not know, a name two tables share and a three-part name
     (`lints::local_table`, `pub(super)` for it) get none.
