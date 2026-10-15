@@ -105,7 +105,8 @@ fn table<'a>(schema: &'a DbSchema, name: &str) -> &'a TableInfo {
 }
 
 /// A default dump of the tables `chosen`, as the app's writer writes it.
-async fn dump_of(src: &Scratch, chosen: &[&str]) -> String {
+/// Shared with [`crate::dump_replay`].
+pub(crate) async fn dump_of(src: &Scratch, chosen: &[&str]) -> String {
     let dialect = src.dialect();
     let schema = schema_of(src).await;
     let chosen: Vec<String> = schema
@@ -166,7 +167,7 @@ async fn dump_of(src: &Scratch, chosen: &[&str]) -> String {
     file
 }
 
-async fn count(s: &Scratch, table: &str) -> String {
+pub(crate) async fn count(s: &Scratch, table: &str) -> String {
     let rs = s
         .exec(&format!("SELECT COUNT(*) FROM {}", s.qualified(table)))
         .await;

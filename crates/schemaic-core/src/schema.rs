@@ -5535,28 +5535,7 @@ impl ObjectItem {
             // call that leant on the certificate's rights fails on permissions.
             // A statement of its own, closed by its own `GO`: a comment in the
             // `CREATE`'s batch would be stored as part of the module.
-            ObjectItem::Routine(r) => {
-                let mut stmts: Vec<String> = r
-                    .tsql
-                    .module
-                    .signed
-                    .then(|| {
-                        format!(
-                            "-- NOTE: {} {} is signed, and the signature is not in this script: it \
-                             is created unsigned. Sign it again (ADD SIGNATURE) after running this.",
-                            r.kind.label(),
-                            crate::export::comment_text(&qualified_ident(
-                                &r.name,
-                                r.schema.as_deref(),
-                                dialect
-                            ))
-                        )
-                    })
-                    .into_iter()
-                    .collect();
-                stmts.extend(crate::ddl::routine_create_statements(r, dialect, true));
-                crate::ddl::client_script(&stmts, dialect)
-            }
+            ObjectItem::Routine(r) => Self::routine_script(r, dialect, false, None),
             // Through `client_script` for the same reason a routine is: this
             // `CREATE` carries no terminator of its own (the apply path sends it
             // whole) and its body may be a `BEGIN … END` full of `;`.
@@ -5575,6 +5554,75 @@ impl ObjectItem {
             ObjectItem::Tsql(t) => t.create_sql(),
             ObjectItem::Extension(x) => x.create_sql(dialect),
         }
+    }
+
+    /// [`Self::create_sql`] for a routine or an event, **replacing** one of
+    /// its name: `CREATE OR REPLACE` (SQL Server's `CREATE OR ALTER`) where
+    /// the engine has the form ([`crate::ddl::supports_or_replace_routine`]),
+    /// else a `DROP … IF EXISTS` first, inside the same script. `None` for
+    /// anything else.
+    ///
+    /// What a dump writes for a replay onto a database that already holds it
+    /// ([`crate::dump::plan`]). In place where the engine can, because that
+    /// keeps what depends on the routine — a trigger outside the file that
+    /// runs it, a default that calls it — where a `DROP` is refused, or with
+    /// `CASCADE` takes them too. MySQL, the engine without the form, holds no
+    /// such reference to drop, and is the one engine with events.
+    pub fn replacing_sql(&self, dialect: crate::intel::SqlDialect) -> Option<String> {
+        let drop = |kind: &str| {
+            format!(
+                "DROP {kind} IF EXISTS {};",
+                qualified_ident(self.name(), self.schema(), dialect)
+            )
+        };
+        match self {
+            ObjectItem::Routine(r) if crate::ddl::supports_or_replace_routine(dialect) => {
+                Some(Self::routine_script(r, dialect, true, None))
+            }
+            ObjectItem::Routine(r) => Some(Self::routine_script(
+                r,
+                dialect,
+                false,
+                Some(drop(r.kind.sql_keyword())),
+            )),
+            ObjectItem::Event(e) => {
+                let mut stmts = vec![drop("EVENT")];
+                stmts.extend(crate::ddl::event_session_wrapped(
+                    e.create_sql(dialect),
+                    e,
+                    dialect,
+                ));
+                Some(crate::ddl::client_script(&stmts, dialect))
+            }
+            _ => None,
+        }
+    }
+
+    /// A routine's script — see [`Self::create_sql`] — replacing one of its
+    /// name in place, or after `drop`.
+    fn routine_script(
+        r: &RoutineInfo,
+        dialect: crate::intel::SqlDialect,
+        replace: bool,
+        drop: Option<String>,
+    ) -> String {
+        let mut stmts: Vec<String> = drop.into_iter().collect();
+        stmts.extend(r.tsql.module.signed.then(|| {
+            format!(
+                "-- NOTE: {} {} is signed, and the signature is not in this script: it \
+                     is created unsigned. Sign it again (ADD SIGNATURE) after running this.",
+                r.kind.label(),
+                crate::export::comment_text(&qualified_ident(
+                    &r.name,
+                    r.schema.as_deref(),
+                    dialect
+                ))
+            )
+        }));
+        stmts.extend(crate::ddl::routine_create_statements(
+            r, dialect, true, replace,
+        ));
+        crate::ddl::client_script(&stmts, dialect)
     }
 }
 

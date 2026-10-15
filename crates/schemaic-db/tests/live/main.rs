@@ -36,6 +36,7 @@
 mod blob;
 mod cases;
 mod ddl;
+mod dump_replay;
 mod editable;
 mod endpoint;
 mod enforced;
@@ -191,6 +192,10 @@ live_suite!(
         a_partitioned_dump_restores_with_every_partitions_rows,
         a_dumped_partition_replays_beside_its_siblings,
         a_compared_partitioned_table_plans_what_the_server_takes,
+    ],
+    dump_replay: [
+        a_replay_replaces_the_routines_it_carries,
+        a_replay_keeps_the_types_and_sequences_it_carries,
     ],
     streaming: [
         a_streamed_export_delivers_every_row,

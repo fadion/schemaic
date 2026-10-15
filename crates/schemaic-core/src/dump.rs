@@ -66,6 +66,9 @@ pub struct DumpOptions {
     /// drops up front ([`drops_up_front`]) inside its transaction, every
     /// routine in the dumped namespaces too ([`drop_before_create_hint`] is
     /// how the modal says so). Never what the file cannot put back as it is.
+    /// Everywhere else each routine and event is replaced beside its
+    /// `CREATE`, and each type and sequence created only where it is missing
+    /// — what a replay onto the source meets still standing.
     pub drop_if_exists: bool,
     /// Wrap the load in one transaction.
     ///
@@ -750,13 +753,19 @@ pub fn refuse_if_present_sql(dialect: SqlDialect, object: &str, why: &str) -> Op
 /// routines too.** There the toggle also drops and replaces every function
 /// and procedure in the dumped schemas, used by the tables or not, so a
 /// replay of an older dump puts older routine code in place of newer — and
-/// the hint spoke of tables alone, which is all it means on the other
-/// engines.
+/// the hint spoke of tables alone.
+///
+/// **Everywhere else it replaces them too, where there are any** — each
+/// beside its `CREATE` ([`plan`]'s `replay_create`), since a replay that met
+/// one still standing stopped at its name.
 pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
     if drops_up_front(dialect) {
         "Drop each table and view before its CREATE, so the file loads onto a database that \
          already holds them. With One transaction it also replaces every routine in their \
          schemas, and stops before dropping anything it cannot put back as it is."
+    } else if crate::ddl::supports_routine_editing(dialect) {
+        "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
+         that already holds these tables. It also replaces every routine in their schemas."
     } else {
         "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
          that already holds these tables."
@@ -1208,8 +1217,10 @@ pub fn named_parents(tables: &[TableInfo], chosen: &[String]) -> Vec<usize> {
 /// it names a constraint or trigger (the catalogue's spelling).
 #[derive(Clone, Copy, Debug)]
 pub enum Present<'a> {
-    /// The table itself.
+    /// The table itself — or any relation of that name, a sequence too.
     Table(&'a str),
+    /// A type of that name — an enum, a domain.
+    Type(&'a str),
     /// A constraint `name` on `table` — a key or a check. **A missing
     /// `table` counts as present**: there is nothing to put it on — a key
     /// from a table outside the file, restored into a database without it.
@@ -1222,9 +1233,9 @@ pub enum Present<'a> {
 /// `present` is not there yet**, or `None` where the engine has no way to say
 /// so in a script.
 ///
-/// For what a dump creates but must not replace — see [`named_parents`]: on
-/// a fresh database it is created as it was, on the database the file came
-/// from it is left exactly as it is.
+/// For what a dump creates but must not replace — see [`named_parents`] and
+/// [`replay_create`]: on a fresh database it is created as it was, on the
+/// database the file came from it is left exactly as it is.
 ///
 /// **PostgreSQL's** is a `DO` block over the catalogue: its `CREATE TABLE IF
 /// NOT EXISTS` covers only the table, and the indexes, keys and triggers that
@@ -1240,6 +1251,7 @@ pub fn unless_present_sql(dialect: SqlDialect, present: Present<'_>, body: &str)
             let lit = |s: &str| crate::schema::ddl_string(s, dialect);
             let absent = match present {
                 Present::Table(t) => format!("to_regclass({}) IS NULL", lit(t)),
+                Present::Type(t) => format!("to_regtype({}) IS NULL", lit(t)),
                 Present::Constraint { table, name } => format!(
                     "to_regclass({0}) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_constraint \
                      WHERE conrelid = to_regclass({0}) AND conname = {1})",
@@ -1265,6 +1277,54 @@ pub fn unless_present_sql(dialect: SqlDialect, present: Present<'_>, body: &str)
             ))
         }
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+    }
+}
+
+/// What [`plan`] writes for a standalone object `o` of `kind` — its `CREATE`,
+/// `sql` — in a file **replayed where nothing is dropped up front**
+/// ([`drops_up_front`]), and whether that replaces the one a replay finds.
+///
+/// A replay onto the database the file came from meets each of them still
+/// standing: a table's `DROP` takes none of them. Written as a bare
+/// `CREATE`, the first stopped the run at a name already taken, after the
+/// tables ahead of it had been dropped and refilled.
+///
+/// - **A routine is replaced** ([`ObjectItem::replacing_sql`]): in place
+///   where the engine can, which keeps what depends on it — PostgreSQL
+///   refuses to drop a function a trigger outside the file runs, and
+///   `CASCADE` would take the trigger; otherwise dropped just before its
+///   `CREATE` — MySQL, where nothing depends on a routine by reference. **An
+///   event** too: MySQL's, the one engine with them.
+/// - **A type or a sequence is created only where it is missing**
+///   ([`unless_present_sql`]), and is never replaced: dropping a type takes
+///   every column typed with it, in the file or not, and a sequence's position
+///   is state no script carries — SQL Server's rule for its own objects. Left
+///   as written where the engine has no guard.
+///
+/// [`ObjectItem::replacing_sql`]: crate::schema::ObjectItem::replacing_sql
+fn replay_create(
+    o: &crate::schema::ObjectItem,
+    kind: ObjectKind,
+    sql: String,
+    dialect: SqlDialect,
+) -> (String, bool) {
+    let qname = crate::schema::qualified_ident(o.name(), o.schema(), dialect);
+    let guarded = |present: Present<'_>, sql: String| {
+        unless_present_sql(dialect, present, &sql).unwrap_or(sql)
+    };
+    match kind {
+        ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event => {
+            match o.replacing_sql(dialect) {
+                Some(replace) => (replace, true),
+                None => (sql, false),
+            }
+        }
+        ObjectKind::Enum | ObjectKind::Domain => (guarded(Present::Type(&qname), sql), false),
+        ObjectKind::Sequence => (guarded(Present::Table(&qname), sql), false),
+        ObjectKind::Synonym
+        | ObjectKind::AliasType
+        | ObjectKind::XmlSchemaCollection
+        | ObjectKind::Extension => (sql, false),
     }
 }
 
@@ -2820,6 +2880,13 @@ pub fn plan(
     // The routines a replay drops and recreates — every one in the dumped
     // namespaces, used by the tables or not, which the header names.
     let mut replaced: Vec<String> = Vec::new();
+    // How many of them are events, for the header's word.
+    let mut replaced_events = 0usize;
+    // **A replay where nothing is dropped up front** — every engine but the
+    // one that drops up front — meets each standalone object the file
+    // carries still standing, and a bare `CREATE` stopped it at the first
+    // name already there. Asked of the same consent the tables' `DROP` is.
+    let replays = opts.structure && opts.drop_if_exists && !drops_up_front(dialect);
     let mut hold = |h: Hold, name: String| match h {
         Hold::Keep => kept.push(name),
         Hold::Refuse { object, why } => refused.push((object, format!("{name} ({why})"))),
@@ -2905,7 +2972,18 @@ pub fn plan(
                         kind,
                         ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event
                     );
-                    let sql = o.create_sql(dialect);
+                    let mut sql = o.create_sql(dialect);
+                    // Replayed where nothing was dropped up front, written so
+                    // a name already there does not stop the run — see
+                    // `replay_create`.
+                    if replays {
+                        let (replay, replaces) = replay_create(&o, kind, sql, dialect);
+                        sql = replay;
+                        if replaces {
+                            replaced.push(display_name(o.schema(), o.name()));
+                            replaced_events += usize::from(o.event().is_some());
+                        }
+                    }
                     // A routine the file recreates is dropped with the tables:
                     // replayed onto its source, its `CREATE` otherwise stops
                     // at a name that is already there. **Not one it cannot
@@ -3387,7 +3465,11 @@ pub fn plan(
         header.push_str(&format!(
             "\n--\n-- Replayed onto a database that already holds them, this file replaces {n} {} in these schemas,\n\
              -- used by the tables above or not, with the {} it carries: {}.",
-            crate::text::plural(n, "routine", "routines"),
+            match replaced_events {
+                0 => crate::text::plural(n, "routine", "routines"),
+                e if e == n => crate::text::plural(n, "event", "events"),
+                _ => "routines and events",
+            },
             crate::text::plural(n, "version", "versions"),
             crate::export::comment_text(&replaced.join(", ")),
         ));
@@ -6800,7 +6882,8 @@ mod tests {
     /// schemas, used by the tables or not — a replay of an older dump puts
     /// older routine code in place of newer — while the toggle spoke of
     /// tables alone, and so did the file. Both say so now, computed from
-    /// `drops_up_front` rather than the engine.
+    /// `drops_up_front` rather than the engine — and every other engine with
+    /// routines replaces them beside their `CREATE` (`replay_create`).
     #[test]
     fn the_drop_toggle_and_the_header_name_the_routines_a_replay_replaces() {
         for d in [
@@ -6810,7 +6893,11 @@ mod tests {
             SqlDialect::MsSql,
         ] {
             let hint = drop_before_create_hint(d);
-            assert_eq!(hint.contains("routine"), drops_up_front(d), "{d:?}: {hint}");
+            assert_eq!(
+                hint.contains("routine"),
+                crate::ddl::supports_routine_editing(d),
+                "{d:?}: {hint}"
+            );
             assert!(hint.contains("CREATE"), "{d:?}: {hint}");
         }
         let mut t = table("orders");
@@ -8178,7 +8265,7 @@ mod tests {
             DumpOptions::default(),
             SqlDialect::Postgres,
         ));
-        let func = pos(&file, "CREATE FUNCTION \"public\".\"next_code\"");
+        let func = pos(&file, "CREATE OR REPLACE FUNCTION \"public\".\"next_code\"");
         assert!(
             pos(&file, "CREATE TABLE \"public\".\"a_src\"") < func,
             "{file}"
@@ -8683,8 +8770,9 @@ mod tests {
             DumpOptions::default(),
             SqlDialect::Postgres,
         ));
-        let callee = file.find("b_base").expect("the callee's CREATE");
-        let caller = file.find("a_total").expect("the caller's CREATE");
+        // Quoted: the header names both, bare, as what a replay replaces.
+        let callee = file.find("\"b_base\"").expect("the callee's CREATE");
+        let caller = file.find("\"a_total\"").expect("the caller's CREATE");
         assert!(callee < caller, "the caller was emitted first:\n{file}");
     }
 
@@ -9077,5 +9165,162 @@ mod tests {
         assert!(text.contains("mood"), "{text}");
         // …and nothing else: no `CREATE TABLE`, no rows.
         assert!(!text.contains("CREATE TABLE"), "{text}");
+    }
+
+    fn one_function(schema: Option<&str>) -> std::sync::Arc<crate::schema::RoutineInfo> {
+        std::sync::Arc::new(crate::schema::RoutineInfo {
+            name: "f_one".to_string(),
+            schema: schema.map(str::to_string),
+            kind: crate::schema::RoutineKind::Function,
+            language: "sql".to_string(),
+            returns: "integer".to_string(),
+            body: "SELECT 1".to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// **A replay onto the database the file came from replaces each routine
+    /// and event it carries, where the file does not drop up front.** Written
+    /// as a bare `CREATE`, the replay stopped at the first name already taken
+    /// (PostgreSQL's *"function … already exists"*, MySQL's ERROR 1304) —
+    /// after the tables had been dropped and refilled. PostgreSQL replaces in
+    /// place, which keeps a trigger or default outside the file that uses the
+    /// routine; MySQL has no such form, and drops it beside its `CREATE`. The
+    /// header names what is replaced, as it does where the file drops up front.
+    #[test]
+    fn a_replay_replaces_each_routine_it_carries() {
+        let mut t = table("t");
+        t.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t]);
+        s.routines.push(one_function(Some("public")));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            file.contains("CREATE OR REPLACE FUNCTION \"public\".\"f_one\"()"),
+            "{file}"
+        );
+        assert!(!file.contains("DROP FUNCTION"), "{file}");
+        assert!(
+            file.contains("this file replaces 1 routine") && file.contains(": f_one."),
+            "{file}"
+        );
+
+        let mut s = schema_of(vec![table("t")]);
+        s.routines.push(one_function(None));
+        s.events.push(std::sync::Arc::new(crate::schema::EventInfo {
+            name: "ev".to_string(),
+            body: "DELETE FROM t".to_string(),
+            ..Default::default()
+        }));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        let drop = pos(&file, "DROP FUNCTION IF EXISTS `f_one`;");
+        assert!(drop < pos(&file, "FUNCTION `f_one`()"), "{file}");
+        // After the table it reads, as the `CREATE` is.
+        assert!(pos(&file, "CREATE TABLE `t`") < drop, "{file}");
+        assert!(
+            pos(&file, "DROP EVENT IF EXISTS `ev`;") < pos(&file, "EVENT `ev`"),
+            "{file}"
+        );
+        assert!(
+            file.contains("this file replaces 2 routines and events"),
+            "{file}"
+        );
+
+        // Without *Drop before create* the file is not one to replay, and
+        // replaces nothing.
+        let opts = DumpOptions {
+            drop_if_exists: false,
+            ..Default::default()
+        };
+        let file = file_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::MySql));
+        assert!(!file.contains("DROP FUNCTION"), "{file}");
+        assert!(!file.contains("DROP EVENT"), "{file}");
+        assert!(!file.contains("replaces"), "{file}");
+        let mut t = table("t");
+        t.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t]);
+        s.routines.push(one_function(Some("public")));
+        let file = file_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::Postgres));
+        assert!(
+            file.contains("CREATE FUNCTION \"public\".\"f_one\"()"),
+            "{file}"
+        );
+    }
+
+    /// **A type, a domain or a sequence the file carries is created only where
+    /// it is missing**, where the engine can say so in a script. Written bare,
+    /// a replay onto the source stopped at the first (*"type … already
+    /// exists"*). None can be replaced: dropping a type takes every column
+    /// typed with it, inside the file or not, and a sequence's position is
+    /// state no script carries — the rule SQL Server's objects already follow.
+    #[test]
+    fn a_replay_creates_a_type_or_sequence_only_where_it_is_missing() {
+        let mut t = table("t");
+        t.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t]);
+        s.enums.push(crate::schema::EnumInfo {
+            name: "mood".to_string(),
+            schema: Some("public".to_string()),
+            values: vec!["ok".to_string()],
+            comment: None,
+        });
+        s.domains.push(crate::schema::DomainInfo {
+            name: "pos".to_string(),
+            schema: Some("public".to_string()),
+            base_type: "integer".to_string(),
+            ..Default::default()
+        });
+        s.sequences.push(crate::schema::SequenceInfo {
+            name: "counter".to_string(),
+            schema: Some("public".to_string()),
+            ..Default::default()
+        });
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        for (absent, create) in [
+            (
+                "to_regtype('\"public\".\"mood\"') IS NULL",
+                "CREATE TYPE \"public\".\"mood\"",
+            ),
+            (
+                "to_regtype('\"public\".\"pos\"') IS NULL",
+                "CREATE DOMAIN \"public\".\"pos\"",
+            ),
+            (
+                "to_regclass('\"public\".\"counter\"') IS NULL",
+                "CREATE SEQUENCE \"public\".\"counter\"",
+            ),
+        ] {
+            let at = pos(&file, create);
+            let guard = pos(&file, absent);
+            assert!(guard < at, "{create}: {file}");
+            assert!(
+                !file[guard..at].contains(';'),
+                "{create} is not inside its guard: {file}"
+            );
+        }
+        // Not a replay: written as it was.
+        let opts = DumpOptions {
+            drop_if_exists: false,
+            ..Default::default()
+        };
+        let file = file_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::Postgres));
+        assert!(!file.contains("to_regtype"), "{file}");
     }
 }

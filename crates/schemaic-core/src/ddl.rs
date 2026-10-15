@@ -7357,7 +7357,7 @@ impl ChangeSet {
                 Change::CreateRoutine(draft) => {
                     let f = &draft.info;
                     // A numbered group's members with it, inside its settings.
-                    out.extend(routine_create_statements(f, d, false));
+                    out.extend(routine_create_statements(f, d, false, false));
                     out.extend(routine_follow_ups(f, None, d));
                 }
                 Change::ReplaceRoutine {
@@ -10960,12 +10960,17 @@ pub(crate) fn tsql_settings_scripted(
 /// A member the server shows no text for (an encrypted one) is a comment
 /// that names it, as an encrypted routine is: written as its empty text, it
 /// was a bare `;` that said nothing.
+///
+/// `replace` is [`RoutineInfo::create_sql`]'s: the head replaces a routine of
+/// its name where the engine has the form — the dump's, for a replay onto a
+/// database that already holds it.
 pub(crate) fn routine_create_statements(
     r: &RoutineInfo,
     d: SqlDialect,
     script: bool,
+    replace: bool,
 ) -> Vec<String> {
-    let head = r.create_sql(d, false);
+    let head = r.create_sql(d, replace);
     match d {
         SqlDialect::MsSql => {
             let members = r.tsql.numbered.iter().map(|(n, text)| {
