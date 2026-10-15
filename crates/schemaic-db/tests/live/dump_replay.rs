@@ -302,6 +302,62 @@ pub async fn a_replay_keeps_the_types_and_sequences_it_carries(target: &'static 
     s.teardown().await;
 }
 
+/// **A MariaDB sequence is dumped, and a replay puts it back where it was.**
+/// The file carried only a comment pointing at `SHOW CREATE SEQUENCE`, so a
+/// restore lost the sequence and every table whose default calls `nextval`
+/// on it. Now the file drops and recreates it before the tables, with its
+/// options, and restarts it at the position the source had reached — so the
+/// next value is the one the source would have handed out after a restart,
+/// never one already used.
+pub async fn a_replay_restores_a_mariadb_sequence_and_its_position(target: &'static Target) {
+    if target.name != "mariadb" {
+        crate::endpoint::note_no_op(target, "has no table-shaped sequence");
+        return;
+    }
+    let s = Scratch::create(target, "replay_sequence").await;
+    let (t, seq) = (s.qualified("t"), s.qualified("counter"));
+    s.exec(&format!(
+        "CREATE SEQUENCE {seq} START WITH 10 INCREMENT BY 5 NOCACHE"
+    ))
+    .await;
+    s.exec(&format!(
+        "CREATE TABLE {t} (id INTEGER PRIMARY KEY DEFAULT (NEXTVAL({seq})), v INTEGER)"
+    ))
+    .await;
+    s.exec(&format!("INSERT INTO {t} (v) VALUES (1), (2)"))
+        .await;
+    let file = dump_of(&s, &["counter", "t"]).await;
+    // Onto its source first, the table standing while the file drops and
+    // recreates the sequence its default calls: MariaDB tracks no such
+    // dependency, so the drop is not refused.
+    assert_eq!(
+        run_file(&s, &file).await,
+        ExecEnd::Done,
+        "{}: the dump did not replay onto its source:\n{file}",
+        target.name
+    );
+    // Then a restore, not a replay over what is still there: a file that left
+    // the sequence alone would pass the first, whatever it said about it.
+    s.exec(&format!("DROP TABLE {t}")).await;
+    s.exec(&format!("DROP SEQUENCE {seq}")).await;
+    assert_eq!(
+        run_file(&s, &file).await,
+        ExecEnd::Done,
+        "{}: the dump did not restore:\n{file}",
+        target.name
+    );
+    assert_eq!(count(&s, "t").await, "2", "{}", target.name);
+    // 10 and 15 were used; with no cache the next not handed out is 20.
+    s.exec(&format!("INSERT INTO {t} (v) VALUES (3)")).await;
+    assert_eq!(
+        scalar(&s, &format!("SELECT id FROM {t} WHERE v = 3")).await,
+        "20",
+        "{}: the replay moved the sequence:\n{file}",
+        target.name
+    );
+    s.teardown().await;
+}
+
 /// **A one-partition replay fires none of its parent's row triggers on the
 /// rows it restores.** The parent is left standing, and the partition the file
 /// creates `OF` it takes a clone of each of the parent's row triggers — so an

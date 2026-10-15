@@ -1426,6 +1426,67 @@ impl TableSource {
     }
 }
 
+/// A MariaDB sequence as the server states it ([`TableInfo::sequence`]).
+///
+/// **The options are the server's own text, not numbers this model
+/// re-spells.** `SHOW CREATE SEQUENCE` writes `start with 10 minvalue 1
+/// maxvalue 1000 increment by 5 cache 20 cycle ENGINE=InnoDB` after the name,
+/// and on 11.5 and later an `as <type>` too, whose unsigned range no `i64`
+/// holds — so the tail is kept verbatim and the name in front of it is the
+/// file's, which may be another database's. It reaches a script as SQL, so
+/// [`SequenceDef::from_show_create`] admits only the characters those words
+/// and numbers are spelt with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SequenceDef {
+    /// Everything `SHOW CREATE SEQUENCE` writes after the sequence's name.
+    pub options: String,
+    /// The state row's `next_not_cached_value`: the next value a restart of
+    /// the server would hand out, which is past any values the source had
+    /// cached and not yet used. `None` where the row could not be read. A
+    /// live value, not part of the definition, so `create_ddl` never writes
+    /// it — only [`TableInfo::sequence_restart_sql`] does.
+    pub next: Option<String>,
+}
+
+impl SequenceDef {
+    /// The definition out of a `SHOW CREATE SEQUENCE` statement, with the
+    /// state row's `next_not_cached_value` — or `None` where the statement is
+    /// not the shape the server writes, or its options hold a character no
+    /// option is spelt with. A `next` that is not an integer is dropped
+    /// rather than written.
+    pub fn from_show_create(show: &str, next: Option<&str>) -> Option<Self> {
+        let s = show.trim();
+        let head = "CREATE SEQUENCE ";
+        if !s.get(..head.len())?.eq_ignore_ascii_case(head) {
+            return None;
+        }
+        // The name: a backticked identifier, a doubled backtick inside it.
+        let name = s[head.len()..].trim_start().strip_prefix('`')?;
+        let b = name.as_bytes();
+        let mut i = 0;
+        let close = loop {
+            match b.get(i)? {
+                b'`' if b.get(i + 1) == Some(&b'`') => i += 2,
+                b'`' => break i,
+                _ => i += 1,
+            }
+        };
+        let options = name[close + 1..].trim().trim_end_matches(';').trim_end();
+        let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '=' | '-' | '+');
+        if options.is_empty() || !options.chars().all(word) || options.contains("--") {
+            return None;
+        }
+        let integer = |n: &&str| {
+            let digits = n.strip_prefix('-').unwrap_or(n);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        };
+        Some(SequenceDef {
+            options: options.to_string(),
+            next: next.map(str::trim).filter(integer).map(str::to_string),
+        })
+    }
+}
+
 /// A table with its columns and indexes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableInfo {
@@ -1462,6 +1523,12 @@ pub struct TableInfo {
     /// SQLite, where a sequence is not a table at all — PostgreSQL's are
     /// modelled properly, in [`DbSchema::sequences`].
     pub is_sequence: bool,
+    /// A MariaDB sequence's definition and position, read from
+    /// `SHOW CREATE SEQUENCE` and its state row — what lets
+    /// [`TableInfo::create_ddl`] restate it and a dump put its counter back.
+    /// `None` on anything that is not a sequence, and on one whose definition
+    /// could not be read, which the script then says it cannot restate.
+    pub sequence: Option<SequenceDef>,
     /// True for a **PostgreSQL foreign table** (`pg_class.relkind = 'f'`) —
     /// rows read through a foreign-data wrapper from somewhere else.
     ///
@@ -5693,6 +5760,27 @@ impl TableInfo {
         }
     }
 
+    /// The statement that puts a sequence's counter back where the source's
+    /// was — `ALTER SEQUENCE s RESTART WITH <next_not_cached_value>` — or
+    /// `None` for anything that is not a read sequence with a read position.
+    ///
+    /// A dump writes it with the rows, since the position is data, not
+    /// definition. Restarting at the *not cached* value skips whatever the
+    /// source had cached and not handed out, which is what a server restart
+    /// does too: a value is never issued twice. It restarts past `maxvalue`
+    /// as readily, so a `nocycle` sequence that had run out is restored run
+    /// out (measured on 10.11.14). The cycle count is not restored.
+    pub fn sequence_restart_sql(&self, dialect: crate::intel::SqlDialect) -> Option<String> {
+        if !self.is_sequence {
+            return None;
+        }
+        let next = self.sequence.as_ref()?.next.as_deref()?;
+        Some(format!(
+            "ALTER SEQUENCE {} RESTART WITH {next};",
+            qualified_ident(&self.name, self.schema.as_deref(), dialect)
+        ))
+    }
+
     /// A `CREATE TABLE`/`CREATE VIEW` skeleton from the introspected schema. Not
     /// a round-trip of the server's DDL — no FK references, engine or charset —
     /// but a valid, useful skeleton in the connection's dialect:
@@ -5735,11 +5823,13 @@ impl TableInfo {
         let qname = qualified_ident(&self.name, self.schema.as_deref(), dialect);
         // **A sequence's columns are its counter, not its definition.** MariaDB
         // stores one as an eight-column table whose *row* holds the start,
-        // increment, bounds and cache — none of which is in the catalogue this
-        // model was built from. Emitting the columns produces a `CREATE TABLE`
-        // that restores as a plain table, and every `NEXTVAL` against it then
-        // fails; emitting a `CREATE SEQUENCE` with invented parameters would be
-        // worse. So the script names the object and says what it could not
+        // increment, bounds and cache — none of which is in the catalogue the
+        // rest of this model was built from. Emitting the columns produces a
+        // `CREATE TABLE` that restores as a plain table, and every `NEXTVAL`
+        // against it then fails. So the definition is read on its own
+        // ([`TableInfo::sequence`]) and restated from that; where it could
+        // not be, emitting a `CREATE SEQUENCE` with invented parameters would
+        // be worse, so the script names the object and says what it could not
         // restate, the way the unreadable-view arm below does — the one thing
         // that leaves the reader able to fix it.
         // **Comment-safed, not merely quoted.** Every arm below that puts this
@@ -5752,10 +5842,15 @@ impl TableInfo {
         // the fix: they double a quote character and say nothing about `\n`.
         // **Invariant:** quoting is not comment-safety.
         let cname = crate::export::comment_text(&qname);
+        // A sequence whose definition was read is restated from it: the
+        // server's own options under the file's name for it.
+        if let (true, Some(def)) = (self.is_sequence, &self.sequence) {
+            return format!("CREATE SEQUENCE {qname} {};", def.options);
+        }
         if self.is_sequence {
             return format!(
-                "-- {cname} is a sequence. Schemaic reads its definition from the row, not the\n\
-                 -- catalogue, so this script cannot restate it. Copy it from\n\
+                "-- {cname} is a sequence whose definition could not be read, so this\n\
+                 -- script cannot restate it. Copy it from\n\
                  -- `SHOW CREATE SEQUENCE {cname}` on the source server."
             );
         }
@@ -7668,8 +7763,9 @@ impl DbSchema {
 
     /// A `CREATE` script for everything in one namespace, blank-line separated.
     ///
-    /// **In dependency order**: the standalone types first, then base tables,
-    /// then views, then the sequences that stand on their own. A view's body
+    /// **In dependency order**: the standalone types first, then MariaDB's
+    /// table-shaped sequences, then base tables, then views, then the
+    /// sequences that stand on their own. A view's body
     /// references the tables it selects from, and a column's type may *be* one
     /// of the namespace's enums or domains — `format_type` prints that
     /// qualified, so the script names it — which is the ordering that matters
@@ -7691,10 +7787,16 @@ impl DbSchema {
     ) -> String {
         use crate::ddl::ObjectKind;
         // **Three ways, through `shape()`.** A two-way `partition(|t| t.is_view)`
-        // put a MariaDB sequence in the base-table half — harmless only because
-        // `create_ddl` then withholds it, which is a second function's accident
-        // rather than this one's decision. A sequence in this script is the
-        // `objects_in(Sequence)` list's business, below.
+        // put a MariaDB sequence in the base-table half, where `create_ddl`
+        // could not restate it. It is a list of its own, written **before**
+        // the tables: a MariaDB table whose default calls `nextval(s)` is
+        // refused while `s` is missing. One whose definition was not read is
+        // `create_ddl`'s comment saying so, rather than silence.
+        let mariadb_seqs: Vec<String> = self
+            .tables_in(schema)
+            .filter(|t| t.shape() == TableShape::Sequence)
+            .map(|t| t.create_ddl(dialect))
+            .collect();
         let (views, tables): (Vec<&TableInfo>, Vec<&TableInfo>) = self
             .tables_in(schema)
             .filter(|t| t.shape() != TableShape::Sequence)
@@ -7742,6 +7844,7 @@ impl DbSchema {
         crate::ddl::join_scripts(
             types
                 .into_iter()
+                .chain(mariadb_seqs)
                 .chain(tables.into_iter().map(|t| t.create_ddl(dialect)))
                 .chain(views.into_iter().map(|t| t.create_ddl(dialect)))
                 .chain(seqs)
@@ -10007,6 +10110,132 @@ mod tests {
             ddl.lines().all(|l| l.trim_start().starts_with("--")),
             "{ddl}"
         );
+    }
+
+    fn sequence_def(options: &str, next: Option<&str>) -> SequenceDef {
+        SequenceDef {
+            options: options.to_string(),
+            next: next.map(str::to_string),
+        }
+    }
+
+    /// **A read sequence is restated as one**, under the file's name for it
+    /// and with the server's own options — the comment saying it could not be
+    /// was the dump's only answer, so a restore lost every MariaDB sequence.
+    #[test]
+    fn a_read_sequence_is_restated_with_the_servers_options() {
+        let t = TableInfo {
+            name: "sq1".into(),
+            is_sequence: true,
+            sequence: Some(sequence_def(
+                "start with 10 minvalue 1 maxvalue 1000 increment by 5 cache 20 cycle ENGINE=InnoDB",
+                Some("110"),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            t.create_ddl(crate::intel::SqlDialect::MySql),
+            "CREATE SEQUENCE `sq1` start with 10 minvalue 1 maxvalue 1000 increment by 5 \
+             cache 20 cycle ENGINE=InnoDB;"
+        );
+        // The position is live state, not definition: never in the CREATE.
+        assert!(
+            !t.create_ddl(crate::intel::SqlDialect::MySql)
+                .contains("110")
+        );
+        assert_eq!(
+            t.sequence_restart_sql(crate::intel::SqlDialect::MySql)
+                .as_deref(),
+            Some("ALTER SEQUENCE `sq1` RESTART WITH 110;")
+        );
+    }
+
+    #[test]
+    fn no_restart_without_a_position_or_a_definition() {
+        let mut t = TableInfo {
+            name: "sq1".into(),
+            is_sequence: true,
+            sequence: Some(sequence_def("start with 1 ENGINE=InnoDB", None)),
+            ..Default::default()
+        };
+        assert_eq!(
+            t.sequence_restart_sql(crate::intel::SqlDialect::MySql),
+            None
+        );
+        t.sequence = None;
+        assert_eq!(
+            t.sequence_restart_sql(crate::intel::SqlDialect::MySql),
+            None
+        );
+        // And an ordinary table has none whatever it holds.
+        let plain = TableInfo {
+            name: "t".into(),
+            sequence: Some(sequence_def("start with 1", Some("5"))),
+            ..Default::default()
+        };
+        assert_eq!(
+            plain.sequence_restart_sql(crate::intel::SqlDialect::MySql),
+            None
+        );
+    }
+
+    /// The server's statement, measured on 10.11.14, split at its name; the
+    /// name may hold a doubled backtick.
+    #[test]
+    fn show_create_sequence_is_split_at_the_name() {
+        let d = SequenceDef::from_show_create(
+            "CREATE SEQUENCE `d` start with -1 minvalue -9223372036854775807 maxvalue -1 \
+             increment by -1 cache 1000 nocycle ENGINE=InnoDB",
+            Some("-1"),
+        )
+        .expect("the server's shape");
+        assert_eq!(
+            d.options,
+            "start with -1 minvalue -9223372036854775807 maxvalue -1 increment by -1 cache 1000 \
+             nocycle ENGINE=InnoDB"
+        );
+        assert_eq!(d.next.as_deref(), Some("-1"));
+        let odd = SequenceDef::from_show_create(
+            "CREATE SEQUENCE `a``b` start with 1 nocache nocycle ENGINE=InnoDB",
+            None,
+        )
+        .expect("a doubled backtick is part of the name");
+        assert_eq!(odd.options, "start with 1 nocache nocycle ENGINE=InnoDB");
+        // 11.5's `as <type>`.
+        assert!(
+            SequenceDef::from_show_create(
+                "CREATE SEQUENCE `u` as bigint unsigned start with 1 minvalue 1 maxvalue \
+                 18446744073709551614 increment by 1 cache 1000 nocycle ENGINE=InnoDB",
+                Some("1"),
+            )
+            .is_some()
+        );
+    }
+
+    /// The options go into the script as SQL, so anything that is not an
+    /// option's word or number refuses the whole definition — as does a
+    /// statement that is not the server's shape, and a position that is not
+    /// an integer is dropped rather than written.
+    #[test]
+    fn a_definition_that_could_carry_sql_is_refused() {
+        for bad in [
+            "CREATE SEQUENCE `s` start with 1; DROP DATABASE prod",
+            "CREATE SEQUENCE `s` start with 1 -- x",
+            "CREATE SEQUENCE `s` start with 1 COMMENT='x'",
+            "CREATE SEQUENCE `s` start with 1\nDROP TABLE t",
+            "CREATE TABLE `s` (id int)",
+            "CREATE SEQUENCE `s`",
+            "CREATE SEQUENCE `s start with 1",
+            "",
+        ] {
+            assert_eq!(SequenceDef::from_show_create(bad, None), None, "{bad:?}");
+        }
+        let d = SequenceDef::from_show_create(
+            "CREATE SEQUENCE `s` start with 1 ENGINE=InnoDB",
+            Some("1; DROP TABLE t"),
+        )
+        .unwrap();
+        assert_eq!(d.next, None);
     }
 
     /// The three-answer question, and that it agrees with the two flags. A
@@ -12618,6 +12847,41 @@ mod tests {
     /// already works when the script is pasted into a query tab. A database
     /// recreated from a script that had quietly dropped them would answer
     /// "function does not exist" to its own triggers.
+    /// **Generate DDL restates a MariaDB sequence it read**, ahead of the
+    /// tables whose defaults call `nextval` on it. It left every one out,
+    /// because `create_ddl` could not restate them and only PostgreSQL's and
+    /// SQL Server's sequences are standalone objects.
+    #[test]
+    fn create_ddl_script_carries_a_read_mariadb_sequence_first() {
+        let s = DbSchema {
+            tables: vec![
+                TableInfo {
+                    name: "accounts".into(),
+                    columns: vec![col("id", "int", false, true)],
+                    ..Default::default()
+                },
+                TableInfo {
+                    name: "ids".into(),
+                    is_sequence: true,
+                    sequence: Some(SequenceDef {
+                        options: "start with 1 nocache nocycle ENGINE=InnoDB".into(),
+                        next: Some("7".into()),
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let out = s.create_ddl_script(None, crate::intel::SqlDialect::MySql);
+        let seq = out
+            .find("CREATE SEQUENCE `ids` start with 1 nocache nocycle ENGINE=InnoDB;")
+            .expect(&out);
+        let tbl = out.find("CREATE TABLE").expect(&out);
+        assert!(seq < tbl, "{out}");
+        // A definition script, not a dump: no position.
+        assert!(!out.contains("RESTART"), "{out}");
+    }
+
     #[test]
     fn create_ddl_script_emits_the_namespaces_routines() {
         use crate::intel::SqlDialect::{MySql, Postgres};

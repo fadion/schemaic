@@ -1984,6 +1984,7 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     apply_check_constraints(&mut schema, &check_rows, mariadb);
     apply_triggers(&mut schema, mysql_triggers(&trigger_rows));
     mysql_fold_partitions(&mut schema.tables, &partition_rows);
+    read_sequences(conn, database, &mut schema.tables).await;
     // The flavour was computed at the top of this function and then thrown
     // away, so the emitter — which is where MySQL and MariaDB actually diverge
     // — had no way to ask. It rides on the schema now, and it is the *same*
@@ -1995,6 +1996,35 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     // subtract it. See `DbSchema::database`.
     schema.database = Some(database.to_string());
     Ok(schema)
+}
+
+/// Each MariaDB sequence's definition and position
+/// ([`schemaic_core::schema::TableInfo::sequence`]): its `SHOW CREATE
+/// SEQUENCE` and its state row's `next_not_cached_value`, two reads a
+/// sequence — no catalogue view holds either, and a database has few.
+///
+/// **Best-effort, per sequence.** One the connection may not read keeps
+/// `None`, and its script says it could not be restated, as before; a
+/// failure here never fails the schema read the tree and the dump share.
+async fn read_sequences(conn: &mut Conn, database: &str, tables: &mut [TableInfo]) {
+    for t in tables.iter_mut().filter(|t| t.is_sequence) {
+        let q = format!("{}.{}", ident(database), ident(&t.name));
+        let show: Option<(String, String)> = conn
+            .query_first(format!("SHOW CREATE SEQUENCE {q}"))
+            .await
+            .ok()
+            .flatten();
+        let next: Option<String> = conn
+            .query_first(format!(
+                "SELECT CAST(next_not_cached_value AS CHAR) FROM {q}"
+            ))
+            .await
+            .ok()
+            .flatten();
+        t.sequence = show.and_then(|(_, sql)| {
+            schemaic_core::schema::SequenceDef::from_show_create(&sql, next.as_deref())
+        });
+    }
 }
 
 /// The `ALGORITHM` of a `SHOW CREATE VIEW` body, or `None` when it doesn't name

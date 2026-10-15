@@ -199,6 +199,7 @@ live_suite!(
         a_replay_replaces_the_materialized_view_it_carries,
         a_replay_replaces_the_routines_it_carries,
         a_replay_keeps_the_types_and_sequences_it_carries,
+        a_replay_restores_a_mariadb_sequence_and_its_position,
         a_partition_replay_fires_no_parent_trigger_on_its_rows,
     ],
     streaming: [

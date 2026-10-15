@@ -2818,6 +2818,14 @@ fn table_entry(
                  repartitions a table — recreate it by hand"
                     .to_string(),
             )
+        } else if shape == TableShape::Sequence && any.sequence.is_some() {
+            // Its definition *was* read — the pane shows it — so the default
+            // note's "could not be read" would contradict the screen.
+            Some(
+                "this comparison writes no statement for a sequence — copy it from \
+                 `SHOW CREATE SEQUENCE`, which its pane shows"
+                    .to_string(),
+            )
         } else if l.is_none()
             && r.is_some_and(|r| r.partitioning.is_some())
             && !crate::schema::restates_partitioning(dialect)
@@ -3333,6 +3341,26 @@ mod tests {
     /// The contradiction was on screen the whole time: the right-hand DDL pane
     /// is built from `TableInfo::create_ddl`, which *does* ask the shape, and
     /// says the object cannot be restated.
+    /// **A sequence whose definition was read is not disclosed as unread.**
+    /// The pane beside the note shows its `CREATE SEQUENCE` now, so the note
+    /// says what is true: this comparison writes no statement for one.
+    #[test]
+    fn a_read_sequence_is_disclosed_as_unplanned_not_unread() {
+        let seq = TableInfo {
+            name: "sq1".to_string(),
+            is_sequence: true,
+            sequence: Some(crate::schema::SequenceDef {
+                options: "start with 1 nocache nocycle ENGINE=InnoDB".to_string(),
+                next: None,
+            }),
+            ..Default::default()
+        };
+        let c = mysql(schema_of(vec![]), schema_of(vec![seq]));
+        let note = find(&c, "sequence:sq1").omission_note();
+        assert!(!note.contains("could not be read"), "{note}");
+        assert!(note.contains("SHOW CREATE SEQUENCE"), "{note}");
+    }
+
     #[test]
     fn a_sequence_is_not_offered_as_a_table() {
         let seq = |name: &str| TableInfo {

@@ -1302,7 +1302,7 @@ fn dollar_tag(parts: &[&str]) -> String {
     tag
 }
 
-/// What a `DROP` calls `t`: `TABLE`, `VIEW`, or `MATERIALIZED VIEW` — which
+/// What a `DROP` calls `t`: `TABLE`, `VIEW`, `SEQUENCE`, or `MATERIALIZED VIEW` — which
 /// PostgreSQL will not drop as a `VIEW` (*"mv" is not a view*), so a file
 /// carrying one stopped its replay onto the source at that line.
 fn drop_keyword(t: &TableInfo) -> &'static str {
@@ -1310,6 +1310,10 @@ fn drop_keyword(t: &TableInfo) -> &'static str {
         "MATERIALIZED VIEW"
     } else if t.is_view {
         "VIEW"
+    } else if t.is_sequence {
+        // MariaDB accepts `DROP TABLE` on a sequence too; the statement
+        // that names what the object is reads true in the file.
+        "SEQUENCE"
     } else {
         "TABLE"
     }
@@ -1577,6 +1581,11 @@ pub fn order_tables(
     // it, and it holds no rows to order against anything.
     let (views, base): (Vec<usize>, Vec<usize>) =
         picked.into_iter().partition(|&i| tables[i].is_view);
+    // **Sequences before every table**, by name: a MariaDB table whose default
+    // calls `nextval(s)` is refused while `s` is missing (ERROR 1146), and a
+    // sequence names nothing itself, so first is always safe.
+    let (sequences, base): (Vec<usize>, Vec<usize>) =
+        base.into_iter().partition(|&i| tables[i].is_sequence);
 
     // Edges point *into* the table that has to wait. A self-reference is not an
     // edge — it is one table, and it can only ever be created before itself.
@@ -1632,7 +1641,8 @@ pub fn order_tables(
 
     let (base_order, base_cycle) = topo_order(&base_edges);
     let (view_order, view_cycle) = topo_order(&view_edges);
-    let mut out: Vec<usize> = Vec::with_capacity(base.len() + views.len());
+    let mut out: Vec<usize> = Vec::with_capacity(sequences.len() + base.len() + views.len());
+    out.extend(sequences);
     out.extend(base_order.into_iter().map(|p| base[p]));
     out.extend(view_order.into_iter().map(|p| views[p]));
     (out, base_cycle || view_cycle)
@@ -1946,15 +1956,18 @@ enum Hold {
     Refuse { object: String, why: String },
 }
 
-/// Does the file's structure step for `t` create it? Not for a sequence or
-/// a foreign table, whose step is a comment ([`TableInfo::create_ddl`]
-/// cannot restate either) — so no `DROP` may name one: dropping what the
-/// file cannot put back is destruction, not a dump, and a foreign table's
-/// name on a target where it is an ordinary table went with its dependents.
+/// Does the file's structure step for `t` create it? Not for a foreign
+/// table, nor for a sequence whose definition was not read
+/// ([`TableInfo::sequence`]), whose step is a comment
+/// ([`TableInfo::create_ddl`] cannot restate either) — so no `DROP` may name
+/// one: dropping what the file cannot put back is destruction, not a dump,
+/// and a foreign table's name on a target where it is an ordinary table went
+/// with its dependents.
 fn file_creates(t: &TableInfo) -> bool {
     match t.shape() {
         TableShape::Table | TableShape::View => true,
-        TableShape::Sequence | TableShape::ForeignTable => false,
+        TableShape::Sequence => t.sequence.is_some(),
+        TableShape::ForeignTable => false,
     }
 }
 
@@ -3567,6 +3580,13 @@ pub fn plan(
                 triggers.push(crate::ddl::client_script(&bodies, dialect));
             }
         }
+        // A sequence's data is its position, put back by a restart rather
+        // than an `INSERT` into its state row (`sequence_restart_sql`).
+        if opts.data
+            && let Some(restart) = t.sequence_restart_sql(dialect)
+        {
+            text!(restart);
+        }
         // Named columns, never `*` — see [`dump_columns`]. A table the server
         // fills entirely has nothing insertable and gets no data step at all;
         // `SELECT  FROM` would not even parse.
@@ -3575,7 +3595,8 @@ pub fn plan(
         // are server-assigned by nothing, so `dump_columns` keeps them all
         // and the file grew an `INSERT INTO sq1` under a structure step that
         // creates no `sq1` — the restore then stops there, and every later
-        // table's structure and rows are never applied.
+        // table's structure and rows are never applied. Its position is the
+        // restart above.
         // And not a graph edge's, which the header explains.
         // Nor a partitioned table whose partitions hold its rows: its
         // `SELECT` reads theirs, which their own steps write.
@@ -5021,8 +5042,8 @@ mod tests {
 
     /// A dump must never name an object it does not create.
     ///
-    /// A MariaDB sequence's structure step is a comment — Schemaic reads the
-    /// definition from the row, not the catalogue, so it cannot restate one.
+    /// A MariaDB sequence whose definition could not be read has a comment
+    /// for its structure step, so the file cannot restate it.
     /// The `DROP` above it and the `INSERT` below it were still asking the
     /// two-answer `is_view`, so the file destroyed the sequence and then died
     /// at an `INSERT` into a table nothing had created — taking every later
@@ -5055,6 +5076,86 @@ mod tests {
             !text.contains("DROP TABLE"),
             "the file drops an object it never recreates:\n{text}"
         );
+    }
+
+    /// A sequence whose definition was read (`TableInfo::sequence`).
+    fn read_sequence(name: &str, next: Option<&str>) -> TableInfo {
+        let mut seq = table(name);
+        seq.is_sequence = true;
+        seq.columns = vec![ColumnInfo {
+            name: "next_not_cached_value".to_string(),
+            type_name: "bigint".to_string(),
+            ..Default::default()
+        }];
+        seq.sequence = Some(crate::schema::SequenceDef {
+            options: "start with 1 minvalue 1 maxvalue 1000 increment by 1 cache 20 nocycle \
+                      ENGINE=InnoDB"
+                .to_string(),
+            next: next.map(str::to_string),
+        });
+        seq
+    }
+
+    /// **A read MariaDB sequence is dumped, and comes back where it was.**
+    /// The file said only that it could not restate one, so a restore lost
+    /// every sequence and every `nextval` default naming one. Now the file
+    /// creates it, drops it first where asked (as `DROP SEQUENCE`, which the
+    /// object is), and puts its counter back with the rows — never as an
+    /// `INSERT` into its state row.
+    #[test]
+    fn a_read_sequence_is_created_and_its_counter_restored() {
+        let s = schema_of(vec![read_sequence("sq1", Some("41"))]);
+        let opts = DumpOptions {
+            data: true,
+            structure: true,
+            drop_if_exists: true,
+            ..Default::default()
+        };
+        let p = plan(&s, "shop", &all(&s), opts, SqlDialect::MySql);
+        let text = text_of(&p);
+        let drop = text.find("DROP SEQUENCE IF EXISTS `sq1`;").expect(&text);
+        let create = text
+            .find("CREATE SEQUENCE `sq1` start with 1 minvalue 1 maxvalue 1000")
+            .expect(&text);
+        let restart = text
+            .find("ALTER SEQUENCE `sq1` RESTART WITH 41;")
+            .expect(&text);
+        assert!(drop < create && create < restart, "{text}");
+        assert!(!text.contains("DROP TABLE"), "{text}");
+        assert!(
+            !p.steps.iter().any(|s| matches!(s, DumpStep::Rows { .. })),
+            "its state row is restored by the restart, not an INSERT"
+        );
+        // Structure only: the definition, not the position.
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions {
+                data: false,
+                ..opts
+            },
+            SqlDialect::MySql,
+        );
+        assert!(!text_of(&p).contains("RESTART"), "{}", text_of(&p));
+    }
+
+    /// **A sequence is created before every table**: a table whose default
+    /// calls `nextval(s)` is refused while `s` is missing (ERROR 1146 on
+    /// 10.11.14), and a sequence's name sorts wherever it happens to.
+    #[test]
+    fn sequences_come_before_the_tables_that_default_from_them() {
+        let mut t = table("accounts");
+        t.columns = vec![ColumnInfo {
+            name: "id".to_string(),
+            type_name: "int".to_string(),
+            default: Some("nextval(`shop`.`zz_ids`)".to_string()),
+            ..Default::default()
+        }];
+        let s = schema_of(vec![t, read_sequence("zz_ids", None)]);
+        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
+        let names: Vec<&str> = order.iter().map(|&i| s.tables[i].name.as_str()).collect();
+        assert_eq!(names, ["zz_ids", "accounts"]);
     }
 
     /// The same rule for a **PostgreSQL foreign table**, whose structure step

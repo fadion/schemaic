@@ -5817,12 +5817,24 @@ existing prose was left alone.
     `a_replay_refuses_to_replace_a_graph_table` and
     `a_replay_drops_no_module_it_cannot_restate_whole`, and the round trip now drops the graph
     tables itself before its replay).
-    **Nor a `DROP` for what the file only comments**: a MariaDB sequence's and a PostgreSQL foreign
-    table's structure step is a comment (`create_ddl` cannot restate either), so `dump::file_creates`
-    keeps both out of both drop sites. The foreign table's `DROP TABLE IF EXISTS … CASCADE` once
-    stayed, which on a target holding an ordinary table of that name dropped it and its dependents
-    with nothing put back (`a_foreign_table_is_neither_dropped_nor_given_rows`,
-    `a_sequence_gets_neither_a_drop_nor_a_row_step`).
+    **Nor a `DROP` for what the file only comments**: a PostgreSQL foreign table's structure step is
+    a comment, and so is a MariaDB sequence's whose definition was not read (`create_ddl` cannot
+    restate either), so `dump::file_creates` keeps both out of both drop sites. The foreign table's
+    `DROP TABLE IF EXISTS … CASCADE` once stayed, which on a target holding an ordinary table of
+    that name dropped it and its dependents with nothing put back
+    (`a_foreign_table_is_neither_dropped_nor_given_rows`,
+    `a_sequence_gets_neither_a_drop_nor_a_row_step`, which now holds the unread sequence).
+    **A MariaDB sequence that was read is created and its counter put back.** `file_creates` is
+    `true` for one with `TableInfo::sequence` filled, `drop_keyword` calls it `SEQUENCE` (MariaDB
+    takes `DROP TABLE` on one too; the file says what the object is), its structure step is
+    `create_ddl`'s `CREATE SEQUENCE`, and its data step — when *Data* is on — is
+    `TableInfo::sequence_restart_sql`'s `ALTER SEQUENCE … RESTART WITH`, never an `INSERT` into its
+    state row: the position is data, and a restart is how the server takes it. Before this every
+    sequence's step was the comment, so a dump restored no MariaDB sequence at all
+    (`a_read_sequence_is_created_and_its_counter_restored`; live,
+    `a_replay_restores_a_mariadb_sequence_and_its_position`, which drops both objects, replays, and
+    asserts the next id is 20 — red on the unfixed tree and green on 10.11 and 11.8, per the
+    change's author).
     **Where the file does not drop up front, what it carries beside the tables is written to be met
     again** (`replay_create`, whenever *Drop before create* is on and `drops_up_front` is not): a
     table's `DROP` takes no routine, type or sequence, so replaying a default dump onto its source
@@ -5928,8 +5940,11 @@ existing prose was left alone.
     failed read from an empty database wrongly. `dump_view.rs`'s entry has the bug in full.
     **Ordering is a topological sort over `TableInfo::foreign_keys`** (`order_tables`): a referenced
     table before the table referencing it, views last — a view's body selects from the tables above
-    it and it holds no rows to order against anything — and ties broken by name, so two dumps of one
-    schema are the same file. A self-reference is not an edge, being one table that can only be
+    it and it holds no rows to order against anything — MariaDB sequences first, by name, ahead of
+    every base table, since a table whose default calls `NEXTVAL(s)` is refused while `s` is missing
+    (ERROR 1146) and a sequence names nothing itself
+    (`sequences_come_before_the_tables_that_default_from_them`), and ties broken by name, so two
+    dumps of one schema are the same file. A self-reference is not an edge, being one table that can only be
     created before itself. A real cycle is **reported, never dropped**: no creation order satisfies
     one, so an edge is broken at the smallest name, every chosen table still reaches the file, and
     `DumpPlan::cycles` is what puts the explanation in the header.
@@ -9185,7 +9200,12 @@ existing prose was left alone.
     into the clash census would make it a drop/create candidate for a name it has no `CREATE TABLE`
     for. **Measured on MariaDB 10.11.14**: a sequence reports `TABLE_TYPE = SEQUENCE` with eight
     counter columns, `DROP TABLE sq1` on one *succeeds*, and `CREATE TABLE sq2 (…)` over an existing
-    sequence is ERROR 1050.
+    sequence is ERROR 1050. Now that `create_ddl` restates a read sequence (under `schema.rs`), the
+    panes show its real `CREATE SEQUENCE`; the comparison itself is unchanged — still
+    unplannable, and two sequences still pair as `Same` whatever their options — except its
+    disclosure, which would otherwise contradict that pane with *"its definition could not be
+    read"*: a read sequence carries `held_back` saying the comparison writes no statement for one
+    and to copy it from `SHOW CREATE SEQUENCE` (`a_read_sequence_is_disclosed_as_unplanned_not_unread`).
     **A PostgreSQL foreign table takes the same road one step removed.** It keys `f:`, so it never
     pairs with a same-named table and is never planned as that table's alter; it is filed under
     `CompareKind::Table`, which is where the tree shows it; and its change set is empty, so it is
@@ -12783,6 +12803,26 @@ existing prose was left alone.
     partition below. `is_view` and `is_sequence` stay public because the three backends fill them
     directly and privatising them needs a constructor first; what they are not is the question a
     decision asks.
+    **`TableInfo::sequence` is what lets a MariaDB sequence be restated** — a `SequenceDef {
+    options, next }` that `db::mysql`'s `read_sequences` fills, `None` on everything else and on a
+    sequence it could not read. `create_ddl` emits `CREATE SEQUENCE <qname> <options>;` from it, and
+    keeps the comment-only note — reworded to *a sequence whose definition could not be read* —
+    only where it is `None`; inventing parameters there would be worse than saying so. **The
+    options are the server's text, not numbers re-spelt**: `SequenceDef::from_show_create` splits
+    `SHOW CREATE SEQUENCE` at the backticked name (a doubled backtick inside it allowed) and keeps
+    the tail verbatim, because 11.5 and later write an `as <type>` whose unsigned range no `i64`
+    holds. That tail reaches a script as SQL, so it admits only `[A-Za-z0-9 _=+-]` and no `--`, and
+    refuses anything else whole (`show_create_sequence_is_split_at_the_name`,
+    `a_definition_that_could_carry_sql_is_refused`); a `next` that is not an integer is dropped
+    rather than written. `next` is `next_not_cached_value`, a live value and not definition, so
+    `create_ddl` never writes it: `sequence_restart_sql(dialect)` does, as `ALTER SEQUENCE q
+    RESTART WITH <next>;`, or `None` without both a definition and a position
+    (`a_read_sequence_is_restated_with_the_servers_options`,
+    `no_restart_without_a_position_or_a_definition`). **Restarting at the not-cached value is the
+    point, not an approximation**: it skips whatever the source had cached and not handed out, as a
+    server restart does, so no value is ever issued twice. It restarts past `maxvalue` as readily,
+    so an exhausted `nocycle` sequence restores exhausted (measured on 10.11.14, per the change's
+    author). What it does **not** restore is the cycle count.
     **`TableShape::ForeignTable` is the fourth answer, and it arrived the same way the third did.**
     PostgreSQL's `table_list_sql` already listed `relkind = 'f'` but typed it `BASE TABLE`, so a
     foreign table was indistinguishable from a table: it was offered Edit table, Truncate, Import
@@ -12791,7 +12831,7 @@ existing prose was left alone.
     and `ADD COLUMN` and `COMMENT ON TABLE` succeed on one, while `DROP TABLE`, `TRUNCATE` and
     `CREATE INDEX` are refused. `TableInfo::is_foreign` carries it (false on every other engine),
     and `shape()` answers it after view and sequence. `create_ddl` for one is a comment-only note
-    with the name comment-safed, as the MariaDB-sequence arm's is, rather than a `CREATE TABLE`:
+    with the name comment-safed, as an unread MariaDB sequence's is, rather than a `CREATE TABLE`:
     the model holds the columns and not the server or options, and restored, a `CREATE TABLE` made
     an empty local table under the name where the wrapper's rows had been
     (`a_foreign_table_is_its_own_shape`, `a_foreign_tables_script_is_a_note_not_a_create_table`).
@@ -13108,9 +13148,13 @@ existing prose was left alone.
     the first `CREATE TABLE`; a sequence a `serial` or an identity column already creates is
     skipped, since restating it fails on a name that exists. **The split is three ways and goes
     through `shape()`**: a two-way `partition(|t| t.is_view)` put a MariaDB sequence in the
-    base-table half, harmless only because `create_ddl` then withheld it — which is a second
-    function's accident rather than this one's decision — so sequences are filtered out before the
-    partition and a sequence in this script is the `objects_in(Sequence)` list's business. `create_ddl_script_all(dialect)` is
+    base-table half, harmless only while `create_ddl` withheld it — so MariaDB sequences are a list
+    of their own, written **first**, after the types and before the tables, since a MariaDB table
+    whose default calls `nextval(s)` is refused while `s` is missing: a read one is its `CREATE
+    SEQUENCE` (no position — this is a definition script), an unread one `create_ddl`'s comment
+    saying so. It left every one out while only the `objects_in(Sequence)` list carried sequences,
+    and that list holds PostgreSQL's and SQL Server's alone
+    (`create_ddl_script_carries_a_read_mariadb_sequence_first`). `create_ddl_script_all(dialect)` is
     the database node's analogue: it walks `schemas()` in **display** order (`public` first, then
     alphabetical), so the script reads down the tree it was raised from, and joins only the
     namespaces that produced something rather than leaving a blank run where an empty one was.
@@ -19065,6 +19109,13 @@ existing prose was left alone.
   author): `RANGE`, `LIST COLUMNS`, `HASH`, `KEY`, `RANGE COLUMNS` and `RANGE` +
   `SUBPARTITION BY HASH` tables read back as these clauses; the dump and restore are under
   `dump.rs`.
+  **A MariaDB sequence's definition and position are read last** (`read_sequences`, after
+  `mysql_fold_partitions`): per sequence, `SHOW CREATE SEQUENCE db.s` and `SELECT
+  CAST(next_not_cached_value AS CHAR) FROM db.s`, since no catalogue view holds either, folded by
+  `SequenceDef::from_show_create` onto `TableInfo::sequence` (under `schema.rs`). **Best-effort per
+  sequence**: one the login cannot read keeps `None` and its script says it could not be restated,
+  and a failure here never fails the schema read the tree and the dump share. Like partitions, it
+  is not in `fetch_table_list`, so the first-paint list holds no definition.
   **A database that is not there is an error, not an empty schema.** Every catalogue read above
   runs over a connection to *no* database and filters `WHERE TABLE_SCHEMA = ?`, so a missing
   database is not a failure there — it matches no rows and reads as a database with nothing in it.
