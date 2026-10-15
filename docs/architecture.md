@@ -3128,7 +3128,25 @@ existing prose was left alone.
     `a_column_of_the_same_name_keeps_group_by_and_loses_order_by`). The bare names are collected by
     sqlparser's own visitor at their `SELECT`'s own level rather than by a match over the expression
     kinds — a kind the match left out would be a reference the rename leaves behind, to bind to a
-    same-named column — and a subquery's names are its own (`a_subquerys_names_are_left_alone`).
+    same-named column. **A subquery's names are its own only where the engine keeps them so**
+    (`subquery_sees_output_aliases`: PostgreSQL and SQL Server). On MySQL and SQLite a subquery in
+    one of the alias's clauses sees it, behind every column on the way out — checked live on
+    MariaDB 10.11, MySQL 8.4 and SQLite 3.50, where `ORDER BY (SELECT t)` beside a column `t` reads
+    the column. `Tree::nested` takes each block inside the alias's through opaque subqueries alone
+    (a derived table's or a CTE's body on the way sees no enclosing alias — `nested_spot`), places
+    the subquery in the alias block's clauses by span (`Block::spots`), and asks that clause's own
+    predicate, the select list's being `select_list_subquery_sees_earlier_aliases` (MySQL, and only
+    for an alias written before the subquery — after it is error 1247). A bare name there that
+    `resolve_bare` finds no source for is the alias; one a source inside or the alias's own `FROM`
+    has is the column; anything else — an unknowable source, an outer query's column, a clause the
+    walk does not place such as a join's `ON`, a same-named alias on the way in — is `Unsure`
+    (`a_subquerys_names_are_left_alone`,
+    `an_alias_read_inside_a_subquery_is_renamed_where_the_engine_binds_it`). Each subquery renamed
+    adds a `Reach` whose rivals are its own sources' columns. **A window's `ORDER BY` and
+    `PARTITION BY`** (`Block::windows`, from `window_idents`) read the alias ahead of a column on
+    MariaDB alone — MySQL 8.4 answers *Unknown column 't' in 'window order by'* — so
+    `window_sees_output_aliases` asks `Catalog::flavour`, and a MySQL-family server it cannot name
+    leaves the rename `Unsure` (`a_windows_order_by_reads_the_alias_on_mariadb_alone`).
     **`output_alias::find` builds a `Tree` of every `SELECT` in the statement** — a sqlparser
     `Visitor` over `pre_visit_query`, `pre_visit_select` and `pre_visit_table_factor`, keyed by node
     address, since the borrow each callback is handed cannot be stored — holding each block's

@@ -3128,6 +3128,53 @@ fn select_alias_in_having(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a **subquery** written in one of a `SELECT`'s clauses see that
+/// `SELECT`'s select-list aliases, where the clause itself does — behind any
+/// column a source on the way out has? MariaDB 10.11, MySQL 8.4 and SQLite
+/// 3.50 bind `ORDER BY (SELECT t)` and `HAVING (SELECT t) > 0` to an alias `t`
+/// no source has; PostgreSQL 16 answers *column "t" does not exist*, and SQL
+/// Server's subqueries see input columns alone. Which clauses those are is
+/// the clause's own predicate, but for the select list
+/// ([`select_list_subquery_sees_earlier_aliases`]).
+fn subquery_sees_output_aliases(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
+}
+
+/// May a subquery in the select list read an alias the list defines
+/// **before** it? MySQL and MariaDB do — `SELECT 1 AS a, (SELECT a + 1)` —
+/// and refuse one defined after it (1247, *forward reference in item list*);
+/// SQLite answers *no such column*, and PostgreSQL and SQL Server see no
+/// alias from a subquery at all ([`subquery_sees_output_aliases`]).
+fn select_list_subquery_sees_earlier_aliases(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a window's `ORDER BY` / `PARTITION BY` read a select-list alias —
+/// ahead of a same-named column? `None` where the catalogue cannot say which
+/// MySQL-family server it is: MariaDB 10.11 does, ahead of the column, and
+/// MySQL 8.4 answers *Unknown column 't' in 'window order by'*. SQLite,
+/// PostgreSQL and SQL Server read input columns alone there.
+fn window_sees_output_aliases(
+    dialect: SqlDialect,
+    flavour: crate::schema::ServerFlavour,
+) -> Option<bool> {
+    use crate::schema::ServerFlavour;
+    match dialect {
+        SqlDialect::MySql => match flavour {
+            ServerFlavour::MariaDb => Some(true),
+            ServerFlavour::MySql => Some(false),
+            ServerFlavour::Unknown => None,
+        },
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => Some(false),
+    }
+}
+
 /// The functions whose **first argument is a datepart keyword** — `DATEADD(day,
 /// 1, d)`, `DATEDIFF(month, a, b)` — which the parser carries as an identifier
 /// and the column resolver took for a column: a red ``Column `day` not
@@ -14161,9 +14208,9 @@ mod output_alias {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        Expr, GroupByExpr, Ident, OrderByKind, Query, Select, SelectItem,
+        Expr, GroupByExpr, Ident, NamedWindowExpr, OrderByKind, Query, Select, SelectItem,
         SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, TableObject,
-        TableWithJoins, Visit, Visitor,
+        TableWithJoins, Visit, Visitor, WindowSpec, WindowType,
     };
 
     use super::{Catalog, LineIndex, SqlDialect, colres};
@@ -14350,6 +14397,20 @@ mod output_alias {
         order_refs: Vec<ColRef>,
         /// Its `ORDER BY`'s bare names, for [`Tree::plan`].
         order_cands: Vec<(Name, Clause)>,
+        /// Where its `ORDER BY` items are written, for the body's block's
+        /// [`Block::spots`].
+        order_spots: Vec<(Span, Spot)>,
+    }
+
+    /// Which clause of a `SELECT` a span is written in — where a subquery
+    /// there stands, which decides whether it sees the `SELECT`'s aliases.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Spot {
+        List,
+        Where,
+        Group,
+        Having,
+        Order,
     }
 
     /// One `SELECT`.
@@ -14365,6 +14426,11 @@ mod output_alias {
         refs: Vec<ColRef>,
         /// Bare names where an output alias may stand ([`Tree::plan`]).
         cands: Vec<(Name, Clause)>,
+        /// Its clauses' spans, for a subquery in one ([`Tree::nested_spot`]);
+        /// empty for a branch, whose aliases are not offered.
+        spots: Vec<(Span, Spot)>,
+        /// Bare names in its windows' `ORDER BY` and `PARTITION BY`.
+        windows: Vec<Name>,
         using: HashSet<String>,
         natural: bool,
     }
@@ -14412,6 +14478,9 @@ mod output_alias {
         blind: HashSet<String>,
         /// Whose rules names are compared by ([`Name::same`]).
         dialect: SqlDialect,
+        /// Which MySQL-family server, for a window's reading of an alias
+        /// ([`super::window_sees_output_aliases`]).
+        flavour: crate::schema::ServerFlavour,
     }
 
     /// A node's address: what the visitor's callbacks can share about a node,
@@ -14657,6 +14726,58 @@ mod output_alias {
         v.out.into_iter().map(|id| (id, false)).collect()
     }
 
+    /// Bare identifiers in the `ORDER BY` and `PARTITION BY` of `sel`'s own
+    /// windows — an `OVER (…)` in its select list, outside any subquery, and
+    /// its `WINDOW w AS (…)` definitions.
+    fn window_idents(sel: &Select) -> Vec<Ident> {
+        fn spec_idents(spec: &WindowSpec, out: &mut Vec<Ident>) {
+            let exprs = spec
+                .partition_by
+                .iter()
+                .chain(spec.order_by.iter().map(|o| &o.expr));
+            for e in exprs {
+                out.extend(bare_idents(e).into_iter().map(|(id, _)| id));
+            }
+        }
+        struct V {
+            depth: usize,
+            out: Vec<Ident>,
+        }
+        impl Visitor for V {
+            type Break = ();
+            fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+                self.depth += 1;
+                ControlFlow::Continue(())
+            }
+            fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+                self.depth -= 1;
+                ControlFlow::Continue(())
+            }
+            fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+                if self.depth == 0
+                    && let Expr::Function(f) = e
+                    && let Some(WindowType::WindowSpec(spec)) = &f.over
+                {
+                    spec_idents(spec, &mut self.out);
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        let mut v = V {
+            depth: 0,
+            out: Vec::new(),
+        };
+        for item in &sel.projection {
+            let _ = item.visit(&mut v);
+        }
+        for def in &sel.named_window {
+            if let NamedWindowExpr::WindowSpec(spec) = &def.1 {
+                spec_idents(spec, &mut v.out);
+            }
+        }
+        v.out
+    }
+
     impl Visitor for Build<'_> {
         type Break = ();
 
@@ -14744,10 +14865,15 @@ mod output_alias {
             branches(&q.body, &mut self.branches, &mut self.tree.blind);
             let mut order_refs = Vec::new();
             let mut order_cands = Vec::new();
+            let mut order_spots = Vec::new();
             if let Some(ob) = &q.order_by
                 && let OrderByKind::Expressions(items) = &ob.kind
             {
                 for item in items {
+                    order_spots.push((
+                        colres::to_range_in(&self.lines, self.stmt, self.lo, item.expr.span()),
+                        Spot::Order,
+                    ));
                     let whole =
                         matches!(item.expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
                     order_refs.extend(self.col_refs(refs_in(&item.expr), Place::Order { whole }));
@@ -14774,6 +14900,7 @@ mod output_alias {
                 ordered: q.order_by.is_some(),
                 order_refs,
                 order_cands,
+                order_spots,
             });
             self.stack.push(idx);
             ControlFlow::Continue(())
@@ -14828,10 +14955,31 @@ mod output_alias {
                 })
                 .collect();
             let mut cands = Vec::new();
+            let mut spots = Vec::new();
+            let mut windows = Vec::new();
             if !branch {
+                let at = |e: &Expr| colres::to_range_in(&self.lines, self.stmt, self.lo, e.span());
+                for item in &sel.projection {
+                    if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } =
+                        item
+                    {
+                        spots.push((at(e), Spot::List));
+                    }
+                }
+                if let Some(w) = &sel.selection {
+                    spots.push((at(w), Spot::Where));
+                }
+                if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+                    spots.extend(exprs.iter().map(|e| (at(e), Spot::Group)));
+                }
+                if let Some(h) = &sel.having {
+                    spots.push((at(h), Spot::Having));
+                }
+                windows = window_idents(sel).iter().map(|id| self.name(id)).collect();
                 let q = &mut self.tree.queries[query];
                 refs.append(&mut q.order_refs);
                 cands.append(&mut q.order_cands);
+                spots.append(&mut q.order_spots);
                 let mut behind = |e: &Expr, visible: bool| {
                     if visible {
                         for (id, _) in bare_idents(e) {
@@ -14861,6 +15009,8 @@ mod output_alias {
                 outs,
                 refs,
                 cands,
+                spots,
+                windows,
                 using,
                 natural,
             });
@@ -14914,6 +15064,7 @@ mod output_alias {
                     decls: Vec::new(),
                     blind: HashSet::new(),
                     dialect,
+                    flavour: catalog.flavour(),
                 },
                 stack: Vec::new(),
                 tops: HashSet::new(),
@@ -15143,6 +15294,26 @@ mod output_alias {
                     Clause::BehindColumns => {}
                 }
             }
+            // A window's `ORDER BY` / `PARTITION BY`: the alias ahead of a
+            // column on MariaDB, never elsewhere, and on a MySQL-family
+            // server the catalogue cannot name, not known.
+            let window = super::window_sees_output_aliases(dialect, self.flavour);
+            for id in &blk.windows {
+                match (window, id.same(target, dialect)) {
+                    (Some(true), true) => found.refs.push(id.at),
+                    (None, true) => {
+                        found.unsure = true;
+                        found.maybe.push(id.at);
+                    }
+                    (Some(true) | None, false) => order_names.push((id.value.clone(), id.quoted)),
+                    (Some(false), _) => {}
+                }
+            }
+            let mut outer = Vec::new();
+            if super::subquery_sees_output_aliases(dialect) {
+                self.nested(b, target, &mut found, &mut order_names, &mut outer);
+                refs_behind_columns |= !outer.is_empty();
+            }
             let others = blk
                 .outs
                 .iter()
@@ -15159,13 +15330,136 @@ mod output_alias {
                 order_names,
                 columns,
                 refs_behind_columns,
-                outer: Vec::new(),
+                outer,
                 dialect,
             };
             self.reach(blk.query, target, dialect, &mut found, &mut ctx, 0);
             found.refs.sort_unstable();
             found.refs.dedup();
             Some((found, ctx))
+        }
+
+        /// The alias `target` of block `b` read **inside a subquery** of
+        /// `b`'s, where the engine lets one see it
+        /// ([`super::subquery_sees_output_aliases`]): a bare name there that
+        /// no source on the way out to `b` — nor `b`'s own, a column beating
+        /// the alias here too — has is the alias, in a clause whose own
+        /// predicate says the alias is visible there. One the catalogue
+        /// cannot settle, one in a clause the walk does not place (a join's
+        /// `ON`), one an outer query's column would take, and one beside a
+        /// same-named alias on the way in are `unsure`. Each subquery whose
+        /// name is renamed adds a [`Reach`] whose rivals are its own sources'
+        /// columns, which a rename to one of them would hand the name to.
+        fn nested(
+            &self,
+            b: usize,
+            target: &Name,
+            found: &mut Found,
+            order_names: &mut Vec<(String, bool)>,
+            outer: &mut Vec<Reach>,
+        ) {
+            let dialect = self.dialect;
+            for (d, db) in self.blocks.iter().enumerate() {
+                if d == b || !self.within(d, b) {
+                    continue;
+                }
+                let Some((spot, start)) = self.nested_spot(d, b) else {
+                    continue;
+                };
+                let visible = spot.map(|spot| match spot {
+                    Spot::List => {
+                        super::select_list_subquery_sees_earlier_aliases(dialect)
+                            && start >= target.at.1
+                    }
+                    Spot::Where => super::select_alias_in_where(dialect),
+                    Spot::Group => super::group_by_sees_output_aliases(dialect),
+                    Spot::Having => super::select_alias_in_having(dialect),
+                    Spot::Order => super::order_by_expression_sees_output_aliases(dialect),
+                });
+                if visible == Some(false) {
+                    continue;
+                }
+                // The blocks from `d` out to `b`, `b` left out.
+                let mut way = Vec::new();
+                let mut cur = Some(d);
+                while let Some(l) = cur.filter(|&l| l != b) {
+                    way.push(l);
+                    cur = self.parent(l);
+                }
+                let shadowed = way.iter().any(|&l| {
+                    self.blocks[l]
+                        .outs
+                        .iter()
+                        .any(|o| matches!(o, Out::Alias(a) if a.same(target, dialect)))
+                });
+                let mut renamed = false;
+                for r in db.refs.iter().filter(|r| r.qual.is_none()) {
+                    let bound = self.resolve_bare(d, &r.col);
+                    let inside = matches!(bound, Bare::Source(x, _) if self.within(x, b));
+                    if !r.col.same(target, dialect) {
+                        // Read nowhere nearer, a rename to it would take it.
+                        if visible == Some(true) && !inside && bound != Bare::Unknown {
+                            order_names.push((r.col.value.clone(), r.col.quoted));
+                        }
+                        continue;
+                    }
+                    match bound {
+                        _ if inside => {}
+                        Bare::Free if visible == Some(true) && !shadowed => {
+                            found.refs.push(r.col.at);
+                            renamed = true;
+                        }
+                        _ => {
+                            found.unsure = true;
+                            found.maybe.push(r.col.at);
+                        }
+                    }
+                }
+                if renamed {
+                    let mut rivals = Some(HashSet::new());
+                    for &l in &way {
+                        for s in 0..self.blocks[l].sources.len() {
+                            let cols = self.source_cols(l, s, 0);
+                            match &mut rivals {
+                                Some(r) if cols.complete => r.extend(cols.names),
+                                _ => rivals = None,
+                            }
+                        }
+                    }
+                    outer.push(Reach {
+                        bare: HashSet::new(),
+                        renamed_bare: true,
+                        rivals,
+                        outputs: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        /// Where block `d`, inside block `b`, stands in `b`: the clause
+        /// holding the subquery of `b`'s that `d` is or is inside — `None`
+        /// for one written elsewhere (a join's `ON`) — with that subquery's
+        /// start. `None` altogether where a derived table's or a CTE's body
+        /// is on the way, which sees no enclosing alias.
+        fn nested_spot(&self, d: usize, b: usize) -> Option<(Option<Spot>, usize)> {
+            let mut q = self.blocks[d].query;
+            loop {
+                let node = &self.queries[q];
+                if !matches!(node.role, Role::Opaque | Role::Branch) {
+                    return None;
+                }
+                let parent = node.parent_block?;
+                if parent == b {
+                    let (a, z) = node.range;
+                    let spot = self.blocks[b]
+                        .spots
+                        .iter()
+                        .find(|&&((s, e), _)| s <= a && z <= e)
+                        .map(|&(_, k)| k);
+                    return Some((spot, a));
+                }
+                q = self.blocks[parent].query;
+            }
         }
 
         /// Follow column `name` of query `q`'s output to every `SELECT` that
@@ -37455,8 +37749,11 @@ mod output_alias_tests {
         assert_eq!(output_alias_name_at(plain, 9, PG, &catalog()), None);
     }
 
-    /// A subquery's own names are its own: `t` inside it is not the outer
-    /// alias.
+    /// A subquery's names are its own where the engine keeps them so —
+    /// PostgreSQL and SQL Server — and where a source in it, or the alias's
+    /// own `FROM`, has the name. On MySQL a name in a subquery in `ORDER BY`
+    /// that no source has *is* the outer alias, so beside a table the
+    /// catalogue does not know (`other`) the rename cannot say, and refuses.
     #[test]
     fn a_subquerys_names_are_left_alone() {
         assert_eq!(
@@ -37465,8 +37762,158 @@ mod output_alias_tests {
                 "x",
                 MY
             ),
-            Ok("SELECT total AS x FROM orders ORDER BY (SELECT max(t) FROM other)".to_string())
+            Err(AliasRenameRefusal::Unsure)
         );
+        // A table known to lack `t`: the name is the alias.
+        assert_eq!(
+            renamed(
+                "SELECT total AS t| FROM orders ORDER BY (SELECT max(t) FROM orders o2)",
+                "x",
+                MY
+            ),
+            Ok("SELECT total AS x FROM orders ORDER BY (SELECT max(x) FROM orders o2)".to_string())
+        );
+        // A source of the subquery's own has it.
+        let own = "SELECT total AS t| FROM orders ORDER BY (SELECT max(t) FROM (SELECT 1 AS t) w)";
+        assert_eq!(renamed(own, "x", MY), Ok(own.replace("AS t|", "AS x")));
+        // PostgreSQL and SQL Server never let a subquery see the alias.
+        for d in [PG, MS] {
+            assert_eq!(
+                renamed(
+                    "SELECT total AS t| FROM orders ORDER BY (SELECT max(t) FROM other)",
+                    "x",
+                    d
+                ),
+                Ok("SELECT total AS x FROM orders ORDER BY (SELECT max(t) FROM other)".to_string()),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// **A subquery sees the enclosing `SELECT`'s aliases where the engine
+    /// lets it** — checked live on MariaDB 10.11, MySQL 8.4 and SQLite 3.50:
+    /// MySQL in the select list (an alias written before it), `HAVING`,
+    /// `GROUP BY` and `ORDER BY`; SQLite in `WHERE`, `GROUP BY`, `HAVING`
+    /// and `ORDER BY`, not the select list. A column of the alias's own
+    /// `FROM` beats it there, as everywhere behind columns.
+    #[test]
+    fn an_alias_read_inside_a_subquery_is_renamed_where_the_engine_binds_it() {
+        let cases: [(&str, &str, &[SqlDialect]); 6] = [
+            (
+                "SELECT qty AS t|, (SELECT t) AS u FROM orders",
+                "SELECT qty AS z, (SELECT z) AS u FROM orders",
+                &[MY],
+            ),
+            (
+                "SELECT qty AS t| FROM orders GROUP BY qty HAVING EXISTS (SELECT 1 WHERE t > 0)",
+                "SELECT qty AS z FROM orders GROUP BY qty HAVING EXISTS (SELECT 1 WHERE z > 0)",
+                &[MY, LITE],
+            ),
+            (
+                "SELECT qty AS t| FROM orders ORDER BY (SELECT t)",
+                "SELECT qty AS z FROM orders ORDER BY (SELECT z)",
+                &[MY, LITE],
+            ),
+            (
+                "SELECT qty AS t| FROM orders GROUP BY (SELECT t)",
+                "SELECT qty AS z FROM orders GROUP BY (SELECT z)",
+                &[MY, LITE],
+            ),
+            (
+                "SELECT qty AS t| FROM orders WHERE (SELECT t) > 1",
+                "SELECT qty AS z FROM orders WHERE (SELECT z) > 1",
+                &[LITE],
+            ),
+            // A forward reference is MySQL's error 1247, not the alias.
+            (
+                "SELECT (SELECT t) AS u, qty AS t| FROM orders",
+                "SELECT (SELECT t) AS u, qty AS z FROM orders",
+                &[],
+            ),
+        ];
+        for (sql, binds, engines) in cases {
+            for d in ALL {
+                let want = if engines.contains(&d) {
+                    binds.to_string()
+                } else {
+                    sql.replace("AS t|", "AS z")
+                };
+                assert_eq!(renamed(sql, "z", d), Ok(want), "{d:?} {sql}");
+            }
+        }
+        // `orders.total` beats the alias inside the subquery too.
+        let col = "SELECT qty AS total| FROM orders ORDER BY (SELECT total)";
+        for d in [MY, LITE] {
+            assert_eq!(
+                renamed(col, "z", d),
+                Ok(col.replace("AS total|", "AS z")),
+                "{d:?}"
+            );
+        }
+        // A column of the subquery's own source would take the new name.
+        assert_eq!(
+            renamed(
+                "SELECT qty * 2 AS t| FROM orders o1 ORDER BY (SELECT max(t) FROM orders o2)",
+                "id",
+                MY
+            ),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        // *Find usages* lists what the rename writes.
+        let sql = "SELECT qty AS t, (SELECT t) AS u FROM orders";
+        let (_, spans) = usages_at(sql, sql.find("AS t").unwrap() + 3, MY, &catalog()).unwrap();
+        assert_eq!(spans.len(), 2);
+    }
+
+    /// **A window's `ORDER BY` reads the alias on MariaDB alone**, ahead of
+    /// a same-named column (MariaDB 10.11); MySQL 8.4 answers *Unknown column
+    /// in 'window order by'*. A catalogue that cannot say which server it is
+    /// leaves the rename `Unsure`.
+    #[test]
+    fn a_windows_order_by_reads_the_alias_on_mariadb_alone() {
+        use crate::schema::ServerFlavour;
+        let sql = "SELECT qty AS t|, sum(qty) OVER (ORDER BY t) AS s FROM orders";
+        let on = |flavour: ServerFlavour| {
+            let col = |n: &str| ColumnInfo {
+                name: n.into(),
+                type_name: "int".into(),
+                ..Default::default()
+            };
+            let schema = DbSchema {
+                tables: vec![TableInfo {
+                    name: "orders".into(),
+                    columns: vec![col("id"), col("total"), col("qty")],
+                    ..Default::default()
+                }],
+                flavour,
+                ..Default::default()
+            };
+            let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+            let caret = sql.find('|').unwrap();
+            let mut text = sql.replace('|', "");
+            output_alias_rename(&text, caret, "z", MY, &cat).map(|m| {
+                for (a, b, t) in m.edits.into_iter().rev() {
+                    text.replace_range(a..b, &t);
+                }
+                text
+            })
+        };
+        assert_eq!(
+            on(ServerFlavour::MariaDb),
+            Ok("SELECT qty AS z, sum(qty) OVER (ORDER BY z) AS s FROM orders".to_string())
+        );
+        assert_eq!(
+            on(ServerFlavour::MySql),
+            Ok("SELECT qty AS z, sum(qty) OVER (ORDER BY t) AS s FROM orders".to_string())
+        );
+        assert_eq!(on(ServerFlavour::Unknown), Err(AliasRenameRefusal::Unsure));
+        for d in [PG, MS, LITE] {
+            assert_eq!(
+                renamed(sql, "z", d),
+                Ok("SELECT qty AS z, sum(qty) OVER (ORDER BY t) AS s FROM orders".to_string()),
+                "{d:?}"
+            );
+        }
     }
 
     /// *Find usages* answers for each of the three names, with the same
