@@ -545,6 +545,11 @@ pub struct Db {
     /// through [`Db::init_statements`]: a connect whose init SQL is not all
     /// settings is refused before any of it runs.
     pub(crate) init_sql: String,
+    /// The server's own `host:port` where it is not the dial address — a
+    /// tunnelled endpoint dials `127.0.0.1:<local port>` — so a cloud IAM
+    /// token is signed for the instance that checks it
+    /// ([`Self::signing_target`]). `None` where the two are the same.
+    pub(crate) signing: Option<(String, u16)>,
 }
 
 /// **Hand-written, because the derived one printed the password.**
@@ -578,6 +583,7 @@ impl std::fmt::Debug for Db {
             .field("tls", &self.tls)
             .field("auth", &self.auth)
             .field("init_sql", &self.init_sql)
+            .field("signing", &self.signing)
             .finish()
     }
 }
@@ -642,6 +648,14 @@ impl Db {
                 }),
                 auth,
                 init_sql,
+                // And so is the token's: RDS checks an IAM token's presigned
+                // `host:port` against its own endpoint, and reads no region
+                // from a loopback address. Carried in the same step, for the
+                // same reason as the certificate's name.
+                signing: Some({
+                    let (host, port) = conn.tcp_target();
+                    (host.to_string(), port)
+                }),
             },
             None => Db {
                 engine,
@@ -654,6 +668,7 @@ impl Db {
                 tls,
                 auth,
                 init_sql,
+                signing: None,
             },
         }
     }
@@ -684,7 +699,23 @@ impl Db {
             tls: None,
             auth: schemaic_core::connection::AuthMode::Password,
             init_sql: String::new(),
+            signing: None,
         }
+    }
+
+    /// Attach the server's own `host:port` to a handle built by
+    /// [`Self::from_parts`] from a tunnelled endpoint — the endpoint handoff's
+    /// half of what [`Self::connect`] sets, so the MCP subprocess signs a cloud
+    /// IAM token for the instance rather than for the app's tunnel.
+    pub fn with_signing_target(mut self, target: Option<(String, u16)>) -> Db {
+        self.signing = target;
+        self
+    }
+
+    /// The server's own `host:port` where it differs from the dial address,
+    /// for the endpoint handoff — `None` where they are the same.
+    pub fn signing_override(&self) -> Option<(&str, u16)> {
+        self.signing.as_ref().map(|(h, p)| (h.as_str(), *p))
     }
 
     /// Attach a connection's init SQL to a handle built by
@@ -753,7 +784,8 @@ impl Db {
         if let Some(why) = self.auth.transport_refusal(self.tls.as_ref()) {
             return Err(DbError::Refused(why.to_string()));
         }
-        cloud_iam::token(cloud, &self.host, self.port, &self.user).await
+        let (host, port) = self.signing_target();
+        cloud_iam::token(cloud, host, port, &self.user).await
     }
 
     /// The database this handle opens in when none is named, or `None`.
@@ -806,6 +838,13 @@ impl Db {
     /// The TLS plan this handle connects with, if any — for the endpoint handoff.
     pub fn tls_plan(&self) -> Option<&schemaic_core::connection::TlsPlan> {
         self.tls.as_ref()
+    }
+
+    /// The `host:port` a cloud IAM token is signed for: the server's own —
+    /// through a tunnel the instance at the far end, not the loopback address
+    /// the driver dials.
+    pub fn signing_target(&self) -> (&str, u16) {
+        self.signing_override().unwrap_or((&self.host, self.port))
     }
 
     /// Borrow the endpoint parts `(host, port, user, pass, file)` — used to
@@ -3868,6 +3907,66 @@ mod tests {
         let tunneled = Db::connect(&ms, Some(55001));
         let plan = tunneled.tls_plan().unwrap();
         assert_eq!(plan.hostname_override.as_deref(), Some("remote.example"));
+    }
+
+    /// **An RDS token through a tunnel is signed for the instance, not the
+    /// tunnel.** RDS checks the token's presigned `host:port` against its own
+    /// endpoint, and the tunnel rewrites the dial address to
+    /// `127.0.0.1:<local port>` — a token minted for that is refused, and
+    /// without the instance's name the CLI cannot read the region from it
+    /// either. A direct connection signs for what it dials.
+    #[test]
+    fn a_tunnelled_iam_sign_in_signs_for_the_instance() {
+        use schemaic_core::cloud_iam::{Cloud, token_args};
+        use schemaic_core::connection::{AuthMode, Connection, SslMode, Tls};
+        let conn = Connection {
+            id: 1,
+            name: "rds".to_string(),
+            db_type: "PostgreSQL".to_string(),
+            host: "app.abc123.eu-west-2.rds.amazonaws.com".to_string(),
+            port: 5432,
+            user: "app".to_string(),
+            password: String::new(),
+            file: String::new(),
+            database: String::new(),
+            ssh: Default::default(),
+            tls: Tls {
+                mode: SslMode::VerifyFull,
+                ..Tls::default()
+            },
+            color: None,
+            prominent_color: false,
+            read_only: false,
+            cli_access: false,
+            environment: Default::default(),
+            ai_data: None,
+            folder: String::new(),
+            auth: AuthMode::AwsIam,
+            statement_timeout_secs: None,
+            init_sql: String::new(),
+        };
+        let tunnelled = Db::connect(&conn, Some(54321));
+        assert_eq!(
+            tunnelled.parts().0,
+            "127.0.0.1",
+            "it still dials the tunnel"
+        );
+        assert_eq!(
+            tunnelled.signing_target(),
+            ("app.abc123.eu-west-2.rds.amazonaws.com", 5432)
+        );
+        let (host, port) = tunnelled.signing_target();
+        let args = token_args(Cloud::Aws, host, port, "app").unwrap();
+        let region = args
+            .iter()
+            .position(|a| a == "--region")
+            .map(|i| &args[i + 1]);
+        assert_eq!(region.map(String::as_str), Some("eu-west-2"));
+        let direct = Db::connect(&conn, None);
+        assert_eq!(
+            direct.signing_target(),
+            ("app.abc123.eu-west-2.rds.amazonaws.com", 5432)
+        );
     }
 
     /// A SQLite connection's target is its file, and **a tunnel port must not

@@ -444,12 +444,21 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         .get("init_sql")
         .and_then(|x| x.as_str())
         .unwrap_or_default();
+    // The server's own `host:port` behind the app's tunnel, which a cloud IAM
+    // token is signed for. Absent — an untunnelled connection, or a blob
+    // written before the field — means the endpoint above is the server.
+    let signing = v.get("signing_target").and_then(|t| {
+        let host = t.get("host")?.as_str()?.to_string();
+        let port = u16::try_from(t.get("port")?.as_u64()?).ok()?;
+        Some((host, port))
+    });
     McpEndpoint {
         db: Db::from_parts(engine, host, port, user, pass, file)
             .with_tls(tls)
             .with_database(conn_database)
             .with_auth(auth)
-            .with_init_sql(init_sql),
+            .with_init_sql(init_sql)
+            .with_signing_target(signing),
         database,
         // Absent → on, matching the endpoint blobs written before the flag
         // existed (which also predate any tool that reads rows from schema).
@@ -498,7 +507,10 @@ fn endpoint_json(
         "database": database, "engine": db.engine().as_str(), "samples": samples,
         "schema": schema, "hidden": hidden, "tls": db.tls_plan(),
         "connection_database": db.database(), "conn_id": conn_id, "auth": db.auth(),
-        "init_sql": db.init_sql()
+        "init_sql": db.init_sql(),
+        "signing_target": db
+            .signing_override()
+            .map(|(host, port)| serde_json::json!({ "host": host, "port": port }))
     })
     .to_string()
 }
@@ -4668,6 +4680,38 @@ mod tests {
         let mut old = v.clone();
         old.as_object_mut().unwrap().remove("init_sql");
         assert_eq!(endpoint_from_value(&old).db.init_sql(), "");
+    }
+
+    /// **The assistant's IAM token is signed for the instance, as the app's
+    /// is.** The endpoint's host and port are the app's tunnel for an SSH
+    /// connection, and a token minted for `127.0.0.1:<port>` is refused by
+    /// RDS — so the server's own `host:port` rides along. A blob from before
+    /// the key, or from an untunnelled connection, signs for what it dials.
+    #[test]
+    fn the_endpoint_handoff_carries_the_signing_target() {
+        use schemaic_core::connection::AuthMode;
+        let db = Db::from_parts(
+            schemaic_db::Engine::Postgres,
+            "127.0.0.1".into(),
+            54321,
+            "app".into(),
+            String::new(),
+            String::new(),
+        )
+        .with_auth(AuthMode::AwsIam)
+        .with_signing_target(Some(("db.abc.eu-west-2.rds.amazonaws.com".into(), 5432)));
+        let json = endpoint_json(&db, 7, None, true, true, &HashSet::new());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            endpoint_from_value(&v).db.signing_target(),
+            ("db.abc.eu-west-2.rds.amazonaws.com", 5432)
+        );
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("signing_target");
+        assert_eq!(
+            endpoint_from_value(&old).db.signing_target(),
+            ("127.0.0.1", 54321)
+        );
     }
 
     /// **The subprocess must reach the server the same way the app does.** The

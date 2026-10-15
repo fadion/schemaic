@@ -19491,7 +19491,16 @@ existing prose was left alone.
   IAM mode `AuthMode::transport_refusal` first — a `DbError::Refused`, with no CLI run, for a plan
   short of the floor, the case being a handle assembled from parts — and then the token
   (`an_iam_sign_in_without_tls_is_refused_before_any_token_is_asked`, red with the transport check
-  removed: the CLI was looked for and a Connect error came back). On MySQL the token travels through
+  removed: the CLI was looked for and a Connect error came back). **The token is signed for
+  `Db::signing_target`, not the dial address**: an RDS token is a presign over `host:port` that
+  the instance checks against its own endpoint, and through an SSH tunnel the handle dials
+  `127.0.0.1:<local port>` — a token for that is refused, and `rds_region` reads no region from
+  it. So `Db::connect`'s tunnel arm carries the server's own `Connection::tcp_target` in the
+  `signing` field in the same step that moves the address, as it carries the certificate's name in
+  `hostname_override`, and the cache key is built from it too
+  (`a_tunnelled_iam_sign_in_signs_for_the_instance`); the MCP endpoint blob hands it on as
+  `signing_target`, rebuilt by `with_signing_target` (`the_endpoint_handoff_carries_the_signing_target`).
+  Not checked against a real RDS instance behind a bastion. On MySQL the token travels through
   `mysql_clear_password`, which RDS and Cloud SQL ask for and `mysql_async` leaves off by default, so
   `opts_with_tls` takes the secret and enables the plugin for the two IAM modes alone, their TLS
   floor keeping the clear text inside an encrypted session; `opts`, which handed the stored
