@@ -858,8 +858,10 @@ impl GridState {
     /// by* / *Exclude*, the pager — used to drop them without a word. The
     /// change is taken as a closure so that no caller can write `grid_query`
     /// first and leave the bar, the header or the page caption describing a
-    /// query that never ran (`the_grid_query_is_written_only_by_the_guarded_action`).
-    /// Returns whether the change was made.
+    /// query that never ran (`the_grid_query_is_written_only_by_the_guarded_action`)
+    /// — and it is written only once the re-run is dispatched, so the three
+    /// refusals after `requery` leave it alone too. Returns whether the change
+    /// was made: `false` on any refusal, the reason in `view_err`.
     fn apply_grid_query(&self, change: impl FnOnce(&mut schemaic_core::filter::GridQuery)) -> bool {
         let next = self
             .grid_query
@@ -871,37 +873,52 @@ impl GridState {
                 return false;
             }
         };
-        self.grid_query.set(gq.clone());
-        let Some(base) = self.base_sql.get_untracked() else {
-            return true;
-        };
-        // Filter, sort and page, composed in one place (`filter::compose`).
-        match schemaic_core::filter::compose(&base, &gq, self.dialect) {
-            // **Two refusals, and they are different questions.** `Ok(None)` is
-            // `build_query` saying it cannot *rewrite* the base; `approved`
-            // returning `None` is the write guard, which lives on the action
-            // and used to live here — this caller's only protection was the
-            // rewritability answer, which is not a write test at all. See
-            // `crate::RerunRequest`.
-            Ok(Some(sql)) => match crate::RerunRequest::approved(sql, self.dialect) {
-                Some(req) => {
-                    if let Some(run) = self.apply_view.get_untracked() {
-                        run(req);
-                    }
+        // Filter, sort and page, composed in one place (`filter::compose`) —
+        // or, with no base to re-run, nothing to compose and nothing to run.
+        //
+        // **`grid_query` is written only once the re-run is on its way**, so
+        // a refusal leaves it describing the rows still on screen. It was
+        // written first, and each refusal below then returned `true`: the ✕
+        // emptied the bar over a refused re-run, leaving filtered rows under
+        // an empty bar, and a refused filter stood as the tab's query for the
+        // next re-run to apply unseen.
+        let rerun = match self.base_sql.get_untracked() {
+            None => Ok(None),
+            Some(base) => match schemaic_core::filter::compose(&base, &gq, self.dialect) {
+                // **Two refusals, and they are different questions.** `Ok(None)`
+                // is `build_query` saying it cannot *rewrite* the base;
+                // `approved` returning `None` is the write guard, which lives
+                // on the action and used to live here — this caller's only
+                // protection was the rewritability answer, which is not a
+                // write test at all. See `crate::RerunRequest`.
+                //
+                // All three refusals are Schemaic's own, decided before
+                // anything reached a server — the last is `sqlparser`'s
+                // reading of the typed condition, not the database's.
+                Ok(Some(sql)) => crate::RerunRequest::approved(sql, self.dialect)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        "Can't re-run this statement — it would write to the database".to_string()
+                    }),
+                Ok(None) => {
+                    Err("Can't filter this query — not a simple single-table SELECT".to_string())
                 }
-                // All three refusals are Schemaic's own, decided before anything
-                // reached a server — the last is `sqlparser`'s reading of the
-                // typed condition, not the database's.
-                None => self.view_err.set(Some(ModalError::app(
-                    "Can't re-run this statement — it would write to the database",
-                ))),
+                Err(FilterError::BadCondition(msg)) => Err(msg),
             },
-            Ok(None) => self.view_err.set(Some(ModalError::app(
-                "Can't filter this query — not a simple single-table SELECT",
-            ))),
-            Err(FilterError::BadCondition(msg)) => self.view_err.set(Some(ModalError::app(msg))),
+        };
+        match rerun {
+            Ok(req) => {
+                self.grid_query.set(gq);
+                if let (Some(req), Some(run)) = (req, self.apply_view.get_untracked()) {
+                    run(req);
+                }
+                true
+            }
+            Err(why) => {
+                self.view_err.set(Some(ModalError::app(why)));
+                false
+            }
         }
-        true
     }
 
     /// The statement that produced the result currently on screen and **may be
@@ -8713,8 +8730,9 @@ fn filter_bar(gs: GridState) -> impl IntoView {
             let buf = RwSignal::new(gs.grid_query.with_untracked(|q| q.filter.clone()));
             let apply = move || {
                 let text = buf.get_untracked().trim().to_string();
-                // Refused over staged work, with the reason in the error bar;
-                // the typed text stays in the field for after the commit.
+                // Refused over staged work or a bad condition, with the
+                // reason in the error bar; the typed text stays in the field
+                // to fix or to apply after the commit.
                 gs.apply_grid_query(|q| {
                     q.filter = text;
                     q.page = 0;
@@ -8747,8 +8765,9 @@ fn filter_bar(gs: GridState) -> impl IntoView {
                         .on_click_stop(move |_| {
                             gs.view_err.set(None);
                             // The field empties only if the filter it shows
-                            // really went: over staged work the re-run is
-                            // refused, and the filter is still applied.
+                            // really went: over staged work, the write guard,
+                            // an un-rewritable base or a bad condition the
+                            // re-run is refused, and the filter still applies.
                             if gs.apply_grid_query(|q| {
                                 q.filter.clear();
                                 q.page = 0;
@@ -10555,11 +10574,13 @@ fn header_cell(
     // `dyn_container` builder and again from the virtualised header row's —
     // neither of which floem 0.2 wraps in a tracking effect, and neither of
     // whose keys mentions `grid_query`. So a value computed here subscribed to
-    // nothing: `apply_grid_query` writes the new order and *then* has three
-    // exits that set `view_err` and re-run nothing (its staged-work refusal
-    // comes before the write, and is not one of them), and on any of them the bar said the query could not be sorted
-    // while the header went on drawing the order before last. A successful
-    // re-run hid it by rebuilding the grid from a new `ResultSet`.
+    // nothing: `apply_grid_query` used to write the new order and *then* take
+    // one of three exits that set `view_err` and re-ran nothing, and on any of
+    // them the bar said the query could not be sorted while the header went
+    // on drawing the order before last. A successful re-run hid it by
+    // rebuilding the grid from a new `ResultSet`. (Those exits no longer write
+    // the order; the closure stays because the header must follow the write
+    // that a dispatched re-run makes before its rows land.)
     let indicator = move || header_sort_indicator(gs.server_sort_dir(ci), sort_val, ci);
     let key = key_map.get(&ci).copied();
 
@@ -13217,6 +13238,36 @@ mod header_sort_tests {
              staged-work guard drops the user's uncommitted edits"
         );
         assert_eq!(inside, 1, "this gate is stale — it found {inside} writes");
+    }
+
+    /// **And inside it, the write comes after every refusal.** It came first:
+    /// the write guard, an un-rewritable base and a bad condition each set
+    /// `view_err` and returned `true` over a query already written, so the
+    /// filter bar's ✕ emptied the bar while the rows stayed filtered. Read
+    /// off the source because the decision lives in a `GridState` method, and
+    /// `GridState` needs the whole `GridCtx` to build.
+    #[test]
+    fn the_grid_query_is_written_after_the_rerun_is_approved() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/grid.rs"))
+            .expect("this module's own source");
+        let body = crate::source_gate::production_code(&src);
+        let start = body
+            .find("fn apply_grid_query(")
+            .expect("`apply_grid_query` is gone — this gate is stale");
+        let end = crate::source_gate::item_end(&body, start).expect("its body");
+        let f = &body[start..end];
+        let at = |needle: &str| {
+            f.find(needle)
+                .unwrap_or_else(|| panic!("no `{needle}` in `apply_grid_query` — stale gate"))
+        };
+        let write = at("grid_query.set(");
+        for refusal in ["filter::compose(", "RerunRequest::approved("] {
+            assert!(
+                at(refusal) < write,
+                "`grid_query` is written before `{refusal}`: a refused re-run \
+                 leaves the bar, header and pager describing a query that never ran"
+            );
+        }
     }
 }
 

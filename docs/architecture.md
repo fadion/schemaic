@@ -42730,9 +42730,14 @@ this bundle's.
   making the change, and over staged work leaves `grid_query` untouched, puts
   `filter::STAGED_REQUERY_MSG` — *Commit or discard your changes first — re-reading the rows would
   throw them away* — in the bottom error bar (`view_err`), and returns `false`
-  (`a_requery_does_not_run_over_staged_changes`). The ✕ empties the field only on `true`, so a
-  refused clear does not show an empty bar over a filter that is still applied; a refused apply
-  leaves the typed text in the field for after the commit. Those controls refuse rather than
+  (`a_requery_does_not_run_over_staged_changes`). **The three refusals after it do the same**:
+  `grid_query` is written only once the re-run is approved and on its way, so the write guard, an
+  un-rewritable base and a bad condition also leave it alone and return `false`
+  (`the_grid_query_is_written_after_the_rerun_is_approved`, a second source gate). It used to be
+  written first and those three returned `true`, so the ✕ emptied the bar over a refused re-run
+  and the grid showed filtered rows under an empty filter bar. The ✕ empties the field only on
+  `true`, so a refused clear does not show an empty bar over a filter that is still applied; a
+  refused apply leaves the typed text in the field to fix, or for after the commit. Those controls refuse rather than
   dim, unlike the chevrons, because the filter field is where the user types the next filter and
   a header click is also the client-side sort's control on every other result.
   `GridState::has_staged` is the one spelling of "is
@@ -43239,13 +43244,14 @@ this bundle's.
   `gs.server_sort_dir(ci)` tracks `grid_query` while `header_cell` is called from the body's builder
   and again from the virtualised header row's, and neither key mentions `grid_query` — a builder is
   not a tracking scope, so the value computed there subscribed to nothing and the chevron froze.
-  **It is reachable, not theoretical**: `cycle_server_sort` hands its new order to
-  `apply_grid_query`, which writes it to `grid_query` and *then* has three exits that set
-  `view_err` and re-run nothing — `build_query`
+  **It was reachable, not theoretical**: `cycle_server_sort` hands its new order to
+  `apply_grid_query`, which used to write it to `grid_query` and *then* take one of three exits
+  that set `view_err` and re-ran nothing — `build_query`
   answering `Ok(None)` on a statement it cannot rewrite, a `BadCondition`, and the write guard's
-  `RerunRequest::approved` refusing. The staged-work refusal (`filter::requery`) is not a fourth:
-  it comes **before** the write, so a sort refused over staged edits leaves the chevron on the order
-  that is still on screen. `filterable()` only asks that `base_sql` and
+  `RerunRequest::approved` refusing. All four refusals, `filter::requery`'s staged-work one
+  included, now come **before** the write, so a refused sort leaves the chevron on the order that
+  is still on screen; the closure stays because the chevron must follow the write a dispatched
+  re-run makes before its rows land. `filterable()` only asks that `base_sql` and
   `insert_target()` are both `Some`, never whether an `ORDER BY` can actually be spliced in, so the
   gap is the join shape `edit::insert_target`'s own doc is written around —
   `SELECT o.* FROM orders o JOIN order_lines l ON l.order_id = o.id`, where every column has an
