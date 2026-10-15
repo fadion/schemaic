@@ -207,7 +207,7 @@ pub async fn read_only_export(
                         }
                         None => Ok(None),
                         Some(Ok(rs)) => Ok(Some(rs)),
-                        Some(Err(e)) => Err(std::io::Error::other(e)),
+                        Some(Err(e)) => Err(forwarded_read_failure(e.to_string())),
                     });
                 let tally = format.stream_to(&mut w, &mut src, None, dialect)?;
                 w.flush()?;
@@ -234,14 +234,28 @@ pub async fn read_only_export(
     let written = writer
         .await
         .map_err(|e| NoRows::Failed(format!("the export's writer stopped: {e}")))?
-        .map_err(|e| e.to_string());
+        .map_err(writer_stop);
     let read = match read {
         Err(_) => Err(timeout),
         Ok(r) => Ok(r.map(|_| ()).map_err(|e| e.to_string())),
     };
     let shown = part.display().to_string();
-    let tally = export_verdict(read, written, format.writes_incrementally(), &shown)
-        .map_err(NoRows::Failed)?;
+    // A read that failed before a byte was written — a refused login, a
+    // missing table — leaves an empty `.part`, which is not "what was
+    // written": it is removed, and not named.
+    let holds_rows = std::fs::metadata(&part).is_ok_and(|m| m.len() > 0);
+    let tally = export_verdict(
+        read,
+        written,
+        format.writes_incrementally() && holds_rows,
+        &shown,
+    )
+    .map_err(|e| {
+        if !holds_rows {
+            let _ = std::fs::remove_file(&part);
+        }
+        NoRows::Failed(e)
+    })?;
     std::fs::rename(&part, path).map_err(|e| {
         NoRows::Failed(format!(
             "the export is complete in {shown} but could not be renamed to {}: {e}",
@@ -251,21 +265,59 @@ pub async fn read_only_export(
     Ok(Exported { tally })
 }
 
+/// Why the export's writer stopped short of a tally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriterStop {
+    /// Its own failure — a full disk, a folder that went away.
+    Write(String),
+    /// The read failed: `Db::stream_query_enforced` sends its failure down
+    /// the channel as well as returning it, and the writer stopped on it.
+    /// The read reports it; this is only the echo.
+    Read(String),
+}
+
+/// The error the writer's chunk source raises for a read failure that came
+/// down the channel — marked, so [`writer_stop`] can tell it from a write's.
+fn forwarded_read_failure(message: String) -> std::io::Error {
+    std::io::Error::other(ReadFailed(message))
+}
+
+#[derive(Debug)]
+struct ReadFailed(String);
+
+impl std::fmt::Display for ReadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReadFailed {}
+
+/// The writer's error, as the read's echo or as its own.
+fn writer_stop(e: std::io::Error) -> WriterStop {
+    match e.get_ref().and_then(|i| i.downcast_ref::<ReadFailed>()) {
+        Some(ReadFailed(m)) => WriterStop::Read(m.clone()),
+        None => WriterStop::Write(e.to_string()),
+    }
+}
+
 /// How an export ended, from its two halves: the read (`Err` for the deadline
-/// passing) and the writer's own result — the tally, or the message the user
-/// is told.
+/// passing) and the writer's own result — the tally, or why it stopped.
 ///
-/// **The writer's error wins**, unless the deadline stopped the read: a writer
-/// that fails (a full disk, a folder that went away) drops its end of the
-/// channel, and the reader's next send then fails with its own "the export
-/// stopped reading" — true, and useless, with the real cause thrown away. So a
-/// failed write is told as itself. A failed read is told as the server's.
+/// **A failed write is told as itself**, unless the deadline stopped the
+/// read: a writer that fails (a full disk, a folder that went away) drops its
+/// end of the channel, and the reader's next send then fails with its own "the
+/// export stopped reading" — true, and useless, with the real cause thrown
+/// away. **A failed read is told as the server's**, and the writer's echo of
+/// it ([`WriterStop::Read`]) is no write failure: taking it for one said
+/// "could not write rows.csv.part: query failed: relation does not exist".
 /// Either way the `.part` is named only where it holds the rows written so far
 /// (`incremental`) — an XLSX workbook is assembled whole and its `.part` is
-/// empty until the end.
+/// empty until the end, and a read that failed before any row has written
+/// nothing.
 pub fn export_verdict(
     read: Result<Result<(), String>, Duration>,
-    written: Result<schemaic_core::export::ExportTally, String>,
+    written: Result<schemaic_core::export::ExportTally, WriterStop>,
     incremental: bool,
     part: &str,
 ) -> Result<schemaic_core::export::ExportTally, String> {
@@ -279,8 +331,11 @@ pub fn export_verdict(
             "the export exceeded {}s and was stopped{left}",
             t.as_secs().max(1)
         )),
-        (_, Err(w)) => Err(format!("could not write {part}: {w}")),
-        (Ok(Err(r)), Ok(_)) => Err(format!("{r}{left}")),
+        (_, Err(WriterStop::Write(w))) => Err(format!("could not write {part}: {w}")),
+        (Ok(Err(r)), _) => Err(format!("{r}{left}")),
+        // The writer saw a read failure the read itself did not return —
+        // not a combination the stream produces, but told as the read's.
+        (Ok(Ok(())), Err(WriterStop::Read(r))) => Err(format!("{r}{left}")),
         (Ok(Ok(())), Ok(tally)) => Ok(tally),
     }
 }
@@ -345,7 +400,9 @@ mod tests {
         fn a_failed_write_is_told_as_itself() {
             let got = export_verdict(
                 Ok(Err("the export stopped reading".into())),
-                Err("No space left on device".into()),
+                Err(writer_stop(std::io::Error::other(
+                    "No space left on device",
+                ))),
                 true,
                 "frag.csv",
             );
@@ -358,14 +415,24 @@ mod tests {
         #[test]
         fn a_failed_read_names_the_part_only_where_it_holds_rows() {
             let read = || Ok(Err("query failed: relation does not exist".to_string()));
+            // What the writer really answers when the read fails: the reader
+            // sends its failure down the channel too, and the writer stops on
+            // it — so the writer's result is the read's error, never a tally.
+            // Built the way the writer builds it: the chunk source's error,
+            // through `writer_stop`.
+            let echo = || {
+                Err(writer_stop(forwarded_read_failure(
+                    "query failed: relation does not exist".to_string(),
+                )))
+            };
             assert_eq!(
-                export_verdict(read(), Ok(tally(0)), true, "frag.csv"),
+                export_verdict(read(), echo(), true, "frag.csv"),
                 Err(
                     "query failed: relation does not exist; what was written is in frag.csv".into()
                 )
             );
             assert_eq!(
-                export_verdict(read(), Ok(tally(0)), false, "frag.xlsx"),
+                export_verdict(read(), echo(), false, "frag.xlsx"),
                 Err("query failed: relation does not exist".into()),
                 "an XLSX .part is empty until the end"
             );
@@ -376,7 +443,7 @@ mod tests {
             assert_eq!(
                 export_verdict(
                     Err(Duration::from_secs(60)),
-                    Err("cancelled".into()),
+                    Err(WriterStop::Write("cancelled".into())),
                     true,
                     "frag.csv"
                 ),

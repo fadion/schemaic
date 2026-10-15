@@ -34402,14 +34402,21 @@ existing prose was left alone.
     only while the token is not cancelled**: after the deadline cancels it, `PullChunks` is handed
     an error rather than `Ok(None)`, the renderers reading `None` as a finished result; an `Err`
     chunk — `stream_query_enforced` sends its failure down the channel as well as returning it — is
-    an `io::Error` the same way. The `.part` is renamed onto `path` only once the read returned `Ok`
-    and the writer finished; how it ended otherwise is the pure `export_verdict(read, written,
-    incremental, part)`. **The writer's error wins** unless the deadline stopped the read: a failed
-    write drops its end of the channel, and the reader's next send fails with its own "the export
-    stopped reading", which is true and useless — so the disk's error is what the user reads. A
-    deadline says it was exceeded; a failed read is the server's message. Each names the `.part`
-    only where it holds rows (`ExportFormat::writes_incrementally` — an XLSX `.part` is empty
-    until the end), as the app's export does (`export_verdict_tests`). A rename that fails says the
+    an `io::Error` the same way, **marked** (`forwarded_read_failure`), so `writer_stop` reads the
+    writer's end as a `WriterStop::Read` echo rather than a `WriterStop::Write` of its own. The
+    `.part` is renamed onto `path` only once the read returned `Ok` and the writer finished; how it
+    ended otherwise is the pure `export_verdict(read, written, incremental, part)`. **A failed
+    write is told as itself** unless the deadline stopped the read: it drops its end of the
+    channel, and the reader's next send fails with its own "the export stopped reading", which is
+    true and useless — so the disk's error is what the user reads. A deadline says it was
+    exceeded; a failed read is the server's message, whatever the writer echoed. Unmarked, the
+    echo took the write arm and every failed read said *"could not write rows.csv.part: query
+    failed: relation "nope" does not exist"*, and the test that pinned the read arm fed the writer
+    a tally the composition never produces; it now builds the echo through `writer_stop`. Each
+    names the `.part` only where it holds rows (`ExportFormat::writes_incrementally` — an XLSX
+    `.part` is empty until the end — and a `.part` that is still empty, which a read failing at
+    the connect leaves and which is then removed), as the app's export does
+    (`export_verdict_tests`). A rename that fails says the
     export is complete in the `.part` rather than that it failed. `run_export` also refuses an
     output whose folder does not exist, as a usage error before anything is read. Verified live:
     25,000 rows from PostgreSQL to CSV across three chunks, a `DELETE` refused with exit 3, and an
