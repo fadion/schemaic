@@ -13,7 +13,10 @@
 //!
 //! **`~/.ssh/config` is read per tunnel** (`core::ssh_config::read_user_config`): the SSH host
 //! and each jump host are looked up as `Host` aliases (`core::ssh_config`), and
-//! the file fills what the connection leaves open, as `ssh <alias>` would.
+//! the file fills what the connection leaves open, as `ssh <alias>` would. The
+//! route is composed by `core::ssh_config::resolve_route`, which also refuses
+//! one the file hides (a `ProxyCommand`, a `Match` block) and a password bound
+//! for a jump host only the file names.
 //!
 //! Lifetime: the returned [`TunnelHandle`] owns the accept-loop task; dropping
 //! it aborts that task, which drops the listener and frees the local port (so a
@@ -422,25 +425,19 @@ pub async fn open_tunnel(
     // own `host:port`, exactly as a direct tunnel's is.
     // An alias in `~/.ssh/config` resolves as `ssh <alias>` would — the SSH
     // host and each jump host alike — with what the connection states winning
-    // over the file (`ssh_config::apply`).
+    // over the file (`ssh_config::resolve_route`).
     let user_config = ssh_config::read_user_config();
-    let resolved;
-    let ssh = match &user_config {
-        Some((text, home)) => {
-            let found = ssh_config::resolve(text, &ssh.host, home.as_deref());
-            resolved = ssh_config::apply(ssh, &found);
-            &resolved
-        }
-        None => ssh,
-    };
-    let mut route = ssh.route().map_err(DbError::Connect)?;
-    if let Some((text, home)) = &user_config {
-        let jumps = route.len() - 1;
-        for hop in route.iter_mut().take(jumps) {
-            let found = ssh_config::resolve(text, &hop.host, home.as_deref());
-            *hop = ssh_config::apply_to_hop(hop.clone(), &found);
-        }
-    }
+    let ssh_config::Route {
+        tunnel: resolved,
+        hops: route,
+    } = ssh_config::resolve_route(
+        ssh,
+        user_config
+            .as_ref()
+            .map(|(text, home)| (text.as_str(), home.as_deref())),
+    )
+    .map_err(DbError::Connect)?;
+    let ssh = &resolved;
     let mut sessions: Vec<client::Handle<TunnelClient>> = Vec::with_capacity(route.len());
     for hop in &route {
         let host_port = format!("{}:{}", hop.host, hop.port);

@@ -15488,6 +15488,11 @@ mod window_key_gate {
         c.ssh.auth = SshAuth::KeyPair;
         c.ssh.key_path = "/k".to_string();
         c.ssh.key_passphrase = "kp".to_string();
+        // Neither may fall back to its form default: an edit through the form
+        // would drop the route, or the per-connection timeout — `Some(0)`, "no
+        // timeout", must not collapse to `None`, "the app's".
+        c.ssh.jump = "ops@edge:2200".to_string();
+        c.statement_timeout_secs = Some(0);
         c.tls.mode = SslMode::Require;
         c.tls.ca_path = "/ca".to_string();
         c.color = Some("#ff0000".to_string());
