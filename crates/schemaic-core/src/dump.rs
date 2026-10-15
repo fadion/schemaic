@@ -1302,6 +1302,19 @@ fn dollar_tag(parts: &[&str]) -> String {
     tag
 }
 
+/// What a `DROP` calls `t`: `TABLE`, `VIEW`, or `MATERIALIZED VIEW` — which
+/// PostgreSQL will not drop as a `VIEW` (*"mv" is not a view*), so a file
+/// carrying one stopped its replay onto the source at that line.
+fn drop_keyword(t: &TableInfo) -> &'static str {
+    if crate::ddl::is_materialized_view(t) {
+        "MATERIALIZED VIEW"
+    } else if t.is_view {
+        "VIEW"
+    } else {
+        "TABLE"
+    }
+}
+
 /// The statement that stops a replay **before its first `DROP … CASCADE`**
 /// where those drops would take an object the file does not put back — or
 /// `None` where the file's `DROP` cascades to nothing ([`drop_cascade`]), or
@@ -3413,7 +3426,7 @@ pub fn plan(
         for (k, &i) in order.iter().enumerate().rev() {
             let t = &schema.tables[i];
             if file_creates(t) && !held.contains(&i) {
-                let kw = if t.is_view { "VIEW" } else { "TABLE" };
+                let kw = drop_keyword(t);
                 drops.push(format!("DROP {kw} IF EXISTS {};", qname(t)));
             }
             drops.extend(routine_drops(Some(k)));
@@ -3480,7 +3493,7 @@ pub fn plan(
             // A foreign table's step is a comment too (`file_creates`).
             // Nor one it cannot put back as it is — see `Hold`.
             if opts.drop_if_exists && !up_front && file_creates(t) && !held.contains(&i) {
-                let kw = if t.is_view { "VIEW" } else { "TABLE" };
+                let kw = drop_keyword(t);
                 text!(format!(
                     "DROP {kw} IF EXISTS {}{};",
                     qname(t),
@@ -9677,6 +9690,45 @@ mod tests {
             SqlDialect::Postgres,
         ));
         assert!(!file.contains("'f_one'"), "{file}");
+    }
+
+    /// **A materialized view is dropped as one.** The drop asked only
+    /// `is_view`, so a dump carrying one wrote `DROP VIEW IF EXISTS "mv"`,
+    /// which PostgreSQL refuses (*"mv" is not a view*): a replay onto the
+    /// source stopped there, every time.
+    #[test]
+    fn a_materialized_view_is_dropped_as_one() {
+        let mut t = table("t");
+        t.schema = Some("public".to_string());
+        let mut mv = view("mv");
+        mv.schema = Some("public".to_string());
+        mv.view_options = Some(crate::schema::ViewOptions {
+            materialized: true,
+            ..Default::default()
+        });
+        let mut v = view("v");
+        v.schema = Some("public".to_string());
+        let s = schema_of(vec![t, mv, v]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            file.contains(r#"DROP MATERIALIZED VIEW IF EXISTS "public"."mv" CASCADE;"#),
+            "{file}"
+        );
+        assert!(
+            !file.contains(r#"DROP VIEW IF EXISTS "public"."mv""#),
+            "{file}"
+        );
+        // A plain view keeps its plain drop.
+        assert!(
+            file.contains(r#"DROP VIEW IF EXISTS "public"."v" CASCADE;"#),
+            "{file}"
+        );
     }
 
     /// **A replay onto the database the file came from replaces each routine

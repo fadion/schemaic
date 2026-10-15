@@ -162,6 +162,47 @@ pub async fn a_replay_leaves_the_views_outside_the_file_standing(target: &'stati
     s.teardown().await;
 }
 
+/// **A dump carrying a materialized view replays onto the database it came
+/// from.** Its drop asked only whether it was a view, so the file wrote
+/// `DROP VIEW IF EXISTS` for it, which PostgreSQL refuses (*"mv_in" is not a
+/// view*), and every such replay stopped there — unless an earlier table's
+/// `DROP … CASCADE` had already taken the view, which is why this one reads a
+/// table the file does not carry. Where the engine has no materialized views
+/// there is nothing to check.
+pub async fn a_replay_replaces_the_materialized_view_it_carries(target: &'static Target) {
+    let s = Scratch::create(target, "replay_matview").await;
+    let (customers, mv) = (s.qualified("customers"), s.qualified("mv_in"));
+    s.exec(&format!(
+        "CREATE TABLE {customers} (id INTEGER PRIMARY KEY)"
+    ))
+    .await;
+    s.exec(&format!("INSERT INTO {customers} VALUES (1), (2)"))
+        .await;
+    if s.try_exec(&format!(
+        "CREATE MATERIALIZED VIEW {mv} AS SELECT COUNT(*) AS n FROM {customers}"
+    ))
+    .await
+    .is_err()
+    {
+        s.teardown().await;
+        return;
+    }
+    let file = dump_of(&s, &["mv_in"]).await;
+    assert_eq!(
+        run_file(&s, &file).await,
+        ExecEnd::Done,
+        "{}: the dump did not replay onto its source:\n{file}",
+        target.name
+    );
+    assert_eq!(
+        scalar(&s, &format!("SELECT n FROM {mv}")).await,
+        "2",
+        "{}: the materialized view did not come back with its rows:\n{file}",
+        target.name
+    );
+    s.teardown().await;
+}
+
 /// **A dump carrying a routine replays onto the database it came from.** The
 /// routine was written as a bare `CREATE FUNCTION` and dropped first only where
 /// the file drops up front, so on every other engine the replay stopped at a

@@ -5751,6 +5751,12 @@ existing prose was left alone.
     a typed empty set, since `VALUES` with no rows is not SQL, `the_cascade_guard_takes_empty_lists`;
     live, on each `live_suite!` leg, `a_replay_leaves_the_views_outside_the_file_standing`, red on
     PostgreSQL 16 before the fix, which also replays the same table with its views in the file).
+    **A materialized view is dropped as one** (`drop_keyword`, asking `ddl::is_materialized_view`):
+    the drop asked only `is_view`, so the file wrote `DROP VIEW IF EXISTS` for it, which PostgreSQL
+    refuses (*"mv" is not a view*). It went unseen wherever an earlier table's `CASCADE` had already
+    taken the view, and stopped the replay wherever none had — a materialized view over a table the
+    file does not carry (`a_materialized_view_is_dropped_as_one`; live,
+    `a_replay_replaces_the_materialized_view_it_carries`, red on PostgreSQL 16 before the fix).
     **SQL Server has neither answer**, so it drops everything the file
     recreates up front (`drops_up_front`, computed from the two: no guard and no `CASCADE`): a
     `-- Dropped first` section before any `CREATE` drops each key between the dumped tables that
