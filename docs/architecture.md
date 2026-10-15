@@ -13420,12 +13420,20 @@ existing prose was left alone.
     load can recover from — and that composition is what decides whether a user's connections, tabs
     and history survive a crash or a full disk, including the failures a real disk will not stage on
     demand.
-    **The save ordering.** `write_bytes` stages the new bytes in a `.tmp` sibling, copies the
-    previous generation to `.bak`, renames the `.tmp` over the target, and falls back to a direct
-    write only when the rename is refused. The `.bak` is **re-written rather than `fs::copy`d**,
-    which would carry the old file's mode onto the backup — including a 0644 left by a build from
-    before this — and the old one is never removed before the new file is in place, because a save
-    that fails must leave the recovery copy it found.
+    **The save ordering.** `write_bytes` stages the new bytes in a `.tmp` sibling, **renames the
+    previous generation to `.bak`**, renames the `.tmp` over the target, and falls back to a direct
+    write only when that rename is refused — putting the moved primary back if the direct write
+    fails too. A rename, not a copy, because the `.bak` is the crash recovery for the ordinary save
+    (below) only while it is durable: re-writing the old bytes into `.bak`, as this did until the
+    v0.34.0 review, truncated the one durable older copy and put the same bytes back unsynced, in
+    the very window the new primary's contents were still in flight, so a power loss there took
+    both and the store loaded as defaults. `a_crash_after_an_ordinary_save_still_reads_a_generation`
+    pins it over `CrashFs`, a store that keeps names and renames across a crash and contents only
+    when synced. Between the two renames the primary is absent, which `recover` reads as `.tmp`,
+    then `.bak`. A renamed file keeps its mode, so `FileStore::narrow` takes the `.bak` to 0600 (a
+    0644 left by a build from before `write_private`); a primary that cannot be moved — absent on a
+    first save, or held open elsewhere — keeps the old copy-in-place, so a save is never refused
+    over its backup.
     **`Saving { Replacing, Erasing }` is an argument to that save, because every deletion this app
     confirms was undone at rest without it.** The history panel's trash asks *"Delete N recorded
     queries for this connection? This can't be undone"*, and the save that answered Yes copied the

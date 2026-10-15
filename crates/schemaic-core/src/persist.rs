@@ -1354,6 +1354,11 @@ pub(crate) trait FileStore {
     /// connection or a history row being removed, is not a cost anybody
     /// notices.
     fn sync(&self, path: &Path);
+    /// Narrow `path` to owner-only where the platform has modes, best effort —
+    /// for a file that became a sibling by a rename rather than by a write,
+    /// which carries whatever mode it had (a 0644 left by a build from before
+    /// [`write_private`]).
+    fn narrow(&self, _path: &Path) {}
 }
 
 /// The real filesystem.
@@ -1385,6 +1390,15 @@ impl FileStore for Fs {
         if let Ok(f) = std::fs::File::open(path) {
             let _ = f.sync_data();
         }
+    }
+    fn narrow(&self, path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 }
 
@@ -1447,7 +1461,13 @@ fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T, saving: Saving) {
 /// a zero-length `connections.json` then fails `serde_json::from_slice`, comes
 /// back as [`Load::Corrupt`], and the backup is read. That is the recovery, and
 /// it is why the sync is not paid for here: [`write_file_atomic`] keeps no
-/// `.bak` by design, so it has nothing else and does sync.
+/// `.bak` by design, so it has nothing else and does sync. **That argument
+/// needs the `.bak` to be durable**, which is why the previous generation is
+/// *renamed* to it rather than copied: a copy is new, unsynced bytes in the
+/// same window, and once truncated the older durable backup is gone too
+/// (`a_crash_after_an_ordinary_save_still_reads_a_generation`, over a store
+/// that forgets unsynced writes). Between the two renames the primary is
+/// absent, which [`recover`] already reads as `.tmp`, then `.bak`.
 ///
 /// Answers **whether the new content landed**, because a caller that has more
 /// to sweep than the `.bak` — [`write_secret_store`] — owes the sweep the same
@@ -1459,12 +1479,24 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], savin
     if store.write(&tmp, json).is_err() {
         return false;
     }
-    // Re-write rather than `fs::copy`, which would carry the *old* file's mode
-    // onto the backup — including a 0644 left by a build from before this.
-    if saving == Saving::Replacing
-        && let Ok(prev) = store.read(path)
-    {
-        let _ = store.write(&sibling(path, ".bak"), &prev);
+    // **The previous generation becomes the `.bak` by a rename, not a copy.**
+    // Its contents are already on disk under the primary's inode; a rename
+    // moves the name and leaves them be. Re-writing them into `.bak` — as this
+    // did — truncated the one durable older copy and put the same bytes back
+    // unsynced, in the same window the new primary's contents are still in
+    // flight, so a power loss there could take both. The rename carries the
+    // old file's mode, hence `narrow`. A primary that cannot be moved (absent
+    // on a first save, or held open elsewhere) keeps the old copy-in-place, so
+    // a save is never refused over its backup.
+    let mut backed_up = false;
+    if saving == Saving::Replacing {
+        let bak = sibling(path, ".bak");
+        if store.rename(path, &bak).is_ok() {
+            store.narrow(&bak);
+            backed_up = true;
+        } else if let Ok(prev) = store.read(path) {
+            let _ = store.write(&bak, &prev);
+        }
     }
     let mut landed = true;
     if store.rename(&tmp, path).is_err() {
@@ -1472,6 +1504,11 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], savin
         // rather than leaving only the temp file.
         landed = store.write(path, json).is_ok();
         store.remove(&tmp);
+        if !landed && backed_up {
+            // Neither landed, and the primary was moved aside: put it back, so
+            // a failed save leaves the file where it found it.
+            let _ = store.rename(&sibling(path, ".bak"), path);
+        }
     }
     if saving == Saving::Erasing && landed {
         // **Synced before the backup goes, because this is the save with no
@@ -2692,6 +2729,122 @@ mod tests {
     fn recovery_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A store modelling **a power loss**, as the module's own crash model has
+    /// it: names and renames reach stable storage, file *contents* only when
+    /// synced. A write creates or truncates the file's inode — the truncation is
+    /// metadata, so it is durable at once — and its new bytes are lost on
+    /// [`CrashFs::crash`] unless `sync` ran. That is the window NTFS, XFS and
+    /// the rest leave open, and the one `FakeFs`, which never forgets a write,
+    /// cannot show.
+    #[derive(Default)]
+    struct CrashFs {
+        /// Name → inode index.
+        names: RefCell<HashMap<PathBuf, usize>>,
+        /// Each inode's `(current, durable)` contents.
+        inodes: RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
+    }
+
+    impl CrashFs {
+        /// A file already safely on disk.
+        fn durable(&self, path: &str, bytes: &str) {
+            let mut inodes = self.inodes.borrow_mut();
+            inodes.push((bytes.as_bytes().to_vec(), bytes.as_bytes().to_vec()));
+            self.names
+                .borrow_mut()
+                .insert(PathBuf::from(path), inodes.len() - 1);
+        }
+        /// The power fails: every inode keeps only what was synced.
+        fn crash(&self) {
+            for (current, durable) in self.inodes.borrow_mut().iter_mut() {
+                *current = durable.clone();
+            }
+        }
+    }
+
+    impl FileStore for CrashFs {
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            let names = self.names.borrow();
+            let i = names.get(path).ok_or(std::io::ErrorKind::NotFound)?;
+            Ok(self.inodes.borrow()[*i].0.clone())
+        }
+        fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            let existing = self.names.borrow().get(path).copied();
+            let mut inodes = self.inodes.borrow_mut();
+            match existing {
+                // Truncated in place: the old contents are gone on disk too.
+                Some(i) => inodes[i] = (bytes.to_vec(), Vec::new()),
+                None => {
+                    inodes.push((bytes.to_vec(), Vec::new()));
+                    self.names
+                        .borrow_mut()
+                        .insert(path.to_path_buf(), inodes.len() - 1);
+                }
+            }
+            Ok(())
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            let mut names = self.names.borrow_mut();
+            let i = names.remove(from).ok_or(std::io::ErrorKind::NotFound)?;
+            names.insert(to.to_path_buf(), i);
+            Ok(())
+        }
+        fn remove(&self, path: &Path) {
+            self.names.borrow_mut().remove(path);
+        }
+        fn ensure_parent(&self, _path: &Path) {}
+        fn sync(&self, path: &Path) {
+            if let Some(i) = self.names.borrow().get(path) {
+                let inode = &mut self.inodes.borrow_mut()[*i];
+                inode.1 = inode.0.clone();
+            }
+        }
+    }
+
+    /// **A power loss straight after an ordinary save still leaves a
+    /// generation to read** — the new one or the one before it, never the
+    /// defaults. The save used to rewrite `.bak` in place, unsynced, so the
+    /// durable copy of the generation before was truncated in the same window
+    /// the renamed primary's contents were still in flight, and both came back
+    /// empty.
+    #[test]
+    fn a_crash_after_an_ordinary_save_still_reads_a_generation() {
+        let _g = recovery_lock();
+        let fs = CrashFs::default();
+        fs.durable(CFG, r#""p1""#);
+        fs.durable(&format!("{CFG}.bak"), r#""p0""#);
+        assert!(write_bytes(
+            &fs,
+            Path::new(CFG),
+            br#""p2""#,
+            Saving::Replacing
+        ));
+        // Before any crash the save did what a save does.
+        assert_eq!(fs.read(Path::new(CFG)).unwrap(), br#""p2""#);
+        assert_eq!(
+            fs.read(&sibling(Path::new(CFG), ".bak")).unwrap(),
+            br#""p1""#
+        );
+        fs.crash();
+        let got: String = read_bytes(&fs, Path::new(CFG));
+        RECOVERIES.lock().unwrap().clear();
+        assert!(got == "p1" || got == "p2", "fell back to {got:?}");
+    }
+
+    /// A first save, with no primary to keep, leaves no `.bak` and lands.
+    #[test]
+    fn a_first_save_takes_no_backup() {
+        let fs = CrashFs::default();
+        assert!(write_bytes(
+            &fs,
+            Path::new(CFG),
+            br#""p1""#,
+            Saving::Replacing
+        ));
+        assert_eq!(fs.read(Path::new(CFG)).unwrap(), br#""p1""#);
+        assert!(fs.read(&sibling(Path::new(CFG), ".bak")).is_err());
+        assert!(fs.read(&sibling(Path::new(CFG), ".tmp")).is_err());
     }
 
     /// **The whole point of the unrecovered read: it writes nothing.**
