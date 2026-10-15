@@ -2773,9 +2773,25 @@ fn table_entry(
         };
     // An index the model only partly read compares equal whatever the server
     // holds, so a match over one is a match this cannot vouch for.
+    // **Two sequences are compared by their definitions**, which the empty set
+    // above cannot say: read as `Same` whatever their options, a pair
+    // incrementing by 1 and by 5 matched. Their `options` only — `next` is the
+    // counter's state, which two copies of one sequence need not share. A side
+    // whose definition was not read leaves the pair unnamed either way, so
+    // `None`, and the match uncertain.
+    let sequences_differ = match (l, r) {
+        (Some(l), Some(r)) if shape == TableShape::Sequence => l
+            .sequence
+            .as_ref()
+            .zip(r.sequence.as_ref())
+            .map(|(l, r)| l.options != r.options),
+        _ => Some(false),
+    };
     let uncertain = match (l, r) {
         (Some(l), Some(r)) => {
-            unread_source || l.indexes.iter().chain(&r.indexes).any(|ix| ix.lossy)
+            unread_source
+                || sequences_differ.is_none()
+                || l.indexes.iter().chain(&r.indexes).any(|ix| ix.lossy)
         }
         _ => false,
     };
@@ -2804,7 +2820,7 @@ fn table_entry(
         name: any.name.clone(),
         table: None,
         signature: None,
-        status: if repartitioned {
+        status: if repartitioned || sequences_differ == Some(true) {
             ObjectStatus::Differing
         } else {
             unread_status(l.is_some(), unread_source, &left_ddl, &right_ddl)
@@ -3359,6 +3375,61 @@ mod tests {
         let note = find(&c, "sequence:sq1").omission_note();
         assert!(!note.contains("could not be read"), "{note}");
         assert!(note.contains("SHOW CREATE SEQUENCE"), "{note}");
+    }
+
+    /// **Two sequences differing in their options are `Differing`, and
+    /// disclosed** — not `Same` because the empty set the comparison plans for
+    /// a sequence reads as nothing to do. The counter (`next`) is state, not
+    /// the definition, and does not make a pair differ; a pair whose
+    /// definition was not read on one side cannot be vouched for.
+    #[test]
+    fn two_sequences_are_compared_by_their_definitions() {
+        let seq = |options: Option<&str>, next: &str| TableInfo {
+            name: "sq1".to_string(),
+            is_sequence: true,
+            sequence: options.map(|o| crate::schema::SequenceDef {
+                options: o.to_string(),
+                next: Some(next.to_string()),
+            }),
+            ..Default::default()
+        };
+        let a = "start with 1 minvalue 1 maxvalue 9223372036854775806 increment by 1 \
+                 cache 1000 nocycle ENGINE=InnoDB";
+        let b = "start with 1 minvalue 1 maxvalue 9223372036854775806 increment by 5 \
+                 cache 1000 nocycle ENGINE=InnoDB";
+
+        let c = mysql(
+            schema_of(vec![seq(Some(a), "1")]),
+            schema_of(vec![seq(Some(b), "1")]),
+        );
+        let e = find(&c, "sequence:sq1");
+        assert_eq!(e.status, ObjectStatus::Differing);
+        assert!(!e.uncertain);
+        let plan = c.plan(|_| true);
+        assert!(plan.emit().is_empty(), "{:?}", plan.emit());
+        assert!(
+            plan.omitted
+                .iter()
+                .any(|o| o.contains("sq1") && o.contains("SHOW CREATE SEQUENCE")),
+            "{:?}",
+            plan.omitted
+        );
+
+        // Only the counter differs: the same sequence.
+        let c = mysql(
+            schema_of(vec![seq(Some(a), "1")]),
+            schema_of(vec![seq(Some(a), "2001")]),
+        );
+        let e = find(&c, "sequence:sq1");
+        assert_eq!(e.status, ObjectStatus::Same);
+        assert!(!e.uncertain);
+
+        // One side unread: no difference can be named, nor a match vouched for.
+        let c = mysql(
+            schema_of(vec![seq(None, "1")]),
+            schema_of(vec![seq(Some(a), "1")]),
+        );
+        assert!(find(&c, "sequence:sq1").uncertain);
     }
 
     #[test]

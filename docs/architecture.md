@@ -9201,11 +9201,15 @@ existing prose was left alone.
     for. **Measured on MariaDB 10.11.14**: a sequence reports `TABLE_TYPE = SEQUENCE` with eight
     counter columns, `DROP TABLE sq1` on one *succeeds*, and `CREATE TABLE sq2 (…)` over an existing
     sequence is ERROR 1050. Now that `create_ddl` restates a read sequence (under `schema.rs`), the
-    panes show its real `CREATE SEQUENCE`; the comparison itself is unchanged — still
-    unplannable, and two sequences still pair as `Same` whatever their options — except its
-    disclosure, which would otherwise contradict that pane with *"its definition could not be
-    read"*: a read sequence carries `held_back` saying the comparison writes no statement for one
-    and to copy it from `SHOW CREATE SEQUENCE` (`a_read_sequence_is_disclosed_as_unplanned_not_unread`).
+    panes show its real `CREATE SEQUENCE`; the comparison still plans nothing for one, but no longer
+    hides what it read. Its disclosure would otherwise contradict that pane with *"its definition
+    could not be read"*: a read sequence carries `held_back` saying the comparison writes no
+    statement for one and to copy it from `SHOW CREATE SEQUENCE`
+    (`a_read_sequence_is_disclosed_as_unplanned_not_unread`). And two sequences pair by their
+    definitions — `SequenceDef::options`, never `next`, the counter two copies of one sequence need
+    not share — so a pair whose options differ is `Differing` and lands in `omitted` instead of
+    reading `Same` off the empty set, while a pair with either side's definition unread is
+    `uncertain` (`two_sequences_are_compared_by_their_definitions`).
     **A PostgreSQL foreign table takes the same road one step removed.** It keys `f:`, so it never
     pairs with a same-named table and is never planned as that table's alter; it is filed under
     `CompareKind::Table`, which is where the tree shows it; and its change set is empty, so it is
