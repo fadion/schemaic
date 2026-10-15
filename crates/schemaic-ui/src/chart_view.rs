@@ -20,7 +20,7 @@ use floem::text::{Attrs, AttrsList, TextLayout};
 use floem::{View, ViewId};
 use floem_renderer::Renderer;
 
-use schemaic_core::chart::{self, Bin, ChartKind, Series};
+use schemaic_core::chart::{self, ChartKind, Plot};
 use schemaic_core::model::ResultSet;
 
 use crate::settings::focusable_dropdown;
@@ -227,35 +227,11 @@ fn chart_body(
     let Some(v) = value else {
         return note("No column of numbers to chart in this result.".to_string());
     };
-    let rows = rs.row_count();
-    let (drawn, skipped) = match kind {
-        ChartKind::Histogram => {
-            let (bins, skipped) = chart::histogram(rs, v);
-            (Drawn::Bins(bins), skipped)
-        }
-        ChartKind::Bar | ChartKind::Line => {
-            let s = chart::series(rs, label, v);
-            let skipped = s.skipped;
-            (Drawn::Series(kind, s), skipped)
-        }
-    };
+    let (drawn, skipped) = Plot::of(rs, kind, v, label);
     if drawn.is_empty() {
         return note("Every value in that column is NULL.".to_string());
     }
-    let mut line = format!(
-        "{} {}",
-        rows,
-        schemaic_core::text::plural(rows, "row", "rows")
-    );
-    if skipped > 0 {
-        line.push_str(&format!(
-            " · {skipped} not drawn (NULL, or past {})",
-            chart::MAX_POINTS
-        ));
-    }
-    if rs.truncated {
-        line.push_str(" · the rows read, not the whole result");
-    }
+    let line = chart::caption(rs.row_count(), kind, skipped, rs.truncated);
     v_stack((
         ChartCanvas {
             id: ViewId::new(),
@@ -268,84 +244,12 @@ fn chart_body(
     .into_any()
 }
 
-/// What the canvas paints.
-enum Drawn {
-    Series(ChartKind, Series),
-    Bins(Vec<Bin>),
-}
-
-impl Drawn {
-    fn is_empty(&self) -> bool {
-        match self {
-            Drawn::Series(_, s) => s.values.is_empty(),
-            Drawn::Bins(b) => b.is_empty(),
-        }
-    }
-
-    /// The value axis's range: a bar or bin stands on 0, so 0 is in it.
-    fn range(&self) -> (f64, f64) {
-        let (lo, hi, zero) = match self {
-            Drawn::Series(k, s) => (
-                s.values.iter().copied().fold(f64::INFINITY, f64::min),
-                s.values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                *k == ChartKind::Bar,
-            ),
-            Drawn::Bins(b) => (
-                0.0,
-                b.iter().map(|b| b.count).max().unwrap_or(0) as f64,
-                true,
-            ),
-        };
-        if zero {
-            (lo.min(0.0), hi.max(0.0))
-        } else {
-            (lo, hi)
-        }
-    }
-
-    /// The labels under the x axis: first, middle and last.
-    fn x_labels(&self) -> Vec<(f64, String)> {
-        let cut = |s: &str| -> String {
-            if s.chars().count() > 18 {
-                format!("{}…", s.chars().take(17).collect::<String>())
-            } else {
-                s.to_string()
-            }
-        };
-        match self {
-            Drawn::Series(_, s) => {
-                let n = s.labels.len();
-                let mut picks = vec![0];
-                if n > 2 {
-                    picks.push(n / 2);
-                }
-                if n > 1 {
-                    picks.push(n - 1);
-                }
-                picks
-                    .into_iter()
-                    .map(|i| ((i as f64 + 0.5) / n as f64, cut(&s.labels[i])))
-                    .collect()
-            }
-            Drawn::Bins(b) => {
-                let (first, last) = (b[0].lo, b[b.len() - 1].hi);
-                let mid = (first + last) / 2.0;
-                vec![
-                    (0.0, chart::tick_label(first)),
-                    (0.5, chart::tick_label(mid)),
-                    (1.0, chart::tick_label(last)),
-                ]
-            }
-        }
-    }
-}
-
 /// The painted chart: grid lines and value labels on the left, the marks,
 /// and three labels under the axis. Colours are read at paint time, so a
 /// theme switch repaints in the new ones.
 struct ChartCanvas {
     id: ViewId,
-    drawn: Rc<Drawn>,
+    drawn: Rc<Plot>,
 }
 
 fn layout(text: &str, size: f32, color: fn() -> floem::peniko::Color) -> TextLayout {
@@ -404,7 +308,7 @@ impl View for ChartCanvas {
         let mark = theme::accent();
         let base = y_of(0.0_f64.clamp(t0, t1));
         match self.drawn.as_ref() {
-            Drawn::Series(ChartKind::Line, s) => {
+            Plot::Series(ChartKind::Line, s) => {
                 let n = s.values.len();
                 let x_of = |i: usize| plot.x0 + (i as f64 + 0.5) / n as f64 * plot.width();
                 let mut path = BezPath::new();
@@ -424,7 +328,7 @@ impl View for ChartCanvas {
                     }
                 }
             }
-            Drawn::Series(_, s) => {
+            Plot::Series(_, s) => {
                 let n = s.values.len();
                 let slot = plot.width() / n as f64;
                 let gap = (slot * 0.2).min(theme::scaled(6.0));
@@ -435,7 +339,7 @@ impl View for ChartCanvas {
                     cx.fill(&r, mark, 0.0);
                 }
             }
-            Drawn::Bins(bins) => {
+            Plot::Bins(bins) => {
                 let n = bins.len();
                 let slot = plot.width() / n as f64;
                 for (i, b) in bins.iter().enumerate() {

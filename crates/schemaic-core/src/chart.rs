@@ -166,6 +166,12 @@ pub fn bins(values: &[f64]) -> Vec<Bin> {
 /// A value axis for `lo..=hi`: round tick values covering the range, about
 /// `want` of them, from 1, 2 or 5 times a power of ten. A bar chart passes a
 /// range that includes 0, so bars stand on it.
+///
+/// **Ticks are counted, never accumulated.** Each is `(first + i) × step`, and
+/// the step is never finer than a few times the spacing of doubles at the
+/// range's magnitude — distinct values a couple of ULPs apart (snowflake ids
+/// minted in one millisecond) once picked a step adding which never moved
+/// `t`, and the loop ran until memory did. The count is bounded besides.
 pub fn ticks(lo: f64, hi: f64, want: usize) -> Vec<f64> {
     if !lo.is_finite() || !hi.is_finite() {
         return Vec::new();
@@ -175,25 +181,171 @@ pub fn ticks(lo: f64, hi: f64, want: usize) -> Vec<f64> {
     } else {
         (lo.min(hi), lo.max(hi))
     };
-    let raw = (hi - lo) / want.max(1) as f64;
+    // The spacing of doubles at the range's largest magnitude: a step below a
+    // few of these cannot tell two ticks apart.
+    let far = lo.abs().max(hi.abs());
+    let ulp = f64::from_bits(far.to_bits() + 1) - far;
+    let raw = ((hi - lo) / want.max(1) as f64).max(ulp * 4.0);
+    if !raw.is_finite() {
+        return Vec::new();
+    }
     let mag = 10f64.powf(raw.log10().floor());
     let step = [1.0, 2.0, 5.0, 10.0]
         .iter()
         .map(|m| m * mag)
         .find(|s| *s >= raw)
         .unwrap_or(10.0 * mag);
-    let start = (lo / step).floor() * step;
-    let mut out = Vec::new();
-    let mut t = start;
-    while t <= hi + step * 1e-9 {
-        // Snap away the float noise of repeated addition.
-        out.push((t / step).round() * step);
-        t += step;
-    }
-    if out.last().is_some_and(|l| *l < hi) {
+    let first = (lo / step).floor();
+    let tick = |i: usize| (first + i as f64) * step;
+    // Ample for `want` ticks of a step at least the raw one, plus the ends.
+    let cap = want.max(1) * 4 + 4;
+    let mut out: Vec<f64> = Vec::new();
+    for i in 0..cap {
+        let t = tick(i);
+        if !t.is_finite() {
+            break;
+        }
+        if out.last().is_some_and(|l| t <= *l) {
+            continue;
+        }
+        let past = t > hi + step * 1e-9;
+        // One tick past the top when the last fell short of it, so the axis
+        // covers the range — and always at least two, so it has a height.
+        if past && out.last().is_some_and(|l| *l >= hi) && out.len() >= 2 {
+            break;
+        }
         out.push(t);
+        if past {
+            break;
+        }
     }
     out
+}
+
+/// What a chart draws: a series of labelled values (a bar or line chart), or
+/// a histogram's bins. The view paints one; the decisions about it — the
+/// value axis's range, the labels under the axis, the line beneath the
+/// canvas — are answered here, where a test can see them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Plot {
+    Series(ChartKind, Series),
+    Bins(Vec<Bin>),
+}
+
+impl Plot {
+    /// Column `value` of `rs` charted as `kind`, labelled by `label` — and how
+    /// many rows it left out.
+    pub fn of(
+        rs: &ResultSet,
+        kind: ChartKind,
+        value: usize,
+        label: Option<usize>,
+    ) -> (Plot, usize) {
+        match kind {
+            ChartKind::Histogram => {
+                let (bins, skipped) = histogram(rs, value);
+                (Plot::Bins(bins), skipped)
+            }
+            ChartKind::Bar | ChartKind::Line => {
+                let s = series(rs, label, value);
+                let skipped = s.skipped;
+                (Plot::Series(kind, s), skipped)
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Plot::Series(_, s) => s.values.is_empty(),
+            Plot::Bins(b) => b.is_empty(),
+        }
+    }
+
+    /// The value axis's range. A bar or bin stands on 0, so 0 is in it; a
+    /// line follows its values, so a narrow band of large numbers is drawn
+    /// as a band rather than flattened against a zero far below it.
+    pub fn range(&self) -> (f64, f64) {
+        let (lo, hi, zero) = match self {
+            Plot::Series(k, s) => (
+                s.values.iter().copied().fold(f64::INFINITY, f64::min),
+                s.values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                *k == ChartKind::Bar,
+            ),
+            Plot::Bins(b) => (
+                0.0,
+                b.iter().map(|b| b.count).max().unwrap_or(0) as f64,
+                true,
+            ),
+        };
+        if zero {
+            (lo.min(0.0), hi.max(0.0))
+        } else {
+            (lo, hi)
+        }
+    }
+
+    /// The labels under the x axis — first, middle and last — each with where
+    /// it sits across the plot, `0.0..=1.0`.
+    pub fn x_labels(&self) -> Vec<(f64, String)> {
+        let cut = |s: &str| -> String {
+            if s.chars().count() > 18 {
+                format!("{}…", s.chars().take(17).collect::<String>())
+            } else {
+                s.to_string()
+            }
+        };
+        match self {
+            Plot::Series(_, s) => {
+                let n = s.labels.len();
+                if n == 0 {
+                    return Vec::new();
+                }
+                let mut picks = vec![0];
+                if n > 2 {
+                    picks.push(n / 2);
+                }
+                if n > 1 {
+                    picks.push(n - 1);
+                }
+                picks
+                    .into_iter()
+                    .map(|i| ((i as f64 + 0.5) / n as f64, cut(&s.labels[i])))
+                    .collect()
+            }
+            Plot::Bins(b) => {
+                let (Some(first), Some(last)) = (b.first(), b.last()) else {
+                    return Vec::new();
+                };
+                let (first, last) = (first.lo, last.hi);
+                let mid = (first + last) / 2.0;
+                vec![
+                    (0.0, tick_label(first)),
+                    (0.5, tick_label(mid)),
+                    (1.0, tick_label(last)),
+                ]
+            }
+        }
+    }
+}
+
+/// The line under the canvas: how many rows the result holds, how many were
+/// not drawn and why, and whether those are all the rows. A series leaves out
+/// a NULL or a row past [`MAX_POINTS`]; a histogram bins every number, so it
+/// has no cap to name.
+pub fn caption(rows: usize, kind: ChartKind, skipped: usize, truncated: bool) -> String {
+    let mut line = format!("{} {}", rows, crate::text::plural(rows, "row", "rows"));
+    if skipped > 0 {
+        match kind {
+            ChartKind::Histogram => line.push_str(&format!(" · {skipped} NULL, not drawn")),
+            ChartKind::Bar | ChartKind::Line => line.push_str(&format!(
+                " · {skipped} not drawn (NULL, or past {MAX_POINTS})"
+            )),
+        }
+    }
+    if truncated {
+        line.push_str(" · the rows read, not the whole result");
+    }
+    line
 }
 
 /// A tick's text: no trailing `.0`, and a thousands-scale value shortened.
@@ -309,6 +461,137 @@ mod tests {
             "a flat range still gets an axis"
         );
         assert!(ticks(f64::NAN, 1.0, 4).is_empty());
+    }
+
+    /// Distinct values within a couple of ULPs of each other — snowflake ids
+    /// minted in one millisecond — once looped forever: the round step fell
+    /// below the spacing of doubles there, so adding it never moved `t`.
+    #[test]
+    fn ticks_terminate_at_extreme_magnitudes() {
+        for (lo, hi) in [
+            (1e17, 1e17 + 16.0),
+            (2f64.powi(54), 2f64.powi(54) + 4.0),
+            (1.8e18, 1.8e18 + 256.0),
+            (1e17, 1e17),
+            (-1e300, -1e300),
+            (f64::MAX / 2.0, f64::MAX / 2.0),
+        ] {
+            let t = ticks(lo, hi, 5);
+            assert!(t.len() >= 2 && t.len() <= 40, "({lo}, {hi}): {t:?}");
+            assert!(
+                t[0] <= lo && *t.last().unwrap() >= hi,
+                "({lo}, {hi}): {t:?}"
+            );
+            assert!(
+                t.windows(2).all(|w| w[0] < w[1]),
+                "strictly rising, so the axis has a height: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_range_does_not_force_zero() {
+        let s = Series {
+            labels: vec!["a".into(), "b".into()],
+            values: vec![1e17, 1e17 + 16.0],
+            skipped: 0,
+        };
+        assert_eq!(
+            Plot::Series(ChartKind::Line, s.clone()).range(),
+            (1e17, 1e17 + 16.0)
+        );
+        assert_eq!(
+            Plot::Series(ChartKind::Bar, s).range(),
+            (0.0, 1e17 + 16.0),
+            "a bar stands on 0"
+        );
+        let neg = Series {
+            labels: vec!["a".into()],
+            values: vec![-5.0],
+            skipped: 0,
+        };
+        assert_eq!(Plot::Series(ChartKind::Bar, neg).range(), (-5.0, 0.0));
+        let bins = Plot::Bins(vec![
+            Bin {
+                lo: 10.0,
+                hi: 20.0,
+                count: 3,
+            },
+            Bin {
+                lo: 20.0,
+                hi: 30.0,
+                count: 7,
+            },
+        ]);
+        assert_eq!(bins.range(), (0.0, 7.0), "a bin's height is its count");
+    }
+
+    #[test]
+    fn x_labels_are_first_middle_and_last() {
+        let s = |n: usize| Series {
+            labels: (0..n).map(|i| format!("r{i}")).collect(),
+            values: vec![1.0; n],
+            skipped: 0,
+        };
+        let at = |n| Plot::Series(ChartKind::Line, s(n)).x_labels();
+        assert_eq!(at(1), [(0.5, "r0".to_string())]);
+        assert_eq!(at(2).len(), 2);
+        let five = at(5);
+        assert_eq!(
+            five.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(),
+            ["r0", "r2", "r4"]
+        );
+        assert_eq!(five[0].0, 0.1);
+        assert!(Plot::Series(ChartKind::Bar, s(0)).x_labels().is_empty());
+        let long = Series {
+            labels: vec!["x".repeat(30)],
+            values: vec![1.0],
+            skipped: 0,
+        };
+        let cut = &Plot::Series(ChartKind::Bar, long).x_labels()[0].1;
+        assert_eq!(cut.chars().count(), 18);
+        assert!(cut.ends_with('…'));
+        let bins = Plot::Bins(bins(&[0.0, 10.0, 20.0, 40.0]));
+        assert_eq!(
+            bins.x_labels(),
+            [
+                (0.0, "0".to_string()),
+                (0.5, "20".to_string()),
+                (1.0, "40".to_string())
+            ]
+        );
+        assert!(Plot::Bins(Vec::new()).x_labels().is_empty());
+    }
+
+    #[test]
+    fn a_histogram_caption_does_not_mention_the_point_cap() {
+        let h = caption(10, ChartKind::Histogram, 3, false);
+        assert_eq!(h, "10 rows · 3 NULL, not drawn");
+        assert!(!h.contains(&MAX_POINTS.to_string()));
+        assert_eq!(
+            caption(1, ChartKind::Bar, 0, false),
+            "1 row",
+            "nothing left out, nothing said"
+        );
+        assert_eq!(
+            caption(2_005, ChartKind::Line, 5, true),
+            "2005 rows · 5 not drawn (NULL, or past 2000) · the rows read, not the whole result"
+        );
+    }
+
+    #[test]
+    fn a_plot_counts_what_it_left_out() {
+        let r = rs(
+            &["n"],
+            vec![vec![Value::Int(1)], vec![Value::Null], vec![Value::Int(3)]],
+        );
+        let (p, skipped) = Plot::of(&r, ChartKind::Histogram, 0, None);
+        assert!(matches!(p, Plot::Bins(_)));
+        assert_eq!(skipped, 1);
+        let (p, skipped) = Plot::of(&r, ChartKind::Line, 0, None);
+        assert!(matches!(p, Plot::Series(ChartKind::Line, _)));
+        assert_eq!(skipped, 1);
+        assert!(!p.is_empty());
     }
 
     #[test]

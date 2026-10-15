@@ -446,11 +446,23 @@ existing prose was left alone.
     A histogram takes every numeric row — the cap is `series`' alone — so its `skipped` is only the
     NULLs and non-numbers.
     `ticks(lo, hi, want)` is the value axis: a step of 1, 2 or 5 × 10ᵏ, the first at least the raw
-    `(hi − lo) / want`, covering the range from `floor(lo / step)` up past `hi`, each tick snapped to
-    a multiple of the step to drop the float noise of repeated addition. A flat range is widened by
-    1 either side so it still gets an axis; a non-finite bound gets none
-    (`ticks_are_round_and_cover_the_range`). A bar chart passes a range that includes 0, so bars
-    stand on it — that is the caller's to do. `tick_label(v)` prints at most two decimals with
+    `(hi − lo) / want`, covering the range from `floor(lo / step)` up past `hi`. **Each tick is
+    counted, `(first + i) × step`, never accumulated**, the step is never finer than four times the
+    spacing of doubles at the range's magnitude, and the count is bounded: distinct values a couple
+    of ULPs apart — snowflake ids minted in one millisecond, charted as a Line — once picked a step
+    that adding never moved, and the loop grew its vector on the UI thread until memory ran out
+    (`ticks_terminate_at_extreme_magnitudes`). A flat range is widened by 1 either side so it still
+    gets an axis, and there are always at least two ticks; a non-finite bound gets none
+    (`ticks_are_round_and_cover_the_range`).
+    `Plot::{Series(kind, Series), Bins(Vec<Bin>)}` is what the canvas paints, `Plot::of(rs, kind,
+    value, label)` → `(Plot, skipped)`. `Plot::range` is the value axis's range: **a bar or a bin
+    stands on 0, so 0 is in it; a line follows its values** (`a_line_range_does_not_force_zero`) —
+    which is exactly what routes a narrow band of large numbers into `ticks`. `Plot::x_labels` is
+    first, middle and last with where each sits across the plot, cut at 18 characters, a histogram's
+    being its edges and midpoint (`x_labels_are_first_middle_and_last`); and `caption(rows, kind,
+    skipped, truncated)` the line under the canvas, a histogram's skipped count being NULLs alone, so
+    it never names the series' cap (`a_histogram_caption_does_not_mention_the_point_cap`).
+    `tick_label(v)` prints at most two decimals with
     trailing zeros dropped, `-0` as `0`, and shortens `≥ 1e4`/`1e6`/`1e9` to `k`/`m`/`b`
     (`tick_labels_drop_noise_and_shorten_large_values`).
   - `result_diff.rs` — **what two results differ by**, behind a result chip's *Compare with*
@@ -25740,8 +25752,11 @@ existing prose was left alone.
     picked. The body is a `dyn_container` keyed on `(kind, value, label)`: *"No column of numbers to
     chart in this result."* where there is none, *"Every value in that column is NULL."* where the
     series or the bins came back empty, and otherwise the canvas, 360 high, with one faint line under
-    it — *"N rows · K not drawn (NULL, or past 2000) · the rows read, not the whole result"*, the
-    middle clause when anything was skipped and the last when the result is `truncated`.
+    it, `chart::caption` — *"N rows · K not drawn (NULL, or past 2000) · the rows read, not the whole
+    result"*, the middle clause when anything was skipped (a histogram's reading *"K NULL, not
+    drawn"*, since it has no cap) and the last when the result is `truncated`. What is drawn is a
+    `chart::Plot` (`Plot::of`), whose range and under-axis labels the canvas asks rather than
+    decides.
     **The canvas is a painted view, `ChartCanvas`** — floem 0.2 has no plotting, so it is a custom
     `View` with a `paint` of its own, as the frozen header's `Hatch` (*Data grid*) and the ER
     diagram's `EdgeCanvas` (under `erd_view.rs`) are. The value axis is `chart::ticks` over the
