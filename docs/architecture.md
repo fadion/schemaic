@@ -11023,8 +11023,12 @@ existing prose was left alone.
     rows behind a read head, PostgreSQL's usual way to write through a function, and
     `contains_write` fails open on it where the read-only gate's PostgreSQL and SQL Server function
     allowlists fail closed (`a_write_through_a_function_call_is_logged`). Logging a read is the
-    acceptable direction; missing a write is not. **It does not cover MySQL/MariaDB**, whose gate
-    has no function allowlist: a `SELECT my_stored_fn()` that writes still gets no line. Where each
+    acceptable direction; missing a write is not. **It does not cover MySQL/MariaDB or SQLite**,
+    whose gate answers a call with a keyword deny-list rather than an allowlist
+    (`sql::read_call_policy` is `None` for both): a `SELECT my_stored_fn()` that writes still reads
+    as a read and gets no line. Closing it is an open design decision, not an oversight — a
+    catalogue-aware "is this a user-defined routine" check, or a line for every `SELECT` that calls
+    anything not built in — and neither has been taken. Where each
     path hooks in, and what is deliberately not logged, is under `app/main.rs` and `cli/run.rs`.
   - `sticky_header.rs` — which band header of a scrolled list is **pinned** to its top edge, and
     how far the next one has pushed it: the pure half of the history and snippet panels' sticky
@@ -35837,7 +35841,8 @@ existing prose was left alone.
     as the editor (`core::write_log`). `log_entry` stamps a `Source::Cli` entry under the
     connection's saved name only when `write_log::is_logged` answers for the statement, because
     `exec` runs reads too and the log has no business holding them — though it errs toward a
-    write, a `SELECT` of a writing function included (under `write_log.rs`). It is stamped after
+    write, a `SELECT` of a writing function included on PostgreSQL and SQL Server — not on the
+    MySQL family or SQLite (under `write_log.rs`). It is stamped after
     `connect`, so a refusal or a connection that failed leaves no line, nothing having been sent.
     `log_exec` ends it through `Entry::landed`, `exec::run`'s answer mapped by `exec_ran` — rows
     affected, the message on a failure, and **`Unknown` for `NoRows::Indeterminate`** — exit 5's
