@@ -12,11 +12,17 @@
 //! in one `write`, so the GUI and a `schemaic exec` in another process do not
 //! interleave inside a line.
 //!
-//! **What counts as a write** is decided by the caller's path, not here: the
-//! editor logs a statement `sql::contains_write` calls a write (it errs toward
-//! one), and the grid commit, the DDL preview, the import, a `.sql` file run
-//! and `schemaic exec` log whatever they ran. The MCP server has no write tool,
-//! so it has nothing to log.
+//! **What counts as a write** is decided by the caller's path: the editor and
+//! `schemaic exec` log a statement [`is_logged`] answers for — one
+//! `sql::contains_write` calls a write, or one the read-only gate will not
+//! call a read, so a `SELECT` of a writing function is logged too — and the
+//! grid commit, the DDL preview, the import and a `.sql` file run log
+//! whatever they ran. The MCP server has no write tool, so it has nothing to
+//! log. **How a statement ended** is [`Entry::landed`]'s, from a [`Ran`] each
+//! front end maps its own state onto, and which statements of a Run All get a
+//! line is [`batch_logged`]'s — decisions that lived in an app closure and a
+//! CLI function, untested, until a typed `COMMIT` of an aborted PostgreSQL
+//! transaction was logged `ok`.
 //!
 //! **Values are masked by default, because the SQL is the user's data.** An
 //! `UPDATE … SET email = 'ann@example.com'` carries the very value a log should
@@ -149,6 +155,80 @@ impl Entry {
         self.error = error;
         self
     }
+
+    /// The same entry ended as `ran` says, or `None` while it has no verdict.
+    ///
+    /// `aborted_before` is whether the statement ran inside a transaction a
+    /// failure had already aborted (`tx::TxState::Poisoned`). There a typed
+    /// `COMMIT` is a `ROLLBACK` on PostgreSQL, which reports it as a success,
+    /// so the line says `failed` and why rather than `ok` — the Commit
+    /// button's `aborted_commit` refusal, for the statement typed by hand.
+    pub fn landed(self, ran: Ran, aborted_before: bool, dialect: SqlDialect) -> Option<Entry> {
+        let commit = matches!(
+            crate::sql::leading_keyword(&self.sql, dialect).as_deref(),
+            Some("COMMIT" | "END")
+        );
+        Some(match ran {
+            Ran::Rows(_) if aborted_before && commit => self.ended(Err(
+                "the transaction was already aborted, so COMMIT rolled it back — nothing was \
+                 committed"
+                    .into(),
+            )),
+            Ran::Rows(rows) => self.ended(Ok(rows)),
+            Ran::Failed(m) => self.ended(Err(m)),
+            Ran::Cancelled => self.ended_as(Outcome::Cancelled, None),
+            Ran::Unknown(m) => self.ended_as(Outcome::Unknown, m),
+            Ran::Pending => return None,
+        })
+    }
+}
+
+/// How one statement's run ended, as a front end saw it — the input to
+/// [`Entry::landed`] and [`batch_logged`], each front end mapping its own
+/// state onto it in one thin match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ran {
+    /// It ran; rows affected where the engine said.
+    Rows(Option<u64>),
+    /// The engine refused it, in its words.
+    Failed(String),
+    /// Stopped, or never dispatched (a batch statement after a stop or a
+    /// failure).
+    Cancelled,
+    /// Sent, and then the client lost track of it — a timeout.
+    Unknown(Option<String>),
+    /// No verdict yet.
+    Pending,
+}
+
+/// Does running `sql` get a line in the log? A statement
+/// `sql::contains_write` calls a write, **or one the read-only gate
+/// (`sql::read_only_reason`) will not call a read** — `SELECT
+/// archive_and_purge(2023)` deletes rows behind a read head, and the gate's
+/// PostgreSQL and SQL Server function allowlists fail closed on a call they do
+/// not know where `contains_write` fails open. Logging a read is the
+/// acceptable direction; missing a write is not.
+pub fn is_logged(sql: &str, dialect: SqlDialect) -> bool {
+    crate::sql::contains_write(sql, dialect) || crate::sql::read_only_reason(sql, dialect).is_err()
+}
+
+/// Which statements of a Run All get a line, by index, given how each ended
+/// and whether the user pressed Stop. A `Cancelled` statement was never
+/// dispatched — except the one in flight at Stop, the first without a result
+/// after the run of successes, which may have written (a statement already
+/// sent is not unsent). One with no verdict yet gets none.
+pub fn batch_logged(ran: &[Ran], stopped: bool) -> Vec<bool> {
+    let in_flight = stopped
+        .then(|| ran.iter().position(|r| !matches!(r, Ran::Rows(_))))
+        .flatten();
+    ran.iter()
+        .enumerate()
+        .map(|(i, r)| match r {
+            Ran::Cancelled => in_flight == Some(i),
+            Ran::Pending => false,
+            Ran::Rows(_) | Ran::Failed(_) | Ran::Unknown(_) => true,
+        })
+        .collect()
 }
 
 /// `entry` as the line the log holds — masked unless `keep_values`, and
@@ -550,5 +630,94 @@ mod tests {
         let e = Entry::now(Source::Grid, "c", Some("d"), "UPDATE t SET a = ?").ended(Ok(Some(2)));
         let back: Entry = serde_json::from_str(&line(&e, PG, true)).unwrap();
         assert_eq!(back, e);
+    }
+
+    fn entry(sql: &str) -> Entry {
+        Entry::now(Source::Editor, "c", None, sql)
+    }
+
+    #[test]
+    fn each_way_a_run_ends_maps_to_its_outcome() {
+        let ok = entry("DELETE FROM t")
+            .landed(Ran::Rows(Some(3)), false, PG)
+            .unwrap();
+        assert_eq!((ok.outcome, ok.rows), (Outcome::Ok, Some(3)));
+        let bad = entry("DELETE FROM t")
+            .landed(Ran::Failed("no".into()), false, PG)
+            .unwrap();
+        assert_eq!(
+            (bad.outcome, bad.error.as_deref()),
+            (Outcome::Failed, Some("no"))
+        );
+        let stop = entry("DELETE FROM t")
+            .landed(Ran::Cancelled, false, PG)
+            .unwrap();
+        assert_eq!(stop.outcome, Outcome::Cancelled);
+        assert!(
+            entry("DELETE FROM t")
+                .landed(Ran::Pending, false, PG)
+                .is_none()
+        );
+    }
+
+    /// The CLI's timeout: sent, then lost track of — neither ok nor failed.
+    #[test]
+    fn an_indeterminate_run_is_unknown() {
+        let e = entry("DELETE FROM t")
+            .landed(Ran::Unknown(Some("timed out".into())), false, PG)
+            .unwrap();
+        assert_eq!(e.outcome, Outcome::Unknown);
+        assert_eq!(e.error.as_deref(), Some("timed out"));
+        assert_eq!(e.rows, None);
+    }
+
+    /// S1.1-L1-02: PostgreSQL answers a `COMMIT` of an aborted block with a
+    /// ROLLBACK it reports as success; the line must not say `ok`.
+    #[test]
+    fn a_commit_typed_into_an_aborted_transaction_is_logged_failed() {
+        for sql in ["COMMIT", "commit;", "END", "COMMIT AND CHAIN"] {
+            let e = entry(sql).landed(Ran::Rows(None), true, PG).unwrap();
+            assert_eq!(e.outcome, Outcome::Failed, "{sql}");
+            assert!(
+                e.error.as_deref().is_some_and(|m| m.contains("rolled")),
+                "{sql}"
+            );
+        }
+        // A rollback of it is what it says, and a commit of a healthy
+        // transaction is a commit.
+        let rb = entry("ROLLBACK").landed(Ran::Rows(None), true, PG).unwrap();
+        assert_eq!(rb.outcome, Outcome::Ok);
+        let ok = entry("COMMIT").landed(Ran::Rows(None), false, PG).unwrap();
+        assert_eq!(ok.outcome, Outcome::Ok);
+    }
+
+    #[test]
+    fn a_stopped_batch_logs_the_in_flight_statement_and_not_the_undispatched() {
+        let ran = [Ran::Rows(Some(1)), Ran::Cancelled, Ran::Cancelled];
+        assert_eq!(batch_logged(&ran, true), [true, true, false]);
+    }
+
+    #[test]
+    fn a_failed_batch_logs_nothing_after_the_failure() {
+        let ran = [
+            Ran::Rows(Some(1)),
+            Ran::Failed("dup".into()),
+            Ran::Cancelled,
+        ];
+        assert_eq!(batch_logged(&ran, false), [true, true, false]);
+        // Stopped after a failure: nothing was in flight past it.
+        assert_eq!(batch_logged(&ran, true), [true, true, false]);
+        assert_eq!(batch_logged(&[Ran::Pending], false), [false]);
+    }
+
+    /// S1.1-L5-04: a write made by calling a function from a `SELECT` is
+    /// still a write. The log asks the read-only gate too, which fails closed
+    /// on a call it does not know.
+    #[test]
+    fn a_write_through_a_function_call_is_logged() {
+        assert!(is_logged("SELECT archive_and_purge(2023)", PG));
+        assert!(is_logged("UPDATE t SET a = 1", PG));
+        assert!(!is_logged("SELECT 1", PG));
+        assert!(!is_logged("SELECT * FROM t WHERE a = 1", MY));
     }
 }

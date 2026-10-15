@@ -1863,25 +1863,33 @@ fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::his
     }
 }
 
-/// Hand a run's write-log `entry` to `log` with how `state` says it ended:
-/// rows affected, the engine's message, or a cancel (which may still have
-/// written — a statement already sent is not unsent). A state with no verdict
-/// logs nothing.
+/// How `state` says a run ended, in the write log's terms — the thin match;
+/// what each end records is `write_log::Entry::landed`, in core and under test.
+fn ran_of(state: &QueryState) -> schemaic_core::write_log::Ran {
+    use schemaic_core::write_log::Ran;
+    match state {
+        QueryState::Loaded(rs) => Ran::Rows(rs.affected),
+        QueryState::Failed(m) => Ran::Failed(m.text.clone()),
+        QueryState::Cancelled => Ran::Cancelled,
+        QueryState::Idle | QueryState::Running => Ran::Pending,
+    }
+}
+
+/// Hand a run's write-log `entry` to `log` with how `state` says it ended
+/// (`write_log::Entry::landed`) — `aborted_before` being whether the tab's
+/// transaction was already aborted when it ran, where a typed `COMMIT` rolled
+/// back. A state with no verdict logs nothing.
 fn log_landed(
     log: &Rc<dyn Fn(u64, SqlDialect, schemaic_core::write_log::Entry)>,
     conn_id: u64,
     dialect: SqlDialect,
     entry: schemaic_core::write_log::Entry,
     state: &QueryState,
+    aborted_before: bool,
 ) {
-    use schemaic_core::write_log::Outcome;
-    let entry = match state {
-        QueryState::Loaded(rs) => entry.ended(Ok(rs.affected)),
-        QueryState::Failed(m) => entry.ended(Err(m.text.clone())),
-        QueryState::Cancelled => entry.ended_as(Outcome::Cancelled, None),
-        QueryState::Idle | QueryState::Running => return,
-    };
-    log(conn_id, dialect, entry);
+    if let Some(entry) = entry.landed(ran_of(state), aborted_before, dialect) {
+        log(conn_id, dialect, entry);
+    }
 }
 
 /// The schema reload a run's completion calls, filled once `refresh_db`
@@ -3386,10 +3394,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let refresh_after_run = refresh_after_run.clone();
             let ddl_owed = ddl_owed.clone();
             // The write log's entry, for a run that writes — a view re-run is a
-            // read Schemaic built, and `contains_write` errs toward a write.
+            // read Schemaic built, and `write_log::is_logged` errs toward a write.
             let conn_id = tab.conn_id.get_untracked();
-            let write_entry =
-                (!is_view && schemaic_core::sql::contains_write(&sql, dialect)).then(|| {
+            let write_entry = (!is_view && schemaic_core::write_log::is_logged(&sql, dialect))
+                .then(|| {
                     schemaic_core::write_log::Entry::now(
                         schemaic_core::write_log::Source::Editor,
                         "",
@@ -3409,7 +3417,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // Logged before the supersede check, as the history is:
                     // the write happened whichever run the tab now shows.
                     if let Some(entry) = write_entry {
-                        log_landed(&log_write, conn_id, dialect, entry, &state);
+                        // Read before the fold below moves it on.
+                        let aborted = matches!(tab.tx.get_untracked(), TxState::Poisoned { .. });
+                        log_landed(&log_write, conn_id, dialect, entry, &state, aborted);
                     }
                     // Fold the transaction state first, and unconditionally: it
                     // tracks the *connection*, so it stays true even when a newer run
@@ -3992,7 +4002,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let write_entries: Vec<Option<schemaic_core::write_log::Entry>> = stmts
                 .iter()
                 .map(|s| {
-                    schemaic_core::sql::contains_write(s, dialect).then(|| {
+                    schemaic_core::write_log::is_logged(s, dialect).then(|| {
                         schemaic_core::write_log::Entry::now(
                             schemaic_core::write_log::Source::Editor,
                             "",
@@ -4012,23 +4022,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     bool,
                 )| {
                     // The write log, before the supersede check like the
-                    // history. A `Cancelled` statement in a batch was never
-                    // dispatched — except the one in flight when the user
-                    // pressed Stop, which is the first statement without a
-                    // verdict after a run of successes.
-                    let in_flight = stopped
-                        .then(|| {
-                            states
-                                .iter()
-                                .position(|s| !matches!(s, QueryState::Loaded(_)))
-                        })
-                        .flatten();
+                    // history. Which statements get a line is
+                    // `write_log::batch_logged` (the one in flight at Stop, not
+                    // the undispatched); whether each ran inside an aborted
+                    // transaction is the tab's state folded statement by
+                    // statement, as the loop below folds it for real.
+                    let ran: Vec<_> = states.iter().map(ran_of).collect();
+                    let logged = schemaic_core::write_log::batch_logged(&ran, stopped);
+                    let mut tx = tab.tx.get_untracked();
                     for (i, (entry, state)) in write_entries.iter().zip(&states).enumerate() {
-                        let Some(entry) = entry else { continue };
-                        if matches!(state, QueryState::Cancelled) && in_flight != Some(i) {
-                            continue;
+                        let aborted = matches!(tx, TxState::Poisoned { .. });
+                        if let (Some(entry), true) = (entry, logged[i]) {
+                            log_landed(&log_write, conn_id, dialect, entry.clone(), state, aborted);
                         }
-                        log_landed(&log_write, conn_id, dialect, entry.clone(), state);
+                        if let (Some(sql), Some(Some(stmt))) = (tx_stmts.get(i), outcomes.get(i)) {
+                            tx = tx.on_statement(engine, sql, *stmt);
+                        }
                     }
                     for (sql, stmt) in tx_stmts.iter().zip(&outcomes) {
                         if let Some(stmt) = stmt {

@@ -1679,14 +1679,14 @@ async fn run_exec(
 
 /// The write log's entry for an `exec` of `sql`, stamped before it runs — or
 /// `None` for a statement that does not write (`exec` runs reads too), which
-/// the log has no business holding. `contains_write` errs toward a write.
+/// the log has no business holding. `write_log::is_logged` errs toward a write.
 fn log_entry(
     conn: &Connection,
     database: Option<&str>,
     sql: &str,
     dialect: schemaic_core::intel::SqlDialect,
 ) -> Option<schemaic_core::write_log::Entry> {
-    schemaic_core::sql::contains_write(sql, dialect).then(|| {
+    schemaic_core::write_log::is_logged(sql, dialect).then(|| {
         schemaic_core::write_log::Entry::now(
             schemaic_core::write_log::Source::Cli,
             &conn.name,
@@ -1705,20 +1705,33 @@ fn log_exec(
     ran: &Result<schemaic_core::model::ResultSet, crate::query::NoRows>,
     dialect: schemaic_core::intel::SqlDialect,
 ) {
-    use crate::query::NoRows;
-    use schemaic_core::write_log::Outcome;
-    let entry = match ran {
-        Ok(rs) => entry.ended(Ok(rs.affected)),
-        Err(NoRows::Indeterminate(_)) | Err(NoRows::TimedOut(_)) => {
-            entry.ended_as(Outcome::Unknown, ran.as_ref().err().map(NoRows::message))
-        }
-        Err(e) => entry.ended(Err(e.message())),
+    // `exec` holds no transaction across runs, so nothing it runs is inside
+    // an aborted one.
+    let Some(entry) = entry.landed(exec_ran(ran), false, dialect) else {
+        return;
     };
     let keep =
         schemaic_core::persist::load_json::<schemaic_core::persist::UiState>("ui_state.json")
             .write_log_values;
     if let Err(e) = schemaic_core::write_log::append(&entry, dialect, keep) {
         warn(&format!("couldn't append to the write log: {e}"));
+    }
+}
+
+/// How an `exec` ended, in the write log's terms: a timeout after the
+/// statement was sent (`TimedOut`, `Indeterminate`) is `Unknown` — it may
+/// have written — never `Failed`.
+fn exec_ran(
+    ran: &Result<schemaic_core::model::ResultSet, crate::query::NoRows>,
+) -> schemaic_core::write_log::Ran {
+    use crate::query::NoRows;
+    use schemaic_core::write_log::Ran;
+    match ran {
+        Ok(rs) => Ran::Rows(rs.affected),
+        Err(e @ (NoRows::Indeterminate(_) | NoRows::TimedOut(_))) => {
+            Ran::Unknown(Some(e.message()))
+        }
+        Err(e) => Ran::Failed(e.message()),
     }
 }
 
@@ -2089,6 +2102,27 @@ mod tests {
         let m = NoRows::Indeterminate(d).message();
         assert!(!m.contains("cancelled"), "{m}");
         assert!(m.contains("may have been applied"), "{m}");
+    }
+
+    /// The write log's reading of an `exec`: a timeout after sending may
+    /// have written, so it is `Unknown`; the server's refusal is `Failed`.
+    #[test]
+    fn an_indeterminate_exec_is_unknown() {
+        use query::NoRows;
+        use schemaic_core::write_log::Ran;
+        let d = Duration::from_secs(1);
+        assert!(matches!(
+            exec_ran(&Err(NoRows::Indeterminate(d))),
+            Ran::Unknown(Some(_))
+        ));
+        assert!(matches!(
+            exec_ran(&Err(NoRows::TimedOut(d))),
+            Ran::Unknown(Some(_))
+        ));
+        assert_eq!(
+            exec_ran(&Err(NoRows::Failed("dup".into()))),
+            Ran::Failed("dup".into())
+        );
     }
 
     /// **An editor's byte-order mark is not part of the statement.** The read

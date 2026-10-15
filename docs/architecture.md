@@ -10719,6 +10719,24 @@ existing prose was left alone.
     it is never masked. `now` stamps an entry (an empty database is `None`,
     `an_empty_database_is_no_database`), `with_detail` adds the detail, and `ended` (`Ok(rows)` or
     `Err(message)`) and `ended_as` (an outcome with no row count) say how it went.
+    **How a run ended is decided here, not in the front ends.** Each maps its own state onto `Ran`
+    (`Rows(Option<u64>)`, `Failed`, `Cancelled`, `Unknown`, `Pending`) in one thin match — the app's
+    `ran_of(&QueryState)`, the CLI's `exec_ran` — and `Entry::landed(ran, aborted_before, dialect)`
+    ends the entry, `None` for `Pending`, which has no verdict to record
+    (`each_way_a_run_ends_maps_to_its_outcome`, `an_indeterminate_run_is_unknown`). These decisions
+    lived in an app closure and a CLI function, untested, until a typed `COMMIT` of an aborted
+    PostgreSQL transaction was logged `ok`: PostgreSQL answers a `COMMIT` of an aborted block with a
+    `ROLLBACK` it reports as a success. So **a `COMMIT`/`END` that "succeeded" with
+    `aborted_before`** — the tab's `tx::TxState::Poisoned` when it ran — **is logged `failed`**, *the
+    transaction was already aborted, so COMMIT rolled it back — nothing was committed*: the Commit
+    button's `aborted_commit` refusal, for the statement typed by hand
+    (`a_commit_typed_into_an_aborted_transaction_is_logged_failed`). `batch_logged(ran, stopped)`
+    is which statements of a Run All get a line: a `Cancelled` one only if it was in flight at Stop
+    — the first without `Rows`, after the run of successes — since a batch reports every statement
+    after a failure or a stop as cancelled without having dispatched it, and a statement already
+    sent is not unsent; `Pending` none
+    (`a_stopped_batch_logs_the_in_flight_statement_and_not_the_undispatched`,
+    `a_failed_batch_logs_nothing_after_the_failure`).
     **Values are masked by default, because the SQL is the user's data.** An `UPDATE … SET email =
     'ann@example.com'` carries the very value a log kept for years should not hold in the clear.
     `line(entry, dialect, keep_values)` is the entry as the file holds it: unless `keep_values`
@@ -10749,9 +10767,15 @@ existing prose was left alone.
     (`a_grid_commit_is_named_step_by_step_in_the_executors_order`); a PostgreSQL step is qualified
     by its schema, a MySQL one by its database (`a_postgres_grid_write_is_qualified_by_its_schema`).
     **What counts as a write is the caller's path, not this module's**: the editor and `exec` log a
-    statement `sql::contains_write` calls a write (it errs toward one), and the grid commit, the
-    DDL preview, the import and a `.sql` file run log whatever they ran. Where each path hooks in,
-    and what is deliberately not logged, is under `app/main.rs` and `cli/run.rs`.
+    statement `is_logged` answers for, and the grid commit, the DDL preview, the import and a `.sql`
+    file run log whatever they ran. `is_logged` is `sql::contains_write` **or** a statement
+    `sql::read_only_reason` will not call a read — because `SELECT archive_and_purge(2023)` deletes
+    rows behind a read head, PostgreSQL's usual way to write through a function, and
+    `contains_write` fails open on it where the read-only gate's PostgreSQL and SQL Server function
+    allowlists fail closed (`a_write_through_a_function_call_is_logged`). Logging a read is the
+    acceptable direction; missing a write is not. **It does not cover MySQL/MariaDB**, whose gate
+    has no function allowlist: a `SELECT my_stored_fn()` that writes still gets no line. Where each
+    path hooks in, and what is deliberately not logged, is under `app/main.rs` and `cli/run.rs`.
   - `sticky_header.rs` — which band header of a scrolled list is **pinned** to its top edge, and
     how far the next one has pushed it: the pure half of the history and snippet panels' sticky
     bands (the view half is `widgets::banded_list`). `pinned(headers, scroll_y, pinned_height)`
@@ -32082,16 +32106,24 @@ existing prose was left alone.
   `connection` with the saved name looked up by `conn_id` (`connection N` once it has gone),
   reads `write_log_values` at that moment, and appends on `spawn_blocking`. An append that fails
   is a `tracing::warn!` and nothing else — the write it records has already happened, and must not
-  be reported as failing because its record did. `log_landed` maps a run's `QueryState` onto the
-  entry: `Loaded` its `affected`, `Failed` the engine's message, `Cancelled` cancelled, which may
-  still have written, a sent statement not being unsent. The hooks, and why each sits where it does:
-  `run_query_core` stamps an entry at launch for a statement `contains_write` calls a write and
+  be reported as failing because its record did. `log_landed` hands a run's entry to the sink as
+  `write_log::Entry::landed` ends it, through the thin `ran_of(&QueryState)` — `Loaded` its
+  `affected`, `Failed` the engine's message, `Cancelled` cancelled, which may still have written, a
+  sent statement not being unsent; `Idle`/`Running` nothing. Its `aborted_before` is whether the
+  tab's transaction was `TxState::Poisoned` when the statement ran, which is what turns a typed
+  `COMMIT` PostgreSQL reported as a success into the `failed` line it really was (under
+  `write_log.rs`). The hooks, and why each sits where it does:
+  `run_query_core` stamps an entry at launch for a statement `write_log::is_logged` answers for and
   that is not a view re-run (`!is_view`), and logs it in the `send` ext action **before the
   supersede check**, where the history is finished: the write happened whichever run the tab now
-  shows. Run All stamps one per writing statement and logs them the same way, **skipping a
-  `Cancelled` statement**, which a batch reports for every statement after a failure without
-  dispatching it (`drop_runs`' reason, under `history.rs`) — except the one in flight when the
-  user pressed Stop, the first statement without a `Loaded` state. `end_tx` logs a Manual tab's
+  shows. **It reads `tab.tx` before the transaction fold below it** — after the fold, the state is
+  the one the statement produced, not the one it ran in. Run All stamps one per logged statement
+  and logs those `write_log::batch_logged` picks, **skipping a `Cancelled` statement**, which a
+  batch reports for every statement after a failure without dispatching it (`drop_runs`' reason,
+  under `history.rs`) — except the one in flight when the user pressed Stop, the first statement
+  without a `Loaded` state. Its `aborted_before` comes from a local copy of the tab's `TxState`
+  folded statement by statement as it logs, since one batch can poison the transaction and then
+  `COMMIT` it; the tab's own state is folded afterwards, as before. `end_tx` logs a Manual tab's
   `COMMIT` or `ROLLBACK` when the transaction was open (`TxState::is_open`): the tab's writes are
   logged `ok` as they run, before anything commits them, and that end entry is the only line that
   says whether they stayed. `script_run` logs a `.sql` file whole — `Source::Script`, its detail
@@ -35259,12 +35291,15 @@ existing prose was left alone.
     statement that `needs_database`, which no read is — is unchanged.
     **`run_exec` appends to the write log the GUI keeps**, so `schemaic exec` is in the same record
     as the editor (`core::write_log`). `log_entry` stamps a `Source::Cli` entry under the
-    connection's saved name only when `sql::contains_write` calls the statement a write, because
-    `exec` runs reads too and the log has no business holding them. It is stamped after `connect`,
-    so a refusal or a connection that failed leaves no line, nothing having been sent. `log_exec`
-    ends it from `exec::run`'s answer — rows affected, the message on a failure, and
-    **`Outcome::Unknown` for `NoRows::Indeterminate`** — exit 5's statement that may have been
-    applied in whole or in part — and for `TimedOut` alike. It reads `ui_state.json`'s `write_log_values` on every
+    connection's saved name only when `write_log::is_logged` answers for the statement, because
+    `exec` runs reads too and the log has no business holding them — though it errs toward a
+    write, a `SELECT` of a writing function included (under `write_log.rs`). It is stamped after
+    `connect`, so a refusal or a connection that failed leaves no line, nothing having been sent.
+    `log_exec` ends it through `Entry::landed`, `exec::run`'s answer mapped by `exec_ran` — rows
+    affected, the message on a failure, and **`Unknown` for `NoRows::Indeterminate`** — exit 5's
+    statement that may have been applied in whole or in part — and for `TimedOut` alike
+    (`an_indeterminate_exec_is_unknown`). Its `aborted_before` is always `false`: `exec` holds no
+    transaction across runs, so nothing it runs is inside an aborted one. It reads `ui_state.json`'s `write_log_values` on every
     run, so the one file follows the setting the user chose in the GUI, and an append that fails is
     a warning on stderr that **leaves the exit status alone**: the status is the statement's, and
     the write has happened either way.
