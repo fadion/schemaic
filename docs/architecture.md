@@ -6022,8 +6022,12 @@ existing prose was left alone.
     object holding one, and the migration carries the right database's name into a statement that
     runs against the left. `ref_schema_is_database` is not the comparison's alone: `dump::plan`,
     `schema::follow_target`, `incoming_keys` and `referencing_target` ask it too, and so does
-    `used_by::used_by`, which reads a qualifier equal to the database it was handed — in a key or in
-    a view body, which the catalogue qualifies the same way — as that database (under `used_by.rs`).
+    `used_by::used_by`, which reads a key's `ref_schema` equal to the database it was handed as that
+    database. **A qualifier in a body is a third predicate's, `body_qualifier_is_database`**, and
+    not this one flipped for SQLite: SQLite's `main.orders` names a database while its keys carry no
+    `ref_schema` at all, so the body answer is MySQL's and SQLite's and the key answer MySQL's alone
+    — asked by `used_by` only (under `used_by.rs`). Beside them, `rename_follows(dialect,
+    DependentKind)` asks which dependents an in-place rename carries along; it is `used_by`'s too.
     **One more asks where a bare name resolves, which decides how a foreign key's target is
     *written*.** `bare_reference_is_own_namespace` asks whether a bare table name in a statement
     about a table resolves in that table's own namespace, so that a key whose
@@ -14459,12 +14463,32 @@ existing prose was left alone.
     carry no namespace — so until `used_by` was handed the database, no MySQL or MariaDB view or
     foreign key was ever found using anything, in the modal, a drop's warning or a preview's *Used
     by* block alike. A qualifier equal to `database` now counts as this database, and one naming
-    another database does not (`a_mysql_catalogue_qualifier_naming_this_database_is_a_use`).
+    another database does not (`a_mysql_catalogue_qualifier_naming_this_database_is_a_use`). **A
+    body's qualifier asks `ddl::body_qualifier_is_database`, a key's `ref_schema` still asks
+    `ref_schema_is_database`**, and the two differ on SQLite: its `main.orders` names a database
+    while its tables and keys carry none, so with the key predicate alone it said *"Nothing in main
+    uses it"* of a view and a trigger the drop then broke
+    (`a_sqlite_qualifier_naming_this_database_is_a_use`). SQL Server's bracketed `[dbo].[orders]`,
+    three-part `shop.dbo.orders` and a bare name in a `sales` routine reaching `dbo` are pinned as its
+    catalogue writes them (`sql_server_qualifiers_are_read_as_its_catalogue_writes_them`).
     **A trigger is listed three ways**: one *on* the table, with `goes_with_it`, since dropping the table drops it; one on another table
     whose body uses the target; and, for a routine target, a PostgreSQL trigger whose
     `TriggerAction::Function` names it — that name is emittable SQL, quoted and qualified outside
-    `public`, so `function_is` unquotes it and reads the qualifier rather than comparing strings
-    (`a_qualified_pg_trigger_function_matches_only_its_schema`). A routine target also finds the
+    `public`, so `function_is` reads it with `schema::split_type_name` rather than comparing strings
+    or splitting on the last dot — a quoted `"audit.v2"` is one name, which `rsplit_once('.')` read
+    as `v2` in `audit` — and a name it cannot read is no routine
+    (`a_qualified_pg_trigger_function_matches_only_its_schema`,
+    `a_quoted_trigger_function_with_a_dot_is_still_the_routine`). **For a column target, a trigger
+    on the table is listed when its body names the column alone** (`uses_column_of_own_row`), and
+    is not `goes_with_it`: it reads the row as `NEW.total` or `inserted.total` and never names the
+    table, so while a body had to name the table first, no MySQL, SQL Server or SQLite trigger on
+    the table was ever listed for a column, and *"Nothing uses it"* preceded a rename or drop that
+    broke every insert (`a_trigger_on_the_table_is_listed_for_a_column_its_body_uses`). A
+    PostgreSQL trigger has no body to read, so it is the **function** a trigger on the table runs
+    that is listed, as a `Routine`, when its body names the column — and not one a trigger on
+    another table runs (`a_pg_trigger_function_on_the_table_is_listed_for_a_column_it_uses`). The
+    same text-scan trade as any column: a same-named column read off another table in that body
+    counts. A routine target also finds the
     tables whose column defaults, generated columns or checks call it, as `Expression`
     (`a_routine_is_used_by_callers_expressions_and_pg_triggers`). A table's key onto itself is
     `goes_with_it` too.
@@ -14475,16 +14499,27 @@ existing prose was left alone.
     breaks (`a_trigger_on_the_table_is_listed_and_one_elsewhere_that_writes_it`,
     `the_drop_warning_counts_by_kind_and_names_the_first_few`).
     **A rename or a column edit asks the same question**, since it breaks a dependent as surely as
-    a drop does. `touched(&[Change]) -> Vec<Touch>` reads off a plan the names it takes away or
-    alters — a `Touch { column, kind }`, `column: None` for the object itself, `TouchKind` one of
-    `Rename`, `Drop` or `Retype`: `RenameTable`, `RenameView` and `RenameRoutine` touch the whole
-    object, `DropColumn` drops a column, and `AlterColumn` is a rename when the name differs, a
-    retype when only the type does — compared case-insensitively, so `int` → `INT` is no change —
-    and nothing otherwise (`an_edit_that_keeps_name_and_type_touches_nothing`). A column renamed
+    a drop does. `touched(&[Change], table) -> Vec<Touch>` reads off a plan the names it takes away
+    or alters — a `Touch { column, kind }`, `column: None` for the object itself, `TouchKind` one of
+    `Rename`, `Recreate`, `Drop` or `Retype`: `RenameTable`, `RenameView` and `RenameRoutine` touch
+    the whole object, `DropColumn` drops a column, and `AlterColumn` is a rename when the name
+    differs, a retype when only the type does — compared case-insensitively, so `int` → `INT` is
+    no change — and nothing otherwise (`an_edit_that_keeps_name_and_type_touches_nothing`). A column renamed
     *and* retyped is **one** rename, the name being what breaks a dependent first
     (`a_renamed_and_retyped_column_is_one_rename`). **A whole-object drop is deliberately not
     here**: its preview already asks through `drop_warning`, and listing it twice would put the
-    same dependents under two headings. `change_warning(touch, object, deps)` words one —
+    same dependents under two headings. **A rename by building anew is a `Recreate`**, though no
+    change in the plan says "rename" — which is why `touched` takes the plan's `table`, the name
+    the server holds: a `ReplaceView { recreate: true }` whose draft is named otherwise (a view
+    rename on SQL Server or SQLite, which have no verb for it), a `ReplaceRoutine { recreate: true }`
+    whose draft is named otherwise than its `server` (a routine rename on MySQL or SQL Server), and
+    a column rename in a plan holding a `RebuildTable` — SQLite's rebuild replays the stored text
+    under `legacy_alter_table`, so nothing names the new column. Before it, such a rename touched
+    nothing and the preview carried no *Used by* lines; checked live on SQL Server 2022, `DROP VIEW
+    v1` succeeds under a `v2` not schema-bound to it, and `v2` then fails with Msg 208/4413
+    (`a_view_renamed_by_dropping_and_creating_it_is_warned_about`,
+    `a_routine_renamed_by_dropping_and_creating_it_is_warned_about`).
+    `change_warning(touch, object, deps, dialect)` words one —
     *"orders is used by 2 views and 1 routine: a, b, c. They still name orders after the
     rename."*, *"Column note is used by …. They break when it is dropped."*, *"… Check them against
     its new type."* — over the private `listing`, which `drop_warning` was factored onto with its
@@ -14494,16 +14529,30 @@ existing prose was left alone.
     key is held against the object, not its name, and was checked live to follow both a renamed
     referenced table and a renamed referenced column on MariaDB, MySQL 8, PostgreSQL, SQL Server and
     SQLite — so *"They still name orders after the rename"* was false of every key it listed
-    (`a_rename_does_not_claim_a_foreign_key_keeps_the_old_name`).
+    (`a_rename_does_not_claim_a_foreign_key_keeps_the_old_name`). **Which other dependents an
+    in-place rename carries is `ddl::rename_follows(dialect, DependentKind)`**, and the sentence
+    leaves those out as well — it used to leave out only keys, on every engine, and so told the user
+    to fix what was not broken. A key follows everywhere; PostgreSQL holds a view, a default, a
+    generated column, a check and a trigger's `EXECUTE FUNCTION` and `UPDATE OF` by OID or column
+    number, so all follow, while a routine body is `prosrc` text and does not; SQLite's `RENAME TO`
+    and `RENAME COLUMN` rewrite its views and triggers; MySQL and SQL Server rewrite nothing. Checked
+    live on PostgreSQL 16 (a table rename, a column rename and a function rename — the plpgsql bodies
+    kept the old name and failed) and SQLite 3.45 (views and triggers rewritten, `main.orders`
+    included) — `a_rename_warns_only_about_dependents_that_do_not_follow_it`,
+    `a_pg_routine_rename_warns_only_about_bodies_that_call_it`,
+    `which_dependents_follow_a_rename_and_which_qualifiers_name_the_database`. **A `Recreate` does
+    not ask it**: building anew carries nothing across but a key, which names a table rather than a
+    view or routine and is put back against the new table, so only keys drop out and the sentence
+    is the same *"They still name X after the rename."*
     `change_warnings(&DbSchema, &ChangeSet, database)` is the composition the preview calls, and it
-    asks **under the name before the plan** — the set's `table`, which is the server's name, or a
-    renamed routine's `from` — because the loaded schema still holds the old one and a dependent
-    still names it (`a_plan_is_warned_about_by_what_uses_the_names_it_changes`,
-    `a_routine_rename_asks_after_the_routine_by_its_old_name`). **A routine rename is seen only
-    where it is a `RenameRoutine`**, which `diff_routine` emits on PostgreSQL alone, and there only
-    when the signature is unchanged: everywhere else — MySQL, SQL Server, a PostgreSQL rename that
-    also changes the signature — the rename is folded into a recreate (`supports_routine_rename`),
-    `touched` finds nothing to ask about, and the preview carries no *Used by* lines.
+    asks **under the name before the plan** — the set's `table`, which is the server's name, a
+    renamed routine's `from`, or a routine re-created under a new name's `server` — because the
+    loaded schema still holds the old one and a dependent still names it
+    (`a_plan_is_warned_about_by_what_uses_the_names_it_changes`,
+    `a_routine_rename_asks_after_the_routine_by_its_old_name`). A routine rename is therefore seen
+    both as a `RenameRoutine`, which `diff_routine` emits on PostgreSQL alone and only when the
+    signature is unchanged, and as the recreate it is folded into everywhere else
+    (`supports_routine_rename`).
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case** itself; built on `skip_noncode` so comments/strings/
     backtick idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -36689,7 +36738,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   whether the Create ▸
   *Extension* entry and the Extensions folder's *Create extension* exist at all, PostgreSQL alone
   and computed from `supports_change` like the editor predicates above; and, for the *comparison* rather than
-  any editor, `ref_schema_is_database` and `view_definition_is_qualified`; and
+  any editor, `ref_schema_is_database` and `view_definition_is_qualified`; for *Used by*,
+  `body_qualifier_is_database` and `rename_follows`; and
   `schema::restates_partitioning`, which asks whether a `CREATE TABLE` carries the partitioning —
   false on SQL Server and SQLite — for `ddl::create_table_sql` and the comparison both. **The same
   rule applies

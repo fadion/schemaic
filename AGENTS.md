@@ -45,7 +45,9 @@ behind it is one engine's alone:
 `ddl::ref_schema_is_database` and `view_definition_is_qualified`, which ask whether a field the
 differ reads names the object or the database it was read from, and
 `namespace_comes_with_every_database`, which keeps a schema the target already has out of the
-plan. Ask a **capability**, never an
+plan — and, for *Used by*, `ddl::rename_follows`, which says which dependents an in-place rename
+carries along, and `body_qualifier_is_database`, which reads SQLite's `main.` in a body as MySQL's
+database qualifier while its keys still carry none. Ask a **capability**, never an
 engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third
 engine onto whichever side it happens to fall — and a *constant* in place of a capability is the
 same failure with no comparison to grep for, which is why the predicates that do answer the same

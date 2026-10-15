@@ -18,7 +18,10 @@
 //! own namespace or the default one. A column is used where a body that uses
 //! its table also names the column — the nearest a text scan gets, and it errs
 //! toward listing: a dynamic-SQL string naming the object is not seen, and a
-//! same-named column of another table in the same body is.
+//! same-named column of another table in the same body is. A body that runs
+//! *on* the table — its own trigger's, or the function a PostgreSQL trigger on
+//! it runs — reads the row as `NEW.total` or `inserted.total` and need not
+//! name the table at all, so there the column word alone is a use.
 //!
 //! A foreign key is exact: its `ref_table` is the object. A trigger *on* the
 //! table is listed too, since dropping the table drops it.
@@ -137,8 +140,11 @@ impl Dependent {
 /// the catalogue writes it into every view body and every key's `ref_schema`,
 /// while the tables themselves carry no namespace at all; a qualifier equal to
 /// `database` is therefore this database, and one naming any other is not.
+/// A body's qualifier is asked separately ([`body_qualifier_is_database`]),
+/// because SQLite's names a database (`main.orders`) while its keys carry none.
 ///
 /// [`ref_schema_is_database`]: crate::ddl::ref_schema_is_database
+/// [`body_qualifier_is_database`]: crate::ddl::body_qualifier_is_database
 pub fn used_by(
     schema: &DbSchema,
     target: Target,
@@ -157,9 +163,16 @@ pub fn used_by(
         Target::Relation { column, .. } => column,
         Target::Routine { .. } => None,
     };
-    // A qualifier names a database here, and the tables carry none: the
-    // database's own name in front of the target is the target.
+    // A key's `ref_schema` names a database here, and the tables carry none:
+    // the database's own name there is the target's.
     let qualifier_is_database = crate::ddl::ref_schema_is_database(dialect);
+    // The same of a qualifier in a body — MySQL's, and SQLite's `main.`.
+    let body_qualifier_is_database = crate::ddl::body_qualifier_is_database(dialect);
+    // Does `text` name the target column, as a word in code? True when the
+    // target is no column.
+    let names_column = |text: &str, code: &[bool]| {
+        column.is_none_or(|c| !crate::intel::code_word_hits_in(text, code, c).is_empty())
+    };
     // Does `text`, written in `own`, use the target?
     let uses = |text: &str, own: Option<&str>| -> bool {
         if text.is_empty() {
@@ -167,8 +180,14 @@ pub fn used_by(
         }
         let code = crate::intel::code_mask(text, dialect);
         let names = |ns| crate::dump::names_object(text, &code, dialect, own, ns, t_name);
-        (names(t_ns) || (qualifier_is_database && t_ns.is_none() && names(Some(database))))
-            && column.is_none_or(|c| !crate::intel::code_word_hits_in(text, &code, c).is_empty())
+        (names(t_ns) || (body_qualifier_is_database && t_ns.is_none() && names(Some(database))))
+            && names_column(text, &code)
+    };
+    // Does `text` — the body of something that runs *on* the target table, so
+    // reads its row as `NEW.total` or `inserted.total` without naming the
+    // table — name the target column?
+    let uses_column_of_own_row = |text: &str| -> bool {
+        column.is_some() && names_column(text, &crate::intel::code_mask(text, dialect))
     };
     let mut out = Vec::new();
     for t in &schema.tables {
@@ -237,10 +256,13 @@ pub fn used_by(
                 }
                 (TriggerAction::Function { .. }, Target::Relation { .. }) => false,
             };
+            // A trigger on the table reads the column off its own row, and
+            // its body need not name the table at all. A PostgreSQL trigger
+            // has no body here: the function it runs is listed below.
             let on_column = is_target
                 && column.is_some_and(|c| {
                     tr.update_columns.iter().any(|u| u.eq_ignore_ascii_case(c))
-                        || matches!(&tr.action, TriggerAction::Body(b) if uses(b, own))
+                        || matches!(&tr.action, TriggerAction::Body(b) if uses_column_of_own_row(b))
                 });
             if fires_on_it || calls_it || on_column {
                 out.push(Dependent {
@@ -254,12 +276,30 @@ pub fn used_by(
             }
         }
     }
+    // The functions triggers on the target table run (PostgreSQL), which read
+    // a column as `NEW.total` and never name the table.
+    let target_trigger_functions: Vec<&str> = match column {
+        Some(_) => schema
+            .tables
+            .iter()
+            .filter(|t| same_ns(t.schema.as_deref(), t_ns) && t.name.eq_ignore_ascii_case(t_name))
+            .flat_map(|t| &t.triggers)
+            .filter_map(|tr| match &tr.action {
+                TriggerAction::Function { name, .. } => Some(name.as_str()),
+                TriggerAction::Body(_) => None,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     for r in &schema.routines {
         let own = r.schema.as_deref();
         let itself = matches!(target, Target::Routine { .. })
             && same_ns(own, t_ns)
             && r.name.eq_ignore_ascii_case(t_name);
-        if !itself && uses(&r.body, own) {
+        let runs_on_target = target_trigger_functions
+            .iter()
+            .any(|f| function_is(f, own, &r.name));
+        if !itself && (uses(&r.body, own) || (runs_on_target && uses_column_of_own_row(&r.body))) {
             out.push(Dependent::new(
                 DependentKind::Routine,
                 display_name(own, &r.name),
@@ -283,11 +323,14 @@ pub fn used_by(
 
 /// Is a PostgreSQL trigger's function `name` — emittable SQL, quoted and
 /// qualified outside `public` — the routine `ns.routine`?
+///
+/// Split by `schema::split_type_name`, the reader for PostgreSQL's own
+/// quoted, qualified spelling: a quoted name may hold a dot (`"audit.v2"`),
+/// which splitting on the last one read as `v2` in `audit`. A name it cannot
+/// read is no routine.
 fn function_is(name: &str, ns: Option<&str>, routine: &str) -> bool {
-    let unquote = |s: &str| s.trim().trim_matches('"').replace("\"\"", "\"");
-    let (qual, bare) = match name.rsplit_once('.') {
-        Some((q, b)) => (Some(unquote(q)), unquote(b)),
-        None => (None, unquote(name)),
+    let Some((qual, bare)) = crate::schema::split_type_name(name.trim()) else {
+        return false;
     };
     bare.eq_ignore_ascii_case(routine)
         && match (qual.as_deref(), ns) {
@@ -314,7 +357,15 @@ pub struct Touch {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TouchKind {
+    /// Renamed in place, by the engine's own rename — what follows it is
+    /// [`crate::ddl::rename_follows`]'s answer.
     Rename,
+    /// Renamed by building it anew under the new name: a view or routine
+    /// dropped and created (the engine has no verb for the rename, or the
+    /// edit needs the drop anyway), or a column inside a table rebuild, whose
+    /// replayed text still names the old one. Nothing the engine rewrites on
+    /// a rename is rewritten.
+    Recreate,
     Drop,
     /// The column's type changed, its name did not.
     Retype,
@@ -325,24 +376,41 @@ pub enum TouchKind {
 /// object is not here: its preview asks for itself, through [`drop_warning`].
 /// A column renamed *and* retyped is one rename, the name being what breaks a
 /// dependent first; a type spelled in another case is no change.
-pub fn touched(changes: &[crate::ddl::Change]) -> Vec<Touch> {
+///
+/// `table` is the plan's own (`ChangeSet::table`), the name the server holds:
+/// a view re-created under another name is renamed, though no change says
+/// "rename".
+pub fn touched(changes: &[crate::ddl::Change], table: &str) -> Vec<Touch> {
     use crate::ddl::Change;
+    let rebuilt = changes.iter().any(|c| matches!(c, Change::RebuildTable(_)));
+    let whole = |kind| Some(Touch { column: None, kind });
     changes
         .iter()
         .filter_map(|c| match c {
             Change::RenameTable { .. }
             | Change::RenameView { .. }
-            | Change::RenameRoutine { .. } => Some(Touch {
-                column: None,
-                kind: TouchKind::Rename,
-            }),
+            | Change::RenameRoutine { .. } => whole(TouchKind::Rename),
+            Change::ReplaceView {
+                draft,
+                recreate: true,
+                ..
+            } if draft.name != table => whole(TouchKind::Recreate),
+            Change::ReplaceRoutine {
+                draft,
+                server,
+                recreate: true,
+            } if draft.info.name != server.name => whole(TouchKind::Recreate),
             Change::DropColumn { name, .. } => Some(Touch {
                 column: Some(name.clone()),
                 kind: TouchKind::Drop,
             }),
             Change::AlterColumn { from, to, .. } => {
                 let kind = if from.name != to.name {
-                    TouchKind::Rename
+                    if rebuilt {
+                        TouchKind::Recreate
+                    } else {
+                        TouchKind::Rename
+                    }
                 } else if !from.type_name.eq_ignore_ascii_case(&to.type_name) {
                     TouchKind::Retype
                 } else {
@@ -362,28 +430,35 @@ pub fn touched(changes: &[crate::ddl::Change]) -> Vec<Touch> {
 /// object is called `object` — `None` when nothing outside the object uses it.
 /// What goes with the object is left out as [`drop_warning`] leaves it: a
 /// trigger on a table follows the table's rename on every engine.
-pub fn change_warning(touch: &Touch, object: &str, deps: &[Dependent]) -> Option<String> {
-    // A key follows a rename of what it points at on every engine — the server
-    // holds it against the object, not the name — so a rename leaves it whole.
-    let kept: Vec<Dependent>;
-    let deps = match touch.kind {
-        TouchKind::Rename => {
-            kept = deps
-                .iter()
-                .filter(|d| d.kind != DependentKind::ForeignKey)
-                .cloned()
-                .collect();
-            &kept[..]
-        }
-        TouchKind::Drop | TouchKind::Retype => deps,
+///
+/// **And so is what follows the rename** on `dialect`
+/// ([`crate::ddl::rename_follows`]): a PostgreSQL view holds the table by
+/// OID and SQLite rewrites one, so neither "still names orders after the
+/// rename", and saying so sent the user to fix what was not broken. A
+/// [`TouchKind::Recreate`] carries nothing across but a key — the one
+/// dependent that names a table rather than a view or a routine, and which
+/// a rebuild puts back against the new table.
+pub fn change_warning(
+    touch: &Touch,
+    object: &str,
+    deps: &[Dependent],
+    dialect: SqlDialect,
+) -> Option<String> {
+    let follows = |kind: DependentKind| match touch.kind {
+        TouchKind::Rename => crate::ddl::rename_follows(dialect, kind),
+        TouchKind::Recreate => kind == DependentKind::ForeignKey,
+        TouchKind::Drop | TouchKind::Retype => false,
     };
-    let listed = listing(deps)?;
+    let deps: Vec<Dependent> = deps.iter().filter(|d| !follows(d.kind)).cloned().collect();
+    let listed = listing(&deps)?;
     let (subject, name) = match &touch.column {
         Some(c) => (format!("Column {c}"), c.as_str()),
         None => (object.to_string(), object),
     };
     let then = match touch.kind {
-        TouchKind::Rename => format!("They still name {name} after the rename."),
+        TouchKind::Rename | TouchKind::Recreate => {
+            format!("They still name {name} after the rename.")
+        }
         TouchKind::Drop => "They break when it is dropped.".to_string(),
         TouchKind::Retype => "Check them against its new type.".to_string(),
     };
@@ -393,7 +468,8 @@ pub fn change_warning(touch: &Touch, object: &str, deps: &[Dependent]) -> Option
 /// The *Used by* sentences a preview of `plan` shows: one per name it
 /// renames, drops or retypes ([`touched`]) that something in `schema` uses,
 /// asked under the name **before** the plan — the server's, which is the
-/// set's `table`, or a renamed routine's `from`. Empty when nothing does.
+/// set's `table`, or a renamed routine's `from` (or, re-created under a new
+/// name, its `server`). Empty when nothing does.
 /// `database` is the one `schema` was read from, as [`used_by`] takes it.
 pub fn change_warnings(
     schema: &DbSchema,
@@ -403,6 +479,11 @@ pub fn change_warnings(
     use crate::ddl::Change;
     let routine = plan.changes.iter().find_map(|c| match c {
         Change::RenameRoutine { from, .. } => Some(from),
+        Change::ReplaceRoutine {
+            draft,
+            server,
+            recreate: true,
+        } if draft.info.name != server.name => Some(server),
         _ => None,
     });
     let (ns, name) = match routine {
@@ -410,7 +491,7 @@ pub fn change_warnings(
         None => (plan.schema.as_deref(), plan.table.as_str()),
     };
     let shown = display_name(ns, name);
-    touched(&plan.changes)
+    touched(&plan.changes, &plan.table)
         .iter()
         .filter_map(|t| {
             let target = match routine {
@@ -421,7 +502,8 @@ pub fn change_warnings(
                     column: t.column.as_deref(),
                 },
             };
-            change_warning(t, &shown, &used_by(schema, target, plan.dialect, database))
+            let deps = used_by(schema, target, plan.dialect, database);
+            change_warning(t, &shown, &deps, plan.dialect)
         })
         .collect()
 }
@@ -803,14 +885,14 @@ mod tests {
     #[test]
     fn a_rename_of_the_object_touches_it_whole() {
         assert_eq!(
-            touched(&[Change::RenameTable { to: "o2".into() }]),
+            touched(&[Change::RenameTable { to: "o2".into() }], "orders"),
             vec![Touch {
                 column: None,
                 kind: TouchKind::Rename
             }]
         );
         assert_eq!(
-            touched(&[Change::RenameView { to: "v2".into() }]),
+            touched(&[Change::RenameView { to: "v2".into() }], "v"),
             vec![Touch {
                 column: None,
                 kind: TouchKind::Rename
@@ -820,14 +902,17 @@ mod tests {
 
     #[test]
     fn a_column_is_touched_under_its_old_name() {
-        let got = touched(&[
-            alter(col("total", "int"), col("amount", "int")),
-            Change::DropColumn {
-                name: "note".into(),
-                type_name: "text".into(),
-            },
-            alter(col("qty", "int"), col("qty", "bigint")),
-        ]);
+        let got = touched(
+            &[
+                alter(col("total", "int"), col("amount", "int")),
+                Change::DropColumn {
+                    name: "note".into(),
+                    type_name: "text".into(),
+                },
+                alter(col("qty", "int"), col("qty", "bigint")),
+            ],
+            "orders",
+        );
         assert_eq!(
             got,
             vec![
@@ -852,7 +937,7 @@ mod tests {
     #[test]
     fn a_renamed_and_retyped_column_is_one_rename() {
         assert_eq!(
-            touched(&[alter(col("a", "int"), col("b", "bigint"))]),
+            touched(&[alter(col("a", "int"), col("b", "bigint"))], "t"),
             vec![Touch {
                 column: Some("a".into()),
                 kind: TouchKind::Rename
@@ -866,16 +951,22 @@ mod tests {
     fn an_edit_that_keeps_name_and_type_touches_nothing() {
         let mut nullable = col("a", "int");
         nullable.nullable = true;
-        assert_eq!(touched(&[alter(col("a", "int"), nullable)]), vec![]);
-        assert_eq!(touched(&[alter(col("a", "int"), col("a", "INT"))]), vec![]);
+        assert_eq!(touched(&[alter(col("a", "int"), nullable)], "t"), vec![]);
         assert_eq!(
-            touched(&[Change::AddColumn {
-                column: col("z", "int"),
-                position: None,
-            }]),
+            touched(&[alter(col("a", "int"), col("a", "INT"))], "t"),
             vec![]
         );
-        assert_eq!(touched(&[]), vec![]);
+        assert_eq!(
+            touched(
+                &[Change::AddColumn {
+                    column: col("z", "int"),
+                    position: None,
+                }],
+                "t"
+            ),
+            vec![]
+        );
+        assert_eq!(touched(&[], "t"), vec![]);
     }
 
     #[test]
@@ -890,6 +981,7 @@ mod tests {
                 },
                 "orders",
                 &deps,
+                MY,
             )
             .unwrap()
         };
@@ -920,7 +1012,7 @@ mod tests {
     fn a_rename_does_not_claim_a_foreign_key_keeps_the_old_name() {
         let d = |kind, name: &str| Dependent::new(kind, name.into(), "");
         let fk_only = vec![d(DependentKind::ForeignKey, "fk_lines")];
-        let rename = |column: Option<&str>, deps: &[Dependent]| {
+        let rename_in = |dialect, column: Option<&str>, deps: &[Dependent]| {
             change_warning(
                 &Touch {
                     column: column.map(Into::into),
@@ -928,10 +1020,18 @@ mod tests {
                 },
                 "orders",
                 deps,
+                dialect,
             )
         };
-        assert_eq!(rename(None, &fk_only), None);
-        assert_eq!(rename(Some("id"), &fk_only), None);
+        let rename = |column: Option<&str>, deps: &[Dependent]| rename_in(MY, column, deps);
+        for dialect in SqlDialect::ALL {
+            assert_eq!(rename_in(dialect, None, &fk_only), None, "{dialect:?}");
+            assert_eq!(
+                rename_in(dialect, Some("id"), &fk_only),
+                None,
+                "{dialect:?}"
+            );
+        }
         let both = vec![
             d(DependentKind::View, "v"),
             d(DependentKind::ForeignKey, "fk_lines"),
@@ -947,6 +1047,7 @@ mod tests {
             },
             "orders",
             &fk_only,
+            MY,
         );
         assert_eq!(
             drop.as_deref(),
@@ -1080,7 +1181,458 @@ mod tests {
             column: None,
             kind: TouchKind::Rename,
         };
-        assert_eq!(change_warning(&touch, "orders", &[own_trigger]), None);
-        assert_eq!(change_warning(&touch, "orders", &[]), None);
+        for dialect in SqlDialect::ALL {
+            let own = std::slice::from_ref(&own_trigger);
+            assert_eq!(change_warning(&touch, "orders", own, dialect), None);
+            assert_eq!(change_warning(&touch, "orders", &[], dialect), None);
+        }
+    }
+
+    const LT: SqlDialect = SqlDialect::Sqlite;
+    const MS: SqlDialect = SqlDialect::MsSql;
+
+    fn plan_in(dialect: SqlDialect, table: &str, changes: Vec<Change>) -> crate::ddl::ChangeSet {
+        crate::ddl::ChangeSet {
+            dialect,
+            ..plan(table, changes)
+        }
+    }
+
+    fn with_total(name: &str) -> TableInfo {
+        let mut t = table(name);
+        t.columns.push(ColumnInfo {
+            name: "total".into(),
+            type_name: "int".into(),
+            ..Default::default()
+        });
+        t
+    }
+
+    fn body_trigger(name: &str, on: &str, body: &str) -> TriggerInfo {
+        TriggerInfo {
+            name: name.into(),
+            table: on.into(),
+            action: TriggerAction::Body(body.into()),
+            ..Default::default()
+        }
+    }
+
+    fn total_of(name: &str) -> Target<'_> {
+        Target::Relation {
+            ns: None,
+            name,
+            column: Some("total"),
+        }
+    }
+
+    /// A trigger on the table reads its columns as `NEW.total` (MySQL,
+    /// SQLite) or through `inserted` (SQL Server) and never names its own
+    /// table, so asking the body to name the table first missed every one —
+    /// and MySQL and SQL Server do not rewrite a trigger body when the column
+    /// is renamed or dropped.
+    #[test]
+    fn a_trigger_on_the_table_is_listed_for_a_column_its_body_uses() {
+        let cases = [
+            (MY, "SET NEW.total = NEW.total * 1.2"),
+            (
+                MS,
+                "SET NOCOUNT ON; IF EXISTS (SELECT 1 FROM inserted WHERE inserted.total < 0) \
+                 THROW 50000, 'negative', 1;",
+            ),
+            (
+                LT,
+                "BEGIN SELECT RAISE(ABORT, 'negative') WHERE NEW.total < 0; END",
+            ),
+        ];
+        for (dialect, body) in cases {
+            let mut orders = with_total("orders");
+            orders
+                .triggers
+                .push(body_trigger("orders_tax", "orders", body));
+            let schema = DbSchema {
+                tables: vec![orders],
+                ..Default::default()
+            };
+            let got = used_by(&schema, total_of("orders"), dialect, "shop");
+            assert_eq!(
+                names(&got),
+                [(DependentKind::Trigger, "orders_tax")],
+                "{dialect:?}"
+            );
+            // It breaks with the column rather than going with it.
+            assert!(!got[0].goes_with_it, "{dialect:?}");
+            // A column its body does not name is not one it uses.
+            let id = Target::Relation {
+                ns: None,
+                name: "orders",
+                column: Some("id"),
+            };
+            assert!(
+                used_by(&schema, id, dialect, "shop").is_empty(),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// PostgreSQL's trigger runs a function, and the function's body — not the
+    /// trigger — is what reads `NEW.total`, never naming the table. It is the
+    /// function a rename or a drop of the column breaks, so it is the one
+    /// listed; a function a trigger on another table runs is not.
+    #[test]
+    fn a_pg_trigger_function_on_the_table_is_listed_for_a_column_it_uses() {
+        let fires = |table: &str, function: &str| TriggerInfo {
+            name: format!("{table}_trg"),
+            table: table.into(),
+            action: TriggerAction::Function {
+                name: function.into(),
+                args: vec![],
+            },
+            ..Default::default()
+        };
+        let mut orders = with_total("orders");
+        orders.triggers.push(fires("orders", "orders_tax"));
+        let mut lines = with_total("lines");
+        lines.triggers.push(fires("lines", "lines_tax"));
+        let body = "BEGIN NEW.total := NEW.total * 1.2; RETURN NEW; END";
+        let schema = DbSchema {
+            tables: vec![orders, lines],
+            routines: vec![routine("orders_tax", body), routine("lines_tax", body)],
+            ..Default::default()
+        };
+        assert_eq!(
+            names(&used_by(&schema, total_of("orders"), PG, "app")),
+            [(DependentKind::Routine, "orders_tax")]
+        );
+    }
+
+    /// SQL Server's spellings of a qualified name: bracketed, and three-part
+    /// with the database in front — and a bare name inside a module in another
+    /// schema, which still reaches `dbo`, the default.
+    #[test]
+    fn sql_server_qualifiers_are_read_as_its_catalogue_writes_them() {
+        let in_ns = |mut t: TableInfo, ns: &str| {
+            t.schema = Some(ns.into());
+            t
+        };
+        let schema = DbSchema {
+            tables: vec![
+                in_ns(table("orders"), "dbo"),
+                in_ns(
+                    view(
+                        "bracketed",
+                        "CREATE VIEW [dbo].[bracketed] AS SELECT id FROM [dbo].[orders]",
+                    ),
+                    "dbo",
+                ),
+                in_ns(
+                    view(
+                        "three_part",
+                        "CREATE VIEW three_part AS SELECT id FROM shop.dbo.orders",
+                    ),
+                    "dbo",
+                ),
+                in_ns(
+                    view(
+                        "other_schema",
+                        "CREATE VIEW sales.other_schema AS SELECT id FROM [sales].[orders]",
+                    ),
+                    "sales",
+                ),
+            ],
+            routines: vec![std::sync::Arc::new(RoutineInfo {
+                name: "bare_in_sales".into(),
+                schema: Some("sales".into()),
+                body: "SELECT id FROM orders".into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let dbo = Target::Relation {
+            ns: Some("dbo"),
+            name: "orders",
+            column: None,
+        };
+        assert_eq!(
+            names(&used_by(&schema, dbo, MS, "shop")),
+            [
+                (DependentKind::View, "dbo.bracketed"),
+                (DependentKind::View, "dbo.three_part"),
+                (DependentKind::Routine, "sales.bare_in_sales"),
+            ]
+        );
+    }
+
+    /// SQLite's qualifier names a database — `main`, or an attached one — as
+    /// MySQL's does, while its tables carry no namespace at all; `main.orders`
+    /// is the table, and `aux.orders` is not.
+    #[test]
+    fn a_sqlite_qualifier_naming_this_database_is_a_use() {
+        let mut other = table("other");
+        other.triggers.push(body_trigger(
+            "other_log",
+            "other",
+            "BEGIN INSERT INTO log SELECT id FROM main.orders; END",
+        ));
+        let schema = DbSchema {
+            tables: vec![
+                table("orders"),
+                other,
+                view("v", "CREATE VIEW v AS SELECT * FROM main.orders"),
+                view(
+                    "elsewhere",
+                    "CREATE VIEW elsewhere AS SELECT * FROM aux.orders",
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            names(&used_by(&schema, rel("orders"), LT, "main")),
+            [
+                (DependentKind::View, "v"),
+                (DependentKind::Trigger, "other_log"),
+            ]
+        );
+    }
+
+    fn rename_table(dialect: SqlDialect, schema: &DbSchema) -> Vec<String> {
+        change_warnings(
+            schema,
+            &plan_in(
+                dialect,
+                "orders",
+                vec![Change::RenameTable { to: "o2".into() }],
+            ),
+            "shop",
+        )
+    }
+
+    /// PostgreSQL holds a view against the table's OID, not its name, and
+    /// SQLite's `ALTER TABLE … RENAME` rewrites every view and trigger that
+    /// names it — so on those two a view does not "still name orders after the
+    /// rename", while on MySQL and SQL Server it does.
+    #[test]
+    fn a_rename_warns_only_about_dependents_that_do_not_follow_it() {
+        let mut lines = table("lines");
+        lines.triggers.push(body_trigger(
+            "lines_touch",
+            "lines",
+            "UPDATE orders SET id = id",
+        ));
+        let schema = DbSchema {
+            tables: vec![
+                with_total("orders"),
+                lines,
+                view("big", "SELECT id, total FROM orders"),
+            ],
+            routines: vec![routine("cap", "UPDATE orders SET total = 0")],
+            ..Default::default()
+        };
+        assert_eq!(
+            rename_table(MY, &schema),
+            vec![
+                "orders is used by 1 view, 1 routine and 1 trigger: big, cap, lines_touch. \
+                 They still name orders after the rename."
+                    .to_string()
+            ]
+        );
+        // PostgreSQL: the view follows by OID; the function body is text.
+        assert_eq!(
+            rename_table(PG, &schema),
+            vec![
+                "orders is used by 1 routine: cap. They still name orders after the rename."
+                    .to_string()
+            ]
+        );
+        // SQLite: the rename rewrites the view and the trigger alike (and it
+        // stores no routines).
+        let schema = DbSchema {
+            routines: vec![],
+            ..schema
+        };
+        assert!(rename_table(LT, &schema).is_empty());
+        // A column renamed by SQLite's own `RENAME COLUMN` follows too ...
+        let rename_total = alter(col("total", "int"), col("amount", "int"));
+        assert!(
+            change_warnings(
+                &schema,
+                &plan_in(LT, "orders", vec![rename_total.clone()]),
+                "shop"
+            )
+            .is_empty()
+        );
+        // ... but not one the twelve-step rebuild carries, whose replayed
+        // text still names the old column.
+        let orders = with_total("orders");
+        let rebuild = Change::RebuildTable(Box::new(crate::ddl::Rebuild {
+            current: orders.clone(),
+            draft: crate::ddl::TableDraft::from_table(&orders),
+        }));
+        assert_eq!(
+            change_warnings(
+                &schema,
+                &plan_in(LT, "orders", vec![rebuild, rename_total]),
+                "shop"
+            ),
+            vec![
+                "Column total is used by 1 view: big. They still name total after the rename."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A PostgreSQL function renamed in place keeps every view, key default
+    /// and trigger bound to it by OID; only another function's body, which is
+    /// text, still calls it by the old name.
+    #[test]
+    fn a_pg_routine_rename_warns_only_about_bodies_that_call_it() {
+        let mut items = table("items");
+        items.check_constraints.push(CheckInfo {
+            name: "ck".into(),
+            expression: "valid_sku(sku)".into(),
+            ..Default::default()
+        });
+        items.triggers.push(TriggerInfo {
+            name: "items_trg".into(),
+            table: "items".into(),
+            action: TriggerAction::Function {
+                name: "valid_sku".into(),
+                args: vec![],
+            },
+            ..Default::default()
+        });
+        let schema = DbSchema {
+            tables: vec![items, view("skus", "SELECT valid_sku(x) FROM y")],
+            routines: vec![
+                routine("valid_sku", "SELECT 1"),
+                routine("caller", "PERFORM valid_sku('a')"),
+            ],
+            ..Default::default()
+        };
+        let from = Box::new(RoutineInfo {
+            name: "valid_sku".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            change_warnings(
+                &schema,
+                &plan_in(
+                    PG,
+                    "valid_sku",
+                    vec![Change::RenameRoutine {
+                        from,
+                        to: "sku_ok".into()
+                    }]
+                ),
+                "app"
+            ),
+            vec![
+                "valid_sku is used by 1 routine: caller. They still name valid_sku after the rename."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// SQL Server and SQLite have no verb for a view rename, so the view
+    /// editor drops the view and creates it under the new name — one
+    /// `ReplaceView { recreate: true }` and no `RenameView`. Every view that
+    /// named the old one still does, on every engine, and SQL Server lets the
+    /// `DROP VIEW` through under a view that is not schema-bound.
+    #[test]
+    fn a_view_renamed_by_dropping_and_creating_it_is_warned_about() {
+        for dialect in [MS, LT] {
+            let v1 = view("v1", "CREATE VIEW v1 AS SELECT id FROM t");
+            let schema = DbSchema {
+                tables: vec![
+                    table("t"),
+                    v1.clone(),
+                    view("v2", "CREATE VIEW v2 AS SELECT * FROM v1"),
+                ],
+                ..Default::default()
+            };
+            let mut draft = crate::ddl::ViewDraft::from_table(&v1).unwrap();
+            draft.name = "v1b".into();
+            let cs = crate::ddl::diff_view(&v1, &draft, dialect);
+            assert!(
+                !cs.changes
+                    .iter()
+                    .any(|c| matches!(c, Change::RenameView { .. })),
+                "{dialect:?}: {:?}",
+                cs.changes
+            );
+            assert_eq!(
+                change_warnings(&schema, &cs, "main"),
+                vec!["v1 is used by 1 view: v2. They still name v1 after the rename.".to_string()],
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// MySQL and SQL Server rename a routine by dropping it and creating it
+    /// under the new name, and the callers still name the old one.
+    #[test]
+    fn a_routine_renamed_by_dropping_and_creating_it_is_warned_about() {
+        for dialect in [MY, MS] {
+            let calc = RoutineInfo {
+                name: "calc".into(),
+                body: "SELECT 1".into(),
+                ..Default::default()
+            };
+            let schema = DbSchema {
+                tables: vec![table("t")],
+                routines: vec![
+                    std::sync::Arc::new(calc.clone()),
+                    routine("caller", "CALL calc()"),
+                ],
+                ..Default::default()
+            };
+            let mut draft = crate::ddl::RoutineDraft::from_info(&calc);
+            draft.info.name = "calc2".into();
+            let cs = crate::ddl::diff_routine(&calc, &draft, dialect);
+            assert_eq!(
+                change_warnings(&schema, &cs, "shop"),
+                vec![
+                    "calc is used by 1 routine: caller. They still name calc after the rename."
+                        .to_string()
+                ],
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// The trigger's function name is emittable SQL, and a quoted name may
+    /// hold a dot: `"audit.v2"` is one name in the default schema, not `v2`
+    /// in `audit`.
+    #[test]
+    fn a_quoted_trigger_function_with_a_dot_is_still_the_routine() {
+        assert!(function_is("\"audit.v2\"", Some("public"), "audit.v2"));
+        assert!(!function_is("\"audit.v2\"", Some("audit"), "v2"));
+        assert!(function_is("s.\"f.g\"", Some("s"), "f.g"));
+        assert!(function_is("\"a\"\"b\"", None, "a\"b"));
+        // A name it cannot read is no routine, rather than a guess.
+        assert!(!function_is("\"unterminated", None, "unterminated"));
+    }
+
+    /// The two capabilities this module asks, answered per engine.
+    #[test]
+    fn which_dependents_follow_a_rename_and_which_qualifiers_name_the_database() {
+        use crate::ddl::{body_qualifier_is_database, rename_follows};
+        use DependentKind as K;
+        for d in SqlDialect::ALL {
+            assert!(rename_follows(d, K::ForeignKey), "{d:?}");
+        }
+        for k in [K::View, K::Routine, K::Trigger, K::Event, K::Expression] {
+            assert!(!rename_follows(MY, k), "{k:?}");
+            assert!(!rename_follows(MS, k), "{k:?}");
+        }
+        for k in [K::View, K::Trigger, K::Expression] {
+            assert!(rename_follows(PG, k), "{k:?}");
+        }
+        assert!(!rename_follows(PG, K::Routine));
+        assert!(rename_follows(LT, K::View) && rename_follows(LT, K::Trigger));
+        assert!(!rename_follows(LT, K::Routine));
+        assert!(body_qualifier_is_database(MY) && body_qualifier_is_database(LT));
+        assert!(!body_qualifier_is_database(PG) && !body_qualifier_is_database(MS));
+        // Not the key's question flipped: SQLite's keys still carry no database.
+        assert!(!crate::ddl::ref_schema_is_database(LT));
     }
 }

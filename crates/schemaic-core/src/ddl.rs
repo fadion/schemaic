@@ -11946,10 +11946,11 @@ pub fn publishes_index_ddl(dialect: SqlDialect) -> bool {
 /// own address first, and asks this to know whether there is an address to
 /// subtract. The dump's plan and the schema's key walks (`follow_target`,
 /// `incoming_keys`, `referencing_target`) ask it too, and
-/// [`crate::used_by::used_by`] reads a qualifier equal to the database it was
-/// handed — in a key, or in a body, which the catalogue qualifies the same way
-/// — as that database: without it no MySQL view or key was ever found using
-/// anything, since the tables carry no namespace at all.
+/// [`crate::used_by::used_by`] reads a key's `ref_schema` equal to the
+/// database it was handed as that database: without it no MySQL key was ever
+/// found using anything, since the tables carry no namespace at all. A
+/// qualifier in a *body* is [`body_qualifier_is_database`]'s question, which
+/// SQLite answers differently.
 ///
 /// An exhaustive `match`, for the reason [`supports_owners`] gives.
 pub fn ref_schema_is_database(dialect: SqlDialect) -> bool {
@@ -11981,6 +11982,76 @@ pub fn view_definition_is_qualified(dialect: SqlDialect) -> bool {
         SqlDialect::MySql => true,
         // `sys.sql_modules.definition` is the statement as it was written.
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does a qualifier written **in a body** — a view's, a trigger's, a
+/// routine's — name the *database* the object lives in, where the tables
+/// themselves carry no namespace?
+///
+/// MySQL's does (`shop.orders`, and the catalogue writes it into every view
+/// body — [`view_definition_is_qualified`]). So does SQLite's: `main.orders`
+/// and `aux.orders` name the main and an attached database, and the table
+/// rows carry `schema: None`. PostgreSQL's and SQL Server's name a schema
+/// inside the database, which is part of the object.
+///
+/// Not [`ref_schema_is_database`] flipped for SQLite: that one is about a
+/// foreign key's `ref_schema`, which SQLite never fills, and it decides the
+/// comparison's and the dump's key walks too. [`crate::used_by::used_by`]
+/// asks this one, so `main.orders` in a SQLite view is a use of `orders` —
+/// it said "Nothing in main uses it" of a view and a trigger the drop then
+/// broke.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn body_qualifier_is_database(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does a dependent of this `kind` **follow a rename** of what it uses — is
+/// it held by the server against the object rather than written against its
+/// name — when the engine renames in place (`ALTER TABLE … RENAME`,
+/// `RENAME COLUMN`, `ALTER FUNCTION … RENAME`, `sp_rename`)?
+///
+/// The question [`crate::used_by::change_warning`] asks before saying a
+/// dependent "still names orders after the rename", which was false of
+/// every dependent here that answers yes:
+///
+/// - **A foreign key, on every engine** — checked live on MariaDB, MySQL 8,
+///   PostgreSQL, SQL Server and SQLite, for a renamed referenced table and a
+///   renamed referenced column.
+/// - **PostgreSQL** stores a view, a column default, a generated column, a
+///   check and a trigger's `EXECUTE FUNCTION` and `UPDATE OF` as references
+///   by OID (or column number), so all of them follow; a function body is
+///   text (`prosrc`) and does not.
+/// - **SQLite**'s `ALTER TABLE … RENAME TO` and `RENAME COLUMN` rewrite
+///   every view and trigger that names the table or the column (with
+///   `legacy_alter_table` off, its default). It has no routines, events or
+///   expressions that call one.
+/// - **MySQL and SQL Server** rewrite nothing: a view, a routine, a
+///   trigger's or an event's body keeps the text it was created with, and
+///   fails on its next use.
+///
+/// It answers for a rename the engine performs **in place**. A view or
+/// routine renamed by dropping it and creating it anew, and a column renamed
+/// inside a table rebuild, carry nothing across — `used_by::touched` tells
+/// those apart, and does not ask this.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn rename_follows(dialect: SqlDialect, kind: crate::used_by::DependentKind) -> bool {
+    use crate::used_by::DependentKind as K;
+    match (dialect, kind) {
+        (_, K::ForeignKey) => true,
+        (SqlDialect::Postgres, K::View | K::Trigger | K::Expression) => true,
+        (SqlDialect::Postgres, K::Routine | K::Event) => false,
+        (SqlDialect::Sqlite, K::View | K::Trigger) => true,
+        (SqlDialect::Sqlite, K::Routine | K::Event | K::Expression) => false,
+        (
+            SqlDialect::MySql | SqlDialect::MsSql,
+            K::View | K::Routine | K::Trigger | K::Event | K::Expression,
+        ) => false,
     }
 }
 
