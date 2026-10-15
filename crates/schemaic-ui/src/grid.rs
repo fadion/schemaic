@@ -9139,17 +9139,20 @@ fn grid_toolbar(
     let pager = dyn_container(
         move || {
             let size = gs.base_sql.with(|b| {
-                b.as_deref()
-                    .and_then(|b| schemaic_core::filter::page_size(b, gs.dialect))
+                b.as_deref().and_then(|b| {
+                    schemaic_core::filter::page_size(b, gs.dialect)
+                        .map(|n| (n, schemaic_core::filter::page_offset(b, gs.dialect)))
+                })
             });
             size.filter(|_| gs.rerunnable())
-                .map(|size| (size, gs.grid_query.with(|q| q.page)))
+                .map(|(size, start)| (size, start, gs.grid_query.with(|q| q.page)))
         },
         move |paged| {
-            let Some((size, page)) = paged else {
+            let Some((size, start, page)) = paged else {
                 return empty().into_any();
             };
-            let (caption, more) = schemaic_core::filter::page_caption(page, size, nrows as u64);
+            let (caption, more) =
+                schemaic_core::filter::page_caption(start, page, size, nrows as u64);
             let busy = gs.view_busy;
             let go = move |to: u64| {
                 if busy.get_untracked() {

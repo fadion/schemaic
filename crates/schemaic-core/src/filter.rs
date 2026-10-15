@@ -32,7 +32,8 @@ pub struct GridQuery {
     /// base statement's existing `WHERE`. Empty = no filter.
     pub filter: String,
     /// Ordering as `(real column name, ascending)` pairs, applied as `ORDER BY`
-    /// (replacing the base statement's). Empty = keep the base `ORDER BY`.
+    /// ahead of the base statement's own terms, which stay on as tie-breakers.
+    /// Empty = keep the base `ORDER BY`.
     pub sort: Vec<(String, bool)>,
     /// Which page of the base statement's `LIMIT` is shown, from 0 — a table
     /// tab's *Next*/*Previous* ([`with_page`]). 0 is the base as written.
@@ -64,8 +65,9 @@ pub enum FilterError {
 ///   multi-statement); the caller should treat the result as not filterable.
 /// - `Err(BadCondition)` — the filter fragment didn't parse; don't run.
 ///
-/// The base statement's projection, `LIMIT`/`OFFSET`, and (when `sort` is empty)
-/// its `ORDER BY` are preserved. An existing `WHERE` is preserved and combined
+/// The base statement's projection and `LIMIT`/`OFFSET` are preserved, and so
+/// is its `ORDER BY` — whole when `sort` is empty, and otherwise after the sort
+/// as its tie-breaker, less any term naming a sorted column. An existing `WHERE` is preserved and combined
 /// with the filter via `AND`, each side parenthesized so operator precedence
 /// never changes its meaning.
 pub fn build_query(
@@ -142,13 +144,14 @@ pub fn build_query(
         });
     }
 
-    // ORDER BY: replace with our sort spec when present; otherwise keep the base's.
+    // ORDER BY: our sort spec first when present, then the base's own terms as
+    // its tie-breakers; otherwise the base's alone.
     if !sort.is_empty() {
         // The name goes in **already quoted**, by the one quoter, as an
         // unquoted `Ident` that renders verbatim. `Ident::with_quote` took a
         // quote character and escaped it itself — correctly for `"` and `` ` ``,
         // and not at all for `[`, which is SQL Server's.
-        let exprs = sort
+        let mut exprs: Vec<OrderByExpr> = sort
             .iter()
             .map(|(col, asc)| OrderByExpr {
                 expr: Expr::Identifier(Ident::new(quote_ident(col, dialect))),
@@ -159,6 +162,23 @@ pub fn build_query(
                 with_fill: None,
             })
             .collect();
+        // **The base's order stays on as the tie-breaker.** A sort on a
+        // non-unique column leaves ties the engine orders as it likes, and
+        // differently for each `LIMIT`/`OFFSET` bound: replacing a table tab's
+        // `ORDER BY <key>` with the sort alone made page 2 repeat 98 of page
+        // 1's 100 rows (PostgreSQL 16) and hid the rows they displaced. A base
+        // term naming a sorted column is left out — the user's direction wins,
+        // and SQL Server refuses a column named twice in one `ORDER BY`.
+        if let Some(OrderBy {
+            kind: OrderByKind::Expressions(base),
+            ..
+        }) = query.order_by.take()
+        {
+            exprs.extend(
+                base.into_iter()
+                    .filter(|t| !sort.iter().any(|(col, _)| names_column(&t.expr, col))),
+            );
+        }
         query.order_by = Some(OrderBy {
             kind: OrderByKind::Expressions(exprs),
             interpolate: None,
@@ -166,6 +186,26 @@ pub fn build_query(
     }
 
     Ok(Some(stmts[0].to_string()))
+}
+
+/// Whether an `ORDER BY` term is column `col` — a bare or qualified name whose
+/// last part is it: exactly when quoted, ignoring ASCII case when not (how
+/// every engine but PostgreSQL compares a bare name, and PostgreSQL folds one
+/// to lower case, which a real column name `col` it matches either way).
+fn names_column(expr: &Expr, col: &str) -> bool {
+    let last = match expr {
+        Expr::Identifier(i) => i,
+        Expr::CompoundIdentifier(parts) => match parts.last() {
+            Some(i) => i,
+            None => return false,
+        },
+        _ => return false,
+    };
+    if last.quote_style.is_some() {
+        last.value == col
+    } else {
+        last.value.eq_ignore_ascii_case(col)
+    }
 }
 
 /// The statement a grid's view runs: `base` with its filter and sort
@@ -261,6 +301,10 @@ pub fn with_page(sql: &str, page: u64, dialect: SqlDialect) -> Option<String> {
             quantity: Some(number(n)),
         });
     } else {
+        // The limit read may have been a `FETCH FIRST n ROWS ONLY` (PostgreSQL
+        // takes both spellings), and `LIMIT … FETCH …` together is a syntax
+        // error: the page is spelled `LIMIT … OFFSET …` alone.
+        query.fetch = None;
         query.limit_clause = Some(LimitClause::LimitOffset {
             limit: Some(number(n)),
             offset: (offset > 0).then(|| Offset {
@@ -275,9 +319,11 @@ pub fn with_page(sql: &str, page: u64, dialect: SqlDialect) -> Option<String> {
 
 /// The pager's words for page `page` of `size` rows with `shown` on screen —
 /// *Rows 101–200* — and whether there can be a next page: only after a full
-/// one, since a short page is the last.
-pub fn page_caption(page: u64, size: u64, shown: u64) -> (String, bool) {
-    let from = page.saturating_mul(size);
+/// one, since a short page is the last. Counted from `start`, the offset the
+/// statement itself began at ([`page_offset`]), since that is where
+/// [`with_page`] moves on from: `LIMIT 10 OFFSET 5` shows rows 6–15.
+pub fn page_caption(start: u64, page: u64, size: u64, shown: u64) -> (String, bool) {
+    let from = start.saturating_add(page.saturating_mul(size));
     // Exact, not `text::human_count`'s `1.2k`: a range that rounds both ends
     // to the same figure says nothing about where the page is.
     let caption = if shown == 0 {
@@ -286,6 +332,19 @@ pub fn page_caption(page: u64, size: u64, shown: u64) -> (String, bool) {
         format!("Rows {}–{}", from + 1, from + shown)
     };
     (caption, shown >= size && size > 0)
+}
+
+/// The offset a pageable statement ([`page_size`]) starts at — its own
+/// `OFFSET`, MySQL's `LIMIT o, n`, SQL Server's `OFFSET o ROWS` — and 0 where
+/// it has none or is not such a statement.
+pub fn page_offset(sql: &str, dialect: SqlDialect) -> u64 {
+    let Ok(stmts) = Parser::parse_sql(&*dialect.parser(), sql) else {
+        return 0;
+    };
+    let [Statement::Query(query)] = stmts.as_slice() else {
+        return 0;
+    };
+    limit_of(query).map_or(0, |(_, start)| start)
 }
 
 /// A query's constant row limit and the offset it starts at, in any of the
@@ -886,13 +945,16 @@ mod tests {
 
     #[test]
     fn the_pager_names_the_rows_and_ends_after_a_short_page() {
-        assert_eq!(page_caption(0, 100, 100), ("Rows 1–100".to_string(), true));
         assert_eq!(
-            page_caption(2, 100, 37),
+            page_caption(0, 0, 100, 100),
+            ("Rows 1–100".to_string(), true)
+        );
+        assert_eq!(
+            page_caption(0, 2, 100, 37),
             ("Rows 201–237".to_string(), false)
         );
-        assert!(!page_caption(3, 100, 0).1);
-        assert!(page_caption(3, 100, 0).0.starts_with("No rows after"));
+        assert!(!page_caption(0, 3, 100, 0).1);
+        assert!(page_caption(0, 3, 100, 0).0.starts_with("No rows after"));
     }
 
     /// Nothing to page by: no limit, a join, a parameter for a limit.
@@ -937,6 +999,136 @@ mod tests {
             None
         );
         assert!(!unlimited.is_empty(), "a page past the first is a view");
+    }
+
+    /// A sort on a non-unique column leaves ties the engine may order
+    /// differently for each bound — page 2 of `ORDER BY status` repeated 98 of
+    /// page 1's 100 rows live on PostgreSQL 16. The base's own order (a table
+    /// tab's key) stays on as the tie-breaker, so the pages partition the rows.
+    #[test]
+    fn a_sorted_page_keeps_the_base_order_as_its_tie_breaker() {
+        let gq = GridQuery {
+            filter: String::new(),
+            sort: vec![("status".into(), true)],
+            page: 1,
+        };
+        assert_eq!(
+            compose(
+                "SELECT * FROM t ORDER BY id ASC LIMIT 100",
+                &gq,
+                SqlDialect::Postgres
+            )
+            .unwrap()
+            .unwrap(),
+            "SELECT * FROM t ORDER BY \"status\" ASC, id ASC LIMIT 100 OFFSET 100"
+        );
+        // Page 0 orders the same way, or it would not be disjoint from page 1.
+        let first = GridQuery { page: 0, ..gq };
+        assert_eq!(
+            compose(
+                "SELECT * FROM `t` ORDER BY `a` ASC, `b` DESC LIMIT 10",
+                &first,
+                SqlDialect::MySql
+            )
+            .unwrap()
+            .unwrap(),
+            "SELECT * FROM `t` ORDER BY `status` ASC, `a` ASC, `b` DESC LIMIT 10"
+        );
+        // SQL Server: through OFFSET/FETCH, and the key keeps its place.
+        let ms = SqlDialect::MsSql;
+        let paged = compose(
+            "SELECT TOP (100) * FROM [t] ORDER BY [id] ASC",
+            &GridQuery {
+                filter: String::new(),
+                sort: vec![("status".into(), false)],
+                page: 2,
+            },
+            ms,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            paged,
+            "SELECT * FROM [t] ORDER BY [status] DESC, [id] ASC OFFSET 200 ROWS FETCH FIRST 100 ROWS ONLY"
+        );
+    }
+
+    /// Sorting by the key itself does not repeat it: SQL Server refuses a
+    /// column named twice in one `ORDER BY` (Msg 169), and the user's
+    /// direction is the one that counts.
+    #[test]
+    fn sorting_by_the_base_order_column_does_not_name_it_twice() {
+        for (d, base, want) in [
+            (
+                SqlDialect::MsSql,
+                "SELECT TOP (100) * FROM [t] ORDER BY [id] ASC",
+                "SELECT TOP (100) * FROM [t] ORDER BY [id] DESC",
+            ),
+            (
+                SqlDialect::Postgres,
+                "SELECT * FROM t ORDER BY \"Id\" ASC, b LIMIT 5",
+                "SELECT * FROM t ORDER BY \"Id\" DESC, b LIMIT 5",
+            ),
+            (
+                SqlDialect::MySql,
+                "SELECT * FROM t ORDER BY t.id LIMIT 5",
+                "SELECT * FROM t ORDER BY `id` DESC LIMIT 5",
+            ),
+        ] {
+            let col = if d == SqlDialect::Postgres {
+                "Id"
+            } else {
+                "id"
+            };
+            assert_eq!(build(base, "", &[(col, false)], d).unwrap(), want, "{d:?}");
+        }
+    }
+
+    /// PostgreSQL reads `FETCH FIRST n ROWS ONLY` as the page size too; a page
+    /// of it is a `LIMIT … OFFSET …` with the `FETCH` gone, since the two
+    /// together are a syntax error there.
+    #[test]
+    fn a_fetch_spelled_limit_pages_without_its_fetch() {
+        for d in [SqlDialect::Postgres, SqlDialect::MySql, SqlDialect::Sqlite] {
+            let Some(size) = page_size("SELECT * FROM t FETCH FIRST 10 ROWS ONLY", d) else {
+                continue;
+            };
+            assert_eq!(size, 10);
+            let paged = with_page("SELECT * FROM t FETCH FIRST 10 ROWS ONLY", 1, d).unwrap();
+            assert!(!paged.contains("FETCH"), "{d:?}: {paged}");
+            assert!(paged.contains("LIMIT 10 OFFSET 10"), "{d:?}: {paged}");
+        }
+        let pg = SqlDialect::Postgres;
+        let paged = with_page(
+            "SELECT * FROM t OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY",
+            2,
+            pg,
+        );
+        assert_eq!(paged.as_deref(), Some("SELECT * FROM t LIMIT 10 OFFSET 25"));
+    }
+
+    /// The caption counts from where the statement itself starts: `LIMIT 10
+    /// OFFSET 5` shows rows 6–15, and its next page 16–25.
+    #[test]
+    fn the_pager_counts_from_the_statements_own_offset() {
+        let pg = SqlDialect::Postgres;
+        assert_eq!(page_offset("SELECT * FROM t LIMIT 10 OFFSET 5", pg), 5);
+        assert_eq!(
+            page_offset("SELECT * FROM t LIMIT 5, 20", SqlDialect::MySql),
+            5
+        );
+        assert_eq!(
+            page_offset(
+                "SELECT * FROM t ORDER BY id OFFSET 7 ROWS FETCH NEXT 3 ROWS ONLY",
+                SqlDialect::MsSql
+            ),
+            7
+        );
+        assert_eq!(page_offset("SELECT * FROM t LIMIT 10", pg), 0);
+        assert_eq!(page_offset("not sql at all", pg), 0);
+        assert_eq!(page_caption(5, 0, 10, 10).0, "Rows 6–15");
+        assert_eq!(page_caption(5, 1, 10, 10).0, "Rows 16–25");
+        assert_eq!(page_caption(5, 2, 10, 0).0, "No rows after 25");
     }
 
     /// A bare name reaches the default namespace's tables — PostgreSQL's
@@ -1491,13 +1683,13 @@ mod tests {
     #[test]
     fn table_query_output_is_rewritable_by_the_filter() {
         // The generated statement is the *base* the header filter/sort rewrites,
-        // so it has to survive a round-trip: sorting by another column replaces
-        // the generated ORDER BY rather than appending to it.
+        // so it has to survive a round-trip: sorting by another column goes
+        // ahead of the generated ORDER BY, which stays on to break its ties.
         let base = tq(SqlDialect::MySql, "orders", &["id"], Order::Asc, 100);
         let out = build(&base, "", &[("total", false)], SqlDialect::MySql).unwrap();
         assert_eq!(
             out,
-            "SELECT * FROM shop.orders ORDER BY `total` DESC LIMIT 100"
+            "SELECT * FROM shop.orders ORDER BY `total` DESC, id ASC LIMIT 100"
         );
     }
 
@@ -1537,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn replaces_existing_order_by() {
+    fn a_sort_goes_ahead_of_the_existing_order_by() {
         let out = build(
             "SELECT * FROM t ORDER BY id",
             "",
@@ -1545,7 +1737,7 @@ mod tests {
             SqlDialect::MySql,
         )
         .unwrap();
-        assert_eq!(out, "SELECT * FROM t ORDER BY `name` DESC");
+        assert_eq!(out, "SELECT * FROM t ORDER BY `name` DESC, id");
     }
 
     #[test]

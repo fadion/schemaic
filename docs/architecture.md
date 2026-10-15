@@ -3652,7 +3652,10 @@ existing prose was left alone.
     `intel::simple_select_source` accepts, and `None` for a parameter, `PERCENT`, `WITH TIES` or a
     join (`a_statement_without_a_constant_limit_does_not_page`). `with_page` moves the offset on by
     `page × n` from the statement's **own** offset, not from zero
-    (`a_page_moves_on_from_the_statements_own_offset`). SQL Server has no `LIMIT`, so there the
+    (`a_page_moves_on_from_the_statements_own_offset`), and **a limit read from a `FETCH FIRST n
+    ROWS ONLY` is written back as `LIMIT … OFFSET …` with the `FETCH` gone** — PostgreSQL takes
+    both spellings, and the two together are a syntax error there
+    (`a_fetch_spelled_limit_pages_without_its_fetch`). SQL Server has no `LIMIT`, so there the
     `TOP` comes off and the query takes `OFFSET m ROWS FETCH FIRST n ROWS ONLY` — which the server
     refuses without an `ORDER BY`, so a statement with none gets `ORDER BY (SELECT NULL)`, an order
     the server picks, since a keyless table has no other (`sql_server_pages_with_offset_fetch`; the
@@ -3660,12 +3663,23 @@ existing prose was left alone.
     `SqlDialect::has_limit_clause`, a capability of its own, exhaustive over the engines.
     **A page past the first on a statement
     with no limit is `Ok(None)`, never the base**: it refuses rather than running the whole table
-    (`a_page_composes_with_the_filter_and_sort`). `page_caption` is the pager's words — *Rows
+    (`a_page_composes_with_the_filter_and_sort`). **A sort goes ahead of the base's `ORDER BY`,
+    not in place of it**: the base's own terms — a table tab's key — stay on after the sort as its
+    tie-breakers, less any naming a sorted column (SQL Server refuses a column twice in one
+    `ORDER BY`, Msg 169, and the user's direction is the one that counts). Replacing them left a
+    sort on a non-unique column with ties the engine orders differently for each bound: page 2 of
+    `ORDER BY status` repeated 98 of page 1's 100 rows on PostgreSQL 16 and 49 on MariaDB 10.11, and
+    the rows they displaced were on no page (`a_sorted_page_keeps_the_base_order_as_its_tie_breaker`,
+    `sorting_by_the_base_order_column_does_not_name_it_twice`; both fixed forms overlap by 0 rows
+    live, and SQL Server's `OFFSET … FETCH` form lands on exactly its window). `page_caption` is
+    the pager's words — *Rows
     101–200* in exact figures, not `text::human_count`'s, because a range whose two ends round to
     the same `1.2k` says nothing about where the page is — and offers a next page only after a full
     one, since a short page is the last; a table holding an exact multiple of `n` rows therefore
     ends on a *No rows after N* page, a full page being unable to say whether another follows
-    (`the_pager_names_the_rows_and_ends_after_a_short_page`).
+    (`the_pager_names_the_rows_and_ends_after_a_short_page`). It counts from `page_offset`, the
+    offset the statement itself starts at, since that is where `with_page` moves on from — `LIMIT 10
+    OFFSET 5` shows *Rows 6–15* (`the_pager_counts_from_the_statements_own_offset`).
     `eq_condition` is the right-click "Filter by / Exclude" fragment, its literal written for the
     column's type (`export::typed_literal`: a SQL Server `datetime` reads the cell's text by the
     login's language otherwise). `table_query` is what opening
@@ -42065,7 +42079,7 @@ this bundle's.
   **client-side stream cutoff**, not a `LIMIT`; this only says how much of the table went past it.
 - **A table tab pages; the pager is the `LIMIT`/`OFFSET` the cap is not.** `grid_toolbar`'s
   `pager` sits after the read-more offer — `· ‹ Rows 101–200 ›`, the words from
-  `filter::page_caption` — and is drawn when `filter::page_size` answers for `base_sql` **and**
+  `filter::page_caption`, counted from the base's own `filter::page_offset` — and is drawn when `filter::page_size` answers for `base_sql` **and**
   `GridState::rerunnable` holds. So it is not a table tab's alone: any single-table `SELECT` with a
   constant limit gets one, a table tab's `table_query` simply always qualifies. The second term is
   the frozen rule and the write guard at once, through the funnel everything that re-runs already
