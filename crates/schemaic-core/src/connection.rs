@@ -1292,6 +1292,21 @@ fn default_db_type() -> String {
     "MySQL".to_string()
 }
 
+/// What a saved edit does to a Manual tab's pinned session —
+/// [`Connection::open_session_after`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenSession {
+    /// Nothing the session rests on moved; it stays.
+    Kept,
+    /// Only the session settings (the init SQL) moved: the session is stale
+    /// but its transaction is alive, so an open one is asked about before the
+    /// drop that would roll it back.
+    AskFirst,
+    /// The server or the transport moved: the transaction is gone either way,
+    /// and the session is dropped without asking.
+    Dropped,
+}
+
 impl Connection {
     /// `host:port`, shown in the UI — or, on SQLite, the file's **name**.
     ///
@@ -1811,6 +1826,15 @@ impl Connection {
     /// corrected password reaches the same server over the same socket, and an
     /// already-authenticated session is not made wrong by it.
     pub fn invalidates_open_connections(&self, other: &Connection) -> bool {
+        self.moves_transport(other)
+            // A session set up by the old init SQL is not the one asked for.
+            || self.init_sql != other.init_sql
+    }
+
+    /// The half of [`invalidates_open_connections`](Connection::invalidates_open_connections)
+    /// that moves the server or the socket under an open session: once it
+    /// has, the session's transaction is gone whatever anyone answers.
+    fn moves_transport(&self, other: &Connection) -> bool {
         !self.targets_same_server(other)
             || self.tls.mode != other.tls.mode
             || self.tls.ca_path != other.tls.ca_path
@@ -1818,8 +1842,25 @@ impl Connection {
             || self.tls.client_key_path != other.tls.client_key_path
             || self.ssh.auth != other.ssh.auth
             || self.ssh.key_path != other.ssh.key_path
-            // A session set up by the old init SQL is not the one asked for.
-            || self.init_sql != other.init_sql
+    }
+
+    /// What saving `other` over this connection does to an open Manual
+    /// session on it.
+    ///
+    /// **An init SQL edit is not a transport edit.** Both make a pinned
+    /// session stale, but a moved server or socket has already lost the
+    /// session's transaction, while after an init SQL edit the socket and the
+    /// transaction are alive and only the drop would roll the work back — so
+    /// that one asks each open transaction first (Commit, Roll back, or keep
+    /// it on the old settings), and the others are dropped as before.
+    pub fn open_session_after(&self, other: &Connection) -> OpenSession {
+        if self.moves_transport(other) {
+            OpenSession::Dropped
+        } else if self.init_sql != other.init_sql {
+            OpenSession::AskFirst
+        } else {
+            OpenSession::Kept
+        }
     }
 
     /// Is `other` **this same saved connection, still pointing where it did** —
@@ -3910,6 +3951,23 @@ mod tests {
         edited.init_sql = "SET ROLE reporting".into();
         assert!(conn().invalidates_open_connections(&edited));
         assert!(edited.invalidates_open_connections(&conn()));
+    }
+
+    /// S1.1-L5-03: an init SQL edit leaves the socket and its transaction
+    /// alive — dropping the session is what would roll the work back — so the
+    /// save asks first. A moved server or transport has already taken the
+    /// transaction, so there is nothing to ask.
+    #[test]
+    fn only_a_session_settings_edit_asks_before_an_open_session_is_dropped() {
+        let mut init = conn();
+        init.init_sql = "SET TIME ZONE 'UTC'".into();
+        assert_eq!(conn().open_session_after(&init), OpenSession::AskFirst);
+        let mut moved = init.clone();
+        moved.host = "elsewhere".into();
+        assert_eq!(conn().open_session_after(&moved), OpenSession::Dropped);
+        let mut renamed = conn();
+        renamed.name = "renamed".into();
+        assert_eq!(conn().open_session_after(&renamed), OpenSession::Kept);
     }
 
     /// Everything that moves the *server* still invalidates what is open — the

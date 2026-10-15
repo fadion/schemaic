@@ -67,7 +67,7 @@ use floem::reactive::{
 };
 use floem::window::{Icon, WindowConfig};
 use schemaic_core::conn_import;
-use schemaic_core::connection::{ConnStatus, Connection, LoadFailure};
+use schemaic_core::connection::{ConnStatus, Connection, LoadFailure, OpenSession};
 use schemaic_core::edit::analyze_edit;
 use schemaic_core::health;
 use schemaic_core::history::Finished;
@@ -11891,6 +11891,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let reset_activity = reset_activity.clone();
         let drop_session = drop_session.clone();
         let ai_session = ai_session.clone();
+        let guard_tx = guard_tx.clone();
+        let log_write = log_write.clone();
         Rc::new(move || {
             let id = draft.id.get_untracked().unwrap_or_else(|| {
                 connections.with_untracked(|cs| {
@@ -11941,9 +11943,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Manual session went on running, and committing, over the plaintext
             // socket it was opened on, while the form and the status bar reported
             // TLS. See `Connection::invalidates_open_connections`.
-            let invalidated = previous
+            let fate = previous
                 .as_ref()
-                .is_some_and(|p| p.invalidates_open_connections(&conn));
+                .map_or(OpenSession::Kept, |p| p.open_session_after(&conn));
+            let invalidated = fate != OpenSession::Kept;
             if repointed {
                 // The cached tunnel reaches the old server — drop it (its listener
                 // is torn down) so `load_schema` establishes a fresh one. **On the
@@ -11965,19 +11968,69 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // a server that is still there, whereas here the tunnel has just
                 // gone and `open_session` would fail on the spot, flip the tab to
                 // Auto anyway and raise an error modal on top.
-                let orphaned: Vec<usize> = tabs.with_untracked(|v| {
+                //
+                // **Except after an init SQL edit alone** (`OpenSession::AskFirst`):
+                // there the socket and its transaction are alive, and the drop
+                // is what would roll the work back — so each open transaction
+                // is asked about first (`guard_tx`: Commit, Roll back, or Cancel
+                // to keep that tab's session on the old settings until it is
+                // re-pinned). Where the transaction is dropped unasked, the log
+                // gets the ROLLBACK the server makes, which is the only line
+                // that says the writes before it did not stay.
+                let dialect = SqlDialect::from_db_type(&conn.db_type);
+                let on_conn: Vec<schemaic_ui::Tab> = tabs.with_untracked(|v| {
                     v.iter()
                         .filter(|t| t.conn_id.get_untracked() == id)
-                        .map(|t| {
-                            t.tx_mode.set(TxMode::Auto);
-                            t.tx.set(TxState::closed());
-                            t.id
-                        })
+                        .copied()
                         .collect()
                 });
-                for tab_id in orphaned {
-                    (drop_session)(tab_id);
+                let release = {
+                    let drop_session = drop_session.clone();
+                    move |t: schemaic_ui::Tab| {
+                        t.tx_mode.set(TxMode::Auto);
+                        t.tx.set(TxState::closed());
+                        (drop_session)(t.id);
+                    }
+                };
+                let mut asked: Vec<schemaic_ui::Tab> = Vec::new();
+                for t in on_conn {
+                    let open = t.tx.get_untracked().is_open();
+                    if open && fate == OpenSession::AskFirst {
+                        asked.push(t);
+                        continue;
+                    }
+                    if open {
+                        (log_write)(
+                            id,
+                            dialect,
+                            schemaic_core::write_log::abandoned(
+                                t.database.get_untracked().as_deref(),
+                                "the connection's server or transport was edited, so the open \
+                                 transaction was dropped and the server rolled it back",
+                            ),
+                        );
+                    }
+                    release(t);
                 }
+                // One prompt at a time (`tx_prompt` holds one question), chained
+                // the way `run_ddl` chains its blockers.
+                let mut next: Rc<dyn Fn()> = Rc::new(|| {});
+                for t in asked.into_iter().rev() {
+                    let (guard_tx, release, then) = (guard_tx.clone(), release.clone(), next);
+                    next = Rc::new(move || {
+                        let release = release.clone();
+                        let then_settled = then.clone();
+                        (guard_tx)(
+                            t.id,
+                            Rc::new(move || {
+                                release(t);
+                                then_settled();
+                            }),
+                            Some(then.clone()),
+                        )
+                    });
+                }
+                next();
                 // And the AI session, whose MCP subprocess holds a `Db` built at
                 // spawn from the old target and the old tunnel port. `needs_respawn`
                 // cannot see this: it compares the conn id, which did not move, and
@@ -12059,6 +12112,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let ai_session = ai_session.clone();
         let history_clear_conn = history.clear_conn.clone();
         let snippet_clear_conn = snippet_store.clear_conn.clone();
+        let log_write = log_write.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -12066,11 +12120,29 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // connection that no longer exists can't do anything with it. No
             // prompt: the connection is already gone as far as the user is
             // concerned, and the server rolls back on disconnect. The tabs drop
-            // back to Auto-commit so their footer stops claiming a transaction.
+            // back to Auto-commit so their footer stops claiming a transaction,
+            // and the write log gets the ROLLBACK the server makes for each
+            // open one — the line that says its writes did not stay.
+            let dialect = connections.with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == id)
+                    .map(|c| SqlDialect::from_db_type(&c.db_type))
+            });
             let orphaned: Vec<usize> = tabs.with_untracked(|v| {
                 v.iter()
                     .filter(|t| t.conn_id.get_untracked() == id)
                     .map(|t| {
+                        if let (true, Some(dialect)) = (t.tx.get_untracked().is_open(), dialect) {
+                            (log_write)(
+                                id,
+                                dialect,
+                                schemaic_core::write_log::abandoned(
+                                    t.database.get_untracked().as_deref(),
+                                    "the connection was deleted, so the open transaction was \
+                                     dropped and the server rolled it back",
+                                ),
+                            );
+                        }
                         t.tx_mode.set(TxMode::Auto);
                         t.tx.set(TxState::closed());
                         t.id

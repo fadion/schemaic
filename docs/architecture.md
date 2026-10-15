@@ -10754,6 +10754,13 @@ existing prose was left alone.
     sent is not unsent; `Pending` none
     (`a_stopped_batch_logs_the_in_flight_statement_and_not_the_undispatched`,
     `a_failed_batch_logs_nothing_after_the_failure`).
+    **`abandoned(database, why)` is the end line for a transaction nobody ended.** A Manual tab's
+    statements are logged `ok` as they run, and its `COMMIT` or `ROLLBACK` is the only line that
+    says whether they stayed — so when Schemaic itself drops an open transaction's session, its
+    connection edited or deleted, the log used to keep those writes as `ok` with nothing after
+    them. The entry is a `ROLLBACK`, `Source::Editor`, outcome `ok`, `why` as its detail: the
+    rollback the server makes on the disconnect, in Schemaic's words for why it happened
+    (`a_dropped_transaction_is_logged_as_the_rollback_the_server_made`).
     **Values are masked by default, because the SQL is the user's data.** An `UPDATE … SET email =
     'ann@example.com'` carries the very value a log kept for years should not hold in the clear.
     `line(entry, dialect, keep_values)` is the entry as the file holds it: unless `keep_values`
@@ -11861,9 +11868,16 @@ existing prose was left alone.
     (`a_connection_saved_before_init_sql_runs_none`). It is no secret, so the redacting `Debug`
     prints it, and it travels in a connection export and import through serde as `folder` does. It
     is a term of `invalidates_open_connections` (not of `targets_same_server`: the server is the
-    same), so saving a changed one tears down a Manual tab's pinned `Session` — set up by the old
+    same), so saving a changed one releases a Manual tab's pinned `Session` — set up by the old
     text, it would otherwise go on running under the old `search_path` or role while every fresh
-    operation ran under the new (`an_init_sql_edit_invalidates_what_is_open`).
+    operation ran under the new (`an_init_sql_edit_invalidates_what_is_open`). **But not unasked
+    when its transaction is open**: that release used to be silent, and since the socket and the
+    transaction were both still alive, the release was itself what rolled the work back — while the
+    write log kept those writes as `ok` with no end line. `open_session_after` answers
+    `OpenSession::AskFirst` for an edit that moved the init SQL and nothing under it, and
+    `save_conn` puts each open transaction through the Commit / Roll back / Cancel prompt before
+    letting go (`only_a_session_settings_edit_asks_before_an_open_session_is_dropped`; the
+    `app/main.rs` passage on what an edit invalidates).
     `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
     **`SshTunnel::jump` is the route before the SSH host**, in OpenSSH's `ProxyJump` spelling —
@@ -11944,6 +11958,19 @@ existing prose was left alone.
     up as. The password stays out for `targets_same_server`'s
     reason: a corrected one reaches the same server over the same socket, and an already
     authenticated session is not made wrong by it.
+    **`open_session_after` splits that yes into two, because the init SQL is not the transport.**
+    The private `moves_transport` holds the server and TLS/SSH terms, and
+    `invalidates_open_connections` is it *or* a changed `init_sql`; `open_session_after` returns
+    `OpenSession::Dropped` when `moves_transport` holds, `AskFirst` when only the init SQL moved,
+    and `Kept` otherwise — and
+    `save_conn` asks an open transaction about the release only under `AskFirst`. Both make a pinned
+    session stale, but after an init SQL edit the socket and its transaction are alive and only the
+    release would roll the work back, so the user is asked first; the code's reason for not asking
+    under `Dropped` is that the transaction is gone either way. That holds where the save evicts the
+    tunnel the session ran through; a TLS or SSH-credential edit (which keeps the tunnel), or a
+    repointed direct connection, leaves the old socket up, and there it is the unasked release that
+    rolls the work back — logged as such through `write_log::abandoned`
+    (`only_a_session_settings_edit_asks_before_an_open_session_is_dropped`).
     **`Tls` and `SslMode` are the transport half**, and they live here rather than in
     `schemaic-db` for the reason the module exists: this is the saved connection, and the mode is a
     saved field. Five rungs — `Disable` / `Prefer` / `Require` / `VerifyCa` / `VerifyFull` — asked
@@ -31942,7 +31969,19 @@ existing prose was left alone.
   tabs get `delete_conn_now`'s treatment rather than `repair_killed_session`'s — drop to Auto-commit,
   `TxState::closed()`, no prompt, since the server rolls back on disconnect — because a reopen would
   put the tab back on a server that has just gone: `open_session` would fail on the spot, flip the
-  tab to Auto anyway and raise an error modal on top of it. The AI session is on the same list
+  tab to Auto anyway and raise an error modal on top of it. Each open transaction released that way
+  gets a `write_log::abandoned` line, as in `delete_conn_now`.
+  **Except after an init SQL edit alone**, which `Connection::open_session_after` answers
+  `OpenSession::AskFirst` (the transport edits are `Dropped`). The silent release rolled back
+  every open Manual transaction on the connection when only its session settings had changed —
+  the socket and the transaction were alive, and the release was what ended them — and the write
+  log kept those writes as `ok` with no end line (S1.1-L5-03). So a tab whose transaction is open
+  goes through `guard_tx`: Commit or Roll back ends it through `end_tx`, which logs its own end, and
+  then releases the session as above; **Cancel keeps that tab's session pinned on the old
+  settings** until something re-pins it — the stale `search_path` or role the init SQL rule exists
+  to prevent, taken by the user's choice over losing the work. `tx_prompt` holds one question, so
+  the prompts are chained one tab at a time, the way `run_ddl` chains its blockers; every other tab
+  on the connection is released at once. The AI session is on the same list
   because `needs_respawn` cannot see a repoint: it compares the conn id, which does not move, and the
   `AiSettings`, none of which name a host, so the assistant's MCP subprocess went on reading the
   previous server — or, tunnelled, a local port that no longer answers. Dropping it costs nothing,
@@ -32151,7 +32190,13 @@ existing prose was left alone.
   `COMMIT` it; the tab's own state is folded afterwards, as before. `end_tx` logs a Manual tab's
   `COMMIT` or `ROLLBACK` when the transaction was open (`TxState::is_open`): the tab's writes are
   logged `ok` as they run, before anything commits them, and that end entry is the only line that
-  says whether they stayed. `script_run` logs a `.sql` file whole — `Source::Script`, its detail
+  says whether they stayed. **So a transaction Schemaic drops rather than ends gets one too**:
+  `save_conn` releasing a session under `OpenSession::Dropped`, and `delete_conn_now`, log
+  `write_log::abandoned` — a `ROLLBACK` whose detail says the connection was edited or deleted — for
+  each tab whose transaction was open; without it those writes stood in the log as `ok` with no
+  end. `delete_conn_now` resolves the dialect from the saved connection, and logs nothing if it
+  cannot find it. A transaction `save_conn` asks about ends through `end_tx`, which logs its own.
+  `script_run` logs a `.sql` file whole — `Source::Script`, its detail
   `file <path>, N statements ran`, and as `sql` the failing statement when `RunOutcome::Failed`'s
   `at` names one; the statements that succeeded are not lines of their own. `commit_edits` logs
   `grid_sql` of the staged batch with `commit_writes`' count, through a `log_commit` ext action

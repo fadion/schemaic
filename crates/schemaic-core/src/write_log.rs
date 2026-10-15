@@ -231,6 +231,17 @@ pub fn batch_logged(ran: &[Ran], stopped: bool) -> Vec<bool> {
         .collect()
 }
 
+/// The line for a Manual tab's open transaction that Schemaic dropped rather
+/// than ended — its connection edited or deleted — which the server rolls
+/// back on the disconnect. Without it the log kept the transaction's writes
+/// as `ok` with no `COMMIT` or `ROLLBACK` after them, and that end line is
+/// the only one that says whether they stayed. `why` is the detail.
+pub fn abandoned(database: Option<&str>, why: &str) -> Entry {
+    Entry::now(Source::Editor, "", database, "ROLLBACK")
+        .with_detail(why)
+        .ended(Ok(None))
+}
+
 /// `entry` as the line the log holds — masked unless `keep_values`, and
 /// masked regardless when it carries a credential — without the newline.
 pub fn line(entry: &Entry, dialect: SqlDialect, keep_values: bool) -> String {
@@ -719,5 +730,15 @@ mod tests {
         assert!(is_logged("UPDATE t SET a = 1", PG));
         assert!(!is_logged("SELECT 1", PG));
         assert!(!is_logged("SELECT * FROM t WHERE a = 1", MY));
+    }
+
+    #[test]
+    fn a_dropped_transaction_is_logged_as_the_rollback_the_server_made() {
+        let e = abandoned(Some("shop"), "the connection was deleted");
+        assert_eq!(
+            (e.sql.as_str(), e.outcome, e.detail.as_deref()),
+            ("ROLLBACK", Outcome::Ok, Some("the connection was deleted"))
+        );
+        assert_eq!(e.database.as_deref(), Some("shop"));
     }
 }
