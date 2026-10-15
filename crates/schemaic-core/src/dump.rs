@@ -1154,7 +1154,7 @@ fn chosen_indices(tables: &[TableInfo], chosen: &[String]) -> Vec<usize> {
     (0..tables.len())
         .filter(|&i| {
             let key = display_name(tables[i].schema.as_deref(), &tables[i].name);
-            chosen.iter().any(|c| *c == key)
+            chosen.contains(&key)
         })
         .collect()
 }
