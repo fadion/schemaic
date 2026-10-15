@@ -60,28 +60,152 @@ impl ResultDiff {
         self.left_only.is_empty() && self.right_only.is_empty() && self.changed.is_empty()
     }
 
-    /// The headline: "3 added, 1 removed, 2 changed, 40 the same".
+    /// The headline: "2 changed · 3 added · 1 removed · 40 unchanged", a kind
+    /// with no rows left out — the filter pills' order.
     pub fn summary(&self) -> String {
         if self.is_identical() {
             return format!(
-                "No differences — {} {} the same",
+                "No differences · {} {} unchanged",
                 self.same,
                 crate::text::plural(self.same, "row", "rows")
             );
         }
         let mut parts = Vec::new();
         for (n, word) in [
+            (self.changed.len(), "changed"),
             (self.right_only.len(), "added"),
             (self.left_only.len(), "removed"),
-            (self.changed.len(), "changed"),
         ] {
             if n > 0 {
                 parts.push(format!("{n} {word}"));
             }
         }
-        parts.push(format!("{} the same", self.same));
-        parts.join(", ")
+        parts.push(format!("{} unchanged", self.same));
+        parts.join(" · ")
     }
+}
+
+/// What a row of the comparison table is: a row both results have with values
+/// that differ, or a row only one of them has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowChange {
+    Changed,
+    /// Only in the second result.
+    Added,
+    /// Only in the first.
+    Removed,
+}
+
+impl RowChange {
+    /// The table's *Change* column.
+    pub fn label(self) -> &'static str {
+        match self {
+            RowChange::Changed => "CHANGED",
+            RowChange::Added => "ADDED",
+            RowChange::Removed => "REMOVED",
+        }
+    }
+}
+
+/// One cell of the comparison table, as one line of text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffCell {
+    /// The row's own value (an added or removed row), or one both sides agree on.
+    Value(String),
+    /// A value that differs: the first result's, then the second's.
+    Changed(String, String),
+}
+
+/// One row of the comparison table: a cell for each of [`ResultDiff::shared`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffRow {
+    pub change: RowChange,
+    pub cells: Vec<DiffCell>,
+}
+
+/// The differences in `d` as a table under its shared columns: the first
+/// result's changed and removed rows in the order it holds them, then the rows
+/// only the second has, in its order. `d` must be `diff(left, right, …)`.
+pub fn table_rows(left: &ResultSet, right: &ResultSet, d: &ResultDiff) -> Vec<DiffRow> {
+    let lc: Vec<Option<usize>> = d.shared.iter().map(|n| col(left, n)).collect();
+    let rc: Vec<Option<usize>> = d.shared.iter().map(|n| col(right, n)).collect();
+    let whole = |rs: &ResultSet, row: usize, cols: &[Option<usize>], change| DiffRow {
+        change,
+        cells: cols
+            .iter()
+            .map(|c| DiffCell::Value(table_value(c.and_then(|c| cell(rs, row, c)))))
+            .collect(),
+    };
+    // Changed and removed rows by their place in the first result.
+    let mut firsts: Vec<(usize, DiffRow)> = d
+        .left_only
+        .iter()
+        .map(|&r| (r, whole(left, r, &lc, RowChange::Removed)))
+        .collect();
+    for ch in &d.changed {
+        let cells = lc
+            .iter()
+            .zip(&rc)
+            .zip(&d.shared)
+            .map(|((l, r), name)| {
+                let before = l.and_then(|c| cell(left, ch.left, c));
+                if ch.columns.contains(name) {
+                    let after = r.and_then(|c| cell(right, ch.right, c));
+                    DiffCell::Changed(table_value(before), table_value(after))
+                } else {
+                    DiffCell::Value(table_value(before))
+                }
+            })
+            .collect();
+        firsts.push((
+            ch.left,
+            DiffRow {
+                change: RowChange::Changed,
+                cells,
+            },
+        ));
+    }
+    firsts.sort_by_key(|(r, _)| *r);
+    let mut added = d.right_only.clone();
+    added.sort_unstable();
+    firsts
+        .into_iter()
+        .map(|(_, row)| row)
+        .chain(
+            added
+                .into_iter()
+                .map(|r| whole(right, r, &rc, RowChange::Added)),
+        )
+        .collect()
+}
+
+/// The longest a table cell's text runs before it is cut.
+const TABLE_VALUE_CHARS: usize = 120;
+
+/// A value as one line of a table cell: `NULL` for a null, line breaks as
+/// spaces (a CRLF as one), cut at [`TABLE_VALUE_CHARS`].
+fn table_value(v: Option<String>) -> String {
+    let Some(s) = v else {
+        return "NULL".to_string();
+    };
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    let mut n = 0;
+    while let Some(c) = chars.next() {
+        if n == TABLE_VALUE_CHARS - 1 && chars.peek().is_some() {
+            out.push('…');
+            break;
+        }
+        match c {
+            '\r' if chars.peek() == Some(&'\n') => continue,
+            // Every mandatory break, as the Live monitor's `is_line_break`:
+            // any one of them shapes the cell to two lines.
+            '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}' => out.push(' '),
+            c => out.push(c),
+        }
+        n += 1;
+    }
+    out
 }
 
 /// Why two results cannot be compared by the key asked for.
@@ -250,50 +374,6 @@ pub fn diff(left: &ResultSet, right: &ResultSet, key: &[String]) -> Result<Resul
     Ok(out)
 }
 
-/// One row as a line of the diff: `name = value` for each of `rs`'s columns,
-/// `NULL` for a null, each value cut at 40 characters.
-pub fn row_line(rs: &ResultSet, row: usize) -> String {
-    rs.columns
-        .iter()
-        .enumerate()
-        .map(|(c, col)| format!("{} = {}", col.name, shown(cell(rs, row, c))))
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-/// A changed row as a line: its key, then `column: before → after` for each
-/// value that differs.
-pub fn change_line(left: &ResultSet, right: &ResultSet, key: &[String], ch: &Changed) -> String {
-    let mut parts: Vec<String> = key
-        .iter()
-        .filter_map(|k| {
-            Some(format!(
-                "{k} = {}",
-                shown(cell(left, ch.left, col(left, k)?))
-            ))
-        })
-        .collect();
-    for c in &ch.columns {
-        let (Some(lc), Some(rc)) = (col(left, c), col(right, c)) else {
-            continue;
-        };
-        parts.push(format!(
-            "{c}: {} → {}",
-            shown(cell(left, ch.left, lc)),
-            shown(cell(right, ch.right, rc))
-        ));
-    }
-    parts.join(" · ")
-}
-
-fn shown(v: Option<String>) -> String {
-    match v {
-        None => "NULL".to_string(),
-        Some(s) if s.chars().count() > 40 => format!("{}…", s.chars().take(39).collect::<String>()),
-        Some(s) => s,
-    }
-}
-
 fn col(rs: &ResultSet, name: &str) -> Option<usize> {
     rs.columns.iter().position(|c| c.name == name)
 }
@@ -365,7 +445,127 @@ mod tests {
             }]
         );
         assert_eq!(d.same, 1);
-        assert_eq!(d.summary(), "1 added, 1 removed, 1 changed, 1 the same");
+        assert_eq!(d.summary(), "1 changed · 1 added · 1 removed · 1 unchanged");
+    }
+
+    #[test]
+    fn the_summary_leaves_out_a_kind_with_no_rows() {
+        let a = rs(&["id"], &[&[i(1)], &[i(2)]]);
+        let b = rs(&["id"], &[&[i(1)], &[i(2)], &[i(3)]]);
+        let d = diff(&a, &b, &["id".into()]).unwrap();
+        assert_eq!(d.summary(), "1 added · 2 unchanged");
+    }
+
+    fn v(s: &str) -> DiffCell {
+        DiffCell::Value(s.into())
+    }
+
+    /// The table reads the first result top to bottom — its changed and
+    /// removed rows where they stood — then the rows only the second has, in
+    /// its order; every cell under the shared columns.
+    #[test]
+    fn the_table_lists_the_first_results_rows_in_order_then_the_added() {
+        let before = rs(
+            &["id", "name", "gone"],
+            &[
+                &[i(1), s("a"), s("x")],
+                &[i(2), s("b"), s("x")],
+                &[i(3), s("c"), s("x")],
+                &[i(4), s("d"), s("x")],
+            ],
+        );
+        let after = rs(
+            &["id", "name"],
+            &[
+                &[i(9), s("z")],
+                &[i(4), s("D")],
+                &[i(1), s("a")],
+                &[i(8), s("y")],
+                &[i(3), s("c")],
+            ],
+        );
+        let d = diff(&before, &after, &["id".into()]).unwrap();
+        let rows = table_rows(&before, &after, &d);
+        assert_eq!(
+            rows,
+            [
+                DiffRow {
+                    change: RowChange::Removed,
+                    cells: vec![v("2"), v("b")],
+                },
+                DiffRow {
+                    change: RowChange::Changed,
+                    cells: vec![v("4"), DiffCell::Changed("d".into(), "D".into())],
+                },
+                DiffRow {
+                    change: RowChange::Added,
+                    cells: vec![v("9"), v("z")],
+                },
+                DiffRow {
+                    change: RowChange::Added,
+                    cells: vec![v("8"), v("y")],
+                },
+            ]
+        );
+    }
+
+    /// Swapping the sides is the same diff read the other way: what was
+    /// added is removed, and every change runs backwards.
+    #[test]
+    fn swapping_the_sides_swaps_added_for_removed_and_reverses_each_change() {
+        let a = rs(&["id", "v"], &[&[i(1), s("old")], &[i(2), s("x")]]);
+        let b = rs(&["id", "v"], &[&[i(1), s("new")], &[i(3), s("y")]]);
+        let key = ["id".to_string()];
+        let back = diff(&b, &a, &key).unwrap();
+        let rows = table_rows(&b, &a, &back);
+        assert_eq!(
+            rows.iter().map(|r| r.change).collect::<Vec<_>>(),
+            [RowChange::Changed, RowChange::Removed, RowChange::Added]
+        );
+        assert_eq!(
+            rows[0].cells[1],
+            DiffCell::Changed("new".into(), "old".into())
+        );
+        assert_eq!(rows[1].cells, [v("3"), v("y")]);
+        assert_eq!(rows[2].cells, [v("2"), v("x")]);
+    }
+
+    /// A table cell is one line: NULL says so, a line break becomes a space,
+    /// and a long value is cut — the comparison still ran on the whole of it.
+    #[test]
+    fn a_table_cell_is_one_short_line() {
+        let long = "z".repeat(500);
+        let a = rs(
+            &["v"],
+            &[
+                &[Value::Null],
+                &[s("one\r\ntwo")],
+                &[s(&long)],
+                &[s("a\u{2028}b\u{2029}c\u{85}d\u{0b}e\u{0c}f")],
+            ],
+        );
+        let b = rs(&["v"], &[]);
+        let d = diff(&a, &b, &[]).unwrap();
+        let rows = table_rows(&a, &b, &d);
+        assert_eq!(rows[0].cells, [v("NULL")]);
+        assert_eq!(rows[1].cells, [v("one two")]);
+        assert_eq!(rows[3].cells, [v("a b c d e f")], "every mandatory break");
+        let DiffCell::Value(cut) = &rows[2].cells[0] else {
+            panic!("a removed row's cell is a value")
+        };
+        assert!(cut.ends_with('…') && cut.chars().count() < long.len());
+    }
+
+    #[test]
+    fn whole_row_identity_has_no_changed_rows_in_the_table() {
+        let a = rs(&["x"], &[&[i(1)], &[i(2)]]);
+        let b = rs(&["x"], &[&[i(2)], &[i(3)]]);
+        let d = diff(&a, &b, &[]).unwrap();
+        let rows = table_rows(&a, &b, &d);
+        assert_eq!(
+            rows.iter().map(|r| r.change).collect::<Vec<_>>(),
+            [RowChange::Removed, RowChange::Added]
+        );
     }
 
     #[test]
@@ -389,7 +589,7 @@ mod tests {
             (d.only_left.as_slice(), d.only_right.as_slice()),
             (&["old".to_string()][..], &["new".to_string()][..])
         );
-        assert_eq!(d.summary(), "No differences — 1 row the same");
+        assert_eq!(d.summary(), "No differences · 1 row unchanged");
     }
 
     #[test]
@@ -422,20 +622,6 @@ mod tests {
         let d = diff(&a, &b, &["k".into()]).unwrap();
         assert_eq!(d.repeated_keys, 1);
         assert!(d.is_identical());
-    }
-
-    #[test]
-    fn rows_and_changes_read_as_lines() {
-        let a = rs(&["id", "qty", "note"], &[&[i(3), i(7), Value::Null]]);
-        let b = rs(&["id", "qty", "note"], &[&[i(3), i(9), s("x")]]);
-        assert_eq!(row_line(&a, 0), "id = 3 · qty = 7 · note = NULL");
-        let d = diff(&a, &b, &["id".into()]).unwrap();
-        assert_eq!(
-            change_line(&a, &b, &["id".into()], &d.changed[0]),
-            "id = 3 · qty: 7 → 9 · note: NULL → x"
-        );
-        let long = rs(&["v"], &[&[s(&"z".repeat(60))]]);
-        assert!(row_line(&long, 0).ends_with('…'));
     }
 
     #[test]

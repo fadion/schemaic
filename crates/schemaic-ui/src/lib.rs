@@ -10052,17 +10052,25 @@ fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
         QueryState::Loaded(rs) if rs.affected.is_none() => Some(rs.clone()),
         _ => None,
     };
-    type Side = (Arc<schemaic_core::model::ResultSet>, String, u64);
+    // The chip's label names the entry; the side carries the rest. "Ran first"
+    // is `(ran_at, id)`: `ran_at` is whole seconds, so the statements of one
+    // Run All tie on it, and ids are handed out in the order panels are made —
+    // unlike the strip's order, which a pin can rearrange.
+    type Side = (String, (u64, u64), result_diff_view::DiffSide);
+    let side = |p: &ResultPanel| -> Option<Side> {
+        Some((
+            p.label.clone(),
+            (p.ran_at, p.id),
+            result_diff_view::DiffSide {
+                rs: loaded(p)?,
+                sql: p.sql.clone(),
+                ran_at: p.ran_at,
+            },
+        ))
+    };
     let (this, others_loaded): (Option<Side>, Vec<Side>) = tab.result_tabs.with_untracked(|v| {
-        let this = v
-            .iter()
-            .find(|p| p.id == id)
-            .and_then(|p| Some((loaded(p)?, p.label.clone(), p.ran_at)));
-        let others = v
-            .iter()
-            .filter(|p| p.id != id)
-            .filter_map(|p| Some((loaded(p)?, p.label.clone(), p.ran_at)))
-            .collect();
+        let this = v.iter().find(|p| p.id == id).and_then(side);
+        let others = v.iter().filter(|p| p.id != id).filter_map(side).collect();
         (this, others)
     });
     if let Some(this) = this
@@ -10070,25 +10078,23 @@ fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
     {
         entries.push(MenuEntry::Separator);
         for other in others_loaded {
-            let shown: String = if other.1.chars().count() > 40 {
-                format!("{}…", other.1.chars().take(39).collect::<String>())
+            let shown: String = if other.0.chars().count() > 40 {
+                format!("{}…", other.0.chars().take(39).collect::<String>())
             } else {
-                other.1.clone()
+                other.0.clone()
             };
-            let (a, b) = if other.2 < this.2 {
-                (other, this.clone())
+            let (a, b) = if other.1 < this.1 {
+                (other.2, this.2.clone())
             } else {
-                (this.clone(), other)
+                (this.2.clone(), other.2)
             };
             let target = gctx.result_diff;
             entries.push(MenuEntry::action(
                 format!("Compare with {shown}"),
                 move || {
                     target.set(Some(DiffTarget {
-                        left: a.0.clone(),
-                        left_label: a.1.clone(),
-                        right: b.0.clone(),
-                        right_label: b.1.clone(),
+                        left: a.clone(),
+                        right: b.clone(),
                     }));
                 },
             ));

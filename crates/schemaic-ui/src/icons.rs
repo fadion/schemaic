@@ -25,6 +25,9 @@ pub const FOLDER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" h
 /// small indicator). Tinted like any icon via the style `color`.
 pub const DOT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 6 6"><circle cx="3" cy="3" r="3" fill="currentColor"/></svg>"#;
 
+/// Lucide `arrow-left-right` — Compare results' swap of its two sides.
+pub const ARROW_LEFT_RIGHT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg>"#;
+
 /// Lucide `chevron-right`.
 pub const CHEVRON_RIGHT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"#;
 

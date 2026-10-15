@@ -469,13 +469,26 @@ existing prose was left alone.
     **Values compare by their displayed text, NULL being its own value**, so `1` and `1.0` from two
     engines differ, as they would on screen, and NULL is not `''`
     (`null_is_its_own_value_and_text_compares_as_shown`). `is_identical` and `summary` give the
-    headline — *"3 added, 1 removed, 2 changed, 40 the same"*, a zero count left out, or *"No
-    differences — N rows the same"*. `suggested_key` is where the picker starts: a shared column
+    footer's headline — *"2 changed · 3 added · 1 removed · 40 unchanged"*, in the filter pills'
+    order, a zero kind left out (the unchanged count never is), or *"No differences · N rows
+    unchanged"*. `suggested_key` is where the picker starts: a shared column
     named `id` in any case, else the first shared column unique and never NULL on both sides, else
     none, the whole row (`the_suggested_key_is_id_else_a_unique_column_else_the_row`).
-    `row_line(rs, row)` prints a row as `name = value · …` and `change_line(left, right, key,
-    changed)` a changed one as `id = 3 · qty: 7 → 9`, both with `NULL` for a null and each value cut
-    at 40 characters — the cut is the line's only; the comparison reads the whole value.
+    **`table_rows(left, right, &diff)` is the modal's table**: a `DiffRow { change, cells }` per
+    difference, one cell per `shared` column — the first result's changed and removed rows in the
+    order it holds them, then the added ones in the second's order
+    (`the_table_lists_the_first_results_rows_in_order_then_the_added`). A cell is
+    `DiffCell::Value` — an added or removed row's own value, or one a changed row's sides agree on —
+    or `DiffCell::Changed(before, after)`; `RowChange::label` is the *Change* column's
+    `CHANGED`/`ADDED`/`REMOVED`. **Every cell is one line**, through the private `table_value`:
+    `NULL` for a null, every mandatory line break as a space (a CRLF as one — the Live monitor's `is_line_break` set), cut at 120 characters ending in `…`
+    (`a_table_cell_is_one_short_line`). That is load-bearing rather than tidy — the view's
+    `virtual_stack` places row `i` at `i * row_h`, and a cell that shaped to two lines would paint
+    across the row below (the `VirtualItemSize::Fixed` gotcha). The cut is the cell's only; the
+    comparison reads the whole value. **Comparing the other way round is `diff(right, left, …)` and
+    nothing more** — added and removed trade places and each change reverses
+    (`swapping_the_sides_swaps_added_for_removed_and_reverses_each_change`), which is all the modal's
+    ⇄ does.
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
@@ -13611,8 +13624,8 @@ existing prose was left alone.
     let the same suffix through. The arithmetic is Howard Hinnant's `days_from_civil`/`civil_from_days` pair — the
     workspace's only date maths, `format.rs`'s epoch formatter included — and `month_cells` is
     **always 42 dates** (six weeks, Monday-first) so the panel doesn't change height as you page
-    through the year. `Date::today`, `Time::now` and `local_now` are the module's only impure
-    functions and the only use of `chrono` in the workspace: they read the **local** clock, because
+    through the year. `Date::today`, `Time::now` and `local_now` are the module's only readers of
+    the clock and, with `Time::at_local`, its only use of `chrono`: they read the **local** clock, because
     `SystemTime` is UTC and a picker that highlights yesterday between local midnight and the offset
     is wrong at exactly the hours somebody is most likely to be looking at it. **A timestamp field
     goes through `local_now`**, which returns the day, the time of day and the zone's offset from
@@ -13620,6 +13633,9 @@ existing prose was left alone.
     them, which is how the calendar's *Now* — `Date::today` plus `Time::now` — wrote yesterday's
     date beside today's time, a stamp a day in the past from the one control whose whole job is the
     current instant. A caller that wants only the day still wants `Date::today`.
+    `Time::at_local(epoch_secs)` is the time of day a *given* instant shows on the local clock —
+    Compare results' *Ran 11:42:08* — so it reads the zone but never the clock, and answers `None`
+    for an instant past what chrono holds.
   - `plan.rs` — `QueryPlan::from_result` parses an `EXPLAIN` result into a table + heuristic
     warnings (full scan / filesort / temp table), and carries the fetch's `truncated` — a plan
     of a table partitioned by day runs two rows a partition and can reach the 10,000-row cap, and
@@ -23311,7 +23327,8 @@ existing prose was left alone.
     `pill_active_bg`/`pill_active_text` when `on`, `text_dim` with a `pill_hover_bg` hover when not.
     The designer's *Table | Columns | Indexes …* strip and Server Variables' *Variables | Status*
     switch both call it, so the two cannot drift apart again — the switch wore Server Activity's
-    underlined labels until the user asked for it to match the designer's tabs. Server Activity's
+    underlined labels until the user asked for it to match the designer's tabs. Compare results'
+    row filter is a third caller, with a coloured dot before each label. Server Activity's
     own *Sessions | Locks* switch does not use it either: it is a switch between views of one
     panel, not a modal's sections, and takes `segmented_tabs` below.
     **`segmented_tabs(tabs, current)` is a tab bar** — the tabs in equal shares of one bar
@@ -25431,28 +25448,73 @@ existing prose was left alone.
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
   - `result_diff_view.rs` — the **Compare results** modal (`result_diff_overlay`): two results of
     one tab as their differences, over `core::result_diff`, opened by setting `overlay.result_diff`
-    to a `DiffTarget { left, left_label, right, right_label }` (re-exported as
+    to a `DiffTarget { left, right }` of two `DiffSide { rs, sql, ran_at }` (re-exported as
     `schemaic_ui::DiffTarget`; the app creates the signal beside `chart`, and `lib.rs` hands it to
-    the grid as `GridCtx::result_diff`) from a result chip's *Compare with* (*The results strip*).
-    The left is the earlier result, so its rows are the *removed* ones. Of the two results **as they
+    the grid as `GridCtx::result_diff`) from a result chip's *Compare with* (*The results strip*),
+    which fills each side from its panel's result, statement and `ran_at`.
+    The left is the earlier result, **A**, so until the sides are swapped its rows are the
+    *removed* ones. Of the two results **as they
     were read** — a kept one is a snapshot, a live one is what its panel held when the menu opened —
-    and of their rows only: nothing is fetched. Read-only like *Chart*, 820 wide: a title, the
-    controls, the body, a footer of **Close**, and Escape and the backdrop closing it. Unlike
+    and of their rows only: nothing is fetched. Read-only like *Chart*, `modal_w(920)` wide — it was
+    a fixed 820 with no cap at the window's width: a title, two statement cards, the controls, the
+    table, a footer of the summary and **Close** — `ActionKind::Neutral`, since the footer offers no
+    decision to affirm — and Escape and the backdrop closing it. Unlike
     *Chart* it is keyed on whether it is open, not on the pair, which holds only because nothing
     can set a second pair while it stands — the chip menu that raises it is under its backdrop.
-    **One picker, *Match rows by*** — *Whole row* or any shared column, a
-    `table_designer::focusable_owned_dropdown`, tab 10, starting on `result_diff::suggested_key` —
-    and beside it the two labels as *left → right*. It picks **one** column; the core takes a
-    composite key, which nothing here offers yet. The body is a `dyn_container` keyed on the pick,
-    so each pick re-runs `diff` over every row read, on the UI thread: the summary; faint notes for
-    the columns only one side has, the repeated keys left out, and a capped result (*"rows past its
-    cap are not compared"*); then up to `SHOWN` (500) lines per section through
-    `widgets::fact_section_owned` — *Added (n)*, `+ ` and the right's `row_line`, in
-    `theme::grid_edit_staged`; *Removed (n)*, `− ` and the left's, in `theme::error`; *Changed (n)*,
-    `~ ` and `change_line`, in `theme::text` — with *"and N more"* past it, in a scroll capped at
-    `modal_body_h(440)`. A key one side lacks is `DiffError::MissingKey`'s sentence in the error
-    colour in place of the body. The lines are monospaced and every colour is a `fn() -> Color`
-    read in the style, as the themable-colour invariant asks.
+    **The cards are the two statements, A and B**, side by side: a letter badge, *Ran HH:MM:SS*
+    (`date::Time::at_local` of `ran_at`, left out for a `0`), *N rows · M ms*, and the SQL in mono
+    with its whitespace collapsed, clipped at three lines — the height computed in the style closure,
+    so the cut follows the interface scale. **The ⇄ between them (`icons::ARROW_LEFT_RIGHT`, in the
+    ring at tab 5) compares the other way round**: `compute` hands `diff` the sides in the other
+    order, which is the whole of a swap (see `core::result_diff`), and each card slot is a
+    `dyn_container` on `swapped`, so the cards trade places and the letters go with their
+    statements. What a swap changes is which statement is compared first, never which is called A;
+    the notes' *Only in A*/*Only in B* follow the same rule.
+    **Then the controls**: on the left the filter pills *All · Changed · Added · Removed*, each with
+    its count, on `widgets::pill_tab_style` with a coloured dot naming each kind. On the active pill
+    the dot takes `theme::pill_active_text`, since the *Changed* blue vanished into the pill's fill;
+    an inactive pill keeps the kind's colour. Each pill is wrapped in `widgets::in_ring_button` at
+    radius 6, so the focus outline follows its corners — Tab stops `PILLS_TAB` 6–9, after the ⇄
+    (`SWAP_TAB` 5), Enter or Space picking. On the right **one picker, *Match rows by*** — *Whole
+    row* or any shared column, a `table_designer::focusable_owned_dropdown`, `PICKER_TAB` 10, then
+    Close (`ACTION_TAB`) and the title's ✕; it starts on `result_diff::suggested_key`. The label and
+    picker are an `h_stack` of their own with a 10px gap, not a `margin_right` on the label: with
+    the margin the picker ended 10px short of the B card's right edge above it, measured in the
+    running app. It picks **one** column; the core takes a composite key, which
+    nothing here offers yet. Under them a faint notes line for the columns only one side has, the
+    repeated keys left out, and a capped result (*"rows past its cap are not compared"*), hidden
+    when it has nothing to say.
+    **The state is three signals — `swapped`, `key`, `filter` — and an `RwSignal<Rc<Computed>>`.**
+    An effect on `swapped` and `key` re-runs `diff` and `result_diff::table_rows` over every row
+    read, on the UI thread, measures the columns, and stores a `Computed { generation, swapped,
+    outcome }`. A filter costs none of that: the table is a `dyn_container` keyed on `(generation,
+    filter)` and only picks indices out of rows already built. It stands at a fixed
+    `modal_body_h(320)` whatever the filter, so switching pills does not move the footer.
+    **The table copies the Live monitor's list, for the monitor's reasons** (`monitor_view.rs`, and
+    the *Floem 0.2 gotchas* on `VirtualItemSize::Fixed` and on padding a virtual stack): a *Change*
+    column, then one per shared column; the header a hidden-bar `scroll` that follows the body's
+    horizontal offset through `scroll_to` and swallows its own wheel, so the body is the offset's
+    one writer; the body a `shift_hscroll` with the autohide thin bars around a `virtual_stack` —
+    `VirtualItemSize::Fixed(row_h)`, 29 scaled, given to the row as its height, over a `Picked` row
+    source that clamps its range as `LogSeqs` does — with its vertical band on a wrapping
+    `container` rather than the stack. **The column widths are fixed for the whole outcome**: each is
+    its header and the three values longest by characters, measured (`measure_text_px_at`) and
+    clamped to 40–360 — shaping every cell of a large result would stall the open — so the content
+    width does not depend on which rows are mounted, the problem the monitor's monotone `widest`
+    answers. They are stored **unscaled** in `Widths` and scaled where a style reads them, so an
+    interface-scale change with the modal open moves the header and the rows together, as the text
+    inside them moves.
+    **The colours take after the Live monitor**: *CHANGED* in `theme::chip_active`, the monitor's
+    UPDATE colour; *ADDED* in its `new_color` (`pub(crate)` for this); *REMOVED* in a fixed lighter
+    red, `rgb(D0, 6B, 6B)`, because the monitor's old-value red is too dark to read struck through.
+    A removed row's values and a changed cell's old value are **struck through** — and Floem 0.2's
+    text has no line-through, so `struck` lays a 1px absolute rule over the text at
+    `inset_top_pct(52)`. A changed cell reads `old → new`, the old struck red and the new green; a
+    changed row's unchanged values are `text_dim`. Every colour reaches its style as a
+    `fn() -> Color`, as the themable-colour invariant asks. What the table cannot show it says in
+    its own area: *No differences.*, or *No changed rows.* and its siblings for an empty filter; and
+    a key one side lacks, `DiffError::MissingKey`'s sentence, in the error colour, with the footer's
+    summary left blank beside it.
     Mounted in the workspace group directly after `chart_overlay`, counted by
     `workspace_modals_up` as a plain term (`diff_open`) — it raises nothing — and on
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
@@ -39024,7 +39086,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   it**: `monitor_view::cell` flattens Unicode's mandatory line breaks before the text reaches
   `text()`, because a watched `TEXT` column holding an address or pretty-printed JSON shapes to two
   lines, lays out past its own box and paints across the row below — the premise was stated in three
-  places and checked in none until `a_cell_holding_a_newline_is_flattened_to_one_line`. **And a slot
+  places and checked in none until `a_cell_holding_a_newline_is_flattened_to_one_line`. Compare
+  results' table makes the same promise and `core::result_diff::table_rows` keeps it, pinned by
+  `a_table_cell_is_one_short_line`. **And a slot
   that renders nothing still owes its height**: `widgets::nothing()` is `display: none`, so
   `entry_row`'s missing-`seq` branch is an `empty()` given `mon_row_h()`; hiding it puts every later
   row in the window 29px above the space the stack reserved for it. **And a vertically-virtualised
@@ -40467,10 +40531,13 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
 (`affected.is_none()` — a statement's *N rows affected* has nothing to compare; a 0-row result is
 offered too, unlike the toolbar's menus), `result_chip_menu`
 adds, after Pin and Close and behind a separator, one *Compare with <label>* per other such panel
-of the tab, the label cut at 40 characters. Whichever of the two ran first (`ResultPanel::ran_at`)
-is the left side, so *added* means added since, whichever chip was right-clicked. The panels are
-read **once, when the menu opens**, and each entry captures its pair of `Arc<ResultSet>`s — the
-opposite of *Close other results* below it, which asks again at the click. The entry sets
+of the tab, the label cut at 40 characters. Whichever of the two ran first is the left side, so
+*added* means added since, whichever chip was right-clicked. "Ran first" is `(ran_at, id)`, not
+`ResultPanel::ran_at` alone: `ran_at` is whole seconds, so the statements of one Run All tie on
+it — and a tie made the right-clicked chip A — while panel ids are handed out in the order panels
+are made, unlike the strip's order, which pinning can rearrange. The panels are
+read **once, when the menu opens**, and each entry captures its pair of `DiffSide`s — each panel's
+`Arc<ResultSet>`, statement and `ran_at`, which the modal's cards show — the opposite of *Close other results* below it, which asks again at the click. The entry sets
 `GridCtx::result_diff` and raises *Compare results* (`result_diff_view.rs`, over
 `core::result_diff`).
 

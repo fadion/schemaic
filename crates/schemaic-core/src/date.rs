@@ -218,8 +218,9 @@ impl Date {
     /// yesterday is wrong at exactly the hours somebody is most likely to be
     /// looking.
     ///
-    /// One of the module's three impure functions, with [`Time::now`] and
-    /// [`local_now`]. A caller that wants *only* the day wants this one; a caller
+    /// One of the module's three functions that read the clock, with
+    /// [`Time::now`] and [`local_now`] ([`Time::at_local`] reads only the
+    /// zone). A caller that wants *only* the day wants this one; a caller
     /// writing a timestamp wants `local_now`, which reads the clock **once** —
     /// two reads are two instants, and local midnight can fall between them.
     pub fn today() -> Date {
@@ -265,6 +266,21 @@ impl Time {
             minute: m,
             second: s,
         }
+    }
+
+    /// The time of day an instant (`epoch_secs`, seconds since the Unix epoch)
+    /// shows on the **local** clock — a result's "Ran 11:42:08". `None` for an
+    /// instant past what chrono holds.
+    pub fn at_local(epoch_secs: u64) -> Option<Time> {
+        use chrono::TimeZone;
+        let secs = i64::try_from(epoch_secs).ok()?;
+        let at = chrono::Local.timestamp_opt(secs, 0).single()?;
+        let (h, m, s) = chrono_hms(&at);
+        Some(Time {
+            hour: h,
+            minute: m,
+            second: s,
+        })
     }
 
     /// Midnight — what a date-only value means once a column wants a time too.
@@ -576,6 +592,16 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> Date {
         Date::new(y, m, day).expect("valid date")
+    }
+
+    /// The zone moves the hour, never the second, and an instant chrono cannot
+    /// hold is no time rather than a wrong one.
+    #[test]
+    fn an_epoch_instant_reads_on_the_local_clock() {
+        let t = Time::at_local(5 * 3600 + 25 * 60 + 7).expect("a real instant");
+        assert_eq!(t.second, 7);
+        assert_eq!(t.hms().len(), 8);
+        assert_eq!(Time::at_local(u64::MAX), None);
     }
 
     // ── Arithmetic ──────────────────────────────────────────────────────────

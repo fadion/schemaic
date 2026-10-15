@@ -127,11 +127,12 @@ impl VirtualVector<u64> for LogSeqs {
     }
 }
 
-/// Old-value tint (removed) and new-value tint (added), shared by updates + inserts.
+/// Old-value tint (removed) and new-value tint (added), shared by updates + inserts
+/// — and the new one by Compare results' added rows (`result_diff_view`).
 fn old_color() -> Color {
     Color::rgb8(0x9D, 0x34, 0x34)
 }
-fn new_color() -> Color {
+pub(crate) fn new_color() -> Color {
     Color::rgb8(0x71, 0xC3, 0x71)
 }
 
