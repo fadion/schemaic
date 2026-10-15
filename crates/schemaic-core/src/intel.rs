@@ -6414,10 +6414,10 @@ pub const INSERT_HINT_CAP: usize = 2_000;
 /// **With no column list the columns are the table's**, from the catalogue,
 /// and which of them the row names is the engine's question rather than a
 /// count: a row as long as the table's visible columns names all of them; one
-/// as long as the columns the server does not assign
-/// ([`Catalog::insert_columns_of`]) names those only on an engine whose
-/// implicit list leaves the assigned ones out
-/// ([`lints::implicit_list_skips_assigned`] — SQL Server, SQLite); on
+/// as long as the columns the engine's implicit list names
+/// ([`Catalog::bare_insert_columns_of`]) names those only on an engine whose
+/// implicit list leaves some out ([`lints::implicit_list_skips`] — SQL
+/// Server every column it assigns, SQLite only a generated one); on
 /// PostgreSQL a shorter row names the table's first columns
 /// ([`lints::short_row_takes_defaults`]), whatever its length. MySQL wants
 /// every column. Any other length is labelled nothing — the diagnostics already say it is wrong,

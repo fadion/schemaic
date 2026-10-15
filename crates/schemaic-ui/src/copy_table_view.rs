@@ -32,6 +32,9 @@ use crate::widgets::{
 /// arrows moving inside it — ahead of the Schema (20) and Name (30) fields.
 const CHOSEN_TAB: u32 = 10;
 const LIST_TAB: u32 = 15;
+
+/// One row of the target picker: its label, its colour and its pick.
+type Pick = (String, fn() -> floem::peniko::Color, Rc<dyn Fn()>);
 use crate::{ConnUi, DdlUi, FieldCfg, OverlayUi, SchemaUi, edit_field, icons, theme};
 
 /// The table *Copy to* was raised on — always the active connection's, since
@@ -240,8 +243,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                     return empty().into_any();
                 }
                 // Each row's label, colour and pick, in the order drawn.
-                let mut picks: Vec<(String, fn() -> floem::peniko::Color, Rc<dyn Fn()>)> =
-                    Vec::new();
+                let mut picks: Vec<Pick> = Vec::new();
                 match listed {
                     Some((cid, dbs)) => {
                         picks.push((
