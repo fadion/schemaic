@@ -380,7 +380,7 @@ fn field_changes(old: &[Option<String>], new: &[Option<String>]) -> Vec<FieldCha
 }
 
 /// One entry in the Live Monitor's change log: a detected [`RowChange`] plus the
-/// elapsed-since-start timestamp (`M:SS`) at which the monitor *observed* it.
+/// local wall-clock time (`HH:MM:SS`) at which the monitor *observed* it.
 ///
 /// The timestamp is an observation time, not an event time — a change is stamped
 /// when a poll saw it, so with a 10-second interval it can be up to ten seconds
@@ -430,7 +430,7 @@ pub struct MonitorEntry {
 /// One function because the three parts are one rule: an entry's sequence number
 /// has to be assigned where it is appended (it is `last + 1`, and the log is never
 /// reordered), and the cap has to be applied in the same breath or the caveat the
-/// status line prints could disagree with what the log holds.
+/// modal's footer prints could disagree with what the log holds.
 pub fn append_changes(
     log: &mut Vec<MonitorEntry>,
     at: &str,
@@ -452,32 +452,150 @@ pub fn append_changes(
     trim_log(log)
 }
 
-/// How many of a change's columns the modal's **Data** column renders before it
-/// stops and counts the rest.
-///
-/// **A bound on views, not on the log.** The log holds every column and
-/// [`log_result_set`] exports every column; this is only what one row of the
-/// change table builds. An `Insert`/`Delete` row renders one span per column
-/// *name* plus one per *value* and an `Update` four per changed field, uncapped
-/// in the table's width — so at `LOG_CAP` entries a 60-column table put ~123,000
-/// views in a mounted list showing about twenty of them, paid by every layout and
-/// paint pass for as long as the modal is open (23,000 at 10 columns, 63,000 at
-/// 30 — counted, not estimated).
-///
-/// Twelve because the Data column is one non-wrapping line that is already
-/// scrolled horizontally to read: past a dozen `col=value` pairs nobody is
-/// reading it as a line, they are reading the export.
-pub const DATA_COLS_SHOWN: usize = 12;
+/// How many entries of each kind a log holds — the modal's filter pills.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KindCounts {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+}
 
-/// What the Data column says in place of the columns it did not render, or
-/// `None` when it rendered them all.
-///
-/// The disclosure is the tested half: a line that silently stops at twelve of
-/// sixty is the defect this would otherwise introduce, and the caller has the
-/// whole export one button away.
-pub fn data_overflow_label(total: usize) -> Option<String> {
-    let hidden = total.checked_sub(DATA_COLS_SHOWN).filter(|n| *n > 0)?;
-    Some(format!(", +{hidden} more"))
+impl KindCounts {
+    /// The entries of `kind`, or of every kind for `None`.
+    pub fn of(&self, kind: Option<ChangeKind>) -> usize {
+        match kind {
+            None => self.inserts + self.updates + self.deletes,
+            Some(ChangeKind::Insert) => self.inserts,
+            Some(ChangeKind::Update) => self.updates,
+            Some(ChangeKind::Delete) => self.deletes,
+        }
+    }
+}
+
+pub fn kind_counts(entries: &[MonitorEntry]) -> KindCounts {
+    let mut n = KindCounts::default();
+    for e in entries {
+        match e.change.kind {
+            ChangeKind::Insert => n.inserts += 1,
+            ChangeKind::Update => n.updates += 1,
+            ChangeKind::Delete => n.deletes += 1,
+        }
+    }
+    n
+}
+
+/// One cell of the modal's change table, as one line of text
+/// ([`crate::text::cell_line`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogCell {
+    /// The row's value: an insert's new one, a delete's last-seen one, or one an
+    /// update left alone.
+    Value(String),
+    /// A value an update changed: the old, then the new.
+    Changed(String, String),
+    /// A column this entry was not recorded with — one an `ALTER` added or
+    /// dropped mid-session.
+    Missing,
+}
+
+/// The change table's columns: the watched table's, under the names each entry
+/// was recorded with — the same union, in the same order, as the export's
+/// ([`log_result_set`]), so the screen and the file head their columns alike.
+pub fn log_columns(entries: &[MonitorEntry], cols: &[String]) -> Vec<String> {
+    let width = entries
+        .iter()
+        .map(|e| width_of(e, cols))
+        .max()
+        .unwrap_or(0)
+        .max(cols.len());
+    let mut headings: Vec<String> = Vec::new();
+    let push = |h: &mut Vec<String>, n: String| {
+        if !h.contains(&n) {
+            h.push(n);
+        }
+    };
+    for i in 0..cols.len() {
+        push(&mut headings, name_at(cols, i));
+    }
+    // The entries of one poll share one list, so a run of them names the same
+    // columns — the modal asks this after every poll that lands.
+    let mut last: Option<(*const Vec<String>, usize)> = None;
+    for e in entries {
+        let shape = (std::sync::Arc::as_ptr(&e.cols), width_of(e, cols));
+        if last == Some(shape) {
+            continue;
+        }
+        last = Some(shape);
+        for i in 0..width_of(e, cols) {
+            push(&mut headings, name_at(names_of(e, cols), i));
+        }
+    }
+    // An index nobody named — a log wider than every list it carries.
+    for i in headings.len()..width {
+        push(&mut headings, unnamed_column(i));
+    }
+    headings
+}
+
+/// `e`'s row of the change table: a cell per heading of [`log_columns`],
+/// each value under the name `e` was recorded with.
+pub fn table_cells(e: &MonitorEntry, headings: &[String], cols: &[String]) -> Vec<LogCell> {
+    entry_indices(e, headings, cols)
+        .into_iter()
+        .map(|at| {
+            let Some(i) = at else {
+                return LogCell::Missing;
+            };
+            if let Some(f) = e.change.fields.iter().find(|f| f.col == i) {
+                return LogCell::Changed(
+                    crate::text::cell_line(f.old.as_deref()),
+                    crate::text::cell_line(f.new.as_deref()),
+                );
+            }
+            LogCell::Value(crate::text::cell_line(
+                e.change.cells.get(i).and_then(|c| c.as_deref()),
+            ))
+        })
+        .collect()
+}
+
+/// An entry recorded before entries carried their own column list — a restored
+/// log, or a test fixture — answers to `cols`.
+fn names_of<'a>(e: &'a MonitorEntry, cols: &'a [String]) -> &'a [String] {
+    if e.cols.is_empty() { cols } else { &e.cols }
+}
+
+/// How many column indices `e` speaks for: its cells, its changed fields and
+/// its names, whichever reaches furthest.
+fn width_of(e: &MonitorEntry, cols: &[String]) -> usize {
+    e.change
+        .fields
+        .iter()
+        .map(|f| f.col + 1)
+        .chain(std::iter::once(e.change.cells.len()))
+        .chain(std::iter::once(names_of(e, cols).len()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The name a list gives index `i`, or [`unnamed_column`]'s.
+fn name_at(names: &[String], i: usize) -> String {
+    names
+        .get(i)
+        .filter(|n| !n.is_empty())
+        .cloned()
+        .unwrap_or_else(|| unnamed_column(i))
+}
+
+/// `e`'s index for each heading, or nothing where its own list has no such
+/// name.
+fn entry_indices(e: &MonitorEntry, headings: &[String], cols: &[String]) -> Vec<Option<usize>> {
+    let w = width_of(e, cols);
+    let names = names_of(e, cols);
+    headings
+        .iter()
+        .map(|h| (0..w).find(|&i| name_at(names, i) == *h))
+        .collect()
 }
 
 /// Separates a changed column's old and new value in an exported cell
@@ -510,11 +628,11 @@ pub const LOG_FORMATS: [crate::export::ExportFormat; 5] = [
 ///
 /// The shape is one row per logged change: `Time`, `Action`, `Key`, then one
 /// column per column of the watched table (`cols`, as captured by the baseline
-/// poll). `Key` rather than the modal's space-constrained `ID`, because the key
-/// can be composite and the file has to describe itself once it's away from the
-/// modal; the values are the key columns joined with `, `, exactly as rendered.
+/// poll). `Key`, which the modal has no column for, because the key can be
+/// composite and the file has to describe itself once it's away from the modal;
+/// the values are the key columns joined with `, `.
 ///
-/// The per-column cells carry the whole row, which is more than the modal shows:
+/// The per-column cells carry the whole row, as the modal's table does:
 ///
 /// - **Insert** — the new values.
 /// - **Delete** — the last-seen values, which is the only remaining record of a
@@ -545,58 +663,9 @@ pub fn log_result_set(entries: &[MonitorEntry], cols: &[String]) -> ResultSet {
     // which needs no gap marker, because nothing is mis-stated to begin with.
     //
     // `cols` still leads, so an unchanged session exports exactly as before: its
-    // entries all carry that same list, and the union is it.
-    // An entry with no list of its own is one recorded before entries carried
-    // them — a restored log, or a test fixture. `cols` is its answer, which is
-    // what the single-list form did for every entry.
-    fn names_of<'a>(e: &'a MonitorEntry, cols: &'a [String]) -> &'a [String] {
-        if e.cols.is_empty() { cols } else { &e.cols }
-    }
-    let width_of = |e: &MonitorEntry| {
-        e.change
-            .fields
-            .iter()
-            .map(|f| f.col + 1)
-            .chain(std::iter::once(e.change.cells.len()))
-            .chain(std::iter::once(names_of(e, cols).len()))
-            .max()
-            .unwrap_or(0)
-    };
-    // The name an entry gives its index `i`, with the same fallbacks the single
-    // list had.
-    let name_at = |names: &[String], i: usize| {
-        names
-            .get(i)
-            .filter(|n| !n.is_empty())
-            .cloned()
-            .unwrap_or_else(|| unnamed_column(i))
-    };
-
-    let width = entries
-        .iter()
-        .map(width_of)
-        .max()
-        .unwrap_or(0)
-        .max(cols.len());
-    let mut headings: Vec<String> = Vec::new();
-    let push = |h: &mut Vec<String>, n: String| {
-        if !h.contains(&n) {
-            h.push(n);
-        }
-    };
-    for i in 0..cols.len() {
-        push(&mut headings, name_at(cols, i));
-    }
-    for e in entries {
-        for i in 0..width_of(e) {
-            push(&mut headings, name_at(names_of(e, cols), i));
-        }
-    }
-    // An index nobody named — a log wider than every list it carries, which the
-    // single-list form covered with a placeholder.
-    for i in headings.len()..width {
-        push(&mut headings, unnamed_column(i));
-    }
+    // entries all carry that same list, and the union is it. The union is
+    // [`log_columns`], which the modal's table heads its columns with too.
+    let headings = log_columns(entries, cols);
 
     let text_col = |name: String| Column {
         name,
@@ -616,14 +685,7 @@ pub fn log_result_set(entries: &[MonitorEntry], cols: &[String]) -> ResultSet {
             row.push(Value::Str(e.at.clone()));
             row.push(Value::Str(action_label(e.change.kind).to_string()));
             row.push(Value::Str(e.change.key.join(", ")));
-            // This entry's index for each heading, or nothing where its own
-            // column list has no such name.
-            let w = width_of(e);
-            let mine: Vec<Option<usize>> = headings
-                .iter()
-                .map(|h| (0..w).find(|&i| name_at(names_of(e, cols), i) == *h))
-                .collect();
-            for at in mine {
+            for at in entry_indices(e, &headings, cols) {
                 row.push(match at {
                     Some(i) => log_cell(&e.change, i),
                     None => Value::Null,
@@ -638,7 +700,7 @@ pub fn log_result_set(entries: &[MonitorEntry], cols: &[String]) -> ResultSet {
 
 /// The exported spelling of a change kind — the modal's own labels, so a file and
 /// the screen it came from say the same word.
-fn action_label(kind: ChangeKind) -> &'static str {
+pub fn action_label(kind: ChangeKind) -> &'static str {
     match kind {
         ChangeKind::Insert => "INSERT",
         ChangeKind::Update => "UPDATE",
@@ -1711,26 +1773,124 @@ mod tests {
         );
     }
 
-    /// **The Data column is a line, not the record.** One span per column name
-    /// plus one per value — four per field on an update — uncapped in the
-    /// table's width, times `LOG_CAP` rows: 23,000 views at 10 columns, 63,000
-    /// at 30, 123,000 at 60, in a mounted list showing about twenty, paid by
-    /// every layout and paint pass while the modal is open.
-    ///
-    /// What must not happen is the quiet version: a line that stops at twelve of
-    /// sixty and looks like the whole change.
+    fn change(kind: ChangeKind, cells: &[Option<&str>], fields: Vec<FieldChange>) -> RowChange {
+        RowChange {
+            kind,
+            key: vec!["1".to_string()],
+            fields,
+            cells: cells.iter().map(|c| c.map(str::to_string)).collect(),
+        }
+    }
+
+    /// The table reads each kind as the mockup does: an insert's and a
+    /// delete's whole row as values, an update's changed columns as old → new
+    /// beside the values it left alone — every cell one line, NULL named.
     #[test]
-    fn a_wide_change_says_how_much_of_it_is_off_the_line() {
-        assert_eq!(data_overflow_label(0), None);
-        assert_eq!(data_overflow_label(DATA_COLS_SHOWN), None, "exactly full");
+    fn the_table_cells_show_each_kind_whole() {
+        let cols = std::sync::Arc::new(vec!["id".to_string(), "name".to_string()]);
+        let mut log = Vec::new();
+        append_changes(
+            &mut log,
+            "11:55:34",
+            vec![
+                change(ChangeKind::Insert, &[Some("420"), Some("Hedy")], vec![]),
+                change(ChangeKind::Delete, &[Some("202"), None], vec![]),
+                change(
+                    ChangeKind::Update,
+                    &[Some("385"), Some("Donald")],
+                    vec![FieldChange {
+                        col: 1,
+                        old: Some("Ken\nK".to_string()),
+                        new: Some("Donald".to_string()),
+                    }],
+                ),
+            ],
+            &cols,
+        );
+        let heads = log_columns(&log, &cols);
+        assert_eq!(heads, ["id", "name"]);
+        let v = |s: &str| LogCell::Value(s.to_string());
+        assert_eq!(table_cells(&log[0], &heads, &cols), [v("420"), v("Hedy")]);
+        assert_eq!(table_cells(&log[1], &heads, &cols), [v("202"), v("NULL")]);
         assert_eq!(
-            data_overflow_label(DATA_COLS_SHOWN + 1).as_deref(),
-            Some(", +1 more")
+            table_cells(&log[2], &heads, &cols),
+            [
+                v("385"),
+                LogCell::Changed("Ken K".to_string(), "Donald".to_string())
+            ]
+        );
+    }
+
+    /// **The screen heads its columns as the file does**: after an `ALTER`
+    /// mid-session, every name from both lists, each entry's value under its
+    /// own name, and a column it never had says so rather than borrowing a
+    /// neighbour's value.
+    #[test]
+    fn a_change_shows_under_the_names_it_was_recorded_with() {
+        let before = std::sync::Arc::new(vec!["id".to_string(), "name".to_string()]);
+        let after = std::sync::Arc::new(vec![
+            "id".to_string(),
+            "note".to_string(),
+            "name".to_string(),
+        ]);
+        let mut log = Vec::new();
+        append_changes(
+            &mut log,
+            "a",
+            vec![change(
+                ChangeKind::Insert,
+                &[Some("1"), Some("ann")],
+                vec![],
+            )],
+            &before,
+        );
+        append_changes(
+            &mut log,
+            "b",
+            vec![change(
+                ChangeKind::Insert,
+                &[Some("2"), Some("n"), Some("bob")],
+                vec![],
+            )],
+            &after,
+        );
+        let heads = log_columns(&log, &after);
+        assert_eq!(heads, ["id", "note", "name"]);
+        let v = |s: &str| LogCell::Value(s.to_string());
+        assert_eq!(
+            table_cells(&log[0], &heads, &after),
+            [v("1"), LogCell::Missing, v("ann")]
         );
         assert_eq!(
-            data_overflow_label(60).as_deref(),
-            Some(&format!(", +{} more", 60 - DATA_COLS_SHOWN)[..])
+            table_cells(&log[1], &heads, &after),
+            [v("2"), v("n"), v("bob")]
         );
+        let rs = log_result_set(&log, &after);
+        let exported: Vec<&str> = rs.columns.iter().skip(3).map(|c| c.name.as_str()).collect();
+        assert_eq!(exported, heads, "the file and the screen agree");
+    }
+
+    #[test]
+    fn the_pills_count_each_kind_and_all() {
+        let cols = std::sync::Arc::new(vec!["id".to_string()]);
+        let mut log = Vec::new();
+        assert_eq!(kind_counts(&log), KindCounts::default());
+        append_changes(
+            &mut log,
+            "t",
+            vec![
+                change(ChangeKind::Insert, &[Some("1")], vec![]),
+                change(ChangeKind::Insert, &[Some("2")], vec![]),
+                change(ChangeKind::Delete, &[Some("3")], vec![]),
+            ],
+            &cols,
+        );
+        let n = kind_counts(&log);
+        assert_eq!((n.inserts, n.updates, n.deletes), (2, 0, 1));
+        assert_eq!(n.of(None), 3);
+        assert_eq!(n.of(Some(ChangeKind::Insert)), 2);
+        assert_eq!(n.of(Some(ChangeKind::Update)), 0);
+        assert_eq!(n.of(Some(ChangeKind::Delete)), 1);
     }
 
     /// **A column list that moved under the log must not re-head what was
@@ -1799,11 +1959,10 @@ mod tests {
         }
     }
 
-    /// **The bound is on the view, and on nothing else.** The export is the
-    /// record, and it must still carry every column of every change — which is
-    /// the property that makes truncating the line acceptable at all.
+    /// **The export is the record**, and it carries every column of every
+    /// change, however wide the watched table.
     #[test]
-    fn the_export_still_carries_the_columns_the_line_does_not() {
+    fn the_export_carries_every_column_of_a_wide_change() {
         let wide: Vec<String> = (0..60).map(|i| format!("c{i}")).collect();
         let cells: Vec<Option<String>> = (0..60).map(|i| Some(format!("v{i}"))).collect();
         let mut log: Vec<MonitorEntry> = Vec::new();
@@ -1829,9 +1988,8 @@ mod tests {
             crate::intel::SqlDialect::MySql,
         );
         // The export gives every watched column a column of its own, so the
-        // header names all sixty and the row carries all sixty values —
-        // including the forty-eight the modal's one-line Data column stops at.
-        for i in [0usize, DATA_COLS_SHOWN, DATA_COLS_SHOWN + 1, 59] {
+        // header names all sixty and the row carries all sixty values.
+        for i in [0usize, 12, 13, 59] {
             assert!(
                 data.contains(&format!("c{i}")),
                 "column {i} is missing from the export: {data}"
@@ -1841,9 +1999,5 @@ mod tests {
                 "column {i}'s value is missing from the export: {data}"
             );
         }
-        assert!(
-            !data.contains("more"),
-            "the export is the record, not the line: {data}"
-        );
     }
 }

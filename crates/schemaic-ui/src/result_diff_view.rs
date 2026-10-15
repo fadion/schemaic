@@ -29,10 +29,10 @@ use schemaic_core::model::ResultSet;
 use schemaic_core::result_diff::{self, DiffCell, DiffRow, ResultDiff, RowChange};
 
 use crate::widgets::{
-    ACTION_TAB, ActionKind, FocusRing, action_button, autohide_state, dismiss_layer,
+    ACTION_TAB, ActionKind, FocusRing, action_button, autohide_state, cell_text, dismiss_layer,
     focus_root_with_ring, in_ring_button, measure_text_px_at, measure_text_px_bold_at,
     modal_body_h, modal_footer_split, modal_pad_h, modal_title_owned, modal_w, panel_style,
-    shift_hscroll, thin_scroll,
+    shift_hscroll, struck_text, thin_scroll, transition_text,
 };
 use crate::{OverlayUi, icons, theme};
 
@@ -87,10 +87,10 @@ fn table_h() -> f64 {
     modal_body_h(320.0)
 }
 
-/// Removed values: the Live monitor's old-value red, lifted to read struck
-/// through at body size on a dark panel.
+/// The Live monitor's colours, so a removed row here reads as a deleted one
+/// there.
 fn removed_color() -> Color {
-    Color::rgb8(0xD0, 0x6B, 0x6B)
+    crate::monitor_view::old_color()
 }
 fn added_color() -> Color {
     crate::monitor_view::new_color()
@@ -511,48 +511,20 @@ fn filter_pills(
         }
     };
     let pill = move |name: &'static str, which: Option<RowChange>, tabindex: u32| {
-        let on = move || filter.get() == which;
-        let dot = match which {
-            Some(c) => {
-                let color = change_color(c);
-                // On the active pill the kind's colour sits on the pill's own
-                // fill — the Changed blue vanished into it — so it takes the
-                // label's colour there.
-                icons::icon(icons::DOT, 6.0)
-                    .style(move |s| {
-                        let c = if on() {
-                            theme::pill_active_text()
-                        } else {
-                            color()
-                        };
-                        s.color(c).margin_right(theme::scaled(6.0))
-                    })
-                    .into_any()
-            }
-            None => empty().into_any(),
-        };
-        let face = h_stack((
-            dot,
-            text(name),
-            label(move || {
+        crate::widgets::count_pill(
+            name,
+            which.map(change_color),
+            move || {
                 computed.with(|c| match &c.outcome {
                     Ok(o) => o.count(which).to_string(),
                     Err(_) => String::new(),
                 })
-            })
-            .style(move |s| {
-                let s = s.margin_left(theme::scaled(6.0));
-                if on() {
-                    s
-                } else {
-                    s.color(theme::text_faint())
-                }
-            }),
-        ))
-        .on_click_stop(move |_| pick(which))
-        .style(move |s| crate::widgets::pill_tab_style(s, on()).items_center());
-        // The pill's own radius, so the focus outline follows its corners.
-        in_ring_button(face, ring.clone(), tabindex, true, 6.0, move || pick(which))
+            },
+            move || filter.get() == which,
+            move || pick(which),
+            ring.clone(),
+            tabindex,
+        )
     };
     h_stack((
         pill("All", None, PILLS_TAB),
@@ -753,21 +725,16 @@ fn table_row(row: &DiffRow, widths: &Widths) -> impl IntoView + use<> {
     for (i, c) in row.cells.iter().enumerate() {
         let w = widths.clone();
         let content: AnyView = match (c, change) {
-            (DiffCell::Changed(before, after), _) => h_stack((
-                struck(before.clone(), removed_color).style(|s| s.flex_shrink(1.0_f32)),
-                text(" → ").style(|s| {
-                    s.color(theme::text_dim())
-                        .font_size(theme::font_body())
-                        .flex_shrink(0.0_f32)
-                }),
-                value_text(after.clone(), added_color).style(|s| s.flex_shrink(1.0_f32)),
-            ))
-            .style(|s| s.items_center().min_width(0.0))
-            .into_any(),
-            (DiffCell::Value(v), RowChange::Removed) => struck(v.clone(), removed_color).into_any(),
-            (DiffCell::Value(v), RowChange::Added) => value_text(v.clone(), added_color).into_any(),
+            (DiffCell::Changed(before, after), _) => {
+                transition_text(before.clone(), after.clone(), removed_color, added_color)
+                    .into_any()
+            }
+            (DiffCell::Value(v), RowChange::Removed) => {
+                struck_text(v.clone(), removed_color).into_any()
+            }
+            (DiffCell::Value(v), RowChange::Added) => cell_text(v.clone(), added_color).into_any(),
             (DiffCell::Value(v), RowChange::Changed) => {
-                value_text(v.clone(), theme::text_dim).into_any()
+                cell_text(v.clone(), theme::text_dim).into_any()
             }
         };
         cells.push(
@@ -788,30 +755,4 @@ fn table_row(row: &DiffRow, widths: &Widths) -> impl IntoView + use<> {
             .padding_horiz(modal_pad_h())
             .height(row_h())
     })
-}
-
-fn value_text(v: String, color: fn() -> Color) -> floem::views::Label {
-    text(v).style(move |s| {
-        s.color(color())
-            .font_size(theme::font_body())
-            .min_width(0.0)
-            .text_ellipsis()
-    })
-}
-
-/// A value struck through: Floem's text has no line-through, so the line is a
-/// 1px rule laid over the text's box at half its height.
-fn struck(v: String, color: fn() -> Color) -> floem::views::Stack {
-    stack((
-        value_text(v, color),
-        empty().style(move |s| {
-            s.absolute()
-                .inset_left(0.0)
-                .inset_right(0.0)
-                .inset_top_pct(52.0)
-                .height(1.0)
-                .background(color())
-        }),
-    ))
-    .style(|s| s.items_center().min_width(0.0))
 }

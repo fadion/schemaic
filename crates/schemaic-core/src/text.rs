@@ -174,6 +174,41 @@ fn decode_utf16(bytes: &[u8], word: fn([u8; 2]) -> u16) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// The longest a table cell's text runs before [`cell_line`] cuts it.
+pub const CELL_LINE_CHARS: usize = 120;
+
+/// A value as one line of a fixed-height table row — Compare results' and the
+/// Live monitor's: `NULL` for a null, every mandatory line break (UAX #14
+/// BK/CR/LF/NL) as a space, a CRLF as one, cut at [`CELL_LINE_CHARS`] ending in
+/// `…`.
+///
+/// **The one line is load-bearing.** Both tables are virtual stacks over
+/// `VirtualItemSize::Fixed`, which places row `i` at `i * height` whatever the
+/// row measures, so a value that shaped to two lines would paint across the row
+/// below. The cut bounds what a column measures; the record (the comparison, the
+/// export) still reads the whole value.
+pub fn cell_line(v: Option<&str>) -> String {
+    let Some(s) = v else {
+        return "NULL".to_string();
+    };
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    let mut n = 0;
+    while let Some(c) = chars.next() {
+        if n == CELL_LINE_CHARS - 1 && chars.peek().is_some() {
+            out.push('…');
+            break;
+        }
+        match c {
+            '\r' if chars.peek() == Some(&'\n') => continue,
+            '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}' => out.push(' '),
+            c => out.push(c),
+        }
+        n += 1;
+    }
+    out
+}
+
 /// Pick the singular or plural noun for a count: `plural(1, "row", "rows")` →
 /// `"row"`; `0` or `2+` → `"rows"`. Returns only the noun form (not the number),
 /// so the call site keeps control of how the count itself is rendered — a row
@@ -285,6 +320,28 @@ pub fn field_suggestion<'a>(typed: &str, options: &'a [String]) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One line whatever the value holds: NULL says so, every mandatory break
+    /// is a space (a CRLF one), and a long value is cut to the limit.
+    #[test]
+    fn a_cell_line_is_one_short_line() {
+        assert_eq!(cell_line(None), "NULL");
+        assert_eq!(cell_line(Some("")), "");
+        assert_eq!(cell_line(Some("one\r\ntwo")), "one two");
+        assert_eq!(
+            cell_line(Some("a\u{2028}b\u{2029}c\u{85}d\u{0b}e\u{0c}f\rg\nh")),
+            "a b c d e f g h"
+        );
+        let exact = "z".repeat(CELL_LINE_CHARS);
+        assert_eq!(
+            cell_line(Some(&exact)),
+            exact,
+            "exactly at the limit is whole"
+        );
+        let cut = cell_line(Some(&"z".repeat(CELL_LINE_CHARS + 1)));
+        assert!(cut.ends_with('…'));
+        assert_eq!(cut.chars().count(), CELL_LINE_CHARS);
+    }
 
     /// **The log's merged edit leaves alone only what every edit did**: after
     /// any run of edits, the text at an older revision and the text now agree

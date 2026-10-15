@@ -3861,7 +3861,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 prev: monitor_prev.clone(),
                 key_cols: monitor_key_cols.clone(),
                 generation: monitor_gen.clone(),
-                started: Instant::now(),
                 // **Once, here, before the first fetch** — see
                 // `MonitorCtx::order_by`. `source` is moved into `target` below,
                 // so this reads it while it is still in hand.
@@ -14808,7 +14807,6 @@ struct MonitorCtx {
     prev: Rc<RefCell<Option<Snapshot>>>,
     key_cols: Rc<RefCell<Vec<usize>>>,
     generation: Rc<Cell<u64>>,
-    started: Instant,
     /// The connection + the table being watched (namespace included, so a
     /// PostgreSQL table outside `public` is actually the one polled).
     target: (u64, TableSource),
@@ -15040,7 +15038,9 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
             if let Some(prev) = ctx.prev.borrow().as_ref() {
                 let changes = diff_snapshots(prev, &snap);
                 if !changes.is_empty() {
-                    let at = fmt_elapsed(ctx.started.elapsed().as_secs());
+                    // The local clock, as the modal's Time column and its
+                    // footer's "since" read it.
+                    let at = schemaic_core::date::local_now().1.hms();
                     let mut dropped = 0usize;
                     ctx.log.update(|log| {
                         // Stamp, append and trim in one core call: the sequence
@@ -15145,16 +15145,6 @@ fn activity_poll(
         (refresh)();
         activity_poll(generation, gen_sig, interval, refresh);
     });
-}
-
-/// Format elapsed seconds since monitoring started as `MM:SS` (or `H:MM:SS`).
-fn fmt_elapsed(secs: u64) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m:02}:{s:02}")
-    }
 }
 
 /// Sample the app process's own CPU/RAM on a self-rescheduling ~1s timer and

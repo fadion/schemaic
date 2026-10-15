@@ -179,33 +179,9 @@ pub fn table_rows(left: &ResultSet, right: &ResultSet, d: &ResultDiff) -> Vec<Di
         .collect()
 }
 
-/// The longest a table cell's text runs before it is cut.
-const TABLE_VALUE_CHARS: usize = 120;
-
-/// A value as one line of a table cell: `NULL` for a null, line breaks as
-/// spaces (a CRLF as one), cut at [`TABLE_VALUE_CHARS`].
+/// A value as one line of a table cell — [`crate::text::cell_line`].
 fn table_value(v: Option<String>) -> String {
-    let Some(s) = v else {
-        return "NULL".to_string();
-    };
-    let mut out = String::new();
-    let mut chars = s.chars().peekable();
-    let mut n = 0;
-    while let Some(c) = chars.next() {
-        if n == TABLE_VALUE_CHARS - 1 && chars.peek().is_some() {
-            out.push('…');
-            break;
-        }
-        match c {
-            '\r' if chars.peek() == Some(&'\n') => continue,
-            // Every mandatory break, as the Live monitor's `is_line_break`:
-            // any one of them shapes the cell to two lines.
-            '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}' => out.push(' '),
-            c => out.push(c),
-        }
-        n += 1;
-    }
-    out
+    crate::text::cell_line(v.as_deref())
 }
 
 /// Why two results cannot be compared by the key asked for.

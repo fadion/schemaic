@@ -480,9 +480,11 @@ existing prose was left alone.
     (`the_table_lists_the_first_results_rows_in_order_then_the_added`). A cell is
     `DiffCell::Value` — an added or removed row's own value, or one a changed row's sides agree on —
     or `DiffCell::Changed(before, after)`; `RowChange::label` is the *Change* column's
-    `CHANGED`/`ADDED`/`REMOVED`. **Every cell is one line**, through the private `table_value`:
-    `NULL` for a null, every mandatory line break as a space (a CRLF as one — the Live monitor's `is_line_break` set), cut at 120 characters ending in `…`
-    (`a_table_cell_is_one_short_line`). That is load-bearing rather than tidy — the view's
+    `CHANGED`/`ADDED`/`REMOVED`. **Every cell is one line**, through the private `table_value`,
+    which is `text::cell_line` — `NULL` for a null, every mandatory line break as a space (a CRLF
+    as one), cut at `CELL_LINE_CHARS` (120) ending in `…`; it owned that logic until the Live
+    monitor's table needed the same line (`a_table_cell_is_one_short_line` still pins it from
+    here). That is load-bearing rather than tidy — the view's
     `virtual_stack` places row `i` at `i * row_h`, and a cell that shaped to two lines would paint
     across the row below (the `VirtualItemSize::Fixed` gotcha). The cut is the cell's only; the
     comparison reads the whole value. **Comparing the other way round is `diff(right, left, …)` and
@@ -9358,7 +9360,10 @@ existing prose was left alone.
     to a row while the table's shape was changing; `main.rs`'s `monitor_apply` does that and **says
     so in the modal**, a silent restart being indistinguishable from a poll that found nothing.
     The **log** lives here too, not just the diff. `MonitorEntry { at, change, seq, cols }` — a
-    change, the `M:SS` at which a poll *observed* it, its position in the log and **the watched
+    change, the local wall-clock `HH:MM:SS` at which a poll *observed* it (stamped by `main.rs`
+    off `date::local_now` as the poll lands, and read by the modal's *since 11:48:12*; it used to
+    be `M:SS` elapsed since the modal opened, and the export's `Time` column changed with it), its
+    position in the log and **the watched
     table's column list as it was when the entry was recorded** — moved down from `ui/lib.rs`, which re-exports it so every
     use site still reads as a UI type, because the log's export is a pure projection of these
     entries and belongs beside the diff that produces them. `log_result_set` is that projection: it
@@ -9397,26 +9402,31 @@ existing prose was left alone.
     a silently truncated record looks complete and isn't). **`trim_log` is the one place `LOG_CAP`
     is applied**, and it returns how many entries went, because the app trimming on `> LOG_CAP`
     while the modal's caveat printed on `>= LOG_CAP` meant a log resting exactly at the cap claimed
-    a loss it hadn't had — on a record whose only value is that it can be trusted. The status line
-    reads the count. `discard_needs_asking(len, exported)` is the other decision that belongs here
+    a loss it hadn't had — on a record whose only value is that it can be trusted. The modal's
+    footer reads the count. `discard_needs_asking(len, exported)` is the other decision that belongs here
     rather than in a modal: the log is the only record of what a deleted row held and no poll
     re-reports a change, so throwing it away is irreversible — unless it is empty, or already on
     disk, which is why the confirmation isn't unconditional.
-    **`DATA_COLS_SHOWN` (12) is a third bound, and it is on *views* rather than on the log.** The
-    modal's Data column renders one span per column name plus one per value — four per changed field
-    on an update — uncapped in the table's width, times `LOG_CAP` rows: **23,000 views at 10 table
-    columns, 63,000 at 30 and 123,000 at 60** (counted, not estimated), in a list showing about
-    twenty, paid by every layout and paint pass for as long as the modal is open. Those totals are
-    no longer all resident — the modal's list is a `virtual_stack` now, so only the visible rows are
-    built — and the cap stands anyway, because the argument for it was never the total. Twelve
-    because that column is one non-wrapping line already being scrolled horizontally to read: past a
-    dozen `col=value` pairs nobody is reading it as a line, they are reading the export. The log
-    keeps every column and `log_result_set` exports every column, which is what makes truncating the
-    line acceptable at all — `the_export_still_carries_the_columns_the_line_does_not` is the pin on
-    that half. `data_overflow_label(total)` is the disclosure (`, +48 more`) and is separate from the
-    constant for the reason `row_overflow_sentence` is separate from `ROW_VIEW_CAP`: a line that
-    silently stops at twelve of sixty and looks like the whole change is the defect this would
-    otherwise introduce.
+    **The modal's table is a projection from here too, and it heads its columns as the file does.**
+    `log_columns(entries, cols)` is the union of names `log_result_set` used to compute inline —
+    factored out, and called by both, so the screen and the file cannot disagree about which value
+    sits under which heading after an `ALTER` (`a_change_shows_under_the_names_it_was_recorded_with`
+    asserts the two lists equal). The modal asks it after every poll that lands, so it skips a run
+    of entries sharing one `Arc` column list and one width rather than re-walking each.
+    `table_cells(entry, headings, cols)` is one row of it as `LogCell`s: `Value` (an insert's new
+    value, a delete's last-seen one, a value an update left alone), `Changed(old, new)`, or
+    `Missing` for a column the entry was not recorded with — rendered empty, not borrowed from a
+    neighbour. Every string goes through `text::cell_line`, which is what keeps the view's
+    one-line-per-row promise (`the_table_cells_show_each_kind_whole` feeds it a newline). The
+    private `names_of`, `width_of`, `name_at` and `entry_indices` are shared by the two projections.
+    `kind_counts` gives the filter pills a `KindCounts`, whose `of(None)` is the whole log
+    (`the_pills_count_each_kind_and_all`), and `action_label` is public because the rows print it.
+    **The table carries every watched column, uncapped.** The cap it once had was on a single
+    *Data* column of `col=value` spans, unreadable as one line past a dozen; with a column per
+    watched column there is no such line, and since the list is a `virtual_stack` a wide table costs
+    views only in the twenty-odd mounted rows, not the 23,000/63,000/123,000 counted at 10/30/60
+    columns when every row was built. `the_export_carries_every_column_of_a_wide_change` pins the
+    export's half.
   - `activity.rs` — the **Server Activity** panel's model and every decision it makes about a
     snapshot of server sessions: no DB, no timer, no UI. `SessionInfo` is engine-neutral by
     construction (`id`/`user`/`client`/`database`/`state`/`sql`/`seconds`/`blocked_by`), so a third
@@ -16574,6 +16584,14 @@ existing prose was left alone.
       paint, and `None` once `typed` already *is* an option in any case — typing `int` with `int` and
       `integer` both listed is a whole answer, and a ghost offering `eger` there would turn the Tab
       that moves on into the Tab that changes the value.
+      **`cell_line(Option<&str>)` is the one definition of "one line" for a fixed-row table** —
+      Compare results' and the Live monitor's: `NULL` for a null, every mandatory break (UAX #14
+      BK/CR/LF/NL) as a space with a CRLF as one, cut at `CELL_LINE_CHARS` (120) ending in `…`
+      (`a_cell_line_is_one_short_line`). Both tables are `VirtualItemSize::Fixed` stacks, so a value
+      that shaped to two lines would paint across the row below (the Floem gotcha); the cut bounds
+      what a column measures, while the comparison and the export still read the whole value. It
+      lived as `result_diff`'s private `table_value` and, before that, as the monitor view's own
+      `cell`/`is_line_break` — two copies of one promise, now one.
     - `stats.rs` — table statistics: `TableStats`/`IndexStats`/`SchemaStats`, `format_bytes`
       (1024-based, IEC units), `format_age`, and the honesty types. Every figure is an `Option`
       because the engines publish different facts — SQLite's sizes are exact, read from `dbstat`,
@@ -23327,8 +23345,16 @@ existing prose was left alone.
     `pill_active_bg`/`pill_active_text` when `on`, `text_dim` with a `pill_hover_bg` hover when not.
     The designer's *Table | Columns | Indexes …* strip and Server Variables' *Variables | Status*
     switch both call it, so the two cannot drift apart again — the switch wore Server Activity's
-    underlined labels until the user asked for it to match the designer's tabs. Compare results'
-    row filter is a third caller, with a coloured dot before each label. Server Activity's
+    underlined labels until the user asked for it to match the designer's tabs. **`count_pill`** is
+    the third caller — the filter pill with a count, shared by Compare results' *All · Changed ·
+    Added · Removed* and the Live monitor's *All · Inserts · Updates · Deletes*: a coloured dot
+    naming the kind (none for *All*), the name, the count in `text_faint` while inactive, wrapped in
+    `in_ring_button` at radius 6 so the focus outline follows its corners, Enter or Space picking.
+    On the active pill the dot takes `pill_active_text`, because Compare's *Changed* blue vanished
+    into the pill's fill. Beside it, the fixed-row tables' cell faces: `cell_text` (one line in a
+    `fn() -> Color`, ending in `…`), `struck_text` — Floem 0.2's text has no line-through, so it lays
+    a 1px absolute rule over the text at `inset_top_pct(52)` — and `transition_text`, `old → new`
+    with the old struck, each side shrinking to its `…` before the arrow does. Server Activity's
     own *Sessions | Locks* switch does not use it either: it is a switch between views of one
     panel, not a modal's sections, and takes `segmented_tabs` below.
     **`segmented_tabs(tabs, current)` is a tab bar** — the tabs in equal shares of one bar
@@ -25471,10 +25497,11 @@ existing prose was left alone.
     statements. What a swap changes is which statement is compared first, never which is called A;
     the notes' *Only in A*/*Only in B* follow the same rule.
     **Then the controls**: on the left the filter pills *All · Changed · Added · Removed*, each with
-    its count, on `widgets::pill_tab_style` with a coloured dot naming each kind. On the active pill
-    the dot takes `theme::pill_active_text`, since the *Changed* blue vanished into the pill's fill;
-    an inactive pill keeps the kind's colour. Each pill is wrapped in `widgets::in_ring_button` at
-    radius 6, so the focus outline follows its corners — Tab stops `PILLS_TAB` 6–9, after the ⇄
+    its count, each a `widgets::count_pill` (shared with the Live monitor's) with a coloured dot
+    naming its kind. On the active pill the dot takes `theme::pill_active_text`, since the
+    *Changed* blue vanished into the pill's fill; an inactive pill keeps the kind's colour. Each
+    pill is in the ring at radius 6, so the focus outline follows its corners — Tab stops
+    `PILLS_TAB` 6–9, after the ⇄
     (`SWAP_TAB` 5), Enter or Space picking. On the right **one picker, *Match rows by*** — *Whole
     row* or any shared column, a `table_designer::focusable_owned_dropdown`, `PICKER_TAB` 10, then
     Close (`ACTION_TAB`) and the title's ✕; it starts on `result_diff::suggested_key`. The label and
@@ -25500,17 +25527,18 @@ existing prose was left alone.
     `container` rather than the stack. **The column widths are fixed for the whole outcome**: each is
     its header and the three values longest by characters, measured (`measure_text_px_at`) and
     clamped to 40–360 — shaping every cell of a large result would stall the open — so the content
-    width does not depend on which rows are mounted, the problem the monitor's monotone `widest`
-    answers. They are stored **unscaled** in `Widths` and scaled where a style reads them, so an
+    width does not depend on which rows are mounted, the problem the monitor's `ColumnWidths`
+    answers for a log that is still growing. They are stored **unscaled** in `Widths` and scaled where a style reads them, so an
     interface-scale change with the modal open moves the header and the rows together, as the text
     inside them moves.
-    **The colours take after the Live monitor**: *CHANGED* in `theme::chip_active`, the monitor's
-    UPDATE colour; *ADDED* in its `new_color` (`pub(crate)` for this); *REMOVED* in a fixed lighter
-    red, `rgb(D0, 6B, 6B)`, because the monitor's old-value red is too dark to read struck through.
-    A removed row's values and a changed cell's old value are **struck through** — and Floem 0.2's
-    text has no line-through, so `struck` lays a 1px absolute rule over the text at
-    `inset_top_pct(52)`. A changed cell reads `old → new`, the old struck red and the new green; a
-    changed row's unchanged values are `text_dim`. Every colour reaches its style as a
+    **The colours are the Live monitor's**: *CHANGED* in `theme::chip_active`, the monitor's
+    UPDATE colour; *ADDED* in its `new_color` and *REMOVED* in its `old_color` (`removed_color`
+    and `added_color` just call them, both `pub(crate)` for this). `old_color` is
+    `rgb(D0, 6B, 6B)`, lightened from the monitor's first `rgb(9D, 34, 34)`, which was too dark to
+    read struck through. A removed row's values and a changed cell's old value are **struck
+    through** with `widgets::struck_text` — Floem 0.2's text has no line-through — and a changed cell
+    is `widgets::transition_text`, `old → new`, the old struck red and the new green; a changed
+    row's unchanged values are `cell_text` in `text_dim`. Every colour reaches its style as a
     `fn() -> Color`, as the themable-colour invariant asks. What the table cannot show it says in
     its own area: *No differences.*, or *No changed rows.* and its siblings for an empty filter; and
     a key one side lacks, `DiffError::MissingKey`'s sentence, in the error colour, with the footer's
@@ -29638,12 +29666,33 @@ existing prose was left alone.
     thread (`export_erd`) and writes the bytes it returns.
   - `monitor_view.rs` — the **Live Monitor** modal (`monitor_overlay`), opened from the results
     title bar with the tab's `conn_id` and the shown result's own table. It renders `overlay.monitor_log` — built
-    by the app's poll loop through `core::monitor::diff_snapshots` — as a Time·Action·ID·Data table,
-    and owns *none* of the polling: closing the modal flips `overlay.monitor_open` false, and that
-    is what stops the loop.
+    by the app's poll loop through `core::monitor::diff_snapshots` — as a table of Time, Action and
+    one column per watched column (the key is just one of them), coloured as Compare results
+    colours its differences, and owns *none* of the polling: closing the modal flips
+    `overlay.monitor_open` false, and that is what stops the loop.
+    **The layout is Compare results'**, at its width (`modal_w(920)`, `MON_H` 560). The title row is
+    its own `title_bar` — *Live monitor*, the watched `database.table` in mono `text_dim`, a pill
+    badge whose dot says *Watching* (`new_color`) or *Paused* (`theme::plan_warn`), and the ✕ in the
+    ring at `TITLE_CLOSE_TAB`; `modal_title` takes only a string. Under it, the filter pills *All ·
+    Inserts · Updates · Deletes* with their counts (`widgets::count_pill`, `PILLS_TAB` 6–9, Enter
+    or Space picking) on the left, and Pause, Clear, Export and the interval dropdown on the right.
+    The filter is an `RwSignal<Option<ChangeKind>>`, the counts a memo over
+    `monitor::kind_counts`. The footer is `modal_footer_split`: `footer_line` on the left and a
+    Neutral **Close** at `ACTION_TAB` — Neutral as Compare's is, the footer offering no decision to
+    affirm. The cells come from `monitor::table_cells`: an insert's values in `new_color`, a
+    delete's struck through in `old_color` (`widgets::struck_text`), an update's changed values
+    `old → new` (`widgets::transition_text`) beside its unchanged ones in `text_dim`, and a
+    `LogCell::Missing` empty. The headings are `monitor::log_columns` in a memo — the export's own
+    union of names, so the screen and the file head their columns alike. `old_color` is
+    `rgb(D0, 6B, 6B)` and `pub(crate)`, Compare's `removed_color` calling it; the darker red it
+    replaced could not be read struck through. Every colour, the pills' dots and the Action label
+    included, reaches its style through `kind_color`'s `fn() -> Color`.
     **The table is built once and diffed, not rebuilt per poll**, and the two halves of that are one
-    change. The body's `dyn_container` reads a **memo** of `log.is_empty()`: reading the log itself
-    subscribed to it, and `dyn_container` does not diff — so every poll that landed a single change
+    change. The body's `dyn_container` reads a **memo**, `Body` — `Waiting` for an empty log (the
+    *Paused.*/*Waiting…* face), `NoneOf(kind)` when the picked pill's kind has none (*No inserts
+    yet.*), `Table(headings)` otherwise — so it rebuilds when what the area *is* changes, or when
+    an `ALTER` changes the columns, never per poll. Reading the log there directly used to
+    subscribe to it, and `dyn_container` does not diff — so every poll that landed a single change
     tore down and rebuilt the header, both scrolls and up to `LOG_CAP` rows, cloning the log twice on
     the way. The list jumped to the top (a fresh scroll starts at zero, and `follow` is false exactly
     when the reader has scrolled away to read history) and the header desynchronised from the body
@@ -29659,12 +29708,11 @@ existing prose was left alone.
     measured against): **1.19 / 2.81 / 5.34 ms per landing poll at 10 / 30 / 60 table columns**, on
     the UI thread, at an interval as short as a second. A
     memo of `Vec<u64>` is 8 KiB at `LOG_CAP` and copies in microseconds, and `entry_row(log, seq,
-    cols)` then clones the *one* entry it is for — which floem asks for only when the key is new.
+    …)` then clones the *one* entry it is for — which floem asks for only when the key is new.
     The log is appended in ascending `seq` and never reordered, so that lookup is a binary search; a
     `seq` the log no longer holds (the window slid while the row was being built) renders nothing,
-    which is what the row would have shown anyway. The Data column inside it is bounded at
-    `monitor::DATA_COLS_SHOWN` with `data_overflow_label` saying so — see that entry for the view
-    counts.
+    which is what the row would have shown anyway. The filter is applied in that memo — it picks
+    which sequence numbers — so switching pills rebuilds nothing but the rows that come into view.
     **The list is a `virtual_stack` over a `LogSeqs` row source**, and this paragraph used to say
     the opposite. A `dyn_stack` built every entry: at `LOG_CAP` that is 1,000 rows of fifteen-odd
     text views apiece, each carrying its own shaped text layout. Measured on the real app against
@@ -29694,30 +29742,33 @@ existing prose was left alone.
     **Two further things keep `Fixed`'s promise, and neither is the row's own style.** `entry_row`'s
     missing-`seq` slot is `empty().style(|s| s.height(mon_row_h()))` rather than `widgets::nothing()`
     — `nothing()` is `display: none`, so it occupies zero rows under a stack that has already
-    reserved 29px for it and puts every later row in the window that far above its place. And `cell`
-    flattens Unicode's mandatory line breaks to a space (UAX #14 BK/CR/LF/NL, through
-    `is_line_break`, with a CRLF collapsed as one break so the value does not gain a column), because
-    "a change row is always one line" is a property of what `cell` hands `text()` and not of the row:
-    a watched `TEXT`/`VARCHAR` column holding an address, a note or pretty-printed JSON is the
-    ordinary case, and it shaped to two lines, laid out past its own box and painted across the row
-    below. `a_cell_holding_a_newline_is_flattened_to_one_line` asserts it where it is decided — the
-    premise was stated in three places and checked in none. The export path (`log_result_set`) is
-    deliberately not routed through `cell` and keeps the engine's value verbatim.
-    **The width objection the old paragraph raised is answered rather than withdrawn.** The rows are
-    content-sized so a long change list scrolls horizontally instead of wrapping, and the table
-    header mirrors the body's `hscroll`; with only the visible rows mounted, the widest row in the
-    *window* would set the content width, so a range that shrank past the current offset would drag
-    the body and the header sideways under a *vertical* gesture. `widest` is the widest row ever
-    seen — monotone, never shrinking, and needing no reset because the signal is owned by the
-    non-empty arm of the body container, whose key *is* the empty↔non-empty edge, so Clear disposes
-    it and a refilling log gets a fresh zero — and the stack's
-    `min_width` reads it, so the range can only grow. That failure is **reasoned from the layout,
-    not observed**: synthetic shift+wheel never reached floem's horizontal scroll, so unlike the
-    memory figures above nothing measured it. The Data column's `DATA_COLS_SHOWN` cap stays, on the
-    line rather than on the list. Three icon buttons sit in the sub-header between the status line and
-    the interval dropdown — Pause, Clear, Export — and they join the modal's `FocusRing` at
-    tabindex 10/11/12 with the dropdown moved to 13, so a monitor is watchable with both hands off
-    the mouse. **Pause holds the fetch, not the loop**: `monitor_tick` reads the three signals and
+    reserved 29px for it and puts every later row in the window that far above its place. And every
+    value is flattened to one line before it reaches `text()` — by `core::monitor::table_cells`,
+    through `text::cell_line` — because "a change row is always one line" is a property of what the
+    row is handed and not of the row: a watched `TEXT`/`VARCHAR` column holding an address, a note
+    or pretty-printed JSON is the ordinary case, and it shaped to two lines, laid out past its own
+    box and painted across the row below. The premise was stated in three places and checked in
+    none until the view's own `cell` was tested; the flattening now lives in the core beside Compare
+    results', one definition for both tables, pinned by `a_cell_line_is_one_short_line` and
+    `the_table_cells_show_each_kind_whole`. The export path (`log_result_set`) is deliberately not
+    routed through it and keeps the engine's value verbatim.
+    **The width objection the old paragraph raised is answered rather than withdrawn.** With only
+    the visible rows mounted, the widest row in the *window* would set the content width, so a
+    range that shrank past the current offset would drag the body and the header — which mirrors
+    the body's `hscroll` — sideways under a *vertical* gesture. So the widths are decided from the
+    **log**, never from the mounted rows: `ColumnWidths` measures each entry once, as it lands, and
+    only shapes a value longer by characters than its column's longest so far, so a poll costs a
+    few measurements rather than one per cell. A column only ever widens, clamped 40–360; the
+    widths are kept **unscaled** in an `RwSignal<Rc<Vec<f64>>>` and scaled where a style reads them
+    (`col_w`, `table_w`), so an interface-scale change moves the header and the rows together. It
+    starts over when the headings change or the log is cleared — its last `seq` going back is the
+    signal — and the stack's `min_width` is `table_w(widths)`, known from the log rather than from
+    the rows that happen to be mounted. It replaced a monotone `widest` kept up through `on_resize`
+    on the mounted rows. The sideways drag it prevents is **reasoned from the layout, not
+    observed**: synthetic shift+wheel never reached floem's horizontal scroll, so unlike the memory
+    figures above nothing measured it. Pause, Clear and Export sit left of the interval dropdown and
+    join the modal's `FocusRing` after the pills, at tabindex 10/11/12 with the dropdown at 13, so a
+    monitor is watchable with both hands off the mouse. **Pause holds the fetch, not the loop**: `monitor_tick` reads the three signals and
     switches on `core::monitor::tick_action(open, superseded, paused) -> Stop | Reschedule | Fetch`,
     which is where the decision lives so it can be tested — the arms sat inside a floem-scheduled
     function no test could call, and swapping two statements would have turned Pause into Stop with
@@ -29758,18 +29809,23 @@ existing prose was left alone.
     between blocks, and for a while the arm rested on a fact that no longer implied anything. What
     holds it now is the absence of any control bound to this run, which is exactly what
     `stoppable: false` says.
-    `status_line(export_err, poll_err, paused, partial, capped)` decides what the sub-header says:
-    an error takes the line outright, worst-to-mislead first (a failed export beats a poll error,
-    because the user believes they have a file and doesn't), and otherwise it is a lead — `Watching`
-    or `Paused` — plus **every** caveat that applies, joined. `partial` (only the first `ROW_CAP`
-    rows are watched) and `capped` co-occur and neither replaces the other. `capped` is
+    `footer_line(export_err, poll_err, partial, capped, events, since)` decides what the footer
+    says: an error takes the line outright in `Tone::Error`, worst-to-mislead first (a failed export
+    beats a poll error, because the user believes they have a file and doesn't). Otherwise it is
+    *"200 events since 11:48:12 · newest at the bottom"* in `Tone::Calm`, `since` being the oldest
+    entry the log still holds, or *No changes yet* for an empty log; with a caveat the tail is
+    replaced by **every** caveat that applies, joined, in `Tone::Warn`. `partial` (only the first
+    `ROW_CAP` rows are watched) and `capped` co-occur and neither replaces the other. Paused is the
+    title's badge, not this line. The line ends in an ellipsis and its tooltip carries the whole of
+    it, since a poll error can outrun the footer. `capped` is
     `overlay.monitor_dropped > 0`, accumulated from `monitor::trim_log`'s return, **not** the log's
     length: at exactly `LOG_CAP` nothing has been dropped yet, and the caveat used to be printed
     there anyway. An export failure that lands after the modal has closed goes to the shared error
     modal rather than to `monitor_export_err`, which nothing renders once it is shut, and the
     message is passed through as the pipeline wrote it — a second `Export failed —` in front of it
     read "Export failed — Export failed: Access is denied". `Tone` resolves to a `fn() -> Color`, per the themable-colour invariant.
-    `entry_row`'s per-kind label colour is the same rule, found the hard way: the rows are keyed on
+    `kind_color`, behind the Action label and the pills' dots, is the same rule, found the hard way
+    in `entry_row`: the rows are keyed on
     `MonitorEntry::seq`, so nothing rebuilds them on a theme switch and one resolved `Color` in a
     three-arm `match` left UPDATE in the old theme beside INSERT and DELETE in the new one — see the
     invariant for the shape.
@@ -39083,22 +39139,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   `conn_import::ROW_VIEW_CAP` took a cap instead: its rows are two lines or three, so virtualising
   them means a `VirtualItemSize::Fn` restating the layout, with no screenshot harness to catch it
   being wrong. **"Always one line" is a promise about the row's *content*, so something has to keep
-  it**: `monitor_view::cell` flattens Unicode's mandatory line breaks before the text reaches
+  it**: `core::text::cell_line` flattens Unicode's mandatory line breaks before the text reaches
   `text()`, because a watched `TEXT` column holding an address or pretty-printed JSON shapes to two
   lines, lays out past its own box and paints across the row below — the premise was stated in three
-  places and checked in none until `a_cell_holding_a_newline_is_flattened_to_one_line`. Compare
-  results' table makes the same promise and `core::result_diff::table_rows` keeps it, pinned by
-  `a_table_cell_is_one_short_line`. **And a slot
+  places and checked in none until a test held it. Both fixed-row tables keep it through that one
+  function — the monitor's via `monitor::table_cells`, Compare results' via
+  `result_diff::table_rows` — pinned by `a_cell_line_is_one_short_line`,
+  `the_table_cells_show_each_kind_whole` and `a_table_cell_is_one_short_line`. **And a slot
   that renders nothing still owes its height**: `widgets::nothing()` is `display: none`, so
   `entry_row`'s missing-`seq` branch is an `empty()` given `mon_row_h()`; hiding it puts every later
   row in the window 29px above the space the stack reserved for it. **And a vertically-virtualised
   list of content-sized rows has a horizontal problem
   too**: only the mounted rows contribute to the content width, so it moves as you scroll, and
   anything mirroring the scroll offset — the monitor's table header — is dragged sideways by a
-  purely vertical gesture. The answer there is a monotone `min_width`: the widest row *seen*, never
-  shrinking, and owned by whatever scope the list's own emptiness disposes, so that clearing the
-  list is what resets it rather than an effect watching for it (reasoned from the layout rather than
-  observed — see `monitor_view`'s entry).
+  purely vertical gesture. The answer is a `min_width` decided from the **data** rather than from
+  the mounted rows: Compare results measures its columns once per outcome, and the monitor's
+  `ColumnWidths` measures each entry as it lands and only ever widens (reasoned from the layout
+  rather than observed — see `monitor_view`'s entry).
 - **Padding on a virtual stack is an arithmetic error — put it on a parent.** `virtual_stack`
   derives start, end and `before_size` from `viewport.y0 / item_size` with no knowledge of any
   padding of its own, and `view_style` forces `height(content_size)`, which taffy reads as a border

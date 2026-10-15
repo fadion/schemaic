@@ -5,19 +5,26 @@
 //! table)`). The app polls that table on an interval, diffs each snapshot against
 //! the previous one (`schemaic_core::monitor`), and appends the resulting
 //! inserts/updates/deletes to `overlay.monitor_log`; this modal renders that log
-//! as a scrollable table (Time · Action · ID · Data). Closing (✕ / Esc /
-//! backdrop) sets `overlay.monitor_open` false, which stops the poll loop.
+//! as a table — Time, Action, then one column per watched column, coloured as
+//! Compare results colours its differences: an insert green, a delete red and
+//! struck through, an update's changed values `old → new` beside the values it
+//! left alone. Closing (✕ / Esc / Close) sets `overlay.monitor_open` false, which
+//! stops the poll loop.
 //!
-//! Three controls sit left of the interval dropdown, and they are what make the
-//! log something you can *use* rather than only watch: **Pause** holds the poll
-//! (the loop keeps re-arming and skips the fetch, so resuming is free),
-//! **Clear** empties the log without disturbing the baseline snapshot, and
-//! **Export** writes it to a file through the ordinary
-//! [`schemaic_core::export`] renderers — the log is projected to a `ResultSet`
-//! by [`schemaic_core::monitor::log_result_set`] so no second renderer exists.
+//! The title names the table and wears a *Watching* or *Paused* badge. Under it,
+//! the filter pills *All · Inserts · Updates · Deletes*, each with its count, and
+//! three controls left of the interval dropdown, which are what make the log
+//! something you can *use* rather than only watch: **Pause** holds the poll (the
+//! loop keeps re-arming and skips the fetch, so resuming is free), **Clear**
+//! empties the log without disturbing the baseline snapshot, and **Export**
+//! writes it to a file through the ordinary [`schemaic_core::export`] renderers —
+//! the log is projected to a `ResultSet` by
+//! [`schemaic_core::monitor::log_result_set`] so no second renderer exists.
 //! Export matters most on a delete, where the log is the only remaining record
-//! of a row the database no longer has.
+//! of a row the database no longer has. The footer counts the log, or says what
+//! went wrong and what the log cannot see.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,22 +37,25 @@ use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::{Point, Rect};
 use floem::peniko::Color;
 use floem::prelude::*;
-use floem::reactive::create_effect;
+use floem::reactive::{Memo, create_effect, create_memo};
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector, virtual_stack};
 
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::monitor::{
-    ChangeKind, DATA_COLS_SHOWN, LOG_FORMATS, RowChange, data_overflow_label, log_result_set,
+    ChangeKind, KindCounts, LOG_FORMATS, LogCell, action_label, kind_counts, log_columns,
+    log_result_set, table_cells,
 };
 
 use crate::settings::focusable_dropdown;
 use crate::theme::{font_body, font_label};
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
-    autohide_state, follow_after_scroll, loading_dots, modal_h, modal_w, panel_style,
-    shift_hscroll, thin_scroll, with_scroll_gesture,
+    ACTION_TAB, ActionKind, TITLE_CLOSE_TAB, action_button, autohide_state, cell_text, count_pill,
+    follow_after_scroll, in_ring_button, loading_dots, measure_text_px_at, modal_footer_split,
+    modal_h, modal_pad_h, modal_w, panel_style, shift_hscroll, struck_text, thin_scroll,
+    transition_text, with_scroll_gesture,
 };
-use crate::{MenuEntry, OverlayUi, PopupAnchor, TabsActions};
+use crate::{MenuEntry, MonitorEntry, OverlayUi, PopupAnchor, TabsActions, icons, theme};
 
 /// The log's rows are shorter than a chat bubble, so it counts as "at the bottom"
 /// a little tighter than the AI panel's `follow_slack`. Scaled for the reason
@@ -53,37 +63,40 @@ use crate::{MenuEntry, OverlayUi, PopupAnchor, TabsActions};
 fn monitor_follow_slack() -> f64 {
     theme::scaled(24.0)
 }
-use crate::{MonitorEntry, icons, theme};
 
-/// Modal size (fixed so the log scrolls within it). The width carries the
-/// sub-header's three icon buttons and the interval dropdown alongside a status
-/// line that has to stay readable — at 660 the partial-window warning wrapped
-/// into the controls.
+/// Modal size (fixed so the log scrolls within it). Compare results' width: a
+/// column per watched column wants the room.
 fn mon_w() -> f64 {
-    modal_w(760.0)
+    modal_w(920.0)
 }
 /// The modal's height at 100% — passed through [`crate::widgets::modal_h`] at the
 /// call site, which scales it and caps it against the window. See
 /// `table_designer::PANEL_H` for why this comment used to claim the opposite.
-const MON_H: f64 = 510.0;
+const MON_H: f64 = 560.0;
+
+/// The Tab order, top to bottom: the four filter pills, Pause, Clear, Export,
+/// the interval, then Close (`ACTION_TAB`) and the title's ✕.
+const PILLS_TAB: u32 = 6;
+const PAUSE_TAB: u32 = 10;
+const CLEAR_TAB: u32 = 11;
+const EXPORT_TAB: u32 = 12;
+const INTERVAL_TAB: u32 = 13;
 
 // Column widths + shared row metrics (header and rows must agree so they align —
 // which is also why they scale together).
 fn time_w() -> f64 {
-    theme::scaled(54.0)
+    theme::scaled(64.0)
 }
 fn act_w() -> f64 {
     theme::scaled(66.0)
 }
-fn id_w() -> f64 {
-    theme::scaled(72.0)
-}
 fn col_gap() -> f64 {
-    theme::scaled(10.0)
+    theme::scaled(24.0)
 }
-fn row_pad_h() -> f64 {
-    theme::scaled(14.0)
-}
+/// A watched column's narrowest and widest, **unscaled** — see [`ColumnWidths`].
+const MIN_COL_W: f64 = 40.0;
+const MAX_COL_W: f64 = 360.0;
+
 /// One change row's **whole** vertical box, gap included.
 ///
 /// **Decreed rather than derived**, and the row is given this height rather than
@@ -98,10 +111,10 @@ fn row_pad_h() -> f64 {
 ///
 /// **"Always one" is enforced, not observed.** The values in a change row are
 /// whatever the engine stored, and a `TEXT` column holding a newline shapes to
-/// two lines — so [`cell`] flattens line breaks on the way to `text()`, and
-/// [`entry_row`]'s empty slot is given this height rather than hidden. Both are
-/// this contract, not tidiness: `Fixed` is a promise about the child's height
-/// that nothing in floem checks.
+/// two lines — so `monitor::table_cells` flattens every value through
+/// `text::cell_line` on the way to `text()`, and [`entry_row`]'s empty slot is
+/// given this height rather than hidden. Both are this contract, not tidiness:
+/// `Fixed` is a promise about the child's height that nothing in floem checks.
 fn mon_row_h() -> f64 {
     theme::scaled(29.0)
 }
@@ -127,13 +140,124 @@ impl VirtualVector<u64> for LogSeqs {
     }
 }
 
-/// Old-value tint (removed) and new-value tint (added), shared by updates + inserts
-/// — and the new one by Compare results' added rows (`result_diff_view`).
-fn old_color() -> Color {
-    Color::rgb8(0x9D, 0x34, 0x34)
+/// Old-value tint (a delete, an update's old value) and new-value tint (an
+/// insert, an update's new value) — Compare results' removed and added rows too
+/// (`result_diff_view`). The red is light enough to read struck through at body
+/// size on a dark panel; the monitor's first, darker one was not.
+pub(crate) fn old_color() -> Color {
+    Color::rgb8(0xD0, 0x6B, 0x6B)
 }
 pub(crate) fn new_color() -> Color {
     Color::rgb8(0x71, 0xC3, 0x71)
+}
+
+/// A kind's colour — its Action label, its pill's dot. **A `fn() -> Color`**:
+/// the rows are keyed on `entry.seq`, so a theme switch rebuilds none of them,
+/// and `theme::chip_active()` resolved at build left the UPDATE labels in the
+/// previous theme's colour beside INSERT and DELETE labels that repainted.
+fn kind_color(kind: ChangeKind) -> fn() -> Color {
+    match kind {
+        ChangeKind::Insert => new_color,
+        ChangeKind::Update => theme::chip_active,
+        ChangeKind::Delete => old_color,
+    }
+}
+
+/// The watched columns' widths, **grown as entries arrive and never shrunk**.
+///
+/// The rows are a virtual stack, so only the visible ones exist to be measured —
+/// and a width that followed them would move every column as you scroll, the
+/// header with it. So each entry is measured once, as it lands, and a column only
+/// ever widens: a scrollbar reads a range that grows as more content arriving,
+/// and one that shrinks as the view moving. Only a value longer by characters than the column's
+/// longest so far is shaped, so a poll costs a few measurements rather than one
+/// per cell.
+///
+/// Kept **unscaled** and scaled where a style reads them, so an interface-scale
+/// change with the modal open moves the header and the rows together.
+#[derive(Default)]
+struct ColumnWidths {
+    /// The columns these widths are for.
+    heads: Vec<String>,
+    /// Each column's longest value so far, in characters.
+    longest: Vec<usize>,
+    widths: Vec<f64>,
+    /// The last entry measured.
+    upto: Option<u64>,
+}
+
+impl ColumnWidths {
+    /// Measure the entries not measured yet — all of them, from each column's
+    /// heading up, when the columns changed or the log was cleared (its last
+    /// `seq` went back). `true` when a width moved.
+    fn take(&mut self, entries: &[MonitorEntry], heads: &[String], cols: &[String]) -> bool {
+        let unit = theme::scaled(1.0);
+        let fit = |px: f64| ((px / unit).ceil() + 2.0).clamp(MIN_COL_W, MAX_COL_W);
+        let mut moved = false;
+        if self.heads != heads || entries.last().map(|e| e.seq) < self.upto {
+            self.heads = heads.to_vec();
+            self.longest = vec![0; heads.len()];
+            self.widths = heads
+                .iter()
+                .map(|h| fit(measure_text_px_at(h, font_label())))
+                .collect();
+            self.upto = None;
+            moved = true;
+        }
+        let upto = self.upto;
+        for e in entries.iter().filter(|e| upto.is_none_or(|u| e.seq > u)) {
+            for (i, c) in table_cells(e, heads, cols).into_iter().enumerate() {
+                let (chars, shown) = match c {
+                    LogCell::Value(v) => (v.chars().count(), v),
+                    LogCell::Changed(a, b) => {
+                        let s = format!("{a} → {b}");
+                        (s.chars().count(), s)
+                    }
+                    LogCell::Missing => continue,
+                };
+                if chars <= self.longest[i] {
+                    continue;
+                }
+                self.longest[i] = chars;
+                let w = fit(measure_text_px_at(&shown, font_body()));
+                if w > self.widths[i] {
+                    self.widths[i] = w;
+                    moved = true;
+                }
+            }
+        }
+        if let Some(e) = entries.last() {
+            self.upto = Some(e.seq);
+        }
+        moved
+    }
+}
+
+/// Watched column `i`'s width at the current scale.
+fn col_w(widths: RwSignal<Rc<Vec<f64>>>, i: usize) -> f64 {
+    theme::scaled(widths.with(|w| w.get(i).copied().unwrap_or(MIN_COL_W)))
+}
+
+/// The table's full width: its padding, Time, Action, every watched column and
+/// the gaps between them.
+fn table_w(widths: RwSignal<Rc<Vec<f64>>>) -> f64 {
+    let n = widths.with(|w| w.len());
+    modal_pad_h() * 2.0
+        + time_w()
+        + act_w()
+        + (0..n).map(|i| col_w(widths, i)).sum::<f64>()
+        + col_gap() * (n + 1) as f64
+}
+
+/// What the area under the controls shows.
+#[derive(Clone, PartialEq)]
+enum Body {
+    /// The log is empty.
+    Waiting,
+    /// The log holds nothing of the kind the filter picked.
+    NoneOf(ChangeKind),
+    /// The table, under these columns.
+    Table(Vec<String>),
 }
 
 pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> impl IntoView {
@@ -183,9 +307,6 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 paused.set(false);
                 export_err.set(None);
             });
-            // One control, but it still gets a ring: without one the root has no
-            // Tab handler, so Tab falls through to floem's whole-window traversal
-            // and walks out of the modal into the workspace behind it.
             let ring = crate::widgets::FocusRing::new();
             // Filled once the Export button exists, so its menu opens under the
             // button rather than at the last cursor position — which, reached by
@@ -215,64 +336,36 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 });
             });
 
-            // Modal header — matches `modal_title` (title 15/bold, dim→bright X,
-            // 14/10 padding, bottom separator) but with a dynamic title string.
-            let heading = title
-                .get_untracked()
-                .map(|t| format!("Live monitor — {t}"))
-                .unwrap_or_else(|| "Live monitor".to_string());
-            let close_x = close.clone();
-            let modal_header = h_stack((
-                text(heading).style(|s| {
-                    s.font_size(theme::scaled_font(15.0))
-                        .font_bold()
-                        .color(theme::text())
-                }),
-                empty().style(|s| s.flex_grow(1.0_f32)),
-                container(icons::icon(icons::X, 16.0))
-                    .on_click_stop(move |_| (close_x)())
-                    .style(|s| {
-                        s.flex_shrink(0.0_f32)
-                            .items_center()
-                            .color(theme::text_dim())
-                            .hover(|s| s.color(theme::text()))
-                    }),
-            ))
-            .style(|s| {
-                s.width_full()
-                    .flex_row()
-                    .items_center()
-                    .padding_horiz(theme::scaled(14.0))
-                    .padding_vert(theme::scaled(10.0))
-                    .border_bottom(1.0)
-                    .border_color(theme::border())
-            });
+            let filter: RwSignal<Option<ChangeKind>> = RwSignal::new(None);
+            let counts = create_memo(move |_| log.with(|l| kind_counts(l)));
+            // The export's columns: the watched table's, under the names each
+            // entry was recorded with, so a mid-session `ALTER` moves no value
+            // under another column's heading. A memo, so a poll that changes no
+            // column notifies nothing.
+            let heads = create_memo(move |_| log.with(|l| cols.with(|c| log_columns(l, c))));
+            let widths: RwSignal<Rc<Vec<f64>>> = RwSignal::new(Rc::new(Vec::new()));
+            {
+                let measured = RefCell::new(ColumnWidths::default());
+                create_effect(move |_| {
+                    heads.with(|h| {
+                        log.with(|l| {
+                            cols.with(|c| {
+                                let mut m = measured.borrow_mut();
+                                if m.take(l, h, c) {
+                                    widths.set(Rc::new(m.widths.clone()));
+                                }
+                            })
+                        })
+                    });
+                });
+            }
 
-            // Sub-line under the separator: a live note (or the latest poll error)
-            // on the left, then the Pause/Clear/Export controls and the poll-interval
-            // dropdown on the right — inline with the subtitle, below the header's X.
-            let status_text = dyn_container(
-                move || {
-                    status_line(
-                        export_err.get(),
-                        error.get(),
-                        paused.get(),
-                        partial.get(),
-                        // What was actually dropped, not what the length implies:
-                        // a log resting *at* the cap has lost nothing yet.
-                        dropped.get() > 0,
-                    )
-                },
-                move |(msg, tone)| {
-                    text(msg).style(move |s| s.color(tone.color()()).font_size(font_label()))
-                },
-            )
-            .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
+            let modal_header = title_bar(title, paused, close.clone(), ring.clone());
 
             // Pause / Clear / Export, left of the interval dropdown. All three are
             // in the modal's ring, in reading order, so the log is operable without
             // a pointer — a monitor is watched with both hands off the mouse.
-            let pause_btn = crate::widgets::in_ring_button(
+            let pause_btn = in_ring_button(
                 dyn_container(
                     move || paused.get(),
                     // `toolbar_icon` takes a `&'static str`, so the play/pause swap
@@ -305,7 +398,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                     text(t).style(crate::widgets::tooltip_style)
                 }),
                 ring.clone(),
-                10,
+                PAUSE_TAB,
                 true,
                 0.0,
                 move || paused.update(|p| *p = !*p),
@@ -357,7 +450,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
             });
             let clear_click = clear.clone();
             let clear_key = clear.clone();
-            let clear_btn = crate::widgets::in_ring_button(
+            let clear_btn = in_ring_button(
                 crate::widgets::toolbar_icon(
                     icons::TRASH_2,
                     0.0,
@@ -367,7 +460,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 )
                 .tooltip(|| text("Clear the log").style(crate::widgets::tooltip_style)),
                 ring.clone(),
-                11,
+                CLEAR_TAB,
                 true,
                 0.0,
                 move || (clear_key)(),
@@ -409,7 +502,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
             };
             let export_click = export_menu.clone();
             let export_key = export_menu.clone();
-            let export_btn = crate::widgets::in_ring_button(
+            let export_btn = in_ring_button(
                 crate::widgets::toolbar_icon(
                     icons::DOWNLOAD,
                     0.0,
@@ -419,7 +512,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 )
                 .tooltip(|| text("Export the log…").style(crate::widgets::tooltip_style)),
                 ring.clone(),
-                12,
+                EXPORT_TAB,
                 true,
                 0.0,
                 move || {
@@ -432,7 +525,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
             // the control, so the menu opens under the whole button. Set after the
             // button exists, like `table_designer::suggest_chevron`.
             export_anchor.set(Some(export_btn.id()));
-            let controls = h_stack((pause_btn, clear_btn, export_btn))
+            let buttons = h_stack((pause_btn, clear_btn, export_btn))
                 .style(|s| s.flex_row().items_center().flex_shrink(0.0_f32));
 
             let interval_dd = container(focusable_dropdown(
@@ -440,18 +533,24 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 [1u64, 2, 5, 10],
                 interval_label,
                 ring.clone(),
-                13,
+                INTERVAL_TAB,
             ))
             .style(|s| s.width(theme::scaled(84.0)).flex_shrink(0.0_f32));
-            let status = h_stack((status_text, controls, interval_dd)).style(|s| {
+            // The filter pills where the status line was — what that line said
+            // is the title's badge and the footer's now.
+            let controls = h_stack((
+                filter_pills(counts, filter, ring.clone()),
+                empty().style(|s| s.flex_grow(1.0_f32).min_width(theme::scaled(12.0))),
+                buttons,
+                interval_dd,
+            ))
+            .style(|s| {
                 s.width_full()
                     .flex_row()
                     .items_center()
                     .gap(theme::scaled(10.0))
-                    .padding_horiz(theme::scaled(14.0))
-                    .padding_top(theme::scaled(10.0))
-                    // 20px gap down to the table (or the empty-state message).
-                    .padding_bottom(theme::scaled(20.0))
+                    .padding_horiz(modal_pad_h())
+                    .padding_vert(theme::scaled(12.0))
             });
 
             // **A memo, not the log.** `dyn_container` does not diff — it rebuilds
@@ -462,45 +561,67 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
             // scroll starts at zero and `follow` is false exactly when the reader has
             // scrolled away) and the header desynchronised from the body
             // horizontally, so reading history in a live monitor was impossible
-            // except by pausing. The memo fires only on the empty↔non-empty edge.
-            let is_empty = floem::reactive::create_memo(move |_| log.with(|l| l.is_empty()));
+            // except by pausing. The memo fires only when what the area *is*
+            // changes: the log empties or fills, the filter picks a kind the log
+            // has none of, or the columns change.
+            let body = create_memo(move |_| {
+                let n = counts.get();
+                match filter.get() {
+                    _ if n.of(None) == 0 => Body::Waiting,
+                    Some(k) if n.of(Some(k)) == 0 => Body::NoneOf(k),
+                    _ => Body::Table(heads.get()),
+                }
+            });
 
-            // Body: the change table (header + rows), or a centred placeholder while
-            // empty — so an empty monitor shows just "Waiting…", not a bare header.
-            // Rows are content-sized (no wrap), so it scrolls both axes.
             let content = dyn_container(
-                move || is_empty.get(),
-                move |empty_log| {
-                    if empty_log {
+                move || body.get(),
+                move |b| {
+                    let heads = match b {
+                        Body::Table(heads) => Rc::new(heads),
+                        Body::NoneOf(k) => {
+                            let said = match k {
+                                ChangeKind::Insert => "No inserts yet.",
+                                ChangeKind::Update => "No updates yet.",
+                                ChangeKind::Delete => "No deletes yet.",
+                            };
+                            return container(text(said).style(|s| {
+                                s.color(theme::text_dim())
+                                    .font_size(theme::scaled_font(13.0))
+                            }))
+                            .style(|s| s.size_full().items_center().justify_center())
+                            .into_any();
+                        }
                         // `paused` is tracked *here*, inside the empty branch, not in
                         // the outer selector: adding it there would rebuild the whole
                         // table on every pause toggle and throw away its scroll
                         // position, which is the thing someone pauses in order to read.
-                        return container(dyn_container(
-                            move || paused.get(),
-                            move |is_paused| {
-                                if is_paused {
-                                    // Static, not `loading_dots`: cycling dots say
-                                    // "any moment now", and a paused monitor is not
-                                    // waiting for anything.
-                                    return text("Paused.")
-                                        .style(|s| {
-                                            s.color(theme::text_dim())
-                                                .font_size(theme::scaled_font(13.0))
-                                        })
-                                        .into_any();
-                                }
-                                loading_dots("Waiting", theme::text_dim, font_body).into_any()
-                            },
-                        ))
-                        .style(|s| s.size_full().items_center().justify_center())
-                        .into_any();
-                    }
+                        Body::Waiting => {
+                            return container(dyn_container(
+                                move || paused.get(),
+                                move |is_paused| {
+                                    if is_paused {
+                                        // Static, not `loading_dots`: cycling dots say
+                                        // "any moment now", and a paused monitor is not
+                                        // waiting for anything.
+                                        return text("Paused.")
+                                            .style(|s| {
+                                                s.color(theme::text_dim())
+                                                    .font_size(theme::scaled_font(13.0))
+                                            })
+                                            .into_any();
+                                    }
+                                    loading_dots("Waiting", theme::text_dim, font_body).into_any()
+                                },
+                            ))
+                            .style(|s| s.size_full().items_center().justify_center())
+                            .into_any();
+                        }
+                    };
                     // Header: full-width separator bar whose labels scroll
                     // horizontally in sync with the body (reads `hscroll`; never
                     // writes it, and blocks its own wheel — the one-writer rule).
                     let table_header = container(
-                        scroll(header_row())
+                        scroll(header_row(heads.clone(), widths))
                             .scroll_style(|cs| cs.hide_bars(true))
                             .scroll_to(move || Some(Point::new(hscroll.get(), 0.0)))
                             .on_event_stop(EventListener::PointerWheel, |_| {})
@@ -518,77 +639,49 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                     // stays `{0..999}` while the thousand changes it describes move
                     // — and floem reuses a view whose key didn't change, which would
                     // freeze the rendered list at the first thousand while Export
-                    // went on sliding. Nothing hid that before because the whole
-                    // table was being rebuilt per poll.
+                    // went on sliding.
                     //
                     // **And the stack iterates the sequence numbers, not the
                     // entries.** `log.get()` deep-copies the whole
                     // `Vec<MonitorEntry>` — every entry carries the watched
-                    // row's full `Vec<Option<String>>` — and `dyn_stack` copies
-                    // it again into its own `SmallVec`: measured 1.19 / 2.81 /
-                    // 5.34 ms per landing poll at 10 / 30 / 60 table columns,
-                    // on the UI thread, at an interval as short as a second.
-                    // A `Vec<u64>` at `LOG_CAP` is 8 KiB and copies in
-                    // microseconds, and the row builder then clones the *one*
-                    // entry it is for — which floem asks for only when the key
-                    // is new.
-                    let seqs = floem::reactive::create_memo(move |_| {
-                        log.with(|l| l.iter().map(|e| e.seq).collect::<Vec<u64>>())
+                    // row's full `Vec<Option<String>>` — and the stack copies
+                    // it again: measured 1.19 / 2.81 / 5.34 ms per landing poll
+                    // at 10 / 30 / 60 table columns, on the UI thread, at an
+                    // interval as short as a second. A `Vec<u64>` at `LOG_CAP`
+                    // is 8 KiB and copies in microseconds, and the row builder
+                    // then clones the *one* entry it is for — which floem asks
+                    // for only when the key is new. The filter picks which
+                    // sequence numbers, so switching pills rebuilds nothing but
+                    // the rows that come into view.
+                    let seqs = create_memo(move |_| {
+                        let f = filter.get();
+                        log.with(|l| {
+                            l.iter()
+                                .filter(|e| f.is_none_or(|k| e.change.kind == k))
+                                .map(|e| e.seq)
+                                .collect::<Vec<u64>>()
+                        })
                     });
                     // **Only the visible rows are built.** A `dyn_stack` built
                     // all of them, and at `LOG_CAP` that is 1,000 rows of
                     // fifteen-odd text views apiece: measured on MariaDB
                     // 10.11.14 against a ten-column table, the process grew from
                     // 336 MB with an empty log to 813 MB with a full one, dead
-                    // linear at ~0.46 MB per row across 250/500/750/1,000. The
-                    // *data* behind those rows is well under a megabyte in
-                    // total, so effectively all of it was the view tree.
-                    // Windowed, the same full log measures 335 MB.
+                    // linear at ~0.46 MB per row across 250/500/750/1,000.
+                    // Windowed, the same full log measures 335 MB — which is
+                    // also why a row may carry every watched column: a wide
+                    // table costs views only in the twenty-odd rows mounted.
                     //
-                    // `LogSeqs` and the `u64` key keep both of the older list's
-                    // properties — see its doc.
-                    let widest = RwSignal::new(0.0_f64);
+                    // The content width is [`ColumnWidths`]', fixed for what
+                    // the log holds rather than for which rows are mounted.
                     let list = virtual_stack(
                         VirtualDirection::Vertical,
                         VirtualItemSize::Fixed(Box::new(mon_row_h)),
                         move || LogSeqs(seqs.get()),
                         |seq| *seq,
-                        move |seq| {
-                            // **The widest row *seen*, and it never shrinks.**
-                            // These rows are content-sized — the Data column has
-                            // no width, so the list is as wide as its widest
-                            // row — and with only the visible ones mounted that
-                            // maximum would change as you scroll. The header
-                            // mirrors `hscroll`, so a range that shrinks past
-                            // the current offset drags both it and the header
-                            // sideways under a vertical gesture. Monotone, the
-                            // range can only grow, which a scrollbar reads as
-                            // more content arriving rather than as the view
-                            // moving.
-                            //
-                            // **Nothing resets it, and nothing needs to.** The
-                            // signal is owned by this builder, and the builder's
-                            // own key is the empty↔non-empty edge — so Clear
-                            // disposes it and a refilling log gets a fresh zero.
-                            // An effect watching for an empty log would never
-                            // have run.
-                            //
-                            // Reasoned from the layout, not measured: the
-                            // horizontal gesture could not be driven through the
-                            // synthetic-input harness, so the *symptom* this
-                            // prevents was never put on screen.
-                            entry_row(log, seq, cols).on_resize(move |r| {
-                                if r.width() > widest.get_untracked() + 0.5 {
-                                    widest.set(r.width());
-                                }
-                            })
-                        },
+                        move |seq| entry_row(log, seq, heads.clone(), cols, widths),
                     )
-                    .style(move |s| {
-                        s.flex_col()
-                            .padding_horiz(row_pad_h())
-                            .min_width(widest.get() + row_pad_h() * 2.0)
-                    });
+                    .style(move |s| s.flex_col().min_width(table_w(widths)));
                     // **The 8px band is a wrapper's, not the stack's.**
                     // `virtual_stack` derives its window straight from
                     // `viewport.y0 / item_size` and knows nothing about the
@@ -639,14 +732,60 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                         })
                         .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
                     v_stack((table_header, list_scroll))
-                        .style(|s| s.flex_col().flex_grow(1.0_f32).width_full().min_height(0.0))
+                        .style(|s| {
+                            s.flex_col()
+                                .flex_grow(1.0_f32)
+                                .width_full()
+                                .min_height(0.0)
+                                .border_top(1.0)
+                                .border_color(theme::border())
+                        })
                         .into_any()
                 },
             )
             .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
+            let line = create_memo(move |_| {
+                log.with(|l| {
+                    footer_line(
+                        export_err.get(),
+                        error.get(),
+                        partial.get(),
+                        // What was actually dropped, not what the length implies:
+                        // a log resting *at* the cap has lost nothing yet.
+                        dropped.get() > 0,
+                        l.len(),
+                        l.first().map(|e| e.at.as_str()),
+                    )
+                })
+            });
+            let status = label(move || line.with(|(msg, _)| msg.clone()))
+                .style(move |s| {
+                    s.color(line.with(|(_, tone)| tone.color())())
+                        .font_size(font_label())
+                        .text_ellipsis()
+                })
+                // A poll error can outrun the footer; the whole of it is here.
+                .tooltip(move || {
+                    text(line.with(|(msg, _)| msg.clone())).style(crate::widgets::tooltip_style)
+                });
+            let done = close.clone();
+            let footer = modal_footer_split(
+                status,
+                action_button(
+                    // Neutral, as Compare results' is: the footer offers no
+                    // decision to affirm.
+                    "Close",
+                    ActionKind::Neutral,
+                    true,
+                    ring.clone(),
+                    ACTION_TAB,
+                    move || (done)(),
+                ),
+            );
+
             // The card is the flex_col itself (fixed height) so the scroll clips.
-            let panel = v_stack((modal_header, status, content))
+            let panel = v_stack((modal_header, controls, content, footer))
                 .on_click_stop(|_| {})
                 .style(|s| {
                     panel_style(s)
@@ -659,7 +798,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
             // **No click-away.** The change log is the one record of what a
             // deleted row held, and reopening the monitor starts a fresh log —
             // so a stray backdrop click threw it away without the confirmation
-            // Clear asks for (`discard_needs_asking`). ✕ and Escape are
+            // Clear asks for (`discard_needs_asking`). ✕, Close and Escape are
             // deliberate and stay. Nor a click handler on the focus root:
             // floem fires `Click` on the focused view for Space, the reflex for
             // "scroll this log" — see `widgets::dismiss_layer`.
@@ -684,43 +823,167 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
     })
 }
 
-/// The bold, left-aligned column header row (`Time · Action · ID · Data`), sized
-/// to match [`entry_row`]'s columns so they line up.
-fn header_row() -> impl IntoView {
-    // The width arrives as a `fn`, resolved inside the closure — the rows below
-    // call `time_w()`/`act_w()`/`id_w()` in *their* style closures, so a header
-    // that captured the numbers at build stopped sitting over its own columns the
-    // moment the interface scale moved them. The comment on those three widths
-    // states the requirement: header and rows must agree, which is also why they
-    // scale together.
-    let cell = |t: &'static str, w: Option<fn() -> f64>| {
-        text(t).style(move |s| {
-            let s = s
-                .color(theme::text_muted())
-                .font_size(font_label())
-                .font_bold();
-            match w {
-                Some(w) => s.width(w()).flex_shrink(0.0_f32),
-                None => s,
-            }
-        })
-    };
-    h_stack((
-        cell("Time", Some(time_w)),
-        cell("Action", Some(act_w)),
-        cell("ID", Some(id_w)),
-        cell("Data", None),
+/// The title row: *Live monitor*, the watched `database.table` in mono, a badge
+/// saying whether it is *Watching* or *Paused*, and the ✕ — `modal_title`'s
+/// shape, which takes only a string.
+fn title_bar(
+    title: RwSignal<Option<String>>,
+    paused: RwSignal<bool>,
+    close: Rc<dyn Fn()>,
+    ring: crate::widgets::FocusRing,
+) -> impl IntoView {
+    let table = title.get_untracked().unwrap_or_default();
+    let badge = h_stack((
+        // 1px low, to sit on the label's optical middle rather than its box's.
+        icons::icon(icons::DOT, 6.0).style(move |s| {
+            s.margin_top(theme::scaled(1.0)).color(if paused.get() {
+                theme::plan_warn()
+            } else {
+                new_color()
+            })
+        }),
+        label(move || if paused.get() { "Paused" } else { "Watching" }),
     ))
     .style(|s| {
         s.items_center()
-            .gap(col_gap())
-            .padding_horiz(row_pad_h())
-            .padding_vert(theme::scaled(6.0))
+            .gap(theme::scaled(6.0))
+            .font_size(theme::font_hint())
+            .color(theme::text_dim())
+            .background(theme::pill_hover_bg())
+            // Half the badge's height, not a CSS-style `999`: floem does not
+            // clamp a radius to the box, and 999 painted a circle round it.
+            .border_radius(theme::scaled(10.0))
+            .padding_horiz(theme::scaled(8.0))
+            // The line box sits low in the badge: 2px more below evens it, as
+            // Compare results' A/B badges do.
+            .padding_top(theme::scaled(3.0))
+            .padding_bottom(theme::scaled(5.0))
+            .flex_shrink(0.0_f32)
+    });
+    let pressed = close.clone();
+    h_stack((
+        text("Live monitor").style(|s| {
+            s.font_size(theme::scaled_font(15.0))
+                .font_bold()
+                .color(theme::text())
+                .flex_shrink(0.0_f32)
+        }),
+        text(table).style(|s| {
+            s.font_family(crate::MONO_FAMILY.to_string())
+                .font_size(font_label())
+                .color(theme::text_dim())
+                .min_width(0.0)
+                .text_ellipsis()
+        }),
+        badge,
+        empty().style(|s| s.flex_grow(1.0_f32)),
+        in_ring_button(
+            container(icons::icon(icons::X, 16.0))
+                .on_click_stop(move |_| (close)())
+                .style(|s| {
+                    s.flex_shrink(0.0_f32)
+                        .items_center()
+                        .padding(theme::scaled(6.0))
+                        .color(theme::text_dim())
+                        .hover(|s| s.color(theme::text()))
+                }),
+            ring,
+            TITLE_CLOSE_TAB,
+            true,
+            0.0,
+            move || (pressed)(),
+        ),
+    ))
+    .style(|s| {
+        s.width_full()
+            .flex_row()
+            .items_center()
+            .gap(theme::scaled(10.0))
+            .min_width(0.0)
+            .padding_horiz(modal_pad_h())
+            .padding_vert(theme::scaled(10.0))
+            .border_bottom(1.0)
+            .border_color(theme::border())
     })
 }
 
-/// One change row: `[time] [KIND] [key] [data]` — content-sized (no wrap) so a
-/// long change list scrolls horizontally instead of wrapping.
+/// *All · Inserts · Updates · Deletes*, each with its count — Compare results'
+/// pills ([`count_pill`]), a dot in each kind's colour. Tab stops `PILLS_TAB`
+/// on, before Pause; Enter or Space picks.
+fn filter_pills(
+    counts: Memo<KindCounts>,
+    filter: RwSignal<Option<ChangeKind>>,
+    ring: crate::widgets::FocusRing,
+) -> impl IntoView {
+    let pill = move |name: &'static str, which: Option<ChangeKind>, tabindex: u32| {
+        count_pill(
+            name,
+            which.map(kind_color),
+            move || counts.get().of(which).to_string(),
+            move || filter.get() == which,
+            move || {
+                if filter.get_untracked() != which {
+                    filter.set(which);
+                }
+            },
+            ring.clone(),
+            tabindex,
+        )
+    };
+    h_stack((
+        pill("All", None, PILLS_TAB),
+        pill("Inserts", Some(ChangeKind::Insert), PILLS_TAB + 1),
+        pill("Updates", Some(ChangeKind::Update), PILLS_TAB + 2),
+        pill("Deletes", Some(ChangeKind::Delete), PILLS_TAB + 3),
+    ))
+    .style(|s| {
+        s.items_center()
+            .gap(theme::scaled(4.0))
+            .flex_shrink(0.0_f32)
+    })
+}
+
+/// The column header row — Time, Action, then each watched column — sized to
+/// match [`entry_row`]'s columns so they line up.
+fn header_row(heads: Rc<Vec<String>>, widths: RwSignal<Rc<Vec<f64>>>) -> impl IntoView {
+    // The width arrives as a closure, resolved inside the style — the rows call
+    // the same functions in *their* style closures, so a header that captured the
+    // numbers at build stopped sitting over its own columns the moment the
+    // interface scale moved them.
+    let cell = |t: String, w: Rc<dyn Fn() -> f64>| {
+        text(t)
+            .style(move |s| {
+                s.color(theme::text_dim())
+                    .font_size(font_label())
+                    .width(w())
+                    .flex_shrink(0.0_f32)
+                    .min_width(0.0)
+                    .text_ellipsis()
+            })
+            .into_any()
+    };
+    let mut cells = vec![
+        cell("Time".to_string(), Rc::new(time_w)),
+        cell("Action".to_string(), Rc::new(act_w)),
+    ];
+    cells.extend(
+        heads
+            .iter()
+            .enumerate()
+            .map(|(i, h)| cell(h.clone(), Rc::new(move || col_w(widths, i)))),
+    );
+    h_stack_from_iter(cells).style(move |s| {
+        s.items_center()
+            .gap(col_gap())
+            .padding_horiz(modal_pad_h())
+            .height(theme::scaled(34.0))
+            .min_width(table_w(widths))
+    })
+}
+
+/// One change row: its time, its kind, then a cell per watched column — an
+/// insert's values green, a delete's red and struck through, an update's
+/// changed values `old → new` beside the rest in `text_dim`.
 ///
 /// **Takes the log and a sequence number rather than the entry**, so the list
 /// above can iterate 8 KiB of `u64` instead of deep-copying every entry's cells
@@ -738,8 +1001,10 @@ fn header_row() -> impl IntoView {
 fn entry_row(
     log: RwSignal<Vec<MonitorEntry>>,
     seq: u64,
+    heads: Rc<Vec<String>>,
     cols: RwSignal<Vec<String>>,
-) -> impl IntoView {
+    widths: RwSignal<Rc<Vec<f64>>>,
+) -> AnyView {
     let Some(entry) = log.with_untracked(|l| {
         l.binary_search_by_key(&seq, |e| e.seq)
             .ok()
@@ -747,137 +1012,73 @@ fn entry_row(
     }) else {
         return empty().style(|s| s.height(mon_row_h())).into_any();
     };
-    // **The entry's own list, not the modal's current one.** A baseline restart
-    // answering an `ALTER` rewrites `monitor_cols` mid-session while the log
-    // keeps entries indexed against the previous list, so reading the signal
-    // here named every earlier change's field wrong — the same defect the export
-    // had, on screen. `cols` is still the fallback, for a log written before
-    // entries carried their own.
-    let names: Vec<String> = if entry.cols.is_empty() {
-        cols.get_untracked()
-    } else {
-        entry.cols.as_ref().clone()
-    };
-    // **`fn() -> Color`, not a `Color`** — the same rule `data_view` states two
-    // functions below and for the same reason: these rows are keyed on
-    // `entry.seq`, so a theme switch rebuilds none of them. `theme::chip_active()`
-    // called *here* was resolved once, when the row was built, and the UPDATE
-    // labels then stayed in the previous theme's colour for as long as the modal
-    // stayed open — beside INSERT and DELETE labels that repainted, because
-    // `new_color`/`old_color` are fixed literals. Two themes at once, in the one
-    // place where colour is the only thing telling the three kinds apart.
-    //
-    // All three arms are `fn`-shaped, so the destructuring is one shape and the
-    // call happens inside the style closure where it is re-run.
-    let (label, color): (&str, fn() -> Color) = match entry.change.kind {
-        ChangeKind::Insert => ("INSERT", new_color),
-        ChangeKind::Update => ("UPDATE", theme::chip_active),
-        ChangeKind::Delete => ("DELETE", old_color),
-    };
-    let key_text = entry.change.key.join(", ");
-    h_stack((
-        text(entry.at).style(|s| {
-            s.color(theme::text_dim())
-                .font_size(font_label())
-                .width(time_w())
-                .flex_shrink(0.0_f32)
-        }),
-        text(label).style(move |s| {
-            s.color(color())
-                .font_size(font_label())
-                .font_bold()
-                .width(act_w())
-                .flex_shrink(0.0_f32)
-        }),
-        text(key_text).style(|s| {
-            s.color(theme::text())
-                .font_size(font_body())
-                .width(id_w())
-                .flex_shrink(0.0_f32)
-        }),
-        data_view(&entry.change, &names),
-    ))
-    .style(|s| {
-        // **A height, where this was `padding_vert(7.0)` and a 2px gap on the
-        // stack.** Same 29px pitch, but stated once — see [`mon_row_h`] for why
-        // the virtual stack cannot be trusted with a height it did not decide.
-        // `items_center` is what puts the line back in the middle of it.
-        s.items_center().gap(col_gap()).height(mon_row_h())
-    })
-    .into_any()
+    let kind = entry.change.kind;
+    let color = kind_color(kind);
+    // **Under the names the entry was recorded with**, not the modal's current
+    // list: a baseline restart answering an `ALTER` rewrites `monitor_cols`
+    // mid-session while the log keeps entries indexed against the previous
+    // list, so reading the signal here named every earlier change's field
+    // wrong — the same defect the export had, on screen. `cols` is the
+    // fallback, for a log written before entries carried their own.
+    let cells = cols.with_untracked(|c| table_cells(&entry, &heads, c));
+    let mut views: Vec<AnyView> = vec![
+        text(entry.at)
+            .style(|s| {
+                s.color(theme::text_dim())
+                    .font_size(font_label())
+                    .width(time_w())
+                    .flex_shrink(0.0_f32)
+            })
+            .into_any(),
+        text(action_label(kind))
+            .style(move |s| {
+                s.color(color())
+                    .font_size(font_label())
+                    .font_bold()
+                    .width(act_w())
+                    .flex_shrink(0.0_f32)
+            })
+            .into_any(),
+    ];
+    for (i, c) in cells.into_iter().enumerate() {
+        let content: AnyView = match (c, kind) {
+            (LogCell::Missing, _) => empty().into_any(),
+            (LogCell::Changed(old, new), _) => {
+                transition_text(old, new, old_color, new_color).into_any()
+            }
+            (LogCell::Value(v), ChangeKind::Insert) => cell_text(v, new_color).into_any(),
+            (LogCell::Value(v), ChangeKind::Delete) => struck_text(v, old_color).into_any(),
+            (LogCell::Value(v), ChangeKind::Update) => cell_text(v, theme::text_dim).into_any(),
+        };
+        views.push(
+            container(content)
+                .style(move |s| {
+                    s.width(col_w(widths, i))
+                        .flex_shrink(0.0_f32)
+                        .min_width(0.0)
+                        .items_center()
+                })
+                .clip()
+                .into_any(),
+        );
+    }
+    h_stack_from_iter(views)
+        .style(|s| {
+            // **A height**, stated once — see [`mon_row_h`] for why the virtual
+            // stack cannot be trusted with a height it did not decide.
+            // `items_center` is what puts the line in the middle of it.
+            s.items_center()
+                .gap(col_gap())
+                .padding_horiz(modal_pad_h())
+                .height(mon_row_h())
+        })
+        .into_any()
 }
 
-/// The Data column, as one non-wrapping line of coloured spans: for an update,
-/// `col: old → new` (old red, new green); for an insert, `col=value` (all
-/// green); for a delete, the same `col=value` in the *old* colour.
-///
-/// A delete used to render nothing, on the rationale that the key column already
-/// identifies the row — while `diff_snapshots` was deliberately cloning every
-/// deleted row's cells so the log *could* show them. A delete is precisely the
-/// case where the row is gone from the database and this log is the only
-/// remaining record of what it held, so the core's answer was the right one.
-fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
-    let name = |ci: usize| cols.get(ci).cloned().unwrap_or_else(|| "?".to_string());
-    // The colour arrives as a fn and is called *inside* the style closure. These
-    // rows are keyed on the log index, so a theme switch rebuilds none of them —
-    // a `Color` read here would be the old theme's for as long as the modal
-    // stays open. `old_color`/`new_color` are fixed red/green by design and pass
-    // as fns too, so there is one shape rather than two.
-    let dim: fn() -> Color = theme::text_dim;
-    let span = move |t: String, c: fn() -> Color| {
-        text(t).style(move |s| s.color(c()).font_size(font_body()))
-    };
-    // **Bounded at `DATA_COLS_SHOWN`, and it says so** — see that constant. Two
-    // to four views per column times `LOG_CAP` rows is ~123,000 views in a
-    // mounted list showing twenty, and nothing here is wide enough to read past
-    // a dozen `col=value` pairs anyway. The log and the export keep every
-    // column; this is the line, not the record.
-    let mut spans: Vec<AnyView> = Vec::new();
-    let shown;
-    let total;
-    match change.kind {
-        ChangeKind::Update => {
-            total = change.fields.len();
-            shown = total.min(DATA_COLS_SHOWN);
-            for (i, f) in change.fields.iter().take(shown).enumerate() {
-                if i > 0 {
-                    spans.push(span(",   ".to_string(), dim).into_any());
-                }
-                spans.push(span(format!("{}: ", name(f.col)), dim).into_any());
-                spans.push(span(cell(&f.old), old_color).into_any());
-                spans.push(span(" → ".to_string(), dim).into_any());
-                spans.push(span(cell(&f.new), new_color).into_any());
-            }
-        }
-        // Same shape for both, differing only in the colour that says whether
-        // the values are arriving or leaving.
-        ChangeKind::Insert | ChangeKind::Delete => {
-            let value_color: fn() -> Color = if change.kind == ChangeKind::Insert {
-                new_color
-            } else {
-                old_color
-            };
-            total = cols.len().min(change.cells.len());
-            shown = total.min(DATA_COLS_SHOWN);
-            for (i, (n, c)) in cols.iter().zip(&change.cells).take(shown).enumerate() {
-                if i > 0 {
-                    spans.push(span(", ".to_string(), dim).into_any());
-                }
-                spans.push(span(format!("{n}="), dim).into_any());
-                spans.push(span(cell(c), value_color).into_any());
-            }
-        }
-    }
-    if let Some(more) = data_overflow_label(total) {
-        spans.push(span(more, dim).into_any());
-    }
-    h_stack_from_iter(spans).style(|s| s.flex_row().items_center().flex_shrink(0.0_f32))
-}
-
-/// How loudly the sub-header's status line should read. Separate from the colour
-/// so the line itself is a pure, testable decision — the colour is looked up
-/// through [`Tone::color`], which hands back a `fn() -> Color` rather than a
-/// `Color` because it is read inside a reactive style (see the themable-colour
+/// How loudly the footer's line should read. Separate from the colour so the
+/// line itself is a pure, testable decision — the colour is looked up through
+/// [`Tone::color`], which hands back a `fn() -> Color` rather than a `Color`
+/// because it is read inside a reactive style (see the themable-colour
 /// invariant).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tone {
@@ -900,57 +1101,57 @@ impl Tone {
     }
 }
 
-/// What the sub-header's status line says, and how loudly.
+/// What the footer says, and how loudly: *"200 events since 11:48:12 · newest
+/// at the bottom"*, `since` being the oldest entry the log still holds.
 ///
 /// Errors take the line outright, worst-to-mislead first: a **failed export**
 /// beats everything, because the user believes they have a file and doesn't; a
 /// **poll error** beats the rest, because nothing below it is true while polling
 /// is broken.
 ///
-/// Otherwise the line is a lead plus every caveat that currently applies, because
-/// they *co-occur* and each one is a different reason the log isn't the whole
-/// story: a paused monitor watching a capped page of an oversized table is three
-/// things at once, and any of them dropped for brevity is the one the reader
-/// needed. `partial` and `capped` are the two silent truncations — rows the poll
-/// can't see, and changes the log has already dropped — and the second only
-/// became load-bearing when the log became exportable.
-fn status_line(
+/// Otherwise the count, then every caveat that currently applies, because they
+/// *co-occur* and each one is a different reason the log isn't the whole story.
+/// `partial` and `capped` are the two silent truncations — rows the poll can't
+/// see, and changes the log has already dropped — and the second only became
+/// load-bearing when the log became exportable. Whether the poll is paused is
+/// the title's badge, not this line.
+fn footer_line(
     export_err: Option<String>,
     poll_err: Option<String>,
-    paused: bool,
     partial: bool,
     capped: bool,
+    events: usize,
+    since: Option<&str>,
 ) -> (String, Tone) {
     if let Some(msg) = export_err.or(poll_err) {
         return (msg, Tone::Error);
     }
-    let mut caveats: Vec<String> = Vec::new();
+    let mut parts = vec![match since {
+        Some(t) if events > 0 => format!(
+            "{events} {} since {t}",
+            schemaic_core::text::plural(events, "event", "events")
+        ),
+        _ => "No changes yet".to_string(),
+    }];
     if partial {
-        caveats.push(format!(
-            "only the first {} rows by primary key are covered",
+        parts.push(format!(
+            "only the first {} rows by primary key are watched",
             schemaic_core::monitor::ROW_CAP
         ));
     }
     if capped {
-        caveats.push(format!(
-            "the log is at its {}-change cap, so the oldest are dropping",
+        parts.push(format!(
+            "the oldest are dropping at the {}-change cap",
             schemaic_core::monitor::LOG_CAP
         ));
     }
-    if caveats.is_empty() {
-        return match paused {
-            true => (
-                "Paused — the log keeps what it has; nothing new is being captured.".to_string(),
-                Tone::Warn,
-            ),
-            false => (
-                "Watching for inserts, updates and deletes — newest at the bottom.".to_string(),
-                Tone::Calm,
-            ),
-        };
+    if parts.len() > 1 {
+        return (parts.join(" · "), Tone::Warn);
     }
-    let lead = if paused { "Paused" } else { "Watching" };
-    (format!("{lead} — {}.", caveats.join("; ")), Tone::Warn)
+    if events > 0 {
+        parts.push("newest at the bottom".to_string());
+    }
+    (parts.join(" · "), Tone::Calm)
 }
 
 /// Write the change log to a file the user picks, in `format`.
@@ -1081,104 +1282,9 @@ fn interval_label(secs: u64) -> &'static str {
     }
 }
 
-/// The characters a shaper starts a new line on, as one definition.
-///
-/// Unicode's mandatory breaks (UAX #14 BK/CR/LF/NL), which is the set
-/// [`cell`] has to flatten and the set its test asserts over — written once so
-/// the two cannot disagree about what "one line" means.
-fn is_line_break(c: char) -> bool {
-    matches!(
-        c,
-        '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
-    )
-}
-
-/// Render one cell value: `NULL` for a missing value, the text otherwise,
-/// flattened to a single line.
-///
-/// **The flattening is what keeps [`mon_row_h`] honest.** The log is a virtual
-/// stack over `VirtualItemSize::Fixed`, which places child `i` at
-/// `i * item_size`; the row is given that exact height, so a value that shapes
-/// to two lines is laid out past its own box and paints across the row below
-/// it. A watched `TEXT`/`VARCHAR` column holding an address, a note or
-/// pretty-printed JSON is the ordinary way that happens.
-///
-/// A single-line, horizontally-scrolled column is what this display means
-/// anyway. The export path ([`log_result_set`]) is deliberately not routed
-/// through here and keeps the engine's value verbatim.
-fn cell(c: &Option<String>) -> String {
-    match c {
-        Some(s) if s.chars().any(is_line_break) => {
-            // A CRLF is one line ending, not two: collapse the pair before the
-            // singletons so the value does not gain a column.
-            let mut out = String::with_capacity(s.len());
-            let mut chars = s.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if is_line_break(ch) {
-                    if ch == '\r' && chars.peek() == Some(&'\n') {
-                        chars.next();
-                    }
-                    out.push(' ');
-                } else {
-                    out.push(ch);
-                }
-            }
-            out
-        }
-        Some(s) => s.clone(),
-        None => "NULL".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// **[`mon_row_h`]'s premise, asserted where it is actually decided.**
-    ///
-    /// `VirtualItemSize::Fixed` places child `i` at `i * item_size`, so a row
-    /// that shapes to two lines is laid out past its own box and paints across
-    /// the row below it. The premise "a change row is always one line" is not a
-    /// property of the row — it is a property of what `cell` hands to `text()`,
-    /// and until this test it was stated in three places and checked in none.
-    /// A `TEXT` column holding an address, a note or pretty-printed JSON is the
-    /// ordinary case, not a contrived one.
-    #[test]
-    fn a_cell_holding_a_newline_is_flattened_to_one_line() {
-        for raw in [
-            "a\nb",
-            "a\r\nb",
-            "a\rb",
-            "line1\nline2\nline3",
-            "\n",
-            "a\u{2028}b",
-        ] {
-            let out = cell(&Some(raw.to_string()));
-            assert!(
-                !out.chars().any(is_line_break),
-                "{raw:?} kept a line break as {out:?}"
-            );
-        }
-    }
-
-    /// The flattening is a display concern and must not eat anything else: a
-    /// value with no line break is handed through byte for byte, and `NULL`
-    /// still reads as `NULL` rather than as an empty cell.
-    #[test]
-    fn a_cell_without_a_newline_is_unchanged() {
-        for raw in ["", "plain", "a\tb", "  spaced  ", "ünïcode", "NULL"] {
-            assert_eq!(cell(&Some(raw.to_string())), raw);
-        }
-        assert_eq!(cell(&None), "NULL");
-    }
-
-    /// One space per break, not one per byte — a CRLF is a single line ending
-    /// and must not widen the value by two columns.
-    #[test]
-    fn a_crlf_costs_exactly_one_space() {
-        assert_eq!(cell(&Some("a\r\nb".to_string())), "a b");
-        assert_eq!(cell(&Some("a\nb".to_string())), "a b");
-    }
 
     /// **The virtual stack may ask for rows the log no longer has.**
     ///
@@ -1206,17 +1312,31 @@ mod tests {
         assert!(none.slice(0..20).collect::<Vec<_>>().is_empty());
     }
 
-    /// `status_line` with no error and nothing paused/capped — the two truncation
-    /// flags are what most of these vary.
-    fn line(paused: bool, partial: bool, capped: bool) -> (String, Tone) {
-        status_line(None, None, paused, partial, capped)
+    /// `footer_line` with no error, 200 events since 11:48:12 — the two
+    /// truncation flags are what most of these vary.
+    fn line(partial: bool, capped: bool) -> (String, Tone) {
+        footer_line(None, None, partial, capped, 200, Some("11:48:12"))
     }
 
     #[test]
-    fn idle_watching_reads_calm() {
-        let (msg, tone) = line(false, false, false);
-        assert_eq!(tone, Tone::Calm);
-        assert!(msg.starts_with("Watching for inserts"), "{msg}");
+    fn a_calm_log_counts_its_events_since_the_oldest() {
+        assert_eq!(
+            line(false, false),
+            (
+                "200 events since 11:48:12 · newest at the bottom".to_string(),
+                Tone::Calm
+            )
+        );
+        let (one, _) = footer_line(None, None, false, false, 1, Some("09:00:00"));
+        assert_eq!(one, "1 event since 09:00:00 · newest at the bottom");
+    }
+
+    #[test]
+    fn an_empty_log_says_nothing_has_changed() {
+        assert_eq!(
+            footer_line(None, None, false, false, 0, None),
+            ("No changes yet".to_string(), Tone::Calm)
+        );
     }
 
     #[test]
@@ -1230,12 +1350,13 @@ mod tests {
         // path could make, and it pinned a wording that was in fact rendered
         // "Export failed — Export failed: Access is denied" on screen.
         let real = "Export failed: Access is denied. (os error 5)";
-        let (msg, tone) = status_line(
+        let (msg, tone) = footer_line(
             Some(real.into()),
             Some("connection lost".into()),
             true,
             true,
-            true,
+            5,
+            Some("10:00:00"),
         );
         assert_eq!(tone, Tone::Error);
         assert_eq!(msg, real);
@@ -1248,24 +1369,23 @@ mod tests {
 
     #[test]
     fn a_poll_error_outranks_the_caveats() {
-        let (msg, tone) = status_line(None, Some("connection lost".into()), false, true, true);
+        let (msg, tone) = footer_line(
+            None,
+            Some("connection lost".into()),
+            true,
+            true,
+            5,
+            Some("10:00:00"),
+        );
         assert_eq!(tone, Tone::Error);
         assert_eq!(msg, "connection lost");
     }
 
     #[test]
-    fn paused_says_the_log_is_kept_and_nothing_is_captured() {
-        let (msg, tone) = line(true, false, false);
-        assert_eq!(tone, Tone::Warn);
-        assert!(msg.starts_with("Paused —"), "{msg}");
-        assert!(msg.contains("nothing new is being captured"), "{msg}");
-    }
-
-    #[test]
     fn a_partial_window_names_the_row_cap() {
-        let (msg, tone) = line(false, true, false);
+        let (msg, tone) = line(true, false);
         assert_eq!(tone, Tone::Warn);
-        assert!(msg.starts_with("Watching —"), "{msg}");
+        assert!(msg.starts_with("200 events since 11:48:12 · "), "{msg}");
         assert!(
             msg.contains(&schemaic_core::monitor::ROW_CAP.to_string()),
             "{msg}"
@@ -1276,7 +1396,7 @@ mod tests {
     fn a_full_log_says_the_oldest_are_dropping() {
         // The caveat that makes an export honest: a log at its cap has already
         // lost entries, and a file written from it looks complete.
-        let (msg, tone) = line(false, false, true);
+        let (msg, tone) = line(false, true);
         assert_eq!(tone, Tone::Warn);
         assert!(msg.contains("oldest are dropping"), "{msg}");
         assert!(
@@ -1287,34 +1407,12 @@ mod tests {
 
     #[test]
     fn co_occurring_caveats_are_both_said() {
-        // The case the earlier one-branch-per-state shape got wrong: these are
-        // different reasons the log isn't the whole story, so neither replaces
-        // the other.
-        let (msg, tone) = line(false, true, true);
+        // These are different reasons the log isn't the whole story, so neither
+        // replaces the other.
+        let (msg, tone) = line(true, true);
         assert_eq!(tone, Tone::Warn);
-        assert!(msg.contains("by primary key are covered"), "{msg}");
+        assert!(msg.contains("by primary key are watched"), "{msg}");
         assert!(msg.contains("oldest are dropping"), "{msg}");
-    }
-
-    #[test]
-    fn pausing_changes_the_lead_and_keeps_the_caveats() {
-        let (msg, tone) = line(true, true, true);
-        assert_eq!(tone, Tone::Warn);
-        assert!(msg.starts_with("Paused —"), "{msg}");
-        assert!(msg.contains("by primary key are covered"), "{msg}");
-        assert!(msg.contains("oldest are dropping"), "{msg}");
-    }
-
-    #[test]
-    fn every_line_is_one_sentence_ending_in_a_stop() {
-        for paused in [false, true] {
-            for partial in [false, true] {
-                for capped in [false, true] {
-                    let (msg, _) = line(paused, partial, capped);
-                    assert!(msg.ends_with('.'), "{paused}/{partial}/{capped}: {msg}");
-                }
-            }
-        }
     }
 
     #[test]

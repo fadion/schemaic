@@ -1706,6 +1706,102 @@ pub(crate) fn pill_tab_style(s: floem::style::Style, on: bool) -> floem::style::
     }
 }
 
+/// A **filter pill with a count** — Compare results' *All · Changed · Added ·
+/// Removed* and the Live monitor's *All · Inserts · Updates · Deletes*: a
+/// [`pill_tab_style`] pill, a coloured `dot` naming its kind (none for *All*),
+/// the name, then `count` in `text_faint` while inactive. A Tab stop at
+/// `tabindex` that Enter or Space picks, its focus outline on the pill's corners.
+///
+/// On the active pill the dot takes `pill_active_text`: the kind's colour on the
+/// pill's own fill — Compare's *Changed* blue — vanished into it.
+pub(crate) fn count_pill(
+    name: &'static str,
+    dot: Option<fn() -> floem::peniko::Color>,
+    count: impl Fn() -> String + 'static,
+    on: impl Fn() -> bool + Copy + 'static,
+    pick: impl Fn() + Copy + 'static,
+    ring: FocusRing,
+    tabindex: u32,
+) -> AnyView {
+    let dot = match dot {
+        Some(color) => icons::icon(icons::DOT, 6.0)
+            .style(move |s| {
+                let c = if on() {
+                    theme::pill_active_text()
+                } else {
+                    color()
+                };
+                s.color(c).margin_right(theme::scaled(6.0))
+            })
+            .into_any(),
+        None => empty().into_any(),
+    };
+    let face = h_stack((
+        dot,
+        text(name),
+        label(count).style(move |s| {
+            let s = s.margin_left(theme::scaled(6.0));
+            if on() {
+                s
+            } else {
+                s.color(theme::text_faint())
+            }
+        }),
+    ))
+    .on_click_stop(move |_| pick())
+    .style(move |s| pill_tab_style(s, on()).items_center());
+    in_ring_button(face, ring, tabindex, true, 6.0, pick)
+}
+
+/// One line of a fixed-height table's cell, in `color`, ending in `…` when its
+/// column is narrower — Compare results' and the Live monitor's values.
+pub(crate) fn cell_text(v: String, color: fn() -> floem::peniko::Color) -> floem::views::Label {
+    text(v).style(move |s| {
+        s.color(color())
+            .font_size(theme::font_body())
+            .min_width(0.0)
+            .text_ellipsis()
+    })
+}
+
+/// [`cell_text`] struck through — a removed row's value, a changed one's old.
+/// Floem 0.2's text has no line-through, so the line is a 1px rule laid over the
+/// text's box just below half its height.
+pub(crate) fn struck_text(v: String, color: fn() -> floem::peniko::Color) -> floem::views::Stack {
+    stack((
+        cell_text(v, color),
+        empty().style(move |s| {
+            s.absolute()
+                .inset_left(0.0)
+                .inset_right(0.0)
+                .inset_top_pct(52.0)
+                .height(1.0)
+                .background(color())
+        }),
+    ))
+    .style(|s| s.items_center().min_width(0.0))
+}
+
+/// A changed value as `old → new`: the old [`struck_text`] in `old_color`, the
+/// new in `new_color`, each shrinking to its `…` before the arrow does.
+pub(crate) fn transition_text(
+    old: String,
+    new: String,
+    old_color: fn() -> floem::peniko::Color,
+    new_color: fn() -> floem::peniko::Color,
+) -> floem::views::Stack {
+    h_stack((
+        struck_text(old, old_color).style(|s| s.flex_shrink(1.0_f32)),
+        text(" → ").style(|s| {
+            s.color(theme::text_dim())
+                .font_size(theme::font_body())
+                .flex_shrink(0.0_f32)
+        }),
+        cell_text(new, new_color).style(|s| s.flex_shrink(1.0_f32)),
+    ))
+    .style(|s| s.items_center().min_width(0.0))
+}
+
 /// A **tab bar**: `tabs` side by side in equal shares of one bar, the one equal
 /// to `current` filled in the primary colour, and a click on another setting
 /// `current`. For a switch between views of one panel — Server Activity's
