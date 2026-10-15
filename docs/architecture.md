@@ -471,9 +471,20 @@ existing prose was left alone.
     the rows already read, like `chart.rs` above — a capped result is compared up to its cap, and
     the modal says so. **Columns are matched by name**: `shared_columns(left, right)` is the
     compared set, in the left's order, and a column only one side has goes to `only_left` /
-    `only_right` and is reported rather than failing the comparison.
+    `only_right` and is reported rather than failing the comparison. **A binary column is left out
+    too, and said to be** (S6.1-L1-05): a column binary on either side — by its type
+    (`Column::is_binary`) or because the backend saw a blob in it (`ResultSet::binary_columns`,
+    SQLite's per-value answer) — has cells reading `model::binary_display`'s `<n bytes>`, a
+    placeholder rather than the value, so two different blobs of one length compared as the same
+    and the row was counted *unchanged*. `key_columns(left, right)` is the shared columns minus
+    those, and is what is compared: such a column is not in `ResultDiff::shared` but in
+    `uncompared`, and `summary` ends in *" · pw_hash not compared"* so *unchanged* is never read as
+    covering it (`a_binary_column_is_named_as_not_compared`). It is never a key either — asked for
+    one, `diff` answers `DiffError::BinaryKey` (`a_binary_column_is_never_a_key`). What this does
+    not do is compare the bytes: the `ResultSet` holds only the placeholder, so the honest answer
+    is to name the column, not to guess.
     `diff(left, right, key)` → `ResultDiff { shared, only_left, only_right, left_only, right_only,
-    changed: Vec<Changed { left, right, columns }>, same, repeated_keys }` — `left_only` being the
+    changed: Vec<Changed { left, right, columns }>, same, repeated_keys, uncompared }` — `left_only` being the
     *removed* rows and `right_only` the *added* ones, so which result goes on which side is the
     caller's decision and decides the words. **Keyed**, a row is matched by its key columns'
     values; **a key repeated within one side** is counted in `repeated_keys` and its later rows
@@ -484,20 +495,33 @@ existing prose was left alone.
     the whole shared row is the identity, as a multiset**: a row is in both or in one, never
     *changed*, and one repeated n times on one side and m on the other is |n − m| rows added or
     removed (`without_a_key_rows_are_counted_as_a_multiset`) — the honest answer for a result with
-    nothing that identifies a row. A key column one side lacks is `DiffError::MissingKey`
+    nothing that identifies a row. **Each bucket of equal rows is consumed through a cursor, not
+    `rows.remove(0)`**: the remove shifted the whole bucket per match, quadratic in a column of few
+    distinct values, and 300,000 equal rows took about 25 s on the UI thread (the fix's own
+    measurement; `whole_row_identity_over_many_equal_rows_is_linear` holds it under 5 s). Don't
+    tidy it back. A key column one side lacks is `DiffError::MissingKey`
     (`a_key_one_side_lacks_is_refused`).
     **Values compare by their displayed text, NULL being its own value**, so `1` and `1.0` from two
     engines differ, as they would on screen, and NULL is not `''`
     (`null_is_its_own_value_and_text_compares_as_shown`). `is_identical` and `summary` give the
     footer's headline — *"2 changed · 3 added · 1 removed · 40 unchanged"*, in the filter pills'
     order, a zero kind left out (the unchanged count never is), or *"No differences · N rows
-    unchanged"*. `suggested_key` is where the picker starts: a shared column
-    named `id` in any case, else the first shared column unique and never NULL on both sides, else
-    none, the whole row (`the_suggested_key_is_id_else_a_unique_column_else_the_row`).
-    **`table_rows(left, right, &diff)` is the modal's table**: a `DiffRow { change, cells }` per
-    difference, one cell per `shared` column — the first result's changed and removed rows in the
+    unchanged"*. `suggested_key` is where the picker starts: a `key_columns` column
+    named `id` in any case, else the first one unique and never NULL on both sides, else
+    none, the whole row (`the_suggested_key_is_id_else_a_unique_column_else_the_row`). It picks
+    from `key_columns` rather than every shared column because a `BINARY(16)` UUID `id` was
+    suggested, every row of it read `<16 bytes>`, and the comparison collapsed into the first row
+    and *repeated keys*.
+    **`table_rows(&diff)` is the modal's table, by reference**: a `TableRow { change, at }` per
+    difference and no text — `at` a removed row's index in the first result, an added row's in the
+    second, a changed row's in `diff.changed` — the first result's changed and removed rows in the
     order it holds them, then the added ones in the second's order
-    (`the_table_lists_the_first_results_rows_in_order_then_the_added`). A cell is
+    (`the_table_lists_the_first_results_rows_in_order_then_the_added`). **`row_cells(left, right,
+    &diff, &row)` builds one row's cells**, one per `shared` column, and a row out of range has none
+    (`table_rows_hold_places_and_row_cells_builds_one_row`). They were one function returning a
+    `DiffRow { change, cells }` per difference, which built a string or three per cell of every
+    differing row, on the UI thread, at open and again on every swap or key change; split, the view
+    builds only the rows its virtual stack mounts. `DiffRow` is gone from the public API. A cell is
     `DiffCell::Value` — an added or removed row's own value, or one a changed row's sides agree on —
     or `DiffCell::Changed(before, after)`; `RowChange::label` is the *Change* column's
     `CHANGED`/`ADDED`/`REMOVED`. **Every cell is one line**, through the private `table_value`,
@@ -9426,6 +9450,13 @@ existing prose was left alone.
     `Snapshot`. The caller must skip the *first* poll itself — diffing against an empty prior reads
     every row as an insert. A delete carries the row's last-seen cells deliberately: it is the one
     case where the row is gone from the database and the log is the only remaining record.
+    **A snapshot sees a binary column's change by its length only**: its cells are the result's
+    text, and a blob's text is `<n bytes>`, so a blob rewritten at the same length is no change to
+    `diff_snapshots`. `length_only_columns(rs)` names those columns — binary by type or by
+    `ResultSet::binary_columns`, as `result_diff` decides — so the modal's footer can say so rather
+    than let the log read as complete (`a_binary_column_is_watched_by_length_only`). It is a
+    caveat, not a fix: the
+    bytes are not in the result to compare.
     **A `Snapshot` records *how it was taken* in two flags, and they were one.** `ordered` says the
     poll asked the server for a deterministic total order (`ORDER BY` the key), so position means
     something and two windows are comparable as prefixes of one sequence; `window_full` says the
@@ -25817,19 +25848,27 @@ existing prose was left alone.
     pill is in the ring at radius 6, so the focus outline follows its corners — Tab stops
     `PILLS_TAB` 6–9, after the ⇄
     (`SWAP_TAB` 5), Enter or Space picking. On the right **one picker, *Match rows by*** — *Whole
-    row* or any shared column, a `table_designer::focusable_owned_dropdown`, `PICKER_TAB` 10, then
+    row* or any column `result_diff::key_columns` offers, which leaves out a binary one since its
+    every cell reads `<n bytes>` and would match nothing apart — a
+    `table_designer::focusable_owned_dropdown`, `PICKER_TAB` 10, then
     Close (`ACTION_TAB`) and the title's ✕; it starts on `result_diff::suggested_key`. The label and
     picker are an `h_stack` of their own with a 10px gap, not a `margin_right` on the label: with
     the margin the picker ended 10px short of the B card's right edge above it, measured in the
     running app. It picks **one** column; the core takes a composite key, which
     nothing here offers yet. Under them a faint notes line for the columns only one side has, the
+    binary columns left out of the comparison (*"Binary, not compared: pw_hash"*), the
     repeated keys left out, and a capped result (*"rows past its cap are not compared"*), hidden
     when it has nothing to say.
     **The state is three signals — `swapped`, `key`, `filter` — and an `RwSignal<Rc<Computed>>`.**
-    An effect on `swapped` and `key` re-runs `diff` and `result_diff::table_rows` over every row
-    read, on the UI thread, measures the columns, and stores a `Computed { generation, swapped,
-    outcome }`. A filter costs none of that: the table is a `dyn_container` keyed on `(generation,
-    filter)` and only picks indices out of rows already built. It stands at a fixed
+    An effect on `swapped` and `key` re-runs `diff` over every row read and `result_diff::table_rows`
+    over its differences, on the UI thread, measures the columns, and stores a `Computed {
+    generation, swapped, outcome }` — the `Outcome` holding the diff as an `Rc<ResultDiff>`, the
+    `TableRow`s, and the two results in compared order as their `Arc<ResultSet>`s, which is what
+    lets the cells be built later. **No cell text is built here beyond the width sample**: the
+    virtual stack's row builder calls `result_diff::row_cells` for the one row it mounts, where the
+    old `table_rows` built every differing row's cells up front at open and on every swap or key
+    change. A filter costs none of that: the table is a `dyn_container` keyed on `(generation,
+    filter)` and only picks indices out of the rows already listed. It stands at a fixed
     `modal_body_h(320)` whatever the filter, so switching pills does not move the footer.
     **The table copies the Live monitor's list, for the monitor's reasons** (`monitor_view.rs`, and
     the *Floem 0.2 gotchas* on `VirtualItemSize::Fixed` and on padding a virtual stack): a *Change*
@@ -25840,15 +25879,19 @@ existing prose was left alone.
     source that clamps its range as `LogSeqs` does — with its vertical band on a wrapping
     `container` rather than the stack. **The column widths are fixed for the whole outcome**: each is
     its header and the three values longest by characters, measured (`measure_text_px_at`) and
-    clamped to 40–360 — shaping every cell of a large result would stall the open — so the content
+    clamped to 40–360 — shaping every cell of a large result would stall the open — taken from the
+    cells of the first `WIDTH_SAMPLE` (2,000) table rows only, built for the purpose, since building
+    them all is the cost `row_cells` exists to defer; a longer value further down is cut by its
+    column rather than widening it. So the content
     width does not depend on which rows are mounted, the problem the monitor's `ColumnWidths`
     answers for a log that is still growing. They are stored **unscaled** in `Widths` and scaled where a style reads them, so an
     interface-scale change with the modal open moves the header and the rows together, as the text
     inside them moves.
     **The colours are the Live monitor's**: *CHANGED* in `theme::chip_active`, the monitor's
     UPDATE colour; *ADDED* in its `new_color` and *REMOVED* in its `old_color` (`removed_color`
-    and `added_color` just call them, both `pub(crate)` for this). `old_color` is
-    `rgb(D0, 6B, 6B)`, lightened from the monitor's first `rgb(9D, 34, 34)`, which was too dark to
+    and `added_color` just call them, both `pub(crate)` for this) — which are the theme roles
+    `theme::diff_removed_text`/`diff_added_text` (see `monitor_view.rs`). The dark theme's red,
+    `#D06B6B`, is lightened from the monitor's first `rgb(9D, 34, 34)`, which was too dark to
     read struck through. A removed row's values and a changed cell's old value are **struck
     through** with `widgets::struck_text` — Floem 0.2's text has no line-through — and a changed cell
     is `widgets::transition_text`, `old → new`, the old struck red and the new green; a changed
@@ -29986,8 +30029,15 @@ existing prose was left alone.
     `overlay.monitor_open` false, and that is what stops the loop.
     **The layout is Compare results'**, at its width (`modal_w(920)`, `MON_H` 560). The title row is
     its own `title_bar` — *Live monitor*, the watched `database.table` in mono `text_dim`, a pill
-    badge whose dot says *Watching* (`new_color`) or *Paused* (`theme::plan_warn`), and the ✕ in the
-    ring at `TITLE_CLOSE_TAB`; `modal_title` takes only a string. Under it, the filter pills *All ·
+    badge whose dot says *Watching* (`new_color`), *Paused* (`theme::plan_warn`) or *Stopped*
+    (`theme::error`), and the ✕ in the
+    ring at `TITLE_CLOSE_TAB`; `modal_title` takes only a string. **Stopped outranks Paused**, and
+    the pure `badge_state(paused, stopped)` decides it (`a_stopped_monitor_never_reads_as_watching`):
+    the loop ends for good when the table has no row key — `monitor_apply` sets
+    `overlay.monitor_stopped` (carried as `MonitorCtx::stopped`, reset by `open_monitor`) where it
+    returns without rescheduling — and the badge used to read only `paused`, so it stayed a green
+    *Watching* over a loop that was not running, beside the footer's *changes can't be tracked*.
+    Under it, the filter pills *All ·
     Inserts · Updates · Deletes* with their counts (`widgets::count_pill`, `PILLS_TAB` 6–9, Enter
     or Space picking) on the left, and Pause, Clear, Export and the interval dropdown on the right.
     The filter is an `RwSignal<Option<ChangeKind>>`, the counts a memo over
@@ -29997,13 +30047,20 @@ existing prose was left alone.
     delete's struck through in `old_color` (`widgets::struck_text`), an update's changed values
     `old → new` (`widgets::transition_text`) beside its unchanged ones in `text_dim`, and a
     `LogCell::Missing` empty. The headings are `monitor::log_columns` in a memo — the export's own
-    union of names, so the screen and the file head their columns alike. `old_color` is
-    `rgb(D0, 6B, 6B)` and `pub(crate)`, Compare's `removed_color` calling it; the darker red it
-    replaced could not be read struck through. Every colour, the pills' dots and the Action label
+    union of names, so the screen and the file head their columns alike. `old_color` and
+    `new_color` are `pub(crate)`, Compare's `removed_color`/`added_color` calling them, and are
+    **theme roles** — `theme::diff_removed_text`/`diff_added_text`, removed `#D06B6B` and added
+    `#71C371` on dark, `#A8332E` and `#1B6B2E` on light. They were fixed `Color::rgb8` literals tuned for the dark panel, which on the light theme's
+    `bg_panel` read at 1.9:1 (added) and 3.1:1 (removed) — under the *Body* floor on text that is
+    the whole of what an INSERT or DELETE row says. `contrast.rs` now carries both on `bg_panel` at
+    *Body* in `UI_PAIRINGS`, and `the_diff_texts_meet_aa_on_the_panel_in_every_theme` asserts the
+    rows are there and pass; the darker red the dark value replaced could not be read struck
+    through. Every colour, the pills' dots and the Action label
     included, reaches its style through `kind_color`'s `fn() -> Color`.
     **The table is built once and diffed, not rebuilt per poll**, and the two halves of that are one
     change. The body's `dyn_container` reads a **memo**, `Body` — `Waiting` for an empty log (the
-    *Paused.*/*Waiting…* face), `NoneOf(kind)` when the picked pill's kind has none (*No inserts
+    *Paused.*/*Waiting…* face, or *Stopped.* once the loop has ended, since a stopped loop is
+    waiting for nothing either and the footer says why), `NoneOf(kind)` when the picked pill's kind has none (*No inserts
     yet.*), `Table(headings)` otherwise — so it rebuilds when what the area *is* changes, or when
     an `ALTER` changes the columns, never per poll. Reading the log there directly used to
     subscribe to it, and `dyn_container` does not diff — so every poll that landed a single change
@@ -30123,13 +30180,19 @@ existing prose was left alone.
     between blocks, and for a while the arm rested on a fact that no longer implied anything. What
     holds it now is the absence of any control bound to this run, which is exactly what
     `stoppable: false` says.
-    `footer_line(export_err, poll_err, partial, capped, events, since)` decides what the footer
+    `footer_line(export_err, poll_err, partial, capped, length_only, events, since)` decides what the footer
     says: an error takes the line outright in `Tone::Error`, worst-to-mislead first (a failed export
     beats a poll error, because the user believes they have a file and doesn't). Otherwise it is
     *"200 events since 11:48:12 · newest at the bottom"* in `Tone::Calm`, `since` being the oldest
     entry the log still holds, or *No changes yet* for an empty log; with a caveat the tail is
     replaced by **every** caveat that applies, joined, in `Tone::Warn`. `partial` (only the first
-    `ROW_CAP` rows are watched) and `capped` co-occur and neither replaces the other. Paused is the
+    `ROW_CAP` rows are watched) and `capped` co-occur and neither replaces the other. `length_only`
+    is the third (S6.1-L1-05): the watched columns `monitor::length_only_columns` names on the
+    baseline poll, held in `overlay.monitor_length_only` (`MonitorCtx::length_only`, reset by
+    `open_monitor`), said as *"photo is binary, so its changes are seen by length only"* — plural
+    *are … their* for several (`a_binary_column_is_said_to_be_watched_by_length_only`). A blob's
+    snapshot cell is `<n bytes>`, so a blob rewritten at the same length is no change to the poll,
+    and a log that said nothing would read as complete. Paused or stopped is the
     title's badge, not this line. The line ends in an ellipsis and its tooltip carries the whole of
     it, since a poll error can outrun the footer. `capped` is
     `overlay.monitor_dropped > 0`, accumulated from `monitor::trim_log`'s return, **not** the log's
@@ -39522,7 +39585,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   lines, lays out past its own box and paints across the row below — the premise was stated in three
   places and checked in none until a test held it. Both fixed-row tables keep it through that one
   function — the monitor's via `monitor::table_cells`, Compare results' via
-  `result_diff::table_rows` — pinned by `a_cell_line_is_one_short_line`,
+  `result_diff::row_cells` — pinned by `a_cell_line_is_one_short_line`,
   `the_table_cells_show_each_kind_whole` and `a_table_cell_is_one_short_line`. **And a slot
   that renders nothing still owes its height**: `widgets::nothing()` is `display: none`, so
   `entry_row`'s missing-`seq` branch is an `empty()` given `mon_row_h()`; hiding it puts every later

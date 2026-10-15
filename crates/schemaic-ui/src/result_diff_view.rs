@@ -26,7 +26,7 @@ use floem::reactive::create_effect;
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector, virtual_stack};
 
 use schemaic_core::model::ResultSet;
-use schemaic_core::result_diff::{self, DiffCell, DiffRow, ResultDiff, RowChange};
+use schemaic_core::result_diff::{self, DiffCell, ResultDiff, RowChange, TableRow};
 
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, autohide_state, cell_text, dismiss_layer,
@@ -76,7 +76,7 @@ fn col_gap() -> f64 {
 }
 /// One table row's whole height — decreed, as the Live monitor's
 /// `mon_row_h` is, because `VirtualItemSize::Fixed` places row `i` at
-/// `i * height` whatever the row actually measures. `table_rows` keeps every
+/// `i * height` whatever the row actually measures. `row_cells` keeps every
 /// cell to one line, which is what makes it honest.
 fn row_h() -> f64 {
     theme::scaled(29.0)
@@ -113,8 +113,13 @@ struct Computed {
 }
 
 struct Outcome {
-    diff: ResultDiff,
-    rows: Rc<Vec<DiffRow>>,
+    diff: Rc<ResultDiff>,
+    /// The table by reference — each row's cells are built by
+    /// `result_diff::row_cells` when the virtual stack mounts it.
+    rows: Rc<Vec<TableRow>>,
+    /// The two results in compared order, for those cells.
+    first: Arc<ResultSet>,
+    second: Arc<ResultSet>,
     widths: Widths,
 }
 
@@ -167,10 +172,18 @@ fn compute(t: &DiffTarget, swapped: bool, key: Option<String>, generation: u64) 
     let key: Vec<String> = key.into_iter().collect();
     let outcome = result_diff::diff(first, second, &key)
         .map(|diff| {
-            let rows = result_diff::table_rows(first, second, &diff);
+            let rows = result_diff::table_rows(&diff);
+            // Widths from a bounded sample of built rows, not all of them:
+            // building every differing row's cells is the cost `row_cells`
+            // exists to defer to the rows a view mounts.
+            let sample: Vec<Vec<DiffCell>> = rows
+                .iter()
+                .take(WIDTH_SAMPLE)
+                .map(|r| result_diff::row_cells(first, second, &diff, r))
+                .collect();
             // Measured at the scale of the moment, stored at 1×.
             let unit = theme::scaled(1.0);
-            let cols = column_widths(&diff.shared, &rows)
+            let cols = column_widths(&diff.shared, &sample)
                 .into_iter()
                 .map(|w| w / unit)
                 .collect();
@@ -182,8 +195,10 @@ fn compute(t: &DiffTarget, swapped: bool, key: Option<String>, generation: u64) 
                 / unit
                 + 2.0;
             Outcome {
-                diff,
+                diff: Rc::new(diff),
                 rows: Rc::new(rows),
+                first: first.clone(),
+                second: second.clone(),
                 widths: Widths {
                     cols: Rc::new(cols),
                     change,
@@ -198,10 +213,14 @@ fn compute(t: &DiffTarget, swapped: bool, key: Option<String>, generation: u64) 
     }
 }
 
+/// How many table rows' cells are built to size the columns: a column's width
+/// is the longest of these, so a longer value further down ends in `…`.
+const WIDTH_SAMPLE: usize = 2_000;
+
 /// Each column wide enough for its header and its longest values, between
 /// [`min_col_w`] and [`max_col_w`]. Only the few values longest by characters
 /// are measured — shaping every cell of a large result would stall the open.
-fn column_widths(names: &[String], rows: &[DiffRow]) -> Vec<f64> {
+fn column_widths(names: &[String], rows: &[Vec<DiffCell>]) -> Vec<f64> {
     const MEASURED: usize = 3;
     let arrow = measure_text_px_at(" → ", theme::font_body());
     let measure = |c: &DiffCell| match c {
@@ -221,7 +240,7 @@ fn column_widths(names: &[String], rows: &[DiffRow]) -> Vec<f64> {
         .enumerate()
         .map(|(i, name)| {
             let mut longest: Vec<(usize, &DiffCell)> = Vec::with_capacity(MEASURED + 1);
-            for c in rows.iter().filter_map(|r| r.cells.get(i)) {
+            for c in rows.iter().filter_map(|r| r.get(i)) {
                 let n = chars(c);
                 if longest.len() < MEASURED || longest.last().is_some_and(|(m, _)| n > *m) {
                     longest.push((n, c));
@@ -249,7 +268,9 @@ pub(crate) fn result_diff_overlay(overlay: OverlayUi) -> impl IntoView {
             let t = Rc::new(t);
             let close: Rc<dyn Fn()> = Rc::new(move || target.set(None));
             let ring = FocusRing::new();
-            let shared = result_diff::shared_columns(&t.left.rs, &t.right.rs);
+            // The key picker offers only what can be compared: a binary column
+            // reads `<n bytes>` in every row, so it would match nothing apart.
+            let shared = result_diff::key_columns(&t.left.rs, &t.right.rs);
             let key = RwSignal::new(
                 result_diff::suggested_key(&t.left.rs, &t.right.rs)
                     .into_iter()
@@ -539,8 +560,9 @@ fn filter_pills(
     })
 }
 
-/// What the table cannot show: columns one side alone has, rows whose key was
-/// taken, a capped result. Hidden when there is none.
+/// What the table cannot show: columns one side alone has, binary columns
+/// (whose `<n bytes>` text is not their value), rows whose key was taken, a
+/// capped result. Hidden when there is none.
 fn notes(computed: RwSignal<Rc<Computed>>, capped: bool) -> impl IntoView {
     let lines = move || {
         computed.with(|c| {
@@ -555,6 +577,9 @@ fn notes(computed: RwSignal<Rc<Computed>>, capped: bool) -> impl IntoView {
             }
             if !d.only_right.is_empty() {
                 notes.push(format!("Only in {second}: {}", d.only_right.join(", ")));
+            }
+            if !d.uncompared.is_empty() {
+                notes.push(format!("Binary, not compared: {}", d.uncompared.join(", ")));
             }
             if d.repeated_keys > 0 {
                 notes.push(format!(
@@ -661,13 +686,19 @@ fn table_view(computed: Rc<Computed>, filter: Option<RowChange>) -> AnyView {
             .border_color(theme::border())
     });
     let rows = o.rows.clone();
+    let (first, second, diff) = (o.first.clone(), o.second.clone(), o.diff.clone());
     let w = widths.clone();
     let list = virtual_stack(
         VirtualDirection::Vertical,
         VirtualItemSize::Fixed(Box::new(row_h)),
         move || Picked(picked.clone()),
         |i| *i,
-        move |i| table_row(&rows[i], &widths),
+        // A row's cells are built here, as the stack mounts it.
+        move |i| {
+            let row = rows[i];
+            let cells = result_diff::row_cells(&first, &second, &diff, &row);
+            table_row(row.change, &cells, &widths)
+        },
     )
     .style(move |s| s.flex_col().min_width(w.total()));
     // The band is a wrapper's, not the stack's: padding on a virtual stack
@@ -707,8 +738,7 @@ fn header_cell(name: String, widths: Widths, col: Option<usize>) -> AnyView {
 }
 
 /// One row of the table: its kind, then a cell per shared column.
-fn table_row(row: &DiffRow, widths: &Widths) -> impl IntoView + use<> {
-    let change = row.change;
+fn table_row(change: RowChange, row_cells: &[DiffCell], widths: &Widths) -> impl IntoView + use<> {
     let color = change_color(change);
     let w = widths.clone();
     let mut cells: Vec<AnyView> = vec![
@@ -722,7 +752,7 @@ fn table_row(row: &DiffRow, widths: &Widths) -> impl IntoView + use<> {
             })
             .into_any(),
     ];
-    for (i, c) in row.cells.iter().enumerate() {
+    for (i, c) in row_cells.iter().enumerate() {
         let w = widths.clone();
         let content: AnyView = match (c, change) {
             (DiffCell::Changed(before, after), _) => {

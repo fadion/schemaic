@@ -213,6 +213,20 @@ impl Snapshot {
     }
 }
 
+/// The watched columns the monitor can see change **only by length**: a
+/// binary column, whose cell text is `<n bytes>` (by its type, or because the
+/// backend saw a blob in it), so a snapshot holds the byte count and not the
+/// bytes. A blob rewritten at the same length is no change to it — which the
+/// modal says rather than let the log read as complete.
+pub fn length_only_columns(rs: &ResultSet) -> Vec<String> {
+    rs.columns
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| c.is_binary() || rs.binary_columns.contains(i))
+        .map(|(_, c)| c.name.clone())
+        .collect()
+}
+
 /// What happened to a row between two snapshots.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChangeKind {
@@ -815,6 +829,29 @@ mod tests {
         // And pausing doesn't rescue it: the timer belongs to a target the user
         // has already left.
         assert_eq!(tick_action(true, true, true), TickAction::Stop);
+    }
+
+    /// A blob's snapshot cell is `<n bytes>`, so a rewrite at the same length
+    /// is invisible to the diff: such columns are named for the modal to say.
+    #[test]
+    fn a_binary_column_is_watched_by_length_only() {
+        use crate::model::{Column, ResultBuilder, Value};
+        let col = |n: &str, t: &str| Column {
+            name: n.into(),
+            type_name: t.into(),
+            origin: None,
+        };
+        let mut b = ResultBuilder::new(vec![
+            col("id", "INT"),
+            col("photo", "BLOB"),
+            col("note", "TEXT"),
+        ]);
+        b.push_row(&[Value::Int(1), Value::Str("<3 bytes>".into()), Value::Null]);
+        let mut rs = b.finish();
+        assert_eq!(length_only_columns(&rs), ["photo"]);
+        // SQLite's per-value mark counts too.
+        rs.binary_columns = vec![2];
+        assert_eq!(length_only_columns(&rs), ["photo", "note"]);
     }
 
     /// **A shift, not a set difference.** The whole snapshot pipeline is

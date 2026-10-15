@@ -6236,6 +6236,13 @@ pub struct OverlayUi {
     /// the table rather than the table. Said in the status line, because a change
     /// beyond that page is invisible and no amount of diffing can recover it.
     pub monitor_partial: RwSignal<bool>,
+    /// The poll loop has **stopped** for good — the table has no row key, so
+    /// nothing can be tracked. The title's badge reads it: a green *Watching*
+    /// over a loop that is not running was the screen claiming two things.
+    pub monitor_stopped: RwSignal<bool>,
+    /// Watched columns whose changes the poll sees by length only (binary
+    /// ones — `monitor::length_only_columns`), said in the footer.
+    pub monitor_length_only: RwSignal<Vec<String>>,
     /// Poll interval in seconds (the popup's dropdown). Read by the poll loop on
     /// each re-arm, so a change takes effect on the next tick. Session-only.
     pub monitor_interval: RwSignal<u64>,

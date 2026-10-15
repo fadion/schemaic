@@ -142,13 +142,15 @@ impl VirtualVector<u64> for LogSeqs {
 
 /// Old-value tint (a delete, an update's old value) and new-value tint (an
 /// insert, an update's new value) — Compare results' removed and added rows too
-/// (`result_diff_view`). The red is light enough to read struck through at body
-/// size on a dark panel; the monitor's first, darker one was not.
+/// (`result_diff_view`). Theme roles, read per call so a live theme switch
+/// repaints them: as fixed literals tuned for the dark panel they read at 1.9:1
+/// (added) and 3.1:1 (removed) on the light one. `crate::contrast` holds both
+/// at AA on `bg_panel` in every theme.
 pub(crate) fn old_color() -> Color {
-    Color::rgb8(0xD0, 0x6B, 0x6B)
+    theme::diff_removed_text()
 }
 pub(crate) fn new_color() -> Color {
-    Color::rgb8(0x71, 0xC3, 0x71)
+    theme::diff_added_text()
 }
 
 /// A kind's colour — its Action label, its pill's dot. **A `fn() -> Color`**:
@@ -267,6 +269,8 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
     let log = o.monitor_log;
     let error = o.monitor_error;
     let partial = o.monitor_partial;
+    let stopped = o.monitor_stopped;
+    let length_only = o.monitor_length_only;
     let interval = o.monitor_interval;
     let paused = o.monitor_paused;
     let export_err = o.monitor_export_err;
@@ -360,7 +364,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 });
             }
 
-            let modal_header = title_bar(title, paused, close.clone(), ring.clone());
+            let modal_header = title_bar(title, paused, stopped, close.clone(), ring.clone());
 
             // Pause / Clear / Export, left of the interval dropdown. All three are
             // in the modal's ring, in reading order, so the log is operable without
@@ -597,8 +601,18 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                         // position, which is the thing someone pauses in order to read.
                         Body::Waiting => {
                             return container(dyn_container(
-                                move || paused.get(),
-                                move |is_paused| {
+                                move || (paused.get(), stopped.get()),
+                                move |(is_paused, is_stopped)| {
+                                    // A stopped loop is waiting for nothing
+                                    // either; the footer says why.
+                                    if is_stopped {
+                                        return text("Stopped.")
+                                            .style(|s| {
+                                                s.color(theme::text_dim())
+                                                    .font_size(theme::scaled_font(13.0))
+                                            })
+                                            .into_any();
+                                    }
                                     if is_paused {
                                         // Static, not `loading_dots`: cycling dots say
                                         // "any moment now", and a paused monitor is not
@@ -754,6 +768,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                         // What was actually dropped, not what the length implies:
                         // a log resting *at* the cap has lost nothing yet.
                         dropped.get() > 0,
+                        &length_only.get(),
                         l.len(),
                         l.first().map(|e| e.at.as_str()),
                     )
@@ -823,26 +838,37 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
     })
 }
 
+/// The title badge's word and dot colour. **Stopped outranks Paused**: a loop
+/// that has ended (a table with no row key) is not waiting for Resume, and
+/// the badge read only `paused`, so it stayed a green *Watching* beside the
+/// footer's "changes can't be tracked".
+fn badge_state(paused: bool, stopped: bool) -> (&'static str, fn() -> Color) {
+    if stopped {
+        ("Stopped", theme::error)
+    } else if paused {
+        ("Paused", theme::plan_warn)
+    } else {
+        ("Watching", new_color)
+    }
+}
+
 /// The title row: *Live monitor*, the watched `database.table` in mono, a badge
-/// saying whether it is *Watching* or *Paused*, and the ✕ — `modal_title`'s
-/// shape, which takes only a string.
+/// saying whether it is *Watching*, *Paused* or *Stopped*, and the ✕ —
+/// `modal_title`'s shape, which takes only a string.
 fn title_bar(
     title: RwSignal<Option<String>>,
     paused: RwSignal<bool>,
+    stopped: RwSignal<bool>,
     close: Rc<dyn Fn()>,
     ring: crate::widgets::FocusRing,
 ) -> impl IntoView {
     let table = title.get_untracked().unwrap_or_default();
+    let state = move || badge_state(paused.get(), stopped.get());
     let badge = h_stack((
         // 1px low, to sit on the label's optical middle rather than its box's.
-        icons::icon(icons::DOT, 6.0).style(move |s| {
-            s.margin_top(theme::scaled(1.0)).color(if paused.get() {
-                theme::plan_warn()
-            } else {
-                new_color()
-            })
-        }),
-        label(move || if paused.get() { "Paused" } else { "Watching" }),
+        icons::icon(icons::DOT, 6.0)
+            .style(move |s| s.margin_top(theme::scaled(1.0)).color(state().1())),
+        label(move || state().0),
     ))
     .style(|s| {
         s.items_center()
@@ -1113,13 +1139,15 @@ impl Tone {
 /// *co-occur* and each one is a different reason the log isn't the whole story.
 /// `partial` and `capped` are the two silent truncations — rows the poll can't
 /// see, and changes the log has already dropped — and the second only became
-/// load-bearing when the log became exportable. Whether the poll is paused is
-/// the title's badge, not this line.
+/// load-bearing when the log became exportable. `length_only` is the third:
+/// binary columns, whose changes a poll sees only when their length moves.
+/// Whether the poll is paused or stopped is the title's badge, not this line.
 fn footer_line(
     export_err: Option<String>,
     poll_err: Option<String>,
     partial: bool,
     capped: bool,
+    length_only: &[String],
     events: usize,
     since: Option<&str>,
 ) -> (String, Tone) {
@@ -1143,6 +1171,19 @@ fn footer_line(
         parts.push(format!(
             "the oldest are dropping at the {}-change cap",
             schemaic_core::monitor::LOG_CAP
+        ));
+    }
+    // A blob's cell is `<n bytes>`: rewritten at the same length, it is no
+    // change to the poll.
+    if !length_only.is_empty() {
+        parts.push(format!(
+            "{} {} by length only",
+            length_only.join(", "),
+            if length_only.len() == 1 {
+                "is binary, so its changes are seen"
+            } else {
+                "are binary, so their changes are seen"
+            }
         ));
     }
     if parts.len() > 1 {
@@ -1315,7 +1356,49 @@ mod tests {
     /// `footer_line` with no error, 200 events since 11:48:12 — the two
     /// truncation flags are what most of these vary.
     fn line(partial: bool, capped: bool) -> (String, Tone) {
-        footer_line(None, None, partial, capped, 200, Some("11:48:12"))
+        footer_line(None, None, partial, capped, &[], 200, Some("11:48:12"))
+    }
+
+    /// A stopped loop is not waiting for anything: its badge says so, ahead of
+    /// a pause, and never in the live green.
+    #[test]
+    fn a_stopped_monitor_never_reads_as_watching() {
+        assert_eq!(badge_state(false, false).0, "Watching");
+        assert_eq!(badge_state(true, false).0, "Paused");
+        for paused in [false, true] {
+            let (word, color) = badge_state(paused, true);
+            assert_eq!(word, "Stopped");
+            assert!(color == theme::error as fn() -> Color);
+        }
+    }
+
+    /// Binary columns are seen by length only, and the footer says which.
+    #[test]
+    fn a_binary_column_is_said_to_be_watched_by_length_only() {
+        let (msg, tone) = footer_line(
+            None,
+            None,
+            false,
+            false,
+            &["photo".to_string()],
+            3,
+            Some("10:00:00"),
+        );
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            msg.ends_with("photo is binary, so its changes are seen by length only"),
+            "{msg}"
+        );
+        let (two, _) = footer_line(
+            None,
+            None,
+            false,
+            false,
+            &["a".to_string(), "b".to_string()],
+            0,
+            None,
+        );
+        assert!(two.contains("a, b are binary"), "{two}");
     }
 
     #[test]
@@ -1327,14 +1410,14 @@ mod tests {
                 Tone::Calm
             )
         );
-        let (one, _) = footer_line(None, None, false, false, 1, Some("09:00:00"));
+        let (one, _) = footer_line(None, None, false, false, &[], 1, Some("09:00:00"));
         assert_eq!(one, "1 event since 09:00:00 · newest at the bottom");
     }
 
     #[test]
     fn an_empty_log_says_nothing_has_changed() {
         assert_eq!(
-            footer_line(None, None, false, false, 0, None),
+            footer_line(None, None, false, false, &[], 0, None),
             ("No changes yet".to_string(), Tone::Calm)
         );
     }
@@ -1355,6 +1438,7 @@ mod tests {
             Some("connection lost".into()),
             true,
             true,
+            &[],
             5,
             Some("10:00:00"),
         );
@@ -1374,6 +1458,7 @@ mod tests {
             Some("connection lost".into()),
             true,
             true,
+            &[],
             5,
             Some("10:00:00"),
         );

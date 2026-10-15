@@ -2955,6 +2955,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let monitor_log: RwSignal<Vec<MonitorEntry>> = RwSignal::new(Vec::new());
     let monitor_error: RwSignal<Option<String>> = RwSignal::new(None);
     let monitor_partial: RwSignal<bool> = RwSignal::new(false);
+    let monitor_stopped: RwSignal<bool> = RwSignal::new(false);
+    let monitor_length_only: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
     let monitor_interval: RwSignal<u64> = RwSignal::new(MONITOR_INTERVAL_SECS);
     let monitor_paused: RwSignal<bool> = RwSignal::new(false);
     let monitor_export_err: RwSignal<Option<String>> = RwSignal::new(None);
@@ -3852,6 +3854,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             monitor_cols.set(Vec::new());
             monitor_error.set(None);
             monitor_partial.set(false);
+            monitor_stopped.set(false);
+            monitor_length_only.set(Vec::new());
             monitor_paused.set(false);
             monitor_export_err.set(None);
             monitor_exported.set(false);
@@ -3868,6 +3872,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 log: monitor_log,
                 error: monitor_error,
                 partial: monitor_partial,
+                stopped: monitor_stopped,
+                length_only: monitor_length_only,
                 prev: monitor_prev.clone(),
                 key_cols: monitor_key_cols.clone(),
                 generation: monitor_gen.clone(),
@@ -14421,6 +14427,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             monitor_log,
             monitor_error,
             monitor_partial,
+            monitor_stopped,
+            monitor_length_only,
             monitor_interval,
             monitor_paused,
             monitor_export_err,
@@ -14885,6 +14893,10 @@ struct MonitorCtx {
     error: RwSignal<Option<String>>,
     /// The last poll filled the row cap — the modal says the window is a page.
     partial: RwSignal<bool>,
+    /// The loop has stopped for good (no row key) — the badge says *Stopped*.
+    stopped: RwSignal<bool>,
+    /// Binary columns, whose changes a poll sees by length only.
+    length_only: RwSignal<Vec<String>>,
     prev: Rc<RefCell<Option<Snapshot>>>,
     key_cols: Rc<RefCell<Vec<usize>>>,
     generation: Rc<Cell<u64>>,
@@ -15065,6 +15077,8 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                 // Baseline poll: capture columns + resolve the identity key once.
                 ctx.cols
                     .set(rs.columns.iter().map(|c| c.name.clone()).collect());
+                ctx.length_only
+                    .set(schemaic_core::monitor::length_only_columns(&rs));
                 let db_nodes = ctx.db_nodes;
                 let model = analyze_edit(&rs, ctx.dialect, |db, ns, table| {
                     db_nodes.with_untracked(|nodes| {
@@ -15084,6 +15098,9 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                         ctx.error.set(Some(
                             "No row key for this table — changes can't be tracked.".to_string(),
                         ));
+                        // The loop ends here, and the badge has to say so:
+                        // it read only `paused`, and stayed a green Watching.
+                        ctx.stopped.set(true);
                         return; // nothing meaningful to poll; leave the modal open on the message
                     }
                 }

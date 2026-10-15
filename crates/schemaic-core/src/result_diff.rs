@@ -17,6 +17,10 @@
 //!
 //! Values compare as the grid shows them — by their text, NULL being its own
 //! value — so `1` and `1.0` from two engines differ, as they would on screen.
+//! **Except where that text is not the value**: a binary column's cells read
+//! `<n bytes>`, which would call two different blobs of one length the same,
+//! so such a column is left out of the comparison, never a key, and named as
+//! not compared ([`ResultDiff::uncompared`]).
 
 use std::collections::HashMap;
 
@@ -52,6 +56,12 @@ pub struct ResultDiff {
     pub same: usize,
     /// Rows ignored because their key was already taken on the same side.
     pub repeated_keys: usize,
+    /// Columns both results have that were **not compared**, because one side
+    /// or the other holds raw bytes there: such a cell's text is
+    /// [`crate::model::binary_display`]'s `<n bytes>`, not its value, so two
+    /// different blobs of one length would read as the same. Not in
+    /// [`Self::shared`], never a key, and said in the summary.
+    pub uncompared: Vec<String>,
 }
 
 impl ResultDiff {
@@ -65,9 +75,10 @@ impl ResultDiff {
     pub fn summary(&self) -> String {
         if self.is_identical() {
             return format!(
-                "No differences · {} {} unchanged",
+                "No differences · {} {} unchanged{}",
                 self.same,
-                crate::text::plural(self.same, "row", "rows")
+                crate::text::plural(self.same, "row", "rows"),
+                self.uncompared_clause()
             );
         }
         let mut parts = Vec::new();
@@ -81,7 +92,17 @@ impl ResultDiff {
             }
         }
         parts.push(format!("{} unchanged", self.same));
-        parts.join(" · ")
+        parts.join(" · ") + &self.uncompared_clause()
+    }
+
+    /// `" · pw_hash not compared"` when a binary column was left out, so
+    /// "unchanged" is never read as covering it.
+    fn uncompared_clause(&self) -> String {
+        if self.uncompared.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} not compared", self.uncompared.join(", "))
+        }
     }
 }
 
@@ -116,67 +137,95 @@ pub enum DiffCell {
     Changed(String, String),
 }
 
-/// One row of the comparison table: a cell for each of [`ResultDiff::shared`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DiffRow {
+/// One row of the comparison table, **by reference**: what kind it is and
+/// where it is — a removed row's index in the first result, an added row's in
+/// the second, a changed row's in [`ResultDiff::changed`]. No cell text: that
+/// is built by [`row_cells`] for the rows a view actually mounts, since
+/// building every differing cell up front was a string or three per cell of
+/// every differing row, on the UI thread, at open and on every swap or key
+/// change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableRow {
     pub change: RowChange,
-    pub cells: Vec<DiffCell>,
+    pub at: usize,
 }
 
 /// The differences in `d` as a table under its shared columns: the first
 /// result's changed and removed rows in the order it holds them, then the rows
 /// only the second has, in its order. `d` must be `diff(left, right, …)`.
-pub fn table_rows(left: &ResultSet, right: &ResultSet, d: &ResultDiff) -> Vec<DiffRow> {
-    let lc: Vec<Option<usize>> = d.shared.iter().map(|n| col(left, n)).collect();
-    let rc: Vec<Option<usize>> = d.shared.iter().map(|n| col(right, n)).collect();
-    let whole = |rs: &ResultSet, row: usize, cols: &[Option<usize>], change| DiffRow {
-        change,
-        cells: cols
-            .iter()
-            .map(|c| DiffCell::Value(table_value(c.and_then(|c| cell(rs, row, c)))))
-            .collect(),
-    };
+pub fn table_rows(d: &ResultDiff) -> Vec<TableRow> {
     // Changed and removed rows by their place in the first result.
-    let mut firsts: Vec<(usize, DiffRow)> = d
+    let mut firsts: Vec<(usize, TableRow)> = d
         .left_only
         .iter()
-        .map(|&r| (r, whole(left, r, &lc, RowChange::Removed)))
+        .map(|&r| {
+            (
+                r,
+                TableRow {
+                    change: RowChange::Removed,
+                    at: r,
+                },
+            )
+        })
+        .chain(d.changed.iter().enumerate().map(|(i, ch)| {
+            (
+                ch.left,
+                TableRow {
+                    change: RowChange::Changed,
+                    at: i,
+                },
+            )
+        }))
         .collect();
-    for ch in &d.changed {
-        let cells = lc
-            .iter()
-            .zip(&rc)
-            .zip(&d.shared)
-            .map(|((l, r), name)| {
-                let before = l.and_then(|c| cell(left, ch.left, c));
-                if ch.columns.contains(name) {
-                    let after = r.and_then(|c| cell(right, ch.right, c));
-                    DiffCell::Changed(table_value(before), table_value(after))
-                } else {
-                    DiffCell::Value(table_value(before))
-                }
-            })
-            .collect();
-        firsts.push((
-            ch.left,
-            DiffRow {
-                change: RowChange::Changed,
-                cells,
-            },
-        ));
-    }
     firsts.sort_by_key(|(r, _)| *r);
     let mut added = d.right_only.clone();
     added.sort_unstable();
     firsts
         .into_iter()
         .map(|(_, row)| row)
-        .chain(
-            added
-                .into_iter()
-                .map(|r| whole(right, r, &rc, RowChange::Added)),
-        )
+        .chain(added.into_iter().map(|r| TableRow {
+            change: RowChange::Added,
+            at: r,
+        }))
         .collect()
+}
+
+/// One table row's cells, one per [`ResultDiff::shared`] column, each one line
+/// of text. `d` must be `diff(left, right, …)` and `row` one of its
+/// [`table_rows`]; a row out of range has no cells.
+pub fn row_cells(
+    left: &ResultSet,
+    right: &ResultSet,
+    d: &ResultDiff,
+    row: &TableRow,
+) -> Vec<DiffCell> {
+    let whole = |rs: &ResultSet, r: usize| -> Vec<DiffCell> {
+        d.shared
+            .iter()
+            .map(|n| DiffCell::Value(table_value(col(rs, n).and_then(|c| cell(rs, r, c)))))
+            .collect()
+    };
+    match row.change {
+        RowChange::Removed => whole(left, row.at),
+        RowChange::Added => whole(right, row.at),
+        RowChange::Changed => {
+            let Some(ch) = d.changed.get(row.at) else {
+                return Vec::new();
+            };
+            d.shared
+                .iter()
+                .map(|name| {
+                    let before = col(left, name).and_then(|c| cell(left, ch.left, c));
+                    if ch.columns.contains(name) {
+                        let after = col(right, name).and_then(|c| cell(right, ch.right, c));
+                        DiffCell::Changed(table_value(before), table_value(after))
+                    } else {
+                        DiffCell::Value(table_value(before))
+                    }
+                })
+                .collect()
+        }
+    }
 }
 
 /// A value as one line of a table cell — [`crate::text::cell_line`].
@@ -189,6 +238,8 @@ fn table_value(v: Option<String>) -> String {
 pub enum DiffError {
     /// A key column one side does not have.
     MissingKey(String),
+    /// A key column holding raw bytes, whose cells all read `<n bytes>`.
+    BinaryKey(String),
 }
 
 impl std::fmt::Display for DiffError {
@@ -196,6 +247,12 @@ impl std::fmt::Display for DiffError {
         match self {
             DiffError::MissingKey(c) => {
                 write!(f, "both results need a column named {c} to match rows by")
+            }
+            DiffError::BinaryKey(c) => {
+                write!(
+                    f,
+                    "{c} holds binary values, which are not compared, so it cannot match rows"
+                )
             }
         }
     }
@@ -210,11 +267,29 @@ pub fn shared_columns(left: &ResultSet, right: &ResultSet) -> Vec<String> {
         .collect()
 }
 
-/// A key to start from: a shared column named `id` (any case), else the
-/// first shared column whose values are unique and never NULL on both sides,
-/// else none — the whole row.
+/// Does column `name` of `rs` hold raw bytes — by its type, or because the
+/// backend saw a blob in it ([`ResultSet::binary_columns`], SQLite's per-value
+/// answer)? Its cells' text is then `<n bytes>`, a placeholder, not the value.
+fn is_binary(rs: &ResultSet, name: &str) -> bool {
+    col(rs, name).is_some_and(|c| rs.columns[c].is_binary() || rs.binary_columns.contains(&c))
+}
+
+/// The shared columns that **can** be compared — and so offered as a key: a
+/// column binary on either side is not, since its cells are placeholders.
+pub fn key_columns(left: &ResultSet, right: &ResultSet) -> Vec<String> {
+    shared_columns(left, right)
+        .into_iter()
+        .filter(|n| !is_binary(left, n) && !is_binary(right, n))
+        .collect()
+}
+
+/// A key to start from: a comparable shared column ([`key_columns`]) named
+/// `id` (any case), else the first one whose values are unique and never NULL
+/// on both sides, else none — the whole row. A binary `id` is passed over:
+/// every `BINARY(16)` UUID reads `<16 bytes>`, so as a key it matched the
+/// first row and called every other a repeat.
 pub fn suggested_key(left: &ResultSet, right: &ResultSet) -> Vec<String> {
-    let shared = shared_columns(left, right);
+    let shared = key_columns(left, right);
     if let Some(id) = shared.iter().find(|n| n.eq_ignore_ascii_case("id")) {
         return vec![id.clone()];
     }
@@ -236,22 +311,34 @@ pub fn suggested_key(left: &ResultSet, right: &ResultSet) -> Vec<String> {
 /// `left` against `right`, rows matched by the `key` columns — or by the whole
 /// shared row when `key` is empty.
 pub fn diff(left: &ResultSet, right: &ResultSet, key: &[String]) -> Result<ResultDiff, DiffError> {
-    let shared = shared_columns(left, right);
+    let both = shared_columns(left, right);
     let names =
         |rs: &ResultSet| -> Vec<String> { rs.columns.iter().map(|c| c.name.clone()).collect() };
     let only_left: Vec<String> = names(left)
         .into_iter()
-        .filter(|n| !shared.contains(n))
+        .filter(|n| !both.contains(n))
         .collect();
     let only_right: Vec<String> = names(right)
         .into_iter()
-        .filter(|n| !shared.contains(n))
+        .filter(|n| !both.contains(n))
         .collect();
     for k in key {
-        if !shared.contains(k) {
+        if !both.contains(k) {
             return Err(DiffError::MissingKey(k.clone()));
         }
     }
+    // A binary column is left out of the comparison and said to be: its text
+    // is `<n bytes>`, so two blobs of one length would read as the same.
+    let compared = key_columns(left, right);
+    if let Some(k) = key.iter().find(|k| !compared.contains(k)) {
+        return Err(DiffError::BinaryKey(k.clone()));
+    }
+    let uncompared: Vec<String> = both
+        .iter()
+        .filter(|n| !compared.contains(n))
+        .cloned()
+        .collect();
+    let shared = compared;
     let cols = |rs: &ResultSet, which: &[String]| -> Vec<usize> {
         which.iter().filter_map(|n| col(rs, n)).collect()
     };
@@ -259,25 +346,32 @@ pub fn diff(left: &ResultSet, right: &ResultSet, key: &[String]) -> Result<Resul
         shared: shared.clone(),
         only_left,
         only_right,
+        uncompared,
         ..ResultDiff::default()
     };
     if key.is_empty() {
-        // Whole-row identity, as a multiset.
+        // Whole-row identity, as a multiset. Each bucket is consumed from the
+        // front through a cursor: `remove(0)` shifted the whole bucket per
+        // match, quadratic in a column of few distinct values — 300k equal
+        // rows took about 25 s (a debug test build), on the UI thread.
         let (lc, rc) = (cols(left, &shared), cols(right, &shared));
-        let mut counts: HashMap<RowKey, Vec<usize>> = HashMap::new();
+        let mut counts: HashMap<RowKey, (Vec<usize>, usize)> = HashMap::new();
         for r in 0..left.row_count() {
-            counts.entry(row_key(left, r, &lc)).or_default().push(r);
+            counts.entry(row_key(left, r, &lc)).or_default().0.push(r);
         }
         for r in 0..right.row_count() {
             match counts.get_mut(&row_key(right, r, &rc)) {
-                Some(rows) if !rows.is_empty() => {
-                    rows.remove(0);
+                Some((rows, next)) if *next < rows.len() => {
+                    *next += 1;
                     out.same += 1;
                 }
                 _ => out.right_only.push(r),
             }
         }
-        let mut gone: Vec<usize> = counts.into_values().flatten().collect();
+        let mut gone: Vec<usize> = counts
+            .into_values()
+            .flat_map(|(rows, next)| rows.into_iter().skip(next))
+            .collect();
         gone.sort_unstable();
         out.left_only = gone;
         return Ok(out);
@@ -436,6 +530,60 @@ mod tests {
         DiffCell::Value(s.into())
     }
 
+    /// A table row with its cells built, as a mounted row is.
+    #[derive(Debug, PartialEq)]
+    struct DiffRow {
+        change: RowChange,
+        cells: Vec<DiffCell>,
+    }
+
+    /// The whole table built — `table_rows` then `row_cells` for each, which
+    /// is the composition the view makes one mounted row at a time.
+    fn table(left: &ResultSet, right: &ResultSet, d: &ResultDiff) -> Vec<DiffRow> {
+        table_rows(d)
+            .iter()
+            .map(|r| DiffRow {
+                change: r.change,
+                cells: row_cells(left, right, d, r),
+            })
+            .collect()
+    }
+
+    /// The table's rows say where each row is, and a row index that does not
+    /// name a change builds no cells rather than panicking.
+    #[test]
+    fn table_rows_hold_places_and_row_cells_builds_one_row() {
+        let a = rs(&["id", "v"], &[&[i(1), s("old")], &[i(2), s("x")]]);
+        let b = rs(&["id", "v"], &[&[i(1), s("new")], &[i(3), s("y")]]);
+        let d = diff(&a, &b, &["id".into()]).unwrap();
+        assert_eq!(
+            table_rows(&d),
+            [
+                TableRow {
+                    change: RowChange::Changed,
+                    at: 0
+                },
+                TableRow {
+                    change: RowChange::Removed,
+                    at: 1
+                },
+                TableRow {
+                    change: RowChange::Added,
+                    at: 1
+                },
+            ]
+        );
+        assert_eq!(
+            row_cells(&a, &b, &d, &table_rows(&d)[0]),
+            [v("1"), DiffCell::Changed("old".into(), "new".into())]
+        );
+        let stray = TableRow {
+            change: RowChange::Changed,
+            at: 9,
+        };
+        assert!(row_cells(&a, &b, &d, &stray).is_empty());
+    }
+
     /// The table reads the first result top to bottom — its changed and
     /// removed rows where they stood — then the rows only the second has, in
     /// its order; every cell under the shared columns.
@@ -461,7 +609,7 @@ mod tests {
             ],
         );
         let d = diff(&before, &after, &["id".into()]).unwrap();
-        let rows = table_rows(&before, &after, &d);
+        let rows = table(&before, &after, &d);
         assert_eq!(
             rows,
             [
@@ -493,7 +641,7 @@ mod tests {
         let b = rs(&["id", "v"], &[&[i(1), s("new")], &[i(3), s("y")]]);
         let key = ["id".to_string()];
         let back = diff(&b, &a, &key).unwrap();
-        let rows = table_rows(&b, &a, &back);
+        let rows = table(&b, &a, &back);
         assert_eq!(
             rows.iter().map(|r| r.change).collect::<Vec<_>>(),
             [RowChange::Changed, RowChange::Removed, RowChange::Added]
@@ -522,7 +670,7 @@ mod tests {
         );
         let b = rs(&["v"], &[]);
         let d = diff(&a, &b, &[]).unwrap();
-        let rows = table_rows(&a, &b, &d);
+        let rows = table(&a, &b, &d);
         assert_eq!(rows[0].cells, [v("NULL")]);
         assert_eq!(rows[1].cells, [v("one two")]);
         assert_eq!(rows[3].cells, [v("a b c d e f")], "every mandatory break");
@@ -537,7 +685,7 @@ mod tests {
         let a = rs(&["x"], &[&[i(1)], &[i(2)]]);
         let b = rs(&["x"], &[&[i(2)], &[i(3)]]);
         let d = diff(&a, &b, &[]).unwrap();
-        let rows = table_rows(&a, &b, &d);
+        let rows = table(&a, &b, &d);
         assert_eq!(
             rows.iter().map(|r| r.change).collect::<Vec<_>>(),
             [RowChange::Removed, RowChange::Added]
@@ -608,6 +756,105 @@ mod tests {
             diff(&a, &b, &["id".into()]),
             Err(DiffError::MissingKey("id".into()))
         );
+    }
+
+    /// Columns with their types — what makes one binary.
+    fn typed(cols: &[(&str, &str)], rows: &[&[Value]]) -> ResultSet {
+        let mut b = ResultBuilder::new(
+            cols.iter()
+                .map(|(n, t)| Column {
+                    name: n.to_string(),
+                    type_name: t.to_string(),
+                    origin: None,
+                })
+                .collect(),
+        );
+        for r in rows {
+            b.push_row(r);
+        }
+        b.finish()
+    }
+
+    /// A binary cell's text is `<n bytes>`, not its value: two blobs of one
+    /// length read the same whatever their bytes. Such a column is said to be
+    /// uncompared rather than reported "unchanged".
+    #[test]
+    fn a_binary_column_is_named_as_not_compared() {
+        let cols = [
+            ("id", "INT"),
+            ("pw_hash", "VARBINARY(32)"),
+            ("name", "TEXT"),
+        ];
+        let a = typed(&cols, &[&[i(1), s("<32 bytes>"), s("x")]]);
+        let b = typed(&cols, &[&[i(1), s("<32 bytes>"), s("x")]]);
+        let d = diff(&a, &b, &["id".into()]).unwrap();
+        assert_eq!(d.uncompared, ["pw_hash"]);
+        assert_eq!(d.shared, ["id", "name"], "the compared columns");
+        assert!(
+            d.summary().contains("pw_hash not compared"),
+            "{}",
+            d.summary()
+        );
+        // Whole-row identity leaves it out too, and says so.
+        let whole = diff(&a, &b, &[]).unwrap();
+        assert_eq!(whole.uncompared, ["pw_hash"]);
+        // Binary on one side is enough: that side's text is a placeholder.
+        let text_b = typed(
+            &[("id", "INT"), ("pw_hash", "TEXT"), ("name", "TEXT")],
+            &[&[i(1), s("<32 bytes>"), s("x")]],
+        );
+        assert_eq!(diff(&a, &text_b, &[]).unwrap().uncompared, ["pw_hash"]);
+        // A plain result says nothing extra.
+        assert!(diff(&a, &b, &["id".into()]).unwrap().uncompared.len() == 1);
+        let plain = rs(&["id"], &[&[i(1)]]);
+        assert!(diff(&plain, &plain, &[]).unwrap().uncompared.is_empty());
+        assert!(
+            !diff(&plain, &plain, &[])
+                .unwrap()
+                .summary()
+                .contains("compared")
+        );
+    }
+
+    /// Every `BINARY(16)` UUID reads `<16 bytes>`, so as a key it would match
+    /// the first row and call every other a repeat: it is never suggested, and
+    /// asked for, it is refused.
+    #[test]
+    fn a_binary_column_is_never_a_key() {
+        let cols = [("id", "BINARY(16)"), ("code", "TEXT")];
+        let a = typed(
+            &cols,
+            &[&[s("<16 bytes>"), s("a")], &[s("<16 bytes>"), s("b")]],
+        );
+        assert_eq!(suggested_key(&a, &a), ["code"]);
+        assert_eq!(
+            diff(&a, &a, &["id".into()]),
+            Err(DiffError::BinaryKey("id".into()))
+        );
+        assert_eq!(key_columns(&a, &a), ["code"]);
+        // SQLite marks a blob per value rather than by type.
+        let mut blob = rs(&["id", "code"], &[&[s("<4 bytes>"), s("a")]]);
+        blob.binary_columns = vec![0];
+        assert_eq!(suggested_key(&blob, &blob), ["code"]);
+    }
+
+    /// Whole-row identity over many equal rows was quadratic — each match
+    /// shifted its whole bucket down by one — and runs on the UI thread.
+    #[test]
+    fn whole_row_identity_over_many_equal_rows_is_linear() {
+        // Large enough that the quadratic shift (≈ n²/2 moves) cannot hide
+        // under the bound below, as 100k rows could behind a fast `memmove`.
+        let n = 300_000;
+        let rows: Vec<Vec<Value>> = (0..n).map(|_| vec![s("same")]).collect();
+        let refs: Vec<&[Value]> = rows.iter().map(Vec::as_slice).collect();
+        let a = rs(&["status"], &refs);
+        let b = rs(&["status"], &refs[..n - 1]);
+        let started = std::time::Instant::now();
+        let d = diff(&a, &b, &[]).unwrap();
+        let took = started.elapsed();
+        assert_eq!(d.same, n - 1);
+        assert_eq!(d.left_only, [n - 1], "the last of the left's copies");
+        assert!(took.as_secs_f64() < 5.0, "{took:?}");
     }
 
     #[test]

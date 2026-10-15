@@ -278,6 +278,14 @@ pub struct UiTheme {
     pub status_warn_hover: Color,
     /// Green for the "no warnings" check.
     pub status_ok: Color,
+    /// A value that arrived — Compare results' added rows and a change's new
+    /// value, the Live monitor's INSERT and an update's new value — as text on
+    /// `bg_panel`. These were two literals tuned for the dark panel, which put
+    /// an added value at 1.9:1 on the light one.
+    pub diff_added_text: Color,
+    /// A value that went — removed rows (struck through), a change's old value,
+    /// the monitor's DELETE — likewise text on `bg_panel`.
+    pub diff_removed_text: Color,
     /// Green CTA *fill* for the AI "Seed rows" Generate button (white text).
     pub seed_button: Color,
     /// The table designer's "N changes" count, when there are changes.
@@ -448,6 +456,11 @@ impl UiTheme {
             status_warn: c("#E08A4B"),
             status_warn_hover: c("#FFA461"),
             status_ok: c("#71C371"),
+            // The values the two literals had, measured here at last: both
+            // clear 4.5:1 on `bg_panel` (#1B1C23), the red light enough to read
+            // struck through at body size.
+            diff_added_text: c("#71C371"),
+            diff_removed_text: c("#D06B6B"),
             // A fill, not text: white on the old #71C371 was 2.15:1 in both
             // palettes, the one accent here that needed to go *darker* on dark.
             seed_button: c("#2E7D32"),
@@ -617,6 +630,10 @@ impl UiTheme {
             status_warn: c("#8A5200"),
             status_warn_hover: c("#6F4200"),
             status_ok: c("#1B6B2E"),
+            // The same hues deepened for `bg_panel` (#F1F2F6), where the dark
+            // theme's pair read at 1.9:1 and 3.1:1.
+            diff_added_text: c("#1B6B2E"),
+            diff_removed_text: c("#A8332E"),
             seed_button: c("#2E7D32"),
             change_count: c("#1B6B2E"),
             tx_open: c("#7D5A00"),

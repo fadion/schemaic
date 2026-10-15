@@ -326,6 +326,10 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(match_highlight on bg_panel, Body, "Find Anywhere: the matched substring"),
     pair!(plan_warn on bg_panel, Body, "import modal: a pre-flight warning"),
     pair!(change_count on bg_panel, Body, "table designer: the N changes count"),
+    pair!(diff_added_text on bg_panel, Body,
+        "Compare results: an added row, a change's new value; Live monitor: INSERT, new value"),
+    pair!(diff_removed_text on bg_panel, Body,
+        "Compare results: a removed row (struck), a change's old value; Live monitor: DELETE, old value"),
     // The in-form button surface — `theme::control_bg()` is `erd_canvas` under
     // another name. Two roles paint on it and neither had a row, so a palette
     // edit could have moved either silently, which is the one thing this table
@@ -1078,6 +1082,36 @@ mod tests {
             let t = kind.build();
             for p in UI_PAIRINGS {
                 assert!(p.ratio(&t) >= 1.0, "{} on {}", p.fg, p.bg);
+            }
+        }
+    }
+
+    /// Compare results' and the Live monitor's added and removed text sits on
+    /// the modal's `bg_panel` at body size. It was two hex literals tuned for
+    /// the dark panel — an added value read at about 1.9:1 on the light one —
+    /// and outside this table, because they were not theme roles.
+    #[test]
+    fn the_diff_texts_meet_aa_on_the_panel_in_every_theme() {
+        for name in ["diff_added_text", "diff_removed_text"] {
+            assert!(
+                UI_PAIRINGS
+                    .iter()
+                    .any(|p| p.fg == name && p.bg == "bg_panel" && p.role == Legibility::Body),
+                "{name} on bg_panel is not in the table"
+            );
+        }
+        for kind in UiThemeKind::ALL {
+            let t = kind.build();
+            for (name, fg) in [
+                ("diff_added_text", t.diff_added_text),
+                ("diff_removed_text", t.diff_removed_text),
+            ] {
+                let r = contrast_ratio(fg, t.bg_panel);
+                assert!(
+                    r >= 4.5,
+                    "{name} on bg_panel in {} = {r:.2}:1",
+                    kind.label()
+                );
             }
         }
     }

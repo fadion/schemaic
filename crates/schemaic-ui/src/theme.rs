@@ -613,6 +613,15 @@ pub fn status_warn_hover() -> Color {
 pub fn status_ok() -> Color {
     ui().status_ok
 }
+/// A value that arrived — an added row, a change's new value — as text on a
+/// panel (Compare results, the Live monitor).
+pub fn diff_added_text() -> Color {
+    ui().diff_added_text
+}
+/// A value that went — a removed row, a change's old value — as text on a panel.
+pub fn diff_removed_text() -> Color {
+    ui().diff_removed_text
+}
 /// Green CTA *fill* for the AI "Seed rows" popover Generate button — the one
 /// here that is a background (white text sits on it), so on a light theme it
 /// wants the opposite treatment to the others.
