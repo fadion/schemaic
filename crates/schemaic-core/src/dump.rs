@@ -690,7 +690,10 @@ pub fn needs_fk_section(t: &TableInfo) -> bool {
 ///
 /// `CASCADE` drops the dependants too, which is right precisely because this file
 /// is about to recreate them: the section below it is their `CREATE`, and the
-/// closing constraints section puts the keys back.
+/// closing constraints section puts the keys back — **those from tables outside
+/// the file as well**, each only where it is missing ([`unless_present_sql`]).
+/// It once restated only the keys between the file's own tables, so a replay
+/// onto the source left an outside table's key onto a dumped one gone, silently.
 pub fn drop_cascade(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::Postgres => " CASCADE",
@@ -2515,12 +2518,15 @@ pub fn plan(
             }
             fks.extend(set.emit());
         }
-        // **A key from outside the file onto a parent it only names**, put back
-        // where missing. The chosen partition's `DROP … CASCADE` takes such a
-        // key whole — the parent's, not just its clone onto that partition —
+        // **A key from outside the file onto any table in it**, put back
+        // where missing. A chosen table's `DROP … CASCADE` takes such a key
+        // with it, and a chosen partition's takes one onto the parent it only
+        // names whole — the parent's, not just its clone onto that partition —
         // so a replay onto the source left `orders` keyed onto nothing, and
-        // said nothing. Restated after the rows, it is validated against them.
-        for &p in &parents {
+        // said nothing: the section above restates only the keys between the
+        // file's own tables. Restated after the rows, it is validated against
+        // them. Only where it can be guarded, which is where `CASCADE` is.
+        for &p in order.iter().filter(|&&p| !schema.tables[p].is_view) {
             for (j, other) in schema.tables.iter().enumerate() {
                 if order.contains(&j) || other.is_view {
                     continue;
@@ -5128,6 +5134,37 @@ mod tests {
         assert!(pos(&file, "<<rows aa_2024") < guard, "{file}");
         // Nothing else of `orders` is in the file.
         assert!(!file.contains("CREATE TABLE \"orders\""), "{file}");
+    }
+
+    /// **A key from a table outside the file onto a chosen table comes back
+    /// too**, where it is missing. The chosen table's own `DROP … CASCADE`
+    /// takes it, exactly as a partition's takes one onto its parent, and the
+    /// closing section put back only the keys between the file's own tables:
+    /// replayed onto its source, `orders` was left keyed onto nothing (seen
+    /// live on PostgreSQL 16), and nothing said so. Restated after the rows,
+    /// it is validated against them. Nowhere else: the other engines' `DROP`
+    /// leaves the referencing table's key standing.
+    #[test]
+    fn a_key_from_outside_onto_a_chosen_table_is_put_back_where_missing() {
+        let s = schema_of(vec![table("customers"), refs(table("orders"), "customers")]);
+        let chosen = ["customers".to_string()];
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &chosen,
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let key = pos(&file, "ADD CONSTRAINT \"fk_orders_customers\"");
+        let guard = file[..key]
+            .rfind("conname = 'fk_orders_customers'")
+            .unwrap_or_else(|| panic!("the key is not guarded:\n{file}"));
+        assert!(pos(&file, "<<rows customers") < guard, "{file}");
+        assert!(!file.contains("CREATE TABLE \"orders\""), "{file}");
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            let file = file_of(&plan(&s, "shop", &chosen, DumpOptions::default(), d));
+            assert!(!file.contains("fk_orders_customers"), "{d:?}: {file}");
+        }
     }
 
     /// Choosing the partitioned table itself still replaces it whole — the

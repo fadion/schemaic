@@ -11,6 +11,67 @@ use crate::partitions::{count, dump_of};
 use crate::runtime::run_file;
 use crate::scratch::Scratch;
 
+/// The foreign keys `table` holds, by name.
+async fn foreign_keys(s: &Scratch, table: &str) -> Vec<String> {
+    let outer = s.namespace_ref();
+    let ns = outer.schema.as_deref().unwrap_or(&s.database);
+    let rs = s
+        .exec(&format!(
+            "SELECT constraint_name FROM information_schema.table_constraints \
+             WHERE table_schema = '{ns}' AND table_name = '{table}' \
+             AND constraint_type = 'FOREIGN KEY' ORDER BY constraint_name"
+        ))
+        .await;
+    (0..rs.row_count())
+        .map(|r| rs.cell(r, 0).expect("a name").display().to_string())
+        .collect()
+}
+
+/// **A key from a table outside the file onto one in it survives the
+/// replay.** On PostgreSQL the file's `DROP TABLE … CASCADE` takes such a key
+/// with the table, and the file put back only the keys between its own
+/// tables: `orders` was left keyed onto nothing, and the replay said nothing.
+pub async fn a_replay_keeps_the_key_a_table_outside_the_file_holds(target: &'static Target) {
+    let s = Scratch::create(target, "replay_outside_key").await;
+    let (customers, orders) = (s.qualified("customers"), s.qualified("orders"));
+    s.exec(&format!(
+        "CREATE TABLE {customers} (id INTEGER PRIMARY KEY)"
+    ))
+    .await;
+    s.exec(&format!(
+        "CREATE TABLE {orders} (id INTEGER PRIMARY KEY, cust_id INTEGER, \
+         CONSTRAINT orders_cust_fk FOREIGN KEY (cust_id) REFERENCES {customers} (id))"
+    ))
+    .await;
+    s.exec(&format!("INSERT INTO {customers} VALUES (1), (2)"))
+        .await;
+    s.exec(&format!("INSERT INTO {orders} VALUES (1, 1), (2, 2)"))
+        .await;
+    let file = dump_of(&s, &["customers"]).await;
+    assert_eq!(
+        run_file(&s, &file).await,
+        ExecEnd::Done,
+        "{}: the dump did not replay onto its source:\n{file}",
+        target.name
+    );
+    assert_eq!(count(&s, "customers").await, "2", "{}", target.name);
+    assert_eq!(
+        foreign_keys(&s, "orders").await,
+        ["orders_cust_fk"],
+        "{}: the key from outside the file is gone:\n{file}",
+        target.name
+    );
+    // Enforced, not merely listed.
+    assert!(
+        s.try_exec(&format!("INSERT INTO {orders} VALUES (3, 99)"))
+            .await
+            .is_err(),
+        "{}: the restored key does not hold",
+        target.name
+    );
+    s.teardown().await;
+}
+
 /// **A dump carrying a routine replays onto the database it came from.** The
 /// routine was written as a bare `CREATE FUNCTION` and dropped first only where
 /// the file drops up front, so on every other engine the replay stopped at a

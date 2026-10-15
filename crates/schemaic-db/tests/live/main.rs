@@ -194,6 +194,7 @@ live_suite!(
         a_compared_partitioned_table_plans_what_the_server_takes,
     ],
     dump_replay: [
+        a_replay_keeps_the_key_a_table_outside_the_file_holds,
         a_replay_replaces_the_routines_it_carries,
         a_replay_keeps_the_types_and_sequences_it_carries,
     ],

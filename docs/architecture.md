@@ -5680,7 +5680,20 @@ existing prose was left alone.
     from, which is how anyone tests a dump, stopped at the first parent table with *cannot drop table
     customers because other objects depend on it* and never reached the rest. Dropping the dependants
     is right precisely here, because the section below is their `CREATE` and the closing constraints
-    section puts the keys back. **SQL Server has neither answer**, so it drops everything the file
+    section puts the keys back — **those from tables outside the file as well**, onto any table in
+    it, each through `unless_present_sql` (`Present::Constraint`) so it is added only where it is
+    missing. That section once restated only the keys between the file's own tables, and `CASCADE`
+    does not stop at them: replaying a dump of `customers` onto its source left `orders`' key onto
+    it gone, and the replay reported success (measured live on PostgreSQL 16, per the change's
+    author). Restated after the rows, the key is validated against them, so a replay whose rows no
+    longer satisfy it fails loudly rather than leaving it off. No other engine writes one, and none
+    needs to: under their key switch a MySQL/MariaDB or SQLite `DROP` leaves the referencing table's
+    key standing (verified live on MySQL 8 and MariaDB 10.11, per the change's author), SQL Server's
+    up-front drop is refused by such a key (Msg 3726, below), and `unless_present_sql` is `None`
+    on all three — unguarded, a replay that took nothing would stop at a name already taken
+    (`a_key_from_outside_onto_a_chosen_table_is_put_back_where_missing`; live, on each
+    `live_suite!` leg, `a_replay_keeps_the_key_a_table_outside_the_file_holds`, which also checks
+    the restored key refuses an orphan). **SQL Server has neither answer**, so it drops everything the file
     recreates up front (`drops_up_front`, computed from the two: no guard and no `CASCADE`): a
     `-- Dropped first` section before any `CREATE` drops each key between the dumped tables that
     is there (`IF OBJECT_ID(…, N'F') IS NOT NULL ALTER TABLE … DROP CONSTRAINT`), then everything
@@ -5869,7 +5882,10 @@ existing prose was left alone.
     onto the parent whole, not just that key's clone onto the partition — seen live, `orders` lost
     its key onto `events` entirely, and nothing said so. So every such key is restated in the closing
     constraints section, after the rows and so validated against them, and only where a guard
-    exists, since unguarded a replay that took nothing would stop at the name. The header names the
+    exists, since unguarded a replay that took nothing would stop at the name — the same
+    restatement, by the same loop, that a chosen table's own `CASCADE` needs (`drop_cascade`,
+    above); it was written for the named parent first, and a chosen table went without it until a
+    plain `customers` dump was replayed. The header names the
     parents and says the file never drops them and creates them only where missing. The trade is
     that a parent already there is left exactly as it is, whatever shape it has
     (`dumping_one_partition_drops_neither_its_parent_nor_its_siblings`,
