@@ -16,8 +16,8 @@
 
 use crate::intel::SqlDialect;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, SetExpr,
-    Statement, Value, visit_expressions_mut,
+    BinaryOperator, Expr, Ident, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, SelectItem,
+    SetExpr, Statement, Value, visit_expressions_mut,
 };
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
@@ -169,15 +169,19 @@ pub fn build_query(
         // 1's 100 rows (PostgreSQL 16) and hid the rows they displaced. A base
         // term naming a sorted column is left out — the user's direction wins,
         // and SQL Server refuses a column named twice in one `ORDER BY`.
+        // Compared as the engine compares names, and through the projection:
+        // an ordinal or an alias is the column it stands for (`names_column`).
+        let outputs = outputs(&select.projection);
         if let Some(OrderBy {
             kind: OrderByKind::Expressions(base),
             ..
         }) = query.order_by.take()
         {
-            exprs.extend(
-                base.into_iter()
-                    .filter(|t| !sort.iter().any(|(col, _)| names_column(&t.expr, col))),
-            );
+            exprs.extend(base.into_iter().filter(|t| {
+                !sort
+                    .iter()
+                    .any(|(col, _)| names_column(&t.expr, col, &outputs, dialect))
+            }));
         }
         query.order_by = Some(OrderBy {
             kind: OrderByKind::Expressions(exprs),
@@ -188,24 +192,94 @@ pub fn build_query(
     Ok(Some(stmts[0].to_string()))
 }
 
-/// Whether an `ORDER BY` term is column `col` — a bare or qualified name whose
-/// last part is it: exactly when quoted, ignoring ASCII case when not (how
-/// every engine but PostgreSQL compares a bare name, and PostgreSQL folds one
-/// to lower case, which a real column name `col` it matches either way).
-fn names_column(expr: &Expr, col: &str) -> bool {
+/// A select-list item's names, each `(value, quoted)`: its alias, and the
+/// column it reads when it is a plain name. `None` for a wildcard, after which
+/// a position no longer says which column it is.
+struct Output {
+    alias: Option<(String, bool)>,
+    column: Option<(String, bool)>,
+}
+
+/// The last part of a bare or qualified name, as written.
+fn plain_name(expr: &Expr) -> Option<(String, bool)> {
     let last = match expr {
         Expr::Identifier(i) => i,
-        Expr::CompoundIdentifier(parts) => match parts.last() {
-            Some(i) => i,
-            None => return false,
-        },
-        _ => return false,
+        Expr::CompoundIdentifier(parts) => parts.last()?,
+        _ => return None,
     };
-    if last.quote_style.is_some() {
-        last.value == col
-    } else {
-        last.value.eq_ignore_ascii_case(col)
-    }
+    Some((last.value.clone(), last.quote_style.is_some()))
+}
+
+/// [`Output`] for each item of `projection`, in order.
+fn outputs(projection: &[SelectItem]) -> Vec<Option<Output>> {
+    projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(e) => Some(Output {
+                alias: None,
+                column: plain_name(e),
+            }),
+            SelectItem::ExprWithAlias { expr, alias } => Some(Output {
+                alias: Some((alias.value.clone(), alias.quote_style.is_some())),
+                column: plain_name(expr),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether an `ORDER BY` term is the sorted column `col` (a result column's
+/// name, as the grid has it) — compared as `dialect` compares names
+/// ([`crate::intel::same_name`]), and **through the projection**: an ordinal
+/// is the item at its position, and an alias the column it reads, either way
+/// round. SQL Server refuses a column named twice in one `ORDER BY` (Msg 169)
+/// and spelt every one of these keepers as that: `[ID]` for `id` under its
+/// case-insensitive collation, `2` for the second column, `bee` for `b AS
+/// bee`. PostgreSQL's bare `Id` is `id`, another column from `"Id"`.
+fn names_column(expr: &Expr, col: &str, outputs: &[Option<Output>], dialect: SqlDialect) -> bool {
+    use crate::intel::same_name;
+    // Everything a name stands for: itself, and the other half of any item
+    // it is the alias or the column of.
+    let denoted = |name: (String, bool)| {
+        let mut out = vec![name.clone()];
+        for o in outputs.iter().flatten() {
+            let is = |n: &Option<(String, bool)>| {
+                n.as_ref()
+                    .is_some_and(|n| same_name((&n.0, n.1), (&name.0, name.1), dialect))
+            };
+            if is(&o.alias) {
+                out.extend(o.column.clone());
+            }
+            if is(&o.column) {
+                out.extend(o.alias.clone());
+            }
+        }
+        out
+    };
+    let term: Vec<(String, bool)> = match expr {
+        // An ordinal: the item at that position, when nothing before it is a
+        // wildcard.
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .filter(|&at| outputs.iter().take(at + 1).all(Option::is_some))
+                .and_then(|at| outputs.get(at)?.as_ref())
+                .map(|o| o.alias.iter().chain(&o.column).cloned().collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+        _ => plain_name(expr).map(denoted).unwrap_or_default(),
+    };
+    // The grid's name is the server's own spelling of the column, so it
+    // compares as a quoted name would: exactly where the engine folds.
+    let sorted = denoted((col.to_string(), true));
+    term.iter().any(|t| {
+        sorted
+            .iter()
+            .any(|s| same_name((&t.0, t.1), (&s.0, s.1), dialect))
+    })
 }
 
 /// The statement a grid's view runs: `base` with its filter and sort
@@ -1160,6 +1234,67 @@ mod tests {
             };
             assert_eq!(build(base, "", &[(col, false)], d).unwrap(), want, "{d:?}");
         }
+    }
+
+    /// **A base term is the sorted column by the engine's rule, and through
+    /// the projection.** SQL Server refuses a column named twice in one
+    /// `ORDER BY` (Msg 169, measured on 2022), and its names compare by a
+    /// case-insensitive collation — so `ORDER BY [ID]` is `id`, and an ordinal
+    /// or an alias names the column it stands for: each was kept as the
+    /// tie-breaker and the sort refused. On PostgreSQL a bare `Id` is `id`,
+    /// another column from `"Id"`, and must stay.
+    #[test]
+    fn a_base_term_naming_the_sorted_column_another_way_is_dropped() {
+        let ms = SqlDialect::MsSql;
+        for (base, col, want) in [
+            (
+                "SELECT TOP (10) * FROM t ORDER BY [ID] ASC",
+                "id",
+                "SELECT TOP (10) * FROM t ORDER BY [id] DESC",
+            ),
+            (
+                "SELECT TOP (10) id, b FROM t ORDER BY 2",
+                "b",
+                "SELECT TOP (10) id, b FROM t ORDER BY [b] DESC",
+            ),
+            (
+                "SELECT TOP (10) id, b AS bee FROM t ORDER BY bee",
+                "bee",
+                "SELECT TOP (10) id, b AS bee FROM t ORDER BY [bee] DESC",
+            ),
+            (
+                "SELECT TOP (10) id, b AS bee FROM t ORDER BY b, id",
+                "bee",
+                "SELECT TOP (10) id, b AS bee FROM t ORDER BY [bee] DESC, id",
+            ),
+        ] {
+            assert_eq!(
+                build(base, "", &[(col, false)], ms).unwrap(),
+                want,
+                "{base}"
+            );
+        }
+        // A tie-breaker naming another column stays.
+        assert_eq!(
+            build(
+                "SELECT TOP (10) id, b FROM t ORDER BY 1",
+                "",
+                &[("b", false)],
+                ms
+            )
+            .unwrap(),
+            "SELECT TOP (10) id, b FROM t ORDER BY [b] DESC, 1"
+        );
+        assert_eq!(
+            build(
+                "SELECT * FROM t ORDER BY Id LIMIT 5",
+                "",
+                &[("Id", false)],
+                SqlDialect::Postgres
+            )
+            .unwrap(),
+            "SELECT * FROM t ORDER BY \"Id\" DESC, Id LIMIT 5"
+        );
     }
 
     /// PostgreSQL reads `FETCH FIRST n ROWS ONLY` as the page size too; a page

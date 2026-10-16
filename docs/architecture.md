@@ -1241,10 +1241,14 @@ existing prose was left alone.
     which columns a row names is the engine's question**, asked more exactly than
     `bare_insert_row_lengths` above asks it, since a label names a column where a length check only
     counts: the visible columns (`columns_of` less `column_invisible`) for a row as long as all of
-    them; the visible `bare_insert_columns_of` for a row as long as those **only where
-    `lints::implicit_list_skips`** answers which — SQL Server, which leaves an identity or computed
-    column out of the implicit list (`ImplicitSkip::Assigned`), and SQLite only a generated one
-    (`ImplicitSkip::Refused`), never its rowid key; the first m where
+    them **where the implicit list is every column**; the visible `bare_insert_columns_of` for a
+    row as long as those **where `lints::implicit_list_skips`** answers which — SQL Server, which
+    leaves an identity or computed column out of the implicit list (`ImplicitSkip::Assigned`), and
+    SQLite only a generated one (`ImplicitSkip::Refused`), never its rowid key — and there a row as
+    long as the table is labelled nothing and flagged, *`events` takes 2 values without a column
+    list but this row has 3*: SQL Server refuses a value for an identity (Msg 8101) or a computed
+    column (Msg 213), and SQLite counts none for a generated one, all checked live
+    (`a_full_row_over_a_column_the_server_fills_is_flagged`); the first m where
     `lints::short_row_takes_defaults` (PostgreSQL, whose list is the table's in order) for any
     shorter row; and nothing for any other length — MySQL lists every column, `AUTO_INCREMENT`
     included, and refuses a short row. So `INSERT INTO events VALUES ('a', 2)` over a
@@ -1586,7 +1590,13 @@ existing prose was left alone.
     alias is the whole row** (`names_whole_rows`): `row_to_json(u)`, `SELECT u FROM users u` —
     `resolve` accepts one naming a visible source once no column of that name has claimed it,
     where it used to report ``Column `u` not found``
-    (`a_whole_row_reference_is_not_an_unknown_column_on_postgres`). A derived table's column
+    (`a_whole_row_reference_is_not_an_unknown_column_on_postgres`). **A key with a non-ASCII
+    letter in it is compared fully folded where the engine ignores every letter's case**
+    (`colres::holds`, over `SqlDialect::names_fold_unicode_case`): the keys are ASCII-folded, so
+    `ORDER BY été` against `AS Été` was squiggled missing on MySQL and SQL Server, which bind it,
+    with an Alt+Enter "fix" to the name already there; SQLite and PostgreSQL fold ASCII alone and
+    keep the flag (`a_non_ascii_case_difference_is_no_missing_column_where_the_engine_ignores_it`).
+    A derived table's column
     list renames its columns as a CTE's does (`cte_cols`): `(SELECT id …) AS d(x)` exposes `x`
     and not `id` (`a_derived_tables_column_list_names_its_columns`). **Three more identifiers
     the parser hands over are not columns**, all measured as red ``Column `…` not found``: a
@@ -3211,10 +3221,13 @@ existing prose was left alone.
     `total` outside already bound to another column — ambiguous after the rename. Each
     `Reach::bare` name keeps whether it was quoted, so the alias's own quoted reader is no rival
     to its own respelling (`a_case_only_rename_collides_where_quoting_keeps_case`). **Names compare as the engine compares column names**
-    (`output_alias::names_match`, which `Name::same`, the qualifiers' `own_source` and
-    `conflicts` all ask): where `SqlDialect::folds_unquoted_names` (PostgreSQL) a bare side folds to
-    lower case and the two then compare exactly, and elsewhere quoting changes nothing — MySQL's
-    aliases, SQL Server's (by its collation) and SQLite's match whatever their case. Byte-exact
+    (`intel::same_name`, which `output_alias::names_match` — asked by `Name::same`, the
+    qualifiers' `own_source` and `conflicts` — and the grid's sort tie-breaker share): where
+    `SqlDialect::folds_unquoted_names` (PostgreSQL) a bare side folds to lower case and the two then
+    compare exactly, and elsewhere quoting changes nothing — MySQL's aliases and SQL Server's (by
+    its collation) match whatever the case of **every** letter
+    (`SqlDialect::names_fold_unicode_case`, so `été` is `Été`, checked live on MySQL 8.4, MariaDB
+    11 and SQL Server 2022), SQLite's whatever the case of an ASCII one. Byte-exact
     wherever one side was quoted, the rename left `ORDER BY dbl` behind `` AS `Dbl` ``, which
     MariaDB then refused (1054), and missed a MySQL capture by `` `X` ``
     (`a_quoted_side_matches_as_the_engine_compares_names`). The edit is `rename_edit`'s, quoting through
@@ -3739,7 +3752,14 @@ existing prose was left alone.
     (`a_page_composes_with_the_filter_and_sort`). **A sort goes ahead of the base's `ORDER BY`,
     not in place of it**: the base's own terms — a table tab's key — stay on after the sort as its
     tie-breakers, less any naming a sorted column (SQL Server refuses a column twice in one
-    `ORDER BY`, Msg 169, and the user's direction is the one that counts). Replacing them left a
+    `ORDER BY`, Msg 169, and the user's direction is the one that counts). **"Naming" is the
+    engine's rule, and goes through the projection** (`names_column`): the two names compare by
+    `intel::same_name`, the grid's column name counting as the server's exact spelling, so SQL
+    Server's `ORDER BY [ID]` is `id` under its case-insensitive collation and PostgreSQL's bare
+    `Id` stays beside a sort on `"Id"`; an ordinal is the select-list item at its position (none
+    past a wildcard), and an alias the column it reads, either way round. Each of `[ID]`, `2` and
+    `bee` over `b AS bee` was kept as a tie-breaker and the sort refused with Msg 169 (measured on
+    2022; `a_base_term_naming_the_sorted_column_another_way_is_dropped`). Replacing them left a
     sort on a non-unique column with ties the engine orders differently for each bound: page 2 of
     `ORDER BY status` repeated 98 of page 1's 100 rows on PostgreSQL 16 and 49 on MariaDB 10.11, and
     the rows they displaced were on no page (`a_sorted_page_keeps_the_base_order_as_its_tie_breaker`,

@@ -145,6 +145,22 @@ impl SqlDialect {
         }
     }
 
+    /// Does the engine compare column names and output aliases **ignoring
+    /// the case of every letter**, not only an ASCII one?
+    ///
+    /// MySQL compares them by its collation (`Été` and `été` are one alias,
+    /// checked live on MySQL 8.4 and MariaDB 11), and so does SQL Server under
+    /// the case-insensitive collation it ships with (2022, live). SQLite folds
+    /// ASCII alone, and PostgreSQL folds only ASCII in a UTF-8 database — so a
+    /// name differing in an `É` is another name there. [`same_name`] and the
+    /// column resolver ask it.
+    pub fn names_fold_unicode_case(self) -> bool {
+        match self {
+            SqlDialect::MySql | SqlDialect::MsSql => true,
+            SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        }
+    }
+
     /// Is `name` one of [`SqlDialect::implicit_columns`]? Case-insensitive, as
     /// column names are on every engine Schemaic speaks to.
     pub fn is_implicit_column(self, name: &str) -> bool {
@@ -6489,15 +6505,15 @@ pub fn insert_value_hints(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> 
         };
         for row in &values.rows {
             let m = row.content.len();
+            let skips = lints::implicit_list_skips(dialect).is_some();
             let labels: &[String] = match &bare {
                 None if m == explicit.len() => &explicit,
                 None => continue,
-                Some((all, _)) if m == all.len() => all,
-                Some((_, needed))
-                    if m == needed.len() && lints::implicit_list_skips(dialect).is_some() =>
-                {
-                    needed
-                }
+                // Where the implicit list leaves columns out, it *is* the
+                // others: a row as long as the table is refused (SQL Server's
+                // Msg 8101 for an identity), and labels nothing.
+                Some((_, needed)) if skips && m == needed.len() => needed,
+                Some((all, _)) if !skips && m == all.len() => all,
                 Some((all, _)) if m < all.len() && lints::short_row_takes_defaults(dialect) => {
                     &all[..m]
                 }
@@ -12295,7 +12311,7 @@ mod colres {
                         if src.quals.iter().any(|x| x == q) {
                             return match &src.cols {
                                 Cols::Open => None,
-                                Cols::Known(cols) if cols.contains(&r.col) => None,
+                                Cols::Known(cols) if holds(cols, &r.col, dialect) => None,
                                 Cols::Known(cols) => {
                                     let mut d = err(
                                         r,
@@ -12360,7 +12376,7 @@ mod colres {
                     for src in s.sources.iter().filter(visible) {
                         match &src.cols {
                             Cols::Open => has_open = true,
-                            Cols::Known(cols) if cols.contains(&r.col) => known_matches += 1,
+                            Cols::Known(cols) if holds(cols, &r.col, dialect) => known_matches += 1,
                             Cols::Known(_) => {}
                         }
                     }
@@ -12389,7 +12405,7 @@ mod colres {
                     // A projection alias resolves an unqualified ref — except in a
                     // clause where this engine has none in scope yet (`alias_blind`):
                     // an alias-only match there falls through to the not-found flag.
-                    if s.proj_aliases.contains(&r.col)
+                    if holds(&s.proj_aliases, &r.col, dialect)
                         && !s
                             .alias_blind
                             .iter()
@@ -12435,6 +12451,22 @@ mod colres {
                 Some(d)
             }
         }
+    }
+
+    /// Is the column or alias `key` in `set`, as `dialect` compares names?
+    /// Both sides are ASCII-folded keys, so where the engine ignores the case
+    /// of every letter ([`super::SqlDialect::names_fold_unicode_case`]) a key
+    /// with a non-ASCII letter in it is compared fully folded as well — `été`
+    /// is the alias `Été` on MySQL and SQL Server, and was squiggled missing.
+    fn holds(set: &HashSet<String>, key: &str, dialect: super::SqlDialect) -> bool {
+        if set.contains(key) {
+            return true;
+        }
+        if key.is_ascii() || !dialect.names_fold_unicode_case() {
+            return false;
+        }
+        let key = key.to_lowercase();
+        set.iter().any(|c| c.to_lowercase() == key)
     }
 
     fn err(r: &Ref, message: &str) -> Diagnostic {
@@ -14191,6 +14223,36 @@ mod alias_refs {
     }
 }
 
+/// Do two column or output names, `(value, quoted)` as written, name the same
+/// thing — compared as `dialect` compares them? Where the engine folds a bare
+/// name ([`SqlDialect::folds_unquoted_names`], PostgreSQL) a bare side is
+/// folded to lower case and the two then compared exactly, a quoted side being
+/// that spelling. Elsewhere quoting changes nothing: MySQL's names and SQL
+/// Server's (by a case-insensitive collation) match whatever the case of
+/// every letter ([`SqlDialect::names_fold_unicode_case`]), SQLite's whatever
+/// the case of an ASCII one.
+///
+/// The one comparison for both *Rename alias* (`output_alias`) and the
+/// grid's sort, whose tie-breaker drops a base term naming the sorted column
+/// (`filter::compose`) — it once compared by PostgreSQL's rule on every
+/// engine, so SQL Server refused a sort over `ORDER BY [ID]` (Msg 169).
+pub fn same_name(a: (&str, bool), b: (&str, bool), dialect: SqlDialect) -> bool {
+    if dialect.folds_unquoted_names() {
+        fn fold((v, quoted): (&str, bool)) -> std::borrow::Cow<'_, str> {
+            if quoted {
+                std::borrow::Cow::Borrowed(v)
+            } else {
+                std::borrow::Cow::Owned(v.to_ascii_lowercase())
+            }
+        }
+        fold(a) == fold(b)
+    } else if dialect.names_fold_unicode_case() {
+        a.0 == b.0 || a.0.to_lowercase() == b.0.to_lowercase()
+    } else {
+        a.0.eq_ignore_ascii_case(b.0)
+    }
+}
+
 /// *Rename alias* for an **output column's** alias — `SELECT total * 2 AS
 /// doubled … ORDER BY doubled` — and the references the server binds to it.
 ///
@@ -14299,24 +14361,9 @@ mod output_alias {
     }
 
     /// Do two names, `(value, quoted)` as written, name the same column or
-    /// output — compared as `dialect` compares them? Where the engine folds a
-    /// bare name ([`SqlDialect::folds_unquoted_names`], PostgreSQL) a bare
-    /// side is folded to lower case and the two then compared exactly, a
-    /// quoted side being that spelling. Elsewhere quoting changes nothing:
-    /// MySQL's column names and aliases, SQL Server's (by a case-insensitive
-    /// collation) and SQLite's match whatever the case.
+    /// output on `dialect`? [`super::same_name`], the one comparison.
     fn names_match(a: (&str, bool), b: (&str, bool), dialect: SqlDialect) -> bool {
-        if !dialect.folds_unquoted_names() {
-            return a.0.eq_ignore_ascii_case(b.0);
-        }
-        fn fold((v, quoted): (&str, bool)) -> std::borrow::Cow<'_, str> {
-            if quoted {
-                std::borrow::Cow::Borrowed(v)
-            } else {
-                std::borrow::Cow::Owned(v.to_ascii_lowercase())
-            }
-        }
-        fold(a) == fold(b)
+        super::same_name(a, b, dialect)
     }
 
     impl Name {
@@ -16090,22 +16137,37 @@ mod lints {
         let visible = |c: &String| !catalog.column_invisible(&r, c);
         let all = all.iter().filter(|c| visible(c)).count();
         let needed = needed.into_iter().filter(|c| visible(c)).count();
+        // **Where the implicit list leaves columns out, it is the others**,
+        // and a row as long as the table is refused too: SQL Server answers a
+        // value for an identity with Msg 8101 and a computed one with Msg 213,
+        // and SQLite counts no value for a generated column.
+        let skipping = implicit_list_skips(dialect).is_some() && needed < all;
         for row in &values.rows {
             let m = row.content.len();
             let short = m < needed && !short_row_takes_defaults(dialect);
-            if m == 0 || !(m > all || short) {
+            let long = if skipping { m > needed } else { m > all };
+            if m == 0 || !(long || short) {
                 continue;
             }
             let span = row.opening_token.0.span.union(&row.closing_token.0.span);
-            out.push(Diagnostic {
-                range: to_range(stmt, lo, span),
-                severity: Severity::Error,
-                message: format!(
+            let message = if skipping {
+                format!(
+                    "`{}` takes {needed} {} without a column list but this row has {m}",
+                    r.name,
+                    crate::text::plural(needed, "value", "values"),
+                )
+            } else {
+                format!(
                     "`{}` has {all} {} but this row has {m} {}",
                     r.name,
                     crate::text::plural(all, "column", "columns"),
                     crate::text::plural(m, "value", "values"),
-                ),
+                )
+            };
+            out.push(Diagnostic {
+                range: to_range(stmt, lo, span),
+                severity: Severity::Error,
+                message,
                 fix: None,
             });
         }
@@ -27868,6 +27930,39 @@ mod tests {
             .collect()
     }
 
+    /// **A name differing only in a non-ASCII letter's case is the same name
+    /// where the engine ignores case for every letter** — MySQL's column names
+    /// and aliases, SQL Server's under a case-insensitive collation (both
+    /// checked live) — and was squiggled as missing, with an Alt+Enter "fix"
+    /// to the name already there. SQLite and PostgreSQL fold ASCII alone, and
+    /// refuse these, so the flag stands there.
+    #[test]
+    fn a_non_ascii_case_difference_is_no_missing_column_where_the_engine_ignores_it() {
+        let both: &[SqlDialect] = &[SqlDialect::MySql, SqlDialect::MsSql];
+        for (sql, quiet) in [
+            ("SELECT salary AS Été FROM employees ORDER BY été", both),
+            // SQL Server's `HAVING` sees no output alias at all.
+            (
+                "SELECT salary AS Été FROM employees GROUP BY salary HAVING ÉTÉ > 1",
+                &[SqlDialect::MySql][..],
+            ),
+            // A derived table's column, the catalogue's side of the lookup.
+            (
+                "SELECT ÉTÉ FROM (SELECT salary AS Été FROM employees) d",
+                both,
+            ),
+        ] {
+            for &d in quiet {
+                assert_eq!(col_errors_d(sql, d), Vec::<String>::new(), "{d:?}: {sql}");
+            }
+            assert!(!col_errors_d(sql, SqlDialect::Sqlite).is_empty(), "{sql}");
+        }
+        assert_eq!(SqlDialect::MySql.names_fold_unicode_case(), true);
+        assert_eq!(SqlDialect::MsSql.names_fold_unicode_case(), true);
+        assert_eq!(SqlDialect::Sqlite.names_fold_unicode_case(), false);
+        assert_eq!(SqlDialect::Postgres.names_fold_unicode_case(), false);
+    }
+
     /// The statement the app generates for a keyless SQLite table, verbatim.
     #[test]
     fn diag_sqlite_rowid_is_not_an_unknown_column() {
@@ -28703,6 +28798,44 @@ mod tests {
         assert!(errs("INSERT INTO z_inv (a, b, r) VALUES (1, 2, 3);").is_empty());
     }
 
+    /// **Where the implicit column list leaves a column out, a row as long as
+    /// the table is refused** (S4-L1-02): SQL Server answers a value for an
+    /// identity with Msg 8101 and one for a computed column with Msg 213, and
+    /// SQLite counts no value for a generated column (`table g has 3 columns
+    /// but 4 values were supplied`, 3.50.4) — all checked live. The row was
+    /// labelled and passed.
+    #[test]
+    fn a_full_row_over_a_column_the_server_fills_is_flagged() {
+        let mut ev = tbl("events", &["id", "name", "at"]);
+        ev.columns[0].auto_increment = true;
+        let mut g = tbl("g", &["id", "a", "b", "c"]);
+        g.columns[2].generated = Some("a * 2".into());
+        let schema = DbSchema {
+            tables: vec![ev, g],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &schema)], Some("company"));
+        let errs = |sql: &str, d: SqlDialect| -> Vec<String> {
+            diagnostics(sql, &cat, d)
+                .into_iter()
+                .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
+                .map(|x| x.message)
+                .collect()
+        };
+        assert_eq!(
+            errs("INSERT INTO events VALUES (1, 'a', 2);", SqlDialect::MsSql),
+            ["`events` takes 2 values without a column list but this row has 3"]
+        );
+        assert!(errs("INSERT INTO events VALUES ('a', 2);", SqlDialect::MsSql).is_empty());
+        assert_eq!(
+            errs("INSERT INTO g VALUES (7, 1, 2, 3);", SqlDialect::Sqlite),
+            ["`g` takes 3 values without a column list but this row has 4"]
+        );
+        assert!(errs("INSERT INTO g VALUES (7, 1, 3);", SqlDialect::Sqlite).is_empty());
+        // MySQL's implicit list is every column.
+        assert!(errs("INSERT INTO events VALUES (1, 'a', 2);", SqlDialect::MySql).is_empty());
+    }
+
     // -- Inlay hints on INSERT … VALUES ----------------------------------------
 
     /// Each hint as `label@the text from its byte to the next space or comma`.
@@ -28764,10 +28897,19 @@ mod tests {
             SqlDialect::Sqlite,
             SqlDialect::MsSql,
         ] {
-            // As long as the table: every column, in the catalogue's case.
+            // As long as the table: every column, in the catalogue's case —
+            // **except where the implicit list leaves one out**: SQL Server
+            // refuses a value for its identity there (Msg 8101), so the row
+            // names nothing and is flagged (S4-L1-02).
+            let want: &[&str] = match d {
+                SqlDialect::MsSql => &[],
+                SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+                    &["id@1", "Name@'a'", "at@2"]
+                }
+            };
             assert_eq!(
                 hints("INSERT INTO events VALUES (1, 'a', 2);", &cat, d),
-                ["id@1", "Name@'a'", "at@2"],
+                want,
                 "{d:?}"
             );
             // As long as what the server does not assign: those columns where
@@ -37864,6 +38006,29 @@ mod output_alias_tests {
         assert_eq!(
             renamed("SELECT total AS t|, qty AS \"X\" FROM orders", "x", PG),
             Ok("SELECT total AS x, qty AS \"X\" FROM orders".to_string())
+        );
+        // **A non-ASCII letter's case too, where the engine ignores it**:
+        // MySQL and SQL Server bind `été` to the alias `Été` (live, MySQL 8.4,
+        // MariaDB 11, SQL Server 2022), and the rename left it behind.
+        for d in [MY, MS] {
+            assert_eq!(
+                renamed(
+                    "SELECT total * 2 AS Été| FROM orders ORDER BY été",
+                    "twice",
+                    d
+                ),
+                Ok(want.clone()),
+                "{d:?}"
+            );
+        }
+        // SQLite folds ASCII alone, so there `été` is another name.
+        assert_eq!(
+            renamed(
+                "SELECT total * 2 AS Été| FROM orders ORDER BY été",
+                "twice",
+                LITE
+            ),
+            Ok("SELECT total * 2 AS twice FROM orders ORDER BY été".to_string())
         );
     }
 
