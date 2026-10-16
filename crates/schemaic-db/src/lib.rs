@@ -1868,6 +1868,40 @@ impl Db {
         }
     }
 
+    /// **What a dump's replay drops besides the objects** — the owners,
+    /// grants and row security of `database`'s tables (PostgreSQL; owners and
+    /// permissions on SQL Server), and every
+    /// account's grant on its routines where the replay has to `DROP` them
+    /// (MySQL 8, `flavour` saying which server this is) — for the file to put
+    /// back ([`schemaic_core::access`]). Read by the dump runner only, for a
+    /// file that drops, never by [`Db::fetch_schema`], whose every caller but
+    /// that one would pay for it.
+    ///
+    /// **A half the account may not read is `None`**, not an error: the dump
+    /// goes on and its header says what it could not put back. MySQL's
+    /// `mysql.procs_priv` needs `SELECT` on the `mysql` schema, which an
+    /// application account seldom has. An engine with nothing to read answers
+    /// both `None`.
+    pub async fn fetch_replay_access(
+        &self,
+        database: &str,
+        flavour: schemaic_core::schema::ServerFlavour,
+    ) -> Result<schemaic_core::access::ReplayAccess, DbError> {
+        match self.engine {
+            Engine::Postgres => pg::fetch_replay_access(self, database).await,
+            Engine::MySql
+                if !schemaic_core::ddl::replay_replaces_routine_in_place(
+                    schemaic_core::intel::SqlDialect::MySql,
+                    flavour,
+                ) =>
+            {
+                mysql::fetch_replay_access(self, database).await
+            }
+            Engine::MsSql => mssql::fetch_replay_access(self, database).await,
+            Engine::MySql | Engine::Sqlite => Ok(Default::default()),
+        }
+    }
+
     /// `database`'s table **list** — name, namespace and view flag, and nothing
     /// else. Every returned [`TableInfo`]'s columns, indexes and foreign keys are
     /// **empty**, so this is not a substitute for [`Db::fetch_schema`]; it shares

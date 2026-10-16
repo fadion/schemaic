@@ -334,24 +334,24 @@ pub async fn a_replay_does_not_reopen_a_locked_down_routine(target: &'static Tar
     s.teardown().await;
 }
 
-/// **A MariaDB replay keeps every grant on the routines it replaces.** The
-/// file dropped each routine before its `CREATE`, and with
+/// **A MySQL-family replay keeps every grant on the routines it replaces.**
+/// The file dropped each routine before its `CREATE`, and with
 /// `automatic_sp_privileges` (the default) the `DROP` revoked every account's
 /// `EXECUTE` on it: the application's next call was *execute command denied*.
 /// MariaDB's `CREATE OR REPLACE` keeps them. MySQL 8 has no such form, so the
-/// file still drops there and says so in its header.
-pub async fn a_mariadb_replay_keeps_the_grants_on_the_routines_it_replaces(
-    target: &'static Target,
-) {
-    if target.name != "mariadb" {
-        crate::endpoint::note_no_op(target, "replaces a routine by dropping it");
+/// file still drops there, and grants back at its end what the dump read from
+/// `mysql.procs_priv`.
+pub async fn a_replay_keeps_the_grants_on_the_routines_it_replaces(target: &'static Target) {
+    if target.name != "mariadb" && target.name != "mysql" {
+        crate::endpoint::note_no_op(target, "replaces its routines in place");
         return;
     }
     let s = Scratch::create(target, "replay_grant").await;
     let (t, f) = (s.qualified("t"), s.qualified("f_one"));
-    // A role rather than a user: no password, and the name carries the scratch
-    // database's, so a stranded one is swept with it.
-    let role = format!("{}_r", s.database);
+    // A role rather than a user: no password. MySQL 8 caps an account name at
+    // 32 bytes, which the scratch database's name is past, so the role carries
+    // its process id and leg instead.
+    let role = format!("schemaic_it_{}_{}_r", std::process::id(), target.name);
     s.exec(&format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY)"))
         .await;
     s.exec(&format!(
@@ -685,5 +685,68 @@ pub async fn a_partition_replay_keeps_its_own_defaults_and_not_null(target: &'st
         target.name
     );
     assert_eq!(count(&s, "events_2024").await, "1", "{}", target.name);
+    s.teardown().await;
+}
+
+/// **A PostgreSQL replay gives each table it replaces back its owner, grants
+/// and row security.** The `DROP … CASCADE` took them, and the recreated
+/// table belonged to whoever replayed, with the default ACL, row security off
+/// and no policies — the application role locked out, or let in past the
+/// policies — under a success report. The file now restates what the dump
+/// read, as `pg_dump` does.
+pub async fn a_pg_replay_puts_back_the_owner_grants_and_row_security(target: &'static Target) {
+    let s = Scratch::create(target, "replay_acl").await;
+    if !schemaic_core::access::drop_resets_table_access(s.dialect()) {
+        crate::endpoint::note_no_op(target, "a drop keeps the table's grants, or none are read");
+        s.teardown().await;
+        return;
+    }
+    let t = s.qualified("customers");
+    // Roles are the cluster's; the scratch database's name in theirs makes a
+    // stranded one self-identifying.
+    let (owner, app) = (format!("{}_o", s.database), format!("{}_a", s.database));
+    for r in [&owner, &app] {
+        s.exec(&format!("CREATE ROLE \"{r}\"")).await;
+    }
+    s.exec(&format!("GRANT \"{owner}\" TO CURRENT_USER")).await;
+    s.exec(&format!(
+        "CREATE TABLE {t} (id INTEGER PRIMARY KEY, secret TEXT)"
+    ))
+    .await;
+    s.exec(&format!("INSERT INTO {t} VALUES (1, 'a'), (2, 'b')"))
+        .await;
+    for sql in [
+        format!("ALTER TABLE {t} OWNER TO \"{owner}\""),
+        format!("GRANT SELECT, INSERT ON {t} TO \"{app}\""),
+        format!("GRANT UPDATE (secret) ON {t} TO \"{app}\""),
+        format!("REVOKE TRUNCATE ON {t} FROM \"{owner}\""),
+        format!("ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE {t} FORCE ROW LEVEL SECURITY"),
+        format!("CREATE POLICY first_only ON {t} FOR SELECT TO \"{app}\" USING (id = 1)"),
+    ] {
+        s.exec(&sql).await;
+    }
+    let state = format!(
+        "SELECT concat_ws(' | ', c.relowner::regrole::text, c.relacl::text, \
+                c.relrowsecurity::text, c.relforcerowsecurity::text, \
+                (SELECT string_agg(attname || '=' || attacl::text, ',') FROM pg_attribute \
+                 WHERE attrelid = c.oid AND attacl IS NOT NULL), \
+                (SELECT string_agg(polname || ':' || polcmd::text || ':' || polroles::regrole[]::text \
+                        || ':' || pg_get_expr(polqual, polrelid), ',') \
+                 FROM pg_policy WHERE polrelid = c.oid)) \
+         FROM pg_class c WHERE c.oid = '{t}'::regclass"
+    );
+    let before = scalar(&s, &state).await;
+    let file = dump_of(&s, &["customers"]).await;
+    let ran = run_file(&s, &file).await;
+    let after = scalar(&s, &state).await;
+    let rows = count(&s, "customers").await;
+    for r in [&owner, &app] {
+        s.exec(&format!("DROP OWNED BY \"{r}\"")).await;
+        s.exec(&format!("DROP ROLE \"{r}\"")).await;
+    }
+    assert_eq!(ran, ExecEnd::Done, "the dump did not replay:\n{file}");
+    assert_eq!(after, before, "the replay did not put them back:\n{file}");
+    assert_eq!(rows, "2", "{file}");
     s.teardown().await;
 }

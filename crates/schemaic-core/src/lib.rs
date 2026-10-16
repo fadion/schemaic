@@ -7,6 +7,7 @@
 //! persistence in [`persist`].
 
 pub mod accepted;
+pub mod access;
 pub mod activity;
 pub mod aggregate;
 pub mod blob;

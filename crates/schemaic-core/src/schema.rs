@@ -6880,6 +6880,11 @@ pub struct DbSchema {
     /// **PostgreSQL's installed extensions** (`pg_extension`) — empty on every
     /// other engine, none of which has the object. See [`ExtensionInfo`].
     pub extensions: Vec<ExtensionInfo>,
+    /// **The owners, grants and row security a replay's drops take** — read
+    /// by the dump runner for a file that drops (`Db::fetch_replay_access`),
+    /// never by the schema read, and so empty on every schema the tree holds.
+    /// See [`crate::access`].
+    pub replay_access: crate::access::ReplayAccess,
     /// The bodies above, folded once for Find Anywhere's body tier
     /// ([`crate::body_search::BodyIndex`]) — built on the first body search,
     /// and empty again in a clone, which is made to be changed. Not part of

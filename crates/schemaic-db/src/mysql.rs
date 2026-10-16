@@ -118,6 +118,67 @@ pub(crate) async fn fetch_grants(db: &Db, principal: &Principal) -> Result<Grant
     out
 }
 
+/// Every account's grant on a routine of one database, from the grant table
+/// itself — MySQL publishes routine privileges nowhere in
+/// `information_schema`. `CAST`s because the columns are binary-collated
+/// `char` and `Proc_priv` a `SET`.
+const MY_PROCS_PRIV_SQL: &str = "SELECT CAST(Routine_name AS CHAR), CAST(Routine_type AS CHAR), \
+            CAST(User AS CHAR), CAST(Host AS CHAR), CAST(Proc_priv AS CHAR) \
+     FROM mysql.procs_priv WHERE Db = ? ORDER BY Routine_type, Routine_name, User, Host";
+
+/// The MySQL 8 half of [`Db::fetch_replay_access`](crate::Db::fetch_replay_access):
+/// every grant on `database`'s routines, for a replay whose `DROP` revokes
+/// them to give back. **`None` where `mysql.procs_priv` cannot be read** —
+/// an account without `SELECT` on the `mysql` schema, the usual application
+/// account — so the dump goes on and its header says it could not.
+pub(crate) async fn fetch_replay_access(
+    db: &Db,
+    database: &str,
+) -> Result<schemaic_core::access::ReplayAccess, DbError> {
+    let mut conn = db.open(None, false).await?;
+    let rows = conn
+        .exec_map(
+            MY_PROCS_PRIV_SQL,
+            (database,),
+            |r: (String, String, String, String, String)| r,
+        )
+        .await;
+    let _ = conn.disconnect().await;
+    Ok(schemaic_core::access::ReplayAccess {
+        tables: None,
+        routines: rows.ok().map(|rows| my_routine_grants(&rows)),
+    })
+}
+
+/// [`MY_PROCS_PRIV_SQL`]'s rows as [`RoutineGrant`]s — `Proc_priv` split on
+/// its commas, a `Routine_type` other than `PROCEDURE` read as a function.
+///
+/// [`RoutineGrant`]: schemaic_core::access::RoutineGrant
+fn my_routine_grants(
+    rows: &[(String, String, String, String, String)],
+) -> Vec<schemaic_core::access::RoutineGrant> {
+    rows.iter()
+        .map(
+            |(name, kind, user, host, privs)| schemaic_core::access::RoutineGrant {
+                name: name.clone(),
+                kind: if kind.eq_ignore_ascii_case("PROCEDURE") {
+                    schemaic_core::schema::RoutineKind::Procedure
+                } else {
+                    schemaic_core::schema::RoutineKind::Function
+                },
+                user: user.clone(),
+                host: host.clone(),
+                privileges: privs
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            },
+        )
+        .collect()
+}
+
 /// `mysql.user`, MariaDB's spelling. `is_role` is the flag that makes a role a
 /// role, and only MariaDB has it.
 const MY_USERS_MARIADB_SQL: &str = "SELECT CAST(User AS CHAR), CAST(Host AS CHAR), \

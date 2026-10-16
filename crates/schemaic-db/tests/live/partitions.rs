@@ -108,7 +108,19 @@ fn table<'a>(schema: &'a DbSchema, name: &str) -> &'a TableInfo {
 /// Shared with [`crate::dump_replay`].
 pub(crate) async fn dump_of(src: &Scratch, chosen: &[&str]) -> String {
     let dialect = src.dialect();
-    let schema = schema_of(src).await;
+    let mut schema = schema_of(src).await;
+    // What the runner reads for a file that drops, as it reads it: a read that
+    // fails leaves it unread (`schemaic_cli::dump::run`).
+    let opts = DumpOptions::default();
+    if opts.structure
+        && opts.drop_if_exists
+        && let Ok(access) = src
+            .db
+            .fetch_replay_access(&src.database, schema.flavour)
+            .await
+    {
+        schema.replay_access = access;
+    }
     let chosen: Vec<String> = schema
         .tables
         .iter()

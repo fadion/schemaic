@@ -1341,6 +1341,84 @@ fn smalldatetime_text(days: u16, minutes: u16) -> String {
     )
 }
 
+// ── What a replay's drops take ───────────────────────────────────────────────
+
+/// Every user table's and view's owner where it is not its schema's
+/// (`principal_id` set), by name.
+const REPLAY_OWNERS: &str = "SELECT SCHEMA_NAME(o.schema_id), o.name, USER_NAME(o.principal_id) \
+     FROM sys.objects o WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+     ORDER BY SCHEMA_NAME(o.schema_id), o.name";
+
+/// Every permission on a user table or view and its columns — the object's
+/// own (`minor_id` 0) before its columns', each in the order granted.
+const REPLAY_PERMISSIONS: &str = "SELECT OBJECT_SCHEMA_NAME(p.major_id), OBJECT_NAME(p.major_id), \
+            COL_NAME(CASE WHEN p.minor_id <> 0 THEN p.major_id END, p.minor_id), \
+            USER_NAME(p.grantee_principal_id), p.permission_name, p.state \
+     FROM sys.database_permissions p JOIN sys.objects o ON o.object_id = p.major_id \
+     WHERE p.class = 1 AND o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+     ORDER BY OBJECT_SCHEMA_NAME(p.major_id), OBJECT_NAME(p.major_id), p.minor_id, \
+              USER_NAME(p.grantee_principal_id), p.state, p.permission_name";
+
+/// The SQL Server half of [`Db::fetch_replay_access`](crate::Db::fetch_replay_access):
+/// every user table's and view's owner and permissions, for a replaying dump
+/// to put back — the recreated object holds none. `None` where a read
+/// failed, so the dump goes on and says so.
+pub(crate) async fn fetch_replay_access(
+    db: &Db,
+    database: &str,
+) -> Result<schemaic_core::access::ReplayAccess, DbError> {
+    let mut client = connect(db, Some(database)).await?;
+    let owners = query_rows(&mut client, REPLAY_OWNERS).await;
+    let perms = query_rows(&mut client, REPLAY_PERMISSIONS).await;
+    Ok(schemaic_core::access::ReplayAccess {
+        tables: match (owners, perms) {
+            (Ok(o), Ok(p)) => Some(mssql_fold_table_access(&o, &p)),
+            _ => None,
+        },
+        routines: None,
+    })
+}
+
+/// [`REPLAY_OWNERS`]' and [`REPLAY_PERMISSIONS`]' rows onto one
+/// [`TableAccess`] per object.
+///
+/// [`TableAccess`]: schemaic_core::access::TableAccess
+fn mssql_fold_table_access(
+    owners: &[Vec<Option<String>>],
+    perms: &[Vec<Option<String>>],
+) -> Vec<schemaic_core::access::TableAccess> {
+    use schemaic_core::access::{Grant, GrantState, TableAccess};
+    let text = |r: &[Option<String>], i: usize| r.get(i).cloned().flatten();
+    let mut out: Vec<TableAccess> = owners
+        .iter()
+        .map(|r| TableAccess {
+            schema: text(r, 0),
+            name: text(r, 1).unwrap_or_default(),
+            owner: text(r, 2).unwrap_or_default(),
+            // A new object holds no permission: nothing to revoke first.
+            default_acl: true,
+            ..Default::default()
+        })
+        .collect();
+    for r in perms {
+        let (schema, name) = (text(r, 0), text(r, 1).unwrap_or_default());
+        let state = text(r, 5).unwrap_or_default();
+        if let Some(t) = out
+            .iter_mut()
+            .find(|t| t.schema == schema && t.name == name)
+        {
+            t.grants.push(Grant {
+                column: text(r, 2),
+                grantee: text(r, 3),
+                privilege: text(r, 4).unwrap_or_default(),
+                grantable: state == "W",
+                state: GrantState::from_mssql(&state),
+            });
+        }
+    }
+    out
+}
+
 // ── Catalogue helpers ────────────────────────────────────────────────────────
 
 /// Every row of a catalogue query, each cell as its text. For the bounded

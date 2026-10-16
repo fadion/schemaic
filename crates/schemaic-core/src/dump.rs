@@ -835,24 +835,32 @@ pub fn refuse_if_present_sql(dialect: SqlDialect, object: &str, why: &str) -> Op
 /// **Everywhere else it replaces them too, where there are any** — each
 /// beside its `CREATE` ([`plan`]'s `replay_create`), since a replay that met
 /// one still standing stopped at its name.
+///
+/// **And it says what the file gives back** where a table's drop takes its
+/// owner and grants ([`crate::access::drop_resets_table_access`]), and what
+/// MySQL 8's routine drops revoke: the toggle is where the user consents to
+/// the drop, so it is where they learn it is undone.
 pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
     if drops_up_front(dialect) {
         "Drop each table and view before its CREATE, so the file loads onto a database that \
          already holds them. With One transaction it also replaces every routine in their \
          schemas, and stops before dropping anything it cannot put back as it is. Without One \
          transaction it leaves routines as they are, so a replay onto a database that still \
-         has them stops at the first one."
+         has them stops at the first one. Each table's owner and permissions are put back at \
+         the end."
     } else if crate::ddl::supports_routine_editing(dialect)
         && crate::ddl::replay_replaces_routine_in_place(dialect, ServerFlavour::MySql)
     {
         "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
-         that already holds these tables. It also replaces every routine in their schemas."
+         that already holds these tables. It also replaces every routine in their schemas. \
+         Each table's owner, grants and row security are put back at the end."
     } else if crate::ddl::supports_routine_editing(dialect) {
         // The modal does not know the flavour: in place on MariaDB, a `DROP`
         // first on MySQL 8.
         "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
          that already holds these tables. It also replaces every routine and event in their \
-         schemas: on MySQL each is dropped first, which revokes every grant on it."
+         schemas: on MySQL each is dropped first, which revokes every grant on it, and the \
+         file grants them back at its end where your account can read mysql.procs_priv."
     } else {
         "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
          that already holds these tables."
@@ -3214,6 +3222,10 @@ pub fn plan(
     let mut replaced: Vec<String> = Vec::new();
     // How many of them are events, for the header's word.
     let mut replaced_events = 0usize;
+    // The routines a replay drops beside their `CREATE` rather than replacing
+    // in place — MySQL 8's — whose grants that `DROP` revokes and the file's
+    // end gives back (`access::RoutineGrant`).
+    let mut regranted: Vec<(String, crate::schema::RoutineKind)> = Vec::new();
     // **A replay where nothing is dropped up front** — every engine but the
     // one that drops up front — meets each standalone object the file
     // carries still standing, and a bare `CREATE` stopped it at the first
@@ -3315,6 +3327,14 @@ pub fn plan(
                         if replaces {
                             replaced.push(display_name(o.schema(), o.name()));
                             replaced_events += usize::from(o.event().is_some());
+                            if let Some(r) = o.routine().filter(|_| {
+                                !crate::ddl::replay_replaces_routine_in_place(
+                                    dialect,
+                                    schema.flavour,
+                                )
+                            }) {
+                                regranted.push((r.name.clone(), r.kind));
+                            }
                         }
                     }
                     // A routine the file recreates is dropped with the tables:
@@ -3844,6 +3864,52 @@ pub fn plan(
         steps.extend(fks.into_iter().map(DumpStep::Text));
     }
 
+    // ── What the drops took besides the objects, once everything is back ────
+    //
+    // Last, so no statement above runs under an owner or a row security the
+    // replaying role does not have, and inside the transaction where there is
+    // one. See `crate::access`.
+    let replaced_relations: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|i| {
+            opts.structure
+                && opts.drop_if_exists
+                && file_creates(&schema.tables[*i])
+                && !held.contains(i)
+        })
+        .collect();
+    let access: Vec<String> = replaced_relations
+        .iter()
+        .flat_map(|&i| {
+            let t = &schema.tables[i];
+            schema
+                .replay_access
+                .table(t.schema.as_deref(), &t.name)
+                .map(|a| a.restate_sql(&qname(t), drop_keyword(t), dialect))
+                .unwrap_or_default()
+        })
+        .collect();
+    if !access.is_empty() {
+        steps.push(DumpStep::Text(
+            "-- Owners, grants and row security".to_string(),
+        ));
+        steps.extend(access.into_iter().map(DumpStep::Text));
+    }
+    let routine_grants: Vec<String> = regranted
+        .iter()
+        .flat_map(|(name, kind)| {
+            schema
+                .replay_access
+                .routine_grants(name, *kind)
+                .filter_map(|g| g.grant_sql(dialect))
+        })
+        .collect();
+    if !routine_grants.is_empty() {
+        steps.push(DumpStep::Text("-- Routine grants".to_string()));
+        steps.extend(routine_grants.into_iter().map(DumpStep::Text));
+    }
+
     if let Some((_, close)) = tx {
         steps.push(DumpStep::Text(close.to_string()));
     }
@@ -3876,12 +3942,33 @@ pub fn plan(
         // Where that is a `DROP` and a `CREATE` beside the tables — MySQL 8's
         // only form. Not where the file drops up front: SQL Server's section
         // keeps no grant either, and its hint names the drop.
+        // The grants were read from `mysql.procs_priv` where the dumping
+        // account may read it, and are given back at the end.
         if replays && !crate::ddl::replay_replaces_routine_in_place(dialect, schema.flavour) {
-            header.push_str(
+            header.push_str(if schema.replay_access.routines.is_some() {
+                "\n-- Each is dropped before its CREATE, which revokes every grant on it; the file\n\
+                 -- grants them back at its end, as they were when it was written, so a replay onto\n\
+                 -- a server without one of those accounts stops there. The CREATE needs the\n\
+                 -- privilege to name its DEFINER: without it, the routine is gone."
+            } else {
                 "\n-- Each is dropped before its CREATE, which revokes every grant on it, and the\n\
-                 -- CREATE needs the privilege to name its DEFINER: without it, the routine is gone.",
-            );
+                 -- account that wrote this file could not read mysql.procs_priv to grant them back.\n\
+                 -- The CREATE needs the privilege to name its DEFINER: without it, the routine is gone."
+            });
         }
+    }
+    // What the tables' and views' drops take with them, where the engine's
+    // `DROP` takes it (`access::drop_resets_table_access`).
+    if !replaced_relations.is_empty() && crate::access::drop_resets_table_access(dialect) {
+        header.push_str(if schema.replay_access.tables.is_some() {
+            "\n--\n-- Replayed onto a database that already holds them, this file gives each table and\n\
+             -- view it replaces back its owner, grants and row security, as they were when it was\n\
+             -- written, at its end: a server without one of their roles stops the replay there."
+        } else {
+            "\n--\n-- Replayed onto a database that already holds them, this file\n\
+             -- does not put back the owner, grants or row security of the tables and views it\n\
+             -- replaces: they were not read."
+        });
     }
     let refused: Vec<String> = refused.into_iter().map(|(_, label)| label).collect();
     if !refused.is_empty() {
@@ -7608,6 +7695,13 @@ mod tests {
                 d == SqlDialect::MySql,
                 "{d:?}: {hint}"
             );
+            // And where a table's drop takes its grants, the file gives them
+            // back, which is the toggle's to say (`access`).
+            assert_eq!(
+                hint.contains("put back"),
+                crate::access::drop_resets_table_access(d),
+                "{d:?}: {hint}"
+            );
         }
         let mut t = table("orders");
         t.schema = Some("dbo".to_string());
@@ -7638,7 +7732,7 @@ mod tests {
             ..Default::default()
         };
         let header = text_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::MsSql));
-        assert!(!header.contains("replaces"), "{header}");
+        assert!(!header.contains("replaces 1 routine"), "{header}");
     }
 
     /// **A replay never drops a graph table.** An edge's rows are not in the
@@ -10288,5 +10382,151 @@ mod tests {
         };
         let file = file_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::Postgres));
         assert!(!file.contains("to_regtype"), "{file}");
+    }
+
+    // ── What a replay's drops take: owners, grants, row security ──────────────
+
+    fn pg_access(name: &str) -> crate::access::TableAccess {
+        crate::access::TableAccess {
+            schema: Some("public".to_string()),
+            name: name.to_string(),
+            owner: "app_owner".to_string(),
+            default_acl: true,
+            ..Default::default()
+        }
+    }
+
+    /// **A PostgreSQL replay gives each table and view it drops back its
+    /// owner, grants and row security**, after everything else the file
+    /// restores and inside its transaction. The `DROP … CASCADE` took them,
+    /// and the recreated table belonged to whoever replayed, with the default
+    /// ACL and row security off — an application role locked out, or let in
+    /// past the policies — under a success report (S1.1-L5-03).
+    #[test]
+    fn a_pg_replay_puts_back_each_dropped_tables_owner_grants_and_row_security() {
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        let mut v = view("open_orders");
+        v.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t, v]);
+        let mut orders = pg_access("orders");
+        orders.default_acl = false;
+        orders.grants = vec![crate::access::Grant {
+            grantee: Some("app".to_string()),
+            privilege: "SELECT".to_string(),
+            ..Default::default()
+        }];
+        orders.row_security = true;
+        s.replay_access.tables = Some(vec![orders, pg_access("open_orders")]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let pos = |needle: &str| {
+            file.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing:\n{file}"))
+        };
+        let section = pos("-- Owners, grants and row security");
+        for line in [
+            "ALTER TABLE \"public\".\"orders\" OWNER TO \"app_owner\";",
+            "REVOKE ALL ON TABLE \"public\".\"orders\" FROM PUBLIC;",
+            "GRANT SELECT ON TABLE \"public\".\"orders\" TO \"app\";",
+            "ALTER TABLE \"public\".\"orders\" ENABLE ROW LEVEL SECURITY;",
+            "ALTER VIEW \"public\".\"open_orders\" OWNER TO \"app_owner\";",
+        ] {
+            assert!(pos(line) > section, "{line} before the section:\n{file}");
+        }
+        assert!(section > pos("<<rows"), "after the rows:\n{file}");
+        assert!(section < pos("COMMIT;"), "inside the transaction:\n{file}");
+        assert!(
+            file.contains("back its owner, grants and row security"),
+            "{file}"
+        );
+
+        // Nothing dropped, nothing to give back.
+        let opts = DumpOptions {
+            drop_if_exists: false,
+            ..DumpOptions::default()
+        };
+        let file = file_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::Postgres));
+        assert!(!file.contains("OWNER TO"), "{file}");
+    }
+
+    /// **Where the dump could not read them, the header says the replay does
+    /// not put them back**, rather than nothing at all.
+    #[test]
+    fn a_pg_replay_without_the_access_read_says_it_does_not_put_it_back() {
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        let s = schema_of(vec![t]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(!file.contains("OWNER TO"), "{file}");
+        assert!(
+            file.contains("does not put back the owner, grants or row security"),
+            "{file}"
+        );
+    }
+
+    /// **A MySQL 8 replay grants back what each routine's `DROP` revoked**,
+    /// at the end of the file, once every routine is recreated — read at dump
+    /// time from `mysql.procs_priv`. Where that table could not be read, the
+    /// header still says the drop revokes them; MariaDB replaces in place and
+    /// grants nothing (S1.1-L5-02).
+    #[test]
+    fn a_mysql_replay_grants_back_what_its_routine_drops_revoke() {
+        let mut s = schema_of(vec![table("t")]);
+        s.routines.push(one_function(None));
+        s.flavour = crate::schema::ServerFlavour::MySql;
+        s.replay_access.routines = Some(vec![crate::access::RoutineGrant {
+            name: "f_one".to_string(),
+            kind: crate::schema::RoutineKind::Function,
+            user: "app".to_string(),
+            host: "%".to_string(),
+            privileges: vec!["Execute".to_string()],
+        }]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        let grant = "GRANT EXECUTE ON FUNCTION `f_one` TO 'app'@'%';";
+        let at = file.find(grant).unwrap_or_else(|| panic!("{file}"));
+        assert!(at > file.find("-- Routine grants").unwrap(), "{file}");
+        assert!(at > file.find("CREATE FUNCTION `f_one`").unwrap(), "{file}");
+        assert!(file.contains("grants them back at its end"), "{file}");
+
+        s.replay_access.routines = None;
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(!file.contains("GRANT EXECUTE"), "{file}");
+        assert!(file.contains("revokes every grant"), "{file}");
+        assert!(file.contains("could not read"), "{file}");
+
+        s.flavour = crate::schema::ServerFlavour::MariaDb;
+        s.replay_access.routines = Some(Vec::new());
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(!file.contains("-- Routine grants"), "{file}");
     }
 }

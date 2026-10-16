@@ -941,9 +941,16 @@ async fn dump_file_of(
     pick: impl Fn(&str) -> bool,
 ) -> String {
     use schemaic_core::dump::{DumpStep, plan};
-    let schema = Box::pin(src.db.fetch_schema(&src.name, CancellationToken::new()))
+    let mut schema = Box::pin(src.db.fetch_schema(&src.name, CancellationToken::new()))
         .await
         .expect("the schema");
+    // What the runner reads for a file that drops, as it reads it.
+    if opts.structure
+        && opts.drop_if_exists
+        && let Ok(access) = src.db.fetch_replay_access(&src.name, schema.flavour).await
+    {
+        schema.replay_access = access;
+    }
     let chosen: Vec<String> = schema
         .tables
         .iter()
@@ -1768,6 +1775,56 @@ async fn a_replay_without_its_transaction_fails_before_dropping_what_it_cannot_p
         "111",
         "{file}"
     );
+}
+
+/// **A replay gives each table it replaces back its owner and permissions**,
+/// with *One transaction* (every drop up front) and without. The recreated
+/// table held none and belonged to its schema's owner, so an application
+/// user lost `SELECT` and a `DENY` was lifted, under a success report.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_puts_back_the_owner_and_permissions_of_what_it_drops() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("dump_acl").await;
+    s.exec(
+        "CREATE USER zz_app WITHOUT LOGIN; CREATE USER zz_owner WITHOUT LOGIN; \
+         CREATE TABLE dbo.customers (id int PRIMARY KEY, secret nvarchar(20)); \
+         INSERT dbo.customers VALUES (1, N'a'); \
+         GRANT SELECT, INSERT ON dbo.customers TO zz_app; \
+         DENY DELETE ON dbo.customers TO zz_app; \
+         GRANT UPDATE (secret) ON dbo.customers TO zz_app WITH GRANT OPTION; \
+         ALTER AUTHORIZATION ON OBJECT::dbo.customers TO zz_owner;",
+    )
+    .await;
+    let state = "SELECT CONCAT((SELECT USER_NAME(principal_id) FROM sys.objects \
+                  WHERE object_id = OBJECT_ID('dbo.customers')), ' | ', \
+                 (SELECT STRING_AGG(CONCAT(COL_NAME(major_id, minor_id), ':', \
+                         USER_NAME(grantee_principal_id), ':', permission_name, ':', state), ',') \
+                  WITHIN GROUP (ORDER BY minor_id, permission_name, state) \
+                  FROM sys.database_permissions \
+                  WHERE class = 1 AND major_id = OBJECT_ID('dbo.customers')))";
+    let before = s.scalar(state).await;
+    assert!(before.starts_with("zz_owner | "), "the fixture: {before}");
+    for wrap_transaction in [true, false] {
+        let opts = DumpOptions {
+            wrap_transaction,
+            ..Default::default()
+        };
+        let file = Box::pin(dump_file(&s, opts)).await;
+        let end = Box::pin(restore_file(&s, &file)).await;
+        assert_eq!(
+            end,
+            schemaic_core::script::ExecEnd::Done,
+            "one transaction {wrap_transaction}:\n{file}"
+        );
+        assert_eq!(
+            s.scalar(state).await,
+            before,
+            "one transaction {wrap_transaction}: the replay did not put them back:\n{file}"
+        );
+    }
 }
 
 /// **A replay drops a schema-bound function between the tables it sits

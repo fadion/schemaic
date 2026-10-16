@@ -338,6 +338,43 @@ existing prose was left alone.
     Schemaic's own ("Not connected — the commit was not attempted") and only the producer knows
     which; `settle_after_switch` passes it through untouched, source and all
     (`a_failure_survives_a_switch_unchanged` checks both).
+  - `access.rs` — **what a dump's replay drops besides the objects, and the statements that put it
+    back**: `ReplayAccess { tables, routines }`, on `DbSchema::replay_access`, each half `None`
+    where it was not read. It is read by the dump runner alone, for a file that drops
+    (`Db::fetch_replay_access`, called from `cli::dump::run` when Structure and *Drop before create*
+    are both on), and never by `Db::fetch_schema`, whose every other caller would pay four
+    catalogue queries for it; a read that fails leaves the half unread rather than failing the
+    export, and the header says so. **Three engines lose something to a replay's `DROP`, and
+    `drop_resets_table_access(dialect)` is the table half's capability**: PostgreSQL's recreated
+    table belonged to whoever replayed, with the default ACL, row security off and no policies, so
+    an application role lost `SELECT` — or kept it through `PUBLIC` past the policies that had
+    limited it — under a success report (S1.1-L5-03); SQL Server's held no permission and belonged
+    to its schema's owner; MySQL keeps a dropped table's privileges in `mysql.tables_priv`, and they
+    apply again to the table recreated under its name, so it answers `false`, as SQLite, with no
+    grants, does. **`TableAccess::restate_sql(qname, keyword, dialect)`** is PostgreSQL's
+    `ALTER … OWNER TO`, then — where `relacl` was not `NULL` (`default_acl`) — `REVOKE ALL` from
+    `PUBLIC` and the owner and every grant again, as `pg_dump` writes it, so a privilege the owner
+    gave up stays given up (`an_empty_explicit_acl_still_revokes`); the column grants, each
+    privilege naming its columns; `ENABLE`/`FORCE ROW LEVEL SECURITY`; and each `CREATE POLICY`
+    with its kind, command (`pg_policy_command`), roles and expressions
+    (`an_explicit_acl_is_revoked_and_granted_back_by_grantee`,
+    `column_grants_are_granted_back_per_grantee`, `row_security_and_policies_are_restated`). On
+    SQL Server it is `ALTER AUTHORIZATION ON OBJECT::` where the owner is not the schema's, then
+    each `GRANT`, grant option, `DENY` and column `REVOKE` (`GrantState`, `sys.database_permissions`'
+    `state`) by grantee — nothing revoked first, since a new object holds no permission
+    (`sql_server_permissions_are_granted_denied_and_revoked_back`). **The routine half is MySQL
+    8's**: a routine has no `CREATE OR REPLACE` there, and its `DROP` revokes every account's grant
+    on it (`automatic_sp_privileges`), so the application's next call was *execute command denied*
+    (S1.1-L5-02, partial until this). `RoutineGrant::grant_sql` gives an account back what
+    `mysql.procs_priv` held — `EXECUTE`, `ALTER ROUTINE`, `Grant` as `WITH GRANT OPTION`, `USAGE`
+    where the option was all — on the unqualified name, beside the `CREATE` that made it in the
+    replay's database (`a_routine_grant_is_granted_back_as_held`); `ReplayAccess::routine_grants`
+    matches a routine's name ignoring case, as MySQL does. MySQL publishes routine privileges
+    nowhere in `information_schema`, so an account without `SELECT` on `mysql` reads `None`, and
+    the header says it could not grant them back. **Read at dump time, so a replay onto a server
+    without one of the roles or accounts stops at the statement naming it** — the cost the user
+    chose over refusing such replays, and the one `pg_dump` without `--no-acl` has. Where `plan`
+    writes them is under `dump.rs`.
   - `aggregate.rs` — what a multi-cell grid selection adds up to (`aggregate` → `Aggregates` +
     `summary`). The arithmetic is **fixed-point, not `f64`**, and that is the whole reason the
     module has substance: `Column::is_numeric` counts `DECIMAL`/`NUMERIC`, while `Value` leaves
@@ -5830,8 +5867,17 @@ existing prose was left alone.
     revoked from `PUBLIC`, came back executable by every role under a success report (measured on
     PostgreSQL 16: `proacl` `{schemaic=X/schemaic}` → `NULL`); one with grants or another owner is
     named now, and the replay stops (`a_replay_does_not_reopen_a_locked_down_routine`, live — red
-    against the old guard). The dropped tables' own grants, owner and policies are still not put
-    back: the model reads none of them. The block is asked of `drop_cascade`, so it
+    against the old guard). **The dropped tables' and views' own owner, grants, row security and
+    policies are put back** at the file's end, inside its transaction — read for the dump rather
+    than from the model (`core::access`; `a_pg_replay_puts_back_each_dropped_tables_owner_grants_and_row_security`,
+    and `a_pg_replay_puts_back_the_owner_grants_and_row_security`, live, red with the read taken
+    out); a section headed *-- Owners, grants and row security*, after the foreign keys, so no
+    statement above it runs under an owner or a row security the replaying role does not have. SQL
+    Server's file writes the same section with its owners and permissions
+    (`a_replay_puts_back_the_owner_and_permissions_of_what_it_drops`, live on 2022 and 2025, with
+    and without *One transaction*). Where the read failed, the header says the file *does not put
+    back the owner, grants or row security* of what it replaces
+    (`a_pg_replay_without_the_access_read_says_it_does_not_put_it_back`). The block is asked of `drop_cascade`, so it
     is written only where that is non-empty and the file drops something — MySQL, SQLite and SQL
     Server files are byte-identical to before — and never with *Drop before create* or Structure off
     (`a_replay_stops_before_a_cascade_would_drop_what_the_file_does_not_put_back`,
@@ -5933,10 +5979,16 @@ existing prose was left alone.
     `EXECUTE` on the routine went with it, and an account that may not write the `DEFINER` had its
     `CREATE` refused (ERROR 1227) after the `DROP` had committed, so the routine was gone — measured
     on MariaDB 10.11.14, where a grant survives `CREATE OR REPLACE` and not `DROP` + `CREATE`
-    (`a_mariadb_replay_keeps_the_grants_on_the_routines_it_replaces`, live; the edit path's
-    `supports_or_replace_routine` still declines the form, for the reason its doc gives). On MySQL 8
-    the header says what the `DROP` costs, and so does the toggle's hint
-    (`mariadb_replaces_routines_in_place_and_mysql_says_what_its_drop_costs`). Each is named in the
+    (`a_replay_keeps_the_grants_on_the_routines_it_replaces`, live on MariaDB and MySQL 8; the edit
+    path's `supports_or_replace_routine` still declines the form, for the reason its doc gives). On
+    MySQL 8 the header says what the `DROP` costs, and so does the toggle's hint
+    (`mariadb_replaces_routines_in_place_and_mysql_says_what_its_drop_costs`) — **and the file
+    grants back at its end what the `DROP` revoked**, under *-- Routine grants*, from what the dump
+    read of `mysql.procs_priv` (`core::access::RoutineGrant`;
+    `a_mysql_replay_grants_back_what_its_routine_drops_revoke`, and the live leg above, red on MySQL
+    8 with the read taken out). Where the dumping account could not read that table the header says
+    so instead. The `DEFINER` half is unchanged: an account that may not write it still has its
+    `CREATE` refused after the `DROP`, which the header says. Each is named in the
     header's *this file replaces …* line, which says *events* or *routines and events* where there
     are events among them, as the up-front path already named its routines
     (`a_replay_replaces_each_routine_it_carries`). **An enum, a domain or a sequence is created only
@@ -22399,9 +22451,9 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **665 tests on Windows, 664 elsewhere,** as this is
-  written (re-derived with `--list`) — 158 suite functions expanded across the three legs by
-  `main.rs`'s macro (474), SQL Server's own 168 in `mssql.rs` (167 off Windows: one,
+  tier stays pure by construction. It is **669 tests on Windows, 668 elsewhere,** as this is
+  written (re-derived with `--list`) — 159 suite functions expanded across the three legs by
+  `main.rs`'s macro (477), SQL Server's own 169 in `mssql.rs` (168 off Windows: one,
   `a_windows_sign_in_is_this_processs_own_identity`, is `cfg(windows)`), the seventeen in the two
   catalog oracles outside the macro (`pg_catalog`'s ten and `mariadb_catalog`'s seven), and the
   six that need no server (the four name-guard cases, `endpoint.rs`'s declared-case count, and the
@@ -27086,7 +27138,10 @@ existing prose was left alone.
     (`the_drop_hint_says_what_a_replay_does_without_one_transaction`). Every
     other engine with routines (`ddl::supports_routine_editing`) gets a hint that says so as well,
     since there the file replaces each routine it carries beside its `CREATE` (`dump::replay_create`,
-    under `core/dump.rs`); SQLite's still speaks of tables alone.
+    under `core/dump.rs`); SQLite's still speaks of tables alone. Where a table's drop takes its
+    owner and grants (`access::drop_resets_table_access`) the hint says they are put back at the end,
+    and MySQL's that the routine grants its drops revoke are granted back where the account can read
+    `mysql.procs_priv`.
     **One panel serves all six, and the split is asked as a capability.** Which entry was clicked is
     `DumpTarget::format`, and `DumpTarget::writes_folder()` — `!matches!(format, Sql)`, written once
     — is what the modal branches on: the title (`Export sakila to CSV`, the one thing about this

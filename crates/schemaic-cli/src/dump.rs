@@ -116,7 +116,7 @@ pub async fn run(
     // exit is a cancel; before `fetch_schema` took a token the `Cancelled` arm
     // below was unreachable and the press did nothing until the whole read was
     // done.
-    let schema = match db.fetch_schema(&req.database, token.clone()).await {
+    let mut schema = match db.fetch_schema(&req.database, token.clone()).await {
         Ok(s) => s,
         // `partial: false` — this is the whole point of the flag. The writer is
         // spawned thirty lines below, so nothing has been created and the note
@@ -124,6 +124,19 @@ pub async fn run(
         Err(DbError::Cancelled) => return DumpOutcome::Cancelled { partial: false },
         Err(e) => return failed(format!("Export failed: {e}"), false),
     };
+    // **What a replay's drops take besides the objects** — owners, grants,
+    // row security — read only for a file that drops, so the file can put
+    // them back (`schemaic_core::access`). A read that fails leaves them
+    // unread, and the file's header says it does not put them back rather
+    // than the export failing over them.
+    if req.opts.structure && req.opts.drop_if_exists {
+        if token.is_cancelled() {
+            return DumpOutcome::Cancelled { partial: false };
+        }
+        if let Ok(access) = db.fetch_replay_access(&req.database, schema.flavour).await {
+            schema.replay_access = access;
+        }
+    }
     let dump = plan(&schema, &req.database, &req.tables, req.opts, req.dialect);
     if dump.steps.is_empty() {
         return failed(

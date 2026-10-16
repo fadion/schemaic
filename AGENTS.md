@@ -31,6 +31,7 @@ whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `table_grant_lifts_column_denies`, `table_revoke_clears_columns`, `blank_password_signs_in`, `drop_user_cuts_off_sessions`,
 `sql::SqlDialect::read_only_is_a_rollback`, `dump::drops_up_front`,
 `drop_runs_referential_actions`, `ddl::replay_replaces_routine_in_place`,
+`access::drop_resets_table_access`,
 `copy_table::counter_follows_written_values`,
 `export::client_substitutes_variables`, `reads_dates_by_language`,
 `schema::unvalidated_check_waits_for_rows`, `writes_not_valid`, `partitions_are_tables`, `restates_partitioning`

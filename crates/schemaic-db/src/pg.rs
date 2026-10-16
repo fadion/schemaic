@@ -2604,7 +2604,166 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         // names as the catalogue stores them: compared exactly.
         names_ignore_case: false,
         extensions: pg_extensions(client).await?,
+        // The dump runner's, for a file that drops (`fetch_replay_access`).
+        replay_access: Default::default(),
     })
+}
+
+/// The PostgreSQL half of [`Db::fetch_replay_access`](crate::Db::fetch_replay_access):
+/// every user relation's owner, ACL, row security and policies, for a
+/// replaying dump to put back. One half only — PostgreSQL replaces its
+/// routines in place — and `None` where a read failed, so the dump goes on
+/// and says so.
+pub(crate) async fn fetch_replay_access(
+    db: &Db,
+    database: &str,
+) -> Result<schemaic_core::access::ReplayAccess, DbError> {
+    let client = connect_to(db, database).await?;
+    Ok(schemaic_core::access::ReplayAccess {
+        tables: pg_table_access(&client).await.ok(),
+        routines: None,
+    })
+}
+
+/// The four reads behind [`fetch_replay_access`], folded by
+/// [`pg_fold_table_access`].
+///
+/// `aclexplode` reads an explicit ACL's entries in the array's order (`WITH
+/// ORDINALITY` keeps it), a grantee of `0` being `PUBLIC`; a column's
+/// privileges are `pg_attribute.attacl`'s, ordered after the relation's own.
+/// `polroles` is one row per role for the same reason, `0` again `PUBLIC`.
+async fn pg_table_access(
+    client: &Client,
+) -> Result<Vec<schemaic_core::access::TableAccess>, DbError> {
+    let filter = user_schema_filter("n.nspname");
+    let rels = query_all(
+        client,
+        &format!(
+            "SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner), \
+                    (c.relacl IS NULL)::text, c.relrowsecurity::text, \
+                    c.relforcerowsecurity::text \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {filter} \
+             ORDER BY n.nspname, c.relname"
+        ),
+    )
+    .await?;
+    let grants = query_all(
+        client,
+        &format!(
+            "SELECT nspname, relname, attname, grantee, privilege_type, is_grantable \
+             FROM ( \
+               SELECT n.nspname, c.relname, NULL::name AS attname, 0 AS attnum, a.ord, \
+                      CASE WHEN a.grantee = 0 THEN NULL ELSE pg_get_userbyid(a.grantee) END \
+                        AS grantee, a.privilege_type, a.is_grantable::text AS is_grantable \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+               CROSS JOIN LATERAL aclexplode(c.relacl) WITH ORDINALITY \
+                 AS a(grantor, grantee, privilege_type, is_grantable, ord) \
+               WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {filter} \
+               UNION ALL \
+               SELECT n.nspname, c.relname, t.attname, t.attnum, a.ord, \
+                      CASE WHEN a.grantee = 0 THEN NULL ELSE pg_get_userbyid(a.grantee) END, \
+                      a.privilege_type, a.is_grantable::text \
+               FROM pg_attribute t JOIN pg_class c ON c.oid = t.attrelid \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               CROSS JOIN LATERAL aclexplode(t.attacl) WITH ORDINALITY \
+                 AS a(grantor, grantee, privilege_type, is_grantable, ord) \
+               WHERE t.attnum > 0 AND NOT t.attisdropped \
+                 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {filter} \
+             ) g ORDER BY nspname, relname, attnum, ord"
+        ),
+    )
+    .await?;
+    let policies = query_all(
+        client,
+        &format!(
+            "SELECT n.nspname, c.relname, p.polname, p.polpermissive::text, p.polcmd::text, \
+                    pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid) \
+             FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE {filter} ORDER BY n.nspname, c.relname, p.polname"
+        ),
+    )
+    .await?;
+    let policy_roles = query_all(
+        client,
+        &format!(
+            "SELECT n.nspname, c.relname, p.polname, \
+                    CASE WHEN r.oid = 0 THEN NULL ELSE pg_get_userbyid(r.oid) END \
+             FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             CROSS JOIN LATERAL unnest(p.polroles) WITH ORDINALITY AS r(oid, ord) \
+             WHERE {filter} ORDER BY n.nspname, c.relname, p.polname, r.ord"
+        ),
+    )
+    .await?;
+    Ok(pg_fold_table_access(
+        &rels,
+        &grants,
+        &policies,
+        &policy_roles,
+    ))
+}
+
+/// [`pg_table_access`]'s rows onto one [`TableAccess`] per relation, each
+/// row set keyed on `(namespace, relation)` in its first two columns.
+///
+/// [`TableAccess`]: schemaic_core::access::TableAccess
+fn pg_fold_table_access(
+    rels: &[Vec<Option<String>>],
+    grants: &[Vec<Option<String>>],
+    policies: &[Vec<Option<String>>],
+    policy_roles: &[Vec<Option<String>>],
+) -> Vec<schemaic_core::access::TableAccess> {
+    use schemaic_core::access::{Grant, Policy, TableAccess};
+    let key = |r: &[Option<String>]| (cell(r, 0), cell(r, 1));
+    let mut grants_of: HashMap<(String, String), Vec<Grant>> = HashMap::new();
+    for r in grants {
+        grants_of.entry(key(r)).or_default().push(Grant {
+            column: opt(r, 2),
+            grantee: opt(r, 3),
+            privilege: cell(r, 4),
+            grantable: cell(r, 5) == "true",
+            // An ACL holds grants only.
+            state: Default::default(),
+        });
+    }
+    let mut roles_of: HashMap<(String, String, String), Vec<Option<String>>> = HashMap::new();
+    for r in policy_roles {
+        roles_of
+            .entry((cell(r, 0), cell(r, 1), cell(r, 2)))
+            .or_default()
+            .push(opt(r, 3));
+    }
+    let mut policies_of: HashMap<(String, String), Vec<Policy>> = HashMap::new();
+    for r in policies {
+        let name = cell(r, 2);
+        policies_of.entry(key(r)).or_default().push(Policy {
+            roles: roles_of
+                .remove(&(cell(r, 0), cell(r, 1), name.clone()))
+                .unwrap_or_default(),
+            name,
+            permissive: cell(r, 3) == "true",
+            command: schemaic_core::access::pg_policy_command(&cell(r, 4)).to_string(),
+            using: opt(r, 5),
+            check: opt(r, 6),
+        });
+    }
+    rels.iter()
+        .map(|r| {
+            let k = key(r);
+            TableAccess {
+                schema: Some(k.0.clone()),
+                name: k.1.clone(),
+                owner: cell(r, 2),
+                default_acl: cell(r, 3) == "true",
+                row_security: cell(r, 4) == "true",
+                force_row_security: cell(r, 5) == "true",
+                grants: grants_of.remove(&k).unwrap_or_default(),
+                policies: policies_of.remove(&k).unwrap_or_default(),
+            }
+        })
+        .collect()
 }
 
 /// The database's installed extensions (`pg_extension` joined to
