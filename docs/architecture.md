@@ -36865,9 +36865,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   unfiltered, unsorted table, with a history entry for a run nobody made. The statement is now
   `filter::post_commit_statement(base, grid_query, dialect)` — `compose`'s filter, sort and page, or
   the base at rest — with `read_only_reason` asked *inside* it of the composed string
-  (`a_commit_rereads_the_page_on_screen`), minted as before and dispatched through `apply_view`,
-  which keeps `grid_query`; `settle_after_switch` still decides whether it runs at all. The raw
-  `run` is left with two callers.
+  (`a_commit_rereads_the_page_on_screen`), minted as before; `settle_after_switch` still decides
+  whether it runs at all. **`filter::post_commit_read` falls back** — the same page without the
+  filter and sort, then the base — and answers the query it stands for: the filter bar admits a
+  filter through its own gate, and one calling an extension's or the database's own function
+  failed `read_only_reason`'s allowlist, so the commit had no re-read at all — the inserted row
+  vanished from the grid and the deleted one came back
+  (`a_commit_rereads_without_a_filter_the_gate_cannot_vouch_for`). Where it fell back, `grid_query`
+  takes the query it stands for and the bar says so (`filter::REREAD_WITHOUT_FILTER_MSG`). **It
+  lands in the panel the commit started on** — `apply_view_into(req, panel)`, `run_query_core`'s
+  `into`, the panel captured at commit start and asked of `model::post_commit_panel` (still the
+  tab's, unpinned) — not whichever is shown when it lands: a click on a pinned chip while the
+  write waited sent it into the pin, which refuses a re-read, and left the committed panel stale
+  (`a_commits_reread_lands_in_the_panel_it_committed_on`). The raw `run` is left with two callers.
   **Running a `.sql` script is the third such path, and it is refused the other way round.**
   `sql::script_verdict` gates `script.rs`'s runner. `run_verdict` takes the statements; a script has
   tens of thousands of them, arriving a block at a time, and *none of them read* at the moment the
@@ -43014,8 +43024,23 @@ this bundle's.
   a header click is also the client-side sort's control on every other result.
   `GridState::has_staged` is the one spelling of "is
   anything staged" for the pager's key, the action and the capped notice's read-more; it reads
-  tracked, because the pager's key has to see the first staged edit, and the other two ask from
-  click handlers where there is nothing to subscribe. The chevrons carry *Previous page*/*Next page* tooltips
+  tracked, because the pager's key has to see the first staged edit — **through a memo**
+  (`staged_key`), since `dyn_container` does not dedup and a bare read rebuilt the pager, and
+  re-parsed the base four times, on every staged cell (`the_pager_key_reads_staging_through_a_memo`)
+  — and the other two ask from click handlers where there is nothing to subscribe. **Those guards
+  ask at launch, and two holes were past them.** A view re-run's landing is decided by
+  `filter::view_landing(loaded, staged_now, pending, shown)`: `grid_query` is written at
+  dispatch, before the server answers, so a sort the server refused (SQL Server's Msg 305 on
+  `xml`, PostgreSQL's on `json`) stood as the tab's query — the chevron over unsorted rows, every
+  page and later re-read replaying it, a commit's re-read failing on it — and a landing that
+  replaced the rows cleared edits staged *while it ran*, unasked. Now a refusal puts back
+  `Tab::grid_query_shown`, the query the shown rows came from, and a landing onto staged edits
+  keeps the rows, the edits and that query, saying `filter::STAGED_LANDING_MSG`
+  (`a_view_landing_keeps_the_shown_query_unless_it_shows_the_rows`). **And a run from the editor
+  asks**: Run and Run All replaced the result holding staged edits, and they went with it, so the
+  run guard folds `Tab::staged_on_replaced_panels` into its verdict
+  (`filter::with_staged_question`, `staged_run_note`) — an allowed run asks first, *Run anyway*
+  discarding them (`a_run_over_staged_edits_names_what_it_discards`). The chevrons carry *Previous page*/*Next page* tooltips
   otherwise, and they are plain clickable containers rather than `in_strip_button`s, so F6's ring does not
   reach them.
 - **The Download menu names the scope, and only when there is a choice to make.** `export_menu`

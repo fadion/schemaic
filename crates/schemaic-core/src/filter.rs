@@ -499,6 +499,111 @@ pub fn post_commit_statement(base: &str, gq: &GridQuery, dialect: SqlDialect) ->
         .then_some(sql)
 }
 
+/// The statement a commit's re-read runs, and **the query it stands for** —
+/// [`post_commit_statement`] of `gq`, else of the same page without the filter
+/// and sort, else of the base alone; `None` only where none is a read.
+///
+/// The filter bar admits a filter through its own gate, and the re-read asks
+/// [`crate::sql::read_only_reason`], whose function allowlist is far narrower
+/// — so a filter calling an extension's function or the database's own left a
+/// commit that inserted or deleted with **no re-read at all**: the inserted
+/// row vanished from the grid and the deleted one came back, unmarked. A
+/// re-read without the filter shows the committed rows; the caller writes the
+/// query it stands for back to the tab, so the bar describes them.
+pub fn post_commit_read(
+    base: &str,
+    gq: &GridQuery,
+    dialect: SqlDialect,
+) -> Option<(String, GridQuery)> {
+    let page = GridQuery {
+        page: gq.page,
+        ..GridQuery::default()
+    };
+    [gq.clone(), page, GridQuery::default()]
+        .into_iter()
+        .find_map(|q| post_commit_statement(base, &q, dialect).map(|sql| (sql, q)))
+}
+
+/// What a view re-run's landing does with its panel — [`view_landing`]'s
+/// answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewLanding {
+    /// The rows replace the panel's.
+    Show,
+    /// The server refused it: the panel keeps its rows, and the bar the error.
+    Refused,
+    /// It read, but edits were staged on the panel while it was in flight:
+    /// the panel keeps its rows and the edits ([`STAGED_LANDING_MSG`]).
+    KeptForStaged,
+}
+
+/// What a view re-run's landing does, and **which query stands after it**:
+/// `loaded` is whether the server answered with rows, `staged_now` whether the
+/// panel holds staged edits as it lands, `pending` the query the re-run was
+/// for — written to the tab when it was dispatched — and `shown` the one the
+/// panel's rows came from.
+///
+/// **Only rows that are shown change the query.** It was written at dispatch
+/// and never put back, so a sort the server refused (SQL Server's Msg 305 on
+/// an `xml` column, PostgreSQL's on `json`) stood as the tab's query: the
+/// chevron over unsorted rows, every page and later re-read replaying it, a
+/// commit's re-read failing on it. **And rows do not replace staged edits**
+/// a landing never asked about: the edits made while a re-read was in flight
+/// were cleared by it, unasked, though every launch asks.
+pub fn view_landing(
+    loaded: bool,
+    staged_now: bool,
+    pending: &GridQuery,
+    shown: &GridQuery,
+) -> (ViewLanding, GridQuery) {
+    match (loaded, staged_now) {
+        (true, false) => (ViewLanding::Show, pending.clone()),
+        (true, true) => (ViewLanding::KeptForStaged, shown.clone()),
+        (false, _) => (ViewLanding::Refused, shown.clone()),
+    }
+}
+
+/// What the bar says when a commit's re-read drops the filter and sort
+/// ([`post_commit_read`]'s fallback).
+pub const REREAD_WITHOUT_FILTER_MSG: &str = "The filter calls a function Schemaic does not \
+     re-run unasked, so after the commit the table was re-read without the filter and sort.";
+
+/// What the bar says when a re-read lands over edits staged while it ran.
+pub const STAGED_LANDING_MSG: &str = "Edits were staged while the table was being re-read, so \
+     they were kept and the table was not refreshed — commit or discard them, then refresh.";
+
+/// `verdict` with the run guard's question about `staged` changes the run
+/// would discard ([`staged_run_note`]) folded in: a run that was allowed asks
+/// first, one that already asks names both, and a refusal stays a refusal.
+pub fn with_staged_question(
+    verdict: crate::sql::RunVerdict,
+    staged: usize,
+) -> crate::sql::RunVerdict {
+    use crate::sql::RunVerdict;
+    let Some(note) = staged_run_note(staged) else {
+        return verdict;
+    };
+    match verdict {
+        RunVerdict::Allow => RunVerdict::Confirm(note),
+        RunVerdict::Confirm(m) => RunVerdict::Confirm(format!("{m} {note}")),
+        RunVerdict::Block(m) => RunVerdict::Block(m),
+    }
+}
+
+/// What the run guard says before an editor run replaces a result holding `n`
+/// staged changes — or `None` with none to lose.
+pub fn staged_run_note(n: usize) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            "This run replaces the result holding {n} staged {} — running would discard {}. \
+             Commit or discard {} first, or run anyway.",
+            crate::text::plural(n, "change", "changes"),
+            crate::text::plural(n, "it", "them"),
+            crate::text::plural(n, "it", "them"),
+        )
+    })
+}
+
 /// A query's constant row limit and the offset it starts at, in any of the
 /// spellings [`page_size`] reads; `None` for a limit that is not a plain
 /// number (a parameter, `PERCENT`, `WITH TIES`).
@@ -1429,6 +1534,107 @@ mod tests {
         assert_eq!(
             post_commit_statement("SELECT 1; DELETE FROM t", &GridQuery::default(), pg),
             None
+        );
+    }
+
+    /// **A filter the read-only gate cannot vouch for still gets a re-read**
+    /// (S2.2-L1-01): a filter calling `my_fn` (an extension's, the database's
+    /// own) ran through the filter bar's gate, but the commit's re-read asks
+    /// `read_only_reason`, which refuses an unknown function — and there was
+    /// no re-read at all, so an inserted row vanished and a deleted one came
+    /// back on screen. The re-read falls back to the page without the filter,
+    /// then to the base, and says which query it stands for.
+    #[test]
+    fn a_commit_rereads_without_a_filter_the_gate_cannot_vouch_for() {
+        let pg = SqlDialect::Postgres;
+        let base = "SELECT * FROM t ORDER BY id LIMIT 10";
+        let gq = GridQuery {
+            filter: "my_fn(id) > 0".into(),
+            sort: vec![("name".into(), false)],
+            page: 2,
+        };
+        let (sql, stands) = post_commit_read(base, &gq, pg).expect("a re-read");
+        assert_eq!(sql, "SELECT * FROM t ORDER BY id LIMIT 10 OFFSET 20");
+        assert_eq!(
+            stands,
+            GridQuery {
+                page: 2,
+                ..GridQuery::default()
+            }
+        );
+        // A filter it can vouch for is kept, as before.
+        let fine = GridQuery {
+            filter: "qty > 0".into(),
+            ..gq.clone()
+        };
+        let (_, stands) = post_commit_read(base, &fine, pg).expect("a re-read");
+        assert_eq!(stands, fine);
+        // A base that writes gets none, fallback or not.
+        assert_eq!(post_commit_read("DELETE FROM t", &gq, pg), None);
+    }
+
+    /// **What a view re-run's landing leaves standing** (S2.2-L1-03,
+    /// S2.2-L1-05): the query was written before the server answered, so a
+    /// sort the server refused (Msg 305 on `xml`) stuck to the tab — chevron,
+    /// pager and every later re-read replaying it; and edits staged while the
+    /// re-read was in flight were cleared by its landing, unasked. A refusal
+    /// puts the shown query back; staging since the launch keeps the rows
+    /// and the edits, and the shown query, and says so.
+    #[test]
+    fn a_view_landing_keeps_the_shown_query_unless_it_shows_the_rows() {
+        let shown = GridQuery::default();
+        let pending = GridQuery {
+            sort: vec![("j".into(), true)],
+            ..GridQuery::default()
+        };
+        assert_eq!(
+            view_landing(true, false, &pending, &shown),
+            (ViewLanding::Show, pending.clone())
+        );
+        assert_eq!(
+            view_landing(false, false, &pending, &shown),
+            (ViewLanding::Refused, shown.clone())
+        );
+        assert_eq!(
+            view_landing(true, true, &pending, &shown),
+            (ViewLanding::KeptForStaged, shown.clone())
+        );
+        assert_eq!(
+            view_landing(false, true, &pending, &shown),
+            (ViewLanding::Refused, shown)
+        );
+        assert!(STAGED_LANDING_MSG.contains("kept"));
+    }
+
+    /// **A run from the editor asks before it replaces staged edits**
+    /// (S2.2-L1-06): Run and Run All replaced the result holding them, and
+    /// they went with it, while every re-read the grid starts refuses.
+    #[test]
+    fn a_run_over_staged_edits_names_what_it_discards() {
+        assert_eq!(staged_run_note(0), None);
+        let one = staged_run_note(1).expect("a note");
+        assert!(
+            one.contains("1 staged change ") && one.contains("discard"),
+            "{one}"
+        );
+        let three = staged_run_note(3).expect("a note");
+        assert!(three.contains("3 staged changes"), "{three}");
+        use crate::sql::RunVerdict;
+        assert_eq!(
+            with_staged_question(RunVerdict::Allow, 0),
+            RunVerdict::Allow
+        );
+        assert_eq!(
+            with_staged_question(RunVerdict::Allow, 1),
+            RunVerdict::Confirm(one.clone())
+        );
+        assert!(matches!(
+            with_staged_question(RunVerdict::Confirm("Writes.".into()), 1),
+            RunVerdict::Confirm(m) if m.starts_with("Writes. ") && m.ends_with(&one)
+        ));
+        assert_eq!(
+            with_staged_question(RunVerdict::Block("No.".into()), 2),
+            RunVerdict::Block("No.".into())
         );
     }
 

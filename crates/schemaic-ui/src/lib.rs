@@ -1926,6 +1926,12 @@ pub struct Tab {
     /// The active server-side filter/sort for this tab's result (persists across
     /// result reloads; reset on a fresh manual run). Session-only.
     pub grid_query: RwSignal<schemaic_core::filter::GridQuery>,
+    /// The query the **shown rows** came from — `grid_query` as of the last
+    /// view re-run that landed rows (reset on a fresh manual run). What a
+    /// refused or kept landing puts `grid_query` back to
+    /// (`filter::view_landing`): it is written at dispatch, before the server
+    /// answers.
+    pub grid_query_shown: RwSignal<schemaic_core::filter::GridQuery>,
     /// A one-off row cap for this tab, overriding the global setting — set by
     /// the capped notice's "read more" action, cleared on a fresh manual run.
     ///
@@ -2123,8 +2129,40 @@ impl Tab {
         self.base_sql.set(base.map(str::to_string));
         self.grid_query
             .set(schemaic_core::filter::GridQuery::default());
+        self.grid_query_shown
+            .set(schemaic_core::filter::GridQuery::default());
         self.row_cap_override.set(None);
         self.view_err.set(None);
+    }
+
+    /// Does panel `id` hold staged edits — a cell, a pending row or a row
+    /// marked for deletion? What a view re-run's landing asks before it
+    /// replaces the rows they sit on (`filter::view_landing`).
+    pub fn panel_has_staged(&self, id: u64) -> bool {
+        self.result_tabs.with_untracked(|v| {
+            v.iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| p.view.staged_count() > 0)
+        })
+    }
+
+    /// Each panel's id and whether it is pinned — what a commit's re-read
+    /// asks of the panel it committed on (`model::post_commit_panel`).
+    pub fn panel_pins(&self) -> Vec<(u64, bool)> {
+        self.result_tabs
+            .with_untracked(|v| v.iter().map(|p| (p.id, p.frozen())).collect())
+    }
+
+    /// How many staged changes sit on the panels a manual run replaces — the
+    /// unpinned ones (`begin_run`). What the run guard asks before Run or Run
+    /// All discards them (`filter::staged_run_note`).
+    pub fn staged_on_replaced_panels(&self) -> usize {
+        self.result_tabs.with_untracked(|v| {
+            v.iter()
+                .filter(|p| !p.frozen())
+                .map(|p| p.view.staged_count())
+                .sum()
+        })
     }
 
     /// Start a run: replace the unpinned panels with one `Running` panel per
@@ -2425,6 +2463,7 @@ impl Tab {
             font_zoom: cx.create_rw_signal(None),
             base_sql: cx.create_rw_signal(None),
             grid_query: cx.create_rw_signal(schemaic_core::filter::GridQuery::default()),
+            grid_query_shown: cx.create_rw_signal(schemaic_core::filter::GridQuery::default()),
             row_cap_override: cx.create_rw_signal(None),
             view_err: cx.create_rw_signal(None),
             view_busy: cx.create_rw_signal(false),
@@ -3196,6 +3235,14 @@ impl PanelView {
         if had_staging {
             self.staging_gen.update(|g| *g = g.wrapping_add(1));
         }
+    }
+
+    /// Every staged change on this panel: cells, pending rows and rows marked
+    /// for deletion, read untracked.
+    fn staged_count(&self) -> usize {
+        self.dirty.with_untracked(|d| d.len())
+            + self.new_rows.with_untracked(Vec::len)
+            + self.del_rows.with_untracked(|r| r.len())
     }
 }
 

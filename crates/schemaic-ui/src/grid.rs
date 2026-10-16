@@ -9201,6 +9201,12 @@ fn grid_toolbar(
     // statement (`filter::compose`, after the filter and the sort), re-run
     // through the same `RerunRequest` mint. Shown only where a re-run may
     // happen at all (`rerunnable`, which a kept result is not).
+    // Whether anything is staged is part of the key, as a bool **behind a
+    // memo**, so a chevron greys out on the first staged edit without a
+    // rebuild per keystroke after it. Read bare, `has_staged`'s tracked reads
+    // re-ran the key — and with it the base's four parses — on every staged
+    // cell, since `dyn_container` does not dedup (`body_rebuild_key`'s rule).
+    let staged_key = create_memo(move |_| gs.has_staged());
     let pager = dyn_container(
         move || {
             let size = gs.base_sql.with(|b| {
@@ -9209,10 +9215,7 @@ fn grid_toolbar(
                         .map(|n| (n, schemaic_core::filter::page_offset(b, gs.dialect)))
                 })
             });
-            // Whether anything is staged is part of the key, as a bool, so a
-            // chevron greys out on the first staged edit without a rebuild
-            // per keystroke after it.
-            let staged = gs.has_staged();
+            let staged = staged_key.get();
             size.filter(|_| gs.rerunnable())
                 .map(|(size, start)| (size, start, gs.grid_query.with(|q| q.page), staged))
         },
@@ -13238,6 +13241,25 @@ mod header_sort_tests {
              staged-work guard drops the user's uncommitted edits"
         );
         assert_eq!(inside, 1, "this gate is stale — it found {inside} writes");
+    }
+
+    /// **The pager's rebuild key reads whether anything is staged through a
+    /// memo** (S2.2-L2-01): `dyn_container` does not dedup, so a bare
+    /// `has_staged()` in the key rebuilt the pager — re-parsing the base four
+    /// times — on every staged cell. A view decision, so pinned by its text.
+    #[test]
+    fn the_pager_key_reads_staging_through_a_memo() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/grid.rs"))
+            .expect("this module's own source");
+        let body = crate::source_gate::production_code(&src);
+        let start = body
+            .find("let pager = dyn_container(")
+            .expect("the pager is gone — this gate is stale");
+        let key_end = start + body[start..].find("move |paged|").expect("its child");
+        let key = &body[start..key_end];
+        assert!(!key.contains("has_staged()"), "{key}");
+        assert!(key.contains("staged_key.get()"), "{key}");
+        assert!(body.contains("let staged_key = create_memo(move |_| gs.has_staged());"));
     }
 
     /// **And inside it, the write comes after every refusal.** It came first:

@@ -1780,6 +1780,24 @@ pub fn settle_after_switch(still_active: bool, outcome: CommitDone) -> (bool, Co
     }
 }
 
+/// The panel a commit's re-read lands in — `committed`, the one the commit
+/// started on, while the tab still has it unpinned (`panels`: each panel's id
+/// and whether it is pinned) — or `None` where it is gone or pinned, and no
+/// re-read is due.
+///
+/// **Not whichever panel is shown when the commit lands.** The re-read
+/// resolved its panel at landing, so a click on a pinned chip while the
+/// write waited sent it into the pin — which refuses a re-read — and the
+/// committed panel kept its stale rows; a run started meanwhile had its
+/// newer result replaced by the old table's statement.
+pub fn post_commit_panel(committed: Option<u64>, panels: &[(u64, bool)]) -> Option<u64> {
+    let id = committed?;
+    panels
+        .iter()
+        .any(|&(p, pinned)| p == id && !pinned)
+        .then_some(id)
+}
+
 /// UI-facing lifecycle of a query in a tab. Shared between the app (writer)
 /// and the UI (reader) through a Floem signal.
 #[derive(Clone, Debug)]
@@ -3622,5 +3640,18 @@ mod tests {
                 "and never after a switch"
             );
         }
+    }
+
+    /// **A commit's re-read goes to the panel it committed on** (S2.2-L1-02),
+    /// while that panel is still the tab's and unpinned — never into the one
+    /// shown when it lands, which a click on a pin had made the snapshot.
+    #[test]
+    fn a_commits_reread_lands_in_the_panel_it_committed_on() {
+        let panels = [(1, true), (2, false)];
+        assert_eq!(post_commit_panel(Some(2), &panels), Some(2));
+        // Pinned since, or replaced by a newer run: no re-read.
+        assert_eq!(post_commit_panel(Some(1), &panels), None);
+        assert_eq!(post_commit_panel(Some(9), &panels), None);
+        assert_eq!(post_commit_panel(None, &panels), None);
     }
 }

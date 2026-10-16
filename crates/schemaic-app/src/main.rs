@@ -3342,7 +3342,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
         }
     };
-    let run_query_core: Rc<dyn Fn(String, bool)> = {
+    // `into` is a view re-run's panel where the caller names one — a commit's
+    // re-read, which goes to the panel it committed on — and `None` for the
+    // shown one (`model::post_commit_panel`).
+    let run_query_core: Rc<dyn Fn(String, bool, Option<u64>)> = {
         let refresh_after_run = refresh_after_run.clone();
         let ddl_owed = ddl_owed.clone();
         let (repin_owed, repin_late) = (repin_owed.clone(), repin_late.clone());
@@ -3354,7 +3357,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let record_history = record_history.clone();
         let finish_history = finish_history.clone();
         let log_write = log_write.clone();
-        Rc::new(move |sql: String, is_view: bool| {
+        Rc::new(move |sql: String, is_view: bool, into: Option<u64>| {
             if sql.trim().is_empty() {
                 return;
             }
@@ -3374,10 +3377,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // (the filter row and the capped notice's "read all rows"); this
                 // is the same rule at the funnel, where a stale affordance or a
                 // later caller cannot get round it.
-                if tab.shown_frozen() {
-                    return;
+                match into {
+                    // Named, it must still be the tab's and unpinned.
+                    Some(p) => {
+                        if schemaic_core::model::post_commit_panel(Some(p), &tab.panel_pins())
+                            .is_none()
+                        {
+                            return;
+                        }
+                        Some(p)
+                    }
+                    None if tab.shown_frozen() => return,
+                    None => tab.shown_panel_id(),
                 }
-                tab.shown_panel_id()
             } else {
                 tab.begin_run(std::slice::from_ref(&sql)).first().copied()
             };
@@ -3554,12 +3566,35 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // is coming, and a link left disabled for ever is worse
                         // than one that can be clicked twice.
                         tab.view_busy.set(false);
+                        // **What the landing does, and which query stands
+                        // after it** (`filter::view_landing`): the query was
+                        // written at dispatch, so a refusal — or rows that
+                        // would replace edits staged while this ran — puts
+                        // the shown one back.
+                        let (landing, stands) = schemaic_core::filter::view_landing(
+                            matches!(state, QueryState::Loaded(_)),
+                            panel.is_some_and(|id| tab.panel_has_staged(id)),
+                            &tab.grid_query.get_untracked(),
+                            &tab.grid_query_shown.get_untracked(),
+                        );
+                        if landing != schemaic_core::filter::ViewLanding::Show
+                            && tab.grid_query.with_untracked(|q| *q != stands)
+                        {
+                            tab.grid_query.set(stands.clone());
+                        }
+                        if landing == schemaic_core::filter::ViewLanding::KeptForStaged {
+                            view_err.set(Some(ModalError::app(
+                                schemaic_core::filter::STAGED_LANDING_MSG,
+                            )));
+                            return;
+                        }
                         match state {
                             // Success → swap in the filtered result, then bump the load
                             // nonce so the grid rebuilds despite Loaded→Loaded. Order
                             // matters: the rebuild reads `results` untracked, so the new
                             // Arc must already be in place before the nonce changes.
                             QueryState::Loaded(_) => {
+                                tab.grid_query_shown.set(stands);
                                 if let Some(id) = panel {
                                     tab.set_panel_state(id, state);
                                     // The panel's rows are this statement's now,
@@ -3748,7 +3783,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // with `None` for the same reason.
                 tab.start_manual_run(Some(&sql));
             }
-            core(sql, false);
+            core(sql, false, None);
         })
     };
 
@@ -3763,7 +3798,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // check.
     let apply_view: Rc<dyn Fn(schemaic_ui::RerunRequest)> = {
         let core = run_query_core.clone();
-        Rc::new(move |req: schemaic_ui::RerunRequest| core(req.into_sql(), true))
+        Rc::new(move |req: schemaic_ui::RerunRequest| core(req.into_sql(), true, None))
+    };
+    // The same re-run, **into a named panel** — a commit's re-read, which lands
+    // in the panel it committed on rather than whichever is shown by then
+    // (`model::post_commit_panel`).
+    let apply_view_into: Rc<dyn Fn(schemaic_ui::RerunRequest, u64)> = {
+        let core = run_query_core.clone();
+        Rc::new(move |req: schemaic_ui::RerunRequest, panel: u64| {
+            core(req.into_sql(), true, Some(panel))
+        })
     };
 
     // ── Run EXPLAIN for the query-plan modal (targets the active tab's db) ──
@@ -5896,10 +5940,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // spliceable single-table UPDATE-only result), we re-`SELECT` just the edited
     // rows and hand them back so the grid splices them in place — no re-run,
     // scroll/selection preserved. Otherwise (inserts, or not spliceable) we re-run
-    // the view on screen — its filter, sort and page — through `apply_view`. On failure the message goes back and the grid keeps its edits.
+    // the view on screen — its filter, sort and page — through `apply_view_into`, into the panel the
+    // commit started on. On failure the message goes back and the grid keeps its edits.
     let commit_edits: schemaic_ui::CommitFn = {
         let handle = handle.clone();
-        let apply_view = apply_view.clone();
+        let apply_view_into = apply_view_into.clone();
         let db_for = db_for.clone();
         let log_write = log_write.clone();
         Rc::new(
@@ -5978,16 +6023,31 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // `apply_view`, which keeps `grid_query`; the `read_only_reason`
                 // check above lives inside that function now, asked of the
                 // composed statement, and the mint is unchanged.
+                //
+                // **With the query it stands for** (`filter::post_commit_read`):
+                // a filter the read-only gate cannot vouch for — a function from
+                // an extension or the database — left the commit with no re-read
+                // at all, so an inserted row vanished from the grid and a deleted
+                // one came back. It falls back to the page without the filter,
+                // and the tab's query follows it, so the bar describes the rows.
+                //
+                // **And into the panel the commit started on**
+                // (`model::post_commit_panel`): resolved at landing, a click on a
+                // pinned chip while the write waited sent it into the pin, which
+                // refuses a re-read, and left the committed panel stale.
+                let committed_panel = tab.shown_panel_id();
                 let refetch_req = tab
                     .base_sql
                     .get_untracked()
                     .and_then(|s| {
                         tab.grid_query.with_untracked(|gq| {
-                            schemaic_core::filter::post_commit_statement(&s, gq, dialect_of(&db))
+                            schemaic_core::filter::post_commit_read(&s, gq, dialect_of(&db))
                         })
                     })
-                    .and_then(|s| schemaic_ui::RerunRequest::approved(s, dialect_of(&db)));
-                let apply_view = apply_view.clone();
+                    .and_then(|(s, stands)| {
+                        schemaic_ui::RerunRequest::approved(s, dialect_of(&db)).map(|r| (r, stands))
+                    });
+                let apply_view_into = apply_view_into.clone();
                 let engine = tx_engine(&db);
                 let fold = create_ext_action(cx, move |stmt: StmtOutcome| {
                     // A write batch is one unit as far as the transaction is
@@ -6032,8 +6092,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         active.get_untracked() == id,
                         outcome,
                     );
-                    if refetch && let Some(req) = refetch_req.clone() {
-                        apply_view(req);
+                    if refetch
+                        && let Some((req, stands)) = refetch_req.clone()
+                        && let Some(panel) = schemaic_core::model::post_commit_panel(
+                            committed_panel,
+                            &tab.panel_pins(),
+                        )
+                    {
+                        if tab.grid_query.with_untracked(|q| *q != stands) {
+                            tab.grid_query.set(stands);
+                            tab.view_err.set(Some(ModalError::app(
+                                schemaic_core::filter::REREAD_WITHOUT_FILTER_MSG,
+                            )));
+                        }
+                        apply_view_into(req, panel);
                     }
                     (done)(outcome);
                 });
@@ -9156,6 +9228,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .unwrap_or_default()
         })
     };
+    // The staged changes a manual run on the active tab would discard — the
+    // run guard's second question (`filter::with_staged_question`).
+    let staged_on_active = move || {
+        let id = active.get_untracked();
+        tabs.with_untracked(|v| {
+            v.iter()
+                .find(|t| t.id == id)
+                .map_or(0, |t| t.staged_on_replaced_panels())
+        })
+    };
+    let with_staged_question = schemaic_core::filter::with_staged_question;
     let guarded_run: Rc<dyn Fn(String)> = {
         let gated_run = gated_run.clone();
         Rc::new(move |sql: String| {
@@ -9178,6 +9261,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             };
             let sql = stmts.pop().unwrap_or(sql);
+            // **Staged edits are asked about too** (`filter::staged_run_note`):
+            // the run replaces the result holding them, and they went with it,
+            // unasked, while every re-read the grid starts refuses over them.
+            let verdict = with_staged_question(verdict, staged_on_active());
             match verdict {
                 RunVerdict::Allow => {
                     // **A run that goes through clears the bar it got past.**
@@ -9219,6 +9306,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         return;
                     }
                 };
+            let verdict = with_staged_question(verdict, staged_on_active());
             match verdict {
                 RunVerdict::Allow => {
                     // Same as `guarded_run`: the batch that gets past the bar is
@@ -15960,7 +16048,7 @@ mod app_tests {
         };
         let cases: [(&str, &[&str], &[&str]); 5] = [
             (
-                "let run_query_core: Rc<dyn Fn(String, bool)> = {",
+                "let run_query_core: Rc<dyn Fn(String, bool, Option<u64>)> = {",
                 &["session_enforce(", "fetch_query_enforced("],
                 &[],
             ),
