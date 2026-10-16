@@ -78,7 +78,9 @@ pub struct DumpOptions {
     /// engines with transactional DDL.
     pub wrap_transaction: bool,
     /// Turn foreign-key enforcement off for the duration, where the engine has a
-    /// session switch for it ([`fk_guard_sql`]).
+    /// session switch for it ([`fk_guard_sql`]). Off is overridden where a
+    /// drop would run referential actions ([`drop_runs_referential_actions`]):
+    /// a file that drops tables there always carries the switch.
     pub disable_fk_checks: bool,
 }
 
@@ -580,6 +582,29 @@ pub fn fk_guard_sql(dialect: SqlDialect) -> Option<(&'static str, &'static str)>
     }
 }
 
+/// Does the engine's `DROP TABLE` **run the referencing tables' `ON DELETE`
+/// actions** while foreign keys are enforced — so a replay's drop of a table
+/// the file recreates empties (or nulls) rows in tables outside the file?
+///
+/// **SQLite does**: with `foreign_keys` on, `DROP TABLE` performs an implicit
+/// `DELETE FROM` first, and that `DELETE` fires every `ON DELETE CASCADE` /
+/// `SET NULL` pointing at it — the same implicit-`DELETE` loss the table
+/// rebuild already guards against. With *Disable foreign-key checks* unticked,
+/// which looks like the stricter choice, replaying `customers` onto its source
+/// emptied `orders` without a word. So [`plan`] writes [`fk_guard_sql`]
+/// whenever such a file drops a table, whatever the toggle says.
+///
+/// MySQL refuses the drop of a referenced table loudly (ERROR 3730),
+/// PostgreSQL's `CASCADE` drops the key rather than any row
+/// ([`cascade_guard_sql`] answers for that), and SQL Server refuses
+/// (Msg 3726) — none of them deletes a row.
+pub fn drop_runs_referential_actions(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
+}
+
 /// How the file makes its string literals mean, on restore, what they meant
 /// when they were written — or `None` where they always do.
 ///
@@ -784,6 +809,20 @@ pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
     } else {
         "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
          that already holds these tables."
+    }
+}
+
+/// The *Disable foreign-key checks* toggle's hint — saying, where
+/// [`drop_runs_referential_actions`], that a file which drops tables turns
+/// them off regardless, since that is what keeps the drop from deleting rows
+/// outside the file.
+pub fn fk_guard_hint(dialect: SqlDialect) -> &'static str {
+    if drop_runs_referential_actions(dialect) {
+        "Off for the duration of the load, so the order rows arrive in can't refuse them. \
+         A file that drops tables turns them off anyway: a drop with them on deletes the \
+         rows of tables outside the file through their ON DELETE actions."
+    } else {
+        "Off for the duration of the load, so the order rows arrive in can't refuse them."
     }
 }
 
@@ -3062,10 +3101,13 @@ pub fn plan(
     }
 
     // ── Scaffolding: the guard wraps the transaction, never the other way ────
-    let guard = opts
-        .disable_fk_checks
-        .then(|| fk_guard_sql(dialect))
-        .flatten();
+    // Whatever the toggle says where a drop would otherwise delete rows
+    // outside the file — see `drop_runs_referential_actions`.
+    let drops_tables = opts.structure && opts.drop_if_exists;
+    let guard = (opts.disable_fk_checks
+        || (drops_tables && drop_runs_referential_actions(dialect)))
+    .then(|| fk_guard_sql(dialect))
+    .flatten();
     if let Some((open, _)) = guard {
         text!(open.to_string());
     }
@@ -6020,6 +6062,40 @@ mod tests {
         ));
         assert!(pos(&file, "SET FOREIGN_KEY_CHECKS = 0;") < pos(&file, "START TRANSACTION;"));
         assert!(pos(&file, "COMMIT;") < pos(&file, "SET FOREIGN_KEY_CHECKS = 1;"));
+    }
+
+    /// **A SQLite `DROP TABLE` with foreign keys on is a `DELETE`**, and the
+    /// `DELETE` runs every referencing table's `ON DELETE` action: with
+    /// *Disable foreign-key checks* unticked, replaying `customers` onto its
+    /// source emptied an `orders` the file never names through its `ON DELETE
+    /// CASCADE` (reproduced: 2 rows → 0) and reported success. So a file that
+    /// drops tables turns the keys off whatever the toggle says, and one that
+    /// drops nothing still honours it.
+    #[test]
+    fn a_sqlite_file_that_drops_tables_turns_foreign_keys_off_whatever_the_toggle() {
+        let s = schema_of(vec![table("customers")]);
+        let strict = DumpOptions {
+            disable_fk_checks: false,
+            ..DumpOptions::default()
+        };
+        let file = file_of(&plan(&s, "main", &all(&s), strict, SqlDialect::Sqlite));
+        assert!(pos(&file, "PRAGMA foreign_keys = OFF;") < pos(&file, "DROP TABLE"));
+        assert!(pos(&file, "COMMIT;") < pos(&file, "PRAGMA foreign_keys = ON;"));
+
+        let keeps = DumpOptions {
+            drop_if_exists: false,
+            ..strict
+        };
+        let file = file_of(&plan(&s, "main", &all(&s), keeps, SqlDialect::Sqlite));
+        assert!(!file.contains("PRAGMA foreign_keys"), "{file}");
+
+        // MySQL refuses such a drop loudly (ERROR 3730), so its toggle stands.
+        let file = file_of(&plan(&s, "shop", &all(&s), strict, SqlDialect::MySql));
+        assert!(!file.contains("FOREIGN_KEY_CHECKS = 0"), "{file}");
+
+        // And the toggle's hint says so where it is overridden, only there.
+        assert!(fk_guard_hint(SqlDialect::Sqlite).contains("anyway"));
+        assert!(!fk_guard_hint(SqlDialect::MySql).contains("anyway"));
     }
 
     /// **The literal guard is the outermost thing in the file**, because it

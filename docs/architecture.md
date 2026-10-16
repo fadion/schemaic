@@ -5648,7 +5648,14 @@ existing prose was left alone.
     the whole file rather than on either function — the bug is the composition. **PostgreSQL gets no
     guard**: `session_replication_role` is superuser-only, so offering it would be a checkbox that
     fails the restore for most roles, and the ordering plus the trailing constraints section is the
-    answer there.
+    answer there. **On SQLite the guard is written whenever the file drops a table, whatever the
+    toggle says** (`drop_runs_referential_actions`): SQLite's `DROP TABLE` with foreign keys on is
+    an implicit `DELETE`, which runs every referencing table's `ON DELETE` action, so unticking
+    *Disable foreign-key checks* — the stricter-looking choice — had a replay of `customers` empty an
+    `orders` the file never names (reproduced: 2 rows → 0) under a success report. MySQL refuses
+    such a drop (ERROR 3730), SQL Server too (Msg 3726), and PostgreSQL's `CASCADE` drops a key, not
+    a row, so their toggle stands; `fk_guard_hint` is the toggle's hint and says so where it does
+    not (`a_sqlite_file_that_drops_tables_turns_foreign_keys_off_whatever_the_toggle`).
     **`literal_mode_guard_sql` sits outside both, and is not one of the two optional scaffolds.**
     It is `export::literal_mode_sql` — the statement that takes `NO_BACKSLASH_ESCAPES` off the
     session so every `'…'` in the file means what `sql_literal` wrote it to mean — with the

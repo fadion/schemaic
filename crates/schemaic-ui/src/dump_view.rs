@@ -643,8 +643,7 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
         if has_guard {
             crate::settings::focusable_toggle_row(
                 "Disable foreign-key checks",
-                "Off for the duration of the load, so the order rows arrive in can't \
-                 refuse them.",
+                schemaic_core::dump::fk_guard_hint(dialect),
                 d.disable_fk_checks,
                 ring.clone(),
                 TAB_OPTS + 50,
