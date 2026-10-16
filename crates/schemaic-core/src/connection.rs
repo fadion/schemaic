@@ -1298,13 +1298,62 @@ fn default_db_type() -> String {
 pub enum OpenSession {
     /// Nothing the session rests on moved; it stays.
     Kept,
-    /// Only the session settings (the init SQL) moved: the session is stale
-    /// but its transaction is alive, so an open one is asked about before the
-    /// drop that would roll it back.
+    /// The session is stale — its settings, its guard or its transport are
+    /// no longer the connection's — but its socket and transaction are alive,
+    /// so an open one is asked about before the session is replaced
+    /// ([`Self::pinned_fate`]).
     AskFirst,
-    /// The server or the transport moved: the transaction is gone either way,
-    /// and the session is dropped without asking.
+    /// The save tears the tunnel under the session down: the transaction is
+    /// gone whatever anyone answers, and the session is dropped without
+    /// asking.
     Dropped,
+}
+
+/// How a pinned session's open transaction was asked about after a saved
+/// edit — [`OpenSession::pinned_fate`]'s second half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxAsked {
+    /// Nothing was open, so nothing was asked.
+    NotOpen,
+    /// Committed or rolled back on the prompt.
+    Settled,
+    /// Cancelled: the user keeps the work on the old session.
+    Cancelled,
+}
+
+/// What becomes of one Manual tab's pinned session after a saved edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinnedFate {
+    /// It stays as it is.
+    Keep,
+    /// Replaced now by one opened under the connection as saved; the tab stays
+    /// in Manual.
+    Repin,
+    /// Kept for the transaction it holds, and replaced when that ends.
+    RepinWhenTxEnds,
+    /// Dropped; the tab falls back to Auto-commit.
+    Release,
+}
+
+impl OpenSession {
+    /// What becomes of a pinned session, given how its transaction was
+    /// `asked` about.
+    ///
+    /// **Where the socket is alive the tab stays in Manual, re-pinned.**
+    /// Dropping it to Auto was the old answer to a server that had gone; to a
+    /// stale session on a live one it only threw the user's mode away. **And
+    /// Cancel keeps the work, not the stale session for good**: the re-pin
+    /// waits for the transaction to end, where it used to never come — the
+    /// tab went on running as the old role, or writing on a connection since
+    /// made read-only, for the rest of its life.
+    pub fn pinned_fate(self, asked: TxAsked) -> PinnedFate {
+        match (self, asked) {
+            (OpenSession::Kept, _) => PinnedFate::Keep,
+            (OpenSession::Dropped, _) => PinnedFate::Release,
+            (OpenSession::AskFirst, TxAsked::NotOpen | TxAsked::Settled) => PinnedFate::Repin,
+            (OpenSession::AskFirst, TxAsked::Cancelled) => PinnedFate::RepinWhenTxEnds,
+        }
+    }
 }
 
 impl Connection {
@@ -1847,16 +1896,24 @@ impl Connection {
     /// What saving `other` over this connection does to an open Manual
     /// session on it.
     ///
-    /// **An init SQL edit is not a transport edit.** Both make a pinned
-    /// session stale, but a moved server or socket has already lost the
-    /// session's transaction, while after an init SQL edit the socket and the
-    /// transaction are alive and only the drop would roll the work back — so
-    /// that one asks each open transaction first (Commit, Roll back, or keep
-    /// it on the old settings), and the others are dropped as before.
+    /// **Only a torn-down tunnel has already lost the transaction.** The save
+    /// removes the tunnel of a connection it repoints, which takes the
+    /// forwarded socket with it; every other edit is a form change that
+    /// touches no open socket — a TLS, CA, client-key or SSH-credential edit,
+    /// a host edit with no tunnel, an init SQL edit — and there the drop was
+    /// what rolled the work back, unasked, on the premise that "the
+    /// transaction is gone either way". Those ask each open transaction first
+    /// (Commit, Roll back, or keep it until it ends).
+    ///
+    /// **Ticking `read_only` is one of them**: the pinned session's
+    /// enforcement was fixed when it opened, and the text gate in front of it
+    /// passes a `SELECT` whose function writes, so the tab went on committing
+    /// on a read-only connection. Lifting `read_only` leaves the stricter
+    /// session as it is.
     pub fn open_session_after(&self, other: &Connection) -> OpenSession {
-        if self.moves_transport(other) {
+        if self.ssh.enabled && !self.targets_same_server(other) {
             OpenSession::Dropped
-        } else if self.init_sql != other.init_sql {
+        } else if self.invalidates_open_connections(other) || (!self.read_only && other.read_only) {
             OpenSession::AskFirst
         } else {
             OpenSession::Kept
@@ -3955,19 +4012,80 @@ mod tests {
 
     /// S1.1-L5-03: an init SQL edit leaves the socket and its transaction
     /// alive — dropping the session is what would roll the work back — so the
-    /// save asks first. A moved server or transport has already taken the
-    /// transaction, so there is nothing to ask.
+    /// save asks first. **So does every edit that leaves the socket up**: a
+    /// TLS, CA, client-key or SSH-credential edit, or a host edit with no
+    /// tunnel, is a form change that touches no open socket, and the drop was
+    /// what rolled the work back, unasked (S3.1-L5-02). Only a repoint of a
+    /// tunnelled connection, whose tunnel the save tears down, has already
+    /// taken the transaction.
     #[test]
-    fn only_a_session_settings_edit_asks_before_an_open_session_is_dropped() {
+    fn only_a_torn_down_tunnel_drops_an_open_session_unasked() {
         let mut init = conn();
         init.init_sql = "SET TIME ZONE 'UTC'".into();
         assert_eq!(conn().open_session_after(&init), OpenSession::AskFirst);
         let mut moved = init.clone();
         moved.host = "elsewhere".into();
-        assert_eq!(conn().open_session_after(&moved), OpenSession::Dropped);
+        assert_eq!(conn().open_session_after(&moved), OpenSession::AskFirst);
+        let mut tls = conn();
+        tls.tls.mode = SslMode::Require;
+        assert_eq!(conn().open_session_after(&tls), OpenSession::AskFirst);
+        let mut key = conn();
+        key.tls.client_key_path = "client.key".into();
+        assert_eq!(conn().open_session_after(&key), OpenSession::AskFirst);
+
+        let mut tunnelled = conn();
+        tunnelled.ssh.enabled = true;
+        tunnelled.ssh.host = "bastion".into();
+        let mut cred = tunnelled.clone();
+        cred.ssh.key_path = "other_key".into();
+        assert_eq!(tunnelled.open_session_after(&cred), OpenSession::AskFirst);
+        let mut repointed = tunnelled.clone();
+        repointed.host = "elsewhere".into();
+        assert_eq!(
+            tunnelled.open_session_after(&repointed),
+            OpenSession::Dropped
+        );
+
         let mut renamed = conn();
         renamed.name = "renamed".into();
         assert_eq!(conn().open_session_after(&renamed), OpenSession::Kept);
+    }
+
+    /// **Ticking read-only does not keep a writable session** (R1-L2-01). The
+    /// pinned session's enforcement was fixed when it opened, and the text
+    /// gate in front of it passes a `SELECT` calling a function that writes,
+    /// so a Manual tab went on committing after the connection was made
+    /// read-only. It is asked about and re-pinned, as an init SQL edit is.
+    /// Lifting read-only leaves the stricter session as it is.
+    #[test]
+    fn ticking_read_only_does_not_keep_a_writable_session() {
+        let mut ro = conn();
+        ro.read_only = true;
+        assert_eq!(conn().open_session_after(&ro), OpenSession::AskFirst);
+        assert_eq!(ro.open_session_after(&conn()), OpenSession::Kept);
+    }
+
+    /// **What becomes of each pinned session**, once its transaction was
+    /// asked about. Where the socket is alive the tab stays in Manual on a
+    /// session re-pinned under the new settings — after Commit or Roll back,
+    /// or at once with nothing open. **Cancel keeps the work, not the stale
+    /// session for good**: the re-pin waits for the transaction to end
+    /// (S3.1-L5-01, where the tab otherwise ran as the old role for the rest of
+    /// its life). Only a torn-down tunnel drops the tab to Auto.
+    #[test]
+    fn a_cancelled_question_repins_when_the_transaction_ends() {
+        use PinnedFate::*;
+        use TxAsked::*;
+        for asked in [NotOpen, Settled, Cancelled] {
+            assert_eq!(OpenSession::Kept.pinned_fate(asked), Keep);
+            assert_eq!(OpenSession::Dropped.pinned_fate(asked), Release);
+        }
+        assert_eq!(OpenSession::AskFirst.pinned_fate(NotOpen), Repin);
+        assert_eq!(OpenSession::AskFirst.pinned_fate(Settled), Repin);
+        assert_eq!(
+            OpenSession::AskFirst.pinned_fate(Cancelled),
+            RepinWhenTxEnds
+        );
     }
 
     /// Everything that moves the *server* still invalidates what is open — the

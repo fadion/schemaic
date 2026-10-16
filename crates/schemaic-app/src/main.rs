@@ -67,7 +67,9 @@ use floem::reactive::{
 };
 use floem::window::{Icon, WindowConfig};
 use schemaic_core::conn_import;
-use schemaic_core::connection::{ConnStatus, Connection, LoadFailure, OpenSession};
+use schemaic_core::connection::{
+    ConnStatus, Connection, LoadFailure, OpenSession, PinnedFate, TxAsked,
+};
 use schemaic_core::edit::analyze_edit;
 use schemaic_core::health;
 use schemaic_core::history::Finished;
@@ -1932,6 +1934,20 @@ fn settle_schema(
     }
 }
 
+/// Re-pin a Manual tab whose stale session was kept for the transaction it
+/// held (`PinnedFate::RepinWhenTxEnds`, `owed` by tab id) — once that
+/// transaction has ended, by Commit, Roll back, or a statement typed in the
+/// editor. Asked wherever a tab's transaction can end: `end_tx` and the run
+/// fold.
+fn repin_if_owed(tab: schemaic_ui::Tab, owed: &RefCell<HashSet<usize>>, repin: &LateAction<usize>) {
+    if tab.tx.get_untracked().is_open() || !owed.borrow_mut().remove(&tab.id) {
+        return;
+    }
+    if let Some(open_session) = repin.borrow().clone() {
+        open_session(tab.id);
+    }
+}
+
 /// Which engine's transaction semantics apply — the divergence that
 /// [`schemaic_core::tx`] encodes (Postgres poisons a transaction on any error;
 /// MySQL implicitly commits on DDL).
@@ -2332,6 +2348,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // on a Manual tab's first statement and removed (rolled back + closed) when
     // the tab leaves Manual, closes, or its connection goes away.
     let sessions: Rc<RefCell<HashMap<usize, Arc<Session>>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Tabs whose pinned session went stale under an open transaction the user
+    // chose to keep (`PinnedFate::RepinWhenTxEnds`): re-pinned through
+    // `repin_late` (`open_session`, built later) once that transaction ends —
+    // see `repin_if_owed`.
+    let repin_owed: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
+    let repin_late: LateAction<usize> = Rc::new(RefCell::new(None));
 
     // Cache of established SSH tunnels: connection id → live tunnel handle.
     // Keeps us from re-opening a tunnel on every schema reload; dropping a handle
@@ -3322,6 +3344,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let run_query_core: Rc<dyn Fn(String, bool)> = {
         let refresh_after_run = refresh_after_run.clone();
         let ddl_owed = ddl_owed.clone();
+        let (repin_owed, repin_late) = (repin_owed.clone(), repin_late.clone());
         let handle = handle.clone();
         let tokens = tokens.clone();
         let run_gen = run_gen.clone();
@@ -3437,6 +3460,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let finish_history = finish_history.clone();
             let refresh_after_run = refresh_after_run.clone();
             let ddl_owed = ddl_owed.clone();
+            let (repin_owed, repin_late) = (repin_owed.clone(), repin_late.clone());
             // The write log's entry, for a run that writes — a view re-run is a
             // read Schemaic built, and `write_log::is_logged` errs toward a write.
             let conn_id = tab.conn_id.get_untracked();
@@ -3472,6 +3496,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         tab.tx
                             .update(|t| *t = t.on_statement(engine, &tx_sql, stmt));
                     }
+                    // A typed COMMIT or ROLLBACK ends a transaction a stale
+                    // session was kept for, as the footer's does.
+                    repin_if_owed(tab, &repin_owed, &repin_late);
                     // **The schema it changed is reloaded** — or owed until the
                     // open transaction ends (`settle_schema`) — before the
                     // supersede check like the transaction and the history: the
@@ -3954,6 +3981,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let finish_history = finish_history.clone();
         let refresh_after_run = refresh_after_run.clone();
         let ddl_owed = ddl_owed.clone();
+        let (repin_owed, repin_late) = (repin_owed.clone(), repin_late.clone());
         let log_write = log_write.clone();
         Rc::new(move |stmts: Vec<String>| {
             let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
@@ -4046,6 +4074,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let dialect = dialect_of(&db);
             let refresh_after_run = refresh_after_run.clone();
             let ddl_owed = ddl_owed.clone();
+            let (repin_owed, repin_late) = (repin_owed.clone(), repin_late.clone());
             // Each writing statement's write-log entry, stamped at launch.
             let write_entries: Vec<Option<schemaic_core::write_log::Entry>> = stmts
                 .iter()
@@ -4092,6 +4121,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             tab.tx.update(|t| *t = t.on_statement(engine, sql, *stmt));
                         }
                     }
+                    // A typed COMMIT or ROLLBACK ends a transaction a stale
+                    // session was kept for, as the footer's does.
+                    repin_if_owed(tab, &repin_owed, &repin_late);
                     // A statement that changed the schema reloads it, once for
                     // the batch — see the single run's.
                     let changed = schemaic_core::sql::run_changes_schema(
@@ -6150,8 +6182,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let db_for = db_for.clone();
         let refresh_after_run = refresh_after_run.clone();
         let ddl_owed = ddl_owed.clone();
+        let (repin_owed, repin_late) = (repin_owed.clone(), repin_late.clone());
         Rc::new(
             move |tab_id: usize, commit: bool, then: Option<Rc<dyn Fn()>>| {
+                let (repin_owed, repin_late) = (repin_owed.clone(), repin_late.clone());
                 let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())
                 else {
                     return;
@@ -6223,6 +6257,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         None => tab.tx.set(TxState::closed()),
                     }
                     settle();
+                    // Its stale session was kept for this transaction alone.
+                    repin_if_owed(tab, &repin_owed, &repin_late);
                     if let Some(then) = then.clone() {
                         then();
                     }
@@ -6293,7 +6329,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let handle = handle.clone();
         let db_for = db_for.clone();
         let drop_session = drop_session.clone();
+        let repin_owed = repin_owed.clone();
         Rc::new(move |tab_id: usize| {
+            // A re-pin by any route settles one that was owed.
+            repin_owed.borrow_mut().remove(&tab_id);
             let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())
             else {
                 return;
@@ -6373,6 +6412,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
         })
     };
+
+    *repin_late.borrow_mut() = Some(open_session.clone());
 
     // Flip a tab between Auto-commit and Manual. Auto is only reachable with no
     // transaction open; the footer raises a `TxPrompt` first if there is one.
@@ -11003,19 +11044,131 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         }
     };
 
-    // Flip a connection's read-only flag and persist (the status-bar shortcut).
-    // The `read_only` memo reads this reactively, so write-gating updates at once.
-    let toggle_read_only: Rc<dyn Fn(u64)> = Rc::new(move |id: u64| {
-        connections.update(|cs| {
-            if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
-                c.read_only = !c.read_only;
+    // What a saved edit of connection `id` does to its Manual tabs' pinned
+    // sessions, `fate` being `Connection::open_session_after`'s answer; each
+    // tab's own is `OpenSession::pinned_fate`. The form's Save and the
+    // status-bar read-only toggle both come here, so a session that went stale
+    // is handled the same whichever way it went stale.
+    //
+    // **Where the socket is alive each open transaction is asked about**
+    // (`guard_tx`: Commit, Roll back, or Cancel to keep it), and the tab stays
+    // in Manual on a session re-pinned under the connection as saved — at
+    // once, after the answer, or (Cancel) when the kept transaction ends
+    // (`repin_owed`). Only a tunnel the save tore down (`OpenSession::Dropped`)
+    // drops a tab to Auto unasked: its transaction is already gone, and the log
+    // gets the ROLLBACK the server makes, the only line that says the writes
+    // before it did not stay. **Not** `repair_killed_session`'s reopen there —
+    // the tunnel has just gone, so `open_session` would fail on the spot.
+    let resettle_sessions: Rc<dyn Fn(u64, OpenSession)> = {
+        let drop_session = drop_session.clone();
+        let open_session = open_session.clone();
+        let guard_tx = guard_tx.clone();
+        let log_write = log_write.clone();
+        let repin_owed = repin_owed.clone();
+        Rc::new(move |id: u64, fate: OpenSession| {
+            if fate == OpenSession::Kept {
+                return;
             }
-        });
-        persist_conns(
-            Some(active_conn.get_untracked()),
-            persist::Saving::Replacing,
-        );
-    });
+            let Some(dialect) = connections.with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == id)
+                    .map(|c| SqlDialect::from_db_type(&c.db_type))
+            }) else {
+                return;
+            };
+            let pinned: Vec<schemaic_ui::Tab> = tabs.with_untracked(|v| {
+                v.iter()
+                    .filter(|t| {
+                        t.conn_id.get_untracked() == id
+                            && t.tx_mode.get_untracked() == TxMode::Manual
+                    })
+                    .copied()
+                    .collect()
+            });
+            let settle: Rc<dyn Fn(schemaic_ui::Tab, PinnedFate)> = {
+                let (drop_session, open_session) = (drop_session.clone(), open_session.clone());
+                let repin_owed = repin_owed.clone();
+                Rc::new(move |t: schemaic_ui::Tab, f: PinnedFate| match f {
+                    PinnedFate::Keep => {}
+                    PinnedFate::Repin => (open_session)(t.id),
+                    PinnedFate::RepinWhenTxEnds => {
+                        repin_owed.borrow_mut().insert(t.id);
+                    }
+                    PinnedFate::Release => {
+                        t.tx_mode.set(TxMode::Auto);
+                        t.tx.set(TxState::closed());
+                        (drop_session)(t.id);
+                    }
+                })
+            };
+            let mut asked: Vec<schemaic_ui::Tab> = Vec::new();
+            for t in pinned {
+                let open = t.tx.get_untracked().is_open();
+                if open && fate == OpenSession::AskFirst {
+                    asked.push(t);
+                    continue;
+                }
+                if open {
+                    (log_write)(
+                        id,
+                        dialect,
+                        schemaic_core::write_log::abandoned(
+                            t.database.get_untracked().as_deref(),
+                            "the connection was repointed and its tunnel closed, so the open \
+                             transaction was dropped and the server rolled it back",
+                        ),
+                    );
+                }
+                settle(t, fate.pinned_fate(TxAsked::NotOpen));
+            }
+            // One prompt at a time (`tx_prompt` holds one question), chained
+            // the way `run_ddl` chains its blockers.
+            let mut next: Rc<dyn Fn()> = Rc::new(|| {});
+            for t in asked.into_iter().rev() {
+                let (guard_tx, settle, then) = (guard_tx.clone(), settle.clone(), next);
+                next = Rc::new(move || {
+                    let (on_settled, settled_then) = (settle.clone(), then.clone());
+                    let (on_cancel, cancelled_then) = (settle.clone(), then.clone());
+                    (guard_tx)(
+                        t.id,
+                        Rc::new(move || {
+                            on_settled(t, fate.pinned_fate(TxAsked::Settled));
+                            settled_then();
+                        }),
+                        Some(Rc::new(move || {
+                            on_cancel(t, fate.pinned_fate(TxAsked::Cancelled));
+                            cancelled_then();
+                        })),
+                    )
+                });
+            }
+            next();
+        })
+    };
+
+    // Flip a connection's read-only flag and persist (the status-bar shortcut).
+    // The `read_only` memo reads this reactively, so write-gating updates at once
+    // — and a Manual tab's pinned session, whose enforcement was fixed when it
+    // opened, is resettled as a saved edit's is: ticking read-only is
+    // `OpenSession::AskFirst` (R1-L2-01).
+    let toggle_read_only: Rc<dyn Fn(u64)> = {
+        let resettle_sessions = resettle_sessions.clone();
+        Rc::new(move |id: u64| {
+            let mut fate = OpenSession::Kept;
+            connections.update(|cs| {
+                if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
+                    let before = c.clone();
+                    c.read_only = !c.read_only;
+                    fate = before.open_session_after(c);
+                }
+            });
+            persist_conns(
+                Some(active_conn.get_untracked()),
+                persist::Saving::Replacing,
+            );
+            resettle_sessions(id, fate);
+        })
+    };
 
     // Switch the active connection and reload its schema.
     // **Point the AI panel at `id`, and leave nothing of the previous
@@ -11961,10 +12114,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let check_conn = check_conn.clone();
         let tunnels = tunnels.clone();
         let reset_activity = reset_activity.clone();
-        let drop_session = drop_session.clone();
         let ai_session = ai_session.clone();
-        let guard_tx = guard_tx.clone();
-        let log_write = log_write.clone();
+        let resettle_sessions = resettle_sessions.clone();
         Rc::new(move || {
             let id = draft.id.get_untracked().unwrap_or_else(|| {
                 connections.with_untracked(|cs| {
@@ -12028,81 +12179,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 tunnels.borrow_mut().remove(&id);
             }
             if invalidated {
-                // Every pinned Manual session on this connection is now either on
-                // a dead socket, on a server the user has left, or on a
-                // transport the user has just changed their mind about — and its
-                // transaction is gone either way. This is `delete_conn_now`'s
-                // treatment, for the same reason and with the same absence of a
-                // prompt: the server rolls back on disconnect, and the tab
-                // dropping to Auto-commit is what stops its footer claiming a
-                // transaction that no longer exists. **Not**
-                // `repair_killed_session`'s reopen — that one puts the tab back on
-                // a server that is still there, whereas here the tunnel has just
-                // gone and `open_session` would fail on the spot, flip the tab to
-                // Auto anyway and raise an error modal on top.
-                //
-                // **Except after an init SQL edit alone** (`OpenSession::AskFirst`):
-                // there the socket and its transaction are alive, and the drop
-                // is what would roll the work back — so each open transaction
-                // is asked about first (`guard_tx`: Commit, Roll back, or Cancel
-                // to keep that tab's session on the old settings until it is
-                // re-pinned). Where the transaction is dropped unasked, the log
-                // gets the ROLLBACK the server makes, which is the only line
-                // that says the writes before it did not stay.
-                let dialect = SqlDialect::from_db_type(&conn.db_type);
-                let on_conn: Vec<schemaic_ui::Tab> = tabs.with_untracked(|v| {
-                    v.iter()
-                        .filter(|t| t.conn_id.get_untracked() == id)
-                        .copied()
-                        .collect()
-                });
-                let release = {
-                    let drop_session = drop_session.clone();
-                    move |t: schemaic_ui::Tab| {
-                        t.tx_mode.set(TxMode::Auto);
-                        t.tx.set(TxState::closed());
-                        (drop_session)(t.id);
-                    }
-                };
-                let mut asked: Vec<schemaic_ui::Tab> = Vec::new();
-                for t in on_conn {
-                    let open = t.tx.get_untracked().is_open();
-                    if open && fate == OpenSession::AskFirst {
-                        asked.push(t);
-                        continue;
-                    }
-                    if open {
-                        (log_write)(
-                            id,
-                            dialect,
-                            schemaic_core::write_log::abandoned(
-                                t.database.get_untracked().as_deref(),
-                                "the connection's server or transport was edited, so the open \
-                                 transaction was dropped and the server rolled it back",
-                            ),
-                        );
-                    }
-                    release(t);
-                }
-                // One prompt at a time (`tx_prompt` holds one question), chained
-                // the way `run_ddl` chains its blockers.
-                let mut next: Rc<dyn Fn()> = Rc::new(|| {});
-                for t in asked.into_iter().rev() {
-                    let (guard_tx, release, then) = (guard_tx.clone(), release.clone(), next);
-                    next = Rc::new(move || {
-                        let release = release.clone();
-                        let then_settled = then.clone();
-                        (guard_tx)(
-                            t.id,
-                            Rc::new(move || {
-                                release(t);
-                                then_settled();
-                            }),
-                            Some(then.clone()),
-                        )
-                    });
-                }
-                next();
+                // Every pinned Manual session on this connection is stale — on a
+                // server the user has left, a transport or guard they have just
+                // changed, or the old init SQL — and is resettled, asking first
+                // wherever its transaction is still alive (`resettle_sessions`).
+                (resettle_sessions)(id, fate);
                 // And the AI session, whose MCP subprocess holds a `Db` built at
                 // spawn from the old target and the old tunnel port. `needs_respawn`
                 // cannot see this: it compares the conn id, which did not move, and
@@ -15898,6 +15979,39 @@ mod app_tests {
                 assert!(!r.contains(needle), "`{head}` still calls `{needle}`");
             }
         }
+    }
+
+    /// **The status-bar read-only toggle resettles the pinned sessions**, as a
+    /// saved edit does (R1-L2-01): a Manual tab's session takes its `Enforce`
+    /// when it opens, so flipping the flag and persisting — all the toggle
+    /// did — left a writable session committing on a read-only connection.
+    /// A decision at a caller no core test sees, so pinned by its text: the
+    /// toggle asks `open_session_after`, and the one resettling path applies
+    /// `pinned_fate` for the save and the toggle alike.
+    #[test]
+    fn the_read_only_toggle_resettles_pinned_sessions() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let region = |head: &str| {
+            let at = body
+                .find(head)
+                .unwrap_or_else(|| panic!("`{head}` — this gate is stale"));
+            let end = at + body[at..].find("\n    };").expect("the end of the closure");
+            &body[at..end]
+        };
+        let toggle = region("let toggle_read_only: Rc<dyn Fn(u64)> = {");
+        assert!(toggle.contains(".open_session_after("), "{toggle}");
+        assert!(toggle.contains("resettle_sessions(id, fate)"), "{toggle}");
+        let save = region("let save_conn: Rc<dyn Fn()> = {");
+        assert!(save.contains("(resettle_sessions)(id, fate)"));
+        let resettle = region("let resettle_sessions: Rc<dyn Fn(u64, OpenSession)> = {");
+        assert!(resettle.contains("pinned_fate(TxAsked::Cancelled)"));
+        assert!(resettle.contains("pinned_fate(TxAsked::Settled)"));
     }
 
     /// **Re-pinning a session clears the tab's transaction state**, in the

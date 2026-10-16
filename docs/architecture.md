@@ -12225,10 +12225,10 @@ existing prose was left alone.
     when its transaction is open**: that release used to be silent, and since the socket and the
     transaction were both still alive, the release was itself what rolled the work back — while the
     write log kept those writes as `ok` with no end line. `open_session_after` answers
-    `OpenSession::AskFirst` for an edit that moved the init SQL and nothing under it, and
-    `save_conn` puts each open transaction through the Commit / Roll back / Cancel prompt before
-    letting go (`only_a_session_settings_edit_asks_before_an_open_session_is_dropped`; the
-    `app/main.rs` passage on what an edit invalidates).
+    `OpenSession::AskFirst` for such an edit, and the app puts each open transaction through the
+    Commit / Roll back / Cancel prompt before re-pinning
+    (`only_a_torn_down_tunnel_drops_an_open_session_unasked`; the `app/main.rs` passage on what an
+    edit invalidates).
     `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
     **`SshTunnel::jump` is the route before the SSH host**, in OpenSSH's `ProxyJump` spelling —
@@ -12311,19 +12311,24 @@ existing prose was left alone.
     up as. The password stays out for `targets_same_server`'s
     reason: a corrected one reaches the same server over the same socket, and an already
     authenticated session is not made wrong by it.
-    **`open_session_after` splits that yes into two, because the init SQL is not the transport.**
-    The private `moves_transport` holds the server and TLS/SSH terms, and
-    `invalidates_open_connections` is it *or* a changed `init_sql`; `open_session_after` returns
-    `OpenSession::Dropped` when `moves_transport` holds, `AskFirst` when only the init SQL moved,
-    and `Kept` otherwise — and
-    `save_conn` asks an open transaction about the release only under `AskFirst`. Both make a pinned
-    session stale, but after an init SQL edit the socket and its transaction are alive and only the
-    release would roll the work back, so the user is asked first; the code's reason for not asking
-    under `Dropped` is that the transaction is gone either way. That holds where the save evicts the
-    tunnel the session ran through; a TLS or SSH-credential edit (which keeps the tunnel), or a
-    repointed direct connection, leaves the old socket up, and there it is the unasked release that
-    rolls the work back — logged as such through `write_log::abandoned`
-    (`only_a_session_settings_edit_asks_before_an_open_session_is_dropped`).
+    **`open_session_after` splits that yes by whether the socket is still up.** The private
+    `moves_transport` holds the server and TLS/SSH terms, and `invalidates_open_connections` is it
+    *or* a changed `init_sql`. `open_session_after` returns `OpenSession::Dropped` only where the
+    save tears the tunnel down — a tunnelled connection repointed, whose tunnel `save_conn` evicts
+    with the forwarded socket in it — and `AskFirst` for every other stale session: a TLS, CA,
+    client-key or SSH-credential edit (which keeps the tunnel), a repointed direct connection, an
+    init SQL edit, and **a `false → true` `read_only`**, since the pinned session's `Enforce` was
+    fixed when it opened and `run_verdict`'s text gate passes a `SELECT` whose function writes (R1-L2-01;
+    lifting read-only is `Kept`, the session stricter than asked). The old split asked only after
+    an init SQL edit, on the premise that a transport edit had already lost the transaction; it held
+    only for the evicted tunnel, and everywhere else the unasked release was what rolled the work
+    back (`only_a_torn_down_tunnel_drops_an_open_session_unasked`,
+    `ticking_read_only_does_not_keep_a_writable_session`). **`OpenSession::pinned_fate(TxAsked)` is
+    each tab's answer**: `Keep`, `Release` (to Auto, `Dropped` only), `Repin` — the tab stays in
+    Manual on a session opened under the connection as saved, at once with nothing open or after
+    Commit / Roll back — or, after Cancel, `RepinWhenTxEnds`: the work is kept, the stale session
+    only until the transaction ends (`a_cancelled_question_repins_when_the_transaction_ends`; it
+    used to stay for the tab's life, S3.1-L5-01).
     **`Tls` and `SslMode` are the transport half**, and they live here rather than in
     `schemaic-db` for the reason the module exists: this is the saved connection, and the mode is a
     saved field. Five rungs — `Disable` / `Prefer` / `Require` / `VerifyCa` / `VerifyFull` — asked
@@ -18659,7 +18664,9 @@ existing prose was left alone.
   pinned session would lift it, as unticking the connection's read-only box would — though on a
   read-only connection that spelling is a `Block` first, `SET` being no read head to
   `contains_write`, which `Session::open_enforced`'s doc now says too. The pinned session's state is
-  decided once, when `open_session` opens it.
+  decided when `open_session` opens it — so **making the connection read-only re-pins it**, from
+  the status-bar toggle as from the form (`Connection::open_session_after`'s `AskFirst`, under
+  `app/main.rs`).
   **MySQL reads one row through two protocols, and `convert_row` has to make them agree.**
   `collect_rows` loads a result with `query_iter` (the **text** protocol, every value a `Bytes` that
   `parse_typed` keeps the server's own characters of), while `refetch_on` re-reads one row with
@@ -32633,23 +32640,26 @@ existing prose was left alone.
   takes the forwarded connections with it — so changing a connection's *colour* killed the socket
   under a pinned Manual transaction and rolled back uncommitted work while the tab went on offering
   Commit and Rollback. **Cheap-and-unconditional is right for a snapshot and wrong for a
-  transaction**, which is the whole distinction between this and `reset_activity` above. The orphaned
-  tabs get `delete_conn_now`'s treatment rather than `repair_killed_session`'s — drop to Auto-commit,
-  `TxState::closed()`, no prompt, since the server rolls back on disconnect — because a reopen would
-  put the tab back on a server that has just gone: `open_session` would fail on the spot, flip the
-  tab to Auto anyway and raise an error modal on top of it. Each open transaction released that way
-  gets a `write_log::abandoned` line, as in `delete_conn_now`.
-  **Except after an init SQL edit alone**, which `Connection::open_session_after` answers
-  `OpenSession::AskFirst` (the transport edits are `Dropped`). The silent release rolled back
-  every open Manual transaction on the connection when only its session settings had changed —
-  the socket and the transaction were alive, and the release was what ended them — and the write
-  log kept those writes as `ok` with no end line (S1.1-L5-03). So a tab whose transaction is open
-  goes through `guard_tx`: Commit or Roll back ends it through `end_tx`, which logs its own end, and
-  then releases the session as above; **Cancel keeps that tab's session pinned on the old
-  settings** until something re-pins it — the stale `search_path` or role the init SQL rule exists
-  to prevent, taken by the user's choice over losing the work. `tx_prompt` holds one question, so
-  the prompts are chained one tab at a time, the way `run_ddl` chains its blockers; every other tab
-  on the connection is released at once. The AI session is on the same list
+  transaction**, which is the whole distinction between this and `reset_activity` above.
+  **`resettle_sessions(id, fate)` is what becomes of the pinned tabs**, shared by `save_conn` and
+  the status-bar `toggle_read_only` (which asks `open_session_after` of the flag's flip, so ticking
+  read-only no longer leaves a writable session committing — R1-L2-01,
+  `the_read_only_toggle_resettles_pinned_sessions`). It applies `OpenSession::pinned_fate` per
+  Manual tab. Under `Dropped` — the tunnel just evicted — a tab gets `delete_conn_now`'s treatment
+  rather than `repair_killed_session`'s: drop to Auto-commit, `TxState::closed()`, no prompt, since
+  the server rolls back on disconnect, and a reopen would put the tab on a tunnel that has just
+  gone; each open transaction released that way gets a `write_log::abandoned` line. **Under
+  `AskFirst` the socket and its transaction are alive**, so a tab whose transaction is open goes
+  through `guard_tx` (the release was what rolled the work back, unasked, and the write log kept
+  those writes as `ok` with no end line — S1.1-L5-03, S3.1-L5-02): Commit or Roll back ends it
+  through `end_tx`, which logs its own end, and the tab is re-pinned in Manual through
+  `open_session`, as one with nothing open is at once; **Cancel keeps the transaction and owes the
+  re-pin** (`repin_owed`), which `repin_if_owed` pays when the transaction ends — in `end_tx` and in
+  both run folds, so a typed `COMMIT` counts. It used to keep the stale session for the tab's life:
+  the old role, the old `search_path`, or writes on a connection since made read-only (S3.1-L5-01).
+  `open_session` is built after the run actions that ask, so it is reached through `repin_late`, a
+  `LateAction`. `tx_prompt` holds one question, so the prompts are chained one tab at a time, the
+  way `run_ddl` chains its blockers. The AI session is on the same list
   because `needs_respawn` cannot see a repoint: it compares the conn id, which does not move, and the
   `AiSettings`, none of which name a host, so the assistant's MCP subprocess went on reading the
   previous server — or, tunnelled, a local port that no longer answers. Dropping it costs nothing,
@@ -32859,7 +32869,7 @@ existing prose was left alone.
   `COMMIT` or `ROLLBACK` when the transaction was open (`TxState::is_open`): the tab's writes are
   logged `ok` as they run, before anything commits them, and that end entry is the only line that
   says whether they stayed. **So a transaction Schemaic drops rather than ends gets one too**:
-  `save_conn` releasing a session under `OpenSession::Dropped`, and `delete_conn_now`, log
+  `resettle_sessions` releasing a session under `OpenSession::Dropped`, and `delete_conn_now`, log
   `write_log::abandoned` — a `ROLLBACK` whose detail says the connection was edited or deleted — for
   each tab whose transaction was open; without it those writes stood in the log as `ok` with no
   end. `delete_conn_now` resolves the dialect from the saved connection, and logs nothing if it
