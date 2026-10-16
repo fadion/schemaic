@@ -1908,12 +1908,13 @@ impl Connection {
     /// **Ticking `read_only` is one of them**: the pinned session's
     /// enforcement was fixed when it opened, and the text gate in front of it
     /// passes a `SELECT` whose function writes, so the tab went on committing
-    /// on a read-only connection. Lifting `read_only` leaves the stricter
-    /// session as it is.
+    /// on a read-only connection. **Lifting it is one too**: the stricter
+    /// session, kept, refused every write while the status bar said *Write
+    /// mode*, until the tab left Manual.
     pub fn open_session_after(&self, other: &Connection) -> OpenSession {
         if self.ssh.enabled && !self.targets_same_server(other) {
             OpenSession::Dropped
-        } else if self.invalidates_open_connections(other) || (!self.read_only && other.read_only) {
+        } else if self.invalidates_open_connections(other) || self.read_only != other.read_only {
             OpenSession::AskFirst
         } else {
             OpenSession::Kept
@@ -4056,13 +4057,19 @@ mod tests {
     /// gate in front of it passes a `SELECT` calling a function that writes,
     /// so a Manual tab went on committing after the connection was made
     /// read-only. It is asked about and re-pinned, as an init SQL edit is.
-    /// Lifting read-only leaves the stricter session as it is.
+    /// **Lifting it re-pins too**: kept, the stricter session went on refusing
+    /// every write (*cannot execute UPDATE in a read-only transaction*) while
+    /// the status bar said *Write mode*, until the tab left Manual — found
+    /// driving the 8dd78136 hand checks. What is open on a read-only session
+    /// holds no write to lose, but it is still asked about rather than ended
+    /// unasked.
     #[test]
     fn ticking_read_only_does_not_keep_a_writable_session() {
         let mut ro = conn();
         ro.read_only = true;
         assert_eq!(conn().open_session_after(&ro), OpenSession::AskFirst);
-        assert_eq!(ro.open_session_after(&conn()), OpenSession::Kept);
+        assert_eq!(ro.open_session_after(&conn()), OpenSession::AskFirst);
+        assert_eq!(ro.open_session_after(&ro), OpenSession::Kept);
     }
 
     /// **What becomes of each pinned session**, once its transaction was

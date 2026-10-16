@@ -12476,9 +12476,11 @@ existing prose was left alone.
     save tears the tunnel down — a tunnelled connection repointed, whose tunnel `save_conn` evicts
     with the forwarded socket in it — and `AskFirst` for every other stale session: a TLS, CA,
     client-key or SSH-credential edit (which keeps the tunnel), a repointed direct connection, an
-    init SQL edit, and **a `false → true` `read_only`**, since the pinned session's `Enforce` was
-    fixed when it opened and `run_verdict`'s text gate passes a `SELECT` whose function writes (R1-L2-01;
-    lifting read-only is `Kept`, the session stricter than asked). The old split asked only after
+    init SQL edit, and **a flipped `read_only`, either way**, since the pinned session's `Enforce` was
+    fixed when it opened: ticked, `run_verdict`'s text gate passes a `SELECT` whose function writes
+    (R1-L2-01); lifted, the stricter session was once `Kept` and refused every write (*cannot
+    execute UPDATE in a read-only transaction*) while the status bar said *Write mode*, until the
+    tab left Manual — found driving the 8dd78136 hand checks. The old split asked only after
     an init SQL edit, on the premise that a transport edit had already lost the transaction; it held
     only for the evicted tunnel, and everywhere else the unasked release was what rolled the work
     back (`only_a_torn_down_tunnel_drops_an_open_session_unasked`,
@@ -18886,7 +18888,8 @@ existing prose was left alone.
   pinned session would lift it, as unticking the connection's read-only box would — though on a
   read-only connection that spelling is a `Block` first, `SET` being no read head to
   `contains_write`, which `Session::open_enforced`'s doc now says too. The pinned session's state is
-  decided when `open_session` opens it — so **making the connection read-only re-pins it**, from
+  decided when `open_session` opens it — so **making the connection read-only, or writable again,
+  re-pins it**, from
   the status-bar toggle as from the form (`Connection::open_session_after`'s `AskFirst`, under
   `app/main.rs`).
   **MySQL reads one row through two protocols, and `convert_row` has to make them agree.**
