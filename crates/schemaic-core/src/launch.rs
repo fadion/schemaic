@@ -931,8 +931,23 @@ pub fn init_role(init_sql: &str, dialect: crate::intel::SqlDialect) -> Option<St
         let (name, after) = crate::sql::ident_at(s, end, dialect);
         // Nothing but the name after it, bar the terminator.
         let rest = s[after..].trim().trim_end_matches(';').trim();
+        // **As the server reads it**: a bare name folded where the engine
+        // folds one (`AppOwner` is `appowner`), a quoted one as written. The
+        // tools quote what they are handed (`fmtId`), so the spelling given
+        // them must be the role's own.
+        let quoted = s[end..]
+            .trim_start()
+            .bytes()
+            .next()
+            .is_some_and(|b| crate::intel::ident_quote(dialect, b).is_some());
         role = match name {
-            Some(n) if rest.is_empty() && !n.eq_ignore_ascii_case("NONE") => Some(n),
+            Some(n) if rest.is_empty() && !n.eq_ignore_ascii_case("NONE") => {
+                Some(if !quoted && dialect.folds_unquoted_names() {
+                    n.to_ascii_lowercase()
+                } else {
+                    n
+                })
+            }
             _ => None,
         };
     }
@@ -1166,6 +1181,14 @@ mod tests {
         assert_eq!(
             init_role("SET search_path = app;\nSET ROLE \"App Owner\";", Postgres).as_deref(),
             Some("App Owner")
+        );
+        // **Unquoted, the server folds it**, and the tools quote what they are
+        // given (`fmtId`): `--role=AppOwner` asked for `"AppOwner"`, a role
+        // that does not exist, while the app's own connections, folding it,
+        // worked (R2-L6-01).
+        assert_eq!(
+            init_role("SET ROLE AppOwner", Postgres).as_deref(),
+            Some("appowner")
         );
         assert_eq!(init_role("SET ROLE NONE", Postgres), None);
         assert_eq!(init_role("SET search_path = app", Postgres), None);

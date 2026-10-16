@@ -16481,7 +16481,11 @@ existing prose was left alone.
     (verified on PostgreSQL 16). `init_role(init_sql, dialect)` reads a plain `SET ROLE <name>` —
     the last one, `NONE` being none — from `init_sql::check`'s statements, so a statement init SQL
     refuses is never read, and answers `None` on every other engine
-    (`a_plain_set_role_in_init_sql_is_the_tools_role`). `pg_dump` and `pg_restore` take it as
+    (`a_plain_set_role_in_init_sql_is_the_tools_role`). **The name is the role's own spelling**:
+    a bare one folded where `SqlDialect::folds_unquoted_names`, a quoted one as written — the tools
+    quote what they are given (`fmtId`), so `SET ROLE AppOwner` once reached `pg_dump` as
+    `--role=AppOwner` and failed every backup with *role "AppOwner" does not exist* (measured on
+    PostgreSQL 16) while the app's own connections, folding it, worked. `pg_dump` and `pg_restore` take it as
     `--role=<r>`, and a role that is empty, leads with `-` or holds a line break refuses the launch
     instead; `psql` has no `--role`, so a `.sql` restore runs `-c "SET ROLE <quoted>"` before its
     `-f`, `psql` running the two in order in one session. The role is the one setting there that
