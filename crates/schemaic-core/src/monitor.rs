@@ -641,8 +641,10 @@ fn entry_indices(e: &MonitorEntry, headings: &[String], cols: &[String]) -> Vec<
 }
 
 /// Separates a changed column's old and new value in an exported cell
-/// (`old → new`), matching what the modal renders as two coloured spans.
-const TRANSITION: &str = " → ";
+/// (`old → new`), matching what the modal renders as two coloured spans. The
+/// compare-results export writes a changed cell the same way
+/// (`result_diff::export_result_set`).
+pub(crate) const TRANSITION: &str = " → ";
 
 /// Fallback name for a change whose column index the watched result never named
 /// — see [`log_result_set`], which widens rather than truncates.

@@ -153,6 +153,15 @@ pub struct TableRow {
     pub at: usize,
 }
 
+impl TableRow {
+    /// Whether the table shows this row under `filter` — every row with
+    /// none. The table and its export both ask this, so the file holds what
+    /// the modal shows.
+    pub fn shown_by(&self, filter: Option<RowChange>) -> bool {
+        filter.is_none_or(|f| self.change == f)
+    }
+}
+
 /// The differences in `d` as a table under its shared columns: the first
 /// result's changed and removed rows in the order it holds them, then the rows
 /// only the second has, in its order. `d` must be `diff(left, right, …)`.
@@ -234,6 +243,142 @@ pub fn row_cells(
 /// A value as one line of a table cell — [`crate::text::cell_line`].
 fn table_value(v: Option<&str>) -> String {
     crate::text::cell_line(v)
+}
+
+/// The formats a comparison exports as — the Live Monitor's
+/// ([`crate::monitor::LOG_FORMATS`]), for its reason: SQL renders
+/// `INSERT INTO <table> …`, and these rows are not rows of a table but
+/// observations about two results, a third of them removals.
+pub const DIFF_FORMATS: [crate::export::ExportFormat; 5] = crate::monitor::LOG_FORMATS;
+
+/// `rows` of the comparison as a [`ResultSet`], so it exports through the
+/// ordinary renderers in [`crate::export`] rather than a second set — the
+/// shape [`crate::monitor::log_result_set`] gives a change log.
+///
+/// A `Change` column (the table's own words, [`RowChange::label`], renamed
+/// with trailing `_` while a shared column holds that name), then one per
+/// [`ResultDiff::shared`] column under the type **both** results give it, and
+/// TEXT where they differ — so a `DECIMAL` column still reaches a spreadsheet
+/// as numbers, XLSX reading a decimal cell's type off its column, while a
+/// second side's `VARCHAR` "007" is never read as a first side's decimal. A
+/// transition, which no decimal parse accepts, is written as text there
+/// whatever the column says:
+///
+/// - **Added / Removed** — the row's values from the side it is on.
+/// - **Changed** — `old → new` in the columns that differ, the first
+///   result's value everywhere else (they agree there).
+///
+/// Standalone values keep their type and a NULL is a real NULL, so each
+/// format renders it its own way; inside a transition NULL can only be the
+/// text `NULL`. The **whole** value, never the table's one-line rendering —
+/// a file is read away from the modal. `d` must be `diff(left, right, …)`
+/// and `rows` some of its [`table_rows`] (the modal passes the filtered
+/// ones); a row out of range is left out.
+pub fn export_result_set(
+    left: &ResultSet,
+    right: &ResultSet,
+    d: &ResultDiff,
+    rows: &[TableRow],
+) -> ResultSet {
+    use crate::model::{Column, Value};
+    let text_col = |name: &str| Column {
+        name: name.to_string(),
+        type_name: "TEXT".to_string(),
+        origin: None,
+    };
+    // Each shared column's place on either side, found once.
+    let at_left: Vec<Option<usize>> = d.shared.iter().map(|n| col(left, n)).collect();
+    let at_right: Vec<Option<usize>> = d.shared.iter().map(|n| col(right, n)).collect();
+    // A shared column under its type when **both sides agree** on it — an
+    // added row's value is the second side's, and the first side's type is
+    // no promise about it — and TEXT otherwise. See the doc above.
+    let type_of = |l: Option<usize>, r: Option<usize>| -> String {
+        match (l, r) {
+            (Some(l), Some(r))
+                if left.columns[l]
+                    .type_name
+                    .eq_ignore_ascii_case(&right.columns[r].type_name) =>
+            {
+                left.columns[l].type_name.clone()
+            }
+            _ => "TEXT".to_string(),
+        }
+    };
+    // The label column's name, clear of every shared one: two keys of one
+    // name in a JSON row and a reader keeps the last, losing the label.
+    let mut change = "Change".to_string();
+    while d.shared.iter().any(|n| n.eq_ignore_ascii_case(&change)) {
+        change.push('_');
+    }
+    let columns: Vec<Column> = std::iter::once(text_col(&change))
+        .chain(
+            d.shared
+                .iter()
+                .zip(at_left.iter().zip(&at_right))
+                .map(|(n, (&l, &r))| Column {
+                    type_name: type_of(l, r),
+                    ..text_col(n)
+                }),
+        )
+        .collect();
+    let typed = |rs: &ResultSet, r: usize, c: Option<usize>| -> Value {
+        c.and_then(|c| rs.cell(r, c))
+            .map(|cell| cell.to_value())
+            .unwrap_or(Value::Null)
+    };
+
+    let shared_at: HashMap<&str, usize> = d
+        .shared
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let label = Value::Str(row.change.label().to_string());
+        let cells: Vec<Value> = match row.change {
+            RowChange::Removed if row.at < left.row_count() => {
+                at_left.iter().map(|&c| typed(left, row.at, c)).collect()
+            }
+            RowChange::Added if row.at < right.row_count() => {
+                at_right.iter().map(|&c| typed(right, row.at, c)).collect()
+            }
+            RowChange::Changed => {
+                let Some(ch) = d.changed.get(row.at) else {
+                    continue;
+                };
+                // Which shared columns differ, by index: each of the row's
+                // changed names looked up once, not `ch.columns` scanned per
+                // shared column of every row.
+                let mut differs = vec![false; d.shared.len()];
+                for name in &ch.columns {
+                    if let Some(&i) = shared_at.get(name.as_str()) {
+                        differs[i] = true;
+                    }
+                }
+                (0..d.shared.len())
+                    .map(|i| {
+                        if !differs[i] {
+                            return typed(left, ch.left, at_left[i]);
+                        }
+                        let text = |rs, r, c: Option<usize>| -> String {
+                            c.and_then(|c| cell(rs, r, c)).unwrap_or("NULL").to_string()
+                        };
+                        Value::Str(format!(
+                            "{}{}{}",
+                            text(left, ch.left, at_left[i]),
+                            crate::monitor::TRANSITION,
+                            text(right, ch.right, at_right[i])
+                        ))
+                    })
+                    .collect()
+            }
+            // A removed or added row out of range.
+            _ => continue,
+        };
+        out.push(std::iter::once(label).chain(cells).collect());
+    }
+    ResultSet::from_rows(columns, out)
 }
 
 /// Why two results cannot be compared by the key asked for.
@@ -486,6 +631,198 @@ mod tests {
     }
     fn s(v: &str) -> Value {
         Value::Str(v.into())
+    }
+
+    /// Every cell of an exported comparison, typed, row by row.
+    fn exported_cells(out: &ResultSet) -> Vec<Vec<Value>> {
+        (0..out.row_count())
+            .map(|r| {
+                (0..out.col_count())
+                    .map(|c| out.cell(r, c).map(|c| c.to_value()).unwrap_or(Value::Null))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A shared column keeps the type both sides give it, so a `DECIMAL`
+    /// money column still reaches a spreadsheet as numbers — XLSX makes a
+    /// decimal cell a number off its column's type, and a transition, which
+    /// no decimal parse accepts, stays text there regardless. (Sides that
+    /// disagree: `a_column_the_sides_type_differently_is_exported_as_text`.)
+    #[test]
+    fn an_export_is_a_change_column_then_the_shared_ones_typed_as_both_sides() {
+        let typed = |names: &[(&str, &str)], rows: &[&[Value]]| {
+            let mut out = rs(&names.iter().map(|(n, _)| *n).collect::<Vec<_>>(), rows);
+            for (c, (_, t)) in out.columns.iter_mut().zip(names) {
+                c.type_name = t.to_string();
+            }
+            out
+        };
+        let a = typed(
+            &[("id", "INT"), ("price", "DECIMAL(10,2)"), ("gone", "INT")],
+            &[&[i(1), s("1.50"), i(0)]],
+        );
+        let b = typed(
+            &[("id", "int"), ("price", "DECIMAL(10,2)"), ("new", "INT")],
+            &[&[i(1), s("2.50"), i(0)]],
+        );
+        let d = diff(&a, &b, &["id".to_string()]).unwrap();
+        let out = export_result_set(&a, &b, &d, &table_rows(&d));
+        let cols: Vec<(&str, &str)> = out
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.type_name.as_str()))
+            .collect();
+        assert_eq!(
+            cols,
+            [
+                ("Change", "TEXT"),
+                ("id", "INT"),
+                ("price", "DECIMAL(10,2)")
+            ]
+        );
+    }
+
+    /// A type the two sides disagree on is no promise about an added row's
+    /// value: under the first side's `DECIMAL`, the second side's `VARCHAR`
+    /// "007" would reach a spreadsheet as the number 7.
+    #[test]
+    fn a_column_the_sides_type_differently_is_exported_as_text() {
+        let typed = |t: &str, v: Value| {
+            let mut out = rs(&["id", "code"], &[&[i(1), v]]);
+            out.columns[1].type_name = t.to_string();
+            out
+        };
+        let a = typed("DECIMAL(5,0)", s("7"));
+        let b = typed("varchar(5)", s("007"));
+        let d = diff(&a, &b, &[]).unwrap();
+        let out = export_result_set(&a, &b, &d, &table_rows(&d));
+        assert_eq!(out.columns[2].type_name, "TEXT");
+        // Agreeing up to case is agreeing.
+        let c = typed("decimal(5,0)", s("8"));
+        let d = diff(&a, &c, &[]).unwrap();
+        let out = export_result_set(&a, &c, &d, &table_rows(&d));
+        assert_eq!(out.columns[2].type_name, "DECIMAL(5,0)");
+    }
+
+    /// A shared column named `Change` would give a row two keys of one name
+    /// in JSON, and most readers keep the last — the label lost.
+    #[test]
+    fn the_change_column_never_takes_a_shared_columns_name() {
+        let a = rs(&["id", "Change", "change_"], &[&[i(1), s("x"), s("y")]]);
+        let b = rs(&["id", "Change", "change_"], &[]);
+        let d = diff(&a, &b, &["id".to_string()]).unwrap();
+        let out = export_result_set(&a, &b, &d, &table_rows(&d));
+        let names: Vec<&str> = out.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names[1..], ["id", "Change", "change_"]);
+        assert!(
+            !names[1..].iter().any(|n| n.eq_ignore_ascii_case(names[0])),
+            "{names:?}"
+        );
+        assert_eq!(exported_cells(&out)[0][0], s("REMOVED"));
+    }
+
+    #[test]
+    fn an_export_has_each_kind_of_row_in_the_tables_order() {
+        let a = rs(
+            &["id", "name", "qty"],
+            &[&[i(1), s("a"), i(5)], &[i(2), s("b"), i(6)]],
+        );
+        let b = rs(
+            &["id", "name", "qty"],
+            &[&[i(1), s("a"), i(9)], &[i(3), s("c"), Value::Null]],
+        );
+        let d = diff(&a, &b, &["id".to_string()]).unwrap();
+        let out = export_result_set(&a, &b, &d, &table_rows(&d));
+        assert_eq!(
+            exported_cells(&out),
+            vec![
+                // Changed: the transition where it differs, the typed value
+                // where both agree.
+                vec![s("CHANGED"), i(1), s("a"), s("5 → 9")],
+                vec![s("REMOVED"), i(2), s("b"), i(6)],
+                // Added: the second result's row, its NULL a real one.
+                vec![s("ADDED"), i(3), s("c"), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_null_inside_a_transition_is_the_word() {
+        let a = rs(&["id", "note"], &[&[i(1), Value::Null]]);
+        let b = rs(&["id", "note"], &[&[i(1), s("hi")]]);
+        let d = diff(&a, &b, &["id".to_string()]).unwrap();
+        let out = export_result_set(&a, &b, &d, &table_rows(&d));
+        assert_eq!(exported_cells(&out)[0][2], s("NULL → hi"));
+    }
+
+    /// The whole value, not the table's one-line rendering of it.
+    #[test]
+    fn an_export_keeps_a_multi_line_value_whole() {
+        let long = "line one\nline two";
+        let a = rs(&["id", "body"], &[&[i(1), s(long)]]);
+        let b = rs(&["id", "body"], &[]);
+        let d = diff(&a, &b, &["id".to_string()]).unwrap();
+        let out = export_result_set(&a, &b, &d, &table_rows(&d));
+        assert_eq!(exported_cells(&out)[0][2], s(long));
+    }
+
+    /// The modal exports the rows its filter shows; an empty pick is an empty
+    /// file with its headings, and a row out of range is left out.
+    #[test]
+    fn an_export_holds_only_the_rows_it_is_given() {
+        let a = rs(&["id"], &[&[i(1)], &[i(2)]]);
+        let b = rs(&["id"], &[&[i(2)], &[i(3)]]);
+        let d = diff(&a, &b, &[]).unwrap();
+        let added: Vec<TableRow> = table_rows(&d)
+            .into_iter()
+            .filter(|r| r.change == RowChange::Added)
+            .collect();
+        let out = export_result_set(&a, &b, &d, &added);
+        assert_eq!(exported_cells(&out), vec![vec![s("ADDED"), i(3)]]);
+
+        let none = export_result_set(&a, &b, &d, &[]);
+        assert_eq!(none.row_count(), 0);
+        assert_eq!(none.col_count(), 2);
+
+        let stray = TableRow {
+            change: RowChange::Changed,
+            at: 99,
+        };
+        assert_eq!(export_result_set(&a, &b, &d, &[stray]).row_count(), 0);
+    }
+
+    #[test]
+    fn a_filter_shows_its_own_kind_and_no_filter_shows_every_row() {
+        let row = |change| TableRow { change, at: 0 };
+        for kind in [RowChange::Changed, RowChange::Added, RowChange::Removed] {
+            assert!(row(kind).shown_by(None));
+            assert!(row(kind).shown_by(Some(kind)));
+            for other in [RowChange::Changed, RowChange::Added, RowChange::Removed] {
+                if other != kind {
+                    assert!(!row(kind).shown_by(Some(other)), "{kind:?} under {other:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diff_formats_are_the_logs_and_never_sql() {
+        assert!(!DIFF_FORMATS.contains(&crate::export::ExportFormat::Sql));
+        assert_eq!(DIFF_FORMATS, crate::monitor::LOG_FORMATS);
+    }
+
+    /// The projection is the ordinary renderers' input, as the log's is.
+    #[test]
+    fn an_export_renders_through_the_ordinary_csv_renderer() {
+        let a = rs(&["id", "qty"], &[&[i(1), i(5)]]);
+        let b = rs(&["id", "qty"], &[&[i(1), i(9)]]);
+        let d = diff(&a, &b, &["id".to_string()]).unwrap();
+        let out = export_result_set(&a, &b, &d, &table_rows(&d));
+        let order: Vec<usize> = (0..out.row_count()).collect();
+        let csv = crate::export::export_csv(&out, &order);
+        assert!(csv.starts_with("Change,id,qty"), "{csv}");
+        assert!(csv.contains("CHANGED,1,5 → 9"), "{csv}");
     }
 
     #[test]

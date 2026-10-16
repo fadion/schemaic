@@ -17,7 +17,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use floem::AnyView;
+use floem::action::save_as;
 use floem::event::EventListener;
+use floem::file::{FileDialogOptions, FileSpec};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Point;
 use floem::peniko::Color;
@@ -25,16 +27,18 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector, virtual_stack};
 
+use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::model::ResultSet;
 use schemaic_core::result_diff::{self, DiffCell, ResultDiff, RowChange, TableRow};
 
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, autohide_state, cell_text, dismiss_layer,
     focus_root_with_ring, in_ring_button, measure_text_px_at, measure_text_px_bold_at,
     modal_body_h, modal_footer_split, modal_pad_h, modal_title_owned, modal_w, panel_style,
     shift_hscroll, struck_text, thin_scroll, transition_text,
 };
-use crate::{OverlayUi, icons, theme};
+use crate::{MenuEntry, OverlayUi, icons, theme};
 
 /// One result the modal compares: its rows, the statement that produced them
 /// and when that ran (epoch seconds; `0` for never).
@@ -56,10 +60,15 @@ pub struct DiffTarget {
 }
 
 /// The Tab order, top to bottom: the ⇄, the four filter pills, the key picker,
-/// then Close (`ACTION_TAB`) and the title's ✕.
+/// the export icon, then Close (`ACTION_TAB`) and the title's ✕.
 const SWAP_TAB: u32 = 5;
 const PILLS_TAB: u32 = 6;
 const PICKER_TAB: u32 = 10;
+const EXPORT_TAB: u32 = 11;
+
+/// How long a "Saved …" stays in the footer — the chart's and the ER
+/// diagram's linger.
+const NOTICE_LINGER: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// The key picker's entry for "no key — the whole row".
 const WHOLE_ROW: &str = "Whole row";
@@ -257,7 +266,10 @@ fn column_widths(names: &[String], rows: &[Vec<DiffCell>]) -> Vec<f64> {
         .collect()
 }
 
-pub(crate) fn result_diff_overlay(overlay: OverlayUi) -> impl IntoView {
+pub(crate) fn result_diff_overlay(
+    overlay: OverlayUi,
+    export_file: crate::ExportFn,
+) -> impl IntoView {
     let target = overlay.result_diff;
     dyn_container(
         move || target.with(Option::is_some),
@@ -266,7 +278,19 @@ pub(crate) fn result_diff_overlay(overlay: OverlayUi) -> impl IntoView {
                 return empty().into_any();
             };
             let t = Rc::new(t);
-            let close: Rc<dyn Fn()> = Rc::new(move || target.set(None));
+            // Closing takes the export menu with it: the menu rides the app's
+            // shared popup, which outlives this modal, and its entries hold
+            // this scope's signals (the chart's and the ER diagram's reason).
+            // Every exit — ✕, Escape, the backdrop, Close — routes through here.
+            let close: Rc<dyn Fn()> = {
+                let popup = overlay.popup_menu;
+                let popup_anchor = overlay.popup_anchor;
+                Rc::new(move || {
+                    popup.set(None);
+                    popup_anchor.set(None);
+                    target.set(None);
+                })
+            };
             let ring = FocusRing::new();
             // The key picker offers only what can be compared: a binary column
             // reads `<n bytes>` in every row, so it would match nothing apart.
@@ -300,6 +324,140 @@ pub(crate) fn result_diff_overlay(overlay: OverlayUi) -> impl IntoView {
                 PICKER_TAB,
                 move |picked| key.set((picked != WHOLE_ROW).then_some(picked)),
             );
+
+            // ── Export ───────────────────────────────────────────────────
+            // What the last export did — said in the footer, in place of the
+            // summary, since the app's error modal is painted under this one.
+            let notice: RwSignal<Option<(String, bool)>> = RwSignal::new(None);
+            let notice_seq = RwSignal::new(0_u64);
+            let say: Rc<dyn Fn(String, bool)> = {
+                let fallback_err = overlay.error_modal_text;
+                let fallback_open = overlay.error_modal_open;
+                Rc::new(move |msg: String, failed: bool| {
+                    // The completion can land after the modal closed and took
+                    // this scope. A failure then still has to be said
+                    // somewhere — the shared error modal, as the Live Monitor
+                    // does; a confirmation to nobody is dropped.
+                    let Some(prev) = notice_seq.try_get_untracked() else {
+                        if failed {
+                            fallback_err.try_update(|v| {
+                                *v = Some(schemaic_core::model::ModalError::app(msg))
+                            });
+                            fallback_open.try_update(|v| *v = true);
+                        }
+                        return;
+                    };
+                    let seq = prev.wrapping_add(1);
+                    notice_seq.set(seq);
+                    notice.set(Some((msg, failed)));
+                    // A confirmation fades; a failure stays, being the only
+                    // place the reason is written down.
+                    if !failed {
+                        floem::action::exec_after(NOTICE_LINGER, move |_| {
+                            if notice_seq.try_get_untracked() == Some(seq) {
+                                notice.set(None);
+                            }
+                        });
+                    }
+                })
+            };
+            // A notice is about the comparison it was said of: a new key,
+            // direction or filter clears it.
+            create_effect(move |prev: Option<()>| {
+                let _ = (computed.with(|c| c.generation), filter.get());
+                if prev.is_some() {
+                    notice.set(None);
+                }
+            });
+            let save: Rc<dyn Fn(ExportFormat)> = {
+                let export_file = export_file.clone();
+                let say = say.clone();
+                Rc::new(move |format| {
+                    // `try_get_untracked`, as a backstop rather than a known
+                    // path: `close` takes the menu down on every exit, and the
+                    // container is keyed on being open, so nothing replaces
+                    // this scope under an open menu today. A menu that did
+                    // outlive it would otherwise panic on a disposed signal.
+                    let (Some(c), Some(f)) =
+                        (computed.try_get_untracked(), filter.try_get_untracked())
+                    else {
+                        return;
+                    };
+                    // The icon's own test, again: the menu can stand open
+                    // over a change of key or filter.
+                    let Some(o) = c.outcome.as_ref().ok().filter(|o| o.count(f) > 0) else {
+                        (say)("Nothing to export.".to_string(), true);
+                        return;
+                    };
+                    save_diff(o, f, format, export_file.clone(), say.clone());
+                })
+            };
+            let popup = overlay.popup_menu;
+            let popup_anchor = overlay.popup_anchor;
+            let popup_width = overlay.popup_width;
+            // Set once the button exists: the ring wrapper's id, so the menu
+            // opens under the whole control (`monitor_view`'s rule).
+            let export_at: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
+            let open_export: Rc<dyn Fn()> = Rc::new(move || {
+                let Some(r) = export_at.get_untracked().map(|id| id.layout_rect()) else {
+                    return;
+                };
+                let mine = crate::PopupAnchor::BelowIcon(r.x0, r.x1, r.y1);
+                // Pressing it again closes its own menu.
+                if crate::widgets::menu_anchored_at(
+                    popup.get_untracked().is_some(),
+                    popup_anchor.get_untracked(),
+                    mine,
+                ) {
+                    popup.set(None);
+                    return;
+                }
+                let entries = result_diff::DIFF_FORMATS
+                    .into_iter()
+                    .map(|f| {
+                        let save = save.clone();
+                        MenuEntry::action(f.label(), move || (save)(f))
+                    })
+                    .collect();
+                popup_width.set(crate::erd_view::export_menu_w());
+                popup_anchor.set(Some(mine));
+                popup.set(Some(entries));
+            });
+            // The Live Monitor's export control: a bare glyph in the Tab ring.
+            // Dimmed while there is nothing to export — the key cannot match
+            // rows, or the filter shows none (identical results, or a pill
+            // with no rows), where a file of headings would be "saved".
+            let comparable = move || {
+                let f = filter.get();
+                computed.with(|c| c.outcome.as_ref().is_ok_and(|o| o.count(f) > 0))
+            };
+            let export_button = {
+                let click = open_export.clone();
+                let key_press = open_export.clone();
+                in_ring_button(
+                    crate::widgets::toolbar_icon(
+                        icons::DOWNLOAD,
+                        0.0,
+                        0.0,
+                        comparable,
+                        move || (click)(),
+                    )
+                    .tooltip(|| {
+                        text("Export the comparison…").style(crate::widgets::tooltip_style)
+                    }),
+                    ring.clone(),
+                    EXPORT_TAB,
+                    true,
+                    0.0,
+                    move || {
+                        if comparable() {
+                            (key_press)()
+                        }
+                    },
+                )
+            };
+            export_at.set(Some(export_button.id()));
+
             let controls = h_stack((
                 filter_pills(computed, filter, ring.clone()),
                 empty().style(|s| s.flex_grow(1.0_f32).min_width(theme::scaled(12.0))),
@@ -314,6 +472,9 @@ pub(crate) fn result_diff_overlay(overlay: OverlayUi) -> impl IntoView {
                             .flex_shrink(0.0_f32)
                     }),
                     picker,
+                    // Set apart from the picker by more than the label is:
+                    // it acts on the comparison, not on how rows are matched.
+                    container(export_button).style(|s| s.margin_left(theme::scaled(6.0))),
                 ))
                 .style(|s| {
                     s.items_center()
@@ -349,9 +510,20 @@ pub(crate) fn result_diff_overlay(overlay: OverlayUi) -> impl IntoView {
             let title =
                 modal_title_owned("Compare results".to_string(), close.clone(), ring.clone());
             let done = close.clone();
-            let summary = summary_line(computed);
+            // The export's notice, while there is one, else the summary.
+            let status = dyn_container(
+                move || notice.get(),
+                move |n| match n {
+                    None => summary_line(computed).into_any(),
+                    Some((msg, true)) => crate::widgets::footer_error(msg),
+                    Some((msg, false)) => text(msg)
+                        .style(|s| s.color(theme::text_dim()).font_size(theme::font_label()))
+                        .into_any(),
+                },
+            )
+            .style(|s| s.min_width(0.0).flex_shrink(1.0_f32));
             let footer = modal_footer_split(
-                summary,
+                status,
                 action_button(
                     // Neutral: closing is the only thing the footer offers,
                     // and there is no decision for it to affirm.
@@ -389,6 +561,95 @@ pub(crate) fn result_diff_overlay(overlay: OverlayUi) -> impl IntoView {
             s
         }
     })
+}
+
+/// Export the comparison's table — the rows `filter` shows, under the
+/// direction and key on screen — as `format`, through the ordinary export
+/// pipeline (`result_diff::export_result_set`'s projection, the app's worker
+/// writing it), as the Live Monitor saves its log.
+///
+/// **Snapshotted before the dialog opens**, for `grid::save_export`'s reason:
+/// the dialog is modal and slow, and the file should be what the user was
+/// looking at when they chose the format.
+fn save_diff(
+    o: &Outcome,
+    filter: Option<RowChange>,
+    format: ExportFormat,
+    export_file: crate::ExportFn,
+    say: Rc<dyn Fn(String, bool)>,
+) {
+    // The snapshot is reference counts — the two results, the diff, the
+    // table — and the filter; the projection waits for a path, so a cancelled
+    // dialog costs nothing and the dialog opens at once on a large one.
+    let (first, second) = (o.first.clone(), o.second.clone());
+    let (diff, rows) = (o.diff.clone(), o.rows.clone());
+    let opts = FileDialogOptions::new()
+        .title("Export comparison")
+        .default_name(suggested_filename(Some("comparison"), format))
+        .allowed_types(vec![FileSpec {
+            name: format.label(),
+            extensions: format.extensions(),
+        }]);
+    save_as(opts, move |file| {
+        let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+            return; // cancelled
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "the comparison".to_string());
+        let shown: Vec<TableRow> = rows
+            .iter()
+            .copied()
+            .filter(|r| r.shown_by(filter))
+            .collect();
+        let rs = Arc::new(result_diff::export_result_set(
+            &first, &second, &diff, &shown,
+        ));
+        // The table's own order; the export applies no sort of its own.
+        let order: Arc<Vec<usize>> = Arc::new((0..rs.row_count()).collect());
+        let say = say.clone();
+        (export_file)(
+            crate::ExportRequest {
+                path,
+                format,
+                rs,
+                order,
+                // No base table, and the dialect is unread: only the SQL
+                // renderer consults either, and `DIFF_FORMATS` does not offer
+                // it — these rows are observations about two results, not rows
+                // of a table.
+                source: None,
+                more: Vec::new(),
+                dialect: Default::default(),
+                // The comparison is of rows in hand; nothing could re-run it.
+                scope: crate::ExportScope::Fetched,
+                // Nothing here offers a Stop, so this run stays out of the
+                // app's single cancel slot (`ExportRequest::stoppable`).
+                stoppable: false,
+            },
+            // Spelled out rather than a catch-all, the way `save_log` spells
+            // its own: `Cancelled` cannot arrive while nothing offers a Stop,
+            // and the day it can, reading it as `Done` would claim a file that
+            // was never wholly written. The message is used as the pipeline
+            // produced it — it already begins "Export failed: …".
+            Rc::new(move |outcome| match outcome {
+                // **The sentence is `export_note`'s**, as the grid's export
+                // is: it states the rows written and whatever the file holds
+                // less of — an XLSX cell cut to the format's limit — which a
+                // bare "Saved" would hide in a file that promises whole
+                // values. Asked with `true`, it always speaks. A caveat stays
+                // up, as a failure does, rather than fading.
+                crate::ExportOutcome::Done(tally) => {
+                    let msg = schemaic_core::export::export_note(&tally, &name, true)
+                        .expect("export_note always speaks when asked with `true`");
+                    (say)(msg, tally.has_caveat())
+                }
+                crate::ExportOutcome::Cancelled => {}
+                crate::ExportOutcome::Failed { message, .. } => (say)(message, true),
+            }),
+        );
+    });
 }
 
 /// The footer's line: what the comparison found, or nothing beside an error
@@ -635,7 +896,7 @@ fn table_view(computed: Rc<Computed>, filter: Option<RowChange>) -> AnyView {
         o.rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| filter.is_none_or(|f| r.change == f))
+            .filter(|(_, r)| r.shown_by(filter))
             .map(|(i, _)| i)
             .collect(),
     );

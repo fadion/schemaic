@@ -627,6 +627,46 @@ existing prose was left alone.
     nothing more** — added and removed trade places and each change reverses
     (`swapping_the_sides_swaps_added_for_removed_and_reverses_each_change`), which is all the modal's
     ⇄ does.
+    **`export_result_set(left, right, &diff, rows)` is the comparison as a file**, the shape
+    `monitor::log_result_set` gives a change log, so it goes out through the ordinary `export`
+    renderers rather than a second set (`an_export_renders_through_the_ordinary_csv_renderer`): a
+    `Change` column in the table's own words (`RowChange::label`), then one per `shared` column
+    (`an_export_is_a_change_column_then_the_shared_ones_typed_as_both_sides`). **The label column's
+    name is clear of every shared one** — `Change`, with `_` appended while a shared column has that
+    name in any case — because a result with its own `change` column would give a JSON row two keys
+    of one name, and readers keep the last, losing the label
+    (`the_change_column_never_takes_a_shared_columns_name`). **Only the compared columns are in the
+    file**: a binary column left out of the comparison and a column one side lacks are not, and the
+    file carries no note of them, the formats having nowhere to put one — the modal's notes line is
+    what says so, on screen. An added or removed row carries
+    its values from its own side; a changed row carries `old → new` in the columns that differ and
+    the first result's value everywhere else, the sides agreeing there
+    (`an_export_has_each_kind_of_row_in_the_tables_order`); which columns differ is read by index
+    through a name→index map of `shared` built once per export, rather than a scan of the change's
+    column list per shared column per row. The arrow is `monitor::TRANSITION`,
+    `pub(crate)` now so the two projections spell it once. A value standing alone keeps its type
+    (`Cell::to_value`) and a NULL stays a real NULL, so each format writes it its own way; inside a
+    transition, which is one cell, it can only be the text `NULL`
+    (`a_null_inside_a_transition_is_the_word`). **It is the whole value, never `row_cells`'
+    one-line rendering**: that line is the table's answer to a fixed row height, and a file is read
+    away from the modal (`an_export_keeps_a_multi_line_value_whole`). **A shared column keeps a type
+    only when both sides agree on it** — `type_name` compared case-insensitively, the first result's
+    spelling written — **and is TEXT otherwise**, unlike the log's all-TEXT columns. Both halves are
+    XLSX's doing, which makes a decimal cell a number off its column's `type_name`
+    (`export::is_fixed_point`, then `exact_decimal`): agreeing types keep a `DECIMAL` money column
+    summing in a spreadsheet, while the first side's type alone would be no promise about an added
+    row, whose value is the second side's — under a first side's `DECIMAL`, a second side's
+    `VARCHAR` `007` would land as the number 7
+    (`a_column_the_sides_type_differently_is_exported_as_text`). A transition, which `exact_decimal`
+    cannot parse, is written as text whatever the column says; the *Change* column is TEXT. `rows`
+    is whichever of `table_rows` the caller
+    passes, kept in the order given, and one out of range is left out
+    (`an_export_holds_only_the_rows_it_is_given`). The modal passes the filtered ones, through
+    **`TableRow::shown_by(filter)`, the one filter predicate** — the table asks it too, so the file
+    holds what the modal shows (`a_filter_shows_its_own_kind_and_no_filter_shows_every_row`).
+    `DIFF_FORMATS` is `monitor::LOG_FORMATS` itself, SQL left out for the log's reason: it renders
+    `INSERT INTO <table>`, and these rows are observations about two results, not rows of a table
+    (`diff_formats_are_the_logs_and_never_sql`).
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
@@ -10005,7 +10045,10 @@ existing prose was left alone.
     and `append_changes` takes the list so the capture happens where the entry is made rather than
     at render time. `LOG_FORMATS` is
     everything the grid offers **except SQL**: SQL renders `INSERT INTO <table>`, and a change log
-    has no such table — its rows are observations *about* one, a third of them deletions. Both caps
+    has no such table — its rows are observations *about* one, a third of them deletions. It has a
+    second user now: Compare results exports through `result_diff::DIFF_FORMATS`, which *is* this
+    list, and `result_diff::export_result_set` is this projection's shape for two results,
+    `TRANSITION` (`pub(crate)` for it) included. Both caps
     are here for one reason, that the modal has to be able to *name* them: `ROW_CAP` (rows per poll,
     past which the monitor watches a page rather than a table) and `LOG_CAP` (changes kept, oldest
     dropping — a cap the app used to keep private, moved here once the log became exportable, since
@@ -26723,10 +26766,12 @@ existing prose was left alone.
     The left is the earlier result, **A**, so until the sides are swapped its rows are the
     *removed* ones. Of the two results **as they
     were read** — a kept one is a snapshot, a live one is what its panel held when the menu opened —
-    and of their rows only: nothing is fetched. Read-only like *Chart*, `modal_w(920)` wide — it was
+    and of their rows only: nothing is fetched. Like *Chart* it changes nothing in the results or
+    the database, its one action writing a file. It is `modal_w(920)` wide — it was
     a fixed 820 with no cap at the window's width: a title, two statement cards, the controls, the
-    table, a footer of the summary and **Close** — `ActionKind::Neutral`, since the footer offers no
-    decision to affirm — and Escape and the backdrop closing it. Unlike
+    table, a footer of the summary (or the export's notice while one stands) and **Close** —
+    `ActionKind::Neutral`, since the footer offers no decision to affirm — and Escape and the
+    backdrop closing it. Unlike
     *Chart* it is keyed on whether it is open, not on the pair, which holds only because nothing
     can set a second pair while it stands — the chip menu that raises it is under its backdrop.
     **The cards are the two statements, A and B**, side by side: a letter badge, *Ran HH:MM:SS*
@@ -26747,11 +26792,14 @@ existing prose was left alone.
     (`SWAP_TAB` 5), Enter or Space picking. On the right **one picker, *Match rows by*** — *Whole
     row* or any column `result_diff::key_columns` offers, which leaves out a binary one since its
     every cell reads `<n bytes>` and would match nothing apart — a
-    `table_designer::focusable_owned_dropdown`, `PICKER_TAB` 10, then
-    Close (`ACTION_TAB`) and the title's ✕; it starts on `result_diff::suggested_key`. The label and
+    `table_designer::focusable_owned_dropdown`, `PICKER_TAB` 10, then the export icon
+    (`EXPORT_TAB` 11), Close (`ACTION_TAB`) and the title's ✕; it starts on
+    `result_diff::suggested_key`. The label and
     picker are an `h_stack` of their own with a 10px gap, not a `margin_right` on the label: with
     the margin the picker ended 10px short of the B card's right edge above it, measured in the
-    running app. It picks **one** column; the core takes a composite key, which
+    running app. The export icon ends that same row, with a further `margin_left(6)` on top of the
+    gap — set apart from the picker because it acts on the comparison, not on how rows are
+    matched. It picks **one** column; the core takes a composite key, which
     nothing here offers yet. Under them a faint notes line for the columns only one side has, the
     binary columns left out of the comparison (*"Binary, not compared: pw_hash"*), the
     repeated keys left out, and a capped result (*"rows past its cap are not compared"*), hidden
@@ -26797,6 +26845,51 @@ existing prose was left alone.
     its own area: *No differences.*, or *No changed rows.* and its siblings for an empty filter; and
     a key one side lacks, `DiffError::MissingKey`'s sentence, in the error colour, with the footer's
     summary left blank beside it.
+    **The export is the Live monitor's, control for control** (`monitor_view.rs`): a bare
+    `toolbar_icon(DOWNLOAD)` in `in_ring_button`, *Export the comparison…* as its tooltip, dimmed —
+    and its Enter and Space ignored — **while there is nothing to export**: the key cannot match
+    rows, the `computed` outcome being an `Err`, or the current filter shows none
+    (`Outcome::count(filter) == 0` — identical results, or a pill with no rows), where a file of
+    headings alone would be reported saved. It raises the shared `overlay.popup_menu` over `result_diff::DIFF_FORMATS`, anchored
+    `PopupAnchor::BelowIcon` off the ring wrapper's `layout_rect()`, toggled shut by a second press
+    through `widgets::menu_anchored_at`, at `erd_view::export_menu_w()`. `result_diff_overlay` takes
+    the app's `ExportFn` for it, `modals.rs` passing `ui.tab_actions.export_file`. A format runs
+    `save_diff`, which **snapshots the comparison on screen before the dialog opens** —
+    `grid::save_export`'s reason, the dialog being modal and slow, so the file is what was shown when
+    the format was chosen. **The snapshot is reference counts and nothing more** — the two results,
+    the diff and the table rows, each an `Arc` or `Rc` the `Outcome` already holds, and the filter —
+    and the filtering (`TableRow::shown_by`) and the projection (`result_diff::export_result_set`)
+    wait inside the `save_as` callback for a path. They still run on the UI thread, but a cancelled
+    dialog costs nothing and the dialog opens at once however large the comparison. The dialog is
+    *Export comparison*, its default name `suggested_filename(Some("comparison"), format)`. The request is the monitor's:
+    `source: None` and a default dialect, which only the SQL renderer would read and
+    `DIFF_FORMATS` does not offer; `ExportScope::Fetched`, since nothing could re-run a
+    comparison; and **`stoppable: false`**, which keeps it out of the app's single export-cancel
+    slot as the monitor's is kept out. The outcome arms are spelled out as `save_log` spells its
+    own — `Done` the grid's sentence, `Cancelled` nothing, `Failed` the pipeline's message as it
+    came — because the day `Cancelled` can arrive, reading it as `Done` would claim a file that was
+    never wholly written. **`Done(tally)` speaks through `export::export_note(&tally, &name,
+    true)`**, as the grid's export does: the rows written and any caveat — an XLSX cell cut to the
+    format's limit — which a bare *Saved* would hide in a file that promises whole values. A
+    sentence with a caveat (`tally.has_caveat()`) is reported as a failure is, so it stays up rather
+    than fading, and after the modal has closed it reaches the shared error modal rather than being
+    dropped; a plain one fades. `save` re-asks the icon's own test before anything — the menu can
+    stand open over a change of key or filter — and says *"Nothing to export."*, as a failure,
+    when it fails.
+    **It reports in the footer**, the notice taking the summary's place while it stands, for
+    *Chart*'s reason: the shared error modal is painted under this one. A confirmation fades after
+    `NOTICE_LINGER` (4 s) behind a sequence number and a failure stays; an effect over the
+    comparison's `generation` and the filter clears it, since a notice is about the comparison it
+    was said of. A completion that lands after the modal closed reaches the notice through
+    `try_get_untracked` and finds it gone: a failure then goes to the shared error modal
+    (`error_modal_text` as `ModalError::app`, `error_modal_open`), as the monitor's does, and a
+    confirmation is dropped. **`close` clears `popup_menu` and `popup_anchor` before `target`**,
+    for the chart's and the ER diagram's reason — the shared popup outlives this modal and its
+    entries hold this scope's signals. `save` still reads `computed` and `filter` with
+    `try_get_untracked` and does nothing when either is gone — a backstop rather than a known path,
+    since `close` takes the menu down on every exit and the open-keyed container above lets nothing
+    replace this scope under an open menu; a menu that did outlive it would otherwise panic on a
+    disposed signal.
     Mounted in the workspace group directly after `chart_overlay`, counted by
     `workspace_modals_up` as a plain term (`diff_open`) — it raises nothing — and on
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
@@ -31054,7 +31147,8 @@ existing prose was left alone.
     none until the view's own `cell` was tested; the flattening now lives in the core beside Compare
     results', one definition for both tables, pinned by `a_cell_line_is_one_short_line` and
     `the_table_cells_show_each_kind_whole`. The export path (`log_result_set`) is deliberately not
-    routed through it and keeps the engine's value verbatim.
+    routed through it and keeps the engine's value verbatim, and Compare results' export
+    (`result_diff::export_result_set`) keeps the same distance from its own table's line.
     **The width objection the old paragraph raised is answered rather than withdrawn.** With only
     the visible rows mounted, the widest row in the *window* would set the content width, so a
     range that shrank past the current offset would drag the body and the header — which mirrors
@@ -31111,7 +31205,8 @@ existing prose was left alone.
     that stopped carrying the argument the moment the `Fetched` render was chunked and gained a Stop
     between blocks, and for a while the arm rested on a fact that no longer implied anything. What
     holds it now is the absence of any control bound to this run, which is exactly what
-    `stoppable: false` says.
+    `stoppable: false` says. Compare results' export (`result_diff_view.rs`) is built on this one —
+    the same glyph in the ring, the same popup, the same request — and inherits both reasons.
     `footer_line(export_err, poll_err, partial, capped, length_only, events, since)` decides what the footer
     says: an error takes the line outright in `Tone::Error`, worst-to-mislead first (a failed export
     beats a poll error, because the user believes they have a file and doesn't). Otherwise it is
