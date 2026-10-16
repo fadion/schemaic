@@ -533,6 +533,32 @@ async fn an_init_sql_never_leaves_implicit_transactions_on() {
     assert_eq!(rs.cell(0, 1).expect("bit").display().to_string(), "16384");
 }
 
+/// **A connection with no init SQL starts in auto-commit too** — the premise
+/// `mssql::connect` runs its `SET IMPLICIT_TRANSACTIONS OFF` belt only after an
+/// init on. A server's `user options` might be expected to turn implicit
+/// transactions on for every new session (`sp_configure 'user options', 2`),
+/// leaving each one-shot write's `COMMIT` at `@@TRANCOUNT` 1, rolled back at
+/// the disconnect. Measured on SQL Server 2025 with `user options` = 2 in use:
+/// this login's `@@OPTIONS` was 5432, bit 2 clear — the client's login sets
+/// the session's options over the server default. Pinned so a driver change
+/// that stops doing so fails here rather than in a user's import.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_with_no_init_sql_starts_in_auto_commit() {
+    if !enabled() {
+        return;
+    }
+    let rs = base_db()
+        .fetch_query(
+            None,
+            "SELECT CAST(@@OPTIONS & 2 AS int)",
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the read runs");
+    assert_eq!(rs.cell(0, 0).expect("bit").display().to_string(), "0");
+}
+
 /// **The server's settings are `sys.configurations`**, each with the value in
 /// use and its description — and SQL Server has no status list, which is an
 /// error that says so rather than an empty one.

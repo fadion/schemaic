@@ -217,7 +217,10 @@ pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient,
     // every auto-commit write would be rolled back at the disconnect while the
     // app reported it done, and `ANSI_DEFAULTS ON` once turned them on from an
     // init the old deny list let through. Whatever the init set, the
-    // operation starts in auto-commit.
+    // operation starts in auto-commit. Without an init there is nothing to
+    // undo: a server's `user options` do not reach this login's session
+    // (measured on SQL Server 2025 with bit 2 in use — `@@OPTIONS` 5432,
+    // `a_connection_with_no_init_sql_starts_in_auto_commit`).
     if !init.is_empty() {
         let off = match client.simple_query("SET IMPLICIT_TRANSACTIONS OFF").await {
             Ok(stream) => stream.into_results().await.map(drop),
