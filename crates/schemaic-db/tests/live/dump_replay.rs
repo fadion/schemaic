@@ -350,8 +350,15 @@ pub async fn a_replay_keeps_the_grants_on_the_routines_it_replaces(target: &'sta
     let (t, f) = (s.qualified("t"), s.qualified("f_one"));
     // A role rather than a user: no password. MySQL 8 caps an account name at
     // 32 bytes, which the scratch database's name is past, so the role carries
-    // its process id and leg instead.
-    let role = format!("schemaic_it_{}_{}_r", std::process::id(), target.name);
+    // its process id and leg instead — and a suffix of its own: `users.rs`'s
+    // accounts are named the same way, and its `_r` was this role's too,
+    // which failed both tests whenever they ran together (ERROR 1396).
+    let role = format!(
+        "{}{}_{}_rtg",
+        crate::scratch::PREFIX,
+        std::process::id(),
+        target.name
+    );
     s.exec(&format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY)"))
         .await;
     s.exec(&format!(
