@@ -7554,3 +7554,60 @@ mod tests {
         assert!(result_columns(&wire(&["x"]), None)[0].origin.is_none());
     }
 }
+
+#[cfg(test)]
+mod replay_access_tests {
+    use super::*;
+    use schemaic_core::access::GrantState;
+
+    fn row(cells: &[Option<&str>]) -> Vec<Option<String>> {
+        cells.iter().map(|c| c.map(str::to_string)).collect()
+    }
+
+    /// **Permissions fold onto the object they name**, with their state:
+    /// `W` a grant held with its option, `D` a deny, a column's kept; a
+    /// schema-owned object names no owner, and a permission on an object
+    /// the owners read did not list is dropped rather than misfiled.
+    #[test]
+    fn permission_rows_fold_onto_their_objects() {
+        let owners = [
+            row(&[Some("dbo"), Some("orders"), Some("auditor")]),
+            row(&[Some("dbo"), Some("v_orders"), None]),
+        ];
+        let perms = [
+            row(&[
+                Some("dbo"),
+                Some("orders"),
+                None,
+                Some("app"),
+                Some("SELECT"),
+                Some("W"),
+            ]),
+            row(&[
+                Some("dbo"),
+                Some("orders"),
+                Some("salary"),
+                Some("app"),
+                Some("SELECT"),
+                Some("D"),
+            ]),
+            row(&[
+                Some("dbo"),
+                Some("gone"),
+                None,
+                Some("app"),
+                Some("SELECT"),
+                Some("G"),
+            ]),
+        ];
+        let out = mssql_fold_table_access(&owners, &perms);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].owner, "auditor");
+        assert!(out[0].grants[0].grantable);
+        assert_eq!(out[0].grants[0].state, GrantState::Grant);
+        assert_eq!(out[0].grants[1].state, GrantState::Deny);
+        assert_eq!(out[0].grants[1].column.as_deref(), Some("salary"));
+        assert!(out[1].owner.is_empty() && out[1].grants.is_empty());
+        assert!(out.iter().all(|t| t.default_acl));
+    }
+}

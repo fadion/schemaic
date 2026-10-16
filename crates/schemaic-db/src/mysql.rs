@@ -8368,3 +8368,34 @@ pub(crate) async fn fetch_blob(
     let _ = conn.disconnect().await;
     outcome
 }
+
+#[cfg(test)]
+mod replay_access_tests {
+    use super::*;
+
+    /// `Proc_priv`'s set splits on its commas, and `Routine_type` says which
+    /// kind of routine the grant is on.
+    #[test]
+    fn procs_priv_rows_become_routine_grants() {
+        let row = |name: &str, kind: &str, privs: &str| {
+            (
+                name.to_string(),
+                kind.to_string(),
+                "app".to_string(),
+                "%".to_string(),
+                privs.to_string(),
+            )
+        };
+        let out = my_routine_grants(&[
+            row("f_one", "FUNCTION", "Execute,Alter Routine"),
+            row("p_two", "PROCEDURE", "Grant"),
+            row("f_none", "FUNCTION", ""),
+        ]);
+        assert_eq!(out[0].privileges, ["Execute", "Alter Routine"]);
+        assert_eq!(out[0].kind, schemaic_core::schema::RoutineKind::Function);
+        assert_eq!(out[1].kind, schemaic_core::schema::RoutineKind::Procedure);
+        assert_eq!(out[1].privileges, ["Grant"]);
+        assert!(out[2].privileges.is_empty());
+        assert_eq!((out[0].user.as_str(), out[0].host.as_str()), ("app", "%"));
+    }
+}

@@ -6869,3 +6869,98 @@ mod index_key_tests {
         assert!(f.contains("'pg_catalog', 'information_schema'"));
     }
 }
+
+#[cfg(test)]
+mod replay_access_tests {
+    use super::*;
+
+    fn row(cells: &[Option<&str>]) -> Vec<Option<String>> {
+        cells.iter().map(|c| c.map(str::to_string)).collect()
+    }
+
+    /// **The four reads fold onto one relation each**, by namespace and
+    /// name: a relation with none of the other rows is its owner and flags
+    /// alone, a NULL grantee is `PUBLIC`, a column grant keeps its column,
+    /// and a policy takes its roles in order, `PUBLIC` among them.
+    #[test]
+    fn table_access_rows_fold_onto_their_relations() {
+        let rels = [
+            row(&[
+                Some("public"),
+                Some("orders"),
+                Some("app_owner"),
+                Some("false"),
+                Some("true"),
+                Some("false"),
+            ]),
+            row(&[
+                Some("sales"),
+                Some("orders"),
+                Some("other"),
+                Some("true"),
+                Some("false"),
+                Some("false"),
+            ]),
+        ];
+        let grants = [
+            row(&[
+                Some("public"),
+                Some("orders"),
+                None,
+                Some("app"),
+                Some("SELECT"),
+                Some("true"),
+            ]),
+            row(&[
+                Some("public"),
+                Some("orders"),
+                None,
+                None,
+                Some("SELECT"),
+                Some("false"),
+            ]),
+            row(&[
+                Some("public"),
+                Some("orders"),
+                Some("secret"),
+                Some("app"),
+                Some("UPDATE"),
+                Some("false"),
+            ]),
+        ];
+        let policies = [row(&[
+            Some("public"),
+            Some("orders"),
+            Some("first_only"),
+            Some("false"),
+            Some("r"),
+            Some("(id = 1)"),
+            None,
+        ])];
+        let roles = [
+            row(&[
+                Some("public"),
+                Some("orders"),
+                Some("first_only"),
+                Some("app"),
+            ]),
+            row(&[Some("public"), Some("orders"), Some("first_only"), None]),
+        ];
+        let out = pg_fold_table_access(&rels, &grants, &policies, &roles);
+        assert_eq!(out.len(), 2);
+        let (a, b) = (&out[0], &out[1]);
+        assert_eq!((a.owner.as_str(), a.default_acl), ("app_owner", false));
+        assert!(a.row_security && !a.force_row_security);
+        assert_eq!(a.grants.len(), 3);
+        assert!(a.grants[0].grantable);
+        assert_eq!(a.grants[1].grantee, None, "PUBLIC");
+        assert_eq!(a.grants[2].column.as_deref(), Some("secret"));
+        let p = &a.policies[0];
+        assert!(!p.permissive);
+        assert_eq!(p.command, "SELECT");
+        assert_eq!(p.roles, [Some("app".to_string()), None]);
+        assert_eq!(p.check, None);
+        assert_eq!(b.schema.as_deref(), Some("sales"));
+        assert!(b.default_acl && b.grants.is_empty() && b.policies.is_empty());
+    }
+}
