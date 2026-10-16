@@ -42244,7 +42244,16 @@ this bundle's.
   is a *border* and so comes out of the content box too. Both estimators reserved a flat `22.0`,
   which is a pixel generous at Normal and short by 6px at 130% and 11px at 160%: **auto-fit clipped
   the value it exists to fit**. `numeric_edit_pad_left` composes the same three terms correctly,
-  which is what makes this a composition bug rather than a wrong constant.
+  which is what makes this a composition bug rather than a wrong constant. **A numeric column's
+  data cells are the second composition, `data_chrome_w(col)`** — `grid_pad_h() +
+  grid_num_pad_right() + GRID_CELL_DIVIDER`, the right side padded 14px rather than 10 — which both
+  estimators ask per column: sized as a text cell, an 18-digit `BIGINT` was 4px short of itself, and
+  a right-aligned number clips its *leading* digits, so `100000000000000000` read
+  `00000000000000000` (`a_numeric_column_is_wide_enough_for_its_own_right_padding`; found driving
+  the v0.34.0 chart hand check). **And a digit is wider than the average character**: measured
+  7.8px at Normal against `grid_char_w()`'s 7, so with the padding fixed the value still clipped.
+  `content_w(col, head, value)` sizes the header at the average advance and a numeric column's
+  values at `grid_digit_w()` (8px, scaled).
   **And stored widths are carried across a live scale change** (`rescale_widths` + `GridState::widths_at`,
   which holds the `grid_char_w()` the current widths were measured at). They cannot follow the scale
   the way everything else in the grid does, because they are pixels *stored* rather than read in a

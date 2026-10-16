@@ -1897,6 +1897,19 @@ fn cell_chrome_w() -> f64 {
     2.0 * grid_pad_h() + GRID_CELL_DIVIDER
 }
 
+/// [`cell_chrome_w`] for a column's **data** cells: a numeric one is padded
+/// `grid_num_pad_right()` on the right rather than `grid_pad_h()`, so the
+/// estimators that sized it as a text cell left it 4px short of its own
+/// value — and a right-aligned number clips its *leading* digits, showing a
+/// different number (`00000000000000000` for `100000000000000000`).
+fn data_chrome_w(col: &Column) -> f64 {
+    if col.is_numeric() {
+        grid_pad_h() + grid_num_pad_right() + GRID_CELL_DIVIDER
+    } else {
+        cell_chrome_w()
+    }
+}
+
 /// Carry stored column widths across an interface-scale change.
 ///
 /// `gs.widths` is measured in pixels from `grid_char_w()` and then *stored*, and
@@ -1950,8 +1963,8 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
         .iter()
         .enumerate()
         .map(|(ci, col)| {
-            let mut chars = header_name_chars(col);
-            chars = chars.max(col.type_name.chars().count());
+            let head = header_name_chars(col).max(col.type_name.chars().count());
+            let mut chars = 0;
             for r in 0..sample {
                 if let Some(c) = rs.cell(r, ci) {
                     // `take` first: `count()` decodes the whole string and the
@@ -1967,7 +1980,7 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
             } else {
                 0.0
             };
-            (chars as f64 * grid_char_w() + cell_chrome_w() + icon)
+            (content_w(col, head, chars) + data_chrome_w(col) + icon)
                 .clamp(min_col_w(), max_col_w_init())
         })
         .collect()
@@ -1977,10 +1990,11 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
 /// `has_key` budgets for the header's leading key icon, and the type-name line is
 /// included so a long type (e.g. `INT UNSIGNED`) isn't clipped after auto-fit.
 fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
-    let mut chars = rs.columns.get(ci).map(header_name_chars).unwrap_or(6);
-    if let Some(c) = rs.columns.get(ci) {
-        chars = chars.max(c.type_name.chars().count());
-    }
+    let Some(col) = rs.columns.get(ci) else {
+        return (6.0 * grid_char_w() + cell_chrome_w()).clamp(min_col_w(), 900.0);
+    };
+    let head = header_name_chars(col).max(col.type_name.chars().count());
+    let mut chars = 0;
     for r in 0..rs.row_count() {
         if let Some(c) = rs.cell(r, ci) {
             // **`take`, not `min` — the cap has to bound the *walk*.**
@@ -1995,7 +2009,20 @@ fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
         }
     }
     let icon = if has_key { header_key_icon_w() } else { 0.0 };
-    (chars as f64 * grid_char_w() + cell_chrome_w() + icon).clamp(min_col_w(), 900.0)
+    (content_w(col, head, chars) + data_chrome_w(col) + icon).clamp(min_col_w(), 900.0)
+}
+
+/// The content box a column needs: its header's `head` characters at the
+/// average advance, or its widest value's `value` characters — at a
+/// **digit's** advance in a numeric column ([`grid_digit_w`]), whose values
+/// are digits and clip their leading ones when short.
+fn content_w(col: &Column, head: usize, value: usize) -> f64 {
+    let per = if col.is_numeric() {
+        grid_digit_w()
+    } else {
+        grid_char_w()
+    };
+    (head as f64 * grid_char_w()).max(value as f64 * per)
 }
 
 fn cell_in(bounds: Option<(usize, usize, usize, usize)>, i: usize, ci: usize) -> bool {
@@ -12426,6 +12453,43 @@ mod cell_preview_tests {
     /// the click handler. This cannot fail against the unfixed tree — the
     /// width is identical either way, which is the point — but it pins the cap
     /// so `take(140)` cannot quietly become `take(4)`.
+    #[test]
+    fn a_numeric_column_is_wide_enough_for_its_own_right_padding() {
+        // **A number is padded 14px on the right, not 10**, and both
+        // estimators budgeted the 10 a text cell has — so an 18-digit BIGINT
+        // was 4px short of itself and showed `00000000000000000` for
+        // `100000000000000000`, its leading digit clipped: a different number
+        // on screen. Found driving the v0.34.0 chart hand check. And a digit
+        // is wider than the 7px average character: with the padding fixed,
+        // the value was still clipped until it was sized at a digit's
+        // advance (`grid_digit_w`). The content box is what `data_cell`
+        // draws for a numeric cell.
+        let col = Column {
+            name: "v".into(),
+            type_name: "BIGINT".into(),
+            origin: None,
+        };
+        assert!(col.is_numeric(), "the fixture is a numeric column");
+        let value = "100000000000000000";
+        let rs = ResultSet::from_rows(vec![col], vec![vec![Value::Str(value.into())]]);
+        // The digits' measured advance (7.8px at Normal), not the average
+        // character's 7px: sized by the latter, the value still clipped.
+        let need = value.len() as f64 * 7.8 * grid_char_w() / 7.0;
+        let content = |w: f64| w - grid_pad_h() - grid_num_pad_right() - GRID_CELL_DIVIDER;
+        let init = init_widths(&rs, &HashMap::new())[0];
+        assert!(
+            content(init) >= need,
+            "init: {init}px holds {} of {need}",
+            content(init)
+        );
+        let fit = autofit_width(&rs, 0, false);
+        assert!(
+            content(fit) >= need,
+            "autofit: {fit}px holds {} of {need}",
+            content(fit)
+        );
+    }
+
     #[test]
     fn autofit_stops_measuring_at_the_cap() {
         let col = Column {

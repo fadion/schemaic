@@ -478,6 +478,15 @@ pub(crate) fn max_col_w_init() -> f64 {
 pub(crate) fn grid_char_w() -> f64 {
     scaled(7.0)
 }
+/// ≈ advance width of one **digit** in the cell font — wider than the average
+/// character [`grid_char_w`] stands for: measured 7.8px at Normal (a run of
+/// zeros repeats every 39px for five). A numeric column's values are sized by
+/// it, since a right-aligned number that is short of its width clips its
+/// *leading* digits and reads as another number — at 7px an 18-digit `BIGINT`
+/// showed `00000000000000000` for `100000000000000000`.
+pub(crate) fn grid_digit_w() -> f64 {
+    scaled(8.0)
+}
 /// Grab width of a column-resize divider.
 pub(crate) fn resize_hit_w() -> f64 {
     scaled(7.0)
