@@ -803,9 +803,17 @@ pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
          schemas, and stops before dropping anything it cannot put back as it is. Without One \
          transaction it leaves routines as they are, so a replay onto a database that still \
          has them stops at the first one."
-    } else if crate::ddl::supports_routine_editing(dialect) {
+    } else if crate::ddl::supports_routine_editing(dialect)
+        && crate::ddl::replay_replaces_routine_in_place(dialect, ServerFlavour::MySql)
+    {
         "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
          that already holds these tables. It also replaces every routine in their schemas."
+    } else if crate::ddl::supports_routine_editing(dialect) {
+        // The modal does not know the flavour: in place on MariaDB, a `DROP`
+        // first on MySQL 8.
+        "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
+         that already holds these tables. It also replaces every routine and event in their \
+         schemas: on MySQL each is dropped first, which revokes every grant on it."
     } else {
         "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
          that already holds these tables."
@@ -1497,11 +1505,13 @@ pub fn cascade_guard_sql(
 /// tables ahead of it had been dropped and refilled.
 ///
 /// - **A routine is replaced** ([`ObjectItem::replacing_sql`]): in place
-///   where the engine can, which keeps what depends on it — PostgreSQL
+///   where the server can, which keeps what depends on it — PostgreSQL
 ///   refuses to drop a function a trigger outside the file runs, and
-///   `CASCADE` would take the trigger; otherwise dropped just before its
-///   `CREATE` — MySQL, where nothing depends on a routine by reference. **An
-///   event** too: MySQL's, the one engine with them.
+///   `CASCADE` would take the trigger — and, on MariaDB, the grants on it;
+///   otherwise dropped just before its `CREATE` — MySQL 8, where nothing
+///   depends on a routine by reference but the `DROP` revokes its grants,
+///   which the header says. **An event** too: MySQL's, the one engine with
+///   them.
 /// - **A type or a sequence is created only where it is missing**
 ///   ([`unless_present_sql`]), and is never replaced: dropping a type takes
 ///   every column typed with it, in the file or not, and a sequence's position
@@ -1514,6 +1524,7 @@ fn replay_create(
     kind: ObjectKind,
     sql: String,
     dialect: SqlDialect,
+    flavour: crate::schema::ServerFlavour,
 ) -> (String, bool) {
     let qname = crate::schema::qualified_ident(o.name(), o.schema(), dialect);
     let guarded = |present: Present<'_>, sql: String| {
@@ -1521,7 +1532,7 @@ fn replay_create(
     };
     match kind {
         ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event => {
-            match o.replacing_sql(dialect) {
+            match o.replacing_sql(dialect, flavour) {
                 Some(replace) => (replace, true),
                 None => (sql, false),
             }
@@ -3252,7 +3263,8 @@ pub fn plan(
                     // a name already there does not stop the run — see
                     // `replay_create`.
                     if replays {
-                        let (replay, replaces) = replay_create(&o, kind, sql, dialect);
+                        let (replay, replaces) =
+                            replay_create(&o, kind, sql, dialect, schema.flavour);
                         sql = replay;
                         if replaces {
                             replaced.push(display_name(o.schema(), o.name()));
@@ -3795,6 +3807,15 @@ pub fn plan(
             crate::text::plural(n, "version", "versions"),
             crate::export::comment_text(&replaced.join(", ")),
         ));
+        // Where that is a `DROP` and a `CREATE` beside the tables — MySQL 8's
+        // only form. Not where the file drops up front: SQL Server's section
+        // keeps no grant either, and its hint names the drop.
+        if replays && !crate::ddl::replay_replaces_routine_in_place(dialect, schema.flavour) {
+            header.push_str(
+                "\n-- Each is dropped before its CREATE, which revokes every grant on it, and the\n\
+                 -- CREATE needs the privilege to name its DEFINER: without it, the routine is gone.",
+            );
+        }
     }
     let refused: Vec<String> = refused.into_iter().map(|(_, label)| label).collect();
     if !refused.is_empty() {
@@ -7463,6 +7484,12 @@ mod tests {
                 "{d:?}: {hint}"
             );
             assert!(hint.contains("CREATE"), "{d:?}: {hint}");
+            // Only MySQL 8's replacement is a `DROP` that revokes grants.
+            assert_eq!(
+                hint.contains("revokes"),
+                d == SqlDialect::MySql,
+                "{d:?}: {hint}"
+            );
         }
         let mut t = table("orders");
         t.schema = Some("dbo".to_string());
@@ -9985,6 +10012,62 @@ mod tests {
             file.contains("CREATE FUNCTION \"public\".\"f_one\"()"),
             "{file}"
         );
+    }
+
+    /// **MariaDB replaces a routine or event in place**, because the `DROP`
+    /// that MySQL's form needs revokes every account's grant on the routine
+    /// (`automatic_sp_privileges`) and, where the restoring account may not
+    /// write the `DEFINER`, leaves it destroyed when the `CREATE` fails with
+    /// ERROR 1227. Measured on MariaDB 10.11.14: a `GRANT EXECUTE` survived
+    /// `CREATE OR REPLACE FUNCTION` and did not survive `DROP` + `CREATE`.
+    /// MySQL 8 has no such form for routines, so it keeps the `DROP` — and
+    /// the header says what that costs.
+    #[test]
+    fn mariadb_replaces_routines_in_place_and_mysql_says_what_its_drop_costs() {
+        let mut s = schema_of(vec![table("t")]);
+        s.routines.push(one_function(None));
+        s.events.push(std::sync::Arc::new(crate::schema::EventInfo {
+            name: "ev".to_string(),
+            body: "DELETE FROM t".to_string(),
+            ..Default::default()
+        }));
+        s.flavour = crate::schema::ServerFlavour::MariaDb;
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(
+            file.contains("CREATE OR REPLACE FUNCTION `f_one`()"),
+            "{file}"
+        );
+        assert!(file.contains("CREATE OR REPLACE EVENT `ev`"), "{file}");
+        assert!(!file.contains("DROP FUNCTION"), "{file}");
+        assert!(!file.contains("DROP EVENT"), "{file}");
+        assert!(
+            file.contains("this file replaces 2 routines and events"),
+            "{file}"
+        );
+        assert!(!file.contains("revokes"), "{file}");
+
+        for flavour in [
+            crate::schema::ServerFlavour::MySql,
+            crate::schema::ServerFlavour::Unknown,
+        ] {
+            s.flavour = flavour;
+            let file = file_of(&plan(
+                &s,
+                "shop",
+                &all(&s),
+                DumpOptions::default(),
+                SqlDialect::MySql,
+            ));
+            assert!(file.contains("DROP FUNCTION IF EXISTS `f_one`;"), "{file}");
+            assert!(!file.contains("OR REPLACE"), "{file}");
+            assert!(file.contains("revokes every grant"), "{file}");
+        }
     }
 
     /// **A type, a domain or a sequence the file carries is created only where

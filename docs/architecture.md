@@ -5849,11 +5849,20 @@ existing prose was left alone.
     exists* on PostgreSQL 16, ERROR 1304 on MariaDB 10.11 and MySQL 8 (measured live, per the
     change's author) — after every table ahead of it had been dropped and refilled. **A routine or
     an event is replaced** (`ObjectItem::replacing_sql`): in place where
-    `ddl::supports_or_replace_routine` says the engine can — PostgreSQL's `CREATE OR REPLACE`, which
-    keeps a trigger or default outside the file that runs the function, where a `DROP` is refused
-    and `CASCADE` would take it — and otherwise by `DROP FUNCTION`/`PROCEDURE`/`EVENT IF EXISTS`
-    inside the same client script, just before the `CREATE`: MySQL's, the engine without the form
-    and the one with events, where nothing holds a routine by reference. Each is named in the
+    `ddl::replay_replaces_routine_in_place` says the server can — PostgreSQL's `CREATE OR REPLACE`,
+    which keeps a trigger or default outside the file that runs the function, where a `DROP` is
+    refused and `CASCADE` would take it, and **MariaDB's** `CREATE OR REPLACE FUNCTION`/`PROCEDURE`/
+    `EVENT`, asked of `DbSchema::flavour` — and otherwise by `DROP FUNCTION`/`PROCEDURE`/`EVENT IF
+    EXISTS` inside the same client script, just before the `CREATE`: MySQL 8's, the server without
+    the form, where nothing holds a routine by reference. **MariaDB is not left on the `DROP`
+    because the drop revokes grants**: with `automatic_sp_privileges` (the default) every account's
+    `EXECUTE` on the routine went with it, and an account that may not write the `DEFINER` had its
+    `CREATE` refused (ERROR 1227) after the `DROP` had committed, so the routine was gone — measured
+    on MariaDB 10.11.14, where a grant survives `CREATE OR REPLACE` and not `DROP` + `CREATE`
+    (`a_mariadb_replay_keeps_the_grants_on_the_routines_it_replaces`, live; the edit path's
+    `supports_or_replace_routine` still declines the form, for the reason its doc gives). On MySQL 8
+    the header says what the `DROP` costs, and so does the toggle's hint
+    (`mariadb_replaces_routines_in_place_and_mysql_says_what_its_drop_costs`). Each is named in the
     header's *this file replaces …* line, which says *events* or *routines and events* where there
     are events among them, as the up-front path already named its routines
     (`a_replay_replaces_each_routine_it_carries`). **An enum, a domain or a sequence is created only

@@ -4083,10 +4083,12 @@ impl RoutineInfo {
     /// `CREATE [OR REPLACE] {FUNCTION|PROCEDURE}`, with every option restated —
     /// the single routine emitter, on the same rule as [`crate::ddl::view_ddl`].
     ///
-    /// `replace` is honoured only where the engine has the form. MySQL has no
-    /// `CREATE OR REPLACE` for a routine, so the flag is ignored there and
-    /// [`crate::ddl::diff_routine`] emits the `DROP` that has to come first
-    /// instead — the same resolution [`diff_view`] performs for SQLite.
+    /// `replace` is asked only where the engine has the form. MySQL has no
+    /// `CREATE OR REPLACE` for a routine, so [`crate::ddl::diff_routine`]
+    /// never asks it there and emits the `DROP` that has to come first
+    /// instead — the same resolution [`diff_view`] performs for SQLite. On the
+    /// MySQL arm the flag writes MariaDB's `CREATE OR REPLACE`, which only a
+    /// dump's replay asks for ([`crate::ddl::replay_replaces_routine_in_place`]).
     ///
     /// [`diff_view`]: crate::ddl::diff_view
     pub fn create_sql(&self, dialect: crate::intel::SqlDialect, replace: bool) -> String {
@@ -4096,7 +4098,7 @@ impl RoutineInfo {
             // (`supports_routine_editing` is false for it), and MySQL's shape is
             // the closer of the two if it somehow does.
             crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => {
-                self.mysql_create_sql(dialect)
+                self.mysql_create_sql(dialect, replace)
             }
             // SQL Server's is rebuilt from the parts `mssql` read the stored
             // text into; `replace` is `CREATE OR ALTER`.
@@ -4299,8 +4301,15 @@ impl RoutineInfo {
     /// happens to contain several. `Db::run_ddl` sends each plan step whole, on
     /// one connection, which is why no `DELIMITER` dance is needed — that is a
     /// client-side convention of the `mysql` CLI, not part of the protocol.
-    fn mysql_create_sql(&self, d: crate::intel::SqlDialect) -> String {
-        let mut out = String::from("CREATE ");
+    ///
+    /// `replace` writes `CREATE OR REPLACE`, MariaDB's form — see
+    /// [`Self::create_sql`].
+    fn mysql_create_sql(&self, d: crate::intel::SqlDialect, replace: bool) -> String {
+        let mut out = String::from(if replace {
+            "CREATE OR REPLACE "
+        } else {
+            "CREATE "
+        });
         if let Some(def) = self.definer.as_deref().filter(|s| !s.trim().is_empty()) {
             out.push_str(&definer_sql(def));
             out.push(' ');
@@ -5625,17 +5634,24 @@ impl ObjectItem {
 
     /// [`Self::create_sql`] for a routine or an event, **replacing** one of
     /// its name: `CREATE OR REPLACE` (SQL Server's `CREATE OR ALTER`) where
-    /// the engine has the form ([`crate::ddl::supports_or_replace_routine`]),
-    /// else a `DROP … IF EXISTS` first, inside the same script. `None` for
-    /// anything else.
+    /// the server has the form
+    /// ([`crate::ddl::replay_replaces_routine_in_place`]), else a
+    /// `DROP … IF EXISTS` first, inside the same script. `None` for anything
+    /// else.
     ///
     /// What a dump writes for a replay onto a database that already holds it
-    /// ([`crate::dump::plan`]). In place where the engine can, because that
+    /// ([`crate::dump::plan`]). In place where the server can, because that
     /// keeps what depends on the routine — a trigger outside the file that
-    /// runs it, a default that calls it — where a `DROP` is refused, or with
-    /// `CASCADE` takes them too. MySQL, the engine without the form, holds no
-    /// such reference to drop, and is the one engine with events.
-    pub fn replacing_sql(&self, dialect: crate::intel::SqlDialect) -> Option<String> {
+    /// runs it, a default that calls it, which a `DROP` is refused over or
+    /// with `CASCADE` takes too — and, on MariaDB, every grant on it. MySQL 8,
+    /// the server without the form, holds no such reference to drop, but its
+    /// `DROP` revokes the grants: [`crate::dump::plan`]'s header says so.
+    pub fn replacing_sql(
+        &self,
+        dialect: crate::intel::SqlDialect,
+        flavour: ServerFlavour,
+    ) -> Option<String> {
+        let in_place = crate::ddl::replay_replaces_routine_in_place(dialect, flavour);
         let drop = |kind: &str| {
             format!(
                 "DROP {kind} IF EXISTS {};",
@@ -5643,7 +5659,7 @@ impl ObjectItem {
             )
         };
         match self {
-            ObjectItem::Routine(r) if crate::ddl::supports_or_replace_routine(dialect) => {
+            ObjectItem::Routine(r) if in_place => {
                 Some(Self::routine_script(r, dialect, true, None))
             }
             ObjectItem::Routine(r) => Some(Self::routine_script(
@@ -5653,12 +5669,14 @@ impl ObjectItem {
                 Some(drop(r.kind.sql_keyword())),
             )),
             ObjectItem::Event(e) => {
-                let mut stmts = vec![drop("EVENT")];
-                stmts.extend(crate::ddl::event_session_wrapped(
-                    e.create_sql(dialect),
-                    e,
-                    dialect,
-                ));
+                let create = e.create_sql(dialect);
+                // The event emitter always opens with `CREATE `, so the form
+                // is that word widened rather than a second emitter.
+                let (mut stmts, create) = match create.strip_prefix("CREATE ") {
+                    Some(rest) if in_place => (Vec::new(), format!("CREATE OR REPLACE {rest}")),
+                    _ => (vec![drop("EVENT")], create),
+                };
+                stmts.extend(crate::ddl::event_session_wrapped(create, e, dialect));
                 Some(crate::ddl::client_script(&stmts, dialect))
             }
             _ => None,

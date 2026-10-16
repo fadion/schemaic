@@ -12565,6 +12565,27 @@ pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a **dump's replay** replace a routine or event in place on
+/// `dialect`/`flavour` — [`supports_or_replace_routine`], plus MariaDB's
+/// `CREATE OR REPLACE PROCEDURE | FUNCTION | EVENT`?
+///
+/// Where [`supports_or_replace_routine`] declines MariaDB's form for an edit —
+/// one round trip is all it buys there — a replay is a different question: the
+/// `DROP` the other form needs revokes every account's grant on the routine
+/// (`automatic_sp_privileges`), and where the restoring account may not write
+/// the `DEFINER` its `CREATE` then fails with ERROR 1227 and the routine is
+/// gone (measured on MariaDB 10.11.14: a `GRANT EXECUTE` survived
+/// `CREATE OR REPLACE FUNCTION`, and not `DROP` + `CREATE`). An `Unknown`
+/// flavour is not offered it, as [`supports_unenforced_check`] does not.
+pub fn replay_replaces_routine_in_place(dialect: SqlDialect, flavour: ServerFlavour) -> bool {
+    match dialect {
+        SqlDialect::MySql => flavour.is_mariadb(),
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => {
+            supports_or_replace_routine(dialect)
+        }
+    }
+}
+
 /// Is a routine written in a **language** it names — `LANGUAGE plpgsql`,
 /// `sql`, `plpython3u`? PostgreSQL's alone, where the clause is required; a
 /// MySQL or SQL Server routine is SQL with no clause to choose, and SQLite has

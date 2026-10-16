@@ -247,6 +247,55 @@ pub async fn a_replay_replaces_the_routines_it_carries(target: &'static Target) 
     s.teardown().await;
 }
 
+/// **A MariaDB replay keeps every grant on the routines it replaces.** The
+/// file dropped each routine before its `CREATE`, and with
+/// `automatic_sp_privileges` (the default) the `DROP` revoked every account's
+/// `EXECUTE` on it: the application's next call was *execute command denied*.
+/// MariaDB's `CREATE OR REPLACE` keeps them. MySQL 8 has no such form, so the
+/// file still drops there and says so in its header.
+pub async fn a_mariadb_replay_keeps_the_grants_on_the_routines_it_replaces(
+    target: &'static Target,
+) {
+    if target.name != "mariadb" {
+        crate::endpoint::note_no_op(target, "replaces a routine by dropping it");
+        return;
+    }
+    let s = Scratch::create(target, "replay_grant").await;
+    let (t, f) = (s.qualified("t"), s.qualified("f_one"));
+    // A role rather than a user: no password, and the name carries the scratch
+    // database's, so a stranded one is swept with it.
+    let role = format!("{}_r", s.database);
+    s.exec(&format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY)"))
+        .await;
+    s.exec(&format!(
+        "CREATE FUNCTION {f}() RETURNS INTEGER DETERMINISTIC NO SQL RETURN 1"
+    ))
+    .await;
+    s.exec(&format!("CREATE ROLE `{role}`")).await;
+    s.exec(&format!("GRANT EXECUTE ON FUNCTION {f} TO `{role}`"))
+        .await;
+    let grants = format!(
+        "SELECT COUNT(*) FROM mysql.procs_priv WHERE Db = '{}' AND Routine_name = 'f_one'",
+        s.database
+    );
+    assert_eq!(
+        scalar(&s, &grants).await,
+        "1",
+        "the fixture's grant is missing"
+    );
+    let file = dump_of(&s, &["t"]).await;
+    let ran = run_file(&s, &file).await;
+    let kept = scalar(&s, &grants).await;
+    s.exec(&format!("DROP ROLE `{role}`")).await;
+    assert_eq!(
+        ran,
+        ExecEnd::Done,
+        "the dump did not replay onto its source:\n{file}"
+    );
+    assert_eq!(kept, "1", "the replay revoked the routine's grant:\n{file}");
+    s.teardown().await;
+}
+
 /// **A dump carrying a type, a domain and a sequence replays onto the
 /// database it came from, and leaves each as it found it.** They were written
 /// as bare `CREATE`s, so the replay stopped at the first name already taken.
