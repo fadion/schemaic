@@ -36056,7 +36056,10 @@ existing prose was left alone.
     `plan`** — the pure `resolve_dump_tables`, the way `cli::compare::resolve` resolves `compare -t`:
     by label (`schema::display_name`), else `schema.name` (PostgreSQL's `public.orders`, which the
     label leaves bare), else a bare name only one schema has (SQL Server's `orders` for
-    `dbo.orders`), exactly or ignoring case where `DbSchema::names_ignore_case`. A name that is not
+    `dbo.orders`), exactly or ignoring case where `DbSchema::names_ignore_case` — which SQL
+    Server's table list now carries (`mssql::names_ignore_case`, the collation probe the full read
+    asks too): it was always `false` there, so `dump -t Orders` failed on a `_CI_` database where
+    `compare -t` found it (`introspection_reads_the_schema_as_declared`, live). A name that is not
     there, or one two schemas share, is a `warn` and `Exit::Usage` before any file is written.
     `plan` used to take `-t` at its word, matching display names exactly: SQL Server's documented
     `-t orders` and PostgreSQL's `-t public.orders` found nothing (exit 4, "Nothing to export"), and

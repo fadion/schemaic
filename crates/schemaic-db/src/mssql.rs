@@ -1398,8 +1398,12 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
             ..Default::default()
         })
         .collect();
+    // So a name matched against the list folds case as the server does —
+    // `dump -t Orders` on a `_CI_` database (`cli::run::resolve_dump_tables`).
+    let names_ignore_case = names_ignore_case(&mut client).await?;
     Ok(DbSchema {
         tables,
+        names_ignore_case,
         ..Default::default()
     })
 }
@@ -3136,13 +3140,7 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
         .map(|r| cell(r, 0).to_string())
         .filter(|n| !n.is_empty())
         .collect();
-    // Whether its object names ignore case — the database collation's
-    // comparison style, bit 1 (`DbSchema::names_ignore_case`).
-    let names_ignore_case = query_rows(client, NAME_CASE_PROBE)
-        .await?
-        .first()
-        .and_then(|r| cell(r, 0).trim().parse::<i64>().ok())
-        .is_some_and(|style| style & 1 == 1);
+    let names_ignore_case = names_ignore_case(client).await?;
     Ok(DbSchema {
         tables,
         routines,
@@ -3166,6 +3164,18 @@ const NAMESPACE_LISTING: &str = "SELECT name FROM sys.schemas \
 /// see `DbSchema::names_ignore_case`.
 const NAME_CASE_PROBE: &str = "SELECT CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), \
      DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'ComparisonStyle'))";
+
+/// Whether the connected database's object names ignore case — the
+/// collation's comparison style, bit 1 ([`NAME_CASE_PROBE`],
+/// `DbSchema::names_ignore_case`). Asked by the full schema read and by the
+/// table list, which `dump -t` resolves its names against.
+async fn names_ignore_case(client: &mut MsClient) -> Result<bool, DbError> {
+    Ok(query_rows(client, NAME_CASE_PROBE)
+        .await?
+        .first()
+        .and_then(|r| cell(r, 0).trim().parse::<i64>().ok())
+        .is_some_and(|style| style & 1 == 1))
+}
 
 // ── The entry points around a query ──────────────────────────────────────────
 

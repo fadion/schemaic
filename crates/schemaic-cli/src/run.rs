@@ -1831,6 +1831,17 @@ mod tests {
             resolve_dump_tables(&mysql, &names(&["orders"])),
             Ok(names(&["orders"]))
         );
+        // Where the server's names ignore case (a `_CI_` SQL Server database,
+        // which the table list now says), so does the match — and only there.
+        let ci = schemaic_core::schema::DbSchema {
+            names_ignore_case: true,
+            ..listed(&[(Some("dbo"), "orders")])
+        };
+        assert_eq!(
+            resolve_dump_tables(&ci, &names(&["Orders", "DBO.ORDERS"])),
+            Ok(names(&["dbo.orders", "dbo.orders"]))
+        );
+        assert!(resolve_dump_tables(&mssql, &names(&["Orders"])).is_err());
     }
 
     /// A name the server does not have, or one two schemas share, is the

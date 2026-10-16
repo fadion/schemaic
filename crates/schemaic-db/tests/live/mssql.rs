@@ -8438,9 +8438,13 @@ async fn introspection_reads_the_schema_as_declared() {
     assert!(!cci.lossy && cci.is_columnstore(), "{cci:?}");
     let ddl = facts.create_ddl(MS);
     assert!(ddl.contains("COLUMNSTORE INDEX [cci]"), "{ddl}");
-    // And the list alone agrees with the whole.
+    // And the list alone agrees with the whole — on whether names ignore
+    // case too, which `dump -t` resolves against (`DBO.ORDERS` on a `_CI_`
+    // database; the list used to say no on every one).
     let list = s.db.fetch_table_list(&s.name).await.expect("the list");
     assert_eq!(list.tables.len(), schema.tables.len());
+    assert_eq!(list.names_ignore_case, schema.names_ignore_case);
+    assert!(list.names_ignore_case, "the default collation is CI");
     // A row count past `int` is what `COUNT_BIG` is for; two is enough to see
     // the statement run.
     s.exec("INSERT dbo.customers (name) VALUES (N'a'), (N'b')")
