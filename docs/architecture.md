@@ -12596,7 +12596,7 @@ existing prose was left alone.
     nobody listed is refused until someone adds it.
     `MYSQL_SETTINGS` is time zone, locale, timeouts, buffer sizes, optimiser knobs and an isolation
     level (which cannot lift `SET SESSION TRANSACTION READ ONLY`). A MySQL user variable (`SET @x =
-    1`) passes, since it sets nothing Schemaic reads; the `SESSION` and `LOCAL` scopes, bare or as
+    1`) passes, since it sets nothing Schemaic reads, with one literal value; the `SESSION` and `LOCAL` scopes, bare or as
     `@@session.`, pass; `GLOBAL`, `PERSIST` and `PERSIST_ONLY`, bare or as `@@global.`, are refused
     as changing the server rather than the session, and `SET PASSWORD` and `SET DEFAULT ROLE` fall
     to the list, naming nothing on it. `POSTGRES_SETTINGS` is the same kind of list, plus the
@@ -12622,9 +12622,20 @@ existing prose was left alone.
     `CHARACTER SET` and `CHARSET`, and PostgreSQL's `NAMES` and `client_encoding`, pass with a
     UTF-8 value only, and MySQL's `character_set_*` variables are on no list
     (`a_client_character_set_other_than_utf8_is_refused`). `SET TRANSACTION` passes only as
-    `ISOLATION LEVEL`, and only where the read-only guard is a rollback
+    `ISOLATION LEVEL` and a level named whole, and only where the read-only guard is a rollback
     (`SqlDialect::read_only_is_a_rollback` — SQL Server), which an isolation level cannot lift;
     elsewhere the transaction characteristics *are* the guard.
+    **A setting takes one value, and the statement ends there** (`one_value`, and `assigned` for
+    MySQL's `= value`): a word, a string (T-SQL's `N'…'` too) or a signed or fractional number, and
+    nothing after it — a MySQL user variable's value too. The arms used to return once they had
+    read a listed name, and **T-SQL needs no `;` between statements**, while `statement_ranges`
+    bounds them only at `;` and `GO`: `SET LANGUAGE us_english` with `SET ANSI_WARNINGS OFF` on the
+    next line was one statement to `check` and two to the server (confirmed on SQL Server 2022 —
+    the second `SET` takes effect), so every refused switch, or a `DELETE` on every ping — on a
+    read-only connection too, since its guard runs after the init — was one line-break away. On
+    MariaDB the value went unread the same way, and `SET @x = NEXT VALUE FOR s` advanced a sequence
+    on every operation (`a_setting_takes_one_value_and_nothing_follows_it`). PostgreSQL's arm keeps
+    its value lists (`search_path TO app, public`): it needs a `;` between statements.
     **Each statement is tokenised, not word-scanned** — `tokens`, over `sql::statement_ranges` and
     `skip_noncode`, the one boundary lexer, with a quoted name told from a string by
     `intel::ident_quote` and **kept as a `Tok::Quoted` token rather than skipped**. Don't tidy that

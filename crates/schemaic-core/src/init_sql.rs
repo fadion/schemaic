@@ -345,6 +345,45 @@ fn value_text(t: Option<&Tok>) -> Option<&str> {
     }
 }
 
+/// `v` is **exactly one literal value** and nothing after it: a word, a string
+/// (T-SQL's `N'…'` too), or a number, signed or with a fraction.
+///
+/// **Every arm that takes a value reads it here, to the end of the
+/// statement.** The arms used to return once they had read a listed name, and
+/// T-SQL needs no `;` between statements: `SET LANGUAGE us_english` with `SET
+/// ANSI_WARNINGS OFF` on the next line was one statement to [`check`] and two
+/// to the server. MariaDB's `NEXT VALUE FOR s`, read past the same way,
+/// advanced a sequence on every operation.
+fn one_value(v: &[Tok]) -> Result<(), String> {
+    let digits = |w: &str| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit());
+    let v = match v {
+        [Tok::Punct(b'-' | b'+'), rest @ ..] => rest,
+        _ => v,
+    };
+    let one = match v {
+        [Tok::Word(_)] | [Tok::Str(_)] => true,
+        [Tok::Word(n), Tok::Str(_)] => n == "N",
+        [Tok::Word(a), Tok::Punct(b'.'), Tok::Word(b)] => digits(a) && digits(b),
+        [Tok::Punct(b'.'), Tok::Word(b)] => digits(b),
+        _ => false,
+    };
+    if one {
+        Ok(())
+    } else {
+        Err("a setting takes one value when connecting, and nothing may follow it".into())
+    }
+}
+
+/// `v` is `= value` (MySQL's `:=` too) with [`one_value`] after it.
+fn assigned(v: &[Tok]) -> Result<(), String> {
+    match v {
+        [Tok::Punct(b'='), value @ ..] | [Tok::Punct(b':'), Tok::Punct(b'='), value @ ..] => {
+            one_value(value)
+        }
+        _ => Err("a setting takes one value when connecting, after an =".into()),
+    }
+}
+
 /// `v` is one character-set value `utf8` accepts, optionally followed — where
 /// `collate` — by `COLLATE` and a UTF-8 collation, and nothing else.
 fn charset(v: &[Tok], utf8: fn(&str) -> bool, collate: bool) -> Result<(), String> {
@@ -379,13 +418,29 @@ fn postgres_utf8(v: &str) -> bool {
     n == "utf8" || n == "unicode"
 }
 
-/// A `SET TRANSACTION …` — only an isolation level, and only where the
-/// read-only guard is a rollback, which an isolation level cannot lift;
-/// elsewhere the transaction characteristics *are* the guard.
+/// A `SET TRANSACTION …` — only an isolation level, named whole and with
+/// nothing after it ([`one_value`]'s rule), and only where the read-only
+/// guard is a rollback, which an isolation level cannot lift; elsewhere the
+/// transaction characteristics *are* the guard.
 fn transaction(dialect: SqlDialect, after: &[Tok]) -> Result<(), String> {
+    let level: Vec<&str> = after
+        .iter()
+        .skip(2)
+        .map(|t| match t {
+            Tok::Word(w) => w.as_str(),
+            _ => "",
+        })
+        .collect();
+    let known = matches!(
+        level.as_slice(),
+        ["READ", "UNCOMMITTED" | "COMMITTED"]
+            | ["REPEATABLE", "READ"]
+            | ["SNAPSHOT" | "SERIALIZABLE"]
+    );
     if dialect.read_only_is_a_rollback()
         && is_word(after.first(), "ISOLATION")
         && is_word(after.get(1), "LEVEL")
+        && known
     {
         Ok(())
     } else {
@@ -424,11 +479,13 @@ fn mysql(rest: &[Tok], dialect: SqlDialect) -> Result<(), String> {
 /// One MySQL assignment: `@user = …` (a user variable, which sets nothing
 /// Schemaic reads), or `[SESSION|LOCAL] name = …`, `@@[session.]name = …`,
 /// `NAMES …`, `CHARACTER SET …` — the name on [`MYSQL_SETTINGS`], the scope
-/// never `GLOBAL`/`PERSIST`/`PERSIST_ONLY`.
+/// never `GLOBAL`/`PERSIST`/`PERSIST_ONLY`, and the value one literal
+/// ([`assigned`]): a variable's too, since `NEXT VALUE FOR s` is a value
+/// that writes.
 fn mysql_assignment(p: &[Tok], dialect: SqlDialect) -> Result<(), String> {
     let at = p.iter().take_while(|t| **t == Tok::Punct(b'@')).count();
     if at == 1 {
-        return Ok(());
+        return assigned(p.get(2..).unwrap_or_default());
     }
     let mut i = at;
     if let Some(Tok::Word(scope)) = p.get(i) {
@@ -454,7 +511,7 @@ fn mysql_assignment(p: &[Tok], dialect: SqlDialect) -> Result<(), String> {
         "CHARSET" => charset(&p[i + 1..], mysql_utf8, false),
         "CHARACTER" if is_word(p.get(i + 1), "SET") => charset(&p[i + 2..], mysql_utf8, false),
         "TRANSACTION" => transaction(dialect, &p[i + 1..]),
-        n if MYSQL_SETTINGS.contains(&n) => Ok(()),
+        n if MYSQL_SETTINGS.contains(&n) => assigned(&p[i + 1..]),
         n => Err(not_listed(n)),
     }
 }
@@ -502,7 +559,8 @@ fn mssql(rest: &[Tok], dialect: SqlDialect) -> Result<(), String> {
         return transaction(dialect, &rest[1..]);
     }
     if MSSQL_VALUE_SETTINGS.contains(&name) {
-        return Ok(());
+        // One value, to the end: the next `SET` needs no `;` in T-SQL.
+        return one_value(&rest[1..]);
     }
     let Some((value, names)) = rest.split_last() else {
         return Err(not_listed(name));
@@ -767,6 +825,52 @@ mod tests {
             ("PRAGMA main.query_only = 1", LITE),
         ] {
             assert!(check(sql, d).is_err(), "{sql}");
+        }
+    }
+
+    /// **A setting takes one value, and the statement ends there.** T-SQL
+    /// needs no `;` between statements, and the arms returned as soon as they
+    /// had read a listed name: `SET LANGUAGE us_english` with `SET
+    /// ANSI_WARNINGS OFF` on the next line was one statement to the allowlist
+    /// and two to the server — the refused switch, or a `DELETE` on every
+    /// ping, even on a read-only connection, whose guard runs after the init.
+    /// On MariaDB the value went unread: `SET @x = NEXT VALUE FOR s` advanced
+    /// a sequence on every operation.
+    #[test]
+    fn a_setting_takes_one_value_and_nothing_follows_it() {
+        for (sql, d) in [
+            ("SET LANGUAGE us_english\nSET ANSI_WARNINGS OFF", MS),
+            ("SET LANGUAGE us_english DELETE FROM dbo.audit", MS),
+            ("SET DATEFORMAT ymd SET TEXTSIZE 10", MS),
+            (
+                "SET TRANSACTION ISOLATION LEVEL SNAPSHOT SET ROWCOUNT 1",
+                MS,
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED DELETE FROM t",
+                MS,
+            ),
+            ("SET LOCK_TIMEOUT 1000 EXEC dbo.purge", MS),
+            ("SET @x = NEXT VALUE FOR s", MY),
+            ("SET time_zone = NEXT VALUE FOR s", MY),
+            ("SET @x = 1 + 1", MY),
+            ("SET wait_timeout", MY),
+        ] {
+            assert!(check(sql, d).is_err(), "{sql}: {:?}", check(sql, d));
+        }
+        // What one value can look like still passes.
+        for (sql, d) in [
+            ("SET LOCK_TIMEOUT -1", MS),
+            ("SET DEADLOCK_PRIORITY -5", MS),
+            ("SET LANGUAGE N'us_english'", MS),
+            ("SET CONTEXT_INFO 0x01", MS),
+            ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", MS),
+            ("SET TRANSACTION ISOLATION LEVEL SNAPSHOT", MS),
+            ("SET long_query_time = 0.5", MY),
+            ("SET @tenant := 'acme'", MY),
+            ("SET wait_timeout = DEFAULT", MY),
+        ] {
+            assert!(check(sql, d).is_ok(), "{sql}: {:?}", check(sql, d));
         }
     }
 }
