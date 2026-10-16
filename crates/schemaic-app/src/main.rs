@@ -15367,6 +15367,14 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
             let ordered = ctx.order_by.is_some();
             ctx.partial.set(full);
             let snap = Snapshot::from_result(&rs, &key_cols).window(ordered, full);
+            // Every poll's binary marks, not the baseline's alone: SQLite marks
+            // a column as blobs arrive in it (`monitor::merge_length_only`).
+            if let Some(grown) = ctx
+                .length_only
+                .with_untracked(|known| schemaic_core::monitor::merge_length_only(known, &rs))
+            {
+                ctx.length_only.set(grown);
+            }
             if let Some(prev) = ctx.prev.borrow().as_ref() {
                 let changes = diff_snapshots(prev, &snap);
                 if !changes.is_empty() {

@@ -9817,7 +9817,10 @@ existing prose was left alone.
     `ResultSet::binary_columns`, as `result_diff` decides — so the modal's footer can say so rather
     than let the log read as complete (`a_binary_column_is_watched_by_length_only`). It is a
     caveat, not a fix: the
-    bytes are not in the result to compare.
+    bytes are not in the result to compare. `merge_length_only(prev, rs)` is that list grown by a
+    poll — `None` where the poll adds no column — since SQLite marks a column binary as blobs
+    arrive in it, so a later poll can name one the baseline could not, and a column once seen by
+    length stays so (`a_column_marked_after_the_baseline_joins_the_length_only_list`).
     **A `Snapshot` records *how it was taken* in two flags, and they were one.** `ordered` says the
     poll asked the server for a deterministic total order (`ORDER BY` the key), so position means
     something and two windows are comparable as prefixes of one sequence; `window_full` says the
@@ -11101,7 +11104,11 @@ existing prose was left alone.
     walks every connection's entries, so `MAX_PER_CONN` alone bounds that list per connection and
     not in total — which is why **`panel_view(entries, scope, query, cap)` is what the panel
     lists**: `in_view`'s entries, newest first as stored, cut at `cap` (the panel passes
-    `MAX_PER_CONN`), and `matched`, how many there were in all. One connection's view is never cut;
+    `MAX_PER_CONN`), and `matched`, how many there were in all. One connection's view is never cut,
+    **over the cap either** — a Run Everything's batch holds a connection above `MAX_PER_CONN`
+    until its first verdict, `push_batch`'s bound being twice it, and the *Current* tab then hid
+    real history under *Showing the newest 200 of 350*
+    (`a_connection_over_the_cap_during_a_batch_is_listed_whole`);
     *All* over ten full connections was 2,000 highlighted rows rebuilt on every run and search
     keystroke, ten times what the cap was sized for. The search narrows before the cut, so an old
     statement past it is still found by searching
@@ -30907,7 +30914,8 @@ existing prose was left alone.
     replaced by **every** caveat that applies, joined, in `Tone::Warn`. `partial` (only the first
     `ROW_CAP` rows are watched) and `capped` co-occur and neither replaces the other. `length_only`
     is the third (S6.1-L1-05): the watched columns `monitor::length_only_columns` names on the
-    baseline poll, held in `overlay.monitor_length_only` (`MonitorCtx::length_only`, reset by
+    baseline poll, and each later poll adds to (`monitor::merge_length_only` — SQLite marks a
+    column binary only as blobs arrive), held in `overlay.monitor_length_only` (`MonitorCtx::length_only`, reset by
     `open_monitor`), said as *"photo is binary, so its changes are seen by length only"* — plural
     *are … their* for several (`a_binary_column_is_said_to_be_watched_by_length_only`). A blob's
     snapshot cell is `<n bytes>`, so a blob rewritten at the same length is no change to the poll,

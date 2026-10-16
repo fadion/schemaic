@@ -227,6 +227,19 @@ pub fn length_only_columns(rs: &ResultSet) -> Vec<String> {
         .collect()
 }
 
+/// `prev`'s length-only columns with those `rs` adds ([`length_only_columns`]),
+/// or `None` where it adds none — so the caller writes its signal only when
+/// the list grows. Asked on every poll, not only the baseline: SQLite marks a
+/// column binary as blobs arrive in it, so a later poll can name one the
+/// baseline could not, and a column once seen by length stays so.
+pub fn merge_length_only(prev: &[String], rs: &ResultSet) -> Option<Vec<String>> {
+    let new: Vec<String> = length_only_columns(rs)
+        .into_iter()
+        .filter(|c| !prev.contains(c))
+        .collect();
+    (!new.is_empty()).then(|| prev.iter().cloned().chain(new).collect())
+}
+
 /// What happened to a row between two snapshots.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChangeKind {
@@ -867,6 +880,40 @@ mod tests {
         // SQLite's per-value mark counts too.
         rs.binary_columns = vec![2];
         assert_eq!(length_only_columns(&rs), ["photo", "note"]);
+    }
+
+    /// **A column first marked after the baseline joins the footer**
+    /// (S5-L1-04): SQLite marks a column binary per value, as blobs arrive,
+    /// and the footer was computed from the baseline alone — so a text
+    /// column a later write filled with a blob was seen by length only and
+    /// never named. Each poll's marks are added, none taken away.
+    #[test]
+    fn a_column_marked_after_the_baseline_joins_the_length_only_list() {
+        use crate::model::{Column, ResultBuilder, Value};
+        let col = |n: &str| Column {
+            name: n.into(),
+            type_name: "TEXT".into(),
+            origin: None,
+        };
+        let mut b = ResultBuilder::new(vec![col("id"), col("payload")]);
+        b.push_row(&[Value::Int(1), Value::Str("x".into())]);
+        let mut rs = b.finish();
+        let prev: Vec<String> = Vec::new();
+        assert_eq!(
+            merge_length_only(&prev, &rs),
+            None,
+            "nothing new, nothing to set"
+        );
+        rs.binary_columns = vec![1];
+        assert_eq!(
+            merge_length_only(&prev, &rs),
+            Some(vec!["payload".to_string()])
+        );
+        let known = vec!["payload".to_string()];
+        assert_eq!(merge_length_only(&known, &rs), None);
+        // A later poll without the mark does not take the name away.
+        rs.binary_columns.clear();
+        assert_eq!(merge_length_only(&known, &rs), None);
     }
 
     /// **A shift, not a set difference.** The whole snapshot pipeline is

@@ -697,14 +697,18 @@ pub struct PanelView {
 /// **The cap is what keeps the *All* tab inside the bound [`MAX_PER_CONN`] was
 /// sized for**: the panel builds a highlighted row for every entry it shows,
 /// with no virtual list, on each run and each search keystroke — and with
-/// every connection listed that was ten connections' 200 apiece. One
-/// connection's view never reaches it.
+/// every connection listed that was ten connections' 200 apiece. **One
+/// connection's view is not cut at all**: it is bounded already, at twice the
+/// cap between a Run Everything's launch and its first verdict
+/// ([`push_batch`]), and cut at the cap it hid real history under a
+/// "newest 200 of 350" note.
 pub fn panel_view(
     entries: &[HistoryEntry],
     scope: Option<u64>,
     query: &str,
     cap: usize,
 ) -> PanelView {
+    let cap = if scope.is_some() { usize::MAX } else { cap };
     let mut rows = Vec::new();
     let mut matched = 0;
     for e in entries.iter().filter(|e| in_view(e, scope, query)) {
@@ -935,6 +939,27 @@ mod tests {
         let found = panel_view(&entries, None, "SELECT 0 FROM t1_", MAX_PER_CONN);
         assert_eq!(found.matched, 1);
         assert_eq!(found.rows[0].sql, "SELECT 0 FROM t1_");
+    }
+
+    /// **One connection's view is never cut — over the cap too** (S5-L1-03):
+    /// a Run Everything's batch holds a connection above `MAX_PER_CONN` until
+    /// its first verdict (`push_batch`'s bound is twice it), and the *Current*
+    /// tab then hid real history under "Showing the newest 200 of 350".
+    #[test]
+    fn a_connection_over_the_cap_during_a_batch_is_listed_whole() {
+        let entries: Vec<HistoryEntry> = (0..MAX_PER_CONN + 50)
+            .map(|i| entry(7, &format!("SELECT {i}"), i as u64))
+            .collect();
+        let one = panel_view(&entries, Some(7), "", MAX_PER_CONN);
+        assert_eq!(
+            (one.rows.len(), one.matched),
+            (MAX_PER_CONN + 50, MAX_PER_CONN + 50)
+        );
+        // The *All* tab still is.
+        assert_eq!(
+            panel_view(&entries, None, "", MAX_PER_CONN).rows.len(),
+            MAX_PER_CONN
+        );
     }
 
     fn entry(conn_id: u64, sql: &str, ts: u64) -> HistoryEntry {
