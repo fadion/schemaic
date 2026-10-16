@@ -26,8 +26,11 @@ use std::collections::HashMap;
 
 use crate::model::{CellTag, ResultSet};
 
-/// One row's key or whole-row identity: each cell's text, `None` for NULL.
-type RowKey = Vec<Option<String>>;
+/// One row's key or whole-row identity: each cell's text, `None` for NULL —
+/// **borrowed from the result**, never copied: a `String` per cell cost
+/// 0.35 s keyed and 0.68 s whole-row per open or swap at 200k × 20
+/// (release), on the UI thread.
+type RowKey<'a> = Vec<Option<&'a str>>;
 
 /// A row present in both results with at least one value that differs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,8 +232,8 @@ pub fn row_cells(
 }
 
 /// A value as one line of a table cell — [`crate::text::cell_line`].
-fn table_value(v: Option<String>) -> String {
-    crate::text::cell_line(v.as_deref())
+fn table_value(v: Option<&str>) -> String {
+    crate::text::cell_line(v)
 }
 
 /// Why two results cannot be compared by the key asked for.
@@ -448,12 +451,12 @@ fn col(rs: &ResultSet, name: &str) -> Option<usize> {
     rs.columns.iter().position(|c| c.name == name)
 }
 
-fn cell(rs: &ResultSet, row: usize, col: usize) -> Option<String> {
+fn cell(rs: &ResultSet, row: usize, col: usize) -> Option<&str> {
     let c = rs.cell(row, col)?;
-    (c.tag != CellTag::Null).then(|| c.text().to_string())
+    (c.tag != CellTag::Null).then(|| c.text())
 }
 
-fn row_key(rs: &ResultSet, row: usize, cols: &[usize]) -> RowKey {
+fn row_key<'a>(rs: &'a ResultSet, row: usize, cols: &[usize]) -> RowKey<'a> {
     cols.iter().map(|&c| cell(rs, row, c)).collect()
 }
 
@@ -865,5 +868,24 @@ mod tests {
         assert_eq!(suggested_key(&u, &u), ["code"]);
         let none = rs(&["n"], &[&[i(1)], &[i(1)]]);
         assert!(suggested_key(&none, &none).is_empty());
+    }
+
+    /// **A row's key is the result's own text, not a copy of it.** A
+    /// `String` per compared cell was most of what an open or a swap cost:
+    /// at 200k × 20, release, 0.35 s keyed and 0.68 s whole-row before,
+    /// 0.13 s and 0.32 s borrowed. A timing bound cannot tell the two apart
+    /// in a loaded debug run (1.2 s against 0.6 s), so this pins the cause:
+    /// the key points into the result.
+    #[test]
+    fn a_row_key_borrows_the_results_text() {
+        let a = rs(&["id", "name"], &[&[i(1), s("a")]]);
+        let k: Vec<Option<&str>> = row_key(&a, 0, &[0, 1]);
+        for (c, text) in k.iter().enumerate() {
+            let held = a.cell(0, c).unwrap().text();
+            assert!(
+                std::ptr::eq(text.unwrap().as_ptr(), held.as_ptr()),
+                "column {c} was copied"
+            );
+        }
     }
 }

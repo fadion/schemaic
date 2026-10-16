@@ -513,7 +513,12 @@ existing prose was left alone.
     `rows.remove(0)`**: the remove shifted the whole bucket per match, quadratic in a column of few
     distinct values, and 300,000 equal rows took about 25 s on the UI thread (the fix's own
     measurement; `whole_row_identity_over_many_equal_rows_is_linear` holds it under 5 s). Don't
-    tidy it back. A key column one side lacks is `DiffError::MissingKey`
+    tidy it back. **A row's key borrows the result's text** (`RowKey<'a>`, `Option<&str>` per
+    cell) rather than copying it: a `String` per compared cell was most of an open's or a swap's
+    cost — at 200k × 20 in release, 0.35 s keyed and 0.68 s whole-row before, 0.13 s and 0.32 s
+    after (S5-L4-01). A timing bound could not tell the two apart in a loaded debug run, so
+    `a_row_key_borrows_the_results_text` pins the cause instead: each key cell points into the
+    result. A key column one side lacks is `DiffError::MissingKey`
     (`a_key_one_side_lacks_is_refused`).
     **Values compare by their displayed text, NULL being its own value**, so `1` and `1.0` from two
     engines differ, as they would on screen, and NULL is not `''`
