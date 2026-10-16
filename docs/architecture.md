@@ -32959,8 +32959,9 @@ existing prose was left alone.
   db.schema.table` and it has no `sql`, the rows being the file's. *Copy to*'s rows are
   `Source::Copy`, logged against the **target** connection in `copy_rows`' report with no `sql`
   and the detail `copy <SELECT> into db.schema.table` — the `SELECT` being `copy_table::select_sql`,
-  identifiers and the engine's own read-as-text wrappers for binary columns (`HEX()`, `encode(…, 'hex')`, `quote()`)
-  but never a value; its `CREATE` is the DDL preview's entry like any plan's. A copy whose rows
+  each column as `copy_table::read_form` reads it (see `core/copy_table.rs` for the forms, which
+  differ by engine and on SQLite wrap every column), but never a value; its `CREATE` is the DDL
+  preview's entry like any plan's. A copy whose rows
   committed but whose PostgreSQL settle failed is logged `failed` **with the committed count** in
   `rows` — the report's payload is `Result<u64, (Option<u64>, Option<String>)>`, its `Option<u64>`
   `Some` only for that case — so the line does not read as a copy that wrote nothing.
@@ -35425,7 +35426,9 @@ existing prose was left alone.
     output whose folder does not exist, or that is itself a folder, as a usage error before
     anything is read — `run.rs`'s `output_problem`, which `run_dump` shares; a folder used to get
     through and fail only at the final rename, after the whole query had run
-    (`an_output_that_is_a_folder_is_the_command_lines_mistake`). Verified live:
+    (`an_output_that_is_a_folder_is_the_command_lines_mistake`). Its one filesystem question,
+    `is_dir`, is a seam (`output_problem_with`), so the tests model the folders rather than stat
+    the checkout's, which the house rule's source-reading exemption does not cover. Verified live:
     25,000 rows from PostgreSQL to CSV across three chunks, a `DELETE` refused with exit 3, and an
     XLSX from SQL Server; the read itself has no unit test.
   - `cli/catalog.rs` — the canned SQL behind `schemaic tables` and `schemaic describe <table>`: two
@@ -39676,9 +39679,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   `no_view_code_clears_or_retains_a_signal_unguarded` scans both view crates for the two spellings
   it names, floored on finding the guarded sites so a rename or a moved `src` cannot make it pass by
   matching nothing. Its `EXEMPT` allowlist is `(file, line fragment, why)` — writes that always
-  change something, so the notification is the point: a dismissed error message, and the three
+  change something, so the notification is the point: a dismissed error message, the three
   `retain`s that delete a tab or a connection by an id that
-  came out of the list being filtered. `every_clear_exemption_still_names_a_real_write` is the floor
+  came out of the list being filtered, and a connection import row's own `notes` — a `Vec` field
+  on the row rather than a collection signal, rewritten on the next line. `every_clear_exemption_still_names_a_real_write` is the floor
   under *that*, `scaled_arg_gate`'s instrument applied a second time, because an exemption matching
   nothing is a hole and not a permission.
   **That counting is available to any test, and is worth knowing before you decide something is only

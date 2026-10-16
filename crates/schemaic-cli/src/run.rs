@@ -692,7 +692,17 @@ async fn run_dump(
 /// there, or a path that is itself a folder — which used to fail only at the
 /// final rename, after the whole `what` had run.
 fn output_problem(output: &std::path::Path, what: &str) -> Option<String> {
-    if output.is_dir() {
+    output_problem_with(output, what, std::path::Path::is_dir)
+}
+
+/// [`output_problem`] over `is_dir`, the one filesystem question it asks —
+/// a seam, so its tests model the folders rather than stat the machine's.
+fn output_problem_with(
+    output: &std::path::Path,
+    what: &str,
+    is_dir: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    if is_dir(output) {
         return Some(format!(
             "{} is a folder: name the file to write the {what} to",
             output.display()
@@ -700,7 +710,7 @@ fn output_problem(output: &std::path::Path, what: &str) -> Option<String> {
     }
     output
         .parent()
-        .filter(|d| !d.as_os_str().is_empty() && !d.is_dir())
+        .filter(|d| !d.as_os_str().is_empty() && !is_dir(d))
         .map(|dir| format!("no folder {} to write the {what} in", dir.display()))
 }
 
@@ -2484,31 +2494,40 @@ mod tests {
         );
     }
 
+    /// The folders a test's machine holds — `output_problem_with`'s seam, so
+    /// no test stats the real filesystem.
+    fn folders(dirs: &'static [&'static str]) -> impl Fn(&std::path::Path) -> bool {
+        move |p| dirs.iter().any(|d| std::path::Path::new(d) == p)
+    }
+
     /// **`-o` naming a folder is refused before anything is read**, not at
-    /// the rename after a whole dump. The crate's own directory stands in for
-    /// one — the repository's source, the exempt kind of filesystem read.
+    /// the rename after a whole dump.
     #[test]
     fn an_output_that_is_a_folder_is_the_command_lines_mistake() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let why = output_problem(dir, "dump").expect("a folder is refused");
+        let out = std::path::Path::new("backups");
+        let why = output_problem_with(out, "dump", folders(&["backups"])).expect("refused");
         assert!(why.contains("is a folder"), "{why}");
         assert!(why.contains("dump"), "{why}");
     }
 
     #[test]
     fn an_output_in_a_missing_folder_is_refused() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let out = dir.join("no-such-folder").join("x.sql");
-        let why = output_problem(&out, "export").expect("refused");
+        let out = std::path::Path::new("backups")
+            .join("no-such-folder")
+            .join("x.sql");
+        let why = output_problem_with(&out, "export", folders(&["backups"])).expect("refused");
         assert!(why.starts_with("no folder"), "{why}");
     }
 
     #[test]
     fn a_new_file_in_an_existing_folder_or_a_bare_name_passes() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert_eq!(output_problem(&dir.join("not-there.sql"), "dump"), None);
+        let out = std::path::Path::new("backups").join("not-there.sql");
         assert_eq!(
-            output_problem(std::path::Path::new("not-there.sql"), "dump"),
+            output_problem_with(&out, "dump", folders(&["backups"])),
+            None
+        );
+        assert_eq!(
+            output_problem_with(std::path::Path::new("not-there.sql"), "dump", folders(&[])),
             None
         );
     }
