@@ -27957,10 +27957,10 @@ mod tests {
             }
             assert!(!col_errors_d(sql, SqlDialect::Sqlite).is_empty(), "{sql}");
         }
-        assert_eq!(SqlDialect::MySql.names_fold_unicode_case(), true);
-        assert_eq!(SqlDialect::MsSql.names_fold_unicode_case(), true);
-        assert_eq!(SqlDialect::Sqlite.names_fold_unicode_case(), false);
-        assert_eq!(SqlDialect::Postgres.names_fold_unicode_case(), false);
+        assert!(SqlDialect::MySql.names_fold_unicode_case());
+        assert!(SqlDialect::MsSql.names_fold_unicode_case());
+        assert!(!SqlDialect::Sqlite.names_fold_unicode_case());
+        assert!(!SqlDialect::Postgres.names_fold_unicode_case());
     }
 
     /// The statement the app generates for a keyless SQLite table, verbatim.
