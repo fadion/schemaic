@@ -3226,6 +3226,7 @@ mod tests {
             schema: None,
             parent: "events".into(),
             bound: "FOR VALUES FROM (1) TO (10)".into(),
+            ..Default::default()
         });
         let schema = DbSchema {
             tables: vec![events, part],
@@ -3252,6 +3253,7 @@ mod tests {
             schema: None,
             parent: parent.into(),
             bound: bound.into(),
+            ..Default::default()
         };
         let mut events = tbl("events", vec![c("id", "int", false, true)]);
         events.partitioning = Some(schemaic_core::schema::Partitioning {

@@ -5477,6 +5477,7 @@ mod tests {
             schema: None,
             parent: "zz_events".into(),
             bound: "FOR VALUES FROM (1) TO (10)".into(),
+            ..Default::default()
         });
         schema_of(vec![child, table("customers"), parent])
     }
@@ -5544,6 +5545,7 @@ mod tests {
             schema: None,
             parent: "zz_events".into(),
             bound: "FOR VALUES FROM (10) TO (20)".into(),
+            ..Default::default()
         });
         s.tables.push(sibling);
         s
@@ -5785,6 +5787,7 @@ mod tests {
             schema: None,
             parent: "aa_2024".into(),
             bound: "FOR VALUES FROM (1) TO (4)".into(),
+            ..Default::default()
         });
         s.tables.push(leaf);
         let named: Vec<&str> = named_parents(&s.tables, &["aa_2024_q1".to_string()])

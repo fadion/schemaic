@@ -206,6 +206,7 @@ live_suite!(
         a_replay_keeps_the_types_and_sequences_it_carries,
         a_replay_restores_a_mariadb_sequence_and_its_position,
         a_partition_replay_fires_no_parent_trigger_on_its_rows,
+        a_partition_replay_keeps_its_own_defaults_and_not_null,
     ],
     streaming: [
         a_streamed_export_delivers_every_row,

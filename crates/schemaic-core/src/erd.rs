@@ -1711,6 +1711,7 @@ mod tests {
             schema: None,
             parent: "orders".into(),
             bound: "DEFAULT".into(),
+            ..Default::default()
         });
         s.tables.push(part);
         let g = build_graph(&s, "shop", &DiagramSeed::Database);
@@ -1752,6 +1753,7 @@ mod tests {
             schema: None,
             parent: "orders".into(),
             bound: "DEFAULT".into(),
+            ..Default::default()
         });
         s.tables.push(part);
         let details = s

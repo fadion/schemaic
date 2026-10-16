@@ -610,3 +610,80 @@ pub async fn a_partition_replay_fires_no_parent_trigger_on_its_rows(target: &'st
     assert_eq!(count(&s, "audit").await, "4", "{}", target.name);
     s.teardown().await;
 }
+
+/// **A partition's replay keeps the default and `NOT NULL` it holds of its
+/// own.** `PARTITION OF` gives a partition its parent's, so the file restates
+/// the partition's as `WITH OPTIONS` (and drops a default it does not have) —
+/// before, a replay onto the source put back the parent's under a success
+/// report.
+pub async fn a_partition_replay_keeps_its_own_defaults_and_not_null(target: &'static Target) {
+    let s = Scratch::create(target, "replay_part_own").await;
+    if !partitions_are_tables(s.dialect()) {
+        crate::endpoint::note_no_op(target, "a partition is not a table to dump here");
+        s.teardown().await;
+        return;
+    }
+    let (events, part) = (s.qualified("events"), s.qualified("events_2024"));
+    s.exec(&format!(
+        "CREATE TABLE {events} (id INTEGER NOT NULL, at DATE NOT NULL, \
+         kind TEXT DEFAULT 'parent', note TEXT, gone TEXT DEFAULT 'parent') \
+         PARTITION BY RANGE (at)"
+    ))
+    .await;
+    s.exec(&format!(
+        "CREATE TABLE {part} PARTITION OF {events} \
+         FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')"
+    ))
+    .await;
+    s.exec(&format!(
+        "ALTER TABLE {part} ALTER COLUMN kind SET DEFAULT 'own', \
+         ALTER COLUMN note SET NOT NULL, ALTER COLUMN gone DROP DEFAULT"
+    ))
+    .await;
+    s.exec(&format!(
+        "INSERT INTO {events} (id, at, note) VALUES (1, '2024-02-01', 'n')"
+    ))
+    .await;
+    let options = || async {
+        let r = s
+            .exec(&format!(
+                "SELECT a.attname, a.attnotnull::text, \
+                        COALESCE(pg_get_expr(d.adbin, d.adrelid), '-') \
+                 FROM pg_attribute a \
+                 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                 WHERE a.attrelid = '{part}'::regclass AND a.attnum > 0 \
+                 AND NOT a.attisdropped ORDER BY a.attnum"
+            ))
+            .await;
+        (0..r.row_count())
+            .map(|i| {
+                (0..3)
+                    .map(|c| r.cell(i, c).expect("a cell").display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = options().await;
+    assert!(
+        before.contains(&"kind false 'own'::text".to_string()),
+        "{}: {before:?}",
+        target.name
+    );
+
+    let file = dump_of(&s, &["events_2024"]).await;
+    assert_eq!(
+        run_file(&s, &file).await,
+        ExecEnd::Done,
+        "{}: the partition's dump did not replay:\n{file}",
+        target.name
+    );
+    assert_eq!(
+        options().await,
+        before,
+        "{}: the replay put back the parent's options:\n{file}",
+        target.name
+    );
+    assert_eq!(count(&s, "events_2024").await, "1", "{}", target.name);
+    s.teardown().await;
+}

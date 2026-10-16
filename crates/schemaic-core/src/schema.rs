@@ -1755,6 +1755,63 @@ pub struct PartitionOf {
     pub parent: String,
     /// `FOR VALUES …` or `DEFAULT`, as `pg_get_expr(relpartbound)` prints it.
     pub bound: String,
+    /// The partition's columns whose default or `NOT NULL` is **its own** —
+    /// a default other than its parent's (or none where the parent has one),
+    /// a `NOT NULL` the parent's column does not carry — in column order.
+    /// Filled by [`mark_partitions_own_columns`].
+    ///
+    /// PostgreSQL lets a partition hold both (measured on 16), and
+    /// `PARTITION OF` gives it only the parent's: [`TableInfo::create_ddl`]
+    /// restates these as `WITH OPTIONS`, or a dump's replay lost them under a
+    /// success report. Not part of which table it is a partition of, so
+    /// [`Self::same_place`] leaves it out.
+    pub own_columns: Vec<String>,
+}
+
+impl PartitionOf {
+    /// The same parent and the same bound — what makes a partition the one
+    /// it is, which no `ALTER` changes. [`Self::own_columns`] is not part of
+    /// it: a differing default is an ordinary column difference.
+    pub fn same_place(&self, other: &PartitionOf) -> bool {
+        self.schema == other.schema && self.parent == other.parent && self.bound == other.bound
+    }
+}
+
+/// Fill each partition's [`PartitionOf::own_columns`] by comparing its
+/// columns with its parent's, where the parent is among `tables`. A column
+/// that is generated or an identity takes neither from the partition, and a
+/// partition whose parent was not read is left as it is.
+pub fn mark_partitions_own_columns(tables: &mut [TableInfo]) {
+    let marks: Vec<(usize, Vec<String>)> = tables
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let of = t.partition_of.as_ref()?;
+            let parent_schema = of.schema.as_ref().or(t.schema.as_ref());
+            let parent = tables
+                .iter()
+                .find(|p| p.name == of.parent && p.schema.as_ref() == parent_schema)?;
+            let own = t
+                .columns
+                .iter()
+                .filter(|c| c.generated.is_none() && !c.auto_increment)
+                .filter(|c| {
+                    parent
+                        .columns
+                        .iter()
+                        .find(|p| p.name == c.name)
+                        .is_some_and(|p| c.default != p.default || (!c.nullable && p.nullable))
+                })
+                .map(|c| c.name.clone())
+                .collect();
+            Some((i, own))
+        })
+        .collect();
+    for (i, own) in marks {
+        if let Some(of) = tables[i].partition_of.as_mut() {
+            of.own_columns = own;
+        }
+    }
 }
 
 /// **Does a `CREATE TABLE` restate the partitioning?** On PostgreSQL and
@@ -5961,8 +6018,39 @@ impl TableInfo {
                         .any(|ix| ix.is_primary() && !ix.inherited)
                         .then(|| format!("  PRIMARY KEY ({})", pk.join(", ")))
                         .filter(|_| !pk.is_empty());
-                    let checks: Vec<String> = own_key
+                    // **Its own default and `NOT NULL`**, which the clause
+                    // gives it only as its parent's; a default it does not
+                    // have where the parent does is dropped after it.
+                    let mut options = Vec::new();
+                    let mut dropped_defaults = Vec::new();
+                    for c in self
+                        .columns
+                        .iter()
+                        .filter(|c| of.own_columns.contains(&c.name))
+                    {
+                        let mut line = format!("  {} WITH OPTIONS", q(&c.name));
+                        if !c.nullable {
+                            line.push_str(" NOT NULL");
+                        }
+                        match &c.default {
+                            Some(d) if is_bare_default(d, dialect) => {
+                                line.push_str(&format!(" DEFAULT {d}"));
+                            }
+                            Some(d) => line.push_str(&format!(" DEFAULT ({d})")),
+                            None => dropped_defaults.push(format!(
+                                "\nALTER TABLE ONLY {qname} ALTER COLUMN {} DROP DEFAULT;",
+                                q(&c.name)
+                            )),
+                        }
+                        // A column whose only difference was a dropped
+                        // default has no option left to state here.
+                        if !line.ends_with("WITH OPTIONS") {
+                            options.push(line);
+                        }
+                    }
+                    let checks: Vec<String> = options
                         .into_iter()
+                        .chain(own_key)
                         .chain(
                             self.check_constraints
                                 .iter()
@@ -5975,8 +6063,9 @@ impl TableInfo {
                         format!(" (\n{}\n)", checks.join(",\n"))
                     };
                     format!(
-                        "CREATE TABLE {qname} PARTITION OF {parent}{own} {}{by};",
-                        of.bound
+                        "CREATE TABLE {qname} PARTITION OF {parent}{own} {}{by};{}",
+                        of.bound,
+                        dropped_defaults.concat()
                     )
                 }
                 None => format!("CREATE TABLE {qname} (\n{}\n){by};", lines.join(",\n")),
@@ -10367,6 +10456,7 @@ mod tests {
                 schema: Some("public".into()),
                 parent: "measurements".into(),
                 bound: "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')".into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -10428,6 +10518,115 @@ mod tests {
         child.indexes.last_mut().unwrap().inherited = true;
         let inherited = child.create_ddl(pg);
         assert!(!inherited.contains("PRIMARY KEY"), "{inherited}");
+    }
+
+    /// **A partition's own default and `NOT NULL` are marked** against its
+    /// parent's columns — and only those: a default the same as the
+    /// parent's, a `NOT NULL` the parent has too, and an identity or
+    /// generated column are not the partition's.
+    #[test]
+    fn a_partitions_own_column_options_are_marked_against_its_parent() {
+        let (mut parent, mut child) = partitioned_pair();
+        let col = |n: &str| ColumnInfo {
+            name: n.into(),
+            type_name: "integer".into(),
+            nullable: true,
+            ..Default::default()
+        };
+        parent.columns.extend([
+            ColumnInfo {
+                default: Some("1".into()),
+                ..col("same")
+            },
+            ColumnInfo {
+                default: Some("1".into()),
+                ..col("other")
+            },
+            ColumnInfo {
+                default: Some("1".into()),
+                ..col("dropped")
+            },
+            col("tight"),
+            col("ident"),
+            col("gen"),
+        ]);
+        child.columns.extend([
+            ColumnInfo {
+                default: Some("1".into()),
+                ..col("same")
+            },
+            ColumnInfo {
+                default: Some("2".into()),
+                ..col("other")
+            },
+            col("dropped"),
+            ColumnInfo {
+                nullable: false,
+                ..col("tight")
+            },
+            ColumnInfo {
+                auto_increment: true,
+                nullable: false,
+                ..col("ident")
+            },
+            ColumnInfo {
+                generated: Some("id * 2".into()),
+                nullable: false,
+                ..col("gen")
+            },
+        ]);
+        let mut tables = vec![parent, child];
+        mark_partitions_own_columns(&mut tables);
+        assert_eq!(
+            tables[1].partition_of.as_ref().unwrap().own_columns,
+            ["other", "dropped", "tight"]
+        );
+        assert!(
+            tables[0].partition_of.is_none(),
+            "the parent is no partition"
+        );
+
+        // A parent that was not read leaves the partition as it is.
+        let mut alone = vec![tables[1].clone()];
+        alone[0].partition_of.as_mut().unwrap().own_columns.clear();
+        mark_partitions_own_columns(&mut alone);
+        assert!(
+            alone[0]
+                .partition_of
+                .as_ref()
+                .unwrap()
+                .own_columns
+                .is_empty()
+        );
+    }
+
+    /// **A partition's own default and `NOT NULL` are restated** as
+    /// `WITH OPTIONS` on its `PARTITION OF` — the clause only gives it the
+    /// parent's, so a dump's replay lost them — and a default the parent has
+    /// and it does not is dropped after it. Measured on PostgreSQL 16: the
+    /// statement below restores both as they were.
+    #[test]
+    fn a_partitions_own_column_options_are_restated_with_options() {
+        let pg = crate::intel::SqlDialect::Postgres;
+        let (_, mut child) = partitioned_pair();
+        child.columns[0].default = Some("7".into());
+        child.columns.push(ColumnInfo {
+            name: "note".into(),
+            type_name: "text".into(),
+            nullable: true,
+            ..Default::default()
+        });
+        child.partition_of.as_mut().unwrap().own_columns = vec!["id".into(), "note".into()];
+        let ddl = child.create_ddl(pg);
+        assert!(
+            ddl.starts_with(
+                "CREATE TABLE \"public\".\"m_2024\" PARTITION OF \"public\".\"measurements\" (\n  \
+                 \"id\" WITH OPTIONS NOT NULL DEFAULT 7\n) FOR VALUES FROM ('2024-01-01') TO \
+                 ('2025-01-01');\nALTER TABLE ONLY \"public\".\"m_2024\" ALTER COLUMN \"note\" \
+                 DROP DEFAULT;"
+            ),
+            "{ddl}"
+        );
     }
 
     /// A partition that is itself partitioned says both.

@@ -2840,7 +2840,10 @@ fn table_entry(
         (Some(l), Some(r)) => {
             if crate::schema::partitions_are_tables(dialect) {
                 l.partitioning.as_ref().map(|p| &p.key) != r.partitioning.as_ref().map(|p| &p.key)
-                    || l.partition_of != r.partition_of
+                    || match (&l.partition_of, &r.partition_of) {
+                        (Some(a), Some(b)) => !a.same_place(b),
+                        (a, b) => a.is_some() != b.is_some(),
+                    }
             } else {
                 l.partitioning != r.partitioning
             }
@@ -3568,6 +3571,7 @@ mod tests {
                 schema: Some("public".into()),
                 parent: "events".into(),
                 bound: bound.into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3762,6 +3766,7 @@ mod tests {
             schema: Some("public".into()),
             parent: "events".into(),
             bound: "FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')".into(),
+            ..Default::default()
         });
         let key = |name: &str, to: &str, inherited: bool| ForeignKeyInfo {
             name: name.to_string(),
@@ -3927,6 +3932,7 @@ mod tests {
                 schema: Some("public".into()),
                 parent: "a_2024".into(),
                 bound: format!("FOR VALUES WITH (MODULUS 2, REMAINDER {r})"),
+                ..Default::default()
             }),
             ..Default::default()
         };

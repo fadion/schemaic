@@ -3765,6 +3765,7 @@ mod tests {
             schema: None,
             parent: "events".into(),
             bound: "DEFAULT".into(),
+            ..Default::default()
         });
         let dbs = vec![db("shop", vec![parent, part])];
         let s = |x: &str| x.to_string();

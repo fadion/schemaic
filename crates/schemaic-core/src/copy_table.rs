@@ -516,6 +516,7 @@ mod tests {
             schema: Some("public".into()),
             parent: "all_orders".into(),
             bound: "DEFAULT".into(),
+            ..Default::default()
         });
         src.indexes[0].inherited = true;
         let sql = plan(&src, &to("orders_copy"), PG).emit().join("\n");

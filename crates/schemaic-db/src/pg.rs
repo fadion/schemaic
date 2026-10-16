@@ -1517,6 +1517,9 @@ fn pg_fold_partitions(tables: &mut [TableInfo], rows: &[PartitionRow]) {
                     schema: Some(pns.clone()),
                     parent: parent.clone(),
                     bound: bound.clone(),
+                    // The full read compares the columns afterwards
+                    // (`mark_partitions_own_columns`); the light list has none.
+                    own_columns: Vec::new(),
                 },
             );
         }
@@ -2536,6 +2539,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         .collect();
     pg_fold_checks_and_triggers(&mut tables, &check_all, &trigger_all, &trigger_cols_all);
     pg_fold_partitions(&mut tables, &partition_rows);
+    schemaic_core::schema::mark_partitions_own_columns(&mut tables);
     for t in &mut tables {
         let ns = t.schema.clone().unwrap_or_default();
         let key = (ns.clone(), t.name.clone());

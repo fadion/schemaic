@@ -13005,7 +13005,14 @@ existing prose was left alone.
     subpartition }`, the key as the engine prints it (`RANGE (at)`, `pg_get_partkeydef`'s text)
     and each `Partition { name, schema, bound }`, its namespace kept because a PostgreSQL partition may live
     in another than its parent's — and `TableInfo::partition_of` is the other end, `PartitionOf {
-    schema, parent, bound }`; a sub-partitioned partition has both. `partitions_are_tables(dialect)`
+    schema, parent, bound, own_columns }`; a sub-partitioned partition has both. `own_columns`
+    names the partition's columns whose default or `NOT NULL` is its own rather than its
+    parent's, which `mark_partitions_own_columns` fills after the full read (under `pg.rs`) by
+    comparing each partition's columns with its parent's — never a generated or identity column,
+    and nothing where the parent was not read
+    (`a_partitions_own_column_options_are_marked_against_its_parent`). It is not part of which
+    table a partition is: `PartitionOf::same_place` compares the other three, and the comparison's
+    *repartitioned* test asks it, since a differing default is an ordinary column difference. `partitions_are_tables(dialect)`
     is the capability the two are read through, `true` on PostgreSQL alone: there a partition is
     listed, sized, queried and dumped as a table, holding the rows while its parent holds none,
     whereas on MySQL and SQL Server a partition is storage inside its table and the table holds
@@ -13058,11 +13065,19 @@ existing prose was left alone.
     its bound (`—` where it has none) up to `cap`, then *and N more partitions*
     (`partition_lines_name_the_key_the_partitions_and_the_parent`).
     `create_ddl`'s PostgreSQL arm restates both ends: a partitioned table's `CREATE TABLE` closes
-    `) PARTITION BY <key>;`, and a partition is `CREATE TABLE q PARTITION OF parent [(own key, own
-    checks)] <bound> [PARTITION BY <key>];` — no column list, which it takes from the parent, and a
-    primary key only where the partition declared one itself (its `PRIMARY` index not `inherited`,
-    possible where the parent has none), an inherited one coming back with it from the parent
-    (`a_partitions_own_primary_key_is_restated_and_an_inherited_one_is_not`).
+    `) PARTITION BY <key>;`, and a partition is `CREATE TABLE q PARTITION OF parent [(own column
+    options, own key, own checks)] <bound> [PARTITION BY <key>];` — no column list, which it takes
+    from the parent, and a primary key only where the partition declared one itself (its `PRIMARY`
+    index not `inherited`, possible where the parent has none), an inherited one coming back with
+    it from the parent (`a_partitions_own_primary_key_is_restated_and_an_inherited_one_is_not`).
+    **Its own column options are `"c" WITH OPTIONS [NOT NULL] [DEFAULT …]`**, one per
+    `PartitionOf::own_columns`, and a default the parent has and the partition does not is an
+    `ALTER TABLE ONLY q ALTER COLUMN "c" DROP DEFAULT;` after it: the clause gives a partition only
+    its parent's, so a dump's replay onto the source put back the parent's default and dropped the
+    partition's `NOT NULL` under a success report
+    (`a_partitions_own_column_options_are_restated_with_options`;
+    `a_partition_replay_keeps_its_own_defaults_and_not_null`, live, failed against a reader that
+    did not mark them).
     Restated as two plain tables, the parent held no rows and routed none, and the partition was a
     stray copy beside it (`a_partitioned_table_and_its_partition_are_restated_as_such`,
     `a_sub_partitioned_partition_keeps_its_own_key`, `partitions_are_tables_on_postgres_alone`).
@@ -22379,9 +22394,9 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **662 tests on Windows, 661 elsewhere,** as this is
-  written (re-derived with `--list`) — 157 suite functions expanded across the three legs by
-  `main.rs`'s macro (471), SQL Server's own 168 in `mssql.rs` (167 off Windows: one,
+  tier stays pure by construction. It is **665 tests on Windows, 664 elsewhere,** as this is
+  written (re-derived with `--list`) — 158 suite functions expanded across the three legs by
+  `main.rs`'s macro (474), SQL Server's own 168 in `mssql.rs` (167 off Windows: one,
   `a_windows_sign_in_is_this_processs_own_identity`, is `cfg(windows)`), the seventeen in the two
   catalog oracles outside the macro (`pg_catalog`'s ten and `mariadb_catalog`'s seven), and the
   six that need no server (the four name-guard cases, `endpoint.rs`'s declared-case count, and the
