@@ -9313,12 +9313,20 @@ existing prose was left alone.
     target's dropped — every row of the table the omission note said was left alone.
     `hold_partitions_of_held_tables`, run in `SchemaComparison::of` right after the table entries,
     sets `held_back` to *"it is a partition of <parent>, which is held back — recreate them
-    together, by hand"* on every table entry that is a difference, is not already held and is a
-    partition, on either side, of a held table — repeated until nothing changes, so a
-    sub-partition follows its partition (`a_held_back_partitioned_table_holds_back_its_partitions`).
+    together, by hand"* (*sub-partition* where the held table is further up) on every table entry
+    that is a difference, is not already held and has, on either side, a held table up its
+    `partition_of` chain — **whatever the tables between compare as**: the hold used to pass only
+    through held entries, so a sub-partition under a `Same` `a_2024` of a held `events` was dropped
+    with its rows (`a_held_back_partitioned_table_holds_back_its_partitions`,
+    `a_hold_reaches_a_sub_partition_below_a_same_partition`).
     **A two-sided table is diffed on what is its own** (`own_parts`, on both sides before
     `ddl::diff`): every `inherited` index and foreign key goes, and on a partition
-    (`partition_of`) every column, all of which are its parent's. PostgreSQL clones a parent's
+    (`partition_of`) every column but those both sides have, each taking everything but its own
+    default and nullability from the target's — the column set, types, identity and generation
+    being the parent's, while PostgreSQL lets a partition keep a default and `NOT NULL` of its
+    own (measured on 16), which clearing its columns outright compared `Same` and never planned
+    (`a_partitions_own_default_is_compared_and_planned`, which also holds that a parent's retype
+    is not restated). PostgreSQL clones a parent's
     columns, indexes and keys onto each partition, and onto a table referencing a partitioned one a
     clone of its key per partition; diffed as the table's own, a column or index added to the
     parent was restated on every partition — *cannot add column to a partition*, *relation …

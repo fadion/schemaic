@@ -2642,10 +2642,32 @@ fn empty_set(name: &str, schema: Option<&str>, dialect: SqlDialect) -> ChangeSet
 ///
 /// Here rather than in `ddl::diff`, which the designer shares: an editor
 /// never drafts a clone, so it has none to strip.
-fn own_parts(t: &TableInfo) -> TableInfo {
+///
+/// **A partition's columns are its parent's, but not all of each one**:
+/// PostgreSQL lets a partition keep a default and a `NOT NULL` of its own
+/// (measured on 16), which clearing its columns wholesale compared `Same` and
+/// never planned. So a partition keeps only the columns both sides of the
+/// pair have — the set being the parent's to change — and each takes
+/// everything but its own default and nullability from **one** side's
+/// (`shape`, the target's for both): the type, identity and generation are
+/// the parent's, and taken from each other's they would trade places and
+/// restate a parent's retype on the partition.
+fn own_parts(t: &TableInfo, other: &TableInfo, shape: &TableInfo) -> TableInfo {
     let mut own = t.clone();
     if own.partition_of.is_some() {
-        own.columns.clear();
+        own.columns = own
+            .columns
+            .iter()
+            .filter(|c| other.columns.iter().any(|o| o.name == c.name))
+            .filter_map(|c| {
+                let base = shape.columns.iter().find(|s| s.name == c.name)?;
+                Some(crate::schema::ColumnInfo {
+                    default: c.default.clone(),
+                    nullable: c.nullable,
+                    ..base.clone()
+                })
+            })
+            .collect();
     }
     own.indexes.retain(|ix| !ix.inherited);
     own.foreign_keys.retain(|fk| !fk.inherited);
@@ -2658,41 +2680,52 @@ fn own_parts(t: &TableInfo) -> TableInfo {
 /// table the target holds plain, which the server refuses, and a target's
 /// partitions were dropped — every row of the table the note said was left
 /// for the user to recreate.
+///
+/// **Through a partition that compares `Same`** too: the walk goes up each
+/// table's `partition_of` to a held ancestor whatever the tables between
+/// are, so a sub-partition under an unchanged `a_2024` of a held `events` is
+/// held — it was dropped with its rows. Only a difference is marked; a `Same`
+/// entry plans nothing to hold.
 fn hold_partitions_of_held_tables(entries: &mut [CompareEntry], left: &DbSchema, right: &DbSchema) {
     let is_table = |e: &CompareEntry| e.kind == CompareKind::Table;
-    loop {
-        let held: Vec<(Option<String>, String)> = entries
+    let held: Vec<(Option<String>, String)> = entries
+        .iter()
+        .filter(|e| is_table(e) && e.held_back.is_some())
+        .map(|e| (e.schema.clone(), e.name.clone()))
+        .collect();
+    // The parent each side's partitions name, by the partition.
+    let parent_of = |schema: &Option<String>, name: &str| {
+        left.tables
             .iter()
-            .filter(|e| is_table(e) && e.held_back.is_some())
-            .map(|e| (e.schema.clone(), e.name.clone()))
-            .collect();
-        // The parent each side's partitions name, by the partition.
-        let parent_of = |schema: &Option<String>, name: &str| {
-            left.tables
-                .iter()
-                .chain(&right.tables)
-                .filter(|t| &t.schema == schema && t.name == name)
-                .find_map(|t| t.partition_of.as_ref())
-                .map(|of| (of.schema.clone(), of.parent.clone()))
-        };
-        let mut changed = false;
-        for e in entries.iter_mut() {
-            if !is_table(e) || e.held_back.is_some() || !e.status.is_difference() {
-                continue;
+            .chain(&right.tables)
+            .filter(|t| &t.schema == schema && t.name == name)
+            .find_map(|t| t.partition_of.as_ref())
+            .map(|of| (of.schema.clone(), of.parent.clone()))
+    };
+    // The nearest held ancestor of `key`, bounded by the tables there are.
+    let held_above = |key: &(Option<String>, String)| {
+        let mut at = key.clone();
+        for _ in 0..=left.tables.len() + right.tables.len() {
+            let up = parent_of(&at.0, &at.1)?;
+            if held.contains(&up) {
+                return Some(up);
             }
-            if let Some((schema, parent)) = parent_of(&e.schema, &e.name)
-                && held.contains(&(schema.clone(), parent.clone()))
-            {
-                e.held_back = Some(format!(
-                    "it is a partition of {}, which is held back — recreate them together, \
-                     by hand",
-                    display_name(schema.as_deref(), &parent)
-                ));
-                changed = true;
-            }
+            at = up;
         }
-        if !changed {
-            return;
+        None
+    };
+    for e in entries.iter_mut() {
+        if !is_table(e) || e.held_back.is_some() || !e.status.is_difference() {
+            continue;
+        }
+        let key = (e.schema.clone(), e.name.clone());
+        if let Some((schema, parent)) = held_above(&key) {
+            let direct = parent_of(&key.0, &key.1) == Some((schema.clone(), parent.clone()));
+            e.held_back = Some(format!(
+                "it is a {} of {}, which is held back — recreate them together, by hand",
+                if direct { "partition" } else { "sub-partition" },
+                display_name(schema.as_deref(), &parent)
+            ));
         }
     }
 }
@@ -2749,7 +2782,7 @@ fn table_entry(
                     None => empty_set(&any.name, any.schema.as_deref(), dialect),
                 },
                 (Some(l), Some(r)) => {
-                    let (l, r) = (own_parts(l), own_parts(r));
+                    let (l, r) = (own_parts(l, r, l), own_parts(r, l, l));
                     ddl::diff(&l, &TableDraft::from_table(&r), target)
                 }
                 (None, Some(r)) if is_view => match ViewDraft::from_table(r) {
@@ -3808,6 +3841,135 @@ mod tests {
             "{:?}",
             plan.omitted
         );
+    }
+
+    /// **A partition's own default and `NOT NULL` are compared** (S1.3-L1-01):
+    /// PostgreSQL lets a partition keep either of its own (measured on 16), and
+    /// clearing a partition's columns wholesale — so a column added to the
+    /// parent was not restated on it — made such a difference `Same` and
+    /// never planned. Only the column set and types are the parent's.
+    #[test]
+    fn a_partitions_own_default_is_compared_and_planned() {
+        let (parent, child) = partitioned_events();
+        let mut own = child.clone();
+        own.columns[1].default = Some("'2024-01-01'".into());
+        let cmp = SchemaComparison::of(
+            &schema_of(vec![parent.clone(), child.clone()]),
+            &schema_of(vec![parent.clone(), own]),
+            SqlDialect::Postgres,
+        );
+        let e = cmp
+            .entries
+            .iter()
+            .find(|e| e.name == "a_2024")
+            .expect("the partition");
+        assert_eq!(e.status, ObjectStatus::Differing, "{e:?}");
+        let sql = cmp.plan(|_| true).emit().join("\n");
+        assert!(
+            sql.contains("a_2024") && sql.contains("SET DEFAULT"),
+            "{sql}"
+        );
+        assert!(!sql.contains("ADD COLUMN"), "{sql}");
+
+        // A column the parent gains is still the parent's alone.
+        let mut wider = parent.clone();
+        wider.columns.push(col("note", "text"));
+        let mut wider_child = child.clone();
+        wider_child.columns.push(col("note", "text"));
+        let sql = SchemaComparison::of(
+            &schema_of(vec![parent, child]),
+            &schema_of(vec![wider, wider_child]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true)
+        .emit()
+        .join("\n");
+        assert_eq!(sql.matches("ADD COLUMN").count(), 1, "{sql}");
+        assert!(!sql.contains("\"a_2024\" ADD"), "{sql}");
+
+        // Nor is a type the parent changes restated on the partition.
+        let (parent, child) = partitioned_events();
+        let mut retyped = parent.clone();
+        retyped.columns[0].type_name = "bigint".into();
+        let mut retyped_child = child.clone();
+        retyped_child.columns[0].type_name = "bigint".into();
+        let sql = SchemaComparison::of(
+            &schema_of(vec![parent, child]),
+            &schema_of(vec![retyped, retyped_child]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true)
+        .emit()
+        .join("\n");
+        assert!(!sql.contains("\"a_2024\""), "{sql}");
+    }
+
+    /// **The hold reaches a sub-partition through a partition that compares
+    /// `Same`** (S1.3-L1-02): `events` is held (its key differs), `a_2024`
+    /// keeps its bound and key so it is `Same`, and the hold stopped there —
+    /// so the target's `a_2024_h1` was dropped with its rows, under a note
+    /// saying the table was left to recreate by hand.
+    #[test]
+    fn a_hold_reaches_a_sub_partition_below_a_same_partition() {
+        use crate::schema::{Partition, PartitionOf, Partitioning};
+        let (mut parent, mut child) = partitioned_events();
+        child.partitioning = Some(Partitioning {
+            key: "HASH (id)".into(),
+            partitions: Vec::new(),
+            subpartition: None,
+        });
+        let columns = child.columns.clone();
+        let sub = |n: &str, r: u32| TableInfo {
+            name: n.to_string(),
+            schema: Some("public".to_string()),
+            columns: columns.clone(),
+            partition_of: Some(PartitionOf {
+                schema: Some("public".into()),
+                parent: "a_2024".into(),
+                bound: format!("FOR VALUES WITH (MODULUS 2, REMAINDER {r})"),
+            }),
+            ..Default::default()
+        };
+        let mut target_child = child.clone();
+        if let Some(p) = target_child.partitioning.as_mut() {
+            p.partitions = ["a_2024_h0", "a_2024_h1"]
+                .iter()
+                .map(|n| Partition {
+                    name: (*n).into(),
+                    schema: Some("public".into()),
+                    bound: String::new(),
+                })
+                .collect();
+        }
+        let target = schema_of(vec![
+            parent.clone(),
+            target_child,
+            sub("a_2024_h0", 0),
+            sub("a_2024_h1", 1),
+        ]);
+        if let Some(p) = parent.partitioning.as_mut() {
+            p.key = "RANGE (created)".into();
+        }
+        if let Some(p) = child.partitioning.as_mut() {
+            p.partitions = vec![Partition {
+                name: "a_2024_h0".into(),
+                schema: Some("public".into()),
+                bound: String::new(),
+            }];
+        }
+        let source = schema_of(vec![parent, child, sub("a_2024_h0", 0)]);
+        let plan = SchemaComparison::of(&target, &source, SqlDialect::Postgres).plan(|_| true);
+        let sql = plan.emit().join("\n");
+        assert!(!sql.contains("DROP TABLE"), "{sql}");
+        assert!(
+            plan.omitted.iter().any(|o| o.contains("a_2024_h1")),
+            "{:?}",
+            plan.omitted
+        );
+        // And the other way round: nothing created under the held table.
+        let plan = SchemaComparison::of(&source, &target, SqlDialect::Postgres).plan(|_| true);
+        let sql = plan.emit().join("\n");
+        assert!(!sql.contains("a_2024_h1"), "{sql}");
     }
 
     /// **A `Same` row can still have two different texts under it.** On SQLite
