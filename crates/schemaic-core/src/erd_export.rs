@@ -657,7 +657,8 @@ fn dot_text(s: &str) -> String {
 ///
 /// A column named `a<U+0001>b` is legal on both engines — MySQL permits the
 /// whole BMP except U+0000 in a quoted identifier, PostgreSQL anything but NUL.
-fn svg_text(s: &str) -> String {
+/// The chart's export (`chart_draw::to_svg`) writes its labels through it too.
+pub(crate) fn svg_text(s: &str) -> String {
     let cleaned: String = s
         .chars()
         .map(|c| match c {
@@ -779,7 +780,7 @@ pub fn to_dot(graph: &DiagramGraph) -> String {
 /// coordinate that came out of a bezier sample, and an edge polyline carries 34 of
 /// them — the noise is most of the file's bytes and makes a rendered diagram
 /// impossible to diff between two exports of the same layout.
-fn n(v: f64) -> String {
+pub(crate) fn n(v: f64) -> String {
     let r = (v * 100.0).round() / 100.0;
     // `-0` is legal SVG but reads as a bug in a diff; normalise it away.
     let r = if r == 0.0 { 0.0 } else { r };

@@ -14,6 +14,7 @@ pub mod blob;
 pub mod body_search;
 pub mod celledit;
 pub mod chart;
+pub mod chart_draw;
 pub mod chat;
 pub mod cli_install;
 pub mod cloud_iam;

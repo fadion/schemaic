@@ -493,7 +493,8 @@ existing prose was left alone.
     (`ticks_terminate_at_extreme_magnitudes`). A flat range is widened by 1 either side so it still
     gets an axis, and there are always at least two ticks; a non-finite bound gets none
     (`ticks_are_round_and_cover_the_range`).
-    `Plot::{Series(kind, Series), Bins(Vec<Bin>)}` is what the canvas paints, `Plot::of(rs, kind,
+    `Plot::{Series(kind, Series), Bins(Vec<Bin>)}` is what is drawn — laid out by `chart_draw.rs`
+    below, for the canvas and the saved file alike — `Plot::of(rs, kind,
     value, label)` → `(Plot, skipped)`. `Plot::range` is the value axis's range: **a bar or a bin
     stands on 0, so 0 is in it; a line follows its values** (`a_line_range_does_not_force_zero`) —
     which is exactly what routes a narrow band of large numbers into `ticks`. `Plot::x_labels` is
@@ -516,6 +517,41 @@ existing prose was left alone.
     `±f64::MAX`), and `Plot::undrawable` is the note the modal shows in the canvas's place — it
     painted nothing, and near `MAX` drew the line above the plot
     (`a_range_too_large_to_draw_has_no_axis_and_says_so`).
+  - `chart_draw.rs` — **where a chart's marks go**: the geometry of a `chart::Plot` in a box of a
+    given size, and that geometry written out as a standalone SVG. **One layout, two painters** —
+    `ui/chart_view.rs`'s `ChartCanvas::paint` draws the `Scene` this returns, and the modal's save
+    menu writes the same `Scene`, so the file is the chart on screen rather than a second drawing of it
+    that drifts. The arithmetic was inline in `paint` until the export needed it; it moved here
+    rather than being copied, the bargain `erd_export`'s `SvgScene` strikes with `EdgeCanvas`.
+    `layout(plot, width, height, &Metrics, measure) -> Option<Scene>` places the horizontal grid
+    lines (one per `chart::ticks` step, labelled as one axis by `tick_labels`), the tick labels
+    in a gutter as wide as the widest of them plus `gutter_pad`, the marks — `Marks::Line { points,
+    dots }`, a point per value at its slot's centre and dots while there are at most `MAX_DOTS`
+    (60), or `Marks::Bars(Vec<Area>)` for bars and histogram bins — the zero line `base` (the
+    axis's nearer end when 0 is off it), and the under-axis labels, clamped inside the box
+    (`labels_under_the_axis_stay_inside_the_box`). Text is measured by a **caller-supplied
+    closure**, since the font system is the UI's and this crate has none — `erd_export::ellipsize`
+    takes its measurer the same way. **The order it calls that closure in is a contract**, stated
+    on `layout`: each of `Scene::ticks` first, in order, then each of `Scene::under`. The canvas
+    keeps the layouts its measurer builds and draws the tick labels from them by position, so a
+    reorder here would paint one tick's text at another's place
+    (`the_tick_labels_are_measured_first_in_order_then_the_labels_under_the_axis`). A tick label is `Align::End`: placed by its measured box but
+    anchored at its right edge, so an SVG renderer whose glyphs come out a hair wider than the
+    canvas's still lines the column up against the plot
+    (`the_gutter_is_the_widest_tick_label_and_the_labels_end_at_it`). It answers `None` for no
+    axis (`Plot::undrawable`'s range), for a box too small for the gutter, and **for an empty
+    plot** — checked first, because every mark's width divides by the count
+    (`nothing_to_lay_out_without_an_axis_or_a_box`).
+    `Metrics` is the spacing, a parameter rather than constants because the two painters size it
+    differently: `Metrics::BASE` is UI scale 1, which the export uses as it is, and the canvas
+    passes `BASE.map(theme::scaled)` — **each value through `scaled`, not one factor**, because
+    `scaled` rounds per value, so multiplying by a scale would not reproduce the rest of the UI's
+    spacing. `to_svg(scene, &SvgColors, font_size, pad)` writes the scene on a `background` rect
+    with `pad` round it, text centred on its box's middle line with `dominant-baseline="central"`
+    as the ER diagram's file does; colours are `SvgColors` strings the caller resolves from the
+    theme. It reuses `erd_export`'s `n` (two-decimal coordinates) and `svg_text` (escaping), now
+    `pub(crate)` for it, rather than a second copy of either
+    (`the_svg_escapes_a_label`).
   - `result_diff.rs` — **what two results differ by**, behind a result chip's *Compare with*
     (`ui/result_diff_view.rs`): the rows one has that the other has not, and the rows both have
     with different values, matched by a key the user picks. Pure over two `ResultSet`s and over
@@ -26580,8 +26616,10 @@ existing prose was left alone.
     on screen, over `core::chart`, opened by setting `overlay.chart` to a `ChartTarget { rs:
     Arc<ResultSet>, title }` (re-exported as `schemaic_ui::ChartTarget`; the app creates the signal
     beside `used_by`) from the results strip's chart icon (*Data grid*), which titles it *"Chart —
-    this result"*. Read-only like Properties: a title, the pickers, the chart, a footer of **Close**,
-    and Escape and the backdrop closing it. The modal is keyed on the `Arc`'s pointer, so charting
+    this result"*. Read-only like Properties — it changes nothing in the result or the database: a
+    title, the pickers with a save icon at the row's right end, the chart, a split footer of a
+    status line on the left and **Close** on the right, and Escape and the backdrop closing it. The modal
+    is keyed on the `Arc`'s pointer, so charting
     another result rebuilds it and nothing else does.
     **Three pickers**: *Chart* — the kind, a `settings::focusable_dropdown`, tab 10; *Values* — the
     numeric columns only (`chart::numeric_columns`, read once per open), a
@@ -26602,16 +26640,77 @@ existing prose was left alone.
     decides.
     **The canvas is a painted view, `ChartCanvas`** — floem 0.2 has no plotting, so it is a custom
     `View` with a `paint` of its own, as the frozen header's `Hatch` (*Data grid*) and the ER
-    diagram's `EdgeCanvas` (under `erd_view.rs`) are. The value axis is `chart::ticks` over the
-    drawn range — a bar's or a histogram's range always includes 0 — with grid lines in
-    `theme::border` and the tick labels laid out by floem's own `TextLayout` and drawn with
-    `cx.draw_text`, so the axis is the app's face at the app's scale; the gutter is the widest
-    label. Bars, or a 2px polyline (with a dot per point while there are at most 60), or contiguous
-    histogram bins, all in `theme::accent`; a zero line over the marks; and three labels under the
-    axis — first, middle and last, cut at 18 characters, a histogram's being its edges and midpoint
-    as tick labels. **Every colour is read at paint time**, so a theme switch repaints in the new
-    one, and the text helper takes its colour as `fn() -> Color` for the same reason the
-    themable-colour invariant gives.
+    diagram's `EdgeCanvas` (under `erd_view.rs`) are. **Where everything goes is
+    `core::chart_draw::layout`'s**, not `paint`'s — the export draws the same `Scene` — so `paint`
+    only strokes and fills what it is handed, at the canvas's size with `Metrics::BASE.map(
+    theme::scaled)` and text measured at `theme::font_hint` by floem's own `TextLayout`. **Its
+    measurer keeps what it builds**: each layout, shaped in the ticks' colour, goes onto a list, and
+    the tick labels are drawn from that list by position — so a tick label is shaped once per paint,
+    not once to measure and again to draw. That rests on `layout`'s stated call order (ticks first,
+    in order; `chart_draw.rs` above), and only the at most three labels under the axis are laid out
+    again, in their own colour. The export measures through `measure`, the same `TextLayout` at the
+    file's size. The value axis is `chart::ticks` over the drawn range — a
+    bar's or a histogram's range always includes 0 — with grid lines in `theme::border` and the
+    tick labels drawn with `cx.draw_text`, so the axis is the app's face at the app's scale; the
+    gutter is the widest label. Bars, or a 2px polyline (with a dot per point while there are at
+    most 60), or contiguous histogram bins, all in `theme::accent`; a zero line over the marks; and
+    three labels under the axis — first, middle and last, cut at 18 characters, a histogram's being
+    its edges and midpoint as tick labels. **Every colour is read at paint time**, so a theme
+    switch repaints in the new one, and the text helper takes its colour as `fn() -> Color` for the
+    same reason the themable-colour invariant gives.
+    **Saving is the Live Monitor's export control, not a pair of buttons** — a feature wanted this
+    rarely kept out of the footer, and a bare glyph with no background or border sits in a modal
+    better than a boxed toolbar control. It is built as `monitor_view.rs`'s Export is:
+    `widgets::toolbar_icon` with the `DOWNLOAD` icon (muted, the text colour on hover) and the
+    tooltip *"Save the chart…"*, inside `widgets::in_ring_button` at `EXPORT_TAB` (40) — so it **is**
+    a stop in the modal's Tab ring, after the three pickers, and Enter or Space opens its menu.
+    `controls` takes it as its final argument and puts a `flex_grow` spacer before it, in a row that
+    is `width_full` and `items_center`, so the icon sits at the row's right end. It stands under a
+    blank caption with the pickers' own gap, so the row's centring puts its middle on the
+    **dropdowns'** rather than the row's — exact at any UI scale, where a fixed nudge would not be.
+    Pressing it raises the app's shared popup — `overlay.popup_menu`, the one surface painted
+    above this modal — at `PopupAnchor::BelowIcon` off the **ring wrapper's** `layout_rect()`, the
+    monitor's rule: the wrapper's `ViewId` goes into `export_at` once the button exists, since the
+    closure that reads it has to be built before the view it anchors to. The menu is
+    `erd_view::export_menu_w()` wide — `pub(crate)` for this — with two entries,
+    `ErdExportFormat::Png.label()` and `Svg.label()` (*PNG image*, *SVG image*); `popup_anchor` is
+    written immediately before `popup_menu`, and pressing the icon again closes its own menu
+    (`widgets::menu_anchored_at`). **Closing the modal takes the menu with it** — `close` sets
+    `popup_menu` and `popup_anchor` to `None` before `target`, for the ER diagram's reason: the
+    shared popup outlives this modal and its entries hold this scope's signals. Every exit — ✕,
+    Escape, the backdrop, **Close** — routes through `close`. That does not cover the one exit
+    that bypasses it, a new target replacing this one under an open menu, which disposes the scope
+    with the menu still up; so the `save` an entry calls reads `kind`, `value` and `label` with
+    `try_get_untracked` and does nothing when any is gone, since a bare read of a disposed signal
+    panics. The entries reuse the ER diagram's formats (`export_doc` answers `None` for the four text ones,
+    since a chart is a picture) and its default name, `file_stem("<title> chart", fmt)`. **The
+    chart is captured from the pickers before the save dialog opens** (`export_doc`), for the ER
+    diagram's reason: the dialog is modal, the signals are this modal's, and the file should be
+    what the user was looking at when they clicked. It is laid out at a **fixed** 800×400 with
+    12px text and 16px of background round it (`EXPORT_W`, `EXPORT_H`, `EXPORT_FONT`,
+    `EXPORT_PAD`), at `Metrics::BASE` rather than the canvas's scaled spacing, so a chart saved at
+    a zoomed UI is the same picture as one saved at 100%; a PNG is that at 2× (`EXPORT_PNG_SCALE`)
+    — `a_saved_chart_is_a_png_of_the_export_size_and_an_svg` pins the pixel size. The colours are
+    the live theme's (`erd_view::hex`, `pub(crate)` for this), on `bg_panel`, the colour the canvas
+    sits on. The SVG is built on the UI thread, because its labels are measured by floem's font
+    system, and that is affordable because the document is **bounded whatever the result's size**:
+    a series draws at most `chart::MAX_POINTS` (2,000) marks and a histogram at most 50 bins
+    (`export_doc`'s comment). The PNG's rasterise is left to the worker as
+    `ErdDoc::Raster` (under `erd_view.rs`). The write is the ER diagram's own writer,
+    `TabActions::export_erd`, which `modals.rs` passes into `chart_overlay` — off the UI thread,
+    through `persist::write_file_atomic` — rather than a second one, and the dialog and the reading
+    of its outcome are the diagram's too: `save` hands the document to `erd_view::save_document`
+    with *"Save chart"* as the dialog's title. Nothing drawable (no numeric
+    column, or a plot `layout` refuses) says *"Nothing to save."* rather than opening a dialog.
+    **The modal reports for itself**, a notice in the footer's status line, because the app's
+    shared error modal is painted *under* this one — the diagram's `notice_bar` reason. The
+    outcome arms are `save_document`'s, spelled out, `Cancelled` saying nothing. A confirmation
+    fades after `NOTICE_LINGER` (4 s, the diagram's) behind a sequence
+    number, and a failure stays; the notice is reached through `try_get_untracked`, because the
+    completion can land after the modal closed and disposed its scope. **A notice is about the
+    chart it was said of**: an effect over `kind`, `value` and `label` clears it when a picker
+    changes — skipping its first run, which is the build, not a change — or *"Nothing to save."*
+    would stand, as a failure does, over a column that can now be saved.
     Mounted in the workspace group directly after `used_by_overlay`, counted by
     `workspace_modals_up` as a plain term (`chart_open`) — it raises nothing — and on
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
@@ -30777,7 +30876,8 @@ existing prose was left alone.
     submenu flips left on any window narrow enough, and a flipped submenu used to be unclickable.
     The anchor is the **button's** rect, taken from `on_move` + `on_resize` rather than by adding
     the control's padding back onto the glyph's origin: a menu hung off the 16px glyph's bottom edge
-    rides up into the button that opened it.
+    rides up into the button that opened it. `export_menu_w` is `pub(crate)` because the *Chart*
+    modal's save menu opens at this same width (`chart_view.rs`).
     `export_scene` is the bridge to `core::erd_export`: it reads the same four signals the cards
     render from (`positions`, `sizes`, `collapsed`, plus the resolved tint) and reuses `rects`,
     `visible_map` and `edge_shapes` — **the very functions `EdgeCanvas::paint` calls** — so a
@@ -30803,6 +30903,11 @@ existing prose was left alone.
     document, rasterising a PNG and writing the file are all the worker's (`ErdDoc::into_bytes`,
     called inside the app's `export_erd` `spawn_blocking`). Measured at 500 tables × 20 columns, that
     took the UI-thread stall between the click and the save dialog from 65 ms to 25.5 ms.
+    A third variant, `Raster(String, f32)`, is a **finished** SVG to rasterise at that scale — the
+    *Chart* modal's PNG (`chart_view.rs`), whose document is bounded — at most 2,000 marks or 50
+    bins — and so is built on the UI thread, and whose raster is still the worker's: `into_bytes` hands it to `erd_raster::png_from_svg`,
+    and `into_text` answers `None` for it as for a diagram's PNG. That modal saves through this
+    same `export_erd`, so the writer is no longer the diagram's alone.
     `ErdDoc::into_text` is the exception and says why: the clipboard is synchronous, so *Copy as SVG*
     is the one caller with nowhere to hand the work and pays for the document here — and it answers
     `None` for a PNG, which that channel cannot hold, which is why PNG is not in the copy menu.
@@ -30817,15 +30922,20 @@ existing prose was left alone.
     outcome lands in the diagram's own `notice_bar` at the canvas's bottom edge rather than the
     app's shared error modal, which is painted *under* this one. It arrives as the `ExportOutcome`
     the results export shares, of which a diagram uses two: one document has no row count and
-    nothing to cancel, so `export_erd` reports `Done(0)` and never `Cancelled`. The handler still
-    **spells all three arms out**, the way `monitor_view::save_log` spells its own and for the
+    nothing to cancel, so `export_erd` reports `Done(0)` and never `Cancelled`. The save dialog and
+    that handler are one function, `save_document(doc, dialog_title, default_name, fmt, export,
+    say)` — `pub(crate)` because the *Chart* modal's save calls it too, titled *"Save chart"* where
+    the diagram's `save` passes *"Export diagram"* — so the two modals read an outcome by one
+    decision: `Done` says *"Saved {name}"*, `Cancelled` nothing, `Failed` its message as a failure.
+    The handler still **spells all three arms out**, the way `monitor_view::save_log` spells its own and for the
     reason that call site gives — the arm is unreachable today, but the rasterise it wraps is one
     change away from being cancellable, and the catch-all `_ =>` this had would then report a
     cancelled export as "Saved <name>". A confirmation fades after
     `NOTICE_LINGER`; a failure stays until dismissed, since it is the only place the reason is
     written down. The fade is `flash_seq`-guarded and `try_get_untracked`-read for the same two
     reasons the find flash is.
-  - `erd_raster.rs` — SVG → PNG for the ER-diagram export, and the only reason `resvg` is a direct
+  - `erd_raster.rs` — SVG → PNG for the ER-diagram export and the *Chart* modal's PNG save
+    (through `ErdDoc::Raster`, above), and the only reason `resvg` is a direct
     dependency (it was already in the tree via floem's `svg` view, same version, so it costs no
     extra compile). **Which version is floem's choice, not ours**: 0.43 is what `floem_renderer`
     pulls, and moving the workspace to 0.48 would not upgrade that copy — it would stand a second
@@ -30839,7 +30949,9 @@ existing prose was left alone.
     tens of thousands of pixels wide on its own, and the pixmap is RGBA in memory, so the requested
     2× is reduced until the result fits both `MAX_PNG_DIM` and `MAX_PNG_PIXELS` — returning **less
     than 1.0** when it has to, because the alternative is a failed allocation at the moment the
-    user asked for the export. It touches no signal and no file, so the app runs it on a worker
+    user asked for the export. Should the pixmap still fail to allocate, `render_png` says *"Image
+    is too large to rasterise (W×H)"* — *Image*, because a chart's PNG comes through it as well as
+    a diagram's. It touches no signal and no file, so the app runs it on a worker
     thread (`export_erd`) and writes the bytes it returns.
   - `monitor_view.rs` — the **Live Monitor** modal (`monitor_overlay`), opened from the results
     title bar with the tab's `conn_id` and the shown result's own table. It renders `overlay.monitor_log` — built
@@ -41554,8 +41666,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   compares the placement it *would* set against the open one, and two controls that disagreed about
   which variant they use would each fail to recognise the other's menu.
 - **`popup_anchor` carries the menu's *identity*, not only its placement — so an opener must write
-  it immediately before `popup_menu`.** One channel serves fifteen openers across ten files
-  (`activity_panel`, `widgets::open_picker` — which is now every `<select>` in the app, not only the
+  it immediately before `popup_menu`.** One channel serves sixteen openers across eleven files
+  (`activity_panel`, `chart_view`, `widgets::open_picker` — which is now every `<select>` in the app, not only the
   cell editors' — `connection_form`, `editor_pane`, `erd_view`,
   `grid` ×6, `lib`'s status bar, `monitor_view`, `table_designer::suggest_chevron`, `tabs`) and nothing in it says who filled it, so the grid
   toolbar's AI / Copy / Save icons ran "dismiss, then open" unconditionally and a second press

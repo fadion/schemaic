@@ -290,7 +290,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             crate::used_by_view::used_by_overlay(ui.overlay, ui.schema, ui.conn),
             // A chart of the result on screen — raised from the results
             // strip, a reading like the properties modal above it.
-            crate::chart_view::chart_overlay(ui.overlay),
+            crate::chart_view::chart_overlay(ui.overlay, ui.tab_actions.export_erd.clone()),
             // Two results' differences — raised from a result chip's menu.
             crate::result_diff_view::result_diff_overlay(ui.overlay),
             users_view::users_overlay(users_view::UsersCtx::new(

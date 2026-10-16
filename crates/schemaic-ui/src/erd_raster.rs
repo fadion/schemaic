@@ -86,7 +86,8 @@ fn render_png(svg: &str, scale: f32, opt: usvg::Options<'_>) -> Result<Vec<u8>, 
     let w = (size.width() * scale).round().max(1.0) as u32;
     let h = (size.height() * scale).round().max(1.0) as u32;
     let mut pixmap = tiny_skia::Pixmap::new(w, h)
-        .ok_or_else(|| format!("Diagram is too large to rasterise ({w}×{h})"))?;
+        // "Image", not "Diagram": the chart modal's PNG comes through here too.
+        .ok_or_else(|| format!("Image is too large to rasterise ({w}×{h})"))?;
     resvg::render(
         &tree,
         tiny_skia::Transform::from_scale(scale, scale),

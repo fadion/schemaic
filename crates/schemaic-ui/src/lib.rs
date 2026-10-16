@@ -567,6 +567,10 @@ pub enum ErdDoc {
     /// A measured scene, plus the scale to rasterise at when the target is a PNG.
     /// `None` writes the SVG itself — see [`crate::erd_raster`] for the raster.
     Scene(Box<schemaic_core::erd_export::SvgScene>, Option<f32>),
+    /// A finished SVG to rasterise at the scale given — the chart modal's PNG
+    /// (`chart_view`), whose document is small enough to build on the UI
+    /// thread and whose raster is still the worker's.
+    Raster(String, f32),
 }
 
 impl ErdDoc {
@@ -579,7 +583,7 @@ impl ErdDoc {
         match self {
             ErdDoc::Text(s) => Some(s),
             ErdDoc::Scene(scene, None) => Some(schemaic_core::erd_export::to_svg(&scene)),
-            ErdDoc::Scene(_, Some(_)) => None,
+            ErdDoc::Scene(_, Some(_)) | ErdDoc::Raster(..) => None,
         }
     }
 
@@ -595,6 +599,7 @@ impl ErdDoc {
                     None => Ok(svg.into_bytes()),
                 }
             }
+            ErdDoc::Raster(svg, scale) => crate::erd_raster::png_from_svg(&svg, scale),
         }
     }
 }

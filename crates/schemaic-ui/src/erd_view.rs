@@ -470,7 +470,7 @@ const NOTICE_LINGER: std::time::Duration = std::time::Duration::from_secs(4);
 const EXPORT_PNG_SCALE: f32 = 2.0;
 /// Width of the export dropdown — wider than the grid's, because "PlantUML…" and
 /// the "Copy as" submenu chevron have to sit side by side without crowding.
-fn export_menu_w() -> f64 {
+pub(crate) fn export_menu_w() -> f64 {
     theme::scaled(190.0)
 }
 
@@ -800,12 +800,69 @@ fn edge_shapes(
 /// the familiar six digits; a translucent one keeps its alpha (`#rrggbbaa`, which
 /// every SVG renderer in the export path reads) rather than being flattened
 /// against a guess at what is behind it.
-fn hex(c: floem::peniko::Color) -> String {
+pub(crate) fn hex(c: floem::peniko::Color) -> String {
     if c.a == 255 {
         format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
     } else {
         format!("#{:02x}{:02x}{:02x}{:02x}", c.r, c.g, c.b, c.a)
     }
+}
+
+/// Ask where `doc` goes, then hand it to `export` — the writer behind
+/// [`crate::ErdExportFn`], off the UI thread — and report through `say`
+/// (`(message, failed)`). A cancelled dialog says nothing.
+///
+/// The ER diagram's export and the *Chart* modal's save both come through
+/// here, so the dialog and the reading of the outcome are one decision.
+pub(crate) fn save_document(
+    doc: crate::ErdDoc,
+    dialog_title: &'static str,
+    default_name: String,
+    fmt: erd_export::ErdExportFormat,
+    export: crate::ErdExportFn,
+    say: Rc<dyn Fn(String, bool)>,
+) {
+    let opts = FileDialogOptions::new()
+        .title(dialog_title)
+        .default_name(default_name)
+        .allowed_types(vec![FileSpec {
+            name: fmt.label(),
+            extensions: fmt.extensions(),
+        }]);
+    // `save_as` takes an `Fn`, so the document is cloned per invocation
+    // rather than moved into the callback.
+    save_as(opts, move |file| {
+        let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+            return; // cancelled
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "the file".to_string());
+        let say = say.clone();
+        (export)(
+            crate::ErdExportRequest {
+                path,
+                doc: doc.clone(),
+            },
+            // A picture is one document, not a stream: no row count to
+            // report and nothing to cancel, so `export_erd` reports `Done(0)`
+            // and never `Cancelled`. **Spelled out rather than a catch-all
+            // `_`**, the way `monitor_view::save_log` spells its own: the arm
+            // is unreachable today, but the rasterise this wraps is one change
+            // away from being cancellable, and a catch-all would then tell the
+            // user a file was saved that never was.
+            Rc::new(move |outcome| match outcome {
+                crate::ExportOutcome::Done(_) => (say)(format!("Saved {name}"), false),
+                crate::ExportOutcome::Cancelled => {}
+                // The document is staged beside the destination and renamed
+                // over it (`persist::write_file_atomic`), so a failed export
+                // leaves the previous file untouched and there is no partial
+                // file to mention here.
+                crate::ExportOutcome::Failed { message, .. } => (say)(message, true),
+            }),
+        );
+    });
 }
 
 /// The card metrics the export draws with — the constants above, handed over as
@@ -2241,58 +2298,14 @@ pub(crate) fn erd_overlay(
                         (say)("Nothing to export.".to_string(), true);
                         return;
                     };
-                    let opts = FileDialogOptions::new()
-                        .title("Export diagram")
-                        .default_name(erd_export::file_stem(&scope_name, fmt))
-                        .allowed_types(vec![FileSpec {
-                            name: fmt.label(),
-                            extensions: fmt.extensions(),
-                        }]);
-                    let export = export.clone();
-                    let say = say.clone();
-                    // `save_as` takes an `Fn`, so the rendered document is cloned
-                    // per invocation rather than moved into the callback.
-                    save_as(opts, move |file| {
-                        let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
-                            return; // cancelled
-                        };
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "the diagram".to_string());
-                        let say = say.clone();
-                        (export)(
-                            crate::ErdExportRequest {
-                                path,
-                                doc: doc.clone(),
-                            },
-                            // A diagram is one document, not a stream: no row
-                            // count to report and nothing to cancel, so
-                            // `export_erd` reports `Done(0)` and never
-                            // `Cancelled`. **Spelled out rather than a catch-all
-                            // `_`**, the way `monitor_view::save_log` spells
-                            // its own: the arm is unreachable today, but the
-                            // rasterise this wraps is one change away from being
-                            // cancellable, and a catch-all would then tell the
-                            // user a file was saved that never was.
-                            Rc::new(move |outcome| match outcome {
-                                crate::ExportOutcome::Done(_) => {
-                                    (say)(format!("Saved {name}"), false)
-                                }
-                                crate::ExportOutcome::Cancelled => {}
-                                // A diagram is staged beside the destination
-                                // and renamed over it
-                                // (`persist::write_file_atomic`), so a failed
-                                // export leaves the previous file untouched and
-                                // there is no partial file to mention here. It
-                                // used to say `fs::write` wrote it whole, which
-                                // is the opposite of what that call does.
-                                crate::ExportOutcome::Failed { message, .. } => {
-                                    (say)(message, true)
-                                }
-                            }),
-                        );
-                    });
+                    save_document(
+                        doc,
+                        "Export diagram",
+                        erd_export::file_stem(&scope_name, fmt),
+                        fmt,
+                        export.clone(),
+                        say.clone(),
+                    );
                 })
             };
 
