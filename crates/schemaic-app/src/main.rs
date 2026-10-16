@@ -2684,11 +2684,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // **An empty file is written once, not per change**: with the setting off
     // every close would otherwise be an erasing save, and each pays the fsync
     // `Saving::Erasing` takes — one per *deletion* is what that cost is for.
-    // `emptied` remembers that the file already says nothing; an erasing write
+    // `on_disk` remembers what the last write left — empty, and whether with
+    // a `.bak` — and an erasing write, or the setting going off over a `.bak`,
     // goes ahead regardless (`persist::closed_ring_saving`).
     let write_closed: Rc<dyn Fn(bool)> = {
         let recently_closed = recently_closed.clone();
-        let emptied = Rc::new(Cell::new(false));
+        let on_disk = Rc::new(Cell::new(schemaic_core::persist::RingOnDisk::Unknown));
         Rc::new(move |erasing: bool| {
             let restore = restore_tabs.get_untracked();
             let file = schemaic_core::persist::ClosedTabsFile::for_disk(
@@ -2697,11 +2698,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             );
             let empty = file.tabs.is_empty();
             let Some(saving) =
-                schemaic_core::persist::closed_ring_saving(empty, emptied.get(), erasing, restore)
+                schemaic_core::persist::closed_ring_saving(empty, on_disk.get(), erasing, restore)
             else {
                 return;
             };
-            emptied.set(empty);
+            on_disk.set(schemaic_core::persist::ring_on_disk_after(empty, saving));
             let name = schemaic_core::persist::CLOSED_TABS_FILE;
             match saving {
                 schemaic_core::persist::Saving::Erasing => persist::save_json_erasing(name, &file),

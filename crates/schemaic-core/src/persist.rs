@@ -673,24 +673,57 @@ impl ClosedTabsFile {
     }
 }
 
+/// What the last write of the recently-closed ring left on disk — what
+/// [`closed_ring_saving`] decides from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RingOnDisk {
+    /// Nothing written yet this session.
+    #[default]
+    Unknown,
+    /// A ring with tabs in it.
+    Holding,
+    /// An empty ring — with the ring before it kept as `.bak` (an ordinary
+    /// write), or not (an erasing one).
+    Empty { backup_kept: bool },
+}
+
+/// What a write of the ring that is `file_empty` (or not) by `saving` leaves.
+pub fn ring_on_disk_after(file_empty: bool, saving: Saving) -> RingOnDisk {
+    if file_empty {
+        RingOnDisk::Empty {
+            backup_kept: saving == Saving::Replacing,
+        }
+    } else {
+        RingOnDisk::Holding
+    }
+}
+
 /// How a write of the recently-closed ring is saved, or `None` when it need
-/// not be: `file_empty` is whether the file to write holds nothing, `emptied`
-/// whether the last write already left it empty, `erasing` the connection
+/// not be: `file_empty` is whether the file to write holds nothing, `on_disk`
+/// what the last write left ([`ring_on_disk_after`]), `erasing` the connection
 /// delete's spelling, `restore` the "restore tabs" setting.
 ///
 /// An ordinary write of a file already left empty is skipped — with the
 /// setting off every close would otherwise be an erasing save, each paying
 /// its fsync — but **an erasing one never is**: the ordinary write that
 /// emptied the file kept the ring before it as `.bak`, and the connection
-/// delete's erasure is what removes it.
+/// delete's erasure is what removes it. **Nor is the setting's own**: off,
+/// where the write that emptied the file kept a `.bak`, that `.bak` is the
+/// closed tabs' text the setting says is not kept, so the write goes ahead as
+/// an erasing one. It was skipped, and a reopen that emptied the ring before
+/// the setting went off left the text there indefinitely.
 pub fn closed_ring_saving(
     file_empty: bool,
-    emptied: bool,
+    on_disk: RingOnDisk,
     erasing: bool,
     restore: bool,
 ) -> Option<Saving> {
-    if file_empty && emptied && !erasing {
-        return None;
+    if file_empty && !erasing {
+        match on_disk {
+            RingOnDisk::Empty { backup_kept: false } => return None,
+            RingOnDisk::Empty { backup_kept: true } if restore => return None,
+            RingOnDisk::Empty { .. } | RingOnDisk::Unknown | RingOnDisk::Holding => {}
+        }
     }
     Some(if erasing || !restore {
         Saving::Erasing
@@ -1359,7 +1392,37 @@ pub(crate) trait FileStore {
     /// which carries whatever mode it had (a 0644 left by a build from before
     /// [`write_private`]).
     fn narrow(&self, _path: &Path) {}
+    /// Are `path`'s contents **settled** — on stable storage, as far as this
+    /// store can tell — so that renaming it to `.bak` keeps a durable
+    /// generation? [`write_bytes`] rotates only a settled primary.
+    fn settled(&self, _path: &Path) -> bool {
+        true
+    }
+    /// `path` was just given contents nothing has synced — what
+    /// [`Self::settled`] answers from, where the store cannot ask the disk.
+    fn unsettle(&self, _path: &Path) {}
+    /// How long ago `path`'s contents were written, or `None` where the
+    /// store cannot say (or there is no such file).
+    fn age(&self, _path: &Path) -> Option<std::time::Duration> {
+        None
+    }
 }
+
+/// How old the `.bak` may grow while every save finds an unsettled primary
+/// ([`FileStore::settled`]) — saves a few seconds apart for an hour of typing
+/// would otherwise keep the session's first generation as the backup. Past
+/// it, the next save syncs the primary once and rotates it.
+const BACKUP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How long after this process wrote a store's file its contents are taken to
+/// be on disk ([`Fs`]'s [`FileStore::settled`]): past Linux's 30-second dirty
+/// expiry plus its writeback interval, and Windows' lazy writer, with margin.
+const SETTLE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The files this process wrote without a sync, and when — [`Fs`]'s answer
+/// to [`FileStore::settled`].
+static UNSETTLED: Mutex<Option<std::collections::HashMap<PathBuf, std::time::Instant>>> =
+    Mutex::new(None);
 
 /// The real filesystem.
 pub(crate) struct Fs;
@@ -1390,6 +1453,34 @@ impl FileStore for Fs {
         if let Ok(f) = std::fs::File::open(path) {
             let _ = f.sync_data();
         }
+        if let Some(m) = UNSETTLED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            m.remove(path);
+        }
+    }
+    fn settled(&self, path: &Path) -> bool {
+        // A file this process did not write since it started is taken as
+        // settled — it outlived the process that wrote it.
+        UNSETTLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(path))
+            .is_none_or(|at| at.elapsed() >= SETTLE_AFTER)
+    }
+    fn age(&self, path: &Path) -> Option<std::time::Duration> {
+        std::fs::metadata(path)
+            .ok()?
+            .modified()
+            .ok()?
+            .elapsed()
+            .ok()
+    }
+    fn unsettle(&self, path: &Path) {
+        UNSETTLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(path.to_path_buf(), std::time::Instant::now());
     }
     fn narrow(&self, path: &Path) {
         #[cfg(unix)]
@@ -1488,9 +1579,27 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], savin
     // old file's mode, hence `narrow`. A primary that cannot be moved (absent
     // on a first save, or held open elsewhere) keeps the old copy-in-place, so
     // a save is never refused over its backup.
+    //
+    // **Only a settled primary is rotated** ([`FileStore::settled`]). A second
+    // save inside the writeback window found the first's contents still in
+    // flight, and renaming them over the `.bak` unlinked the one durable
+    // generation: a power loss then read the defaults — the open tabs, or
+    // every saved connection — where the module's promise is the new
+    // generation or the one before. An unsettled primary is simply replaced
+    // below, and the older, durable `.bak` stays — unless that `.bak` has
+    // grown past `BACKUP_MAX_AGE` (or is missing), when the primary is synced
+    // once and rotated, so the backup is never more than minutes old.
     let mut backed_up = false;
-    if saving == Saving::Replacing {
-        let bak = sibling(path, ".bak");
+    let bak = sibling(path, ".bak");
+    let rotate = saving == Saving::Replacing
+        && (store.settled(path) || {
+            let stale = store.age(&bak).is_none_or(|a| a >= BACKUP_MAX_AGE);
+            if stale {
+                store.sync(path);
+            }
+            stale
+        });
+    if rotate {
         if store.rename(path, &bak).is_ok() {
             store.narrow(&bak);
             backed_up = true;
@@ -1509,6 +1618,9 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], savin
             // a failed save leaves the file where it found it.
             let _ = store.rename(&sibling(path, ".bak"), path);
         }
+    }
+    if landed {
+        store.unsettle(path);
     }
     if saving == Saving::Erasing && landed {
         // **Synced before the backup goes, because this is the save with no
@@ -2642,6 +2754,9 @@ mod tests {
         /// Paths whose `write` fails, and whether `rename` fails at all.
         unwritable: RefCell<Vec<PathBuf>>,
         rename_fails: RefCell<bool>,
+        /// Paths a `rename` *from* fails for, the others going through — the
+        /// one rename of two that a real disk refuses.
+        rename_fails_from: RefCell<Vec<PathBuf>>,
         /// Paths whose `read` fails as a denied permission would — present,
         /// and not readable.
         unreadable: RefCell<Vec<PathBuf>>,
@@ -2692,7 +2807,9 @@ mod tests {
             Ok(())
         }
         fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-            if *self.rename_fails.borrow() {
+            if *self.rename_fails.borrow()
+                || self.rename_fails_from.borrow().iter().any(|p| p == from)
+            {
                 return Err(FakeFs::err());
             }
             let Some(bytes) = self.files.borrow_mut().remove(from) else {
@@ -2744,6 +2861,9 @@ mod tests {
         names: RefCell<HashMap<PathBuf, usize>>,
         /// Each inode's `(current, durable)` contents.
         inodes: RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
+        /// Every file reads as written an hour ago rather than just now —
+        /// what [`FileStore::age`] answers.
+        old: std::cell::Cell<bool>,
     }
 
     impl CrashFs {
@@ -2800,6 +2920,21 @@ mod tests {
                 inode.1 = inode.0.clone();
             }
         }
+        // Exactly what the disk holds: settled when nothing is in flight.
+        fn settled(&self, path: &Path) -> bool {
+            self.names
+                .borrow()
+                .get(path)
+                .is_none_or(|i| self.inodes.borrow()[*i].0 == self.inodes.borrow()[*i].1)
+        }
+        fn age(&self, path: &Path) -> Option<std::time::Duration> {
+            self.names.borrow().get(path)?;
+            Some(if self.old.get() {
+                std::time::Duration::from_secs(3600)
+            } else {
+                std::time::Duration::ZERO
+            })
+        }
     }
 
     /// **A power loss straight after an ordinary save still leaves a
@@ -2830,6 +2965,111 @@ mod tests {
         let got: String = read_bytes(&fs, Path::new(CFG));
         RECOVERIES.lock().unwrap().clear();
         assert!(got == "p1" || got == "p2", "fell back to {got:?}");
+    }
+
+    /// **Two ordinary saves inside the writeback window still leave a
+    /// generation** (R3-L5-03): the second rotated the first's unsynced
+    /// primary over the one durable `.bak`, so a power loss then read the
+    /// defaults — the open tabs, or every saved connection. A primary the
+    /// store does not call settled is replaced without being rotated, and the
+    /// durable `.bak` stays.
+    #[test]
+    fn two_saves_inside_the_writeback_window_still_leave_a_generation() {
+        let _g = recovery_lock();
+        let fs = CrashFs::default();
+        fs.durable(CFG, r#""p1""#);
+        fs.durable(&format!("{CFG}.bak"), r#""p0""#);
+        for p in [br#""p2""#, br#""p3""#] {
+            assert!(write_bytes(&fs, Path::new(CFG), p, Saving::Replacing));
+        }
+        assert_eq!(fs.read(Path::new(CFG)).unwrap(), br#""p3""#);
+        fs.crash();
+        let got: String = read_bytes(&fs, Path::new(CFG));
+        RECOVERIES.lock().unwrap().clear();
+        assert!(
+            ["p1", "p2", "p3"].contains(&got.as_str()),
+            "fell back to {got:?}"
+        );
+    }
+
+    /// **But the `.bak` does not stay the session's first generation**: once
+    /// it is older than `BACKUP_MAX_AGE`, a save over an unsettled primary
+    /// syncs it once and rotates it, so a crash then reads the generation
+    /// before the last rather than one from an hour ago.
+    #[test]
+    fn a_stale_backup_is_refreshed_by_syncing_the_primary_once() {
+        let _g = recovery_lock();
+        let fs = CrashFs::default();
+        fs.durable(CFG, r#""p1""#);
+        fs.durable(&format!("{CFG}.bak"), r#""p0""#);
+        assert!(write_bytes(
+            &fs,
+            Path::new(CFG),
+            br#""p2""#,
+            Saving::Replacing
+        ));
+        fs.old.set(true);
+        assert!(write_bytes(
+            &fs,
+            Path::new(CFG),
+            br#""p3""#,
+            Saving::Replacing
+        ));
+        fs.crash();
+        let got: String = read_bytes(&fs, Path::new(CFG));
+        RECOVERIES.lock().unwrap().clear();
+        assert_eq!(got, "p2", "the backup is the generation before the last");
+    }
+
+    /// **A save that cannot land puts the primary back** (S3.2-L6-01): the
+    /// primary moved to `.bak`, then neither the `.tmp`'s rename nor the
+    /// direct write landed — so the file is where the save found it, and the
+    /// `.bak` is the generation before.
+    #[test]
+    fn a_save_that_cannot_land_moves_the_primary_back() {
+        let _g = recovery_lock();
+        let fs = FakeFs::default();
+        fs.put(CFG, r#""old""#);
+        fs.put(&format!("{CFG}.bak"), r#""older""#);
+        fs.rename_fails_from
+            .borrow_mut()
+            .push(PathBuf::from(format!("{CFG}.tmp")));
+        fs.unwritable.borrow_mut().push(PathBuf::from(CFG));
+        assert!(!write_bytes(
+            &fs,
+            Path::new(CFG),
+            br#""new""#,
+            Saving::Replacing
+        ));
+        assert_eq!(fs.get(CFG).as_deref(), Some(&br#""old""#[..]));
+        let got: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(got, "old");
+        assert!(
+            RECOVERIES.lock().unwrap().is_empty(),
+            "no recovery: the file is there"
+        );
+    }
+
+    /// **A primary that cannot be moved is copied to `.bak` instead**
+    /// (S3.2-L6-01) — a `.bak` held open on Windows — and the new value
+    /// still lands.
+    #[test]
+    fn a_primary_that_cannot_be_moved_is_copied_and_the_save_lands() {
+        let fs = FakeFs::default();
+        fs.put(CFG, r#""old""#);
+        fs.rename_fails_from.borrow_mut().push(PathBuf::from(CFG));
+        assert!(write_bytes(
+            &fs,
+            Path::new(CFG),
+            br#""new""#,
+            Saving::Replacing
+        ));
+        assert_eq!(fs.get(CFG).as_deref(), Some(&br#""new""#[..]));
+        assert_eq!(
+            fs.get(&format!("{CFG}.bak")).as_deref(),
+            Some(&br#""old""#[..])
+        );
+        assert!(fs.get(&format!("{CFG}.tmp")).is_none());
     }
 
     /// A first save, with no primary to keep, leaves no `.bak` and lands.
@@ -3991,31 +4231,58 @@ mod tests {
     /// since that ordinary write left the previous ring in `.bak`.
     #[test]
     fn an_erasing_ring_write_happens_even_when_the_file_is_already_empty() {
-        use super::{Saving, closed_ring_saving};
-        assert_eq!(
-            closed_ring_saving(true, true, true, true),
-            Some(Saving::Erasing)
-        );
-        assert_eq!(
-            closed_ring_saving(true, true, true, false),
-            Some(Saving::Erasing)
-        );
-        // An ordinary write of an already-empty file is skipped: with the
-        // setting off it would otherwise pay an erasing save per close.
-        assert_eq!(closed_ring_saving(true, true, false, false), None);
-        assert_eq!(closed_ring_saving(true, true, false, true), None);
+        use super::{RingOnDisk, Saving, closed_ring_saving};
+        let kept = RingOnDisk::Empty { backup_kept: true };
+        let erased = RingOnDisk::Empty { backup_kept: false };
+        for on_disk in [kept, erased] {
+            for restore in [true, false] {
+                assert_eq!(
+                    closed_ring_saving(true, on_disk, true, restore),
+                    Some(Saving::Erasing)
+                );
+            }
+        }
+        // An ordinary write of a file already left empty, with no `.bak`, is
+        // skipped: with the setting off it would otherwise pay an erasing
+        // save per close. So is one with the setting on, whose `.bak` is the
+        // ring the user asked to keep.
+        assert_eq!(closed_ring_saving(true, erased, false, false), None);
+        assert_eq!(closed_ring_saving(true, erased, false, true), None);
+        assert_eq!(closed_ring_saving(true, kept, false, true), None);
         // The first empty write still happens, erasing when the setting is off.
         assert_eq!(
-            closed_ring_saving(true, false, false, false),
+            closed_ring_saving(true, RingOnDisk::Unknown, false, false),
             Some(Saving::Erasing)
         );
         assert_eq!(
-            closed_ring_saving(false, false, false, true),
+            closed_ring_saving(false, RingOnDisk::Unknown, false, true),
             Some(Saving::Replacing)
         );
         assert_eq!(
-            closed_ring_saving(false, true, true, true),
+            closed_ring_saving(false, kept, true, true),
             Some(Saving::Erasing)
+        );
+    }
+
+    /// **Turning *Restore tabs* off after a reopen emptied the ring still
+    /// erases its `.bak`** (S3.2-L5-01): the ordinary write that emptied the
+    /// file kept the ring before it — the closed tab's text — as `.bak`, and
+    /// the setting's write was skipped as one of an already-empty file, so the
+    /// text stayed against the setting's own promise of "no `.bak`".
+    #[test]
+    fn restore_tabs_off_after_an_ordinary_emptying_write_erases_the_backup() {
+        use super::{RingOnDisk, Saving, closed_ring_saving, ring_on_disk_after};
+        let after_reopen = ring_on_disk_after(true, Saving::Replacing);
+        assert_eq!(after_reopen, RingOnDisk::Empty { backup_kept: true });
+        assert_eq!(
+            closed_ring_saving(true, after_reopen, false, false),
+            Some(Saving::Erasing)
+        );
+        let after_erasing = ring_on_disk_after(true, Saving::Erasing);
+        assert_eq!(closed_ring_saving(true, after_erasing, false, false), None);
+        assert_eq!(
+            ring_on_disk_after(false, Saving::Replacing),
+            RingOnDisk::Holding
         );
     }
 

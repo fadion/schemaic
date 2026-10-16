@@ -13868,7 +13868,21 @@ existing prose was left alone.
     the very window the new primary's contents were still in flight, so a power loss there took
     both and the store loaded as defaults. `a_crash_after_an_ordinary_save_still_reads_a_generation`
     pins it over `CrashFs`, a store that keeps names and renames across a crash and contents only
-    when synced. Between the two renames the primary is absent, which `recover` reads as `.tmp`,
+    when synced. **Only a settled primary is rotated** (`FileStore::settled`): a second save
+    inside the writeback window found the first's contents still in flight, and renaming them over
+    the `.bak` unlinked the one durable generation — two ordinary saves and a power loss read the
+    defaults (`two_saves_inside_the_writeback_window_still_leave_a_generation`). An unsettled
+    primary is replaced without being rotated, so the `.bak` stays the older, durable generation,
+    and no fsync is paid per save — until that `.bak` is older than `BACKUP_MAX_AGE` (5 minutes,
+    `FileStore::age`) or missing, when the save syncs the primary once and rotates it, so saves
+    seconds apart for an hour of typing do not keep the session's first generation as the backup
+    (`a_stale_backup_is_refreshed_by_syncing_the_primary_once`). `Fs` answers from a process-wide record of the files it wrote
+    unsynced (`FileStore::unsettle`, cleared by `sync`): settled once `SETTLE_AFTER` (60 s, past
+    Linux's dirty expiry and Windows' lazy writer) has gone by, and a file this process never wrote
+    always; `CrashFs` answers exactly. The two partial failures are pinned over `FakeFs`'s per-path
+    `rename_fails_from` (`a_save_that_cannot_land_moves_the_primary_back`,
+    `a_primary_that_cannot_be_moved_is_copied_and_the_save_lands`). Between the two renames the
+    primary is absent, which `recover` reads as `.tmp`,
     then `.bak`. A renamed file keeps its mode, so `FileStore::narrow` takes the `.bak` to 0600 (a
     0644 left by a build from before `write_private`); a primary that cannot be moved — absent on a
     first save, or held open elsewhere — keeps the old copy-in-place, so a save is never refused
@@ -14074,11 +14088,16 @@ existing prose was left alone.
     off, and **never an entry whose text `sql::carries_credential` flags** under any dialect — the
     rule `history.json` keeps, so closing a tab that ran `ALTER USER … IDENTIFIED BY` does not leave
     the password on disk until ten more closes push it out; the entry stays in the in-memory ring
-    (`a_closed_tab_carrying_a_credential_stays_off_disk`). `closed_ring_saving(file_empty, emptied,
-    erasing, restore)` decides how a write is saved, or that it is skipped: an ordinary write of a
-    file the last write already emptied is, an **erasing one never is**, because the ordinary write
+    (`a_closed_tab_carrying_a_credential_stays_off_disk`). `closed_ring_saving(file_empty, on_disk,
+    erasing, restore)` decides how a write is saved, or that it is skipped — `on_disk` being what
+    the last write left (`RingOnDisk`, from `ring_on_disk_after`): an ordinary write of a file the
+    last write already emptied is skipped, an **erasing one never is**, because the ordinary write
     that emptied it kept the ring before it as `.bak`
-    (`an_erasing_ring_write_happens_even_when_the_file_is_already_empty`). The writer is the app's
+    (`an_erasing_ring_write_happens_even_when_the_file_is_already_empty`), **and nor is the
+    setting's own where that `.bak` was kept**: off, the closed tabs' text is what it says is not
+    kept, so the write goes ahead erasing — a reopen that emptied the ring before the setting went
+    off left the text in `.bak` indefinitely
+    (`restore_tabs_off_after_an_ordinary_emptying_write_erases_the_backup`). The writer is the app's
     `save_closed`, under the session-restore passage in *app/main.rs*.
     **`ai_harness` has two defaults, and the difference between them is the point.** A file *without*
     the key takes the serde default, `default_ai_harness` — `"claude"`, which is what every file
@@ -14096,13 +14115,15 @@ existing prose was left alone.
     `recover(primary, staged, backup)` returns the value *and* a `Recovered` — `Primary`,
     `FirstRun`, `Corrupt(err)` or `Restored(sibling)` — and an absent primary walks `.tmp` then
     `.bak` before it concedes. That order, because `write_bytes` stages the *new* value into `.tmp`
-    and copies the *old* primary into `.bak`, so where both survive the staged one is the newer; a
+    and moves the *old* primary to `.bak`, so where both survive the staged one is the newer; a
     sibling that does not parse is stepped over rather than believed, which is what stops a
     half-written `.tmp` shadowing an intact `.bak`. Before this the absent case defaulted with
     nothing said, the next save wrote the defaults over the primary, and the save *after* that
     copied the now-defaulted primary onto `.bak` — the last copy gone within two ordinary saves, and
-    saves are frequent (a tab change, a history entry). The two ways to arrive there are a crash
-    between the staged write and the rename on a *first* save, which leaves a `.tmp` holding
+    saves are frequent (a tab change, a history entry). The three ways to arrive there are a crash
+    between the two renames of **any** rotating save — the primary moved to `.bak`, the `.tmp` not
+    yet over it, the most frequent of the three — a crash between the staged write and the rename
+    on a *first* save, which leaves a `.tmp` holding
     everything, and the file being removed from outside: the Settings modal's own *Open folder*
     button puts the user in that directory, and a roaming-profile sync, a backup restore or an AV
     quarantine reach it too. **`read_bytes` classifies before it sweeps**, and sweeps the orphan
@@ -33076,11 +33097,12 @@ existing prose was left alone.
   tab carrying a credential stays off disk. An effect on `restore_tabs` calls it, so turning the
   setting off empties the file within the debounce rather than at the next close; its first run,
   at startup, rewrites the file as just filtered. **An empty file is written once, not per
-  change**: `write_closed` keeps an `emptied` flag and skips an ordinary write that would leave
-  the file saying nothing again, so with the setting off a close is not an erasing save paying the
-  fsync `persist.rs` budgets one per deletion — but not an erasing one
+  change**: `write_closed` keeps what the last write left (`persist::RingOnDisk`) and skips an
+  ordinary write that would leave the file saying nothing again, so with the setting off a close
+  is not an erasing save paying the fsync `persist.rs` budgets one per deletion — but not an
+  erasing one, nor the setting's own going off over a kept `.bak`
   (`persist::closed_ring_saving`): the ordinary write that emptied the file kept the ring before it
-  as `.bak`, which only the delete's erasure removes. What this does not
+  as `.bak`, which the delete's erasure or the setting's removes. What this does not
   keep, stated rather than implied: with the setting off, a closed file tab's unsaved text in the
   ring does not survive a restart, unlike an open one's.
   **What the assistant knows about the result on screen, and how rows reach it.** `TurnContext`
