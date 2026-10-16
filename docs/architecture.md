@@ -22163,6 +22163,20 @@ existing prose was left alone.
   LANGUAGE British; SET DATEFIRST 3` read back, which is also what proves the batch-not-RPC send,
   and `SET LANGUAGE NoSuchLanguage` failing the operation — passing on 2022 and 2025 by the
   change's author's report.
+  **`partitions.rs` and `dump_replay.rs` hold a dump to what it does when it is run**, both in
+  `live_suite!`. `partitions.rs` reads a partitioned table back as one, dumps it and restores it
+  with every partition's rows, replays one partition beside its siblings, and plans a compared
+  partitioned table the server takes; its `dump_of(scratch, tables)` — the app's `plan` and
+  `render_rows` over the rows read on `Db::for_rows`, as `cli::dump::run` reads them — and `count`
+  are shared with the other module. `dump_replay.rs` is the **replay onto the source**, the case a
+  dump meets most and a fresh-database restore never exercises: a key a table outside the file
+  holds, the views and materialized views outside it, a materialized view and the routines it
+  carries, types and sequences left as they stand, a MariaDB sequence restored and never rewound
+  past where it stands, a MariaDB routine's grants kept, a `TIMESTAMP` restored as the instant it
+  was across session zones, a locked-down PostgreSQL routine the cascade would take refused rather
+  than reopened, and a restored partition firing none of its parent's triggers. Each is gated on the
+  capability it needs — `drop_cascade`, `partitions_are_tables`, the dialect where only one engine
+  has the object — and notes a no-op where the leg cannot hold it.
   **In `users.rs` the reads are of accounts that were already there and the writes make their own.**
   An account is server-wide — it is not inside the scratch database and would not go away with it —
   so the read half asks about the account the suite **connected as** (`Target::user()`), that being
@@ -22365,11 +22379,13 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **636 tests** as this is written — 149 suite functions
-  expanded across the three legs by `main.rs`'s macro (447), SQL Server's own 166 in `mssql.rs`,
-  the seventeen in the two catalog oracles outside the macro (`pg_catalog`'s ten and
-  `mariadb_catalog`'s seven), and the six that need no server (the four name-guard cases,
-  `endpoint.rs`'s declared-case count, and the skip-notice source gate). The figure this sentence
+  tier stays pure by construction. It is **662 tests on Windows, 661 elsewhere,** as this is
+  written (re-derived with `--list`) — 157 suite functions expanded across the three legs by
+  `main.rs`'s macro (471), SQL Server's own 168 in `mssql.rs` (167 off Windows: one,
+  `a_windows_sign_in_is_this_processs_own_identity`, is `cfg(windows)`), the seventeen in the two
+  catalog oracles outside the macro (`pg_catalog`'s ten and `mariadb_catalog`'s seven), and the
+  six that need no server (the four name-guard cases, `endpoint.rs`'s declared-case count, and the
+  skip-notice source gate). The figure this sentence
   carried for a while was 306, a count that had never included the oracles, and then 388, which had
   never included SQL Server's leg; both went stale as the suite grew, so `cargo test -p schemaic-db
   --features live-tests --test live -- --list` is where to re-derive it rather than adjust it by
