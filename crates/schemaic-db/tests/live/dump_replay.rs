@@ -282,6 +282,58 @@ pub async fn a_timestamp_restores_as_the_instant_it_was(target: &'static Target)
     s.teardown().await;
 }
 
+/// **A replay does not bring a locked-down routine back open.** On
+/// PostgreSQL the file's `DROP TABLE … CASCADE` takes a function over the
+/// table's row type, and its `CREATE OR REPLACE` then *creates* it afresh —
+/// with the default ACL and the replaying role as owner: a `SECURITY
+/// DEFINER` function revoked from `PUBLIC` came back executable by every role,
+/// and the cascade guard let it through as a routine the file recreates. The
+/// guard now names it, and the replay stops before dropping anything.
+pub async fn a_replay_does_not_reopen_a_locked_down_routine(target: &'static Target) {
+    let s = Scratch::create(target, "replay_definer").await;
+    if schemaic_core::dump::drop_cascade(s.dialect()).is_empty() {
+        crate::endpoint::note_no_op(target, "drops no routine with a table");
+        s.teardown().await;
+        return;
+    }
+    let (customers, f) = (s.qualified("customers"), s.qualified("f_set"));
+    s.exec(&format!(
+        "CREATE TABLE {customers} (id INTEGER PRIMARY KEY)"
+    ))
+    .await;
+    s.exec(&format!(
+        "CREATE FUNCTION {f}() RETURNS SETOF {customers} SECURITY DEFINER LANGUAGE sql \
+         AS $$ SELECT * FROM {customers} $$"
+    ))
+    .await;
+    s.exec(&format!("REVOKE EXECUTE ON FUNCTION {f}() FROM PUBLIC"))
+        .await;
+    let open =
+        format!("SELECT (proacl IS NULL)::text FROM pg_proc WHERE oid = '{f}()'::regprocedure");
+    assert_eq!(scalar(&s, &open).await, "false", "the fixture's revoke");
+    let file = dump_of(&s, &["customers"]).await;
+    assert!(
+        file.contains("f_set"),
+        "the fixture no longer carries the routine:\n{file}"
+    );
+    let end = run_file(&s, &file).await;
+    assert_eq!(
+        scalar(&s, &open).await,
+        "false",
+        "the replay reopened the function to PUBLIC:\n{file}"
+    );
+    match end {
+        ExecEnd::Failed { message, .. } => {
+            assert!(
+                message.contains("f_set"),
+                "the refusal names no function:\n{message}"
+            )
+        }
+        other => panic!("the replay ran: {other:?}"),
+    }
+    s.teardown().await;
+}
+
 /// **A MariaDB replay keeps every grant on the routines it replaces.** The
 /// file dropped each routine before its `CREATE`, and with
 /// `automatic_sp_privileges` (the default) the `DROP` revoked every account's

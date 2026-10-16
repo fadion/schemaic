@@ -202,6 +202,7 @@ live_suite!(
         a_replay_replaces_the_routines_it_carries,
         a_mariadb_replay_keeps_the_grants_on_the_routines_it_replaces,
         a_timestamp_restores_as_the_instant_it_was,
+        a_replay_does_not_reopen_a_locked_down_routine,
         a_replay_keeps_the_types_and_sequences_it_carries,
         a_replay_restores_a_mariadb_sequence_and_its_position,
         a_partition_replay_fires_no_parent_trigger_on_its_rows,

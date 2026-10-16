@@ -5794,7 +5794,7 @@ existing prose was left alone.
     (reached through their auto, internal and partition dependencies alone), the keys the closing
     section restates, the routines the file recreates with `CREATE OR REPLACE`, and any part of
     something already counted. Whatever is left is named in one error — *replaying this file would
-    drop … along with the tables it replaces, and does not put them back*, with the hint *Add them
+    drop … along with the tables it replaces, and does not put them back as they are*, with the hint *Add them
     to the export, or drop them yourself first* — before anything is dropped. A relation the target
     does not have seeds nothing (`to_regclass` is `NULL`), so a restore into an empty database walks
     nothing. Measured on PostgreSQL 16 by the same author: a one-partition dump's walk reaches the
@@ -5806,8 +5806,15 @@ existing prose was left alone.
     new snapshot, not the one the user had. The trade is that a replay onto a source holding a view
     outside the file over a dumped table, which used to "succeed" with the view gone, now stops
     loudly with nothing dropped. A routine the file recreates is accepted although `CASCADE` drops
-    it — the status quo before the guard, left as a known gap rather than judged sound
-    (`a_cascade_may_take_a_routine_the_file_recreates`). The block is asked of `drop_cascade`, so it
+    it **only where recreating it changes nothing about it** — `proacl IS NULL` (the default
+    privileges) and owned by the replaying role (`a_cascade_may_take_a_routine_the_file_recreates`).
+    The file's `CREATE OR REPLACE` *creates* a routine the cascade took, with the default ACL and
+    the replaying role as owner, so a `SECURITY DEFINER` function over a dumped table's row type,
+    revoked from `PUBLIC`, came back executable by every role under a success report (measured on
+    PostgreSQL 16: `proacl` `{schemaic=X/schemaic}` → `NULL`); one with grants or another owner is
+    named now, and the replay stops (`a_replay_does_not_reopen_a_locked_down_routine`, live — red
+    against the old guard). The dropped tables' own grants, owner and policies are still not put
+    back: the model reads none of them. The block is asked of `drop_cascade`, so it
     is written only where that is non-empty and the file drops something — MySQL, SQLite and SQL
     Server files are byte-identical to before — and never with *Drop before create* or Structure off
     (`a_replay_stops_before_a_cascade_would_drop_what_the_file_does_not_put_back`,

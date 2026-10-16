@@ -1431,7 +1431,13 @@ fn drop_keyword(t: &TableInfo) -> &'static str {
 /// partition's clone of it) — and takes away what is the dropped tables' own
 /// (reached through their auto, internal and partition dependencies only),
 /// the restated keys and the recreated routines, and what is part of anything
-/// already counted. Whatever remains is named in the error, which ends the
+/// already counted. **A recreated routine only where recreating it changes
+/// nothing**: its ACL the default and its owner the replaying role. The file's
+/// `CREATE OR REPLACE` *creates* one the `CASCADE` dropped — a
+/// `SECURITY DEFINER` function over a dropped table's row type, revoked from
+/// `PUBLIC`, came back executable by every role and owned by whoever replayed
+/// (measured on PostgreSQL 16: `proacl` `{schemaic=X/schemaic}` → `NULL`) —
+/// so one with grants or another owner is named instead. Whatever remains is named in the error, which ends the
 /// run there — inside the file's transaction where it has one, and either way
 /// before anything is dropped. Measured on PostgreSQL 16: a one-partition
 /// dump's walk counts the key a table outside the file holds on the parent
@@ -1508,7 +1514,8 @@ pub fn cascade_guard_sql(
                  AND NOT EXISTS (SELECT 1 FROM pg_proc p\n             \
                  JOIN pg_namespace s ON s.oid = p.pronamespace\n             \
                  JOIN procs u ON s.nspname = u.ns AND p.proname = u.name\n             \
-                 WHERE c.classid = 'pg_proc'::regclass AND p.oid = c.objid)\n       \
+                 WHERE c.classid = 'pg_proc'::regclass AND p.oid = c.objid\n               \
+                 AND p.proacl IS NULL AND pg_get_userbyid(p.proowner) = current_user)\n       \
                  AND NOT EXISTS (SELECT 1 FROM cand o\n             \
                  WHERE c.objsubid <> 0 AND o.classid = c.classid\n               \
                  AND o.objid = c.objid AND o.objsubid = 0)\n       \
@@ -1522,8 +1529,8 @@ pub fn cascade_guard_sql(
                  FROM lost_rows) l;\n  \
                  IF lost IS NOT NULL THEN\n    \
                  RAISE EXCEPTION 'Schemaic: replaying this file would drop % along with the tables \
-                 it replaces, and does not put them back. The replay stopped here, before dropping \
-                 anything.', lost\n      \
+                 it replaces, and does not put them back as they are. The replay stopped here, \
+                 before dropping anything.', lost\n      \
                  USING HINT = 'Add them to the export, or drop them yourself first.';\n  \
                  END IF;\nEND"
             );
@@ -9988,6 +9995,13 @@ mod tests {
         // back by the file's own `CREATE OR REPLACE`, so it is no refusal.
         assert!(
             file.contains("procs(ns, name) AS (VALUES ('public', 'f_one'))"),
+            "{file}"
+        );
+        // **Only one recreating changes nothing about** — its ACL the default,
+        // its owner the replaying role (S1.1-L5-03): a revoked `SECURITY
+        // DEFINER` function came back executable by every role.
+        assert!(
+            file.contains("AND p.proacl IS NULL AND pg_get_userbyid(p.proowner) = current_user)"),
             "{file}"
         );
         // Not without the routines.
