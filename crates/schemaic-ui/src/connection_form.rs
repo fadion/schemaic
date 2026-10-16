@@ -313,8 +313,8 @@ fn jump_hosts_field(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl
 }
 
 /// What `~/.ssh/config` makes of the tunnel as typed — the host an alias names,
-/// and the port, user, key and jump hosts the file fills in
-/// (`core::ssh_config::describe`) — or nothing when it changes nothing. The
+/// and the port, user, key and jump hosts the file fills in, or the connect's
+/// refusal (`core::ssh_config::describe_route`) — or nothing when it changes nothing. The
 /// file is read once, when the tunnel's fields are built; the tunnel itself
 /// re-reads it at every connect, so an edit shows here on reopening the form.
 fn ssh_config_hint(draft: DraftSignals) -> impl IntoView {
@@ -334,8 +334,9 @@ fn ssh_config_hint(draft: DraftSignals) -> impl IntoView {
         if tunnel.host.is_empty() {
             return None;
         }
-        let found = schemaic_core::ssh_config::resolve(text, &tunnel.host, home.as_deref());
-        schemaic_core::ssh_config::describe(&tunnel, &found)
+        // The route the connect builds, so the note says what it will —
+        // its refusal included (`describe_route`).
+        schemaic_core::ssh_config::describe_route(&tunnel, Some((text, home.as_deref())))
     });
     // The box collapses with the line, so an alias-free host claims no gap
     // (`widgets::collapse_unless`).

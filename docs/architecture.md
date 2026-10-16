@@ -12549,7 +12549,7 @@ existing prose was left alone.
     and the module doc says so rather than half-doing them**: `Match` blocks, whose conditions need
     the local user, the network and a shell — skipped as a block that did not match, so their
     options never leak into the answer (`a_match_block_is_skipped_and_its_options_never_leak`);
-    `ProxyCommand`, a program to run; `Include`; and every
+    `ProxyCommand`, a program to run; and every
     token but `%h`, `%d`, a leading `~` and `%%`, with `~` and `%d` left as written when no home
     directory is known. **A route either of the first two would set is marked, not skipped
     silently** (`unread_route`), because skipping it dialled the alias straight at its `HostName`
@@ -12564,7 +12564,22 @@ existing prose was left alone.
     criterion — `exec`, `user`, `localnetwork` — needs the machine to answer, so it counts as
     may-apply (`a_match_block_that_may_route_the_host_is_marked_unread`); the cost is that a
     `Match` which would never fire here refuses a tunnel `ssh` would open, and typing the route as
-    jump hosts is the way past it. An unparseable `Port` or a keyword with no argument says nothing — and the
+    jump hosts is the way past it. **A may-apply `Match`'s `none` counts too**: it may settle the
+    slot, so a route a later block sets is `UnreadRoute::Match` — the "direct on the office LAN,
+    through the bastion elsewhere" config went silently through the bastion
+    (`a_match_none_before_a_later_route_marks_it_unread`). **And the destination**: a may-apply
+    `Match` setting `HostName` or `Port` before any block has is `UnreadRoute::MatchDestination`,
+    which typed jump hosts do not settle (`UnreadRoute::settled_by_typed_jumps`) — skipped, the
+    tunnel dialled the bare alias, trusting its key and, under password sign-in, sending the
+    password there (`a_match_block_that_may_set_the_destination_is_marked_unread`). **`Include` is
+    read** (`expand_includes`, the reader a seam): `read_user_config` replaces each `Include` line
+    with the files it names — relative to `~/.ssh`, a wildcard in the last component matched in name
+    order, OpenSSH's nesting limit of 16, each file under `MAX_CONFIG_BYTES` — in spans `resolve`
+    scopes as OpenSSH does: an include in a block that does not apply is skipped, and the block
+    state is put back after it. One that cannot be read is left as its line, which `resolve` marks
+    `UnreadRoute::Include` where it applies (`an_include_is_read_where_it_stands`); it was not read
+    at all, so an alias whose `HostName` lived in an included `config.d/work` dialled the bare name.
+    An unparseable `Port` or a keyword with no argument says nothing — and the
     first `Port` still counts when it is unreadable, so a later block's cannot slip in behind it,
     where OpenSSH would refuse the file (`an_empty_or_unparseable_config_says_nothing`). `MAX_CONFIG_BYTES` (1 MiB) is the largest file
     the reader takes; a real one is a few kilobytes.
@@ -12637,7 +12652,11 @@ existing prose was left alone.
     Where the connect would refuse, `describe` answers the refusal's own sentence instead of that
     line — the unread route where the connection names no jump hosts, the password one where
     password sign-in would go through a config-supplied jump — so the form says so before anyone
-    connects (`the_form_says_when_the_config_routes_the_host_unreadably`). It reaches them through
+    connects (`the_form_says_when_the_config_routes_the_host_unreadably`). **The form asks
+    `describe_route(tunnel, config)`**, which answers `resolve_route`'s refusal where the connect
+    refuses and `describe`'s line otherwise: `describe` sees only the host's own block, so the
+    connect's refusal of the first jump host's own route read as *through inner* in the form
+    (`the_form_names_the_first_jump_hosts_refusal`). It reaches them through
     the same sentence functions and `may_offer_password`, not by calling `resolve_route`. It speaks
     only of the SSH host, so the first jump host's refusal is not among them: that one shows at
     connect, not under the field.

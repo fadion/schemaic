@@ -13,14 +13,18 @@
 //!
 //! **Not read**, and said so rather than half-done: `Match` blocks (whose
 //! conditions need the local user, the network and a shell), `ProxyCommand`
-//! (a program to run), `Include`, and every token but `%h`, `%d`, `~` and
-//! `%%`. A `Match` block's options are skipped as a block that did not match.
+//! (a program to run), and every token but `%h`, `%d`, `~` and `%%`. A
+//! `Match` block's options are skipped as a block that did not match.
 //! A **route** either would set is not skipped silently — that would dial the
 //! `HostName` directly, by a route `ssh` never takes — but marked
 //! ([`SshConfigHost::unread_route`]): a `ProxyCommand` that takes the route
-//! slot, or a `ProxyJump`/`ProxyCommand` in a `Match` block whose `host` and
-//! `originalhost` conditions do not rule this host out. [`resolve_route`] then
-//! refuses, saying so, unless the connection names its own jump hosts. The
+//! slot, or a `ProxyJump`/`ProxyCommand` (a `none` before a later route too)
+//! in a `Match` block whose `host` and `originalhost` conditions do not rule
+//! this host out. [`resolve_route`] then refuses, saying so, unless the
+//! connection names its own jump hosts. A **destination** such a block may
+//! set — `HostName`, `Port` — is marked as well, and refused whatever jump
+//! hosts are typed. `Include` is read where it stands ([`expand_includes`]),
+//! and one that cannot be read is marked. The
 //! **first jump host** is refused the same way when its own block routes it
 //! (a `ProxyCommand`, a `Match`, or a `ProxyJump` — `ssh` reaches it by that
 //! route, and nothing here follows one); a later hop's own route is the chain
@@ -54,9 +58,113 @@ pub enum UnreadRoute {
     /// The alias's route is a `ProxyCommand` — a program to run, which
     /// Schemaic does not. It takes the slot a later `ProxyJump` would.
     ProxyCommand,
-    /// A `Match` block that may apply sets `ProxyJump` or `ProxyCommand`, and
-    /// its conditions are not evaluated.
+    /// A `Match` block that may apply sets `ProxyJump` or `ProxyCommand` — or
+    /// a `none` that a later block's route would otherwise follow — and its
+    /// conditions are not evaluated.
     Match,
+    /// A `Match` block that may apply sets the host's `HostName` or `Port`:
+    /// not a route but the destination, which typed jump hosts do not settle.
+    MatchDestination,
+    /// An `Include` that applies and could not be read
+    /// ([`expand_includes`]), so what it sets is unknown.
+    Include,
+}
+
+/// The line [`expand_includes`] opens an included file's text with, and the
+/// one it closes it with — a byte no config holds, so no line of the user's
+/// can be one. [`resolve`] scopes the span between them.
+const INCLUDE_BEGIN: &str = "\u{1}include-begin";
+const INCLUDE_END: &str = "\u{1}include-end";
+
+/// How deep an `Include` may nest — OpenSSH's own limit.
+const MAX_INCLUDE_DEPTH: usize = 16;
+
+/// `text` with each `Include` line replaced by the files it names, each in an
+/// [`INCLUDE_BEGIN`]/[`INCLUDE_END`] span, where it stands — `read` answering
+/// a pattern with the texts of the files it names (none, for a glob matching
+/// nothing) or `None` where they cannot be read, which leaves the line for
+/// [`resolve`] to mark ([`UnreadRoute::Include`]).
+///
+/// **Pure over the reader**, so a test models the files; [`read_user_config`]
+/// gives it the one that reads `~/.ssh`. An alias whose `HostName` and
+/// `ProxyJump` live in an included `config.d/work` — the shape OrbStack,
+/// Colima and Teleport write — resolved to nothing, and the tunnel dialled
+/// the bare name where `ssh` dials the configured host.
+pub fn expand_includes(text: &str, read: &dyn Fn(&str) -> Option<Vec<String>>) -> String {
+    expand_at(text, read, 0)
+}
+
+fn expand_at(text: &str, read: &dyn Fn(&str) -> Option<Vec<String>>, depth: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in crate::text::strip_bom(text).lines() {
+        let include = split_line(line).filter(|(k, _)| k.eq_ignore_ascii_case("include"));
+        let Some((_, arg)) = include.filter(|_| depth < MAX_INCLUDE_DEPTH) else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        for pattern in arg.split_whitespace() {
+            match read(pattern) {
+                Some(files) => {
+                    for file in files {
+                        out.push_str(INCLUDE_BEGIN);
+                        out.push('\n');
+                        out.push_str(&expand_at(&file, read, depth + 1));
+                        out.push_str(INCLUDE_END);
+                        out.push('\n');
+                    }
+                }
+                // Left as written: `resolve` marks what it cannot see.
+                None => {
+                    out.push_str("Include ");
+                    out.push_str(pattern);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The texts of the files an `Include` `pattern` names under `ssh_dir`
+/// (`~/.ssh`, which a relative pattern is relative to; `~` is `home`), or
+/// `None` where they cannot be read. A wildcard (`*`, `?`) is matched in the
+/// last component alone, the files taken in name order as `glob(3)` gives
+/// them; one in a folder's name is not read.
+fn read_include(pattern: &str, ssh_dir: &std::path::Path, home: &str) -> Option<Vec<String>> {
+    let expanded = match pattern.strip_prefix("~/") {
+        Some(rest) => std::path::Path::new(home).join(rest),
+        None => ssh_dir.join(pattern),
+    };
+    let wild = |s: &str| s.contains(['*', '?']);
+    let read_one = |p: &std::path::Path| -> Option<String> {
+        let meta = std::fs::metadata(p).ok()?;
+        if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
+            return None;
+        }
+        Some(crate::text::decode_text_file(&std::fs::read(p).ok()?))
+    };
+    let name = expanded.file_name()?.to_string_lossy().into_owned();
+    let dir = expanded.parent()?;
+    if wild(&dir.to_string_lossy()) {
+        return None;
+    }
+    if !wild(&name) {
+        // A file that is not there is no error to `ssh`: it reads nothing.
+        if !expanded.exists() {
+            return Some(Vec::new());
+        }
+        return read_one(&expanded).map(|t| vec![t]);
+    }
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        // `glob(3)` leaves a dot-file to a pattern that names the dot.
+        .filter(|n| glob(&name, n) && (!n.starts_with('.') || name.starts_with('.')))
+        .collect();
+    names.sort();
+    names.iter().map(|n| read_one(&dir.join(n))).collect()
 }
 
 /// The largest config file worth reading. A real one is a few kilobytes.
@@ -66,21 +174,24 @@ pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// there is no such file (or it is too large to be one). The one read of it:
 /// the tunnel opener reads it per connect (`db::ssh::open_tunnel`), as `ssh`
 /// reads it per connection, so an edit applies at the next connect; the
-/// connection form reads it once when the tunnel's fields are shown.
+/// connection form reads it once when the tunnel's fields are shown. Its
+/// `Include`s are read with it ([`expand_includes`]).
 pub fn read_user_config() -> Option<(String, Option<String>)> {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .filter(|h| !h.is_empty())?;
-    let path = std::path::Path::new(&home).join(".ssh").join("config");
+    let ssh_dir = std::path::Path::new(&home).join(".ssh");
+    let path = ssh_dir.join("config");
     let meta = std::fs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
         return None;
     }
     let bytes = std::fs::read(&path).ok()?;
-    Some((
-        crate::text::decode_text_file(&bytes),
-        Some(home.to_string_lossy().into_owned()),
-    ))
+    let home = home.to_string_lossy().into_owned();
+    let text = expand_includes(&crate::text::decode_text_file(&bytes), &|pattern| {
+        read_include(pattern, &ssh_dir, &home)
+    });
+    Some((text, Some(home)))
 }
 
 /// What `text` (an `ssh_config`) says about `alias`, with `home` (when known)
@@ -96,11 +207,43 @@ pub fn resolve(text: &str, alias: &str, home: Option<&str>) -> SshConfigHost {
     let mut route_seen = false;
     // Inside a `Match` block: whether it may apply to this host.
     let mut match_block: Option<bool> = None;
+    // A `Match` that may apply set the route slot to `none`: a route a later
+    // block sets is then one `ssh` may not take.
+    let mut match_none = false;
+    // The block state at each open include span, put back at its end — an
+    // included file's `Host` lines end its own blocks, not the includer's.
+    let mut includes: Vec<(bool, Option<bool>)> = Vec::new();
+    // Inside an include span whose `Include` sat in a block that does not
+    // apply: how deep, so its nested spans are skipped with it.
+    let mut skipping = 0usize;
     for line in crate::text::strip_bom(text).lines() {
+        match line {
+            INCLUDE_BEGIN if skipping > 0 || !(applies || match_block == Some(true)) => {
+                skipping += 1;
+                continue;
+            }
+            INCLUDE_END if skipping > 0 => {
+                skipping -= 1;
+                continue;
+            }
+            _ if skipping > 0 => continue,
+            INCLUDE_BEGIN => {
+                includes.push((applies, match_block));
+                continue;
+            }
+            INCLUDE_END => {
+                if let Some((a, m)) = includes.pop() {
+                    (applies, match_block) = (a, m);
+                }
+                continue;
+            }
+            _ => {}
+        }
         let Some((key, arg)) = split_line(line) else {
             continue;
         };
         let key = key.to_ascii_lowercase();
+        let may_match = match_block == Some(true);
         match key.as_str() {
             "host" => {
                 applies = host_matches(&arg, alias);
@@ -115,16 +258,38 @@ pub fn resolve(text: &str, alias: &str, home: Option<&str>) -> SshConfigHost {
                 match_block = Some(match_may_apply(&arg, alias, host));
                 continue;
             }
-            "proxyjump" | "proxycommand"
-                if match_block == Some(true)
-                    && !route_seen
-                    && !arg.eq_ignore_ascii_case("none") =>
+            // One `expand_includes` could not read, where it would apply.
+            "include" if applies || may_match => {
+                out.unread_route.get_or_insert(UnreadRoute::Include);
+                continue;
+            }
+            "proxyjump" | "proxycommand" if may_match && !route_seen => {
+                if arg.eq_ignore_ascii_case("none") {
+                    match_none = true;
+                } else {
+                    out.unread_route.get_or_insert(UnreadRoute::Match);
+                }
+                continue;
+            }
+            // The destination, where nothing before settled it.
+            "hostname" | "port"
+                if may_match
+                    && (if key == "port" {
+                        !port_seen
+                    } else {
+                        out.hostname.is_none()
+                    }) =>
             {
-                out.unread_route.get_or_insert(UnreadRoute::Match);
+                out.unread_route
+                    .get_or_insert(UnreadRoute::MatchDestination);
                 continue;
             }
             _ if !applies => continue,
             "proxyjump" | "proxycommand" if route_seen => {}
+            "proxyjump" | "proxycommand" if match_none && !arg.eq_ignore_ascii_case("none") => {
+                route_seen = true;
+                out.unread_route.get_or_insert(UnreadRoute::Match);
+            }
             "proxycommand" => {
                 route_seen = true;
                 if arg.eq_ignore_ascii_case("none") {
@@ -203,7 +368,9 @@ pub fn apply(
 /// config hides where the connection names no jump hosts is said instead, in
 /// the sentence the connect refuses with ([`resolve_route`]).
 pub fn describe(tunnel: &crate::connection::SshTunnel, cfg: &SshConfigHost) -> Option<String> {
-    if let (true, Some(unread)) = (tunnel.jump.trim().is_empty(), cfg.unread_route) {
+    if let Some(unread) = cfg.unread_route
+        && !(!tunnel.jump.trim().is_empty() && unread.settled_by_typed_jumps())
+    {
         return Some(unread_route_sentence(&tunnel.host, unread));
     }
     let t = apply(tunnel, cfg);
@@ -230,6 +397,23 @@ pub fn describe(tunnel: &crate::connection::SshTunnel, cfg: &SshConfigHost) -> O
         out.push_str(&format!(", through {}", t.jump));
     }
     Some(out)
+}
+
+/// The connection form's note under the SSH host, from the **route the
+/// connect builds** ([`resolve_route`]): its refusal where it refuses, else
+/// [`describe`]'s line. `describe` alone sees only the host's own block, so a
+/// refusal of the first jump host's own route — which the connect makes —
+/// read as an ordinary *through inner* line in the form. `None` with no
+/// config, or where it changes nothing.
+pub fn describe_route(
+    tunnel: &crate::connection::SshTunnel,
+    config: Option<(&str, Option<&str>)>,
+) -> Option<String> {
+    let (text, home) = config?;
+    if let Err(why) = resolve_route(tunnel, Some((text, home))) {
+        return Some(why);
+    }
+    describe(tunnel, &resolve(text, &tunnel.host, home))
 }
 
 /// A jump host as `~/.ssh/config` completes it: its `HostName`, and the
@@ -280,7 +464,9 @@ pub fn resolve_route(
     };
     let found = resolve(text, &tunnel.host, home);
     let typed_jumps = !tunnel.jump.trim().is_empty();
-    if let (false, Some(unread)) = (typed_jumps, found.unread_route) {
+    if let Some(unread) = found.unread_route
+        && !(typed_jumps && unread.settled_by_typed_jumps())
+    {
         return Err(unread_route_sentence(&tunnel.host, unread));
     }
     let resolved = apply(tunnel, &found);
@@ -373,6 +559,26 @@ fn unread_route_sentence(alias: &str, unread: UnreadRoute) -> String {
             "~/.ssh/config may route {alias} through a Match block, which Schemaic does not \
              read. Give the route as Jump hosts instead."
         ),
+        UnreadRoute::MatchDestination => format!(
+            "~/.ssh/config may point {alias} at another host or port through a Match block, \
+             which Schemaic does not read. Give the address itself as the SSH host instead."
+        ),
+        UnreadRoute::Include => format!(
+            "~/.ssh/config includes a file Schemaic could not read where it applies to {alias}. \
+             Give the address itself as the SSH host, and the route as Jump hosts."
+        ),
+    }
+}
+
+impl UnreadRoute {
+    /// Do jump hosts the connection names settle it? A hidden **route** yes —
+    /// a typed jump wins over the config's, as on `ssh`'s command line — but
+    /// not a hidden **destination**, nor an `Include` that may hold either.
+    pub fn settled_by_typed_jumps(self) -> bool {
+        match self {
+            UnreadRoute::ProxyCommand | UnreadRoute::Match => true,
+            UnreadRoute::MatchDestination | UnreadRoute::Include => false,
+        }
     }
 }
 
@@ -889,6 +1095,120 @@ Host *
         // A Match block without a route is skipped silently, as before.
         let quiet = resolve("Match all\n  User x\n", "db", None);
         assert_eq!(quiet, SshConfigHost::default());
+    }
+
+    /// **A `Match` block that may set the host's destination is marked
+    /// too** (S3.2-L1-01): its `HostName` (or `Port`) was skipped as a block
+    /// that did not match, so the tunnel dialled the bare alias — trusting
+    /// its key on first sight, and under password sign-in sending the
+    /// password there — where `ssh` dials the configured host. A destination
+    /// is not a route: typed jump hosts do not settle it.
+    #[test]
+    fn a_match_block_that_may_set_the_destination_is_marked_unread() {
+        for text in [
+            "Match originalhost db\n  HostName 10.1.2.5\n",
+            "Match exec \"on-vpn\"\n  Port 2200\n",
+        ] {
+            let found = resolve(text, "db", None);
+            assert_eq!(
+                found.unread_route,
+                Some(UnreadRoute::MatchDestination),
+                "{text}"
+            );
+            let mut t = tunnel("db", crate::connection::SshAuth::KeyPair);
+            t.jump = "edge".into();
+            let why = resolve_route(&t, Some((text, None))).expect_err(text);
+            assert!(why.contains("Match"), "{why}");
+        }
+        // Set first by a Host block, it is settled: a later Match cannot move it.
+        let settled = resolve(
+            "Host db\n  HostName db.corp\nMatch all\n  HostName x\n",
+            "db",
+            None,
+        );
+        assert_eq!(settled.unread_route, None);
+        assert_eq!(settled.hostname.as_deref(), Some("db.corp"));
+    }
+
+    /// **A `none` in a `Match` block that may apply settles the route as
+    /// `ssh` may read it** (S3.2-L1-03): the usual "direct on the office LAN"
+    /// config was dropped, so the later `Host *.corp`'s `ProxyJump bastion`
+    /// took the slot and the tunnel went through a host `ssh` would skip.
+    #[test]
+    fn a_match_none_before_a_later_route_marks_it_unread() {
+        let text = "Match exec \"on-lan.sh\"\n  ProxyJump none\nHost *\n  ProxyJump bastion\n";
+        assert_eq!(
+            resolve(text, "db", None).unread_route,
+            Some(UnreadRoute::Match)
+        );
+        // Alone, a `none` changes nothing to read.
+        let alone = resolve("Match exec \"x\"\n  ProxyJump none\n", "db", None);
+        assert_eq!(alone, SshConfigHost::default());
+    }
+
+    /// **An `Include` is read where it stands** (S3.2-L1-01): an alias whose
+    /// `HostName` and `ProxyJump` live in `config.d/work` resolved to
+    /// nothing, and the tunnel dialled the bare name. `expand_includes`
+    /// inlines each file in spans `resolve` scopes as OpenSSH does — an
+    /// include inside a block that does not apply is skipped, and the block
+    /// state is put back after it — and an `Include` it could not read is
+    /// marked rather than passed over.
+    #[test]
+    fn an_include_is_read_where_it_stands() {
+        let files = |pattern: &str| match pattern {
+            "config.d/*" => Some(vec![
+                "Host db\n  HostName 10.1.2.5\n  ProxyJump bastion\n".into(),
+            ]),
+            "inner" => Some(vec!["Host *\n  User other\n".into()]),
+            _ => None,
+        };
+        let text = expand_includes("Include config.d/*\nHost *\n  User me\n", &files);
+        let found = resolve(&text, "db", None);
+        assert_eq!(found.hostname.as_deref(), Some("10.1.2.5"));
+        assert_eq!(found.proxy_jump.as_deref(), Some("bastion"));
+        assert_eq!(found.user.as_deref(), Some("me"));
+        assert_eq!(found.unread_route, None);
+        // Conditional: inside a block that does not apply, nothing of it.
+        let text = expand_includes("Host other\n  Include inner\nHost db\n  Port 2\n", &files);
+        let found = resolve(&text, "db", None);
+        assert_eq!((found.user, found.port), (None, Some(2)));
+        // And the block it sits in goes on after it: `Port` is still db's.
+        let text = expand_includes("Host db\n  Include inner\n  Port 3\n", &files);
+        assert_eq!(resolve(&text, "db", None).port, Some(3));
+        // One it could not read is not passed over.
+        let text = expand_includes("Include nope\n", &files);
+        assert_eq!(
+            resolve(&text, "db", None).unread_route,
+            Some(UnreadRoute::Include)
+        );
+        // Nor is an `Include` left in text nobody expanded.
+        assert_eq!(
+            resolve("Include config.d/*\n", "db", None).unread_route,
+            Some(UnreadRoute::Include)
+        );
+    }
+
+    /// **The form says what the connect will say about the first jump
+    /// host** (S3.2-L1-02): its note read *through inner* while the connect
+    /// refused inner's own ProxyJump. `describe_route` is the note, from the
+    /// route the connect builds.
+    #[test]
+    fn the_form_names_the_first_jump_hosts_refusal() {
+        let text =
+            "Host db\n  ProxyJump inner\nHost inner\n  HostName 10.0.0.2\n  ProxyJump outer\n";
+        let t = tunnel("db", crate::connection::SshAuth::KeyPair);
+        let note = describe_route(&t, Some((text, None))).expect("a note");
+        assert!(
+            note.contains("does not follow a jump host's own ProxyJump"),
+            "{note}"
+        );
+        // A route that builds keeps the ordinary line.
+        let fine = "Host db\n  HostName 10.0.0.9\n";
+        assert_eq!(
+            describe_route(&t, Some((fine, None))).as_deref(),
+            Some("~/.ssh/config: me@10.0.0.9:22")
+        );
+        assert_eq!(describe_route(&t, None), None);
     }
 
     fn tunnel(host: &str, auth: crate::connection::SshAuth) -> crate::connection::SshTunnel {
