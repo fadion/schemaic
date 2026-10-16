@@ -243,7 +243,103 @@ pub fn ticks(lo: f64, hi: f64, want: usize) -> Vec<f64> {
             break;
         }
     }
+    // An axis that stops short of the top — a tick past it overflowed, near
+    // `f64::MAX` — would draw the marks above the plot: none at all, and
+    // `Plot::undrawable` says why.
+    if out.len() < 2 || out.last().is_some_and(|l| *l < hi) {
+        return Vec::new();
+    }
     out
+}
+
+/// The labels of an axis whose ticks are `ticks` — **as precise as the axis
+/// is fine**, so no two read alike.
+///
+/// Each label kept two decimals of its scaled value, so ticks closer than
+/// that printed the same text: `100000000b` twice for snowflake ids a few
+/// apart, `0` five times for a fraction column of 0..0.004, while a value
+/// near `1e150` printed a hundred digits and left the plot no width. Here the
+/// step sets the precision: while seven significant digits tell the ticks
+/// apart, each is [`tick_label`]'s scaled form (`k`, `m`, `b`) with as many
+/// decimals as the step needs, or an exponent past `1e15`; finer than that,
+/// the first tick is written in full and the rest as its offset — `1e17`,
+/// `+96`.
+pub fn tick_labels(ticks: &[f64]) -> Vec<String> {
+    let step = ticks
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|d| *d > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let far = ticks.iter().fold(0.0f64, |m, t| m.max(t.abs()));
+    if !step.is_finite() {
+        return ticks.iter().map(|t| tick_label(*t)).collect();
+    }
+    let needed = if far > step {
+        (far / step).log10().ceil() as i32 + 1
+    } else {
+        1
+    };
+    if needed > 7 {
+        let base = ticks[0];
+        return ticks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                if i == 0 {
+                    exponent(base, 4)
+                } else {
+                    format!("+{}", scaled(t - base, step))
+                }
+            })
+            .collect();
+    }
+    if far >= 1e15 {
+        return ticks
+            .iter()
+            .map(|t| exponent(*t, needed.max(1) as usize))
+            .collect();
+    }
+    ticks.iter().map(|t| scaled(*t, step)).collect()
+}
+
+/// `v` in [`tick_label`]'s scaled form, with the decimals a step of `step`
+/// needs to show.
+fn scaled(v: f64, step: f64) -> String {
+    let a = v.abs().max(step);
+    // Past a billion billions a scaled number is all digits: an exponent,
+    // with the digits the step needs.
+    if a >= 1e15 {
+        let digits = ((a / step).log10().ceil() as i32 + 1).clamp(1, 7);
+        return exponent(v, digits as usize);
+    }
+    let (unit, suffix) = if a >= 1e9 {
+        (1e9, "b")
+    } else if a >= 1e6 {
+        (1e6, "m")
+    } else if a >= 1e4 {
+        (1e3, "k")
+    } else {
+        (1.0, "")
+    };
+    let decimals = (-(step / unit).log10()).ceil().clamp(0.0, 6.0) as usize;
+    format!("{}{suffix}", trim_to(v / unit, decimals))
+}
+
+/// `v` as `1.234e17`, with at most `digits` significant digits and no
+/// trailing zeros in the mantissa.
+fn exponent(v: f64, digits: usize) -> String {
+    let s = format!("{:.*e}", digits.saturating_sub(1), v);
+    match s.split_once('e') {
+        Some((m, e)) => {
+            let m = if m.contains('.') {
+                m.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                m
+            };
+            format!("{m}e{e}")
+        }
+        None => s,
+    }
 }
 
 /// What a chart draws: a series of labelled values (a bar or line chart), or
@@ -283,6 +379,18 @@ impl Plot {
             Plot::Series(_, s) => s.values.is_empty(),
             Plot::Bins(b) => b.is_empty(),
         }
+    }
+
+    /// Why this cannot be drawn, in the words the modal shows in place of the
+    /// canvas — or `None` when it can. A value at or near `±f64::MAX` (a
+    /// common "no upper bound" sentinel) leaves the axis no step a double
+    /// holds ([`ticks`] answers none), and the canvas painted nothing with
+    /// nothing saying why.
+    pub fn undrawable(&self) -> Option<&'static str> {
+        let (lo, hi) = self.range();
+        ticks(lo, hi, 5)
+            .is_empty()
+            .then_some("These values are too large to draw.")
     }
 
     /// The value axis's range. A bar or bin stands on 0, so 0 is in it; a
@@ -387,8 +495,17 @@ pub fn tick_label(v: f64) -> String {
 }
 
 fn trim(v: f64) -> String {
-    let s = format!("{v:.2}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
+    trim_to(v, 2)
+}
+
+/// `v` with at most `decimals` decimals, no trailing zeros, and no `-0`.
+fn trim_to(v: f64, decimals: usize) -> String {
+    let s = format!("{v:.decimals$}");
+    let s = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &s
+    };
     if s == "-0" {
         "0".to_string()
     } else {
@@ -662,6 +779,92 @@ mod tests {
         assert_eq!(tick_label(25_000.0), "25k");
         assert_eq!(tick_label(1_500_000.0), "1.5m");
         assert_eq!(tick_label(-0.0), "0");
+        assert_eq!(
+            tick_labels(&[0.0, 20.0, 40.0]),
+            ["0", "20", "40"],
+            "a round axis reads as before"
+        );
+        assert_eq!(
+            tick_labels(&[1_000_000.0, 1_500_000.0, 2_000_000.0]),
+            ["1m", "1.5m", "2m"]
+        );
+    }
+
+    /// **An axis's labels are as precise as its step** (S5-L1-01): each
+    /// label kept two decimals of its scaled value, so ticks closer than
+    /// that read the same — `100000000b` twice for 3ea81a7d's own snowflake
+    /// ids, `0` five times for a fraction column of 0..0.004 — and a value
+    /// near `1e150` made a label of a hundred digits that left the plot no
+    /// width. Every axis `ticks` builds is labelled pairwise distinct, short.
+    #[test]
+    fn an_axis_never_labels_two_ticks_alike() {
+        for (lo, hi) in [
+            (1e17, 1e17 + 16.0),
+            (2f64.powi(54), 2f64.powi(54) + 4.0),
+            (1.8e18, 1.8e18 + 256.0),
+            (1e17, 1e17),
+            (-1e300, -1e300),
+            (f64::MAX / 2.0, f64::MAX / 2.0),
+            (0.0, 0.004),
+            (101.234, 101.239),
+            (1.7e12, 1.7e12 + 600_000.0),
+            (i64::MAX as f64, i64::MAX as f64),
+            (1e150, 5e150),
+            (0.0, 100.0),
+            (-5.0, 5.0),
+        ] {
+            let t = ticks(lo, hi, 5);
+            let labels = tick_labels(&t);
+            assert_eq!(labels.len(), t.len());
+            for (i, a) in labels.iter().enumerate() {
+                assert!(a.chars().count() <= 16, "({lo}, {hi}): {a:?} of {labels:?}");
+                assert!(
+                    !labels[i + 1..].contains(a),
+                    "({lo}, {hi}): {a:?} twice in {labels:?} for {t:?}"
+                );
+            }
+        }
+        assert_eq!(tick_labels(&ticks(0.0, 0.004, 5))[1], "0.001");
+        assert_eq!(tick_labels(&[1e17, 1e17 + 96.0]), ["1e17", "+96"]);
+    }
+
+    /// **A range too large to draw is said, not left blank** (S5-L1-02): at
+    /// `±f64::MAX` the step overflowed and `ticks` came back empty — the
+    /// canvas painted nothing, with nothing saying why — and near it the axis
+    /// stopped short of the top, so the line ran above the plot.
+    #[test]
+    fn a_range_too_large_to_draw_has_no_axis_and_says_so() {
+        for (lo, hi) in [
+            (0.0, f64::MAX),
+            (-f64::MAX, f64::MAX),
+            (f64::MAX, f64::MAX),
+            (1.7e308, 1.79e308),
+        ] {
+            assert!(
+                ticks(lo, hi, 5).is_empty(),
+                "({lo}, {hi}): {:?}",
+                ticks(lo, hi, 5)
+            );
+        }
+        let s = Series {
+            labels: vec!["a".into()],
+            values: vec![f64::MAX],
+            skipped: 0,
+        };
+        let plot = Plot::Series(ChartKind::Bar, s);
+        assert!(
+            plot.undrawable()
+                .is_some_and(|n| n.contains("too large to draw"))
+        );
+        let fine = Plot::Series(
+            ChartKind::Bar,
+            Series {
+                labels: vec!["a".into()],
+                values: vec![3.0],
+                skipped: 0,
+            },
+        );
+        assert_eq!(fine.undrawable(), None);
     }
 
     #[test]

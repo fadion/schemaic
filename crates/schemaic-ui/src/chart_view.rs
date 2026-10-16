@@ -239,6 +239,10 @@ fn chart_body(
     if drawn.is_empty() {
         return note("Every value in that column is NULL.".to_string());
     }
+    // Said, where the canvas would otherwise paint nothing.
+    if let Some(why) = drawn.undrawable() {
+        return note(why.to_string());
+    }
     let line = chart::caption(rs.row_count(), kind, skipped, rs.truncated);
     v_stack((
         ChartCanvas {
@@ -282,9 +286,10 @@ impl View for ChartCanvas {
         let (Some(&t0), Some(&t1)) = (ticks.first(), ticks.last()) else {
             return;
         };
-        let labels: Vec<TextLayout> = ticks
+        // As one axis, so their precision follows the step (`tick_labels`).
+        let labels: Vec<TextLayout> = chart::tick_labels(&ticks)
             .iter()
-            .map(|t| layout(&chart::tick_label(*t), font, theme::text_faint))
+            .map(|t| layout(t, font, theme::text_faint))
             .collect();
         let gutter = labels.iter().map(|l| l.size().width).fold(0.0, f64::max) + theme::scaled(8.0);
         let label_h = labels.first().map_or(12.0, |l| l.size().height);

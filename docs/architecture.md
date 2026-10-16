@@ -466,7 +466,19 @@ existing prose was left alone.
     it never names the series' cap (`a_histogram_caption_does_not_mention_the_point_cap`).
     `tick_label(v)` prints at most two decimals with
     trailing zeros dropped, `-0` as `0`, and shortens `≥ 1e4`/`1e6`/`1e9` to `k`/`m`/`b`
-    (`tick_labels_drop_noise_and_shorten_large_values`).
+    (`tick_labels_drop_noise_and_shorten_large_values`) — the x-axis's form. **The value axis is
+    labelled as one, `tick_labels(ticks)`, its precision set by the step**: while seven significant
+    digits tell the ticks apart each is the scaled form with as many decimals as the step needs
+    (`0.001` … for a fraction column of 0..0.004) or an exponent past `1e15`; finer than that the
+    first tick is written in full and the rest as its offset (`1e17`, `+96`; `1.7e12`, `+200k`).
+    Per-tick labels of two decimals read the same on a narrow band — `100000000b` twice for the
+    snowflake ids 3ea81a7d made paintable — and a value near `1e150` printed a hundred digits and
+    left the plot no width (`an_axis_never_labels_two_ticks_alike`, pairwise distinct and at most 16
+    characters across the extreme ranges). **A range the axis cannot hold is said**: `ticks` answers
+    none for a range whose step overflows or whose top it cannot reach (values at or near
+    `±f64::MAX`), and `Plot::undrawable` is the note the modal shows in the canvas's place — it
+    painted nothing, and near `MAX` drew the line above the plot
+    (`a_range_too_large_to_draw_has_no_axis_and_says_so`).
   - `result_diff.rs` — **what two results differ by**, behind a result chip's *Compare with*
     (`ui/result_diff_view.rs`): the rows one has that the other has not, and the rows both have
     with different values, matched by a key the user picks. Pure over two `ResultSet`s and over
