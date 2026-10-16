@@ -5778,23 +5778,30 @@ impl TableInfo {
         }
     }
 
-    /// The statement that puts a sequence's counter back where the source's
-    /// was — `ALTER SEQUENCE s RESTART WITH <next_not_cached_value>` — or
+    /// The statement that moves a sequence's counter **forward** to where the
+    /// source's was — `SELECT SETVAL(s, <next_not_cached_value>, 0)` — or
     /// `None` for anything that is not a read sequence with a read position.
     ///
     /// A dump writes it with the rows, since the position is data, not
-    /// definition. Restarting at the *not cached* value skips whatever the
-    /// source had cached and not handed out, which is what a server restart
-    /// does too: a value is never issued twice. It restarts past `maxvalue`
-    /// as readily, so a `nocycle` sequence that had run out is restored run
-    /// out (measured on 10.11.14). The cycle count is not restored.
+    /// definition. The *not cached* value skips whatever the source had cached
+    /// and not handed out, which is what a server restart does too: a value is
+    /// never issued twice. **Never backwards**: `SETVAL` ignores a value below
+    /// the counter (answering `NULL`), where `ALTER SEQUENCE … RESTART WITH`
+    /// rewound a live sequence on a replay onto its source — for tables
+    /// outside the file drawing from it too, and with the restart DDL,
+    /// committed, surviving a replay that then failed. Measured on 10.11.14
+    /// and 11.8.9: after 10, 15, 20 a `SETVAL(s, 20, 0)` left the next value
+    /// 25, and `SETVAL(s, 100, 0)` made it 100. It moves past `maxvalue` as
+    /// readily, so a `nocycle` sequence that had run out is restored run out
+    /// (ERROR 4084 at the next value, measured). The cycle count is not
+    /// restored.
     pub fn sequence_restart_sql(&self, dialect: crate::intel::SqlDialect) -> Option<String> {
         if !self.is_sequence {
             return None;
         }
         let next = self.sequence.as_ref()?.next.as_deref()?;
         Some(format!(
-            "ALTER SEQUENCE {} RESTART WITH {next};",
+            "SELECT SETVAL({}, {next}, 0);",
             qualified_ident(&self.name, self.schema.as_deref(), dialect)
         ))
     }
@@ -10164,7 +10171,8 @@ mod tests {
         assert_eq!(
             t.sequence_restart_sql(crate::intel::SqlDialect::MySql)
                 .as_deref(),
-            Some("ALTER SEQUENCE `sq1` RESTART WITH 110;")
+            // Forward only: a `RESTART` rewound a live sequence (R3-L5-04).
+            Some("SELECT SETVAL(`sq1`, 110, 0);")
         );
     }
 

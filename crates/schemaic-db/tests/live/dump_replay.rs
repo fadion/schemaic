@@ -411,15 +411,27 @@ pub async fn a_replay_restores_a_mariadb_sequence_and_its_position(target: &'sta
     s.exec(&format!("INSERT INTO {t} (v) VALUES (1), (2)"))
         .await;
     let file = dump_of(&s, &["counter", "t"]).await;
-    // Onto its source first, the table standing while the file drops and
-    // recreates the sequence its default calls: MariaDB tracks no such
-    // dependency, so the drop is not refused.
+    // The source goes on after the dump: 20 and 25 handed out.
+    s.exec(&format!("INSERT INTO {t} (v) VALUES (8), (9)"))
+        .await;
+    // Onto its source first, the sequence standing — and **ahead of the
+    // file's position**: the replay must not rewind it (R3-L5-04). It used to
+    // drop, recreate and `RESTART WITH 20`, so the next insert drew 20 again,
+    // a value already used (and by tables outside the file too).
     assert_eq!(
         run_file(&s, &file).await,
         ExecEnd::Done,
         "{}: the dump did not replay onto its source:\n{file}",
         target.name
     );
+    s.exec(&format!("INSERT INTO {t} (v) VALUES (7)")).await;
+    assert_eq!(
+        scalar(&s, &format!("SELECT id FROM {t} WHERE v = 7")).await,
+        "30",
+        "{}: the replay rewound the sequence:\n{file}",
+        target.name
+    );
+    s.exec(&format!("DELETE FROM {t} WHERE v = 7")).await;
     // Then a restore, not a replay over what is still there: a file that left
     // the sequence alone would pass the first, whatever it said about it.
     s.exec(&format!("DROP TABLE {t}")).await;

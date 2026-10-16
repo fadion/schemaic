@@ -3598,7 +3598,16 @@ pub fn plan(
             // gives one file down.
             // A foreign table's step is a comment too (`file_creates`).
             // Nor one it cannot put back as it is — see `Hold`.
-            if opts.drop_if_exists && !up_front && file_creates(t) && !held.contains(&i) {
+            // **Nor a sequence**: its position is state no file carries, so a
+            // replay that dropped and recreated one rewound it — for tables
+            // outside the file drawing from it too. It is created where
+            // missing instead, and moved forward only (`sequence_restart_sql`).
+            if opts.drop_if_exists
+                && !up_front
+                && file_creates(t)
+                && !held.contains(&i)
+                && t.shape() != TableShape::Sequence
+            {
                 let kw = drop_keyword(t);
                 text!(format!(
                     "DROP {kw} IF EXISTS {}{};",
@@ -3650,6 +3659,10 @@ pub fn plan(
                         crate::ddl::client_script(&bodies, dialect),
                     ));
                 }
+            } else if opts.drop_if_exists && t.shape() == TableShape::Sequence {
+                // A file written to be replayed meets the sequence standing.
+                text!(create.replacen("CREATE SEQUENCE ", "CREATE SEQUENCE IF NOT EXISTS ", 1));
+                held_checks.extend(held);
             } else {
                 text!(create);
                 held_checks.extend(held);
@@ -5205,11 +5218,14 @@ mod tests {
         seq
     }
 
-    /// **A read MariaDB sequence is dumped, and comes back where it was.**
-    /// The file said only that it could not restate one, so a restore lost
-    /// every sequence and every `nextval` default naming one. Now the file
-    /// creates it, drops it first where asked (as `DROP SEQUENCE`, which the
-    /// object is), and puts its counter back with the rows — never as an
+    /// **A read MariaDB sequence is dumped, and comes back where it was —
+    /// never behind where it stands.** The file said only that it could not
+    /// restate one, so a restore lost every sequence and every `nextval`
+    /// default naming one. Now the file creates it — where it is missing,
+    /// when the file is one to replay, and **never dropping it**: a drop,
+    /// recreate and `RESTART WITH` rewound a live sequence on a replay onto
+    /// its source, for tables outside the file drawing from it too
+    /// (R3-L5-04) — and moves its counter forward with the rows, never as an
     /// `INSERT` into its state row.
     #[test]
     fn a_read_sequence_is_created_and_its_counter_restored() {
@@ -5222,15 +5238,21 @@ mod tests {
         };
         let p = plan(&s, "shop", &all(&s), opts, SqlDialect::MySql);
         let text = text_of(&p);
-        let drop = text.find("DROP SEQUENCE IF EXISTS `sq1`;").expect(&text);
         let create = text
-            .find("CREATE SEQUENCE `sq1` start with 1 minvalue 1 maxvalue 1000")
+            .find("CREATE SEQUENCE IF NOT EXISTS `sq1` start with 1 minvalue 1 maxvalue 1000")
             .expect(&text);
-        let restart = text
-            .find("ALTER SEQUENCE `sq1` RESTART WITH 41;")
-            .expect(&text);
-        assert!(drop < create && create < restart, "{text}");
+        let restart = text.find("SELECT SETVAL(`sq1`, 41, 0);").expect(&text);
+        assert!(create < restart, "{text}");
+        assert!(!text.contains("DROP SEQUENCE"), "{text}");
+        assert!(!text.contains("RESTART"), "{text}");
         assert!(!text.contains("DROP TABLE"), "{text}");
+        // A file not written to be replayed creates it plainly.
+        let fresh = DumpOptions {
+            drop_if_exists: false,
+            ..opts
+        };
+        let text = text_of(&plan(&s, "shop", &all(&s), fresh, SqlDialect::MySql));
+        assert!(text.contains("CREATE SEQUENCE `sq1` start with"), "{text}");
         assert!(
             !p.steps.iter().any(|s| matches!(s, DumpStep::Rows { .. })),
             "its state row is restored by the restart, not an INSERT"

@@ -5876,17 +5876,22 @@ existing prose was left alone.
     that name dropped it and its dependents with nothing put back
     (`a_foreign_table_is_neither_dropped_nor_given_rows`,
     `a_sequence_gets_neither_a_drop_nor_a_row_step`, which now holds the unread sequence).
-    **A MariaDB sequence that was read is created and its counter put back.** `file_creates` is
-    `true` for one with `TableInfo::sequence` filled, `drop_keyword` calls it `SEQUENCE` (MariaDB
-    takes `DROP TABLE` on one too; the file says what the object is), its structure step is
-    `create_ddl`'s `CREATE SEQUENCE`, and its data step — when *Data* is on — is
-    `TableInfo::sequence_restart_sql`'s `ALTER SEQUENCE … RESTART WITH`, never an `INSERT` into its
-    state row: the position is data, and a restart is how the server takes it. Before this every
-    sequence's step was the comment, so a dump restored no MariaDB sequence at all
-    (`a_read_sequence_is_created_and_its_counter_restored`; live,
-    `a_replay_restores_a_mariadb_sequence_and_its_position`, which drops both objects, replays, and
-    asserts the next id is 20 — red on the unfixed tree and green on 10.11 and 11.8, per the
-    change's author).
+    **A MariaDB sequence that was read is created and its counter moved forward — never dropped,
+    never rewound.** `file_creates` is `true` for one with `TableInfo::sequence` filled; its
+    structure step is `create_ddl`'s `CREATE SEQUENCE` — `CREATE SEQUENCE IF NOT EXISTS` where the
+    file is one to replay (*Drop before create*), and **no `DROP` before it**, unlike a table's; and
+    its data step — when *Data* is on — is `TableInfo::sequence_restart_sql`'s `SELECT SETVAL(s,
+    <next>, 0)`, never an `INSERT` into its state row. A sequence's position is state no file
+    carries — the rule the other engines' sequences already follow — and the drop, recreate and
+    `RESTART WITH` this once wrote rewound a live sequence on a replay onto its source: the next
+    insert drew a value already used, for every table drawing from it, inside the file or not, and
+    the restart, DDL, committed even under a replay that then failed. `SETVAL` ignores a value below
+    the counter. Before any of this every sequence's step was the comment, so a dump restored no
+    MariaDB sequence at all (`a_read_sequence_is_created_and_its_counter_restored`; live,
+    `a_replay_restores_a_mariadb_sequence_and_its_position`, which advances the source past the
+    dump's position, replays onto it and asserts the next value is not reissued — 20 against the
+    unfixed file, 30 now — then drops both objects, replays, and asserts the next id is 20; green on
+    10.11 and 11.8).
     **Where the file does not drop up front, what it carries beside the tables is written to be met
     again** (`replay_create`, whenever *Drop before create* is on and `drops_up_front` is not): a
     table's `DROP` takes no routine, type or sequence, so replaying a default dump onto its source
@@ -12944,14 +12949,15 @@ existing prose was left alone.
     refuses anything else whole (`show_create_sequence_is_split_at_the_name`,
     `a_definition_that_could_carry_sql_is_refused`); a `next` that is not an integer is dropped
     rather than written. `next` is `next_not_cached_value`, a live value and not definition, so
-    `create_ddl` never writes it: `sequence_restart_sql(dialect)` does, as `ALTER SEQUENCE q
-    RESTART WITH <next>;`, or `None` without both a definition and a position
+    `create_ddl` never writes it: `sequence_restart_sql(dialect)` does, as `SELECT SETVAL(q,
+    <next>, 0);` — forward only, `SETVAL` answering `NULL` and moving nothing for a value below the
+    counter (measured on 10.11.14 and 11.8.9) — or `None` without both a definition and a position
     (`a_read_sequence_is_restated_with_the_servers_options`,
-    `no_restart_without_a_position_or_a_definition`). **Restarting at the not-cached value is the
-    point, not an approximation**: it skips whatever the source had cached and not handed out, as a
-    server restart does, so no value is ever issued twice. It restarts past `maxvalue` as readily,
-    so an exhausted `nocycle` sequence restores exhausted (measured on 10.11.14, per the change's
-    author). What it does **not** restore is the cycle count.
+    `no_restart_without_a_position_or_a_definition`). **The not-cached value is the point, not an
+    approximation**: it skips whatever the source had cached and not handed out, as a server
+    restart does, so no value is ever issued twice. It moves past `maxvalue` as readily, so an
+    exhausted `nocycle` sequence restores exhausted (ERROR 4084 at the next value, measured). What
+    it does **not** restore is the cycle count.
     **`TableShape::ForeignTable` is the fourth answer, and it arrived the same way the third did.**
     PostgreSQL's `table_list_sql` already listed `relkind = 'f'` but typed it `BASE TABLE`, so a
     foreign table was indistinguishable from a table: it was offered Edit table, Truncate, Import
