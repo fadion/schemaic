@@ -11094,7 +11094,15 @@ existing prose was left alone.
     `aborted_before`** — the tab's `tx::TxState::Poisoned` when it ran — **is logged `failed`**, *the
     transaction was already aborted, so COMMIT rolled it back — nothing was committed*: the Commit
     button's `aborted_commit` refusal, for the statement typed by hand
-    (`a_commit_typed_into_an_aborted_transaction_is_logged_failed`). `batch_logged(ran, stopped)`
+    (`a_commit_typed_into_an_aborted_transaction_is_logged_failed`). **`PREPARE TRANSACTION` is
+    the third spelling** — measured on PG 16, a rollback answered with success and the tag
+    `ROLLBACK` — and is logged the same way, naming itself
+    (`a_prepare_typed_into_an_aborted_transaction_is_logged_failed`). **`batch_aborted(start,
+    engine, steps)` is each batch statement's `aborted_before`**: the state *ahead* of it, folded
+    in order from the tab's at launch, a statement with no outcome moving nothing — so a batch that
+    poisons its transaction and then commits logs the `COMMIT` as the rollback it is
+    (`a_batch_reads_each_statement_against_the_state_before_it`; the app folded it inline, where no
+    test saw the order). `batch_logged(ran, stopped)`
     is which statements of a Run All get a line: a `Cancelled` one only if it was in flight at Stop
     — the first without `Rows`, after the run of successes — since a batch reports every statement
     after a failure or a stop as cancelled without having dispatched it, and a statement already
@@ -32863,9 +32871,9 @@ existing prose was left alone.
   and logs those `write_log::batch_logged` picks, **skipping a `Cancelled` statement**, which a
   batch reports for every statement after a failure without dispatching it (`drop_runs`' reason,
   under `history.rs`) — except the one in flight when the user pressed Stop, the first statement
-  without a `Loaded` state. Its `aborted_before` comes from a local copy of the tab's `TxState`
-  folded statement by statement as it logs, since one batch can poison the transaction and then
-  `COMMIT` it; the tab's own state is folded afterwards, as before. `end_tx` logs a Manual tab's
+  without a `Loaded` state. Its `aborted_before` is `write_log::batch_aborted` over the tab's
+  `TxState` at launch, since one batch can poison the transaction and then `COMMIT` it; the tab's
+  own state is folded afterwards, as before. `end_tx` logs a Manual tab's
   `COMMIT` or `ROLLBACK` when the transaction was open (`TxState::is_open`): the tab's writes are
   logged `ok` as they run, before anything commits them, and that end entry is the only line that
   says whether they stayed. **So a transaction Schemaic drops rather than ends gets one too**:

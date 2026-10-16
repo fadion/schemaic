@@ -170,17 +170,28 @@ impl Entry {
     /// `COMMIT` is a `ROLLBACK` on PostgreSQL, which reports it as a success,
     /// so the line says `failed` and why rather than `ok` — the Commit
     /// button's `aborted_commit` refusal, for the statement typed by hand.
+    ///
+    /// **`PREPARE TRANSACTION` is the third such spelling**: PostgreSQL ends
+    /// an aborted transaction it is typed into with a rollback and the tag
+    /// `ROLLBACK`, reported as a success, as it does a `COMMIT` or `END`.
     pub fn landed(self, ran: Ran, aborted_before: bool, dialect: SqlDialect) -> Option<Entry> {
-        let commit = matches!(
-            crate::sql::leading_keyword(&self.sql, dialect).as_deref(),
-            Some("COMMIT" | "END")
-        );
+        let words = crate::sql::leading_words(&self.sql, 2, dialect);
+        let ends = match words
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["COMMIT" | "END", ..] => Some("COMMIT"),
+            ["PREPARE", "TRANSACTION"] => Some("PREPARE TRANSACTION"),
+            _ => None,
+        };
         Some(match ran {
-            Ran::Rows(_) if aborted_before && commit => self.ended(Err(
-                "the transaction was already aborted, so COMMIT rolled it back — nothing was \
-                 committed"
-                    .into(),
-            )),
+            Ran::Rows(_) if aborted_before && ends.is_some() => self.ended(Err(format!(
+                "the transaction was already aborted, so {} rolled it back — nothing was \
+                 committed",
+                ends.unwrap_or("COMMIT")
+            ))),
             Ran::Rows(rows) => self.ended(Ok(rows)),
             Ran::Failed(m) => self.ended(Err(m)),
             Ran::Cancelled => self.ended_as(Outcome::Cancelled, None),
@@ -234,6 +245,32 @@ pub fn batch_logged(ran: &[Ran], stopped: bool) -> Vec<bool> {
             Ran::Cancelled => in_flight == Some(i),
             Ran::Pending => false,
             Ran::Rows(_) | Ran::Failed(_) | Ran::Unknown(_) => true,
+        })
+        .collect()
+}
+
+/// For each statement of a batch, whether it ran inside a transaction a
+/// failure had already aborted — [`Entry::landed`]'s `aborted_before` — given
+/// the tab's state at launch (`start`) and each statement with its outcome
+/// (`None`: never dispatched, which moves nothing).
+///
+/// **Read before the statement's own outcome is folded in**, in order, since
+/// one batch can poison its transaction and then `COMMIT` it: the `COMMIT` is
+/// the rollback, the statement that failed ran in a healthy transaction.
+pub fn batch_aborted(
+    start: crate::tx::TxState,
+    engine: crate::tx::TxEngine,
+    steps: &[(&str, Option<crate::tx::StmtOutcome>)],
+) -> Vec<bool> {
+    let mut tx = start;
+    steps
+        .iter()
+        .map(|(sql, outcome)| {
+            let aborted = matches!(tx, crate::tx::TxState::Poisoned { .. });
+            if let Some(o) = outcome {
+                tx = tx.on_statement(engine, sql, *o);
+            }
+            aborted
         })
         .collect()
 }
@@ -707,6 +744,71 @@ mod tests {
         assert_eq!(rb.outcome, Outcome::Ok);
         let ok = entry("COMMIT").landed(Ran::Rows(None), false, PG).unwrap();
         assert_eq!(ok.outcome, Outcome::Ok);
+    }
+
+    /// **`PREPARE TRANSACTION` is the third spelling**: in an aborted
+    /// PostgreSQL transaction it is a rollback too, answered with success
+    /// and the tag `ROLLBACK` (measured on PG 16), and it was logged `ok`.
+    #[test]
+    fn a_prepare_typed_into_an_aborted_transaction_is_logged_failed() {
+        for sql in ["PREPARE TRANSACTION 'batch42'", "prepare transaction 'x';"] {
+            let e = entry(sql).landed(Ran::Rows(None), true, PG).unwrap();
+            assert_eq!(e.outcome, Outcome::Failed, "{sql}");
+            assert!(
+                e.error
+                    .as_deref()
+                    .is_some_and(|m| m.contains("PREPARE TRANSACTION rolled")),
+                "{sql}: {:?}",
+                e.error
+            );
+        }
+        let ok = entry("PREPARE TRANSACTION 'x'")
+            .landed(Ran::Rows(None), false, PG)
+            .unwrap();
+        assert_eq!(ok.outcome, Outcome::Ok);
+        // A prepared statement is not a transaction's end.
+        let stmt = entry("PREPARE q AS SELECT 1")
+            .landed(Ran::Rows(None), true, PG)
+            .unwrap();
+        assert_eq!(stmt.outcome, Outcome::Ok);
+    }
+
+    /// **Where each statement of a batch ran is folded before it runs, in
+    /// order** — `aborted_before` is the state *ahead* of the statement, so a
+    /// batch that poisons its transaction and then commits it logs the
+    /// `COMMIT` as the rollback it is, and the statement that failed as
+    /// having run in a healthy one. The app folded this inline, a caller
+    /// seam no test saw (R2-L6-02).
+    #[test]
+    fn a_batch_reads_each_statement_against_the_state_before_it() {
+        use crate::tx::{StmtOutcome, TxEngine, TxState};
+        let steps = [
+            ("BEGIN", Some(StmtOutcome::Ok)),
+            ("SELECT 1/0", Some(StmtOutcome::Failed)),
+            ("COMMIT", Some(StmtOutcome::Ok)),
+        ];
+        assert_eq!(
+            batch_aborted(TxState::Idle, TxEngine::Postgres, &steps),
+            [false, false, true]
+        );
+        // Opened earlier in the tab and already aborted: every one of them.
+        let poisoned = TxState::Idle
+            .on_statement(TxEngine::Postgres, "BEGIN", StmtOutcome::Ok)
+            .on_statement(TxEngine::Postgres, "SELECT 1/0", StmtOutcome::Failed);
+        assert_eq!(
+            batch_aborted(poisoned, TxEngine::Postgres, &steps[2..]),
+            [true]
+        );
+        // A statement with no outcome (never dispatched) moves nothing.
+        let held = [
+            ("BEGIN", Some(StmtOutcome::Ok)),
+            ("SELECT 1/0", None),
+            ("COMMIT", Some(StmtOutcome::Ok)),
+        ];
+        assert_eq!(
+            batch_aborted(TxState::Idle, TxEngine::Postgres, &held),
+            [false, false, false]
+        );
     }
 
     #[test]

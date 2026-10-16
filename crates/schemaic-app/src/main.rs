@@ -4106,14 +4106,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // statement, as the loop below folds it for real.
                     let ran: Vec<_> = states.iter().map(ran_of).collect();
                     let logged = schemaic_core::write_log::batch_logged(&ran, stopped);
-                    let mut tx = tab.tx.get_untracked();
+                    let steps: Vec<(&str, Option<schemaic_core::tx::StmtOutcome>)> = tx_stmts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, sql)| (sql.as_str(), outcomes.get(i).copied().flatten()))
+                        .collect();
+                    let aborted = schemaic_core::write_log::batch_aborted(
+                        tab.tx.get_untracked(),
+                        engine,
+                        &steps,
+                    );
                     for (i, (entry, state)) in write_entries.iter().zip(&states).enumerate() {
-                        let aborted = matches!(tx, TxState::Poisoned { .. });
                         if let (Some(entry), true) = (entry, logged[i]) {
-                            log_landed(&log_write, conn_id, dialect, entry.clone(), state, aborted);
-                        }
-                        if let (Some(sql), Some(Some(stmt))) = (tx_stmts.get(i), outcomes.get(i)) {
-                            tx = tx.on_statement(engine, sql, *stmt);
+                            let before = aborted.get(i).copied().unwrap_or(false);
+                            log_landed(&log_write, conn_id, dialect, entry.clone(), state, before);
                         }
                     }
                     for (sql, stmt) in tx_stmts.iter().zip(&outcomes) {
