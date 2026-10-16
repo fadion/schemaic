@@ -247,6 +247,41 @@ pub async fn a_replay_replaces_the_routines_it_carries(target: &'static Target) 
     s.teardown().await;
 }
 
+/// **A MySQL-family `TIMESTAMP` restores as the instant it was, whatever
+/// zone either session is in.** MySQL hands one over in the session's zone
+/// and converts a literal back from it, and the file named none: dumped from
+/// a `+05:00` session and replayed on a `-03:00` one, every `TIMESTAMP` moved
+/// eight hours. The rows are read at `+00:00` (`Db::for_rows`) and the file
+/// replays at `+00:00` (`dump::literal_mode_guard_sql`).
+pub async fn a_timestamp_restores_as_the_instant_it_was(target: &'static Target) {
+    let mut s = Scratch::create(target, "replay_zone").await;
+    if !s.dialect().eq(&schemaic_core::intel::SqlDialect::MySql) {
+        crate::endpoint::note_no_op(target, "spells its timestamps' zone");
+        s.teardown().await;
+        return;
+    }
+    let t = s.qualified("t");
+    s.exec(&format!(
+        "CREATE TABLE {t} (id INTEGER PRIMARY KEY, at TIMESTAMP NULL)"
+    ))
+    .await;
+    // `FROM_UNIXTIME` stores the instant whatever the session's zone.
+    s.exec(&format!(
+        "INSERT INTO {t} VALUES (1, FROM_UNIXTIME(1760000000))"
+    ))
+    .await;
+    let base = s.db.clone();
+    s.db = base.clone().with_init_sql("SET time_zone = '+05:00'");
+    let file = dump_of(&s, &["t"]).await;
+    s.db = base.clone().with_init_sql("SET time_zone = '-03:00'");
+    let ran = run_file(&s, &file).await;
+    let at = scalar(&s, &format!("SELECT UNIX_TIMESTAMP(at) FROM {t}")).await;
+    s.db = base;
+    assert_eq!(ran, ExecEnd::Done, "the dump did not replay:\n{file}");
+    assert_eq!(at, "1760000000", "the replay moved the timestamp:\n{file}");
+    s.teardown().await;
+}
+
 /// **A MariaDB replay keeps every grant on the routines it replaces.** The
 /// file dropped each routine before its `CREATE`, and with
 /// `automatic_sp_privileges` (the default) the `DROP` revoked every account's

@@ -744,6 +744,23 @@ impl Db {
         &self.init_sql
     }
 
+    /// This handle for a session that **reads or writes rows for another
+    /// session** — a dump's read, each end of a copy: the connection's init
+    /// SQL, then `export::rows_session_sql` (MySQL's `SET time_zone =
+    /// '+00:00'`), so a `TIMESTAMP` is the same instant on both ends. Last, so
+    /// an init's own `time_zone` does not move it. The handle itself where
+    /// the engine needs nothing.
+    pub fn for_rows(&self) -> Db {
+        match schemaic_core::export::rows_session_sql(self.engine.dialect()) {
+            Some(sql) if self.init_sql.trim().is_empty() => self.clone().with_init_sql(sql),
+            Some(sql) => {
+                let init = format!("{}\n;\n{sql}", self.init_sql);
+                self.clone().with_init_sql(&init)
+            }
+            None => self.clone(),
+        }
+    }
+
     /// The init SQL's statements, each checked by `init_sql::check` for this
     /// engine — or the refusal, as the connect's error. Asked by every
     /// engine's connect function before it runs any of them.
@@ -2997,8 +3014,9 @@ impl Db {
         }
         let (tx, rx) = tokio::sync::mpsc::channel::<ExportChunk>(2);
         let read_cancel = cancel.child_token();
+        // Both ends in one zone — see `for_rows`.
         let reader = {
-            let db = self.clone();
+            let db = self.for_rows();
             let database = database.map(str::to_string);
             let select = select.to_string();
             let read_cancel = read_cancel.clone();
@@ -3021,7 +3039,7 @@ impl Db {
             handed: 0,
             progress,
         };
-        let written = to.import_rows(target, &mut rows, cancel).await;
+        let written = to.for_rows().import_rows(target, &mut rows, cancel).await;
         // Whatever the write did, the read has nothing left to feed: a write
         // that failed stops it, and one that finished found its end.
         read_cancel.cancel();

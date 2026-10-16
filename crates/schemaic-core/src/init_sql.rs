@@ -119,15 +119,18 @@ const MYSQL_SETTINGS: &[&str] = &[
 /// carrier of a row-level-security tenant). Not here, on purpose:
 /// `standard_conforming_strings`, the transaction characteristics and
 /// read-only default, `session_replication_role` (it switches triggers and
-/// foreign keys off), `bytea_output`/`extra_float_digits` (how values the app
-/// reads are spelt), `client_encoding` with a value other than UTF-8, and
-/// anything else nobody has weighed yet.
+/// foreign keys off), how values the app reads are spelt —
+/// `bytea_output`, `extra_float_digits`, `DateStyle`, `IntervalStyle`, and
+/// `lc_monetary` (a `money` value's text) — the first three of which
+/// `pg::connect` pins on the startup packet, which an init running after it
+/// would undo: under `SET DateStyle = 'SQL, DMY'` a dump wrote 2 January as
+/// `02/01/2026`, which a default session restores as 1 February —
+/// `client_encoding` with a value other than UTF-8, and anything else nobody
+/// has weighed yet.
 const POSTGRES_SETTINGS: &[&str] = &[
     "SEARCH_PATH",
     "SCHEMA",
     "TIMEZONE",
-    "DATESTYLE",
-    "INTERVALSTYLE",
     "STATEMENT_TIMEOUT",
     "LOCK_TIMEOUT",
     "IDLE_IN_TRANSACTION_SESSION_TIMEOUT",
@@ -141,7 +144,6 @@ const POSTGRES_SETTINGS: &[&str] = &[
     "ROLE",
     "AUTHORIZATION",
     "LC_MESSAGES",
-    "LC_MONETARY",
     "LC_NUMERIC",
     "LC_TIME",
     "RANDOM_PAGE_COST",
@@ -788,7 +790,6 @@ mod tests {
             ("SET SESSION AUTHORIZATION app_user", PG),
             ("SET app.tenant_id = '42'", PG),
             ("SET enable_seqscan = off", PG),
-            ("SET DateStyle = 'ISO, DMY'", PG),
             ("SET default_transaction_isolation = 'serializable'", PG),
             ("SET time_zone = 'Europe/Berlin'", MY),
             ("SET SESSION time_zone = '+00:00'", MY),
@@ -818,6 +819,12 @@ mod tests {
     fn a_setting_nobody_has_weighed_is_refused() {
         for (sql, d) in [
             ("SET session_replication_role = replica", PG),
+            // How a value the app reads is spelt — the startup packet's pins,
+            // which an init would undo.
+            ("SET DateStyle = 'SQL, DMY'", PG),
+            ("SET IntervalStyle = sql_standard", PG),
+            ("SET extra_float_digits = 0", PG),
+            ("SET lc_monetary = 'de_DE'", PG),
             ("SET no_such_setting_here = 1", PG),
             ("SET foreign_key_checks = 0", MY),
             ("SET STATISTICS XML ON", MS),

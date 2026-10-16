@@ -560,6 +560,35 @@ pub fn literal_select(
     }
 }
 
+/// The read of `c` that keeps a **MySQL-family `FLOAT`** exact —
+/// `` (`x` + 0e0) AS `x` ``, the value widened to the double it already is —
+/// or `None` for any other column.
+///
+/// The text protocol spells a `FLOAT` with six significant digits: a stored
+/// `16777215` read `16777200` and `1.2345678` `1.23457`, other floats, which
+/// the dump and *Copy to* wrote back under a success report. As a double it
+/// arrives as `16777215` and `1.2345677614212036`, and a `FLOAT` column takes
+/// that back as the same float (measured on MariaDB 10.11.14 and MySQL 8.4: a
+/// join on the column matches every row). A `DOUBLE` reads with 17 digits
+/// already, and the other engines spell a single-precision value exactly
+/// (PostgreSQL's `real` once `extra_float_digits` is pinned, `pg::connect`).
+pub fn exact_float_select(c: &crate::schema::ColumnInfo, dialect: SqlDialect) -> Option<String> {
+    match dialect {
+        SqlDialect::MySql => {
+            let head = c
+                .type_name
+                .split(|ch: char| ch == '(' || ch.is_whitespace())
+                .next()
+                .unwrap_or_default();
+            head.eq_ignore_ascii_case("float").then(|| {
+                let col = ident_sql(&c.name, dialect);
+                format!("({col} + 0e0) AS {col}")
+            })
+        }
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+    }
+}
+
 /// The session switch that turns foreign-key enforcement off and back on, when
 /// the engine has one an ordinary user can throw.
 ///
@@ -627,16 +656,26 @@ pub fn drop_runs_referential_actions(dialect: SqlDialect) -> bool {
 /// `pg_dump` does is a separate question and an open one — the *live* path has
 /// no need of it, because `pg::connect_probe` pins the GUC on the startup
 /// packet, but a `.sql` file is replayed in somebody else's client.
+///
+/// **The mode is the import's** ([`crate::export::import_mode_sql`]): the
+/// literal half plus `NO_AUTO_VALUE_ON_ZERO`, so a row whose `AUTO_INCREMENT`
+/// key is 0 restores as 0 rather than as the counter's next value. **And the
+/// zone is `+00:00`** ([`crate::export::rows_session_sql`]), the zone the
+/// rows were read in, so a `TIMESTAMP` restores as the instant it was on a
+/// session in any other zone. `mysqldump`'s two pins, for its reasons.
 pub fn literal_mode_guard_sql(dialect: SqlDialect) -> Option<(String, &'static str)> {
-    let set = crate::export::literal_mode_sql(dialect)?;
+    let set = crate::export::import_mode_sql(dialect)?;
     debug_assert_eq!(
         dialect,
         SqlDialect::MySql,
         "the guard below is MySQL's session-variable syntax"
     );
+    let zone = crate::export::rows_session_sql(dialect).map_or_else(String::new, |z| {
+        format!("\nSET @SCHEMAIC_OLD_TIME_ZONE = @@SESSION.time_zone;\n{z};")
+    });
     Some((
-        format!("SET @SCHEMAIC_OLD_SQL_MODE = @@SESSION.sql_mode;\n{set};"),
-        "SET SESSION sql_mode = @SCHEMAIC_OLD_SQL_MODE;",
+        format!("SET @SCHEMAIC_OLD_SQL_MODE = @@SESSION.sql_mode;\n{set};{zone}"),
+        "SET time_zone = @SCHEMAIC_OLD_TIME_ZONE;\nSET SESSION sql_mode = @SCHEMAIC_OLD_SQL_MODE;",
     ))
 }
 
@@ -3704,10 +3743,17 @@ pub fn plan(
                 select: format!(
                     "SELECT {} FROM {}",
                     cols.iter()
-                        .map(|c| read_as
-                            .iter()
-                            .find(|(n, _)| n == c)
-                            .map_or_else(|| q(c), |(_, (expr, _))| expr.clone()))
+                        .map(|c| read_as.iter().find(|(n, _)| n == c).map_or_else(
+                            // A `FLOAT` read as the double it is.
+                            || {
+                                t.columns
+                                    .iter()
+                                    .find(|ci| ci.name == *c)
+                                    .and_then(|ci| exact_float_select(ci, dialect))
+                                    .unwrap_or_else(|| q(c))
+                            },
+                            |(_, (expr, _))| expr.clone()
+                        ))
                         .collect::<Vec<_>>()
                         .join(", "),
                     qualified_table(database, t.schema.as_deref(), &t.name, dialect)
@@ -6142,6 +6188,46 @@ mod tests {
         assert!(pos(&file, &open) < pos(&file, "SET FOREIGN_KEY_CHECKS = 0;"));
         assert!(pos(&file, &open) < pos(&file, "CREATE TABLE"));
         assert!(pos(&file, "SET FOREIGN_KEY_CHECKS = 1;") < pos(&file, close));
+    }
+
+    /// **The file also says which zone its `TIMESTAMP`s are in, and keeps a
+    /// key of 0.** MySQL hands a `TIMESTAMP` over in the *session's* zone and
+    /// converts a literal back from it, and the file pinned none — so a dump
+    /// written on a UTC session and replayed on a Berlin one moved every
+    /// `TIMESTAMP` by the difference. The rows are read on a `+00:00` session
+    /// (`export::rows_session_sql`) and the file replays under `+00:00`, as
+    /// `mysqldump`'s does; an `AUTO_INCREMENT` key of 0 is kept by
+    /// `NO_AUTO_VALUE_ON_ZERO`, its other pin. Both go back as the session had
+    /// them at the end.
+    #[test]
+    fn a_mysql_dump_pins_utc_and_keeps_a_zero_key_around_its_rows() {
+        let s = schema_of(vec![table("orders")]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        let zone = pos(&file, "SET time_zone = '+00:00';");
+        assert!(zone < pos(&file, "<<rows"), "{file}");
+        assert!(
+            pos(&file, "NO_AUTO_VALUE_ON_ZERO") < pos(&file, "<<rows"),
+            "{file}"
+        );
+        assert!(
+            pos(&file, "<<rows") < pos(&file, "SET time_zone = @SCHEMAIC_OLD_TIME_ZONE;"),
+            "{file}"
+        );
+        assert_eq!(
+            crate::export::rows_session_sql(SqlDialect::MySql),
+            Some("SET time_zone = '+00:00'")
+        );
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite, SqlDialect::MsSql] {
+            assert_eq!(crate::export::rows_session_sql(d), None, "{d:?}");
+            let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), d));
+            assert!(!file.contains("time_zone"), "{d:?}:\n{file}");
+        }
     }
 
     /// It is not scaffolding the user can turn off: the two checkboxes choose
@@ -10012,6 +10098,35 @@ mod tests {
             file.contains("CREATE FUNCTION \"public\".\"f_one\"()"),
             "{file}"
         );
+    }
+
+    /// **A MySQL-family `FLOAT` is dumped as the double it is**
+    /// (`exact_float_select`): read as text it was spelled with six
+    /// significant digits, so the file restored other floats.
+    #[test]
+    fn a_mysql_float_column_is_read_as_a_double() {
+        let mut t = table("m");
+        let mut x = t.columns[0].clone();
+        x.name = "x".into();
+        x.type_name = "float".into();
+        t.columns.push(x);
+        let s = schema_of(vec![t]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(file.contains("(`x` + 0e0) AS `x`"), "{file}");
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(!file.contains("0e0"), "{file}");
     }
 
     /// **MariaDB replaces a routine or event in place**, because the `DROP`

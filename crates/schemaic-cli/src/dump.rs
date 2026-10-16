@@ -103,6 +103,10 @@ pub async fn run(
     chunk_rows: usize,
 ) -> DumpOutcome {
     let failed = |message: String, partial: bool| DumpOutcome::Failed { message, partial };
+    // Read in the zone the file replays in (`dump::literal_mode_guard_sql`),
+    // so a MySQL `TIMESTAMP` — a row's, or a column default `SHOW CREATE`
+    // prints in the session's zone — is the instant it was (`Db::for_rows`).
+    let db = db.for_rows();
 
     // **Freshly introspected, never the tree's cache.** A dump is a backup, and
     // a `CREATE TABLE` for a shape the server no longer has is a backup that

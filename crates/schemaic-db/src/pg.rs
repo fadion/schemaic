@@ -127,7 +127,23 @@ async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool
         // Sent on the startup packet, so it is in force before the first
         // statement; nothing the app runs undoes it, and a connection's init
         // SQL may not name it (`init_sql::check`).
-        .options("-c standard_conforming_strings=on")
+        //
+        // **Beside it, the three settings that decide how a value the app
+        // reads as text is spelt** — every cell here is the server's text
+        // (`simple_query_raw`), which a dump writes and a copy inserts as it
+        // came. `extra_float_digits=3`: at 0 (PostgreSQL 11's default, or a
+        // role's) `0.1 + 0.2` read `0.3`, another double; from 12 any value
+        // above 0 is the shortest exact form. `DateStyle=ISO`: `SQL, DMY`
+        // spelt 2 January `02/01/2026`, read back elsewhere as 1 February.
+        // `IntervalStyle=postgres`: `sql_standard` spelt `-1 day +2 hours` so
+        // the default reads −1 day −2 hours. `pg_dump` pins the same on its
+        // own session. A role's settings no longer reach them
+        // (`a_role_cannot_change_how_values_are_spelt`), and the init SQL may
+        // not name them.
+        .options(
+            "-c standard_conforming_strings=on -c extra_float_digits=3 -c DateStyle=ISO \
+             -c IntervalStyle=postgres",
+        )
         // `Prefer` here is what implements the mode of the same name: unlike
         // MySQL, the Postgres driver negotiates the downgrade itself, so no
         // retry of ours is involved and `require` upward cannot fall back.

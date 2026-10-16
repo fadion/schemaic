@@ -141,7 +141,8 @@ pub(crate) async fn dump_of(src: &Scratch, chosen: &[&str]) -> String {
                 select,
                 server,
             } => {
-                let rs = Box::pin(src.db.fetch_query(
+                // On the session the app's dump reads on (`cli::dump::run`).
+                let rs = Box::pin(src.db.for_rows().fetch_query(
                     Some(&database),
                     &select,
                     10_000,

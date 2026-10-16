@@ -381,7 +381,12 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 .conn
                 .connections
                 .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, dst_conn));
-            let read = copy_table::rows_read(&src.database, &info, dialect);
+            // The source database's alias types, so a column typed by one is
+            // read by its base (`rows_read_with`).
+            let aliases = crate::table_designer::loaded_schema(ctx.schema, &src.database)
+                .map(|db| db.tsql_objects.clone())
+                .unwrap_or_default();
+            let read = copy_table::rows_read_with(&src.database, &info, &aliases, dialect);
             let req = CopyRowsRequest {
                 src_conn: src.conn_id,
                 src_database: src.database.clone(),

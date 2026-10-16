@@ -178,6 +178,21 @@ pub struct RowsRead {
 /// The read *Copy to* runs on `database`'s `src`, and how its cells are
 /// written.
 pub fn rows_read(database: &str, src: &TableInfo, dialect: SqlDialect) -> RowsRead {
+    rows_read_with(database, src, &[], dialect)
+}
+
+/// [`rows_read`] with the source database's SQL Server objects
+/// (`DbSchema::tsql_objects`), so a column typed by an **alias** is read by the
+/// alias's base, as the dump reads it ([`crate::dump::literal_select`]):
+/// without them an alias over `varbinary` arrived as the `<n bytes>`
+/// placeholder and stopped every copy of its table, and one over
+/// `sql_variant` came back an `nvarchar` variant.
+pub fn rows_read_with(
+    database: &str,
+    src: &TableInfo,
+    aliases: &[crate::schema::TsqlObject],
+    dialect: SqlDialect,
+) -> RowsRead {
     let columns = columns(src, dialect);
     let forms = columns
         .iter()
@@ -185,7 +200,9 @@ pub fn rows_read(database: &str, src: &TableInfo, dialect: SqlDialect) -> RowsRe
             src.columns
                 .iter()
                 .find(|c| &c.name == name)
-                .map_or(crate::import::CellForm::Value, |c| read_form(c, dialect).1)
+                .map_or(crate::import::CellForm::Value, |c| {
+                    read_form_with(c, aliases, dialect).1
+                })
         })
         .collect();
     let overriding = crate::import::overriding_clause(dialect).is_some()
@@ -194,7 +211,7 @@ pub fn rows_read(database: &str, src: &TableInfo, dialect: SqlDialect) -> RowsRe
             .iter()
             .any(|c| c.is_server_assigned() && carries_identity(c, dialect));
     RowsRead {
-        select: select_sql(database, src, &columns, dialect),
+        select: select_sql_with(database, src, &columns, aliases, dialect),
         columns,
         forms,
         overriding,
@@ -212,11 +229,28 @@ pub fn rows_read(database: &str, src: &TableInfo, dialect: SqlDialect) -> RowsRe
 /// `quote()` of *every* column, since a declared type there is only an
 /// affinity and a blob can sit in any of them. A column this misses still
 /// arrives as the placeholder, and [`chunk_refusal`] stops the copy on it.
+///
+/// **A MySQL-family `FLOAT` is read as a double** ([`crate::dump::exact_float_select`]):
+/// the text protocol spells one with six significant digits, so the copy
+/// wrote another float under a success report.
 pub fn read_form(
     c: &crate::schema::ColumnInfo,
     dialect: SqlDialect,
 ) -> (String, crate::import::CellForm) {
+    read_form_with(c, &[], dialect)
+}
+
+/// [`read_form`], with SQL Server's alias types to judge a column by — see
+/// [`rows_read_with`].
+pub fn read_form_with(
+    c: &crate::schema::ColumnInfo,
+    aliases: &[crate::schema::TsqlObject],
+    dialect: SqlDialect,
+) -> (String, crate::import::CellForm) {
     use crate::import::CellForm;
+    if let Some(expr) = crate::dump::exact_float_select(c, dialect) {
+        return (expr, CellForm::Value);
+    }
     let col = ident_sql(&c.name, dialect);
     let head = c
         .type_name
@@ -233,7 +267,7 @@ pub fn read_form(
         SqlDialect::Postgres if head == "bytea" => {
             (format!("encode({col}, 'hex') AS {col}"), CellForm::Hex)
         }
-        SqlDialect::MsSql => match crate::dump::literal_select(c, &[], dialect) {
+        SqlDialect::MsSql => match crate::dump::literal_select(c, aliases, dialect) {
             Some((expr, form)) => (expr, CellForm::Server(form)),
             None => (col, CellForm::Value),
         },
@@ -265,10 +299,21 @@ pub fn select_sql(
     columns: &[String],
     dialect: SqlDialect,
 ) -> String {
+    select_sql_with(database, src, columns, &[], dialect)
+}
+
+/// [`select_sql`] with SQL Server's alias types — see [`rows_read_with`].
+pub fn select_sql_with(
+    database: &str,
+    src: &TableInfo,
+    columns: &[String],
+    aliases: &[crate::schema::TsqlObject],
+    dialect: SqlDialect,
+) -> String {
     let list = columns
         .iter()
         .map(|name| match src.columns.iter().find(|c| &c.name == name) {
-            Some(c) => read_form(c, dialect).0,
+            Some(c) => read_form_with(c, aliases, dialect).0,
             None => ident_sql(name, dialect),
         })
         .collect::<Vec<_>>()
@@ -646,6 +691,79 @@ mod tests {
             rows_read("shop", &blob_table("text"), PG).forms[1],
             CellForm::Value
         );
+    }
+
+    /// **A MySQL-family `FLOAT` is read as the double it is**: the text
+    /// protocol spells a `FLOAT` with six significant digits, so `16777215`
+    /// read `16777200` and `1.2345678` `1.23457`, and the copy wrote those —
+    /// other floats — under a success report. Widened to a double the value
+    /// arrives exact (`16777215`, `1.2345677614212036`) and the `FLOAT` column
+    /// takes it back as the same float (measured on MariaDB 10.11 and
+    /// MySQL 8.4: a join on the column matches every row). A `DOUBLE` reads
+    /// with its own 17 digits and is left as it is.
+    #[test]
+    fn a_mysql_float_is_read_as_a_double() {
+        for ty in ["float", "float(7,4)", "float unsigned"] {
+            let my = rows_read("shop", &blob_table(ty), SqlDialect::MySql);
+            assert!(
+                my.select.contains("(`body` + 0e0) AS `body`"),
+                "{ty}: {}",
+                my.select
+            );
+            assert_eq!(my.forms[1], crate::import::CellForm::Value);
+        }
+        let double = rows_read("shop", &blob_table("double"), SqlDialect::MySql);
+        assert!(!double.select.contains("0e0"), "{}", double.select);
+        let pg = rows_read("shop", &blob_table("real"), PG);
+        assert!(!pg.select.contains("0e0"), "{}", pg.select);
+    }
+
+    /// **A SQL Server alias type is read by its base**, as the dump reads it:
+    /// with no aliases passed, a column typed `[dbo].[Hash]` over `varbinary`
+    /// matched no head, arrived as the `<n bytes>` placeholder and stopped
+    /// every copy of its table, and one over `sql_variant` came back an
+    /// `nvarchar` variant.
+    #[test]
+    fn a_sql_server_alias_type_is_read_by_its_base() {
+        use crate::export::ServerLiteral;
+        use crate::import::CellForm;
+        use crate::schema::{TsqlObject, TsqlObjectKind};
+        let alias = |name: &str, base: &str| TsqlObject {
+            schema: Some("dbo".into()),
+            name: name.into(),
+            kind: TsqlObjectKind::AliasType {
+                base: base.into(),
+                nullable: true,
+            },
+        };
+        let aliases = [alias("Hash", "varbinary(32)"), alias("Any", "sql_variant")];
+        let hash = rows_read_with(
+            "shop",
+            &blob_table("[dbo].[Hash]"),
+            &aliases,
+            SqlDialect::MsSql,
+        );
+        assert_eq!(
+            hash.forms[1],
+            CellForm::Server(ServerLiteral::Hex),
+            "{}",
+            hash.select
+        );
+        let any = rows_read_with(
+            "shop",
+            &blob_table("[dbo].[Any]"),
+            &aliases,
+            SqlDialect::MsSql,
+        );
+        assert_eq!(
+            any.forms[1],
+            CellForm::Server(ServerLiteral::Variant),
+            "{}",
+            any.select
+        );
+        // Without them, as before: the alias is no type it knows.
+        let blind = rows_read("shop", &blob_table("[dbo].[Hash]"), SqlDialect::MsSql);
+        assert_eq!(blind.forms[1], CellForm::Value);
     }
 
     fn chunk(ty: &str, cells: Vec<crate::model::Value>) -> crate::model::ResultSet {

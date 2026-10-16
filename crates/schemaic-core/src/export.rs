@@ -1084,6 +1084,51 @@ pub fn literal_mode_sql(dialect: SqlDialect) -> Option<&'static str> {
     }
 }
 
+/// [`MYSQL_LITERAL_MODE_SQL`] plus `NO_AUTO_VALUE_ON_ZERO`: the mode an
+/// **import's** session writes its rows under, `mysqldump`'s two pins.
+pub const MYSQL_IMPORT_MODE_SQL: &str = "SET SESSION sql_mode = CONCAT_WS(',', NULLIF(TRIM(BOTH \
+     ',' FROM REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ',')), ''), \
+     'NO_AUTO_VALUE_ON_ZERO')";
+
+/// What an import's or a copy's write session sends before its first
+/// `INSERT` — `None` where nothing needs saying.
+///
+/// **Both halves are a value written as another under a success report.**
+/// The literals are [`sql_literal`]'s, so a server whose `sql_mode` carries
+/// `NO_BACKSLASH_ESCAPES` stored every backslash doubled — `C:\data` as
+/// `C:\\data` — as [`literal_mode_sql`] says, though only `run_ddl` sent it.
+/// And an `AUTO_INCREMENT` key of 0 asked for the next counter value, so a
+/// copy renumbered the row the source keeps as 0 (and a file's 0 with it).
+/// Measured on MariaDB 10.11.14 and MySQL 8.4.11: the mode comes out with the
+/// flag removed and `NO_AUTO_VALUE_ON_ZERO` added, the rest kept, from an
+/// empty mode too.
+pub fn import_mode_sql(dialect: SqlDialect) -> Option<&'static str> {
+    match dialect {
+        SqlDialect::MySql => Some(MYSQL_IMPORT_MODE_SQL),
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+    }
+}
+
+/// What a session that **reads or writes rows for another session** — a
+/// dump's read, both ends of a copy — sends first, so a value means the same
+/// on both: `None` where the engine's values carry their own zone.
+///
+/// **MySQL's `TIMESTAMP` is handed over in the session's zone and read back
+/// from it.** A dump's literals were the source session's wall time and the
+/// file named no zone, so a replay on a session in another zone — a server
+/// whose `SYSTEM` zone differs, an init SQL's `SET time_zone` — moved every
+/// `TIMESTAMP` by the difference, as did a copy between two such sessions.
+/// `+00:00` on both ends, and at the head of the file
+/// ([`crate::dump::literal_mode_guard_sql`]), is `mysqldump`'s answer; a
+/// numeric offset needs no time-zone tables. PostgreSQL's `timestamptz` and
+/// SQL Server's `datetimeoffset` spell their offset; SQLite has no zones.
+pub fn rows_session_sql(dialect: SqlDialect) -> Option<&'static str> {
+    match dialect {
+        SqlDialect::MySql => Some("SET time_zone = '+00:00'"),
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+    }
+}
+
 /// A name going into a position the server reads as a **`LIKE` pattern** rather
 /// than as a plain identifier: MySQL's and MariaDB's `GRANT … ON db.*`.
 ///
@@ -4416,6 +4461,20 @@ mod tests {
             "\"s\".\"o\""
         );
         assert_eq!(qualified_row_target("main", None, "o", Sqlite), "\"o\"");
+    }
+
+    /// **An import's session takes the backslash flag off and keeps a key of
+    /// 0**, on MySQL alone — the two halves `import_mode_sql`'s doc measures.
+    #[test]
+    fn an_import_session_drops_backslash_escapes_and_keeps_a_zero_key() {
+        let sql = import_mode_sql(MySql).expect("MySQL pins its import session");
+        assert!(sql.contains("',NO_BACKSLASH_ESCAPES,', ','"), "{sql}");
+        assert!(sql.contains("'NO_AUTO_VALUE_ON_ZERO'"), "{sql}");
+        // Built on the session's own mode, not a replacement of it.
+        assert!(sql.contains("@@SESSION.sql_mode"), "{sql}");
+        for d in [Postgres, Sqlite, SqlDialect::MsSql] {
+            assert_eq!(import_mode_sql(d), None, "{d:?}");
+        }
     }
 
     /// **`None` is a claim about the connection, not about the engine**, and

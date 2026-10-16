@@ -353,6 +353,173 @@ pub async fn a_copied_table_has_every_row_and_numbers_on_past_them(target: &'sta
     scratch.teardown().await;
 }
 
+/// **A role cannot change how PostgreSQL spells the values the app reads.**
+/// Every cell arrives as the server's text, and three settings decide that
+/// text: `extra_float_digits` (0 — PostgreSQL 11's default, or a role's —
+/// spells `0.1 + 0.2` as `0.3`, another double), `DateStyle` (`SQL, DMY`
+/// spells 2 January `02/01/2026`, which a default session reads as 1
+/// February) and `IntervalStyle` (`sql_standard` spells `-1 day +2 hours` as
+/// `-1 +2:00:00`, which the default reads as −1 day −2 hours). A dump or copy
+/// then wrote other values under a success report. `pg::connect` pins all
+/// three on the startup packet; this sets them **on the role** the tier
+/// connects as, where every new connection inherits them, and reads anyway.
+pub async fn a_role_cannot_change_how_values_are_spelt(target: &'static Target) {
+    use schemaic_core::intel::SqlDialect;
+    let scratch = Scratch::create(target, "pg_spelling").await;
+    if scratch.dialect() != SqlDialect::Postgres {
+        crate::endpoint::note_no_op(target, "has no session setting for its values' text");
+        scratch.teardown().await;
+        return;
+    }
+    let who = schemaic_core::export::ident_sql(&target.user(), SqlDialect::Postgres);
+    let settings = [
+        ("extra_float_digits", "0"),
+        ("DateStyle", "'SQL, DMY'"),
+        ("IntervalStyle", "sql_standard"),
+    ];
+    // As `a_password_with_a_backslash_is_stored_as_it_was_typed` does: set,
+    // observe, `RESET` (leaving no row behind), and only then assert.
+    for (name, value) in settings {
+        scratch
+            .exec(&format!("ALTER ROLE {who} SET {name} = {value}"))
+            .await;
+    }
+    let rs = scratch
+        .try_exec(
+            "SELECT 0.1::float8 + 0.2::float8, DATE '2026-01-02', \
+             INTERVAL '-1 day' + INTERVAL '2 hours'",
+        )
+        .await;
+    for (name, _) in settings {
+        scratch
+            .exec(&format!("ALTER ROLE {who} RESET {name}"))
+            .await;
+    }
+    let rs = rs.unwrap_or_else(|e| panic!("{}: the read: {e}", target.name));
+    let cell = |c: usize| rs.cell(0, c).map(|v| v.text().to_string());
+    assert_eq!(
+        cell(0).as_deref(),
+        Some("0.30000000000000004"),
+        "extra_float_digits"
+    );
+    assert_eq!(cell(1).as_deref(), Some("2026-01-02"), "DateStyle");
+    assert_eq!(
+        cell(2).as_deref(),
+        Some("-1 days +02:00:00"),
+        "IntervalStyle"
+    );
+    scratch.teardown().await;
+}
+
+/// **A MySQL-family copy writes every value as the source holds it** — the
+/// three ways it did not:
+/// - a `FLOAT` was read as the text protocol spells one, six significant
+///   digits, so `16777215` landed as `16777200` (`copy_table::read_form`
+///   now widens it to the double it is);
+/// - an `AUTO_INCREMENT` key of 0 asked the target for the next counter value
+///   and was renumbered, the write session having no `NO_AUTO_VALUE_ON_ZERO`;
+/// - under a server-wide `NO_BACKSLASH_ESCAPES` every backslash was doubled,
+///   the write session never taking the flag off as `run_ddl` does
+///   (`export::import_mode_sql` now pins both on the import's session). That
+///   half is red only on such a server: measured on MariaDB 11.8 with the
+///   global mode set.
+pub async fn a_mysql_copy_keeps_floats_backslashes_and_a_zero_key(target: &'static Target) {
+    use schemaic_core::copy_table::{self, CopyTarget};
+    let scratch = Scratch::create(target, "copy_exact").await;
+    if scratch.dialect() != schemaic_core::intel::SqlDialect::MySql {
+        crate::endpoint::note_no_op(target, "has no FLOAT, AUTO_INCREMENT 0 or backslash escape");
+        scratch.teardown().await;
+        return;
+    }
+    let src = scratch.qualified("src");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {src} (id INT AUTO_INCREMENT PRIMARY KEY, p VARCHAR(40), x FLOAT)"
+        ))
+        .await;
+    // The backslash spelled so no session's mode decides it, and the zero key
+    // set by an UPDATE, which needs no mode either.
+    scratch
+        .exec(&format!(
+            "INSERT INTO {src} (id, p, x) VALUES (5, CONCAT('C:', CHAR(92), 'data'), 16777215), \
+             (6, 'plain', 1.2345678)"
+        ))
+        .await;
+    scratch
+        .exec(&format!("UPDATE {src} SET id = 0 WHERE id = 5"))
+        .await;
+    let schema = scratch
+        .db
+        .fetch_schema(&scratch.database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{}: read the schema: {e}", target.name));
+    let info = schema
+        .tables
+        .iter()
+        .find(|t| t.name == "src")
+        .expect("the source")
+        .clone();
+    let to = CopyTarget {
+        database: scratch.database.clone(),
+        schema: info.schema.clone(),
+        name: "dst".into(),
+    };
+    let dialect = scratch.dialect();
+    scratch
+        .apply_plan(&copy_table::plan(&info, &to, dialect), "copy")
+        .await;
+    let read = copy_table::rows_read(&scratch.database, &info, dialect);
+    scratch
+        .db
+        .copy_rows(
+            Some(&scratch.database),
+            &read.select,
+            &scratch.db,
+            ImportTarget {
+                database: &scratch.database,
+                schema: to.schema.as_deref(),
+                table: &to.name,
+                columns: &read.columns,
+                forms: &read.forms,
+                overriding: read.overriding,
+            },
+            CancellationToken::new(),
+            &|_| {},
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{}: the copy failed: {e}", target.name));
+    let dst = scratch.qualified("dst");
+    let same = scratch
+        .exec(&format!(
+            "SELECT COUNT(*) FROM {src} s JOIN {dst} d ON d.id = s.id AND d.p = s.p AND d.x = s.x"
+        ))
+        .await;
+    let lines = scratch
+        .exec(&format!(
+            "SELECT id, LENGTH(p), x + 0e0 FROM {dst} ORDER BY id"
+        ))
+        .await;
+    let shown: Vec<String> = (0..lines.row_count())
+        .map(|r| {
+            (0..3)
+                .map(|c| {
+                    lines
+                        .cell(r, c)
+                        .map_or(String::new(), |v| v.display().to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    assert_eq!(
+        same.cell(0, 0).expect("a count").display().to_string(),
+        "2",
+        "{}: the copy's rows differ from the source's: {shown:?}",
+        target.name
+    );
+    scratch.teardown().await;
+}
+
 /// A reader that fails partway rolls the whole import back.
 ///
 /// The rows before the error were already sent to the server in an earlier

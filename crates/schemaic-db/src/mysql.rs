@@ -7167,6 +7167,16 @@ pub(crate) async fn import_rows(
 ) -> Result<u64, DbError> {
     let mut conn = db.open(Some(target.database), false).await?;
     let conn_id = conn.id();
+    // The rows' literals mean what `sql_literal` wrote them to mean, and a key
+    // of 0 stays 0 — see `export::import_mode_sql`. Not best-effort: a
+    // session that kept the server's `NO_BACKSLASH_ESCAPES` would store
+    // every backslash doubled.
+    if let Some(sql) = schemaic_core::export::import_mode_sql(db.engine.dialect()) {
+        if let Err(e) = conn.query_drop(sql).await {
+            let _ = conn.disconnect().await;
+            return Err(DbError::Query(e.to_string()));
+        }
+    }
     // **The cancel is inside the loop, not a race around it.** This was
     // `tokio::select!` over the whole of `import_on`, and the cancel arm
     // then *dropped* that future mid-statement — which leaves a

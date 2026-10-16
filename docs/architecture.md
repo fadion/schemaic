@@ -4758,11 +4758,28 @@ existing prose was left alone.
     over **code only** — the comment block above that option explains the setting by name, and the
     first version of this gate stayed green over the deletion because of it — and the live tier's
     `a_password_with_a_backslash_is_stored_as_it_was_typed` turns the GUC off on the role the tier
-    connects as and checks that a plan's connection reports `on` anyway. Two kinds of
-    caller: a **file**, where `dump::literal_mode_guard_sql` wraps it in a save/restore pair, and a
+    connects as and checks that a plan's connection reports `on` anyway. **Beside it on the startup
+    packet, the three settings that decide how a value the app reads is spelt** —
+    `extra_float_digits=3`, `DateStyle=ISO`, `IntervalStyle=postgres`, as `pg_dump` pins them for
+    its own read: every PostgreSQL cell is the server's text, which a dump writes and a copy
+    inserts as it came, so a role's `extra_float_digits = 0` (PostgreSQL 11's default) copied
+    `0.1 + 0.2` as `0.3`, its `DateStyle = 'SQL, DMY'` dumped 2 January as `02/01/2026` — 1 February
+    to a default session — and `IntervalStyle = sql_standard` an interval the default reads with
+    the opposite sign on its hours (`a_role_cannot_change_how_values_are_spelt`, which sets all
+    three on the tier's role). The init SQL may name none of them, since it runs after the packet
+    (`init_sql`, below). Three kinds of
+    caller: a **file**, where `dump::literal_mode_guard_sql` wraps it in a save/restore pair, a
     **live plan**, where `Db::run_ddl` and `Db::run_server_ddl` run the bare statement best-effort
     beside `lock_wait_sql` — scoped to the plan, never pinned at connect time, because a user who
-    sets that mode means it for the SQL they type.
+    sets that mode means it for the SQL they type — and **an import's or a copy's write**, whose
+    session sends `export::import_mode_sql`: the flag off *and* `NO_AUTO_VALUE_ON_ZERO` on, so an
+    `AUTO_INCREMENT` key of 0 is written as 0 rather than as the counter's next value (a copy
+    renumbered such a row), and a server-wide `NO_BACKSLASH_ESCAPES` no longer doubles every
+    backslash a copy or import writes — which it did, the path never having sent the statement
+    (`a_mysql_copy_keeps_floats_backslashes_and_a_zero_key`, red on MariaDB 11.8 with the global mode
+    set). Not best-effort there: a session that kept the flag would store other values. The file's
+    guard takes the same mode, and with it `export::rows_session_sql`'s `+00:00` zone — see
+    `literal_mode_guard_sql` under `core/dump.rs`.
     **`ExportTally` is what a renderer returns, because a row count was never the whole result.**
     `rows`, plus three losses the file itself shows no trace of: `withheld` (those binary columns,
     named — empty for Markdown and HTML), `blanked` (`ResultSet::capped_columns`, the cells past a
@@ -5656,6 +5673,14 @@ existing prose was left alone.
     such a drop (ERROR 3730), SQL Server too (Msg 3726), and PostgreSQL's `CASCADE` drops a key, not
     a row, so their toggle stands; `fk_guard_hint` is the toggle's hint and says so where it does
     not (`a_sqlite_file_that_drops_tables_turns_foreign_keys_off_whatever_the_toggle`).
+    **The guard's mode is the import's and it pins the zone**: `export::import_mode_sql` — the
+    flag off and `NO_AUTO_VALUE_ON_ZERO` on, so a key of 0 restores as 0 — and, saved and put back
+    like the mode, `time_zone = '+00:00'` (`export::rows_session_sql`), the zone the rows were read
+    in (`Db::for_rows`): MySQL hands a `TIMESTAMP` over in the session's zone and reads a literal
+    back from it, and the file named none, so a dump from a `+05:00` session replayed on a `-03:00`
+    one moved every `TIMESTAMP` eight hours (`a_mysql_dump_pins_utc_and_keeps_a_zero_key_around_its_rows`;
+    live, `a_timestamp_restores_as_the_instant_it_was`, red by five hours with the read unpinned).
+    `mysqldump`'s two pins, for its reasons.
     **`literal_mode_guard_sql` sits outside both, and is not one of the two optional scaffolds.**
     It is `export::literal_mode_sql` — the statement that takes `NO_BACKSLASH_ESCAPES` off the
     session so every `'…'` in the file means what `sql_literal` wrote it to mean — with the
@@ -9531,7 +9556,17 @@ existing prose was left alone.
     (`Server` — `varbinary`/`image`/CLR types as `0x…`, a `sql_variant` as its base type); and on
     SQLite **every** column as `quote(col)` (`Quoted`), since a declared type there is only an
     affinity and a blob can sit in any column — `quote()` is lossless for every storage class,
-    ±infinity included. Everything else is `Value`. `select_sql` is the read on the source: those
+    ±infinity included. **A MySQL-family `FLOAT` is read as the double it is** —
+    `dump::exact_float_select`, `` (`x` + 0e0) AS `x` ``, which the dump's rows read too: the text
+    protocol spells a `FLOAT` with six significant digits, so `16777215` copied as `16777200` and
+    `1.2345678` as `1.23457`, other floats, while as a double it arrives exact and the `FLOAT`
+    column takes it back as the same float (measured on MariaDB 10.11 and MySQL 8.4;
+    `a_mysql_float_is_read_as_a_double`, `a_mysql_float_column_is_read_as_a_double`).
+    **`rows_read_with`/`read_form_with` take the source's SQL Server alias types**
+    (`DbSchema::tsql_objects`, which the modal passes from the loaded schema), so a column typed
+    `[dbo].[Hash]` over `varbinary` is read by its base as the dump reads it, where with none it
+    stopped every copy of its table and an alias over `sql_variant` came back an `nvarchar` variant
+    (`a_sql_server_alias_type_is_read_by_its_base`). Everything else is `Value`. `select_sql` is the read on the source: those
     columns in table order, each as `read_form` reads it, qualified by `export::qualified_table`
     and unsorted, since an insert needs no order
     (`a_blob_is_read_as_text_the_write_turns_back_into_bytes`; SQLite's
@@ -9540,8 +9575,8 @@ existing prose was left alone.
     of every streamed chunk: it fails the copy when a cell in a bytes column (`binary_columns` or
     `Column::is_binary`) is still a placeholder (`model::is_binary_display`), or when any column hit
     the chunk's arena cap (`capped_columns`), whose cells read blank past it. A type `read_form`
-    does not know — a SQL Server alias over `varbinary`, since the copy passes `literal_select` no
-    alias list — therefore stops the copy loudly instead of writing the placeholder
+    does not know — an alias type the schema was not loaded with — therefore stops the copy
+    loudly instead of writing the placeholder
     (`a_chunk_holding_a_bytes_placeholder_is_refused`, which also holds that prose reading
     `<3 bytes>` in a text column passes; SQLite's `a_copy_never_writes_a_bytes_placeholder`).
     `rows_change(src)` is the preview's change-list line for the rows — *"Then copy every row of
@@ -12626,8 +12661,11 @@ existing prose was left alone.
     comment saying which: the transaction characteristics and read-only flags, `autocommit`,
     `IMPLICIT_TRANSACTIONS`/`ANSI_DEFAULTS`, `NOCOUNT`/`ROWCOUNT` (the row counts the one-row
     safety net reads), `foreign_key_checks`, PostgreSQL's `session_replication_role` (it switches
-    triggers and foreign keys off) and `bytea_output`/`extra_float_digits` (how values the app reads
-    are spelt), and the settings the literals Schemaic writes are lexed by — PostgreSQL's
+    triggers and foreign keys off) and how values the app reads are spelt — `bytea_output`,
+    `extra_float_digits`, `DateStyle`, `IntervalStyle` and `lc_monetary`, the first three pinned on
+    `pg::connect`'s startup packet, which an init running after it would undo (`DateStyle` and
+    `IntervalStyle` were listed, so a `SET DateStyle = 'SQL, DMY'` dumped 2 January as 1 February) —
+    and the settings the literals Schemaic writes are lexed by — PostgreSQL's
     `standard_conforming_strings`, the one `pg::connect_probe` pins on the startup packet, and
     MySQL's `sql_mode` (`what_the_guards_rest_on_cannot_be_moved`,
     `settings_that_make_an_operation_deliver_less_are_refused`). The client character set is a
@@ -21267,7 +21305,11 @@ existing prose was left alone.
   database for its file** — the data half of *Copy to* (`core::copy_table`), run once the preview
   has created the table. The read is `stream_query_enforced(…, Some(Enforce::ReadOnly))` on `self`
   in `COPY_CHUNK_ROWS` (2,000) chunks: the `SELECT` is generated, but a copy writes nothing on its
-  source by any route. The write is `to.import_rows`, so it inherits that path's whole discipline —
+  source by any route. **Both ends run on `Db::for_rows`** — the connection's init SQL, then
+  `export::rows_session_sql` (MySQL's `SET time_zone = '+00:00'`, last so an init's own zone does
+  not move it) — because a MySQL `TIMESTAMP` is handed over in the session's zone and read back
+  from it, so two sessions in different zones moved every one; the dump's read takes the same
+  handle (`cli::dump::run`). The write is `to.import_rows`, so it inherits that path's whole discipline —
   one transaction, every batch's count checked, the cancel inside the loop — and a copy that stops
   part-way leaves a transactional target table as the `CREATE` made it rather than holding the
   first rows as if they were all. A non-transactional one keeps what arrived, exactly as an import
