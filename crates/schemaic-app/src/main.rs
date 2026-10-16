@@ -3569,6 +3569,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // is coming, and a link left disabled for ever is worse
                         // than one that can be clicked twice.
                         tab.view_busy.set(false);
+                        // A note the caller left for this landing
+                        // (`Tab::view_note`), spent whatever the landing is.
+                        let note = tab.view_note.get_untracked();
+                        tab.view_note.set(None);
                         // **What the landing does, and which query stands
                         // after it** (`filter::view_landing`): the query was
                         // written at dispatch, so a refusal — or rows that
@@ -3611,7 +3615,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     // somewhere else. See `ResultPanel::load_gen`.
                                     tab.bump_panel_load(id);
                                 }
-                                view_err.set(None);
+                                view_err.set(note);
                             }
                             // Error → keep the current table, show the message in the bar.
                             // The re-run's SQL is the one Schemaic built for the
@@ -6104,7 +6108,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     {
                         if tab.grid_query.with_untracked(|q| *q != stands) {
                             tab.grid_query.set(stands);
-                            tab.view_err.set(Some(ModalError::app(
+                            // For the landing to show (`Tab::view_note`): the
+                            // re-read clears `view_err` as it starts and lands.
+                            tab.view_note.set(Some(ModalError::app(
                                 schemaic_core::filter::REREAD_WITHOUT_FILTER_MSG,
                             )));
                         }
@@ -16118,6 +16124,39 @@ mod app_tests {
         let resettle = region("let resettle_sessions: Rc<dyn Fn(u64, OpenSession)> = {");
         assert!(resettle.contains("pinned_fate(TxAsked::Cancelled)"));
         assert!(resettle.contains("pinned_fate(TxAsked::Settled)"));
+    }
+
+    /// **The note that a commit's re-read dropped the filter reaches the
+    /// bar.** It was written to `view_err` just before the re-read ran, and the
+    /// view re-run clears `view_err` as it starts and again as it lands, so
+    /// the bar never said why the filter had emptied — found driving the
+    /// 8dd78136 hand checks. It rides in `Tab::view_note` now, which the
+    /// landing takes after its own clear. Pinned by its text: the wiring is a
+    /// closure no core test reaches.
+    #[test]
+    fn a_commits_reread_note_survives_the_reread_it_announces() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let at = body
+            .find("schemaic_core::filter::REREAD_WITHOUT_FILTER_MSG")
+            .expect("the commit's note — this gate is stale");
+        let before = &body[at.saturating_sub(160)..at];
+        assert!(before.contains("tab.view_note.set("), "{before}");
+        assert!(!before.contains("view_err.set("), "{before}");
+        let core = body
+            .find("let run_query_core: Rc<dyn Fn(String, bool, Option<u64>)> = {")
+            .expect("run_query_core — this gate is stale");
+        let core = &body[core..core + body[core..].find("\n    };").expect("its end")];
+        assert!(
+            core.contains("tab.view_note.get_untracked()"),
+            "the landing takes the note"
+        );
+        assert!(core.contains("tab.view_note.set(None)"), "and spends it");
     }
 
     /// **Re-pinning a session clears the tab's transaction state**, in the

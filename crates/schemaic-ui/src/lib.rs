@@ -1943,6 +1943,14 @@ pub struct Tab {
     /// the *table* (the previous results stay put — unlike a manual run, which
     /// replaces the grid with the error). Cleared on a table click / new run.
     pub view_err: RwSignal<Option<schemaic_core::model::ModalError>>,
+    /// **What the next view re-run's landing says in [`Self::view_err`]**, in
+    /// place of clearing it — set by a caller that changes the query and
+    /// wants the bar to say why, such as a commit whose re-read had to drop
+    /// the filter (`filter::REREAD_WITHOUT_FILTER_MSG`). Written straight to
+    /// `view_err` it never showed: the re-run clears that bar as it starts
+    /// and again as it lands. Spent by the landing whatever it ends in, so it
+    /// cannot surface on a later, unrelated one.
+    pub view_note: RwSignal<Option<schemaic_core::model::ModalError>>,
     /// True while a **view re-run** is in flight — the filter/sort splice, and the
     /// capped notice's "read all rows".
     ///
@@ -2133,6 +2141,7 @@ impl Tab {
             .set(schemaic_core::filter::GridQuery::default());
         self.row_cap_override.set(None);
         self.view_err.set(None);
+        self.view_note.set(None);
     }
 
     /// Does panel `id` hold staged edits — a cell, a pending row or a row
@@ -2466,6 +2475,7 @@ impl Tab {
             grid_query_shown: cx.create_rw_signal(schemaic_core::filter::GridQuery::default()),
             row_cap_override: cx.create_rw_signal(None),
             view_err: cx.create_rw_signal(None),
+            view_note: cx.create_rw_signal(None),
             view_busy: cx.create_rw_signal(false),
             path: cx.create_rw_signal(None),
             disk_sql: cx.create_rw_signal(None),

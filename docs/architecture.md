@@ -36966,7 +36966,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   failed `read_only_reason`'s allowlist, so the commit had no re-read at all — the inserted row
   vanished from the grid and the deleted one came back
   (`a_commit_rereads_without_a_filter_the_gate_cannot_vouch_for`). Where it fell back, `grid_query`
-  takes the query it stands for and the bar says so (`filter::REREAD_WITHOUT_FILTER_MSG`). **It
+  takes the query it stands for and the bar says so (`filter::REREAD_WITHOUT_FILTER_MSG`) —
+  **through `Tab::view_note`, which the re-read's landing shows after its own clear**: written
+  straight to `view_err` before the re-read ran, the note was cleared by the very re-run it
+  announced, as it started and again as it landed, so the filter bar emptied with no word of why
+  (`a_commits_reread_note_survives_the_reread_it_announces`, a source gate; found driving the
+  8dd78136 hand checks). The landing spends the note whatever it ends in, so it cannot surface on a
+  later one, and a manual run clears it with the rest of the tab's view state. **It
   lands in the panel the commit started on** — `apply_view_into(req, panel)`, `run_query_core`'s
   `into`, the panel captured at commit start and asked of `model::post_commit_panel` (still the
   tab's, unpinned) — not whichever is shown when it lands: a click on a pinned chip while the
