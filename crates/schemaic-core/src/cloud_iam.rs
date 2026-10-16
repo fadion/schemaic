@@ -425,10 +425,13 @@ mod tests {
 
     #[test]
     fn the_candidates_cover_path_and_the_installers() {
-        let path = std::env::join_paths([r"C:\bin", ""]).unwrap();
+        // Absolute on whichever OS runs this — `C:\bin` is relative on Unix, and its `:` is
+        // the separator `join_paths` refuses there.
+        let abs = std::env::temp_dir();
+        let path = std::env::join_paths([abs.as_os_str(), "".as_ref()]).unwrap();
         let pf = Path::new(r"C:\Program Files");
         let got = cli_candidates(Cloud::Aws, Some(&path), &[pf], None, true);
-        assert!(got.contains(&Path::new(r"C:\bin").join("aws.exe")));
+        assert!(got.contains(&abs.join("aws.exe")));
         assert!(got.contains(&pf.join("Amazon").join("AWSCLIV2").join("aws.exe")));
         let lad = Path::new(r"C:\Users\u\AppData\Local");
         let got = cli_candidates(Cloud::Gcloud, None, &[], Some(lad), true);
@@ -440,8 +443,6 @@ mod tests {
                 .join("bin")
                 .join("gcloud.cmd")]
         );
-        // Absolute on whichever OS runs this — `/usr/bin` is relative on Windows.
-        let abs = std::env::temp_dir();
         assert_eq!(
             cli_candidates(Cloud::Gcloud, Some(abs.as_os_str()), &[], None, false),
             [abs.join("gcloud")]
