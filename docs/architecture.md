@@ -15984,7 +15984,20 @@ existing prose was left alone.
     walking forward with the bounds rather than re-counted per statement, which would be quadratic
     in a block holding thousands of small `INSERT`s. `pending` is the driver's backpressure signal
     and `MAX_PENDING_BYTES` its ceiling: a file that reaches it is not a script with a long
-    statement, it is a file with no terminator in it at all.
+    statement, it is a file with no terminator in it at all. **Every driver sizes its reads by
+    `next_read`**, which grows the read with what is pending: the buffer is re-scanned from its
+    start on every block, so a fixed block made a long statement quadratic — the restore's scan
+    was that inline spelling a second time (a fixed 1 MiB, 32 MB in 5.4 s and 260 MB in 317 s),
+    and now shares the one function with the script runner
+    (`the_read_grows_with_what_is_still_unfinished`, `the_switch_scan_reads_in_growing_blocks`).
+    **`Splitter::skipping_copy_data` is the splitter for a scan that reads SQL rather than runs
+    it**: after a statement `copies_from_stdin` answers for — PostgreSQL's `COPY … FROM stdin`, the
+    head of every plain `pg_dump` table — it drops each line up to one that is exactly `\.`, as
+    psql reads them, holding at most the line it is in. Lexed as SQL, a row's `O'Brien` opened a
+    string that hid every later `\connect`, and a numeric table's rows (no `;`) grew one
+    "statement" past the ceiling, so *Restore from file* refused a 260 MB dump psql restores
+    (`copy_data_hides_no_later_switch`, `a_long_copy_section_is_never_held`). The runner's
+    splitter is the plain one: what a run does with `COPY … FROM stdin` is the server's answer.
     `probe` is the other half, and is `import::read_sample`'s counterpart: what the Import modal's
     second step shows once a file is picked. A CSV's sample can show the opening *rows*; a script's
     can only show what its opening statements **do**, which is the thing worth knowing before
@@ -16069,8 +16082,8 @@ existing prose was left alone.
     invariant.
     **`database_switches` reads a script for the lines that take it off its database**, for
     *Restore from file*, and reads **all** of it where `probe` stops at a prefix: `mysqldump
-    --databases a b` writes `USE b` half-way down. It feeds the `Splitter` a block at a time, so a
-    dump is never held whole, and answers a `DatabaseSwitch { database, how, line }` for each
+    --databases a b` writes `USE b` half-way down. It feeds a `Splitter::skipping_copy_data` a
+    block at a time (see `next_read` above), so a dump is never held whole, and answers a `DatabaseSwitch { database, how, line }` for each
     client command at the start of a line outside any string or comment — psql's `\c`/`\connect`,
     the `mysql` client's `\u` and `\r` (`switch_commands`) — and each statement headed `USE` (MySQL,
     SQL Server), the `mysql` client's bare `connect`, `CREATE`/`DROP DATABASE`, or on MySQL
@@ -34312,7 +34325,7 @@ existing prose was left alone.
     (two SQL Server, one MySQL 8 published on `127.0.0.1:3307`).
   - `app/script.rs` — the I/O half of `core::script`, and `cli/dump.rs`'s mirror image: that module
     reads a database and writes a file, this reads a file and writes a database. Two halves at once — a
-    **blocking reader** walks the file in `BLOCK`-sized reads, feeds `script::Splitter` and pushes
+    **blocking reader** walks the file in reads sized by `script::next_read`, feeds `script::Splitter` and pushes
     completed statements into a bounded channel, while `Db::run_script` pulls from the other end.
     Each reports how it ended and `script::run_outcome` decides which ending the user hears, which is
     **not** the same precedence `dump_verdict` uses (see `core::script`).

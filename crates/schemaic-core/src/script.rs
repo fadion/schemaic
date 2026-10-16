@@ -34,6 +34,33 @@ use crate::sql::{self, ScanState};
 /// a dump truncated inside a string literal.
 pub const MAX_PENDING_BYTES: usize = 256 << 20;
 
+/// How much of a script file a driver reads per syscall while little is held.
+pub const READ_BLOCK: usize = 256 * 1024;
+
+/// The largest single read, however much is being held: [`next_read`]'s growth
+/// must not turn into one 256 MB allocation at the ceiling.
+pub const MAX_READ_BLOCK: usize = 32 * 1024 * 1024;
+
+/// How much a driver reads next, given what the [`Splitter`] is still holding
+/// ([`Splitter::pending`]).
+///
+/// **The whole of the linearity fix, and it was one expression inside the
+/// loop.** [`Splitter`] re-scans its buffer from the start on every block, so
+/// a statement spanning *m* blocks costs O(m²·block): a file with no
+/// terminator in it at all — a CSV renamed `.sql`, a dump truncated inside a
+/// string literal — grows the buffer to [`MAX_PENDING_BYTES`] and would
+/// re-scan a quarter of a gigabyte a thousand times before being refused,
+/// which is minutes of a pinned thread before the message saying the file is
+/// not a script. Doubling the read makes the number of re-scans logarithmic.
+///
+/// **Every driver sizes its reads here** — the script runner and
+/// [`database_switches`]. Written inline, `let want = BLOCK;` restored the
+/// quadratic cost and left the workspace green, and the restore's scan was
+/// that inline spelling a second time (32 MB in 5.4 s, 260 MB in 317 s).
+pub fn next_read(pending: usize) -> usize {
+    READ_BLOCK.max(pending / 2).min(MAX_READ_BLOCK)
+}
+
 /// One statement, with where in the file it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Statement {
@@ -99,6 +126,14 @@ pub struct Splitter {
     /// The file is UTF-16 in this byte order, told by its BOM — as
     /// [`crate::sqlfile::decode`] reads one opened in a tab.
     utf16: Option<crate::sqlfile::Utf16>,
+    /// Skip a `COPY … FROM stdin` statement's data — see
+    /// [`skipping_copy_data`](Self::skipping_copy_data).
+    copy_data: bool,
+    /// Inside such data: the held bytes are rows until a `\.` line.
+    in_copy: bool,
+    /// …and still on the rest of the `COPY` statement's own line, which
+    /// psql does not read as a row.
+    copy_mid_line: bool,
 }
 
 impl Splitter {
@@ -115,6 +150,28 @@ impl Splitter {
             at_start: true,
             sniffed: false,
             utf16: None,
+            copy_data: false,
+            in_copy: false,
+            copy_mid_line: false,
+        }
+    }
+
+    /// [`new`](Self::new), but a statement that reads **`COPY … FROM stdin`**
+    /// ([`copies_from_stdin`]) is followed by data the splitter drops — every
+    /// line up to one that is exactly `\.`, as psql reads a plain `pg_dump`.
+    ///
+    /// For a scan that reads the file's SQL rather than running it
+    /// ([`database_switches`]). Lexed as SQL, a row's `O'Brien` opened a
+    /// string that hid every later line, and a numeric table's rows — no `;`
+    /// in them — grew one "statement" past [`MAX_PENDING_BYTES`], so the scan
+    /// refused a restore the client runs. Held a line at a time instead,
+    /// a COPY section of any length costs nothing. Not the runner's splitter:
+    /// what a script run does with `COPY … FROM stdin` is the server's answer,
+    /// and that path is unchanged.
+    pub fn skipping_copy_data(dialect: SqlDialect) -> Self {
+        Self {
+            copy_data: true,
+            ..Self::new(dialect)
         }
     }
 
@@ -274,9 +331,27 @@ impl Splitter {
             text
         };
         self.buf.push_str(text);
-        let bounds = sql::statement_bounds_open(&self.buf, self.dialect, &mut self.state);
-        let cut = bounds.last().expect("a scan always starts at 0").at;
         let mut out = Vec::new();
+        // Each round drains what it can; a `COPY … FROM stdin` ends a round
+        // early, and its data is dropped before the next one scans again.
+        loop {
+            if self.in_copy && !self.drop_copy_data() {
+                return out;
+            }
+            if !self.split_held(&mut out) {
+                return out;
+            }
+        }
+    }
+
+    /// One round of [`split`](Self::split): the statements the held buffer
+    /// completes, drained into `out`. `true` where it stopped after a
+    /// `COPY … FROM stdin` whose data now follows
+    /// ([`skipping_copy_data`](Self::skipping_copy_data)).
+    fn split_held(&mut self, out: &mut Vec<Statement>) -> bool {
+        let bounds = sql::statement_bounds_open(&self.buf, self.dialect, &mut self.state);
+        let mut cut = bounds.last().expect("a scan always starts at 0").at;
+        let mut copying = false;
         // Newlines are counted once, walking forward with the windows, rather
         // than re-counted from the buffer start per statement — which would be
         // quadratic in a block holding thousands of tiny `INSERT`s.
@@ -296,12 +371,51 @@ impl Splitter {
                     line,
                     offset: self.offset + lo as u64,
                 });
+                // What the scan made of the bytes after it is rows, not SQL.
+                if self.copy_data && copies_from_stdin(text, self.dialect) {
+                    cut = w[1].at;
+                    copying = true;
+                    break;
+                }
             }
         }
-        self.line += newlines(&self.buf[..cut]) as u64;
-        self.offset += cut as u64;
-        self.buf.drain(..cut);
-        out
+        self.drop_held(cut);
+        if copying {
+            self.in_copy = true;
+            self.copy_mid_line = true;
+        }
+        copying
+    }
+
+    /// Drop the held COPY rows up to and including their `\.` line — `true`
+    /// once that line was found, `false` with the rest of the buffer dropped
+    /// but for a line it has not seen the end of, which may yet be `\.`.
+    fn drop_copy_data(&mut self) -> bool {
+        let mut at = 0usize;
+        loop {
+            let Some(n) = self.buf[at..].find('\n') else {
+                self.drop_held(at);
+                return false;
+            };
+            let row = &self.buf[at..at + n];
+            at += n + 1;
+            if std::mem::take(&mut self.copy_mid_line) {
+                continue;
+            }
+            if row.strip_suffix('\r').unwrap_or(row) == "\\." {
+                self.in_copy = false;
+                self.drop_held(at);
+                return true;
+            }
+        }
+    }
+
+    /// Hand the first `n` held bytes on — counted into the line and offset —
+    /// and stop holding them.
+    fn drop_held(&mut self, n: usize) {
+        self.line += newlines(&self.buf[..n]) as u64;
+        self.offset += n as u64;
+        self.buf.drain(..n);
     }
 
     /// The end of the file: whatever is still held, scanned once more **as the
@@ -330,6 +444,13 @@ impl Splitter {
         if !self.carry.is_empty() {
             self.carry.clear();
             self.buf.push('\u{FFFD}');
+        }
+        // A file that ends inside COPY data — its last row, or a `\.` with no
+        // newline after it — ends there: none of it is a statement.
+        if std::mem::take(&mut self.in_copy) {
+            let n = self.buf.len();
+            self.drop_held(n);
+            return Vec::new();
         }
         let bounds = sql::statement_bounds_closing(&self.buf, self.dialect, &mut self.state);
         let mut out = Vec::new();
@@ -377,6 +498,28 @@ impl Splitter {
 /// `\n` count — the line accounting, in one place.
 fn newlines(s: &str) -> usize {
     s.as_bytes().iter().filter(|&&b| b == b'\n').count()
+}
+
+/// Is `stmt` a **`COPY … FROM stdin`** — a statement whose rows follow it in
+/// the script, up to a `\.` line? PostgreSQL's alone; the other engines have
+/// no in-band data. Read over [`sql::leading_words`], so a `'stdin'` file
+/// name or a comment is not the word — and with the psql commands the
+/// statement carries in front of it (`\connect shop`) left out, since they
+/// are lines of their own to psql and not the statement's head.
+pub fn copies_from_stdin(stmt: &str, dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => {
+            let sql: String = stmt
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('\\'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let words = sql::leading_words(&sql, usize::MAX, dialect);
+            words.first().is_some_and(|w| w == "COPY")
+                && words.windows(2).any(|w| w[0] == "FROM" && w[1] == "STDIN")
+        }
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
 }
 
 /// Heads whose *object* matters as much as the verb: `CREATE TABLE` and
@@ -1094,8 +1237,10 @@ pub struct DatabaseSwitch {
 /// Every [`DatabaseSwitch`] in a whole script — **the whole of it**, unlike
 /// [`probe`]: `mysqldump --databases a b` writes `USE b` half-way down, and a
 /// look at the first megabytes would pass it. Read a block at a time through
-/// the [`Splitter`], so a large dump is never held whole; the caller runs it
-/// off the UI thread.
+/// the [`Splitter`], so a large dump is never held whole, in reads sized by
+/// [`next_read`]; the caller runs it off the UI thread. A psql `COPY … FROM
+/// stdin` section is skipped as the data it is
+/// ([`Splitter::skipping_copy_data`]), the way psql reads it.
 ///
 /// `InvalidData` when one statement outgrows [`MAX_PENDING_BYTES`] — a file
 /// with no terminator, which the client could not run as a script either.
@@ -1103,11 +1248,17 @@ pub fn database_switches<R: std::io::Read>(
     mut r: R,
     dialect: SqlDialect,
 ) -> std::io::Result<Vec<DatabaseSwitch>> {
-    let mut splitter = Splitter::new(dialect);
+    // COPY data is not SQL to this scan — see `Splitter::skipping_copy_data`.
+    let mut splitter = Splitter::skipping_copy_data(dialect);
     let mut found = Vec::new();
-    let mut buf = vec![0u8; 1 << 20];
+    let mut buf = Vec::new();
     loop {
-        let n = r.read(&mut buf)?;
+        // Grown with what is held — see `next_read`.
+        let want = next_read(splitter.pending());
+        if buf.len() < want {
+            buf.resize(want, 0);
+        }
+        let n = r.read(&mut buf[..want])?;
         let stmts = if n == 0 {
             splitter.finish()
         } else {
@@ -1481,6 +1632,162 @@ mod tests {
                 (Some("shop".into()), "\\connect".into(), 4),
                 (Some("legacy".into()), "\\c".into(), 8),
             ]
+        );
+    }
+
+    /// **`COPY … FROM stdin` data is data, not SQL.** A plain `pg_dump` is
+    /// COPY-based, and its rows were lexed as statements: an `O'Brien` opened a
+    /// string that hid every later line, so two `pg_dump -C` scripts
+    /// concatenated reported only the first database's switches and the
+    /// restore into it was not refused. The data runs to a line that is
+    /// exactly `\.`; whatever follows is SQL again, on the right line.
+    #[test]
+    fn copy_data_hides_no_later_switch() {
+        let dump = "CREATE DATABASE shop;\n\
+            \\connect shop\n\
+            COPY public.c (id, name) FROM stdin;\n\
+            1\tO'Brien\n\
+            2\tsrc/*.rs\n\
+            \\.\n\
+            \n\
+            CREATE DATABASE other;\n\
+            \\connect other\n\
+            COPY public.d (id) FROM STDIN WITH (FORMAT text);\n\
+            3\n\
+            \\.\n\
+            SELECT 1;\n";
+        assert_eq!(
+            switches(dump, SqlDialect::Postgres),
+            vec![
+                (Some("shop".into()), "CREATE DATABASE".into(), 1),
+                (Some("shop".into()), "\\connect".into(), 2),
+                (Some("other".into()), "CREATE DATABASE".into(), 8),
+                (Some("other".into()), "\\connect".into(), 9),
+            ]
+        );
+        assert!(
+            restore_refusal(
+                "x.sql",
+                "shop",
+                &database_switches(dump.as_bytes(), SqlDialect::Postgres).unwrap()
+            )
+            .is_some()
+        );
+        // Cut anywhere, the same statements, data dropped.
+        for block in [1, 2, 7, 64] {
+            let mut s = Splitter::skipping_copy_data(SqlDialect::Postgres);
+            let mut got: Vec<(String, u64)> = Vec::new();
+            for chunk in dump.as_bytes().chunks(block) {
+                got.extend(s.push(chunk).into_iter().map(|st| (st.sql, st.line)));
+            }
+            got.extend(s.finish().into_iter().map(|st| (st.sql, st.line)));
+            assert_eq!(got.len(), 5, "block {block}: {got:#?}");
+            assert_eq!(got[4], ("SELECT 1;".to_string(), 13), "block {block}");
+        }
+    }
+
+    /// **A COPY section longer than [`MAX_PENDING_BYTES`] is not held**: a
+    /// numeric table's rows carry no `;`, so 260 MB of them grew one
+    /// "statement" past the ceiling and the restore was refused — after a
+    /// five-minute silent scan — as "not a SQL script". Fed in blocks, the
+    /// splitter holds at most the line it is in.
+    #[test]
+    fn a_long_copy_section_is_never_held() {
+        let mut s = Splitter::skipping_copy_data(SqlDialect::Postgres);
+        assert!(s.push(b"COPY t (id) FROM stdin;\n").len() == 1);
+        let rows: String = (0..20_000).map(|i| format!("{i}\n")).collect();
+        for _ in 0..50 {
+            assert!(s.push(rows.as_bytes()).is_empty());
+            assert!(s.pending() < 16, "held {} bytes of COPY data", s.pending());
+        }
+        let tail = s.push(b"\\.\nSELECT 2;\n");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].sql, "SELECT 2;");
+        // A plain splitter — Run file's — still reads it as it always has.
+        let plain = split_in_blocks(b"COPY t FROM stdin;\n1\n\\.\n", 4, SqlDialect::Postgres);
+        assert_eq!(plain[0], "COPY t FROM stdin;");
+        assert!(plain.len() > 1);
+    }
+
+    #[test]
+    fn only_a_postgres_copy_from_stdin_carries_its_rows() {
+        let pg = SqlDialect::Postgres;
+        assert!(copies_from_stdin("COPY public.t (a, b) FROM stdin;", pg));
+        assert!(copies_from_stdin(
+            "copy t from STDIN with (format csv);",
+            pg
+        ));
+        assert!(!copies_from_stdin("COPY t FROM '/tmp/stdin';", pg));
+        assert!(!copies_from_stdin("COPY t TO stdout;", pg));
+        assert!(!copies_from_stdin("SELECT 1 /* COPY t FROM stdin */;", pg));
+        assert!(!copies_from_stdin("COPY t FROM stdin;", SqlDialect::MySql));
+        // The psql command a statement carries in front of it is not its head.
+        assert!(copies_from_stdin(
+            "\\connect shop\n-- data\nCOPY t FROM stdin;",
+            pg
+        ));
+    }
+
+    /// **The linearity fix, which was one expression with no test.** Writing
+    /// `let want = BLOCK;` where it lived left the whole workspace green while a
+    /// file with no terminator in it re-scanned a quarter of a gigabyte a
+    /// thousand times. The property is that the read *grows with what is held*,
+    /// so the number of re-scans over a buffer growing to `MAX_PENDING_BYTES`
+    /// is logarithmic rather than linear — asserted as the count of reads it
+    /// takes to get there, which is the thing that actually hurt.
+    #[test]
+    fn the_read_grows_with_what_is_still_unfinished() {
+        // Small files read a whole block; the growth only starts once more than
+        // two blocks are held.
+        assert_eq!(next_read(0), READ_BLOCK);
+        assert_eq!(next_read(READ_BLOCK), READ_BLOCK);
+        assert_eq!(next_read(4 * READ_BLOCK), 2 * READ_BLOCK);
+        // And it never becomes one enormous allocation.
+        assert_eq!(next_read(usize::MAX), MAX_READ_BLOCK);
+        // A fixed block needs `MAX_PENDING_BYTES / READ_BLOCK` = 1024 reads.
+        let mut held = 0usize;
+        let mut reads = 0u32;
+        while held < MAX_PENDING_BYTES {
+            held += next_read(held);
+            reads += 1;
+            assert!(reads < 10_000, "the read is not growing at all");
+        }
+        assert!(
+            reads < 64,
+            "{reads} reads to reach the ceiling — the growth is gone (a fixed block takes {})",
+            MAX_PENDING_BYTES / READ_BLOCK
+        );
+    }
+
+    /// **The scan's reads grow with what is held**, as the script runner's do
+    /// ([`next_read`]): a fixed 1 MiB block re-scanned one long statement from
+    /// its start on every read — 32 MB took 5.4 s, 260 MB 317 s, before the
+    /// refusal. Asserted as the size it asks for once megabytes are held,
+    /// which a fixed block never grows.
+    #[test]
+    fn the_switch_scan_reads_in_growing_blocks() {
+        struct Asked {
+            left: usize,
+            largest: usize,
+        }
+        impl std::io::Read for Asked {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.largest = self.largest.max(buf.len());
+                let n = buf.len().min(self.left);
+                buf[..n].fill(b'a');
+                self.left -= n;
+                Ok(n)
+            }
+        }
+        let mut r = Asked {
+            left: 8 << 20,
+            largest: 0,
+        };
+        database_switches(&mut r, SqlDialect::MySql).unwrap();
+        assert!(
+            r.largest >= 2 << 20,
+            "the largest read was {} bytes with megabytes of one statement held",
+            r.largest
         );
     }
 
