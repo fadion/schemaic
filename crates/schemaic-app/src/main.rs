@@ -1474,7 +1474,7 @@ fn dialect_for(engine: schemaic_db::Engine) -> SqlDialect {
 ///
 /// **The message is shell source, so it goes through `launch::shell_message_text`
 /// first.** This is the one place in the app that hands a string to a shell:
-/// `sh -c "echo '<msg>'; exec /bin/sh"` and `cmd /k echo <msg>` are both parsed
+/// `sh -c "printf '%s\n' '<msg>'; exec /bin/sh"` and `cmd /k echo <msg>` are both parsed
 /// before they are run. That was harmless while every caller passed a fixed
 /// sentence and stopped being harmless when one began reporting a program name
 /// out of `terminal.json` and an OS error. Validated at the boundary rather than
@@ -1494,7 +1494,10 @@ fn message_shell(msg: &str) -> schemaic_term::ShellConfig {
     {
         schemaic_term::ShellConfig {
             program: "/bin/sh".into(),
-            args: vec!["-c".into(), format!("echo '{msg}'; exec /bin/sh")],
+            // `printf`, not `echo`: dash's `echo` reads `\n` and `\c` in its
+            // argument, and a message may carry a Windows path's backslashes
+            // (`launch::shell_message_text`).
+            args: vec!["-c".into(), format!("printf '%s\\n' '{msg}'; exec /bin/sh")],
             cwd: None,
             env: Vec::new(),
         }

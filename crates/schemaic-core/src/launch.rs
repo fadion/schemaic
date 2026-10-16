@@ -622,7 +622,7 @@ fn is_windows_path(p: &str) -> bool {
 /// **The one place in the app where a string really is handed to a shell.** The
 /// two rules at the top of this module say the argv here is executed directly
 /// and nothing parses it — true of every other function, and not of the
-/// message terminal: it spawns `/bin/sh -c "echo '<msg>'; exec /bin/sh"` on Unix
+/// message terminal: it spawns `/bin/sh -c "printf '%s\n' '<msg>'; exec /bin/sh"` on Unix
 /// and `cmd.exe /k echo <msg>` on Windows, so the message is **shell source**.
 /// A `'` in it closes the quote on Unix; `&`, `|`, `^`, `>` and `%` are syntax
 /// to `cmd`. That was harmless while every caller passed a fixed sentence, and
@@ -636,10 +636,16 @@ fn is_windows_path(p: &str) -> bool {
 /// character, newline among them — becomes a space, and runs of spaces collapse
 /// so a stripped run does not leave a gap. The result can be pasted into either
 /// command with no quoting beyond what is already there.
+///
+/// **The backslash is on the list**, so a Windows path in a message stays a
+/// path: `cmd` gives it no meaning, `sh` none inside single quotes, and the
+/// Unix shell prints the message with `printf '%s\n'` rather than an `echo`
+/// that would read `\n` or `\c` in it. Stripped, a restore refusal named
+/// `C: Users jonid backup.sql`.
 pub fn shell_message_text(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     for ch in msg.chars() {
-        let keep = ch.is_ascii_alphanumeric() || " .,:;!?-_/()[]+=@#".contains(ch);
+        let keep = ch.is_ascii_alphanumeric() || " .,:;!?-_/()[]+=@#\\".contains(ch);
         let ch = if keep { ch } else { ' ' };
         if ch == ' ' && out.ends_with(' ') {
             continue;
@@ -1353,6 +1359,15 @@ mod tests {
         assert_eq!(shell_message_text("naïve 東京"), "na ve");
         assert_eq!(shell_message_text("   "), "");
         assert_eq!(shell_message_text(""), "");
+        // **A Windows path stays legible**: a backslash is no syntax to `cmd`,
+        // and inside `sh`'s single quotes nothing escapes — the Unix branch
+        // prints with `printf '%s\n'`, so no `echo` reads `\n` in it either. A
+        // restore refusal once named `C: Users jonid backup.sql`.
+        assert_eq!(
+            shell_message_text(r"C:\Users\me\new.sql moves to another database"),
+            r"C:\Users\me\new.sql moves to another database"
+        );
+        assert!(!shell_message_text(r"a\'b").contains('\''));
     }
 
     /// The programs that would make any amount of filtering above pointless.
