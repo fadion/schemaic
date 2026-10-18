@@ -5322,8 +5322,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 MenuEntry::Separator,
             ];
             let mut entries = if ai_on { ai_entries } else { Vec::new() };
-            entries.extend([
-                MenuEntry::action("Plan", move || {
+            // "Plan" only where the engine has one this build reads
+            // (`plan::supports_plan`) — absent rather than dimmed, like
+            // "Create view" below, because on such an engine it never will.
+            // Decided here, where it is built: it used to be built always and
+            // then found again by its label and removed, which a translated
+            // label would have quietly stopped doing.
+            if schemaic_core::plan::supports_plan(dialect.get_untracked()) {
+                entries.push(MenuEntry::action("Plan", move || {
                     let sql = query.get_untracked();
                     let dia = dialect.get_untracked();
                     let (lo, hi) = statement_range(&sql, menu_offset.get_untracked(), dia);
@@ -5341,7 +5347,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         (show_plan)(stmt);
                         highlight_pick(&sql, lo, hi, dialect.get_untracked(), highlight);
                     }
-                }),
+                }));
+            }
+            entries.extend([
                 // Named by its shortcut row, as the palette's "Format Code" is
                 // (`the_format_action_has_one_name_on_every_surface`).
                 MenuEntry::action(crate::shortcuts::MenuKey::EditorFormat.label(), move || {
@@ -5600,13 +5608,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // thing this menu can offer, and the one the user came for.
             if let Some(fix) = fix_entry {
                 entries.insert(0, fix);
-            }
-            // "Plan" only where the engine has one this build reads
-            // (`plan::supports_plan`) — absent rather than dimmed, like
-            // "Create view" below, because on such an engine it never will.
-            if !schemaic_core::plan::supports_plan(dialect.get_untracked()) {
-                entries
-                    .retain(|e| !matches!(e, MenuEntry::Action { label, .. } if label == "Plan"));
             }
             // "Create view" only when there's a query to make one *out of* — the
             // statement the right-click landed on has to be something a view's

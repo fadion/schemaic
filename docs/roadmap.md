@@ -65,23 +65,22 @@ otherwise.
 Each phase leaves English output byte-identical, so the existing suite — several hundred
 assertions pin English wording — stays the regression net throughout.
 
-2. **Labels that are identities.** Before anything is translated, every place that compares
-   displayed English to decide behaviour becomes an id: the editor's context menu, which drops
-   its *Plan* entry on an engine without plans by matching `label == "Plan"`
-   (`editor_pane.rs`); `text::human_count`'s `k`/`m`/`b`, which `model::goto_row_index` parses
-   back. `sql::NO_DATABASE_SELECTED` is matched by text only in the CLI, which stays English, so
-   it waits for phase 4's typed messages. The `"Favourite" | "Unfavourite" | "Colour" | "Hide"`
-   match in `overlays.rs` is a test (`menu_order_gate`) reading source literals, not behaviour;
-   it and its siblings are retargeted in phase 3, with the ellipsis gate.
 3. **UI literals** in `schemaic-ui` and `schemaic-app` — on the order of two to three thousand,
    heaviest in `widgets.rs`, `overlays.rs`, `lib.rs`, `grid.rs` and `shortcuts.rs`. Mechanical,
    one file per session, by hand: the rule against scripted edits applies in full. Retarget
    `source_gate::no_menu_label_ends_in_an_ellipsis` at the catalogue as labels leave the source —
-   it asserts a minimum count of literal labels scanned and will fail as they go.
+   it asserts a minimum count of literal labels scanned and will fail as they go. So do the
+   menu-order gates that read labels out of the source (`overlays.rs`'s `menu_order_gate`, whose
+   `"Favourite" | "Unfavourite" | "Colour" | "Hide"` match looks like behaviour and is not, and
+   its mirror in `schema_tree.rs`). `schemaic-app` has no `i18n.toml` yet and `tr!` is
+   `pub(crate)` to `schemaic-ui`; the app's first converted file decides how it reaches the
+   loader.
 4. **Messages built in `schemaic-core`.** The hard part. Around 130 functions return finished
    English prose (`run_verdict`, the DDL preview notes, `Rollback::note`, `tx`, `dump`, `compare`,
    `stats`, `import`, `conn_import`, `users`), and core cannot — and should not — reach a UI
-   catalogue. Each becomes a typed message (an id plus arguments, or an enum per area) the UI
+   catalogue. `run_verdict`'s `Block(NO_DATABASE_SELECTED)` is the one the CLI already
+   recognises by its text (`cli::run::refused_for_no_database`) — harmless while the CLI is
+   English, and the first thing a typed refusal replaces. Each becomes a typed message (an id plus arguments, or an enum per area) the UI
    renders; core keeps an English rendering for the CLI and MCP. Settle the message type on one
    area first and review it before the rest follow. The existing enums are the nearest starting
    points, though they render in three different ways: `AliasRenameRefusal` through `message()`,

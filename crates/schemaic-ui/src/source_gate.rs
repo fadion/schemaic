@@ -1565,6 +1565,38 @@ mod tests {
         );
     }
 
+    /// **Nothing is found by its English label.** A label is about to become a
+    /// catalogue message, so code that decides what to do by comparing one to
+    /// an English literal stops deciding once it is translated — and silently,
+    /// since the comparison is merely false. The editor's context menu built a
+    /// *Plan* entry and then removed it again on an engine without plans by
+    /// matching `label == "Plan"`; translated, the entry would have stayed.
+    /// Decide where the thing is built instead, or give it an id.
+    #[test]
+    fn nothing_is_found_by_its_english_label() {
+        let needles = [
+            "label == \"",
+            "label != \"",
+            "label.as_str() == \"",
+            "label.starts_with(\"",
+            "label.ends_with(\"",
+        ];
+        let mut offenders = Vec::new();
+        for (name, code) in &crate_sources() {
+            for needle in needles {
+                for (at, _) in code.match_indices(needle) {
+                    let line = 1 + code[..at].bytes().filter(|c| *c == b'\n').count();
+                    offenders.push(format!("{name}:{line}: `{needle}`"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "behaviour keyed on an English label, which translation will break:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// **No pointer cursor outside a hyperlink.** `docs/architecture.md`'s UI
     /// conventions keep the arrow on every button, tab and icon — a pointer
     /// reads as a web page — and allow `Pointer` only on a genuine link. The

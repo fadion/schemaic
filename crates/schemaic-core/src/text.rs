@@ -218,6 +218,17 @@ pub fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
 }
 
+/// The units [`human_count`] writes and [`crate::model::goto_row_index`] reads
+/// back, as `(suffix, power of ten)`, smallest first.
+///
+/// **Symbols, not words, and never translated.** The grid's stats line prints a
+/// count through one and the go-to-row box parses what the user retypes from it,
+/// so a suffix translated on the printing side alone would print counts the box
+/// then refuses. One table is what keeps the two sides from being changed
+/// apart. The decimal point between them is the same question — localising it
+/// has to move both sides at once (`docs/roadmap.md`, locale formatting).
+pub const COUNT_UNITS: [(char, u32); 3] = [('k', 3), ('m', 6), ('b', 9)];
+
 /// Compact row-count label: `1000 → 1k`, `1250 → 1.25k`, `1_000_000 → 1m`.
 /// Up to two decimals, trailing zeros trimmed. Under 1000 stays exact.
 ///
@@ -239,13 +250,14 @@ pub fn human_count(n: usize) -> String {
     // convey scale before something irreversible. The threshold is the value at
     // which two decimals round up to 1000.
     const PROMOTE: f64 = 999.995;
-    let (val, suffix) = if f >= 1e9 || f / 1e6 >= PROMOTE {
+    let [thousand, million, billion] = COUNT_UNITS;
+    let (val, (suffix, _)) = if f >= 1e9 || f / 1e6 >= PROMOTE {
         // `b` is the largest unit there is, so past a trillion it keeps counting.
-        (f / 1e9, "b")
+        (f / 1e9, billion)
     } else if f >= 1e6 || f / 1e3 >= PROMOTE {
-        (f / 1e6, "m")
+        (f / 1e6, million)
     } else if f >= 1e3 || f >= PROMOTE {
-        (f / 1e3, "k")
+        (f / 1e3, thousand)
     } else {
         return n.to_string();
     };

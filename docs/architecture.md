@@ -17697,6 +17697,15 @@ existing prose was left alone.
       count as well as the noun. `human_count` (`1250` → `1.25k`), the **row-count** printer, shared
       by the grid's stats line and the properties surface so `200k` means one thing — and bound by a
       round-trip property: every string it emits must parse back through `model::goto_row_index`.
+      **Both sides read their suffixes from one table, `COUNT_UNITS`** (`k`, `m`, `b` as powers of
+      ten), where each used to spell them itself — and they are **symbols, never translated**: the
+      stats line prints a count through one and the go-to box parses what the user retypes from it,
+      so translating the printing side alone would print counts the box refuses. The decimal point
+      between them is the same question for locale formatting, and has to move both sides at once.
+      The property was stated in `human_count`'s doc and tested by nothing until
+      `model::tests::every_count_human_count_prints_reads_back`, which reads back every printed
+      count — the promotion edges `999_995` and `999_995_000` and a count past a billion among them —
+      to within the print's rounding, and asserts every unit in the table parses.
       Not the namesake in `transcript.rs`, which buckets token counts differently on purpose.
       `completion_tail(complete, typed)` is the **inline ghost's** rule — the tail of `complete`
       past a case-insensitive prefix `typed` — and it walks `complete`'s own char boundaries rather
@@ -26146,6 +26155,7 @@ existing prose was left alone.
     invariants*, with the empty allowlist it should keep), an unscaled `const` length in
     `consts.rs` that says nowhere why (`consts::unscaled_const_gate`), a menu label ending in an
     ellipsis (`no_menu_label_ends_in_an_ellipsis`, whose subject is under *UI conventions*), a
+    behaviour keyed on an English label (`nothing_is_found_by_its_english_label`, likewise), a
     pointer cursor outside a hyperlink (`no_pointer_cursor_outside_a_hyperlink`, likewise), a
     connection form that decides its own trimming instead of going through `Connection::trimmed` (`lib.rs`'s
     `the_connection_form_trims_through_core`, which is a gate because `to_connection` reads a couple
@@ -39695,6 +39705,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   setting's own three messages have moved so far — every other label is still an English literal
   until phase 3 of the roadmap's *Interface translation* converts it — and only the GUI is
   translated: CLI, MCP and AI text stays English, as do SQL, persisted names and key names.
+  - **Nothing decides behaviour by an English label** — decide where the thing is built, or give
+    it an id. A comparison against a literal simply turns false once the label is translated, with
+    nothing to say so: the editor's context menu built *Plan* on every engine and then removed it
+    by `label == "Plan"` where the engine has no plan, and it is now built only when
+    `plan::supports_plan` answers yes. `source_gate::nothing_is_found_by_its_english_label` fails
+    on `label == "`, `label != "`, `label.as_str() == "` and `label.starts_with("`/`ends_with("` in
+    both view crates' production code, and was red on exactly that site before the fix. It sees
+    those spellings only — a label matched under another name, or through a `match`, passes it.
   - **Where and how a message is written.** `crates/schemaic-ui/i18n/en-GB/schemaic.ftl` is the
     source, in British spelling, and a new message goes there first, since `fl!` checks ids and
     argument names against that file alone. Ids are kebab-case and start with the area they belong
@@ -43923,7 +43941,9 @@ this bundle's.
   overshooting is cheap to recover from — the gutter number and the row highlight say where you
   landed. **It accepts exactly the forms the grid prints**, which is why it isn't a
   `parse::<usize>()`: `human_count` writes `200k`, and typing that back returned `None` — the count
-  on screen was a miss. `200k`/`1.25k`/`3m`/`1b` all read, in fixed point; separators are accepted
+  on screen was a miss. `200k`/`1.25k`/`3m`/`1b` all read, in fixed point, the suffixes coming from
+  `text::COUNT_UNITS`, the table `human_count` prints from (both under `text.rs`, with the test
+  that pins the round trip); separators are accepted
   for a count pasted from elsewhere (the app writes none). `None` is left for the only two cases
   that can mean no row: an empty grid, and input that isn't a number.
   The three decisions around it are **`model::goto_target`** — which row, the landing gesture, and

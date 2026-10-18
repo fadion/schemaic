@@ -1535,11 +1535,14 @@ pub fn goto_row_index(input: &str, total: usize) -> Option<usize> {
             _ => s.push(c.to_ascii_lowercase()),
         }
     }
-    let (digits, mult): (&str, u128) = match s.as_bytes().last() {
-        Some(b'k') => (&s[..s.len() - 1], 1_000),
-        Some(b'm') => (&s[..s.len() - 1], 1_000_000),
-        Some(b'b') => (&s[..s.len() - 1], 1_000_000_000),
-        _ => (&s[..], 1),
+    // The units `human_count` prints, from the one table both sides read.
+    let unit = s
+        .chars()
+        .last()
+        .and_then(|c| crate::text::COUNT_UNITS.iter().find(|(u, _)| *u == c));
+    let (digits, mult): (&str, u128) = match unit {
+        Some((u, exp)) => (&s[..s.len() - u.len_utf8()], 10u128.pow(*exp)),
+        None => (&s[..], 1),
     };
     let (int_part, frac_part) = match digits.split_once('.') {
         // Only a suffix gives a fraction a meaning: `1.25k` is 1250 rows, a bare
@@ -3378,6 +3381,44 @@ mod tests {
         assert_eq!(goto_row_index("1b", 100), Some(99), "past the end clamps");
         // Case and spacing come off a copy-paste as often as not.
         assert_eq!(goto_row_index(" 200K ", 200_000), Some(199_999));
+    }
+
+    /// **Every count the stats line can print reads back**, to within the
+    /// rounding the print did — the contract `text::human_count`'s doc states
+    /// and nothing tested. It is why `text::COUNT_UNITS` is one table and its
+    /// suffixes are symbols: translate `k` on the printing side alone and the
+    /// grid would print counts its own go-to box refuses.
+    #[test]
+    fn every_count_human_count_prints_reads_back() {
+        for n in [
+            1usize,
+            999,
+            1_000,
+            1_253,
+            9_999,
+            999_994,
+            999_995,
+            999_999,
+            1_000_000,
+            12_345_678,
+            999_995_000,
+            1_000_000_000,
+            7_654_321_098,
+        ] {
+            let shown = crate::text::human_count(n);
+            let back = goto_row_index(&shown, usize::MAX)
+                .unwrap_or_else(|| panic!("{n} prints as {shown:?}, which the go-to box refuses"))
+                + 1;
+            // Two decimals of the unit: off by at most half a hundredth of it.
+            let slack = n / 200 + 1;
+            assert!(back.abs_diff(n) <= slack, "{n} → {shown:?} → {back}");
+        }
+        for (unit, _) in crate::text::COUNT_UNITS {
+            assert!(
+                goto_row_index(&format!("2{unit}"), usize::MAX).is_some(),
+                "{unit}"
+            );
+        }
     }
 
     /// A fraction means something only against a suffix — `1.25k` is 1250 rows,
