@@ -543,3 +543,63 @@ tabs-reload = Reload from disk
 tabs-reopen-last = Reopen last tab
 tabs-close-others = Close other tabs
 tabs-close-all = Close all tabs
+
+## Server Activity panel
+
+activity-title = SERVER ACTIVITY
+activity-refresh-tip = Refresh now
+activity-auto-refresh-off = Auto-refresh off
+# $secs is the poll interval in seconds.
+activity-auto-refresh-every = Auto-refresh every { $secs }s
+activity-view-sessions = Sessions
+activity-view-locks = Locks
+activity-search-sessions = Search sessions…
+activity-search-locks = Search locks…
+activity-loading = Loading…
+activity-sqlite-no-sessions = SQLite has no server sessions — it runs inside this process, so there is nothing else connected to see.
+activity-sessions-no-match = No matching sessions.
+activity-sessions-none = No other sessions on this server.
+# Below the drawn rows when the search matched more than the panel draws.
+activity-sessions-undrawn = { $n } more { $n ->
+    [one] session matches — narrow the search to see it.
+   *[other] sessions match — narrow the search to see them.
+}
+activity-locks-no-match = No matching locks.
+activity-locks-no-waits = No lock waits on this server.
+activity-locks-none = No other session holds a lock.
+activity-locks-undrawn = { $n } more { $n ->
+    [one] lock matches — narrow the search to see it.
+   *[other] locks match — narrow the search to see them.
+}
+# The fetch stopped at its cap, so the list is not the whole server's.
+activity-list-capped = list capped
+activity-lock-wait = Lock wait
+# $id is the blocking session's id.
+activity-kill-holder = Kill { $id }
+activity-terminate-tip = Terminate session { $id }
+activity-read-only-tip = This connection is marked read-only.
+activity-lock-holds = holds
+activity-lock-waits-for = waits for
+# $ids is a comma-separated list of session ids.
+activity-lock-held-by = held by { $ids }
+activity-copy-statement = Copy statement
+# KillKind's words, as core's label names them.
+activity-cancel-query = Cancel query
+activity-kill-session = Kill session
+
+## AI assistant panel
+## The panel's own words only — prompts sent to the agent stay English.
+
+ai-title = AI ASSISTANT
+ai-new-chat-tip = New chat
+ai-settings-tip = AI settings
+ai-empty-ask = Ask about your SQL…
+# $cli is the agent CLI's product name (Claude Code, Codex).
+ai-empty-not-connected = { $cli } not connected.
+ai-input-placeholder = Message…
+ai-input-off = The AI assistant is off
+ai-input-db-down = Not connected to the database
+# The user's messages are headed by this; the agent's by its own name.
+ai-speaker-you = YOU
+# After a tool result cut to its first lines; $n is how many were cut.
+ai-result-more-lines = … (+{ $n } more lines)

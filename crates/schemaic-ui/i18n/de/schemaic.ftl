@@ -508,3 +508,53 @@ tabs-reload = Von der Festplatte neu laden
 tabs-reopen-last = Letzten Tab wieder öffnen
 tabs-close-others = Andere Tabs schließen
 tabs-close-all = Alle Tabs schließen
+
+## Server Activity panel
+
+activity-title = SERVERAKTIVITÄT
+activity-refresh-tip = Jetzt aktualisieren
+activity-auto-refresh-off = Automatische Aktualisierung aus
+activity-auto-refresh-every = Automatisch alle { $secs } s aktualisieren
+activity-view-sessions = Sitzungen
+activity-view-locks = Sperren
+activity-search-sessions = Sitzungen durchsuchen…
+activity-search-locks = Sperren durchsuchen…
+activity-loading = Wird geladen…
+activity-sqlite-no-sessions = SQLite hat keine Serversitzungen – es läuft in diesem Prozess, daher ist nichts anderes verbunden, das sich anzeigen ließe.
+activity-sessions-no-match = Keine passenden Sitzungen.
+activity-sessions-none = Keine anderen Sitzungen auf diesem Server.
+activity-sessions-undrawn = { $n ->
+    [one] { $n } weitere passende Sitzung – Suche eingrenzen, um sie zu sehen.
+   *[other] { $n } weitere passende Sitzungen – Suche eingrenzen, um sie zu sehen.
+}
+activity-locks-no-match = Keine passenden Sperren.
+activity-locks-no-waits = Keine Sperrwartezeiten auf diesem Server.
+activity-locks-none = Keine andere Sitzung hält eine Sperre.
+activity-locks-undrawn = { $n ->
+    [one] { $n } weitere passende Sperre – Suche eingrenzen, um sie zu sehen.
+   *[other] { $n } weitere passende Sperren – Suche eingrenzen, um sie zu sehen.
+}
+activity-list-capped = Liste gekürzt
+activity-lock-wait = Sperrwartezeit
+activity-kill-holder = { $id } beenden
+activity-terminate-tip = Sitzung { $id } beenden
+activity-read-only-tip = Diese Verbindung ist als schreibgeschützt markiert.
+activity-lock-holds = hält
+activity-lock-waits-for = wartet auf
+activity-lock-held-by = gehalten von { $ids }
+activity-copy-statement = Anweisung kopieren
+activity-cancel-query = Abfrage abbrechen
+activity-kill-session = Sitzung beenden
+
+## AI assistant panel
+
+ai-title = KI-ASSISTENT
+ai-new-chat-tip = Neuer Chat
+ai-settings-tip = KI-Einstellungen
+ai-empty-ask = Frag etwas zu deinem SQL…
+ai-empty-not-connected = { $cli } ist nicht verbunden.
+ai-input-placeholder = Nachricht…
+ai-input-off = Der KI-Assistent ist aus
+ai-input-db-down = Nicht mit der Datenbank verbunden
+ai-speaker-you = DU
+ai-result-more-lines = … (+{ $n } weitere Zeilen)

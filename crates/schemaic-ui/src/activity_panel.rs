@@ -26,9 +26,9 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::activity::{self, KillFrom, KillKind, SessionInfo, SessionState};
-use schemaic_core::text::plural;
 
 use crate::consts::{MONO_FAMILY, SEARCH_DEBOUNCE_MS};
+use crate::i18n::tr;
 use crate::theme::{font_body, font_label};
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
@@ -43,8 +43,18 @@ use crate::{
 /// What the panel says on a SQLite connection. Only reachable by a connection
 /// switch or a restored layout — the footer toggle and the palette both decline
 /// to open it there ([`schemaic_core::activity::supports_activity`]).
-const SQLITE_HAS_NO_SESSIONS: &str = "SQLite has no server sessions — it runs inside \
-     this process, so there is nothing else connected to see.";
+fn sqlite_has_no_sessions() -> String {
+    tr!("activity-sqlite-no-sessions")
+}
+
+/// A kill entry's label — `KillKind::label`'s words in the interface's
+/// language; `english_names_every_kill_as_core_does` holds the two equal.
+fn kill_label(kind: KillKind) -> String {
+    match kind {
+        KillKind::Query => tr!("activity-cancel-query"),
+        KillKind::Session => tr!("activity-kill-session"),
+    }
+}
 
 /// [`crate::ActivityActions::kill`]: the session, the kind, and which list asked.
 type KillFn = Rc<dyn Fn(i64, KillKind, KillFrom)>;
@@ -119,11 +129,11 @@ pub(crate) fn activity_panel(
             move || !busy.get(),
             move || (refresh)(),
         )
-        .tooltip(|| text("Refresh now").style(tooltip_style));
+        .tooltip(|| text(tr!("activity-refresh-tip")).style(tooltip_style));
         let clock = interval_button(interval, menu_open, menu_anchor, menus);
         let icons_group = h_stack((refresh_btn, clock))
             .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
-        h_stack((section_title("SERVER ACTIVITY"), icons_group))
+        h_stack((section_title(tr!("activity-title")), icons_group))
             .style(|s| s.width_full().flex_row().items_start().justify_between())
     };
 
@@ -133,8 +143,8 @@ pub(crate) fn activity_panel(
     let locks = activity.locks;
     let view_switch = container(crate::widgets::segmented_tabs(
         vec![
-            ("Sessions", crate::ActivityView::Sessions),
-            ("Locks", crate::ActivityView::Locks),
+            (tr!("activity-view-sessions"), crate::ActivityView::Sessions),
+            (tr!("activity-view-locks"), crate::ActivityView::Locks),
         ],
         view,
     ))
@@ -195,7 +205,7 @@ pub(crate) fn activity_panel(
             if v == crate::ActivityView::Locks {
                 return match (&st, lk) {
                     (ActivityState::Unsupported, _) => {
-                        list_message(SQLITE_HAS_NO_SESSIONS, theme::text_muted)
+                        list_message(sqlite_has_no_sessions(), theme::text_muted)
                     }
                     (_, crate::LocksState::Loaded(list)) => {
                         locks_list(&list, &q, kill.clone(), overlay, menus, read_only, dialect)
@@ -208,20 +218,22 @@ pub(crate) fn activity_panel(
                     (ActivityState::Failed(e), crate::LocksState::Idle) => {
                         list_message(e.clone(), theme::error)
                     }
-                    (_, crate::LocksState::Idle) => list_message("Loading…", theme::text_muted),
+                    (_, crate::LocksState::Idle) => {
+                        list_message(tr!("activity-loading"), theme::text_muted)
+                    }
                 };
             }
             let sessions = match &st {
                 ActivityState::Loaded { sessions, .. } => sessions,
                 // No snapshot: say which kind of nothing this is.
                 ActivityState::Unsupported => {
-                    return list_message(SQLITE_HAS_NO_SESSIONS, theme::text_muted);
+                    return list_message(sqlite_has_no_sessions(), theme::text_muted);
                 }
                 ActivityState::Failed(e) => return list_message(e.clone(), theme::error),
                 // `Loading` and `Idle` both mean "ask again in a moment"; the
                 // first fetch of a panel that just opened is fast enough that two
                 // different messages would only ever flicker.
-                _ => return list_message("Loading…", theme::text_muted),
+                _ => return list_message(tr!("activity-loading"), theme::text_muted),
             };
             // **References, not copies.** This filtered up to five hundred
             // `SessionInfo` into a fresh `Vec` — each carrying an unbounded `sql`
@@ -235,11 +247,11 @@ pub(crate) fn activity_panel(
             if matched.is_empty() {
                 return list_message(
                     if term.is_some() {
-                        "No matching sessions."
+                        tr!("activity-sessions-no-match")
                     } else {
                         // The fetch excludes our own connection, so an empty list
                         // really does mean nobody else is here.
-                        "No other sessions on this server."
+                        tr!("activity-sessions-none")
                     },
                     theme::text_muted,
                 );
@@ -271,11 +283,7 @@ pub(crate) fn activity_panel(
                 .collect::<Vec<_>>();
             if undrawn > 0 {
                 items.push(list_message(
-                    format!(
-                        "{undrawn} more {} — narrow the search to see {}.",
-                        plural(undrawn, "session matches", "sessions match"),
-                        plural(undrawn, "it", "them")
-                    ),
+                    tr!("activity-sessions-undrawn", n = undrawn),
                     theme::text_faint,
                 ));
             }
@@ -302,8 +310,8 @@ pub(crate) fn activity_panel(
             FieldCfg {
                 // The box searches the list shown, so it says which.
                 placeholder_of: Some(Rc::new(move || match view.get() {
-                    crate::ActivityView::Sessions => "Search sessions…".to_string(),
-                    crate::ActivityView::Locks => "Search locks…".to_string(),
+                    crate::ActivityView::Sessions => tr!("activity-search-sessions"),
+                    crate::ActivityView::Locks => tr!("activity-search-locks"),
                 })),
                 background: theme::bg_chrome,
                 clearable: true,
@@ -437,9 +445,9 @@ fn interval_button(
     button.tooltip(move || {
         let secs = interval.get();
         let msg = if secs == 0 {
-            "Auto-refresh off".to_string()
+            tr!("activity-auto-refresh-off")
         } else {
-            format!("Auto-refresh every {secs}s")
+            tr!("activity-auto-refresh-every", secs = secs)
         };
         text(msg).style(tooltip_style)
     })
@@ -460,6 +468,12 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
     ];
     /// One figure in the counts line: how many, what to call them, and the
     /// colour that state wears on the rows below.
+    ///
+    /// The words stay English with the line's total, which is core's
+    /// (`ActivitySummary::total_label`/`state_label`): translating these alone
+    /// would put German figures beside an English total. They go with core's
+    /// prose (roadmap phase 4), as does `SessionState::label`, which the
+    /// search box also matches.
     type Figure = (usize, &'static str, fn() -> floem::peniko::Color);
     let figures: [Figure; 3] = [
         (sum.running, "running", theme::status_ok),
@@ -491,7 +505,7 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
     // Saying the list is capped is the whole of what this side of the wire knows.
     if truncated {
         parts.push(
-            text("list capped")
+            text(tr!("activity-list-capped"))
                 .style(|s| s.font_size(font_label()).color(theme::text_faint()))
                 .into_any(),
         );
@@ -543,7 +557,7 @@ fn banner(
     let heading = h_stack((
         icons::icon(icons::LOCK, 13.0)
             .style(|s| s.color(theme::status_warn()).flex_shrink(0.0_f32)),
-        text("Lock wait").style(|s| {
+        text(tr!("activity-lock-wait")).style(|s| {
             s.font_size(font_label())
                 .font_bold()
                 .color(theme::status_warn())
@@ -581,7 +595,7 @@ fn banner(
     // `accept_launch`'s contract asks this side to supply: "The disabled button
     // stays: it is what *says* the action is unavailable."
     let kill_btn = crate::widgets::key_pressable(
-        text(format!("Kill {holder_id}")),
+        text(tr!("activity-kill-holder", id = holder_id)),
         // The same literal the box below rounds itself by — a small button radius
         // is a shape, so it stays literal, and the focus ring must round with the
         // thing it rings rather than drifting from it at 130% and 160%.
@@ -624,9 +638,9 @@ fn banner(
         // Read when the hover delay fires, not when the row was built — the tip
         // closure is called fresh on every hover (see `widgets::tip_when`).
         text(if read_only.get_untracked() {
-            "This connection is marked read-only.".to_string()
+            tr!("activity-read-only-tip")
         } else {
-            format!("Terminate session {holder_id}")
+            tr!("activity-terminate-tip", id = holder_id)
         })
         .style(tooltip_style)
     });
@@ -852,7 +866,7 @@ fn locks_header(list: &activity::LockList) -> floem::AnyView {
     }
     if list.truncated {
         parts.push(
-            text("list capped")
+            text(tr!("activity-list-capped"))
                 .style(|s| s.font_size(font_label()).color(theme::text_faint()))
                 .into_any(),
         );
@@ -908,11 +922,11 @@ fn locks_list(
     if matched.is_empty() {
         return list_message(
             if !q.trim().is_empty() {
-                "No matching locks."
+                tr!("activity-locks-no-match")
             } else if list.contended_only {
-                "No lock waits on this server."
+                tr!("activity-locks-no-waits")
             } else {
-                "No other session holds a lock."
+                tr!("activity-locks-none")
             },
             theme::text_muted,
         );
@@ -924,11 +938,7 @@ fn locks_list(
         .collect();
     if undrawn > 0 {
         items.push(list_message(
-            format!(
-                "{undrawn} more {} — narrow the search to see {}.",
-                plural(undrawn, "lock matches", "locks match"),
-                plural(undrawn, "it", "them")
-            ),
+            tr!("activity-locks-undrawn", n = undrawn),
             theme::text_faint,
         ));
     }
@@ -967,9 +977,13 @@ fn lock_row(
                 .flex_shrink(0.0_f32)
                 .margin_right(theme::scaled(7.0))
         }),
-        text(if l.granted { "holds" } else { "waits for" })
-            .style(move |s| s.font_size(font_label()).color(color()))
-            .style(|s| s.margin_right(theme::scaled(7.0)).flex_shrink(0.0_f32)),
+        text(if l.granted {
+            tr!("activity-lock-holds")
+        } else {
+            tr!("activity-lock-waits-for")
+        })
+        .style(move |s| s.font_size(font_label()).color(color()))
+        .style(|s| s.margin_right(theme::scaled(7.0)).flex_shrink(0.0_f32)),
         text(format!("{} {}", l.kind, l.mode)).style(|s| {
             s.font_size(font_label())
                 .color(theme::text_muted())
@@ -988,7 +1002,7 @@ fn lock_row(
     if !l.granted && !l.blocked_by.is_empty() {
         let ids: Vec<String> = l.blocked_by.iter().map(i64::to_string).collect();
         rows.push(
-            text(format!("held by {}", ids.join(", ")))
+            text(tr!("activity-lock-held-by", ids = ids.join(", ")))
                 .style(|s| s.font_size(font_label()).color(theme::text_muted()))
                 .into_any(),
         );
@@ -1051,23 +1065,26 @@ fn row_menu(
     let mut entries = Vec::new();
     if activity::supports_kill_kind(dialect, KillKind::Query) {
         entries.push(
-            MenuEntry::action(KillKind::Query.label(), move || {
+            MenuEntry::action(kill_label(KillKind::Query), move || {
                 (cancel)(id, KillKind::Query, KillFrom::Sessions)
             })
             .disabled(read_only || !KillKind::Query.applies_to(s)),
         );
     }
     entries.push(
-        MenuEntry::action(KillKind::Session.label(), move || {
+        MenuEntry::action(kill_label(KillKind::Session), move || {
             (kill)(id, KillKind::Session, KillFrom::Sessions)
         })
         .disabled(read_only),
     );
     if let Some(sql) = s.sql.clone() {
         entries.push(MenuEntry::Separator);
-        entries.push(MenuEntry::action("Copy statement", move || {
-            let _ = floem::Clipboard::set_contents(sql.clone());
-        }));
+        entries.push(MenuEntry::action(
+            tr!("activity-copy-statement"),
+            move || {
+                let _ = floem::Clipboard::set_contents(sql.clone());
+            },
+        ));
     }
     entries
 }
@@ -1093,17 +1110,56 @@ fn lock_menu(
     let mut entries = Vec::new();
     if activity::supports_kill_kind(dialect, KillKind::Query) {
         entries.push(
-            MenuEntry::action(KillKind::Query.label(), move || {
+            MenuEntry::action(kill_label(KillKind::Query), move || {
                 (cancel)(id, KillKind::Query, KillFrom::Locks)
             })
             .disabled(read_only || !l.offers(KillKind::Query)),
         );
     }
     entries.push(
-        MenuEntry::action(KillKind::Session.label(), move || {
+        MenuEntry::action(kill_label(KillKind::Session), move || {
             (kill)(id, KillKind::Session, KillFrom::Locks)
         })
         .disabled(read_only || !l.offers(KillKind::Session)),
     );
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::i18n::tr;
+    use schemaic_core::activity::KillKind;
+    use schemaic_core::text::plural;
+
+    /// English names each kill as core's `KillKind::label` does.
+    #[test]
+    fn english_names_every_kill_as_core_does() {
+        for kind in [KillKind::Query, KillKind::Session] {
+            assert_eq!(super::kill_label(kind), kind.label(), "{kind:?}");
+        }
+    }
+
+    /// **The "more below" notes read as the sentences they replaced** — a
+    /// `format!` around two `text::plural`s each, now one plural message.
+    #[test]
+    fn the_undrawn_notes_read_as_they_did() {
+        for n in [1usize, 2, 350] {
+            assert_eq!(
+                tr!("activity-sessions-undrawn", n = n),
+                format!(
+                    "{n} more {} — narrow the search to see {}.",
+                    plural(n, "session matches", "sessions match"),
+                    plural(n, "it", "them")
+                )
+            );
+            assert_eq!(
+                tr!("activity-locks-undrawn", n = n),
+                format!(
+                    "{n} more {} — narrow the search to see {}.",
+                    plural(n, "lock matches", "locks match"),
+                    plural(n, "it", "them")
+                )
+            );
+        }
+    }
 }

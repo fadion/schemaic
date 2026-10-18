@@ -26733,6 +26733,17 @@ existing prose was left alone.
     is running), absent where the engine has no statement for it as on a session row, and both
     kills are dimmed on a read-only connection and on a lock a server process holds
     (`LockInfo::killable`).
+    **The panel's own words are the catalogue's** (`activity-*`, roadmap phase 3), SQLite's
+    no-sessions note included — `sqlite_has_no_sessions()`, a constant before it. The two kill
+    entries are `kill_label(KillKind)`, `KillKind::label`'s words drawn here (the core-words rule
+    under *UI conventions*). Each "N more … match — narrow the search" note is one Fluent plural
+    where it was a `format!` around two `text::plural`s, and
+    `the_undrawn_notes_read_as_they_did` holds the English to the old sentence for 1, 2 and 350.
+    **The counts line stays on core's English on purpose**: its total is
+    `ActivitySummary::total_label`, so translating the *running*/*blocked*/*idle in txn* words
+    handed to `state_label` alone would set German figures beside an English total; they go with
+    core's prose in phase 4, as do `SessionState::label` — which the search box matches too — and
+    `activity::lock_wait_text`, the lock-wait card's sentence.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
     read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
@@ -28948,6 +28959,11 @@ existing prose was left alone.
     the panel is there to say that it is off. The transcript stays on screen, but the last reply's
     Regenerate icon does not: it has nothing to send to (the off rule under *Architecture
     invariants*).
+    **The panel's own words are the catalogue's** (`ai-*`, roadmap phase 3): the title, tooltips,
+    empty-state lines, placeholder and disabled-box notes (`ai_input_disabled` takes a `String`),
+    *YOU* in `bubble_speaker_label`, and a tool result's *(+N more lines)* cut. What stays English
+    is not the panel's to translate: the agents' product names and `harness::speaker_label`'s, every
+    prompt sent to the agent, and `AI_OFF_NOTE`, which lives in `lib.rs` and moves with that file.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, the date picker's calendar (`date_pick_overlay`, whose panel is
     `cell_editors::calendar_panel` — up here because the field it drops from sits inside a scrolling
@@ -39841,7 +39857,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). The Settings modal
   (`settings.rs`), the shortcut table it draws (`shortcuts.rs`), the popups of `overlays.rs` and
   the schema panel (`schema_tree.rs`), Query History (`history_panel.rs`), the snippet library
-  (`snippet_panel.rs`) and the tab strip's menu and tooltip (`tabs.rs`) are converted; every other
+  (`snippet_panel.rs`), the tab strip's menu and tooltip (`tabs.rs`), Server Activity
+  (`activity_panel.rs`) and the AI Assistant panel (`ai_panel.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -39861,9 +39878,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     by message.
   - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
     core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
-    and `history_panel::bucket_title` for `history::Bucket::label` —
+    `history_panel::bucket_title` for `history::Bucket::label`, and `activity_panel::kill_label`
+    for `activity::KillKind::label` —
     with a test holding its English equal to core's for every variant
-    (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`).
+    (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`,
+    `english_names_every_kill_as_core_does`).
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.

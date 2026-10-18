@@ -31,6 +31,7 @@ use schemaic_core::transcript::{
 };
 
 use crate::consts::{chat_pad_h, follow_slack};
+use crate::i18n::tr;
 use crate::markdown::{CodeActions, render_markdown};
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
@@ -375,8 +376,9 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                     move |(on, ok, h)| {
                         let msg = match (on, ok) {
                             (false, _) => crate::AI_OFF_NOTE.to_string(),
-                            (true, true) => "Ask about your SQL…".to_string(),
-                            (true, false) => format!("{} not connected.", h.label()),
+                            (true, true) => tr!("ai-empty-ask"),
+                            // The harness's product name (Claude Code, Codex).
+                            (true, false) => tr!("ai-empty-not-connected", cli = h.label()),
                         };
                         // **Pinned to `panel_w`, as the bubble list is**, and for
                         // its reason: the scroll hands its child unbounded width,
@@ -662,9 +664,9 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             InputState::Live => {
                 ai_input_row(input, messages, busy, send.clone(), cancel.clone()).into_any()
             }
-            InputState::Off => ai_input_disabled("The AI assistant is off").into_any(),
-            InputState::DbDown => ai_input_disabled("Not connected to the database").into_any(),
-            InputState::Unreachable => ai_input_disabled("Message…").into_any(),
+            InputState::Off => ai_input_disabled(tr!("ai-input-off")).into_any(),
+            InputState::DbDown => ai_input_disabled(tr!("ai-input-db-down")).into_any(),
+            InputState::Unreachable => ai_input_disabled(tr!("ai-input-placeholder")).into_any(),
         },
     )
     .style(|s| s.flex_shrink(0.0_f32));
@@ -679,7 +681,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         || true,
         move || (new_chat_cb)(),
     )
-    .tooltip(|| text("New chat").style(crate::widgets::tooltip_style));
+    .tooltip(|| text(tr!("ai-new-chat-tip")).style(crate::widgets::tooltip_style));
     let gear = toolbar_icon(
         icons::SLIDERS_VERTICAL,
         5.0,
@@ -687,10 +689,10 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         || true,
         move || crate::settings::open_settings_at(layout, crate::SettingsSection::Ai),
     )
-    .tooltip(|| text("AI settings").style(crate::widgets::tooltip_style));
+    .tooltip(|| text(tr!("ai-settings-tip")).style(crate::widgets::tooltip_style));
     let icons_group =
         h_stack((new_chat, gear)).style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
-    let title_row = h_stack((section_title("AI ASSISTANT"), icons_group))
+    let title_row = h_stack((section_title(tr!("ai-title")), icons_group))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
     // The chip sits between the conversation and the box, so "what will go with
@@ -826,7 +828,7 @@ fn ai_input_row(
     let field = edit_field(
         input,
         FieldCfg {
-            placeholder: "Message…",
+            placeholder_of: Some(Rc::new(|| tr!("ai-input-placeholder"))),
             multiline: true,
             // Enter mirrors the send icon's gating: ignore while a turn is in
             // flight (the icon is Stop, not Send) or when the box is empty.
@@ -1126,7 +1128,7 @@ mod input_state_tests {
 
 // The disabled message box shown when the selected CLI isn't connected — matches the real
 // box's metrics but is inert (dim placeholder, no send icon, no pointer events).
-fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
+fn ai_input_disabled(placeholder: String) -> impl IntoView {
     let box_ = container(text(placeholder).style(|s| {
         s.font_size(theme::font_body())
             .font_family("IBM Plex Sans".to_string())
@@ -1172,7 +1174,7 @@ fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
 /// the view.
 fn bubble_speaker_label(m: &ChatMessage) -> String {
     match m.role == Role::User {
-        true => "YOU".to_string(),
+        true => tr!("ai-speaker-you"),
         false => schemaic_ai::harness::speaker_label(m.harness.as_deref()),
     }
 }
@@ -1551,7 +1553,9 @@ fn truncate_result(r: &str) -> String {
         return r.trim_end().to_string();
     }
     let mut out = lines[..MAX_LINES].join("\n");
-    out.push_str(&format!("\n… (+{} more lines)", lines.len() - MAX_LINES));
+    out.push('\n');
+    let cut: usize = lines.len() - MAX_LINES;
+    out.push_str(&tr!("ai-result-more-lines", n = cut));
     out
 }
 
