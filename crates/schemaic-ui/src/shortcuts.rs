@@ -44,8 +44,45 @@ use std::borrow::Cow;
 
 use floem::keyboard::Modifiers;
 
+use crate::i18n::tr;
+
+/// A heading of the Shortcuts modal — and the scope the tests below check a
+/// binding against, which is why it is an enum and not its label: a group is
+/// named in `KEY_FILES`, `COMMAND_KEYS` and `MenuKey::row`, and none of those
+/// may change with the language.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Group {
+    Global,
+    Editor,
+    ResultsGrid,
+    SchemaTree,
+    AiPanel,
+    Terminal,
+    ErDiagram,
+}
+
+impl Group {
+    /// The heading, in the interface's language.
+    pub(crate) fn label(self) -> String {
+        match self {
+            Group::Global => tr!("shortcuts-group-global"),
+            Group::Editor => tr!("shortcuts-group-editor"),
+            Group::ResultsGrid => tr!("shortcuts-group-results-grid"),
+            Group::SchemaTree => tr!("shortcuts-group-schema-tree"),
+            Group::AiPanel => tr!("shortcuts-group-ai-panel"),
+            Group::Terminal => tr!("shortcuts-group-terminal"),
+            Group::ErDiagram => tr!("shortcuts-group-er-diagram"),
+        }
+    }
+}
+
+/// What a row does, in the interface's language: a function rather than the
+/// text, so the table stays a `const` while each message id is still checked
+/// by `tr!` at compile time. The key string beside it is never translated.
+pub(crate) type Describe = fn() -> String;
+
 /// One group of the Shortcuts modal: a heading and its `(keys, description)` rows.
-pub(crate) type ShortcutGroup = (&'static str, &'static [(&'static str, &'static str)]);
+pub(crate) type ShortcutGroup = (Group, &'static [(&'static str, Describe)]);
 
 /// Every shortcut the modal shows, in display order.
 ///
@@ -56,106 +93,105 @@ pub(crate) type ShortcutGroup = (&'static str, &'static [(&'static str, &'static
 /// would bury the handful of bindings that genuinely cannot be discovered.
 pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
     (
-        "Global",
+        Group::Global,
         &[
-            ("Ctrl+P", "Find Anywhere"),
-            ("Ctrl+Shift+P", "Command palette"),
-            ("Ctrl+T", "New query tab"),
-            ("Ctrl+W", "Close query tab"),
+            ("Ctrl+P", || tr!("shortcuts-find-anywhere")),
+            ("Ctrl+Shift+P", || tr!("shortcuts-command-palette")),
+            ("Ctrl+T", || tr!("shortcuts-new-tab")),
+            ("Ctrl+W", || tr!("shortcuts-close-tab")),
             // Split rather than "Ctrl+Tab (Shift = reverse)": the palette shows a
             // command's own keys, and Previous Tab needs a row of its own to name.
-            ("Ctrl+Tab", "Next tab"),
-            ("Ctrl+Shift+Tab", "Previous tab"),
-            ("Ctrl+1…9", "Jump to tab"),
-            ("Ctrl+Shift+T", "Reopen last closed tab"),
-            ("Ctrl+O", "Open SQL file"),
-            ("Ctrl+S", "Save SQL file"),
-            ("Ctrl+Shift+S", "Save SQL file as"),
-            ("Ctrl+Shift+E", "Toggle schema panel"),
-            ("Ctrl+Shift+A", "Toggle AI panel"),
-            ("Ctrl+`", "Toggle terminal"),
+            ("Ctrl+Tab", || tr!("shortcuts-next-tab")),
+            ("Ctrl+Shift+Tab", || tr!("shortcuts-previous-tab")),
+            ("Ctrl+1…9", || tr!("shortcuts-jump-to-tab")),
+            ("Ctrl+Shift+T", || tr!("shortcuts-reopen-tab")),
+            ("Ctrl+O", || tr!("shortcuts-open-file")),
+            ("Ctrl+S", || tr!("shortcuts-save-file")),
+            ("Ctrl+Shift+S", || tr!("shortcuts-save-file-as")),
+            ("Ctrl+Shift+E", || tr!("shortcuts-toggle-schema")),
+            ("Ctrl+Shift+A", || tr!("shortcuts-toggle-ai")),
+            ("Ctrl+`", || tr!("shortcuts-toggle-terminal")),
         ],
     ),
     (
-        "Editor",
+        Group::Editor,
         &[
-            ("Ctrl+Enter", "Run query"),
-            ("Ctrl+Space", "Autocomplete"),
-            ("Ctrl+K", "Inline AI edit"),
-            ("Ctrl+F", "Find in editor"),
+            ("Ctrl+Enter", || tr!("shortcuts-run-query")),
+            ("Ctrl+Space", || tr!("shortcuts-autocomplete")),
+            ("Ctrl+K", || tr!("shortcuts-inline-ai")),
+            ("Ctrl+F", || tr!("shortcuts-find-in-editor")),
             // Ctrl+F collapses the replace row, so nothing in the UI reveals
             // Ctrl+H — this modal is its only affordance.
-            ("Ctrl+H", "Find and replace"),
-            ("Ctrl+G", "Go to line"),
-            ("Ctrl+Shift+\\", "Jump to the matching bracket or BEGIN/END"),
-            ("Ctrl+/", "Toggle line comment"),
-            ("Ctrl+Shift+/", "Toggle block comment"),
-            ("Ctrl+Shift+U", "Toggle case"),
-            ("Ctrl+Shift+J", "Join lines"),
-            ("Ctrl+D", "Duplicate line / selection"),
-            ("Ctrl+X", "Cut line / selection"),
-            ("Ctrl+Alt+L", "Format code"),
-            ("Ctrl+Alt+Shift+L", "Format statement"),
-            ("Ctrl+Alt+J", "Make single line"),
-            ("Alt+↑ / Alt+↓", "Move line up / down"),
-            ("Alt+Enter", "Apply the quick fix under the caret"),
-            ("Tab / Shift+Tab", "Indent / outdent"),
-            (
-                "Tab / Ctrl+→",
-                "Take the inline prediction (→ too, at a line's end) / its next word",
-            ),
+            ("Ctrl+H", || tr!("shortcuts-find-replace")),
+            ("Ctrl+G", || tr!("shortcuts-go-to-line")),
+            ("Ctrl+Shift+\\", || tr!("shortcuts-matching-bracket")),
+            ("Ctrl+/", || tr!("shortcuts-line-comment")),
+            ("Ctrl+Shift+/", || tr!("shortcuts-block-comment")),
+            ("Ctrl+Shift+U", || tr!("shortcuts-toggle-case")),
+            ("Ctrl+Shift+J", || tr!("shortcuts-join-lines")),
+            ("Ctrl+D", || tr!("shortcuts-duplicate")),
+            ("Ctrl+X", || tr!("shortcuts-cut")),
+            ("Ctrl+Alt+L", || tr!("shortcuts-format-code")),
+            ("Ctrl+Alt+Shift+L", || tr!("shortcuts-format-statement")),
+            ("Ctrl+Alt+J", || tr!("shortcuts-single-line")),
+            ("Alt+↑ / Alt+↓", || tr!("shortcuts-move-line")),
+            ("Alt+Enter", || tr!("shortcuts-quick-fix")),
+            ("Tab / Shift+Tab", || tr!("shortcuts-indent")),
+            ("Tab / Ctrl+→", || tr!("shortcuts-take-prediction")),
         ],
     ),
     (
-        "Results grid",
+        Group::ResultsGrid,
         &[
-            ("Ctrl+F", "Find in results"),
+            ("Ctrl+F", || tr!("shortcuts-find-in-results")),
             // Ctrl+G in the grid has no affordance anywhere else either.
-            ("Ctrl+G", "Go to row"),
-            ("Ctrl+C", "Copy"),
-            ("Ctrl+V", "Paste as staged edits"),
-            ("Ctrl+A", "Select all"),
-            ("Ctrl+Home / Ctrl+End", "First / last cell"),
+            ("Ctrl+G", || tr!("shortcuts-go-to-row")),
+            ("Ctrl+C", || tr!("shortcuts-copy")),
+            ("Ctrl+V", || tr!("shortcuts-paste-staged")),
+            ("Ctrl+A", || tr!("shortcuts-select-all")),
+            ("Ctrl+Home / Ctrl+End", || tr!("shortcuts-first-last-cell")),
             // "Edit cell" only. Enter on a **read-only** cell does nothing —
             // viewing one is the right-click menu's View — and a row promising
             // otherwise teaches a key that isn't there.
-            ("Enter", "Edit cell"),
-            ("Tab / Shift+Tab", "Next / previous cell while editing"),
-            ("Ctrl+Enter", "Commit edits"),
-            ("Del", "Mark row for deletion"),
+            ("Enter", || tr!("shortcuts-edit-cell")),
+            ("Tab / Shift+Tab", || tr!("shortcuts-next-cell")),
+            ("Ctrl+Enter", || tr!("shortcuts-commit-edits")),
+            ("Del", || tr!("shortcuts-mark-deletion")),
             // The toolbar strip is the app's one ring outside an overlay, and F6
             // is its only affordance — nothing on screen says the icons can be
             // reached at all.
-            ("F6", "Go to the results toolbar"),
-            ("← / →", "Move along the toolbar (Esc returns to the grid)"),
+            ("F6", || tr!("shortcuts-results-toolbar")),
+            ("← / →", || tr!("shortcuts-along-toolbar")),
         ],
     ),
     (
-        "Schema tree",
+        Group::SchemaTree,
         &[
-            ("Enter", "Open the selected table, column or object"),
+            ("Enter", || tr!("shortcuts-open-selected")),
             // The same menu the right-click builds, opened at the row rather
             // than at the pointer.
-            ("Shift+F10", "Context menu for the selected row"),
+            ("Shift+F10", || tr!("shortcuts-context-menu")),
         ],
     ),
     (
-        "AI panel",
+        Group::AiPanel,
         &[
-            ("Enter", "Send message"),
-            ("Shift+Enter", "New line"),
-            ("Ctrl+↑ / Ctrl+↓", "Recall previous / next prompt"),
+            ("Enter", || tr!("shortcuts-send-message")),
+            ("Shift+Enter", || tr!("shortcuts-new-line")),
+            ("Ctrl+↑ / Ctrl+↓", || tr!("shortcuts-recall-prompt")),
         ],
     ),
     (
-        "Terminal",
-        &[("Ctrl+Shift+C / Ctrl+Shift+V", "Copy / paste")],
+        Group::Terminal,
+        &[("Ctrl+Shift+C / Ctrl+Shift+V", || {
+            tr!("shortcuts-copy-paste")
+        })],
     ),
     (
-        "ER diagram",
+        Group::ErDiagram,
         // Ctrl+F is the find bar's only opener — there is no button for it — so
         // this modal is the one place it is written down.
-        &[("Ctrl+F", "Find in the diagram")],
+        &[("Ctrl+F", || tr!("shortcuts-find-in-diagram"))],
     ),
 ];
 
@@ -181,18 +217,18 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
 /// advertising `Ctrl+G` for "Go to Line" while the surviving row means the
 /// grid's row jump. A nearly-right keycap is worse than none, because it teaches
 /// a key that does something else.
-pub(crate) const COMMAND_KEYS: &[(&str, &str, &str)] = &[
-    ("new tab", "Global", "Ctrl+T"),
-    ("close tab", "Global", "Ctrl+W"),
-    ("open file", "Global", "Ctrl+O"),
-    ("save file", "Global", "Ctrl+S"),
-    ("save file as", "Global", "Ctrl+Shift+S"),
-    ("next tab", "Global", "Ctrl+Tab"),
-    ("previous tab", "Global", "Ctrl+Shift+Tab"),
-    ("format code", "Editor", "Ctrl+Alt+L"),
-    ("format statement", "Editor", "Ctrl+Alt+Shift+L"),
-    ("make single line", "Editor", "Ctrl+Alt+J"),
-    ("go to line", "Editor", "Ctrl+G"),
+pub(crate) const COMMAND_KEYS: &[(&str, Group, &str)] = &[
+    ("new tab", Group::Global, "Ctrl+T"),
+    ("close tab", Group::Global, "Ctrl+W"),
+    ("open file", Group::Global, "Ctrl+O"),
+    ("save file", Group::Global, "Ctrl+S"),
+    ("save file as", Group::Global, "Ctrl+Shift+S"),
+    ("next tab", Group::Global, "Ctrl+Tab"),
+    ("previous tab", Group::Global, "Ctrl+Shift+Tab"),
+    ("format code", Group::Editor, "Ctrl+Alt+L"),
+    ("format statement", Group::Editor, "Ctrl+Alt+Shift+L"),
+    ("make single line", Group::Editor, "Ctrl+Alt+J"),
+    ("go to line", Group::Editor, "Ctrl+G"),
 ];
 
 /// The keys to show on a palette row for the command called `name`.
@@ -232,12 +268,16 @@ pub(crate) enum MenuKey {
 
 impl MenuKey {
     /// The `SHORTCUTS` row this entry shows: `(group, keys, description)`.
-    fn row(self) -> (&'static str, &'static str, &'static str) {
+    fn row(self) -> (Group, &'static str, Describe) {
         match self {
-            MenuKey::GridCopy => ("Results grid", "Ctrl+C", "Copy"),
-            MenuKey::GridPaste => ("Results grid", "Ctrl+V", "Paste as staged edits"),
-            MenuKey::GridDeleteRows => ("Results grid", "Del", "Mark row for deletion"),
-            MenuKey::EditorFormat => ("Editor", "Ctrl+Alt+L", "Format code"),
+            MenuKey::GridCopy => (Group::ResultsGrid, "Ctrl+C", || tr!("shortcuts-copy")),
+            MenuKey::GridPaste => (Group::ResultsGrid, "Ctrl+V", || {
+                tr!("shortcuts-paste-staged")
+            }),
+            MenuKey::GridDeleteRows => {
+                (Group::ResultsGrid, "Del", || tr!("shortcuts-mark-deletion"))
+            }
+            MenuKey::EditorFormat => (Group::Editor, "Ctrl+Alt+L", || tr!("shortcuts-format-code")),
         }
     }
 
@@ -248,8 +288,8 @@ impl MenuKey {
 
     /// What the `SHORTCUTS` row calls the action — the menu entry's own label
     /// where the menu takes it from here, so the two say the same thing.
-    pub(crate) fn label(self) -> &'static str {
-        self.row().2
+    pub(crate) fn label(self) -> String {
+        (self.row().2)()
     }
 }
 
@@ -518,7 +558,8 @@ mod primary_key_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_KEYS, MenuKey, SHORTCUTS, command_keys, keys_label, keys_label_on, primary_from,
+        COMMAND_KEYS, Group, MenuKey, SHORTCUTS, command_keys, keys_label, keys_label_on,
+        primary_from,
     };
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -542,20 +583,20 @@ mod tests {
     /// navigation keys because it consumes every KeyDown itself. When a binding
     /// legitimately belongs to a group not listed here, add the group; the
     /// failure message says so.
-    const KEY_FILES: &[(&str, &[&str])] = &[
-        ("editor_pane.rs", &["Editor", "Global"]),
-        ("grid.rs", &["Results grid", "Global"]),
-        ("lib.rs", &["Global", "Terminal"]),
-        ("ai_panel.rs", &["Global"]),
-        ("schema_tree.rs", &["Schema tree", "Global"]),
-        ("overlays.rs", &["Global"]),
+    const KEY_FILES: &[(&str, &[Group])] = &[
+        ("editor_pane.rs", &[Group::Editor, Group::Global]),
+        ("grid.rs", &[Group::ResultsGrid, Group::Global]),
+        ("lib.rs", &[Group::Global, Group::Terminal]),
+        ("ai_panel.rs", &[Group::Global]),
+        ("schema_tree.rs", &[Group::SchemaTree, Group::Global]),
+        ("overlays.rs", &[Group::Global]),
         // **Short until it wasn't.** The ER diagram binds Ctrl+F and that
         // binding is the find bar's *only* affordance — no toolbar button, no
         // menu entry — and because this array is hand-maintained and the file
         // was not on it, `bound_letters` never read the file, the `f` was never
         // seen, and the module whose doc opens "a binding missing here is a
         // feature nobody can find" passed green over exactly that.
-        ("erd_view.rs", &["ER diagram"]),
+        ("erd_view.rs", &[Group::ErDiagram]),
     ];
 
     /// Letters bound to something that is not a user-facing shortcut, each with
@@ -697,7 +738,7 @@ mod tests {
     /// vouched for by the *editor's* Ctrl+D, which does something else entirely.
     /// `groups` empty means "anywhere", which is what the whole-table questions
     /// below ask.
-    fn documented_in(letter: char, groups: &[&str]) -> bool {
+    fn documented_in(letter: char, groups: &[Group]) -> bool {
         let upper = letter.to_ascii_uppercase();
         SHORTCUTS
             .iter()
@@ -822,7 +863,7 @@ mod tests {
                         && c.is_ascii_alphabetic()
                         && !found.contains(&c.to_ascii_lowercase())
                     {
-                        stale.push(format!("{group} / {keys} ({desc})"));
+                        stale.push(format!("{group:?} / {keys} ({})", desc()));
                     }
                 }
             }
@@ -846,14 +887,14 @@ mod tests {
     fn a_row_only_vouches_for_its_own_group() {
         // Ctrl+D exists, in the Editor group only.
         assert!(documented('d'), "table-wide");
-        assert!(documented_in('d', &["Editor"]));
+        assert!(documented_in('d', &[Group::Editor]));
         assert!(
-            !documented_in('d', &["Results grid"]),
+            !documented_in('d', &[Group::ResultsGrid]),
             "the grid has no Ctrl+D row, so a grid binding must fail the gate"
         );
         // And the letters that legitimately appear in two groups still do.
-        assert!(documented_in('f', &["Editor"]));
-        assert!(documented_in('f', &["Results grid"]));
+        assert!(documented_in('f', &[Group::Editor]));
+        assert!(documented_in('f', &[Group::ResultsGrid]));
     }
 
     /// Every group a `KEY_FILES` row names has to exist, or a typo silently
@@ -864,8 +905,8 @@ mod tests {
         for (file, groups) in KEY_FILES {
             for g in *groups {
                 assert!(
-                    SHORTCUTS.iter().any(|(name, _)| name == g),
-                    "{file} names group {g:?}, which is not in SHORTCUTS"
+                    SHORTCUTS.iter().any(|(group, _)| group == g),
+                    "{file} names group {g:?}, which has no rows in SHORTCUTS"
                 );
             }
         }
@@ -927,11 +968,12 @@ mod tests {
             let found = SHORTCUTS
                 .iter()
                 .filter(|(g, _)| *g == group)
-                .any(|(_, rows)| rows.iter().any(|(k, d)| *k == keys && *d == what));
+                .any(|(_, rows)| rows.iter().any(|(k, d)| *k == keys && d() == what()));
             assert!(
                 found,
-                "{key:?} shows {keys:?} as {what:?} in {group:?}, which is not a \
-                 SHORTCUTS row — fix the entry to name a real one"
+                "{key:?} shows {keys:?} as {:?} in {group:?}, which is not a \
+                 SHORTCUTS row — fix the entry to name a real one",
+                what()
             );
             assert_eq!(key.keys(), keys_label(keys));
         }
@@ -980,7 +1022,7 @@ mod tests {
     /// above names the group — this pins that the ambiguity is real.
     #[test]
     fn a_key_string_can_mean_two_things_in_two_groups() {
-        let with_ctrl_g: Vec<&str> = SHORTCUTS
+        let with_ctrl_g: Vec<Group> = SHORTCUTS
             .iter()
             .filter(|(_, rows)| rows.iter().any(|(k, _)| *k == "Ctrl+G"))
             .map(|(g, _)| *g)
@@ -1142,7 +1184,7 @@ mod tests {
             assert!(!rows.is_empty(), "group {group:?} has no rows");
             for (keys, desc) in *rows {
                 assert!(
-                    !keys.is_empty() && !desc.is_empty(),
+                    !keys.is_empty() && !desc().is_empty(),
                     "blank row in {group:?}"
                 );
             }

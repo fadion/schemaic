@@ -76,13 +76,16 @@ assertions pin English wording — stays the regression net throughout.
    `pub(crate)` to `schemaic-ui`; the app's first converted file decides how it reaches the
    loader.
 
-   **Converted:** `settings.rs`. **How a file goes**, as that one settled it: a helper taking
+   **Converted:** `settings.rs`, `shortcuts.rs`. **How a file goes**, as those settled it: a helper taking
    `&'static str` widens to `impl Into<String>` (every literal caller still compiles); a
    placeholder goes through `FieldCfg::placeholder_of(|| tr!(…))`, whose `placeholder` is still
    `&'static str`; a sentence assembled from parts becomes whole messages, one per variant; a
    count becomes a Fluent plural. Every message is one line in the `.ftl` — a continued Fluent
    value keeps its line break, where the Rust `\` it replaces kept none. German is written in the
-   same change. Text that is not the file's own stays: labels a dropdown takes from another
+   same change. A `const` table of labels keeps its identity and loses its text: a string the
+   code or a test matches on becomes an enum with a `label()` (`shortcuts::Group`), and the text
+   becomes a `fn() -> String` closure calling `tr!` (`shortcuts::Describe`), so the table stays
+   `const` and the id is still checked at compile time. Text that is not the file's own stays: labels a dropdown takes from another
    module or crate (`TermCursor::label`, `Agent::label`, `KeywordCase::label`), and core's
    prose (`statement_timeout_label`, the install status), which is phase 4. Afterwards, compare
    each placeable-free message against the file's literals at `HEAD` with `\` continuations

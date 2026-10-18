@@ -14851,7 +14851,7 @@ mod tests {
     fn no_global_ctrl_shift_shortcut_is_taken_by_the_grid() {
         let global = crate::shortcuts::SHORTCUTS
             .iter()
-            .find(|(g, _)| *g == "Global")
+            .find(|(g, _)| *g == crate::shortcuts::Group::Global)
             .expect("a Global group")
             .1;
         let mut checked = 0;
@@ -14867,7 +14867,8 @@ mod tests {
                 assert_eq!(
                     grid_ctrl_command(&key, mods(true, true, false)),
                     None,
-                    "{keys} ({what}) is swallowed by the grid"
+                    "{keys} ({}) is swallowed by the grid",
+                    what()
                 );
             }
         }

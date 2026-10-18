@@ -25467,9 +25467,11 @@ existing prose was left alone.
     **Every word the modal writes itself comes from the catalogue** — the first file roadmap phase
     3 converted: labels, hints, placeholders, section names and the Settings and Shortcuts titles
     are `tr!` over `settings-*`/`shortcuts-*` messages (`ui/i18n.rs`), with German beside them, and
-    English output was compared message by message against the literals they replaced. Text the
-    file does not own stays English for now: the Shortcuts modal's rows are `shortcuts.rs`'s, and
-    the options a dropdown takes from elsewhere — `TermCursor::label`, `Agent::label`,
+    English output was compared message by message against the literals they replaced. The
+    Shortcuts modal's headings and rows are `shortcuts.rs`'s, converted after it (below), which is
+    why `shortcut_group` takes a `shortcuts::Group` and renders `group.label()` and `shortcut_row`
+    takes an owned description. Text no converted file owns stays English for now: the options a
+    dropdown takes from elsewhere — `TermCursor::label`, `Agent::label`,
     `KeywordCase::label`, core's `statement_timeout_label` — wait for their own file or for phase 4.
     That is why its builders take owned text: `focusable_toggle_row`, `focusable_toggle_row_when`,
     `toggle_row_layout` and `settings_group_label` take `impl Into<String>`, so a literal caller
@@ -25538,6 +25540,15 @@ existing prose was left alone.
     variant, walking `menu_keys_all()`, which sits beside an exhaustive `_exhaustive` match so a
     new variant fails to compile until it is listed — a list the test walks is only as good as its
     completeness. Palette and menus draw one keycap, `widgets::keycap`.
+    **A group is an identity, its heading is text, and the two are kept apart for translation.**
+    `Group` is an enum (`Global`, `Editor`, `ResultsGrid`, `SchemaTree`, `AiPanel`, `Terminal`,
+    `ErDiagram`) whose `label()` is the `tr!` heading, because `KEY_FILES`, `COMMAND_KEYS` and
+    `MenuKey::row` all name groups for the tests above and none of that may change with the
+    language — a heading string would have made every one of those checks depend on the locale. A
+    row's description is a `Describe = fn() -> String`, a non-capturing closure over `tr!`, so
+    `SHORTCUTS` stays a `const` while each message id is still checked at compile time; the key
+    string beside it is never translated. So `MenuKey::label` answers a `String`, and
+    `every_menu_key_is_the_shortcut_row_it_names` compares rendered descriptions.
     **The primary modifier is asked for, never spelled at the use site.** The modal said `Ctrl+…`
     everywhere, and simply relabelling it for macOS would have been worse than the wrong word: the
     grid and the terminal already took `.control() || .meta()`, but the editor pane, the ER diagram,
@@ -39717,7 +39728,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     indent lands on the pixel the glyphs it aligns under actually occupy — at 80% those differ by one.
 - **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
   value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). The Settings modal
-  (`settings.rs`) is converted; every other label is still an English literal until phase 3 of the
+  (`settings.rs`) and the shortcut table it draws (`shortcuts.rs`) are converted; every other
+  label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
   translated: CLI, MCP and AI text stays English, as do SQL, persisted names and key names.

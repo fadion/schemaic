@@ -5433,7 +5433,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     .iter()
                     .position(|e| {
                         matches!(e, MenuEntry::Action { label, .. }
-                            if label == crate::shortcuts::MenuKey::EditorFormat.label())
+                            if *label == crate::shortcuts::MenuKey::EditorFormat.label())
                     })
                     .map_or(entries.len(), |i| i + 1);
                 entries.insert(

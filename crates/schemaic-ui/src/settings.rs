@@ -1311,7 +1311,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
 
 /// One shortcut line: description on the left, the key combo on the right in a
 /// monospace pill.
-fn shortcut_row(keys: &'static str, desc: &'static str) -> impl IntoView {
+fn shortcut_row(keys: &'static str, desc: String) -> impl IntoView {
     h_stack((
         text(desc).style(|s| s.color(theme::text()).font_size(theme::font_body())),
         empty().style(|s| s.flex_grow(1.0_f32).min_width(12.0)),
@@ -1336,15 +1336,18 @@ fn shortcut_row(keys: &'static str, desc: &'static str) -> impl IntoView {
 }
 
 /// A titled group of shortcut rows (Global / Editor / Results grid).
-fn shortcut_group(title: &'static str, rows: &[(&'static str, &'static str)]) -> impl IntoView {
+fn shortcut_group(
+    group: crate::shortcuts::Group,
+    rows: &[(&'static str, crate::shortcuts::Describe)],
+) -> impl IntoView {
     let rows: Vec<_> = rows.to_vec();
     v_stack((
-        text(title).style(|s| {
+        text(group.label()).style(|s| {
             s.font_size(theme::font_label())
                 .color(theme::text_dim())
                 .margin_bottom(theme::scaled(2.0))
         }),
-        v_stack_from_iter(rows.into_iter().map(|(k, d)| shortcut_row(k, d)))
+        v_stack_from_iter(rows.into_iter().map(|(k, d)| shortcut_row(k, d())))
             .style(|s| s.flex_col()),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(2.0)))
@@ -2392,7 +2395,7 @@ pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
             let body = v_stack_from_iter(
                 crate::shortcuts::SHORTCUTS
                     .iter()
-                    .map(|(title, rows)| shortcut_group(title, rows)),
+                    .map(|(group, rows)| shortcut_group(*group, rows)),
             )
             .style(|s| {
                 s.flex_col()

@@ -146,3 +146,69 @@ settings-appearance-scale = Oberflächengröße
 ## Shortcuts modal
 
 shortcuts-title = Tastenkürzel
+
+## Shortcuts modal › group headings
+
+shortcuts-group-global = Global
+shortcuts-group-editor = Editor
+shortcuts-group-results-grid = Ergebnistabelle
+shortcuts-group-schema-tree = Schemabaum
+shortcuts-group-ai-panel = KI-Bereich
+shortcuts-group-terminal = Terminal
+shortcuts-group-er-diagram = ER-Diagramm
+
+## Shortcuts modal › rows
+
+shortcuts-find-anywhere = Überall suchen
+shortcuts-command-palette = Befehlspalette
+shortcuts-new-tab = Neuer Abfrage-Tab
+shortcuts-close-tab = Abfrage-Tab schließen
+shortcuts-next-tab = Nächster Tab
+shortcuts-previous-tab = Vorheriger Tab
+shortcuts-jump-to-tab = Zu Tab springen
+shortcuts-reopen-tab = Zuletzt geschlossenen Tab wieder öffnen
+shortcuts-open-file = SQL-Datei öffnen
+shortcuts-save-file = SQL-Datei speichern
+shortcuts-save-file-as = SQL-Datei speichern unter
+shortcuts-toggle-schema = Schemabereich ein-/ausblenden
+shortcuts-toggle-ai = KI-Bereich ein-/ausblenden
+shortcuts-toggle-terminal = Terminal ein-/ausblenden
+shortcuts-run-query = Abfrage ausführen
+shortcuts-autocomplete = Autovervollständigung
+shortcuts-inline-ai = KI-Bearbeitung im Editor
+shortcuts-find-in-editor = Im Editor suchen
+shortcuts-find-replace = Suchen und ersetzen
+shortcuts-go-to-line = Gehe zu Zeile
+shortcuts-matching-bracket = Zur passenden Klammer oder zu BEGIN/END springen
+shortcuts-line-comment = Zeilenkommentar umschalten
+shortcuts-block-comment = Blockkommentar umschalten
+shortcuts-toggle-case = Groß-/Kleinschreibung umschalten
+shortcuts-join-lines = Zeilen verbinden
+shortcuts-duplicate = Zeile / Auswahl duplizieren
+shortcuts-cut = Zeile / Auswahl ausschneiden
+shortcuts-format-code = Code formatieren
+shortcuts-format-statement = Anweisung formatieren
+shortcuts-single-line = In eine Zeile umwandeln
+shortcuts-move-line = Zeile nach oben / unten verschieben
+shortcuts-quick-fix = Schnellkorrektur am Cursor anwenden
+shortcuts-indent = Einrücken / Ausrücken
+shortcuts-take-prediction = Inline-Vorschlag übernehmen (am Zeilenende auch →) / sein nächstes Wort
+shortcuts-find-in-results = In Ergebnissen suchen
+shortcuts-go-to-row = Gehe zu Zeile
+shortcuts-copy = Kopieren
+shortcuts-paste-staged = Als vorgemerkte Änderungen einfügen
+shortcuts-select-all = Alles auswählen
+shortcuts-first-last-cell = Erste / letzte Zelle
+shortcuts-edit-cell = Zelle bearbeiten
+shortcuts-next-cell = Nächste / vorherige Zelle beim Bearbeiten
+shortcuts-commit-edits = Änderungen übernehmen
+shortcuts-mark-deletion = Zeile zum Löschen vormerken
+shortcuts-results-toolbar = Zur Werkzeugleiste der Ergebnisse
+shortcuts-along-toolbar = In der Werkzeugleiste bewegen (Esc kehrt zur Tabelle zurück)
+shortcuts-open-selected = Ausgewählte Tabelle, Spalte oder Objekt öffnen
+shortcuts-context-menu = Kontextmenü der ausgewählten Zeile
+shortcuts-send-message = Nachricht senden
+shortcuts-new-line = Neue Zeile
+shortcuts-recall-prompt = Vorherige / nächste Eingabe zurückholen
+shortcuts-copy-paste = Kopieren / Einfügen
+shortcuts-find-in-diagram = Im Diagramm suchen

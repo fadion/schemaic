@@ -152,3 +152,72 @@ settings-appearance-scale = Interface scale
 ## Shortcuts modal (its rows are `shortcuts.rs`'s)
 
 shortcuts-title = Shortcuts
+
+## Shortcuts modal › group headings
+
+shortcuts-group-global = Global
+shortcuts-group-editor = Editor
+shortcuts-group-results-grid = Results grid
+shortcuts-group-schema-tree = Schema tree
+shortcuts-group-ai-panel = AI panel
+shortcuts-group-terminal = Terminal
+shortcuts-group-er-diagram = ER diagram
+
+## Shortcuts modal › rows (the keys beside them are never translated)
+
+shortcuts-find-anywhere = Find Anywhere
+shortcuts-command-palette = Command palette
+shortcuts-new-tab = New query tab
+shortcuts-close-tab = Close query tab
+shortcuts-next-tab = Next tab
+shortcuts-previous-tab = Previous tab
+shortcuts-jump-to-tab = Jump to tab
+shortcuts-reopen-tab = Reopen last closed tab
+shortcuts-open-file = Open SQL file
+shortcuts-save-file = Save SQL file
+shortcuts-save-file-as = Save SQL file as
+shortcuts-toggle-schema = Toggle schema panel
+shortcuts-toggle-ai = Toggle AI panel
+shortcuts-toggle-terminal = Toggle terminal
+shortcuts-run-query = Run query
+shortcuts-autocomplete = Autocomplete
+shortcuts-inline-ai = Inline AI edit
+shortcuts-find-in-editor = Find in editor
+shortcuts-find-replace = Find and replace
+shortcuts-go-to-line = Go to line
+# BEGIN/END are SQL keywords.
+shortcuts-matching-bracket = Jump to the matching bracket or BEGIN/END
+shortcuts-line-comment = Toggle line comment
+shortcuts-block-comment = Toggle block comment
+shortcuts-toggle-case = Toggle case
+shortcuts-join-lines = Join lines
+shortcuts-duplicate = Duplicate line / selection
+shortcuts-cut = Cut line / selection
+# Also the editor menu's entry, and named like the palette's "Format Code".
+shortcuts-format-code = Format code
+shortcuts-format-statement = Format statement
+shortcuts-single-line = Make single line
+shortcuts-move-line = Move line up / down
+shortcuts-quick-fix = Apply the quick fix under the caret
+shortcuts-indent = Indent / outdent
+# Its keys are "Tab / Ctrl+→": the first half is Tab (or →), the second Ctrl+→.
+shortcuts-take-prediction = Take the inline prediction (→ too, at a line's end) / its next word
+shortcuts-find-in-results = Find in results
+shortcuts-go-to-row = Go to row
+shortcuts-copy = Copy
+shortcuts-paste-staged = Paste as staged edits
+shortcuts-select-all = Select all
+shortcuts-first-last-cell = First / last cell
+shortcuts-edit-cell = Edit cell
+shortcuts-next-cell = Next / previous cell while editing
+shortcuts-commit-edits = Commit edits
+shortcuts-mark-deletion = Mark row for deletion
+shortcuts-results-toolbar = Go to the results toolbar
+shortcuts-along-toolbar = Move along the toolbar (Esc returns to the grid)
+shortcuts-open-selected = Open the selected table, column or object
+shortcuts-context-menu = Context menu for the selected row
+shortcuts-send-message = Send message
+shortcuts-new-line = New line
+shortcuts-recall-prompt = Recall previous / next prompt
+shortcuts-copy-paste = Copy / paste
+shortcuts-find-in-diagram = Find in the diagram
