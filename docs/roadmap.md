@@ -39,6 +39,14 @@ strings table, every user-facing string an English literal at its call site.
   — so the choice is a proper translation or none, and a proper one waits on the font question
   below. Many developers in those markets run technical tools in English anyway. CJK *data* is in
   scope regardless; see below.
+- **German first.** It is a large developer market and runs longer than any other common
+  interface language, so it is also the layout stress test phase 6 needs. The first catalogue is
+  machine-drafted and ships unreviewed; proofreading waits until the project has users, who can
+  then contribute corrections. Treat that as accepted, not as a blocker.
+- **A language change applies on the next start.** The Settings override is read once, at launch;
+  no label re-renders when it changes, which spares two to three thousand call sites a reactive
+  dependency for a setting changed once. Changing it says so where the user changed it:
+  *The language change takes effect the next time Schemaic starts.*
 
 ### Never translated
 
@@ -99,12 +107,11 @@ These affect users today, with the English UI, whenever a table holds non-Latin 
 - **Fonts.** Only IBM Plex is bundled (Latin, Cyrillic, Greek). CJK, Arabic and Hebrew rely on
   cosmic-text falling back to system fonts, which is unverified per OS; `erd_raster` has its own
   font database holding only Plex Sans, so a diagram PNG probably drops those glyphs.
-- **IME in single-line inputs.** The editor handles preedit and commit; Floem's `text_input`
-  appears not to, which would leave search boxes, form fields and grid cell editors without CJK
-  composition. Verify first.
+- **IME in the grid's inline cell editor.** Every other field is `edit_field`, on Floem's editor
+  engine, which enables IME and handles preedit and commit (`vendor/floem/src/views/editor/view.rs`).
+  The grid's inline editor is the one `floem::views::text_input`, which never calls
+  `set_ime_allowed` and handles neither event, so a cell cannot take CJK composition. Either move
+  it onto `edit_field` or teach the vendored `text_input` IME (a `PATCHES.md` entry); either way
+  the check is by hand, with a real input method.
 - **Right-to-left cell data** shapes and reorders through cosmic-text, but always sits
   left-aligned. Aligning a cell by its first strong character is cheap and optional.
-
-### Open
-
-- **Which languages first**, and who reviews a translation nobody on the project reads.
