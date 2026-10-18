@@ -1781,7 +1781,7 @@ pub(crate) fn pill_tab_style(s: floem::style::Style, on: bool) -> floem::style::
 /// On the active pill the dot takes `pill_active_text`: the kind's colour on the
 /// pill's own fill — Compare's *Changed* blue — vanished into it.
 pub(crate) fn count_pill(
-    name: &'static str,
+    name: impl Into<String>,
     dot: Option<fn() -> floem::peniko::Color>,
     count: impl Fn() -> String + 'static,
     on: impl Fn() -> bool + Copy + 'static,
@@ -1804,7 +1804,7 @@ pub(crate) fn count_pill(
     };
     let face = h_stack((
         dot,
-        text(name),
+        text(name.into()),
         label(count).style(move |s| {
             let s = s.margin_left(theme::scaled(6.0));
             if on() {

@@ -1466,3 +1466,51 @@ export-progress-starting = Starting
 # $name is the destination file's name.
 export-progress-file = File: { $name }
 export-progress-writing = Writing { $name }
+
+## Live monitor (monitor_view.rs)
+## The Action column's INSERT/UPDATE/DELETE are SQL keywords and stay as they are.
+
+monitor-title = Live monitor
+monitor-badge-watching = Watching
+monitor-badge-paused = Paused
+monitor-badge-stopped = Stopped
+monitor-filter-all = All
+monitor-filter-inserts = Inserts
+monitor-filter-updates = Updates
+monitor-filter-deletes = Deletes
+monitor-resume = Resume polling
+monitor-pause = Pause polling
+monitor-clear-tip = Clear the log
+monitor-export-tip = Export the log…
+# A poll interval in the dropdown, in seconds.
+monitor-interval = { $secs }s
+monitor-clear-title = Clear the log?
+monitor-clear-message = { $count ->
+    [one] { $count } change would be discarded. The log is the only record of what a deleted row held — the poll will not report a change again — and this can't be undone. Export it first if you want to keep it.
+   *[other] { $count } changes would be discarded. The log is the only record of what a deleted row held — the poll will not report a change again — and this can't be undone. Export it first if you want to keep it.
+}
+monitor-col-time = Time
+monitor-col-action = Action
+monitor-no-inserts = No inserts yet.
+monitor-no-updates = No updates yet.
+monitor-no-deletes = No deletes yet.
+monitor-empty-stopped = Stopped.
+monitor-empty-paused = Paused.
+# Animated with trailing dots while it lasts.
+monitor-waiting = Waiting
+# The footer's line is made of these, joined by " · ". $since is a time (11:48:12).
+monitor-events-since = { $count ->
+    [one] { $count } event since { $since }
+   *[other] { $count } events since { $since }
+}
+monitor-no-changes = No changes yet
+monitor-partial = only the first { $cap } rows by primary key are watched
+monitor-capped = the oldest are dropping at the { $cap }-change cap
+# $columns is a comma-separated list of column names; $count how many.
+monitor-length-only = { $count ->
+    [one] { $columns } is binary, so its changes are seen by length only
+   *[other] { $columns } are binary, so their changes are seen by length only
+}
+monitor-newest-at-bottom = newest at the bottom
+# The file picker's window title.
+monitor-export-dialog = Export change log

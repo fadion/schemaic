@@ -31723,6 +31723,22 @@ existing prose was left alone.
     invariant for the shape.
     It is pure and tested inline, which is what keeps the copy honest: the two caveats co-occurring
     is precisely the case a per-state `match` got wrong.
+    **Its words are the catalogue's** (`monitor-*`, roadmap phase 3) — the title, the badge's three
+    words (`badge_state` returns `(String, fn() -> Color)`), the four filter pills (`count_pill`
+    takes its name as `impl Into<String>`, so Compare results' literals still compile), the Pause/
+    Resume, Clear and Export tooltips, the interval labels (`interval_label`, `monitor-interval`
+    with `$secs`; the `—` fallback stays), the Clear confirm's title and message — a plural on
+    `$count`, one whole sentence per form — the Time and Action headers, the three no-kind-yet
+    notes, the Stopped./Paused./Waiting faces and the export dialog's window title; Close is the
+    shared `dialog-close`. `footer_line`'s parts are whole messages, still joined by ` · `:
+    `monitor-events-since` (plural, `$count`, `$since`), `monitor-no-changes`, `monitor-partial`
+    and `monitor-capped` (`$cap`, `monitor::ROW_CAP`/`LOG_CAP`), `monitor-length-only` (plural on
+    `$count`, `$columns`) — which replaced the assembled *is … its*/*are … their* pair — and
+    `monitor-newest-at-bottom`. The footer's tests pin the English and pass unchanged;
+    `the_clear_prompt_and_the_intervals_read_as_they_did_in_english` pins the rest. English stays:
+    `monitor::action_label`'s INSERT/UPDATE/DELETE (SQL keywords, and what the export writes), the
+    export menu's `ExportFormat::label`s, the `old → new` arrow, the file name's `-monitor`
+    suffix, and a poll or export error's text.
   - `blob_view.rs` — the **binary-cell panel** (`blob_overlay`), over `core::blob`: what a
     `<n bytes>` cell looks like when you open it. Raised from the grid's cell menu and mounted in
     the modal layer's **workspace** group beside the properties, monitor and ERD modals — it is a
@@ -40125,7 +40141,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
   grant forms (`account_editor.rs`), the table designer (`table_designer.rs`), Manage
   Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
-  and the grid export's progress box (`dump_view.rs`) are converted;
+  and the grid export's progress box (`dump_view.rs`) and the Live monitor (`monitor_view.rs`) are
+  converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

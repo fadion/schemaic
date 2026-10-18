@@ -1305,3 +1305,42 @@ export-progress-rows = { $count ->
 export-progress-starting = Wird gestartet
 export-progress-file = Datei: { $name }
 export-progress-writing = Schreibe { $name }
+monitor-title = Live-Monitor
+monitor-badge-watching = Beobachtet
+monitor-badge-paused = Pausiert
+monitor-badge-stopped = Angehalten
+monitor-filter-all = Alle
+monitor-filter-inserts = Einfügungen
+monitor-filter-updates = Aktualisierungen
+monitor-filter-deletes = Löschungen
+monitor-resume = Abfragen fortsetzen
+monitor-pause = Abfragen pausieren
+monitor-clear-tip = Protokoll leeren
+monitor-export-tip = Protokoll exportieren…
+monitor-interval = { $secs } s
+monitor-clear-title = Protokoll leeren?
+monitor-clear-message = { $count ->
+    [one] { $count } Änderung würde verworfen. Das Protokoll ist die einzige Aufzeichnung dessen, was eine gelöschte Zeile enthielt – die Abfrage meldet eine Änderung nicht noch einmal –, und das lässt sich nicht rückgängig machen. Exportiere es vorher, wenn du es behalten willst.
+   *[other] { $count } Änderungen würden verworfen. Das Protokoll ist die einzige Aufzeichnung dessen, was eine gelöschte Zeile enthielt – die Abfrage meldet eine Änderung nicht noch einmal –, und das lässt sich nicht rückgängig machen. Exportiere es vorher, wenn du es behalten willst.
+}
+monitor-col-time = Zeit
+monitor-col-action = Aktion
+monitor-no-inserts = Noch keine Einfügungen.
+monitor-no-updates = Noch keine Aktualisierungen.
+monitor-no-deletes = Noch keine Löschungen.
+monitor-empty-stopped = Angehalten.
+monitor-empty-paused = Pausiert.
+monitor-waiting = Warte
+monitor-events-since = { $count ->
+    [one] { $count } Ereignis seit { $since }
+   *[other] { $count } Ereignisse seit { $since }
+}
+monitor-no-changes = Noch keine Änderungen
+monitor-partial = nur die ersten { $cap } Zeilen nach Primärschlüssel werden beobachtet
+monitor-capped = die ältesten fallen bei der Obergrenze von { $cap } Änderungen weg
+monitor-length-only = { $count ->
+    [one] { $columns } ist binär, daher werden seine Änderungen nur an der Länge erkannt
+   *[other] { $columns } sind binär, daher werden ihre Änderungen nur an der Länge erkannt
+}
+monitor-newest-at-bottom = neueste unten
+monitor-export-dialog = Änderungsprotokoll exportieren

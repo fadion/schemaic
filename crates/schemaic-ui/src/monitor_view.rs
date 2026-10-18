@@ -46,6 +46,7 @@ use schemaic_core::monitor::{
     log_result_set, table_cells,
 };
 
+use crate::i18n::tr;
 use crate::settings::focusable_dropdown;
 use crate::theme::{font_body, font_label};
 use crate::tooltip::TooltipExt;
@@ -395,9 +396,9 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 )
                 .tooltip(move || {
                     let t = if paused.get() {
-                        "Resume polling"
+                        tr!("monitor-resume")
                     } else {
-                        "Pause polling"
+                        tr!("monitor-pause")
                     };
                     text(t).style(crate::widgets::tooltip_style)
                 }),
@@ -435,14 +436,8 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                     return;
                 }
                 confirm.set(Some(crate::Confirm {
-                    title: "Clear the log?".to_string(),
-                    message: format!(
-                        "{n} change{} would be discarded. The log is the only record \
-                         of what a deleted row held — the poll will not report a \
-                         change again — and this can't be undone. Export it first if \
-                         you want to keep it.",
-                        if n == 1 { "" } else { "s" }
-                    ),
+                    title: tr!("monitor-clear-title"),
+                    message: tr!("monitor-clear-message", count = n),
                     resolve: Rc::new(move |yes| {
                         if yes {
                             log.set(Vec::new());
@@ -462,7 +457,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                     move || log.with(|l| !l.is_empty()),
                     move || (clear_click)(),
                 )
-                .tooltip(|| text("Clear the log").style(crate::widgets::tooltip_style)),
+                .tooltip(|| text(tr!("monitor-clear-tip")).style(crate::widgets::tooltip_style)),
                 ring.clone(),
                 CLEAR_TAB,
                 true,
@@ -514,7 +509,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                     move || log.with(|l| !l.is_empty()),
                     move || (export_click)(),
                 )
-                .tooltip(|| text("Export the log…").style(crate::widgets::tooltip_style)),
+                .tooltip(|| text(tr!("monitor-export-tip")).style(crate::widgets::tooltip_style)),
                 ring.clone(),
                 EXPORT_TAB,
                 true,
@@ -584,9 +579,9 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                         Body::Table(heads) => Rc::new(heads),
                         Body::NoneOf(k) => {
                             let said = match k {
-                                ChangeKind::Insert => "No inserts yet.",
-                                ChangeKind::Update => "No updates yet.",
-                                ChangeKind::Delete => "No deletes yet.",
+                                ChangeKind::Insert => tr!("monitor-no-inserts"),
+                                ChangeKind::Update => tr!("monitor-no-updates"),
+                                ChangeKind::Delete => tr!("monitor-no-deletes"),
                             };
                             return container(text(said).style(|s| {
                                 s.color(theme::text_dim())
@@ -606,7 +601,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                                     // A stopped loop is waiting for nothing
                                     // either; the footer says why.
                                     if is_stopped {
-                                        return text("Stopped.")
+                                        return text(tr!("monitor-empty-stopped"))
                                             .style(|s| {
                                                 s.color(theme::text_dim())
                                                     .font_size(theme::scaled_font(13.0))
@@ -617,14 +612,15 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                                         // Static, not `loading_dots`: cycling dots say
                                         // "any moment now", and a paused monitor is not
                                         // waiting for anything.
-                                        return text("Paused.")
+                                        return text(tr!("monitor-empty-paused"))
                                             .style(|s| {
                                                 s.color(theme::text_dim())
                                                     .font_size(theme::scaled_font(13.0))
                                             })
                                             .into_any();
                                     }
-                                    loading_dots("Waiting", theme::text_dim, font_body).into_any()
+                                    loading_dots(tr!("monitor-waiting"), theme::text_dim, font_body)
+                                        .into_any()
                                 },
                             ))
                             .style(|s| s.size_full().items_center().justify_center())
@@ -790,7 +786,7 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 action_button(
                     // Neutral, as Compare results' is: the footer offers no
                     // decision to affirm.
-                    "Close",
+                    tr!("dialog-close"),
                     ActionKind::Neutral,
                     true,
                     ring.clone(),
@@ -842,13 +838,13 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
 /// that has ended (a table with no row key) is not waiting for Resume, and
 /// the badge read only `paused`, so it stayed a green *Watching* beside the
 /// footer's "changes can't be tracked".
-fn badge_state(paused: bool, stopped: bool) -> (&'static str, fn() -> Color) {
+fn badge_state(paused: bool, stopped: bool) -> (String, fn() -> Color) {
     if stopped {
-        ("Stopped", theme::error)
+        (tr!("monitor-badge-stopped"), theme::error)
     } else if paused {
-        ("Paused", theme::plan_warn)
+        (tr!("monitor-badge-paused"), theme::plan_warn)
     } else {
-        ("Watching", new_color)
+        (tr!("monitor-badge-watching"), new_color)
     }
 }
 
@@ -888,7 +884,7 @@ fn title_bar(
     });
     let pressed = close.clone();
     h_stack((
-        text("Live monitor").style(|s| {
+        text(tr!("monitor-title")).style(|s| {
             s.font_size(theme::scaled_font(15.0))
                 .font_bold()
                 .color(theme::text())
@@ -941,7 +937,7 @@ fn filter_pills(
     filter: RwSignal<Option<ChangeKind>>,
     ring: crate::widgets::FocusRing,
 ) -> impl IntoView {
-    let pill = move |name: &'static str, which: Option<ChangeKind>, tabindex: u32| {
+    let pill = move |name: String, which: Option<ChangeKind>, tabindex: u32| {
         count_pill(
             name,
             which.map(kind_color),
@@ -957,10 +953,22 @@ fn filter_pills(
         )
     };
     h_stack((
-        pill("All", None, PILLS_TAB),
-        pill("Inserts", Some(ChangeKind::Insert), PILLS_TAB + 1),
-        pill("Updates", Some(ChangeKind::Update), PILLS_TAB + 2),
-        pill("Deletes", Some(ChangeKind::Delete), PILLS_TAB + 3),
+        pill(tr!("monitor-filter-all"), None, PILLS_TAB),
+        pill(
+            tr!("monitor-filter-inserts"),
+            Some(ChangeKind::Insert),
+            PILLS_TAB + 1,
+        ),
+        pill(
+            tr!("monitor-filter-updates"),
+            Some(ChangeKind::Update),
+            PILLS_TAB + 2,
+        ),
+        pill(
+            tr!("monitor-filter-deletes"),
+            Some(ChangeKind::Delete),
+            PILLS_TAB + 3,
+        ),
     ))
     .style(|s| {
         s.items_center()
@@ -989,8 +997,8 @@ fn header_row(heads: Rc<Vec<String>>, widths: RwSignal<Rc<Vec<f64>>>) -> impl In
             .into_any()
     };
     let mut cells = vec![
-        cell("Time".to_string(), Rc::new(time_w)),
-        cell("Action".to_string(), Rc::new(act_w)),
+        cell(tr!("monitor-col-time"), Rc::new(time_w)),
+        cell(tr!("monitor-col-action"), Rc::new(act_w)),
     ];
     cells.extend(
         heads
@@ -1155,42 +1163,32 @@ fn footer_line(
         return (msg, Tone::Error);
     }
     let mut parts = vec![match since {
-        Some(t) if events > 0 => format!(
-            "{events} {} since {t}",
-            schemaic_core::text::plural(events, "event", "events")
-        ),
-        _ => "No changes yet".to_string(),
+        Some(t) if events > 0 => tr!("monitor-events-since", count = events, since = t),
+        _ => tr!("monitor-no-changes"),
     }];
     if partial {
-        parts.push(format!(
-            "only the first {} rows by primary key are watched",
-            schemaic_core::monitor::ROW_CAP
+        parts.push(tr!(
+            "monitor-partial",
+            cap = schemaic_core::monitor::ROW_CAP
         ));
     }
     if capped {
-        parts.push(format!(
-            "the oldest are dropping at the {}-change cap",
-            schemaic_core::monitor::LOG_CAP
-        ));
+        parts.push(tr!("monitor-capped", cap = schemaic_core::monitor::LOG_CAP));
     }
     // A blob's cell is `<n bytes>`: rewritten at the same length, it is no
     // change to the poll.
     if !length_only.is_empty() {
-        parts.push(format!(
-            "{} {} by length only",
-            length_only.join(", "),
-            if length_only.len() == 1 {
-                "is binary, so its changes are seen"
-            } else {
-                "are binary, so their changes are seen"
-            }
+        parts.push(tr!(
+            "monitor-length-only",
+            count = length_only.len(),
+            columns = length_only.join(", ")
         ));
     }
     if parts.len() > 1 {
         return (parts.join(" · "), Tone::Warn);
     }
     if events > 0 {
-        parts.push("newest at the bottom".to_string());
+        parts.push(tr!("monitor-newest-at-bottom"));
     }
     (parts.join(" · "), Tone::Calm)
 }
@@ -1222,7 +1220,7 @@ fn save_log(
     // extension.
     let base = title.get_untracked().map(|t| format!("{t}-monitor"));
     let opts = FileDialogOptions::new()
-        .title("Export change log")
+        .title(tr!("monitor-export-dialog"))
         .default_name(suggested_filename(base.as_deref(), format))
         .allowed_types(vec![FileSpec {
             name: format.label(),
@@ -1313,19 +1311,36 @@ fn save_log(
 }
 
 /// Poll-interval option labels for the dropdown.
-fn interval_label(secs: u64) -> &'static str {
+fn interval_label(secs: u64) -> String {
     match secs {
-        1 => "1s",
-        2 => "2s",
-        5 => "5s",
-        10 => "10s",
-        _ => "—",
+        1 | 2 | 5 | 10 => tr!("monitor-interval", secs = secs),
+        _ => "—".to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Clear prompt and the interval dropdown read as they did in English
+    /// before the catalogue — the footer's line and the badge have tests of
+    /// their own below.
+    #[test]
+    fn the_clear_prompt_and_the_intervals_read_as_they_did_in_english() {
+        let tail = "would be discarded. The log is the only record of what a deleted row held \
+                    — the poll will not report a change again — and this can't be undone. \
+                    Export it first if you want to keep it.";
+        assert_eq!(
+            tr!("monitor-clear-message", count = 1),
+            format!("1 change {tail}")
+        );
+        assert_eq!(
+            tr!("monitor-clear-message", count = 40),
+            format!("40 changes {tail}")
+        );
+        let labels: Vec<String> = [1, 2, 5, 10, 3].into_iter().map(interval_label).collect();
+        assert_eq!(labels, ["1s", "2s", "5s", "10s", "—"]);
+    }
 
     /// **The virtual stack may ask for rows the log no longer has.**
     ///
