@@ -1591,3 +1591,6 @@ usages-title = { $count ->
     [one] { $count } Verwendung von { $name }
    *[other] { $count } Verwendungen von { $name }
 }
+raster-invalid-svg = Ungültiges SVG: { $error }
+raster-too-large = Das Bild ist zu groß zum Rastern ({ $width }×{ $height })
+raster-png-failed = PNG-Kodierung fehlgeschlagen: { $error }

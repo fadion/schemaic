@@ -17,6 +17,8 @@
 
 use resvg::{tiny_skia, usvg};
 
+use crate::i18n::tr;
+
 /// Hard cap on either PNG dimension. 8192 is the ceiling a lot of image pipelines
 /// and GPU texture paths share, and past it a "picture of the schema" has stopped
 /// being useful anyway.
@@ -115,14 +117,21 @@ fn font_options() -> usvg::Options<'static> {
 }
 
 fn render_png(svg: &str, scale: f32, opt: usvg::Options<'_>) -> Result<Vec<u8>, String> {
-    let tree = usvg::Tree::from_str(svg, &opt).map_err(|e| format!("Invalid SVG: {e}"))?;
+    let tree = usvg::Tree::from_str(svg, &opt)
+        .map_err(|e| tr!("raster-invalid-svg", error = e.to_string()))?;
     let size = tree.size();
     let scale = clamp_scale(size.width(), size.height(), scale);
     let w = (size.width() * scale).round().max(1.0) as u32;
     let h = (size.height() * scale).round().max(1.0) as u32;
     let mut pixmap = tiny_skia::Pixmap::new(w, h)
         // "Image", not "Diagram": the chart modal's PNG comes through here too.
-        .ok_or_else(|| format!("Image is too large to rasterise ({w}×{h})"))?;
+        .ok_or_else(|| {
+            tr!(
+                "raster-too-large",
+                width = w.to_string(),
+                height = h.to_string()
+            )
+        })?;
     resvg::render(
         &tree,
         tiny_skia::Transform::from_scale(scale, scale),
@@ -130,12 +139,26 @@ fn render_png(svg: &str, scale: f32, opt: usvg::Options<'_>) -> Result<Vec<u8>, 
     );
     pixmap
         .encode_png()
-        .map_err(|e| format!("PNG encoding failed: {e}"))
+        .map_err(|e| tr!("raster-png-failed", error = e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two refusals no test can provoke read as they did in English before
+    /// the catalogue; *Invalid SVG* is reached for real below.
+    #[test]
+    fn the_unreachable_refusals_read_as_they_did_in_english() {
+        assert_eq!(
+            tr!("raster-too-large", width = "40000", height = "30000"),
+            "Image is too large to rasterise (40000×30000)"
+        );
+        assert_eq!(
+            tr!("raster-png-failed", error = "out of memory"),
+            "PNG encoding failed: out of memory"
+        );
+    }
 
     const SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\" \
                        viewBox=\"-10 -10 100 50\"><rect x=\"-10\" y=\"-10\" width=\"100\" \

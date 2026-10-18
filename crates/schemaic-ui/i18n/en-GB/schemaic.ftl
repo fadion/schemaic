@@ -1867,3 +1867,11 @@ usages-title = { $count ->
     [one] { $count } usage of { $name }
    *[other] { $count } usages of { $name }
 }
+
+## Saving a diagram or chart as PNG (erd_raster.rs) — the failed export's notice.
+## $error is the library's own message.
+
+raster-invalid-svg = Invalid SVG: { $error }
+# "Image", not "Diagram": the chart's PNG comes through here too.
+raster-too-large = Image is too large to rasterise ({ $width }×{ $height })
+raster-png-failed = PNG encoding failed: { $error }
