@@ -26,6 +26,7 @@ use schemaic_core::chart_draw;
 use schemaic_core::erd_export::{self, ErdExportFormat};
 use schemaic_core::model::ResultSet;
 
+use crate::i18n::tr;
 use crate::settings::focusable_dropdown;
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
@@ -50,7 +51,22 @@ fn canvas_h() -> f64 {
 }
 
 /// The label column's picker entry for "no column — number the rows".
-const ROW_NUMBER: &str = "Row number";
+///
+/// The picker hands back the text it shows, so the pick is compared against
+/// this — one call per build, both sides in the same language.
+fn row_number() -> String {
+    tr!("chart-row-number")
+}
+
+/// A chart kind's name — `ChartKind::label`'s word in the interface's
+/// language; `english_names_every_chart_kind_as_core_does` holds them equal.
+fn chart_kind_label(kind: ChartKind) -> String {
+    match kind {
+        ChartKind::Bar => tr!("chart-kind-bar"),
+        ChartKind::Line => tr!("chart-kind-line"),
+        ChartKind::Histogram => tr!("chart-kind-histogram"),
+    }
+}
 
 /// The save icon's place in the Tab ring: after the three pickers (10, 20, 30).
 const EXPORT_TAB: u32 = 40;
@@ -135,7 +151,7 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
                     .iter()
                     .map(|c| c.name.clone())
                     .collect::<Vec<_>>(),
-                &[ROW_NUMBER],
+                &[row_number().as_str()],
             );
 
             // The choices. The value column starts on the last numeric one —
@@ -154,8 +170,11 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
                 )
                 .style(|s| s.width_full())
             };
-            let title =
-                modal_title_owned(format!("Chart — {}", t.title), close.clone(), ring.clone());
+            let title = modal_title_owned(
+                tr!("chart-title", tab = t.title.clone()),
+                close.clone(),
+                ring.clone(),
+            );
 
             // ── Save ──────────────────────────────────────────────────────
             // What the last save did, and whether it failed — said here, since
@@ -215,13 +234,13 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
                         export_doc(&drawn, fmt)
                     });
                     let Some(doc) = doc else {
-                        (say)("Nothing to save.".to_string(), true);
+                        (say)(tr!("chart-nothing-to-save"), true);
                         return;
                     };
                     crate::erd_view::save_document(
                         doc,
-                        "Save chart",
-                        erd_export::file_stem(&format!("{name} chart"), fmt),
+                        &tr!("chart-save-dialog"),
+                        erd_export::file_stem(&tr!("chart-file-stem", name = name.clone()), fmt),
                         fmt,
                         export.clone(),
                         say.clone(),
@@ -276,7 +295,7 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
                         || true,
                         move || (click)(),
                     )
-                    .tooltip(|| text("Save the chart…").style(crate::widgets::tooltip_style)),
+                    .tooltip(|| text(tr!("chart-save-tip")).style(crate::widgets::tooltip_style)),
                     ring.clone(),
                     EXPORT_TAB,
                     true,
@@ -311,7 +330,7 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
             let footer = modal_footer_split(
                 status,
                 action_button(
-                    "Close",
+                    tr!("dialog-close"),
                     ActionKind::Primary,
                     true,
                     ring.clone(),
@@ -367,7 +386,7 @@ fn controls(
     ring: FocusRing,
     export: AnyView,
 ) -> AnyView {
-    let caption = |s: &'static str| text(s).style(crate::widgets::form_label_style);
+    let caption = |s: String| text(s).style(crate::widgets::form_label_style);
     let col_w = || theme::scaled(200.0);
     // A picked name → its column; `names` are distinct, so two columns the
     // result names alike are two choices.
@@ -393,7 +412,8 @@ fn controls(
     // A histogram's labels are its bins, so the picker is not there at all —
     // built or not rather than hidden, since a hidden control is still a stop
     // in the modal's Tab ring.
-    let mut label_options = vec![ROW_NUMBER.to_string()];
+    let row_number = row_number();
+    let mut label_options = vec![row_number.clone()];
     label_options.extend(names.iter().cloned());
     let label_ring = ring.clone();
     let label_group = dyn_container(
@@ -403,39 +423,38 @@ fn controls(
                 return empty().into_any();
             }
             let lookup = lookup.clone();
+            let picked_none = row_number.clone();
             let field = crate::table_designer::focusable_owned_dropdown(
-                move || {
-                    label
-                        .get()
-                        .map(name_of)
-                        .unwrap_or_else(|| ROW_NUMBER.to_string())
-                },
+                // A fn item, not a captured `String`: the picker wants a
+                // `Copy` closure.
+                move || label.get().map(name_of).unwrap_or_else(self::row_number),
                 label_options.clone(),
                 col_w,
                 label_ring.clone(),
                 30,
-                move |picked| label.set(lookup(&picked).filter(|_| picked != ROW_NUMBER)),
+                move |picked| label.set(lookup(&picked).filter(|_| picked != picked_none)),
             );
-            v_stack((caption("Labels"), field))
+            v_stack((caption(tr!("chart-caption-labels")), field))
                 .style(|s| s.flex_col().gap(theme::scaled(6.0)))
                 .into_any()
         },
     );
     h_stack((
         v_stack((
-            caption("Chart"),
-            focusable_dropdown(kind, ChartKind::ALL, ChartKind::label, ring, 10)
+            caption(tr!("chart-caption-kind")),
+            focusable_dropdown(kind, ChartKind::ALL, chart_kind_label, ring, 10)
                 .style(|s| s.width(theme::scaled(140.0))),
         ))
         .style(|s| s.flex_col().gap(theme::scaled(6.0))),
-        v_stack((caption("Values"), value_field)).style(|s| s.flex_col().gap(theme::scaled(6.0))),
+        v_stack((caption(tr!("chart-caption-values")), value_field))
+            .style(|s| s.flex_col().gap(theme::scaled(6.0))),
         label_group,
         // Pushed to the row's right end, and centred on the **dropdowns**
         // rather than the row: under a blank caption, the pickers' own
         // caption and gap, so the row's centring puts the icon's middle on
         // theirs at any UI scale without a measured nudge.
         empty().style(|s| s.flex_grow(1.0_f32)),
-        v_stack((caption(" "), export))
+        v_stack((caption(" ".to_string()), export))
             .style(|s| s.flex_col().items_center().gap(theme::scaled(6.0))),
     ))
     .style(|s| s.gap(theme::scaled(16.0)).items_center().width_full())
@@ -460,11 +479,11 @@ fn chart_body(
             .into_any()
     };
     let Some(v) = value else {
-        return note("No column of numbers to chart in this result.".to_string());
+        return note(tr!("chart-no-numbers"));
     };
     let (drawn, skipped) = Plot::of(rs, kind, v, label);
     if drawn.is_empty() {
-        return note("Every value in that column is NULL.".to_string());
+        return note(tr!("chart-all-null"));
     }
     // Said, where the canvas would otherwise paint nothing.
     if let Some(why) = drawn.undrawable() {
@@ -596,6 +615,14 @@ fn measure(text: &str, size: f32) -> (f64, f64) {
 mod tests {
     use super::*;
     use schemaic_core::chart::Series;
+
+    /// English names each chart kind as core's `ChartKind::label` does.
+    #[test]
+    fn english_names_every_chart_kind_as_core_does() {
+        for kind in ChartKind::ALL {
+            assert_eq!(chart_kind_label(kind), kind.label(), "{kind:?}");
+        }
+    }
 
     fn bars() -> Plot {
         Plot::Series(

@@ -31,6 +31,7 @@ use floem::reactive::create_effect;
 
 use schemaic_core::ddl::{self, ViewDraft};
 
+use crate::i18n::tr;
 use crate::settings::focusable_toggle_row;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, loaded_table};
 use crate::widgets::{
@@ -290,11 +291,12 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
 
     // No "In {database}" row: the modal title names the place now.
     let name = form_setting(
-        "Name",
+        tr!("view-editor-name"),
         bound_field(
             d,
             draft.name.clone(),
             FieldCfg {
+                // An identifier's shape, not a word: never translated.
                 placeholder: "view_name",
                 focus: Some((ring.clone(), 10)),
                 ..Default::default()
@@ -310,7 +312,7 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
     // DDL preview shows SQL in, so it reads and selects like every other SQL
     // surface here.
     let body = form_setting(
-        "SELECT statement",
+        tr!("view-editor-select"),
         bound_field(
             d,
             draft.select.clone(),
@@ -341,7 +343,7 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     } else {
         form_setting(
-            "Check option",
+            tr!("view-editor-check-option"),
             bound_choice(
                 d,
                 draft.options.check_option.clone().unwrap_or_default(),
@@ -365,12 +367,12 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     } else {
         form_setting(
-            "Column names",
+            tr!("view-editor-column-names"),
             bound_field(
                 d,
                 draft.options.column_list.clone().unwrap_or_default(),
                 FieldCfg {
-                    placeholder: "optional — taken from the SELECT when empty",
+                    placeholder_of: Some(Rc::new(|| tr!("view-editor-column-names-placeholder"))),
                     focus: Some((ring.clone(), 30)),
                     mono: true,
                     ..Default::default()
@@ -396,7 +398,7 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
         crate::widgets::nothing()
     } else {
         let security = form_setting(
-            "SQL security",
+            tr!("view-editor-sql-security"),
             bound_choice(
                 d,
                 draft.options.security.clone().unwrap_or_default(),
@@ -413,7 +415,7 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
         // privileged operation, and the reason it's here at all is that the
         // emitted statement restates it.
         let definer = form_setting_owned(
-            "Definer".to_string(),
+            tr!("view-editor-definer"),
             text(draft.options.definer.clone().unwrap_or_else(|| "—".into()))
                 .style(|s| s.color(theme::text_dim()).font_size(theme::font_body())),
         );
@@ -436,10 +438,8 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
             v
         });
         focusable_toggle_row(
-            "Re-create instead of replacing",
-            "PostgreSQL can only add columns to an existing view. Renaming, retyping or \
-             reordering one needs a DROP and a CREATE, which takes dependent views and \
-             grants with it.",
+            tr!("view-editor-recreate"),
+            tr!("view-editor-recreate-hint"),
             sig,
             ring,
             50,
@@ -448,11 +448,13 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
     };
 
     v_stack((
-        form_section("View"),
+        form_section(tr!("view-editor-section-view")),
         name,
-        form_section("Definition").style(|s| s.margin_top(theme::scaled(4.0))),
+        form_section(tr!("view-editor-section-definition"))
+            .style(|s| s.margin_top(theme::scaled(4.0))),
         body,
-        form_section("Options").style(|s| s.margin_top(theme::scaled(4.0))),
+        form_section(tr!("view-editor-section-options"))
+            .style(|s| s.margin_top(theme::scaled(4.0))),
         check,
         column_names,
         mysql_only,
@@ -523,14 +525,17 @@ pub(crate) fn view_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
                 return empty().into_any();
             };
             let title = match &target.current {
-                Some(t) => format!(
-                    "Edit view {}.{}",
-                    object_location(&target.database, t.schema.as_deref()),
-                    t.name
+                Some(t) => tr!(
+                    "view-editor-title-edit",
+                    view = format!(
+                        "{}.{}",
+                        object_location(&target.database, t.schema.as_deref()),
+                        t.name
+                    )
                 ),
-                None => format!(
-                    "Create view in {}",
-                    object_location(&target.database, target.schema.as_deref())
+                None => tr!(
+                    "view-editor-title-create",
+                    location = object_location(&target.database, target.schema.as_deref())
                 ),
             };
 
@@ -573,19 +578,15 @@ pub(crate) fn view_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
                         return crate::widgets::footer_error(first.clone());
                     }
                     let n = change_set(&status_target, &draft).len();
-                    text(match n {
-                        0 => "No changes".to_string(),
-                        1 => "1 change".to_string(),
-                        n => format!("{n} changes"),
-                    })
-                    .style(move |s| {
-                        s.font_size(theme::font_label()).color(if n == 0 {
-                            theme::text_faint()
-                        } else {
-                            theme::change_count()
+                    text(tr!("editor-change-count", n = n))
+                        .style(move |s| {
+                            s.font_size(theme::font_label()).color(if n == 0 {
+                                theme::text_faint()
+                            } else {
+                                theme::change_count()
+                            })
                         })
-                    })
-                    .into_any()
+                        .into_any()
                 },
             );
 
@@ -604,7 +605,7 @@ pub(crate) fn view_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
                     let ready = draft.validate(target.dialect).is_empty() && !cs.is_empty();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -612,7 +613,7 @@ pub(crate) fn view_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,

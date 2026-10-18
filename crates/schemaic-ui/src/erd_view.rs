@@ -816,7 +816,7 @@ pub(crate) fn hex(c: floem::peniko::Color) -> String {
 /// here, so the dialog and the reading of the outcome are one decision.
 pub(crate) fn save_document(
     doc: crate::ErdDoc,
-    dialog_title: &'static str,
+    dialog_title: &str,
     default_name: String,
     fmt: erd_export::ErdExportFormat,
     export: crate::ErdExportFn,

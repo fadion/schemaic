@@ -351,6 +351,37 @@ mod tests {
         assert_eq!(de.get("kind-group-procedure"), "Prozeduren");
     }
 
+    /// **Plurals that replaced a `match` or a `text::plural` read as before**,
+    /// for the editors and panels whose files hold no tests of their own: the
+    /// schema editors' change count (`[0]` included — "No changes"), the
+    /// properties panel's structure counts, and its vacuum note.
+    #[test]
+    fn the_shared_counts_read_as_they_did() {
+        use schemaic_core::text::plural;
+        assert_eq!(tr!("editor-change-count", n = 0), "No changes");
+        assert_eq!(tr!("editor-change-count", n = 1), "1 change");
+        assert_eq!(tr!("editor-change-count", n = 7), "7 changes");
+        for n in [1usize, 2, 30] {
+            assert_eq!(
+                tr!("props-count-columns", n = n),
+                format!("{n} {}", plural(n, "column", "columns"))
+            );
+            assert_eq!(
+                tr!("props-count-indexes", n = n),
+                format!("{n} {}", plural(n, "index", "indexes"))
+            );
+            assert_eq!(
+                tr!("props-count-keys", n = n),
+                format!("{n} {}", plural(n, "key", "keys"))
+            );
+        }
+        assert_eq!(
+            tr!("props-vacuum-note", pct = "23"),
+            "23% of this table's row versions are dead and not yet reclaimed. A VACUUM \
+             would return that space."
+        );
+    }
+
     #[test]
     fn pseudo_leaves_whitespace_alone() {
         assert_eq!(pseudo(" "), " ");

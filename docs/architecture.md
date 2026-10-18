@@ -24578,7 +24578,8 @@ existing prose was left alone.
     Also the **shared modal form chrome** every modal wears — `form_setting`/`form_section`/
     `form_separator`/`form_gap()`/`control_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
-    than copying them a third time. `field_button` is `control_button` with no vertical padding,
+    than copying them a third time. `form_setting` and `form_section` take `impl Into<String>` and
+    hand it to their `_owned` siblings, so a `tr!` label passes as readily as a literal. `field_button` is `control_button` with no vertical padding,
     for `FieldCfg::button` (under `lib.rs`), which stretches it to the field's height; both go
     through a private `control_button_padded`. Every control button centres its label both ways
     (`items_center().justify_center()`) — nothing at its natural size, and what keeps the label
@@ -24703,7 +24704,7 @@ existing prose was left alone.
     reason every other length here is: one resolved at build freezes at the scale it was built at.
     `fact_section_owned` is `fact_section` under a heading built at run time — the *Used by* modal's
     *"Views (3)"*, where the count is the heading — and `fact_section` delegates to it, so there is
-    still one section view.
+    still one section view; its title is `impl Into<String>`, for the properties panel's `tr!` headings.
     Also the right-hand panels' shared list chrome — `panel_search`, `panel_group_header` (a band's
     title and count; its colour and border rulings are on the function) and **`banded_list`, which
     makes those bands sticky**: the band under the top edge keeps its header pinned while its rows
@@ -26818,6 +26819,12 @@ existing prose was left alone.
       emptiness check leaves it out for a table that is neither.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
+    - **The panel's own words are the catalogue's** (`props-*`, roadmap phase 3), so `section`,
+      `section_with_gap`, `detail` and `swatch` take a `String`. The structure counts are Fluent
+      plurals and the vacuum note a message, its percentage rounded with `{pct:.0}` before it
+      reaches Fluent, which would otherwise print the fraction (`the_shared_counts_read_as_they_did`
+      holds both to the old English). What core words stays English until phase 4: `row_caption`,
+      `stats::index_facts`, the freshness notes and the copied Markdown.
   - `used_by_view.rs` — the **Used by** modal (`used_by_overlay`), over `core::used_by`, opened by
     setting `overlay.used_by` to a `UsedByTarget { database, schema, name, column, routine }`
     (re-exported as `schemaic_ui::UsedByTarget`; the app creates the signal beside `properties`)
@@ -26938,6 +26945,13 @@ existing prose was left alone.
     chart it was said of**: an effect over `kind`, `value` and `label` clears it when a picker
     changes — skipping its first run, which is the build, not a change — or *"Nothing to save."*
     would stand, as a failure does, over a column that can now be saved.
+    **Its own words are the catalogue's** (`chart-*`, roadmap phase 3), **Close** `dialog-close`,
+    and the kinds `chart_kind_label(ChartKind)` (the core-words rule under *UI conventions*). *Row
+    number* is `row_number()`, a message where it was the constant `ROW_NUMBER`, and it is a
+    **value as well as a label**: the picker hands back the text it shows, so a pick is compared
+    with `row_number()`, and `picker_labels` reserves it, so the entry, the comparison and the name
+    a same-named column steps aside for are all one language. `chart::caption` and
+    `Plot::undrawable` are core's prose and stay English until phase 4.
     Mounted in the workspace group directly after `used_by_overlay`, counted by
     `workspace_modals_up` as a plain term (`chart_open`) — it raises nothing — and on
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
@@ -28074,6 +28088,13 @@ existing prose was left alone.
     covered by nothing here. The four doors are called from `overlays.rs` (the tree's Edit view and Create ▸
     View), `properties.rs` (the properties modal's Edit) and `lib.rs`'s `create_view` callback (the
     editor's *Create view from this query*).
+    **Its words are the catalogue's** (`view-editor-*`, roadmap phase 3) — labels, sections, the
+    column-names placeholder, the re-create toggle and its hint, both titles — with **Cancel**
+    `dialog-cancel` and the footer's other two named for no one editor, though this is their only
+    caller so far: `editor-preview-sql` and `editor-change-count`, whose `[0]` case is *No changes*
+    (`the_shared_counts_read_as_they_did` pins 0, 1 and 7). The `view_name` and `SELECT …`
+    placeholders and the `CASCADED`/`LOCAL`/`DEFINER`/`INVOKER` choices are SQL and stay;
+    `ViewDraft::validate`'s errors are core's prose, phase 4.
   - `ui/window_chrome.rs` — the client-side window decorations: the caption buttons (minimize /
     maximize-restore / close), the drag strip, and the eight resize zones. Draws what
     `core::window_chrome::Chrome` decides, and contains no `cfg!(target_os = …)` of its own.
@@ -31257,7 +31278,8 @@ existing prose was left alone.
     nothing to cancel, so `export_erd` reports `Done(0)` and never `Cancelled`. The save dialog and
     that handler are one function, `save_document(doc, dialog_title, default_name, fmt, export,
     say)` — `pub(crate)` because the *Chart* modal's save calls it too, titled *"Save chart"* where
-    the diagram's `save` passes *"Export diagram"* — so the two modals read an outcome by one
+    the diagram's `save` passes *"Export diagram"*, the title a `&str` so the chart's translated
+    one passes — so the two modals read an outcome by one
     decision: `Done` says *"Saved {name}"*, `Cancelled` nothing, `Failed` its message as a failure.
     The handler still **spells all three arms out**, the way `monitor_view::save_log` spells its own and for the
     reason that call site gives — the arm is unreachable today, but the rasterise it wraps is one
@@ -39858,7 +39880,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`settings.rs`), the shortcut table it draws (`shortcuts.rs`), the popups of `overlays.rs` and
   the schema panel (`schema_tree.rs`), Query History (`history_panel.rs`), the snippet library
   (`snippet_panel.rs`), the tab strip's menu and tooltip (`tabs.rs`), Server Activity
-  (`activity_panel.rs`) and the AI Assistant panel (`ai_panel.rs`) are converted; every other
+  (`activity_panel.rs`), the AI Assistant panel (`ai_panel.rs`), the Chart modal
+  (`chart_view.rs`), the view editor (`view_editor.rs`) and the properties panel (`properties.rs`)
+  are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -39878,11 +39902,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     by message.
   - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
     core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
-    `history_panel::bucket_title` for `history::Bucket::label`, and `activity_panel::kill_label`
-    for `activity::KillKind::label` —
+    `history_panel::bucket_title` for `history::Bucket::label`, `activity_panel::kill_label`
+    for `activity::KillKind::label`, and `chart_view::chart_kind_label` for `chart::ChartKind::label` —
     with a test holding its English equal to core's for every variant
     (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`,
-    `english_names_every_kill_as_core_does`).
+    `english_names_every_kill_as_core_does`, `english_names_every_chart_kind_as_core_does`).
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.

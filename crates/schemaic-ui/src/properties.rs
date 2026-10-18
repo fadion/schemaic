@@ -31,8 +31,8 @@ use floem::reactive::create_effect;
 use schemaic_core::schema::TableInfo;
 use schemaic_core::stats;
 use schemaic_core::stats::{IndexStats, RowCount, TableStats, format_bytes};
-use schemaic_core::text::plural;
 
+use crate::i18n::tr;
 use crate::theme::{font_body, font_hint, font_label};
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, dismiss_layer,
@@ -217,7 +217,7 @@ pub(crate) fn properties_overlay(ctx: PropertiesCtx) -> impl IntoView {
                 .style(|s| s.width_full().flex_col())
             };
             let title = modal_title_owned(
-                format!("Properties — {}", t.display()),
+                tr!("props-title", table = t.display()),
                 close.clone(),
                 ring.clone(),
             );
@@ -276,7 +276,7 @@ fn stats_body(
     let sections: Vec<AnyView> = match state {
         PropertiesState::Loading => {
             return container(loading_dots(
-                "Reading statistics",
+                tr!("props-reading"),
                 theme::text_dim,
                 font_body,
             ))
@@ -309,11 +309,9 @@ fn stats_body(
                 icons::CIRCLE_QUESTION,
                 theme::text_dim,
                 if target.is_view {
-                    "A view has no storage of its own, so the server reports no \
-                     statistics for it."
-                        .to_string()
+                    tr!("props-no-stats-view")
                 } else {
-                    "The server reported no statistics for this table.".to_string()
+                    tr!("props-no-stats-table")
                 },
             )),
             structure_section(target, info),
@@ -374,7 +372,7 @@ fn headline(stats: &TableStats) -> AnyView {
             .total_bytes()
             .map(format_bytes)
             .unwrap_or_else(|| "—".to_string()),
-        "on disk".to_string(),
+        tr!("props-on-disk"),
     );
     h_stack((row_tile, size_tile))
         .style(|s| s.width_full().gap(theme::scaled(28.0)))
@@ -432,8 +430,8 @@ fn count_row(
         let stop = ctx.count_cancel.clone();
         let press = stop.clone();
         let face = h_stack((
-            loading_dots("Counting", theme::text_dim, font_label),
-            text("Cancel").style(|s| {
+            loading_dots(tr!("props-counting"), theme::text_dim, font_label),
+            text(tr!("dialog-cancel")).style(|s| {
                 s.font_size(font_label())
                     .color(theme::text_dim())
                     .padding_horiz(theme::scaled(8.0))
@@ -467,7 +465,7 @@ fn count_row(
         let clicked = press.clone();
         let face = h_stack((
             icons::icon(icons::HASH, 14.0).style(|s| s.flex_shrink(0.0_f32)),
-            text("Count rows").style(|s| s.font_size(font_label())),
+            text(tr!("props-count-rows")).style(|s| s.font_size(font_label())),
         ))
         .style(|s| {
             s.items_center()
@@ -499,7 +497,7 @@ fn count_row(
         ),
         // The warning belongs *before* the press, not after.
         Some(stats::CountHint::Slow) => Some(
-            text("A full scan of the table. Slow on a large one.")
+            text(tr!("props-count-slow"))
                 .style(|s| s.font_size(font_body()).color(theme::text_faint()))
                 .into_any(),
         ),
@@ -541,14 +539,22 @@ fn storage_section(stats: &TableStats) -> Option<AnyView> {
     .clip();
 
     let mut legend: Vec<AnyView> = vec![
-        swatch(theme::accent, "Data", stats.data_bytes),
-        swatch(theme::key_index, "Indexes", stats.index_bytes),
+        swatch(theme::accent, tr!("props-storage-data"), stats.data_bytes),
+        swatch(
+            theme::key_index,
+            tr!("props-storage-indexes"),
+            stats.index_bytes,
+        ),
     ];
     // Free space is MySQL's `DATA_FREE`, and it is only worth a legend entry when
     // there is some — the threshold is the model's (`shows_free`), shared with the
     // copied Markdown.
     if stats.shows_free() {
-        legend.push(swatch(theme::border, "Free", stats.free_bytes));
+        legend.push(swatch(
+            theme::border,
+            tr!("props-storage-free"),
+            stats.free_bytes,
+        ));
     }
 
     Some(
@@ -571,7 +577,7 @@ fn storage_section(stats: &TableStats) -> Option<AnyView> {
 }
 
 /// One legend entry: a colour chip, a name, and the figure it stands for.
-fn swatch(color: fn() -> Color, label: &'static str, bytes: Option<u64>) -> AnyView {
+fn swatch(color: fn() -> Color, label: String, bytes: Option<u64>) -> AnyView {
     h_stack((
         empty().style(move |s| {
             s.width(theme::scaled(9.0))
@@ -595,28 +601,32 @@ fn structure_section(target: &PropertiesTarget, info: Option<&TableInfo>) -> Opt
     let mut rows: Vec<AnyView> = Vec::new();
     let n = info.columns.len();
     rows.push(detail(
-        "Columns",
-        format!("{n} {}", plural(n, "column", "columns")),
+        tr!("props-columns"),
+        tr!("props-count-columns", n = n),
     ));
     let n = info.indexes.len();
     if n > 0 {
         rows.push(detail(
-            "Indexes",
-            format!("{n} {}", plural(n, "index", "indexes")),
+            tr!("props-indexes"),
+            tr!("props-count-indexes", n = n),
         ));
     }
     let n = info.foreign_keys.len();
     if n > 0 {
         rows.push(detail(
-            "Foreign keys",
-            format!("{n} {}", plural(n, "key", "keys")),
+            tr!("props-foreign-keys"),
+            tr!("props-count-keys", n = n),
         ));
     }
     rows.push(detail(
-        "Type",
-        if target.is_view { "View" } else { "Table" }.to_string(),
+        tr!("props-type"),
+        if target.is_view {
+            tr!("props-type-view")
+        } else {
+            tr!("props-type-table")
+        },
     ));
-    Some(section("Structure", rows))
+    Some(section(tr!("props-section-structure"), rows))
 }
 
 /// The table options the engine reports back — read here, edited in the
@@ -624,30 +634,33 @@ fn structure_section(target: &PropertiesTarget, info: Option<&TableInfo>) -> Opt
 fn options_section(stats: &TableStats, info: Option<&TableInfo>) -> Option<AnyView> {
     let mut rows: Vec<AnyView> = Vec::new();
     if let Some(e) = &stats.engine {
-        rows.push(detail("Engine", e.clone()));
+        rows.push(detail(tr!("props-engine"), e.clone()));
     }
     if let Some(f) = &stats.row_format {
-        rows.push(detail("Row format", f.clone()));
+        rows.push(detail(tr!("props-row-format"), f.clone()));
     }
     if let Some(c) = info.and_then(|i| i.collation.clone()) {
-        rows.push(detail("Collation", c));
+        rows.push(detail(tr!("props-collation"), c));
     }
     if let Some(a) = stats.auto_increment {
-        rows.push(detail("Next auto-increment", RowCount::Exact(a).label()));
+        rows.push(detail(
+            tr!("props-next-auto-increment"),
+            RowCount::Exact(a).label(),
+        ));
     }
     if let Some(c) = &stats.created {
-        rows.push(detail("Created", c.clone()));
+        rows.push(detail(tr!("props-created"), c.clone()));
     }
     if let Some(u) = &stats.updated {
-        rows.push(detail("Updated", u.clone()));
+        rows.push(detail(tr!("props-updated"), u.clone()));
     }
     if let Some(c) = info.and_then(|i| i.comment.clone()) {
-        rows.push(detail("Comment", c));
+        rows.push(detail(tr!("props-comment"), c));
     }
     if rows.is_empty() {
         return None;
     }
-    Some(section("Options", rows))
+    Some(section(tr!("props-section-options"), rows))
 }
 
 /// How the table is partitioned, or which table it is a partition of
@@ -662,7 +675,7 @@ fn partition_section(info: Option<&TableInfo>) -> Option<AnyView> {
         .into_iter()
         .map(|(label, value)| crate::widgets::fact_row(label, value, label_w))
         .collect();
-    Some(section("Partitioning", rows))
+    Some(section(tr!("props-section-partitioning"), rows))
 }
 
 /// How many partitions the panel names before it says how many more there are.
@@ -678,10 +691,8 @@ fn vacuum_note(stats: &TableStats) -> Option<AnyView> {
     Some(note_line(
         icons::TRIANGLE_ALERT,
         theme::plan_warn,
-        format!(
-            "{pct:.0}% of this table's row versions are dead and not yet reclaimed. \
-             A VACUUM would return that space."
-        ),
+        // Rounded here, as `{pct:.0}` did: Fluent would print the fraction.
+        tr!("props-vacuum-note", pct = format!("{pct:.0}")),
     ))
 }
 
@@ -695,7 +706,11 @@ fn index_section(stats: &TableStats) -> Option<AnyView> {
     // Looser than the detail lists above it: an index row is a name plus a run of
     // facts (and sometimes a second line under it), so at the shared 4px the rows
     // ran together into one block instead of reading as a list.
-    Some(section_with_gap("Indexes", rows, index_row_gap))
+    Some(section_with_gap(
+        tr!("props-section-indexes"),
+        rows,
+        index_row_gap,
+    ))
 }
 
 fn index_row(idx: &IndexStats) -> AnyView {
@@ -775,19 +790,19 @@ fn freshness_note(stats: &TableStats) -> Option<AnyView> {
 /// **General** in Settings rather than inventing a third heading style.
 /// This panel's rows at its own gap — see [`crate::widgets::fact_section`],
 /// which is the shared view and where the reasoning lives.
-fn section(title: &'static str, rows: Vec<AnyView>) -> AnyView {
+fn section(title: String, rows: Vec<AnyView>) -> AnyView {
     section_with_gap(title, rows, row_gap)
 }
 
 /// [`section`] for a group whose rows need more air than the shared [`row_gap()`]
 /// — the index list, whose rows are taller and less uniform than a detail list's.
-fn section_with_gap(title: &'static str, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
+fn section_with_gap(title: String, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
     crate::widgets::fact_section(title, rows, gap)
 }
 
 /// One `label: value` row of a section, at this panel's label column.
-fn detail(label: &'static str, value: String) -> AnyView {
-    crate::widgets::fact_row(label.to_string(), value, label_w)
+fn detail(label: String, value: String) -> AnyView {
+    crate::widgets::fact_row(label, value, label_w)
 }
 
 /// An icon-led sentence — a caveat, a warning, or an engine's limitation.
@@ -869,7 +884,7 @@ fn footer(
     let done = close.clone();
     modal_footer_split(
         action_button(
-            "Copy",
+            tr!("props-copy"),
             ActionKind::Quiet,
             true,
             ring.clone(),
@@ -878,7 +893,11 @@ fn footer(
         ),
         h_stack((
             action_button(
-                if is_view { "Edit view" } else { "Edit table" },
+                if is_view {
+                    tr!("tree-edit-view")
+                } else {
+                    tr!("tree-edit-table")
+                },
                 ActionKind::Neutral,
                 can_edit,
                 ring.clone(),
@@ -886,7 +905,7 @@ fn footer(
                 edit,
             ),
             action_button(
-                "Close",
+                tr!("dialog-close"),
                 ActionKind::Primary,
                 true,
                 ring,

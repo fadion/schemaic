@@ -603,3 +603,105 @@ ai-input-db-down = Not connected to the database
 ai-speaker-you = YOU
 # After a tool result cut to its first lines; $n is how many were cut.
 ai-result-more-lines = … (+{ $n } more lines)
+
+## Shared dialog buttons (continued)
+
+dialog-close = Close
+
+## Chart modal
+
+# $tab is the result's tab title.
+chart-title = Chart — { $tab }
+chart-caption-kind = Chart
+chart-caption-values = Values
+chart-caption-labels = Labels
+# The label picker's entry for "no column — number the rows".
+chart-row-number = Row number
+# ChartKind's words, as core's label names them.
+chart-kind-bar = Bar
+chart-kind-line = Line
+chart-kind-histogram = Histogram
+chart-save-tip = Save the chart…
+chart-save-dialog = Save chart
+# The saved file's suggested name, before its extension.
+chart-file-stem = { $name } chart
+chart-nothing-to-save = Nothing to save.
+chart-no-numbers = No column of numbers to chart in this result.
+chart-all-null = Every value in that column is NULL.
+
+## Schema editors — shared
+
+editor-preview-sql = Preview SQL
+# The footer's count of what the draft would change.
+editor-change-count = { $n ->
+    [0] No changes
+    [one] 1 change
+   *[other] { $n } changes
+}
+
+## View editor
+
+# $view is database.schema.view (or database.view).
+view-editor-title-edit = Edit view { $view }
+# $location is the database, or database.schema.
+view-editor-title-create = Create view in { $location }
+view-editor-section-view = View
+view-editor-section-definition = Definition
+view-editor-section-options = Options
+view-editor-name = Name
+view-editor-select = SELECT statement
+view-editor-check-option = Check option
+view-editor-column-names = Column names
+view-editor-column-names-placeholder = optional — taken from the SELECT when empty
+view-editor-sql-security = SQL security
+view-editor-definer = Definer
+view-editor-recreate = Re-create instead of replacing
+view-editor-recreate-hint = PostgreSQL can only add columns to an existing view. Renaming, retyping or reordering one needs a DROP and a CREATE, which takes dependent views and grants with it.
+
+## Table properties panel
+
+# $table is the table's display name.
+props-title = Properties — { $table }
+props-reading = Reading statistics
+props-no-stats-view = A view has no storage of its own, so the server reports no statistics for it.
+props-no-stats-table = The server reported no statistics for this table.
+# Under the size figure.
+props-on-disk = on disk
+props-counting = Counting
+props-count-rows = Count rows
+props-count-slow = A full scan of the table. Slow on a large one.
+props-storage-data = Data
+props-storage-indexes = Indexes
+props-storage-free = Free
+props-section-structure = Structure
+props-columns = Columns
+props-indexes = Indexes
+props-foreign-keys = Foreign keys
+props-count-columns = { $n ->
+    [one] { $n } column
+   *[other] { $n } columns
+}
+props-count-indexes = { $n ->
+    [one] { $n } index
+   *[other] { $n } indexes
+}
+props-count-keys = { $n ->
+    [one] { $n } key
+   *[other] { $n } keys
+}
+props-type = Type
+props-type-view = View
+props-type-table = Table
+props-section-options = Options
+props-engine = Engine
+props-row-format = Row format
+props-collation = Collation
+props-next-auto-increment = Next auto-increment
+props-created = Created
+props-updated = Updated
+props-comment = Comment
+props-section-partitioning = Partitioning
+props-section-indexes = Indexes
+# $pct is a whole-number percentage. VACUUM is a SQL keyword.
+props-vacuum-note = { $pct }% of this table's row versions are dead and not yet reclaimed. A VACUUM would return that space.
+props-copy = Copy

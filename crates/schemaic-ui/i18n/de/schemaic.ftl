@@ -558,3 +558,95 @@ ai-input-off = Der KI-Assistent ist aus
 ai-input-db-down = Nicht mit der Datenbank verbunden
 ai-speaker-you = DU
 ai-result-more-lines = … (+{ $n } weitere Zeilen)
+
+## Shared dialog buttons (continued)
+
+dialog-close = Schließen
+
+## Chart modal
+
+chart-title = Diagramm – { $tab }
+chart-caption-kind = Diagramm
+chart-caption-values = Werte
+chart-caption-labels = Beschriftungen
+chart-row-number = Zeilennummer
+chart-kind-bar = Balken
+chart-kind-line = Linie
+chart-kind-histogram = Histogramm
+chart-save-tip = Diagramm speichern…
+chart-save-dialog = Diagramm speichern
+chart-file-stem = { $name } Diagramm
+chart-nothing-to-save = Nichts zu speichern.
+chart-no-numbers = In diesem Ergebnis gibt es keine Zahlenspalte für ein Diagramm.
+chart-all-null = Jeder Wert dieser Spalte ist NULL.
+
+## Schema editors — shared
+
+editor-preview-sql = SQL-Vorschau
+editor-change-count = { $n ->
+    [0] Keine Änderungen
+    [one] 1 Änderung
+   *[other] { $n } Änderungen
+}
+
+## View editor
+
+view-editor-title-edit = Sicht { $view } bearbeiten
+view-editor-title-create = Sicht in { $location } erstellen
+view-editor-section-view = Sicht
+view-editor-section-definition = Definition
+view-editor-section-options = Optionen
+view-editor-name = Name
+view-editor-select = SELECT-Anweisung
+view-editor-check-option = Check-Option
+view-editor-column-names = Spaltennamen
+view-editor-column-names-placeholder = optional – aus dem SELECT übernommen, wenn leer
+view-editor-sql-security = SQL-Sicherheit
+view-editor-definer = Definer
+view-editor-recreate = Neu erstellen statt ersetzen
+view-editor-recreate-hint = PostgreSQL kann einer bestehenden Sicht nur Spalten hinzufügen. Eine umzubenennen, ihren Typ zu ändern oder sie umzuordnen braucht ein DROP und ein CREATE, das abhängige Sichten und Rechte mitnimmt.
+
+## Table properties panel
+
+props-title = Eigenschaften – { $table }
+props-reading = Statistiken werden gelesen
+props-no-stats-view = Eine Sicht hat keinen eigenen Speicher, daher meldet der Server keine Statistiken für sie.
+props-no-stats-table = Der Server hat für diese Tabelle keine Statistiken gemeldet.
+props-on-disk = auf der Festplatte
+props-counting = Wird gezählt
+props-count-rows = Zeilen zählen
+props-count-slow = Ein vollständiger Durchlauf der Tabelle. Bei einer großen langsam.
+props-storage-data = Daten
+props-storage-indexes = Indizes
+props-storage-free = Frei
+props-section-structure = Struktur
+props-columns = Spalten
+props-indexes = Indizes
+props-foreign-keys = Fremdschlüssel
+props-count-columns = { $n ->
+    [one] { $n } Spalte
+   *[other] { $n } Spalten
+}
+props-count-indexes = { $n ->
+    [one] { $n } Index
+   *[other] { $n } Indizes
+}
+props-count-keys = { $n ->
+    [one] { $n } Schlüssel
+   *[other] { $n } Schlüssel
+}
+props-type = Typ
+props-type-view = Sicht
+props-type-table = Tabelle
+props-section-options = Optionen
+props-engine = Engine
+props-row-format = Zeilenformat
+props-collation = Sortierung
+props-next-auto-increment = Nächster Auto-Increment
+props-created = Erstellt
+props-updated = Aktualisiert
+props-comment = Kommentar
+props-section-partitioning = Partitionierung
+props-section-indexes = Indizes
+props-vacuum-note = { $pct } % der Zeilenversionen dieser Tabelle sind tot und noch nicht freigegeben. Ein VACUUM würde diesen Platz zurückgeben.
+props-copy = Kopieren

@@ -1920,8 +1920,11 @@ pub(crate) fn segmented_tabs<L: Into<String>, T: Copy + PartialEq + 'static>(
 }
 
 /// A labelled control: caption above, control below.
-pub(crate) fn form_setting(label: &'static str, control: impl IntoView + 'static) -> impl IntoView {
-    form_setting_owned(label.to_string(), control)
+pub(crate) fn form_setting(
+    label: impl Into<String>,
+    control: impl IntoView + 'static,
+) -> impl IntoView {
+    form_setting_owned(label.into(), control)
 }
 
 /// [`form_setting`] for a caption that isn't known at compile time.
@@ -1931,8 +1934,8 @@ pub(crate) fn form_setting_owned(label: String, control: impl IntoView + 'static
 }
 
 /// A small bold section heading.
-pub(crate) fn form_section(label: &'static str) -> impl IntoView {
-    form_section_owned(label.to_string())
+pub(crate) fn form_section(label: impl Into<String>) -> impl IntoView {
+    form_section_owned(label.into())
 }
 
 /// [`form_section`] for a heading that isn't known at compile time — the DDL
@@ -1955,8 +1958,12 @@ pub(crate) fn form_section_owned(label: String) -> impl IntoView {
 // on screen to say they had.
 
 /// A heading with its rows under it.
-pub(crate) fn fact_section(title: &'static str, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
-    fact_section_owned(title.to_string(), rows, gap)
+pub(crate) fn fact_section(
+    title: impl Into<String>,
+    rows: Vec<AnyView>,
+    gap: fn() -> f64,
+) -> AnyView {
+    fact_section_owned(title.into(), rows, gap)
 }
 
 /// [`fact_section`] under a heading built at run time — *Used by*'s

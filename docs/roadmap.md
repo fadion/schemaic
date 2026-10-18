@@ -78,7 +78,9 @@ assertions pin English wording — stays the regression net throughout.
    loader.
 
    **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`, `schema_tree.rs`,
-   `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`, `activity_panel.rs`, `ai_panel.rs`. The
+   `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`, `activity_panel.rs`, `ai_panel.rs`,
+   `chart_view.rs`, `view_editor.rs`, `properties.rs`. The schema editors share
+   `editor-preview-sql` and `editor-change-count`, and `dialog-close` joins the dialog words. The
    activity panel's counts line ("18 sessions · 4 running") and its session-state words stay
    core's English with phase 4: the total is core's `ActivitySummary::total_label`, and the
    state word is also what the search box matches. A palette
@@ -116,8 +118,9 @@ assertions pin English wording — stays the regression net throughout.
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
-   `ObjectKind`, `history::Bucket` (`history_panel::bucket_title`) and `activity::KillKind`
-   (`activity_panel::kill_label`); `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
+   `ObjectKind`, `history::Bucket` (`history_panel::bucket_title`), `activity::KillKind`
+   (`activity_panel::kill_label`) and `chart::ChartKind` (`chart_view::chart_kind_label`);
+   `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
    like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
