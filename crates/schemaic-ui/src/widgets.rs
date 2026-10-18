@@ -2553,12 +2553,13 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
 /// any key. The question dialogs' `dialog_button` (gone with GitHub #25) called
 /// itself the last ring-less button family in the app; it was not.
 pub(crate) fn sparkle_action(
-    label: &'static str,
+    label: impl Into<String>,
     color: fn() -> floem::peniko::Color,
     hover: fn() -> floem::peniko::Color,
     ring: Option<(FocusRing, u32)>,
     on_click: impl Fn() + 'static,
 ) -> AnyView {
+    let label: String = label.into();
     let face = h_stack((
         icons::icon(icons::SPARKLES, 16.0).style(|s| s.margin_right(theme::scaled(5.0))),
         text(label).style(|s| s.font_size(theme::font_body())),

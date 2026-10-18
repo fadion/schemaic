@@ -14,8 +14,10 @@
 //!
 //! Invariant the caller must uphold: **no argument-command name may be a
 //! word-prefix of another** (e.g. `indent style` and `indent width`, but never a
-//! bare `indent` alongside `indent width`). The longest-match below then can't
-//! mis-resolve a name the user is still typing toward.
+//! bare `indent` alongside `indent width`) — across every name passed, which is
+//! a command's translated label and its English name together. The
+//! longest-match below then can't mis-resolve a name the user is still typing
+//! toward.
 
 /// The parse of a search-box query. `Command`/`Filter` only arise in command mode
 /// (a leading `>`); `Search` is the default table search.
@@ -31,39 +33,52 @@ pub enum Parsed {
     Command { name: String, arg: String },
 }
 
-/// Whether `name` is a whole-word prefix of `s` (case-insensitive): either equal,
-/// or `s` continues with a space right after `name`. Both are ASCII.
-fn is_word_prefix(s_lower: &str, name_lower: &str) -> bool {
-    s_lower == name_lower
-        || s_lower
-            .strip_prefix(name_lower)
-            .is_some_and(|rest| rest.starts_with(' '))
+/// What follows `name` in `s` when `name` is a whole-word prefix of it,
+/// case-insensitively: `Some("")` when they are equal, `Some(rest)` when `s`
+/// continues with a space, `None` otherwise.
+///
+/// Compared a character at a time and cut at `s`'s own byte offset, because a
+/// name is a translated label (`größe ändern`) and the input is whatever case
+/// Tab or the user left it in. Lowercasing the whole input first only works for
+/// ASCII — `to_ascii_lowercase` leaves `Ä` alone, and a full `to_lowercase` can
+/// change a string's byte length, so its offsets no longer index `s`.
+fn after_word_prefix<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let mut chars = s.char_indices();
+    for n in name.chars() {
+        let (_, c) = chars.next()?;
+        if !c.to_lowercase().eq(n.to_lowercase()) {
+            return None;
+        }
+    }
+    let rest = chars.next().map_or("", |(at, _)| &s[at..]);
+    (rest.is_empty() || rest.starts_with(' ')).then_some(rest)
 }
 
 /// Parse a search-box `input` given the set of argument-taking command names
-/// (canonical, lowercase, e.g. `"toggle panel"`). Instant commands aren't passed —
-/// they're resolved by the UI's list filtering, not here.
+/// (lowercase, e.g. `"toggle panel"`). A command may be passed under more than
+/// one name — its label in the interface's language and its English one — and
+/// [`Parsed::Command`] carries the name that matched. Instant commands aren't
+/// passed — they're resolved by the UI's list filtering, not here.
 pub fn parse(input: &str, arg_commands: &[&str]) -> Parsed {
     let Some(rest) = input.strip_prefix('>') else {
         return Parsed::Search(input.trim().to_string());
     };
     // Allow "> history" (a space after the sigil) the same as ">history".
     let s = rest.trim_start();
-    let lower = s.to_ascii_lowercase();
     // Longest argument-command whose full name is a word-prefix of the input wins
     // (defensive — the no-nesting invariant means at most one ever matches).
-    let mut best: Option<&str> = None;
+    let mut best: Option<(&str, &str)> = None;
     for &name in arg_commands {
-        if is_word_prefix(&lower, name) && best.is_none_or(|b| name.len() > b.len()) {
-            best = Some(name);
+        if let Some(arg) = after_word_prefix(s, name)
+            && best.is_none_or(|(b, _)| name.chars().count() > b.chars().count())
+        {
+            best = Some((name, arg));
         }
     }
     match best {
-        // `name` matched case-insensitively over ASCII, so its byte length indexes
-        // `s` (original case) at the same boundary.
-        Some(name) => Parsed::Command {
+        Some((name, arg)) => Parsed::Command {
             name: name.to_string(),
-            arg: s[name.len()..].trim_start().to_string(),
+            arg: arg.trim_start().to_string(),
         },
         None => Parsed::Filter(s.to_string()),
     }
@@ -210,6 +225,33 @@ mod tests {
         assert_eq!(
             parse(">clear history", ARGS),
             Parsed::Filter("clear history".into())
+        );
+    }
+
+    /// **A translated name matches whatever its case**, umlauts included: a
+    /// German label Tab-completes as `Größe Ändern`, and the parser compared
+    /// ASCII-lowercased input with the name, which leaves `Ä` as it is.
+    #[test]
+    fn a_name_beyond_ascii_matches_case_insensitively() {
+        let args = &["größe ändern", "verlauf"];
+        assert_eq!(
+            parse(">Größe Ändern 3", args),
+            Parsed::Command {
+                name: "größe ändern".into(),
+                arg: "3".into()
+            }
+        );
+        assert_eq!(
+            parse(">VERLAUF Umsätze", args),
+            Parsed::Command {
+                name: "verlauf".into(),
+                arg: "Umsätze".into()
+            }
+        );
+        // Still a whole word: `größe änderung` is not `größe ändern`.
+        assert_eq!(
+            parse(">größe änderung", args),
+            Parsed::Filter("größe änderung".into())
         );
     }
 

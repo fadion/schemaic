@@ -8740,7 +8740,8 @@ mod read_only_gate {
         // caught this one on its first run.
         let flag = format!("{}_only", "read");
         let icon = format!("let db_cli_btn = {}(", "toolbar_icon");
-        let entry = format!("MenuEntry::action(\"Open in {}\"", "CLI");
+        // By its message id: the label is the catalogue's, in any language.
+        let entry = format!("MenuEntry::action(tr!(\"tree-open-in-{}\")", "cli");
         // **The launch, not the tooltip.** The region has to stop where the
         // launch expression does: with a window measured in bytes, a tip that
         // merely *says* "read-only" beside a button that is still live satisfied

@@ -17628,7 +17628,15 @@ existing prose was left alone.
       `Parsed::{Search,Filter,Command{name,arg}}`. The hard part is when typing stops filtering the
       command list and becomes an argument: longest-word-prefix match against the caller's
       argument-command names, under an invariant the caller must uphold — no argument-command name
-      may be a word-prefix of another (`indent style`/`indent width`, never a bare `indent`).
+      may be a word-prefix of another (`indent style`/`indent width`, never a bare `indent`), across
+      every name passed: a command arrives under its translated label *and* its English name, and
+      `Command { name }` carries whichever spelling matched. The match is a character at a time,
+      case-insensitive, and cut at the **input's** own byte offset (`after_word_prefix`). It used to
+      compare `to_ascii_lowercase`d input with the name and cut at the name's byte length, so a
+      Tab-completed German `>Größe Ändern` never matched — `Ä` is not ASCII — and a full
+      `to_lowercase` would not have fixed it, since lowercasing can change a string's byte length
+      and its offsets would no longer index the input
+      (`a_name_beyond_ascii_matches_case_insensitively`).
     - `resource.rs` — the status bar's CPU/RAM model. `ResourceSample::new` divides `sysinfo`'s
       per-process CPU% (single-core-relative, so it exceeds 100 on a multi-core box) across the
       logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary.
@@ -25536,7 +25544,8 @@ existing prose was left alone.
     let either vouch for the keycap; the
     other half — that each name still names a live command — can only be checked against a built
     registry, so it rides `overlays::assert_names_match_labels`' `debug_assert`, without which a
-    renamed command would drop its keycap in silence.
+    renamed command would drop its keycap in silence. The name it checks is the command's `id`, its
+    English name, never the translated label, so the mapping holds in every language.
     `MenuKey` is the third: the context menus' half of `COMMAND_KEYS`, held to the same rule (which
     entries earn one is under *Popup menus*). It is an **enum rather than a string**, so a menu
     cannot name an entry that is not there, and `MenuKey::row` names its `SHORTCUTS` row by group,
@@ -28471,7 +28480,9 @@ existing prose was left alone.
     test module could not reach it, while its sibling had already been split out after an ordering
     inversion no test could see. `GearEntry` carries a `GearKind` discriminant rather than a bare
     label, for `BlankKind`'s reason: routing on the string with a catch-all arm makes a sixth entry
-    render as a row that does nothing. **Whether a row is *inert* is a second question with a
+    render as a row that does nothing. It now carries no label at all, and neither does
+    `CreateEntry`: `GearKind::label()` and `CreateKind::label()` draw it from the kind, so an entry
+    holds no text a test or a route could key on, and the tests read `e.kind.label()`. **Whether a row is *inert* is a second question with a
     different lifetime, and that is why it is `GearKind::disabled_when(read_only, down)` rather than
     a field `gear_entries` fills.** Which rows exist is settled when the menu opens — the engine's
     capabilities and whether a connection is saved cannot change under a standing menu — but whether
@@ -28971,6 +28982,16 @@ existing prose was left alone.
     table `DROP TABLE` treats it as — and both now ride into the preview's warning through
     `stats::drop_warning`. **Truncate still asks first** (`stats::truncate_prompt`): it is
     not a drop, and it keeps its confirm-then-preview.
+    **Its words are the catalogue's** (phase 3 of the roadmap's *Interface translation*). The
+    context menu and the SCHEMA gear share `tree-*`, so an action both offer cannot be worded two
+    ways; the confirm dialog's buttons are `dialog-cancel`/`dialog-yes`/`dialog-no`, named for no
+    one dialog so other files can take them; and the transaction prompt's body is one message per
+    variant (`tx-prompt-body`, `tx-prompt-body-aborted`) with the statement count's plural inside
+    it, where it was a `1 statement`/`{n} statements` match spliced into a `format!`
+    (`the_transaction_prompt_is_one_sentence_with_its_count` pins the English). Some words reaching
+    these popups are still another module's English: `ObjectKind::label()` inside *Create {kind}*
+    and *Edit {kind}*, `ExportFormat::label`, `activity::interval_label`, the colour presets' names
+    (`lib.rs`'s `CONN_COLOR_PRESETS`) and `stats::truncate_prompt`.
     **A PostgreSQL foreign table is offered what its server takes** (`object_entries` over
     `TableShape::ForeignTable`): its Drop, which `object_drop_change` makes `DROP FOREIGN TABLE`;
     not Edit table, since the designer's keys and indexes are refused on one (*cannot create index
@@ -29022,6 +29043,23 @@ existing prose was left alone.
     entry on the active connection — which removes the entry and saves the ring. It is scoped to
     the active connection for the shortcut's reason: the strip shows only that connection's tabs,
     so reopening another's would restore it out of sight.
+    **A palette command answers to two names, its label's and its English one.** `Command` is
+    `{ id, label, hint, arg }`: `label` and `hint` are translated `String`s from the `palette-*`
+    messages, and `name()` — the label lowercased — is what the parser matches, because Tab
+    completes the label into the box. `id` is the English name lowercased, and it matches in every
+    language too, as VS Code's translated palette accepts its English names: the list filter takes
+    either (`name()` or `id`), `arg_names` hands the parser both (`Command::names`, once in English
+    where they are the same string), and `is_named` finds the command by whichever came back. **`id`
+    is also what everything else keys on** — `COMMAND_KEYS`, the `retain` filters that drop *Server
+    Variables* and *Ask AI* — so nothing holds a translated string as an identity.
+    `assert_names_match_labels` holds `id` to the English label only while the interface is
+    English, the one language where that is checkable. Its word-prefix check is **wider than the
+    parser's invariant**: no argument command's name, in either spelling, may be a word-prefix of
+    *any* command's name, instant ones included — in German *Verlauf* (History) takes an argument,
+    so typing all of *Verlauf leeren* would resolve to it with `leeren` as the argument, which is
+    why German's *Clear History* is *Abfrageverlauf leeren*. Toggle Panel's and Indent Style's
+    option labels are translated while their values stay English, and the options filter matches
+    values too, so `>toggle panel ai` still works in German.
     **The error modal wears `modal_title("Error", …)` and its ✕**, where it used to have neither a
     title row nor a close button and only click-away and Escape closed it. All three exits run the
     one `close`, which is also what clears `error_modal_text` so the editor bar's next *View* falls
@@ -29309,7 +29347,8 @@ existing prose was left alone.
     **The Extensions folder is the exception to both.** Its Create is *Create extension*, which
     opens `database_editor`'s picker rather than the object editor — there is no `ObjectDraft` for
     an extension, so `supports_object_creation` answers no and the entry asks
-    `ddl::supports_extensions` instead; `menu_order_gate` lists the literal beside `Create {}`.
+    `ddl::supports_extensions` instead; `menu_order_gate` lists its id,
+    `tree-folder-create-extension`, beside `Create {}`'s `tree-create-kind`.
     An extension row has **no Edit entry at all** — absent, as SQL Server's objects' once was,
     since no state of the connection gives it a form — and its Drop goes to the preview through
     `ddl::drop_item` like any other row's.
@@ -37504,7 +37543,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   source gate because both sites are closures inside view builders that need a mounted Floem tree.
   What it reads is the **launch expression**, bounded to end where that expression does: with a
   window measured in bytes, a tip that merely *says* "read-only" beside a button that is still live
-  satisfied the check, which is the disclosure without the gate. Its needles are assembled from
+  satisfied the check, which is the disclosure without the gate. The tree entry is found by its
+  message id (`MenuEntry::action(tr!("tree-open-in-cli")`), so the anchor holds in any language.
+  Its needles are assembled from
   fragments for the reason every source gate here assembles them — the test names both launch sites
   in its own prose, so a literal anchor matches there first, and that caught this one on its first
   run.
@@ -39102,7 +39143,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   `PALETTE_HISTORY_CAP`), its primary the matching line by `body_snippet` — or the first 60
   characters of `history::preview` where the match is the panel's alone, across a line break the
   preview collapses or on the database or tab name, which `body_snippet` cannot find — over
-  `history · {relative_time} · {db}`. **Activating one opens the statement in a new tab through
+  `history · {relative_time} · {db}`. Those secondary words — *snippet*, *open tab*, *history*,
+  *view body*, *{kind} body*, *trigger on {table}* — are the catalogue's (`palette-row-*`); the
+  `{kind}` (`ObjectKind::label`) and `relative_time` inside them are still core's English.
+  **Activating a history row opens the statement in a new tab through
   `HistoryActions::open`, exactly as the panel's row does, and does not run it**, so neither tier
   goes anywhere near the write guard. Both glyphs are `text_muted` — `icons::FILE` for a tab and
   `icons::CLOCK` for history, deliberately not the rotating clock, which marks the empty query's
@@ -39494,7 +39538,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   was seen red on exactly that label. It scans both view crates' production source (`crate_sources`) for every
   `MenuEntry::<constructor>(` whose first argument is a string literal and fails on one ending in
   `…` or `...`, with a floor of 50 labels scanned so a scan that stopped matching cannot report
-  success. It reads source, so a label built at run time is not seen.
+  success. **The rule follows a label into the catalogue**: a first argument of `tr!("id"…)` has
+  that id's text checked in *every* catalogue (`catalogue_messages`, the single-line messages of
+  each `i18n/*/schemaic.ftl` — the repository-source exemption), since a translation that adds the
+  dots is the same habit in another language; given an ellipsis, the German `tree-hide` failed it
+  as `tree-hide (de)`. It reads source, so a label built at run time is not seen.
 - **The footer's panel toggles: a control that can't act must not look like one, and when the user
   can fix that, say so.** Below their breakpoints the side panels are *force-hidden* — the schema
   tree at `panels_min_schema_w`, the right column at the wider `panels_min_full_w` — and the window
@@ -39751,7 +39799,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     indent lands on the pixel the glyphs it aligns under actually occupy — at 80% those differ by one.
 - **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
   value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). The Settings modal
-  (`settings.rs`) and the shortcut table it draws (`shortcuts.rs`) are converted; every other
+  (`settings.rs`), the shortcut table it draws (`shortcuts.rs`) and the popups of `overlays.rs`
+  are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -41882,6 +41931,13 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   is the skeleton as data, and an **unknown label fails** rather than being skipped, which is the
   load-bearing part — a thirteenth entry can't be added to any menu without placing it in a group
   first, which is the drift the comment was written to stop and could not.
+  **The gate reads message ids, not words.** Every builder label is `tr!("tree-…")`, so the first
+  literal the scan meets is the id: `group` is keyed on ids, the colour test expects `tree-drop`,
+  `tree-drop-foreign-key`, `tree-drop-index` and `tree-truncate`, the drop checks match the
+  `tree-drop` prefix, and the gate holds in every language. The closing landmark is `AI_EXPLAIN`,
+  the id **with its quotes** (`"tree-ai-explain"` as it stands in the source) — the quotes are what
+  keep a comment naming the row from standing in for it, the trap the landmark already fell into
+  once with the English label.
   `drop_is_the_last_entry_before_ai_explain` pins the one position that isn't a matter of taste, in
   both halves: every menu that writes ends on its `Drop` (`Database`, `Schema` and `ObjectGroup` have
   nothing to drop, asserted by name), and nothing but `AI explain` follows the `match`.
@@ -41909,7 +41965,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   the gate in `schema_tree::blank_space_is_a_subsequence_of_the_skeleton`, asserted over the entry
   **values** rather than over the source, since unlike the context menus those entries are data,
   and walked for every dialect in `SqlDialect::ALL`. It
-  mirrors the group number for each of its labels from `group` here by hand, which is why
+  mirrors the group number for each of its labels from `group` here by hand — still by English
+  label, `schema_tree.rs` not being converted, against the ids here — which is why
   `Users and privileges` and `Server variables` (group 2 both, the second a read of the server
   like the first) are in this table at all: neither is **a context-menu row today**, but an
   unknown label fails, so a second menu cannot place an entry this one has never heard of. The

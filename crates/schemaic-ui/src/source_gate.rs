@@ -1517,15 +1517,24 @@ mod tests {
     /// corrected after the fact because nothing but a reader enforced it: the
     /// grid's `AI seed table…` shipped past it.
     ///
-    /// Every `MenuEntry::<constructor>(` whose first argument is a literal. A
-    /// label built at run time is not seen, which is the price of reading
-    /// source; the literal case is the habit this is for.
+    /// Every `MenuEntry::<constructor>(` whose first argument is a literal —
+    /// or a catalogue message, `tr!("id"…)`, whose text is then read **in
+    /// every catalogue**: as labels leave the source for the catalogue the
+    /// rule follows them there, and a translation that adds the dots is the
+    /// same habit in another language. A label built at run time is not
+    /// seen, which is the price of reading source; the literal case is the
+    /// habit this is for.
     #[test]
     fn no_menu_label_ends_in_an_ellipsis() {
         let files = crate_sources();
+        let catalogues = catalogue_messages();
         let needle = "MenuEntry::";
         let mut scanned = 0usize;
         let mut offenders = Vec::new();
+        let ends_in_ellipsis = |s: &str| {
+            let s = s.trim_end();
+            s.ends_with('…') || s.ends_with("...")
+        };
         for (name, code) in &files {
             let mut from = 0usize;
             while let Some(rel) = code[from..].find(needle) {
@@ -1538,17 +1547,31 @@ mod tests {
                 let Some(args) = rest[ctor..].strip_prefix('(') else {
                     continue;
                 };
-                let Some(lit) = args.trim_start().strip_prefix('"') else {
+                let args = args.trim_start();
+                let line = || 1 + code[..at].bytes().filter(|c| *c == b'\n').count();
+                if let Some(id) = args.strip_prefix("tr!(\"") {
+                    let Some(end) = id.find('"') else {
+                        continue;
+                    };
+                    let id = &id[..end];
+                    scanned += 1;
+                    for (lang, messages) in &catalogues {
+                        if let Some(text) = messages.get(id).filter(|t| ends_in_ellipsis(t)) {
+                            offenders.push(format!("{name}:{}: {id} ({lang}) {text:?}", line()));
+                        }
+                    }
+                    continue;
+                }
+                let Some(lit) = args.strip_prefix('"') else {
                     continue;
                 };
                 let Some(end) = lit.find('"') else {
                     continue;
                 };
                 scanned += 1;
-                let label = lit[..end].trim_end();
-                if label.ends_with('…') || label.ends_with("...") {
-                    let line = 1 + code[..at].bytes().filter(|c| *c == b'\n').count();
-                    offenders.push(format!("{name}:{line}: {label:?}"));
+                let label = &lit[..end];
+                if ends_in_ellipsis(label) {
+                    offenders.push(format!("{name}:{}: {label:?}", line()));
                 }
             }
         }
@@ -1563,6 +1586,31 @@ mod tests {
              never `Create database…`:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Every catalogue's single-line messages, `(language, id → text)` — read
+    /// from the repository's own `i18n/` folder, the source-reading exemption
+    /// this module lives under. A message continued over several lines is a
+    /// select or a long hint, never a menu label, so the first line is enough.
+    fn catalogue_messages() -> Vec<(String, std::collections::HashMap<String, String>)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("i18n");
+        let mut out = Vec::new();
+        for dir in std::fs::read_dir(&root).expect("the i18n folder") {
+            let dir = dir.expect("a catalogue folder").path();
+            let Ok(text) = std::fs::read_to_string(dir.join("schemaic.ftl")) else {
+                continue;
+            };
+            let messages = text
+                .lines()
+                .filter(|l| !l.starts_with(['#', ' ']))
+                .filter_map(|l| l.split_once(" = "))
+                .map(|(id, text)| (id.to_string(), text.to_string()))
+                .collect();
+            let lang = dir.file_name().unwrap().to_string_lossy().into_owned();
+            out.push((lang, messages));
+        }
+        assert!(out.len() >= 2, "found only {} catalogues", out.len());
+        out
     }
 
     /// **Nothing is found by its English label.** A label is about to become a

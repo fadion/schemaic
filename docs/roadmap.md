@@ -69,16 +69,20 @@ assertions pin English wording — stays the regression net throughout.
 
 3. **UI literals** in `schemaic-ui` and `schemaic-app` — on the order of two to three thousand,
    heaviest in `widgets.rs`, `overlays.rs`, `lib.rs`, `grid.rs` and `shortcuts.rs`. Mechanical,
-   one file per session, by hand: the rule against scripted edits applies in full. Retarget
-   `source_gate::no_menu_label_ends_in_an_ellipsis` at the catalogue as labels leave the source —
-   it asserts a minimum count of literal labels scanned and will fail as they go. So do the
-   menu-order gates that read labels out of the source (`overlays.rs`'s `menu_order_gate`, whose
-   `"Favourite" | "Unfavourite" | "Colour" | "Hide"` match looks like behaviour and is not, and
-   its mirror in `schema_tree.rs`). `schemaic-app` has no `i18n.toml` yet and `tr!` is
+   one file per session, by hand: the rule against scripted edits applies in full.
+   `source_gate::no_menu_label_ends_in_an_ellipsis` already reads a `tr!` label's text in every
+   catalogue, and `overlays.rs`'s `menu_order_gate` keys its skeleton on message ids; the mirror
+   of that gate in `schema_tree.rs` still matches English labels and moves to ids with that file.
+   `schemaic-app` has no `i18n.toml` yet and `tr!` is
    `pub(crate)` to `schemaic-ui`; the app's first converted file decides how it reaches the
    loader.
 
-   **Converted:** `settings.rs`, `shortcuts.rs`. **How a file goes**, as those settled it: a helper taking
+   **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`. A palette command's typed name
+   is its translated label lowercased, and its English name (`Command::id`) matches in every
+   language too, as VS Code's translated palette does. Shared words live under `dialog-*`
+   (Cancel, Yes, No) and the schema tree's menus under `tree-*`, which `schema_tree.rs`'s
+   blank-space menu should reuse for the actions it shares with them.
+   **How a file goes**, as those settled it: a helper taking
    `&'static str` widens to `impl Into<String>` (every literal caller still compiles); a
    placeholder goes through `FieldCfg::placeholder_of(|| tr!(…))`, whose `placeholder` is still
    `&'static str`; a sentence assembled from parts becomes whole messages, one per variant; a

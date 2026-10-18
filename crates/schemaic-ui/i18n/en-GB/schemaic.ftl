@@ -235,3 +235,191 @@ key-del = Del
 key-home = Home
 key-end = End
 key-space = Space
+
+## Command palette › commands
+## A command's label is also what is typed to pick it, lowercased (Tab types
+## the label into the box), so no argument-taking command's label may be the
+## first words of another command's: "History" before "Clear History" is
+## fine, "Verlauf" before "Verlauf leeren" is not. The English names match in
+## every language as well.
+
+palette-toggle-panel = Toggle Panel
+palette-toggle-panel-hint = schema · ai · terminal · query history · server activity
+palette-panel-schema = Schema
+palette-panel-ai = AI
+palette-panel-terminal = Terminal
+palette-panel-history = Query History
+palette-panel-activity = Server Activity
+palette-new-tab = New Tab
+palette-export-settings = Export Settings
+palette-import-settings = Import Settings
+palette-duplicate-tab = Duplicate Tab
+palette-close-tab = Close Tab
+palette-reopen-closed-tab = Reopen Closed Tab
+palette-reopen-closed-tab-hint = <tab>
+palette-open-file = Open File
+palette-open-file-hint = a .sql script
+palette-save-file = Save File
+palette-save-file-as = Save File As
+palette-next-tab = Next Tab
+palette-previous-tab = Previous Tab
+# Named like the editor menu's and the shortcut sheet's "Format code".
+palette-format-code = Format Code
+palette-format-statement = Format Statement
+palette-format-statement-hint = the statement at the caret
+palette-make-single-line = Make Single Line
+palette-make-single-line-hint = the selection or statement, on one line
+palette-run = Run
+palette-run-hint = run all statements
+palette-go-to-line = Go to Line
+palette-go-to-line-hint = <number>
+palette-go-to-statement = Go to Statement
+palette-search-hint = <search>
+palette-history = History
+palette-clear-history = Clear History
+palette-clear-history-hint = current connection
+palette-ask-ai = Ask AI
+palette-ask-ai-hint = <prompt>
+palette-ask-ai-empty = Type a prompt…
+palette-terminal = Terminal
+palette-terminal-hint = <command>
+palette-run-in-terminal = Run in Terminal
+palette-terminal-empty = Type a command…
+palette-ui-theme = UI Theme
+palette-ui-theme-hint = light · dark
+palette-editor-theme = Editor Theme
+palette-editor-theme-hint = <theme>
+palette-font-size = Font Size
+palette-increase-font-size = Increase Font Size
+palette-decrease-font-size = Decrease Font Size
+palette-indent-style = Indent Style
+palette-indent-style-hint = tabs · spaces
+palette-indent-spaces = Spaces
+palette-indent-tabs = Tabs
+palette-indent-width = Indent Width
+palette-toggle-word-wrap = Toggle Word Wrap
+palette-toggle-whitespace = Toggle Whitespace
+palette-toggle-whitespace-hint = show spaces and tabs
+palette-toggle-indent-guides = Toggle Indent Guides
+palette-switch-connection = Switch Connection
+palette-switch-connection-hint = <connection>
+palette-server-variables = Server Variables
+palette-server-variables-hint = the active connection's settings
+palette-enter-number = Enter a number
+palette-nothing-found = Nothing found
+
+## Command palette › what a result row is
+
+palette-row-snippet = snippet
+palette-row-open-tab = open tab
+palette-row-history = history
+palette-row-view-body = view body
+# $kind is the object's kind as the schema names it (procedure, function, event).
+palette-row-body = { $kind } body
+# $table is the table the trigger fires on.
+palette-row-trigger-on = trigger on { $table }
+
+## Schema tree › right-click menu and the SCHEMA gear's menu
+## No ellipsis on a menu label (AGENTS.md).
+
+tree-open-in-cli = Open in CLI
+tree-open = Open
+tree-open-in-new-tab = Open in new tab
+tree-copy-name = Copy name
+tree-copy-qualified-name = Copy qualified name
+tree-properties = Properties
+tree-used-by = Used by
+tree-live-monitor = Live monitor
+tree-er-diagram = ER diagram
+tree-compare-with = Compare with
+tree-generate = Generate
+tree-generate-ddl = Generate DDL
+# The Generate submenu's children, each the statement it drafts.
+tree-generate-create = Create
+tree-generate-insert = Insert
+tree-generate-update = Update
+tree-generate-delete = Delete
+tree-refresh = Refresh
+tree-collapse-all = Collapse all
+tree-favourite = Favourite
+tree-unfavourite = Unfavourite
+tree-colour = Colour
+tree-colour-none = None
+tree-hide = Hide
+tree-import = Import
+tree-export = Export
+tree-back-up = Back up
+tree-restore-from-file = Restore from file
+tree-copy-to = Copy to
+tree-create = Create
+# The Create submenu's children: the noun, the verb being the parent row's.
+tree-create-table = Table
+tree-create-view = View
+tree-create-type = Type
+tree-create-domain = Domain
+tree-create-sequence = Sequence
+tree-create-synonym = Synonym
+tree-create-alias-type = Alias type
+tree-create-xml-schema-collection = XML schema collection
+tree-create-function = Function
+tree-create-procedure = Procedure
+tree-create-event = Event
+tree-create-extension = Extension
+tree-create-database = Database
+tree-create-schema = Schema
+# $kind is the object's kind as the schema names it (type, domain, sequence).
+tree-create-kind = Create { $kind }
+tree-edit-kind = Edit { $kind }
+tree-folder-create-extension = Create extension
+tree-edit-table = Edit table
+tree-edit-view = Edit view
+tree-edit-column = Edit column
+tree-edit-index = Edit index
+tree-edit-primary-key = Edit primary key
+tree-edit-foreign-key = Edit foreign key
+tree-triggers = Triggers
+# Only shown with one or more triggers; none is the bare "Triggers".
+tree-triggers-count = Triggers ({ $n })
+tree-refresh-view = Refresh view
+tree-truncate = Truncate
+tree-truncate-title = Truncate table
+tree-drop = Drop
+tree-drop-index = Drop index
+tree-drop-foreign-key = Drop foreign key
+tree-ai-explain = AI explain
+tree-users = Users and privileges
+tree-server-variables = Server variables
+tree-gear-create-database = Create database
+tree-show-table-sizes = Show table sizes
+
+## Connection switcher
+
+conn-menu-manage = Manage Connections
+
+## Shared dialog buttons
+
+dialog-cancel = Cancel
+dialog-yes = Yes
+dialog-no = No
+
+## Open-transaction prompt
+
+tx-prompt-title = Open transaction
+# $tab is the tab's title; $n how many statements the transaction holds.
+tx-prompt-body = { $tab } has an open transaction with { $n ->
+    [one] 1 statement
+   *[other] { $n } statements
+} in it. You can commit to keep the changes, or rollback to discard them.
+tx-prompt-body-aborted = { $tab } has a transaction that a failed statement aborted, with { $n ->
+    [one] 1 statement
+   *[other] { $n } statements
+} in it. It can only be rolled back, which discards the changes.
+tx-prompt-rollback = Rollback
+tx-prompt-commit = Commit
+
+## Error modal
+
+error-modal-title = Error
+error-modal-none = No error.
+error-modal-ai-fix = AI fix
+error-modal-explain = Explain

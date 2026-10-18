@@ -223,3 +223,177 @@ key-del = Entf
 key-home = Pos1
 key-end = Ende
 key-space = Leertaste
+
+## Command palette › commands
+
+palette-toggle-panel = Bereich umschalten
+palette-toggle-panel-hint = Schema · KI · Terminal · Abfrageverlauf · Serveraktivität
+palette-panel-schema = Schema
+palette-panel-ai = KI
+palette-panel-terminal = Terminal
+palette-panel-history = Abfrageverlauf
+palette-panel-activity = Serveraktivität
+palette-new-tab = Neuer Tab
+palette-export-settings = Einstellungen exportieren
+palette-import-settings = Einstellungen importieren
+palette-duplicate-tab = Tab duplizieren
+palette-close-tab = Tab schließen
+palette-reopen-closed-tab = Geschlossenen Tab wieder öffnen
+palette-reopen-closed-tab-hint = <Tab>
+palette-open-file = Datei öffnen
+palette-open-file-hint = ein .sql-Skript
+palette-save-file = Datei speichern
+palette-save-file-as = Datei speichern unter
+palette-next-tab = Nächster Tab
+palette-previous-tab = Vorheriger Tab
+palette-format-code = Code formatieren
+palette-format-statement = Anweisung formatieren
+palette-format-statement-hint = die Anweisung am Cursor
+palette-make-single-line = In eine Zeile umwandeln
+palette-make-single-line-hint = die Auswahl oder Anweisung, auf einer Zeile
+palette-run = Ausführen
+palette-run-hint = alle Anweisungen ausführen
+palette-go-to-line = Gehe zu Zeile
+palette-go-to-line-hint = <Nummer>
+palette-go-to-statement = Gehe zu Anweisung
+palette-search-hint = <Suche>
+palette-history = Verlauf
+palette-clear-history = Abfrageverlauf leeren
+palette-clear-history-hint = aktuelle Verbindung
+palette-ask-ai = KI fragen
+palette-ask-ai-hint = <Frage>
+palette-ask-ai-empty = Frage eingeben…
+palette-terminal = Terminal
+palette-terminal-hint = <Befehl>
+palette-run-in-terminal = Im Terminal ausführen
+palette-terminal-empty = Befehl eingeben…
+palette-ui-theme = Oberflächen-Design
+palette-ui-theme-hint = hell · dunkel
+palette-editor-theme = Editor-Design
+palette-editor-theme-hint = <Design>
+palette-font-size = Schriftgröße
+palette-increase-font-size = Schrift vergrößern
+palette-decrease-font-size = Schrift verkleinern
+palette-indent-style = Einrückungsart
+palette-indent-style-hint = Tabs · Leerzeichen
+palette-indent-spaces = Leerzeichen
+palette-indent-tabs = Tabs
+palette-indent-width = Einrückungsbreite
+palette-toggle-word-wrap = Zeilenumbruch umschalten
+palette-toggle-whitespace = Leerraum umschalten
+palette-toggle-whitespace-hint = Leerzeichen und Tabs anzeigen
+palette-toggle-indent-guides = Einrückungshilfen umschalten
+palette-switch-connection = Verbindung wechseln
+palette-switch-connection-hint = <Verbindung>
+palette-server-variables = Servervariablen
+palette-server-variables-hint = die Einstellungen der aktiven Verbindung
+palette-enter-number = Eine Zahl eingeben
+palette-nothing-found = Nichts gefunden
+
+## Command palette › what a result row is
+
+palette-row-snippet = Snippet
+palette-row-open-tab = offener Tab
+palette-row-history = Verlauf
+palette-row-view-body = Rumpf der Sicht
+palette-row-body = Rumpf ({ $kind })
+palette-row-trigger-on = Trigger auf { $table }
+
+## Schema tree › right-click menu and the SCHEMA gear's menu
+
+tree-open-in-cli = In der CLI öffnen
+tree-open = Öffnen
+tree-open-in-new-tab = In neuem Tab öffnen
+tree-copy-name = Namen kopieren
+tree-copy-qualified-name = Qualifizierten Namen kopieren
+tree-properties = Eigenschaften
+tree-used-by = Verwendet von
+tree-live-monitor = Live-Überwachung
+tree-er-diagram = ER-Diagramm
+tree-compare-with = Vergleichen mit
+tree-generate = Generieren
+tree-generate-ddl = DDL generieren
+tree-generate-create = CREATE
+tree-generate-insert = INSERT
+tree-generate-update = UPDATE
+tree-generate-delete = DELETE
+tree-refresh = Aktualisieren
+tree-collapse-all = Alle einklappen
+tree-favourite = Zu Favoriten
+tree-unfavourite = Aus Favoriten entfernen
+tree-colour = Farbe
+tree-colour-none = Keine
+tree-hide = Ausblenden
+tree-import = Importieren
+tree-export = Exportieren
+tree-back-up = Sichern
+tree-restore-from-file = Aus Datei wiederherstellen
+tree-copy-to = Kopieren nach
+tree-create = Erstellen
+tree-create-table = Tabelle
+tree-create-view = Sicht
+tree-create-type = Typ
+tree-create-domain = Domäne
+tree-create-sequence = Sequenz
+tree-create-synonym = Synonym
+tree-create-alias-type = Aliastyp
+tree-create-xml-schema-collection = XML-Schemaauflistung
+tree-create-function = Funktion
+tree-create-procedure = Prozedur
+tree-create-event = Ereignis
+tree-create-extension = Erweiterung
+tree-create-database = Datenbank
+tree-create-schema = Schema
+tree-create-kind = Erstellen: { $kind }
+tree-edit-kind = Bearbeiten: { $kind }
+tree-folder-create-extension = Erweiterung erstellen
+tree-edit-table = Tabelle bearbeiten
+tree-edit-view = Sicht bearbeiten
+tree-edit-column = Spalte bearbeiten
+tree-edit-index = Index bearbeiten
+tree-edit-primary-key = Primärschlüssel bearbeiten
+tree-edit-foreign-key = Fremdschlüssel bearbeiten
+tree-triggers = Trigger
+tree-triggers-count = Trigger ({ $n })
+tree-refresh-view = Sicht aktualisieren
+tree-truncate = Leeren
+tree-truncate-title = Tabelle leeren
+tree-drop = Löschen
+tree-drop-index = Index löschen
+tree-drop-foreign-key = Fremdschlüssel löschen
+tree-ai-explain = Mit KI erklären
+tree-users = Benutzer und Rechte
+tree-server-variables = Servervariablen
+tree-gear-create-database = Datenbank erstellen
+tree-show-table-sizes = Tabellengrößen anzeigen
+
+## Connection switcher
+
+conn-menu-manage = Verbindungen verwalten
+
+## Shared dialog buttons
+
+dialog-cancel = Abbrechen
+dialog-yes = Ja
+dialog-no = Nein
+
+## Open-transaction prompt
+
+tx-prompt-title = Offene Transaktion
+tx-prompt-body = { $tab } hat eine offene Transaktion mit { $n ->
+    [one] einer Anweisung
+   *[other] { $n } Anweisungen
+}. Du kannst sie committen, um die Änderungen zu behalten, oder per Rollback verwerfen.
+tx-prompt-body-aborted = { $tab } hat eine Transaktion mit { $n ->
+    [one] einer Anweisung
+   *[other] { $n } Anweisungen
+}, die eine fehlgeschlagene Anweisung abgebrochen hat. Sie kann nur zurückgerollt werden, wodurch die Änderungen verworfen werden.
+tx-prompt-rollback = Rollback
+tx-prompt-commit = Commit
+
+## Error modal
+
+error-modal-title = Fehler
+error-modal-none = Kein Fehler.
+error-modal-ai-fix = KI-Korrektur
+error-modal-explain = Erklären

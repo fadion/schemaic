@@ -21,12 +21,13 @@ use schemaic_core::schema::{SchemaState, TableSource, db_visible};
 use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton};
 
 use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
+use crate::i18n::tr;
 use crate::widgets::{
     ACTION_TAB, ActionKind, CURSOR_MENU_GAP, MenuEntry, action_button, action_gap, autohide,
     box_menu_inset, cursor_menu_insets, first_enabled, focus_root, list_step_enabled,
     measure_text_px_at, menu_drawn_height, menu_inset, menu_item_style, menu_panel,
-    menu_panel_width, modal_body_h, modal_footer, modal_pad_h, modal_title, modal_title_owned,
-    modal_w, panel_style, window_size,
+    menu_panel_width, modal_body_h, modal_footer, modal_pad_h, modal_title_owned, modal_w,
+    panel_style, window_size,
 };
 use crate::{
     ActivityUi, Confirm, ConnNode, ConnUi, CtxKind, CtxMenu, DdlUi, LayoutUi, OverlayUi,
@@ -161,7 +162,7 @@ fn export_submenu(
             })
         })
         .collect();
-    MenuEntry::sub("Export", children)
+    MenuEntry::sub(tr!("tree-export"), children)
 }
 
 /// The **Create** submenu a database or namespace node offers: `Table` and
@@ -209,7 +210,7 @@ fn create_submenu(
             // ever used — the shape that entry already records.
             let (db, ns) = (database.to_string(), schema.map(str::to_string));
             let actions = actions.clone();
-            MenuEntry::action(e.label, move || match e.kind {
+            MenuEntry::action(e.kind.label(), move || match e.kind {
                 CreateKind::Table => {
                     crate::table_designer::open_for_new(conn, schema_ui, ddl, &db, ns.as_deref());
                 }
@@ -258,7 +259,7 @@ fn create_submenu(
             .disabled(e.disabled)
         })
         .collect();
-    Some(MenuEntry::sub("Create", children))
+    Some(MenuEntry::sub(tr!("tree-create"), children))
 }
 
 /// Which of the per-object entries the schema tree's table/view menu offers **at
@@ -566,10 +567,40 @@ pub(crate) enum CreateKind {
     Extension,
 }
 
-/// One Create entry as data: its label, what it opens, and whether it is inert.
+impl CreateKind {
+    /// The entry's label under `Create ▸`: the noun, the verb being the
+    /// parent row's. Drawn from the kind rather than stored beside it, so the
+    /// entry carries no text a test or a route could key on.
+    pub(crate) fn label(self) -> String {
+        use schemaic_core::ddl::ObjectKind;
+        match self {
+            CreateKind::Table => tr!("tree-create-table"),
+            CreateKind::View => tr!("tree-create-view"),
+            CreateKind::Object(ObjectKind::Enum) => tr!("tree-create-type"),
+            CreateKind::Object(ObjectKind::Domain) => tr!("tree-create-domain"),
+            CreateKind::Object(ObjectKind::Sequence) => tr!("tree-create-sequence"),
+            CreateKind::Object(ObjectKind::Synonym) => tr!("tree-create-synonym"),
+            CreateKind::Object(ObjectKind::AliasType) => tr!("tree-create-alias-type"),
+            CreateKind::Object(ObjectKind::XmlSchemaCollection) => {
+                tr!("tree-create-xml-schema-collection")
+            }
+            CreateKind::Object(ObjectKind::Function) => tr!("tree-create-function"),
+            CreateKind::Object(ObjectKind::Procedure) => tr!("tree-create-procedure"),
+            CreateKind::Object(ObjectKind::Event) => tr!("tree-create-event"),
+            // No Create entry makes any other kind; core's own word for it is
+            // the honest fallback rather than a blank row.
+            CreateKind::Object(kind) => kind.label().to_string(),
+            CreateKind::Extension => tr!("tree-create-extension"),
+            CreateKind::Database => tr!("tree-create-database"),
+            CreateKind::Schema => tr!("tree-create-schema"),
+        }
+    }
+}
+
+/// One Create entry as data: what it opens, and whether it is inert. Its label
+/// is [`CreateKind::label`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct CreateEntry {
-    pub label: &'static str,
     pub kind: CreateKind,
     pub disabled: bool,
 }
@@ -602,14 +633,12 @@ pub(crate) fn create_children(
         &schemaic_core::ddl::Change::CreateTable(Box::default()),
     ) {
         out.push(CreateEntry {
-            label: "Table",
             kind: CreateKind::Table,
             disabled: read_only,
         });
     }
     if schemaic_core::ddl::supports_view_editing(dialect) {
         out.push(CreateEntry {
-            label: "View",
             kind: CreateKind::View,
             disabled: read_only,
         });
@@ -621,17 +650,16 @@ pub(crate) fn create_children(
     // literal: SQL Server's kinds would have needed a second one beside it.
     out.extend(
         [
-            (ObjectKind::Enum, "Type"),
-            (ObjectKind::Domain, "Domain"),
-            (ObjectKind::Sequence, "Sequence"),
-            (ObjectKind::Synonym, "Synonym"),
-            (ObjectKind::AliasType, "Alias type"),
-            (ObjectKind::XmlSchemaCollection, "XML schema collection"),
+            ObjectKind::Enum,
+            ObjectKind::Domain,
+            ObjectKind::Sequence,
+            ObjectKind::Synonym,
+            ObjectKind::AliasType,
+            ObjectKind::XmlSchemaCollection,
         ]
         .into_iter()
-        .filter(|(kind, _)| schemaic_core::ddl::supports_object_creation(dialect, *kind))
-        .map(|(kind, label)| CreateEntry {
-            label,
+        .filter(|kind| schemaic_core::ddl::supports_object_creation(dialect, *kind))
+        .map(|kind| CreateEntry {
             kind: CreateKind::Object(kind),
             disabled: read_only,
         }),
@@ -642,16 +670,12 @@ pub(crate) fn create_children(
     // the view entry above makes.
     if schemaic_core::ddl::supports_routine_editing(dialect) {
         out.extend(
-            [
-                (ObjectKind::Function, "Function"),
-                (ObjectKind::Procedure, "Procedure"),
-            ]
-            .into_iter()
-            .map(|(kind, label)| CreateEntry {
-                label,
-                kind: CreateKind::Object(kind),
-                disabled: read_only,
-            }),
+            [ObjectKind::Function, ObjectKind::Procedure]
+                .into_iter()
+                .map(|kind| CreateEntry {
+                    kind: CreateKind::Object(kind),
+                    disabled: read_only,
+                }),
         );
     }
     // Scheduled events, on the one engine that has them. A **capability**, not
@@ -659,7 +683,6 @@ pub(crate) fn create_children(
     // `CREATE EVENT` at all — the same call the view and routine entries make.
     if schemaic_core::ddl::supports_event_editing(dialect) {
         out.push(CreateEntry {
-            label: "Event",
             kind: CreateKind::Object(ObjectKind::Event),
             disabled: read_only,
         });
@@ -668,7 +691,6 @@ pub(crate) fn create_children(
     // after everything that lives in a namespace and before the containers.
     if schemaic_core::ddl::supports_extensions(dialect) {
         out.push(CreateEntry {
-            label: "Extension",
             kind: CreateKind::Extension,
             disabled: read_only,
         });
@@ -683,14 +705,12 @@ pub(crate) fn create_children(
     // the smaller thing would quietly make the larger one.
     if schemaic_core::ddl::supports_database_editing(dialect) {
         out.push(CreateEntry {
-            label: "Database",
             kind: CreateKind::Database,
             disabled: read_only,
         });
     }
     if schemaic_core::ddl::supports_namespace_editing(dialect) {
         out.push(CreateEntry {
-            label: "Schema",
             kind: CreateKind::Schema,
             disabled: read_only,
         });
@@ -853,7 +873,7 @@ pub(crate) fn conn_menu_overlay(
             // Icon + label share the row's 8px gap (label sits 8px from the icon).
             let manage = h_stack((
                 icons::icon(icons::SETTINGS, 16.0).style(|s| s.color(theme::accent())),
-                text("Manage Connections").style(|s| s.color(theme::accent())),
+                text(tr!("conn-menu-manage")).style(|s| s.color(theme::accent())),
             ))
             .on_click_stop(move |_| {
                 (select_conn)(active_conn.get_untracked());
@@ -1342,13 +1362,25 @@ impl GearKind {
             GearKind::CreateDatabase => read_only || down,
         }
     }
+
+    /// The row's label — the context menu's message where the two menus
+    /// share an action, so they cannot word it two ways.
+    pub(crate) fn label(self) -> String {
+        match self {
+            GearKind::Refresh => tr!("tree-refresh"),
+            GearKind::CollapseAll => tr!("tree-collapse-all"),
+            GearKind::Users => tr!("tree-users"),
+            GearKind::ServerVariables => tr!("tree-server-variables"),
+            GearKind::CreateDatabase => tr!("tree-gear-create-database"),
+            GearKind::ShowTableSizes => tr!("tree-show-table-sizes"),
+        }
+    }
 }
 
-/// One SCHEMA-gear entry as data: its label, what it does, and whether it is
-/// inert.
+/// One SCHEMA-gear entry as data: what it does, and whether it is inert. Its
+/// label is [`GearKind::label`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct GearEntry {
-    pub label: &'static str,
     pub kind: GearKind,
     pub disabled: bool,
 }
@@ -1381,12 +1413,10 @@ pub(crate) fn gear_entries(
         // Never dimmed: a down connection is the one most worth re-reading, and
         // collapsing the tree needs no server at all.
         GearEntry {
-            label: "Refresh",
             kind: GearKind::Refresh,
             disabled: false,
         },
         GearEntry {
-            label: "Collapse all",
             kind: GearKind::CollapseAll,
             disabled: false,
         },
@@ -1397,7 +1427,6 @@ pub(crate) fn gear_entries(
     // `Create database` would answer a question this action does not ask.
     if connection_exists && schemaic_core::users::supports_users(dialect) {
         out.push(GearEntry {
-            label: "Users and privileges",
             kind: GearKind::Users,
             disabled: GearKind::Users.disabled_when(read_only, down),
         });
@@ -1408,7 +1437,6 @@ pub(crate) fn gear_entries(
     // asked anyway, so a fifth engine answers it rather than inheriting a row.
     if connection_exists && schemaic_core::server_vars::supports_server_vars(dialect) {
         out.push(GearEntry {
-            label: "Server variables",
             kind: GearKind::ServerVariables,
             disabled: GearKind::ServerVariables.disabled_when(read_only, down),
         });
@@ -1418,13 +1446,11 @@ pub(crate) fn gear_entries(
     // real SQL and fail at Apply with a connect error the header already showed.
     if connection_exists && schemaic_core::ddl::supports_database_editing(dialect) {
         out.push(GearEntry {
-            label: "Create database",
             kind: GearKind::CreateDatabase,
             disabled: GearKind::CreateDatabase.disabled_when(read_only, down),
         });
     }
     out.push(GearEntry {
-        label: "Show table sizes",
         kind: GearKind::ShowTableSizes,
         disabled: false,
     });
@@ -1507,7 +1533,7 @@ pub(crate) fn schema_settings_overlay(
                             conn_status.get().is_down(),
                         )
                     };
-                    container(text(e.label).style(move |s| {
+                    container(text(kind.label()).style(move |s| {
                         let disabled = live_disabled();
                         // **The size toggle's label carries its state, the
                         // way the eye menu's rows do** — `db_toggle_on` when
@@ -1699,13 +1725,18 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // commit and refuses *Kill session*. See the terminal
                     // panel's `db_cli_btn`.
                     entries.push(
-                        MenuEntry::action("Open in CLI", move || (ocli)(Some(dbn.clone())))
-                            .disabled(conn_read_only(&connections, active_conn)),
+                        MenuEntry::action(tr!("tree-open-in-cli"), move || {
+                            (ocli)(Some(dbn.clone()))
+                        })
+                        .disabled(conn_read_only(&connections, active_conn)),
                     );
                     entries.push(MenuEntry::Separator);
                     // ── Read: clipboard, then what the node can show you, then
                     // the two that only rearrange the tree under it ───────────
-                    entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    entries.push(MenuEntry::action(
+                        tr!("tree-copy-name"),
+                        copy(menu.name.clone()),
+                    ));
                     // The namespace script's database-level analog, and absent
                     // for the same reason it is: a schema that hasn't loaded has
                     // no script to give, and an entry that copies "" is worse
@@ -1717,14 +1748,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // database is one Ctrl+Enter from building the tables
                         // somewhere else entirely.
                         let db = menu.name.clone();
-                        entries.push(MenuEntry::action("Generate DDL", move || {
+                        entries.push(MenuEntry::action(tr!("tree-generate-ddl"), move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
                             (oq)(ddl.clone(), Some(db.clone()));
                         }));
                     }
                     // ER diagram of the whole database (every related table).
                     let edb = menu.name.clone();
-                    entries.push(MenuEntry::action("ER diagram", move || {
+                    entries.push(MenuEntry::action(tr!("tree-er-diagram"), move || {
                         erd.set(Some(crate::ErdTarget {
                             conn_id: active_conn.get_untracked(),
                             database: edb.clone(),
@@ -1739,7 +1770,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let ui = ui.clone();
                         let cdb = menu.name.clone();
-                        entries.push(MenuEntry::action("Compare with", move || {
+                        entries.push(MenuEntry::action(tr!("tree-compare-with"), move || {
                             crate::compare_view::open_compare(
                                 ui.overlay,
                                 active_conn.get_untracked(),
@@ -1750,10 +1781,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                     let rf = refresh_db.clone();
                     let dn = menu.name.clone();
-                    entries.push(MenuEntry::action("Refresh", move || (rf)(dn.clone())));
+                    entries.push(MenuEntry::action(tr!("tree-refresh"), move || {
+                        (rf)(dn.clone())
+                    }));
                     let cd = collapse_db.clone();
                     let cn = menu.name.clone();
-                    entries.push(MenuEntry::action("Collapse all", move || (cd)(cn.clone())));
+                    entries.push(MenuEntry::action(tr!("tree-collapse-all"), move || {
+                        (cd)(cn.clone())
+                    }));
                     // ── How this database *looks* in the tree ─────────────────
                     // Its own group: colour, favourite and hide change nothing
                     // about the database, only about the row standing for it —
@@ -1782,7 +1817,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let dbc = db_colors;
                         let db = db_name.clone();
-                        swatches.push(MenuEntry::action("None", move || {
+                        swatches.push(MenuEntry::action(tr!("tree-colour-none"), move || {
                             let cid = active_conn.get_untracked();
                             dbc.update(|r| schemaic_core::db_color::upsert(r, cid, &db, None));
                         }));
@@ -1805,7 +1840,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let dbf = db_favorites;
                         let db = menu.name.clone();
-                        let label = if fav_now { "Unfavourite" } else { "Favourite" };
+                        let label = if fav_now {
+                            tr!("tree-unfavourite")
+                        } else {
+                            tr!("tree-favourite")
+                        };
                         entries.push(MenuEntry::action(label, move || {
                             let cid = active_conn.get_untracked();
                             dbf.update(|r| {
@@ -1813,10 +1852,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             });
                         }));
                     }
-                    entries.push(MenuEntry::sub("Colour", swatches));
+                    entries.push(MenuEntry::sub(tr!("tree-colour"), swatches));
                     let th = toggle_hidden.clone();
                     let n = menu.name.clone();
-                    entries.push(MenuEntry::action("Hide", move || (th)(n.clone())));
+                    entries.push(MenuEntry::action(tr!("tree-hide"), move || (th)(n.clone())));
                     // ── Write ─────────────────────────────────────────────────
                     // ── The whole-database group: Import, Export, Create ──────
                     //
@@ -1843,7 +1882,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // modal, a file dialog and an 8 MB probe — an answer the
                         // menu could have given for free.
                         entries.push(
-                            MenuEntry::action("Import", move || {
+                            MenuEntry::action(tr!("tree-import"), move || {
                                 let ctx = crate::table_designer::edit_ctx(iui.conn);
                                 crate::script_view::open_script(
                                     iui.script,
@@ -1872,7 +1911,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             crate::table_designer::edit_ctx(import_ui.conn).dialect,
                         );
                         entries.push(
-                            MenuEntry::action("Back up", move || (backup)(db.clone()))
+                            MenuEntry::action(tr!("tree-back-up"), move || (backup)(db.clone()))
                                 .disabled(writes && conn_read_only(&connections, active_conn)),
                         );
                     }
@@ -1882,8 +1921,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let restore = restore_db.clone();
                         let db = menu.name.clone();
                         entries.push(
-                            MenuEntry::action("Restore from file", move || (restore)(db.clone()))
-                                .disabled(conn_read_only(&connections, active_conn)),
+                            MenuEntry::action(tr!("tree-restore-from-file"), move || {
+                                (restore)(db.clone())
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
                         );
                     }
                     // On PostgreSQL a database node stands for its `public`
@@ -1915,7 +1956,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let ui = import_ui.clone();
                         let db = menu.name.clone();
                         entries.push(
-                            MenuEntry::action_colored("Drop", theme::error, move || {
+                            MenuEntry::action_colored(tr!("tree-drop"), theme::error, move || {
                                 // **Straight to the preview.** A confirm asked
                                 // first with the change's own risk sentence, and
                                 // the preview then said it again over Apply —
@@ -1954,10 +1995,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         schemaic_core::schema::display_name(item.schema(), item.name())
                     );
                     entries.push(MenuEntry::action(
-                        "Copy name",
+                        tr!("tree-copy-name"),
                         copy(item.name().to_string()),
                     ));
-                    entries.push(MenuEntry::action("Copy qualified name", copy(qualified)));
+                    entries.push(MenuEntry::action(
+                        tr!("tree-copy-qualified-name"),
+                        copy(qualified),
+                    ));
                     // What calls a routine — views, other routines, triggers
                     // and table expressions (`core::used_by`).
                     if let Some(r) = item.routine() {
@@ -1969,14 +2013,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             column: None,
                             routine: true,
                         };
-                        entries.push(MenuEntry::action("Used by", move || {
+                        entries.push(MenuEntry::action(tr!("tree-used-by"), move || {
                             used_by.set(Some(target.clone()))
                         }));
                     }
                     {
                         let oq = open_query.clone();
                         let db = database.clone();
-                        entries.push(MenuEntry::action("Generate DDL", move || {
+                        entries.push(MenuEntry::action(tr!("tree-generate-ddl"), move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
                             (oq)(ddl.clone(), Some(db.clone()));
                         }));
@@ -1984,7 +2028,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let rf = refresh_db.clone();
                         let db = database.clone();
-                        entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
+                        entries.push(MenuEntry::action(tr!("tree-refresh"), move || {
+                            (rf)(db.clone())
+                        }));
                     }
                     entries.push(MenuEntry::Separator);
                     // Absent, not dimmed, for an extension: it has no form,
@@ -1999,16 +2045,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // sequences, synonyms and more, and the menu is the only thing that says
                         // which of them the row under the cursor is.
                         entries.push(
-                            MenuEntry::action(format!("Edit {}", kind.label()), move || {
-                                crate::object_editor::open_for_object(
-                                    ui.conn,
-                                    ui.schema,
-                                    ui.ddl,
-                                    &ui.schema_actions,
-                                    &db,
-                                    &obj,
-                                );
-                            })
+                            // `kind.label()` is core's word for the kind,
+                            // English until core's labels are (roadmap phase 4).
+                            MenuEntry::action(
+                                tr!("tree-edit-kind", kind = kind.label()),
+                                move || {
+                                    crate::object_editor::open_for_object(
+                                        ui.conn,
+                                        ui.schema,
+                                        ui.ddl,
+                                        &ui.schema_actions,
+                                        &db,
+                                        &obj,
+                                    );
+                                },
+                            )
                             .disabled(read_only || !editable),
                         );
                     }
@@ -2026,7 +2077,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // that can only ever fail.
                         let internal = obj.is_internal();
                         entries.push(
-                            MenuEntry::action_colored("Drop", theme::error, move || {
+                            MenuEntry::action_colored(tr!("tree-drop"), theme::error, move || {
                                 // Straight to the preview, which names the drop
                                 // and its statement; a plain "Drop x? This can't
                                 // be undone." asked first made it ask twice.
@@ -2051,7 +2102,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                 }
                 CtxKind::Schema { database, ddl } => {
-                    entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    entries.push(MenuEntry::action(
+                        tr!("tree-copy-name"),
+                        copy(menu.name.clone()),
+                    ));
                     // The whole namespace as one CREATE script — the schema-level
                     // analog of a table's "Generate DDL" (same clipboard + new-tab
                     // behaviour). Empty for a namespace with no tables, in which
@@ -2059,7 +2113,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     if !ddl.is_empty() {
                         let oq = open_query.clone();
                         let db = database.clone();
-                        entries.push(MenuEntry::action("Generate DDL", move || {
+                        entries.push(MenuEntry::action(tr!("tree-generate-ddl"), move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
                             (oq)(ddl.clone(), Some(db.clone()));
                         }));
@@ -2068,7 +2122,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // refreshing targets the database.
                     let rf = refresh_db.clone();
                     let refresh_database = database.clone();
-                    entries.push(MenuEntry::action("Refresh", move || {
+                    entries.push(MenuEntry::action(tr!("tree-refresh"), move || {
                         (rf)(refresh_database.clone())
                     }));
                     // ── Import, Export, Create ────────────────────────────────
@@ -2089,7 +2143,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // Dimmed on a read-only connection, as on the database
                         // node above and for the same reason.
                         entries.push(
-                            MenuEntry::action("Import", move || {
+                            MenuEntry::action(tr!("tree-import"), move || {
                                 let ctx = crate::table_designer::edit_ctx(iui.conn);
                                 crate::script_view::open_script(
                                     iui.script,
@@ -2127,7 +2181,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let ui = import_ui.clone();
                         let (db, ns) = (database.clone(), menu.name.clone());
                         entries.push(
-                            MenuEntry::action_colored("Drop", theme::error, move || {
+                            MenuEntry::action_colored(tr!("tree-drop"), theme::error, move || {
                                 let ctx = crate::table_designer::edit_ctx(ui.conn);
                                 let on = crate::ddl_preview::PlanTarget {
                                     conn_id: ctx.conn_id,
@@ -2161,7 +2215,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     if !ddl.is_empty() {
                         let oq = open_query.clone();
                         let db = database.clone();
-                        entries.push(MenuEntry::action("Generate DDL", move || {
+                        entries.push(MenuEntry::action(tr!("tree-generate-ddl"), move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
                             (oq)(ddl.clone(), Some(db.clone()));
                         }));
@@ -2169,7 +2223,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let rf = refresh_db.clone();
                         let db = database.clone();
-                        entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
+                        entries.push(MenuEntry::action(tr!("tree-refresh"), move || {
+                            (rf)(db.clone())
+                        }));
                     }
                     // Absent where the engine has no form for the kind — SQL
                     // Server's Sequences folder would otherwise open
@@ -2190,17 +2246,20 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // either side of it. Same lower-case spelling as the
                         // object row's "Edit type".
                         entries.push(
-                            MenuEntry::action(format!("Create {}", kind.label()), move || {
-                                crate::object_editor::open_for_new(
-                                    ui.conn,
-                                    ui.schema,
-                                    ui.ddl,
-                                    &ui.schema_actions,
-                                    &db,
-                                    ns.as_deref(),
-                                    kind,
-                                );
-                            })
+                            MenuEntry::action(
+                                tr!("tree-create-kind", kind = kind.label()),
+                                move || {
+                                    crate::object_editor::open_for_new(
+                                        ui.conn,
+                                        ui.schema,
+                                        ui.ddl,
+                                        &ui.schema_actions,
+                                        &db,
+                                        ns.as_deref(),
+                                        kind,
+                                    );
+                                },
+                            )
                             .disabled(conn_read_only(&connections, active_conn)),
                         );
                     }
@@ -2217,7 +2276,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let db = database.clone();
                         entries.push(MenuEntry::Separator);
                         entries.push(
-                            MenuEntry::action("Create extension", move || {
+                            MenuEntry::action(tr!("tree-folder-create-extension"), move || {
                                 crate::database_editor::open_for_extension(
                                     ui.conn,
                                     ui.schema,
@@ -2245,7 +2304,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let ot = open_table.clone();
                         let src = source.clone();
-                        entries.push(MenuEntry::action("Open", move || (ot)(src.clone())));
+                        entries.push(MenuEntry::action(tr!("tree-open"), move || {
+                            (ot)(src.clone())
+                        }));
                     }
                     // "Open in new tab" is only useful (and only shown) when a tab
                     // for this table is already open — otherwise it does exactly
@@ -2260,7 +2321,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     if already_open {
                         let otn = open_table_new.clone();
                         let src = source.clone();
-                        entries.push(MenuEntry::action("Open in new tab", move || {
+                        entries.push(MenuEntry::action(tr!("tree-open-in-new-tab"), move || {
                             (otn)(src.clone())
                         }));
                     }
@@ -2269,8 +2330,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // a "Copy" submenu: two children behind a hover is a hover
                     // spent on the most-used entry in the menu.
                     entries.push(MenuEntry::Separator);
-                    entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
-                    entries.push(MenuEntry::action("Copy qualified name", copy(qualified)));
+                    entries.push(MenuEntry::action(
+                        tr!("tree-copy-name"),
+                        copy(menu.name.clone()),
+                    ));
+                    entries.push(MenuEntry::action(
+                        tr!("tree-copy-qualified-name"),
+                        copy(qualified),
+                    ));
                     // The full `TableInfo` (columns, nullability) that the
                     // schema-editing entries below map onto, and which only
                     // exists once the schema has loaded. Read here rather than
@@ -2302,7 +2369,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let ui = import_ui.clone();
                         let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
-                        entries.push(MenuEntry::action("Properties", move || {
+                        entries.push(MenuEntry::action(tr!("tree-properties"), move || {
                             crate::properties::open_for_table(
                                 ui.overlay,
                                 active_conn.get_untracked(),
@@ -2318,7 +2385,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let used_by = import_ui.overlay.used_by;
                         let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
-                        entries.push(MenuEntry::action("Used by", move || {
+                        entries.push(MenuEntry::action(tr!("tree-used-by"), move || {
                             used_by.set(Some(crate::UsedByTarget {
                                 database: db.clone(),
                                 schema: ns.clone(),
@@ -2338,7 +2405,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let om = open_monitor.clone();
                         let src = source.clone();
-                        entries.push(MenuEntry::action("Live monitor", move || {
+                        entries.push(MenuEntry::action(tr!("tree-live-monitor"), move || {
                             (om)(active_conn.get_untracked(), src.clone());
                         }));
                     }
@@ -2349,7 +2416,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // name — so a table outside `public` seeds `sales.orders`
                         // and can't be confused with a same-named one elsewhere.
                         let seed_id = source.display();
-                        entries.push(MenuEntry::action("ER diagram", move || {
+                        entries.push(MenuEntry::action(tr!("tree-er-diagram"), move || {
                             erd.set(Some(crate::ErdTarget {
                                 conn_id: active_conn.get_untracked(),
                                 database: db.clone(),
@@ -2363,7 +2430,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let ui = import_ui.clone();
                         let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
-                        entries.push(MenuEntry::action("Compare with", move || {
+                        entries.push(MenuEntry::action(tr!("tree-compare-with"), move || {
                             crate::compare_view::open_compare(
                                 ui.overlay,
                                 active_conn.get_untracked(),
@@ -2413,25 +2480,30 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let dialect = crate::table_designer::edit_ctx(import_ui.conn).dialect;
                             let db = database.as_str();
                             let items = vec![
-                                MenuEntry::action("Create", generate(ddl.clone())),
                                 MenuEntry::action(
-                                    "Insert",
+                                    tr!("tree-generate-create"),
+                                    generate(ddl.clone()),
+                                ),
+                                MenuEntry::action(
+                                    tr!("tree-generate-insert"),
                                     generate(insert_skeleton(dialect, db, t)),
                                 ),
                                 MenuEntry::action(
-                                    "Update",
+                                    tr!("tree-generate-update"),
                                     generate(update_skeleton(dialect, db, t)),
                                 ),
                                 MenuEntry::action(
-                                    "Delete",
+                                    tr!("tree-generate-delete"),
                                     generate(delete_skeleton(dialect, db, t)),
                                 ),
                             ];
-                            entries.push(MenuEntry::sub("Generate", items));
+                            entries.push(MenuEntry::sub(tr!("tree-generate"), items));
                         }
                         // A view, or a table whose schema hasn't loaded — the
                         // DDL is in hand either way, and nothing else is.
-                        None => entries.push(MenuEntry::action("Generate DDL", generate(ddl))),
+                        None => {
+                            entries.push(MenuEntry::action(tr!("tree-generate-ddl"), generate(ddl)))
+                        }
                     }
                     // Refresh closes the read group in every menu in this tree.
                     // It used to sit between Copy and Properties, splitting the
@@ -2439,7 +2511,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // on the table at all: a table is introspected as part of
                     // its database, so this targets the database.
                     let rf = refresh_db.clone();
-                    entries.push(MenuEntry::action("Refresh", move || {
+                    entries.push(MenuEntry::action(tr!("tree-refresh"), move || {
                         (rf)(refresh_database.clone())
                     }));
                     // ── How this table *looks* in the tree ────────────────────
@@ -2480,14 +2552,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let tc = table_colors;
                             let db = database.clone();
                             let tbl = key.clone();
-                            swatches.push(MenuEntry::action("None", move || {
+                            swatches.push(MenuEntry::action(tr!("tree-colour-none"), move || {
                                 let cid = active_conn.get_untracked();
                                 tc.update(|r| {
                                     schemaic_core::db_color::table_upsert(r, cid, &db, &tbl, None)
                                 });
                             }));
                         }
-                        entries.push(MenuEntry::sub("Colour", swatches));
+                        entries.push(MenuEntry::sub(tr!("tree-colour"), swatches));
                     }
                     // Its own group, just above AI explain: everything that
                     // *writes* — import and schema editing — reads as one set
@@ -2535,7 +2607,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let offers = object_entries(shape, dialect, materialized);
                         if offers.import {
                             entries.push(
-                                MenuEntry::action("Import", move || {
+                                MenuEntry::action(tr!("tree-import"), move || {
                                     if let Some(info) = info.clone() {
                                         crate::import_view::open_import(
                                             ui.import,
@@ -2581,7 +2653,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         if offers.edit && !is_view {
                             let copy_open = import_ui.overlay.copy_table;
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
-                            entries.push(MenuEntry::action("Copy to", move || {
+                            entries.push(MenuEntry::action(tr!("tree-copy-to"), move || {
                                 copy_open.set(Some(crate::CopySource {
                                     conn_id: active_conn.get_untracked(),
                                     database: db.clone(),
@@ -2608,7 +2680,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             // since the two rows look alike in the tree.
                             entries.push(
                                 MenuEntry::action(
-                                    if is_view { "Edit view" } else { "Edit table" },
+                                    if is_view {
+                                        tr!("tree-edit-view")
+                                    } else {
+                                        tr!("tree-edit-table")
+                                    },
                                     move || {
                                         if is_view {
                                             crate::view_editor::open_for_view(
@@ -2672,9 +2748,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     // is the useful half. Bare when there are none
                                     // — "(0)" reads as a broken count.
                                     if n == 0 {
-                                        "Triggers".to_string()
+                                        tr!("tree-triggers")
                                     } else {
-                                        format!("Triggers ({n})")
+                                        tr!("tree-triggers-count", n = n)
                                     },
                                     move || {
                                         crate::trigger_editor::open_for_table(
@@ -2721,7 +2797,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let ui = import_ui.clone();
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                             entries.push(
-                                MenuEntry::action("Refresh view", move || {
+                                MenuEntry::action(tr!("tree-refresh-view"), move || {
                                     crate::ddl_preview::preview_change(
                                         ui.conn,
                                         ui.ddl,
@@ -2766,28 +2842,32 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                             let label = source.display();
                             entries.push(
-                                MenuEntry::action_colored("Truncate", theme::error, move || {
-                                    let (ui, db, ns, tbl) =
-                                        (ui.clone(), db.clone(), ns.clone(), tbl.clone());
-                                    confirm.set(Some(crate::Confirm {
-                                        title: "Truncate table".to_string(),
-                                        message: schemaic_core::stats::truncate_prompt(
-                                            &label, rows,
-                                        ),
-                                        resolve: Rc::new(move |yes| {
-                                            if yes {
-                                                crate::ddl_preview::preview_change(
-                                                    ui.conn,
-                                                    ui.ddl,
-                                                    &db,
-                                                    &tbl,
-                                                    ns.as_deref(),
-                                                    schemaic_core::ddl::Change::TruncateTable,
-                                                );
-                                            }
-                                        }),
-                                    }));
-                                })
+                                MenuEntry::action_colored(
+                                    tr!("tree-truncate"),
+                                    theme::error,
+                                    move || {
+                                        let (ui, db, ns, tbl) =
+                                            (ui.clone(), db.clone(), ns.clone(), tbl.clone());
+                                        confirm.set(Some(crate::Confirm {
+                                            title: tr!("tree-truncate-title"),
+                                            message: schemaic_core::stats::truncate_prompt(
+                                                &label, rows,
+                                            ),
+                                            resolve: Rc::new(move |yes| {
+                                                if yes {
+                                                    crate::ddl_preview::preview_change(
+                                                        ui.conn,
+                                                        ui.ddl,
+                                                        &db,
+                                                        &tbl,
+                                                        ns.as_deref(),
+                                                        schemaic_core::ddl::Change::TruncateTable,
+                                                    );
+                                                }
+                                            }),
+                                        }));
+                                    },
+                                )
                                 .disabled(read_only),
                             );
                         }
@@ -2795,64 +2875,71 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let ui = import_ui.clone();
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                             entries.push(
-                                MenuEntry::action_colored("Drop", theme::error, move || {
-                                    let used = crate::used_by_view::dependents_of(
-                                        ui.schema,
-                                        ui.conn,
-                                        &crate::UsedByTarget {
-                                            database: db.clone(),
-                                            schema: ns.clone(),
-                                            name: tbl.clone(),
-                                            column: None,
-                                            routine: false,
-                                        },
-                                    );
-                                    // **Straight to the preview.** A confirm
-                                    // asked first, and then the preview asked
-                                    // again with Apply — the same question
-                                    // twice. What the confirm said that the
-                                    // preview's warning did not — a table's row
-                                    // figure, and a sequence named as one
-                                    // rather than as the table `DROP TABLE`
-                                    // takes it for — `drop_warning` says there.
-                                    crate::ddl_preview::preview_change_warning(
-                                        ui.conn,
-                                        ui.ddl,
-                                        &db,
-                                        &tbl,
-                                        ns.as_deref(),
-                                        // `DropTable` for a sequence — see
-                                        // `stats::drop_change`, which the gate
-                                        // asks about too; its line and its
-                                        // warning are worded as a sequence's.
-                                        object_drop_change(shape, materialized),
-                                        |lines, w| {
-                                            let (lines, mut w) = schemaic_core::stats::drop_preview(
-                                                lines, w, rows, shape,
-                                            );
-                                            // What it breaks, named before Apply
-                                            // rather than by the next error
-                                            // (`core::used_by`).
-                                            w.extend(
-                                                used.as_deref()
-                                                    .and_then(schemaic_core::used_by::drop_warning),
-                                            );
-                                            (lines, w)
-                                        },
-                                    );
-                                })
+                                MenuEntry::action_colored(
+                                    tr!("tree-drop"),
+                                    theme::error,
+                                    move || {
+                                        let used = crate::used_by_view::dependents_of(
+                                            ui.schema,
+                                            ui.conn,
+                                            &crate::UsedByTarget {
+                                                database: db.clone(),
+                                                schema: ns.clone(),
+                                                name: tbl.clone(),
+                                                column: None,
+                                                routine: false,
+                                            },
+                                        );
+                                        // **Straight to the preview.** A confirm
+                                        // asked first, and then the preview asked
+                                        // again with Apply — the same question
+                                        // twice. What the confirm said that the
+                                        // preview's warning did not — a table's row
+                                        // figure, and a sequence named as one
+                                        // rather than as the table `DROP TABLE`
+                                        // takes it for — `drop_warning` says there.
+                                        crate::ddl_preview::preview_change_warning(
+                                            ui.conn,
+                                            ui.ddl,
+                                            &db,
+                                            &tbl,
+                                            ns.as_deref(),
+                                            // `DropTable` for a sequence — see
+                                            // `stats::drop_change`, which the gate
+                                            // asks about too; its line and its
+                                            // warning are worded as a sequence's.
+                                            object_drop_change(shape, materialized),
+                                            |lines, w| {
+                                                let (lines, mut w) =
+                                                    schemaic_core::stats::drop_preview(
+                                                        lines, w, rows, shape,
+                                                    );
+                                                // What it breaks, named before Apply
+                                                // rather than by the next error
+                                                // (`core::used_by`).
+                                                w.extend(used.as_deref().and_then(
+                                                    schemaic_core::used_by::drop_warning,
+                                                ));
+                                                (lines, w)
+                                            },
+                                        );
+                                    },
+                                )
                                 .disabled(read_only),
                             );
                         }
                     }
                 }
                 CtxKind::Field { source, column } => {
-                    entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    entries.push(MenuEntry::action(
+                        tr!("tree-copy-name"),
+                        copy(menu.name.clone()),
+                    ));
                     // `database.schema.table.column` — the one qualification a
                     // column has, and the shape you paste into a query. Built
                     // the way the table entry builds its own.
                     entries.push(MenuEntry::action(
-                        "Copy qualified name",
+                        tr!("tree-copy-qualified-name"),
                         copy(format!(
                             "{}.{}.{}",
                             source.database,
@@ -2865,7 +2952,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let used_by = import_ui.overlay.used_by;
                         let (src, col) = (source.clone(), column.clone());
-                        entries.push(MenuEntry::action("Used by", move || {
+                        entries.push(MenuEntry::action(tr!("tree-used-by"), move || {
                             used_by.set(Some(crate::UsedByTarget {
                                 database: src.database.clone(),
                                 schema: src.schema.clone(),
@@ -2885,7 +2972,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let ui = import_ui.clone();
                         let (src, col) = (source.clone(), column.clone());
                         entries.push(
-                            MenuEntry::action("Edit column", move || {
+                            MenuEntry::action(tr!("tree-edit-column"), move || {
                                 crate::table_designer::open_for_table(
                                     ui.conn,
                                     ui.schema,
@@ -2913,7 +3000,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // this one used to be the same colour as Edit column
                         // directly above it.
                         entries.push(
-                            MenuEntry::action_colored("Drop", theme::error, move || {
+                            MenuEntry::action_colored(tr!("tree-drop"), theme::error, move || {
                                 let col = col.clone();
                                 crate::table_designer::preview_draft_edit(
                                     ui.conn,
@@ -2940,7 +3027,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     index,
                     foreign_key,
                 } => {
-                    entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    entries.push(MenuEntry::action(
+                        tr!("tree-copy-name"),
+                        copy(menu.name.clone()),
+                    ));
                     let read_only = conn_read_only(&connections, active_conn);
                     entries.push(MenuEntry::Separator);
                     let offers = key_entries(
@@ -2962,11 +3052,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // is where the key is actually edited (the index form's
                         // own hint says so).
                         let label = if fk.is_some() {
-                            "Edit foreign key"
+                            tr!("tree-edit-foreign-key")
                         } else if ix.is_primary() {
-                            "Edit primary key"
+                            tr!("tree-edit-primary-key")
                         } else {
-                            "Edit index"
+                            tr!("tree-edit-index")
                         };
                         entries.push(
                             MenuEntry::action(label, move || {
@@ -3004,7 +3094,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let src = source.clone();
                             entries.push(
                                 MenuEntry::action_colored(
-                                    "Drop foreign key",
+                                    tr!("tree-drop-foreign-key"),
                                     theme::error,
                                     move || {
                                         crate::ddl_preview::preview_change(
@@ -3029,25 +3119,29 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let src = source.clone();
                             let ix = index.clone();
                             entries.push(
-                                MenuEntry::action_colored("Drop index", theme::error, move || {
-                                    crate::ddl_preview::preview_change(
-                                        ui.conn,
-                                        ui.ddl,
-                                        &src.database,
-                                        &src.table,
-                                        src.schema.as_deref(),
-                                        schemaic_core::ddl::Change::DropIndex {
-                                            name: ix.name.clone(),
-                                            constraint: ix.constraint.clone(),
-                                            // Carried so the preview can say
-                                            // duplicates are accepted from now
-                                            // on — `Change::risks`' arm.
-                                            unique: ix.unique,
-                                            // Dropped for good.
-                                            remade: false,
-                                        },
-                                    );
-                                })
+                                MenuEntry::action_colored(
+                                    tr!("tree-drop-index"),
+                                    theme::error,
+                                    move || {
+                                        crate::ddl_preview::preview_change(
+                                            ui.conn,
+                                            ui.ddl,
+                                            &src.database,
+                                            &src.table,
+                                            src.schema.as_deref(),
+                                            schemaic_core::ddl::Change::DropIndex {
+                                                name: ix.name.clone(),
+                                                constraint: ix.constraint.clone(),
+                                                // Carried so the preview can say
+                                                // duplicates are accepted from now
+                                                // on — `Change::risks`' arm.
+                                                unique: ix.unique,
+                                                // Dropped for good.
+                                                remade: false,
+                                            },
+                                        );
+                                    },
+                                )
                                 .disabled(read_only),
                             );
                         }
@@ -3063,7 +3157,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                 let ai = ai_send.clone();
                 let prompt = menu.ai_prompt.clone();
                 entries.push(MenuEntry::action_icon(
-                    "AI explain",
+                    tr!("tree-ai-explain"),
                     (icons::SPARKLES, theme::key_foreign),
                     // Reveal, then send — as the palette's Ask AI and the grid's AI
                     // Summary already did. Without it, with the right column showing
@@ -3807,19 +3901,21 @@ fn body_result_item(
             close.clone(),
         )
     };
+    // `kind().label()` is core's word for the kind ("procedure"), English until
+    // core's labels are translated (roadmap phase 4).
     let (mut row, what) = match hit.owner {
         BodyOwner::View { schema, name } => (
             table_row(TableSource::new(database.clone(), schema, name)),
-            "view body".to_string(),
+            tr!("palette-row-view-body"),
         ),
         BodyOwner::Routine(r) => {
             let item = ObjectItem::Routine(r);
-            let what = format!("{} body", item.kind().label());
+            let what = tr!("palette-row-body", kind = item.kind().label());
             (object_row(item), what)
         }
         BodyOwner::Event(e) => {
             let item = ObjectItem::Event(e);
-            let what = format!("{} body", item.kind().label());
+            let what = tr!("palette-row-body", kind = item.kind().label());
             (object_row(item), what)
         }
         BodyOwner::Trigger {
@@ -3828,7 +3924,7 @@ fn body_result_item(
             name,
         } => {
             let source = TableSource::new(database.clone(), schema, table);
-            let what = format!("trigger on {}", source.display());
+            let what = tr!("palette-row-trigger-on", table = source.display());
             let mut row = table_row(source);
             row.primary = name.clone();
             row.complete = Some(name);
@@ -3934,23 +4030,51 @@ enum CmdArg {
     Text(ItemsFn),
 }
 
-/// A command-palette entry. `name` is the canonical lowercase keyword the pure
-/// parser matches (see `schemaic_core::palette`); `label`/`hint` are display.
+/// A command-palette entry: `label`/`hint` in the interface's language, and two
+/// names the pure parser matches (see `schemaic_core::palette`).
 ///
-/// **`name` must be `label` lowercased**, because `name` is not an internal id —
-/// Tab completion types it into the box the user is looking at. "Ask AI" that
-/// completed to `>ai` read as the palette having chosen a different command;
-/// [`assert_names_match_labels`] holds every entry to it.
+/// **The name typed is the label lowercased** ([`Command::name`]), because Tab
+/// completion types the label into the box the user is looking at. "Ask AI"
+/// that completed to `>ai` read as the palette having chosen a different
+/// command.
+///
+/// **`id` is the English name, and matches in every language** — what
+/// someone who learned the palette in English, or follows an English page,
+/// types into a German one, as VS Code's translated palette also accepts. It is
+/// also what the rest of the code knows a command by (`COMMAND_KEYS`, the
+/// filters below that drop one), so nothing keys on a translated string.
+/// [`assert_names_match_labels`] holds it to the English label.
 struct Command {
-    name: &'static str,
-    label: &'static str,
-    hint: &'static str,
+    id: &'static str,
+    label: String,
+    hint: String,
     arg: CmdArg,
 }
 
 impl Command {
     fn takes_arg(&self) -> bool {
         !matches!(self.arg, CmdArg::Instant(_))
+    }
+
+    /// The name the parser matches in the interface's language.
+    fn name(&self) -> String {
+        self.label.to_lowercase()
+    }
+
+    /// Every name this command answers to: its label's and its English one —
+    /// the same string in English, so listed once.
+    fn names(&self) -> Vec<String> {
+        let name = self.name();
+        if name == self.id {
+            vec![name]
+        } else {
+            vec![name, self.id.to_string()]
+        }
+    }
+
+    /// Is `name` (as the parser returned it) one of this command's names?
+    fn is_named(&self, name: &str) -> bool {
+        self.id == name || self.name() == name
     }
 }
 
@@ -3960,8 +4084,10 @@ impl Command {
 /// built from a live [`Ui`]: it fires the first time the palette opens on a dev
 /// build, which is where a new command is written. Also checks the invariant
 /// `schemaic_core::palette::parse` documents but cannot verify from inside — no
-/// argument-command name may be a word-prefix of another, or the longer one
-/// becomes unreachable.
+/// argument-command name may be a word-prefix of another command's name, in
+/// either language, or the longer one becomes unreachable. That covers instant
+/// commands too: typing all of `verlauf leeren` would otherwise resolve to the
+/// argument-command `verlauf` with the argument `leeren`.
 ///
 /// And the half of the keycap mapping that no static test can reach:
 /// `shortcuts::COMMAND_KEYS` is checked against `SHORTCUTS` in that module, but
@@ -3970,27 +4096,35 @@ impl Command {
 fn assert_names_match_labels(cmds: &[Command]) {
     for (name, _, keys) in crate::shortcuts::COMMAND_KEYS {
         debug_assert!(
-            cmds.iter().any(|c| c.name == *name),
+            cmds.iter().any(|c| c.id == *name),
             "shortcuts::COMMAND_KEYS maps {name:?} to {keys:?}, but no palette \
              command is called that — it was renamed, and the keycap silently \
              stopped showing"
         );
     }
-    for c in cmds {
-        debug_assert_eq!(
-            c.name,
-            c.label.to_lowercase(),
-            "palette command name must be its label lowercased — Tab types it in front of the user"
-        );
+    // The id is the English label lowercased — checkable only while the
+    // interface is drawn in English, which is every dev build by default.
+    if crate::i18n::active() == schemaic_core::locale::UiLanguage::EnGb {
+        for c in cmds {
+            debug_assert_eq!(
+                c.id,
+                c.name(),
+                "a palette command's id must be its English label lowercased — \
+                 it is the name English matches"
+            );
+        }
     }
     for a in cmds.iter().filter(|c| c.takes_arg()) {
-        for b in cmds.iter().filter(|c| c.takes_arg()) {
-            debug_assert!(
-                std::ptr::eq(a, b) || !b.name.starts_with(&format!("{} ", a.name)),
-                "argument-command `{}` is a word-prefix of `{}`, which the parser can never reach",
-                a.name,
-                b.name
-            );
+        for b in cmds {
+            for a_name in a.names() {
+                for b_name in b.names() {
+                    debug_assert!(
+                        std::ptr::eq(a, b) || !b_name.starts_with(&format!("{a_name} ")),
+                        "argument-command `{a_name}` is a word-prefix of `{b_name}`, \
+                         which the parser can never reach"
+                    );
+                }
+            }
         }
     }
 }
@@ -4043,9 +4177,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
 
     let mut cmds = vec![
         Command {
-            name: "toggle panel",
-            label: "Toggle Panel",
-            hint: "schema · ai · terminal · query history · server activity",
+            id: "toggle panel",
+            label: tr!("palette-toggle-panel"),
+            hint: tr!("palette-toggle-panel-hint"),
             arg: CmdArg::Options {
                 // **The window is too narrow for that panel right now.** Dimmed
                 // and skipped rather than dropped: this state changes as the user
@@ -4069,11 +4203,13 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 // and note this is *omission*, a different answer from `live`'s
                 // dimming, because that one is permanent for the connection.
                 list: Rc::new(move || {
+                    // The value stays English, and the filter matches it as
+                    // well as the label, so `>toggle panel ai` works in German.
                     let mut list = vec![
-                        ("schema", "Schema"),
-                        ("ai", "AI"),
-                        ("terminal", "Terminal"),
-                        ("history", "Query History"),
+                        ("schema", tr!("palette-panel-schema")),
+                        ("ai", tr!("palette-panel-ai")),
+                        ("terminal", tr!("palette-panel-terminal")),
+                        ("history", tr!("palette-panel-history")),
                     ];
                     let cid = active_conn.get_untracked();
                     let has_sessions = connections.with_untracked(|cs| {
@@ -4084,11 +4220,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         })
                     });
                     if has_sessions {
-                        list.push(("activity", "Server Activity"));
+                        list.push(("activity", tr!("palette-panel-activity")));
                     }
-                    list.into_iter()
-                        .map(|(v, l)| (v.to_string(), l.to_string()))
-                        .collect()
+                    list.into_iter().map(|(v, l)| (v.to_string(), l)).collect()
                 }),
                 run: {
                     let close = close.clone();
@@ -4124,27 +4258,27 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             },
         },
         Command {
-            name: "new tab",
-            label: "New Tab",
-            hint: "",
+            id: "new tab",
+            label: tr!("palette-new-tab"),
+            hint: String::new(),
             arg: instant(add_tab.clone(), &close),
         },
         Command {
-            name: "export settings",
-            label: "Export Settings",
-            hint: "",
+            id: "export settings",
+            label: tr!("palette-export-settings"),
+            hint: String::new(),
             arg: instant(ui.export_settings.clone(), &close),
         },
         Command {
-            name: "import settings",
-            label: "Import Settings",
-            hint: "",
+            id: "import settings",
+            label: tr!("palette-import-settings"),
+            hint: String::new(),
             arg: instant(ui.import_settings.clone(), &close),
         },
         Command {
-            name: "duplicate tab",
-            label: "Duplicate Tab",
-            hint: "",
+            id: "duplicate tab",
+            label: tr!("palette-duplicate-tab"),
+            hint: String::new(),
             arg: instant(
                 {
                     let dup = duplicate_tab.clone();
@@ -4158,9 +4292,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             ),
         },
         Command {
-            name: "close tab",
-            label: "Close Tab",
-            hint: "",
+            id: "close tab",
+            label: tr!("palette-close-tab"),
+            hint: String::new(),
             arg: instant(
                 {
                     let close_tab = close_tab.clone();
@@ -4177,9 +4311,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         // connection's closed tabs — the ring outlives a restart while
         // "restore tabs" is on — to pick an older one.
         Command {
-            name: "reopen closed tab",
-            label: "Reopen Closed Tab",
-            hint: "<tab>",
+            id: "reopen closed tab",
+            label: tr!("palette-reopen-closed-tab"),
+            hint: tr!("palette-reopen-closed-tab-hint"),
             arg: CmdArg::Options {
                 live: None,
                 list: ui.tab_actions.closed_tabs_list.clone(),
@@ -4198,15 +4332,15 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         // The file group, right after the tab lifecycle it belongs to: a tab is
         // where a `.sql` file is opened into and saved from.
         Command {
-            name: "open file",
-            label: "Open File",
-            hint: "a .sql script",
+            id: "open file",
+            label: tr!("palette-open-file"),
+            hint: tr!("palette-open-file-hint"),
             arg: instant(open_sql_file.clone(), &close),
         },
         Command {
-            name: "save file",
-            label: "Save File",
-            hint: "",
+            id: "save file",
+            label: tr!("palette-save-file"),
+            hint: String::new(),
             arg: instant(
                 {
                     let save = save_sql_file.clone();
@@ -4220,9 +4354,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             ),
         },
         Command {
-            name: "save file as",
-            label: "Save File As",
-            hint: "",
+            id: "save file as",
+            label: tr!("palette-save-file-as"),
+            hint: String::new(),
             arg: instant(
                 {
                     let save_as = save_sql_file_as.clone();
@@ -4236,27 +4370,27 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             ),
         },
         Command {
-            name: "next tab",
-            label: "Next Tab",
-            hint: "",
+            id: "next tab",
+            label: tr!("palette-next-tab"),
+            hint: String::new(),
             arg: instant(
                 Rc::new(move || cycle_tab(tabs, active, active_conn, 1)),
                 &close,
             ),
         },
         Command {
-            name: "previous tab",
-            label: "Previous Tab",
-            hint: "",
+            id: "previous tab",
+            label: tr!("palette-previous-tab"),
+            hint: String::new(),
             arg: instant(
                 Rc::new(move || cycle_tab(tabs, active, active_conn, -1)),
                 &close,
             ),
         },
         Command {
-            name: "format code",
-            label: "Format Code",
-            hint: "",
+            id: "format code",
+            label: tr!("palette-format-code"),
+            hint: String::new(),
             // Ask the editor pane to do it, don't reformat the text here. This
             // command used to run `sqlfmt` itself and write the result into
             // `t.query` — where nothing ever read it, because the mounted editor
@@ -4277,9 +4411,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         // The editor menu's in-place entries, at the caret — through the
         // same request, so the palette cannot drift from the menu.
         Command {
-            name: "format statement",
-            label: "Format Statement",
-            hint: "the statement at the caret",
+            id: "format statement",
+            label: tr!("palette-format-statement"),
+            hint: tr!("palette-format-statement-hint"),
             arg: instant(
                 Rc::new(move || {
                     if let Some(t) = active_tab() {
@@ -4291,9 +4425,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             ),
         },
         Command {
-            name: "make single line",
-            label: "Make Single Line",
-            hint: "the selection or statement, on one line",
+            id: "make single line",
+            label: tr!("palette-make-single-line"),
+            hint: tr!("palette-make-single-line-hint"),
             arg: instant(
                 Rc::new(move || {
                     if let Some(t) = active_tab() {
@@ -4305,9 +4439,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             ),
         },
         Command {
-            name: "run",
-            label: "Run",
-            hint: "run all statements",
+            id: "run",
+            label: tr!("palette-run"),
+            hint: tr!("palette-run-hint"),
             arg: instant(
                 Rc::new(move || {
                     if let Some(t) = active_tab() {
@@ -4334,9 +4468,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             ),
         },
         Command {
-            name: "go to line",
-            label: "Go to Line",
-            hint: "<number>",
+            id: "go to line",
+            label: tr!("palette-go-to-line"),
+            hint: tr!("palette-go-to-line-hint"),
             arg: CmdArg::Number {
                 min: 1,
                 max: i64::MAX,
@@ -4370,9 +4504,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         // tab, by line and as its code reads, and the pick jumps there — a
         // long script's `CREATE`s, temp tables and `WITH`s found by typing.
         Command {
-            name: "go to statement",
-            label: "Go to Statement",
-            hint: "<search>",
+            id: "go to statement",
+            label: tr!("palette-go-to-statement"),
+            hint: tr!("palette-search-hint"),
             arg: CmdArg::Options {
                 list: Rc::new(move || {
                     let Some(t) = active_tab() else {
@@ -4407,9 +4541,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             },
         },
         Command {
-            name: "history",
-            label: "History",
-            hint: "<search>",
+            id: "history",
+            label: tr!("palette-history"),
+            hint: tr!("palette-search-hint"),
             arg: CmdArg::Text({
                 let close = close.clone();
                 Rc::new(move |arg: &str| {
@@ -4445,27 +4579,31 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             }),
         },
         Command {
-            name: "clear history",
-            label: "Clear History",
-            hint: "current connection",
+            id: "clear history",
+            label: tr!("palette-clear-history"),
+            hint: tr!("palette-clear-history-hint"),
             arg: instant(hist_clear.clone(), &close),
         },
         Command {
-            name: "ask ai",
-            label: "Ask AI",
-            hint: "<prompt>",
+            id: "ask ai",
+            label: tr!("palette-ask-ai"),
+            hint: tr!("palette-ask-ai-hint"),
             arg: CmdArg::Text({
                 let close = close.clone();
                 Rc::new(move |arg: &str| {
                     let arg = arg.trim();
                     if arg.is_empty() {
-                        return vec![hint_item("Ask AI", "Type a prompt…", None)];
+                        return vec![hint_item(
+                            &tr!("palette-ask-ai"),
+                            &tr!("palette-ask-ai-empty"),
+                            None,
+                        )];
                     }
                     let prompt = arg.to_string();
                     let ai_send = ai_send.clone();
                     let close = close.clone();
                     vec![PaletteItem {
-                        primary: "Ask AI".to_string(),
+                        primary: tr!("palette-ask-ai"),
                         secondary: prompt.clone(),
                         enabled: true,
                         activate: Rc::new(move || {
@@ -4483,21 +4621,25 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             }),
         },
         Command {
-            name: "terminal",
-            label: "Terminal",
-            hint: "<command>",
+            id: "terminal",
+            label: tr!("palette-terminal"),
+            hint: tr!("palette-terminal-hint"),
             arg: CmdArg::Text({
                 let close = close.clone();
                 Rc::new(move |arg: &str| {
                     let arg = arg.trim();
                     if arg.is_empty() {
-                        return vec![hint_item("Run in Terminal", "Type a command…", None)];
+                        return vec![hint_item(
+                            &tr!("palette-run-in-terminal"),
+                            &tr!("palette-terminal-empty"),
+                            None,
+                        )];
                     }
                     let cmd = arg.to_string();
                     let term_input = term_input.clone();
                     let close = close.clone();
                     vec![PaletteItem {
-                        primary: "Run in Terminal".to_string(),
+                        primary: tr!("palette-run-in-terminal"),
                         secondary: cmd.clone(),
                         enabled: true,
                         activate: Rc::new(move || {
@@ -4515,9 +4657,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             }),
         },
         Command {
-            name: "ui theme",
-            label: "UI Theme",
-            hint: "light · dark",
+            id: "ui theme",
+            label: tr!("palette-ui-theme"),
+            hint: tr!("palette-ui-theme-hint"),
             arg: CmdArg::Options {
                 live: None,
                 list: Rc::new(|| {
@@ -4536,9 +4678,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             },
         },
         Command {
-            name: "editor theme",
-            label: "Editor Theme",
-            hint: "<theme>",
+            id: "editor theme",
+            label: tr!("palette-editor-theme"),
+            hint: tr!("palette-editor-theme-hint"),
             arg: CmdArg::Options {
                 live: None,
                 list: Rc::new(|| {
@@ -4557,9 +4699,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             },
         },
         Command {
-            name: "font size",
-            label: "Font Size",
-            hint: "<8–32>",
+            id: "font size",
+            label: tr!("palette-font-size"),
+            hint: "<8–32>".to_string(),
             arg: CmdArg::Number {
                 min: 8,
                 max: 32,
@@ -4574,33 +4716,33 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             },
         },
         Command {
-            name: "increase font size",
-            label: "Increase Font Size",
-            hint: "",
+            id: "increase font size",
+            label: tr!("palette-increase-font-size"),
+            hint: String::new(),
             arg: instant(
                 Rc::new(move || editor_font.update(|f| *f = (*f + 1.0).clamp(8.0, 32.0))),
                 &close,
             ),
         },
         Command {
-            name: "decrease font size",
-            label: "Decrease Font Size",
-            hint: "",
+            id: "decrease font size",
+            label: tr!("palette-decrease-font-size"),
+            hint: String::new(),
             arg: instant(
                 Rc::new(move || editor_font.update(|f| *f = (*f - 1.0).clamp(8.0, 32.0))),
                 &close,
             ),
         },
         Command {
-            name: "indent style",
-            label: "Indent Style",
-            hint: "tabs · spaces",
+            id: "indent style",
+            label: tr!("palette-indent-style"),
+            hint: tr!("palette-indent-style-hint"),
             arg: CmdArg::Options {
                 live: None,
                 list: Rc::new(|| {
                     vec![
-                        ("spaces".to_string(), "Spaces".to_string()),
-                        ("tabs".to_string(), "Tabs".to_string()),
+                        ("spaces".to_string(), tr!("palette-indent-spaces")),
+                        ("tabs".to_string(), tr!("palette-indent-tabs")),
                     ]
                 }),
                 run: {
@@ -4613,9 +4755,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             },
         },
         Command {
-            name: "indent width",
-            label: "Indent Width",
-            hint: "<1–8>",
+            id: "indent width",
+            label: tr!("palette-indent-width"),
+            hint: "<1–8>".to_string(),
             arg: CmdArg::Number {
                 min: 1,
                 max: 8,
@@ -4630,30 +4772,30 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             },
         },
         Command {
-            name: "toggle word wrap",
-            label: "Toggle Word Wrap",
-            hint: "",
+            id: "toggle word wrap",
+            label: tr!("palette-toggle-word-wrap"),
+            hint: String::new(),
             arg: instant(Rc::new(move || word_wrap.update(|w| *w = !*w)), &close),
         },
         Command {
-            name: "toggle whitespace",
-            label: "Toggle Whitespace",
-            hint: "show spaces and tabs",
+            id: "toggle whitespace",
+            label: tr!("palette-toggle-whitespace"),
+            hint: tr!("palette-toggle-whitespace-hint"),
             arg: instant(
                 Rc::new(move || show_whitespace.update(|w| *w = !*w)),
                 &close,
             ),
         },
         Command {
-            name: "toggle indent guides",
-            label: "Toggle Indent Guides",
-            hint: "",
+            id: "toggle indent guides",
+            label: tr!("palette-toggle-indent-guides"),
+            hint: String::new(),
             arg: instant(Rc::new(move || indent_guides.update(|g| *g = !*g)), &close),
         },
         Command {
-            name: "switch connection",
-            label: "Switch Connection",
-            hint: "<connection>",
+            id: "switch connection",
+            label: tr!("palette-switch-connection"),
+            hint: tr!("palette-switch-connection-hint"),
             arg: CmdArg::Options {
                 live: None,
                 list: Rc::new(move || {
@@ -4676,9 +4818,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         },
         // The SCHEMA gear's entry, from the keyboard — the same door.
         Command {
-            name: "server variables",
-            label: "Server Variables",
-            hint: "the active connection's settings",
+            id: "server variables",
+            label: tr!("palette-server-variables"),
+            hint: tr!("palette-server-variables-hint"),
             arg: instant(
                 Rc::new({
                     let conn = ui.conn;
@@ -4697,13 +4839,13 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         connections.with_untracked(|cs| schemaic_core::connection::by_id(cs, id).is_some())
     };
     if !has_conn {
-        cmds.retain(|c| c.name != "server variables");
+        cmds.retain(|c| c.id != "server variables");
     }
     // **No "Ask AI" while the assistant is off** — omitted, as the Activity
     // panel is on an engine without sessions. The registry is built per open,
     // so turning the assistant on brings it back at the next.
     if !ai_enabled.get_untracked() {
-        cmds.retain(|c| c.name != "ask ai");
+        cmds.retain(|c| c.id != "ask ai");
     }
     cmds
 }
@@ -4793,8 +4935,10 @@ fn snippet_items(search: &SnippetSearch, q: &str, close: &Rc<dyn Fn()>) -> Vec<P
                     // nothing else in the list and would otherwise read as a
                     // table nobody can find.
                     secondary: match &s.abbrev {
-                        Some(a) if !a.is_empty() => format!("snippet · {a}"),
-                        _ => "snippet".to_string(),
+                        Some(a) if !a.is_empty() => {
+                            format!("{} · {a}", tr!("palette-row-snippet"))
+                        }
+                        _ => tr!("palette-row-snippet"),
                     },
                     enabled: true,
                     activate: Rc::new(move || {
@@ -4866,7 +5010,7 @@ fn tab_items(
             let (active, tabs_sig, close) = (search.active, search.tabs, close.clone());
             PaletteItem {
                 primary: tab.title(),
-                secondary: format!("open tab · {}", hit.snippet),
+                secondary: format!("{} · {}", tr!("palette-row-open-tab"), hit.snippet),
                 enabled: true,
                 activate: Rc::new(move || {
                     // The tab may have closed since the row was built.
@@ -4921,7 +5065,13 @@ fn history_items(
             // on the database or tab name).
             let line = schemaic_core::body_search::body_snippet(&entry.sql, needle)
                 .unwrap_or_else(|| history::preview(&entry.sql).chars().take(60).collect());
-            let mut secondary = format!("history · {}", history::relative_time(entry.ts, now));
+            // `relative_time` is core's prose ("5 min ago"), English until
+            // locale formatting (roadmap phase 7).
+            let mut secondary = format!(
+                "{} · {}",
+                tr!("palette-row-history"),
+                history::relative_time(entry.ts, now)
+            );
             if let Some(db) = &entry.database {
                 secondary.push_str(" · ");
                 secondary.push_str(db);
@@ -5102,9 +5252,9 @@ fn build_items(
             let f = f.trim().to_lowercase();
             commands
                 .iter()
-                .filter(|c| {
-                    f.is_empty() || c.label.to_lowercase().contains(&f) || c.name.contains(&f)
-                })
+                // The English name filters too, so an English word finds its
+                // command in any language (`Command::id`).
+                .filter(|c| f.is_empty() || c.name().contains(&f) || c.id.contains(&f))
                 .map(|c| {
                     // Tab/ghost target: the **label**, as shown on the row, plus a
                     // trailing space for argument-commands so the caret lands ready
@@ -5133,8 +5283,8 @@ fn build_items(
                         }
                     };
                     PaletteItem {
-                        primary: c.label.to_string(),
-                        secondary: c.hint.to_string(),
+                        primary: c.label.clone(),
+                        secondary: c.hint.clone(),
                         enabled: true,
                         activate,
                         complete: Some(complete),
@@ -5144,19 +5294,19 @@ fn build_items(
                         // The command list is the one place a keycap earns its
                         // room: this is what people open when they can't
                         // remember the key.
-                        keys: crate::shortcuts::command_keys(c.name),
+                        keys: crate::shortcuts::command_keys(c.id),
                     }
                 })
                 .collect()
         }
         // A resolved argument-command: render its argument choices/results.
         Parsed::Command { name, arg } => {
-            let Some(c) = commands.iter().find(|c| c.name == name) else {
+            let Some(c) = commands.iter().find(|c| c.is_named(&name)) else {
                 return Vec::new();
             };
             match &c.arg {
                 CmdArg::Instant(run) => vec![PaletteItem {
-                    primary: c.label.to_string(),
+                    primary: c.label.clone(),
                     secondary: String::new(),
                     enabled: true,
                     activate: run.clone(),
@@ -5164,7 +5314,7 @@ fn build_items(
                     match_term: None,
                     icon: None,
                     right_icon: None,
-                    keys: crate::shortcuts::command_keys(c.name),
+                    keys: crate::shortcuts::command_keys(c.id),
                 }],
                 CmdArg::Options { list, run, live } => {
                     let a = arg.trim().to_lowercase();
@@ -5214,12 +5364,12 @@ fn build_items(
                     // into this branch, and dropping it here made the binding
                     // blink out of existence on the keystroke that *selected* the
                     // command — which is exactly when it was being read.
-                    let keys = crate::shortcuts::command_keys(c.name);
+                    let keys = crate::shortcuts::command_keys(c.id);
                     let t = arg.trim();
                     if t.is_empty() {
                         return match empty {
                             Some(e) => vec![PaletteItem {
-                                primary: c.label.to_string(),
+                                primary: c.label.clone(),
                                 secondary: "↵".to_string(),
                                 enabled: true,
                                 activate: e.clone(),
@@ -5229,7 +5379,7 @@ fn build_items(
                                 right_icon: None,
                                 keys,
                             }],
-                            None => vec![hint_item(c.label, c.hint, keys)],
+                            None => vec![hint_item(&c.label, &c.hint, keys)],
                         };
                     }
                     match t.parse::<i64>() {
@@ -5237,7 +5387,7 @@ fn build_items(
                             let clamped = n.clamp(*min, *max);
                             let run = run.clone();
                             vec![PaletteItem {
-                                primary: c.label.to_string(),
+                                primary: c.label.clone(),
                                 secondary: format!("→ {clamped}"),
                                 enabled: true,
                                 activate: Rc::new(move || (run)(clamped)),
@@ -5248,7 +5398,7 @@ fn build_items(
                                 keys,
                             }]
                         }
-                        Err(_) => vec![hint_item(c.label, "Enter a number", keys)],
+                        Err(_) => vec![hint_item(&c.label, &tr!("palette-enter-number"), keys)],
                     }
                 }
                 CmdArg::Text(f) => f(&arg),
@@ -5340,10 +5490,11 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             // argument-taking commands, which the pure parser needs.
             let commands = Rc::new(palette_commands(&ui_reg, close.clone()));
             assert_names_match_labels(&commands);
-            let arg_names: Vec<&'static str> = commands
+            // Both names of each — its label's and its English one.
+            let arg_names: Vec<String> = commands
                 .iter()
                 .filter(|c| c.takes_arg())
-                .map(|c| c.name)
+                .flat_map(Command::names)
                 .collect();
 
             // Current rows + the keyboard-selected index, recomputed from the query.
@@ -5373,7 +5524,8 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     db_nodes.with(|nodes| nodes.iter().for_each(|n| n.schema.track()));
                     hidden.track();
                     active_conn.track();
-                    let parsed = schemaic_core::palette::parse(&raw, &arg_names);
+                    let names: Vec<&str> = arg_names.iter().map(String::as_str).collect();
+                    let parsed = schemaic_core::palette::parse(&raw, &names);
                     items.set(build_items(
                         parsed,
                         &commands,
@@ -5521,7 +5673,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                             return empty().into_any(); // nothing typed, no history
                         }
                         // Left-aligned like a normal result row (same padding), 13px.
-                        return text("Nothing found")
+                        return text(tr!("palette-nothing-found"))
                             .style(|s| {
                                 s.color(theme::text_muted())
                                     .font_size(theme::scaled_font(14.0))
@@ -5726,23 +5878,13 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
             let Some(p) = p else {
                 return empty().into_any();
             };
-            let stmts = match p.stmts {
-                1 => "1 statement".to_string(),
-                n => format!("{n} statements"),
-            };
+            // Whole sentences with the count's plural inside, so a language can
+            // put the tab's name and the count where its grammar wants them.
             let body = if p.can_commit {
-                format!(
-                    "{} has an open transaction with {stmts} in it. \
-                     You can commit to keep the changes, or rollback to discard them.",
-                    p.tab
-                )
+                tr!("tx-prompt-body", tab = p.tab.clone(), n = p.stmts)
             } else {
                 // Postgres aborted it, so committing isn't on the table.
-                format!(
-                    "{} has a transaction that a failed statement aborted, with {stmts} \
-                     in it. It can only be rolled back, which discards the changes.",
-                    p.tab
-                )
+                tr!("tx-prompt-body-aborted", tab = p.tab.clone(), n = p.stmts)
             };
 
             // One button row: Cancel (quiet) · Rollback (danger) · Commit — all
@@ -5762,7 +5904,7 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
             let cancel = {
                 let r = resolve.clone();
                 action_button(
-                    "Cancel",
+                    tr!("dialog-cancel"),
                     ActionKind::Neutral,
                     true,
                     ring.clone(),
@@ -5774,7 +5916,7 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
                 let r = resolve.clone();
                 // "Rollback", matching the status bar's action and the body text.
                 action_button(
-                    "Rollback",
+                    tr!("tx-prompt-rollback"),
                     ActionKind::Danger,
                     true,
                     ring.clone(),
@@ -5789,7 +5931,7 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
             let commit: AnyView = if p.can_commit {
                 let r = resolve.clone();
                 action_button(
-                    "Commit",
+                    tr!("tx-prompt-commit"),
                     ActionKind::Primary,
                     true,
                     ring.clone(),
@@ -5806,7 +5948,7 @@ pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
             };
 
             let panel = v_stack((
-                modal_title("Open transaction", close, ring.clone()),
+                modal_title_owned(tr!("tx-prompt-title"), close, ring.clone()),
                 text(body).style(|s| {
                     s.width_full()
                         .color(theme::text())
@@ -5898,7 +6040,7 @@ pub(crate) fn confirm_overlay(confirm: RwSignal<Option<Confirm>>) -> impl IntoVi
             let no = {
                 let a = answer.clone();
                 action_button(
-                    "No",
+                    tr!("dialog-no"),
                     ActionKind::Neutral,
                     true,
                     ring.clone(),
@@ -5909,7 +6051,7 @@ pub(crate) fn confirm_overlay(confirm: RwSignal<Option<Confirm>>) -> impl IntoVi
             let yes = {
                 let a = answer.clone();
                 action_button(
-                    "Yes",
+                    tr!("dialog-yes"),
                     ActionKind::Danger,
                     true,
                     ring.clone(),
@@ -6046,7 +6188,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             } else {
                 (None, None)
             };
-            let msg = shown.unwrap_or_else(|| "No error.".to_string());
+            let msg = shown.unwrap_or_else(|| tr!("error-modal-none"));
             let has_actions = explain_error.is_some() || fixable_error.is_some();
 
             // Closing clears the text override so the next open (e.g. the editor's
@@ -6073,7 +6215,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             let ring = crate::widgets::FocusRing::new();
             let fix = if let Some(err) = fixable_error.clone() {
                 crate::widgets::sparkle_action(
-                    "AI fix",
+                    tr!("error-modal-ai-fix"),
                     theme::accent,
                     theme::accent_hover,
                     Some((ring.clone(), ACTION_TAB + 10)),
@@ -6135,7 +6277,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                     })
                 });
                 crate::widgets::sparkle_action(
-                    "Explain",
+                    tr!("error-modal-explain"),
                     theme::accent,
                     theme::accent_hover,
                     Some((ring.clone(), ACTION_TAB)),
@@ -6192,13 +6334,16 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             // The ✕ every other modal wears, closing through the same `close` as
             // click-away and Escape so the three exits cannot disagree. It joins
             // the ring, which on a notice with no actions makes it the only stop.
-            let panel = v_stack((modal_title("Error", Rc::new(close), ring.clone()), body))
-                .on_click_stop(|_| {})
-                .style(|s| {
-                    panel_style(s)
-                        .width(modal_w(500.0))
-                        .border_color(theme::modal_border())
-                });
+            let panel = v_stack((
+                modal_title_owned(tr!("error-modal-title"), Rc::new(close), ring.clone()),
+                body,
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| {
+                panel_style(s)
+                    .width(modal_w(500.0))
+                    .border_color(theme::modal_border())
+            });
             crate::widgets::focus_root_with_ring(
                 stack((crate::widgets::dismiss_layer(close), panel)),
                 ring,
@@ -6998,10 +7143,10 @@ mod create_menu_tests {
     use schemaic_core::ddl::ObjectKind;
     use schemaic_core::intel::SqlDialect;
 
-    fn labels(dialect: SqlDialect) -> Vec<&'static str> {
+    fn labels(dialect: SqlDialect) -> Vec<String> {
         create_children(dialect, false)
             .into_iter()
-            .map(|e| e.label)
+            .map(|e| e.kind.label())
             .collect()
     }
 
@@ -7058,8 +7203,8 @@ mod create_menu_tests {
     #[test]
     fn sqlite_is_offered_no_routines() {
         let labels = labels(SqlDialect::Sqlite);
-        assert!(!labels.contains(&"Function"), "{labels:?}");
-        assert!(!labels.contains(&"Procedure"), "{labels:?}");
+        assert!(!labels.contains(&"Function".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"Procedure".to_string()), "{labels:?}");
     }
 
     /// **The event entry is MySQL's alone.** PostgreSQL's nearest equivalent is
@@ -7068,9 +7213,9 @@ mod create_menu_tests {
     /// routine entries make one test up.
     #[test]
     fn only_mysql_is_offered_an_event() {
-        assert!(labels(SqlDialect::MySql).contains(&"Event"));
+        assert!(labels(SqlDialect::MySql).contains(&"Event".to_string()));
         for d in [SqlDialect::Postgres, SqlDialect::Sqlite] {
-            assert!(!labels(d).contains(&"Event"), "{d:?}");
+            assert!(!labels(d).contains(&"Event".to_string()), "{d:?}");
         }
     }
 
@@ -7120,7 +7265,7 @@ mod create_menu_tests {
     #[test]
     fn only_postgres_is_offered_an_extension() {
         for d in [SqlDialect::MySql, SqlDialect::Sqlite, SqlDialect::MsSql] {
-            assert!(!labels(d).contains(&"Extension"), "{d:?}");
+            assert!(!labels(d).contains(&"Extension".to_string()), "{d:?}");
         }
     }
 
@@ -7132,13 +7277,13 @@ mod create_menu_tests {
     #[test]
     fn only_the_engines_with_namespaces_are_offered_one() {
         for d in [SqlDialect::Postgres, SqlDialect::MsSql] {
-            assert!(labels(d).contains(&"Schema"), "{d:?}");
+            assert!(labels(d).contains(&"Schema".to_string()), "{d:?}");
         }
         for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
-            assert!(!labels(d).contains(&"Schema"), "{d:?}");
+            assert!(!labels(d).contains(&"Schema".to_string()), "{d:?}");
         }
-        assert!(labels(SqlDialect::MySql).contains(&"Database"));
-        assert!(!labels(SqlDialect::Sqlite).contains(&"Database"));
+        assert!(labels(SqlDialect::MySql).contains(&"Database".to_string()));
+        assert!(!labels(SqlDialect::Sqlite).contains(&"Database".to_string()));
     }
 
     /// The gate that matters if it drifts: every one of these opens an editor
@@ -7843,7 +7988,26 @@ mod find_tests {
 #[cfg(test)]
 mod tests {
     use super::{GearKind, gear_entries, ghost_suffix};
+    use crate::i18n::tr;
     use schemaic_core::intel::SqlDialect;
+
+    /// **The transaction prompt reads as the sentence it replaced.** It was a
+    /// `format!` around a `1 statement` / `{n} statements` match and is now one
+    /// catalogue message with the plural inside, written over several lines of
+    /// the `.ftl` — where a stray line break would reach the dialog.
+    #[test]
+    fn the_transaction_prompt_is_one_sentence_with_its_count() {
+        assert_eq!(
+            tr!("tx-prompt-body", tab = "Query 2", n = 1),
+            "Query 2 has an open transaction with 1 statement in it. You can commit to \
+             keep the changes, or rollback to discard them."
+        );
+        assert_eq!(
+            tr!("tx-prompt-body-aborted", tab = "Query 2", n = 3),
+            "Query 2 has a transaction that a failed statement aborted, with 3 statements \
+             in it. It can only be rolled back, which discards the changes."
+        );
+    }
 
     fn gear_kinds(d: SqlDialect, exists: bool, read_only: bool, down: bool) -> Vec<GearKind> {
         gear_entries(d, exists, read_only, down)
@@ -7863,9 +8027,9 @@ mod tests {
     #[test]
     fn the_gear_offers_the_panel_actions_then_the_server_ones() {
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
-            let labels: Vec<&str> = gear_entries(d, true, false, false)
+            let labels: Vec<String> = gear_entries(d, true, false, false)
                 .into_iter()
-                .map(|e| e.label)
+                .map(|e| e.kind.label())
                 .collect();
             assert_eq!(
                 labels,
@@ -8110,9 +8274,9 @@ mod sqlite_create_menu_tests {
     /// here on any of them.
     #[test]
     fn sqlite_can_create_a_table_and_a_view() {
-        let labels: Vec<&str> = create_children(Sqlite, false)
+        let labels: Vec<String> = create_children(Sqlite, false)
             .into_iter()
-            .map(|e| e.label)
+            .map(|e| e.kind.label())
             .collect();
         assert_eq!(labels, vec!["Table", "View"]);
     }
@@ -8308,7 +8472,7 @@ fn ",
                 .unwrap_or_else(|| panic!("the builder's landmark is gone: {needle}"))
         };
         let start = find_from(0, "let build: Rc<dyn Fn(CtxMenu)");
-        let end = find_from(start, "\"AI explain\"");
+        let end = find_from(start, AI_EXPLAIN);
 
         let mut out = Vec::new();
         let mut arm = "(before the match)".to_string();
@@ -8345,7 +8509,7 @@ fn ",
                 out.push(Built {
                     arm: arm.clone(),
                     line: i as u32 + 1,
-                    label: "Export".to_string(),
+                    label: EXPORT_SUBMENU.to_string(),
                     destructive: false,
                     top_level: true,
                 });
@@ -8378,7 +8542,7 @@ fn ",
             // tail of every menu — the one entry that legitimately follows a
             // Drop. Its constructor sits one line above its label, so bounding
             // the scan by the label alone still catches it.
-            if head.contains("\"AI explain\"") {
+            if head.contains(AI_EXPLAIN) {
                 continue;
             }
             let first_literal = |span: &str| {
@@ -8427,8 +8591,18 @@ fn ",
     }
 
     /// The Create ▸ entry, which two arms contribute through `create_submenu`
-    /// rather than by constructing it here.
-    const CREATE_SUBMENU: &str = "Create ▸";
+    /// rather than by constructing it here — named by its message id, as every
+    /// entry the scan reads is.
+    const CREATE_SUBMENU: &str = "tree-create";
+
+    /// The Export ▸ entry, which `export_submenu` builds for three arms.
+    const EXPORT_SUBMENU: &str = "tree-export";
+
+    /// The `AI explain` row's message id **as it appears in the source**, quotes
+    /// and all: the fixed tail every menu ends on, and the landmark the scan
+    /// stops at. The quotes are what keep a comment that names the row from
+    /// standing in for it.
+    const AI_EXPLAIN: &str = "\"tree-ai-explain\"";
 
     /// **The skeleton as data.** Which group of the ordering comment above `build`
     /// each entry belongs to — 1 Open, 2 Read, 3 Tree state, 4 Write — so "every
@@ -8440,48 +8614,52 @@ fn ",
     /// the load-bearing half: a thirteenth entry cannot be added to any menu
     /// without placing it in the skeleton first, which is the drift the comment was
     /// written to stop and could not.
+    ///
+    /// **Keyed on message ids**, not on what the entries say: the builder spells
+    /// every label `tr!("tree-…")`, so the first literal the scan reads is the
+    /// id — which is also what keeps this table true in every language.
     fn group(label: &str) -> Option<u8> {
         Some(match label {
             // 1. Open — what a double-click would have done.
-            "Open in CLI" | "Open" | "Open in new tab" => 1,
+            "tree-open-in-cli" | "tree-open" | "tree-open-in-new-tab" => 1,
             // 2. Read — the clipboard, then what the node can show you, closing
             //    with Refresh. `Collapse all` only rearranges the tree under the
             //    row and sits *after* Refresh in the database arm; the skeleton's
             //    wording says the group closes with Refresh, so that is a real
             //    deviation — one this gate tolerates because it stays inside the
             //    group and misplaces nothing irreversible. Recorded, not hidden.
-            "Copy name"
-            | "Copy qualified name"
-            | "Properties"
+            "tree-copy-name"
+            | "tree-copy-qualified-name"
+            | "tree-properties"
             // A reading of the loaded schema, writing nothing.
-            | "Used by"
-            | "Live monitor"
-            | "ER diagram"
+            | "tree-used-by"
+            | "tree-live-monitor"
+            | "tree-er-diagram"
             // **Group 2, beside the ER diagram, and not the writing group.** A
             // comparison reads two databases and emits nothing: the plan it
             // builds goes to the DDL preview, where Apply lives and where the
             // write guard is. Putting it in group 4 would place a read above
             // `Drop` and misfile the one entry whose whole point is that it
             // changes nothing by itself.
-            | "Compare with"
+            | "tree-compare-with"
             // One node, two spellings, same slot: a table has four things to
             // generate and gets the submenu, a view has one and keeps the flat
             // entry rather than spending a hover on a lone child.
-            | "Generate"
-            | "Generate DDL"
+            | "tree-generate"
+            | "tree-generate-ddl"
             // Not a context-menu row today — it is raised from the SCHEMA gear
             // and from the tree's blank space, and `schema_tree`'s own half of
             // this gate mirrors the number from here. It is in the table because
             // that is what the table is for: a label with no group fails, so a
             // second menu cannot place an entry this one has never heard of.
-            | "Users and privileges"
+            | "tree-users"
             // Raised from the same two places as the browser, for the same
             // reason, and a read of the server like it.
-            | "Server variables"
-            | "Refresh"
-            | "Collapse all" => 2,
+            | "tree-server-variables"
+            | "tree-refresh"
+            | "tree-collapse-all" => 2,
             // 3. Tree state — the row, not the object.
-            "Favourite" | "Unfavourite" | "Colour" | "Hide" => 3,
+            "tree-favourite" | "tree-unfavourite" | "tree-colour" | "tree-hide" => 3,
             // 4. Write, with the irreversible entries last inside it. The order
             //    *within* the group is not checked: the table arm ships
             //    Import → Edit table → Triggers where the skeleton lists
@@ -8494,17 +8672,31 @@ fn ",
             // view's menu carries both, and this table is what keeps them on
             // opposite sides of the separator.
             // `Create extension` is the Extensions folder's `Create {}`: the
-            // picker rather than the object editor, spelled as a literal.
-            // `Back up` writes a file, not the server, like `Export` beside
-            // it; it sits with the node's round trips for the same reason.
-            // `Copy to` writes another database — a `CREATE TABLE` there and
-            // its rows — so it is a write, if not of this one.
-            CREATE_SUBMENU | "Create {}" | "Create extension" | "Import" | "Back up"
-            | "Copy to"
-            | "Restore from file" | "Edit table" | "Edit view"
-            | "Edit column" | "Edit index" | "Edit primary key" | "Edit foreign key"
-            | "Edit {}" | "Triggers" | "Refresh view" | "Truncate" | "Drop" | "Drop index"
-            | "Drop foreign key" => 4,
+            // picker rather than the object editor, spelled as a message of
+            // its own. `Back up` writes a file, not the server, like `Export`
+            // beside it; it sits with the node's round trips for the same
+            // reason. `Copy to` writes another database — a `CREATE TABLE`
+            // there and its rows — so it is a write, if not of this one.
+            CREATE_SUBMENU
+            | "tree-create-kind"
+            | "tree-folder-create-extension"
+            | "tree-import"
+            | "tree-back-up"
+            | "tree-copy-to"
+            | "tree-restore-from-file"
+            | "tree-edit-table"
+            | "tree-edit-view"
+            | "tree-edit-column"
+            | "tree-edit-index"
+            | "tree-edit-primary-key"
+            | "tree-edit-foreign-key"
+            | "tree-edit-kind"
+            | "tree-triggers"
+            | "tree-refresh-view"
+            | "tree-truncate"
+            | "tree-drop"
+            | "tree-drop-index"
+            | "tree-drop-foreign-key" => 4,
             _ => return None,
         })
     }
@@ -8547,7 +8739,7 @@ fn ",
             // never the server, so it is never the irreversible entry. The
             // position that actually matters is still pinned, by
             // `drop_is_the_last_entry_before_ai_explain`.
-            if b.label == "Export" {
+            if b.label == EXPORT_SUBMENU {
                 continue;
             }
             let Some(g) = group(&b.label) else {
@@ -8612,7 +8804,7 @@ fn ",
         let src = std::fs::read_to_string(this_file()).expect("this file");
         let arms: Vec<String> = built_entries(&src)
             .into_iter()
-            .filter(|b| b.top_level && b.label == "Export")
+            .filter(|b| b.top_level && b.label == EXPORT_SUBMENU)
             .map(|b| b.arm)
             .collect();
         assert_eq!(
@@ -8645,7 +8837,7 @@ fn ",
             let rows: Vec<&Built> = built.iter().filter(|b| &b.arm == arm).collect();
             let drops: Vec<&&Built> = rows
                 .iter()
-                .filter(|b| b.label.starts_with("Drop"))
+                .filter(|b| b.label.starts_with("tree-drop"))
                 .collect();
             if drops.is_empty() {
                 dropless.push(arm);
@@ -8653,7 +8845,7 @@ fn ",
             }
             let last = rows.last().expect("a non-empty arm");
             assert!(
-                last.label.starts_with("Drop"),
+                last.label.starts_with("tree-drop"),
                 "{arm}: the menu ends on `{}` at line {}, after the irreversible \
                  `{}` at line {}",
                 last.label,
@@ -8683,7 +8875,7 @@ fn ",
             .position(|l| l.contains("let build: Rc<dyn Fn(CtxMenu)"))
             .expect("the builder");
         let ai_at = (build_at..lines.len())
-            .find(|&i| lines[i].contains("\"AI explain\""))
+            .find(|&i| lines[i].contains(AI_EXPLAIN))
             .expect("the AI explain row");
         let close_at = (ai_at..lines.len())
             .find(|&i| lines[i].trim() == "});")
@@ -8761,7 +8953,12 @@ fn ",
         labels.dedup();
         assert_eq!(
             labels,
-            vec!["Drop", "Drop foreign key", "Drop index", "Truncate"],
+            vec![
+                "tree-drop",
+                "tree-drop-foreign-key",
+                "tree-drop-index",
+                "tree-truncate"
+            ],
             "an entry gained or lost the irreversible marking"
         );
     }
