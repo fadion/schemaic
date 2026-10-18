@@ -23,6 +23,7 @@ use crate::widgets::{
 };
 use schemaic_core::snippet;
 
+use crate::i18n::tr;
 use crate::{FieldCfg, OverlayUi, SnippetActions, SnippetsUi, edit_field, theme};
 
 fn panel_w() -> f64 {
@@ -77,11 +78,11 @@ pub(crate) fn snippet_edit_overlay(
 
             let form = v_stack((
                 form_setting(
-                    "Name",
+                    tr!("snippet-edit-name"),
                     edit_field(
                         name,
                         FieldCfg {
-                            placeholder: "Snippet name",
+                            placeholder_of: Some(Rc::new(|| tr!("snippet-edit-name-placeholder"))),
                             focus: Some((ring.clone(), 10)),
                             ..Default::default()
                         },
@@ -89,11 +90,11 @@ pub(crate) fn snippet_edit_overlay(
                     .style(|s| s.width(theme::scaled(320.0))),
                 ),
                 form_setting(
-                    "Expansion shortcut",
+                    tr!("snippet-edit-shortcut"),
                     edit_field(
                         abbrev,
                         FieldCfg {
-                            placeholder: "none",
+                            placeholder_of: Some(Rc::new(|| tr!("snippet-edit-shortcut-none"))),
                             mono: true,
                             // An × to empty it: clearing the field is what
                             // *removes* the shortcut, and "delete every
@@ -106,7 +107,7 @@ pub(crate) fn snippet_edit_overlay(
                     .style(|s| s.width(theme::scaled(140.0))),
                 ),
                 form_setting(
-                    "Query",
+                    tr!("snippet-edit-query"),
                     edit_field(
                         body,
                         FieldCfg {
@@ -190,7 +191,7 @@ pub(crate) fn snippet_edit_overlay(
                     let save = save.clone();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring_actions.clone(),
@@ -198,7 +199,7 @@ pub(crate) fn snippet_edit_overlay(
                             close,
                         ),
                         action_button(
-                            "Save",
+                            tr!("snippet-edit-save"),
                             ActionKind::Primary,
                             ready,
                             ring_actions.clone(),
@@ -214,7 +215,7 @@ pub(crate) fn snippet_edit_overlay(
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             let panel = v_stack((
                 modal_title_owned(
-                    format!("Edit snippet — {}", snip.name),
+                    tr!("snippet-edit-title", name = snip.name.clone()),
                     close_x,
                     root_ring.clone(),
                 ),
@@ -247,4 +248,18 @@ pub(crate) fn snippet_edit_overlay(
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::i18n::tr;
+
+    /// The title reads as it did in English before the catalogue.
+    #[test]
+    fn the_title_reads_as_it_did_in_english() {
+        assert_eq!(
+            tr!("snippet-edit-title", name = "Top customers"),
+            "Edit snippet \u{2014} Top customers"
+        );
+    }
 }

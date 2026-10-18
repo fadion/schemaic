@@ -1722,3 +1722,15 @@ server-vars-count = { $count ->
 # While the search narrows the list; $count is the total.
 server-vars-count-filtered = { $shown } of { $count } settings
 server-vars-refresh = Refresh
+
+## Edit snippet modal (snippet_edit.rs)
+
+# $name is the snippet's name.
+snippet-edit-title = Edit snippet — { $name }
+snippet-edit-name = Name
+snippet-edit-name-placeholder = Snippet name
+snippet-edit-shortcut = Expansion shortcut
+# The empty shortcut field: the snippet has no shortcut.
+snippet-edit-shortcut-none = none
+snippet-edit-query = Query
+snippet-edit-save = Save

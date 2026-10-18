@@ -26216,6 +26216,11 @@ existing prose was left alone.
     the predicate doesn't know about resolves its `inset(0)` against a zero-by-zero box and paints
     nothing, which is exactly how the event editor once shipped invisible. It shares its tuple
     element with *Rename alias* and *Find usages* (`alias_rename.rs` and `usages_view.rs`, next).
+    **Its words are the catalogue's** (`snippet-edit-*`, roadmap phase 3) — the title (`$name`),
+    the *Name*, *Expansion shortcut* and *Query* labels, the name field's and the shortcut field's
+    placeholders (both through `FieldCfg::placeholder_of`; the shortcut's is the word *none*), and
+    Save; Cancel is the shared `dialog-cancel`. `the_title_reads_as_it_did_in_english` pins the
+    title. The Query field's `SELECT …` placeholder stays a literal, being a SQL sample.
   - `alias_rename.rs` — the SQL editor's *Rename alias* and *Rename CTE* dialog
     (`alias_rename_overlay`, raised by `OverlayUi::alias_rename`): a title, one *New name* field
     opened on the name as its definition writes it, Cancel and Rename. The two share it whole;
@@ -40236,7 +40241,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`),
   Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`), Import
   Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`), the ER diagram
-  (`erd_view.rs`) and Server variables (`server_vars_view.rs`) are converted;
+  (`erd_view.rs`), Server variables (`server_vars_view.rs`) and the snippet editor
+  (`snippet_edit.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

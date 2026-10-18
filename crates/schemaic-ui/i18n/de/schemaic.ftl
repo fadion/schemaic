@@ -1495,3 +1495,10 @@ server-vars-count = { $count ->
 }
 server-vars-count-filtered = { $shown } von { $count } Einstellungen
 server-vars-refresh = Aktualisieren
+snippet-edit-title = Snippet bearbeiten — { $name }
+snippet-edit-name = Name
+snippet-edit-name-placeholder = Name des Snippets
+snippet-edit-shortcut = Kürzel zum Erweitern
+snippet-edit-shortcut-none = keins
+snippet-edit-query = Abfrage
+snippet-edit-save = Speichern
