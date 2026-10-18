@@ -1554,3 +1554,32 @@ diff-no-differences = No differences.
 diff-no-changed = No changed rows.
 diff-no-added = No added rows.
 diff-no-removed = No removed rows.
+
+## The DDL preview — the plan a schema editor or a comparison applies (ddl_preview.rs)
+## The change list, the risk heading and its lines, and the Used by,
+## withheld and omitted lines are core's words and stay as they are for now.
+
+# $connection is the connection's name; $subject what the plan changes
+# (shop.orders, app@%).
+preview-title = Apply changes to { $connection } · { $subject }
+# The heading over the change list.
+preview-changes = { $count ->
+    [one] { $count } Change
+   *[other] { $count } Changes
+}
+preview-used-by = Used by
+preview-withheld = This engine can't express part of this plan
+preview-withheld-hint = Nothing is applied while this is listed.
+preview-omitted = Not included in this migration
+preview-omitted-hint = Applying leaves these objects as they are.
+preview-copy = Copy
+preview-open-in-editor = Open in editor
+# Returns to the editor the plan came from, with the draft intact.
+preview-back = Back
+preview-apply = Apply
+preview-applying = Applying…
+preview-applied = { $count ->
+    [one] Applied { $count } statement to { $subject }.
+   *[other] Applied { $count } statements to { $subject }.
+}
+preview-refreshed = The schema has been refreshed.

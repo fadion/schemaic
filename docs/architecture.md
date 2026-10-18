@@ -27504,8 +27504,8 @@ existing prose was left alone.
     window title, *Skip* in the mapping dropdown (`target_label`), the nothing-mapped and
     values-withheld notes, the footer's Next/Reading…/Back/Import/Importing… and the cancelled line;
     Cancel and Close are the shared `dialog-cancel`/`dialog-close`, and the read-only sentence
-    beside the disabled Import is the new shared `dialog-read-only`, which `ddl_preview` still spells
-    as a literal until its own file is converted. Composed lines are whole messages:
+    beside the disabled Import is the shared `dialog-read-only`, the message `ddl_preview` puts
+    beside its own disabled Apply. Composed lines are whole messages:
     `import-missing-required` (`$columns`), `import-engine-not-transactional` (`$engine`), the
     plurals `import-problems` and `import-done`, and each problem's line through `issue_line` —
     `import-problem-at-line` or `import-problem-at-column`, a message per shape rather than a place
@@ -28124,6 +28124,21 @@ existing prose was left alone.
     `ddl::accounts`**, because SQL Server's New account form can raise two: a login and the user it
     brings, which it sends as one plan under one preview and one Apply. The account form passes
     `account_editor::preview_changes`; the grant form and the browser's Drop pass one change each.
+    **The preview's words are the catalogue's** (`preview-*`, roadmap phase 3) — the title through
+    `preview_title`, one whole message `preview-title` (`$connection`, `$subject`) whose subject is
+    `database.subject` when `qualified` and the bare subject otherwise, so its tests pass unchanged;
+    the change-list heading `preview-changes`, a plural on `$count` that replaced `text::plural`;
+    the Used by, withheld and omitted headings and the latter two's closing lines; Copy, Open in
+    editor, Back (`preview-back`) and Apply/Applying…; and the applied view's `preview-applied`
+    (plural, `$count`, `$subject`) and *The schema has been refreshed.* Stop, Cancel and Close are
+    the shared `dialog-stop`, `dialog-cancel` and `dialog-close`, and the note beside the disabled
+    Apply is the shared `dialog-read-only` — the import modal's message, so the sentence the two
+    footers share is now one message rather than two literals that modal's source gate held equal.
+    `the_counted_lines_read_as_they_did_in_english` pins both plurals. English stays: the SQL box
+    (`sql_box_text`, its `-- After the plan commits…` comment included, being generated SQL) and the
+    *SQL* heading; `ChangeSet::risk_heading` and the change, risk, used-by, withheld and omitted
+    lines, core's prose, phase 4; and `preview_proposal`'s two `Err` sentences, which go back
+    through the AI panel's propose path, whose sibling error in `ai_panel.rs` is English too.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
     tree's column and key right-clicks (`Edit column`, and `Edit index` / `Edit foreign key` /
@@ -39056,7 +39071,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   source, all three living in view closures, and asserts the `accept_launch` call as well — a
   disabled button is not what stops the write. Since the catalogue it looks for
   `tr!("dialog-read-only")` and asserts that message's English, the point being that the sentence
-  is `ddl_preview`'s own, which that file will reach through the same message once converted.
+  is `ddl_preview`'s own, which that file now reaches through the same message.
   **And the state that guard exists for is, as far as the code can be read, unreachable — which is
   written down here so the next reader neither hunts for the race nor deletes the guard for want of
   one.** The question was whether the flag can move while this modal stands, and the answer is that
@@ -40157,8 +40172,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
   grant forms (`account_editor.rs`), the table designer (`table_designer.rs`), Manage
   Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
-  and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`) and
-  Compare results (`result_diff_view.rs`) are converted;
+  and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`),
+  Compare results (`result_diff_view.rs`) and the DDL preview (`ddl_preview.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

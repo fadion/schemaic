@@ -1372,3 +1372,23 @@ diff-no-differences = Keine Unterschiede.
 diff-no-changed = Keine geänderten Zeilen.
 diff-no-added = Keine hinzugefügten Zeilen.
 diff-no-removed = Keine entfernten Zeilen.
+preview-title = Änderungen auf { $connection } anwenden · { $subject }
+preview-changes = { $count ->
+    [one] { $count } Änderung
+   *[other] { $count } Änderungen
+}
+preview-used-by = Verwendet von
+preview-withheld = Diese Engine kann einen Teil dieses Plans nicht ausdrücken
+preview-withheld-hint = Nichts wird angewendet, solange dies aufgeführt ist.
+preview-omitted = Nicht in dieser Migration enthalten
+preview-omitted-hint = Das Anwenden lässt diese Objekte, wie sie sind.
+preview-copy = Kopieren
+preview-open-in-editor = Im Editor öffnen
+preview-back = Zurück
+preview-apply = Anwenden
+preview-applying = Wird angewendet…
+preview-applied = { $count ->
+    [one] { $count } Anweisung auf { $subject } angewendet.
+   *[other] { $count } Anweisungen auf { $subject } angewendet.
+}
+preview-refreshed = Das Schema wurde aktualisiert.

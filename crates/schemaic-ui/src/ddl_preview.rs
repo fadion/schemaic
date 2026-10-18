@@ -19,7 +19,8 @@ use floem::prelude::*;
 
 use schemaic_core::connection::Connection;
 use schemaic_core::intel::SqlDialect;
-use schemaic_core::text::plural;
+
+use crate::i18n::tr;
 
 use crate::widgets::{
     ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, action_button_icon, action_gap,
@@ -707,7 +708,7 @@ fn used_by_block(lines: Vec<String>) -> impl IntoView {
         h_stack((
             icons::icon(icons::TRIANGLE_ALERT, 15.0)
                 .style(|s| s.color(theme::accent()).flex_shrink(0.0_f32)),
-            text("Used by").style(|s| {
+            text(tr!("preview-used-by")).style(|s| {
                 s.color(theme::text())
                     .font_size(theme::font_body())
                     .font_bold()
@@ -751,7 +752,7 @@ fn omitted_block(omitted: Vec<String>) -> impl IntoView {
         h_stack((
             icons::icon(icons::CIRCLE_DOT, 15.0)
                 .style(|s| s.color(theme::text_faint()).flex_shrink(0.0_f32)),
-            text("Not included in this migration").style(|s| {
+            text(tr!("preview-omitted")).style(|s| {
                 s.color(theme::text())
                     .font_size(theme::font_body())
                     .font_bold()
@@ -771,7 +772,7 @@ fn omitted_block(omitted: Vec<String>) -> impl IntoView {
                     .margin_bottom(theme::scaled(2.0))
             })
         })),
-        text("Applying leaves these objects as they are.").style(|s| {
+        text(tr!("preview-omitted-hint")).style(|s| {
             s.color(theme::text_faint())
                 .font_size(theme::font_body())
                 .margin_top(theme::scaled(4.0))
@@ -797,7 +798,7 @@ fn withheld_block(withheld: Vec<String>) -> impl IntoView {
         h_stack((
             icons::icon(icons::TRIANGLE_ALERT, 15.0)
                 .style(|s| s.color(theme::accent()).flex_shrink(0.0_f32)),
-            text("This engine can't express part of this plan").style(|s| {
+            text(tr!("preview-withheld")).style(|s| {
                 s.color(theme::accent())
                     .font_size(theme::font_body())
                     .font_bold()
@@ -817,7 +818,7 @@ fn withheld_block(withheld: Vec<String>) -> impl IntoView {
                     .margin_bottom(theme::scaled(2.0))
             })
         })),
-        text("Nothing is applied while this is listed.").style(|s| {
+        text(tr!("preview-withheld-hint")).style(|s| {
             s.color(theme::text_faint())
                 .font_size(theme::font_body())
                 .margin_top(theme::scaled(4.0))
@@ -959,14 +960,12 @@ fn connection_label(connections: RwSignal<Vec<Connection>>, conn_id: u64) -> Str
 /// A free function so the sentence has a test; it was a `match` inside a
 /// `dyn_container` child.
 pub(crate) fn preview_title(connection: &str, p: &DdlPreview) -> String {
-    if p.qualified {
-        format!(
-            "Apply changes to {connection} · {}.{}",
-            p.database, p.subject
-        )
+    let subject = if p.qualified {
+        format!("{}.{}", p.database, p.subject)
     } else {
-        format!("Apply changes to {connection} · {}", p.subject)
-    }
+        p.subject.clone()
+    };
+    tr!("preview-title", connection = connection, subject = subject)
 }
 
 /// May an apply in flight be stopped — from the preview's plan, or from there
@@ -1084,14 +1083,13 @@ pub(crate) fn ddl_preview_overlay(
             let body: AnyView = if applied {
                 container(
                     v_stack((
-                        text(format!(
-                            "Applied {} statement{} to {}.",
-                            p.statements.len(),
-                            if p.statements.len() == 1 { "" } else { "s" },
-                            p.subject
+                        text(tr!(
+                            "preview-applied",
+                            count = p.statements.len(),
+                            subject = p.subject.clone()
                         ))
                         .style(|s| s.color(theme::text()).font_size(theme::font_body())),
-                        text("The schema has been refreshed.").style(|s| {
+                        text(tr!("preview-refreshed")).style(|s| {
                             s.color(theme::text_dim())
                                 .font_size(theme::font_label())
                                 .margin_top(theme::scaled(6.0))
@@ -1107,7 +1105,7 @@ pub(crate) fn ddl_preview_overlay(
                     // The count *is* the heading — a bare "Changes" above the list
                     // and a "2 changes" below it said the same thing twice, once
                     // in each direction.
-                    form_section_owned(format!("{n} {}", plural(n, "Change", "Changes"))),
+                    form_section_owned(tr!("preview-changes", count = n)),
                     v_stack_from_iter(p.changes.iter().cloned().map(change_line))
                         .style(|s| s.flex_col().width_full()),
                     risk_block(p.risk_heading, p.destructive.clone())
@@ -1210,7 +1208,7 @@ pub(crate) fn ddl_preview_overlay(
                     let open_query = open_query_side.clone();
                     h_stack((
                         action_button_icon(
-                            "Copy",
+                            tr!("preview-copy"),
                             icons::COPY,
                             ActionKind::Quiet,
                             !busy,
@@ -1223,7 +1221,7 @@ pub(crate) fn ddl_preview_overlay(
                         // The escape hatch: the generated script, in a tab, where
                         // it can be read, edited and run like anything else.
                         action_button_icon(
-                            "Open in editor",
+                            tr!("preview-open-in-editor"),
                             icons::FILE_PEN_LINE,
                             ActionKind::Quiet,
                             !busy,
@@ -1265,7 +1263,7 @@ pub(crate) fn ddl_preview_overlay(
                     let exit = footer_exit.clone();
                     if applied {
                         return action_button(
-                            "Close",
+                            tr!("dialog-close"),
                             ActionKind::Primary,
                             true,
                             ring,
@@ -1301,11 +1299,11 @@ pub(crate) fn ddl_preview_overlay(
                         // intact.
                         action_button(
                             if stoppable {
-                                "Stop"
+                                tr!("dialog-stop")
                             } else if has_editor_behind(d) {
-                                "Back"
+                                tr!("preview-back")
                             } else {
-                                "Cancel"
+                                tr!("dialog-cancel")
                             },
                             if stoppable {
                                 ActionKind::Danger
@@ -1321,7 +1319,11 @@ pub(crate) fn ddl_preview_overlay(
                             },
                         ),
                         action_button(
-                            if busy { "Applying…" } else { "Apply" },
+                            if busy {
+                                tr!("preview-applying")
+                            } else {
+                                tr!("preview-apply")
+                            },
                             // A destructive plan's affirmative action wears the
                             // colour of what it does. Same place and same weight
                             // as an ordinary Apply — only the fill differs — since
@@ -1348,7 +1350,7 @@ pub(crate) fn ddl_preview_overlay(
 
             // A read-only connection blocks the write, and says so where the
             // disabled button is rather than leaving it unexplained.
-            let read_only_note = text("This connection is read-only.").style(move |s| {
+            let read_only_note = text(tr!("dialog-read-only")).style(move |s| {
                 let s = s
                     .color(theme::plan_warn())
                     .font_size(theme::font_label())
@@ -1485,6 +1487,22 @@ mod tests {
     use super::*;
     use floem::reactive::Scope;
     use schemaic_core::intel::SqlDialect;
+
+    /// The change count heading and the applied line read as they did in
+    /// English before the catalogue — the title has tests of its own below.
+    #[test]
+    fn the_counted_lines_read_as_they_did_in_english() {
+        assert_eq!(tr!("preview-changes", count = 1), "1 Change");
+        assert_eq!(tr!("preview-changes", count = 3), "3 Changes");
+        assert_eq!(
+            tr!("preview-applied", count = 1, subject = "shop.orders"),
+            "Applied 1 statement to shop.orders."
+        );
+        assert_eq!(
+            tr!("preview-applied", count = 4, subject = "shop.orders"),
+            "Applied 4 statements to shop.orders."
+        );
+    }
 
     use super::test_ddl_ui as ddl_ui;
 
