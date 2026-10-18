@@ -1344,3 +1344,31 @@ monitor-length-only = { $count ->
 }
 monitor-newest-at-bottom = neueste unten
 monitor-export-dialog = Änderungsprotokoll exportieren
+diff-title = Ergebnisse vergleichen
+diff-filter-all = Alle
+diff-filter-changed = Geändert
+diff-filter-added = Hinzugefügt
+diff-filter-removed = Entfernt
+diff-match-rows-by = Zeilen zuordnen nach
+diff-whole-row = Ganze Zeile
+diff-export-tip = Vergleich exportieren…
+diff-nothing-to-export = Nichts zu exportieren.
+diff-export-dialog = Vergleich exportieren
+diff-unnamed-file = den Vergleich
+diff-ran-at = Ausgeführt { $time }
+diff-side-facts = { $count ->
+    [one] { $count } Zeile · { $ms } ms
+   *[other] { $count } Zeilen · { $ms } ms
+}
+diff-only-in = Nur in { $side }: { $columns }
+diff-uncompared = Binär, nicht verglichen: { $columns }
+diff-repeated-keys = { $count ->
+    [one] { $count } Zeile wiederholt einen auf ihrer Seite schon vergebenen Schlüssel und wird ausgelassen.
+   *[other] { $count } Zeilen wiederholen einen auf ihrer Seite schon vergebenen Schlüssel und werden ausgelassen.
+}
+diff-capped = Ein Ergebnis wurde begrenzt: Zeilen jenseits der Grenze werden nicht verglichen.
+diff-col-change = Änderung
+diff-no-differences = Keine Unterschiede.
+diff-no-changed = Keine geänderten Zeilen.
+diff-no-added = Keine hinzugefügten Zeilen.
+diff-no-removed = Keine entfernten Zeilen.

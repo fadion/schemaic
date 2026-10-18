@@ -31,6 +31,7 @@ use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::model::ResultSet;
 use schemaic_core::result_diff::{self, DiffCell, ResultDiff, RowChange, TableRow};
 
+use crate::i18n::tr;
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, autohide_state, cell_text, dismiss_layer,
@@ -69,9 +70,6 @@ const EXPORT_TAB: u32 = 11;
 /// How long a "Saved …" stays in the footer — the chart's and the ER
 /// diagram's linger.
 const NOTICE_LINGER: std::time::Duration = std::time::Duration::from_secs(4);
-
-/// The key picker's entry for "no key — the whole row".
-const WHOLE_ROW: &str = "Whole row";
 
 /// The widest a column grows to fit its values; a longer one ends in `…`.
 fn max_col_w() -> f64 {
@@ -314,15 +312,20 @@ pub(crate) fn result_diff_overlay(
                 });
             }
 
-            let mut options = vec![WHOLE_ROW.to_string()];
+            // The key picker's entry for "no key — the whole row". The picker
+            // hands back the text it shows, so the pick is matched against
+            // this same string. Drawn in the closure rather than captured: the
+            // current-value closure has to be `Copy`.
+            let whole_row = tr!("diff-whole-row");
+            let mut options = vec![whole_row.clone()];
             options.extend(shared.iter().cloned());
             let picker = crate::table_designer::focusable_owned_dropdown(
-                move || key.get().unwrap_or_else(|| WHOLE_ROW.to_string()),
+                move || key.get().unwrap_or_else(|| tr!("diff-whole-row")),
                 options,
                 || theme::scaled(200.0),
                 ring.clone(),
                 PICKER_TAB,
-                move |picked| key.set((picked != WHOLE_ROW).then_some(picked)),
+                move |picked| key.set((picked != whole_row).then_some(picked)),
             );
 
             // ── Export ───────────────────────────────────────────────────
@@ -386,7 +389,7 @@ pub(crate) fn result_diff_overlay(
                     // The icon's own test, again: the menu can stand open
                     // over a change of key or filter.
                     let Some(o) = c.outcome.as_ref().ok().filter(|o| o.count(f) > 0) else {
-                        (say)("Nothing to export.".to_string(), true);
+                        (say)(tr!("diff-nothing-to-export"), true);
                         return;
                     };
                     save_diff(o, f, format, export_file.clone(), say.clone());
@@ -442,9 +445,7 @@ pub(crate) fn result_diff_overlay(
                         comparable,
                         move || (click)(),
                     )
-                    .tooltip(|| {
-                        text("Export the comparison…").style(crate::widgets::tooltip_style)
-                    }),
+                    .tooltip(|| text(tr!("diff-export-tip")).style(crate::widgets::tooltip_style)),
                     ring.clone(),
                     EXPORT_TAB,
                     true,
@@ -466,7 +467,7 @@ pub(crate) fn result_diff_overlay(
                 // card's edge above it — measured in the running app, and gone
                 // with this spelling.
                 h_stack((
-                    text("Match rows by").style(|s| {
+                    text(tr!("diff-match-rows-by")).style(|s| {
                         s.color(theme::text_dim())
                             .font_size(theme::font_label())
                             .flex_shrink(0.0_f32)
@@ -507,8 +508,7 @@ pub(crate) fn result_diff_overlay(
                     .border_color(theme::border())
             });
 
-            let title =
-                modal_title_owned("Compare results".to_string(), close.clone(), ring.clone());
+            let title = modal_title_owned(tr!("diff-title"), close.clone(), ring.clone());
             let done = close.clone();
             // The export's notice, while there is one, else the summary.
             let status = dyn_container(
@@ -527,7 +527,7 @@ pub(crate) fn result_diff_overlay(
                 action_button(
                     // Neutral: closing is the only thing the footer offers,
                     // and there is no decision for it to affirm.
-                    "Close",
+                    tr!("dialog-close"),
                     ActionKind::Neutral,
                     true,
                     ring.clone(),
@@ -584,7 +584,7 @@ fn save_diff(
     let (first, second) = (o.first.clone(), o.second.clone());
     let (diff, rows) = (o.diff.clone(), o.rows.clone());
     let opts = FileDialogOptions::new()
-        .title("Export comparison")
+        .title(tr!("diff-export-dialog"))
         .default_name(suggested_filename(Some("comparison"), format))
         .allowed_types(vec![FileSpec {
             name: format.label(),
@@ -597,7 +597,7 @@ fn save_diff(
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "the comparison".to_string());
+            .unwrap_or_else(|| tr!("diff-unnamed-file"));
         let shown: Vec<TableRow> = rows
             .iter()
             .copied()
@@ -715,13 +715,12 @@ fn sides(t: &Rc<DiffTarget>, swapped: RwSignal<bool>, ring: FocusRing) -> impl I
 fn side_card(side: &DiffSide, letter: &'static str) -> impl IntoView + use<> {
     let ran = schemaic_core::date::Time::at_local(side.ran_at)
         .filter(|_| side.ran_at > 0)
-        .map(|t| format!("Ran {}", t.hms()))
+        .map(|t| tr!("diff-ran-at", time = t.hms()))
         .unwrap_or_default();
-    let n = side.rs.row_count();
-    let facts = format!(
-        "{n} {} · {} ms",
-        schemaic_core::text::plural(n, "row", "rows"),
-        side.rs.elapsed_ms
+    let facts = tr!(
+        "diff-side-facts",
+        count = side.rs.row_count(),
+        ms = side.rs.elapsed_ms
     );
     let sql = side.sql.split_whitespace().collect::<Vec<_>>().join(" ");
     let line = 1.5_f32;
@@ -792,7 +791,7 @@ fn filter_pills(
             filter.set(which);
         }
     };
-    let pill = move |name: &'static str, which: Option<RowChange>, tabindex: u32| {
+    let pill = move |name: String, which: Option<RowChange>, tabindex: u32| {
         crate::widgets::count_pill(
             name,
             which.map(change_color),
@@ -809,10 +808,22 @@ fn filter_pills(
         )
     };
     h_stack((
-        pill("All", None, PILLS_TAB),
-        pill("Changed", Some(RowChange::Changed), PILLS_TAB + 1),
-        pill("Added", Some(RowChange::Added), PILLS_TAB + 2),
-        pill("Removed", Some(RowChange::Removed), PILLS_TAB + 3),
+        pill(tr!("diff-filter-all"), None, PILLS_TAB),
+        pill(
+            tr!("diff-filter-changed"),
+            Some(RowChange::Changed),
+            PILLS_TAB + 1,
+        ),
+        pill(
+            tr!("diff-filter-added"),
+            Some(RowChange::Added),
+            PILLS_TAB + 2,
+        ),
+        pill(
+            tr!("diff-filter-removed"),
+            Some(RowChange::Removed),
+            PILLS_TAB + 3,
+        ),
     ))
     .style(|s| {
         s.items_center()
@@ -830,30 +841,7 @@ fn notes(computed: RwSignal<Rc<Computed>>, capped: bool) -> impl IntoView {
             let Ok(o) = &c.outcome else {
                 return Vec::new();
             };
-            let (first, second) = if c.swapped { ("B", "A") } else { ("A", "B") };
-            let d = &o.diff;
-            let mut notes = Vec::new();
-            if !d.only_left.is_empty() {
-                notes.push(format!("Only in {first}: {}", d.only_left.join(", ")));
-            }
-            if !d.only_right.is_empty() {
-                notes.push(format!("Only in {second}: {}", d.only_right.join(", ")));
-            }
-            if !d.uncompared.is_empty() {
-                notes.push(format!("Binary, not compared: {}", d.uncompared.join(", ")));
-            }
-            if d.repeated_keys > 0 {
-                notes.push(format!(
-                    "{} {} a key already taken on its side, and {} left out.",
-                    d.repeated_keys,
-                    schemaic_core::text::plural(d.repeated_keys, "row repeats", "rows repeat"),
-                    schemaic_core::text::plural(d.repeated_keys, "is", "are")
-                ));
-            }
-            if capped {
-                notes.push("A result was capped: rows past its cap are not compared.".to_string());
-            }
-            notes
+            diff_notes(&o.diff, c.swapped, capped)
         })
     };
     label(move || lines().join("  ·  ")).style(move |s| {
@@ -865,6 +853,38 @@ fn notes(computed: RwSignal<Rc<Computed>>, capped: bool) -> impl IntoView {
             .min_width(0.0);
         if empty { s.hide() } else { s }
     })
+}
+
+/// [`notes`]' lines, each a whole message: columns one side alone has — named
+/// by the letter of the side compared first or second, so a swap swaps them —
+/// binary columns, rows whose key was taken, and a capped result.
+fn diff_notes(d: &ResultDiff, swapped: bool, capped: bool) -> Vec<String> {
+    let (first, second) = if swapped { ("B", "A") } else { ("A", "B") };
+    let mut notes = Vec::new();
+    if !d.only_left.is_empty() {
+        notes.push(tr!(
+            "diff-only-in",
+            side = first,
+            columns = d.only_left.join(", ")
+        ));
+    }
+    if !d.only_right.is_empty() {
+        notes.push(tr!(
+            "diff-only-in",
+            side = second,
+            columns = d.only_right.join(", ")
+        ));
+    }
+    if !d.uncompared.is_empty() {
+        notes.push(tr!("diff-uncompared", columns = d.uncompared.join(", ")));
+    }
+    if d.repeated_keys > 0 {
+        notes.push(tr!("diff-repeated-keys", count = d.repeated_keys));
+    }
+    if capped {
+        notes.push(tr!("diff-capped"));
+    }
+    notes
 }
 
 /// Row source for the table's virtual stack: indices into the outcome's rows.
@@ -902,13 +922,13 @@ fn table_view(computed: Rc<Computed>, filter: Option<RowChange>) -> AnyView {
     );
     if picked.is_empty() {
         let said = match filter {
-            _ if o.rows.is_empty() => "No differences.",
-            Some(RowChange::Changed) => "No changed rows.",
-            Some(RowChange::Added) => "No added rows.",
-            Some(RowChange::Removed) => "No removed rows.",
-            None => "No differences.",
+            _ if o.rows.is_empty() => tr!("diff-no-differences"),
+            Some(RowChange::Changed) => tr!("diff-no-changed"),
+            Some(RowChange::Added) => tr!("diff-no-added"),
+            Some(RowChange::Removed) => tr!("diff-no-removed"),
+            None => tr!("diff-no-differences"),
         };
-        return message(said.to_string(), theme::text_dim).into_any();
+        return message(said, theme::text_dim).into_any();
     }
     let widths = o.widths.clone();
     // The one writer of the horizontal offset is the body; the header reads it
@@ -916,7 +936,7 @@ fn table_view(computed: Rc<Computed>, filter: Option<RowChange>) -> AnyView {
     let hscroll = RwSignal::new(0.0_f64);
     let head = {
         let w = widths.clone();
-        let mut cells: Vec<AnyView> = vec![header_cell("Change".to_string(), w, None)];
+        let mut cells: Vec<AnyView> = vec![header_cell(tr!("diff-col-change"), w, None)];
         cells.extend(
             o.diff
                 .shared
@@ -1046,4 +1066,49 @@ fn table_row(change: RowChange, row_cells: &[DiffCell], widths: &Widths) -> impl
             .padding_horiz(modal_pad_h())
             .height(row_h())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::diff_notes;
+    use crate::i18n::tr;
+    use schemaic_core::result_diff::ResultDiff;
+
+    /// The notes and the cards' facts read as they did in English before the
+    /// catalogue, the side letters following a swap.
+    #[test]
+    fn the_composed_lines_read_as_they_did_in_english() {
+        let d = ResultDiff {
+            only_left: vec!["note".into(), "tag".into()],
+            only_right: vec!["email".into()],
+            uncompared: vec!["photo".into()],
+            repeated_keys: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            diff_notes(&d, false, true),
+            [
+                "Only in A: note, tag",
+                "Only in B: email",
+                "Binary, not compared: photo",
+                "1 row repeats a key already taken on its side, and is left out.",
+                "A result was capped: rows past its cap are not compared.",
+            ]
+        );
+        let swapped = diff_notes(&d, true, false);
+        assert_eq!(swapped[0], "Only in B: note, tag");
+        assert_eq!(swapped[1], "Only in A: email");
+        let many = ResultDiff {
+            repeated_keys: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            diff_notes(&many, false, false),
+            ["3 rows repeat a key already taken on its side, and are left out."]
+        );
+        assert!(diff_notes(&ResultDiff::default(), false, false).is_empty());
+        assert_eq!(tr!("diff-side-facts", count = 1, ms = 12), "1 row · 12 ms");
+        assert_eq!(tr!("diff-side-facts", count = 40, ms = 7), "40 rows · 7 ms");
+        assert_eq!(tr!("diff-ran-at", time = "11:48:12"), "Ran 11:48:12");
+    }
 }

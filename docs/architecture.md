@@ -27118,6 +27118,22 @@ existing prose was left alone.
     Mounted in the workspace group directly after `chart_overlay`, counted by
     `workspace_modals_up` as a plain term (`diff_open`) — it raises nothing — and on
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
+    **Its words are the catalogue's** (`diff-*`, roadmap phase 3) — the title, the four filter
+    pills, *Match rows by*, the export tooltip, *Nothing to export.*, the export dialog's window
+    title, the saved notice's fallback file name (`diff-unnamed-file`), the cards' `diff-ran-at`
+    (`$time`) and `diff-side-facts` (a plural on `$count`, with `$ms`), the *Change* header and the
+    four empty-table notes; Close is the shared `dialog-close`. The key picker's *Whole row* is
+    `diff-whole-row`, which replaced the `WHOLE_ROW` const: the picker hands back the text it shows,
+    so the pick is matched against that same message, and the current-value closure draws it with
+    `tr!` itself rather than capturing it, since that closure has to be `Copy`. The notes are whole
+    messages built by `diff_notes(diff, swapped, capped)`, still joined by `"  ·  "` in `notes`:
+    `diff-only-in` (`$side`, the letter, and `$columns`), `diff-uncompared`, the plural
+    `diff-repeated-keys` — which replaced a sentence spliced from two `plural` calls — and
+    `diff-capped`. `the_composed_lines_read_as_they_did_in_english` pins them and the card lines in
+    English. English stays: the A/B letters; `RowChange::label`'s CHANGED/ADDED/REMOVED, core's
+    word, which the export file writes too and which sizes the *Change* column; core's
+    `ResultDiff::summary` (phase 4); the export menu's `ExportFormat::label`s; the suggested file
+    name `comparison`; and the arrow.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
     It lists the server's accounts, shows one account's privileges, and is where the five write
     actions are raised from — the forms themselves are `account_editor.rs`. Mounted in the
@@ -31725,7 +31741,7 @@ existing prose was left alone.
     is precisely the case a per-state `match` got wrong.
     **Its words are the catalogue's** (`monitor-*`, roadmap phase 3) — the title, the badge's three
     words (`badge_state` returns `(String, fn() -> Color)`), the four filter pills (`count_pill`
-    takes its name as `impl Into<String>`, so Compare results' literals still compile), the Pause/
+    takes its name as `impl Into<String>`, as Compare results' pills now pass it too), the Pause/
     Resume, Clear and Export tooltips, the interval labels (`interval_label`, `monitor-interval`
     with `$secs`; the `—` fallback stays), the Clear confirm's title and message — a plural on
     `$count`, one whole sentence per form — the Time and Action headers, the three no-kind-yet
@@ -40141,8 +40157,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
   grant forms (`account_editor.rs`), the table designer (`table_designer.rs`), Manage
   Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
-  and the grid export's progress box (`dump_view.rs`) and the Live monitor (`monitor_view.rs`) are
-  converted;
+  and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`) and
+  Compare results (`result_diff_view.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

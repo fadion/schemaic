@@ -1514,3 +1514,43 @@ monitor-length-only = { $count ->
 monitor-newest-at-bottom = newest at the bottom
 # The file picker's window title.
 monitor-export-dialog = Export change log
+
+## Compare results (result_diff_view.rs)
+## A and B name the two results compared and stay as they are; the table's
+## CHANGED/ADDED/REMOVED are core's words, which the export file writes too.
+
+diff-title = Compare results
+diff-filter-all = All
+diff-filter-changed = Changed
+diff-filter-added = Added
+diff-filter-removed = Removed
+diff-match-rows-by = Match rows by
+# The key picker's entry for matching on the whole row rather than a column.
+diff-whole-row = Whole row
+diff-export-tip = Export the comparison…
+diff-nothing-to-export = Nothing to export.
+# The file picker's window title.
+diff-export-dialog = Export comparison
+# Names the file in the saved notice when its own name cannot be read.
+diff-unnamed-file = the comparison
+# $time is when the statement ran (11:48:12).
+diff-ran-at = Ran { $time }
+# $ms is how long it took, in milliseconds.
+diff-side-facts = { $count ->
+    [one] { $count } row · { $ms } ms
+   *[other] { $count } rows · { $ms } ms
+}
+# The notes under the table, joined by a middle dot. $side is A or B; $columns a
+# comma-separated list of column names.
+diff-only-in = Only in { $side }: { $columns }
+diff-uncompared = Binary, not compared: { $columns }
+diff-repeated-keys = { $count ->
+    [one] { $count } row repeats a key already taken on its side, and is left out.
+   *[other] { $count } rows repeat a key already taken on its side, and are left out.
+}
+diff-capped = A result was capped: rows past its cap are not compared.
+diff-col-change = Change
+diff-no-differences = No differences.
+diff-no-changed = No changed rows.
+diff-no-added = No added rows.
+diff-no-removed = No removed rows.
