@@ -1545,3 +1545,5 @@ used-by-noun-trigger = Trigger
 used-by-noun-event = Ereignis
 used-by-noun-foreign-key = Fremdschlüssel
 used-by-noun-expression = Tabellenausdruck
+theme-dark = Dunkel
+theme-light = Hell

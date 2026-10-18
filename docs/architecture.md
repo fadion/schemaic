@@ -32402,6 +32402,9 @@ existing prose was left alone.
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
     `scale_at`/`scale_font_at` rounding; `icons.rs` sizes every glyph, scaling the **base** size its
     callers pass.
+    **Its words are the catalogue's** (`theme-dark`/`theme-light`, roadmap phase 3) —
+    `UiThemeKind::label`, the interface-theme dropdown's, answers a `String`; `key` is what is
+    persisted, so nothing saved changes. `EditorThemeKind::label` stays a literal: product names.
     **The editor's font size and tab width are healed where they are *loaded*, not only where they
     are stored**, which is what `clamped_editor_font`/`clamped_tab_width` and
     `EDITOR_FONT_MIN`/`EDITOR_FONT_MAX`/`DEFAULT_EDITOR_FONT` are for (defined in `themes.rs`,
@@ -40262,8 +40265,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`), Import
   Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`), the ER diagram
   (`erd_view.rs`), Server variables (`server_vars_view.rs`), the snippet editor
-  (`snippet_edit.rs`), the Query plan modal (`plan_view.rs`) and the Used by modal
-  (`used_by_view.rs`) are converted;
+  (`snippet_edit.rs`), the Query plan modal (`plan_view.rs`), the Used by modal
+  (`used_by_view.rs`) and the interface themes' names (`themes.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

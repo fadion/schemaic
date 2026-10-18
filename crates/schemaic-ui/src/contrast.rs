@@ -948,7 +948,7 @@ mod tests {
                 UI_PAIRINGS,
                 UI_SHORTFALL,
                 kind.key(),
-                kind.label(),
+                &kind.label(),
                 &t,
                 &mut bad,
                 &mut stale,

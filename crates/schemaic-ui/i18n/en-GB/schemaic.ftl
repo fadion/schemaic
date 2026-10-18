@@ -1794,3 +1794,9 @@ used-by-noun-trigger = trigger
 used-by-noun-event = event
 used-by-noun-foreign-key = foreign key
 used-by-noun-expression = table expression
+
+## Interface themes (themes.rs) — Settings › Appearance's first dropdown.
+## The editor themes' names (One Dark Pro, Tokyo Night…) are product names.
+
+theme-dark = Dark
+theme-light = Light

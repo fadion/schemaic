@@ -772,10 +772,14 @@ pub enum UiThemeKind {
 }
 impl UiThemeKind {
     pub const ALL: [UiThemeKind; 2] = [UiThemeKind::Dark, UiThemeKind::Light];
-    pub fn label(self) -> &'static str {
+    /// What the Settings dropdown calls it — the catalogue's word. [`key`] is
+    /// what is persisted, so translating this changes nothing saved.
+    ///
+    /// [`key`]: UiThemeKind::key
+    pub fn label(self) -> String {
         match self {
-            UiThemeKind::Dark => "Dark",
-            UiThemeKind::Light => "Light",
+            UiThemeKind::Dark => crate::i18n::tr!("theme-dark"),
+            UiThemeKind::Light => crate::i18n::tr!("theme-light"),
         }
     }
     pub fn key(self) -> &'static str {
