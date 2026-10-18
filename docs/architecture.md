@@ -26084,6 +26084,21 @@ existing prose was left alone.
     again was already narrow and only had to say so**, and six of six were, which is why a file's
     number says nothing about how hard it is to move — this 6 took minutes where `overlays.rs`'s
     remaining 4 are immovable.
+    **Its words are the catalogue's** (`conn-import-*`, roadmap phase 3) — the title (through
+    `modal_title_owned`), the URL field's label, hint and *Add*, the three source buttons and their
+    busy words, `empty_message`'s three sentences (it returns `String` now), the plural found count
+    (`conn-import-found`, pinned by `the_found_count_reads_as_it_did_in_english`), Select all/None,
+    and Import through `import_label` — `conn-import-import` at zero, `conn-import-import-count`
+    with `$count` otherwise; Close is the shared `dialog-close`. `skipped_sentence` is two whole
+    messages, `conn-import-skipped` and `conn-import-skipped-more` (plurals on `$count`, with
+    `$names` and `$rest`), where an opening clause used to be spliced into a `format!`. A row's
+    notes are core's word drawn UI-side: `import_note_label(ImportNote)` replaces
+    `ImportNote::label` (`conn-import-note-*`), and
+    `english_words_every_import_note_as_core_does` holds its English equal to core's. The
+    `import_label`, `empty_message` and `skipped_sentence` tests pass unchanged. English stays: the
+    URL placeholder, a sample; `SkipReason::message` inside the skipped names and
+    `UrlError::message` (core's prose, phase 4); and the "Added N connections." line, which the
+    app's import action writes, not this file.
   - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
     panel's edges) and `v_resize_handle` (the editor/results split), plus the `DelayedHover` they
     share. Not `window_chrome::resize_zones`, which resizes the *window* and is mounted outside the
@@ -40173,7 +40188,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   grant forms (`account_editor.rs`), the table designer (`table_designer.rs`), Manage
   Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
   and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`),
-  Compare results (`result_diff_view.rs`) and the DDL preview (`ddl_preview.rs`) are converted;
+  Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`) and Import
+  Connections (`connection_import.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

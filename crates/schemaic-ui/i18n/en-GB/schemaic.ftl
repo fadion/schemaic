@@ -1583,3 +1583,49 @@ preview-applied = { $count ->
    *[other] Applied { $count } statements to { $subject }.
 }
 preview-refreshed = The schema has been refreshed.
+
+## Import Connections modal (connection_import.rs)
+## Why an entry was skipped, and what is wrong with a pasted URL, are core's
+## words and stay as they are for now.
+
+conn-import-title = Import Connections
+conn-import-url = Connection URL
+# The button inside the URL field.
+conn-import-add = Add
+# DATABASE_URL and .env are a variable and a file name: never translated.
+conn-import-url-hint = A connection URL, a JDBC URL, or a DATABASE_URL line out of a .env — one per line.
+conn-import-choose-file = Choose a file…
+conn-import-scan = Scan installed clients
+conn-import-scanning = Scanning…
+conn-import-docker = Docker containers
+conn-import-asking-docker = Asking Docker…
+conn-import-looking = Looking for connections on this machine…
+conn-import-none-found = No connections found. DBeaver, the JetBrains IDEs and the command-line clients keep their files in known places; if yours is elsewhere, choose it above.
+conn-import-nothing-yet = Nothing found yet — paste a URL, read a file, or scan for clients you already use.
+conn-import-found = { $count ->
+    [one] { $count } connection found
+   *[other] { $count } connections found
+}
+conn-import-select-all = Select all
+conn-import-select-none = None
+# A row's notes, joined by a middle dot. English must read exactly as core's
+# ImportNote::label (a test holds it).
+conn-import-note-no-password = No password in the source
+conn-import-note-already-saved = Already saved
+conn-import-note-unexpanded-path = Path contains an unexpanded macro
+conn-import-note-pgpass = Password taken from your own .pgpass
+conn-import-note-port-assumed = The source named no port; this is the default
+conn-import-note-external-login = Signs in a way Schemaic can't: set a SQL login
+# $names is up to three entries, each "name (why)", joined by commas.
+conn-import-skipped = { $count ->
+    [one] { $count } entry was not imported: { $names }.
+   *[other] { $count } entries were not imported: { $names }.
+}
+# As above, with $rest more entries counted rather than named.
+conn-import-skipped-more = { $count ->
+    [one] { $count } entry was not imported: { $names }, and { $rest } more.
+   *[other] { $count } entries were not imported: { $names }, and { $rest } more.
+}
+conn-import-import = Import
+# The Import button with how many connections it will add.
+conn-import-import-count = Import { $count }

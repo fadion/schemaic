@@ -1392,3 +1392,37 @@ preview-applied = { $count ->
    *[other] { $count } Anweisungen auf { $subject } angewendet.
 }
 preview-refreshed = Das Schema wurde aktualisiert.
+conn-import-title = Verbindungen importieren
+conn-import-url = Verbindungs-URL
+conn-import-add = Hinzufügen
+conn-import-url-hint = Eine Verbindungs-URL, eine JDBC-URL oder eine DATABASE_URL-Zeile aus einer .env – eine pro Zeile.
+conn-import-choose-file = Datei auswählen…
+conn-import-scan = Installierte Clients durchsuchen
+conn-import-scanning = Wird durchsucht…
+conn-import-docker = Docker-Container
+conn-import-asking-docker = Docker wird gefragt…
+conn-import-looking = Suche nach Verbindungen auf diesem Rechner…
+conn-import-none-found = Keine Verbindungen gefunden. DBeaver, die JetBrains-IDEs und die Kommandozeilen-Clients legen ihre Dateien an bekannten Orten ab; liegt deine woanders, wähle sie oben aus.
+conn-import-nothing-yet = Noch nichts gefunden – füge eine URL ein, lies eine Datei oder durchsuche Clients, die du schon nutzt.
+conn-import-found = { $count ->
+    [one] { $count } Verbindung gefunden
+   *[other] { $count } Verbindungen gefunden
+}
+conn-import-select-all = Alle auswählen
+conn-import-select-none = Keine
+conn-import-note-no-password = Kein Passwort in der Quelle
+conn-import-note-already-saved = Bereits gespeichert
+conn-import-note-unexpanded-path = Pfad enthält ein nicht aufgelöstes Makro
+conn-import-note-pgpass = Passwort aus deiner eigenen .pgpass übernommen
+conn-import-note-port-assumed = Die Quelle nannte keinen Port; dies ist der Standard
+conn-import-note-external-login = Meldet sich auf eine Weise an, die Schemaic nicht kann: SQL-Anmeldung festlegen
+conn-import-skipped = { $count ->
+    [one] { $count } Eintrag wurde nicht importiert: { $names }.
+   *[other] { $count } Einträge wurden nicht importiert: { $names }.
+}
+conn-import-skipped-more = { $count ->
+    [one] { $count } Eintrag wurde nicht importiert: { $names } und { $rest } weitere.
+   *[other] { $count } Einträge wurden nicht importiert: { $names } und { $rest } weitere.
+}
+conn-import-import = Importieren
+conn-import-import-count = { $count } importieren

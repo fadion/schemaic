@@ -25,10 +25,11 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use schemaic_core::conn_import::{ImportNote, Imported, Skipped};
 
+use crate::i18n::tr;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_button_icon, autohide, field_button,
     focus_root_with_ring, form_hint, form_label_style, link_button, modal_h, modal_pad_h,
-    modal_title, modal_w, panel_style,
+    modal_title_owned, modal_w, panel_style,
 };
 use crate::{ConnImportUi, FieldCfg, edit_field, icons, theme};
 
@@ -82,7 +83,7 @@ pub(crate) fn conn_import_overlay(
             .style(|s| s.flex_col().width_full().gap(theme::scaled(14.0)));
 
             let panel = v_stack((
-                modal_title("Import Connections", close_x, ring.clone()),
+                modal_title_owned(tr!("conn-import-title"), close_x, ring.clone()),
                 autohide(scroll(body.style(|s| {
                     s.flex_col()
                         .width_full()
@@ -144,7 +145,12 @@ fn paste_row(imp: ConnImportUi, add: Rc<dyn Fn()>, ring: FocusRing) -> impl Into
             placeholder: "postgres://user@host:5432/db",
             button: Some(Rc::new(move || {
                 let add = add.clone();
-                field_button("Add", ring_add.clone(), TAB_ADD, move || (add)())
+                field_button(
+                    tr!("conn-import-add"),
+                    ring_add.clone(),
+                    TAB_ADD,
+                    move || (add)(),
+                )
             })),
             // Monospace, because what goes in it is a URL: the punctuation that
             // decides where the host stops and the database starts is what the
@@ -172,16 +178,13 @@ fn paste_row(imp: ConnImportUi, add: Rc<dyn Fn()>, ring: FocusRing) -> impl Into
                         .width_full()
                 })
                 .into_any(),
-            None => form_hint(
-                "A connection URL, a JDBC URL, or a DATABASE_URL line out of a .env — one per line.",
-            )
-            .into_any(),
+            None => form_hint(tr!("conn-import-url-hint")).into_any(),
         },
     )
     .style(|s| s.width_full());
 
     v_stack((
-        text("Connection URL").style(form_label_style),
+        text(tr!("conn-import-url")).style(form_label_style),
         field,
         message,
     ))
@@ -255,7 +258,7 @@ fn row_of_buttons(
     let ring_docker = ring.clone();
     h_stack((
         action_button_icon(
-            "Choose a file…",
+            tr!("conn-import-choose-file"),
             icons::FILE,
             ActionKind::Quiet,
             true,
@@ -276,9 +279,9 @@ fn row_of_buttons(
                 let (scan, ring) = (scan.clone(), ring.clone());
                 action_button_icon(
                     if busy {
-                        "Scanning…"
+                        tr!("conn-import-scanning")
                     } else {
-                        "Scan installed clients"
+                        tr!("conn-import-scan")
                     },
                     icons::SEARCH,
                     ActionKind::Quiet,
@@ -297,9 +300,9 @@ fn row_of_buttons(
                 let (docker, ring) = (docker.clone(), ring_docker.clone());
                 action_button_icon(
                     if busy {
-                        "Asking Docker…"
+                        tr!("conn-import-asking-docker")
                     } else {
-                        "Docker containers"
+                        tr!("conn-import-docker")
                     },
                     icons::DATABASE,
                     ActionKind::Quiet,
@@ -367,25 +370,17 @@ fn row_list(imp: ConnImportUi, ring: FocusRing) -> impl IntoView {
 /// Pure and tested: before a scan the emptiness is an invitation, during one it
 /// is progress, and after one it is the answer — and a screen that says
 /// "Nothing found yet" in all three cases makes the scan button look dead.
-fn empty_message(scanning: bool, scanned: bool) -> &'static str {
+fn empty_message(scanning: bool, scanned: bool) -> String {
     match (scanning, scanned) {
-        (true, _) => "Looking for connections on this machine…",
-        (false, true) => {
-            "No connections found. DBeaver, the JetBrains IDEs and the command-line clients \
-             keep their files in known places; if yours is elsewhere, choose it above."
-        }
-        (false, false) => {
-            "Nothing found yet — paste a URL, read a file, or scan for clients you already use."
-        }
+        (true, _) => tr!("conn-import-looking"),
+        (false, true) => tr!("conn-import-none-found"),
+        (false, false) => tr!("conn-import-nothing-yet"),
     }
 }
 
 /// How many were found, and the two links that tick them.
 fn found_header(imp: crate::ConnImportUi, ring: FocusRing) -> impl IntoView {
-    let found = move || match imp.rows.with(|r| r.len()) {
-        1 => "1 connection found".to_string(),
-        n => format!("{n} connections found"),
-    };
+    let found = move || tr!("conn-import-found", count = imp.rows.with(|r| r.len()));
     h_stack((
         label(found).style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
         empty().style(|s| s.flex_grow(1.0_f32)),
@@ -393,7 +388,7 @@ fn found_header(imp: crate::ConnImportUi, ring: FocusRing) -> impl IntoView {
         // they are not the decision the modal is asking about. That decision has
         // exactly two buttons and they are in the footer.
         link_button(
-            "Select all",
+            tr!("conn-import-select-all"),
             theme::accent,
             ring.clone(),
             TAB_ALL,
@@ -402,9 +397,13 @@ fn found_header(imp: crate::ConnImportUi, ring: FocusRing) -> impl IntoView {
                 imp.chosen.set((0..n).collect());
             },
         ),
-        link_button("None", theme::text_muted, ring, TAB_NONE, move || {
-            imp.chosen.set(HashSet::new())
-        }),
+        link_button(
+            tr!("conn-import-select-none"),
+            theme::text_muted,
+            ring,
+            TAB_NONE,
+            move || imp.chosen.set(HashSet::new()),
+        ),
     ))
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
@@ -424,7 +423,7 @@ fn import_row(chosen: RwSignal<HashSet<usize>>, index: usize, imp: Imported) -> 
     let notes = imp
         .notes
         .iter()
-        .map(|n| n.label())
+        .map(|&n| import_note_label(n))
         .collect::<Vec<_>>()
         .join(" · ");
     let alarming = imp.has(ImportNote::AlreadySaved);
@@ -575,15 +574,15 @@ fn skipped_sentence(skipped: &[Skipped], hidden: usize) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
     let rest = total.saturating_sub(NAMED);
-    let opening = if total == 1 {
-        "1 entry was not imported".to_string()
-    } else {
-        format!("{total} entries were not imported")
-    };
     Some(if rest == 0 {
-        format!("{opening}: {head}.")
+        tr!("conn-import-skipped", count = total, names = head)
     } else {
-        format!("{opening}: {head}, and {rest} more.")
+        tr!(
+            "conn-import-skipped-more",
+            count = total,
+            names = head,
+            rest = rest
+        )
     })
 }
 
@@ -656,7 +655,7 @@ fn footer(
             let (run, ring, close) = (run.clone(), ring.clone(), close.clone());
             h_stack((
                 action_button(
-                    "Close",
+                    tr!("dialog-close"),
                     ActionKind::Neutral,
                     true,
                     ring.clone(),
@@ -688,8 +687,21 @@ fn footer(
 /// "Import 0": a disabled button still has to say what it *is*.
 fn import_label(count: usize) -> String {
     match count {
-        0 => "Import".to_string(),
-        n => format!("Import {n}"),
+        0 => tr!("conn-import-import"),
+        n => tr!("conn-import-import-count", count = n),
+    }
+}
+
+/// What a row's note says — `ImportNote::label`'s words, drawn here so they can
+/// be translated; core keeps its English.
+fn import_note_label(note: ImportNote) -> String {
+    match note {
+        ImportNote::NoPassword => tr!("conn-import-note-no-password"),
+        ImportNote::AlreadySaved => tr!("conn-import-note-already-saved"),
+        ImportNote::UnexpandedPath => tr!("conn-import-note-unexpanded-path"),
+        ImportNote::PasswordFromPgpass => tr!("conn-import-note-pgpass"),
+        ImportNote::PortAssumed => tr!("conn-import-note-port-assumed"),
+        ImportNote::ExternalLogin => tr!("conn-import-note-external-login"),
     }
 }
 
@@ -707,6 +719,31 @@ mod tests {
     use super::*;
     use schemaic_core::conn_import::{SkipReason, parse_url};
     use schemaic_core::connection::Connection;
+
+    /// The interface's words for a row's note are core's in English, for
+    /// every note.
+    #[test]
+    fn english_words_every_import_note_as_core_does() {
+        for note in [
+            ImportNote::NoPassword,
+            ImportNote::AlreadySaved,
+            ImportNote::UnexpandedPath,
+            ImportNote::PasswordFromPgpass,
+            ImportNote::PortAssumed,
+            ImportNote::ExternalLogin,
+        ] {
+            assert_eq!(import_note_label(note), note.label(), "{note:?}");
+        }
+    }
+
+    /// The found count reads as it did in English before the catalogue — the
+    /// skipped sentence and the Import button have tests of their own below.
+    #[test]
+    fn the_found_count_reads_as_it_did_in_english() {
+        assert_eq!(tr!("conn-import-found", count = 1), "1 connection found");
+        assert_eq!(tr!("conn-import-found", count = 0), "0 connections found");
+        assert_eq!(tr!("conn-import-found", count = 12), "12 connections found");
+    }
 
     fn skip(name: &str) -> Skipped {
         Skipped {
