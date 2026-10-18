@@ -697,3 +697,103 @@ results-collapse-editor-tip = Editor einklappen
 
 query-title = ABFRAGE
 query-no-database = Keine Datenbank
+
+## Shared dialog buttons (continued)
+
+dialog-stop = Anhalten
+
+## Copy table modal
+
+copy-table-title = { $table } kopieren
+copy-table-into = Kopieren nach
+copy-table-schema = Schema
+copy-table-name = Name
+copy-table-back = ‹ zurück
+copy-table-data = Daten kopieren
+copy-table-data-hint = Die Zeilen kopieren, sobald die Tabelle erstellt ist. Aus kopiert nur die Struktur.
+copy-table-what-with-rows = Die Struktur und die Zeilen. Fremdschlüssel und Trigger werden nicht kopiert, und eine generierte Spalte wird neu berechnet.
+copy-table-what-structure = Nur die Struktur. Fremdschlüssel und Trigger werden nicht kopiert.
+copy-table-choose-database = Wähle die Datenbank, in die kopiert werden soll.
+copy-table-connection-changed = Die aktive Verbindung hat sich geändert – öffne „Kopieren nach“ erneut von der Tabelle aus.
+copy-table-schema-not-loaded = Das Schema von { $database } ist nicht geladen – klappe es im Baum auf und versuche es dann erneut.
+copy-table-preview-subject = Kopie von { $table }
+copy-table-copying = Zeilen werden kopiert… { $n }
+copy-table-copied = { $n ->
+    [one] { $n } Zeile kopiert.
+   *[other] { $n } Zeilen kopiert.
+}
+copy-table-stopped = Angehalten, bevor alle Zeilen kopiert waren. Die Tabelle wurde erstellt.
+
+## Database, schema and extension editor
+
+database-editor-title-database = Datenbank erstellen
+database-editor-title-schema = Schema erstellen
+database-editor-title-extension = Erweiterung erstellen
+database-editor-title-schema-in = Schema in { $database } erstellen
+database-editor-title-extension-in = Erweiterung in { $database } erstellen
+database-editor-section-database = Datenbank
+database-editor-section-schema = Schema
+database-editor-section-extension = Erweiterung
+database-editor-name = Name
+database-editor-charset = Zeichensatz
+database-editor-collation = Sortierung
+database-editor-owner = Eigentümer
+database-editor-server-default = Vorgabe des Servers
+database-editor-owner-you = du
+database-editor-no-extensions = Keine Erweiterungen mehr zu installieren
+database-editor-no-charsets = Keine Zeichensätze vorzuschlagen
+database-editor-no-collations = Keine Sortierungen vorzuschlagen
+database-editor-no-roles = Keine Rollen auf diesem Server
+
+## SQL script import modal
+
+script-title = Import in { $database }
+script-dialog-title = SQL-Skript ausführen
+script-section = SQL-Skript
+script-choose-file = Datei wählen…
+script-no-file = Keine Datei gewählt
+script-reading = Datei wird gelesen
+script-hint = Das Skript kann eine andere Datenbank als die, in die du importierst, anlegen und auswählen. Es kann auch mehr als eine Datenbank anlegen. Prüfe das Skript, damit es tut, was du erwartest.
+script-hint-namespace = Das Skript kann eine andere Datenbank als die, in die du importierst, anlegen und auswählen. Es kann auch mehr als eine Datenbank anlegen. Das Öffnen aus { $namespace } legt das Skript auch nicht dort hinein: Alles, was die Datei nicht qualifiziert, landet dort, wohin der search_path des Servers zeigt. Prüfe das Skript, damit es tut, was du erwartest.
+script-what-it-does = Was diese Datei tut
+script-probe-nothing = Diese Datei enthält keine Anweisungen, die Schemaic ausführen kann.
+script-probe-cut-off = Die ersten { $size } dieser Datei sind eine einzige unvollständige Anweisung, daher gibt es noch nichts zusammenzufassen. Beim Ausführen wird die Datei vollständig gesendet.
+script-probe-counted = { $count } { $n ->
+    [one] Anweisung
+   *[other] Anweisungen
+} aus den ersten { $size } gelesen.
+script-destroys = { $count } { $n ->
+    [one] Anweisung in dieser Datei zerstört
+   *[other] Anweisungen in dieser Datei zerstören
+} Daten – DROP, TRUNCATE oder DELETE. Das lässt sich von hier aus nicht rückgängig machen.
+script-unread = Nur die ersten { $size } dieser Datei wurden gelesen, und nichts darin zerstört Daten – aber der Rest wurde nicht angesehen. Er kann DROP, TRUNCATE oder DELETE enthalten, und das lässt sich von hier aus nicht rückgängig machen.
+script-unqualified = { $count } { $n ->
+    [one] Anweisung in dieser Datei wirkt
+   *[other] Anweisungen in dieser Datei wirken
+} auf jede Zeile einer Tabelle – ein DELETE, UPDATE oder TRUNCATE ohne WHERE. Das lässt sich von hier aus nicht rückgängig machen.
+script-tx-own = Diese Datei öffnet ihre eigene Transaktion, sie landet also ganz oder gar nicht. Schemaic fügt keine eigene hinzu.
+script-tx-none = Diese Datei öffnet keine Transaktion, ein Fehler mittendrin lässt also stehen, was davor lief.
+script-connecting = Verbindung wird hergestellt
+script-progress-of = { $done } von { $total }
+script-progress-read = { $done } gelesen
+script-run = Ausführen
+script-done = { $n ->
+    [one] { $n } Anweisung
+   *[other] { $n } Anweisungen
+} aus { $file } ausgeführt.
+script-stopped = Nach { $n ->
+    [one] { $n } Anweisung
+   *[other] { $n } Anweisungen
+} angehalten.
+script-failed = Fehlgeschlagen: { $message } – davor { $n ->
+    [one] lief { $n } Anweisung
+   *[other] liefen { $n } Anweisungen
+}.
+script-failed-at = Fehlgeschlagen in Zeile { $line } von { $file }: { $message } – davor { $n ->
+    [one] lief { $n } Anweisung
+   *[other] liefen { $n } Anweisungen
+}.
+script-durability-rolled-back = { $file } hat eine eigene Transaktion geöffnet, daher hat der Server den ganzen Lauf zurückgerollt – nichts wurde übernommen, auch nicht die erfolgreichen Anweisungen.
+script-durability-applied = { $file } hat keine Transaktion geöffnet, daher ist jede Anweisung, die lief, weiterhin übernommen.
+script-durability-applied-before = Jede Anweisung, die lief, bevor { $file } eine eigene Transaktion öffnete, ist weiterhin übernommen; was innerhalb der Transaktion lief, wurde zurückgerollt.
+script-durability-unknown = Jede bereits gelaufene Anweisung ist weiterhin übernommen, es sei denn, { $file } hat eine eigene Transaktion geöffnet.

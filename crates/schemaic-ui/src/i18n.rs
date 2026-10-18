@@ -400,6 +400,10 @@ mod tests {
                 format!("{n} {}", plural(n, "key", "keys"))
             );
         }
+        // The copy modal's "Copied 1 row." / "Copied 3 rows.".
+        assert_eq!(tr!("copy-table-copied", n = 1), "Copied 1 row.");
+        assert_eq!(tr!("copy-table-copied", n = 3), "Copied 3 rows.");
+        assert_eq!(tr!("copy-table-copied", n = 0), "Copied 0 rows.");
         assert_eq!(
             tr!("props-vacuum-note", pct = "23"),
             "23% of this table's row versions are dead and not yet reclaimed. A VACUUM \
@@ -435,6 +439,65 @@ mod tests {
                 )
             };
             assert_eq!(words(n, capped), english);
+        }
+    }
+
+    /// **The script import's sentences read as the `format!`s they replaced**,
+    /// each with a plural (or two) inside, for one statement and for several —
+    /// `script_view` holds no tests of its own.
+    #[test]
+    fn the_script_import_sentences_read_as_they_did() {
+        use schemaic_core::text::plural;
+        for n in [1usize, 3] {
+            let st = plural(n, "statement", "statements");
+            assert_eq!(
+                tr!("script-done", n = n, file = "a.sql"),
+                format!("Ran {n} {st} from a.sql.")
+            );
+            assert_eq!(
+                tr!("script-stopped", n = n),
+                format!("Stopped after {n} {st}.")
+            );
+            assert_eq!(
+                tr!("script-failed", message = "boom", n = n),
+                format!("Failed: boom — {n} {st} ran before it.")
+            );
+            assert_eq!(
+                tr!(
+                    "script-failed-at",
+                    line = 12,
+                    file = "a.sql",
+                    message = "boom",
+                    n = n
+                ),
+                format!("Failed at line 12 of a.sql: boom — {n} {st} ran before it.")
+            );
+            let count = format!("{n}+");
+            assert_eq!(
+                tr!(
+                    "script-probe-counted",
+                    count = count.clone(),
+                    n = n,
+                    size = "8 MB"
+                ),
+                format!("{count} {st} read from the first 8 MB.")
+            );
+            assert_eq!(
+                tr!("script-destroys", count = count.clone(), n = n),
+                format!(
+                    "{count} {st} in this file {} data — DROP, TRUNCATE or DELETE. That cannot \
+                     be undone from here.",
+                    plural(n, "destroys", "destroy")
+                )
+            );
+            assert_eq!(
+                tr!("script-unqualified", count = count.clone(), n = n),
+                format!(
+                    "{count} {st} in this file {} on every row of a table — a DELETE, UPDATE or \
+                     TRUNCATE with no WHERE. That cannot be undone from here.",
+                    plural(n, "acts", "act")
+                )
+            );
         }
     }
 

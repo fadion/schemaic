@@ -34,6 +34,7 @@ use schemaic_core::script::{
 };
 use schemaic_core::sql::GuardPolicy;
 
+use crate::i18n::tr;
 use crate::theme;
 use crate::widgets::{
     ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, autohide, exit_action,
@@ -184,8 +185,10 @@ fn pick_file(ctx: &ScriptCtx) {
         return;
     }
     let dialog = FileDialogOptions::new()
-        .title("Run a SQL script")
+        .title(tr!("script-dialog-title"))
         .allowed_types(vec![FileSpec {
+            // `FileSpec` holds a `&'static str`, so the file type's name in
+            // the system dialog stays English.
             name: "SQL script",
             extensions: &["sql"],
         }]);
@@ -305,10 +308,10 @@ fn run_script(ctx: &ScriptCtx) {
             s.running.set(false);
             s.progress.set(None);
             match outcome {
-                RunOutcome::Done { ran } => s.done.set(Some(format!(
-                    "Ran {ran} {} from {name}.",
-                    schemaic_core::text::plural(ran, "statement", "statements")
-                ))),
+                RunOutcome::Done { ran } => {
+                    s.done
+                        .set(Some(tr!("script-done", n = ran, file = name.clone())))
+                }
                 // **The count is the message, not a footnote.** A script is not
                 // transactional unless the file said so, so a stopped run has
                 // very often changed the database — and the number of statements
@@ -322,20 +325,27 @@ fn run_script(ctx: &ScriptCtx) {
                 // whole run back, and a user who edits the file to skip the
                 // first N and re-runs loses all N.
                 RunOutcome::Cancelled { ran } => s.error.set(Some(format!(
-                    "Stopped after {ran} {}. {}",
-                    schemaic_core::text::plural(ran, "statement", "statements"),
+                    "{} {}",
+                    tr!("script-stopped", n = ran),
                     durability_sentence(s.probe.get_untracked().as_ref(), &name, ran),
                 ))),
                 RunOutcome::Failed { message, ran, at } => {
-                    let where_ = match at {
+                    // The server's message rides inside as it came: server
+                    // and driver errors stay in the server's language.
+                    let failed = match at {
                         // The line, because this is a file too big to open in
                         // the editor — "statement 30,000" would be no answer.
-                        Some((_, line)) => format!(" at line {line} of {name}"),
-                        None => String::new(),
+                        Some((_, line)) => tr!(
+                            "script-failed-at",
+                            line = line,
+                            file = name.clone(),
+                            message = message,
+                            n = ran
+                        ),
+                        None => tr!("script-failed", message = message, n = ran),
                     };
                     s.error.set(Some(format!(
-                        "Failed{where_}: {message} — {ran} {} ran before it. {}",
-                        schemaic_core::text::plural(ran, "statement", "statements"),
+                        "{failed} {}",
                         durability_sentence(s.probe.get_untracked().as_ref(), &name, ran),
                     )))
                 }
@@ -355,21 +365,12 @@ fn run_script(ctx: &ScriptCtx) {
 /// the opposite.
 fn durability_sentence(probe: Option<&Probe>, name: &str, ran: usize) -> String {
     match schemaic_core::script::durability(probe, ran) {
-        Durability::RolledBack => format!(
-            "{name} opened its own transaction, so the server rolled the whole run back — \
-             nothing was applied, including the statements that succeeded."
-        ),
-        Durability::Applied => {
-            format!("{name} opened no transaction, so every statement that ran is still applied.")
+        Durability::RolledBack => tr!("script-durability-rolled-back", file = name),
+        Durability::Applied => tr!("script-durability-applied", file = name),
+        Durability::AppliedBeforeTransaction => {
+            tr!("script-durability-applied-before", file = name)
         }
-        Durability::AppliedBeforeTransaction => format!(
-            "Any statement that ran before {name} opened its own transaction is still applied; \
-             what ran inside the transaction was rolled back."
-        ),
-        Durability::Unknown => format!(
-            "Any statement that already ran is still applied unless {name} opened its own \
-             transaction."
-        ),
+        Durability::Unknown => tr!("script-durability-unknown", file = name),
     }
 }
 
@@ -407,22 +408,23 @@ fn probe_body(p: &Probe) -> impl IntoView {
     // look was described as holding nothing runnable — a claim about a file the
     // probe had not finished reading.
     let summary = match summary_kind(p) {
-        ProbeSummary::NothingToRun => "This file holds no statements Schemaic can run.".to_string(),
-        ProbeSummary::CutOffBeforeFirst => format!(
-            "The first {} of this file is one unfinished statement, so there is nothing to \
-             summarise yet. Running it sends the file whole.",
-            schemaic_core::stats::format_bytes(p.bytes_read),
+        ProbeSummary::NothingToRun => tr!("script-probe-nothing"),
+        ProbeSummary::CutOffBeforeFirst => tr!(
+            "script-probe-cut-off",
+            size = schemaic_core::stats::format_bytes(p.bytes_read)
         ),
-        ProbeSummary::Counted => format!(
-            "{} {} read from the first {}.",
-            p.count_label(p.statements),
-            schemaic_core::text::plural(p.statements, "statement", "statements"),
-            schemaic_core::stats::format_bytes(p.bytes_read),
+        // `count` is the figure as shown (`412+` when the probe stopped short)
+        // and `n` the number the plural is chosen by.
+        ProbeSummary::Counted => tr!(
+            "script-probe-counted",
+            count = p.count_label(p.statements),
+            n = p.statements,
+            size = schemaic_core::stats::format_bytes(p.bytes_read)
         ),
     };
 
     v_stack((
-        form_section("What this file does"),
+        form_section(tr!("script-what-it-does")),
         label(summary, true),
         v_stack_from_iter(kinds).style(|s| {
             s.flex_col()
@@ -449,28 +451,20 @@ fn probe_body(p: &Probe) -> impl IntoView {
             // compile.
             match destruction_notice(p) {
                 Some(DestructionNotice::Found(n)) => rows.push(
-                    text(format!(
-                        "{} {} in this file {} data — DROP, TRUNCATE or DELETE. \
-                         That cannot be undone from here.",
-                        p.count_label(n),
-                        schemaic_core::text::plural(n, "statement", "statements"),
-                        schemaic_core::text::plural(n, "destroys", "destroy"),
-                    ))
-                    .style(|s| {
-                        s.font_size(theme::font_label())
-                            .color(theme::error())
-                            .padding_top(theme::scaled(8.0))
-                    })
-                    .into_any(),
+                    text(tr!("script-destroys", count = p.count_label(n), n = n))
+                        .style(|s| {
+                            s.font_size(theme::font_label())
+                                .color(theme::error())
+                                .padding_top(theme::scaled(8.0))
+                        })
+                        .into_any(),
                 ),
                 // Not muted, and not softer than the line above: "we did not
                 // look" is a warning, not a hint.
                 Some(DestructionNotice::Unread) => rows.push(
-                    text(format!(
-                        "Only the first {} of this file was read, and nothing in it destroys \
-                         data — but the rest was not looked at. It may DROP, TRUNCATE or \
-                         DELETE, and that cannot be undone from here.",
-                        schemaic_core::stats::format_bytes(p.bytes_read),
+                    text(tr!(
+                        "script-unread",
+                        size = schemaic_core::stats::format_bytes(p.bytes_read)
                     ))
                     .style(|s| {
                         s.font_size(theme::font_label())
@@ -492,19 +486,13 @@ fn probe_body(p: &Probe) -> impl IntoView {
             // say different things and a statement can be in both.
             if let Some(n) = unqualified_notice(p) {
                 rows.push(
-                    text(format!(
-                        "{} {} in this file {} on every row of a table — a DELETE, UPDATE or \
-                         TRUNCATE with no WHERE. That cannot be undone from here.",
-                        p.count_label(n),
-                        schemaic_core::text::plural(n, "statement", "statements"),
-                        schemaic_core::text::plural(n, "acts", "act"),
-                    ))
-                    .style(|s| {
-                        s.font_size(theme::font_label())
-                            .color(theme::error())
-                            .padding_top(theme::scaled(8.0))
-                    })
-                    .into_any(),
+                    text(tr!("script-unqualified", count = p.count_label(n), n = n))
+                        .style(|s| {
+                            s.font_size(theme::font_label())
+                                .color(theme::error())
+                                .padding_top(theme::scaled(8.0))
+                        })
+                        .into_any(),
                 );
             }
             // **Same size as the warning above it, not a hint.** Whether the
@@ -514,11 +502,9 @@ fn probe_body(p: &Probe) -> impl IntoView {
             // line above it. Muted rather than red: it is a fact about the file,
             // and on the `own_transaction` side it is the reassuring one.
             let tx_line = if p.own_transaction {
-                "This file opens its own transaction, so it either lands whole or not at all. \
-                 Schemaic adds none of its own."
+                tr!("script-tx-own")
             } else {
-                "This file opens no transaction, so a failure part-way leaves what ran before \
-                 it in place."
+                tr!("script-tx-none")
             };
             rows.push(
                 text(tx_line)
@@ -576,7 +562,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                 move |running| {
                     let pick_ctx = pick_ctx.clone();
                     crate::widgets::control_button_enabled(
-                        "Choose a file…",
+                        tr!("script-choose-file"),
                         !running,
                         pick_ring.clone(),
                         TAB_PICK,
@@ -591,12 +577,12 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                         .style(|st| st.color(theme::text()).font_size(theme::font_body()))
                         .into_any(),
                     (Some(_), true) => crate::widgets::loading_dots(
-                        "Reading the file",
+                        tr!("script-reading"),
                         theme::text_muted,
                         theme::font_body,
                     )
                     .into_any(),
-                    (None, _) => text("No file chosen")
+                    (None, _) => text(tr!("script-no-file"))
                         .style(|st| st.color(theme::text_dim()).font_size(theme::font_body()))
                         .into_any(),
                 },
@@ -610,7 +596,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
             // Choices and findings only; everything the run says about itself is
             // in the footer, which does not scroll.
             let body = v_stack((
-                form_section("SQL script"),
+                form_section(tr!("script-section")),
                 // No *File* caption over the row: the section heading already
                 // says what is being chosen, and `form_setting`'s label would be
                 // a second word for the same thing directly above the button
@@ -630,17 +616,8 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                     // unqualified `CREATE TABLE` lands in `public` — measured.
                     // The hint used to speak only of databases, under a title
                     // that named the namespace as though it were the scope.
-                    Some(ns) => format!(
-                        "The script may create and select a different database from the one \
-                         you're importing into. It may also create more than one database. \
-                         Opening this from {ns} does not put the script in it either: anything \
-                         the file does not qualify goes wherever the server's search_path says. \
-                         Check the script to make sure it does what you expect."
-                    ),
-                    None => "The script may create and select a different database from the one \
-                             you're importing into. It may also create more than one database. \
-                             Check the script to make sure it does what you expect."
-                        .to_string(),
+                    Some(ns) => tr!("script-hint-namespace", namespace = ns),
+                    None => tr!("script-hint"),
                 }),
                 form_separator(|| theme::scaled(16.0)),
                 dyn_container(
@@ -683,10 +660,10 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                                 // `ScriptProgress`. A file whose length could not
                                 // be read reports what it has done and no
                                 // denominator, rather than dividing by zero.
-                                Some(p) if p.bytes_total > 0 => text(format!(
-                                    "{} of {}",
-                                    schemaic_core::stats::format_bytes(p.bytes_done),
-                                    schemaic_core::stats::format_bytes(p.bytes_total),
+                                Some(p) if p.bytes_total > 0 => text(tr!(
+                                    "script-progress-of",
+                                    done = schemaic_core::stats::format_bytes(p.bytes_done),
+                                    total = schemaic_core::stats::format_bytes(p.bytes_total)
                                 ))
                                 .style(|st| {
                                     st.color(theme::text_muted())
@@ -694,9 +671,9 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                                         .min_width(0.0)
                                 })
                                 .into_any(),
-                                Some(p) => text(format!(
-                                    "{} read",
-                                    schemaic_core::stats::format_bytes(p.bytes_done)
+                                Some(p) => text(tr!(
+                                    "script-progress-read",
+                                    done = schemaic_core::stats::format_bytes(p.bytes_done)
                                 ))
                                 .style(|st| {
                                     st.color(theme::text_muted())
@@ -705,7 +682,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                                 })
                                 .into_any(),
                                 None => crate::widgets::loading_dots(
-                                    "Connecting",
+                                    tr!("script-connecting"),
                                     theme::text_muted,
                                     theme::font_label,
                                 )
@@ -736,7 +713,11 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                         left,
                         h_stack((
                             action_button(
-                                if running { "Stop" } else { "Close" },
+                                if running {
+                                    tr!("dialog-stop")
+                                } else {
+                                    tr!("dialog-close")
+                                },
                                 if running {
                                     ActionKind::Danger
                                 } else {
@@ -757,7 +738,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                             // words, in the panel, where it can be specific;
                             // the button is the same button.
                             action_button(
-                                "Run",
+                                tr!("script-run"),
                                 ActionKind::Primary,
                                 !running && ready,
                                 ring,
@@ -781,7 +762,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
             // *"Import into schemaic.sales"* landed in `public`. Which node was
             // right-clicked is said in the hint below instead, where it can be
             // said truthfully.
-            let title = format!("Import into {}", target.database);
+            let title = tr!("script-title", database = target.database.clone());
             let panel = v_stack((
                 modal_title_owned(title, close_x, ring.clone()),
                 autohide(scroll(body.style(|st| {

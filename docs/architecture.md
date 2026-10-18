@@ -27505,6 +27505,17 @@ existing prose was left alone.
     `stop` is `ctx.cancel`, the closure `ui.schema_actions.script_cancel` was. What came *off*
     `ScriptCtx` before it shipped, and why that is the mirror of `DumpCtx`'s near-miss, is under
     `lib.rs`'s `whole_ui_gate`.
+    **Its words are the catalogue's** (`script-*`, roadmap phase 3) — title, file row, hints, the
+    probe summary and its red warnings, the transaction line, progress, Run, the outcome sentences
+    and `durability_sentence`'s four, with Stop and Close the shared `dialog-stop`/`dialog-close`.
+    **A count is two arguments, not one**: `$count` is the figure as shown — `Probe::count_label`'s,
+    so `412+` where the read-ahead stopped short — and `$n` the number Fluent chooses the plural by,
+    since a `412+` is no number to choose one with; both warnings carry two plurals over that one
+    `$n` (*statements … destroy*, *statements … act*). The server's error goes into the failure
+    sentences unchanged. `script_view` has no tests of its own, so
+    `i18n::tests::the_script_import_sentences_read_as_they_did` holds
+    every composed sentence to the `format!` it replaced, for one statement and for three. The
+    system file dialog's file-type name stays English: `FileSpec::name` is a `&'static str`.
   - `dump_view.rs` — the **schema + data dump** modal, **Export** to the user, over `core::dump`.
     Three entry points and one modal: a database's schema context menu and a PostgreSQL namespace's,
     where it is the middle of **`Import → Export ▸ → Create ▸`** — the three entries about the node
@@ -27741,7 +27752,9 @@ existing prose was left alone.
     built on its own copy would have gained the menu and not the ghost — the column Type and MySQL
     Engine (`bound_field_with_menu`), the database editor's `optional_field`, the grant form's
     `suggested_field` and the domain's base Type all go through it now, as does the connection
-    form's Folder.
+    form's Folder. The chevron's *nothing to suggest* row is the caller's: `suggest_field` takes it
+    as `impl Into<String>` and `suggest_chevron` as a `String`, so a `tr!` note passes as readily as
+    a literal (roadmap phase 3).
     The preview's SQL box is a read-only monospace `edit_field` that **wraps**: it was `no_wrap`,
     and an `edit_field` has no wheel to scroll sideways (only the editor pane wires Shift+wheel, see
     the Floem gotchas), so the end of a long statement — a selective XML index's paths, a rebuild's
@@ -28098,8 +28111,9 @@ existing prose was left alone.
     editor's *Create view from this query*).
     **Its words are the catalogue's** (`view-editor-*`, roadmap phase 3) — labels, sections, the
     column-names placeholder, the re-create toggle and its hint, both titles — with **Cancel**
-    `dialog-cancel` and the footer's other two named for no one editor, though this is their only
-    caller so far: `editor-preview-sql` and `editor-change-count`, whose `[0]` case is *No changes*
+    `dialog-cancel` and the footer's other two named for no one editor: `editor-preview-sql`, which
+    the Copy to modal and the database editor now share, and `editor-change-count`, still this
+    footer's alone, whose `[0]` case is *No changes*
     (`the_shared_counts_read_as_they_did` pins 0, 1 and 7). The `view_name` and `SELECT …`
     placeholders and the `CASCADED`/`LOCAL`/`DEFINER`/`INVOKER` choices are SQL and stay;
     `ViewDraft::validate`'s errors are core's prose, phase 4.
@@ -28635,6 +28649,15 @@ existing prose was left alone.
     `container_preview`); and it leaves through
     `preview_container` like a schema — `is_server_level` is false for it, so it runs inside the
     database through `Db::run_ddl`.
+    **Its words are the catalogue's** (`database-editor-*`, roadmap phase 3) — sections, fields, the
+    *server default* and *you* placeholders and each chevron's empty note, with Cancel and Preview
+    SQL the shared `dialog-cancel`/`editor-preview-sql`. **The title is one message per kind and
+    placement** — `database-editor-title-{database,schema,extension}` and the `-schema-in`/
+    `-extension-in` pair that take `$database` — where it had been `format!("Create {}",
+    ContainerKind::label())` beside a separate *Create schema in {db}*: a sentence assembled from an
+    English noun cannot be translated. `optional_field` takes its placeholder and note as `String`
+    for the same reason. The identifier placeholders (`database_name`, `extension_name`, …) stay,
+    and `DatabaseDraft::validate`'s errors are core's prose, phase 4.
   - `account_editor.rs` — the Users and privileges browser's **write half**: two overlays in one
     module, `account_editor_overlay` (create an account, or reset one's password) and
     `grant_editor_overlay` (grant or
@@ -32039,6 +32062,13 @@ existing prose was left alone.
     `e` carries `Rollback::note` saying so, so the sentence used to contradict its own error. After
     it, *"{n} rows were copied, but the table's counter was not moved past them, so the next insert
     may collide: {e}"*.
+    **The modal's own words are the catalogue's** (`copy-table-*`, roadmap phase 3) — title,
+    fields, the *Copy data* toggle and its notes, the refusals it raises itself, the preview's
+    *Copy of {table}*, progress, the stop note and *Copied N rows.*, a plural
+    (`the_shared_counts_read_as_they_did` pins 0, 1 and 3) — with Cancel, Preview SQL, Stop and
+    Close the shared `dialog-cancel`, `editor-preview-sql`, `dialog-stop` and `dialog-close`. What
+    stays English: `copy_table::refusal`, core's prose until phase 4; the app's failure sentences
+    above, which arrive whole; and the `<table>_copy` default, which is an identifier.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
     surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
@@ -39889,8 +39919,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   the schema panel (`schema_tree.rs`), Query History (`history_panel.rs`), the snippet library
   (`snippet_panel.rs`), the tab strip's menu and tooltip (`tabs.rs`), Server Activity
   (`activity_panel.rs`), the AI Assistant panel (`ai_panel.rs`), the Chart modal
-  (`chart_view.rs`), the view editor (`view_editor.rs`) and the properties panel (`properties.rs`)
-  are converted; every other
+  (`chart_view.rs`), the view editor (`view_editor.rs`), the properties panel (`properties.rs`),
+  the three workspace panel headers (`lib.rs`'s `term-*` and `results-*`, `editor_pane.rs`'s
+  `query-*`), the Copy to modal (`copy_table_view.rs`), the Create database/schema/extension form
+  (`database_editor.rs`) and the script import (`script_view.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

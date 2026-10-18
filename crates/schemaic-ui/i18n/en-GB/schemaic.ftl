@@ -748,3 +748,124 @@ results-collapse-editor-tip = Collapse the editor
 query-title = QUERY
 # The database selector when the tab has none chosen.
 query-no-database = No database
+
+## Shared dialog buttons (continued)
+
+dialog-stop = Stop
+
+## Copy table modal
+
+# $table is the source table's display name.
+copy-table-title = Copy { $table }
+copy-table-into = Copy into
+copy-table-schema = Schema
+copy-table-name = Name
+copy-table-back = ‹ back
+copy-table-data = Copy data
+copy-table-data-hint = Copy the rows once the table is created. Off copies the structure only.
+copy-table-what-with-rows = The structure and the rows. Foreign keys and triggers are not copied, and a generated column is computed afresh.
+copy-table-what-structure = The structure only. Foreign keys and triggers are not copied.
+copy-table-choose-database = Choose the database to copy into.
+copy-table-connection-changed = The active connection changed — reopen Copy to from the table.
+# $database is the source database's name.
+copy-table-schema-not-loaded = { $database }'s schema is not loaded — expand it in the tree, then try again.
+# The DDL preview's subject; $table is the source table.
+copy-table-preview-subject = Copy of { $table }
+# $n is how many rows have been copied so far.
+copy-table-copying = Copying rows… { $n }
+copy-table-copied = Copied { $n } { $n ->
+    [one] row
+   *[other] rows
+}.
+copy-table-stopped = Stopped before every row was copied. The table was created.
+
+## Database, schema and extension editor
+
+database-editor-title-database = Create database
+database-editor-title-schema = Create schema
+database-editor-title-extension = Create extension
+# $database is the database the schema or extension goes into.
+database-editor-title-schema-in = Create schema in { $database }
+database-editor-title-extension-in = Create extension in { $database }
+database-editor-section-database = Database
+database-editor-section-schema = Schema
+database-editor-section-extension = Extension
+database-editor-name = Name
+database-editor-charset = Character set
+database-editor-collation = Collation
+database-editor-owner = Owner
+# Placeholder of the character set and collation fields left empty.
+database-editor-server-default = server default
+# Placeholder of the owner field left empty.
+database-editor-owner-you = you
+database-editor-no-extensions = No extensions left to install
+database-editor-no-charsets = No character sets to suggest
+database-editor-no-collations = No collations to suggest
+database-editor-no-roles = No roles on this server
+
+## SQL script import modal
+## $count is a statement count as shown — "412+" when the read-ahead stopped
+## short — and $n the number the plural is chosen by. $size is a size such as
+## "8 MB". DROP, TRUNCATE, DELETE, UPDATE and WHERE are SQL keywords.
+
+# $database is the database the modal was opened on.
+script-title = Import into { $database }
+script-dialog-title = Run a SQL script
+script-section = SQL script
+script-choose-file = Choose a file…
+script-no-file = No file chosen
+script-reading = Reading the file
+script-hint = The script may create and select a different database from the one you're importing into. It may also create more than one database. Check the script to make sure it does what you expect.
+# $namespace is the schema the modal was opened from. search_path is PostgreSQL's setting.
+script-hint-namespace = The script may create and select a different database from the one you're importing into. It may also create more than one database. Opening this from { $namespace } does not put the script in it either: anything the file does not qualify goes wherever the server's search_path says. Check the script to make sure it does what you expect.
+script-what-it-does = What this file does
+script-probe-nothing = This file holds no statements Schemaic can run.
+script-probe-cut-off = The first { $size } of this file is one unfinished statement, so there is nothing to summarise yet. Running it sends the file whole.
+script-probe-counted = { $count } { $n ->
+    [one] statement
+   *[other] statements
+} read from the first { $size }.
+script-destroys = { $count } { $n ->
+    [one] statement
+   *[other] statements
+} in this file { $n ->
+    [one] destroys
+   *[other] destroy
+} data — DROP, TRUNCATE or DELETE. That cannot be undone from here.
+script-unread = Only the first { $size } of this file was read, and nothing in it destroys data — but the rest was not looked at. It may DROP, TRUNCATE or DELETE, and that cannot be undone from here.
+script-unqualified = { $count } { $n ->
+    [one] statement
+   *[other] statements
+} in this file { $n ->
+    [one] acts
+   *[other] act
+} on every row of a table — a DELETE, UPDATE or TRUNCATE with no WHERE. That cannot be undone from here.
+script-tx-own = This file opens its own transaction, so it either lands whole or not at all. Schemaic adds none of its own.
+script-tx-none = This file opens no transaction, so a failure part-way leaves what ran before it in place.
+script-connecting = Connecting
+# Progress, in bytes: $done of $total, or $done alone when the size is unknown.
+script-progress-of = { $done } of { $total }
+script-progress-read = { $done } read
+script-run = Run
+# $file is the script's file name.
+script-done = Ran { $n } { $n ->
+    [one] statement
+   *[other] statements
+} from { $file }.
+script-stopped = Stopped after { $n } { $n ->
+    [one] statement
+   *[other] statements
+}.
+# $message is the server's own error, in the server's language.
+script-failed = Failed: { $message } — { $n } { $n ->
+    [one] statement
+   *[other] statements
+} ran before it.
+script-failed-at = Failed at line { $line } of { $file }: { $message } — { $n } { $n ->
+    [one] statement
+   *[other] statements
+} ran before it.
+script-durability-rolled-back = { $file } opened its own transaction, so the server rolled the whole run back — nothing was applied, including the statements that succeeded.
+script-durability-applied = { $file } opened no transaction, so every statement that ran is still applied.
+script-durability-applied-before = Any statement that ran before { $file } opened its own transaction is still applied; what ran inside the transaction was rolled back.
+script-durability-unknown = Any statement that already ran is still applied unless { $file } opened its own transaction.

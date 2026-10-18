@@ -22,6 +22,7 @@ use floem::reactive::{create_effect, create_memo};
 use schemaic_core::copy_table::{self, CopyTarget};
 use schemaic_core::schema::display_name;
 
+use crate::i18n::tr;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, cursor_row, fact_note,
     focus_root_with_ring, form_gap, form_setting, in_ring_button, modal_footer, modal_pad_h,
@@ -252,7 +253,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 match listed {
                     Some((cid, dbs)) => {
                         picks.push((
-                            "‹ back".to_string(),
+                            tr!("copy-table-back"),
                             theme::text_muted,
                             Rc::new(move || o.compare_dbs.set(None)),
                         ));
@@ -340,16 +341,14 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
         let src = src.clone();
         Rc::new(move || {
             let Some((dst_conn, database)) = dst.get_untracked() else {
-                return refusal.set(Some("Choose the database to copy into.".into()));
+                return refusal.set(Some(tr!("copy-table-choose-database")));
             };
             // The schema and the dialect read below are the **active**
             // connection's, which was the source's when this opened. Switched
             // since, they would describe another server's same-named table
             // while the rows still came from this one.
             if ctx.conn.active_conn.get_untracked() != src.conn_id {
-                return refusal.set(Some(
-                    "The active connection changed — reopen Copy to from the table.".into(),
-                ));
+                return refusal.set(Some(tr!("copy-table-connection-changed")));
             }
             let Some(info) = crate::table_designer::loaded_table(
                 ctx.schema,
@@ -357,9 +356,9 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 src.schema.as_deref(),
                 &src.table,
             ) else {
-                return refusal.set(Some(format!(
-                    "{}'s schema is not loaded — expand it in the tree, then try again.",
-                    src.database
+                return refusal.set(Some(tr!(
+                    "copy-table-schema-not-loaded",
+                    database = src.database.clone()
                 )));
             };
             let to = CopyTarget {
@@ -401,9 +400,9 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
             let mut p = crate::ddl_preview::preview_of(
                 dst_conn,
                 &to.database,
-                format!(
-                    "Copy of {}",
-                    display_name(info.schema.as_deref(), &info.name)
+                tr!(
+                    "copy-table-preview-subject",
+                    table = display_name(info.schema.as_deref(), &info.name)
                 ),
                 &cs,
                 read_only,
@@ -445,11 +444,11 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
         let has_schema = src.schema.is_some();
         v_stack((
             form_setting(
-                "Copy into",
+                tr!("copy-table-into"),
                 v_stack((chosen, list, db_err)).style(|s| s.width_full()),
             ),
             form_setting(
-                "Schema",
+                tr!("copy-table-schema"),
                 edit_field(
                     ns,
                     FieldCfg {
@@ -461,7 +460,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
             )
             .style(move |s| s.apply_if(!has_schema, |s| s.hide())),
             form_setting(
-                "Name",
+                tr!("copy-table-name"),
                 edit_field(
                     name,
                     FieldCfg {
@@ -473,8 +472,8 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 .style(|s| s.width_full()),
             ),
             crate::settings::focusable_toggle_row(
-                "Copy data",
-                "Copy the rows once the table is created. Off copies the structure only.",
+                tr!("copy-table-data"),
+                tr!("copy-table-data-hint"),
                 copy_data,
                 ring.clone(),
                 40,
@@ -486,12 +485,10 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                         icons::CIRCLE_DOT,
                         theme::text_dim,
                         if rows {
-                            "The structure and the rows. Foreign keys and triggers are not \
-                             copied, and a generated column is computed afresh."
+                            tr!("copy-table-what-with-rows")
                         } else {
-                            "The structure only. Foreign keys and triggers are not copied."
-                        }
-                        .to_string(),
+                            tr!("copy-table-what-structure")
+                        },
                     )
                 },
             ),
@@ -516,20 +513,20 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
         move || stage.get(),
         move |st| match st {
             Stage::Choosing => empty().into_any(),
-            Stage::Copying => label(move || format!("Copying rows… {}", o.copy_progress.get()))
+            Stage::Copying => label(move || tr!("copy-table-copying", n = o.copy_progress.get()))
                 .style(|s| s.font_size(theme::font_body()).color(theme::text()))
                 .into_any(),
             Stage::Finished(CopyOutcome::Done(n)) => fact_note(
                 icons::CIRCLE_CHECK,
                 theme::text,
-                format!("Copied {n} {}.", if n == 1 { "row" } else { "rows" }),
+                tr!("copy-table-copied", n = n),
             ),
             Stage::Finished(CopyOutcome::Cancelled) => fact_note(
                 icons::TRIANGLE_ALERT,
                 theme::text_dim,
                 // Not "holds no rows": on a table whose engine ignores the
                 // rollback (MyISAM, Aria) what arrived before the stop stays.
-                "Stopped before every row was copied. The table was created.".to_string(),
+                tr!("copy-table-stopped"),
             ),
             // The app's whole sentence: it alone knows whether the rows went
             // in before what failed (a counter left behind) or not at all.
@@ -558,7 +555,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                         let preview = preview.clone();
                         h_stack((
                             action_button(
-                                "Cancel",
+                                tr!("dialog-cancel"),
                                 ActionKind::Neutral,
                                 true,
                                 ring.clone(),
@@ -566,7 +563,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                                 move || close(),
                             ),
                             action_button(
-                                "Preview SQL",
+                                tr!("editor-preview-sql"),
                                 ActionKind::Primary,
                                 ready,
                                 ring.clone(),
@@ -579,7 +576,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                     Stage::Copying => {
                         let cancel = cancel.clone();
                         action_button(
-                            "Stop",
+                            tr!("dialog-stop"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -589,7 +586,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                         .into_any()
                     }
                     Stage::Finished(_) => action_button(
-                        "Close",
+                        tr!("dialog-close"),
                         ActionKind::Primary,
                         true,
                         ring.clone(),
@@ -605,7 +602,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
 
     let panel = v_stack((
         modal_title_owned(
-            format!("Copy {src_label}"),
+            tr!("copy-table-title", table = src_label.clone()),
             close.clone(),
             root_ring.clone(),
         ),

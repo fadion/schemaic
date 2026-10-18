@@ -33,6 +33,7 @@ use floem::reactive::create_effect;
 
 use schemaic_core::ddl::{self, DatabaseDraft};
 
+use crate::i18n::tr;
 use crate::table_designer::{edit_ctx, suggest_field};
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
@@ -353,11 +354,11 @@ fn optional_field(
     draft: RwSignal<DatabaseDraft>,
     overlay: OverlayUi,
     initial: Option<String>,
-    placeholder: &'static str,
+    placeholder: String,
     options: impl Fn() -> Vec<String> + 'static,
     // What the chevron's menu says when `options` answers nothing — see
     // `suggest_chevron`.
-    empty_note: &'static str,
+    empty_note: String,
     ring: &FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut DatabaseDraft, Option<String>) + 'static,
@@ -374,7 +375,7 @@ fn optional_field(
         overlay,
         sig,
         FieldCfg {
-            placeholder,
+            placeholder_of: Some(Rc::new(move || placeholder.clone())),
             ..Default::default()
         },
         field_w,
@@ -400,16 +401,17 @@ fn form(
         // needs no rebuild.
         let offered = ui.extensions;
         form_setting(
-            "Name",
+            tr!("database-editor-name"),
             optional_field(
                 bound,
                 overlay,
                 Some(draft.name.clone()).filter(|n| !n.is_empty()),
-                "extension_name",
+                // An identifier's shape, not a word: never translated.
+                "extension_name".to_string(),
                 move || offered.get_untracked(),
                 // Reachable: empty until the fetch lands, and for good where
                 // every extension the server ships is already installed.
-                "No extensions left to install",
+                tr!("database-editor-no-extensions"),
                 &ring,
                 10,
                 |d, v| d.name = v.unwrap_or_default(),
@@ -417,7 +419,7 @@ fn form(
         )
     } else {
         form_setting(
-            "Name",
+            tr!("database-editor-name"),
             bound_field(
                 bound,
                 draft.name.clone(),
@@ -438,9 +440,9 @@ fn form(
 
     let mut rows: Vec<AnyView> = vec![
         form_section(match target.kind {
-            ContainerKind::Database => "Database",
-            ContainerKind::Schema => "Schema",
-            ContainerKind::Extension => "Extension",
+            ContainerKind::Database => tr!("database-editor-section-database"),
+            ContainerKind::Schema => tr!("database-editor-section-schema"),
+            ContainerKind::Extension => tr!("database-editor-section-extension"),
         })
         .into_any(),
         name.into_any(),
@@ -467,14 +469,14 @@ fn form(
     if charsets {
         rows.push(
             form_setting(
-                "Character set",
+                tr!("database-editor-charset"),
                 optional_field(
                     bound,
                     overlay,
                     draft.charset.clone(),
-                    "server default",
+                    tr!("database-editor-server-default"),
                     || ddl::MYSQL_CHARSETS.iter().map(|c| c.to_string()).collect(),
-                    "No character sets to suggest",
+                    tr!("database-editor-no-charsets"),
                     &ring,
                     20,
                     |d, v| d.charset = v,
@@ -487,14 +489,14 @@ fn form(
         let offered = ddl::database_collations(target.dialect);
         rows.push(
             form_setting(
-                "Collation",
+                tr!("database-editor-collation"),
                 optional_field(
                     bound,
                     overlay,
                     draft.collation.clone(),
-                    "server default",
+                    tr!("database-editor-server-default"),
                     move || offered.iter().map(|c| c.to_string()).collect(),
-                    "No collations to suggest",
+                    tr!("database-editor-no-collations"),
                     &ring,
                     30,
                     |d, v| d.collation = v,
@@ -511,17 +513,17 @@ fn form(
         let roles = ui.roles;
         rows.push(
             form_setting(
-                "Owner",
+                tr!("database-editor-owner"),
                 optional_field(
                     bound,
                     overlay,
                     draft.owner.clone(),
-                    "you",
+                    tr!("database-editor-owner-you"),
                     move || roles.get_untracked(),
                     // Reachable: the roles arrive from a fetch, so the list is
                     // empty until it lands and for good if it fails — and a
                     // chevron that answers with silence reads as broken.
-                    "No roles on this server",
+                    tr!("database-editor-no-roles"),
                     &ring,
                     40,
                     |d, v| d.owner = v,
@@ -565,9 +567,15 @@ pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl Into
                 return empty().into_any();
             };
             let title = match (target.kind, target.database.as_deref()) {
-                (ContainerKind::Schema, Some(db)) => format!("Create schema in {db}"),
-                (ContainerKind::Extension, Some(db)) => format!("Create extension in {db}"),
-                (kind, _) => format!("Create {}", kind.label()),
+                (ContainerKind::Schema, Some(db)) => {
+                    tr!("database-editor-title-schema-in", database = db)
+                }
+                (ContainerKind::Extension, Some(db)) => {
+                    tr!("database-editor-title-extension-in", database = db)
+                }
+                (ContainerKind::Database, _) => tr!("database-editor-title-database"),
+                (ContainerKind::Schema, None) => tr!("database-editor-title-schema"),
+                (ContainerKind::Extension, None) => tr!("database-editor-title-extension"),
             };
 
             let ring = FocusRing::new();
@@ -619,7 +627,7 @@ pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl Into
                     let ready = draft.validate().is_empty();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -627,7 +635,7 @@ pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl Into
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,

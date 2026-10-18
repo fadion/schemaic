@@ -721,7 +721,7 @@ fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
     overlay: crate::OverlayUi,
     sig: RwSignal<String>,
     options: F,
-    empty_note: &'static str,
+    empty_note: String,
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView + use<F> {
@@ -779,7 +779,7 @@ fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
         // has none.
         let entries = options();
         let entries: Vec<MenuEntry> = if entries.is_empty() {
-            vec![MenuEntry::action(empty_note, || {}).disabled(true)]
+            vec![MenuEntry::action(empty_note.clone(), || {}).disabled(true)]
         } else {
             entries
                 .into_iter()
@@ -840,10 +840,11 @@ pub(crate) fn suggest_field<F: Fn() -> Vec<String> + 'static>(
     cfg: FieldCfg,
     width: fn() -> f64,
     options: F,
-    empty_note: &'static str,
+    empty_note: impl Into<String>,
     ring: FocusRing,
     tabindex: u32,
 ) -> AnyView {
+    let empty_note: String = empty_note.into();
     let options: Rc<dyn Fn() -> Vec<String>> = Rc::new(options);
     let menu = options.clone();
     h_stack((
