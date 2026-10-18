@@ -27778,6 +27778,26 @@ existing prose was left alone.
     all, on the argument that the grid's bar told the whole story in one strip; that bar has no
     export state any more. The state behind it (`ExportUi`, the single `exit` closure both its exits
     run, and who may write into it) is in *Data grid*.
+    **Its words are the catalogue's** (`dump-*` and `export-progress-*`, roadmap phase 3). The
+    export modal's: the title through `dump_title` — two whole messages, `dump-title-schema` and
+    `dump-title`, rather than a namespace spliced in — the save and folder dialogs' window titles
+    (`dump-sql-dialog`, `dump-folder-dialog` with `$format`), the folder hint, the picker's count
+    (`dump-all-selected`, `dump-some-selected`), its Select all/None and its three notes, the two
+    sections' toggles and the hints this file owns, the no-FK-guard hint, Export, the progress line
+    `dump-progress` (`$table`, `$index`, `$total`, and `$rows`, `human_count`'s abbreviated figure),
+    *Reading the schema* and the *Replace files* confirm's title. The progress box's: its count
+    through `export_count_line` — `export-progress-of-about` for the `~` case, `export-progress-of`,
+    and the plural `export-progress-rows`, whose `$count` is the exact number Fluent chooses the
+    plural by and `$rows` the abbreviated one shown, since a `9.4k` is no number to choose one with
+    (`script_view`'s two-argument count, above) — *Starting*, and the destination line,
+    `export-progress-file` or `export-progress-writing` (`$name`). Stop and Close in both footers
+    are the shared `dialog-stop`/`dialog-close`. `the_composed_lines_read_as_they_did_in_english`
+    pins the titles, counts, progress line and destination lines in English. What stays English:
+    the format names (`ExportFormat::label`, a `$format` placeable); the save dialog's file-type
+    name `SQL` (`FileSpec::name` is a `&'static str`); and core's prose —
+    `dump::drop_before_create_hint`, `fk_guard_hint`, `done_note`, `cancel_note`,
+    `folder_replace_prompt`, `export::export_note`, `export_failure_note` and the `files_*_note`s
+    (phase 4).
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
     designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
@@ -40104,7 +40124,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`event_editor.rs`), the trigger editor (`trigger_editor.rs`), the object editor
   (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
   grant forms (`account_editor.rs`), the table designer (`table_designer.rs`), Manage
-  Connections (`connection_form.rs`) and the file import (`import_view.rs`) are converted;
+  Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
+  and the grid export's progress box (`dump_view.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

@@ -41,6 +41,7 @@ use floem::reactive::{Memo, create_effect, create_memo};
 use schemaic_core::dump::PickerBody;
 use schemaic_core::intel::SqlDialect;
 
+use crate::i18n::tr;
 use crate::theme;
 use crate::widgets::{
     ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, autohide, exit_action,
@@ -281,7 +282,7 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
         return;
     }
     let dialog = FileDialogOptions::new()
-        .title("Export to SQL")
+        .title(tr!("dump-sql-dialog"))
         .default_name(format!("{}.sql", target.database))
         .allowed_types(vec![FileSpec {
             name: "SQL",
@@ -431,7 +432,7 @@ fn run_files(ctx: &DumpCtx, target: DumpTarget) {
         // two tables can sanitize to one file name and only the plan sees the
         // whole set.
         .select_directories()
-        .title(format!("Export to {}", target.format.label()));
+        .title(tr!("dump-folder-dialog", format = target.format.label()));
     let asked_at = d.generation.get_untracked();
     let format = target.format;
     floem::action::open_file(dialog, move |file| {
@@ -553,7 +554,7 @@ fn launch_files(ctx: &DumpCtx, req: FilesRequest, name: String) {
                         let req = req_retry.clone();
                         let name = name_retry.clone();
                         ctx_retry.overlay.confirm.set(Some(crate::Confirm {
-                            title: "Replace files".to_string(),
+                            title: tr!("dump-replace-files"),
                             message: schemaic_core::dump::folder_replace_prompt(&name, &replaced),
                             resolve: Rc::new(move |yes| {
                                 if !yes {
@@ -594,24 +595,24 @@ fn launch_files(ctx: &DumpCtx, req: FilesRequest, name: String) {
 /// them.
 fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl IntoView {
     let what = v_stack((
-        form_section_header("Contents"),
+        form_section_header(tr!("dump-section-contents")),
         crate::settings::focusable_toggle_row(
-            "Structure",
-            "CREATE TABLE, its triggers, and the foreign keys, restated after the data.",
+            tr!("dump-structure"),
+            tr!("dump-structure-hint"),
             d.structure,
             ring.clone(),
             TAB_OPTS,
         ),
         crate::settings::focusable_toggle_row(
-            "Data",
-            "Every row, as INSERT statements.",
+            tr!("dump-data"),
+            tr!("dump-data-hint"),
             d.data,
             ring.clone(),
             TAB_OPTS + 10,
         ),
         crate::settings::focusable_toggle_row(
-            "Other objects",
-            "Types, sequences, routines and events these tables lean on.",
+            tr!("dump-other-objects"),
+            tr!("dump-other-objects-hint"),
             d.other_objects,
             ring.clone(),
             TAB_OPTS + 20,
@@ -624,9 +625,9 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
     // again here.
     let has_guard = schemaic_core::dump::fk_guard_sql(dialect).is_some();
     let replay = v_stack((
-        form_section_header("Replaying"),
+        form_section_header(tr!("dump-section-replaying")),
         crate::settings::focusable_toggle_row(
-            "Drop before create",
+            tr!("dump-drop-before-create"),
             // What it drops differs by engine — see the core function.
             schemaic_core::dump::drop_before_create_hint(dialect),
             d.drop_if_exists,
@@ -634,15 +635,15 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
             TAB_OPTS + 30,
         ),
         crate::settings::focusable_toggle_row(
-            "One transaction",
-            "Wrap the load, so a failure leaves nothing behind.",
+            tr!("dump-one-transaction"),
+            tr!("dump-one-transaction-hint"),
             d.wrap_transaction,
             ring.clone(),
             TAB_OPTS + 40,
         ),
         if has_guard {
             crate::settings::focusable_toggle_row(
-                "Disable foreign-key checks",
+                tr!("dump-disable-fk-checks"),
                 schemaic_core::dump::fk_guard_hint(dialect),
                 d.disable_fk_checks,
                 ring.clone(),
@@ -653,11 +654,7 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
             // Said, rather than shown greyed: PostgreSQL's switch is
             // superuser-only, so offering it would be a checkbox that fails the
             // restore for most roles.
-            form_hint(
-                "This engine has no session switch for foreign-key checks; the file \
-                 adds the constraints after the data instead.",
-            )
-            .into_any()
+            form_hint(tr!("dump-no-fk-guard-hint")).into_any()
         },
     ))
     .style(|s| s.flex_col().width_full().gap(theme::scaled(10.0)));
@@ -730,9 +727,9 @@ fn table_picker(d: DumpUi, ring: FocusRing) -> impl IntoView {
     let count = move || {
         let (a, b) = (d.chosen.with(|c| c.len()), d.tables.with(|t| t.len()));
         if a == b {
-            format!("All {b} selected")
+            tr!("dump-all-selected", total = b)
         } else {
-            format!("{a} of {b} selected")
+            tr!("dump-some-selected", chosen = a, total = b)
         }
     };
     // Links, not buttons, and the import list's pair verbatim — same words, same
@@ -741,12 +738,20 @@ fn table_picker(d: DumpUi, ring: FocusRing) -> impl IntoView {
     let head = h_stack((
         label(count).style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
         empty().style(|s| s.flex_grow(1.0_f32)),
-        link_button("Select all", theme::accent, ring.clone(), TAB_ALL, {
-            move || d.chosen.set(d.tables.get_untracked())
-        }),
-        link_button("None", theme::text_muted, ring, TAB_NONE, move || {
-            d.chosen.set(Vec::new())
-        }),
+        link_button(
+            tr!("dump-select-all"),
+            theme::accent,
+            ring.clone(),
+            TAB_ALL,
+            move || d.chosen.set(d.tables.get_untracked()),
+        ),
+        link_button(
+            tr!("dump-select-none"),
+            theme::text_muted,
+            ring,
+            TAB_NONE,
+            move || d.chosen.set(Vec::new()),
+        ),
     ))
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)));
 
@@ -757,15 +762,15 @@ fn table_picker(d: DumpUi, ring: FocusRing) -> impl IntoView {
     let list = dyn_container(
         move || (d.listing.get(), d.tables.get()),
         move |(listing, names)| {
-            let note = |s: &'static str| {
+            let note = |s: String| {
                 text(s)
                     .style(|s| s.color(theme::text_muted()).font_size(theme::font_body()))
                     .into_any()
             };
             match schemaic_core::dump::picker_body(listing, names.len()) {
-                PickerBody::Reading => note("Reading the table list…"),
-                PickerBody::NoTables => note("This database has no tables."),
-                PickerBody::Unreadable => note("The table list could not be read."),
+                PickerBody::Reading => note(tr!("dump-reading-tables")),
+                PickerBody::NoTables => note(tr!("dump-no-tables")),
+                PickerBody::Unreadable => note(tr!("dump-tables-unreadable")),
                 PickerBody::Tables => {
                     v_stack_from_iter(names.into_iter().map(move |n| table_row(d, chosen_set, n)))
                         .style(|s| s.flex_col().width_full())
@@ -840,11 +845,7 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
             let options: floem::AnyView = if folder {
                 // What replaces them: the one sentence a folder export needs,
                 // since it has no options and its destination is not a file.
-                form_hint(&format!(
-                    "One {} file per table, written into a folder you choose.",
-                    target.format.label()
-                ))
-                .into_any()
+                form_hint(tr!("dump-folder-hint", format = target.format.label())).into_any()
             } else {
                 dump_options(d, target.dialect, ring.clone()).into_any()
             };
@@ -904,12 +905,12 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                                 // The table name and the running count are the
                                 // difference between an export that looks stuck
                                 // and one visibly grinding through a large table.
-                                Some(p) => text(format!(
-                                    "Writing {} — {} of {}, {} rows so far",
-                                    p.table,
-                                    p.index,
-                                    p.total,
-                                    schemaic_core::text::human_count(p.rows as usize),
+                                Some(p) => text(tr!(
+                                    "dump-progress",
+                                    table = p.table.clone(),
+                                    index = p.index,
+                                    total = p.total,
+                                    rows = schemaic_core::text::human_count(p.rows as usize),
                                 ))
                                 .style(|s| {
                                     s.color(theme::text_muted())
@@ -922,7 +923,7 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                                 // large database — animated, because a static
                                 // label and a hung one look identical.
                                 None => crate::widgets::loading_dots(
-                                    "Reading the schema",
+                                    tr!("dump-reading-schema"),
                                     theme::text_muted,
                                     theme::font_label,
                                 )
@@ -967,7 +968,11 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                             // stop the export too and no exit can disagree with
                             // another.
                             action_button(
-                                if running { "Stop" } else { "Close" },
+                                if running {
+                                    tr!("dialog-stop")
+                                } else {
+                                    tr!("dialog-close")
+                                },
                                 if running {
                                     ActionKind::Danger
                                 } else {
@@ -979,7 +984,7 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                                 move || (exit)(),
                             ),
                             action_button(
-                                "Export",
+                                tr!("dump-export"),
                                 ActionKind::Primary,
                                 !running && !none_chosen && !no_content,
                                 ring,
@@ -1000,14 +1005,7 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
             // this modal the picker below cannot show and the user cannot change
             // from here — six submenu entries open the same panel, and without
             // it the CSV one and the dump are the same window.
-            let title = match target.schema.as_deref() {
-                Some(ns) => format!(
-                    "Export {}.{ns} to {}",
-                    target.database,
-                    target.format.label()
-                ),
-                None => format!("Export {} to {}", target.database, target.format.label()),
-            };
+            let title = dump_title(&target.database, target.schema.as_deref(), target.format);
             let panel = v_stack((
                 modal_title_owned(title, close_x, ring.clone()),
                 autohide(scroll(body.style(|s| {
@@ -1048,6 +1046,44 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
             s
         }
     })
+}
+
+/// The dump modal's title — two whole messages, with the namespace and without.
+/// Why the format is in it is said where it is called.
+fn dump_title(database: &str, schema: Option<&str>, format: ExportFormat) -> String {
+    match schema {
+        Some(ns) => tr!(
+            "dump-title-schema",
+            database = database,
+            schema = ns,
+            format = format.label()
+        ),
+        None => tr!("dump-title", database = database, format = format.label()),
+    }
+}
+
+/// The export modal's count while it runs: `rows` written so far, out of
+/// `total` when it is known.
+///
+/// The `~` is the *estimated* case only — a streamed export is re-reading the
+/// server and carries the catalogue's guess, the same mark and the same figure
+/// the `All rows` entry the user chose from shows. A fetched export knows
+/// exactly what it holds, and dressing that up as an estimate would hedge a
+/// number that needs no hedging.
+fn export_count_line(rows: u64, total: Option<u64>, approx: bool) -> String {
+    let shown = schemaic_core::text::human_count(rows as usize);
+    match total {
+        Some(total) => {
+            let total = schemaic_core::text::human_count(total as usize);
+            if approx {
+                tr!("export-progress-of-about", rows = shown, total = total)
+            } else {
+                tr!("export-progress-of", rows = shown, total = total)
+            }
+        }
+        // The count decides the plural; the abbreviated figure is what is shown.
+        None => tr!("export-progress-rows", count = rows, rows = shown),
+    }
 }
 
 /// The grid export's progress modal — raised by **every** grid export, both
@@ -1149,39 +1185,15 @@ pub(crate) fn export_progress_overlay(e: ExportUi, cancel: Rc<dyn Fn()>) -> impl
                         // through a large table — the dump's line, and its
                         // reason.
                         None => match rows {
-                            Some(rows) => text(match total {
-                                // The `~` is the *estimated* case only — a
-                                // streamed export is re-reading the server and
-                                // carries the catalogue's guess, the same mark
-                                // and the same figure the `All rows` entry the
-                                // user chose from shows. A fetched export knows
-                                // exactly what it holds, and dressing that up as
-                                // an estimate would hedge a number that needs no
-                                // hedging.
-                                Some(total) if approx => format!(
-                                    "{} of ~{} rows",
-                                    schemaic_core::text::human_count(rows as usize),
-                                    schemaic_core::text::human_count(total as usize),
-                                ),
-                                Some(total) => format!(
-                                    "{} of {} rows",
-                                    schemaic_core::text::human_count(rows as usize),
-                                    schemaic_core::text::human_count(total as usize),
-                                ),
-                                None => format!(
-                                    "{} {}",
-                                    schemaic_core::text::human_count(rows as usize),
-                                    schemaic_core::text::plural(rows as usize, "row", "rows"),
-                                ),
-                            })
-                            .style(|s| s.color(theme::text()).font_size(theme::font_body()))
-                            .into_any(),
+                            Some(rows) => text(export_count_line(rows, total, approx))
+                                .style(|s| s.color(theme::text()).font_size(theme::font_body()))
+                                .into_any(),
                             // Before the first block there is nothing to count,
                             // and the server's first read is the slow part —
                             // animated, because a static label and a hung one
                             // look identical.
                             None => crate::widgets::loading_dots(
-                                "Starting",
+                                tr!("export-progress-starting"),
                                 theme::text_muted,
                                 theme::font_label,
                             )
@@ -1193,11 +1205,11 @@ pub(crate) fn export_progress_overlay(e: ExportUi, cancel: Rc<dyn Fn()>) -> impl
                 // tense once the run is over**: `Writing orders.csv` beside
                 // `Exported 16k rows` would describe a file still being written
                 // and one already finished, in the same breath.
-                text(format!(
-                    "{} {}",
-                    if finished { "File:" } else { "Writing" },
-                    target.name
-                ))
+                text(if finished {
+                    tr!("export-progress-file", name = target.name.clone())
+                } else {
+                    tr!("export-progress-writing", name = target.name.clone())
+                })
                 // Bounded for the reason the sentence above it is: a long file
                 // name is as able to paint past the panel as a long caveat.
                 .style(|s| {
@@ -1227,7 +1239,11 @@ pub(crate) fn export_progress_overlay(e: ExportUi, cancel: Rc<dyn Fn()>) -> impl
                     // is what stops the control moving under the cursor when the
                     // line above it changes width.
                     action_button(
-                        if finished { "Close" } else { "Stop" },
+                        if finished {
+                            tr!("dialog-close")
+                        } else {
+                            tr!("dialog-stop")
+                        },
                         if finished {
                             ActionKind::Neutral
                         } else {
@@ -1292,4 +1308,66 @@ fn watch_connection(d: DumpUi, conn: ConnUi) {
             d.target.set(None);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dump_title, export_count_line};
+    use crate::i18n::tr;
+    use schemaic_core::export::ExportFormat;
+    use schemaic_core::text::human_count;
+
+    /// The lines this file composes read as they did in English before the
+    /// catalogue. The counts are spelled through `human_count`, as the old
+    /// `format!`s were, so the test pins the sentence and not the abbreviation.
+    #[test]
+    fn the_composed_lines_read_as_they_did_in_english() {
+        assert_eq!(
+            dump_title("shop", Some("sales"), ExportFormat::Csv),
+            "Export shop.sales to CSV"
+        );
+        assert_eq!(
+            dump_title("shop", None, ExportFormat::Sql),
+            "Export shop to SQL"
+        );
+        assert_eq!(tr!("dump-all-selected", total = 12), "All 12 selected");
+        assert_eq!(
+            tr!("dump-some-selected", chosen = 3, total = 12),
+            "3 of 12 selected"
+        );
+        assert_eq!(
+            tr!(
+                "dump-progress",
+                table = "orders",
+                index = 3,
+                total = 12,
+                rows = human_count(9_400)
+            ),
+            format!(
+                "Writing orders — 3 of 12, {} rows so far",
+                human_count(9_400)
+            )
+        );
+        assert_eq!(
+            export_count_line(9_400, Some(180_000), true),
+            format!("{} of ~{} rows", human_count(9_400), human_count(180_000))
+        );
+        assert_eq!(
+            export_count_line(9_400, Some(180_000), false),
+            format!("{} of {} rows", human_count(9_400), human_count(180_000))
+        );
+        assert_eq!(export_count_line(1, None, false), "1 row");
+        assert_eq!(
+            export_count_line(16_000, None, false),
+            format!("{} rows", human_count(16_000))
+        );
+        assert_eq!(
+            tr!("export-progress-file", name = "orders.csv"),
+            "File: orders.csv"
+        );
+        assert_eq!(
+            tr!("export-progress-writing", name = "orders.csv"),
+            "Writing orders.csv"
+        );
+    }
 }

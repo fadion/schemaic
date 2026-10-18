@@ -1411,3 +1411,58 @@ import-import = Import
 import-importing = Importing…
 # Beside a disabled write button, saying why it is disabled.
 dialog-read-only = This connection is read-only.
+
+## Export modal — a database to a .sql file or a folder of files (dump_view.rs)
+## $format is the export format's name (SQL, CSV, JSON, Excel…): never translated.
+
+# $database is the database; $schema the namespace inside it.
+dump-title-schema = Export { $database }.{ $schema } to { $format }
+dump-title = Export { $database } to { $format }
+# The file pickers' window titles.
+dump-sql-dialog = Export to SQL
+dump-folder-dialog = Export to { $format }
+dump-folder-hint = One { $format } file per table, written into a folder you choose.
+dump-all-selected = All { $total } selected
+dump-some-selected = { $chosen } of { $total } selected
+dump-select-all = Select all
+dump-select-none = None
+dump-reading-tables = Reading the table list…
+dump-no-tables = This database has no tables.
+dump-tables-unreadable = The table list could not be read.
+dump-section-contents = Contents
+# CREATE TABLE and INSERT are SQL keywords.
+dump-structure = Structure
+dump-structure-hint = CREATE TABLE, its triggers, and the foreign keys, restated after the data.
+dump-data = Data
+dump-data-hint = Every row, as INSERT statements.
+dump-other-objects = Other objects
+dump-other-objects-hint = Types, sequences, routines and events these tables lean on.
+dump-section-replaying = Replaying
+dump-drop-before-create = Drop before create
+dump-one-transaction = One transaction
+dump-one-transaction-hint = Wrap the load, so a failure leaves nothing behind.
+dump-disable-fk-checks = Disable foreign-key checks
+dump-no-fk-guard-hint = This engine has no session switch for foreign-key checks; the file adds the constraints after the data instead.
+dump-export = Export
+# The progress line; $rows is an abbreviated count (9.4k).
+dump-progress = Writing { $table } — { $index } of { $total }, { $rows } rows so far
+# Animated with trailing dots while it lasts.
+dump-reading-schema = Reading the schema
+# The title of the prompt asking whether to overwrite files already in the folder.
+dump-replace-files = Replace files
+
+## Grid export's progress box (dump_view.rs)
+## $rows and $total are abbreviated counts (9.4k, ~180k).
+
+export-progress-of-about = { $rows } of ~{ $total } rows
+export-progress-of = { $rows } of { $total } rows
+# $count is the exact number, which decides the plural; $rows is how it is shown.
+export-progress-rows = { $count ->
+    [one] { $rows } row
+   *[other] { $rows } rows
+}
+# Animated with trailing dots while it lasts.
+export-progress-starting = Starting
+# $name is the destination file's name.
+export-progress-file = File: { $name }
+export-progress-writing = Writing { $name }
