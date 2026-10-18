@@ -28584,6 +28584,27 @@ existing prose was left alone.
     Server, Database, Schema and Object (`TsqlObject::synonym_fields`, under `schema.rs`); an alias
     type a *Base type* and a Nullable toggle; a collection one multi-line, monospaced *Schemas*
     field.
+    **Its words are the catalogue's** (`object-editor-*`, roadmap phase 3) — sections, fields,
+    toggles and their hints, the notes and placeholders that have words in them — with Cancel,
+    Preview SQL and the change count the shared `dialog-cancel`, `editor-preview-sql` and
+    `editor-change-count`, and the value rows' arrows the new shared `editor-row-move-up` /
+    `editor-row-move-down` beside the trigger editor's `editor-row-remove`. **The title is two
+    whole messages** (`object-editor-title-{edit,create}`) around `i18n::object_kind`'s word, built
+    by `editor_title`, where it had been `format!("Edit {} …", kind.label())` — so a language can
+    put the verb last (`the_title_reads_as_it_did_in_english`). `restart_label` is both engines'
+    *Restart at* label, and **the counter goes to Fluent as text, not a number**: as a number it
+    would be grouped for the locale, and it is the server's value to the digit
+    (`the_restart_label_prints_the_counter_as_the_server_has_it`). **A number field's message is
+    also the key `object_errors` withdraws it by** — `object-editor-not-whole-number`, naming the
+    field — so `num_field` builds it once per field: built afresh per report, a message that came
+    out differently would never be withdrawn (`a_number_fields_error_names_the_field`).
+    `tsql_field`'s placeholder is a closure (`FieldCfg::placeholder_of`), so a SQL sample and a
+    catalogue phrase (*this server*) go in alike, and the synonym's four parts are a
+    `[(String, fn() -> String); 4]` table; `bound_toggle`/`tsql_toggle` and `num_col` take owned
+    `String`s. The NOT NULL toggle's label is the SQL clause and stays, as do the SQL samples and
+    identifier placeholders (`domain_name`, `sequence_name`, `bigint`, `nvarchar(50)`,
+    `<xsd:schema …>`) and the storage-type dropdown's `smallint`/`integer`/`bigint`; the drafts'
+    `validate` sentences are core's prose, phase 4.
   - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's or SQL
     Server's namespaces inside one, over `core::ddl`'s `DatabaseDraft` — and PostgreSQL's
     **Create extension** picker, the same form (below). The smallest of the schema
@@ -39992,7 +40013,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `query-*`), the Copy to modal (`copy_table_view.rs`), the Create database/schema/extension form
   (`database_editor.rs`), the script import (`script_view.rs`), the schema comparison
   (`compare_view.rs`), the routine editor (`routine_editor.rs`), the event editor
-  (`event_editor.rs`), the trigger editor (`trigger_editor.rs`) and the Users and privileges browser (`users_view.rs`) are converted; every other
+  (`event_editor.rs`), the trigger editor (`trigger_editor.rs`), the object editor
+  (`object_editor.rs`) and the Users and privileges browser (`users_view.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

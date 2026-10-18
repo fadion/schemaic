@@ -42,6 +42,7 @@ use schemaic_core::schema::{
     CheckInfo, ObjectItem, SequenceInfo, SequenceOwner, TsqlObject, TsqlObjectKind,
 };
 
+use crate::i18n::tr;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, suggest_field};
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
@@ -307,11 +308,12 @@ fn bound_field(
 /// The draft holds `i64`, so text that isn't a number yet has nowhere to live in
 /// it. Rather than drop the keystroke, the message goes to `object_errors` — the
 /// signal the footer's status line and its readiness test both read — and is
-/// withdrawn as soon as the text parses. One message per field, keyed by its
-/// label, so two bad fields report two problems and neither erases the other.
+/// withdrawn as soon as the text parses. One message per field, its text the
+/// key — it names the field — so two bad fields report two problems and neither
+/// erases the other.
 fn num_field(
     ui: DdlUi,
-    label: &'static str,
+    label: String,
     initial: String,
     ring: FocusRing,
     tabindex: u32,
@@ -320,10 +322,13 @@ fn num_field(
     let draft = ui.object_draft;
     let errs = ui.object_errors;
     let sig = floem::reactive::create_rw_signal(initial);
+    // The message is also the key it is withdrawn by, so it is built once:
+    // the same text every time this field reports.
+    let msg = tr!("object-editor-not-whole-number", field = label);
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
         if prev.is_some_and(|p| p != v) {
-            let msg = format!("{label} has to be a whole number.");
+            let msg = msg.clone();
             let ok = draft.try_update(|d| match d {
                 ObjectDraft::Sequence(s) => apply(s, v.trim()),
                 _ => Ok(()),
@@ -355,8 +360,8 @@ fn num_field(
 /// A toggle bound to the draft.
 fn bound_toggle(
     ui: DdlUi,
-    title: &'static str,
-    hint: &'static str,
+    title: String,
+    hint: String,
     initial: bool,
     ring: FocusRing,
     tabindex: u32,
@@ -411,7 +416,7 @@ fn enum_values(ui: DdlUi, ring: FocusRing) -> AnyView {
                     ui,
                     v,
                     FieldCfg {
-                        placeholder: "value",
+                        placeholder_of: Some(Rc::new(|| tr!("object-editor-value-placeholder"))),
                         focus: Some((ring.clone(), base)),
                         ..Default::default()
                     },
@@ -439,16 +444,20 @@ fn enum_values(ui: DdlUi, ring: FocusRing) -> AnyView {
                 // already first and the last is already last, so an arrow there
                 // is a control whose only outcome is nothing happening.
                 let up = if i > 0 {
-                    row_button(icons::CHEVRON_UP, "Move up", ring.clone(), btn, move || {
-                        swap(i, i - 1)
-                    })
+                    row_button(
+                        icons::CHEVRON_UP,
+                        tr!("editor-row-move-up"),
+                        ring.clone(),
+                        btn,
+                        move || swap(i, i - 1),
+                    )
                 } else {
                     row_gap()
                 };
                 let down = if i + 1 < n {
                     row_button(
                         icons::CHEVRON_DOWN,
-                        "Move down",
+                        tr!("editor-row-move-down"),
                         ring.clone(),
                         btn + 1,
                         move || swap(i, i + 1),
@@ -460,16 +469,22 @@ fn enum_values(ui: DdlUi, ring: FocusRing) -> AnyView {
                     field,
                     up,
                     down,
-                    row_button(icons::TRASH_2, "Remove", ring.clone(), btn + 2, move || {
-                        draft.update(|d| {
-                            if let ObjectDraft::Enum(e) = d
-                                && i < e.info.values.len()
-                            {
-                                e.info.values.remove(i);
-                            }
-                        });
-                        rev.update(|r| *r += 1);
-                    }),
+                    row_button(
+                        icons::TRASH_2,
+                        tr!("editor-row-remove"),
+                        ring.clone(),
+                        btn + 2,
+                        move || {
+                            draft.update(|d| {
+                                if let ObjectDraft::Enum(e) = d
+                                    && i < e.info.values.len()
+                                {
+                                    e.info.values.remove(i);
+                                }
+                            });
+                            rev.update(|r| *r += 1);
+                        },
+                    ),
                 ))
                 .style(|s| {
                     s.flex_row()
@@ -483,7 +498,7 @@ fn enum_values(ui: DdlUi, ring: FocusRing) -> AnyView {
             // Last in the block, above every row — it is what you reach after
             // walking them.
             let add = crate::widgets::control_button(
-                "Add value",
+                tr!("object-editor-add-value"),
                 add_ring,
                 VALUE_TAB + n as u32 * ROW_TAB_STRIDE,
                 move || {
@@ -509,11 +524,12 @@ fn enum_values(ui: DdlUi, ring: FocusRing) -> AnyView {
 
 fn enum_form(ui: DdlUi, d: &EnumDraft, ring: FocusRing) -> AnyView {
     let name = form_setting(
-        "Name",
+        tr!("object-editor-name"),
         bound_field(
             ui,
             d.info.name.clone(),
             FieldCfg {
+                // Identifier shapes (here and in the other forms) are never translated.
                 placeholder: "type_name",
                 focus: Some((ring.clone(), 10)),
                 ..Default::default()
@@ -527,7 +543,7 @@ fn enum_form(ui: DdlUi, d: &EnumDraft, ring: FocusRing) -> AnyView {
         .style(move |s| s.width(field_w())),
     );
     let comment = form_setting(
-        "Comment",
+        tr!("object-editor-comment"),
         bound_field(
             ui,
             d.info.comment.clone().unwrap_or_default(),
@@ -545,14 +561,12 @@ fn enum_form(ui: DdlUi, d: &EnumDraft, ring: FocusRing) -> AnyView {
         .style(|s| s.width_full()),
     );
     v_stack((
-        form_section("Type"),
+        form_section(tr!("object-editor-section-type")),
         name,
         comment,
-        form_section("Values").style(|s| s.margin_top(theme::scaled(4.0))),
-        form_setting_owned(
-            "In comparison order — this is the order ORDER BY uses".to_string(),
-            enum_values(ui, ring),
-        ),
+        form_section(tr!("object-editor-section-values"))
+            .style(|s| s.margin_top(theme::scaled(4.0))),
+        form_setting_owned(tr!("object-editor-values-order"), enum_values(ui, ring)),
     ))
     .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()
@@ -621,7 +635,7 @@ fn domain_checks(ui: DdlUi, ring: FocusRing) -> AnyView {
                     expr,
                     row_button(
                         icons::TRASH_2,
-                        "Remove",
+                        tr!("editor-row-remove"),
                         ring.clone(),
                         base + ROW_BUTTON_TAB,
                         move || {
@@ -646,7 +660,7 @@ fn domain_checks(ui: DdlUi, ring: FocusRing) -> AnyView {
             .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
             let add = crate::widgets::control_button(
-                "Add constraint",
+                tr!("object-editor-add-constraint"),
                 add_ring,
                 VALUE_TAB + n as u32 * ROW_TAB_STRIDE,
                 move || {
@@ -700,7 +714,7 @@ fn domain_form(
 ) -> AnyView {
     let draft = ui.object_draft;
     let name = form_setting(
-        "Name",
+        tr!("object-editor-name"),
         bound_field(
             ui,
             d.info.name.clone(),
@@ -733,7 +747,7 @@ fn domain_form(
             v
         });
         form_setting(
-            "Type",
+            tr!("object-editor-type"),
             // The same control the designer's column type wears: a free-text box
             // with a chevron offering the usual types. It was a `Dropdown` parked
             // beside the field, which said the same thing in a second shape — and
@@ -754,14 +768,14 @@ fn domain_form(
                         .map(|t| t.to_string())
                         .collect()
                 },
-                "This engine suggests no base types",
+                tr!("object-editor-no-base-types"),
                 ring.clone(),
                 20,
             ),
         )
     };
     let default = form_setting(
-        "Default",
+        tr!("object-editor-default"),
         bound_field(
             ui,
             d.info.default_value.clone().unwrap_or_default(),
@@ -784,8 +798,9 @@ fn domain_form(
     );
     let not_null = bound_toggle(
         ui,
-        "NOT NULL",
-        "Every column of this domain rejects NULL. Turning it on fails if one already holds one.",
+        // The clause itself — a SQL keyword, not translated.
+        "NOT NULL".to_string(),
+        tr!("object-editor-not-null-hint"),
         d.info.not_null,
         ring.clone(),
         40,
@@ -796,7 +811,7 @@ fn domain_form(
         },
     );
     let comment = form_setting(
-        "Comment",
+        tr!("object-editor-comment"),
         bound_field(
             ui,
             d.info.comment.clone().unwrap_or_default(),
@@ -814,13 +829,14 @@ fn domain_form(
         .style(|s| s.width_full()),
     );
     v_stack((
-        form_section("Domain"),
+        form_section(tr!("object-editor-section-domain")),
         name,
         base,
         default,
         not_null,
         comment,
-        form_section("Constraints").style(|s| s.margin_top(theme::scaled(4.0))),
+        form_section(tr!("object-editor-section-constraints"))
+            .style(|s| s.margin_top(theme::scaled(4.0))),
         domain_checks(ui, ring),
     ))
     .style(|s| s.flex_col().gap(form_gap()).width_full())
@@ -869,6 +885,19 @@ fn restart_seed(restart: Option<i64>) -> String {
     restart.map(|r| r.to_string()).unwrap_or_default()
 }
 
+/// The **Restart at** label, which says where the counter is now — both
+/// engines' sequence forms wear it, PostgreSQL's from `last_value` and SQL
+/// Server's from `current_value`.
+///
+/// The value goes to the catalogue as text, not a number: Fluent would format
+/// a number for the locale, and this is the server's counter to the digit.
+fn restart_label(last: Option<impl std::fmt::Display>) -> String {
+    match last {
+        Some(v) => tr!("object-editor-restart-at", last = v.to_string()),
+        None => tr!("object-editor-restart-at-unused"),
+    }
+}
+
 fn sequence_form(
     ui: DdlUi,
     d: &SequenceDraft,
@@ -877,7 +906,7 @@ fn sequence_form(
 ) -> AnyView {
     let draft = ui.object_draft;
     let name = form_setting(
-        "Name",
+        tr!("object-editor-name"),
         bound_field(
             ui,
             d.info.name.clone(),
@@ -899,7 +928,7 @@ fn sequence_form(
     let data_type = {
         let sig = floem::reactive::create_rw_signal(d.info.data_type.clone());
         form_setting(
-            "Stores",
+            tr!("object-editor-stores"),
             focusable_owned_dropdown(
                 move || sig.get(),
                 ["smallint", "integer", "bigint"]
@@ -928,15 +957,15 @@ fn sequence_form(
     // the spacing between a 130 px box and the next label came out at whatever
     // the leftovers divided into, twice what it was asked to be and different on
     // the two-field row from the three-field one.
-    let num_col = |label: &'static str, field: AnyView| {
+    let num_col = |label: String, field: AnyView| {
         form_setting(label, field).style(|s| s.width(num_w()).flex_shrink(0.0_f32))
     };
     let numbers = h_stack((
         num_col(
-            "Increment",
+            tr!("object-editor-increment"),
             num_field(
                 ui,
-                "Increment",
+                tr!("object-editor-increment"),
                 d.info.increment.to_string(),
                 ring.clone(),
                 30,
@@ -944,10 +973,10 @@ fn sequence_form(
             ),
         ),
         num_col(
-            "Start",
+            tr!("object-editor-start"),
             num_field(
                 ui,
-                "Start",
+                tr!("object-editor-start"),
                 d.info.start.to_string(),
                 ring.clone(),
                 40,
@@ -955,10 +984,10 @@ fn sequence_form(
             ),
         ),
         num_col(
-            "Cache",
+            tr!("object-editor-cache"),
             num_field(
                 ui,
-                "Cache",
+                tr!("object-editor-cache"),
                 d.info.cache.to_string(),
                 ring.clone(),
                 50,
@@ -969,10 +998,10 @@ fn sequence_form(
     .style(|s| s.flex_row().gap(num_gap()).width_full());
     let bounds = h_stack((
         num_col(
-            "Minimum",
+            tr!("object-editor-minimum"),
             num_field(
                 ui,
-                "Minimum",
+                tr!("object-editor-minimum"),
                 d.info.min_value.to_string(),
                 ring.clone(),
                 60,
@@ -980,10 +1009,10 @@ fn sequence_form(
             ),
         ),
         num_col(
-            "Maximum",
+            tr!("object-editor-maximum"),
             num_field(
                 ui,
-                "Maximum",
+                tr!("object-editor-maximum"),
                 d.info.max_value.to_string(),
                 ring.clone(),
                 70,
@@ -994,8 +1023,8 @@ fn sequence_form(
     .style(|s| s.flex_row().gap(num_gap()).width_full());
     let cycle = bound_toggle(
         ui,
-        "Cycle",
-        "Wrap around to the other end of the range instead of failing when the sequence runs out.",
+        tr!("object-editor-cycle"),
+        tr!("object-editor-cycle-hint"),
         d.info.cycle,
         ring.clone(),
         80,
@@ -1011,53 +1040,47 @@ fn sequence_form(
     // times the editor is *opened* — which `SequenceDraft::from_info`'s
     // `restart: None` is what actually says, and is why seeding from the draft
     // keeps that property (see [`restart_seed`]).
-    let position = form_setting_owned(
-        match d.info.last_value {
-            Some(v) => format!("Restart at — the counter last handed out {v}"),
-            None => "Restart at — the counter has not been used".to_string(),
-        },
-        {
-            let errs = ui.object_errors;
-            let sig = floem::reactive::create_rw_signal(restart_seed(d.restart));
-            create_effect(move |prev: Option<String>| {
-                let v = sig.get();
-                if prev.is_some_and(|p| p != v) {
-                    let msg = "Restart at has to be a whole number.".to_string();
-                    let t = v.trim();
-                    let parsed = if t.is_empty() {
-                        Some(None)
-                    } else {
-                        t.parse::<i64>().ok().map(Some)
-                    };
-                    match parsed {
-                        Some(r) => {
-                            errs.update(|e| e.retain(|m| m != &msg));
-                            draft.update(|d| {
-                                if let ObjectDraft::Sequence(s) = d {
-                                    s.restart = r;
-                                }
-                            });
-                        }
-                        None => errs.update(|e| {
-                            if !e.contains(&msg) {
-                                e.push(msg.clone());
+    let position = form_setting_owned(restart_label(d.info.last_value), {
+        let errs = ui.object_errors;
+        let sig = floem::reactive::create_rw_signal(restart_seed(d.restart));
+        create_effect(move |prev: Option<String>| {
+            let v = sig.get();
+            if prev.is_some_and(|p| p != v) {
+                let msg = tr!("object-editor-restart-not-whole");
+                let t = v.trim();
+                let parsed = if t.is_empty() {
+                    Some(None)
+                } else {
+                    t.parse::<i64>().ok().map(Some)
+                };
+                match parsed {
+                    Some(r) => {
+                        errs.update(|e| e.retain(|m| m != &msg));
+                        draft.update(|d| {
+                            if let ObjectDraft::Sequence(s) = d {
+                                s.restart = r;
                             }
-                        }),
+                        });
                     }
+                    None => errs.update(|e| {
+                        if !e.contains(&msg) {
+                            e.push(msg.clone());
+                        }
+                    }),
                 }
-                v
-            });
-            edit_field(
-                sig,
-                FieldCfg {
-                    placeholder: "leave empty to keep the position",
-                    focus: Some((ring.clone(), 100)),
-                    ..Default::default()
-                },
-            )
-            .style(|s| s.width(field_w()))
-        },
-    );
+            }
+            v
+        });
+        edit_field(
+            sig,
+            FieldCfg {
+                placeholder_of: Some(Rc::new(|| tr!("object-editor-restart-placeholder"))),
+                focus: Some((ring.clone(), 100)),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width(field_w()))
+    });
 
     // The owner is context, and detaching is the one change to it worth a
     // control: re-pointing a sequence at a different column needs a table and a
@@ -1071,14 +1094,14 @@ fn sequence_form(
     let owner: AnyView = match orig_owner.clone() {
         Some(o) => v_stack((
             form_setting_owned(
-                "Owned by".to_string(),
+                tr!("object-editor-owned-by"),
                 text(format!("{}.{}", o.table, o.column))
                     .style(|s| s.color(theme::text_dim()).font_size(theme::font_body())),
             ),
             bound_toggle(
                 ui,
-                "Detach from its column",
-                "The sequence stops being dropped with the column, and outlives it.",
+                tr!("object-editor-detach"),
+                tr!("object-editor-detach-hint"),
                 d.info.owned_by.is_none(),
                 ring.clone(),
                 110,
@@ -1099,7 +1122,7 @@ fn sequence_form(
     };
 
     let comment = form_setting(
-        "Comment",
+        tr!("object-editor-comment"),
         bound_field(
             ui,
             d.info.comment.clone().unwrap_or_default(),
@@ -1118,14 +1141,15 @@ fn sequence_form(
     );
 
     v_stack((
-        form_section("Sequence"),
+        form_section(tr!("object-editor-section-sequence")),
         name,
         data_type,
         numbers,
         bounds,
         cycle,
         comment,
-        form_section("Position").style(|s| s.margin_top(theme::scaled(4.0))),
+        form_section(tr!("object-editor-section-position"))
+            .style(|s| s.margin_top(theme::scaled(4.0))),
         position,
         owner,
     ))
@@ -1136,10 +1160,13 @@ fn sequence_form(
 // ── SQL Server's objects ─────────────────────────────────────────────────────
 
 /// A text field bound to one place in a SQL Server object's draft.
+///
+/// The placeholder is a closure, as `FieldCfg::placeholder_of` takes it, so a
+/// sample (`bigint`) and a catalogue phrase (*this server*) go in alike.
 fn tsql_field(
     ui: DdlUi,
     initial: String,
-    placeholder: &'static str,
+    placeholder: impl Fn() -> String + 'static,
     ring: FocusRing,
     tabindex: u32,
     width: fn() -> f64,
@@ -1149,7 +1176,7 @@ fn tsql_field(
         ui,
         initial,
         FieldCfg {
-            placeholder,
+            placeholder_of: Some(Rc::new(placeholder)),
             focus: Some((ring, tabindex)),
             ..Default::default()
         },
@@ -1166,8 +1193,8 @@ fn tsql_field(
 /// A toggle bound to a SQL Server object's draft.
 fn tsql_toggle(
     ui: DdlUi,
-    title: &'static str,
-    hint: &'static str,
+    title: String,
+    hint: String,
     initial: bool,
     ring: FocusRing,
     tabindex: u32,
@@ -1212,11 +1239,11 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
     let existing = d.original.is_some();
     let kind = d.info.object_kind();
     let name = form_setting(
-        "Name",
+        tr!("object-editor-name"),
         tsql_field(
             ui,
             d.info.name.clone(),
-            "name",
+            || "name".to_string(),
             ring.clone(),
             10,
             field_w,
@@ -1224,13 +1251,13 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
         ),
     );
     let section = match kind {
-        ObjectKind::Sequence => "Sequence",
-        ObjectKind::Synonym => "Synonym",
-        ObjectKind::AliasType => "Alias type",
-        _ => "XML schema collection",
+        ObjectKind::Sequence => tr!("object-editor-section-sequence"),
+        ObjectKind::Synonym => tr!("object-editor-section-synonym"),
+        ObjectKind::AliasType => tr!("object-editor-section-alias-type"),
+        _ => tr!("object-editor-section-xml-schema-collection"),
     };
     let mut rows: Vec<AnyView> = vec![form_section(section).into_any(), name.into_any()];
-    let num_col = |label: &'static str, field: AnyView| {
+    let num_col = |label: String, field: AnyView| {
         form_setting(label, field)
             .style(|s| s.width(num_w()).flex_shrink(0.0_f32))
             .into_any()
@@ -1248,11 +1275,11 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
         } => {
             rows.push(
                 form_setting(
-                    "Stores",
+                    tr!("object-editor-stores"),
                     tsql_field(
                         ui,
                         data_type.clone(),
-                        "bigint",
+                        || "bigint".to_string(),
                         ring.clone(),
                         20,
                         field_w,
@@ -1267,7 +1294,7 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
                     tsql_field(
                         ui,
                         value.clone(),
-                        "",
+                        String::new,
                         ring.clone(),
                         tab,
                         num_w,
@@ -1279,9 +1306,9 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
                     ),
                 )
             };
-            let mut first = vec![num("Increment", increment, 30, 1)];
+            let mut first = vec![num(tr!("object-editor-increment"), increment, 30, 1)];
             if !existing {
-                first.push(num("Start", start, 40, 0));
+                first.push(num(tr!("object-editor-start"), start, 40, 0));
             }
             rows.push(
                 h_stack_from_iter(first)
@@ -1289,15 +1316,17 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
                     .into_any(),
             );
             rows.push(
-                h_stack((num("Minimum", min, 60, 2), num("Maximum", max, 70, 3)))
-                    .style(|s| s.flex_row().gap(num_gap()).width_full())
-                    .into_any(),
+                h_stack((
+                    num(tr!("object-editor-minimum"), min, 60, 2),
+                    num(tr!("object-editor-maximum"), max, 70, 3),
+                ))
+                .style(|s| s.flex_row().gap(num_gap()).width_full())
+                .into_any(),
             );
             rows.push(tsql_toggle(
                 ui,
-                "Cycle",
-                "Wrap around to the other end of the range instead of failing when the sequence \
-                 runs out.",
+                tr!("object-editor-cycle"),
+                tr!("object-editor-cycle-hint"),
                 *cycle,
                 ring.clone(),
                 80,
@@ -1334,9 +1363,8 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
             }
             rows.push(
                 crate::settings::focusable_toggle_row(
-                    "Cache",
-                    "Hand out values from memory, faster, at the cost of a gap after a restart \
-                     of the server.",
+                    tr!("object-editor-cache"),
+                    tr!("object-editor-cache-hint"),
                     cache_on,
                     ring.clone(),
                     85,
@@ -1345,11 +1373,13 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
             );
             rows.push(
                 form_setting(
-                    "Cache size",
+                    tr!("object-editor-cache-size"),
                     edit_field(
                         cache_size,
                         FieldCfg {
-                            placeholder: "server default",
+                            placeholder_of: Some(Rc::new(|| {
+                                tr!("object-editor-cache-size-placeholder")
+                            })),
                             focus: Some((ring.clone(), 90)),
                             ..Default::default()
                         },
@@ -1360,22 +1390,19 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
             );
             if existing {
                 rows.push(
-                    form_section("Position")
+                    form_section(tr!("object-editor-section-position"))
                         .style(|s| s.margin_top(theme::scaled(4.0)))
                         .into_any(),
                 );
                 rows.push(
                     form_setting_owned(
-                        match last_used {
-                            Some(v) => format!("Restart at — the counter last handed out {v}"),
-                            None => "Restart at — the counter has not been used".to_string(),
-                        },
+                        restart_label(last_used.clone()),
                         tsql_field(
                             ui,
                             d.restart.clone().unwrap_or_default(),
                             // A new type re-creates the sequence, which
                             // keeps no position: empty, it starts over.
-                            "empty keeps it, unless the type changes",
+                            || tr!("object-editor-tsql-restart-placeholder"),
                             ring.clone(),
                             100,
                             field_w,
@@ -1389,17 +1416,26 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
             }
         }
         TsqlObjectKind::Synonym { target } => {
-            rows.push(form_section("Stands for").into_any());
+            rows.push(form_section(tr!("object-editor-section-stands-for")).into_any());
             let fields = TsqlObject::synonym_fields(target);
-            for (i, (label, placeholder)) in [
-                ("Server", "this server"),
-                ("Database", "this database"),
-                ("Schema", "the default schema"),
-                ("Object", "table, view or routine"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            // The four parts of the name it stands for, each with what an
+            // empty one means. `fn` items, so each placeholder is a closure
+            // the field can keep.
+            let parts: [(String, fn() -> String); 4] = [
+                (tr!("object-editor-synonym-server"), || {
+                    tr!("object-editor-synonym-server-placeholder")
+                }),
+                (tr!("object-editor-synonym-database"), || {
+                    tr!("object-editor-synonym-database-placeholder")
+                }),
+                (tr!("object-editor-synonym-schema"), || {
+                    tr!("object-editor-synonym-schema-placeholder")
+                }),
+                (tr!("object-editor-synonym-object"), || {
+                    tr!("object-editor-synonym-object-placeholder")
+                }),
+            ];
+            for (i, (label, placeholder)) in parts.into_iter().enumerate() {
                 rows.push(
                     form_setting(
                         label,
@@ -1426,11 +1462,11 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
         TsqlObjectKind::AliasType { base, nullable } => {
             rows.push(
                 form_setting(
-                    "Base type",
+                    tr!("object-editor-base-type"),
                     tsql_field(
                         ui,
                         base.clone(),
-                        "nvarchar(50)",
+                        || "nvarchar(50)".to_string(),
                         ring.clone(),
                         20,
                         field_w,
@@ -1445,8 +1481,8 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
             );
             rows.push(tsql_toggle(
                 ui,
-                "Nullable",
-                "A column of this type accepts NULL unless the column says otherwise.",
+                tr!("object-editor-nullable"),
+                tr!("object-editor-nullable-hint"),
                 *nullable,
                 ring.clone(),
                 30,
@@ -1461,7 +1497,7 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
             let max_rows = floem::reactive::create_rw_signal(14usize);
             rows.push(
                 form_setting(
-                    "Schemas",
+                    tr!("object-editor-schemas"),
                     bound_field(
                         ui,
                         definition.clone(),
@@ -1497,6 +1533,26 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
 }
 
 // ── the modal ────────────────────────────────────────────────────────────────
+
+/// The modal's title: *Edit sequence db.public.orders_id_seq* for an existing
+/// object, *Create sequence in db.public* for a new one. Whole messages, so a
+/// language can put the verb last; the kind is the interface's word for it
+/// (`i18n::object_kind`).
+fn editor_title(kind: ObjectKind, location: &str, existing: Option<&str>) -> String {
+    let kind = crate::i18n::object_kind(kind);
+    match existing {
+        Some(name) => tr!(
+            "object-editor-title-edit",
+            kind = kind,
+            name = format!("{location}.{name}")
+        ),
+        None => tr!(
+            "object-editor-title-create",
+            kind = kind,
+            location = location
+        ),
+    }
+}
 
 fn form(ui: DdlUi, overlay: OverlayUi, target: &ObjectTarget, ring: FocusRing) -> AnyView {
     let draft = ui.object_draft.get_untracked();
@@ -1561,10 +1617,7 @@ pub(crate) fn object_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVi
             };
             let kind = d.object_draft.with_untracked(|dr| dr.kind());
             let location = object_location(&target.database, target.schema.as_deref());
-            let title = match &target.current {
-                Some(c) => format!("Edit {} {location}.{}", kind.label(), c.name()),
-                None => format!("Create {} in {location}", kind.label()),
-            };
+            let title = editor_title(kind, &location, target.current.as_ref().map(|c| c.name()));
 
             // One ring for the modal: the value/constraint rows rebuild on
             // `object_rev` and re-register themselves, so the root — built once,
@@ -1592,19 +1645,15 @@ pub(crate) fn object_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVi
                         return crate::widgets::footer_error(first);
                     }
                     let n = change_set(&status_target, &draft).len();
-                    text(match n {
-                        0 => "No changes".to_string(),
-                        1 => "1 change".to_string(),
-                        n => format!("{n} changes"),
-                    })
-                    .style(move |s| {
-                        s.font_size(theme::font_label()).color(if n == 0 {
-                            theme::text_faint()
-                        } else {
-                            theme::change_count()
+                    text(tr!("editor-change-count", n = n))
+                        .style(move |s| {
+                            s.font_size(theme::font_label()).color(if n == 0 {
+                                theme::text_faint()
+                            } else {
+                                theme::change_count()
+                            })
                         })
-                    })
-                    .into_any()
+                        .into_any()
                 },
             );
 
@@ -1619,7 +1668,7 @@ pub(crate) fn object_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVi
                     let ready = errs.is_empty() && draft.validate().is_empty() && !cs.is_empty();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -1627,7 +1676,7 @@ pub(crate) fn object_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVi
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,
@@ -1807,5 +1856,60 @@ mod tests {
         assert_eq!(detach_apply(Some(&orig), false), Some(orig));
         // A sequence that never had an owner has nothing to restore.
         assert_eq!(detach_apply(None, false), None);
+    }
+
+    /// The title is two whole messages around the interface's kind word, and in
+    /// English it reads as the `format!` it replaced did, kind word included.
+    #[test]
+    fn the_title_reads_as_it_did_in_english() {
+        assert_eq!(
+            editor_title(ObjectKind::Sequence, "shop.public", Some("orders_id_seq")),
+            "Edit sequence shop.public.orders_id_seq"
+        );
+        assert_eq!(
+            editor_title(ObjectKind::AliasType, "shop.dbo", None),
+            "Create alias type in shop.dbo"
+        );
+        // An enum is a *type* to the user, as `ObjectKind::label` has it.
+        assert_eq!(
+            editor_title(ObjectKind::Enum, "shop.public", Some("mood")),
+            format!("Edit {} shop.public.mood", ObjectKind::Enum.label())
+        );
+    }
+
+    /// Both engines' counters go through one label, and a counter is printed to
+    /// the digit — a number handed to Fluent would be grouped for the locale.
+    #[test]
+    fn the_restart_label_prints_the_counter_as_the_server_has_it() {
+        assert_eq!(
+            restart_label(Some(1_234_567_i64)),
+            "Restart at — the counter last handed out 1234567"
+        );
+        assert_eq!(
+            restart_label(Some("-42".to_string())),
+            "Restart at — the counter last handed out -42"
+        );
+        assert_eq!(
+            restart_label(None::<i64>),
+            "Restart at — the counter has not been used"
+        );
+    }
+
+    /// A number field's error names the field, and is also the key it is
+    /// withdrawn by — so it has to come out the same each time it is built.
+    #[test]
+    fn a_number_fields_error_names_the_field() {
+        let a = tr!(
+            "object-editor-not-whole-number",
+            field = tr!("object-editor-increment")
+        );
+        assert_eq!(a, "Increment has to be a whole number.");
+        assert_eq!(
+            a,
+            tr!(
+                "object-editor-not-whole-number",
+                field = tr!("object-editor-increment")
+            )
+        );
     }
 }

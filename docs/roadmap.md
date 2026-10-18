@@ -81,7 +81,7 @@ assertions pin English wording — stays the regression net throughout.
    `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`, `activity_panel.rs`, `ai_panel.rs`,
    `chart_view.rs`, `view_editor.rs`, `properties.rs`, `copy_table_view.rs`,
    `database_editor.rs`, `script_view.rs`, `compare_view.rs`, `event_editor.rs`,
-   `routine_editor.rs`, `users_view.rs`, `trigger_editor.rs`; and, ahead of their files, the three
+   `routine_editor.rs`, `users_view.rs`, `trigger_editor.rs`, `object_editor.rs`; and, ahead of their files, the three
    workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
    `editor_pane.rs`'s query header (`query-*`). The schema editors share
    `editor-preview-sql` and `editor-change-count`, and `dialog-close` joins the dialog words. The

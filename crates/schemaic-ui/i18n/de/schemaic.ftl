@@ -980,3 +980,65 @@ trigger-editor-edit-function = Bearbeiten
 trigger-editor-new-function = Neue Funktion
 trigger-editor-arguments = Argumente
 trigger-editor-add-argument = Argument hinzufügen
+
+## Schema editors — shared (continued)
+
+editor-row-move-up = Nach oben
+editor-row-move-down = Nach unten
+
+## Object editor
+
+object-editor-title-edit = { $kind } { $name } bearbeiten
+object-editor-title-create = { $kind } in { $location } erstellen
+object-editor-name = Name
+object-editor-comment = Kommentar
+object-editor-type = Typ
+object-editor-default = Standardwert
+object-editor-section-type = Typ
+object-editor-section-values = Werte
+object-editor-section-domain = Domäne
+object-editor-section-constraints = Constraints
+object-editor-section-sequence = Sequenz
+object-editor-section-position = Position
+object-editor-section-synonym = Synonym
+object-editor-section-alias-type = Aliastyp
+object-editor-section-xml-schema-collection = XML-Schemaauflistung
+object-editor-section-stands-for = Steht für
+object-editor-value-placeholder = Wert
+object-editor-add-value = Wert hinzufügen
+object-editor-values-order = In Vergleichsreihenfolge – diese Reihenfolge verwendet ORDER BY
+object-editor-add-constraint = Constraint hinzufügen
+object-editor-no-base-types = Diese Engine schlägt keine Basistypen vor
+object-editor-not-null-hint = Jede Spalte dieser Domäne lehnt NULL ab. Das Einschalten schlägt fehl, wenn eine bereits NULL enthält.
+object-editor-stores = Speichert
+object-editor-increment = Schrittweite
+object-editor-start = Start
+object-editor-cache = Cache
+object-editor-minimum = Minimum
+object-editor-maximum = Maximum
+object-editor-not-whole-number = { $field } muss eine ganze Zahl sein.
+object-editor-cycle = Zyklisch
+object-editor-cycle-hint = Am anderen Ende des Bereichs neu beginnen, statt fehlzuschlagen, wenn die Sequenz erschöpft ist.
+object-editor-restart-at = Neu starten bei – der Zähler hat zuletzt { $last } ausgegeben
+object-editor-restart-at-unused = Neu starten bei – der Zähler wurde noch nicht verwendet
+object-editor-restart-not-whole = „Neu starten bei“ muss eine ganze Zahl sein.
+object-editor-restart-placeholder = leer lassen, um die Position zu behalten
+object-editor-tsql-restart-placeholder = leer behält sie, außer der Typ ändert sich
+object-editor-owned-by = Gehört zu
+object-editor-detach = Von der Spalte lösen
+object-editor-detach-hint = Die Sequenz wird nicht mehr mit der Spalte entfernt und überdauert sie.
+object-editor-cache-hint = Werte aus dem Speicher ausgeben – schneller, um den Preis einer Lücke nach einem Neustart des Servers.
+object-editor-cache-size = Cache-Größe
+object-editor-cache-size-placeholder = Serverstandard
+object-editor-synonym-server = Server
+object-editor-synonym-server-placeholder = dieser Server
+object-editor-synonym-database = Datenbank
+object-editor-synonym-database-placeholder = diese Datenbank
+object-editor-synonym-schema = Schema
+object-editor-synonym-schema-placeholder = das Standardschema
+object-editor-synonym-object = Objekt
+object-editor-synonym-object-placeholder = Tabelle, Sicht oder Routine
+object-editor-base-type = Basistyp
+object-editor-nullable = Nullable
+object-editor-nullable-hint = Eine Spalte dieses Typs akzeptiert NULL, sofern die Spalte nichts anderes angibt.
+object-editor-schemas = Schemas

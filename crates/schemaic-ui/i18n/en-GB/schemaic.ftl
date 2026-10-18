@@ -1075,3 +1075,73 @@ trigger-editor-edit-function = Edit
 trigger-editor-new-function = New function
 trigger-editor-arguments = Arguments
 trigger-editor-add-argument = Add argument
+
+## Schema editors — shared (continued)
+
+# The tooltips on a value row's arrows.
+editor-row-move-up = Move up
+editor-row-move-down = Move down
+
+## Object editor (enum and domain types, sequences, SQL Server's synonyms, alias types and XML schema collections)
+
+# $kind is the object kind's word ("sequence", "alias type"); $name is database.schema.name.
+object-editor-title-edit = Edit { $kind } { $name }
+# $location is database.schema (or database).
+object-editor-title-create = Create { $kind } in { $location }
+object-editor-name = Name
+object-editor-comment = Comment
+object-editor-type = Type
+object-editor-default = Default
+object-editor-section-type = Type
+object-editor-section-values = Values
+object-editor-section-domain = Domain
+object-editor-section-constraints = Constraints
+object-editor-section-sequence = Sequence
+object-editor-section-position = Position
+object-editor-section-synonym = Synonym
+object-editor-section-alias-type = Alias type
+object-editor-section-xml-schema-collection = XML schema collection
+object-editor-section-stands-for = Stands for
+object-editor-value-placeholder = value
+object-editor-add-value = Add value
+object-editor-values-order = In comparison order — this is the order ORDER BY uses
+object-editor-add-constraint = Add constraint
+object-editor-no-base-types = This engine suggests no base types
+# Beside the NOT NULL toggle, whose label is the SQL clause.
+object-editor-not-null-hint = Every column of this domain rejects NULL. Turning it on fails if one already holds one.
+object-editor-stores = Stores
+object-editor-increment = Increment
+object-editor-start = Start
+object-editor-cache = Cache
+object-editor-minimum = Minimum
+object-editor-maximum = Maximum
+# $field is one of the number fields' labels.
+object-editor-not-whole-number = { $field } has to be a whole number.
+object-editor-cycle = Cycle
+object-editor-cycle-hint = Wrap around to the other end of the range instead of failing when the sequence runs out.
+# $last is the value the sequence last handed out.
+object-editor-restart-at = Restart at — the counter last handed out { $last }
+object-editor-restart-at-unused = Restart at — the counter has not been used
+object-editor-restart-not-whole = Restart at has to be a whole number.
+object-editor-restart-placeholder = leave empty to keep the position
+# SQL Server: a new type re-creates the sequence, which keeps no position.
+object-editor-tsql-restart-placeholder = empty keeps it, unless the type changes
+object-editor-owned-by = Owned by
+object-editor-detach = Detach from its column
+object-editor-detach-hint = The sequence stops being dropped with the column, and outlives it.
+object-editor-cache-hint = Hand out values from memory, faster, at the cost of a gap after a restart of the server.
+object-editor-cache-size = Cache size
+object-editor-cache-size-placeholder = server default
+# The parts of the name a synonym stands for; each placeholder says what an empty one means.
+object-editor-synonym-server = Server
+object-editor-synonym-server-placeholder = this server
+object-editor-synonym-database = Database
+object-editor-synonym-database-placeholder = this database
+object-editor-synonym-schema = Schema
+object-editor-synonym-schema-placeholder = the default schema
+object-editor-synonym-object = Object
+object-editor-synonym-object-placeholder = table, view or routine
+object-editor-base-type = Base type
+object-editor-nullable = Nullable
+object-editor-nullable-hint = A column of this type accepts NULL unless the column says otherwise.
+object-editor-schemas = Schemas
