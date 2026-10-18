@@ -1344,7 +1344,7 @@ fn shortcut_row(keys: &'static str, desc: String) -> impl IntoView {
             .flex_row()
             .items_center()
             .gap(theme::scaled(12.0))
-            .padding_vert(theme::scaled(2.0))
+            .padding_vert(theme::scaled(3.0))
     })
 }
 
