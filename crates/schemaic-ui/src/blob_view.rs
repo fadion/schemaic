@@ -42,6 +42,7 @@ use schemaic_core::blob::{
 };
 use schemaic_core::format::{contrasting_bytes, human_bytes};
 
+use crate::i18n::tr;
 use crate::theme;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, focus_root_with_ring, modal_footer_split,
@@ -267,7 +268,7 @@ impl BlobUi {
             return;
         }
         self.note
-            .set(Some(outcome.map(|path| format!("Saved to {path}"))));
+            .set(Some(outcome.map(|path| tr!("blob-saved-to", path = path))));
     }
 
     /// Report a finished **load**: show the file's bytes and stage them into the
@@ -317,8 +318,7 @@ impl BlobUi {
         // this is unreachable rather than a case. Reported rather than ignored:
         // silently dropping the file would look exactly like a load that worked.
         let Some(stage) = self.stage.get_untracked() else {
-            self.note
-                .set(Some(Err("This cell cannot be written.".to_string())));
+            self.note.set(Some(Err(tr!("blob-not-writable"))));
             return;
         };
         // **Refused here, where the user chose the file.** The server would
@@ -335,8 +335,10 @@ impl BlobUi {
             // being *different* is the whole message, and one decimal place
             // rounds 65,536 and a `BLOB`'s 65,535 to the same `64.0 KB`.
             let (got, most) = contrasting_bytes(bytes.len() as u64, cap);
-            self.note.set(Some(Err(format!(
-                "That file is {got} — this column holds at most {most}."
+            self.note.set(Some(Err(tr!(
+                "blob-file-too-large",
+                got = got,
+                most = most
             ))));
             return;
         }
@@ -351,9 +353,7 @@ impl BlobUi {
         // `Arc<[u8]>` it stores. See `BlobStage::put`.
         let shared: Arc<[u8]> = Arc::from(&bytes[..]);
         if !stage.put(shared) {
-            self.note.set(Some(Err(
-                "That cell is no longer accepting a value — nothing was staged.".to_string(),
-            )));
+            self.note.set(Some(Err(tr!("blob-not-accepting"))));
             return;
         }
         let kind = schemaic_core::blob::sniff(&bytes);
@@ -367,9 +367,7 @@ impl BlobUi {
         });
         self.state.set(BlobState::Ready { value, kind });
         self.epoch.set(self.epoch.get_untracked().wrapping_add(1));
-        self.note.set(Some(Ok(
-            "Loaded file. Commit in the grid to write it.".to_string()
-        )));
+        self.note.set(Some(Ok(tr!("blob-loaded-file"))));
     }
 }
 
@@ -457,14 +455,32 @@ fn body_h() -> f64 {
 /// field for it. But it does not need to: how much arrived is the fact the
 /// reader wants, and it is `bytes.len()`.
 fn summary_line(value: &BlobValue, kind: BlobKind) -> String {
-    let mut s = format!("{} · {}", kind.label(), human_bytes(value.len as i64));
+    let (kind, size) = (blob_kind_label(kind), human_bytes(value.len as i64));
     if value.truncated() {
-        s.push_str(&format!(
-            " · showing the first {}",
-            human_bytes(value.bytes.len() as i64)
-        ));
+        tr!(
+            "blob-summary-truncated",
+            kind = kind,
+            size = size,
+            shown = human_bytes(value.bytes.len() as i64)
+        )
+    } else {
+        tr!("blob-summary", kind = kind, size = size)
     }
-    s
+}
+
+/// What the panel calls a kind of value — `BlobKind::label`'s words, drawn here
+/// so they can be translated; core keeps its English. The save dialog's file
+/// type still takes core's, as it needs a `&'static str`.
+fn blob_kind_label(kind: BlobKind) -> String {
+    match kind {
+        BlobKind::Png => tr!("blob-kind-png"),
+        BlobKind::Jpeg => tr!("blob-kind-jpeg"),
+        BlobKind::Gif => tr!("blob-kind-gif"),
+        BlobKind::Bmp => tr!("blob-kind-bmp"),
+        BlobKind::Webp => tr!("blob-kind-webp"),
+        BlobKind::Ico => tr!("blob-kind-ico"),
+        BlobKind::Opaque => tr!("blob-kind-opaque"),
+    }
 }
 
 /// Whether **Save to file** is offered, and the sentence that says why it is
@@ -494,10 +510,10 @@ fn save_offer(value: Option<&BlobValue>) -> (bool, Option<String>) {
         // (`max_allowed_packet`). The two figures it has are both true.
         Some(v) if v.truncated() => (
             false,
-            Some(format!(
-                "Only the first {} of {} could be read, so this would save the front of the value.",
-                human_bytes(v.bytes.len() as i64),
-                human_bytes(v.len as i64)
+            Some(tr!(
+                "blob-save-truncated",
+                shown = human_bytes(v.bytes.len() as i64),
+                size = human_bytes(v.len as i64)
             )),
         ),
         Some(_) => (true, None),
@@ -505,10 +521,10 @@ fn save_offer(value: Option<&BlobValue>) -> (bool, Option<String>) {
 }
 
 /// What each pane is called, in the switch and nowhere else.
-fn pane_label(pane: BlobPane) -> &'static str {
+fn pane_label(pane: BlobPane) -> String {
     match pane {
-        BlobPane::Preview => "Preview",
-        BlobPane::Hex => "Hex",
+        BlobPane::Preview => tr!("blob-pane-preview"),
+        BlobPane::Hex => tr!("blob-pane-hex"),
     }
 }
 
@@ -622,29 +638,21 @@ fn preview_view(value: Arc<BlobValue>, kind: BlobKind) -> impl IntoView {
         .style(|s| s.size_full())
         .into_any(),
         PreviewVerdict::TooLarge { width, height } => note_view(
-            format!(
-                "This image is {width} × {height} — too large to preview here. \
-                 The bytes are intact: read them as Hex, or save them to a file."
-            ),
+            tr!("blob-preview-too-large", width = width, height = height),
             false,
         )
         .into_any(),
         PreviewVerdict::Truncated => note_view(
-            format!(
-                "Only the first {} of this {} was read, so it cannot be drawn. \
-                 Read the bytes as Hex.",
-                human_bytes(value.bytes.len() as i64),
-                kind.label()
+            tr!(
+                "blob-preview-truncated",
+                shown = human_bytes(value.bytes.len() as i64),
+                kind = blob_kind_label(kind)
             ),
             false,
         )
         .into_any(),
         PreviewVerdict::Unmeasurable => note_view(
-            format!(
-                "These bytes begin like a {} but cannot be read as one. \
-                 Read them as Hex, or save them to a file.",
-                kind.label()
-            ),
+            tr!("blob-preview-unreadable", kind = blob_kind_label(kind)),
             false,
         )
         .into_any(),
@@ -810,12 +818,8 @@ pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl Into
                 }
             };
             let body: floem::AnyView = match &state {
-                BlobState::Loading => note_view("Reading…".to_string(), false).into_any(),
-                BlobState::Empty => note_view(
-                    "This cell is NULL, or its row is no longer there.".to_string(),
-                    false,
-                )
-                .into_any(),
+                BlobState::Loading => note_view(tr!("blob-reading"), false).into_any(),
+                BlobState::Empty => note_view(tr!("blob-empty"), false).into_any(),
                 BlobState::Failed(msg) => note_view(msg.clone(), true).into_any(),
                 // An opaque blob has no preview to build, so it does not get
                 // the pair — the switch that would reach it is absent too.
@@ -878,7 +882,7 @@ pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl Into
                 move || {
                     let load = load.clone();
                     open_file(
-                        FileDialogOptions::new().title("Load binary value from file"),
+                        FileDialogOptions::new().title(tr!("blob-load-dialog")),
                         move |file| {
                             let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
                                 return; // cancelled
@@ -905,7 +909,7 @@ pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl Into
                         return;
                     }
                     let opts = FileDialogOptions::new()
-                        .title("Save binary value")
+                        .title(tr!("blob-save-dialog"))
                         .default_name(format!("{stem}.{}", kind.extension()))
                         .allowed_types(vec![FileSpec {
                             name: kind.label(),
@@ -950,7 +954,7 @@ pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl Into
                 modal_footer_split(
                     h_stack((
                         crate::widgets::action_button_icon(
-                            "Load from file",
+                            tr!("blob-load"),
                             crate::icons::UPLOAD,
                             ActionKind::Neutral,
                             loadable,
@@ -960,7 +964,7 @@ pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl Into
                         )
                         .style(|s| s.flex_shrink(0.0_f32)),
                         crate::widgets::action_button_icon(
-                            "Save to file",
+                            tr!("blob-save"),
                             crate::icons::DOWNLOAD,
                             ActionKind::Neutral,
                             saveable,
@@ -977,7 +981,7 @@ pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl Into
                     ))
                     .style(|s| s.items_center().min_width(0.0).gap(theme::scaled(8.0))),
                     action_button(
-                        "Close",
+                        tr!("dialog-close"),
                         ActionKind::Primary,
                         true,
                         ring.clone(),
@@ -1030,6 +1034,69 @@ mod tests {
     // two truncation sentences stopped naming it — but the fixtures still want
     // it, because it is the cut point on PostgreSQL and SQLite.
     use schemaic_core::blob::FETCH_CAP;
+
+    /// The panel's words for a kind of value are core's in English, for every
+    /// kind.
+    #[test]
+    fn english_words_every_blob_kind_as_core_does() {
+        for kind in [
+            BlobKind::Png,
+            BlobKind::Jpeg,
+            BlobKind::Gif,
+            BlobKind::Bmp,
+            BlobKind::Webp,
+            BlobKind::Ico,
+            BlobKind::Opaque,
+        ] {
+            assert_eq!(blob_kind_label(kind), kind.label(), "{kind:?}");
+        }
+    }
+
+    /// The summary line and the preview's notes read as they did in English
+    /// before the catalogue. Sizes go through `human_bytes`, as the old
+    /// `format!`s did, so the test pins the sentence and not the unit.
+    #[test]
+    fn the_composed_lines_read_as_they_did_in_english() {
+        let whole = BlobValue {
+            bytes: vec![0; 16],
+            len: 16,
+        };
+        assert_eq!(
+            summary_line(&whole, BlobKind::Png),
+            format!("PNG image · {}", human_bytes(16))
+        );
+        let front = BlobValue {
+            bytes: vec![0; 16],
+            len: 4096,
+        };
+        assert_eq!(
+            summary_line(&front, BlobKind::Opaque),
+            format!(
+                "Binary data · {} · showing the first {}",
+                human_bytes(4096),
+                human_bytes(16)
+            )
+        );
+        assert_eq!(
+            tr!("blob-preview-too-large", width = 9000, height = 7000),
+            "This image is 9000 × 7000 — too large to preview here. The bytes are intact: \
+             read them as Hex, or save them to a file."
+        );
+        assert_eq!(
+            tr!("blob-preview-truncated", shown = "16 B", kind = "PNG image"),
+            "Only the first 16 B of this PNG image was read, so it cannot be drawn. Read the \
+             bytes as Hex."
+        );
+        assert_eq!(
+            tr!("blob-preview-unreadable", kind = "GIF image"),
+            "These bytes begin like a GIF image but cannot be read as one. Read them as Hex, \
+             or save them to a file."
+        );
+        assert_eq!(
+            tr!("blob-file-too-large", got = "64.0 KB", most = "63.9 KB"),
+            "That file is 64.0 KB — this column holds at most 63.9 KB."
+        );
+    }
 
     /// A target with no size cap — the shape every test here wants, and a
     /// constructor rather than a literal so a new field on `BlobTarget` does not

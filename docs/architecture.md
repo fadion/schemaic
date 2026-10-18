@@ -32009,6 +32009,22 @@ existing prose was left alone.
     cancel exists to avoid. The new token also has to *replace* the stored one rather than only
     cancel it: keeping the stale token there pointed the new panel's Escape at a read that was
     already over.
+    **Its words are the catalogue's** (`blob-*`, roadmap phase 3) — the pane switch's labels
+    (`pane_label` returns `String`), the Reading…/NULL-cell notes, the preview's three refusals
+    (`blob-preview-too-large` with `$width`/`$height`, `blob-preview-truncated`,
+    `blob-preview-unreadable`), `save_offer`'s refusal (`blob-save-truncated`), Load from file and
+    Save to file and their dialogs' window titles, and `BlobUi`'s status lines — `saved_at`'s
+    `blob-saved-to` (`$path`), and `loaded_file`'s `blob-loaded-file`, `blob-not-writable`,
+    `blob-file-too-large` (`$got`, `$most`) and `blob-not-accepting`; Close is the shared
+    `dialog-close`. `summary_line` is two whole messages, `blob-summary` and
+    `blob-summary-truncated` (`$kind`, `$size`, `$shown`). The kind is core's word drawn UI-side:
+    `blob_kind_label(BlobKind)` replaces `BlobKind::label` in the summary and the preview's notes
+    (`blob-kind-*`), and `english_words_every_blob_kind_as_core_does` holds its English equal to
+    core's — but the save dialog's `FileSpec` still takes `kind.label()`, since it needs a
+    `&'static str`. `the_composed_lines_read_as_they_did_in_english` pins the assembled lines; the
+    saved-to, `save_offer` and loaded-line tests pass unchanged. English stays: the sizes
+    (`human_bytes`/`contrasting_bytes`, core's formatting, phase 7), the save dialog's file type
+    name, the suggested file name, and a load failure's OS message.
   - `compare_view.rs` — the **schema-compare** overlay (`compare_overlay`), over `core::compare`:
     two databases side by side, and the migration between them. Not a tab — there is no tab kind in
     this app, `Tab`/`SavedTab` being query tabs — so it is the sixth entry of the modal layer's
@@ -40188,8 +40204,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   grant forms (`account_editor.rs`), the table designer (`table_designer.rs`), Manage
   Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
   and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`),
-  Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`) and Import
-  Connections (`connection_import.rs`) are converted;
+  Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`), Import
+  Connections (`connection_import.rs`) and the binary-cell panel (`blob_view.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

@@ -1629,3 +1629,39 @@ conn-import-skipped-more = { $count ->
 conn-import-import = Import
 # The Import button with how many connections it will add.
 conn-import-import-count = Import { $count }
+
+## Binary value panel (blob_view.rs)
+## Sizes ($size, $shown, $got, $most) arrive formatted (16 B, 64.0 MB).
+
+# What a value is. English must read exactly as core's BlobKind::label (a
+# test holds it); the save dialog's file type still uses core's.
+blob-kind-png = PNG image
+blob-kind-jpeg = JPEG image
+blob-kind-gif = GIF image
+blob-kind-bmp = BMP image
+blob-kind-webp = WebP image
+blob-kind-ico = Icon
+blob-kind-opaque = Binary data
+# The line over the value; $kind is one of the blob-kind-* messages.
+blob-summary = { $kind } · { $size }
+blob-summary-truncated = { $kind } · { $size } · showing the first { $shown }
+blob-pane-preview = Preview
+blob-pane-hex = Hex
+blob-reading = Reading…
+# NULL is the SQL keyword.
+blob-empty = This cell is NULL, or its row is no longer there.
+blob-preview-too-large = This image is { $width } × { $height } — too large to preview here. The bytes are intact: read them as Hex, or save them to a file.
+blob-preview-truncated = Only the first { $shown } of this { $kind } was read, so it cannot be drawn. Read the bytes as Hex.
+blob-preview-unreadable = These bytes begin like a { $kind } but cannot be read as one. Read them as Hex, or save them to a file.
+blob-save-truncated = Only the first { $shown } of { $size } could be read, so this would save the front of the value.
+blob-load = Load from file
+blob-save = Save to file
+# The file pickers' window titles.
+blob-load-dialog = Load binary value from file
+blob-save-dialog = Save binary value
+# $path is where the file was written.
+blob-saved-to = Saved to { $path }
+blob-loaded-file = Loaded file. Commit in the grid to write it.
+blob-not-writable = This cell cannot be written.
+blob-file-too-large = That file is { $got } — this column holds at most { $most }.
+blob-not-accepting = That cell is no longer accepting a value — nothing was staged.
