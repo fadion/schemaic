@@ -50,6 +50,7 @@ use floem::style::FlexWrap;
 use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::date::{self, Date};
 
+use crate::i18n::tr;
 use crate::widgets::{
     MenuEntry, MenuFlags, MenuId, MenuInset, PopupChannel, box_menu_inset, close_picker,
     open_picker,
@@ -164,7 +165,7 @@ pub(crate) fn pick_field(
             move || celledit::held_label(&editor, &buf.get()),
             move |v| {
                 let unset = v.is_empty();
-                text(if unset { "Choose…".to_string() } else { v })
+                text(if unset { tr!("cell-choose") } else { v })
                     .style(move |s| {
                         s.font_size(theme::font_body())
                             .text_ellipsis()
@@ -297,7 +298,7 @@ pub(crate) fn pick_cell_face(buf: RwSignal<String>, editor: CellEditor) -> AnyVi
             move || celledit::held_label(&editor, &buf.get()),
             move |v| {
                 let unset = v.is_empty();
-                text(if unset { "Choose…".to_string() } else { v })
+                text(if unset { tr!("cell-choose") } else { v })
                     .style(move |s| {
                         s.font_size(theme::font_body())
                             .text_ellipsis()
@@ -725,9 +726,13 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
         dyn_container(
             move || shown.get(),
             move |(y, m)| {
-                text(format!("{} {y}", date::month_name(m)))
-                    .style(|s| s.font_size(theme::font_body()).color(theme::text()))
-                    .into_any()
+                text(tr!(
+                    "cell-calendar-month",
+                    month = month_name(m),
+                    year = y.to_string()
+                ))
+                .style(|s| s.font_size(theme::font_body()).color(theme::text()))
+                .into_any()
             },
         )
         .style(|s| s.flex_grow(1.0_f32).items_center().justify_center()),
@@ -735,8 +740,8 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
     ))
     .style(move |s| s.width_full().height(calendar_band_h()).items_center());
 
-    let headings = h_stack_from_iter(date::WEEKDAY_INITIALS.iter().map(|d| {
-        text(*d)
+    let headings = h_stack_from_iter((0..7).map(|d| {
+        text(weekday_initials(d))
             .style(|s| {
                 s.width(day_w())
                     .justify_center()
@@ -769,7 +774,11 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
     );
 
     let picks_time = matches!(editor, CellEditor::DateTime(_));
-    let now_label = if picks_time { "Now" } else { "Today" };
+    let now_label = if picks_time {
+        tr!("cell-calendar-now")
+    } else {
+        tr!("cell-calendar-today")
+    };
     let footer = h_stack((
         empty().style(|s| s.flex_grow(1.0_f32)),
         text(now_label)
@@ -941,6 +950,41 @@ pub(crate) fn calendar_insets(
 /// existing one — which is exactly how this arrived. It cannot see that the
 /// control *uses* them; that half is `focus_on_mount` and the `escape` helper,
 /// which exist so there is one implementation to read rather than four.
+/// A month's name in the calendar's header — `date::MONTH_NAMES`' word, drawn
+/// here so it can be translated; core keeps its English. `month` is 1–12, and
+/// anything else is blank, as `date::month_name` answers.
+fn month_name(month: u32) -> String {
+    match month {
+        1 => tr!("cell-month-1"),
+        2 => tr!("cell-month-2"),
+        3 => tr!("cell-month-3"),
+        4 => tr!("cell-month-4"),
+        5 => tr!("cell-month-5"),
+        6 => tr!("cell-month-6"),
+        7 => tr!("cell-month-7"),
+        8 => tr!("cell-month-8"),
+        9 => tr!("cell-month-9"),
+        10 => tr!("cell-month-10"),
+        11 => tr!("cell-month-11"),
+        12 => tr!("cell-month-12"),
+        _ => String::new(),
+    }
+}
+
+/// A weekday's column heading, Monday first (`0` is Monday) —
+/// `date::WEEKDAY_INITIALS`' word, drawn here; the week's order stays core's.
+fn weekday_initials(day: usize) -> String {
+    match day {
+        0 => tr!("cell-weekday-mon"),
+        1 => tr!("cell-weekday-tue"),
+        2 => tr!("cell-weekday-wed"),
+        3 => tr!("cell-weekday-thu"),
+        4 => tr!("cell-weekday-fri"),
+        5 => tr!("cell-weekday-sat"),
+        _ => tr!("cell-weekday-sun"),
+    }
+}
+
 #[cfg(test)]
 mod row_panel_focus_gate {
     /// The controls `grid::typed_editor` can build. `CellEditor::Text` is not
@@ -986,6 +1030,24 @@ mod row_panel_focus_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The calendar's month names and weekday headings are core's in English,
+    /// in core's order, and its header reads as it did before the catalogue.
+    #[test]
+    fn english_words_the_calendar_as_core_does() {
+        for (i, name) in date::MONTH_NAMES.iter().enumerate() {
+            assert_eq!(month_name(i as u32 + 1), *name);
+        }
+        assert_eq!(month_name(0), date::month_name(0));
+        assert_eq!(month_name(13), date::month_name(13));
+        for (i, initials) in date::WEEKDAY_INITIALS.iter().enumerate() {
+            assert_eq!(weekday_initials(i), *initials);
+        }
+        assert_eq!(
+            tr!("cell-calendar-month", month = month_name(3), year = "2026"),
+            "March 2026"
+        );
+    }
 
     /// **The panel's declared box must hold the panel's contents, at every
     /// scale.** taffy 0.4 has no `box_sizing`, so the `.width`/`.height`

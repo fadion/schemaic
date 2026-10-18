@@ -1818,3 +1818,34 @@ md-proposal-count = { $count ->
 md-proposal-review = Review change…
 # $error says why the proposal could not be read.
 md-proposal-unreadable = The assistant proposed a change that couldn't be read — { $error }
+
+## The grid's cell pickers and calendar (cell_editors.rs)
+
+# An enum, set or date cell with nothing chosen yet.
+cell-choose = Choose…
+# The calendar's header; $month is one of the cell-month-* messages.
+cell-calendar-month = { $month } { $year }
+# The calendar's button for the current instant (a date-and-time cell) or date.
+cell-calendar-now = Now
+cell-calendar-today = Today
+# English must read exactly as core's MONTH_NAMES and WEEKDAY_INITIALS (a test
+# holds it). The week starts on Monday.
+cell-month-1 = January
+cell-month-2 = February
+cell-month-3 = March
+cell-month-4 = April
+cell-month-5 = May
+cell-month-6 = June
+cell-month-7 = July
+cell-month-8 = August
+cell-month-9 = September
+cell-month-10 = October
+cell-month-11 = November
+cell-month-12 = December
+cell-weekday-mon = Mo
+cell-weekday-tue = Tu
+cell-weekday-wed = We
+cell-weekday-thu = Th
+cell-weekday-fri = Fr
+cell-weekday-sat = Sa
+cell-weekday-sun = Su

@@ -30209,6 +30209,15 @@ existing prose was left alone.
     Escape closed the row panel out from under an open calendar. While it is up the toggle is lit,
     and **it pins its own hover**: it is the calendar's dismissal then, and `field_box`'s hover tint
     would otherwise repaint the accent border grey under the pointer.
+    **Its words are the catalogue's** (`cell-*`, roadmap phase 3) — the unset picker's *Choose…*
+    (`pick_field`'s and `pick_cell_face`'s alike), the calendar's header (`cell-calendar-month`,
+    `$month` and `$year`, the year passed as text so a later number-formatting phase cannot group
+    it) and the footer's *Now*/*Today*. The month names and weekday initials are core's words drawn
+    here, by the typed-value rule: the file's own `month_name` and `weekday_initials` replace
+    `date::month_name` and `date::WEEKDAY_INITIALS` in the calendar (`cell-month-1`…`12`,
+    `cell-weekday-*`), while the week's order — Monday first — stays core's, and core keeps its
+    English constants for whatever else reads them. `english_words_the_calendar_as_core_does` holds
+    both equal to core's arrays and pins the header.
   - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `loaded_view` is the entry point,
     called from the results strip's body). `editor_pane.rs` — SQL editor pane
     (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `syntax_view` draws
@@ -40274,8 +40283,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`), the ER diagram
   (`erd_view.rs`), Server variables (`server_vars_view.rs`), the snippet editor
   (`snippet_edit.rs`), the Query plan modal (`plan_view.rs`), the Used by modal
-  (`used_by_view.rs`), the interface themes' names (`themes.rs`) and the AI panel's reply
-  renderer's own controls (`markdown.rs`) are converted;
+  (`used_by_view.rs`), the interface themes' names (`themes.rs`), the AI panel's reply
+  renderer's own controls (`markdown.rs`) and the grid's cell pickers and calendar
+  (`cell_editors.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
