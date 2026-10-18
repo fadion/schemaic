@@ -1264,3 +1264,84 @@ designer-check-expression = Expression
 designer-check-expression-hint = The condition every row must satisfy. Written without CHECK (…).
 designer-check-enforced = Enforced
 designer-check-enforced-hint = Off records the constraint without applying it — existing and new rows are both accepted.
+
+## Manage Connections modal (connection_form.rs)
+## The engine names in the Type picker (MySQL, PostgreSQL, SQLite, SQL Server)
+## are product names and persisted: never translated.
+
+connections-title = Manage Connections
+connections-new = New connection
+connections-import = Import connections
+connections-export = Export connections
+connections-duplicate = Duplicate
+connections-delete = Delete
+connections-test = Test
+connections-save = Save
+# The tooltip on a failed test when the failure carried no text of its own.
+connections-test-failed = Connection failed
+# The button inside a path field that opens the file picker.
+connections-browse = Browse…
+connections-section-general = General
+connections-section-safeguards = Safeguards
+connections-section-database = Database
+connections-section-network = Network
+connections-name = Name
+connections-colour = Colour
+connections-folder = Folder
+connections-no-folders = No folders yet
+connections-folder-hint = Optional. Connections with the same folder are listed together.
+connections-prominent-colour = Prominent colour in editor
+connections-prominent-colour-hint = Frame the query editor in this connection's colour.
+connections-read-only = Read-only
+connections-read-only-hint = Disable cell edits and block write/DDL queries on this connection.
+# "schemaic" and "schemaic mcp" are a command and its subcommand: never translated.
+connections-cli-access = CLI access
+connections-cli-access-hint = Let the schemaic command line, and AI agents through schemaic mcp, use this connection.
+connections-ai-data-access = AI data access
+connections-statement-timeout = Statement timeout
+connections-statement-timeout-hint = Cancels a statement on this connection that runs longer.
+connections-environment = Environment
+connections-type = Type
+connections-init-sql = Init SQL
+# PRAGMA and SET are SQL keywords.
+connections-init-sql-pragma-hint = Optional. PRAGMA settings run on every connection Schemaic opens.
+connections-init-sql-set-hint = Optional. SET statements run on every connection Schemaic opens — a search path, a time zone, a role.
+connections-host = Host
+connections-port = Port
+connections-database = Database
+connections-database-hint = Optional, and the database the connection opens in. Some hosted providers allow only their own and refuse a connection that does not name it.
+connections-authentication = Authentication
+connections-user = User
+connections-password = Password
+# The commands in backticks are typed as written: never translated.
+connections-azure-cli-hint = Signs in as whoever is signed in to the Azure CLI (run `az login` first). The token is fetched when a connection needs one and never saved.
+connections-aws-iam-hint = Signs in as the user below with a token from the AWS CLI's credentials (`aws configure` or `aws sso login` first). The user needs the rds_iam role (PostgreSQL) or the AWSAuthenticationPlugin (MySQL). The token is fetched when a connection needs one and never saved.
+connections-gcp-iam-hint = Signs in as the user below — the IAM user or service account Cloud SQL knows — with a token from the Google Cloud CLI (`gcloud auth login` first). The token is fetched when a connection needs one and never saved.
+# $account is the Windows account, DOMAIN\user.
+connections-windows-hint-named = Signs in as the Windows account Schemaic runs as ({ $account }). The server must know that account as a Windows login.
+connections-windows-hint = Signs in as the Windows account Schemaic runs as. The server must know that account as a Windows login.
+connections-database-file = Database file
+# The file pickers' window titles.
+connections-database-file-dialog = Select SQLite database
+connections-sqlite-hint = A SQLite database is a single file, so there is no server to reach — no host, user, password or tunnel. Manual transactions aren't available on one yet: statements commit as they are sent.
+connections-ssh-tunnel = SSH tunnel
+connections-ssh-tunnel-hint = Reach the server through an SSH tunnel.
+connections-ssh-host = SSH host
+connections-ssh-port = SSH port
+connections-ssh-user = SSH user
+connections-ssh-password = SSH password
+connections-ssh-agent-hint = Signing is delegated to your running SSH agent (OpenSSH agent / Pageant on Windows). No key is stored by Schemaic.
+connections-jump-hosts = Jump hosts
+connections-jump-hosts-hint = Optional. Hosts to pass through before the SSH host, nearest first — each signs in the way set below.
+connections-private-key = Private key
+connections-private-key-dialog = Select private key
+connections-passphrase = Passphrase
+connections-tls = SSL / TLS
+connections-ca-certificate = CA certificate
+connections-ca-certificate-dialog = Select CA certificate
+connections-ca-certificate-hint = Leave empty to trust the certificate authorities your operating system trusts, including any your organisation installed. Name a file to trust that one instead.
+connections-client-certificate = Client certificate
+connections-client-certificate-dialog = Select client certificate
+connections-client-key = Client key
+connections-client-key-dialog = Select client key
+connections-client-identity-hint = A client certificate and key are only needed where the server asks you to prove who you are (mutual TLS). The key must not be passphrase-protected.

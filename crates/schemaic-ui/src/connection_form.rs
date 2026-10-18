@@ -32,6 +32,7 @@ use schemaic_core::connection::SslMode;
 use schemaic_core::intel::SqlDialect;
 
 use crate::consts::MASK_CH;
+use crate::i18n::tr;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::table_designer::suggest_field;
 use crate::tooltip::TooltipExt;
@@ -39,8 +40,8 @@ use crate::widgets;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, MenuEntry, NAV_TAB, NavAxis, action_button,
     action_button_icon, action_face, action_gap, autohide, field_button, focus_root_with_ring,
-    form_hint, form_label_style, in_ring_button, menu_item_style, modal_h, modal_title, modal_w,
-    nav_group, panel_style,
+    form_hint, form_label_style, in_ring_button, menu_item_style, modal_h, modal_title_owned,
+    modal_w, nav_group, panel_style,
 };
 use crate::{ConnActions, ConnUi, DraftSignals, FieldCfg, OverlayUi, edit_field, icons, theme};
 
@@ -161,13 +162,13 @@ pub(crate) fn folder_heading(name: String) -> impl IntoView {
 /// the SSH block is built only when its toggle is on and would otherwise
 /// register after the fields that follow it on screen.
 fn field(
-    lbl: &'static str,
+    lbl: impl Into<String>,
     sig: RwSignal<String>,
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
     v_stack((
-        text(lbl).style(form_label_style),
+        text(lbl.into()).style(form_label_style),
         edit_field(
             sig,
             FieldCfg {
@@ -183,9 +184,9 @@ fn field(
 // Host (fills) + Port (fixed, ~8 chars) on one line, 25px apart. Shared by the
 // normal and SSH field groups so they lay out identically.
 fn host_port_row(
-    host_lbl: &'static str,
+    host_lbl: String,
     host: RwSignal<String>,
-    port_lbl: &'static str,
+    port_lbl: String,
     port: RwSignal<String>,
     ring: FocusRing,
     tabindex: u32,
@@ -224,9 +225,9 @@ fn host_port_row(
 /// shouldn't have to reach for the mouse, and one who wants to paste a path
 /// shouldn't have to open a dialog.
 fn path_field(
-    label_text: &'static str,
+    label_text: String,
     sig: RwSignal<String>,
-    dialog_title: &'static str,
+    dialog_title: String,
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
@@ -238,15 +239,21 @@ fn path_field(
     // (GitHub #19). A cancelled dialog leaves the field alone.
     let ring_browse = ring.clone();
     let browse = Rc::new(move || {
-        field_button("Browse…", ring_browse.clone(), tabindex + 1, move || {
-            open_file(FileDialogOptions::new().title(dialog_title), move |file| {
-                if let Some(info) = file
-                    && let Some(path) = info.path.first()
-                {
-                    sig.set(path.to_string_lossy().to_string());
-                }
-            })
-        })
+        let dialog_title = dialog_title.clone();
+        field_button(
+            tr!("connections-browse"),
+            ring_browse.clone(),
+            tabindex + 1,
+            move || {
+                open_file(FileDialogOptions::new().title(&dialog_title), move |file| {
+                    if let Some(info) = file
+                        && let Some(path) = info.path.first()
+                    {
+                        sig.set(path.to_string_lossy().to_string());
+                    }
+                })
+            },
+        )
     });
 
     v_stack((
@@ -287,16 +294,12 @@ fn jump_hosts_field(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl
                         .width_full()
                 })
                 .into_any(),
-            None => form_hint(
-                "Optional. Hosts to pass through before the SSH host, nearest first — each signs \
-                 in the way set below.",
-            )
-            .into_any(),
+            None => form_hint(tr!("connections-jump-hosts-hint")).into_any(),
         },
     )
     .style(|s| s.width_full());
     v_stack((
-        text("Jump hosts").style(form_label_style),
+        text(tr!("connections-jump-hosts")).style(form_label_style),
         edit_field(
             jump,
             FieldCfg {
@@ -353,14 +356,19 @@ fn ssh_config_hint(draft: DraftSignals) -> impl IntoView {
 fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl IntoView {
     v_stack((
         path_field(
-            "Private key",
+            tr!("connections-private-key"),
             draft.ssh_key_path,
-            "Select private key",
+            tr!("connections-private-key-dialog"),
             ring.clone(),
             tabindex,
         ),
-        masked_field("Passphrase", draft.ssh_key_passphrase, ring, tabindex + 2)
-            .style(|s| s.width(conn_field_w())),
+        masked_field(
+            tr!("connections-passphrase"),
+            draft.ssh_key_passphrase,
+            ring,
+            tabindex + 2,
+        )
+        .style(|s| s.width(conn_field_w())),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
@@ -528,7 +536,7 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
         });
 
     v_stack((
-        text("Colour").style(form_label_style),
+        text(tr!("connections-colour")).style(form_label_style),
         // The row shrink-wraps inside a full-width line, so the focus halo hugs
         // the swatches instead of stretching across the form.
         h_stack((row, empty().style(|s| s.flex_grow(1.0_f32))))
@@ -638,13 +646,13 @@ pub(crate) fn splice_real(prev_real: &str, prev_len: usize, runs: &[MaskRun]) ->
 // the buffer to match. `disp` and `real` always share a char count, which is what
 // makes a `Keep` run's offsets index both.
 fn masked_field(
-    lbl: &'static str,
+    lbl: impl Into<String>,
     sig: RwSignal<String>,
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
     v_stack((
-        text(lbl).style(form_label_style),
+        text(lbl.into()).style(form_label_style),
         masked_edit_field(sig, ring, tabindex),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
@@ -914,7 +922,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                             popup_anchor.set(None);
                             popup_width.set(conn_menu_w());
                             popup_menu.set(Some(vec![
-                                MenuEntry::action("Duplicate", move || {
+                                MenuEntry::action(tr!("connections-duplicate"), move || {
                                     (sel)(id);
                                     (dup)(id)
                                 }),
@@ -923,10 +931,14 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                                 // before it runs — the connection, its keyring
                                 // secrets, its history and its tabs are all
                                 // unrecoverable.
-                                MenuEntry::action_colored("Delete", theme::error, move || {
-                                    (sel_del)(id);
-                                    (del)(id)
-                                }),
+                                MenuEntry::action_colored(
+                                    tr!("connections-delete"),
+                                    theme::error,
+                                    move || {
+                                        (sel_del)(id);
+                                        (del)(id)
+                                    },
+                                ),
                             ]));
                         })
                         // Full-width row: resting `conn_list_text`, hover text
@@ -1012,7 +1024,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 container(
                     h_stack((
                         icons::icon(icons::CIRCLE_PLUS, 16.0),
-                        text("New connection").style(|s| s.font_size(theme::font_body())),
+                        text(tr!("connections-new")).style(|s| s.font_size(theme::font_body())),
                     ))
                     .style(|s| {
                         s.flex_row()
@@ -1049,7 +1061,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                         icons::icon(icons::DOWNLOAD, 15.0),
                         // Not "from another client": the modal reads Schemaic's
                         // own exports and Docker's containers as well.
-                        text("Import connections").style(|s| s.font_size(theme::font_label())),
+                        text(tr!("connections-import")).style(|s| s.font_size(theme::font_label())),
                     ))
                     .style(|s| {
                         s.flex_row()
@@ -1076,7 +1088,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 container(
                     h_stack((
                         icons::icon(icons::UPLOAD, 15.0),
-                        text("Export connections").style(|s| s.font_size(theme::font_label())),
+                        text(tr!("connections-export")).style(|s| s.font_size(theme::font_label())),
                     ))
                     .style(|s| {
                         s.flex_row()
@@ -1126,7 +1138,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
 
             let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
             let panel = v_stack((
-                modal_title("Manage Connections", close, root_ring.clone()),
+                modal_title_owned(tr!("connections-title"), close, root_ring.clone()),
                 body,
             ))
             .on_click_stop(|_| {})
@@ -1207,7 +1219,7 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     let mode = draft.tls_mode;
 
     let picker = v_stack((
-        text("SSL / TLS").style(form_label_style),
+        text(tr!("connections-tls")).style(form_label_style),
         container(focusable_dropdown(
             draft.tls_mode,
             SslMode::ALL,
@@ -1300,17 +1312,13 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 rows.push(
                     v_stack((
                         path_field(
-                            "CA certificate",
+                            tr!("connections-ca-certificate"),
                             draft.tls_ca_path,
-                            "Select CA certificate",
+                            tr!("connections-ca-certificate-dialog"),
                             ring.clone(),
                             151,
                         ),
-                        form_hint(
-                            "Leave empty to trust the certificate authorities your \
-                             operating system trusts, including any your organisation \
-                             installed. Name a file to trust that one instead.",
-                        ),
+                        form_hint(tr!("connections-ca-certificate-hint")),
                     ))
                     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
                     .into_any(),
@@ -1318,9 +1326,9 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             }
             rows.push(
                 path_field(
-                    "Client certificate",
+                    tr!("connections-client-certificate"),
                     draft.tls_client_cert_path,
-                    "Select client certificate",
+                    tr!("connections-client-certificate-dialog"),
                     ring.clone(),
                     153,
                 )
@@ -1328,9 +1336,9 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             );
             rows.push(
                 path_field(
-                    "Client key",
+                    tr!("connections-client-key"),
                     draft.tls_client_key_path,
-                    "Select client key",
+                    tr!("connections-client-key-dialog"),
                     ring.clone(),
                     155,
                 )
@@ -1345,14 +1353,7 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             // `db::tls::preflight`, which now refuses an encrypted key by name
             // and says how to decrypt it.
             let _ = ring;
-            rows.push(
-                form_hint(
-                    "A client certificate and key are only needed where the server asks \
-                     you to prove who you are (mutual TLS). The key must not be \
-                     passphrase-protected.",
-                )
-                .into_any(),
-            );
+            rows.push(form_hint(tr!("connections-client-identity-hint")).into_any());
 
             v_stack_from_iter(rows)
                 // Grouped like the SSH block: outlined rather than tinted, since a
@@ -1384,8 +1385,8 @@ fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // (like the other toggles); the fields lay out exactly like the normal ones.
     let ssh_enabled = draft.ssh_enabled;
     let ssh_toggle = focusable_toggle_row(
-        "SSH tunnel",
-        "Reach the server through an SSH tunnel.",
+        tr!("connections-ssh-tunnel"),
+        tr!("connections-ssh-tunnel-hint"),
         draft.ssh_enabled,
         ring.clone(),
         90,
@@ -1404,7 +1405,7 @@ fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             let ring = ring_ssh.clone();
             // Authentication method picker (150px), matching the settings dropdowns.
             let auth_field = v_stack((
-                text("Authentication").style(form_label_style),
+                text(tr!("connections-authentication")).style(form_label_style),
                 focusable_dropdown(
                     draft.ssh_auth,
                     SshAuth::ALL,
@@ -1422,18 +1423,18 @@ fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             let auth_creds = dyn_container(
                 move || ssh_auth.get(),
                 move |auth| match auth {
-                    SshAuth::Password => {
-                        masked_field("SSH password", draft.ssh_password, ring_creds.clone(), 140)
-                            .style(|s| s.width(conn_field_w()))
-                            .into_any()
-                    }
-                    SshAuth::KeyPair => key_pair_fields(draft, ring_creds.clone(), 140).into_any(),
-                    SshAuth::Agent => form_hint(
-                        "Signing is delegated to your running SSH agent (OpenSSH \
-                         agent / Pageant on Windows). No key is stored by Schemaic.",
+                    SshAuth::Password => masked_field(
+                        tr!("connections-ssh-password"),
+                        draft.ssh_password,
+                        ring_creds.clone(),
+                        140,
                     )
-                    .style(|s| s.width_full())
+                    .style(|s| s.width(conn_field_w()))
                     .into_any(),
+                    SshAuth::KeyPair => key_pair_fields(draft, ring_creds.clone(), 140).into_any(),
+                    SshAuth::Agent => form_hint(tr!("connections-ssh-agent-hint"))
+                        .style(|s| s.width_full())
+                        .into_any(),
                 },
             )
             .style(|s| s.width_full());
@@ -1441,9 +1442,9 @@ fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             v_stack((
                 v_stack((
                     host_port_row(
-                        "SSH host",
+                        tr!("connections-ssh-host"),
                         draft.ssh_host,
-                        "SSH port",
+                        tr!("connections-ssh-port"),
                         draft.ssh_port,
                         ring.clone(),
                         100,
@@ -1451,8 +1452,13 @@ fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                     ssh_config_hint(draft),
                 ))
                 .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full()),
-                field("SSH user", draft.ssh_user, ring.clone(), 120)
-                    .style(|s| s.width(conn_field_w())),
+                field(
+                    tr!("connections-ssh-user"),
+                    draft.ssh_user,
+                    ring.clone(),
+                    120,
+                )
+                .style(|s| s.width(conn_field_w())),
                 jump_hosts_field(draft, ring.clone(), 125),
                 auth_field,
                 auth_creds,
@@ -1497,12 +1503,14 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // puts it and where every other client shows it. 65: the gap the surrounding
     // indices were spaced out to leave.
     let database_field = v_stack((
-        field("Database", draft.database, ring.clone(), 65).style(|s| s.width(conn_field_w())),
-        form_hint(
-            "Optional, and the database the connection opens in. Some hosted \
-             providers allow only their own and refuse a connection that does \
-             not name it.",
-        ),
+        field(
+            tr!("connections-database"),
+            draft.database,
+            ring.clone(),
+            65,
+        )
+        .style(|s| s.width(conn_field_w())),
+        form_hint(tr!("connections-database-hint")),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
@@ -1529,27 +1537,15 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         AuthMode::Windows => form_hint(windows_sign_in_hint())
             .style(|s| s.width_full())
             .into_any(),
-        AuthMode::AzureCli => form_hint(
-            "Signs in as whoever is signed in to the Azure CLI (run `az login` first). \
-             The token is fetched when a connection needs one and never saved.",
-        )
-        .style(|s| s.width_full())
-        .into_any(),
-        AuthMode::AwsIam => form_hint(
-            "Signs in as the user below with a token from the AWS CLI's credentials \
-             (`aws configure` or `aws sso login` first). The user needs the rds_iam role \
-             (PostgreSQL) or the AWSAuthenticationPlugin (MySQL). The token is fetched when a \
-             connection needs one and never saved.",
-        )
-        .style(|s| s.width_full())
-        .into_any(),
-        AuthMode::GcpIam => form_hint(
-            "Signs in as the user below — the IAM user or service account Cloud SQL knows — \
-             with a token from the Google Cloud CLI (`gcloud auth login` first). The token is \
-             fetched when a connection needs one and never saved.",
-        )
-        .style(|s| s.width_full())
-        .into_any(),
+        AuthMode::AzureCli => form_hint(tr!("connections-azure-cli-hint"))
+            .style(|s| s.width_full())
+            .into_any(),
+        AuthMode::AwsIam => form_hint(tr!("connections-aws-iam-hint"))
+            .style(|s| s.width_full())
+            .into_any(),
+        AuthMode::GcpIam => form_hint(tr!("connections-gcp-iam-hint"))
+            .style(|s| s.width_full())
+            .into_any(),
     })
     // Collapsed on a password, or its empty box would add the stack's 6px
     // under the dropdown.
@@ -1559,7 +1555,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     });
     let auth_picker = if modes.len() > 1 {
         v_stack((
-            text("Authentication").style(form_label_style),
+            text(tr!("connections-authentication")).style(form_label_style),
             focusable_dropdown(draft.auth, modes.clone(), AuthMode::label, ring.clone(), 68)
                 .style(|s| s.width(theme::scaled(240.0))),
             sign_in_hint,
@@ -1586,14 +1582,20 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             return crate::widgets::nothing();
         }
         let password_row = if password {
-            masked_field("Password", draft.password, ring_creds.clone(), 80)
-                .style(|s| s.width(conn_field_w()))
-                .into_any()
+            masked_field(
+                tr!("connections-password"),
+                draft.password,
+                ring_creds.clone(),
+                80,
+            )
+            .style(|s| s.width(conn_field_w()))
+            .into_any()
         } else {
             crate::widgets::nothing()
         };
         v_stack((
-            field("User", draft.user, ring_creds.clone(), 70).style(|s| s.width(conn_field_w())),
+            field(tr!("connections-user"), draft.user, ring_creds.clone(), 70)
+                .style(|s| s.width(conn_field_w())),
             password_row,
         ))
         .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
@@ -1620,7 +1622,14 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
 
     v_stack((
         v_stack((
-            host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
+            host_port_row(
+                tr!("connections-host"),
+                draft.host,
+                tr!("connections-port"),
+                draft.port,
+                ring.clone(),
+                60,
+            ),
             instance_note,
         ))
         .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full()),
@@ -1654,14 +1663,23 @@ fn conn_statement_timeout_label(v: Option<u64>) -> String {
 /// which is the one SSPI hands the server. From the environment Windows sets
 /// for every process; without it, the sentence says so generically.
 fn windows_sign_in_hint() -> String {
-    let who = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
-        (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!(" ({d}\\{u})"),
-        _ => String::new(),
-    };
-    format!(
-        "Signs in as the Windows account Schemaic runs as{who}. The server must know that \
-         account as a Windows login."
+    windows_sign_in_hint_for(
+        std::env::var("USERDOMAIN").ok().as_deref(),
+        std::env::var("USERNAME").ok().as_deref(),
     )
+}
+
+/// [`windows_sign_in_hint`]'s sentence for a given domain and user — two whole
+/// messages, one naming the account and one not, rather than an account
+/// spliced into one.
+fn windows_sign_in_hint_for(domain: Option<&str>, user: Option<&str>) -> String {
+    match (domain, user) {
+        (Some(d), Some(u)) if !d.is_empty() && !u.is_empty() => tr!(
+            "connections-windows-hint-named",
+            account = format!("{d}\\{u}")
+        ),
+        _ => tr!("connections-windows-hint"),
+    }
 }
 
 /// The half of the form a **SQLite** connection has instead: one path, and a
@@ -1679,18 +1697,13 @@ fn sqlite_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // second copy of `path_field` until GitHub #19 moved the button in.
     v_stack((
         path_field(
-            "Database file",
+            tr!("connections-database-file"),
             draft.file,
-            "Select SQLite database",
+            tr!("connections-database-file-dialog"),
             ring,
             60,
         ),
-        form_hint(
-            "A SQLite database is a single file, so there is no server to reach — \
-             no host, user, password or tunnel. Manual transactions aren't \
-             available on one yet: statements commit as they are sent.",
-        )
-        .style(|s| s.width_full()),
+        form_hint(tr!("connections-sqlite-hint")).style(|s| s.width_full()),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
@@ -1835,7 +1848,7 @@ fn conn_form(
                 return widgets::nothing();
             }
             v_stack((
-                widgets::form_section_header("Network"),
+                widgets::form_section_header(tr!("connections-section-network")),
                 network_fields(draft, ring_network.clone()),
             ))
             .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
@@ -1848,16 +1861,16 @@ fn conn_form(
     // query+results editor (a guard-rail for e.g. production connections). Uses
     // the same themed switch as the AI/terminal settings toggles.
     let prominent_toggle = focusable_toggle_row(
-        "Prominent colour in editor",
-        "Frame the query editor in this connection's colour.",
+        tr!("connections-prominent-colour"),
+        tr!("connections-prominent-colour-hint"),
         draft.prominent_color,
         ring.clone(),
         20,
     );
     // Read-only guard-rail: disables cell edits and blocks write/DDL queries.
     let read_only_toggle = focusable_toggle_row(
-        "Read-only",
-        "Disable cell edits and block write/DDL queries on this connection.",
+        tr!("connections-read-only"),
+        tr!("connections-read-only-hint"),
         draft.read_only,
         ring.clone(),
         30,
@@ -1869,15 +1882,15 @@ fn conn_form(
     // exposure is granted one connection at a time and never inherited. The
     // hint names the agents because this is their consent switch too.
     let cli_access_toggle = focusable_toggle_row(
-        "CLI access",
-        "Let the schemaic command line, and AI agents through schemaic mcp, use this connection.",
+        tr!("connections-cli-access"),
+        tr!("connections-cli-access-hint"),
         draft.cli_access,
         ring.clone(),
         33,
     );
 
     let type_field = v_stack((
-        text("Type").style(form_label_style),
+        text(tr!("connections-type")).style(form_label_style),
         // 150px wide (not full width), matching the settings dropdowns' look.
         container(focusable_dropdown(
             engine,
@@ -1901,7 +1914,7 @@ fn conn_form(
     // read data" is choosable without knowing that the last two send rows off
     // this machine, so the sentence says so.
     let ai_data_field = v_stack((
-        text("AI data access").style(form_label_style),
+        text(tr!("connections-ai-data-access")).style(form_label_style),
         container(focusable_dropdown(
             draft.ai_data,
             AiData::ALL,
@@ -1925,7 +1938,7 @@ fn conn_form(
     // Query). The app's choices plus "follow the app", which leads because it
     // is what every connection saved before the field did.
     let timeout_field = v_stack((
-        text("Statement timeout").style(form_label_style),
+        text(tr!("connections-statement-timeout")).style(form_label_style),
         container(focusable_dropdown(
             draft.statement_timeout,
             CONN_STATEMENT_TIMEOUTS,
@@ -1935,7 +1948,7 @@ fn conn_form(
             37,
         ))
         .style(|s| s.width(theme::scaled(200.0))),
-        text("Cancels a statement on this connection that runs longer.").style(|s| {
+        text(tr!("connections-statement-timeout-hint")).style(|s| {
             s.width_full()
                 .font_size(theme::font_hint())
                 .color(theme::text_muted())
@@ -1952,7 +1965,7 @@ fn conn_form(
     // before the tunnel (90).
     let init_ring = ring.clone();
     let init_field = v_stack((
-        text("Init SQL").style(form_label_style),
+        text(tr!("connections-init-sql")).style(form_label_style),
         dyn_container(
             move || SqlDialect::from_db_type(&draft.db_type.get()),
             move |dialect| {
@@ -1980,12 +1993,9 @@ fn conn_form(
                 .with(|sql| match schemaic_core::init_sql::check(sql, dialect) {
                     Err(why) => why,
                     Ok(_) if schemaic_core::init_sql::settings_are_pragmas(dialect) => {
-                        "Optional. PRAGMA settings run on every connection Schemaic opens."
-                            .to_string()
+                        tr!("connections-init-sql-pragma-hint")
                     }
-                    Ok(_) => "Optional. SET statements run on every connection Schemaic \
-                              opens — a search path, a time zone, a role."
-                        .to_string(),
+                    Ok(_) => tr!("connections-init-sql-set-hint"),
                 })
         })
         .style(move |s| {
@@ -2003,7 +2013,7 @@ fn conn_form(
 
     // Environment picker → the top-bar badge. Defaults to None (no badge).
     let env_field = v_stack((
-        text("Environment").style(form_label_style),
+        text(tr!("connections-environment")).style(form_label_style),
         container(focusable_dropdown(
             draft.environment,
             Environment::ALL,
@@ -2024,7 +2034,7 @@ fn conn_form(
     // default name (`FieldCfg::caret_end`).
     let focus_pulse = RwSignal::new(0u64);
     let name_field = v_stack((
-        text("Name").style(form_label_style),
+        text(tr!("connections-name")).style(form_label_style),
         edit_field(
             draft.name,
             FieldCfg {
@@ -2077,7 +2087,7 @@ fn conn_form(
     // × is the visible way back to "no folder", which an empty box otherwise
     // only implies.
     let folder_field = v_stack((
-        text("Folder").style(form_label_style),
+        text(tr!("connections-folder")).style(form_label_style),
         suggest_field(
             overlay,
             draft.folder,
@@ -2087,11 +2097,11 @@ fn conn_form(
             },
             conn_field_w,
             move || connections.with_untracked(|cs| folder_names(cs)),
-            "No folders yet",
+            tr!("connections-no-folders"),
             ring.clone(),
             17,
         ),
-        text("Optional. Connections with the same folder are listed together.").style(|s| {
+        text(tr!("connections-folder-hint")).style(|s| {
             s.width_full()
                 .font_size(theme::font_hint())
                 .color(theme::text_muted())
@@ -2127,13 +2137,13 @@ fn conn_form(
     // the fields keep the form's 20.
     let section = |s: floem::style::Style| s.flex_col().gap(theme::scaled(20.0)).width_full();
     let general = v_stack((
-        widgets::form_section_header("General"),
+        widgets::form_section_header(tr!("connections-section-general")),
         name_color,
         folder_field,
     ))
     .style(section);
     let safeguards = v_stack((
-        widgets::form_section_header("Safeguards"),
+        widgets::form_section_header(tr!("connections-section-safeguards")),
         prominent_toggle,
         read_only_toggle,
         cli_access_toggle,
@@ -2142,7 +2152,7 @@ fn conn_form(
     ))
     .style(section);
     let database = v_stack((
-        widgets::form_section_header("Database"),
+        widgets::form_section_header(tr!("connections-section-database")),
         env_field,
         type_field,
         engine_block,
@@ -2170,7 +2180,7 @@ fn conn_form(
             Some(cid) => {
                 let del = del.clone();
                 action_button_icon(
-                    "Delete",
+                    tr!("connections-delete"),
                     icons::TRASH_2,
                     ActionKind::Danger,
                     true,
@@ -2188,7 +2198,7 @@ fn conn_form(
     // the test is going is said by the status line beside it (`test_status`).
     let test = test_conn.clone();
     let test_btn = action_button(
-        "Test",
+        tr!("connections-test"),
         ActionKind::Neutral,
         true,
         ring.clone(),
@@ -2201,8 +2211,10 @@ fn conn_form(
     // `save_gen` is Save's counterpart to `test_gen`, for the identical reason.
     let save_gen: RwSignal<u64> = RwSignal::new(0);
     let save = save_conn.clone();
+    let save_label = tr!("connections-save");
+    let save_text = save_label.clone();
     let save_btn = action_face(
-        "Save",
+        &save_label,
         ActionKind::Primary,
         true,
         ring.clone(),
@@ -2213,7 +2225,7 @@ fn conn_form(
                 if flashed {
                     icons::icon(icons::CHECK, 16.0).into_any()
                 } else {
-                    text("Save")
+                    text(save_text.clone())
                         .style(move |s| s.font_size(theme::font_body()))
                         .into_any()
                 }
@@ -2279,7 +2291,9 @@ fn conn_form(
                 words
                     .tooltip(move || {
                         let full = conn_test.with_untracked(|st| {
-                            st.failure().unwrap_or("Connection failed").to_string()
+                            st.failure()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| tr!("connections-test-failed"))
                         });
                         text(full).style(|s| s.max_width(theme::scaled(420.0)))
                     })
@@ -2326,8 +2340,26 @@ fn conn_form(
 
 #[cfg(test)]
 mod tests {
-    use super::{MaskRun, mask_of_len, preset_cursor, runs_of_delta, splice_real};
+    use super::{
+        MaskRun, mask_of_len, preset_cursor, runs_of_delta, splice_real, windows_sign_in_hint_for,
+    };
     use floem::views::editor::core::xi_rope::{Interval, Rope, RopeDelta};
+
+    /// The one sentence this file composes, read as it did in English before
+    /// the catalogue: with the account in brackets, and without it when either
+    /// half is missing or blank.
+    #[test]
+    fn the_windows_sign_in_hint_reads_as_it_did_in_english() {
+        assert_eq!(
+            windows_sign_in_hint_for(Some("CORP"), Some("ada")),
+            "Signs in as the Windows account Schemaic runs as (CORP\\ada). The server must \
+             know that account as a Windows login."
+        );
+        let bare = "Signs in as the Windows account Schemaic runs as. The server must know that \
+                    account as a Windows login.";
+        assert_eq!(windows_sign_in_hint_for(None, Some("ada")), bare);
+        assert_eq!(windows_sign_in_hint_for(Some("CORP"), Some("")), bare);
+    }
 
     /// One edit of the masked buffer, driven through the **whole** path the
     /// widget uses: a real `RopeDelta` of the shape floem hands to

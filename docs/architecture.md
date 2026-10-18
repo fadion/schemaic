@@ -25935,6 +25935,25 @@ existing prose was left alone.
     dialled, and the note says how to skip the Browser — the bare host and the instance's own port.
     The label is **hidden**, not merely empty, when the note is `None`: an empty label still takes
     a line and the column's gap.
+    **Its words are the catalogue's** (`connections-*`, roadmap phase 3) — the title (through
+    `modal_title_owned`), the list's New/Import/Export rows and its right-click Duplicate/Delete,
+    the footer's Delete/Test/Save, the four section headings, every field label, toggle and hint,
+    the five file pickers' window titles (`connections-*-dialog`) and the *Browse…* inside a path
+    field (`connections-browse`); the failed Test's tooltip falls back to `connections-test-failed`.
+    `field` and `masked_field` take their label as `impl Into<String>`, `host_port_row` and
+    `path_field` as `String` — `path_field` clones the dialog title into its Browse closure — and
+    Save's flash face reads the translated label for its pinned width as well as its text. The
+    Windows sign-in hint is two whole messages, `connections-windows-hint-named` with `$account`
+    (`DOMAIN\user`) and `connections-windows-hint` without: `windows_sign_in_hint` reads the
+    environment and `windows_sign_in_hint_for(domain, user)` composes, which is what
+    `the_windows_sign_in_hint_reads_as_it_did_in_english` pins. What stays English: the Type
+    picker's engine names (`DbKind::label`), which are product names and are also what is persisted
+    as `Connection::db_type` and read by `default_port`/`is_networked`; the samples
+    `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules' words —
+    `SslMode`, `SshAuth`, `AuthMode`, `AiData` and `Environment`'s labels and notes,
+    `statement_timeout_choice_label`, `read_only_caveat`, `named_instance_port_note`,
+    `ssh_config::describe_route`, `SshTunnel::route`'s error, `init_sql::check`'s refusal (core's
+    prose, phase 4) and `lib.rs`'s `TestLine::text`.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import connections" — it was
     "Import from another client", which misled once the modal read Schemaic's own exports and
@@ -40064,8 +40083,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`compare_view.rs`), the routine editor (`routine_editor.rs`), the event editor
   (`event_editor.rs`), the trigger editor (`trigger_editor.rs`), the object editor
   (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
-  grant forms (`account_editor.rs`) and the table designer (`table_designer.rs`) are converted;
-  every other
+  grant forms (`account_editor.rs`), the table designer (`table_designer.rs`) and Manage
+  Connections (`connection_form.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
