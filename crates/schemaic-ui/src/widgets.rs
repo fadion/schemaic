@@ -1878,12 +1878,12 @@ pub(crate) fn transition_text(
 /// `field_border`), so it sits beside the panel's search box as a control of
 /// the same family. Only the inactive tabs answer a hover, and only by
 /// brightening their text: the active one is already where a click would go.
-pub(crate) fn segmented_tabs<T: Copy + PartialEq + 'static>(
-    tabs: Vec<(&'static str, T)>,
+pub(crate) fn segmented_tabs<L: Into<String>, T: Copy + PartialEq + 'static>(
+    tabs: Vec<(L, T)>,
     current: RwSignal<T>,
 ) -> impl IntoView {
     h_stack_from_iter(tabs.into_iter().map(|(label, which)| {
-        container(text(label))
+        container(text(label.into()))
             .on_click_stop(move |_| {
                 if current.get_untracked() != which {
                     current.set(which);

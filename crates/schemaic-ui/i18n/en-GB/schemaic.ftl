@@ -481,3 +481,65 @@ kind-group-synonym = Synonyms
 kind-group-alias-type = Alias types
 kind-group-xml-schema-collection = XML schema collections
 kind-group-extension = Extensions
+
+## Query history panel
+
+history-title = QUERY HISTORY
+history-clear-tip = Clear this connection's history…
+history-clear-title = Clear query history
+history-clear-message = Delete { $n } recorded { $n ->
+    [one] query
+   *[other] queries
+} for this connection? This can't be undone.
+history-scope-current = Current
+history-scope-all = All
+# Above the list when the cap left rows out; $shown rows of $matched.
+history-cut-note = Showing the newest { $shown } of { $matched } — search to narrow.
+history-empty = No queries yet.
+history-no-match = No matching queries.
+history-open-in-new-tab = Open in new tab
+history-delete = Delete
+history-failed = Failed
+
+## Snippet library panel
+
+snippets-title = SNIPPET LIBRARY
+snippets-save-tip = Save the editor's SQL as a snippet
+snippets-no-match = No snippet matches.
+snippets-band-this-connection = THIS CONNECTION
+snippets-band-all-connections = ALL CONNECTIONS
+snippets-builtin = Built-in
+snippets-name-placeholder = Snippet name
+snippets-insert = Insert into editor
+snippets-open-in-new-tab = Open in new tab
+snippets-edit = Edit
+snippets-duplicate = Duplicate
+snippets-delete = Delete
+snippets-show-in = Show in
+snippets-scope-this-connection = This connection
+# $engine is the product's name (MySQL, PostgreSQL).
+snippets-scope-engine = Every { $engine } connection
+snippets-scope-all-connections = All connections
+
+## Query history panel › recency bands (core's history::Bucket words)
+
+history-band-today = TODAY
+history-band-this-week = THIS WEEK
+history-band-earlier = EARLIER
+
+## Query tab strip
+
+# A file tab's tooltip when its text differs from the file on disk.
+tabs-tip-unsaved = { $path } — unsaved changes
+tabs-pin = Pin
+tabs-unpin = Unpin
+tabs-rename = Rename
+tabs-duplicate = Duplicate
+tabs-close = Close
+tabs-open-file = Open file
+tabs-save = Save
+tabs-save-as = Save as
+tabs-reload = Reload from disk
+tabs-reopen-last = Reopen last tab
+tabs-close-others = Close other tabs
+tabs-close-all = Close all tabs

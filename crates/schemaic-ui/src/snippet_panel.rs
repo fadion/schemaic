@@ -24,6 +24,7 @@ use schemaic_core::snippet::{self, Bucket, Snippet, Source};
 use schemaic_core::intel::SqlDialect;
 
 use crate::consts::{MONO_FAMILY, SEARCH_DEBOUNCE_MS};
+use crate::i18n::tr;
 use crate::theme::{font_body, font_label};
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
@@ -150,9 +151,9 @@ pub(crate) fn snippet_panel(
             renaming.set(Some(id));
         },
     )
-    .tooltip(|| text("Save the editor's SQL as a snippet").style(crate::widgets::tooltip_style));
+    .tooltip(|| text(tr!("snippets-save-tip")).style(crate::widgets::tooltip_style));
 
-    let title_row = h_stack((section_title("SNIPPET LIBRARY"), plus))
+    let title_row = h_stack((section_title(tr!("snippets-title")), plus))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
     v_stack((
@@ -186,7 +187,7 @@ fn snippet_search(filter: RwSignal<String>) -> impl IntoView {
 /// mean the filter matched nothing. There is no "library is empty" state to
 /// write: `snippet::library` always has the pack in it.
 fn empty_state() -> impl IntoView {
-    container(text("No snippet matches.").style(|s| {
+    container(text(tr!("snippets-no-match")).style(|s| {
         s.font_size(font_label())
             .color(theme::text_faint())
             .padding_horiz(theme::scaled(12.0))
@@ -206,9 +207,10 @@ fn group_title(bucket: Bucket) -> String {
         // Named for what it *means* rather than for the connection: the panel is
         // already scoped to the active connection, and repeating its name here
         // says nothing the header above the panel doesn't.
-        Bucket::Conn(_) => "THIS CONNECTION".to_string(),
+        Bucket::Conn(_) => tr!("snippets-band-this-connection"),
+        // A product name, never translated.
         Bucket::Dialect(d) => d.engine_label().to_uppercase(),
-        Bucket::Global => "ALL CONNECTIONS".to_string(),
+        Bucket::Global => tr!("snippets-band-all-connections"),
     }
 }
 
@@ -238,7 +240,7 @@ fn snippet_row(
     // last used, or `Built-in` for a shipped snippet, which has no "last used"
     // worth showing on a row nobody has touched.
     let right = match (snip.source, snip.last_used) {
-        (Source::Builtin, _) => "Built-in".to_string(),
+        (Source::Builtin, _) => tr!("snippets-builtin"),
         (_, Some(ts)) => schemaic_core::history::relative_time(ts, now_millis()),
         (_, None) => String::new(),
     };
@@ -299,7 +301,7 @@ fn snippet_row(
             edit_field(
                 rename_buf,
                 FieldCfg {
-                    placeholder: "Snippet name",
+                    placeholder_of: Some(Rc::new(|| tr!("snippets-name-placeholder"))),
                     autofocus: true,
                     on_submit: Some(commit.clone()),
                     on_blur: Some(commit),
@@ -487,17 +489,25 @@ fn row_menu(
     let remove = actions.remove.clone();
 
     let mut entries = vec![
-        MenuEntry::action("Insert into editor", move || (insert)(insert_snip.clone())),
-        MenuEntry::action("Open in new tab", move || (open)(open_snip.clone())),
+        MenuEntry::action(tr!("snippets-insert"), move || {
+            (insert)(insert_snip.clone())
+        }),
+        MenuEntry::action(tr!("snippets-open-in-new-tab"), move || {
+            (open)(open_snip.clone())
+        }),
     ];
     if !builtin {
-        entries.push(MenuEntry::action("Edit", move || (edit)(id)));
+        entries.push(MenuEntry::action(tr!("snippets-edit"), move || (edit)(id)));
         entries.push(scope_menu(snip, actions, dialect, conn_id));
     }
-    entries.push(MenuEntry::action("Duplicate", move || (duplicate)(id)));
+    entries.push(MenuEntry::action(tr!("snippets-duplicate"), move || {
+        (duplicate)(id)
+    }));
     if !builtin {
         entries.push(MenuEntry::Separator);
-        entries.push(MenuEntry::action("Delete", move || (remove)(id)));
+        entries.push(MenuEntry::action(tr!("snippets-delete"), move || {
+            (remove)(id)
+        }));
     }
     entries
 }
@@ -527,9 +537,11 @@ fn scope_menu(
                 // Not the connection's *name*: the panel is already scoped to
                 // the active connection, and the band this choice moves the row
                 // to says "THIS CONNECTION" too.
-                snippet::Scope::Conn(_) => "This connection".to_string(),
-                snippet::Scope::Dialect(d) => format!("Every {} connection", d.engine_label()),
-                _ => "All connections".to_string(),
+                snippet::Scope::Conn(_) => tr!("snippets-scope-this-connection"),
+                snippet::Scope::Dialect(d) => {
+                    tr!("snippets-scope-engine", engine = d.engine_label())
+                }
+                _ => tr!("snippets-scope-all-connections"),
             };
             let held = scope == current;
             let set_scope = actions.set_scope.clone();
@@ -541,7 +553,7 @@ fn scope_menu(
             }
         })
         .collect();
-    MenuEntry::sub("Show in", children)
+    MenuEntry::sub(tr!("snippets-show-in"), children)
 }
 
 /// Current wall-clock time, unix millis — for the "3d ago" label, exactly as the

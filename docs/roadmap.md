@@ -77,7 +77,8 @@ assertions pin English wording — stays the regression net throughout.
    `pub(crate)` to `schemaic-ui`; the app's first converted file decides how it reaches the
    loader.
 
-   **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`, `schema_tree.rs`. A palette
+   **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`, `schema_tree.rs`,
+   `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`. A palette
    command's typed name is its translated label lowercased, and its English name
    (`Command::id`) matches in every language too, as VS Code's translated palette does. Shared
    words live under `dialog-*` (Cancel, Yes, No), and the schema tree's menus and panel under
@@ -112,7 +113,7 @@ assertions pin English wording — stays the regression net throughout.
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
-   `ObjectKind`; `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
+   `ObjectKind` and `history::Bucket` (`history_panel::bucket_title`); `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
    like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

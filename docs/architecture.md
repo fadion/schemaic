@@ -24626,7 +24626,8 @@ existing prose was left alone.
     brightens them to `text`. Server Activity's *Sessions | Locks* was its first caller, replacing the
     row of accent-underlined labels it drew before, and Query History's *Current | All* the second,
     replacing an unlabelled icon toggle; `pill_tab_style`'s loose pills stay the look of
-    a modal's section strip.
+    a modal's section strip. A label is any `L: Into<String>` rather than the `&'static str` it
+    was, so Query History's `tr!` labels pass as readily as Server Activity's literals.
     **There is no `footer_button` any more.** Every modal with a footer bar wears the filled
     `action_button`, and the text-only button that sat beside it at a smaller padding left with the
     last of those footers. The rest of that family went with GitHub #25: `dialog_button` (over a
@@ -26109,7 +26110,8 @@ existing prose was left alone.
     two connections that both have no history yield the same empty `visible`, and without it the
     rows would stay built with the previous engine's lexer.
     **A *Current | All* switch under the title lifts that filter** — `widgets::segmented_tabs(
-    vec![("Current", false), ("All", true)], …)` on `HistoryUi::all_conns`, persisted as
+    vec![(tr!("history-scope-current"), false), (tr!("history-scope-all"), true)], …)` on
+    `HistoryUi::all_conns`, persisted as
     `UiState::history_all_connections`, with the activity panel's Sessions/Locks spacing exactly
     (`scaled(12)` side padding, `scaled(4)` from the title, `scaled(10)` spacers either side of the
     search box). It replaced a `widgets::toggle_icon(icons::DATABASE, …)` beside the trash: an
@@ -26129,10 +26131,14 @@ existing prose was left alone.
     — so *All* left on never widens what a click deletes. Opening another connection's row
     switches to it first (`open_history`, in *app/main.rs*'s `app_view` — `history_store.rs` says
     why it is not there).
-    Its TODAY / THIS WEEK / EARLIER bands (`history::group_by_recency`, titled by `bucket.label()`)
-    are laid out by `widgets::banded_list`, so their headers stick while their rows scroll. The
-    `viewport` signal that list reads is created at panel level, outside that `dyn_container`: it
-    belongs to the scroll, which outlives every rebuild of the rows, and the scroll publishes into
+    Its TODAY / THIS WEEK / EARLIER bands (`history::group_by_recency`) are titled by
+    `bucket_title(bucket)` — `history::Bucket::label`'s word in the interface's language
+    (`history-band-*`), drawn here rather than translated from core's, which stays English;
+    `english_titles_every_band_as_core_does` holds English equal to core's. That test lists the
+    three variants by hand, so a new `Bucket` is caught by `bucket_title`'s exhaustive `match`, not
+    by it. The bands are laid out by `widgets::banded_list`, so their headers stick while their
+    rows scroll. The `viewport` signal that list reads is created at panel level, outside that
+    `dyn_container`: it belongs to the scroll, which outlives every rebuild of the rows, and the scroll publishes into
     it through `autohide_tracking`.
     **A row's right-click menu takes the snippet library's route exactly** —
     `menus.close_except(Some(MenuId::Popup))`, `popup_anchor` cleared so the panel opens at the
@@ -39834,7 +39840,8 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
   value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). The Settings modal
   (`settings.rs`), the shortcut table it draws (`shortcuts.rs`), the popups of `overlays.rs` and
-  the schema panel (`schema_tree.rs`) are converted; every other
+  the schema panel (`schema_tree.rs`), Query History (`history_panel.rs`), the snippet library
+  (`snippet_panel.rs`) and the tab strip's menu and tooltip (`tabs.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -39853,9 +39860,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     to (`settings-language-restart`). A translation lives beside it at `i18n/<tag>/schemaic.ftl` and falls back to `en-GB` message
     by message.
   - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
-    core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label` —
+    core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
+    and `history_panel::bucket_title` for `history::Bucket::label` —
     with a test holding its English equal to core's for every variant
-    (`english_names_every_object_kind_as_core_does`). Core's own stays English for the CLI, the
+    (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`).
+    Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.
   - **Isolation marks are off**, set after every catalogue load, because Fluent's default

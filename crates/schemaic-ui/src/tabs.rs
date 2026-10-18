@@ -12,6 +12,7 @@ use floem::reactive::create_effect;
 use floem::style::TextOverflow;
 
 use crate::consts::{chat_pad_h, tab_bar_h, tab_max_w};
+use crate::i18n::tr;
 use crate::tooltip::TooltipExt;
 use crate::widgets::{MenuEntry, measure_text_px, wheel_hscroll};
 use crate::{
@@ -302,7 +303,7 @@ fn tab_chip(
             // screen does. (`modified` implies a path — `Tab::modified` is false
             // without one — so there is no unsaved-but-pathless arm to write.)
             let tip = match (path, truncated, modified) {
-                (Some(p), _, true) => Some(format!("{p} — unsaved changes")),
+                (Some(p), _, true) => Some(tr!("tabs-tip-unsaved", path = p)),
                 (Some(p), _, false) => Some(p),
                 (None, true, _) => Some(title),
                 (None, false, _) => None,
@@ -411,28 +412,37 @@ fn tab_chip(
             overlay.popup_anchor.set(None);
             let pinned = tab.pinned.get_untracked();
             let mut entries = vec![
-                MenuEntry::action(if pinned { "Unpin" } else { "Pin" }, {
-                    let toggle = toggle_pin.clone();
-                    move || (toggle)(tab.id)
-                }),
+                MenuEntry::action(
+                    if pinned {
+                        tr!("tabs-unpin")
+                    } else {
+                        tr!("tabs-pin")
+                    },
+                    {
+                        let toggle = toggle_pin.clone();
+                        move || (toggle)(tab.id)
+                    },
+                ),
                 // Same inline rename the double-click opens — the field carries
                 // its own commit/discard rules, so this only has to seed the
                 // buffer and switch the chip into edit mode. Offered on a pinned
                 // tab too: a name has nothing to do with whether it can close.
-                MenuEntry::action("Rename", move || {
+                MenuEntry::action(tr!("tabs-rename"), move || {
                     if !tab.editing.get_untracked() {
                         tab.edit_buf.set(tab.title());
                         tab.editing.set(true);
                     }
                 }),
-                MenuEntry::action("Duplicate", {
+                MenuEntry::action(tr!("tabs-duplicate"), {
                     let duplicate = duplicate.clone();
                     move || (duplicate)(tab.id)
                 }),
             ];
             if !pinned {
                 let close = close_tab.clone();
-                entries.push(MenuEntry::action("Close", move || (close)(tab.id)));
+                entries.push(MenuEntry::action(tr!("tabs-close"), move || {
+                    (close)(tab.id)
+                }));
             }
             // The `.sql` file group, fenced off on both sides: these are the only
             // entries about a file rather than about the tab, and Ctrl+O is
@@ -443,17 +453,17 @@ fn tab_chip(
             // ("Reopen last tab", "Reload from disk") — this menu doesn't mark the
             // entries that open something, and two of the three that do are the
             // ones the user is least likely to be surprised by.
-            entries.push(MenuEntry::action("Open file", {
+            entries.push(MenuEntry::action(tr!("tabs-open-file"), {
                 let open = open_file.clone();
                 move || (open)()
             }));
             // Save is offered on a tab with no file too — it opens Save as, which
             // is the answer to "save this" there.
-            entries.push(MenuEntry::action("Save", {
+            entries.push(MenuEntry::action(tr!("tabs-save"), {
                 let save = save_file.clone();
                 move || (save)(tab.id)
             }));
-            entries.push(MenuEntry::action("Save as", {
+            entries.push(MenuEntry::action(tr!("tabs-save-as"), {
                 let save_as = save_file_as.clone();
                 move || (save_as)(tab.id)
             }));
@@ -461,7 +471,7 @@ fn tab_chip(
                 // Dimmed rather than hidden on a tab with no file, the way
                 // "Reopen last tab" is when the ring is empty — the menu keeps
                 // one shape and says why an entry is unavailable by looking it.
-                MenuEntry::action("Reload from disk", {
+                MenuEntry::action(tr!("tabs-reload"), {
                     let reload = reload_file.clone();
                     move || (reload)(tab.id)
                 })
@@ -469,7 +479,7 @@ fn tab_chip(
             );
             entries.push(MenuEntry::Separator);
             entries.push(
-                MenuEntry::action("Reopen last tab", {
+                MenuEntry::action(tr!("tabs-reopen-last"), {
                     let reopen = reopen.clone();
                     move || (reopen)()
                 })
@@ -482,7 +492,7 @@ fn tab_chip(
             // pinned tab is already the one that survives everything, so
             // "close the others" is exactly as meaningful there.
             entries.push(
-                MenuEntry::action("Close other tabs", {
+                MenuEntry::action(tr!("tabs-close-others"), {
                     let close_others = close_others.clone();
                     move || (close_others)(tab.id)
                 })
@@ -492,7 +502,7 @@ fn tab_chip(
                 // dimmed for the same kind of reason.
                 .disabled(!(can_close_others)(tab.id)),
             );
-            entries.push(MenuEntry::action("Close all tabs", {
+            entries.push(MenuEntry::action(tr!("tabs-close-all"), {
                 let close_all = close_all.clone();
                 move || (close_all)()
             }));

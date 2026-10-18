@@ -22,6 +22,7 @@ use schemaic_core::history::{self, HistoryEntry};
 use schemaic_core::intel::SqlDialect;
 
 use crate::consts::SEARCH_DEBOUNCE_MS;
+use crate::i18n::tr;
 use crate::theme::{font_body, font_label};
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
@@ -103,10 +104,10 @@ pub(crate) fn history_panel(
     let cut_note = create_memo(move |_| {
         view.with(|v| {
             (v.matched > v.rows.len()).then(|| {
-                format!(
-                    "Showing the newest {} of {} — search to narrow.",
-                    v.rows.len(),
-                    v.matched
+                tr!(
+                    "history-cut-note",
+                    shown = v.rows.len(),
+                    matched = v.matched
                 )
             })
         })
@@ -130,9 +131,9 @@ pub(crate) fn history_panel(
             if rows.is_empty() {
                 // Distinguish "nothing recorded" from "filtered everything out".
                 let msg = if q.trim().is_empty() {
-                    "No queries yet."
+                    tr!("history-empty")
                 } else {
-                    "No matching queries."
+                    tr!("history-no-match")
                 };
                 return text(msg)
                     .style(|s| {
@@ -188,7 +189,7 @@ pub(crate) fn history_panel(
                             .into_any()
                         })
                         .collect::<Vec<_>>();
-                    (bucket.label().to_string(), count, rows)
+                    (bucket_title(bucket), count, rows)
                 })
                 .collect::<Vec<_>>();
             crate::widgets::banded_list(bands, viewport)
@@ -223,11 +224,8 @@ pub(crate) fn history_panel(
             let n = clearable.get_untracked();
             let clear = clear.clone();
             confirm.set(Some(crate::Confirm {
-                title: "Clear query history".to_string(),
-                message: format!(
-                    "Delete {n} recorded {} for this connection? This can't be undone.",
-                    schemaic_core::text::plural(n, "query", "queries")
-                ),
+                title: tr!("history-clear-title"),
+                message: tr!("history-clear-message", n = n),
                 resolve: Rc::new(move |yes| {
                     if yes {
                         (clear)();
@@ -239,8 +237,8 @@ pub(crate) fn history_panel(
     // Named for what it clears: a bare "Clear history" beside a filtered list —
     // or beside every connection's, with *All* on — reads as "all of it", and
     // it only ever clears the active connection's.
-    .tooltip(|| text("Clear this connection's history…").style(crate::widgets::tooltip_style));
-    let title_row = h_stack((section_title("QUERY HISTORY"), trash))
+    .tooltip(|| text(tr!("history-clear-tip")).style(crate::widgets::tooltip_style));
+    let title_row = h_stack((section_title(tr!("history-title")), trash))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
     // *Current* / *All*: the active connection's queries, or every
     // connection's in one list with each row naming its connection. The same
@@ -249,7 +247,10 @@ pub(crate) fn history_panel(
     // tooltip and its confirm say so — so *All* left on can never widen what a
     // click deletes.
     let scope_switch = container(crate::widgets::segmented_tabs(
-        vec![("Current", false), ("All", true)],
+        vec![
+            (tr!("history-scope-current"), false),
+            (tr!("history-scope-all"), true),
+        ],
         all_conns,
     ))
     .style(|s| {
@@ -313,11 +314,15 @@ fn row_menu(
     let (open, open_entry) = (open.clone(), entry.clone());
     let (remove, remove_entry) = (remove.clone(), entry.clone());
     vec![
-        MenuEntry::action("Open in new tab", move || (open)(open_entry.clone())),
+        MenuEntry::action(tr!("history-open-in-new-tab"), move || {
+            (open)(open_entry.clone())
+        }),
         // The separator before the destructive entry, as in the snippet
         // library's row menu.
         MenuEntry::Separator,
-        MenuEntry::action("Delete", move || (remove)(remove_entry.clone())),
+        MenuEntry::action(tr!("history-delete"), move || {
+            (remove)(remove_entry.clone())
+        }),
     ]
 }
 
@@ -459,7 +464,12 @@ fn history_row(
                         .min_width(0.0)
                 }),
                 // Only a failure says anything, and it is the only colour here.
-                text(if failed { "Failed" } else { "" }).style(move |s| {
+                text(if failed {
+                    tr!("history-failed")
+                } else {
+                    String::new()
+                })
+                .style(move |s| {
                     s.font_size(font_label())
                         .color(theme::error())
                         .flex_shrink(0.0_f32)
@@ -507,4 +517,45 @@ fn history_row(
                 .border_color(theme::border())
                 .hover(|s| s.background(theme::row_hover_soft()))
         })
+}
+
+/// A recency band's title — `history::Bucket::label`'s word in the
+/// interface's language. Core's stays English for whatever else reads it; the
+/// test below holds the two equal in English.
+fn bucket_title(bucket: history::Bucket) -> String {
+    match bucket {
+        history::Bucket::Today => tr!("history-band-today"),
+        history::Bucket::ThisWeek => tr!("history-band-this-week"),
+        history::Bucket::Earlier => tr!("history-band-earlier"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::i18n::tr;
+
+    /// English titles the bands exactly as core does.
+    #[test]
+    fn english_titles_every_band_as_core_does() {
+        use schemaic_core::history::Bucket;
+        for b in [Bucket::Today, Bucket::ThisWeek, Bucket::Earlier] {
+            assert_eq!(super::bucket_title(b), b.label(), "{b:?}");
+        }
+    }
+
+    /// **The clear confirmation reads as the sentence it replaced** — a
+    /// `format!` around `text::plural(n, "query", "queries")`, now one message
+    /// with the plural inside, written over several lines of the catalogue.
+    #[test]
+    fn the_clear_confirmation_counts_its_queries() {
+        for n in [1usize, 2, 40] {
+            assert_eq!(
+                tr!("history-clear-message", n = n),
+                format!(
+                    "Delete {n} recorded {} for this connection? This can't be undone.",
+                    schemaic_core::text::plural(n, "query", "queries")
+                )
+            );
+        }
+    }
 }

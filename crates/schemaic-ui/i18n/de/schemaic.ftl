@@ -449,3 +449,62 @@ kind-group-synonym = Synonyme
 kind-group-alias-type = Aliastypen
 kind-group-xml-schema-collection = XML-Schemaauflistungen
 kind-group-extension = Erweiterungen
+
+## Query history panel
+
+history-title = ABFRAGEVERLAUF
+history-clear-tip = Verlauf dieser Verbindung leeren…
+history-clear-title = Abfrageverlauf leeren
+history-clear-message = { $n ->
+    [one] { $n } gespeicherte Abfrage
+   *[other] { $n } gespeicherte Abfragen
+} dieser Verbindung löschen? Das lässt sich nicht rückgängig machen.
+history-scope-current = Aktuell
+history-scope-all = Alle
+history-cut-note = Die neuesten { $shown } von { $matched } – suchen, um einzugrenzen.
+history-empty = Noch keine Abfragen.
+history-no-match = Keine passenden Abfragen.
+history-open-in-new-tab = In neuem Tab öffnen
+history-delete = Löschen
+history-failed = Fehlgeschlagen
+
+## Snippet library panel
+
+snippets-title = SNIPPET-BIBLIOTHEK
+snippets-save-tip = Das SQL im Editor als Snippet speichern
+snippets-no-match = Kein passendes Snippet.
+snippets-band-this-connection = DIESE VERBINDUNG
+snippets-band-all-connections = ALLE VERBINDUNGEN
+snippets-builtin = Mitgeliefert
+snippets-name-placeholder = Name des Snippets
+snippets-insert = In den Editor einfügen
+snippets-open-in-new-tab = In neuem Tab öffnen
+snippets-edit = Bearbeiten
+snippets-duplicate = Duplizieren
+snippets-delete = Löschen
+snippets-show-in = Anzeigen in
+snippets-scope-this-connection = Diese Verbindung
+snippets-scope-engine = Jede { $engine }-Verbindung
+snippets-scope-all-connections = Alle Verbindungen
+
+## Query history panel › recency bands
+
+history-band-today = HEUTE
+history-band-this-week = DIESE WOCHE
+history-band-earlier = FRÜHER
+
+## Query tab strip
+
+tabs-tip-unsaved = { $path } – ungespeicherte Änderungen
+tabs-pin = Anheften
+tabs-unpin = Lösen
+tabs-rename = Umbenennen
+tabs-duplicate = Duplizieren
+tabs-close = Schließen
+tabs-open-file = Datei öffnen
+tabs-save = Speichern
+tabs-save-as = Speichern unter
+tabs-reload = Von der Festplatte neu laden
+tabs-reopen-last = Letzten Tab wieder öffnen
+tabs-close-others = Andere Tabs schließen
+tabs-close-all = Alle Tabs schließen
