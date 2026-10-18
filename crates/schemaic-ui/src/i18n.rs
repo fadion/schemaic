@@ -216,6 +216,24 @@ mod tests {
         assert_eq!(loader(UiLanguage::De).get("settings-language"), "Sprache");
     }
 
+    /// German shortcut labels use the German keyboard's legends — the ones
+    /// `shortcuts`' tests take as their German namer.
+    #[test]
+    fn german_names_keys_by_its_keyboard_legends() {
+        let de = loader(UiLanguage::De);
+        for (id, legend) in [
+            ("key-ctrl", "Strg"),
+            ("key-shift", "Umschalt"),
+            ("key-enter", "Eingabe"),
+            ("key-del", "Entf"),
+            ("key-home", "Pos1"),
+            ("key-end", "Ende"),
+            ("key-space", "Leertaste"),
+        ] {
+            assert_eq!(de.get(id), legend, "{id}");
+        }
+    }
+
     /// The pseudo-locale changes every text piece — so a string left as a
     /// literal is the one that reads plain — and leaves the values put into a
     /// message alone, since those are data and not the interface's words.

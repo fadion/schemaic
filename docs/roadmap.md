@@ -57,8 +57,10 @@ strings table, every user-facing string an English literal at its call site.
 SQL of any kind (generated DDL, dumps, exports, formatted queries); SQL keywords and the plan
 modal's *Analyze*; persisted names (serde keys, `favorites.json` and the other file names);
 `pg_builtins.rs` and `mssql_builtins.rs`, which quote the servers' own text; CLI, MCP and AI text
-as above; key names in shortcut labels (`Ctrl`, `Shift`, `Tab`) unless a platform convention says
-otherwise.
+as above. Key names in shortcut labels follow the language's keyboard legends rather than staying
+English — German reads `Strg`, `Umschalt`, `Entf`, `Eingabe`, `Pos1` — through the catalogue's
+`key-*` messages, which `shortcuts::keys_label` reads key by key; a key printed the same
+everywhere (letters, arrows, `Tab`, `Esc`, `F6`) and macOS's `Cmd` have no message.
 
 ### Phases
 

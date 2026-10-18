@@ -25464,6 +25464,12 @@ existing prose was left alone.
     apart had outgrown the window — and the main Settings modal had it first; both left it when the
     one became two panes and the other a section of it. Settings' panel is a fixed `modal_h(560)`
     and each page, the AI assistant's included, scrolls inside it on its own (above).
+    **A Shortcuts row's description wraps and its keycap pill never does.** `shortcut_row` gives the
+    description `flex_grow(1)` + `min_width(0)`, so a German row longer than the panel breaks onto
+    a second line instead of pushing the pill past the panel's edge, and the pill `flex_shrink(0)`,
+    so a chord like `Strg+Umschalt+C / Strg+Umschalt+V` stays whole; a 12px gap replaced the
+    spacer between them. The panel widened from `modal_w(420)` to `modal_w(460)` for German's
+    longer rows and chords as well — the wrap is for the row that still does not fit.
     **Every word the modal writes itself comes from the catalogue** — the first file roadmap phase
     3 converted: labels, hints, placeholders, section names and the Settings and Shortcuts titles
     are `tr!` over `settings-*`/`shortcuts-*` messages (`ui/i18n.rs`), with German beside them, and
@@ -25536,7 +25542,7 @@ existing prose was left alone.
     cannot name an entry that is not there, and `MenuKey::row` names its `SHORTCUTS` row by group,
     keys **and description** — stronger than `COMMAND_KEYS`' group-and-keys, so a row reworded
     under it fails the test rather than going on vouching for the keycap. `keys()` hands it out through `keys_label`, so it is
-    respelled for macOS like the rest. `every_menu_key_is_the_shortcut_row_it_names` checks each
+    respelled for the platform and the language like the rest. `every_menu_key_is_the_shortcut_row_it_names` checks each
     variant, walking `menu_keys_all()`, which sits beside an exhaustive `_exhaustive` match so a
     new variant fails to compile until it is listed — a list the test walks is only as good as its
     completeness. Palette and menus draw one keycap, `widgets::keycap`.
@@ -25562,7 +25568,23 @@ existing prose was left alone.
     — `PaletteItem::keys` is a `Cow<'static, str>` for exactly that. The tables stay Ctrl-spelled: a
     second Cmd-spelled table would drift, and `every_command_key_is_a_real_shortcut` works by
     comparing the two byte for byte, so respelling at the source would have dissolved that
-    guarantee. **A key label is respelled, never spelled, and that is a source gate** —
+    guarantee. **The interface language is the respelling's second half, applied the same way** —
+    key by key on the way to the screen, never through a translated table, for the reason a Cmd
+    table was refused. `keys_label_on(keys, primary_is_cmd, name)` splits a row into bindings on
+    ` / ` and each binding into keys on `+` — so the `/` in `Ctrl+/`, with no spaces around it, is a
+    key and not a separator — turns `Ctrl` into `Cmd` where Cmd is the primary modifier, and
+    otherwise asks `key_name`, which maps `Ctrl`, `Shift`, `Alt`, `Enter`, `Del`, `Home`, `End` and
+    `Space` to `key-*` catalogue messages. German reads its keyboard's legends (`Strg`, `Umschalt`,
+    `Eingabe`, `Entf`, `Pos1`, `Ende`, `Leertaste`), as its catalogue's own prose does (`Strg+→`
+    in the predictions hint). A key written the same everywhere (a letter, an arrow, `Tab`,
+    `Esc`, an F-key) has no message, and neither has `Cmd`, which is macOS's name in every language
+    and wins over the language's name for Ctrl (`cmd_is_named_before_the_language_is`). It
+    replaced a substring replace of `Ctrl` with `Cmd` that knew nothing of keys. English
+    stays byte-identical, and that is pinned rather than assumed:
+    `english_names_every_key_as_the_table_spells_it` runs every `SHORTCUTS` row through the real
+    namer and expects it back unchanged. Every caller — the modal, the palette, `MenuKey::keys`, the
+    tooltips, the new tab's prompt, the quick-fix hint — takes the language with no change of its
+    own. **A key label is respelled, never spelled, and that is a source gate** —
     `no_view_code_spells_the_primary_modifier_in_a_label`, over both view crates, because the three
     sites that broke it were `&'static str`s in view code that no runtime test reaches. What they
     produced: on macOS the Shortcuts modal, the palette and the ER diagram all said `Cmd+Enter` while
@@ -25579,7 +25601,8 @@ existing prose was left alone.
     working. Off macOS it ignores Meta deliberately, because there it is the Windows/Super key and
     answering to it would take over shortcuts that belong to the desktop
     (`cmd_counts_as_the_primary_modifier_only_where_cmd_is_the_modifier` pins that direction).
-    Both pure halves take the capability as an argument (`keys_label_on`, `primary_from`) so either
+    Both pure halves take the capability as an argument (`keys_label_on`, `primary_from`; the first
+    takes the namer too, so German is testable without switching the catalogue) so either
     platform is testable from whichever one runs the suite — and that is also what makes the blast
     radius provable rather than argued: `primary_from(c, m, false) == c`, so off macOS the whole
     change cannot behave differently, and on macOS it acts on keys that previously did nothing.

@@ -212,3 +212,14 @@ shortcuts-new-line = Neue Zeile
 shortcuts-recall-prompt = Vorherige / nächste Eingabe zurückholen
 shortcuts-copy-paste = Kopieren / Einfügen
 shortcuts-find-in-diagram = Im Diagramm suchen
+
+## Key names in shortcut labels — the German keyboard's legends
+
+key-ctrl = Strg
+key-shift = Umschalt
+key-alt = Alt
+key-enter = Eingabe
+key-del = Entf
+key-home = Pos1
+key-end = Ende
+key-space = Leertaste

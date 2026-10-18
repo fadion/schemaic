@@ -1311,12 +1311,23 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
 
 /// One shortcut line: description on the left, the key combo on the right in a
 /// monospace pill.
+///
+/// **The description wraps and the pill never does.** `flex_grow(1) +
+/// min_width(0)` lets the description shrink below its natural width, so a
+/// German row that runs longer than the modal breaks onto a second line instead
+/// of pushing the pill past the panel's edge; `flex_shrink(0)` keeps a long
+/// chord (`Strg+Umschalt+C / Strg+Umschalt+V`) whole on one line.
 fn shortcut_row(keys: &'static str, desc: String) -> impl IntoView {
     h_stack((
-        text(desc).style(|s| s.color(theme::text()).font_size(theme::font_body())),
-        empty().style(|s| s.flex_grow(1.0_f32).min_width(12.0)),
-        // Respelled for the platform here rather than in the table: one choke
-        // point for every row the modal shows. See `shortcuts::keys_label`.
+        text(desc).style(|s| {
+            s.color(theme::text())
+                .font_size(theme::font_body())
+                .flex_grow(1.0_f32)
+                .min_width(0.0)
+        }),
+        // Respelled for the platform and language here rather than in the
+        // table: one choke point for every row the modal shows. See
+        // `shortcuts::keys_label`.
         text(crate::shortcuts::keys_label(keys)).style(|s| {
             s.color(theme::text_muted())
                 .font_size(theme::font_label())
@@ -1325,12 +1336,14 @@ fn shortcut_row(keys: &'static str, desc: String) -> impl IntoView {
                 .padding_horiz(theme::scaled(6.0))
                 .padding_vert(theme::scaled(2.0))
                 .border_radius(4.0)
+                .flex_shrink(0.0_f32)
         }),
     ))
     .style(|s| {
         s.width_full()
             .flex_row()
             .items_center()
+            .gap(theme::scaled(12.0))
             .padding_vert(theme::scaled(2.0))
     })
 }
@@ -2421,7 +2434,9 @@ pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
             .style(|s| {
                 panel_style(s)
                     .background(theme::bg_panel())
-                    .width(crate::widgets::modal_w(420.0))
+                    // Room for German, whose rows and chords both run longer;
+                    // a row that still does not fit wraps (`shortcut_row`).
+                    .width(crate::widgets::modal_w(460.0))
             });
 
             let esc = close.clone();

@@ -308,22 +308,63 @@ impl MenuKey {
 /// precisely so both platforms stay testable from whichever one runs the suite.
 pub(crate) const PRIMARY_IS_CMD: bool = cfg!(target_os = "macos");
 
-/// A [`SHORTCUTS`] key string as this platform should read it: `Ctrl+K` on
-/// Windows and Linux, `Cmd+K` on macOS.
+/// A [`SHORTCUTS`] key string as this platform and language should read it:
+/// `Ctrl+K` on Windows and Linux, `Cmd+K` on macOS, `Strg+K` in German.
 ///
-/// The tables stay Ctrl-spelled and are rewritten here on the way to the screen.
-/// A second, Cmd-spelled table would be the obvious alternative and is the wrong
-/// one — two tables drift, and the tests that keep the modal and the palette
-/// honest work by comparing them literally.
+/// The tables stay Ctrl-spelled in English and are rewritten here on the way to
+/// the screen. A second, Cmd-spelled table would be the obvious alternative and
+/// is the wrong one — two tables drift, and the tests that keep the modal and
+/// the palette honest work by comparing them literally. The same holds for a
+/// language: its keyboard's legends (`Strg`, `Umschalt`, `Entf`) come from the
+/// catalogue key by key ([`key_name`]), never from a translated table.
 pub(crate) fn keys_label(keys: &'static str) -> Cow<'static, str> {
-    keys_label_on(keys, PRIMARY_IS_CMD)
+    keys_label_on(keys, PRIMARY_IS_CMD, key_name)
 }
 
-fn keys_label_on(keys: &'static str, primary_is_cmd: bool) -> Cow<'static, str> {
-    if primary_is_cmd && keys.contains("Ctrl") {
-        Cow::Owned(keys.replace("Ctrl", "Cmd"))
-    } else {
+/// A named key's legend in the interface's language, or `None` for a key
+/// written the same everywhere (a letter, a digit, an arrow, `Tab`, `Esc`,
+/// `F6`). `Cmd` is not here: it is macOS's name in every language.
+fn key_name(key: &str) -> Option<String> {
+    Some(match key {
+        "Ctrl" => tr!("key-ctrl"),
+        "Shift" => tr!("key-shift"),
+        "Alt" => tr!("key-alt"),
+        "Enter" => tr!("key-enter"),
+        "Del" => tr!("key-del"),
+        "Home" => tr!("key-home"),
+        "End" => tr!("key-end"),
+        "Space" => tr!("key-space"),
+        _ => return None,
+    })
+}
+
+/// [`keys_label`] with the platform and the namer passed in, so both are
+/// testable from whichever machine runs the suite. A row is bindings joined by
+/// ` / `, each a chord of keys joined by `+` — so the `/` in `Ctrl+/`, with no
+/// spaces around it, is a key and not a separator.
+fn keys_label_on(
+    keys: &'static str,
+    primary_is_cmd: bool,
+    name: impl Fn(&str) -> Option<String>,
+) -> Cow<'static, str> {
+    let named = keys
+        .split(" / ")
+        .map(|chord| {
+            chord
+                .split('+')
+                .map(|key| match key {
+                    "Ctrl" if primary_is_cmd => Cow::Borrowed("Cmd"),
+                    _ => name(key).map_or(Cow::Borrowed(key), Cow::Owned),
+                })
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" / ");
+    if named == keys {
         Cow::Borrowed(keys)
+    } else {
+        Cow::Owned(named)
     }
 }
 
@@ -1068,8 +1109,8 @@ mod tests {
     /// go on comparing the two tables byte for byte.
     #[test]
     fn a_key_string_is_respelled_for_cmd_only_where_cmd_is_the_modifier() {
-        assert_eq!(keys_label_on("Ctrl+K", true), "Cmd+K");
-        assert_eq!(keys_label_on("Ctrl+K", false), "Ctrl+K");
+        assert_eq!(keys_label_on("Ctrl+K", true, english), "Cmd+K");
+        assert_eq!(keys_label_on("Ctrl+K", false, english), "Ctrl+K");
     }
 
     #[test]
@@ -1077,18 +1118,91 @@ mod tests {
         // `Ctrl+Home / Ctrl+End` is one row holding two bindings; respelling the
         // head of it and leaving the tail would document a key that isn't there.
         assert_eq!(
-            keys_label_on("Ctrl+Home / Ctrl+End", true),
+            keys_label_on("Ctrl+Home / Ctrl+End", true, english),
             "Cmd+Home / Cmd+End"
         );
-        assert_eq!(keys_label_on("Ctrl+Shift+A", true), "Cmd+Shift+A");
-        assert_eq!(keys_label_on("Ctrl+Alt+L", true), "Cmd+Alt+L");
+        assert_eq!(keys_label_on("Ctrl+Shift+A", true, english), "Cmd+Shift+A");
+        assert_eq!(keys_label_on("Ctrl+Alt+L", true, english), "Cmd+Alt+L");
     }
 
     #[test]
     fn a_row_with_no_ctrl_is_left_exactly_as_it_was() {
         for row in ["Alt+↑ / Alt+↓", "Enter", "F5", "Shift+Tab"] {
-            assert_eq!(keys_label_on(row, true), row);
-            assert_eq!(keys_label_on(row, false), row);
+            assert_eq!(keys_label_on(row, true, english), row);
+            assert_eq!(keys_label_on(row, false, english), row);
+        }
+    }
+
+    /// A namer that knows no key — what English amounts to.
+    fn english(_: &str) -> Option<String> {
+        None
+    }
+
+    /// The German keyboard's legends, as the `de` catalogue writes them.
+    fn german(key: &str) -> Option<String> {
+        let name = match key {
+            "Ctrl" => "Strg",
+            "Shift" => "Umschalt",
+            "Enter" => "Eingabe",
+            "Del" => "Entf",
+            "Home" => "Pos1",
+            "End" => "Ende",
+            "Space" => "Leertaste",
+            _ => return None,
+        };
+        Some(name.to_string())
+    }
+
+    /// **A key is named in the interface's language**, key by key: German
+    /// reads Strg+Umschalt where English reads Ctrl+Shift, and a key with no
+    /// name of its own there (a letter, `Tab`, `/`, an arrow) is left alone —
+    /// including the `/` that is a key in `Ctrl+/` rather than the separator
+    /// between two bindings.
+    #[test]
+    fn every_key_in_a_row_is_named_in_the_interface_language() {
+        assert_eq!(
+            keys_label_on("Ctrl+Shift+Tab", false, german),
+            "Strg+Umschalt+Tab"
+        );
+        assert_eq!(
+            keys_label_on("Ctrl+Home / Ctrl+End", false, german),
+            "Strg+Pos1 / Strg+Ende"
+        );
+        assert_eq!(keys_label_on("Ctrl+/", false, german), "Strg+/");
+        assert_eq!(
+            keys_label_on("Ctrl+Shift+/", false, german),
+            "Strg+Umschalt+/"
+        );
+        assert_eq!(keys_label_on("Del", false, german), "Entf");
+        assert_eq!(keys_label_on("Ctrl+1…9", false, german), "Strg+1…9");
+        assert_eq!(keys_label_on("← / →", false, german), "← / →");
+    }
+
+    /// Cmd is macOS's name for the primary modifier in every language, so it
+    /// wins over the language's name for Ctrl — and the rest of the row is
+    /// still named.
+    #[test]
+    fn cmd_is_named_before_the_language_is() {
+        assert_eq!(
+            keys_label_on("Ctrl+Shift+P", true, german),
+            "Cmd+Umschalt+P"
+        );
+    }
+
+    /// **English output is byte-identical**: the `en-GB` catalogue names every
+    /// key exactly as the table spells it, so every row comes back as it was
+    /// written — the regression net the suite's English assertions rely on.
+    #[test]
+    fn english_names_every_key_as_the_table_spells_it() {
+        for (_, rows) in SHORTCUTS {
+            for (keys, _) in *rows {
+                assert_eq!(keys_label_on(keys, false, super::key_name), *keys);
+            }
+        }
+        for key in [
+            "Ctrl", "Shift", "Alt", "Enter", "Del", "Home", "End", "Space", "Tab",
+        ] {
+            assert_eq!(super::key_name(key).as_deref().unwrap_or(key), key);
         }
     }
 

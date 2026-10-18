@@ -2,8 +2,8 @@
 #
 # Every other language's catalogue falls back to this one message by message.
 # Ids are kebab-case and start with the area they belong to. Spelling is
-# British throughout (AGENTS.md); SQL keywords, persisted names and key names
-# are never put here.
+# British throughout (AGENTS.md); SQL keywords and persisted names are never
+# put here, and a key name only as the `key-*` legends at the end.
 
 ## Settings › Appearance › Language
 
@@ -221,3 +221,17 @@ shortcuts-new-line = New line
 shortcuts-recall-prompt = Recall previous / next prompt
 shortcuts-copy-paste = Copy / paste
 shortcuts-find-in-diagram = Find in the diagram
+
+## Key names in shortcut labels — a keyboard's own legends, so a language
+## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
+## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's
+## Cmd are not here. Read key by key by `shortcuts::keys_label`.
+
+key-ctrl = Ctrl
+key-shift = Shift
+key-alt = Alt
+key-enter = Enter
+key-del = Del
+key-home = Home
+key-end = End
+key-space = Space
