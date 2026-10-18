@@ -676,3 +676,24 @@ outcome-rows = { $n ->
    *[other] { $n } Zeilen
 }
 outcome-rows-capped = { $n }+ Zeilen
+
+## Terminal panel header
+
+term-title = TERMINAL
+term-db-cli-tip = Datenbank-CLI öffnen
+term-db-cli-tip-read-only = Datenbank-CLI öffnen – diese Verbindung ist als schreibgeschützt markiert
+term-restart-tip = Terminal neu starten
+term-settings-tip = Terminal-Einstellungen
+
+## Results panel header
+
+results-title = ERGEBNISSE
+results-properties-tip = Tabelleneigenschaften…
+results-monitor-tip = Live-Überwachung…
+results-restore-editor-tip = Editor wiederherstellen
+results-collapse-editor-tip = Editor einklappen
+
+## Query panel header
+
+query-title = ABFRAGE
+query-no-database = Keine Datenbank

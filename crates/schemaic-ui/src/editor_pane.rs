@@ -8767,7 +8767,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     };
     let db_selector = h_stack((
         dyn_container(shown_db, move |db| {
-            let name = db.unwrap_or_else(|| "No database".to_string());
+            let name = db.unwrap_or_else(|| crate::i18n::tr!("query-no-database"));
             // No `.color(...)` — inherits the h_stack's (hover-reactive) colour.
             text(name)
                 .style(|s| s.font_size(theme::font_title()))
@@ -8842,7 +8842,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // `section_title` (no pane/toolbar padding on the left). The DB selector
     // keeps a 14px right inset, where Run used to sit.
     let toolbar = h_stack((
-        section_title("QUERY"),
+        section_title(crate::i18n::tr!("query-title")),
         empty().style(|s| s.flex_grow(1.0_f32)),
         db_selector,
     ))

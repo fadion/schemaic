@@ -111,6 +111,7 @@ use grid::{
     phase_of, running_view,
 };
 use history_panel::history_panel;
+use i18n::tr;
 pub use schemaic_ai::harness::{Constraint, Harness};
 // The modal overlays are imported by `modals`, which is the only thing that
 // mounts them — the root tuple below carries one entry for the whole layer.
@@ -9613,7 +9614,7 @@ fn results_section(
                 (open_properties)(monitor_conn.get_untracked(), src);
             }
         })
-        .tooltip(|| text("Table properties…").style(widgets::tooltip_style))
+        .tooltip(|| text(tr!("results-properties-tip")).style(widgets::tooltip_style))
     };
     let monitor_btn = {
         let open_monitor = open_monitor.clone();
@@ -9622,25 +9623,25 @@ fn results_section(
                 (open_monitor)(monitor_conn.get_untracked(), src);
             }
         })
-        .tooltip(|| text("Live monitor…").style(widgets::tooltip_style))
+        .tooltip(|| text(tr!("results-monitor-tip")).style(widgets::tooltip_style))
     };
     let toggle_btn = dyn_container(
         move || editor_collapsed.get(),
         move |collapsed| {
             let (markup, tip) = if collapsed {
-                (icons::SHRINK, "Restore the editor")
+                (icons::SHRINK, tr!("results-restore-editor-tip"))
             } else {
-                (icons::EXPAND, "Collapse the editor")
+                (icons::EXPAND, tr!("results-collapse-editor-tip"))
             };
             let t = toggle_collapse.clone();
             toolbar_icon(markup, 5.0, 7.0, || true, move || (t)())
-                .tooltip(move || text(tip).style(widgets::tooltip_style))
+                .tooltip(move || text(tip.clone()).style(widgets::tooltip_style))
                 .into_any()
         },
     );
     let icons_group = h_stack((properties_btn, monitor_btn, toggle_btn))
         .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
-    let title_row = h_stack((section_title("RESULTS"), icons_group))
+    let title_row = h_stack((section_title(tr!("results-title")), icons_group))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
     let panel = v_stack((title_row, body)).style(|s| {
@@ -10521,14 +10522,14 @@ fn terminal_panel(
     )
     .tooltip(move || {
         let t = if cli_read_only.get() {
-            "Open the database CLI — this connection is marked read-only"
+            tr!("term-db-cli-tip-read-only")
         } else {
-            "Open the database CLI"
+            tr!("term-db-cli-tip")
         };
         text(t).style(widgets::tooltip_style)
     });
     let restart_btn = toolbar_icon(icons::REFRESH_CW, 5.0, 2.0, || true, move || (restart)())
-        .tooltip(|| text("Restart the terminal").style(widgets::tooltip_style));
+        .tooltip(|| text(tr!("term-restart-tip")).style(widgets::tooltip_style));
     let gear = toolbar_icon(
         icons::SLIDERS_VERTICAL,
         5.0,
@@ -10536,7 +10537,7 @@ fn terminal_panel(
         || true,
         move || settings::open_settings_at(layout, SettingsSection::Terminal),
     )
-    .tooltip(|| text("Terminal settings").style(widgets::tooltip_style));
+    .tooltip(|| text(tr!("term-settings-tip")).style(widgets::tooltip_style));
     let icons_group = h_stack((db_cli_btn, restart_btn, gear))
         .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     // The engine, but only while this is a DB CLI session — see `TermUi::db_label`.
@@ -10565,7 +10566,7 @@ fn terminal_panel(
         },
     )
     .style(|s| s.flex_shrink(0.0_f32));
-    let title_group = h_stack((section_title("TERMINAL"), engine))
+    let title_group = h_stack((section_title(tr!("term-title")), engine))
         .style(|s| s.flex_row().items_start().min_width(0.0));
     let title_row = h_stack((title_group, icons_group))
         .style(|s| s.width_full().flex_row().items_start().justify_between());

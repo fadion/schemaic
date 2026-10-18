@@ -726,3 +726,25 @@ outcome-rows = { $n ->
 }
 # The fetch stopped at its cap: "at least this many", so always plural.
 outcome-rows-capped = { $n }+ rows
+
+## Terminal panel header
+
+term-title = TERMINAL
+term-db-cli-tip = Open the database CLI
+term-db-cli-tip-read-only = Open the database CLI — this connection is marked read-only
+term-restart-tip = Restart the terminal
+term-settings-tip = Terminal settings
+
+## Results panel header
+
+results-title = RESULTS
+results-properties-tip = Table properties…
+results-monitor-tip = Live monitor…
+results-restore-editor-tip = Restore the editor
+results-collapse-editor-tip = Collapse the editor
+
+## Query panel header
+
+query-title = QUERY
+# The database selector when the tab has none chosen.
+query-no-database = No database

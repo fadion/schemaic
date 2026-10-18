@@ -79,7 +79,9 @@ assertions pin English wording — stays the regression net throughout.
 
    **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`, `schema_tree.rs`,
    `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`, `activity_panel.rs`, `ai_panel.rs`,
-   `chart_view.rs`, `view_editor.rs`, `properties.rs`. The schema editors share
+   `chart_view.rs`, `view_editor.rs`, `properties.rs`; and, ahead of their files, the three
+   workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
+   `editor_pane.rs`'s query header (`query-*`). The schema editors share
    `editor-preview-sql` and `editor-change-count`, and `dialog-close` joins the dialog words. The
    activity panel's counts line ("18 sessions · 4 running") and its session-state words stay
    core's English with phase 4: the total is core's `ActivitySummary::total_label`, and the
