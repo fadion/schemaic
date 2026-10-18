@@ -81,7 +81,8 @@ assertions pin English wording — stays the regression net throughout.
    `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`, `activity_panel.rs`, `ai_panel.rs`,
    `chart_view.rs`, `view_editor.rs`, `properties.rs`, `copy_table_view.rs`,
    `database_editor.rs`, `script_view.rs`, `compare_view.rs`, `event_editor.rs`,
-   `routine_editor.rs`, `users_view.rs`, `trigger_editor.rs`, `object_editor.rs`, `account_editor.rs`, `table_designer.rs`; and, ahead of their files, the three
+   `routine_editor.rs`, `users_view.rs`, `trigger_editor.rs`, `object_editor.rs`,
+   `account_editor.rs`, `table_designer.rs`; and, ahead of their files, the three
    workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
    `editor_pane.rs`'s query header (`query-*`). The schema editors share
    `editor-preview-sql` and `editor-change-count`, and `dialog-close` joins the dialog words. The
@@ -93,6 +94,18 @@ assertions pin English wording — stays the regression net throughout.
    words live under `dialog-*` (Cancel, Yes, No), and the schema tree's menus and panel under
    `tree-*`. `section_title` and `loading_dots` take owned text now, so the other panels'
    headings can follow.
+   **Left, in order** — delete a name as its file lands: the remaining modals by size,
+   `connection_form.rs`, `import_view.rs`, `dump_view.rs`, `monitor_view.rs`,
+   `result_diff_view.rs`, `ddl_preview.rs`, `connection_import.rs`, `blob_view.rs`,
+   `erd_view.rs`, `server_vars_view.rs`, `snippet_edit.rs`, `plan_view.rs`, `used_by_view.rs`,
+   `themes.rs`, `markdown.rs`, `cell_editors.rs`, `alias_rename.rs`, `usages_view.rs`,
+   `tooltip.rs`, `erd_raster.rs`; then the four large files' remainders, `grid.rs`, `lib.rs`,
+   `widgets.rs` and `editor_pane.rs`, each more than one session; then `schemaic-app`
+   (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`, `agent_cli.rs`,
+   `antigravity.rs`), whose first file settles how it reaches the loader (above). A file with
+   no literal a user reads drops off without a commit. The list came from a sweep for
+   capitalised string literals, so sweep a file whole before calling it done; a sentence that
+   starts lower-case, or spans a `\` continuation, slips past a quick one.
    **How a file goes**, as those settled it: a helper taking
    `&'static str` widens to `impl Into<String>` (every literal caller still compiles); a
    placeholder goes through `FieldCfg::placeholder_of(|| tr!(…))`, whose `placeholder` is still
