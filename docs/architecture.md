@@ -26993,7 +26993,9 @@ existing prose was left alone.
     **value as well as a label**: the picker hands back the text it shows, so a pick is compared
     with `row_number()`, and `picker_labels` reserves it, so the entry, the comparison and the name
     a same-named column steps aside for are all one language. `chart::caption` and
-    `Plot::undrawable` are core's prose and stay English until phase 4.
+    `Plot::undrawable` are core's prose and stay English until phase 4. Its *"Saved {name}"* and
+    that notice's *the file* fallback are not `chart-*`: they are `save_document`'s `erd-saved` and
+    `erd-unnamed-file`, shared with the diagram, so they are translated with `erd_view.rs`.
     Mounted in the workspace group directly after `used_by_overlay`, counted by
     `workspace_modals_up` as a plain term (`chart_open`) — it raises nothing — and on
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
@@ -31549,6 +31551,25 @@ existing prose was left alone.
     `NOTICE_LINGER`; a failure stays until dismissed, since it is the only place the reason is
     written down. The fade is `flash_seq`-guarded and `try_get_untracked`-read for the same two
     reasons the find flash is.
+    **Its words are the catalogue's** (`erd-*`, roadmap phase 3) — the title
+    (`widgets::modal_title_borderless` takes `impl Into<String>`, so its literal callers still
+    compile), *Scope* (which `toolbar_metrics` measures through the same message, so the label and
+    the width budgeted for it cannot disagree), the three count chips (`chips`: `erd-chip-tables`,
+    `erd-chip-relationships`, `erd-chip-hidden`), the find bar's placeholder (through
+    `FieldCfg::placeholder_of`), a collapsed card's `+N more` and *show less* — `erd-more-columns`
+    is also the export model's `more`, so a saved picture says what the canvas says — the
+    not-loaded and no-relationships notes, the export tooltip (`menu_button`'s tip is a `String`),
+    *Copy as*, the export dialog's window title, and the notices: nothing to export or copy,
+    `erd-copied-as` (`$format`), `erd-clipboard-unavailable`, `erd-copy-failed` (`$error`) and
+    `save_document`'s `erd-saved` (`$name`, falling back on `erd-unnamed-file`). **The chips stay
+    unpluralised in English** — `{ $count } tables` reads "1 tables", exactly as the `format!` it
+    replaced did, because each phase leaves English byte-identical; German selects a plural on
+    `$count` for the tables and relationships chips (its hidden chip's phrase does not change with
+    the count), and English can take one when the plural phase comes.
+    `the_counts_and_notices_read_as_they_did_in_english` pins the English, `1 tables` included; the
+    export-model test's `"+2 more"` passes unchanged. English stays: the formats' names
+    (`ErdExportFormat::label`), the zoom percentage, a not-loaded schema's `—` scope, the
+    `#rrggbb` colours `hex` writes, and `diagrams.json`.
   - `erd_raster.rs` — SVG → PNG for the ER-diagram export and the *Chart* modal's PNG save
     (through `ErdDoc::Raster`, above), and the only reason `resvg` is a direct
     dependency (it was already in the tree via floem's `svg` view, same version, so it costs no
@@ -40205,7 +40226,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
   and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`),
   Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`), Import
-  Connections (`connection_import.rs`) and the binary-cell panel (`blob_view.rs`) are converted;
+  Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`) and the ER diagram
+  (`erd_view.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

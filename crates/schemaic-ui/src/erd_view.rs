@@ -55,6 +55,7 @@ use schemaic_core::erd::{
 use schemaic_core::erd_export;
 use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type};
 
+use crate::i18n::tr;
 use crate::schema_tree::column_type_icon;
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
@@ -309,7 +310,7 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
             let input = crate::edit_field(
                 find.query,
                 crate::FieldCfg {
-                    placeholder: "Find table or column",
+                    placeholder_of: Some(Rc::new(|| tr!("erd-find-placeholder"))),
                     autofocus: true,
                     font_size: theme::font_body,
                     border_radius: 6.0,
@@ -838,7 +839,7 @@ pub(crate) fn save_document(
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "the file".to_string());
+            .unwrap_or_else(|| tr!("erd-unnamed-file"));
         let say = say.clone();
         (export)(
             crate::ErdExportRequest {
@@ -853,7 +854,9 @@ pub(crate) fn save_document(
             // away from being cancellable, and a catch-all would then tell the
             // user a file was saved that never was.
             Rc::new(move |outcome| match outcome {
-                crate::ExportOutcome::Done(_) => (say)(format!("Saved {name}"), false),
+                crate::ExportOutcome::Done(_) => {
+                    (say)(tr!("erd-saved", name = name.clone()), false)
+                }
                 crate::ExportOutcome::Cancelled => {}
                 // The document is staged beside the destination and renamed
                 // over it (`persist::write_file_atomic`), so a failed export
@@ -1008,7 +1011,7 @@ fn export_scene(
             }),
             stub,
             rows,
-            more: (hidden > 0).then(|| format!("+{hidden} more")),
+            more: (hidden > 0).then(|| tr!("erd-more-columns", count = hidden)),
             icon,
             icon_fill: hex(if node.kind == NodeKind::View {
                 theme::view_icon()
@@ -1345,9 +1348,9 @@ fn column_rows(
     if collapsible {
         let hidden = node.columns.len() - visible.len();
         let label = if is_collapsed {
-            format!("+{hidden} more")
+            tr!("erd-more-columns", count = hidden)
         } else {
-            "show less".to_string()
+            tr!("erd-show-less")
         };
         let id = node.id.clone();
         let node2 = node.clone();
@@ -1839,7 +1842,7 @@ fn control_button(glyph: &'static str, action: Rc<dyn Fn()>) -> AnyView {
 /// choices — the same convention the grid's menu-opening icons follow.
 fn menu_button(
     glyph: &'static str,
-    tip: &'static str,
+    tip: String,
     at: RwSignal<floem::kurbo::Rect>,
     action: Rc<dyn Fn()>,
 ) -> AnyView {
@@ -1864,7 +1867,7 @@ fn menu_button(
                 .padding_vert(theme::scaled(TOOLBAR_PAD_V))
                 .hover(|s| s.background(theme::erd_node_bg()))
         })
-        .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
+        .tooltip(move || text(tip.clone()).style(crate::widgets::tooltip_style))
         .into_any()
 }
 
@@ -2017,11 +2020,7 @@ pub(crate) fn erd_overlay(
 
             // Resolve the schema; if it isn't introspected yet, say so.
             let Some(schema) = resolve_schema(db_nodes, &target.database) else {
-                let body = centered_msg(
-                    "Schema isn't loaded for this database yet.",
-                    theme::text_dim,
-                )
-                .into_any();
+                let body = centered_msg(tr!("erd-not-loaded"), theme::text_dim).into_any();
                 return modal_frame(win, close, "—".to_string(), Vec::new(), None, body, None)
                     .into_any();
             };
@@ -2034,9 +2033,7 @@ pub(crate) fn erd_overlay(
 
             // Empty graph (e.g. a table with no relationships, or unknown seed).
             if graph.nodes.is_empty() {
-                let body =
-                    centered_msg("No foreign-key relationships to diagram.", theme::text_dim)
-                        .into_any();
+                let body = centered_msg(tr!("erd-no-relationships"), theme::text_dim).into_any();
                 return modal_frame(win, close, scope, chips(&graph), None, body, None).into_any();
             }
 
@@ -2295,12 +2292,12 @@ pub(crate) fn erd_overlay(
                 let say = say.clone();
                 Rc::new(move |fmt| {
                     let Some(doc) = (render)(fmt) else {
-                        (say)("Nothing to export.".to_string(), true);
+                        (say)(tr!("erd-nothing-to-export"), true);
                         return;
                     };
                     save_document(
                         doc,
-                        "Export diagram",
+                        &tr!("erd-export-dialog"),
                         erd_export::file_stem(&scope_name, fmt),
                         fmt,
                         export.clone(),
@@ -2338,15 +2335,15 @@ pub(crate) fn erd_overlay(
                         // carries the platform's own words and is worth
                         // repeating.
                         Some(s) => match floem::Clipboard::set_contents(s) {
-                            Ok(()) => (say)(format!("Copied as {}", fmt.label()), false),
+                            Ok(()) => (say)(tr!("erd-copied-as", format = fmt.label()), false),
                             Err(floem::ClipboardError::NotAvailable) => {
-                                (say)("The clipboard is not available.".to_string(), true)
+                                (say)(tr!("erd-clipboard-unavailable"), true)
                             }
                             Err(floem::ClipboardError::ProviderError(e)) => {
-                                (say)(format!("Couldn't copy: {e}"), true)
+                                (say)(tr!("erd-copy-failed", error = e), true)
                             }
                         },
-                        None => (say)("Nothing to copy.".to_string(), true),
+                        None => (say)(tr!("erd-nothing-to-copy"), true),
                     },
                 )
             };
@@ -2373,7 +2370,7 @@ pub(crate) fn erd_overlay(
                     }
                     v.push(MenuEntry::Separator);
                     v.push(MenuEntry::sub(
-                        "Copy as",
+                        tr!("erd-copy-as"),
                         erd_export::ErdExportFormat::ALL
                             .into_iter()
                             .filter(|f| f.is_text())
@@ -2438,7 +2435,7 @@ pub(crate) fn erd_overlay(
                 reset: control_button(icons::ROTATE_CCW, reset),
                 export: menu_button(
                     icons::DOWNLOAD,
-                    "Export the diagram…",
+                    tr!("erd-export-tip"),
                     export_at,
                     open_export,
                 ),
@@ -2748,11 +2745,11 @@ fn chips(graph: &DiagramGraph) -> Vec<String> {
         .filter(|n| n.kind != NodeKind::Stub)
         .count();
     let mut v = vec![
-        format!("{tables} tables"),
-        format!("{} relationships", graph.edges.len()),
+        tr!("erd-chip-tables", count = tables),
+        tr!("erd-chip-relationships", count = graph.edges.len()),
     ];
     if !graph.hidden_islands.is_empty() {
-        v.push(format!("{} unrelated hidden", graph.hidden_islands.len()));
+        v.push(tr!("erd-chip-hidden", count = graph.hidden_islands.len()));
     }
     v
 }
@@ -2792,7 +2789,7 @@ fn toolbar_metrics(scope: &str, labels: &[String], has_controls: bool) -> (f64, 
                 + theme::scaled(TOOLBAR_GAP)
         }
     };
-    let scope_w = crate::widgets::measure_text_px_at("Scope", toolbar_font())
+    let scope_w = crate::widgets::measure_text_px_at(&tr!("erd-scope"), toolbar_font())
         + theme::scaled(SCOPE_GAP)
         + crate::widgets::measure_text_px_at(scope, toolbar_font());
     let mut fixed = theme::scaled(TOOLBAR_PAD_LEFT)
@@ -2873,7 +2870,7 @@ fn modal_frame(
         // to its right.
         h_stack((
             h_stack((
-                text("Scope").style(|s| {
+                text(tr!("erd-scope")).style(|s| {
                     s.font_size(toolbar_font())
                         .color(theme::text_muted())
                         .flex_shrink(0.0_f32)
@@ -2941,7 +2938,7 @@ fn modal_frame(
     // walks out of the modal.
     let ring = crate::widgets::FocusRing::new();
     let panel = v_stack((
-        modal_title_borderless("ER diagram", close.clone(), ring.clone()),
+        modal_title_borderless(tr!("erd-title"), close.clone(), ring.clone()),
         toolbar,
         body,
     ))
@@ -3006,6 +3003,28 @@ fn modal_frame(
 mod tests {
     use super::*;
     use schemaic_core::erd::{Cardinality, DiagramEdge, DiagramGraph, DiagramNode, NodeKind};
+
+    /// The toolbar's counts and the export notices read as they did in English
+    /// before the catalogue — counts unpluralised, as they always were.
+    #[test]
+    fn the_counts_and_notices_read_as_they_did_in_english() {
+        assert_eq!(
+            chips(&DiagramGraph::default()),
+            ["0 tables", "0 relationships"]
+        );
+        assert_eq!(tr!("erd-chip-tables", count = 1), "1 tables");
+        assert_eq!(tr!("erd-chip-hidden", count = 3), "3 unrelated hidden");
+        assert_eq!(tr!("erd-more-columns", count = 4), "+4 more");
+        assert_eq!(
+            tr!("erd-copied-as", format = "Mermaid"),
+            "Copied as Mermaid"
+        );
+        assert_eq!(
+            tr!("erd-copy-failed", error = "busy"),
+            "Couldn't copy: busy"
+        );
+        assert_eq!(tr!("erd-saved", name = "shop.svg"), "Saved shop.svg");
+    }
 
     /// **The band is a frame, not an edge.** The bar pads 8 px horizontally and
     /// 6 px vertically, so a press can miss the field on any of four sides; the

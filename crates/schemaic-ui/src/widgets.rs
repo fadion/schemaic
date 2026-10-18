@@ -1589,7 +1589,7 @@ pub(crate) fn modal_title(
 /// Like [`modal_title`] but without the bottom separator border — for modals
 /// whose body already reads as a distinct block (the plan modal's boxed table).
 pub(crate) fn modal_title_borderless(
-    title: &'static str,
+    title: impl Into<String>,
     close: Rc<dyn Fn()>,
     ring: FocusRing,
 ) -> impl IntoView {

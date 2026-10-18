@@ -1665,3 +1665,37 @@ blob-loaded-file = Loaded file. Commit in the grid to write it.
 blob-not-writable = This cell cannot be written.
 blob-file-too-large = That file is { $got } — this column holds at most { $most }.
 blob-not-accepting = That cell is no longer accepting a value — nothing was staged.
+
+## ER diagram (erd_view.rs)
+## The export formats' names (PNG, SVG, Mermaid…) are core's and stay as they are.
+
+erd-title = ER diagram
+# Before the diagram's database or table.
+erd-scope = Scope
+# The toolbar's counts. Unpluralised in English as they always were; a
+# language that needs a plural may select on $count.
+erd-chip-tables = { $count } tables
+erd-chip-relationships = { $count } relationships
+erd-chip-hidden = { $count } unrelated hidden
+erd-find-placeholder = Find table or column
+# A collapsed table's row for the columns it is not showing; also drawn in an
+# exported picture.
+erd-more-columns = +{ $count } more
+erd-show-less = show less
+erd-not-loaded = Schema isn't loaded for this database yet.
+erd-no-relationships = No foreign-key relationships to diagram.
+erd-export-tip = Export the diagram…
+erd-copy-as = Copy as
+# The file picker's window title.
+erd-export-dialog = Export diagram
+erd-nothing-to-export = Nothing to export.
+erd-nothing-to-copy = Nothing to copy.
+# $format is the export format's name.
+erd-copied-as = Copied as { $format }
+erd-clipboard-unavailable = The clipboard is not available.
+# $error is the platform's own message.
+erd-copy-failed = Couldn't copy: { $error }
+# $name is the file written.
+erd-saved = Saved { $name }
+# Names the file in the saved notice when its own name cannot be read.
+erd-unnamed-file = the file

@@ -1452,3 +1452,29 @@ blob-loaded-file = Datei geladen. Übernimm die Änderungen im Ergebnisraster, u
 blob-not-writable = Diese Zelle kann nicht geschrieben werden.
 blob-file-too-large = Diese Datei ist { $got } groß – diese Spalte fasst höchstens { $most }.
 blob-not-accepting = Diese Zelle nimmt keinen Wert mehr an – nichts wurde vorgemerkt.
+erd-title = ER-Diagramm
+erd-scope = Umfang
+erd-chip-tables = { $count ->
+    [one] { $count } Tabelle
+   *[other] { $count } Tabellen
+}
+erd-chip-relationships = { $count ->
+    [one] { $count } Beziehung
+   *[other] { $count } Beziehungen
+}
+erd-chip-hidden = { $count } unverbundene ausgeblendet
+erd-find-placeholder = Tabelle oder Spalte suchen
+erd-more-columns = +{ $count } weitere
+erd-show-less = weniger anzeigen
+erd-not-loaded = Das Schema dieser Datenbank ist noch nicht geladen.
+erd-no-relationships = Keine Fremdschlüsselbeziehungen für ein Diagramm.
+erd-export-tip = Diagramm exportieren…
+erd-copy-as = Kopieren als
+erd-export-dialog = Diagramm exportieren
+erd-nothing-to-export = Nichts zu exportieren.
+erd-nothing-to-copy = Nichts zu kopieren.
+erd-copied-as = Als { $format } kopiert
+erd-clipboard-unavailable = Die Zwischenablage ist nicht verfügbar.
+erd-copy-failed = Kopieren fehlgeschlagen: { $error }
+erd-saved = { $name } gespeichert
+erd-unnamed-file = die Datei
