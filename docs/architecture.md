@@ -31036,9 +31036,20 @@ existing prose was left alone.
     So this dependency follows floem's rather than the registry's latest. It lives in this crate
     **because of the fonts**: the cards' widths were
     measured against the bundled IBM Plex Sans, so `png_from_svg` loads those exact bytes
-    (`fonts::SANS_FACES`) into its own `fontdb` instead of scanning the machine's — deterministic,
-    no startup sweep, and the text lands inside the boxes it was measured for on a build server as
-    much as on a desktop. `clamp_scale` is the guard that matters: a whole-database diagram can be
+    (`fonts::SANS_FACES`) into its own `fontdb` **first**, as the named family (`PLEX_SANS`) and
+    `sans-serif` both — so whatever Plex can draw comes from the bytes the cards were measured
+    against, and the text lands inside its boxes on a build server as much as on a desktop. The
+    machine's fonts are loaded **behind** them (`export_options`, fontdb's `load_system_fonts`) as
+    the fallback for glyphs Plex has none of: with the bundled faces alone, a CJK, Arabic or Hebrew
+    table name rendered as a row of empty boxes in the PNG while the canvas, which falls back
+    through cosmic-text, showed it. The trade is that those glyphs now depend on the machine — taken
+    over bundling a CJK face at 10–20 MB. The scan runs once per process, into a
+    `OnceLock<Arc<fontdb::Database>>`, on the first export's worker — measured on Windows at ~57 ms
+    for that export and ~4 ms for each after. **That layer is the one the tests leave out**: reaching
+    the system fonts is filesystem access, so they render through `font_options` (bundled only, via
+    the test helper `png`). resvg's `system-fonts` feature is named in `Cargo.toml` for it, though
+    `floem_renderer` already enabled it, so no build changed. `clamp_scale` is the guard that
+    matters: a whole-database diagram can be
     tens of thousands of pixels wide on its own, and the pixmap is RGBA in memory, so the requested
     2× is reduced until the result fits both `MAX_PNG_DIM` and `MAX_PNG_PIXELS` — returning **less
     than 1.0** when it has to, because the alternative is a failed allocation at the moment the

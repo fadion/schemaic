@@ -99,9 +99,9 @@ assertions pin English wording — stays the regression net throughout.
 
 These affect users today, with the English UI, whenever a table holds non-Latin text:
 
-- **Fonts.** Only IBM Plex is bundled (Latin, Cyrillic, Greek). CJK, Arabic and Hebrew rely on
-  cosmic-text falling back to system fonts, which is unverified per OS; `erd_raster` has its own
-  font database holding only Plex Sans, so a diagram PNG probably drops those glyphs.
+- **Fonts on screen.** Only IBM Plex is bundled (Latin, Cyrillic, Greek). CJK, Arabic and Hebrew
+  rely on cosmic-text falling back to system fonts, which is unverified on macOS and Linux. (The
+  diagram PNG has its own fallback now, `erd_raster::export_options`.)
 - **IME in the grid's inline cell editor.** Every other field is `edit_field`, on Floem's editor
   engine, which enables IME and handles preedit and commit (`vendor/floem/src/views/editor/view.rs`).
   The grid's inline editor is the one `floem::views::text_input`, which never calls

@@ -9,7 +9,8 @@
 //! measured against the bundled IBM Plex Sans ([`crate::fonts`]), so the renderer
 //! is handed those exact bytes rather than left to find a face on the machine —
 //! which is what makes the PNG's text land inside the boxes it was measured for,
-//! on a build server as much as on a developer's desktop.
+//! on a build server as much as on a developer's desktop. The machine's fonts sit
+//! only *behind* them, for the glyphs Plex has none of ([`export_options`]).
 //!
 //! Nothing here touches the filesystem or a signal: the caller passes a string and
 //! gets bytes back, off the UI thread.
@@ -46,14 +47,48 @@ pub fn clamp_scale(w: f32, h: f32, want: f32) -> f32 {
 
 /// Render `svg` to PNG bytes at `scale`× its own size (clamped by [`clamp_scale`]).
 ///
-/// The font database holds only the bundled faces — no system-font scan, so this
-/// is deterministic and costs no startup sweep. `sans-serif` is pointed at IBM
-/// Plex Sans as well as the family being named outright, because the document's
+/// The fonts are [`export_options`]': the bundled faces first, the machine's
+/// behind them for what Plex cannot draw. `sans-serif` is pointed at IBM Plex
+/// Sans as well as the family being named outright, because the document's
 /// fallback chain ends at the generic and a machine without Plex installed would
 /// otherwise resolve it to whatever `usvg` defaults to.
 pub fn png_from_svg(svg: &str, scale: f32) -> Result<Vec<u8>, String> {
-    render_png(svg, scale, font_options())
+    render_png(svg, scale, export_options())
 }
+
+/// [`font_options`] with the machine's own fonts loaded **behind** the bundled
+/// faces, as the fallback for a glyph Plex does not have. Plex covers Latin,
+/// Cyrillic and Greek; a CJK, Arabic or Hebrew table name rendered as a row of
+/// empty boxes in the PNG while the canvas, which falls back through
+/// cosmic-text, showed it.
+/// Plex stays the named family and `sans-serif`, so whatever it can draw still
+/// comes from the bundled bytes the cards were measured against; only what it
+/// cannot depends on the machine — accepted, against bundling a CJK face.
+///
+/// The scan runs once per process, on the first export (on its worker), and the
+/// database is shared after that — measured on Windows at ~57 ms for the first
+/// export and ~4 ms for each after it. Nothing tests this layer: reaching the system
+/// fonts is filesystem access, so the tests render through [`font_options`] and
+/// this is the one line they leave out.
+fn export_options() -> usvg::Options<'static> {
+    use std::sync::{Arc, OnceLock};
+    static DB: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
+    let db = DB
+        .get_or_init(|| {
+            let mut db = (*font_options().fontdb).clone();
+            db.load_system_fonts();
+            Arc::new(db)
+        })
+        .clone();
+    usvg::Options {
+        font_family: PLEX_SANS.to_string(),
+        fontdb: db,
+        ..Default::default()
+    }
+}
+
+/// The family every exported `<text>` names, and `sans-serif` resolves to.
+const PLEX_SANS: &str = "IBM Plex Sans";
 
 /// The parse options carrying the bundled faces — the whole reason this module
 /// lives in the UI crate.
@@ -66,7 +101,7 @@ pub fn png_from_svg(svg: &str, scale: f32) -> Result<Vec<u8>, String> {
 /// exports with `cargo test --workspace` still green.
 fn font_options() -> usvg::Options<'static> {
     let mut opt = usvg::Options {
-        font_family: "IBM Plex Sans".to_string(),
+        font_family: PLEX_SANS.to_string(),
         ..Default::default()
     };
     {
@@ -74,7 +109,7 @@ fn font_options() -> usvg::Options<'static> {
         for face in crate::fonts::SANS_FACES {
             db.load_font_data(face.to_vec());
         }
-        db.set_sans_serif_family("IBM Plex Sans");
+        db.set_sans_serif_family(PLEX_SANS);
     }
     opt
 }
@@ -106,6 +141,12 @@ mod tests {
                        viewBox=\"-10 -10 100 50\"><rect x=\"-10\" y=\"-10\" width=\"100\" \
                        height=\"50\" fill=\"#101010\"/><text x=\"0\" y=\"20\" font-size=\"12\" \
                        fill=\"#ffffff\">users</text></svg>";
+
+    /// [`png_from_svg`] on the bundled faces alone: its own fonts add the
+    /// machine's, and a test may not reach the filesystem for them.
+    fn png(svg: &str, scale: f32) -> Result<Vec<u8>, String> {
+        render_png(svg, scale, font_options())
+    }
 
     #[test]
     fn clamp_scale_keeps_a_small_diagram_at_the_asked_for_scale() {
@@ -139,7 +180,7 @@ mod tests {
 
     #[test]
     fn png_from_svg_writes_a_png_at_the_scaled_size() {
-        let png = png_from_svg(SVG, 2.0).expect("renders");
+        let png = png(SVG, 2.0).expect("renders");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "PNG magic");
         // IHDR width/height are big-endian u32 at bytes 16..24.
         let w = u32::from_be_bytes(png[16..20].try_into().unwrap());
@@ -149,7 +190,7 @@ mod tests {
 
     #[test]
     fn png_from_svg_reports_a_broken_document_rather_than_panicking() {
-        let err = png_from_svg("not an svg", 1.0).unwrap_err();
+        let err = png("not an svg", 1.0).unwrap_err();
         assert!(err.starts_with("Invalid SVG:"), "{err}");
     }
 
@@ -224,7 +265,7 @@ mod tests {
             },
         };
         let svg = to_svg(&scene);
-        let png = png_from_svg(&svg, 2.0).expect("renders");
+        let png = png(&svg, 2.0).expect("renders");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "PNG magic");
         let w = u32::from_be_bytes(png[16..20].try_into().unwrap());
         let h = u32::from_be_bytes(png[20..24].try_into().unwrap());

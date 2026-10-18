@@ -28,10 +28,11 @@ floem_renderer = "0.2.0"
 getrandom = "0.3"
 serde_json = { workspace = true }
 # Rasterise the ER diagram's exported SVG to PNG. Already in the tree via floem
-# (its `svg` view), same version — no extra compile. `default-features = false`
-# +`text`: we want glyph rendering but not the system-font scan, since the export
-# is handed the app's own embedded faces (see `erd_raster`).
-resvg = { version = "0.43", default-features = false, features = ["text"] }
+# (its `svg` view), same version — no extra compile. `text` for glyph rendering;
+# `system-fonts` for the fallback behind the app's own embedded faces, for the
+# glyphs Plex has none of (see `erd_raster::export_options`). floem_renderer
+# already turns both on, so naming them here changes no build.
+resvg = { version = "0.43", default-features = false, features = ["text", "system-fonts"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 # **Header reading only** — `blob_view` asks an image its dimensions before
 # handing the bytes to floem's `img()`, which decodes to RGBA (width x height x
