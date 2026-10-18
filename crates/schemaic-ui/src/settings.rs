@@ -10,10 +10,11 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
 use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
+use crate::i18n::tr;
 use crate::widgets::{
     ActionKind, FocusRing, MenuEntry, action_button, action_button_dyn, action_gap, autohide,
     focus_root_with_ring, form_hint, form_hint_style, form_label_style, form_section_header,
-    modal_title, nothing, panel_style,
+    modal_title_owned, nothing, panel_style,
 };
 use crate::{
     AiActions, AiEffort, AiUi, ConnUi, FieldCfg, LayoutUi, SchemaScope, TermActions, TermCursor,
@@ -51,19 +52,28 @@ fn terminal_section(term: TermUi, actions: Rc<TermActions>, ring: FocusRing) -> 
     );
 
     let group = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
-    let shell_section = v_stack((settings_group_label("Shell"), shell_dd)).style(group);
-    let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(group);
-    let cursor_section = v_stack((settings_group_label("Cursor style"), cursor_dd)).style(group);
+    let shell_section =
+        v_stack((settings_group_label(tr!("settings-term-shell")), shell_dd)).style(group);
+    let font_section = v_stack((
+        settings_group_label(tr!("settings-term-font-size")),
+        font_dd,
+    ))
+    .style(group);
+    let cursor_section = v_stack((
+        settings_group_label(tr!("settings-term-cursor-style")),
+        cursor_dd,
+    ))
+    .style(group);
     let copy_row = focusable_toggle_row(
-        "Copy on selection",
-        "Copy selected text to the clipboard the moment a selection ends.",
+        tr!("settings-term-copy-on-select"),
+        tr!("settings-term-copy-on-select-hint"),
         copy_on_select,
         ring.clone(),
         40,
     );
     let blink_row = focusable_toggle_row(
-        "Blink cursor",
-        "Blink the cursor while the terminal is focused.",
+        tr!("settings-term-blink"),
+        tr!("settings-term-blink-hint"),
         cursor_blink,
         ring,
         50,
@@ -149,8 +159,8 @@ fn shell_dropdown(
 /// the ring is [`focusable_toggle_row_when`]'s greyed one, which nobody can flip
 /// either.
 pub(crate) fn focusable_toggle_row(
-    title: &'static str,
-    hint: &'static str,
+    title: impl Into<String>,
+    hint: impl Into<String>,
     sig: RwSignal<bool>,
     ring: crate::widgets::FocusRing,
     tabindex: u32,
@@ -172,8 +182,8 @@ pub(crate) fn focusable_toggle_row(
 /// as Settings' Install and Remove buttons are, so the ring gains and loses
 /// it with the state. Its value is kept either way.
 pub(crate) fn focusable_toggle_row_when(
-    title: &'static str,
-    hint: &'static str,
+    title: impl Into<String>,
+    hint: impl Into<String>,
     sig: RwSignal<bool>,
     enabled: RwSignal<bool>,
     ring: crate::widgets::FocusRing,
@@ -196,11 +206,13 @@ pub(crate) fn focusable_toggle_row_when(
 /// The layout every toggle row shares: title and hint on the left, `switch`
 /// on the right.
 fn toggle_row_layout(
-    title: &'static str,
-    hint: &'static str,
+    title: impl Into<String>,
+    hint: impl Into<String>,
     title_color: impl Fn() -> floem::peniko::Color + 'static,
     switch: impl IntoView + 'static,
 ) -> impl IntoView {
+    let title: String = title.into();
+    let hint: String = hint.into();
     h_stack((
         // `flex_grow(1) + min_width(0)`: take the space left of the switch and be
         // allowed to shrink below the text's natural width, so a long hint wraps
@@ -921,11 +933,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
     // What off means, under the choice that made it — text, not a
     // control, so hiding it is safe for the ring (§ Floem: a `.hide()`n
     // control is still in the Tab order).
-    let off_hint = text(
-        "Nothing is sent to any agent, no agent CLI is started, and no AI action is \
-                 offered. Pick a CLI to turn the assistant on.",
-    )
-    .style(move |s| {
+    let off_hint = text(tr!("settings-ai-off-hint")).style(move |s| {
         let s = s
             .width_full()
             .font_size(theme::font_hint())
@@ -937,7 +945,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         }
     });
     let harness_section = v_stack((
-        settings_group_label("Agent CLI"),
+        settings_group_label(tr!("settings-ai-agent")),
         agent_dd,
         harness_notice,
         off_hint,
@@ -961,7 +969,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         let path_field = edit_field(
             cli_path,
             FieldCfg {
-                placeholder: "Leave empty to auto-detect",
+                placeholder_of: Some(Rc::new(|| tr!("settings-ai-cli-path-placeholder"))),
                 clearable: true,
                 focus: Some((ring.clone(), 10)),
                 ..Default::default()
@@ -994,22 +1002,20 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
             move |(path, h)| {
                 if path.trim().is_empty() {
                     match detect_path() {
-                        Some(p) => text(format!("Auto-detected: {}", p)).style(|s| {
+                        Some(p) => text(tr!("settings-ai-detected", path = p)).style(|s| {
                             s.width_full()
                                 .font_size(theme::font_label())
                                 .color(theme::conn_ok())
                         }),
-                        None => text(format!(
-                            "Auto-detect failed. {} not found — give it a path above.",
-                            h.label()
-                        ))
-                        .style(red),
+                        None => text(tr!("settings-ai-detect-failed", cli = h.label())).style(red),
                     }
                     .into_any()
                 } else if cli_ok(path) {
                     empty().into_any()
                 } else {
-                    text("File doesn't exist.").style(red).into_any()
+                    text(tr!("settings-ai-cli-path-missing"))
+                        .style(red)
+                        .into_any()
                 }
             },
         );
@@ -1022,7 +1028,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         let model_field = edit_field(
             model,
             FieldCfg {
-                placeholder: "Leave empty for the harness's default",
+                placeholder_of: Some(Rc::new(|| tr!("settings-ai-model-placeholder"))),
                 clearable: true,
                 focus: Some((ring.clone(), 20)),
                 ..Default::default()
@@ -1040,7 +1046,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         let instr_field = edit_field(
             instructions,
             FieldCfg {
-                placeholder: "Dialect, conventions, house rules…",
+                placeholder_of: Some(Rc::new(|| tr!("settings-ai-instructions-placeholder"))),
                 multiline: true,
                 focus: Some((ring.clone(), 40)),
                 ..Default::default()
@@ -1052,7 +1058,8 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         // binary, and a box captioned "Claude Code CLI path" over a Codex
         // session is the kind of stale caption a user reasonably acts on.
         let cli_section = v_stack((
-            label(move || format!("{} path", harness.get().label())).style(form_label_style),
+            label(move || tr!("settings-ai-cli-path", cli = harness.get().label()))
+                .style(form_label_style),
             path_field,
             hint,
         ))
@@ -1109,7 +1116,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
             true => s.display(floem::style::Display::None),
         });
         let model_section = v_stack((
-            settings_group_label("Model"),
+            settings_group_label(tr!("settings-ai-model")),
             model_field,
             suggestions,
             // **The second sentence is about the chips, so it goes when they
@@ -1117,16 +1124,11 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
             // are shortcuts, not the whole list" pointed at buttons that
             // were not on screen — a hint that describes an absent control
             // reads as a bug in the modal rather than a note about the
-            // field.
-            label(move || {
-                let base = "Any id this CLI accepts — an alias, or a dated snapshot to pin \
-                                one across upgrades.";
-                match harness.get().suggested_models().is_empty() {
-                    true => base.to_string(),
-                    false => {
-                        format!("{base} The buttons are shortcuts, not the whole list.")
-                    }
-                }
+            // field. Two whole messages rather than a sentence appended, so a
+            // translation is never two fragments joined in English order.
+            label(move || match harness.get().suggested_models().is_empty() {
+                true => tr!("settings-ai-model-hint"),
+                false => tr!("settings-ai-model-hint-with-chips"),
             })
             .style(|s| {
                 s.width_full()
@@ -1181,7 +1183,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
                 // container's own child — so the dropdown took its label's
                 // width while every other one on the page ran full width.
                 v_stack((
-                    settings_group_label("Effort"),
+                    settings_group_label(tr!("settings-ai-effort")),
                     focusable_dropdown(effort, offered, AiEffort::label, effort_ring.clone(), 30),
                 ))
                 .style(move |s| group(s).width_full())
@@ -1196,8 +1198,11 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
             true => s.width_full(),
             false => s.display(floem::style::Display::None),
         });
-        let instr_section =
-            v_stack((settings_group_label("Custom instructions"), instr_field)).style(group);
+        let instr_section = v_stack((
+            settings_group_label(tr!("settings-ai-instructions")),
+            instr_field,
+        ))
+        .style(group);
         // **What this setting is, said out loud.** It reads as a context
         // budget — how much structure is worth spending the model's window
         // on — and *Data access*, below and per-connection, is the consent
@@ -1207,14 +1212,9 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         // infer is one they will infer wrongly in the safe direction or the
         // unsafe one.
         let scope_section = v_stack((
-            settings_group_label("Schema context"),
+            settings_group_label(tr!("settings-ai-schema-context")),
             scope_dd,
-            text(
-                "How much database structure rides in every message. None also withholds \
-                     the schema tools, so the assistant asks you for names instead of reading \
-                     the catalogue itself.",
-            )
-            .style(|s| {
+            text(tr!("settings-ai-schema-context-hint")).style(|s| {
                 s.width_full()
                     .font_size(theme::font_hint())
                     .color(theme::text_muted())
@@ -1229,7 +1229,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         // silently omitted the subject would read as "there is no such
         // setting".
         let data_section = v_stack((
-            settings_group_label("Data access"),
+            settings_group_label(tr!("settings-ai-data-access")),
             label(move || {
                 let (name, lvl) = active_ai_data.get();
                 if name.is_empty() {
@@ -1243,7 +1243,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
                     .font_size(theme::font_hint())
                     .color(theme::text_muted())
             }),
-            text("Set per connection, in the connection's settings.").style(|s| {
+            text(tr!("settings-ai-data-access-where")).style(|s| {
                 s.width_full()
                     .font_size(theme::font_hint())
                     .color(theme::text_muted())
@@ -1255,12 +1255,11 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         // enter `ai_settings_now()` and closing the modal after flipping it
         // leaves the live conversation alone.
         let gutter_row = focusable_toggle_row(
-            "Accent rule on replies",
+            tr!("settings-ai-gutter"),
             // Not "Claude's" — the panel is driven by whichever CLI the user
             // picked, and this setting is about replies rather than about
             // any one vendor's.
-            "Mark the assistant's replies with a coloured rule down their right edge. Off \
-                 gives them the same margin on both sides.",
+            tr!("settings-ai-gutter-hint"),
             gutter,
             ring.clone(),
             60,
@@ -1375,9 +1374,9 @@ const WRAP_WIDTHS: [usize; 4] = [0, 80, 100, 120];
 
 fn wrap_width_label(n: usize) -> String {
     if n == 0 {
-        "Off".to_string()
+        tr!("settings-off")
     } else {
-        format!("{n} characters")
+        tr!("settings-format-wrap-width", n = n)
     }
 }
 
@@ -1458,12 +1457,8 @@ fn should_ask_for_a_notice(path: &str, resolves: impl Fn(String) -> bool) -> boo
 /// to say why.
 fn log_hint(log: Option<&std::path::Path>) -> String {
     match log {
-        Some(p) => format!(
-            "Diagnostics, including crashes, are written to {}.",
-            p.display()
-        ),
-        None => "No log file could be opened on this machine, so nothing is being written to one."
-            .to_string(),
+        Some(p) => tr!("settings-log-hint", path = p.display().to_string()),
+        None => tr!("settings-log-hint-none"),
     }
 }
 
@@ -1483,7 +1478,8 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
     let enabled = schemaic_core::persist::config_dir().is_some();
     h_stack((
         v_stack((
-            text("Log file").style(|s| s.color(theme::text()).font_size(theme::font_label())),
+            text(tr!("settings-log"))
+                .style(|s| s.color(theme::text()).font_size(theme::font_label())),
             form_hint(log_hint(log.as_deref())),
         ))
         .style(|s| {
@@ -1493,7 +1489,7 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
                 .min_width(0.0)
         }),
         action_button(
-            "Open folder",
+            tr!("settings-log-open-folder"),
             ActionKind::Quiet,
             enabled,
             ring,
@@ -1516,12 +1512,9 @@ fn bundle_row(
 ) -> impl IntoView {
     h_stack((
         v_stack((
-            text("Settings file").style(|s| s.color(theme::text()).font_size(theme::font_label())),
-            form_hint(
-                "Your preferences and snippets in one file, to take to another machine. \
-                 Connections, window layout, the terminal's shell and connection-specific \
-                 snippets stay here.",
-            ),
+            text(tr!("settings-bundle"))
+                .style(|s| s.color(theme::text()).font_size(theme::font_label())),
+            form_hint(tr!("settings-bundle-hint")),
         ))
         .style(|s| {
             s.flex_col()
@@ -1530,7 +1523,7 @@ fn bundle_row(
                 .min_width(0.0)
         }),
         action_button(
-            "Export",
+            tr!("settings-bundle-export"),
             ActionKind::Quiet,
             true,
             ring.clone(),
@@ -1538,7 +1531,7 @@ fn bundle_row(
             move || export(),
         ),
         action_button(
-            "Import",
+            tr!("settings-bundle-import"),
             ActionKind::Quiet,
             true,
             ring,
@@ -1625,8 +1618,8 @@ fn cli_row(
                 let remove = remove.clone();
                 action_button_dyn(
                     move || match state.get() {
-                        InstallState::Removing => "Removing".to_string(),
-                        _ => "Remove".to_string(),
+                        InstallState::Removing => tr!("settings-cli-removing"),
+                        _ => tr!("settings-cli-remove"),
                     },
                     ActionKind::Quiet,
                     true,
@@ -1653,8 +1646,8 @@ fn cli_row(
             let install = install.clone();
             action_button_dyn(
                 move || match state.get() {
-                    InstallState::Running => "Installing".to_string(),
-                    _ => "Install".to_string(),
+                    InstallState::Running => tr!("settings-cli-installing"),
+                    _ => tr!("settings-cli-install"),
                 },
                 ActionKind::Quiet,
                 can,
@@ -1667,7 +1660,7 @@ fn cli_row(
     v_stack((
         h_stack((
             v_stack((
-                text("Command line")
+                text(tr!("settings-cli"))
                     .style(|s| s.color(theme::text()).font_size(theme::font_label())),
                 floem::views::label(move || status.with(|s| s.hint.clone())).style(form_hint_style),
             ))
@@ -1736,15 +1729,15 @@ impl SettingsSection {
     ];
 
     /// The section's name, in its list and as its page's heading.
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            SettingsSection::General => "General",
-            SettingsSection::Editor => "Editor",
-            SettingsSection::Formatting => "Code formatting",
-            SettingsSection::Query => "Query",
-            SettingsSection::Terminal => "Terminal",
-            SettingsSection::Ai => "AI assistant",
-            SettingsSection::Appearance => "Appearance",
+            SettingsSection::General => tr!("settings-section-general"),
+            SettingsSection::Editor => tr!("settings-section-editor"),
+            SettingsSection::Formatting => tr!("settings-section-formatting"),
+            SettingsSection::Query => tr!("settings-section-query"),
+            SettingsSection::Terminal => tr!("settings-section-terminal"),
+            SettingsSection::Ai => tr!("settings-section-ai"),
+            SettingsSection::Appearance => tr!("settings-section-appearance"),
         }
     }
 }
@@ -1871,14 +1864,17 @@ pub(crate) fn settings_overlay(ctx: SettingsCtx) -> impl IntoView {
 
             // One height for every section, so switching never resizes the
             // modal; a long page scrolls inside it.
-            let panel = v_stack((modal_title("Settings", close.clone(), ring.clone()), body))
-                .on_click_stop(|_| {})
-                .style(|s| {
-                    panel_style(s)
-                        .background(theme::bg_panel())
-                        .width(crate::widgets::modal_w(SECTION_LIST_W + SECTION_PAGE_W))
-                        .height(crate::widgets::modal_h(560.0))
-                });
+            let panel = v_stack((
+                modal_title_owned(tr!("settings-title"), close.clone(), ring.clone()),
+                body,
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| {
+                panel_style(s)
+                    .background(theme::bg_panel())
+                    .width(crate::widgets::modal_w(SECTION_LIST_W + SECTION_PAGE_W))
+                    .height(crate::widgets::modal_h(560.0))
+            });
 
             let esc = close.clone();
             // Click-to-dismiss on a sibling behind the panel, never on the focus
@@ -2009,8 +2005,8 @@ fn general_section(
 ) -> AnyView {
     let restore_tabs = layout.restore_tabs;
     let restore_row = focusable_toggle_row(
-        "Restore tabs on startup",
-        "Reopen the query tabs from your last session when the app starts.",
+        tr!("settings-restore-tabs"),
+        tr!("settings-restore-tabs-hint"),
         restore_tabs,
         ring.clone(),
         10,
@@ -2041,13 +2037,14 @@ fn editor_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         ring.clone(),
         100,
     );
-    let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(ctrl);
+    let font_section = v_stack((
+        settings_group_label(tr!("settings-editor-font-size")),
+        font_dd,
+    ))
+    .style(ctrl);
     let predictions_row = focusable_toggle_row(
-        "Inline predictions",
-        "Show the likely next words after the caret — the partner of a keyword, a \
-                 join's foreign key, the columns to group by or insert. Tab, or → at the end of \
-                 a line, takes them whole, Ctrl+→ (⌘→ on macOS) a word at a time, and Escape \
-                 turns them down.",
+        tr!("settings-editor-predictions"),
+        tr!("settings-editor-predictions-hint"),
         editor_predictions,
         ring.clone(),
         110,
@@ -2055,42 +2052,37 @@ fn editor_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     // Greyed out while inline predictions are off: it refines them, and
     // means nothing without them.
     let remembered_row = focusable_toggle_row_when(
-        "Predictions from past statements",
-        "Also offer the rest of a line from a statement you ran, wrote in another \
-                 tab or saved as a snippet. Switch off to keep past statements off the \
-                 screen.",
+        tr!("settings-editor-remembered"),
+        tr!("settings-editor-remembered-hint"),
         editor_remembered_predictions,
         editor_predictions,
         ring.clone(),
         120,
     );
     let aliases_row = focusable_toggle_row(
-        "Table aliases",
-        "When completion writes a table after FROM or JOIN, follow it with a short \
-                 alias made of its initials — orders o, order_items oi — and use the alias \
-                 in a join's ON condition.",
+        tr!("settings-editor-aliases"),
+        tr!("settings-editor-aliases-hint"),
         table_aliases,
         ring.clone(),
         125,
     );
     let rainbow_row = focusable_toggle_row(
-        "Rainbow brackets",
-        "Colour each pair of brackets by how deeply it is nested, so a closing \
-                 bracket can be matched to its opening one at a glance.",
+        tr!("settings-editor-rainbow"),
+        tr!("settings-editor-rainbow-hint"),
         rainbow_brackets,
         ring.clone(),
         130,
     );
     let whitespace_row = focusable_toggle_row(
-        "Show whitespace",
-        "Draw spaces and tabs as faint marks, so a tab can be told from spaces.",
+        tr!("settings-editor-whitespace"),
+        tr!("settings-editor-whitespace-hint"),
         show_whitespace,
         ring.clone(),
         140,
     );
     let guides_row = focusable_toggle_row(
-        "Indent guides",
-        "Draw a faint vertical line at each indent level.",
+        tr!("settings-editor-guides"),
+        tr!("settings-editor-guides-hint"),
         indent_guides,
         ring.clone(),
         150,
@@ -2127,12 +2119,9 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         160,
     );
     let case_section = v_stack((
-        settings_group_label("Keyword case"),
+        settings_group_label(tr!("settings-format-keyword-case")),
         case_dd,
-        form_hint(
-            "How Format Code writes keywords such as SELECT and FROM. Names, \
-                     strings and comments keep their case.",
-        ),
+        form_hint(tr!("settings-format-keyword-case-hint")),
     ))
     .style(ctrl);
     let function_case_dd = focusable_dropdown(
@@ -2143,12 +2132,9 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         163,
     );
     let function_case_section = v_stack((
-        settings_group_label("Function case"),
+        settings_group_label(tr!("settings-format-function-case")),
         function_case_dd,
-        form_hint(
-            "How Format Code writes the engine's own functions, such as COUNT and \
-                     COALESCE, where they are called. Your own functions keep their case.",
-        ),
+        form_hint(tr!("settings-format-function-case-hint")),
     ))
     .style(ctrl);
     let type_case_dd = focusable_dropdown(
@@ -2159,12 +2145,9 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         166,
     );
     let type_case_section = v_stack((
-        settings_group_label("Type case"),
+        settings_group_label(tr!("settings-format-type-case")),
         type_case_dd,
-        form_hint(
-            "How Format Code writes the engine's own data types, such as INT and \
-                     VARCHAR. Types you created keep their case.",
-        ),
+        form_hint(tr!("settings-format-type-case-hint")),
     ))
     .style(ctrl);
     let commas_dd = focusable_dropdown(
@@ -2175,13 +2158,9 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         170,
     );
     let commas_section = v_stack((
-        settings_group_label("Commas"),
+        settings_group_label(tr!("settings-format-commas")),
         commas_dd,
-        form_hint(
-            "Where Format Code puts the comma of a list it breaks across lines. \
-                     Lists kept on one line, like a function's arguments, are left alone \
-                     unless the wrap width breaks them.",
-        ),
+        form_hint(tr!("settings-format-commas-hint")),
     ))
     .style(ctrl);
     let gap_dd = focusable_dropdown(
@@ -2192,44 +2171,35 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         180,
     );
     let gap_section = v_stack((
-        settings_group_label("Between statements"),
+        settings_group_label(tr!("settings-format-statement-gap")),
         gap_dd,
-        form_hint(
-            "The blank lines Format Code leaves between two statements. As typed \
-                     keeps a blank line wherever there was one.",
-        ),
+        form_hint(tr!("settings-format-statement-gap-hint")),
     ))
     .style(ctrl);
     let wrap_dd = focusable_dropdown(wrap_width, WRAP_WIDTHS, wrap_width_label, ring.clone(), 183);
     let wrap_section = v_stack((
-        settings_group_label("Wrap width"),
+        settings_group_label(tr!("settings-format-wrap")),
         wrap_dd,
-        form_hint(
-            "A list Format Code keeps on one line, like a function's arguments, \
-                     goes one item a line once its line would run past this width.",
-        ),
+        form_hint(tr!("settings-format-wrap-hint")),
     ))
     .style(ctrl);
     let river_row = focusable_toggle_row(
-        "Right-align clause keywords",
-        "Line SELECT, FROM, WHERE and the rest up on their right edge, each \
-                 clause's body beside its keyword, instead of a keyword on a line of its own.",
+        tr!("settings-format-river"),
+        tr!("settings-format-river-hint"),
         river,
         ring.clone(),
         185,
     );
     let align_row = focusable_toggle_row(
-        "Align columns",
-        "Line up the AS of a select list's aliases, the = of an UPDATE's \
-                 assignments and the types of a table's columns.",
+        tr!("settings-format-align"),
+        tr!("settings-format-align-hint"),
         align,
         ring.clone(),
         188,
     );
     let join_on_row = focusable_toggle_row(
-        "Join condition on its own line",
-        "Put a join's ON, and the AND and OR of its condition, on a line of \
-                 their own under the join.",
+        tr!("settings-format-join-on"),
+        tr!("settings-format-join-on-hint"),
         join_on_own_line,
         ring.clone(),
         190,
@@ -2258,7 +2228,11 @@ fn query_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     let live_validate = layout.live_validate;
     let notify_finished = layout.notify_finished;
     let row_dd = focusable_dropdown(row_limit, ROW_LIMITS, row_limit_label, ring.clone(), 200);
-    let row_section = v_stack((settings_group_label("Default row limit"), row_dd)).style(ctrl);
+    let row_section = v_stack((
+        settings_group_label(tr!("settings-query-row-limit")),
+        row_dd,
+    ))
+    .style(ctrl);
     // 210, because `timeout_section` is the row *below* the row limit in
     // the group below — the two toggles come after it.
     let timeout_dd = focusable_dropdown(
@@ -2269,47 +2243,37 @@ fn query_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         210,
     );
     let confirm_row = focusable_toggle_row(
-        "Confirm before running writes",
-        "Ask before executing any statement that modifies data or schema.",
+        tr!("settings-query-confirm-writes"),
+        tr!("settings-query-confirm-writes-hint"),
         confirm_writes,
         ring.clone(),
         220,
     );
     let validate_row = focusable_toggle_row(
-        "Live database validation",
-        "Check the statement under the cursor against the database as you type \
-                 (a non-executing PREPARE) to surface exact errors. Adds a DB round-trip \
-                 on each pause.",
+        tr!("settings-query-validate"),
+        tr!("settings-query-validate-hint"),
         live_validate,
         ring.clone(),
         230,
     );
     let notify_row = focusable_toggle_row(
-        "Notify when a run finishes in the background",
-        "Show a desktop notification when a query, script, export or dump that \
-                 took a second or more ends while Schemaic is not the active window. The \
-                 taskbar button is highlighted either way. The notification never \
-                 includes the SQL.",
+        tr!("settings-query-notify"),
+        tr!("settings-query-notify-hint"),
         notify_finished,
         ring.clone(),
         240,
     );
     let write_log_row = focusable_toggle_row(
-        "Keep values in the write log",
-        "Every write Schemaic or schemaic exec runs is appended to write_log.jsonl in the \
-                 settings folder, and never cleared. Values in its SQL are masked unless \
-                 this is on; a password is masked either way.",
+        tr!("settings-query-write-log"),
+        tr!("settings-query-write-log-hint"),
         write_log_values,
         ring.clone(),
         250,
     );
     let timeout_section = v_stack((
-        settings_group_label("Statement timeout"),
+        settings_group_label(tr!("settings-query-timeout")),
         timeout_dd,
-        form_hint(
-            "Cancel a statement that runs longer than this. Off by default — \
-                     an import or a report can legitimately take a while.",
-        ),
+        form_hint(tr!("settings-query-timeout-hint")),
     ))
     .style(ctrl);
     section_page((
@@ -2343,13 +2307,25 @@ fn appearance_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         310,
     );
     let scale_dd = scale_picker(ui_scale, ring.clone(), 320);
-    let ui_section = v_stack((settings_group_label("Interface theme"), ui_dd)).style(ctrl);
-    let editor_section = v_stack((settings_group_label("Editor theme"), editor_dd)).style(ctrl);
+    let ui_section = v_stack((
+        settings_group_label(tr!("settings-appearance-ui-theme")),
+        ui_dd,
+    ))
+    .style(ctrl);
+    let editor_section = v_stack((
+        settings_group_label(tr!("settings-appearance-editor-theme")),
+        editor_dd,
+    ))
+    .style(ctrl);
     // No hint under this one, unlike the settings that carry a
     // consequence: four segments named by their percentage, applying the
     // instant they are pressed, explain themselves better than a line of
     // prose restating them.
-    let scale_section = v_stack((settings_group_label("Interface scale"), scale_dd)).style(ctrl);
+    let scale_section = v_stack((
+        settings_group_label(tr!("settings-appearance-scale")),
+        scale_dd,
+    ))
+    .style(ctrl);
     section_page((
         form_section_header(SettingsSection::Appearance.label()),
         ui_section,
@@ -2370,7 +2346,7 @@ fn language_section(
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
-    use crate::i18n::{LanguageChoice, tr};
+    use crate::i18n::LanguageChoice;
     let dd = focusable_dropdown(
         choice,
         LanguageChoice::options(),
@@ -2434,13 +2410,16 @@ pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
             // one the root has no Tab handler and Tab falls through to floem's
             // whole-window traversal, out of the modal into the workspace.
             let ring = crate::widgets::FocusRing::new();
-            let panel = v_stack((modal_title("Shortcuts", close.clone(), ring.clone()), body))
-                .on_click_stop(|_| {})
-                .style(|s| {
-                    panel_style(s)
-                        .background(theme::bg_panel())
-                        .width(crate::widgets::modal_w(420.0))
-                });
+            let panel = v_stack((
+                modal_title_owned(tr!("shortcuts-title"), close.clone(), ring.clone()),
+                body,
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| {
+                panel_style(s)
+                    .background(theme::bg_panel())
+                    .width(crate::widgets::modal_w(420.0))
+            });
 
             let esc = close.clone();
             focus_root_with_ring(

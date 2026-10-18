@@ -302,8 +302,8 @@ pub(crate) fn activity_panel(
             FieldCfg {
                 // The box searches the list shown, so it says which.
                 placeholder_of: Some(Rc::new(move || match view.get() {
-                    crate::ActivityView::Sessions => "Search sessions…",
-                    crate::ActivityView::Locks => "Search locks…",
+                    crate::ActivityView::Sessions => "Search sessions…".to_string(),
+                    crate::ActivityView::Locks => "Search locks…".to_string(),
                 })),
                 background: theme::bg_chrome,
                 clearable: true,

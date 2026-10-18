@@ -10965,8 +10965,9 @@ pub(crate) struct FieldCfg {
     /// [`Self::placeholder`] — for one box that searches whichever list is shown
     /// (Server Activity's *Search sessions…* / *Search locks…*). Read in the
     /// placeholder's own reactive label, so a switch relabels the box without
-    /// rebuilding the field.
-    pub placeholder_of: Option<Rc<dyn Fn() -> &'static str>>,
+    /// rebuilding the field. Also how a **translated** placeholder is given
+    /// (`|| tr!("…")`), since a catalogue message is an owned `String`.
+    pub placeholder_of: Option<Rc<dyn Fn() -> String>>,
     /// Box background. A fn (not a `Color`) so it's re-read inside the field's
     /// reactive style — the surface then follows a live theme switch instead of
     /// freezing the colour captured when the field was first built.
@@ -12262,21 +12263,25 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         move |show| {
             if show {
                 let placeholder_of = placeholder_of.clone();
-                label(move || placeholder_of.as_ref().map_or(placeholder, |f| f()))
-                    .style(move |s| {
-                        s.font_size(font_size())
-                            .font_family("IBM Plex Sans".to_string())
-                            .color(placeholder_color())
-                            // The trim itself. `width_full` is what makes it
-                            // definite — a label sizes to its content otherwise
-                            // and overflows the box that was meant to bound it —
-                            // and `min_width(0)` is what lets it shrink below
-                            // that content width in the first place.
-                            .width_full()
-                            .min_width(0.0)
-                            .text_ellipsis()
-                    })
-                    .into_any()
+                label(move || {
+                    placeholder_of
+                        .as_ref()
+                        .map_or_else(|| placeholder.to_string(), |f| f())
+                })
+                .style(move |s| {
+                    s.font_size(font_size())
+                        .font_family("IBM Plex Sans".to_string())
+                        .color(placeholder_color())
+                        // The trim itself. `width_full` is what makes it
+                        // definite — a label sizes to its content otherwise
+                        // and overflows the box that was meant to bound it —
+                        // and `min_width(0)` is what lets it shrink below
+                        // that content width in the first place.
+                        .width_full()
+                        .min_width(0.0)
+                        .text_ellipsis()
+                })
+                .into_any()
             } else {
                 empty().into_any()
             }

@@ -75,6 +75,18 @@ assertions pin English wording — stays the regression net throughout.
    its mirror in `schema_tree.rs`). `schemaic-app` has no `i18n.toml` yet and `tr!` is
    `pub(crate)` to `schemaic-ui`; the app's first converted file decides how it reaches the
    loader.
+
+   **Converted:** `settings.rs`. **How a file goes**, as that one settled it: a helper taking
+   `&'static str` widens to `impl Into<String>` (every literal caller still compiles); a
+   placeholder goes through `FieldCfg::placeholder_of(|| tr!(…))`, whose `placeholder` is still
+   `&'static str`; a sentence assembled from parts becomes whole messages, one per variant; a
+   count becomes a Fluent plural. Every message is one line in the `.ftl` — a continued Fluent
+   value keeps its line break, where the Rust `\` it replaces kept none. German is written in the
+   same change. Text that is not the file's own stays: labels a dropdown takes from another
+   module or crate (`TermCursor::label`, `Agent::label`, `KeywordCase::label`), and core's
+   prose (`statement_timeout_label`, the install status), which is phase 4. Afterwards, compare
+   each placeable-free message against the file's literals at `HEAD` with `\` continuations
+   joined — the suite pins too little of a page's wording to show a changed word.
 4. **Messages built in `schemaic-core`.** The hard part. Around 130 functions return finished
    English prose (`run_verdict`, the DDL preview notes, `Rollback::note`, `tx`, `dump`, `compare`,
    `stats`, `import`, `conn_import`, `users`), and core cannot — and should not — reach a UI

@@ -1738,8 +1738,8 @@ pub(crate) fn form_hint(hint: impl Into<String>) -> impl IntoView {
 /// form; the object editors, the DDL preview, Run script and the fact panels
 /// head a few lines with `form_section`, where it reads as a label rather than a
 /// divider, and the blue there was judged to be noise.
-pub(crate) fn form_section_header(t: &'static str) -> impl IntoView {
-    form_section(t).style(|s| {
+pub(crate) fn form_section_header(t: impl Into<String>) -> impl IntoView {
+    form_section_owned(t.into()).style(|s| {
         s.color(theme::form_heading())
             .margin_bottom(theme::scaled(2.0))
     })

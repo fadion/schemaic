@@ -24581,7 +24581,9 @@ existing prose was left alone.
     gap inside a section (16 in Settings, 20 in the connection form), which is the whole of what
     sets the sections apart. `form_section_header` is `form_section` in `theme::form_heading`
     (the palette's `accent_hover` — the lighter blue on dark, the deeper one on light) with a
-    `margin_bottom(scaled(2))` added, built on it rather than restyled beside it. Import and
+    `margin_bottom(scaled(2))` added, built on it rather than restyled beside it — on
+    `form_section_owned`, strictly, since it takes `impl Into<String>` so a translated heading
+    (`tr!`, an owned `String`) passes as readily as a literal. Import and
     Export (`import_view.rs`, `dump_view.rs`) head their sections with it too, at their own
     spacing; everywhere else keeps `form_section` in `text` — the object editors, the DDL preview,
     Run script and the fact panels head a few lines each, where a heading is a label rather than
@@ -25462,6 +25464,19 @@ existing prose was left alone.
     apart had outgrown the window — and the main Settings modal had it first; both left it when the
     one became two panes and the other a section of it. Settings' panel is a fixed `modal_h(560)`
     and each page, the AI assistant's included, scrolls inside it on its own (above).
+    **Every word the modal writes itself comes from the catalogue** — the first file roadmap phase
+    3 converted: labels, hints, placeholders, section names and the Settings and Shortcuts titles
+    are `tr!` over `settings-*`/`shortcuts-*` messages (`ui/i18n.rs`), with German beside them, and
+    English output was compared message by message against the literals they replaced. Text the
+    file does not own stays English for now: the Shortcuts modal's rows are `shortcuts.rs`'s, and
+    the options a dropdown takes from elsewhere — `TermCursor::label`, `Agent::label`,
+    `KeywordCase::label`, core's `statement_timeout_label` — wait for their own file or for phase 4.
+    That is why its builders take owned text: `focusable_toggle_row`, `focusable_toggle_row_when`,
+    `toggle_row_layout` and `settings_group_label` take `impl Into<String>`, so a literal caller
+    still compiles and a `tr!` result passes as well; `SettingsSection::label()` answers a
+    `String`; both titles go through `modal_title_owned`; and `wrap_width_label` is the Fluent
+    plural `settings-format-wrap-width`, with `settings-off` for `0`. A translated placeholder is
+    `FieldCfg::placeholder_of(|| tr!(…))` (under `lib.rs`), `placeholder` itself being `&'static str`.
   - `shortcuts.rs` — the app's keyboard shortcuts as **one table** (`SHORTCUTS`), which
     `settings::help_overlay` renders straight from — plus the tests that keep it honest. This list
     is the app's *only* keyboard documentation and for Ctrl+H / Ctrl+G the only affordance of any
@@ -39701,9 +39716,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   - Derived metrics sum the **scaled parts** rather than scaling the sum (`consts::leaf_pad`), so an
     indent lands on the pixel the glyphs it aligns under actually occupy — at 80% those differ by one.
 - **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
-  value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). Only the *Language*
-  setting's own three messages have moved so far — every other label is still an English literal
-  until phase 3 of the roadmap's *Interface translation* converts it — and only the GUI is
+  value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). The Settings modal
+  (`settings.rs`) is converted; every other label is still an English literal until phase 3 of the
+  roadmap's *Interface translation* converts its file — that entry keeps the list of what is
+  converted and the recipe a file follows, so neither is repeated here. Only the GUI is
   translated: CLI, MCP and AI text stays English, as do SQL, persisted names and key names.
   - **Nothing decides behaviour by an English label** — decide where the thing is built, or give
     it an id. A comparison against a literal simply turns false once the label is translated, with
