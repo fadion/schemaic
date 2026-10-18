@@ -1547,3 +1547,14 @@ used-by-noun-foreign-key = Fremdschlüssel
 used-by-noun-expression = Tabellenausdruck
 theme-dark = Dunkel
 theme-light = Hell
+md-code-block = CODE
+md-code-copy = Kopieren
+md-code-insert = Einfügen
+md-code-run = Ausführen
+md-proposal-title = Vorgeschlagene Änderung an { $table }
+md-proposal-count = { $count ->
+    [one] { $count } Änderung
+   *[other] { $count } Änderungen
+}
+md-proposal-review = Änderung prüfen…
+md-proposal-unreadable = Der Assistent hat eine Änderung vorgeschlagen, die sich nicht lesen ließ — { $error }

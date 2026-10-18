@@ -24998,6 +24998,14 @@ existing prose was left alone.
     would execute the block in whatever tab is in front, which is the connection the insert had just
     declined to open on. The `bool` exists for that one question; the refusal itself is reported by
     the action.
+    **Its words are the catalogue's** (`md-*`, roadmap phase 3) — a code block's *CODE* label when
+    it names no language (`md-code-block`; *SQL*, and a named language upper-cased, stay as they
+    are), its Copy/Insert/Run links (`code_action_link` takes a `String`), and the proposal card's
+    title (`$table`), its change count (`md-proposal-count`, a plural on `$count` in place of
+    `text::plural`), *Review change…* (`card_button` takes a `String`) and the unreadable line
+    (`$error`). The model's own text — the reply, the proposal's summary — is never translated;
+    the unreadable line's `$error` is serde's, and the error `CodeActions::propose` hands back is
+    shown as it comes. `the_proposal_card_reads_as_it_did_in_english` pins the card's lines.
   - `i18n.rs` — **the interface's string catalogue**: Fluent, through `i18n-embed` (feature
     `fluent-system`) and `i18n-embed-fl`, over the language `core::locale` chose. The catalogues
     are `crates/schemaic-ui/i18n/<tag>/schemaic.ftl` — `en-GB` the source, `de` machine-drafted and
@@ -40266,7 +40274,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`), the ER diagram
   (`erd_view.rs`), Server variables (`server_vars_view.rs`), the snippet editor
   (`snippet_edit.rs`), the Query plan modal (`plan_view.rs`), the Used by modal
-  (`used_by_view.rs`) and the interface themes' names (`themes.rs`) are converted;
+  (`used_by_view.rs`), the interface themes' names (`themes.rs`) and the AI panel's reply
+  renderer's own controls (`markdown.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

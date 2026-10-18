@@ -1800,3 +1800,21 @@ used-by-noun-expression = table expression
 
 theme-dark = Dark
 theme-light = Light
+
+## The assistant's rendered replies (markdown.rs)
+## The model's own text is never translated; these are the controls around it.
+
+# A code block's label when it names no language; "SQL" stays as it is.
+md-code-block = CODE
+md-code-copy = Copy
+md-code-insert = Insert
+md-code-run = Run
+# A proposed table change's card; $table is the table.
+md-proposal-title = Proposed change to { $table }
+md-proposal-count = { $count ->
+    [one] { $count } change
+   *[other] { $count } changes
+}
+md-proposal-review = Review change…
+# $error says why the proposal could not be read.
+md-proposal-unreadable = The assistant proposed a change that couldn't be read — { $error }

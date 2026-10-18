@@ -20,6 +20,7 @@ use floem::views::{RichText, rich_text};
 
 use schemaic_core::intel::SqlDialect;
 
+use crate::i18n::tr;
 use crate::{icons, theme};
 
 // ===== moved from lib.rs (markdown cluster) =====
@@ -623,7 +624,7 @@ pub(crate) struct CodeActions {
 /// than icons because the header is always on screen — an icon row standing
 /// permanently over every code block is noise, and "Run" said in a word can't be
 /// mistaken for "Insert".
-fn code_action_link(label: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
+fn code_action_link(label: String, on_click: impl Fn() + 'static) -> impl IntoView {
     text(label).on_click_stop(move |_| on_click()).style(|s| {
         s.font_size(theme::font_label())
             .color(theme::text_dim())
@@ -691,7 +692,7 @@ fn sql_leading_keyword(code: &str) -> bool {
 /// The card's own action button — the small-toolbar chrome, without the modal
 /// focus machinery `widgets::control_button` carries. A chat bubble is not a
 /// focus root and has no tab order to join.
-fn card_button(label: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
+fn card_button(label: String, on_click: impl Fn() + 'static) -> impl IntoView {
     text(label).on_click_stop(move |_| on_click()).style(|s| {
         crate::widgets::control_surface(s)
             .font_size(crate::widgets::toolbar_font())
@@ -723,10 +724,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
                 // (The count that used to stand here was already out of date by
                 // the commit that wrote it, which is the argument for not
                 // keeping one.)
-                text(format!(
-                    "The assistant proposed a change that couldn't be read — {e}"
-                ))
-                .style(|s| {
+                text(tr!("md-proposal-unreadable", error = e.to_string())).style(|s| {
                     s.width_full()
                         .font_size(theme::font_label())
                         .color(theme::text_muted())
@@ -744,16 +742,12 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
     let head = h_stack((
         icons::icon(icons::TABLE_PROPERTIES, 15.0)
             .style(|s| s.color(theme::text_muted()).flex_shrink(0.0_f32)),
-        text(format!("Proposed change to {}", proposal.table)).style(|s| {
+        text(tr!("md-proposal-title", table = proposal.table.clone())).style(|s| {
             s.font_size(theme::font_body())
                 .color(theme::text())
                 .flex_grow(1.0_f32)
         }),
-        text(format!(
-            "{ops} {}",
-            schemaic_core::text::plural(ops, "change", "changes")
-        ))
-        .style(|s| {
+        text(tr!("md-proposal-count", count = ops)).style(|s| {
             s.font_size(theme::font_label())
                 .color(theme::text_faint())
                 .flex_shrink(0.0_f32)
@@ -782,7 +776,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
 
     let review = {
         let propose = actions.propose.clone();
-        card_button("Review change…", move || {
+        card_button(tr!("md-proposal-review"), move || {
             // The failure lands on the card, not in a modal: it is the model
             // being wrong about the table, and this is where the user can see
             // what it asked for.
@@ -881,7 +875,7 @@ fn code_block(
     let kind = if is_sql {
         "SQL".to_string()
     } else if lang.trim().is_empty() {
-        "CODE".to_string()
+        tr!("md-code-block")
     } else {
         lang.trim().to_ascii_uppercase()
     };
@@ -892,7 +886,7 @@ fn code_block(
     let mut links: Vec<AnyView> = Vec::new();
     let copy_code = code.clone();
     links.push(
-        code_action_link("Copy", move || {
+        code_action_link(tr!("md-code-copy"), move || {
             let _ = floem::Clipboard::set_contents(copy_code.clone());
         })
         .into_any(),
@@ -915,7 +909,7 @@ fn code_block(
         let insert_code = code.clone();
         let insert = actions.insert.clone();
         links.push(
-            code_action_link("Insert", move || {
+            code_action_link(tr!("md-code-insert"), move || {
                 (insert)(insert_code.clone());
             })
             .into_any(),
@@ -924,7 +918,7 @@ fn code_block(
         let run_insert = actions.insert.clone();
         let run = actions.run.clone();
         links.push(
-            code_action_link("Run", move || {
+            code_action_link(tr!("md-code-run"), move || {
                 // **Only if the insert really opened a tab.** `run` targets the
                 // *active* tab, so running after a refused insert would run this
                 // block in whatever tab is in front — which is the connection
@@ -982,6 +976,23 @@ const CODE_LINE_H: f32 = 1.4;
 #[cfg(test)]
 mod tests {
     use super::{code_is_sql, sql_leading_keyword};
+    use crate::i18n::tr;
+
+    /// A proposal card's composed lines read as they did in English before the
+    /// catalogue, the count in both numbers.
+    #[test]
+    fn the_proposal_card_reads_as_it_did_in_english() {
+        assert_eq!(
+            tr!("md-proposal-title", table = "orders"),
+            "Proposed change to orders"
+        );
+        assert_eq!(tr!("md-proposal-count", count = 1), "1 change");
+        assert_eq!(tr!("md-proposal-count", count = 4), "4 changes");
+        assert_eq!(
+            tr!("md-proposal-unreadable", error = "missing field `table`"),
+            "The assistant proposed a change that couldn't be read \u{2014} missing field `table`"
+        );
+    }
 
     /// The decision this pair encodes is *which code blocks get a Run button*,
     /// and it is the only place in the chat where a model's output becomes
