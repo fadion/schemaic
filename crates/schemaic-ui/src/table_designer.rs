@@ -31,6 +31,7 @@ use schemaic_core::ddl::{
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, ServerFlavour};
 
+use crate::i18n::tr;
 use crate::settings::focusable_toggle_row;
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
@@ -592,7 +593,7 @@ fn bound_field(
     draft: RwSignal<TableDraft>,
     initial: String,
     width: fn() -> f64,
-    placeholder: &'static str,
+    placeholder: impl Into<Placeholder>,
     ring: FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
@@ -616,7 +617,7 @@ fn sql_field(
     draft: RwSignal<TableDraft>,
     initial: String,
     width: fn() -> f64,
-    placeholder: &'static str,
+    placeholder: impl Into<Placeholder>,
     ring: FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
@@ -651,18 +652,41 @@ fn bound_signal(
     sig
 }
 
+/// What an empty field shows: a **sample** of what goes in it — a name, a type,
+/// an expression, which reads the same in every language and stays a literal —
+/// or a **phrase**, drawn from the catalogue when the field is built.
+///
+/// A `&'static str` converts into a sample, so the dozen fields whose
+/// placeholder is SQL or an identifier pass it as they always did, and only a
+/// phrase has to say so.
+pub(crate) enum Placeholder {
+    Sample(&'static str),
+    Phrase(fn() -> String),
+}
+
+impl From<&'static str> for Placeholder {
+    fn from(s: &'static str) -> Self {
+        Placeholder::Sample(s)
+    }
+}
+
 fn field_view(
     sig: RwSignal<String>,
     width: fn() -> f64,
-    placeholder: &'static str,
+    placeholder: impl Into<Placeholder>,
     mono: bool,
     ring: FocusRing,
     tabindex: u32,
 ) -> AnyView {
+    let (placeholder, placeholder_of) = match placeholder.into() {
+        Placeholder::Sample(s) => (s, None),
+        Placeholder::Phrase(f) => ("", Some(Rc::new(f) as Rc<dyn Fn() -> String>)),
+    };
     edit_field(
         sig,
         FieldCfg {
             placeholder,
+            placeholder_of,
             mono,
             focus: Some((ring, tabindex)),
             ..Default::default()
@@ -896,7 +920,7 @@ fn bound_field_with_menu(
         },
         width,
         move || options.clone(),
-        "No suggestions",
+        tr!("designer-no-suggestions"),
         ring,
         tabindex,
     )
@@ -956,8 +980,8 @@ pub(crate) fn focusable_owned_dropdown(
 /// A toggle row bound to the draft, same shape as the settings modals'.
 fn bound_toggle(
     draft: RwSignal<TableDraft>,
-    title: &'static str,
-    hint: &'static str,
+    title: String,
+    hint: String,
     initial: bool,
     ring: FocusRing,
     tabindex: u32,
@@ -987,7 +1011,7 @@ pub(crate) fn list_actions(
     move_down: Option<Rc<dyn Fn()>>,
     ring: FocusRing,
 ) -> impl IntoView {
-    let btn = move |glyph: &'static str, tip: &'static str, slot: u32, act: Rc<dyn Fn()>| {
+    let btn = move |glyph: &'static str, tip: String, slot: u32, act: Rc<dyn Fn()>| {
         let pressed = act.clone();
         // **Every one of these four writes the draft, and the draft is half the
         // key of the `dyn_container` this bar lives inside** — so each press
@@ -1018,7 +1042,7 @@ pub(crate) fn list_actions(
                     .color(theme::text_dim())
                     .hover(|s| s.color(theme::text()))
             })
-            .tooltip(move || text(tip).style(crate::widgets::tooltip_style));
+            .tooltip(move || text(tip.clone()).style(crate::widgets::tooltip_style));
         // 0.0: an icon face, square.
         crate::widgets::in_ring_button(
             face,
@@ -1034,14 +1058,14 @@ pub(crate) fn list_actions(
     };
     let arrows: Vec<AnyView> = match (move_up, move_down) {
         (Some(u), Some(d)) => vec![
-            btn(icons::CHEVRON_UP, "Move up", 2, u).into_any(),
-            btn(icons::CHEVRON_DOWN, "Move down", 3, d).into_any(),
+            btn(icons::CHEVRON_UP, tr!("editor-row-move-up"), 2, u).into_any(),
+            btn(icons::CHEVRON_DOWN, tr!("editor-row-move-down"), 3, d).into_any(),
         ],
         _ => Vec::new(),
     };
     h_stack((
-        btn(icons::PLUS, "Add", 0, Rc::new(add)),
-        btn(icons::TRASH_2, "Remove", 1, Rc::new(remove)),
+        btn(icons::PLUS, tr!("designer-list-add"), 0, Rc::new(add)),
+        btn(icons::TRASH_2, tr!("editor-row-remove"), 1, Rc::new(remove)),
         h_stack_from_iter(arrows).style(|s| s.flex_row().gap(theme::scaled(2.0))),
     ))
     .style(|s| {
@@ -1265,13 +1289,43 @@ fn detail_pane(tab: RwSignal<DesignerTab>, body: impl IntoView + 'static) -> imp
     })
 }
 
-fn hint(t: &'static str) -> impl IntoView {
+fn hint(t: String) -> impl IntoView {
     form_hint(t)
 }
 
 /// A field with a hint under it.
-fn field_with_hint(field: impl IntoView + 'static, h: &'static str) -> impl IntoView {
+fn field_with_hint(field: impl IntoView + 'static, h: String) -> impl IntoView {
     v_stack((field, hint(h))).style(|s| s.flex_col().gap(theme::scaled(4.0)))
+}
+
+/// The server-assigned-key toggle's label and hint — `ddl::identity_wording`'s
+/// words, drawn here so they can be translated. The keyword in the hint is the
+/// one `ColumnInfo::definition_sql` writes on `dialect`, and stays SQL.
+fn identity_wording(dialect: SqlDialect) -> (String, String) {
+    let (label, keyword) = match dialect {
+        SqlDialect::Postgres => (tr!("designer-identity"), "GENERATED BY DEFAULT AS IDENTITY"),
+        SqlDialect::MsSql => (tr!("designer-identity"), "IDENTITY(1,1)"),
+        SqlDialect::MySql | SqlDialect::Sqlite => {
+            (tr!("designer-auto-increment"), "AUTO_INCREMENT")
+        }
+    };
+    (label, tr!("designer-identity-hint", keyword = keyword))
+}
+
+/// What the Storage dropdown calls an index kind — `IndexStorage::label`'s
+/// word, drawn here. The dropdown hands back the text it shows, so the pick is
+/// matched through this too.
+fn storage_label(kind: ddl::IndexStorage) -> String {
+    use ddl::IndexStorage as K;
+    match kind {
+        K::Rowstore => tr!("designer-storage-rowstore"),
+        K::Columnstore => tr!("designer-storage-columnstore"),
+        K::ClusteredColumnstore => tr!("designer-storage-clustered-columnstore"),
+        K::PrimaryXml => tr!("designer-storage-primary-xml"),
+        K::SelectiveXml => tr!("designer-storage-selective-xml"),
+        K::SecondaryXml => tr!("designer-storage-secondary-xml"),
+        K::Spatial => tr!("designer-storage-spatial"),
+    }
 }
 
 // ── the Table section ────────────────────────────────────────────────────────
@@ -1292,7 +1346,7 @@ fn table_section(
     let has_comments = ddl::supports_comments(target.dialect);
     let draft = d.get_untracked();
     let name = form_setting(
-        "Name",
+        tr!("designer-name"),
         bound_field(
             d,
             draft.name.clone(),
@@ -1308,12 +1362,12 @@ fn table_section(
     // the engine and collation fields aren't.
     let comment: AnyView = if has_comments {
         form_setting(
-            "Comment",
+            tr!("designer-comment"),
             bound_field(
                 d,
                 draft.comment.clone().unwrap_or_default(),
                 sentence_field_w,
-                "What this table is for",
+                Placeholder::Phrase(|| tr!("designer-table-comment-placeholder")),
                 ring.clone(),
                 20,
                 |d, v| d.comment = Some(v.to_string()).filter(|s| !s.is_empty()),
@@ -1330,7 +1384,7 @@ fn table_section(
     let mysql_only: AnyView = if table_options {
         v_stack((
             form_setting(
-                "Engine",
+                tr!("designer-engine"),
                 bound_field_with_menu(
                     d,
                     overlay,
@@ -1346,7 +1400,7 @@ fn table_section(
                 ),
             ),
             form_setting(
-                "Collation",
+                tr!("designer-collation"),
                 bound_field(
                     d,
                     draft.collation.clone().unwrap_or_default(),
@@ -1454,7 +1508,7 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(c) = draft.columns.get(i).map(|c| c.info.clone()) else {
-        return empty_hint("No column selected.").into_any();
+        return empty_hint(tr!("designer-no-column")).into_any();
     };
     // Asked as capabilities, because SQLite is neither of the other two here: it
     // *has* a column collation (`COLLATE NOCASE`), has no comment on anything,
@@ -1463,11 +1517,11 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
     // Server has no comment the emitter writes either (`ddl::supports_comments`).
     let has_comments = ddl::supports_comments(target.dialect);
     let has_on_update = ddl::supports_column_on_update(target.dialect);
-    let (identity_label, identity_hint) = ddl::identity_wording(target.dialect);
+    let (identity_label, identity_hint) = identity_wording(target.dialect);
     let in_pk = draft.is_in_primary_key(i);
 
     let name = form_setting(
-        "Name",
+        tr!("designer-name"),
         bound_field(
             d.draft,
             c.name.clone(),
@@ -1479,7 +1533,7 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
         ),
     );
     let ty = form_setting(
-        "Type",
+        tr!("designer-type"),
         field_with_hint(
             bound_field_with_menu(
                 d.draft,
@@ -1500,13 +1554,13 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
                     }
                 },
             ),
-            "Written straight through — the server decides what it means.",
+            tr!("designer-type-hint"),
         ),
     );
     let nullable = bound_toggle(
         d.draft,
-        "Nullable",
-        "Allow NULL in this column.",
+        tr!("designer-nullable"),
+        tr!("designer-nullable-hint"),
         c.nullable,
         ring.clone(),
         30,
@@ -1518,13 +1572,13 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
     );
     let primary = bound_toggle(
         d.draft,
-        "Primary key",
+        tr!("designer-primary-key"),
         // The order is the **column** order, not the order these were switched
         // on — that is what `2279fcb` fixed, and this hint still promised the
         // old rule. On InnoDB the primary key is the clustered index, so its
         // order decides the physical layout, and nothing else on screen
         // contradicts a wrong sentence before Preview SQL.
-        "Part of the table's primary key, in column order.",
+        tr!("designer-primary-key-hint"),
         in_pk,
         ring.clone(),
         40,
@@ -1544,7 +1598,7 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
         },
     );
     let default = form_setting(
-        "Default",
+        tr!("designer-default"),
         field_with_hint(
             sql_field(
                 d.draft,
@@ -1559,11 +1613,11 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
                     }
                 },
             ),
-            "SQL text, as you'd write it: 'draft', 0, CURRENT_TIMESTAMP.",
+            tr!("designer-default-hint"),
         ),
     );
     let generated = form_setting(
-        "Generated from",
+        tr!("designer-generated"),
         field_with_hint(
             sql_field(
                 d.draft,
@@ -1578,12 +1632,12 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
                     }
                 },
             ),
-            "An expression, e.g. qty * price. A generated column takes no default.",
+            tr!("designer-generated-hint"),
         ),
     );
     let comment: AnyView = if has_comments {
         form_setting(
-            "Comment",
+            tr!("designer-comment"),
             bound_field(
                 d.draft,
                 c.comment.clone().unwrap_or_default(),
@@ -1603,7 +1657,7 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
         crate::widgets::nothing()
     };
     let collation = form_setting(
-        "Collation",
+        tr!("designer-collation"),
         bound_field(
             d.draft,
             c.collation.clone().unwrap_or_default(),
@@ -1624,7 +1678,7 @@ fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: Focu
         crate::widgets::nothing()
     } else {
         form_setting(
-            "On update",
+            tr!("designer-on-update"),
             bound_field(
                 d.draft,
                 c.on_update.clone().unwrap_or_default(),
@@ -1666,15 +1720,15 @@ fn indexes_list(d: DdlUi, ring: FocusRing) -> AnyView {
             .iter()
             .any(|h| matches!(h, ddl::IndexHint::Redundant { index, .. } if *index == i));
         let detail = match (ix.info.unique, redundant) {
-            (true, _) => "unique",
-            (false, true) => "redundant",
-            (false, false) => "",
+            (true, _) => tr!("designer-index-unique-detail"),
+            (false, true) => tr!("designer-index-redundant-detail"),
+            (false, false) => String::new(),
         };
         list_row(
             selected,
             i,
             ix.info.name.clone(),
-            detail.to_string(),
+            detail,
             Some((icons::KEY_SQUARE, theme::key_index)),
         )
     }))
@@ -1735,7 +1789,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(ix) = draft.indexes.get(i).map(|x| x.info.clone()) else {
-        return empty_hint("No index selected. The primary key lives on the columns.").into_any();
+        return empty_hint(tr!("designer-no-index")).into_any();
     };
     let dialect = target.dialect;
     // **Unique, Columns and Include are built only for a kind that keeps
@@ -1746,24 +1800,24 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // (`of_in`): MySQL's spatial index carries SQL Server's spatial `method`.
     use ddl::IndexStorage as K;
     let kind = K::of_in(&ix, dialect);
-    let key_hint: &'static str = if matches!(
+    let key_hint = if matches!(
         kind,
         K::PrimaryXml | K::SelectiveXml | K::SecondaryXml | K::Spatial
     ) {
-        "The one xml, geometry or geography column it indexes."
+        tr!("designer-index-columns-hint-single")
     } else if kind == K::Columnstore {
-        "Comma-separated columns it stores."
+        tr!("designer-index-columns-hint-columnstore")
     } else if ddl::supports_index_prefix(dialect) {
-        "Comma-separated, in key order. bio(20) is a prefix length; add DESC to sort down."
+        tr!("designer-index-columns-hint-prefix")
     } else {
-        "Comma-separated, in key order. Add DESC for a descending column."
+        tr!("designer-index-columns-hint")
     };
 
     // Each built only where the engine has it: a `hide()`n field is still in
     // the modal's Tab order.
     let method_field: AnyView = if ddl::supports_index_method(dialect) {
         form_setting(
-            "Method",
+            tr!("designer-index-method"),
             field_with_hint(
                 bound_field(
                     d.draft,
@@ -1778,7 +1832,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                         }
                     },
                 ),
-                "Leave empty for the default (btree).",
+                tr!("designer-index-method-hint"),
             ),
         )
         .into_any()
@@ -1791,7 +1845,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // `validate` asks.
     let filter_field: AnyView = if ddl::index_takes_filter(&ix, dialect) {
         form_setting(
-            "Only rows where",
+            tr!("designer-index-filter"),
             field_with_hint(
                 bound_field(
                     d.draft,
@@ -1806,7 +1860,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                         }
                     },
                 ),
-                "A partial index's condition, without the WHERE.",
+                tr!("designer-index-filter-hint"),
             ),
         )
         .into_any()
@@ -1826,12 +1880,14 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let storage: AnyView = if kinds.len() > 1 {
         let draft = d.draft;
         let rev = d.rev;
-        let sig = floem::reactive::create_rw_signal(kind.label().to_string());
+        // The picker hands back the text it shows, so the match below reads
+        // through the same `storage_label` that built the entries.
+        let sig = floem::reactive::create_rw_signal(storage_label(kind));
         form_setting(
-            "Storage",
+            tr!("designer-index-storage"),
             crate::table_designer::focusable_owned_dropdown(
                 move || sig.get(),
-                kinds.iter().map(|s| s.label().to_string()).collect(),
+                kinds.iter().map(|s| storage_label(*s)).collect(),
                 field_w,
                 ring.clone(),
                 27,
@@ -1840,7 +1896,10 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                         return;
                     }
                     sig.set(v.clone());
-                    if let Some(s) = ddl::IndexStorage::ALL.into_iter().find(|s| s.label() == v) {
+                    if let Some(s) = ddl::IndexStorage::ALL
+                        .into_iter()
+                        .find(|s| storage_label(*s) == v)
+                    {
                         draft.update(|dr| {
                             if let Some(x) = dr.indexes.get_mut(i) {
                                 s.apply(&mut x.info);
@@ -1871,7 +1930,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // Its example is its own kind's clause (`IndexStorage::using_example`).
     let using: AnyView = if let Some(example) = kind.using_example() {
         form_setting(
-            "Using",
+            tr!("designer-index-using"),
             field_with_hint(
                 bound_field(
                     d.draft,
@@ -1886,10 +1945,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                         }
                     },
                 ),
-                "The clause after the column: a secondary XML index's USING XML INDEX … FOR \
-                 PATH, VALUE or PROPERTY (or FOR (path) on a selective one), a selective XML \
-                 index's [WITH XMLNAMESPACES (…)] FOR (name = '/path' [AS …], …), or a spatial \
-                 index's USING … WITH (…).",
+                tr!("designer-index-using-hint"),
             ),
         )
         .into_any()
@@ -1902,7 +1958,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // when Storage changes, so it comes and goes with the choice.
     let order: AnyView = if ix.is_columnstore() && ddl::supports_columnstore_order(dialect) {
         form_setting(
-            "Order",
+            tr!("designer-index-order"),
             field_with_hint(
                 bound_field(
                     d.draft,
@@ -1917,8 +1973,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                         }
                     },
                 ),
-                "Comma-separated columns the segments are sorted by — SQL Server 2022 on, and \
-                 2025 on for a nonclustered index, which sorts only by columns it stores.",
+                tr!("designer-index-order-hint"),
             ),
         )
         .into_any()
@@ -1932,7 +1987,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // index (Msg 10601) — `ddl::index_takes_include`, which `validate` asks.
     let include: AnyView = if ddl::index_takes_include(&ix, dialect) {
         form_setting(
-            "Include",
+            tr!("designer-index-include"),
             field_with_hint(
                 bound_field(
                     d.draft,
@@ -1947,7 +2002,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                         }
                     },
                 ),
-                "Comma-separated columns carried in the index but not part of its key.",
+                tr!("designer-index-include-hint"),
             ),
         )
         .into_any()
@@ -1957,7 +2012,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
     let columns: AnyView = if kind.takes_columns() {
         form_setting(
-            "Columns",
+            tr!("designer-columns"),
             field_with_hint(
                 bound_field(
                     d.draft,
@@ -1983,8 +2038,8 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let unique: AnyView = if kind.takes_unique() {
         bound_toggle(
             d.draft,
-            "Unique",
-            "Refuse duplicate values across these columns.",
+            tr!("designer-index-unique"),
+            tr!("designer-index-unique-hint"),
             ix.unique,
             ring.clone(),
             30,
@@ -2001,7 +2056,7 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
     v_stack((
         form_setting(
-            "Name",
+            tr!("designer-name"),
             bound_field(
                 d.draft,
                 ix.name.clone(),
@@ -2058,7 +2113,10 @@ fn fks_list(d: DdlUi, ring: FocusRing) -> AnyView {
             i,
             fk.info.name.clone(),
             if unindexed {
-                format!("→ {} · no index", fk.info.ref_table)
+                tr!(
+                    "designer-fk-detail-unindexed",
+                    table = fk.info.ref_table.clone()
+                )
             } else {
                 format!("→ {}", fk.info.ref_table)
             },
@@ -2119,7 +2177,7 @@ fn fk_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(fk) = draft.foreign_keys.get(i).map(|f| f.info.clone()) else {
-        return empty_hint("No foreign key selected.").into_any();
+        return empty_hint(tr!("designer-no-fk")).into_any();
     };
     let draft_sig = d.draft;
     let actions: Vec<String> = ddl::fk_actions(target.dialect)
@@ -2131,7 +2189,7 @@ fn fk_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // typed by hand is the single most common way a new key fails.
     let tables = target.tables.clone();
     let ref_table = form_setting(
-        "References table",
+        tr!("designer-fk-ref-table"),
         focusable_owned_dropdown(
             move || {
                 draft_sig.with(|d| {
@@ -2156,7 +2214,7 @@ fn fk_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     );
 
     let on_delete = form_setting(
-        "On delete",
+        tr!("designer-fk-on-delete"),
         focusable_owned_dropdown(
             move || {
                 draft_sig.with(|d| {
@@ -2181,7 +2239,7 @@ fn fk_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         ),
     );
     let on_update = form_setting(
-        "On update",
+        tr!("designer-on-update"),
         focusable_owned_dropdown(
             move || {
                 draft_sig.with(|d| {
@@ -2208,7 +2266,7 @@ fn fk_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
     v_stack((
         form_setting(
-            "Name",
+            tr!("designer-name"),
             bound_field(
                 d.draft,
                 fk.name.clone(),
@@ -2224,7 +2282,7 @@ fn fk_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             ),
         ),
         form_setting(
-            "Columns",
+            tr!("designer-columns"),
             field_with_hint(
                 bound_field(
                     d.draft,
@@ -2239,12 +2297,12 @@ fn fk_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                         }
                     },
                 ),
-                "Comma-separated, paired in order with the referenced columns.",
+                tr!("designer-fk-columns-hint"),
             ),
         ),
         ref_table,
         form_setting(
-            "References columns",
+            tr!("designer-fk-ref-columns"),
             bound_field(
                 d.draft,
                 fk.ref_columns.join(", "),
@@ -2336,11 +2394,11 @@ fn check_form(
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(ck) = draft.check_constraints.get(i).map(|c| c.info.clone()) else {
-        return empty_hint("No check selected.").into_any();
+        return empty_hint(tr!("designer-no-check")).into_any();
     };
 
     let name = form_setting(
-        "Name",
+        tr!("designer-name"),
         bound_field(
             d.draft,
             ck.name.clone(),
@@ -2356,7 +2414,7 @@ fn check_form(
         ),
     );
     let expression = form_setting(
-        "Expression",
+        tr!("designer-check-expression"),
         field_with_hint(
             bound_field(
                 d.draft,
@@ -2373,7 +2431,7 @@ fn check_form(
                     }
                 },
             ),
-            "The condition every row must satisfy. Written without CHECK (…).",
+            tr!("designer-check-expression-hint"),
         ),
     );
 
@@ -2391,8 +2449,8 @@ fn check_form(
     } else {
         bound_toggle(
             d.draft,
-            "Enforced",
-            "Off records the constraint without applying it — existing and new rows are both accepted.",
+            tr!("designer-check-enforced"),
+            tr!("designer-check-enforced-hint"),
             ck.enforced,
             ring,
             30,
@@ -2525,14 +2583,17 @@ pub(crate) fn table_designer_overlay(
                 return empty().into_any();
             };
             let title = match &target.current {
-                Some(t) => format!(
-                    "Edit {}.{}",
-                    object_location(&target.database, t.schema.as_deref()),
-                    t.name
+                Some(t) => tr!(
+                    "designer-title-edit",
+                    table = format!(
+                        "{}.{}",
+                        object_location(&target.database, t.schema.as_deref()),
+                        t.name
+                    )
                 ),
-                None => format!(
-                    "Create table in {}",
-                    object_location(&target.database, target.schema.as_deref())
+                None => tr!(
+                    "designer-title-create",
+                    location = object_location(&target.database, target.schema.as_deref())
                 ),
             };
 
@@ -2624,21 +2685,17 @@ pub(crate) fn table_designer_overlay(
                         return crate::widgets::footer_error(first.clone());
                     }
                     let n = change_set(&status_target, &draft).len();
-                    let count = text(match n {
-                        0 => "No changes".to_string(),
-                        1 => "1 change".to_string(),
-                        n => format!("{n} changes"),
-                    })
-                    // Green once there's something to apply — the same signal the
-                    // Preview button gives by lighting up, at the other end of
-                    // the footer where the count lives.
-                    .style(move |s| {
-                        s.font_size(theme::font_label()).color(if n == 0 {
-                            theme::text_faint()
-                        } else {
-                            theme::change_count()
-                        })
-                    });
+                    let count = text(tr!("editor-change-count", n = n))
+                        // Green once there's something to apply — the same signal the
+                        // Preview button gives by lighting up, at the other end of
+                        // the footer where the count lives.
+                        .style(move |s| {
+                            s.font_size(theme::font_label()).color(if n == 0 {
+                                theme::text_faint()
+                            } else {
+                                theme::change_count()
+                            })
+                        });
                     // **Advice, after the count and never instead of it**: an
                     // index hint does not block Preview (`ddl::index_hints` is
                     // not `validate`). The first one, cut to the footer with
@@ -2683,7 +2740,7 @@ pub(crate) fn table_designer_overlay(
                     let ready = draft.validate(target.dialect).is_empty() && !cs.is_empty();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -2691,7 +2748,7 @@ pub(crate) fn table_designer_overlay(
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,
@@ -2866,6 +2923,67 @@ mod tests {
 /// A test rather than a rule in a comment, because that is exactly the failure
 /// mode: invisible, and reintroduced by the next person who writes a width at a
 /// call site.
+/// Words core gives as properties of a value — the identity toggle's wording,
+/// an index kind — are drawn here so they can be translated, while core keeps
+/// its English. In English the two have to agree word for word.
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    #[test]
+    fn english_words_the_identity_toggle_as_core_does_on_every_engine() {
+        for d in SqlDialect::ALL {
+            let (label, hint) = identity_wording(d);
+            let (core_label, core_hint) = ddl::identity_wording(d);
+            assert_eq!(
+                (label.as_str(), hint.as_str()),
+                (core_label, core_hint),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// The Storage pick is matched back through `storage_label`, so two kinds
+    /// sharing a word would make one of them unpickable.
+    #[test]
+    fn english_names_every_index_kind_as_core_does_and_each_apart() {
+        for k in ddl::IndexStorage::ALL {
+            assert_eq!(storage_label(k), k.label(), "{k:?}");
+        }
+        let mut words: Vec<String> = ddl::IndexStorage::ALL
+            .into_iter()
+            .map(storage_label)
+            .collect();
+        words.sort();
+        words.dedup();
+        assert_eq!(words.len(), ddl::IndexStorage::ALL.len());
+    }
+
+    #[test]
+    fn the_tabs_and_the_composed_lines_read_as_they_did_in_english() {
+        let tabs: Vec<String> = DesignerTab::ALL
+            .into_iter()
+            .map(DesignerTab::label)
+            .collect();
+        assert_eq!(
+            tabs,
+            ["Table", "Columns", "Indexes", "Foreign keys", "Checks"]
+        );
+        assert_eq!(
+            tr!("designer-fk-detail-unindexed", table = "customers"),
+            "→ customers · no index"
+        );
+        assert_eq!(
+            tr!("designer-title-edit", table = "shop.orders"),
+            "Edit shop.orders"
+        );
+        assert_eq!(
+            tr!("designer-title-create", location = "shop.public"),
+            "Create table in shop.public"
+        );
+    }
+}
+
 #[cfg(test)]
 mod width_scale_tests {
     use super::*;

@@ -1261,13 +1261,14 @@ impl DesignerTab {
         DesignerTab::ForeignKeys,
         DesignerTab::Checks,
     ];
-    pub fn label(self) -> &'static str {
+    /// The tab's name in the designer's strip, from the catalogue.
+    pub fn label(self) -> String {
         match self {
-            DesignerTab::Table => "Table",
-            DesignerTab::Columns => "Columns",
-            DesignerTab::Indexes => "Indexes",
-            DesignerTab::ForeignKeys => "Foreign keys",
-            DesignerTab::Checks => "Checks",
+            DesignerTab::Table => tr!("designer-tab-table"),
+            DesignerTab::Columns => tr!("designer-tab-columns"),
+            DesignerTab::Indexes => tr!("designer-tab-indexes"),
+            DesignerTab::ForeignKeys => tr!("designer-tab-foreign-keys"),
+            DesignerTab::Checks => tr!("designer-tab-checks"),
         }
     }
 }

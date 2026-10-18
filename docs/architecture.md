@@ -27797,7 +27797,8 @@ existing prose was left alone.
     local function is gone, taking one of this file's admitted `engine_comparison_gate` comparisons
     (9 → 8) with it. **SQL Server's Create table took it 8 → 5**: both comment fields — table and
     column — ask `ddl::supports_comments`, so SQL Server's were hidden rather than typed into and
-    dropped, until the emitter wrote them and the predicate turned them back on; the identity toggle asks `ddl::identity_wording`, having said *Auto-increment
+    dropped, until the emitter wrote them and the predicate turned them back on; the identity toggle took `ddl::identity_wording`'s words (drawn UI-side now, by this
+    file's own `identity_wording` — below), having said *Auto-increment
     (AUTO_INCREMENT)* there; the index key hint asks `ddl::supports_index_prefix`, having named
     MySQL's `bio(20)` prefix on every engine but PostgreSQL. **The MySQL-only fields took it
     4 → 1**: the storage-engine and table-collation row asks `ddl::takes_table_options` — the
@@ -28065,6 +28066,36 @@ existing prose was left alone.
     `None` — a name the draft doesn't hold — is dropped **silently** and the designer opens on the
     `Table` tab, which is what it did before it was asked at all: the request that failed is the
     landing, not the edit.
+    **Its words are the catalogue's** (`designer-*`, roadmap phase 3) — the tab strip, sections,
+    fields, toggles and their hints, the Indexes rows' *unique*/*redundant* details and the Foreign
+    keys row's *→ {table} · no index* (`designer-fk-detail-unindexed`) — with Cancel, Preview SQL
+    and the change count the shared `dialog-cancel`, `editor-preview-sql` and
+    `editor-change-count`. The titles are whole messages, `designer-title-edit` with `$table` and
+    `designer-title-create` with `$location`. `DesignerTab::label` (in `lib.rs`) returns a `String`
+    from `designer-tab-*`, and this strip is its only reader. `list_actions`' tooltips are
+    `designer-list-add` for `+` and the shared `editor-row-remove` and
+    `editor-row-move-up`/`-down` for the bin and the arrows — so the trigger editor's list bar,
+    which calls it, is translated with this file — and its `btn` closure takes the tip as a
+    `String`, as `bound_toggle`'s title and hint, `hint` and `field_with_hint` do. **A placeholder
+    is a sample or a phrase** (`pub(crate) enum Placeholder`): `bound_field`, `sql_field` and
+    `field_view` take `impl Into<Placeholder>`, and a `&'static str` converts into
+    `Placeholder::Sample`, so the SQL and identifier samples — `table_name`, `varchar(255)`,
+    `InnoDB`, `utf8mb4_general_ci`, `btree`, `id, name`, `qty > 0`, `CURRENT_TIMESTAMP` — pass as
+    they always did and stay English, while the table comment's *What this table is for* is the one
+    `Placeholder::Phrase`, reaching the field as `FieldCfg::placeholder_of`. **Two words core gives
+    are drawn here** (the core-words rule under *UI conventions*): `identity_wording(dialect)` in
+    place of `ddl::identity_wording`, the keyword in its hint staying SQL as a `$keyword`
+    placeable, and `storage_label` in place of `IndexStorage::label` in the Storage dropdown.
+    **The pick is matched back through `storage_label` too**, because the picker hands back the
+    text it shows: no English label decides which kind was chosen, and two kinds sharing a word
+    would leave one unpickable, which `english_names_every_index_kind_as_core_does_and_each_apart`
+    checks beside holding the English equal to core's.
+    `english_words_the_identity_toggle_as_core_does_on_every_engine` does the same for the toggle on
+    every dialect, and `the_tabs_and_the_composed_lines_read_as_they_did_in_english` pins the tabs,
+    the foreign-key detail and both titles. What stays English: the referential actions in the On
+    delete/On update dropdowns (`NO ACTION`, `CASCADE`, …), which are SQL keywords; the samples
+    above; a new item's name (`column`, `{table}_idx`, `fk_{table}`, `{table}_chk`); and core's
+    prose — `ddl::index_hints`' messages and `TableDraft::validate`'s sentences, phase 4.
   - `view_editor.rs` — the **view** modal (tree "Edit" on a view, "Create view" on a database/
     schema node *and* on the editor's right-click when the statement under the caret can be a
     view body — `ddl::can_be_view_body`, which seeds the draft with it), over `core::ddl`'s
@@ -28390,7 +28421,7 @@ existing prose was left alone.
     `table_designer::empty_hint`'s message, takes `impl Into<String>`). The NOT FOR REPLICATION
     toggle's own label is the SQL clause and stays, as do the SQL samples and keyword choices
     (`INSERT`/`UPDATE`/`DELETE`, `FOR EACH ROW`, `BEGIN … END`). The list's `+`/`−` are
-    `table_designer::list_actions`' and convert with that file; `TriggerDraft::validate`'s
+    `table_designer::list_actions`' and were converted with that file; `TriggerDraft::validate`'s
     sentences are core's prose, phase 4.
   - `routine_editor.rs` — the **stored routine** modal: one form for a function or a procedure,
     over `core::ddl`'s `RoutineDraft`, on the three engines that have them. Reached from the schema
@@ -40033,7 +40064,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`compare_view.rs`), the routine editor (`routine_editor.rs`), the event editor
   (`event_editor.rs`), the trigger editor (`trigger_editor.rs`), the object editor
   (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
-  grant forms (`account_editor.rs`) are converted; every other
+  grant forms (`account_editor.rs`) and the table designer (`table_designer.rs`) are converted;
+  every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -40060,13 +40092,16 @@ Re-introducing the anti-patterns these guard against is a regression:
     `event_editor::event_status_label` for `schema::EventStatus::label`, and
     `users_view::principal_kind_label` for `users::PrincipalKind::label`, and
     `account_editor::grant_subject_label`/`grant_level_label` for `users::GrantSubject::label`/
-    `GrantLevelKind::label` —
+    `GrantLevelKind::label`, and `table_designer::identity_wording`/`storage_label` for
+    `ddl::identity_wording` and `ddl::IndexStorage::label` —
     with a test holding its English equal to core's for every variant
     (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`,
     `english_names_every_kill_as_core_does`, `english_names_every_chart_kind_as_core_does`,
     `english_names_every_compare_kind_as_core_does`, `english_says_every_empty_reason_as_core_does`,
     `english_names_every_event_status_as_core_does`, `english_names_every_principal_kind_as_core_does`,
-    `english_names_every_grant_subject_and_level_as_core_does`).
+    `english_names_every_grant_subject_and_level_as_core_does`,
+    `english_words_the_identity_toggle_as_core_does_on_every_engine`,
+    `english_names_every_index_kind_as_core_does_and_each_apart`).
     Where the word is a phrase core composes rather than a label, core answers with a value or
     keeps the composition and lets the caller word the part that is language: `history::ago` hands
     back an `Ago` that `i18n::relative_time` says from `ago-*` (the history and snippet rows, the
