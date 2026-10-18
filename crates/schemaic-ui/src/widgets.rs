@@ -2121,11 +2121,12 @@ pub(crate) fn row_slot(inner: impl IntoView + 'static) -> impl IntoView {
 /// next row.
 pub(crate) fn row_button(
     glyph: &'static str,
-    tip: &'static str,
+    tip: impl Into<String>,
     ring: FocusRing,
     tabindex: u32,
     act: impl Fn() + 'static,
 ) -> AnyView {
+    let tip: String = tip.into();
     let act = Rc::new(act);
     let pressed = act.clone();
     let button = row_slot(crate::icons::icon(glyph, ROW_ICON))
@@ -2135,7 +2136,7 @@ pub(crate) fn row_button(
         // one here would paint on an id that never takes focus, which is what
         // `.tooltip()` below used to guarantee.
         .style(|s| s.color(theme::text_dim()).hover(|s| s.color(theme::text())))
-        .tooltip(move || text(tip).style(tooltip_style));
+        .tooltip(move || text(tip.clone()).style(tooltip_style));
     in_ring_button(button, ring, tabindex, true, 0.0, move || pressed())
 }
 

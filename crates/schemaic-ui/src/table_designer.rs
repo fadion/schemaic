@@ -2424,8 +2424,8 @@ fn check_form(
 /// itself, the same one every form in this modal gets — nothing here adds its own.
 ///
 /// Shared with the trigger editor, which lays its two panes out the same way.
-pub(crate) fn empty_hint(msg: &'static str) -> impl IntoView {
-    text(msg).style(|s| {
+pub(crate) fn empty_hint(msg: impl Into<String>) -> impl IntoView {
+    text(msg.into()).style(|s| {
         s.color(theme::text_faint())
             .font_size(theme::font_body())
             .width_full()

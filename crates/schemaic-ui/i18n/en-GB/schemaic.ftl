@@ -1036,3 +1036,42 @@ users-count = { $n } { $n ->
 # While a filter narrows the list: $shown of $n.
 users-count-filtered = { $shown } of { $n } accounts
 users-copy-privileges = Copy privileges
+
+## Schema editors — shared (continued)
+
+# The tooltip on a value row's bin.
+editor-row-remove = Remove
+
+## Trigger editor
+
+# $table is database.schema.table (or database.table).
+trigger-editor-title = Triggers on { $table }
+# The DDL preview's subject: a plan can touch several of a table's triggers.
+trigger-editor-preview-subject = triggers on { $table }
+trigger-editor-none-selected = No trigger selected.
+trigger-editor-readonly-constraint = This is a constraint trigger. Schemaic doesn't model the deferral settings one carries, so it can be removed here but not edited — change it in SQL instead.
+trigger-editor-readonly-hidden = This trigger's definition is encrypted or hidden from this login, so it can be removed here but not edited.
+trigger-editor-readonly-unmodelled = This trigger uses an option Schemaic doesn't model, so it can be removed here but not edited — change it in SQL instead.
+trigger-editor-section-trigger = Trigger
+trigger-editor-section-condition = Condition
+trigger-editor-section-action = Action
+trigger-editor-name = Name
+trigger-editor-timing = Timing
+trigger-editor-event = Event
+trigger-editor-fires = Fires
+# Beside TRUNCATE in PostgreSQL's event toggles.
+trigger-editor-truncate-hint = Statement-level only.
+trigger-editor-not-for-replication-hint = Silent while a replication agent writes the table.
+# SQL Server's firing order for one event (sp_settriggerorder).
+trigger-editor-rank-any = Any order
+trigger-editor-rank-first = Fires first
+trigger-editor-rank-last = Fires last
+trigger-editor-when = When
+trigger-editor-of-columns = Of columns
+trigger-editor-of-columns-placeholder = optional — every column when empty
+trigger-editor-body = Body
+trigger-editor-function = Function
+trigger-editor-edit-function = Edit
+trigger-editor-new-function = New function
+trigger-editor-arguments = Arguments
+trigger-editor-add-argument = Add argument

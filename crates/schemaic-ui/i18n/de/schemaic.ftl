@@ -946,3 +946,37 @@ users-count = { $n ->
 }
 users-count-filtered = { $shown } von { $n } Konten
 users-copy-privileges = Rechte kopieren
+
+## Schema editors — shared (continued)
+
+editor-row-remove = Entfernen
+
+## Trigger editor
+
+trigger-editor-title = Trigger auf { $table }
+trigger-editor-preview-subject = Trigger auf { $table }
+trigger-editor-none-selected = Kein Trigger ausgewählt.
+trigger-editor-readonly-constraint = Dies ist ein Constraint-Trigger. Schemaic bildet dessen Verzögerungseinstellungen nicht ab, daher kann er hier entfernt, aber nicht bearbeitet werden – ändere ihn stattdessen in SQL.
+trigger-editor-readonly-hidden = Die Definition dieses Triggers ist verschlüsselt oder für diese Anmeldung verborgen, daher kann er hier entfernt, aber nicht bearbeitet werden.
+trigger-editor-readonly-unmodelled = Dieser Trigger nutzt eine Option, die Schemaic nicht abbildet, daher kann er hier entfernt, aber nicht bearbeitet werden – ändere ihn stattdessen in SQL.
+trigger-editor-section-trigger = Trigger
+trigger-editor-section-condition = Bedingung
+trigger-editor-section-action = Aktion
+trigger-editor-name = Name
+trigger-editor-timing = Zeitpunkt
+trigger-editor-event = Ereignis
+trigger-editor-fires = Feuert
+trigger-editor-truncate-hint = Nur auf Anweisungsebene.
+trigger-editor-not-for-replication-hint = Schweigt, während ein Replikationsagent die Tabelle schreibt.
+trigger-editor-rank-any = Beliebige Reihenfolge
+trigger-editor-rank-first = Feuert zuerst
+trigger-editor-rank-last = Feuert zuletzt
+trigger-editor-when = Wenn
+trigger-editor-of-columns = Von Spalten
+trigger-editor-of-columns-placeholder = optional – jede Spalte, wenn leer
+trigger-editor-body = Rumpf
+trigger-editor-function = Funktion
+trigger-editor-edit-function = Bearbeiten
+trigger-editor-new-function = Neue Funktion
+trigger-editor-arguments = Argumente
+trigger-editor-add-argument = Argument hinzufügen

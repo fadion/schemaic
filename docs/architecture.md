@@ -28285,7 +28285,11 @@ existing prose was left alone.
     **read from the draft on every frame, not seeded once** as `bound_choice` is: switching the event
     off clears the rank from under it, and a dropdown seeded at build would go on showing a rank
     the draft no longer holds. Its select writes only a real change, since `update` notifies whatever
-    it writes. `INSTEAD OF` with a rank is left to the validator to name, as `UPDATE OF` is. An
+    it writes. The picker hands back the text it shows, so **one `label` closure builds both the
+    entries and the match a pick is read back through** — it replaced `ANY`/`FIRST`/`LAST` consts,
+    and translating the entries alone would have left the comparison against an English const
+    silently false (*Nothing decides behaviour by an English label*). The closure captures nothing,
+    which keeps it `Copy`, as the picker's `current` closure needs. `INSTEAD OF` with a rank is left to the validator to name, as `UPDATE OF` is. An
     **Execute as** field (`supports_trigger_execute_as`) follows NOT FOR REPLICATION, the same one
     field as the routine form's over `ExecuteAs::parse_field`. The Tab order interleaves them: event
     toggle `30 + 2n`, its rank `31 + 2n`, NOT FOR REPLICATION 45, Execute as 47.
@@ -28376,6 +28380,18 @@ existing prose was left alone.
     **empty on PostgreSQL**, where the name is scoped to the table and avoiding a sibling's would
     propose `new_trigger_2` for no reason the user can see; empty too until the database's schema has
     loaded. Only `blank_trigger` reads it, and only to pick a name.
+    **Its words are the catalogue's** (`trigger-editor-*`, roadmap phase 3) — the title, the
+    preview's subject, the empty-selection hint, the three read-only explanations, sections,
+    fields, the TRUNCATE and NOT FOR REPLICATION hints, the function picker's *Edit* / *New
+    function*, *Arguments* and *Add argument* — with Cancel, Preview SQL and the change count the
+    shared `dialog-cancel`, `editor-preview-sql` and `editor-change-count`, *Execute as* and its
+    placeholder the routine editor's `routine-editor-execute-as{,-placeholder}`, and the value
+    rows' bin the new shared `editor-row-remove` (so `widgets::row_button`'s tooltip, like
+    `table_designer::empty_hint`'s message, takes `impl Into<String>`). The NOT FOR REPLICATION
+    toggle's own label is the SQL clause and stays, as do the SQL samples and keyword choices
+    (`INSERT`/`UPDATE`/`DELETE`, `FOR EACH ROW`, `BEGIN … END`). The list's `+`/`−` are
+    `table_designer::list_actions`' and convert with that file; `TriggerDraft::validate`'s
+    sentences are core's prose, phase 4.
   - `routine_editor.rs` — the **stored routine** modal: one form for a function or a procedure,
     over `core::ddl`'s `RoutineDraft`, on the three engines that have them. Reached from the schema
     tree's Functions/Procedures folders (row **Edit**, folder **Create**), from the database and
@@ -39976,7 +39992,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `query-*`), the Copy to modal (`copy_table_view.rs`), the Create database/schema/extension form
   (`database_editor.rs`), the script import (`script_view.rs`), the schema comparison
   (`compare_view.rs`), the routine editor (`routine_editor.rs`), the event editor
-  (`event_editor.rs`) and the Users and privileges browser (`users_view.rs`) are converted; every other
+  (`event_editor.rs`), the trigger editor (`trigger_editor.rs`) and the Users and privileges browser (`users_view.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

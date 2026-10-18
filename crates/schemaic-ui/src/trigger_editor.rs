@@ -63,6 +63,7 @@ use schemaic_core::schema::{
     RoutineInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
 };
 
+use crate::i18n::tr;
 use crate::settings::focusable_toggle_row;
 use crate::table_designer::{
     LIST_TAB, edit_ctx, empty_hint, focusable_owned_dropdown, list_actions, list_pane,
@@ -536,30 +537,29 @@ fn rank_choice(
     tabindex: u32,
 ) -> AnyView {
     use schemaic_core::schema::FiringRank;
-    const ANY: &str = "Any order";
-    const FIRST: &str = "Fires first";
-    const LAST: &str = "Fires last";
+    // **One function for the entries and for reading a pick back**, since the
+    // picker hands back the text it shows: both sides are then the
+    // interface's language. It captures nothing, so it stays `Copy`, which
+    // the picker's `current` closure has to be.
     let label = |r: Option<FiringRank>| match r {
-        None => ANY,
-        Some(FiringRank::First) => FIRST,
-        Some(FiringRank::Last) => LAST,
+        None => tr!("trigger-editor-rank-any"),
+        Some(FiringRank::First) => tr!("trigger-editor-rank-first"),
+        Some(FiringRank::Last) => tr!("trigger-editor-rank-last"),
     };
     focusable_owned_dropdown(
-        move || {
-            draft.with(|s| {
-                label(s.triggers.get(i).and_then(|t| t.info.tsql.rank_on(event))).to_string()
-            })
-        },
-        vec![ANY.into(), FIRST.into(), LAST.into()],
+        move || draft.with(|s| label(s.triggers.get(i).and_then(|t| t.info.tsql.rank_on(event)))),
+        vec![
+            label(None),
+            label(Some(FiringRank::First)),
+            label(Some(FiringRank::Last)),
+        ],
         rank_w,
         ring,
         tabindex,
         move |v: String| {
-            let rank = match v.as_str() {
-                FIRST => Some(FiringRank::First),
-                LAST => Some(FiringRank::Last),
-                _ => None,
-            };
+            let rank = [FiringRank::First, FiringRank::Last]
+                .into_iter()
+                .find(|r| label(Some(*r)) == v);
             // Only a real change is an edit: `update` notifies whatever it
             // writes.
             let held =
@@ -667,7 +667,7 @@ pub(crate) fn value_rows(
                     .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
                     crate::widgets::row_button(
                         crate::icons::TRASH_2,
-                        "Remove",
+                        tr!("editor-row-remove"),
                         ring.clone(),
                         base + crate::widgets::ROW_BUTTON_TAB,
                         move || {
@@ -745,7 +745,7 @@ fn form(
         // Same empty state the designer's tabs show, in the same place: this pane
         // is otherwise a blank half of the modal with no indication that the list
         // beside it is what fills it.
-        return empty_hint("No trigger selected.").into_any();
+        return empty_hint(tr!("trigger-editor-none-selected")).into_any();
     };
     // SQLite is a third shape here, not MySQL's: it has PostgreSQL's `WHEN` and
     // `UPDATE OF` alongside MySQL's inline body, so every control below asks
@@ -759,20 +759,16 @@ fn form(
     // a SQL Server one with hidden or unreadable text, likewise.
     if !is_editable_trigger(&draft.info) {
         let why = if draft.info.constraint {
-            "This is a constraint trigger. Schemaic doesn't model the deferral \
-             settings one carries, so it can be removed here but not edited — \
-             change it in SQL instead."
+            tr!("trigger-editor-readonly-constraint")
         } else if draft.info.tsql.hidden {
-            "This trigger's definition is encrypted or hidden from this login, so \
-             it can be removed here but not edited."
+            tr!("trigger-editor-readonly-hidden")
         } else {
-            "This trigger uses an option Schemaic doesn't model, so it can be \
-             removed here but not edited — change it in SQL instead."
+            tr!("trigger-editor-readonly-unmodelled")
         };
         return v_stack((
-            form_section("Trigger"),
+            form_section(tr!("trigger-editor-section-trigger")),
             form_setting_owned(
-                "Name".to_string(),
+                tr!("trigger-editor-name"),
                 text(draft.info.name.clone())
                     .style(|s| s.color(theme::text()).font_size(theme::font_body())),
             ),
@@ -787,12 +783,13 @@ fn form(
     }
 
     let name = form_setting(
-        "Name",
+        tr!("trigger-editor-name"),
         bound_field(
             d,
             i,
             draft.info.name.clone(),
             FieldCfg {
+                // An identifier's shape, not a word: never translated.
                 placeholder: "trigger_name",
                 focus: Some((ring.clone(), 10)),
                 ..Default::default()
@@ -822,7 +819,7 @@ fn form(
             .map(|t| t.sql().to_string())
             .collect();
     let timing = form_setting(
-        "Timing",
+        tr!("trigger-editor-timing"),
         bound_choice(
             d,
             i,
@@ -868,8 +865,8 @@ fn form(
             let toggle = focusable_toggle_row(
                 ev.sql(),
                 match ev {
-                    TriggerEvent::Truncate => "Statement-level only.",
-                    _ => "",
+                    TriggerEvent::Truncate => tr!("trigger-editor-truncate-hint"),
+                    _ => String::new(),
                 },
                 on,
                 ring.clone(),
@@ -897,7 +894,7 @@ fn form(
             .into_any()
     } else {
         form_setting(
-            "Event",
+            tr!("trigger-editor-event"),
             bound_choice(
                 d,
                 i,
@@ -926,7 +923,7 @@ fn form(
         crate::widgets::nothing()
     } else {
         form_setting(
-            "Fires",
+            tr!("trigger-editor-fires"),
             bound_choice(
                 d,
                 i,
@@ -966,8 +963,9 @@ fn form(
             v
         });
         focusable_toggle_row(
+            // The clause itself, as the SQL Server documentation names it.
             "NOT FOR REPLICATION",
-            "Silent while a replication agent writes the table.",
+            tr!("trigger-editor-not-for-replication-hint"),
             on,
             ring.clone(),
             45,
@@ -983,13 +981,13 @@ fn form(
     } else {
         use schemaic_core::schema::ExecuteAs;
         form_setting(
-            "Execute as",
+            tr!("routine-editor-execute-as"),
             bound_field(
                 d,
                 i,
                 ExecuteAs::field_text(draft.info.tsql.execute_as.as_ref()),
                 FieldCfg {
-                    placeholder: "CALLER, SELF, OWNER or a user",
+                    placeholder_of: Some(Rc::new(|| tr!("routine-editor-execute-as-placeholder"))),
                     mono: true,
                     focus: Some((ring.clone(), 47)),
                     ..Default::default()
@@ -1007,7 +1005,7 @@ fn form(
         crate::widgets::nothing()
     } else {
         form_setting(
-            "When",
+            tr!("trigger-editor-when"),
             bound_field(
                 d,
                 i,
@@ -1041,13 +1039,13 @@ fn form(
         crate::widgets::nothing()
     } else {
         form_setting(
-            "Of columns",
+            tr!("trigger-editor-of-columns"),
             bound_field(
                 d,
                 i,
                 draft.info.update_columns.join(", "),
                 FieldCfg {
-                    placeholder: "optional — every column when empty",
+                    placeholder_of: Some(Rc::new(|| tr!("trigger-editor-of-columns-placeholder"))),
                     mono: true,
                     focus: Some((ring.clone(), 55)),
                     ..Default::default()
@@ -1071,7 +1069,7 @@ fn form(
         pg_action(conn, ui, source, i, &draft, target, ring.clone()).into_any()
     } else {
         form_setting(
-            "Body",
+            tr!("trigger-editor-body"),
             bound_field(
                 d,
                 i,
@@ -1105,14 +1103,14 @@ fn form(
     };
 
     v_stack((
-        form_section("Trigger"),
+        form_section(tr!("trigger-editor-section-trigger")),
         name,
         timing,
         events,
         level,
         not_for_replication,
         execute_as,
-        form_section("Condition").style(move |s| {
+        form_section(tr!("trigger-editor-section-condition")).style(move |s| {
             let s = s.margin_top(theme::scaled(4.0));
             if has_when || has_update_of {
                 s
@@ -1122,7 +1120,8 @@ fn form(
         }),
         when,
         update_of,
-        form_section("Action").style(|s| s.margin_top(theme::scaled(4.0))),
+        form_section(tr!("trigger-editor-section-action"))
+            .style(|s| s.margin_top(theme::scaled(4.0))),
         action,
     ))
     .style(|s| s.flex_col().gap(form_gap()).width_full())
@@ -1341,15 +1340,20 @@ fn pg_action(
     // list the ring skipped the far button and landed on the near one — which
     // reads as arbitrary rather than reversed. Nothing machine-checks
     // adjacency: the tabindex gates check collisions and ceilings.
-    let new_btn = control_button("New function", ring.clone(), 62, move || {
-        crate::routine_editor::open_for_new_trigger_function(
-            new_conn,
-            new_ddl,
-            &new_source,
-            &database,
-            schema.as_deref(),
-        );
-    });
+    let new_btn = control_button(
+        tr!("trigger-editor-new-function"),
+        ring.clone(),
+        62,
+        move || {
+            crate::routine_editor::open_for_new_trigger_function(
+                new_conn,
+                new_ddl,
+                &new_source,
+                &database,
+                schema.as_deref(),
+            );
+        },
+    );
 
     // Editing an existing function lives here rather than in the schema tree
     // because this is where the list exists: it is fetched lazily when this
@@ -1373,25 +1377,33 @@ fn pg_action(
             let found = matching(&list, &named).cloned();
             let source = edit_source.clone();
             let db = edit_db.clone();
-            control_button_enabled("Edit", found.is_some(), ring, 61, move || {
-                if let Some(f) = &found {
-                    crate::routine_editor::open_for_routine(edit_conn, edit_ddl, &source, &db, f);
-                }
-            })
+            control_button_enabled(
+                tr!("trigger-editor-edit-function"),
+                found.is_some(),
+                ring,
+                61,
+                move || {
+                    if let Some(f) = &found {
+                        crate::routine_editor::open_for_routine(
+                            edit_conn, edit_ddl, &source, &db, f,
+                        );
+                    }
+                },
+            )
         },
     );
 
     v_stack((
         form_setting_owned(
-            "Function".to_string(),
+            tr!("trigger-editor-function"),
             h_stack((picker, edit_btn, new_btn))
                 .style(|s| s.flex_row().items_center().gap(theme::scaled(10.0))),
         ),
         form_setting(
-            "Arguments",
+            tr!("trigger-editor-arguments"),
             value_rows(
                 "col_a",
-                "Add argument",
+                tr!("trigger-editor-add-argument"),
                 false,
                 ring,
                 crate::widgets::VALUE_TAB,
@@ -1529,7 +1541,7 @@ fn preview_from(target: &TriggerTarget, cs: &ddl::ChangeSet) -> DdlPreview {
         &target.database,
         // The subject is the table: a plan here can touch several triggers, so
         // heading it with one of their names would misdescribe it.
-        format!("triggers on {}", target.display()),
+        tr!("trigger-editor-preview-subject", table = target.display()),
         cs,
         target.read_only,
     )
@@ -1608,10 +1620,13 @@ pub(crate) fn trigger_editor_overlay(
             let Some(target) = d.trigger.get_untracked() else {
                 return empty().into_any();
             };
-            let title = format!(
-                "Triggers on {}.{}",
-                object_location(&target.database, target.schema.as_deref()),
-                target.table
+            let title = tr!(
+                "trigger-editor-title",
+                table = format!(
+                    "{}.{}",
+                    object_location(&target.database, target.schema.as_deref()),
+                    target.table
+                )
             );
 
             // The form is keyed on `(selected, rev)` and NOT on the draft: a
@@ -1678,19 +1693,15 @@ pub(crate) fn trigger_editor_overlay(
                         return crate::widgets::footer_error(first.clone());
                     }
                     let n = change_set(&status_target, &draft).len();
-                    text(match n {
-                        0 => "No changes".to_string(),
-                        1 => "1 change".to_string(),
-                        n => format!("{n} changes"),
-                    })
-                    .style(move |s| {
-                        s.font_size(theme::font_label()).color(if n == 0 {
-                            theme::text_faint()
-                        } else {
-                            theme::change_count()
+                    text(tr!("editor-change-count", n = n))
+                        .style(move |s| {
+                            s.font_size(theme::font_label()).color(if n == 0 {
+                                theme::text_faint()
+                            } else {
+                                theme::change_count()
+                            })
                         })
-                    })
-                    .into_any()
+                        .into_any()
                 },
             );
 
@@ -1708,7 +1719,7 @@ pub(crate) fn trigger_editor_overlay(
                         && !cs.is_empty();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -1716,7 +1727,7 @@ pub(crate) fn trigger_editor_overlay(
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,
