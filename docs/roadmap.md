@@ -99,9 +99,6 @@ assertions pin English wording — stays the regression net throughout.
 
 These affect users today, with the English UI, whenever a table holds non-Latin text:
 
-- **Grid column auto-fit counts characters** (`grid_char_w`, a fixed 7 px) instead of measuring
-  them, so CJK columns come out about half as wide as they should and other scripts mis-size too.
-  Measure the sampled strings with `measure_text_px_at`, as tabs and the ERD already do.
 - **Fonts.** Only IBM Plex is bundled (Latin, Cyrillic, Greek). CJK, Arabic and Hebrew rely on
   cosmic-text falling back to system fonts, which is unverified per OS; `erd_raster` has its own
   font database holding only Plex Sans, so a diagram PNG probably drops those glyphs.

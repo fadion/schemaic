@@ -1954,7 +1954,32 @@ fn header_name_chars(col: &Column) -> usize {
     } else {
         0
     };
-    col.name.chars().count() + 3 + mark
+    grid_chars(&col.name, usize::MAX) + 3 + mark
+}
+
+/// How many grid characters `s` takes, at most `cap`: an East Asian wide or
+/// fullwidth character is **two** — a full em, about twice the average Latin
+/// advance [`grid_char_w`] stands for — a combining mark or other zero-width
+/// character none, and anything else one, the control characters a cell
+/// flattens to a space included. On ASCII it is exactly the character count.
+///
+/// Reads at most `cap` characters: **the cap has to bound the walk** (see
+/// [`autofit_width`]), and a run of zero-width marks would otherwise be read
+/// to its end without ever reaching it.
+fn grid_chars(s: &str, cap: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut n = 0;
+    for c in s.chars().take(cap) {
+        n += if c.is_control() {
+            1
+        } else {
+            c.width().unwrap_or(0)
+        };
+        if n >= cap {
+            return cap;
+        }
+    }
+    n
 }
 
 fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
@@ -1963,14 +1988,14 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
         .iter()
         .enumerate()
         .map(|(ci, col)| {
-            let head = header_name_chars(col).max(col.type_name.chars().count());
+            let head = header_name_chars(col).max(grid_chars(&col.type_name, usize::MAX));
             let mut chars = 0;
             for r in 0..sample {
                 if let Some(c) = rs.cell(r, ci) {
-                    // `take` first: `count()` decodes the whole string and the
-                    // cap then throws it away. See `autofit_width`, where the
-                    // same expression walks every row rather than 200.
-                    chars = chars.max(c.display().chars().take(60).count());
+                    // The cap bounds the walk, not just the answer. See
+                    // `autofit_width`, where the same expression walks every
+                    // row rather than 200.
+                    chars = chars.max(grid_chars(c.display(), 60));
                 }
             }
             // A key column's header carries a leading key icon; budget for it so the
@@ -1993,7 +2018,7 @@ fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
     let Some(col) = rs.columns.get(ci) else {
         return (6.0 * grid_char_w() + cell_chrome_w()).clamp(min_col_w(), 900.0);
     };
-    let head = header_name_chars(col).max(col.type_name.chars().count());
+    let head = header_name_chars(col).max(grid_chars(&col.type_name, usize::MAX));
     let mut chars = 0;
     for r in 0..rs.row_count() {
         if let Some(c) = rs.cell(r, ci) {
@@ -2004,8 +2029,8 @@ fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
             // walked ~200 MB of UTF-8 synchronously inside the click handler,
             // with no spinner because nothing here expects to be slow. The
             // answer is unchanged; the `.min(140)` read as a bound and was not
-            // one.
-            chars = chars.max(c.display().chars().take(140).count());
+            // one. `grid_chars` keeps the bound.
+            chars = chars.max(grid_chars(c.display(), 140));
         }
     }
     let icon = if has_key { header_key_icon_w() } else { 0.0 };
@@ -13941,6 +13966,59 @@ mod tests {
         assert!(!bars.any_up());
         bars.commit_note.set(Some("Exported 16k rows".to_string()));
         assert!(bars.any_up(), "a note still raises it");
+    }
+
+    /// **A wide character takes two grid characters.** Both estimators counted
+    /// `char`s, so a CJK value — each character a full em, about twice the
+    /// average Latin advance — got a column half as wide as it needed and every
+    /// value in it was ellipsised. A value of twelve such characters must be
+    /// sized as twenty-four Latin ones, by the open's estimate and by auto-fit
+    /// alike; and a combining mark, which draws on the letter before it, takes
+    /// no room of its own.
+    #[test]
+    fn a_wide_character_is_sized_as_two_and_a_mark_as_none() {
+        let width_of = |v: &str| {
+            let rs =
+                ResultSet::from_rows(vec![col("note", "TEXT")], vec![vec![Value::Str(v.into())]]);
+            (
+                init_widths(&rs, &HashMap::new())[0],
+                autofit_width(&rs, 0, false),
+            )
+        };
+        assert_eq!(width_of(&"日本語".repeat(4)), width_of(&"x".repeat(24)));
+        assert_eq!(width_of(&"e\u{301}".repeat(20)), width_of(&"x".repeat(20)));
+        // The header is sized the same way: a wide name needs the room too.
+        let header = |name: &str| {
+            let rs = ResultSet::from_rows(vec![col(name, "TEXT")], vec![vec![Value::Null]]);
+            init_widths(&rs, &HashMap::new())[0]
+        };
+        assert_eq!(header(&"名前".repeat(6)), header(&"x".repeat(24)));
+    }
+
+    /// `grid_chars` is the character count on ASCII — so no Latin column moved
+    /// — and stops at its cap both in the answer and in the walk.
+    #[test]
+    fn grid_chars_counts_columns_and_stops_at_its_cap() {
+        assert_eq!(grid_chars("", 60), 0);
+        assert_eq!(grid_chars("hello world", 60), 11);
+        assert_eq!(
+            grid_chars("a\tb\r\n", 60),
+            5,
+            "a flattened control is a space"
+        );
+        assert_eq!(grid_chars("日本語", 60), 6);
+        assert_eq!(grid_chars("ｱｲｳ", 60), 3, "halfwidth katakana is narrow");
+        assert_eq!(grid_chars("e\u{301}", 60), 1);
+        assert_eq!(grid_chars(&"x".repeat(100), 60), 60);
+        assert_eq!(grid_chars(&"日".repeat(100), 60), 60);
+        assert_eq!(
+            grid_chars(&"日".repeat(100), 59),
+            59,
+            "a wide char never overshoots"
+        );
+        // A million zero-width marks: answered without reading them all, which
+        // only the time it takes would show — so it is bounded here by `take`.
+        assert_eq!(grid_chars(&"\u{301}".repeat(1_000_000), 60), 0);
     }
 
     /// Run `f` at `scale`, then put the scale back — the registry is a

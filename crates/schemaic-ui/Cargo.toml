@@ -48,6 +48,10 @@ image = { version = "0.25", default-features = false }
 # its combining mark (`grid::cell_preview`). Already in the tree via floem,
 # cosmic-text and winit, same version — no extra compile.
 unicode-segmentation = "1.13"
+# East Asian width, so the grid's column estimate sizes a wide character as two
+# and a combining mark as none (`grid::grid_chars`). Already in the tree at this
+# version — no extra compile.
+unicode-width = "0.2"
 
 [lints]
 workspace = true

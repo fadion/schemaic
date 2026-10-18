@@ -40374,7 +40374,7 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **No `text-align` in Floem 0.2.** `text_input` paints at a fixed left origin, clips-to-cursor on
   overflow; `Style` only has `text_overflow`. To right-align an inline editor (numeric grid cells),
   pad left by the free space — measure with a throwaway `TextLayout` at `font_body()` (same global
-  `FontSystem` → pixel-exact), recomputed reactively on the buffer (`grid::measure_text_px`).
+  `FontSystem` → pixel-exact), recomputed reactively on the buffer (`widgets::measure_text_px`).
   **"Free space" is the cell's real content box** (`grid::numeric_edit_pad_left`, tested): the column
   width less its padding *and* its 1px right divider, which is a border and so comes out of the
   content too. Floem sizes the input's inner text node to `content − padding_left` and clips as soon
@@ -42461,6 +42461,21 @@ this bundle's.
   7.8px at Normal against `grid_char_w()`'s 7, so with the padding fixed the value still clipped.
   `content_w(col, head, value)` sizes the header at the average advance and a numeric column's
   values at `grid_digit_w()` (8px, scaled).
+  **A "character" to both estimators is a display column, not a `char`** (`grid_chars`): an East
+  Asian wide or fullwidth character counts two — a full em, about twice the average advance
+  `grid_char_w()` stands for — a combining mark none, and a control character one, since the cell
+  flattens it to a space. Counting `char`s gave a CJK value half the room it draws in and a
+  decomposed `é` two characters' worth; on ASCII the two counts agree, so no Latin column moved
+  (`a_wide_character_is_sized_as_two_and_a_mark_as_none`,
+  `grid_chars_counts_columns_and_stops_at_its_cap`). The name line, the type line and every sampled
+  value go through it, the values capped at 60 on open and 140 on auto-fit, and **the cap bounds the
+  walk**, not just the answer — `grid_chars` reads at most `cap` characters, since a run of
+  zero-width marks would otherwise be read to its end without ever reaching it (`autofit_width`'s
+  comment has what the unbounded spelling cost). It is the `unicode-width` table rather than shaping
+  each value with `measure_text_px_at` because shaping would be 200 × columns passes per result
+  open and one per row on a divider double-click, and would tie the width tests to the installed
+  fonts; the estimate stays an average advance, now one that tells a wide character from a narrow
+  one. The crate was already in the lock; only the direct edge is new.
   **And stored widths are carried across a live scale change** (`rescale_widths` + `GridState::widths_at`,
   which holds the `grid_char_w()` the current widths were measured at). They cannot follow the scale
   the way everything else in the grid does, because they are pixels *stored* rather than read in a
