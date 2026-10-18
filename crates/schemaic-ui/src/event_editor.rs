@@ -39,6 +39,7 @@ use floem::reactive::create_effect;
 use schemaic_core::ddl::{self, EventDraft};
 use schemaic_core::schema::{EVENT_INTERVAL_UNITS, EventInfo, EventSchedule, EventStatus};
 
+use crate::i18n::tr;
 use crate::settings::focusable_toggle_row;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown};
 use crate::trigger_editor::unique_name;
@@ -73,11 +74,32 @@ fn unit_field_w() -> f64 {
 /// The body box's height before it scrolls.
 const BODY_ROWS: usize = 12;
 
-/// The two labels the schedule switch offers, and the order it offers them in.
-/// Recurring first, because it is what the overwhelming majority of events are
-/// and what a blank draft starts as.
-const SCHED_EVERY: &str = "Repeating";
-const SCHED_AT: &str = "Once";
+/// The first of the two labels the schedule switch offers — recurring first,
+/// because it is what the overwhelming majority of events are and what a blank
+/// draft starts as. The picker hands back the text it shows, so a pick is
+/// compared against these — one call per build, both sides in the interface's
+/// language.
+fn sched_every() -> String {
+    tr!("event-editor-runs-repeating")
+}
+
+/// The second: a one-off, `AT` a timestamp. See [`sched_every`].
+fn sched_at() -> String {
+    tr!("event-editor-runs-once")
+}
+
+/// An event status's name — `EventStatus::label`'s word in the interface's
+/// language; `english_names_every_event_status_as_core_does` holds them equal.
+/// The picker matches a pick back by it, as it matched core's label before.
+fn event_status_label(status: EventStatus) -> String {
+    match status {
+        EventStatus::Enabled => tr!("event-editor-status-enabled"),
+        EventStatus::Disabled => tr!("event-editor-status-disabled"),
+        EventStatus::SlavesideDisabled | EventStatus::ReplicaDisabled => {
+            tr!("event-editor-status-replica")
+        }
+    }
+}
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
@@ -319,8 +341,8 @@ fn bound_field_on(
 
 fn bound_toggle(
     draft: RwSignal<EventDraft>,
-    label: &'static str,
-    hint: &'static str,
+    label: String,
+    hint: String,
     initial: bool,
     ring: FocusRing,
     tabindex: u32,
@@ -380,19 +402,17 @@ fn schedule_form(ui: DdlUi, ring: FocusRing) -> AnyView {
         floem::reactive::create_rw_signal(!d.with_untracked(|dr| dr.info.schedule.is_one_shot()));
 
     let shape = {
-        let sig = floem::reactive::create_rw_signal(
-            if recurring.get_untracked() {
-                SCHED_EVERY
-            } else {
-                SCHED_AT
-            }
-            .to_string(),
-        );
+        let (every, at) = (sched_every(), sched_at());
+        let sig = floem::reactive::create_rw_signal(if recurring.get_untracked() {
+            every.clone()
+        } else {
+            at.clone()
+        });
         form_setting(
-            "Runs",
+            tr!("event-editor-runs"),
             focusable_owned_dropdown(
                 move || sig.get(),
-                vec![SCHED_EVERY.to_string(), SCHED_AT.to_string()],
+                vec![every.clone(), at],
                 field_w,
                 ring.clone(),
                 TAB_SHAPE,
@@ -401,7 +421,7 @@ fn schedule_form(ui: DdlUi, ring: FocusRing) -> AnyView {
                         return;
                     }
                     sig.set(label.clone());
-                    let want_every = label == SCHED_EVERY;
+                    let want_every = label == every;
                     // **The draft first, the flag second.** The fields below are
                     // rebuilt by the flag and seed themselves from the draft, so
                     // flipping the flag first would seed them from the shape
@@ -440,7 +460,7 @@ fn schedule_form(ui: DdlUi, ring: FocusRing) -> AnyView {
                     EventSchedule::Every { .. } => String::new(),
                 });
                 return form_setting(
-                    "At",
+                    tr!("event-editor-at"),
                     bound_field(
                         d,
                         at,
@@ -504,7 +524,7 @@ fn schedule_form(ui: DdlUi, ring: FocusRing) -> AnyView {
             let units = interval_units(server_unit.as_deref(), &unit);
             let unit_sig = floem::reactive::create_rw_signal(unit);
             let interval = form_setting(
-                "Every",
+                tr!("event-editor-every"),
                 h_stack((
                     bound_field(
                         d,
@@ -545,7 +565,7 @@ fn schedule_form(ui: DdlUi, ring: FocusRing) -> AnyView {
                 .style(|s| s.flex_row().items_center().gap(theme::scaled(8.0))),
             );
 
-            let bound = |label: &'static str,
+            let bound = |label: String,
                          initial: String,
                          tab: u32,
                          set: fn(&mut EventSchedule, Option<String>)| {
@@ -571,12 +591,17 @@ fn schedule_form(ui: DdlUi, ring: FocusRing) -> AnyView {
 
             v_stack((
                 interval,
-                bound("Starts", starts, TAB_SCHED + 20, |s, v| {
-                    if let EventSchedule::Every { starts, .. } = s {
-                        *starts = v;
-                    }
-                }),
-                bound("Ends", ends, TAB_SCHED + 30, |s, v| {
+                bound(
+                    tr!("event-editor-starts"),
+                    starts,
+                    TAB_SCHED + 20,
+                    |s, v| {
+                        if let EventSchedule::Every { starts, .. } = s {
+                            *starts = v;
+                        }
+                    },
+                ),
+                bound(tr!("event-editor-ends"), ends, TAB_SCHED + 30, |s, v| {
                     if let EventSchedule::Every { ends, .. } = s {
                         *ends = v;
                     }
@@ -654,11 +679,12 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
     let server_status = server.as_ref().map(|c| c.status);
 
     let name = form_setting(
-        "Name",
+        tr!("event-editor-name"),
         bound_field(
             d,
             draft.info.name.clone(),
             FieldCfg {
+                // An identifier's shape, not a word: never translated.
                 placeholder: "nightly_purge",
                 focus: Some((ring.clone(), TAB_NAME)),
                 ..Default::default()
@@ -669,7 +695,7 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
     );
 
     let body = form_setting(
-        "Body",
+        tr!("event-editor-body"),
         bound_field_on(
             d,
             ui.event_body,
@@ -709,11 +735,11 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
         // the state the event is really in for the life of the modal, and the form
         // is rebuilt every time the preview opens or closes.
         let choices = status_choices(server_status, current);
-        let labels: Vec<String> = choices.iter().map(|s| s.label().to_string()).collect();
-        let sig = floem::reactive::create_rw_signal(current.label().to_string());
+        let labels: Vec<String> = choices.iter().map(|s| event_status_label(*s)).collect();
+        let sig = floem::reactive::create_rw_signal(event_status_label(current));
         options.push(
             form_setting(
-                "Status",
+                tr!("event-editor-status"),
                 focusable_owned_dropdown(
                     move || sig.get(),
                     labels,
@@ -725,7 +751,11 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
                             return;
                         }
                         sig.set(label.clone());
-                        if let Some(v) = choices.iter().copied().find(|s| s.label() == label) {
+                        if let Some(v) = choices
+                            .iter()
+                            .copied()
+                            .find(|s| event_status_label(*s) == label)
+                        {
                             d.update(|dr| dr.info.status = v);
                         }
                     },
@@ -737,10 +767,8 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
 
     options.push(bound_toggle(
         d,
-        "Preserve after it completes",
-        "ON COMPLETION PRESERVE. Off is MySQL's default and means the server deletes \
-         the event once its last run is past — which for a one-off is immediately \
-         after it runs.",
+        tr!("event-editor-preserve"),
+        tr!("event-editor-preserve-hint"),
         draft.info.preserve,
         ring.clone(),
         TAB_OPT + 10,
@@ -752,7 +780,7 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
     // rights are the only rights its body ever runs with.
     options.push(
         form_setting(
-            "Definer",
+            tr!("event-editor-definer"),
             bound_field(
                 d,
                 draft.info.definer.clone().unwrap_or_default(),
@@ -774,12 +802,12 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
 
     options.push(
         form_setting(
-            "Comment",
+            tr!("event-editor-comment"),
             bound_field(
                 d,
                 draft.info.comment.clone().unwrap_or_default(),
                 FieldCfg {
-                    placeholder: "what it does",
+                    placeholder_of: Some(Rc::new(|| tr!("editor-comment-placeholder"))),
                     focus: Some((ring.clone(), TAB_OPT + 30)),
                     ..Default::default()
                 },
@@ -793,21 +821,24 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
         .into_any(),
     );
 
-    let mut rows: Vec<AnyView> = vec![form_section("Event").into_any(), name.into_any()];
+    let mut rows: Vec<AnyView> = vec![
+        form_section(tr!("event-editor-section-event")).into_any(),
+        name.into_any(),
+    ];
     rows.push(
-        form_section("Schedule")
+        form_section(tr!("event-editor-section-schedule"))
             .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
     rows.push(schedule_form(ui, ring.clone()));
     rows.push(
-        form_section("Body")
+        form_section(tr!("event-editor-section-body"))
             .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
     rows.push(body.into_any());
     rows.push(
-        form_section("Options")
+        form_section(tr!("event-editor-section-options"))
             .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
@@ -853,17 +884,20 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                 return empty().into_any();
             };
             let title = match &target.current {
-                Some(e) => format!(
-                    "Edit event {}.{}",
-                    object_location(&target.database, e.schema.as_deref()),
-                    e.name
+                Some(e) => tr!(
+                    "event-editor-title-edit",
+                    event = format!(
+                        "{}.{}",
+                        object_location(&target.database, e.schema.as_deref()),
+                        e.name
+                    )
                 ),
                 // A new event's namespace isn't chosen — it is *inherited* from
                 // wherever the modal was opened, so the title is where it is
                 // disclosed.
-                None => format!(
-                    "Create event in {}",
-                    object_location(
+                None => tr!(
+                    "event-editor-title-create",
+                    location = object_location(
                         &target.database,
                         d.event_draft
                             .with_untracked(|e| e.info.schema.clone())
@@ -921,15 +955,12 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                     // lands the count is over `information_schema`'s resolved
                     // body rather than the event as written.
                     if pending {
-                        return text("Reading the event's source…")
+                        return text(tr!("event-editor-reading-source"))
                             .style(|s| s.color(theme::text_faint()).font_size(theme::font_label()))
                             .into_any();
                     }
                     if stale {
-                        return say("The event's real source arrived after you started typing, \
-                             so this Body is built on the catalogue's copy — which \
-                             isn't what the server holds. Close and reopen to edit it."
-                            .to_string());
+                        return say(tr!("event-editor-source-stale"));
                     }
                     let errs = draft.validate();
                     if let Some(first) = errs.first() {
@@ -941,19 +972,15 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                         return say(clash);
                     }
                     let n = change_set(&status_target, &draft).len();
-                    text(match n {
-                        0 => "No changes".to_string(),
-                        1 => "1 change".to_string(),
-                        n => format!("{n} changes"),
-                    })
-                    .style(move |s| {
-                        s.font_size(theme::font_label()).color(if n == 0 {
-                            theme::text_faint()
-                        } else {
-                            theme::change_count()
+                    text(tr!("editor-change-count", n = n))
+                        .style(move |s| {
+                            s.font_size(theme::font_label()).color(if n == 0 {
+                                theme::text_faint()
+                            } else {
+                                theme::change_count()
+                            })
                         })
-                    })
-                    .into_any()
+                        .into_any()
                 },
             );
 
@@ -987,7 +1014,7 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                     let subject = draft.info.name.clone();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -995,7 +1022,7 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,
@@ -1057,6 +1084,19 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// English names every status as core's `EventStatus::label` does.
+    #[test]
+    fn english_names_every_event_status_as_core_does() {
+        for s in [
+            EventStatus::Enabled,
+            EventStatus::Disabled,
+            EventStatus::SlavesideDisabled,
+            EventStatus::ReplicaDisabled,
+        ] {
+            assert_eq!(event_status_label(s), s.label(), "{s:?}");
+        }
+    }
 
     /// **The exotic entry belongs to the server, not to the draft.**
     ///

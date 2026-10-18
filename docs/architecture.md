@@ -28112,8 +28112,9 @@ existing prose was left alone.
     **Its words are the catalogue's** (`view-editor-*`, roadmap phase 3) — labels, sections, the
     column-names placeholder, the re-create toggle and its hint, both titles — with **Cancel**
     `dialog-cancel` and the footer's other two named for no one editor: `editor-preview-sql`, which
-    the Copy to modal and the database editor now share, and `editor-change-count`, still this
-    footer's alone, whose `[0]` case is *No changes*
+    the Copy to modal, the database editor and the routine and event editors now share, and
+    `editor-change-count`, shared with the routine and event editors' footers, whose `[0]` case is
+    *No changes*
     (`the_shared_counts_read_as_they_did` pins 0, 1 and 7). The `view_name` and `SELECT …`
     placeholders and the `CASCADED`/`LOCAL`/`DEFINER`/`INVOKER` choices are SQL and stay;
     `ViewDraft::validate`'s errors are core's prose, phase 4.
@@ -28420,6 +28421,20 @@ existing prose was left alone.
     editor has none, and the title is where the inheritance is disclosed. It clears every sibling
     overlay's target on open **except the trigger editor's**, which is the handoff described
     above.
+    **Its words are the catalogue's** (`routine-editor-*`, roadmap phase 3) — sections, fields,
+    every option toggle and its hint, Inlining's *Automatic*, *Settings* and *Add setting*, the
+    titles and notes, and the comment placeholder, which is the new shared
+    `editor-comment-placeholder` — with Cancel, Preview SQL and the change count the shared
+    `dialog-cancel`, `editor-preview-sql` and `editor-change-count`. **The title is one message per
+    kind**, edit or create × function or procedure
+    (`routine-editor-title-{edit,create}-{function,procedure}`), where it had been
+    `format!("Edit {} …", RoutineKind::label())` — the sentence
+    assembled from an English noun that `database_editor`'s titles stopped being for the same
+    reason. Of the placeholders only SQL Server's Returns (*int, or TABLE*) and Execute as have
+    words in them, so those two go through `FieldCfg::placeholder_of`, Returns' still a `match` on
+    the dialect; the rest are SQL samples and stay, as do the keyword choices (`VOLATILE`,
+    `CONTAINS SQL`, `INLINE = ON`, …). The local `bound_toggle` takes its label and hint as
+    `String`. `RoutineDraft::validate` and `name_clash`'s sentences are core's prose, phase 4.
   - `event_editor.rs` — the **scheduled event** modal, over `core::ddl`'s `EventDraft`, on the
     one engine that has them. Reached from the schema tree's Events folder (row **Edit**),
     from the database and namespace **Create ▸ Event** submenus, and from Find-Anywhere.
@@ -28460,6 +28475,19 @@ existing prose was left alone.
     nobody edited.
     It shares one tuple element with the trigger and routine overlays (Floem's 16-arity
     `ViewTuple` limit) and clears both of their targets on open, as they clear its.
+    **Its words are the catalogue's** (`event-editor-*`, roadmap phase 3) — sections, fields, the
+    schedule picker, the preserve toggle and its hint, the titles, the source-reading and stale
+    notes — with Cancel, Preview SQL, the change count and the comment placeholder the shared
+    `dialog-cancel`, `editor-preview-sql`, `editor-change-count` and `editor-comment-placeholder`.
+    **Both pickers match a pick back by the text they show**, so both sides of that comparison have
+    to be in the interface's language: the schedule's two entries were the consts `SCHED_EVERY`/
+    `SCHED_AT` and are now `sched_every()`/`sched_at()`, called once per build and compared against
+    that one value, and the statuses are `event_status_label(EventStatus)`, `EventStatus::label`'s
+    words drawn here (the core-words rule under `i18n.rs`), which the Status picker's `find` reads
+    the pick back through — `english_names_every_event_status_as_core_does` holds English equal to
+    core's. The local `bound_toggle` takes `String`s. The identifier and SQL placeholders
+    (`nightly_purge`, the `DELETE` example, `root@localhost`, the timestamp literal, `DAY`) stay;
+    `EventDraft::validate` and `name_clash`'s sentences are core's prose, phase 4.
   - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s
     `ObjectDraft`, and SQL Server's **sequence / synonym / alias type / XML schema collection**
     in the same modal. Reached from a tree object's **Edit**, from a database or schema node's
@@ -39933,8 +39961,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`chart_view.rs`), the view editor (`view_editor.rs`), the properties panel (`properties.rs`),
   the three workspace panel headers (`lib.rs`'s `term-*` and `results-*`, `editor_pane.rs`'s
   `query-*`), the Copy to modal (`copy_table_view.rs`), the Create database/schema/extension form
-  (`database_editor.rs`), the script import (`script_view.rs`) and the schema comparison
-  (`compare_view.rs`) are converted; every other
+  (`database_editor.rs`), the script import (`script_view.rs`), the schema comparison
+  (`compare_view.rs`), the routine editor (`routine_editor.rs`) and the event editor
+  (`event_editor.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

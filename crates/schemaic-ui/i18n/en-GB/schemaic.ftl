@@ -920,3 +920,85 @@ compare-empty-agrees = These two schemas match, object for object.
 compare-empty-agrees-noted = Every object agrees, but not everything could be compared — see the notes above.
 compare-empty-no-match = Nothing matches that filter.
 compare-empty-only-identical = Everything matching that filter is identical — turn on Include identical to see it.
+
+## Schema editors — shared (continued)
+
+# The comment field's placeholder, in every editor that has one.
+editor-comment-placeholder = what it does
+
+## Event editor
+
+# $event is database.schema.event (or database.event).
+event-editor-title-edit = Edit event { $event }
+# $location is the database, or database.schema.
+event-editor-title-create = Create event in { $location }
+event-editor-section-event = Event
+event-editor-section-schedule = Schedule
+event-editor-section-body = Body
+event-editor-section-options = Options
+event-editor-name = Name
+event-editor-body = Body
+event-editor-runs = Runs
+# The schedule picker's two shapes: EVERY … or AT ….
+event-editor-runs-repeating = Repeating
+event-editor-runs-once = Once
+event-editor-at = At
+event-editor-every = Every
+event-editor-starts = Starts
+event-editor-ends = Ends
+event-editor-status = Status
+# EventStatus's words, as core's label names them.
+event-editor-status-enabled = Enabled
+event-editor-status-disabled = Disabled
+event-editor-status-replica = Disabled on replica
+event-editor-preserve = Preserve after it completes
+event-editor-preserve-hint = ON COMPLETION PRESERVE. Off is MySQL's default and means the server deletes the event once its last run is past — which for a one-off is immediately after it runs.
+event-editor-definer = Definer
+event-editor-comment = Comment
+event-editor-reading-source = Reading the event's source…
+event-editor-source-stale = The event's real source arrived after you started typing, so this Body is built on the catalogue's copy — which isn't what the server holds. Close and reopen to edit it.
+
+## Routine editor
+
+# $routine is database.schema.name, with its parameter list where the engine overloads.
+routine-editor-title-edit-function = Edit function { $routine }
+routine-editor-title-edit-procedure = Edit procedure { $routine }
+# $location is the database, or database.schema.
+routine-editor-title-create-function = Create function in { $location }
+routine-editor-title-create-procedure = Create procedure in { $location }
+routine-editor-section-function = Function
+routine-editor-section-procedure = Procedure
+routine-editor-section-body = Body
+routine-editor-section-options = Options
+routine-editor-name = Name
+routine-editor-parameters = Parameters
+routine-editor-returns = Returns
+# SQL Server's: a scalar type, or TABLE for a table function. int and TABLE are SQL.
+routine-editor-returns-placeholder-mssql = int, or TABLE
+routine-editor-language = Language
+routine-editor-body = Body
+routine-editor-recompile = Recompile
+routine-editor-recompile-hint = WITH RECOMPILE — a fresh plan on every call, never a cached one.
+routine-editor-schema-binding = Schema binding
+routine-editor-schema-binding-hint = WITH SCHEMABINDING — the tables and views it reads can't be changed out from under it.
+routine-editor-execute-as = Execute as
+# CALLER, SELF and OWNER are SQL Server keywords.
+routine-editor-execute-as-placeholder = CALLER, SELF, OWNER or a user
+routine-editor-null-input = Returns NULL on NULL input
+routine-editor-null-input-hint = RETURNS NULL ON NULL INPUT — the body doesn't run when an argument is NULL.
+routine-editor-inlining = Inlining
+routine-editor-inlining-automatic = Automatic
+routine-editor-comment = Comment
+routine-editor-volatility = Volatility
+routine-editor-strict = Strict
+routine-editor-security-definer = Security definer
+routine-editor-security-definer-hint-pg = Runs with the owner's rights instead of the caller's. Pin a search_path below when you use this.
+routine-editor-security-definer-hint-mysql = Runs with the definer's rights instead of the caller's. This is MySQL's default — turning it off is SQL SECURITY INVOKER.
+routine-editor-settings = Settings
+routine-editor-add-setting = Add setting
+routine-editor-deterministic = Deterministic
+routine-editor-deterministic-hint = Promises the same result for the same arguments. A server with binary logging refuses a non-deterministic routine unless it trusts creators.
+routine-editor-data-access = Data access
+routine-editor-definer = Definer
+routine-editor-reading-source = Reading the routine's source…
+routine-editor-source-stale = The routine's real source arrived after you started typing, so this Body is built on the catalogue's copy — which isn't what the server holds. Close and reopen to edit it.

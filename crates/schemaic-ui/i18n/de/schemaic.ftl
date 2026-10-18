@@ -844,3 +844,76 @@ compare-empty-agrees = Diese beiden Schemas stimmen Objekt für Objekt überein.
 compare-empty-agrees-noted = Jedes Objekt stimmt überein, aber nicht alles ließ sich vergleichen – siehe die Hinweise oben.
 compare-empty-no-match = Nichts passt zu diesem Filter.
 compare-empty-only-identical = Alles, was zu diesem Filter passt, ist identisch – schalte „Identische einbeziehen“ ein, um es zu sehen.
+
+## Schema editors — shared (continued)
+
+editor-comment-placeholder = wozu es dient
+
+## Event editor
+
+event-editor-title-edit = Ereignis { $event } bearbeiten
+event-editor-title-create = Ereignis in { $location } erstellen
+event-editor-section-event = Ereignis
+event-editor-section-schedule = Zeitplan
+event-editor-section-body = Rumpf
+event-editor-section-options = Optionen
+event-editor-name = Name
+event-editor-body = Rumpf
+event-editor-runs = Läuft
+event-editor-runs-repeating = Wiederholt
+event-editor-runs-once = Einmal
+event-editor-at = Am
+event-editor-every = Alle
+event-editor-starts = Beginnt
+event-editor-ends = Endet
+event-editor-status = Status
+event-editor-status-enabled = Aktiviert
+event-editor-status-disabled = Deaktiviert
+event-editor-status-replica = Auf dem Replikat deaktiviert
+event-editor-preserve = Nach Abschluss behalten
+event-editor-preserve-hint = ON COMPLETION PRESERVE. Aus ist MySQLs Vorgabe und bedeutet, dass der Server das Ereignis löscht, sobald sein letzter Lauf vorbei ist – bei einem einmaligen also gleich nach dem Lauf.
+event-editor-definer = Definer
+event-editor-comment = Kommentar
+event-editor-reading-source = Quelltext des Ereignisses wird gelesen…
+event-editor-source-stale = Der echte Quelltext des Ereignisses kam erst an, nachdem du zu tippen begonnen hattest, daher beruht dieser Rumpf auf der Kopie des Katalogs – die nicht dem entspricht, was der Server hält. Schließe und öffne erneut, um ihn zu bearbeiten.
+
+## Routine editor
+
+routine-editor-title-edit-function = Funktion { $routine } bearbeiten
+routine-editor-title-edit-procedure = Prozedur { $routine } bearbeiten
+routine-editor-title-create-function = Funktion in { $location } erstellen
+routine-editor-title-create-procedure = Prozedur in { $location } erstellen
+routine-editor-section-function = Funktion
+routine-editor-section-procedure = Prozedur
+routine-editor-section-body = Rumpf
+routine-editor-section-options = Optionen
+routine-editor-name = Name
+routine-editor-parameters = Parameter
+routine-editor-returns = Rückgabe
+routine-editor-returns-placeholder-mssql = int oder TABLE
+routine-editor-language = Sprache
+routine-editor-body = Rumpf
+routine-editor-recompile = Neu kompilieren
+routine-editor-recompile-hint = WITH RECOMPILE – bei jedem Aufruf ein frischer Plan, nie ein zwischengespeicherter.
+routine-editor-schema-binding = Schemabindung
+routine-editor-schema-binding-hint = WITH SCHEMABINDING – die Tabellen und Sichten, die sie liest, können nicht unter ihr geändert werden.
+routine-editor-execute-as = Ausführen als
+routine-editor-execute-as-placeholder = CALLER, SELF, OWNER oder ein Benutzer
+routine-editor-null-input = Gibt bei NULL-Eingabe NULL zurück
+routine-editor-null-input-hint = RETURNS NULL ON NULL INPUT – der Rumpf läuft nicht, wenn ein Argument NULL ist.
+routine-editor-inlining = Inlining
+routine-editor-inlining-automatic = Automatisch
+routine-editor-comment = Kommentar
+routine-editor-volatility = Volatilität
+routine-editor-strict = Strikt
+routine-editor-security-definer = Security Definer
+routine-editor-security-definer-hint-pg = Läuft mit den Rechten des Eigentümers statt des Aufrufers. Lege unten einen search_path fest, wenn du das nutzt.
+routine-editor-security-definer-hint-mysql = Läuft mit den Rechten des Definers statt des Aufrufers. Das ist MySQLs Vorgabe – ausschalten bedeutet SQL SECURITY INVOKER.
+routine-editor-settings = Einstellungen
+routine-editor-add-setting = Einstellung hinzufügen
+routine-editor-deterministic = Deterministisch
+routine-editor-deterministic-hint = Verspricht für dieselben Argumente dasselbe Ergebnis. Ein Server mit Binärprotokoll lehnt eine nicht deterministische Routine ab, sofern er ihren Erstellern nicht vertraut.
+routine-editor-data-access = Datenzugriff
+routine-editor-definer = Definer
+routine-editor-reading-source = Quelltext der Routine wird gelesen…
+routine-editor-source-stale = Der echte Quelltext der Routine kam erst an, nachdem du zu tippen begonnen hattest, daher beruht dieser Rumpf auf der Kopie des Katalogs – die nicht dem entspricht, was der Server hält. Schließe und öffne erneut, um ihn zu bearbeiten.

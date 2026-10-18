@@ -47,6 +47,7 @@ use schemaic_core::ddl::{self, RoutineDraft};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{RoutineInfo, RoutineKind, SqlDataAccess, Volatility};
 
+use crate::i18n::tr;
 use crate::settings::focusable_toggle_row;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown};
 use crate::trigger_editor::{unique_name, value_rows};
@@ -461,8 +462,8 @@ fn bound_choice<T: Clone + PartialEq + 'static>(
 
 fn bound_toggle(
     draft: RwSignal<RoutineDraft>,
-    label: &'static str,
-    hint: &'static str,
+    label: String,
+    hint: String,
     initial: bool,
     ring: FocusRing,
     tabindex: u32,
@@ -495,6 +496,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     let d = ui.routine_draft;
     let draft = d.get_untracked();
     let takes_language = ddl::routine_takes_language(target.dialect);
+    let target_dialect = target.dialect;
     let is_function = draft.info.kind == RoutineKind::Function;
     // A trigger function has no arguments to declare and no return type to
     // choose — both are fixed by what a trigger is — so the two fields are
@@ -503,11 +505,12 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     let trigger_fn = draft.info.is_trigger_function();
 
     let name = form_setting(
-        "Name",
+        tr!("routine-editor-name"),
         bound_field(
             d,
             draft.info.name.clone(),
             FieldCfg {
+                // An identifier's shape, not a word: never translated.
                 placeholder: "audit_fn",
                 focus: Some((ring.clone(), TAB_NAME)),
                 ..Default::default()
@@ -524,7 +527,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     // change a declaration the user didn't touch.
     let arguments = (!trigger_fn).then(|| {
         form_setting(
-            "Parameters",
+            tr!("routine-editor-parameters"),
             bound_field(
                 d,
                 draft.info.arguments.clone(),
@@ -548,18 +551,19 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     // syntax error rather than a harmless extra.
     let returns = (is_function && !trigger_fn).then(|| {
         form_setting(
-            "Returns",
+            tr!("routine-editor-returns"),
             bound_field(
                 d,
                 draft.info.returns.clone(),
                 FieldCfg {
                     // SQL Server's is also where a table function says so:
-                    // `TABLE`, or `@t TABLE (…)`.
-                    placeholder: match target.dialect {
-                        SqlDialect::Postgres => "integer",
-                        SqlDialect::MsSql => "int, or TABLE",
-                        SqlDialect::MySql | SqlDialect::Sqlite => "INT",
-                    },
+                    // `TABLE`, or `@t TABLE (…)` — the one placeholder here
+                    // with a word in it, so the one drawn from the catalogue.
+                    placeholder_of: Some(Rc::new(move || match target_dialect {
+                        SqlDialect::Postgres => "integer".to_string(),
+                        SqlDialect::MsSql => tr!("routine-editor-returns-placeholder-mssql"),
+                        SqlDialect::MySql | SqlDialect::Sqlite => "INT".to_string(),
+                    })),
                     mono: true,
                     focus: Some((ring.clone(), TAB_RETURNS)),
                     ..Default::default()
@@ -574,7 +578,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     // `LANGUAGE` clause, so the control is absent there rather than offering a
     // choice with one entry.
     let language = takes_language.then(|| {
-        form_setting("Language", {
+        form_setting(tr!("routine-editor-language"), {
             let current = draft.info.language.trim().to_string();
             // The two Schemaic proposes, **plus whatever this routine already
             // is**. A `plperl` or `plpython3u` function is edited here quite
@@ -606,7 +610,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     });
 
     let body = form_setting(
-        "Body",
+        tr!("routine-editor-body"),
         bound_field_on(
             d,
             ui.routine_body,
@@ -660,8 +664,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             if shape.allows(&O::Recompile, &with) {
                 options.push(bound_toggle(
                     d,
-                    "Recompile",
-                    "WITH RECOMPILE — a fresh plan on every call, never a cached one.",
+                    tr!("routine-editor-recompile"),
+                    tr!("routine-editor-recompile-hint"),
                     draft.info.tsql.has_option(&O::Recompile),
                     ring.clone(),
                     TAB_OPT,
@@ -673,9 +677,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             if shape.allows(&O::SchemaBinding, &with) {
                 options.push(bound_toggle(
                     d,
-                    "Schema binding",
-                    "WITH SCHEMABINDING — the tables and views it reads can't be changed out \
-                 from under it.",
+                    tr!("routine-editor-schema-binding"),
+                    tr!("routine-editor-schema-binding-hint"),
                     draft.info.tsql.has_option(&O::SchemaBinding),
                     ring.clone(),
                     TAB_OPT + 10,
@@ -689,12 +692,14 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 // `ExecuteAs::parse_field` and `field_text` hold.
                 options.push(
                     form_setting(
-                        "Execute as",
+                        tr!("routine-editor-execute-as"),
                         bound_field(
                             d,
                             ExecuteAs::field_text(draft.info.tsql.execute_as()),
                             FieldCfg {
-                                placeholder: "CALLER, SELF, OWNER or a user",
+                                placeholder_of: Some(Rc::new(|| {
+                                    tr!("routine-editor-execute-as-placeholder")
+                                })),
                                 mono: true,
                                 focus: Some((ring.clone(), TAB_OPT + 20)),
                                 ..Default::default()
@@ -709,9 +714,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             if shape.allows(&O::ReturnsNullOnNullInput, &with) {
                 options.push(bound_toggle(
                     d,
-                    "Returns NULL on NULL input",
-                    "RETURNS NULL ON NULL INPUT — the body doesn't run when an argument \
-                 is NULL.",
+                    tr!("routine-editor-null-input"),
+                    tr!("routine-editor-null-input-hint"),
                     draft.info.tsql.returns_null_on_null_input(),
                     ring.clone(),
                     TAB_OPT + 25,
@@ -723,12 +727,12 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 // server, which inlines a function that qualifies.
                 options.push(
                     form_setting(
-                        "Inlining",
+                        tr!("routine-editor-inlining"),
                         bound_choice(
                             d,
                             draft.info.tsql.inline(),
                             vec![
-                                ("Automatic".to_string(), None),
+                                (tr!("routine-editor-inlining-automatic"), None),
                                 ("INLINE = ON".to_string(), Some(true)),
                                 ("INLINE = OFF".to_string(), Some(false)),
                             ],
@@ -742,12 +746,12 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             }
             options.push(
                 form_setting(
-                    "Comment",
+                    tr!("routine-editor-comment"),
                     bound_field(
                         d,
                         draft.info.comment.clone().unwrap_or_default(),
                         FieldCfg {
-                            placeholder: "what it does",
+                            placeholder_of: Some(Rc::new(|| tr!("editor-comment-placeholder"))),
                             focus: Some((ring.clone(), TAB_OPT + 40)),
                             ..Default::default()
                         },
@@ -772,7 +776,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             if is_function {
                 options.push(
                     form_setting(
-                        "Volatility",
+                        tr!("routine-editor-volatility"),
                         bound_choice(
                             d,
                             draft.info.volatility,
@@ -790,9 +794,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 );
                 options.push(bound_toggle(
                     d,
-                    "Strict",
-                    "RETURNS NULL ON NULL INPUT — the body doesn't run when an argument \
-                 is NULL.",
+                    tr!("routine-editor-strict"),
+                    tr!("routine-editor-null-input-hint"),
                     draft.info.strict,
                     ring.clone(),
                     TAB_OPT + 10,
@@ -801,9 +804,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             }
             options.push(bound_toggle(
                 d,
-                "Security definer",
-                "Runs with the owner's rights instead of the caller's. Pin a search_path \
-             below when you use this.",
+                tr!("routine-editor-security-definer"),
+                tr!("routine-editor-security-definer-hint-pg"),
                 draft.info.security_definer,
                 ring.clone(),
                 TAB_OPT + 20,
@@ -811,10 +813,10 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             ));
             options.push(
                 form_setting(
-                    "Settings",
+                    tr!("routine-editor-settings"),
                     value_rows(
                         "search_path=public, pg_temp",
-                        "Add setting",
+                        tr!("routine-editor-add-setting"),
                         true,
                         ring.clone(),
                         crate::widgets::VALUE_TAB,
@@ -829,9 +831,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
         SqlDialect::MySql | SqlDialect::Sqlite => {
             options.push(bound_toggle(
                 d,
-                "Deterministic",
-                "Promises the same result for the same arguments. A server with binary \
-             logging refuses a non-deterministic routine unless it trusts creators.",
+                tr!("routine-editor-deterministic"),
+                tr!("routine-editor-deterministic-hint"),
                 draft.info.deterministic,
                 ring.clone(),
                 TAB_OPT,
@@ -839,7 +840,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             ));
             options.push(
                 form_setting(
-                    "Data access",
+                    tr!("routine-editor-data-access"),
                     bound_choice(
                         d,
                         draft.info.data_access,
@@ -861,9 +862,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             );
             options.push(bound_toggle(
                 d,
-                "Security definer",
-                "Runs with the definer's rights instead of the caller's. This is MySQL's \
-             default — turning it off is SQL SECURITY INVOKER.",
+                tr!("routine-editor-security-definer"),
+                tr!("routine-editor-security-definer-hint-mysql"),
                 draft.info.security_definer,
                 ring.clone(),
                 TAB_OPT + 20,
@@ -876,7 +876,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             // the server with a message that says so.
             options.push(
                 form_setting(
-                    "Definer",
+                    tr!("routine-editor-definer"),
                     bound_field(
                         d,
                         draft.info.definer.clone().unwrap_or_default(),
@@ -897,12 +897,12 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             );
             options.push(
                 form_setting(
-                    "Comment",
+                    tr!("routine-editor-comment"),
                     bound_field(
                         d,
                         draft.info.comment.clone().unwrap_or_default(),
                         FieldCfg {
-                            placeholder: "what it does",
+                            placeholder_of: Some(Rc::new(|| tr!("editor-comment-placeholder"))),
                             focus: Some((ring.clone(), TAB_OPT + 40)),
                             ..Default::default()
                         },
@@ -919,20 +919,25 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     }
 
     let mut rows: Vec<AnyView> = vec![
-        form_section(if is_function { "Function" } else { "Procedure" }).into_any(),
+        form_section(if is_function {
+            tr!("routine-editor-section-function")
+        } else {
+            tr!("routine-editor-section-procedure")
+        })
+        .into_any(),
         name.into_any(),
     ];
     rows.extend(arguments.map(IntoView::into_any));
     rows.extend(returns.map(IntoView::into_any));
     rows.extend(language.map(IntoView::into_any));
     rows.push(
-        form_section("Body")
+        form_section(tr!("routine-editor-section-body"))
             .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
     rows.push(body.into_any());
     rows.push(
-        form_section("Options")
+        form_section(tr!("routine-editor-section-options"))
             .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
@@ -988,26 +993,43 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
                 // overloads: a remembered palette hit resolves by name alone, so
                 // this is what says *which* `add` is open before Apply rewrites
                 // it.
-                Some(f) => format!(
-                    "Edit {} {}.{}{}",
-                    f.kind.label(),
-                    object_location(&target.database, f.schema.as_deref()),
-                    f.name,
-                    f.identity_suffix(dialect)
-                ),
+                // One message per kind, not core's kind word spliced into an
+                // English sentence.
+                Some(f) => {
+                    let routine = format!(
+                        "{}.{}{}",
+                        object_location(&target.database, f.schema.as_deref()),
+                        f.name,
+                        f.identity_suffix(dialect)
+                    );
+                    match f.kind {
+                        RoutineKind::Function => {
+                            tr!("routine-editor-title-edit-function", routine = routine)
+                        }
+                        RoutineKind::Procedure => {
+                            tr!("routine-editor-title-edit-procedure", routine = routine)
+                        }
+                    }
+                }
                 // A new routine's namespace isn't chosen — it is *inherited*
                 // from wherever the modal was opened, so the title is where it
                 // is disclosed.
-                None => format!(
-                    "Create {} in {}",
-                    d.routine_draft.with_untracked(|r| r.info.kind.label()),
-                    object_location(
+                None => {
+                    let location = object_location(
                         &target.database,
                         d.routine_draft
                             .with_untracked(|f| f.info.schema.clone())
                             .as_deref(),
-                    )
-                ),
+                    );
+                    match d.routine_draft.with_untracked(|r| r.info.kind) {
+                        RoutineKind::Function => {
+                            tr!("routine-editor-title-create-function", location = location)
+                        }
+                        RoutineKind::Procedure => {
+                            tr!("routine-editor-title-create-procedure", location = location)
+                        }
+                    }
+                }
             };
 
             // The form is built once per open, so one ring covers it.
@@ -1070,17 +1092,13 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
                     // lands the count is over `information_schema`'s resolved
                     // body rather than the routine as written.
                     if pending {
-                        return text("Reading the routine's source…")
+                        return text(tr!("routine-editor-reading-source"))
                             .style(|s| s.color(theme::text_faint()).font_size(theme::font_label()))
                             .into_any();
                     }
                     // …and once it has landed, the case waiting cannot cover.
                     if stale {
-                        return say("The routine's real source arrived after you started \
-                             typing, so this Body is built on the catalogue's \
-                             copy — which isn't what the server holds. Close and \
-                             reopen to edit it."
-                            .to_string());
+                        return say(tr!("routine-editor-source-stale"));
                     }
                     let errs = draft.validate(dialect);
                     if let Some(first) = errs.first() {
@@ -1092,19 +1110,15 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
                         return say(clash);
                     }
                     let n = change_set(&status_target, &draft).len();
-                    text(match n {
-                        0 => "No changes".to_string(),
-                        1 => "1 change".to_string(),
-                        n => format!("{n} changes"),
-                    })
-                    .style(move |s| {
-                        s.font_size(theme::font_label()).color(if n == 0 {
-                            theme::text_faint()
-                        } else {
-                            theme::change_count()
+                    text(tr!("editor-change-count", n = n))
+                        .style(move |s| {
+                            s.font_size(theme::font_label()).color(if n == 0 {
+                                theme::text_faint()
+                            } else {
+                                theme::change_count()
+                            })
                         })
-                    })
-                    .into_any()
+                        .into_any()
                 },
             );
 
@@ -1147,7 +1161,7 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
                     let subject = draft.info.name.clone();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -1155,7 +1169,7 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,

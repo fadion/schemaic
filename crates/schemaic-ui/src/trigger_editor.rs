@@ -602,7 +602,7 @@ fn rank_choice(
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 pub(crate) fn value_rows(
     placeholder: &'static str,
-    add_label: &'static str,
+    add_label: impl Into<String>,
     mono: bool,
     ring: FocusRing,
     tabindex: u32,
@@ -624,12 +624,14 @@ pub(crate) fn value_rows(
     // the modal's `rev` really does change, the form is rebuilt and `value_rows`
     // is created afresh with a counter of its own.
     let rows_rev = RwSignal::new(0u64);
+    let add_label: String = add_label.into();
     dyn_container(
         // Structural only, as in the object editor.
         move || rows_rev.get(),
         move |_| {
             let (read, write) = (read.clone(), write.clone());
             let (read_a, write_a) = (read.clone(), write.clone());
+            let add_label = add_label.clone();
             let ring = ring.clone();
             let add_ring = ring.clone();
             let n = read().len();
