@@ -1345,3 +1345,69 @@ connections-client-certificate-dialog = Select client certificate
 connections-client-key = Client key
 connections-client-key-dialog = Select client key
 connections-client-identity-hint = A client certificate and key are only needed where the server asks you to prove who you are (mutual TLS). The key must not be passphrase-protected.
+
+## Import modal (import_view.rs)
+## The format names (CSV / TSV, JSON, Excel) are core's and stay as they are.
+
+# $table is the target table, as the schema tree names it.
+import-title = Import into { $table }
+import-section-source = Source
+import-section-reading = Reading
+import-section-columns = Columns
+import-section-preview = Preview
+import-file = File
+import-choose-file = Choose a file…
+# The file picker's window title.
+import-file-dialog = Import into table
+import-no-file = No file chosen
+# Shown for a chosen file whose name cannot be read.
+import-unnamed-file = (file)
+import-format = Format
+import-sheet = Sheet
+import-delimiter = Delimiter
+import-header-row = First row is a header
+import-header-row-hint = Use the first row as column names instead of data.
+import-trim = Trim whitespace
+import-trim-hint = Strip spaces around every value — including inside quotes.
+# NULL is the SQL keyword.
+import-empty-is-null = Empty field is NULL
+import-empty-is-null-hint = An empty field means NULL rather than an empty string.
+import-null-tokens = Other values meaning NULL
+# NULL, \N and NA are values as they appear in files: never translated.
+import-null-tokens-hint = Comma-separated, e.g. NULL, \N, NA.
+# A file column's mapping that imports it nowhere.
+import-skip = Skip
+import-nothing-mapped = Nothing is mapped, so there's nothing to import.
+import-values-withheld = This file's first record is too large to preview, so only the column names were read. Mapping and import read the whole file.
+# $columns is a comma-separated list of column names.
+import-missing-required = Not mapped, and can't be empty: { $columns }. The import will fail unless the database fills them in.
+# $engine is the storage engine's name (MyISAM, MEMORY).
+import-engine-not-transactional = This table's storage engine ({ $engine }) is not transactional, so a failed import can't be undone — the rows loaded before the failure will remain.
+import-problems = { $count ->
+    [one] { $count } problem in the file — nothing was imported.
+   *[other] { $count } problems in the file — nothing was imported.
+}
+# One problem in the list: $line is the record's number, $column the column's
+# name and $message what is wrong (one of the import-issue-* messages).
+import-problem-at-line = line { $line }: { $message }
+import-problem-at-column = line { $line }, { $column }: { $message }
+# What is wrong with a field. English must read exactly as core's
+# IssueKind::message (a test holds it).
+import-issue-not-an-integer = not a whole number
+import-issue-not-a-number = not a number
+import-issue-not-a-boolean = not a true/false value
+import-issue-cell-error = the sheet could not evaluate this cell
+import-issue-null-in-not-null = empty, but the column can't be NULL
+import-issue-field-count = has { $found } fields, expected { $expected }
+import-cancelled = Import cancelled — the transaction rolled back, so nothing was written.
+import-done = { $count ->
+    [one] Imported { $count } row into { $table }.
+   *[other] Imported { $count } rows into { $table }.
+}
+import-next = Next
+import-reading = Reading…
+import-back = Back
+import-import = Import
+import-importing = Importing…
+# Beside a disabled write button, saying why it is disabled.
+dialog-read-only = This connection is read-only.

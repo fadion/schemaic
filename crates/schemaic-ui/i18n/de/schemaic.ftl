@@ -1218,3 +1218,52 @@ connections-client-certificate-dialog = Client-Zertifikat auswählen
 connections-client-key = Client-Schlüssel
 connections-client-key-dialog = Client-Schlüssel auswählen
 connections-client-identity-hint = Ein Client-Zertifikat und ein Schlüssel werden nur gebraucht, wo der Server verlangt, dass du dich ausweist (gegenseitiges TLS). Der Schlüssel darf nicht durch eine Passphrase geschützt sein.
+import-title = Import in { $table }
+import-section-source = Quelle
+import-section-reading = Einlesen
+import-section-columns = Spalten
+import-section-preview = Vorschau
+import-file = Datei
+import-choose-file = Datei auswählen…
+import-file-dialog = In Tabelle importieren
+import-no-file = Keine Datei ausgewählt
+import-unnamed-file = (Datei)
+import-format = Format
+import-sheet = Tabellenblatt
+import-delimiter = Trennzeichen
+import-header-row = Erste Zeile ist eine Kopfzeile
+import-header-row-hint = Die erste Zeile als Spaltennamen statt als Daten verwenden.
+import-trim = Leerraum entfernen
+import-trim-hint = Leerzeichen um jeden Wert entfernen – auch innerhalb von Anführungszeichen.
+import-empty-is-null = Leeres Feld ist NULL
+import-empty-is-null-hint = Ein leeres Feld bedeutet NULL statt einer leeren Zeichenkette.
+import-null-tokens = Weitere Werte, die NULL bedeuten
+import-null-tokens-hint = Kommagetrennt, z. B. NULL, \N, NA.
+import-skip = Überspringen
+import-nothing-mapped = Nichts ist zugeordnet, also gibt es nichts zu importieren.
+import-values-withheld = Der erste Datensatz dieser Datei ist zu groß für die Vorschau, daher wurden nur die Spaltennamen gelesen. Zuordnung und Import lesen die ganze Datei.
+import-missing-required = Nicht zugeordnet und dürfen nicht leer sein: { $columns }. Der Import schlägt fehl, sofern die Datenbank sie nicht selbst füllt.
+import-engine-not-transactional = Die Speicher-Engine dieser Tabelle ({ $engine }) ist nicht transaktional, ein fehlgeschlagener Import lässt sich also nicht rückgängig machen – die vor dem Fehler geladenen Zeilen bleiben erhalten.
+import-problems = { $count ->
+    [one] { $count } Problem in der Datei – nichts wurde importiert.
+   *[other] { $count } Probleme in der Datei – nichts wurde importiert.
+}
+import-problem-at-line = Zeile { $line }: { $message }
+import-problem-at-column = Zeile { $line }, { $column }: { $message }
+import-issue-not-an-integer = keine ganze Zahl
+import-issue-not-a-number = keine Zahl
+import-issue-not-a-boolean = kein Wahr/Falsch-Wert
+import-issue-cell-error = das Tabellenblatt konnte diese Zelle nicht auswerten
+import-issue-null-in-not-null = leer, aber die Spalte darf nicht NULL sein
+import-issue-field-count = hat { $found } Felder, erwartet { $expected }
+import-cancelled = Import abgebrochen – die Transaktion wurde zurückgesetzt, also wurde nichts geschrieben.
+import-done = { $count ->
+    [one] { $count } Zeile in { $table } importiert.
+   *[other] { $count } Zeilen in { $table } importiert.
+}
+import-next = Weiter
+import-reading = Wird gelesen…
+import-back = Zurück
+import-import = Importieren
+import-importing = Wird importiert…
+dialog-read-only = Diese Verbindung ist schreibgeschützt.

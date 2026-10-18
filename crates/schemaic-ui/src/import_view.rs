@@ -18,11 +18,12 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::import::{
-    self, CsvDialect, ImportFormat, Issue, Mapping, NullRule, ReadConfig, Target,
+    self, CsvDialect, ImportFormat, Issue, IssueKind, Mapping, NullRule, ReadConfig, Target,
 };
 use schemaic_core::model::engine_is_transactional;
 
 use crate::consts::row_h;
+use crate::i18n::tr;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
     ACTION_TAB, ActionKind, ExitAction, FocusRing, MenuEntry, action_button, action_gap, autohide,
@@ -344,10 +345,10 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
     // The first stop in the step, ahead of the Format picker at 10: without it a
     // keyboard user could reach every reading setting and never pick a file,
     // which is the one thing this step is for.
-    let pick = control_button("Choose a file…", ring.clone(), 5, move || {
+    let pick = control_button(tr!("import-choose-file"), ring.clone(), 5, move || {
         let ctx = ctx_pick.clone();
         floem::action::open_file(
-            floem::file::FileDialogOptions::new().title("Import into table"),
+            floem::file::FileDialogOptions::new().title(tr!("import-file-dialog")),
             move |file| {
                 let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
                     return;
@@ -375,14 +376,14 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
     let chosen = dyn_container(
         move || i.path.get(),
         move |p| match p {
-            None => text("No file chosen")
+            None => text(tr!("import-no-file"))
                 .style(|s| s.color(theme::text_dim()).font_size(theme::font_body()))
                 .into_any(),
             Some(p) => text(
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or("(file)")
-                    .to_string(),
+                    .map(str::to_string)
+                    .unwrap_or_else(|| tr!("import-unnamed-file")),
             )
             .style(|s| s.color(theme::text()).font_size(theme::font_body()))
             .into_any(),
@@ -471,7 +472,7 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
                             }
                         };
                         form_setting(
-                            "Sheet",
+                            tr!("import-sheet"),
                             container(crate::settings::in_ring_picker(
                                 crate::settings::picker_box_content(current),
                                 entries,
@@ -500,11 +501,11 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
                 }
             });
             v_stack((
-                form_section_header("Reading"),
+                form_section_header(tr!("import-section-reading")),
                 picker,
                 focusable_toggle_row(
-                    "First row is a header",
-                    "Use the first row as column names instead of data.",
+                    tr!("import-header-row"),
+                    tr!("import-header-row-hint"),
                     i.has_header,
                     ring,
                     30,
@@ -538,34 +539,34 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
             }
             let ring = ring_csv.clone();
             v_stack((
-                form_section_header("Reading"),
+                form_section_header(tr!("import-section-reading")),
                 form_setting(
-                    "Delimiter",
+                    tr!("import-delimiter"),
                     small_field(i.delimiter, delimiter_w, ring.clone(), 20),
                 ),
                 focusable_toggle_row(
-                    "First row is a header",
-                    "Use the first row as column names instead of data.",
+                    tr!("import-header-row"),
+                    tr!("import-header-row-hint"),
                     i.has_header,
                     ring.clone(),
                     30,
                 ),
                 focusable_toggle_row(
-                    "Trim whitespace",
-                    "Strip spaces around every value — including inside quotes.",
+                    tr!("import-trim"),
+                    tr!("import-trim-hint"),
                     i.trim,
                     ring.clone(),
                     40,
                 ),
                 focusable_toggle_row(
-                    "Empty field is NULL",
-                    "An empty field means NULL rather than an empty string.",
+                    tr!("import-empty-is-null"),
+                    tr!("import-empty-is-null-hint"),
                     i.empty_is_null,
                     ring.clone(),
                     50,
                 ),
                 form_setting(
-                    "Other values meaning NULL",
+                    tr!("import-null-tokens"),
                     v_stack((
                         edit_field(
                             i.null_tokens,
@@ -575,7 +576,7 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
                             },
                         )
                         .style(|s| s.width(field_w())),
-                        form_hint("Comma-separated, e.g. NULL, \\N, NA."),
+                        form_hint(tr!("import-null-tokens-hint")),
                     ))
                     .style(|s| s.flex_col().gap(theme::scaled(4.0))),
                 ),
@@ -600,14 +601,14 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
     });
 
     v_stack((
-        form_section_header("Source"),
+        form_section_header(tr!("import-section-source")),
         form_setting(
-            "File",
+            tr!("import-file"),
             h_stack((pick, chosen.style(|s| s.flex_grow(1.0_f32).min_width(0.0))))
                 .style(|s| s.items_center().gap(theme::scaled(10.0)).width_full()),
         ),
         form_setting(
-            "Format",
+            tr!("import-format"),
             container(focusable_dropdown(
                 i.format,
                 ImportFormat::ALL,
@@ -626,7 +627,7 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
 /// How a target reads in the dropdown.
 fn target_label(target: &Target, table: &schemaic_core::schema::TableInfo) -> String {
     match target {
-        Target::Skip => "Skip".to_string(),
+        Target::Skip => tr!("import-skip"),
         Target::Column(ci) => table
             .columns
             .get(*ci)
@@ -824,7 +825,7 @@ fn preview_table(i: ImportUi) -> impl IntoView {
                 .collect();
             if shown.is_empty() {
                 return container(
-                    text("Nothing is mapped, so there's nothing to import.")
+                    text(tr!("import-nothing-mapped"))
                         .style(|s| s.color(theme::plan_warn()).font_size(theme::font_body())),
                 )
                 .style(|s| s.padding(theme::scaled(12.0)))
@@ -839,11 +840,8 @@ fn preview_table(i: ImportUi) -> impl IntoView {
             // records has the same shape and a different explanation.
             if sample.values_withheld {
                 return container(
-                    text(
-                        "This file's first record is too large to preview, so only the \
-                         column names were read. Mapping and import read the whole file.",
-                    )
-                    .style(|s| s.color(theme::text_dim()).font_size(theme::font_body())),
+                    text(tr!("import-values-withheld"))
+                        .style(|s| s.color(theme::text_dim()).font_size(theme::font_body())),
                 )
                 .style(|s| s.padding(theme::scaled(12.0)))
                 .into_any();
@@ -932,6 +930,42 @@ fn preview_table(i: ImportUi) -> impl IntoView {
     )
 }
 
+/// What is wrong with a field — `IssueKind::message`'s words, drawn here so
+/// they can be translated; core keeps its English for the CLI.
+fn issue_kind_message(kind: IssueKind) -> String {
+    match kind {
+        IssueKind::NotAnInteger => tr!("import-issue-not-an-integer"),
+        IssueKind::NotANumber => tr!("import-issue-not-a-number"),
+        IssueKind::NotABoolean => tr!("import-issue-not-a-boolean"),
+        IssueKind::CellError => tr!("import-issue-cell-error"),
+        IssueKind::NullInNotNull => tr!("import-issue-null-in-not-null"),
+        IssueKind::FieldCount { expected, found } => {
+            tr!(
+                "import-issue-field-count",
+                expected = expected,
+                found = found
+            )
+        }
+    }
+}
+
+/// One problem's line: where it is — the line, and the column when the
+/// problem has one — then what is wrong ([`issue_kind_message`]). A whole
+/// message per shape rather than a place spliced in.
+fn issue_line(is: &Issue) -> String {
+    let message = issue_kind_message(is.kind);
+    if is.column.is_empty() {
+        tr!("import-problem-at-line", line = is.line, message = message)
+    } else {
+        tr!(
+            "import-problem-at-column",
+            line = is.line,
+            column = is.column.clone(),
+            message = message
+        )
+    }
+}
+
 /// Problems the full check found. Present ⇒ the import was refused and nothing
 /// was written, which the heading has to say plainly.
 fn issue_list(i: ImportUi) -> impl IntoView {
@@ -945,12 +979,7 @@ fn issue_list(i: ImportUi) -> impl IntoView {
                 // *common* case — this section usually has nothing to show.
                 return crate::widgets::nothing();
             }
-            let heading = text(format!(
-                "{} problem{} in the file — nothing was imported.",
-                issues.len(),
-                if issues.len() == 1 { "" } else { "s" }
-            ))
-            .style(|s| {
+            let heading = text(tr!("import-problems", count = issues.len())).style(|s| {
                 s.color(theme::error())
                     .font_size(theme::font_body())
                     .font_bold()
@@ -958,12 +987,7 @@ fn issue_list(i: ImportUi) -> impl IntoView {
             });
             let shown = issues.len().min(ISSUE_LINES);
             let lines = v_stack_from_iter(issues.iter().take(ISSUE_LINES).map(|is: &Issue| {
-                let where_ = if is.column.is_empty() {
-                    format!("line {}", is.line)
-                } else {
-                    format!("line {}, {}", is.line, is.column)
-                };
-                text(format!("{where_}: {}", is.kind.message())).style(|s| {
+                text(issue_line(is)).style(|s| {
                     s.font_size(theme::scaled_font(11.0))
                         .color(theme::text())
                         .margin_bottom(theme::scaled(2.0))
@@ -1020,18 +1044,14 @@ fn mapping_step(i: ImportUi, ring: FocusRing) -> impl IntoView {
             if cols.is_empty() {
                 return crate::widgets::nothing();
             }
-            text(format!(
-                "Not mapped, and can't be empty: {}. The import will fail unless \
-                 the database fills them in.",
-                cols.join(", ")
-            ))
-            .style(|s| {
-                s.color(theme::plan_warn())
-                    .font_size(theme::font_body())
-                    .max_width(theme::scaled(560.0))
-                    .margin_top(theme::scaled(20.0))
-            })
-            .into_any()
+            text(tr!("import-missing-required", columns = cols.join(", ")))
+                .style(|s| {
+                    s.color(theme::plan_warn())
+                        .font_size(theme::font_body())
+                        .max_width(theme::scaled(560.0))
+                        .margin_top(theme::scaled(20.0))
+                })
+                .into_any()
         },
     );
 
@@ -1079,30 +1099,26 @@ fn mapping_step(i: ImportUi, ring: FocusRing) -> impl IntoView {
             let Some(engine) = engine else {
                 return crate::widgets::nothing();
             };
-            text(format!(
-                "This table's storage engine ({engine}) is not transactional, so a \
-                 failed import can't be undone — the rows loaded before the failure \
-                 will remain."
-            ))
-            .style(|s| {
-                s.color(theme::plan_warn())
-                    .font_size(theme::font_body())
-                    .max_width(theme::scaled(560.0))
-                    .margin_top(theme::scaled(20.0))
-            })
-            .into_any()
+            text(tr!("import-engine-not-transactional", engine = engine))
+                .style(|s| {
+                    s.color(theme::plan_warn())
+                        .font_size(theme::font_body())
+                        .max_width(theme::scaled(560.0))
+                        .margin_top(theme::scaled(20.0))
+                })
+                .into_any()
         },
     );
 
     const GAP: f64 = 8.0;
     v_stack((
-        form_section_header("Columns"),
+        form_section_header(tr!("import-section-columns")),
         autohide(scroll(rows)).style(|s| s.max_height(mapping_list_h()).width_full()),
         missing,
         size_note,
         engine_note,
         form_separator(|| GAP),
-        form_section_header("Preview"),
+        form_section_header(tr!("import-section-preview")),
         preview_table(i),
         issue_list(i).style(|s| s.margin_top(theme::scaled(16.0))),
     ))
@@ -1183,10 +1199,7 @@ fn run_import(ctx: &ImportCtx) {
                 // unconditionally, which on `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV`
                 // told the user nothing was written while ~250k rows sat in the
                 // table — and the re-run then doubled them.
-                crate::ImportOutcome::Cancelled => i.error.set(Some(
-                    "Import cancelled — the transaction rolled back, so nothing was written."
-                        .to_string(),
-                )),
+                crate::ImportOutcome::Cancelled => i.error.set(Some(tr!("import-cancelled"))),
                 crate::ImportOutcome::Failed(e) => i.error.set(Some(e)),
             }
         }),
@@ -1338,14 +1351,10 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
             let body = match step {
                 ImportStep::Source => source_step(&ctx, ring.clone()).into_any(),
                 ImportStep::Mapping => mapping_step(i, ring.clone()).into_any(),
-                ImportStep::Done => text(format!(
-                    "Imported {} row{} into {title}.",
-                    i.imported.get_untracked(),
-                    if i.imported.get_untracked() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
+                ImportStep::Done => text(tr!(
+                    "import-done",
+                    count = i.imported.get_untracked(),
+                    table = title.clone()
                 ))
                 .style(|s| s.color(theme::text()).font_size(theme::font_body()))
                 .into_any(),
@@ -1393,7 +1402,7 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
                         modal_footer(
                             h_stack((
                                 action_button(
-                                    "Cancel",
+                                    tr!("dialog-cancel"),
                                     ActionKind::Neutral,
                                     true,
                                     ring.clone(),
@@ -1401,7 +1410,11 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
                                     exit_at(&exit_src),
                                 ),
                                 action_button(
-                                    if busy { "Reading…" } else { "Next" },
+                                    if busy {
+                                        tr!("import-reading")
+                                    } else {
+                                        tr!("import-next")
+                                    },
                                     ActionKind::Primary,
                                     has_sample && !busy,
                                     ring,
@@ -1437,7 +1450,7 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
                             .unwrap_or(false);
                         modal_footer_split(
                             action_button(
-                                "Back",
+                                tr!("import-back"),
                                 ActionKind::Neutral,
                                 !busy,
                                 ring.clone(),
@@ -1448,7 +1461,7 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
                                 // Said where the disabled button is, rather than
                                 // leaving it unexplained — the same sentence, in
                                 // the same place, as `ddl_preview`'s.
-                                text("This connection is read-only.").style(move |s| {
+                                text(tr!("dialog-read-only")).style(move |s| {
                                     let s = s
                                         .color(theme::plan_warn())
                                         .font_size(theme::font_label())
@@ -1463,7 +1476,7 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
                                 // which Escape and the ✕ share; this button used
                                 // to be the only one that had it.
                                 action_button(
-                                    "Cancel",
+                                    tr!("dialog-cancel"),
                                     ActionKind::Neutral,
                                     true,
                                     ring.clone(),
@@ -1471,7 +1484,11 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
                                     exit_at(&exit_map),
                                 ),
                                 action_button(
-                                    if busy { "Importing…" } else { "Import" },
+                                    if busy {
+                                        tr!("import-importing")
+                                    } else {
+                                        tr!("import-import")
+                                    },
                                     ActionKind::Primary,
                                     // **The enable term `run_import`'s guard was
                                     // copied without.** The guard is real —
@@ -1494,7 +1511,7 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
                 )
                 .into_any(),
                 ImportStep::Done => modal_footer(action_button(
-                    "Close",
+                    tr!("dialog-close"),
                     ActionKind::Primary,
                     true,
                     ring_done,
@@ -1506,7 +1523,11 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
 
             let close_x: Rc<dyn Fn()> = exit_x.clone();
             let panel = v_stack((
-                modal_title_owned(format!("Import into {title}"), close_x, root_ring.clone()),
+                modal_title_owned(
+                    tr!("import-title", table = title.clone()),
+                    close_x,
+                    root_ring.clone(),
+                ),
                 // `autohide`, not a plain `scroll`: each section inside scrolls on
                 // its own, so this outer one is only a safety net for the issue
                 // list that appears after a failed check. A permanently-visible
@@ -1560,6 +1581,73 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
+    use super::{issue_kind_message, issue_line};
+    use crate::i18n::tr;
+    use schemaic_core::import::{Issue, IssueKind};
+
+    /// The interface's words for a problem are core's in English, for every
+    /// kind — the CLI still prints core's.
+    #[test]
+    fn english_words_every_issue_kind_as_core_does() {
+        for kind in [
+            IssueKind::NotAnInteger,
+            IssueKind::NotANumber,
+            IssueKind::NotABoolean,
+            IssueKind::CellError,
+            IssueKind::NullInNotNull,
+            IssueKind::FieldCount {
+                expected: 3,
+                found: 5,
+            },
+        ] {
+            assert_eq!(issue_kind_message(kind), kind.message(), "{kind:?}");
+        }
+    }
+
+    /// The lines this file composes read as they did in English before the
+    /// catalogue, counts in both numbers.
+    #[test]
+    fn the_composed_lines_read_as_they_did_in_english() {
+        let at = |column: &str| Issue {
+            line: 12,
+            column: column.to_string(),
+            text: String::new(),
+            kind: IssueKind::NotANumber,
+        };
+        assert_eq!(issue_line(&at("")), "line 12: not a number");
+        assert_eq!(issue_line(&at("price")), "line 12, price: not a number");
+        assert_eq!(
+            tr!("import-problems", count = 1),
+            "1 problem in the file — nothing was imported."
+        );
+        assert_eq!(
+            tr!("import-problems", count = 7),
+            "7 problems in the file — nothing was imported."
+        );
+        assert_eq!(
+            tr!("import-done", count = 1, table = "shop.orders"),
+            "Imported 1 row into shop.orders."
+        );
+        assert_eq!(
+            tr!("import-done", count = 0, table = "shop.orders"),
+            "Imported 0 rows into shop.orders."
+        );
+        assert_eq!(
+            tr!("import-title", table = "shop.orders"),
+            "Import into shop.orders"
+        );
+        assert_eq!(
+            tr!("import-missing-required", columns = "id, name"),
+            "Not mapped, and can't be empty: id, name. The import will fail unless the database \
+             fills them in."
+        );
+        assert_eq!(
+            tr!("import-engine-not-transactional", engine = "MyISAM"),
+            "This table's storage engine (MyISAM) is not transactional, so a failed import \
+             can't be undone — the rows loaded before the failure will remain."
+        );
+    }
+
     /// **The other half of `ImportUi::begin_probe`, and the only half that was
     /// ever wrong.** Asserting that `begin_probe` empties `issues` proves
     /// nothing — it did the moment it was written, and a `set(vec![])` in this
@@ -1644,7 +1732,7 @@ mod tests {
         let body = crate::source_gate::production_code(&src);
 
         assert!(
-            body.contains("if busy { \"Importing…\" } else { \"Import\" }"),
+            body.contains("tr!(\"import-importing\")") && body.contains("tr!(\"import-import\")"),
             "the Import button was not found — this gate is stale"
         );
         assert!(
@@ -1653,9 +1741,13 @@ mod tests {
              stays lit on a connection whose write `run_import` will refuse"
         );
         assert!(
-            body.contains("This connection is read-only."),
+            body.contains("tr!(\"dialog-read-only\")"),
             "the footer no longer says why Import is disabled — the same \
              sentence `ddl_preview` puts beside its own disabled Apply"
+        );
+        assert_eq!(
+            crate::i18n::tr!("dialog-read-only"),
+            "This connection is read-only."
         );
         // The guard itself, which the enable term does not replace: a disabled
         // button is not what stops the write.

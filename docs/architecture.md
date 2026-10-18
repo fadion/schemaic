@@ -27483,6 +27483,24 @@ existing prose was left alone.
     `max_issues` together. The section sits inside the body's own scroll, so the cut was never a
     layout requirement — 20 was a bare literal, and its whole cost was that the disclosure beneath
     it answered about the other cap (see `core::import`).
+    **Its words are the catalogue's** (`import-*`, roadmap phase 3) — the title (`import-title`,
+    `$table`), the four section headings, every field, toggle and hint, the file picker's button and
+    window title, *Skip* in the mapping dropdown (`target_label`), the nothing-mapped and
+    values-withheld notes, the footer's Next/Reading…/Back/Import/Importing… and the cancelled line;
+    Cancel and Close are the shared `dialog-cancel`/`dialog-close`, and the read-only sentence
+    beside the disabled Import is the new shared `dialog-read-only`, which `ddl_preview` still spells
+    as a literal until its own file is converted. Composed lines are whole messages:
+    `import-missing-required` (`$columns`), `import-engine-not-transactional` (`$engine`), the
+    plurals `import-problems` and `import-done`, and each problem's line through `issue_line` —
+    `import-problem-at-line` or `import-problem-at-column`, a message per shape rather than a place
+    spliced in. What is wrong with a field is core's word drawn here, early, as the roadmap's rule
+    for a property of a typed value has it: `issue_kind_message` stands in for `IssueKind::message`
+    (`import-issue-*`), core keeping its English for the CLI, and
+    `english_words_every_issue_kind_as_core_does` holds the two equal for every kind;
+    `the_composed_lines_read_as_they_did_in_english` pins the rest. What stays English: the format
+    names (`ImportFormat::label`); core's composed prose, `import::issue_tail` and
+    `import::memory_warning` (phase 4); the preview's `NULL` cell, a SQL keyword; the `—` for a
+    missing column; and a target's `name  (type)`.
   - `script_view.rs` — the **script-load** modal, **Import** to the user, over `core::script`; the
     inverse of `dump_view.rs` below, and the entry directly *above* it in the two menus that carry
     both (a database's and a PostgreSQL namespace's), where the group reads
@@ -38984,7 +39002,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   **key** rather than being read in the builder, which is not a tracking scope.
   `the_import_button_says_a_read_only_connection_rather_than_going_quiet` reads all three off the
   source, all three living in view closures, and asserts the `accept_launch` call as well — a
-  disabled button is not what stops the write.
+  disabled button is not what stops the write. Since the catalogue it looks for
+  `tr!("dialog-read-only")` and asserts that message's English, the point being that the sentence
+  is `ddl_preview`'s own, which that file will reach through the same message once converted.
   **And the state that guard exists for is, as far as the code can be read, unreachable — which is
   written down here so the next reader neither hunts for the race nor deletes the guard for want of
   one.** The question was whether the flag can move while this modal stands, and the answer is that
@@ -40083,9 +40103,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`compare_view.rs`), the routine editor (`routine_editor.rs`), the event editor
   (`event_editor.rs`), the trigger editor (`trigger_editor.rs`), the object editor
   (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
-  grant forms (`account_editor.rs`), the table designer (`table_designer.rs`) and Manage
-  Connections (`connection_form.rs`) are converted; every other
-  label is still an English literal until phase 3 of the
+  grant forms (`account_editor.rs`), the table designer (`table_designer.rs`), Manage
+  Connections (`connection_form.rs`) and the file import (`import_view.rs`) are converted;
+  every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
   translated: CLI, MCP and AI text stays English, as do SQL, persisted names and key names.
