@@ -27437,6 +27437,15 @@ existing prose was left alone.
     the unsupported sentence, the failure in the error colour, and *No matching settings.* The
     footer counts *N settings*, or *x of N settings* while the search is narrowing them, beside
     Refresh and Close; Escape and the dismiss layer close it too.
+    **Its words are the catalogue's** (`server-vars-*`, roadmap phase 3) — the title
+    (`$connection`), the search placeholder (through `FieldCfg::placeholder_of`), the *Variables |
+    Status* pills (`kind_switch`'s `tab` takes a `String`), the loading, unsupported and no-match
+    notes, the past-the-cap line `server-vars-more` (a plural on `$count`, which replaced
+    `text::plural` — the file no longer imports it), the footer's `server-vars-count` (a plural)
+    and `server-vars-count-filtered` (`$shown` of `$count`), and Refresh; Close is the shared
+    `dialog-close`. `the_counted_lines_read_as_they_did_in_english` pins the title and the counted
+    lines in both numbers. English stays: the variables' names, values and descriptions — the
+    server's own text — and a fetch failure's message.
   - `import_view.rs` — the file-import modal (schema context menu → **Import**), over
     `core::import`. Two steps (Source → Mapping) in one panel driven by the `ImportUi` bundle;
     `SchemaActions::import_probe`/`import_run` do the file + DB work off the UI thread, reached
@@ -40226,8 +40235,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
   and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`),
   Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`), Import
-  Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`) and the ER diagram
-  (`erd_view.rs`) are converted;
+  Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`), the ER diagram
+  (`erd_view.rs`) and Server variables (`server_vars_view.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

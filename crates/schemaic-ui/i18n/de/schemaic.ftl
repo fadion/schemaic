@@ -1478,3 +1478,20 @@ erd-clipboard-unavailable = Die Zwischenablage ist nicht verfügbar.
 erd-copy-failed = Kopieren fehlgeschlagen: { $error }
 erd-saved = { $name } gespeichert
 erd-unnamed-file = die Datei
+server-vars-title = Servervariablen — { $connection }
+server-vars-search = Einstellungen suchen
+server-vars-variables = Variablen
+server-vars-status = Status
+server-vars-loading = Wird geladen…
+server-vars-unsupported = Die Engine dieser Verbindung veröffentlicht keine Liste dieser Art.
+server-vars-no-match = Keine passenden Einstellungen.
+server-vars-more = { $count ->
+    [one] { $count } weitere Einstellung passt – Suche eingrenzen
+   *[other] { $count } weitere Einstellungen passen – Suche eingrenzen
+}
+server-vars-count = { $count ->
+    [one] { $count } Einstellung
+   *[other] { $count } Einstellungen
+}
+server-vars-count-filtered = { $shown } von { $count } Einstellungen
+server-vars-refresh = Aktualisieren

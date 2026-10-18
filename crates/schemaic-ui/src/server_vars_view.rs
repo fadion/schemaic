@@ -33,7 +33,8 @@ use floem::reactive::create_effect;
 
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::server_vars::{self, ServerVar, VarKind};
-use schemaic_core::text::plural;
+
+use crate::i18n::tr;
 
 use crate::consts::MONO_FAMILY;
 use crate::theme::{font_body, font_hint};
@@ -153,7 +154,7 @@ pub(crate) fn server_vars_overlay(ctx: VarsCtx) -> impl IntoView {
             let ring = FocusRing::new();
 
             let title = modal_title_owned(
-                format!("Server variables \u{2014} {}", t.name),
+                tr!("server-vars-title", connection = t.name.clone()),
                 close.clone(),
                 ring.clone(),
             );
@@ -183,7 +184,7 @@ pub(crate) fn server_vars_overlay(ctx: VarsCtx) -> impl IntoView {
                 edit_field(
                     filter,
                     FieldCfg {
-                        placeholder: "Search settings",
+                        placeholder_of: Some(Rc::new(|| tr!("server-vars-search"))),
                         clearable: true,
                         focus: Some((ring.clone(), 10)),
                         ..Default::default()
@@ -253,7 +254,7 @@ pub(crate) fn server_vars_overlay(ctx: VarsCtx) -> impl IntoView {
 /// ([`crate::widgets::pill_tab_style`]). A switch is a fetch, which the modal's
 /// effect makes.
 fn kind_switch(kind: RwSignal<VarKind>) -> impl IntoView {
-    let tab = move |label: &'static str, which: VarKind| {
+    let tab = move |label: String, which: VarKind| {
         text(label)
             .on_click_stop(move |_| {
                 if kind.get_untracked() != which {
@@ -263,8 +264,8 @@ fn kind_switch(kind: RwSignal<VarKind>) -> impl IntoView {
             .style(move |s| crate::widgets::pill_tab_style(s, kind.get() == which))
     };
     h_stack((
-        tab("Variables", VarKind::Variables),
-        tab("Status", VarKind::Status),
+        tab(tr!("server-vars-variables"), VarKind::Variables),
+        tab(tr!("server-vars-status"), VarKind::Status),
     ))
     .style(|s| s.items_center().gap(theme::scaled(4.0)))
 }
@@ -275,15 +276,13 @@ fn var_list(state: RwSignal<VarsState>, filter: RwSignal<String>) -> impl IntoVi
     dyn_container(
         move || (state.get(), filter.get()),
         move |(st, needle)| match st {
-            VarsState::Loading => message(
-                icons::CLOCK,
-                theme::text_faint,
-                "Loading\u{2026}".to_string(),
-            ),
+            VarsState::Loading => {
+                message(icons::CLOCK, theme::text_faint, tr!("server-vars-loading"))
+            }
             VarsState::Unsupported => message(
                 icons::CIRCLE_QUESTION,
                 theme::text_faint,
-                "This connection's engine publishes no list of this kind.".to_string(),
+                tr!("server-vars-unsupported"),
             ),
             VarsState::Failed(e) => message(icons::TRIANGLE_ALERT, theme::error, e),
             VarsState::Loaded(vars) => {
@@ -292,7 +291,7 @@ fn var_list(state: RwSignal<VarsState>, filter: RwSignal<String>) -> impl IntoVi
                     return message(
                         icons::CIRCLE_QUESTION,
                         theme::text_faint,
-                        "No matching settings.".to_string(),
+                        tr!("server-vars-no-match"),
                     );
                 }
                 let mut rows: Vec<AnyView> = shown.into_iter().map(var_row).collect();
@@ -300,10 +299,7 @@ fn var_list(state: RwSignal<VarsState>, filter: RwSignal<String>) -> impl IntoVi
                     rows.push(message(
                         icons::CIRCLE_QUESTION,
                         theme::text_faint,
-                        format!(
-                            "{more} more {} \u{2014} narrow the search",
-                            plural(more, "setting matches", "settings match")
-                        ),
+                        tr!("server-vars-more", count = more),
                     ));
                 }
                 v_stack_from_iter(rows)
@@ -387,9 +383,9 @@ fn footer(
             // "3 of 600" only while the search is narrowing them, for the
             // Users browser's reason.
             if shown == total {
-                format!("{total} {}", plural(total, "setting", "settings"))
+                tr!("server-vars-count", count = total)
             } else {
-                format!("{shown} of {total} settings")
+                tr!("server-vars-count-filtered", shown = shown, count = total)
             }
         }
         _ => String::new(),
@@ -400,7 +396,7 @@ fn footer(
         status,
         h_stack((
             action_button(
-                "Refresh",
+                tr!("server-vars-refresh"),
                 ActionKind::Quiet,
                 true,
                 ring.clone(),
@@ -408,7 +404,7 @@ fn footer(
                 refresh,
             ),
             action_button(
-                "Close",
+                tr!("dialog-close"),
                 ActionKind::Neutral,
                 true,
                 ring,
@@ -419,4 +415,33 @@ fn footer(
         .style(|s| s.flex_row().items_center().gap(action_gap())),
     )
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::i18n::tr;
+
+    /// The counted lines and the title read as they did in English before the
+    /// catalogue, in both numbers.
+    #[test]
+    fn the_counted_lines_read_as_they_did_in_english() {
+        assert_eq!(
+            tr!("server-vars-title", connection = "My MariaDB"),
+            "Server variables \u{2014} My MariaDB"
+        );
+        assert_eq!(
+            tr!("server-vars-more", count = 1),
+            "1 more setting matches \u{2014} narrow the search"
+        );
+        assert_eq!(
+            tr!("server-vars-more", count = 40),
+            "40 more settings match \u{2014} narrow the search"
+        );
+        assert_eq!(tr!("server-vars-count", count = 1), "1 setting");
+        assert_eq!(tr!("server-vars-count", count = 600), "600 settings");
+        assert_eq!(
+            tr!("server-vars-count-filtered", shown = 3, count = 600),
+            "3 of 600 settings"
+        );
+    }
 }

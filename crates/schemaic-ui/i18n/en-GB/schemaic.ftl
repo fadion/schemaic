@@ -1699,3 +1699,26 @@ erd-copy-failed = Couldn't copy: { $error }
 erd-saved = Saved { $name }
 # Names the file in the saved notice when its own name cannot be read.
 erd-unnamed-file = the file
+
+## Server variables modal (server_vars_view.rs)
+
+# $connection is the connection's name.
+server-vars-title = Server variables — { $connection }
+server-vars-search = Search settings
+server-vars-variables = Variables
+server-vars-status = Status
+server-vars-loading = Loading…
+server-vars-unsupported = This connection's engine publishes no list of this kind.
+server-vars-no-match = No matching settings.
+# Under the rows shown, for the matches past the list's cap.
+server-vars-more = { $count ->
+    [one] { $count } more setting matches — narrow the search
+   *[other] { $count } more settings match — narrow the search
+}
+server-vars-count = { $count ->
+    [one] { $count } setting
+   *[other] { $count } settings
+}
+# While the search narrows the list; $count is the total.
+server-vars-count-filtered = { $shown } of { $count } settings
+server-vars-refresh = Refresh
