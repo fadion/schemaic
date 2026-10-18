@@ -11090,6 +11090,29 @@ pub(crate) struct FieldCfg {
     /// Tab (e.g. accept the command-palette ghost completion). When set, the key
     /// is consumed here instead of inserting a tab / moving focus.
     pub on_tab: Option<Rc<dyn Fn()>>,
+    /// Shift+Tab, consumed here — the grid's cell editor hopping back a cell.
+    /// [`FieldCfg::on_tab`] never sees the shifted key, so a field whose Tab
+    /// and Shift+Tab are both its own needs both ([`tab_action`]).
+    pub on_shift_tab: Option<Rc<dyn Fn()>>,
+    /// Focus gained — the field took the keyboard, by a click, a ring step, an
+    /// autofocus or a [`FieldCfg::caret_end`] pulse. The mirror of
+    /// [`FieldCfg::on_blur`], but **not deferred**: a gain is never half of a
+    /// click's lost/gained pair the way a loss is. The grid's calendar cell
+    /// drops a stale panel-press flag on it.
+    pub on_focus: Option<Rc<dyn Fn()>>,
+    /// **Draw in place, inside something that is already a box** — the grid's
+    /// cell editor. No border, no padding, no background and no rounding, and
+    /// exactly one line tall, for the parent to centre (a multi-line value
+    /// scrolls within that line). Everything else — keys, IME, the blur and
+    /// cleanup hand-backs — is the ordinary field's.
+    pub bare: bool,
+    /// The box's left padding, read reactively — the grid's numeric cell
+    /// editor right-aligns its value by padding the left by the free space
+    /// (`grid::numeric_edit_pad_left`), since Floem 0.2 has no `text-align`.
+    /// Padding the editor itself is a no-op (it is a scroll view), so this is
+    /// the box's. Overrides the horizontal padding's left half; `None` leaves
+    /// the field's own.
+    pub inset_left: Option<Rc<dyn Fn() -> f64>>,
     /// **Values to complete what is typed with, inline.** While the field has
     /// focus, the caret is at the end and nothing is selected, the first of these
     /// the typed text begins ([`schemaic_core::text::field_suggestion`]) paints
@@ -11204,6 +11227,10 @@ impl Default for FieldCfg {
             on_ctrl_arrow_down: None,
             uncommitted: None,
             on_tab: None,
+            on_shift_tab: None,
+            on_focus: None,
+            bare: false,
+            inset_left: None,
             suggest: None,
             focus: None,
             tab_indents: false,
@@ -11281,6 +11308,8 @@ fn common_suffix_len(a: &str, b: &str, floor: usize) -> usize {
 pub(crate) enum TabAction {
     /// Run [`FieldCfg::on_tab`] (the command palette's ghost completion).
     Callback,
+    /// Run [`FieldCfg::on_shift_tab`] (the grid's cell editor, hopping back).
+    BackCallback,
     /// Take the [`FieldCfg::suggest`] ghost showing in the field.
     Accept,
     /// Move to the next control in [`FieldCfg::focus`]'s ring.
@@ -11307,14 +11336,22 @@ pub(crate) enum TabAction {
 /// ring, so a shifted Tab there falls through to `Insert` — which is what the
 /// code did before this was written down, and what the doc on `on_tab` says —
 /// and a suggesting field's walks back past the ghost.
+///
+/// **Shift+Tab has its own override**, `on_shift_tab`, ahead of everything for
+/// the shifted key as `on_tab` is for the plain one: the grid's cell editor hops
+/// to the previous cell on it, and without it the key fell to floem and typed a
+/// tab into the value.
 pub(crate) fn tab_action(
     on_tab: bool,
+    on_shift_tab: bool,
     ghost: bool,
     tab_indents: bool,
     in_ring: bool,
     shift: bool,
 ) -> TabAction {
-    if on_tab && !shift {
+    if on_shift_tab && shift {
+        TabAction::BackCallback
+    } else if on_tab && !shift {
         TabAction::Callback
     } else if ghost && !shift {
         TabAction::Accept
@@ -11397,6 +11434,10 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         on_ctrl_arrow_down,
         uncommitted,
         on_tab,
+        on_shift_tab,
+        on_focus,
+        bare,
+        inset_left,
         suggest,
         focus,
         tab_indents,
@@ -11441,6 +11482,16 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         Some(hf) => ((hf() - line_h()) / 2.0 - 2.0).max(2.0),
         None => chat_pad_v(),
     };
+    // The box's left padding and border, which everything placed over the text
+    // — the placeholder, the ghost, the click-in-the-chrome mapping — has to
+    // agree with: `inset_left` when the caller sets it, none for a `bare` field,
+    // the field's own otherwise.
+    let pad_left: Rc<dyn Fn() -> f64> = Rc::new(move || match &inset_left {
+        Some(f) => f(),
+        None if bare => 0.0,
+        None => chat_pad_h(),
+    });
+    let border_w = if bare { 0.0 } else { 1.0 };
     let cap = if multiline { CHAT_MAX_ROWS } else { 1 };
     let wrap = if multiline && !no_wrap {
         WrapMethod::EditorWidth
@@ -11483,6 +11534,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let ctrl_up = on_ctrl_arrow_up.clone();
     let ctrl_down = on_ctrl_arrow_down.clone();
     let tab = on_tab.clone();
+    let shift_tab = on_shift_tab.clone();
     let key_focus = focus.clone();
     let key_ghost = ghost_of.clone();
     let editor = text_editor_keys(text_sig.get_untracked(), move |editor_sig, kp, mods| {
@@ -11582,6 +11634,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             };
             match tab_action(
                 tab.is_some(),
+                shift_tab.is_some(),
                 ghost.is_some(),
                 tab_indents,
                 key_focus.is_some(),
@@ -11599,6 +11652,12 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 // the end of the text that is now there — the reconcile alone
                 // would keep it where it was whenever the typed head matched
                 // the value's own case.
+                TabAction::BackCallback => {
+                    if let Some(cb) = &shift_tab {
+                        (cb)();
+                    }
+                    return CommandExecuted::Yes;
+                }
                 TabAction::Accept => {
                     if let Some(value) = ghost {
                         text_sig.set(value);
@@ -12112,10 +12171,18 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         let focus_now = focus_now.clone();
         let focus_now_f = focus_now.clone();
         let ed_focus = ed.clone();
-        create_effect(move |_| {
+        let focus_cb = on_focus.clone();
+        create_effect(move |prev: Option<()>| {
             ed_focus.editor_view_focused.track();
             focused.set(true);
             focus_now_f.set(true);
+            // Not on the initial run, which only establishes tracking (the
+            // blur effect below overrules it at once), as `on_blur` skips it.
+            if prev.is_some()
+                && let Some(cb) = &focus_cb
+            {
+                cb();
+            }
             // A read-only field can still be focused (to receive Enter/Escape),
             // but shows no blinking caret. **`frozen` counts here too**, and
             // untracked so this stays a focus effect: the Ctrl+K bar opens
@@ -12210,11 +12277,14 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             }
         },
     )
-    .style(move |s| {
-        s.absolute()
-            .inset_left(chat_pad_h())
-            .inset_right(side_inset(has_trailing))
-            .inset_top(ph_top())
+    .style({
+        let pad_left = pad_left.clone();
+        move |s| {
+            s.absolute()
+                .inset_left(pad_left())
+                .inset_right(side_inset(has_trailing))
+                .inset_top(ph_top())
+        }
     })
     // Let clicks fall through to the editor beneath — otherwise clicking on the
     // placeholder text (which sits on top) fails to focus the field.
@@ -12247,16 +12317,19 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             .into_any(),
         None => empty().into_any(),
     })
-    .style(move |s| {
-        let typed_w = text_sig.with(|t| widgets::measure_field_text_px(t, font_size(), mono));
-        let scrolled = ghost_pos_ed.viewport.with(|v| v.x0);
-        // `has_side`, where the placeholder above passes `has_trailing`: the
-        // clearable × shows exactly while the field holds text, which is when
-        // the placeholder is hidden and the only time a ghost can show.
-        s.absolute()
-            .inset_left(chat_pad_h() + typed_w - scrolled)
-            .inset_right(side_inset(has_side))
-            .inset_top(ph_top())
+    .style({
+        let pad_left = pad_left.clone();
+        move |s| {
+            let typed_w = text_sig.with(|t| widgets::measure_field_text_px(t, font_size(), mono));
+            let scrolled = ghost_pos_ed.viewport.with(|v| v.x0);
+            // `has_side`, where the placeholder above passes `has_trailing`: the
+            // clearable × shows exactly while the field holds text, which is when
+            // the placeholder is hidden and the only time a ghost can show.
+            s.absolute()
+                .inset_left(pad_left() + typed_w - scrolled)
+                .inset_right(side_inset(has_side))
+                .inset_top(ph_top())
+        }
     })
     .pointer_events(|| false);
 
@@ -12364,6 +12437,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // recorded at registration rather than the editor's signal, which by cleanup
     // time may already be disposed.
     let ring_cleanup = focus.map(|(ring, _)| ring);
+    let click_pad_left = pad_left.clone();
     stack((inner, placeholder, ghost))
         .on_cleanup(move || {
             // Hand the keyboard back if this field held it — floem clears the
@@ -12383,9 +12457,11 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         })
         .on_event_cont(EventListener::PointerDown, move |e| {
             let Event::PointerDown(pe) = e else { return };
-            // The editor sits at the content origin (1px border + the box padding)
-            // and is exactly as large as its own viewport; the rest is chrome.
-            let (left, top) = (1.0 + chat_pad_h(), 1.0 + pad_v());
+            // The editor sits at the content origin (the border + the box padding)
+            // and is exactly as large as its own viewport; the rest is chrome. A
+            // `bare` box has neither, its one line starting at its own top.
+            let top = if bare { 0.0 } else { 1.0 + pad_v() };
+            let left = border_w + click_pad_left();
             let vp = ed_click.viewport.get_untracked();
             if pe.pos.x >= left
                 && pe.pos.x <= left + vp.width()
@@ -12415,6 +12491,22 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             ed_click.cursor.update(|c| c.set_offset(off, false, false));
         })
         .style(move |s| {
+            // In place inside a box that already exists (the grid's cell): one
+            // line tall, for that box to centre, and nothing of our own drawn
+            // around the text. Not `height_full`: the editor fills its box, so a
+            // box the cell's height would set the line at the cell's top.
+            if bare {
+                return s
+                    .min_width(0.0)
+                    .height(line_h())
+                    .padding_left(pad_left())
+                    .padding_right(0.0)
+                    .padding_vert(0.0)
+                    .background(floem::peniko::Color::TRANSPARENT)
+                    .border(0.0)
+                    .border_radius(0.0)
+                    .cursor(CursorStyle::Text);
+            }
             // Fixed height when given; else derive from content. +3 (auto case): the
             // 1px top/bottom borders (border-box) plus a hair of slack so the editor's
             // viewport fully contains its content and no phantom scrollbar shows.
@@ -12443,6 +12535,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 .min_width(0.0)
                 .height(h)
                 .padding_horiz(chat_pad_h())
+                .padding_left(pad_left())
                 .padding_vert(pad_v())
                 .background(background())
                 .border(1.0)
@@ -14807,16 +14900,16 @@ mod field_key_tests {
     #[test]
     fn an_explicit_tab_handler_wins() {
         assert_eq!(
-            tab_action(true, false, false, true, false),
+            tab_action(true, false, false, false, true, false),
             TabAction::Callback,
             "even with a ring"
         );
         assert_eq!(
-            tab_action(true, false, true, true, false),
+            tab_action(true, false, false, true, true, false),
             TabAction::Callback
         );
         assert_eq!(
-            tab_action(true, true, false, true, false),
+            tab_action(true, false, true, false, true, false),
             TabAction::Callback
         );
     }
@@ -14827,16 +14920,16 @@ mod field_key_tests {
     #[test]
     fn shift_tab_never_accepts_a_completion() {
         assert_eq!(
-            tab_action(true, false, false, false, true),
+            tab_action(true, false, false, false, false, true),
             TabAction::Insert
         );
         assert_eq!(
-            tab_action(true, false, false, true, true),
+            tab_action(true, false, false, false, true, true),
             TabAction::StepRing
         );
         // Nor a field's ghost: Shift+Tab walks back past it.
         assert_eq!(
-            tab_action(false, true, false, true, true),
+            tab_action(false, false, true, false, true, true),
             TabAction::StepRing
         );
     }
@@ -14847,11 +14940,11 @@ mod field_key_tests {
     #[test]
     fn a_showing_ghost_is_accepted_before_the_ring_steps() {
         assert_eq!(
-            tab_action(false, true, false, true, false),
+            tab_action(false, false, true, false, true, false),
             TabAction::Accept
         );
         assert_eq!(
-            tab_action(false, false, false, true, false),
+            tab_action(false, false, false, false, true, false),
             TabAction::StepRing
         );
     }
@@ -14859,11 +14952,11 @@ mod field_key_tests {
     #[test]
     fn a_ringed_field_steps_in_both_directions() {
         assert_eq!(
-            tab_action(false, false, false, true, false),
+            tab_action(false, false, false, false, true, false),
             TabAction::StepRing
         );
         assert_eq!(
-            tab_action(false, false, false, true, true),
+            tab_action(false, false, false, false, true, true),
             TabAction::StepRing
         );
     }
@@ -14874,23 +14967,50 @@ mod field_key_tests {
     #[test]
     fn a_code_field_types_the_indent_instead_of_leaving() {
         assert_eq!(
-            tab_action(false, false, true, true, false),
+            tab_action(false, false, false, true, true, false),
             TabAction::Insert
         );
         assert_eq!(
-            tab_action(false, false, true, true, true),
+            tab_action(false, false, false, true, true, true),
             TabAction::Insert
+        );
+    }
+
+    /// Shift+Tab has a hook of its own, for a field whose Tab and Shift+Tab are
+    /// both explicit — the grid's cell editor, hopping to the next and the
+    /// previous cell. Without it Shift+Tab fell to floem and typed a tab into
+    /// the value. It wins over the ring and the indent, as `on_tab` does for
+    /// Tab, and answers only the shifted key.
+    #[test]
+    fn a_shift_tab_handler_answers_shift_tab_only() {
+        assert_eq!(
+            tab_action(true, true, false, false, false, true),
+            TabAction::BackCallback
+        );
+        assert_eq!(
+            tab_action(false, true, false, true, true, true),
+            TabAction::BackCallback,
+            "even with a ring or an indent"
+        );
+        assert_eq!(
+            tab_action(true, true, false, false, false, false),
+            TabAction::Callback
+        );
+        assert_eq!(
+            tab_action(false, true, true, false, false, false),
+            TabAction::Accept,
+            "plain Tab still takes a ghost"
         );
     }
 
     #[test]
     fn a_plain_field_outside_any_ring_inserts() {
         assert_eq!(
-            tab_action(false, false, false, false, false),
+            tab_action(false, false, false, false, false, false),
             TabAction::Insert
         );
         assert_eq!(
-            tab_action(false, false, true, false, false),
+            tab_action(false, false, false, true, false, false),
             TabAction::Insert
         );
     }

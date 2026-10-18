@@ -133,7 +133,7 @@ pub(crate) fn press_places_focus(button: floem::pointer::PointerButton) -> bool 
 ///
 /// **Use it beside every `.keyboard_navigable()`**, and on the floem views that
 /// are focusable without one — the text editor the SQL pane and `edit_field`
-/// are built on, and the grid's inline `text_input`.
+/// (the grid's inline cell editor among them) are built on.
 /// `menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it`
 /// keeps the first half honest; the second half is a census this comment is the
 /// record of, because a floem built-in announces nothing a gate could match.
@@ -7349,8 +7349,8 @@ mod menu_return_gate {
     /// **What this cannot see**, stated because a gate that reads as broader
     /// than it is does more harm than none: floem's own focusable views carry
     /// no `.keyboard_navigable()` for the needle to find — the editor behind
-    /// the SQL pane and `edit_field`, and the grid's inline `text_input` — so
-    /// those three are a census kept by hand (`takes_pointer_focus`'s doc lists
+    /// the SQL pane and `edit_field`, the grid's inline cell editor being one —
+    /// so those are a census kept by hand (`takes_pointer_focus`'s doc lists
     /// them). It also reads only this crate, which is where every navigable
     /// view is today.
     #[test]

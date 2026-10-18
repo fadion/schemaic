@@ -26094,9 +26094,10 @@ existing prose was left alone.
     **`widgets::menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it` is the
     third**, and it is the shape's limit case: it holds every `.keyboard_navigable()` in both view
     crates to a `takes_pointer_focus` in the preceding 600 bytes, and it cannot see the views floem
-    focuses *without* one — the SQL editor, `edit_field`'s editor and the grid's inline `text_input`
-    carry no such call for a needle to match, so those three are a census kept by hand in
-    `takes_pointer_focus`'s doc and the test says so rather than reading as broader than it is.
+    focuses *without* one — the SQL editor and `edit_field`'s editor (the grid's inline cell editor
+    among them, since it stopped being floem's `text_input`) carry no such call for a needle to
+    match, so those two are a census kept by hand in `takes_pointer_focus`'s doc and the test says
+    so rather than reading as broader than it is.
     **`lib.rs`'s `persisted_store_gate` was the fourth, and it is deleted — a type made it
     unnecessary.** It held each of four core mutators (`db_color::upsert(`,
     `db_color::table_upsert(`, `favorite::toggle(`, `format::upsert(`) to a `persist::Saving::`
@@ -32731,6 +32732,19 @@ existing prose was left alone.
     click-to-focus `PointerDown` leaves a press right of the editor's viewport alone when a button
     is there: that corner is the button's, and focusing the text under it would take the keyboard
     from the button being pressed.
+    **Four options exist for the grid's inline cell editor**, the last field in the app to move off
+    floem's `text_input` (*Data grid* has why). `FieldCfg::bare` draws in place inside a box that
+    already exists — no border, padding, background or rounding, and exactly one line tall for the parent
+    to centre, not `height_full`, since the editor fills its box and a full-height one would set the
+    line at the top. `FieldCfg::inset_left` is the box's left padding read reactively, for a numeric
+    cell's right-alignment; padding the editor itself is a no-op, it being a scroll view. Both feed
+    one `pad_left` closure, which the placeholder, the `suggest` ghost and the click-in-chrome
+    mapping read too, so nothing laid over the text drifts from it. `FieldCfg::on_shift_tab` is
+    Shift+Tab's own override (`tab_action`, under *Floem 0.2 gotchas*). `FieldCfg::on_focus` is
+    `on_blur`'s mirror, **not deferred** — a gain is never half of a click's lost/gained pair the way
+    a loss is — and, like `on_blur`, skips the focus effect's initial run, which only establishes
+    tracking; it is how the calendar cell drops a stale panel press, the focus landing on the inner
+    editor where no listener on a wrapping view would hear it.
     The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
@@ -39406,7 +39420,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   s.selectable(false))`, which cascades to the whole tree (and, via the captured context style, into
   dropdown popups); `tooltip_style` repeats it because a tip is an overlay outside that tree, styled
   by `tooltip_style` alone.
-  Text selection belongs to real text surfaces — `text_input`/`edit_field`, the SQL editor, and the
+  Text selection belongs to real text surfaces — `edit_field`, the SQL editor, and the
   terminal (which paints its own selection). Don't re-enable it on a label.
 - **Colors live in `theme.rs`** as named fns — add one rather than inlining a hex literal. They read
   the *active* theme from `themes.rs` (reactive), so calling one inside a `.style(…)` closure follows
@@ -39767,16 +39781,21 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **A view's own `event_before_children` runs *before* its listeners, and a processed event stops
   there** (`context.rs::unconditional_view_event`) — so `on_event(KeyDown, …)` on a built-in view
   never sees a key that view handles itself. **`floem::views::text_input` handles Escape by calling
-  `app_state.clear_focus()`**, which is how the grid's inline cell editor came to leave the keyboard
-  on *nothing*: its own Escape arm was dead code, and after a press the arrows, Enter and Ctrl+Enter
-  all did nothing until a cell was clicked. There is no `disable_default_event` escape hatch worth
-  using either — it is per *listener kind*, so suppressing KeyDown suppresses typing.
-  What the host does hear is `FocusLost`, which is also what a click on anything else produces, and
-  floem exposes no way to ask where the focus went (`AppState::focus` is private, and by the time a
-  listener runs `focus_changed` has already assigned the new one). `grid::reclaim_keyboard` is the
-  compromise: the **pointer** decides, and it is over the grid for Escape and over the something-else
-  for a click on it. `edit_field` does not have the problem — it is a `text_editor` with a command
-  hook, so its `on_escape` is real.
+  `app_state.clear_focus()`**, which is how the grid's inline cell editor, when it was a
+  `text_input`, came to leave the keyboard on *nothing*: its own Escape arm was dead code, and after
+  a press the arrows, Enter and Ctrl+Enter all did nothing until a cell was clicked. There is no
+  `disable_default_event` escape hatch worth using either — it is per *listener kind*, so
+  suppressing KeyDown suppresses typing. What the host did hear was `FocusLost`, indistinguishable
+  from a click on anything else, so the pointer had to guess which it was — and an Escape pressed
+  with the pointer parked outside the grid still left the keyboard on nothing. `edit_field` does not
+  have the problem — it is a `text_editor` with a command hook, so its `on_escape` is real — and the
+  cell editor is one now (no `text_input` is left in the app; *Data grid* has why it moved), so its
+  Escape is a key handler that hands the keyboard back unconditionally. **The pointer still decides
+  for a real blur**, because floem exposes no way to ask where the focus went (`AppState::focus` is
+  private, and by the time a listener runs `focus_changed` has already assigned the new one):
+  `grid::reclaim_keyboard` takes the keyboard back for a click-away only when the pointer is over
+  the grid — another cell, or chrome that takes no focus — and leaves it with the something-else a
+  click elsewhere landed on.
 - **An overlay that would overflow the window is nudged back in *paint only*.**
   `OverlayView::paint` (`floem-0.2.0/src/window_handle.rs`) does
   `cx.offset((-x, -y))` when `window_origin + size` passes `parent_size - 5` on either axis — and
@@ -40382,17 +40401,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   outer scope and let the child inherit (put the hover `color()` on the parent `h_stack`, not the
   `active_db`-keyed child). Reading *global* signals (theme, `connections`/`active_conn`) there is
   fine — they never dispose.
-- **No `text-align` in Floem 0.2.** `text_input` paints at a fixed left origin, clips-to-cursor on
-  overflow; `Style` only has `text_overflow`. To right-align an inline editor (numeric grid cells),
-  pad left by the free space — measure with a throwaway `TextLayout` at `font_body()` (same global
-  `FontSystem` → pixel-exact), recomputed reactively on the buffer (`widgets::measure_text_px`).
-  **"Free space" is the cell's real content box** (`grid::numeric_edit_pad_left`, tested): the column
-  width less its padding *and* its 1px right divider, which is a border and so comes out of the
-  content too. Floem sizes the input's inner text node to `content − padding_left` and clips as soon
-  as the text is one pixel wider — **on a glyph boundary**, so a 5px error is a whole missing
-  character: a padding computed against `col_w − 20` showed one digit of a 2-digit id and *nothing*
-  for a 1-digit one. Leave a couple of px of slack; the node width goes through an f32 percentage
-  resolution, and landing a hair under the text width costs a digit, not a hair.
+- **No `text-align` in Floem 0.2.** Text paints from a fixed left origin; `Style` only has
+  `text_overflow`. To right-align an inline editor (numeric grid cells), pad left by the free space
+  — measure with a throwaway `TextLayout` at `font_body()` (same global `FontSystem` →
+  pixel-exact), recomputed reactively on the buffer (`widgets::measure_text_px`). The padding goes
+  on the field's **box**, through `FieldCfg::inset_left` — padding floem's editor itself is a no-op,
+  it being a scroll view (see the SQL editor's entry below) — and `edit_field` reads that one
+  `pad_left` closure for the placeholder, the `suggest` ghost and the click-in-chrome mapping too,
+  so none of them drifts from the text. **"Free space" is the cell's real content box**
+  (`grid::numeric_edit_pad_left`, tested): the column width less its padding *and* its 1px right
+  divider, which is a border and so comes out of the content too. When the editor was floem's
+  `text_input`, it sized its inner text node to `content − padding_left` and clipped as soon as the
+  text was one pixel wider — **on a glyph boundary**, so a 5px error was a whole missing character:
+  a padding computed against `col_w − 20` showed one digit of a 2-digit id and *nothing* for a
+  1-digit one. The `edit_field` that replaced it has the same `content − padding_left` viewport but
+  *scrolls* a value a hair too wide to keep the caret in view, so the cliff is now a pixel or two of
+  scroll rather than a lost digit. Leave the couple of px of slack anyway: the caret is drawn past
+  the last digit, and the slack is what keeps it inside.
 - **SQL editor padding is a no-op; inset via a wrapper.** The editor is a scroll view — its own
   `padding_*` is ignored. Wrap it in a container carrying the border + padding (`editor_box`); the
   editor fills it flush. Top padding shifts the content origin, so `points_of_offset`-anchored
@@ -40767,11 +40792,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   not `90.0` (~14 turns → glyph vanishes). `scale` is a `Pct`. Both transition via
   `.transition(Rotation/ScaleX, …)`. Even correct, a transform-transition on a small `svg` proved
   unreliable — an icon swap is the safe chevron-flip fallback.
-- **`edit_field` lets you control Escape/blur; `text_input` eats Escape.** `text_input` handles
+- **`edit_field` lets you control Escape/blur; `text_input` eats Escape — and takes no IME.** There
+  is no `text_input` left in the app, and a new one would bring both back. `text_input` handles
   Escape internally (`clear_focus`, `event_before_children`, returns `Stop`), so your
-  `on_event(KeyDown)` never sees it. `edit_field` routes Escape to `on_escape` and focus-loss to
-  `on_blur` (guarded to skip the mount run) — use it for discard-on-Escape / commit-on-blur (inline
-  rename, find/replace).
+  `on_event(KeyDown)` never sees it; and it never calls `set_ime_allowed` nor handles
+  `ImePreedit`/`ImeCommit`, so a field built on it cannot take Chinese, Japanese or Korean at all —
+  which is what moved the grid's cell editor, the last one, off it. `edit_field` is on floem's
+  editor engine, which composes, and routes Escape to `on_escape` and focus-loss to `on_blur`
+  (guarded to skip the mount run) — use it for discard-on-Escape / commit-on-blur (inline rename,
+  find/replace, the cell editor). **The editor consumes every key it is sent**, so a key policy on
+  an `edit_field` is a `FieldCfg` hook or nothing: a `KeyDown` listener bolted on from outside hears
+  no key at all.
 - **A key event goes to the focused view and, if consumed, to *nobody* else.** The dispatch is
   `directed` — no bubbling to ancestors, and with focus on nothing only the root view's own
   listeners run.
@@ -41023,9 +41054,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   to spell beside every `.keyboard_navigable()`, and it is `on_event_cont` and never
   `on_event_stop`, or the press stops reaching the root that closes the menus. It wraps
   `focus_root_inner`, `key_pressable` and `in_focus_ring_with` — which is most sites by inheritance
-  — plus the grid body and its inline `text_input`, `pick_field` and the set chip, the schema tree,
-  the terminal surface and `edit_field`'s editor; the SQL editor calls `note_pointer_focus()`
-  directly at the top of the `PointerDown` handler it already had.
+  — plus the grid body, `pick_field` and the set chip, the schema tree, the terminal surface and
+  `edit_field`'s editor (the grid's inline cell editor among them); the SQL editor calls
+  `note_pointer_focus()` directly at the top of the `PointerDown` handler it already had.
   `menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it` fails on a navigable
   view with no report above it; what it cannot see is floem's own focusable views, which carry no
   `.keyboard_navigable()` for a needle to match and are a census kept by hand in
@@ -41314,7 +41345,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   custom instructions) or on the DDL preview's read-only script box, where there is no indent to
   type and Tab moving on is simply better.
 - **A field offering suggestions takes Tab only while its ghost is showing.** `lib.rs`'s
-  `tab_action` is `edit_field`'s whole Tab precedence as one decision — `on_tab`, then a showing
+  `tab_action` is `edit_field`'s whole Tab precedence as one decision — `on_shift_tab` for the
+  shifted key ahead of everything (`TabAction::BackCallback`; the grid's cell editor hopping back a
+  cell, which without it fell to floem and typed a tab into the value), then `on_tab`, then a showing
   `FieldCfg::suggest` ghost (`TabAction::Accept`), then `tab_indents`, then the ring, then floem's
   `InsertTab` — and the ghost arm is gated on a ghost being *on screen*, not on the field having a
   list: with none showing, Tab means what it meant before the field had suggestions. Accepting
@@ -41322,7 +41355,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `None` once the text already is an option, which is what stops an exact `int` being "completed"
   to `integer` by the key meant to leave. **Shift+Tab never accepts** — a completion is a forward
   motion — and walks back past the ghost. `field_key_tests` pins the order
-  (`a_showing_ghost_is_accepted_before_the_ring_steps`, `shift_tab_never_accepts_a_completion`).
+  (`a_showing_ghost_is_accepted_before_the_ring_steps`, `shift_tab_never_accepts_a_completion`,
+  `a_shift_tab_handler_answers_shift_tab_only`).
 - **A popup that takes the keyboard can only be closed from the *window root*.** The corollary of
   the directed dispatch above, and it is not obvious: a modal's Escape handler runs because its
   `focus_root` is the *focused view*, not because it is an ancestor — there is no bubbling in
@@ -43019,6 +43053,26 @@ this bundle's.
   one itself — passing `0` as the data index for a pending row, which is what `data_row` passes and
   for the same reason, there being no result row behind one and every consumer reading `pending`
   first.
+  **The inline editor is an `edit_field`, not floem's `text_input`, because `text_input` takes no
+  IME** — it never allows it on the window and handles neither preedit nor commit — so a cell could
+  not take Chinese, Japanese or Korean at all; floem's editor engine, which `edit_field` is built
+  on, composes. `FieldCfg::bare` draws it in place: no border, padding, background or rounding, and
+  exactly one line tall (`height(line_h())`) for the cell to centre. **Not `height_full`** — the
+  editor fills its box, so a box the cell's height would put the line at the cell's top. Every key
+  policy is a `FieldCfg` hook, because the editor consumes every key it is sent and nothing bolted on
+  from outside would hear one: `on_submit` is Enter (stage and close, handing the grid its keyboard
+  back — or, in a pending row, hop on), `on_tab`/`on_shift_tab` hop to the next/previous editable
+  cell through `advance_edit`, staging this one, and `on_escape` discards and calls `refocus_grid`
+  unconditionally. `on_blur` discards on a click-away; the field defers it a tick so a click inside
+  it is not a blur, which is why it asks `gs.alive()` (a switched tab has disposed the grid by then)
+  and that `edit_cell` still is this cell (a Tab/Enter hop has already repointed it, and the blur
+  must not clobber that), and it takes the keyboard back only when `reclaim_keyboard` finds the
+  pointer over the grid — Floem 0.2 gotchas has why the pointer decides. **A value that already
+  holds a `\n` or `\r` is edited `multiline`** (`no_wrap`, `enter_never_breaks`, one line tall
+  either way): a single-line field strips line breaks from its document and writes the stripped text
+  back, which would rewrite a multi-line value on its first keystroke. A numeric cell right-aligns
+  through `FieldCfg::inset_left` (*No `text-align` in Floem 0.2*, under the gotchas), and a date
+  cell's calendar has its own blur guard (*Dates keep the text input*, below).
   **What the commit's landing clears is addressed by position and by key, and ✗ Discard is live
   while the write is in flight.** `commit_grid` captures a `CommittedStaging` — the staged cell
   keys, how many pending rows there were, the rows marked for deletion — and `drop_committed_staging`
@@ -43134,9 +43188,9 @@ this bundle's.
     - **The keyboard cannot decide when the editor closes while the panel is up.** Floem takes the
       window focus on *every* pointer-down and hands it back only to a focusable view under the
       cursor — a day, a month arrow and the Now button are none — so the first click inside the
-      calendar reached the field's `FocusLost` as "the user left", closed the editor, and the pick
-      it was about to make landed on a cell that was no longer being edited. `data_cell`'s
-      `FocusLost` therefore stands down for a press the panel reports having taken, and the panel
+      calendar reached the field's blur as "the user left", closed the editor, and the pick it was
+      about to make landed on a cell that was no longer being edited. `data_cell`'s `on_blur`
+      therefore stands down for a press the panel reports having taken, and the panel
       closes the editor instead: a chosen day stages through `keep_cell_edit` (the in-cell picker's
       commit, a cell having no Save button in reach) and every other way the panel goes away closes
       the editor without staging, which is the effect on the channel.
@@ -43145,15 +43199,22 @@ this bundle's.
       because floem clears the focus, dispatches the press, and only then emits the `FocusLost` it
       caused — so a flag set during dispatch is readable by the handler that follows it. Standing
       down for the whole time a panel was merely *open* was the first spelling, and it ate Escape:
-      `text_input` answers Escape by dropping the window focus and reporting the key handled, so
-      that key reaches this `FocusLost` and nothing else in the app, and swallowing it closed
-      neither the editor nor the panel and left the grid with no keyboard. The field also drops a
-      standing flag when it regains the caret, the one moment it is certainly stale.
+      the field was floem's `text_input` then, which answers Escape by dropping the window focus
+      and reporting the key handled, so that key reached this blur and nothing else in the app, and
+      swallowing it closed neither the editor nor the panel and left the grid with no keyboard.
+      (Escape is the field's own `on_escape` now and never arrives here; the press-not-panel rule
+      stands for the real blur — a click elsewhere — which must still close the editor while the
+      panel is up.) The field also drops a standing flag when it regains the caret, the one moment
+      it is certainly stale — through `FieldCfg::on_focus`, set on the field where it is built. A
+      `FocusGained` listener on the view around it, which is where this used to be, never fires:
+      the focus lands on `edit_field`'s inner editor, and no listener outside it hears that.
     - **Standing down is only half of it: the guard hands the caret back.** Nothing else will —
       floem returns the focus only to a focusable view under the cursor, and a day is not one — so
       a field that merely survived the press was mounted and deaf, with a `DATETIME`'s time of day
-      untypable and Enter/Tab going to the window root. The caret lands at the end of the value,
-      `text_input` dropping its selection and moving the cursor there on regaining focus.
+      untypable and Enter/Tab going to the window root. The hand-back is a pulse of the field's
+      `FieldCfg::caret_end` (a counter bumped with `try_update`), not a `request_focus` on an id:
+      the field refocuses itself with the caret at the end of the value, which is where
+      `text_input` used to put it on regaining focus.
     - The field keeps working throughout — it still holds the value, Enter still stages it, Tab
       still hops — and its teardown clears the channel, because `edit_buf` belongs to the *next*
       cell to be edited as much as to this one.

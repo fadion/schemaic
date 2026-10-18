@@ -102,11 +102,5 @@ These affect users today, with the English UI, whenever a table holds non-Latin 
 - **Fonts on screen.** Only IBM Plex is bundled (Latin, Cyrillic, Greek). CJK, Arabic and Hebrew
   rely on cosmic-text falling back to system fonts, which is unverified on macOS and Linux. (The
   diagram PNG has its own fallback now, `erd_raster::export_options`.)
-- **IME in the grid's inline cell editor.** Every other field is `edit_field`, on Floem's editor
-  engine, which enables IME and handles preedit and commit (`vendor/floem/src/views/editor/view.rs`).
-  The grid's inline editor is the one `floem::views::text_input`, which never calls
-  `set_ime_allowed` and handles neither event, so a cell cannot take CJK composition. Either move
-  it onto `edit_field` or teach the vendored `text_input` IME (a `PATCHES.md` entry); either way
-  the check is by hand, with a real input method.
 - **Right-to-left cell data** shapes and reorders through cosmic-text, but always sits
   left-aligned. Aligning a cell by its first strong character is cheap and optional.
