@@ -22,6 +22,7 @@ use floem::reactive::create_effect;
 
 use schemaic_core::plan::{PlanWarningKind, QueryPlan};
 
+use crate::i18n::tr;
 use crate::settings::focusable_toggle;
 use crate::theme::{font_body, font_label};
 use crate::widgets::{
@@ -104,15 +105,16 @@ pub(crate) fn plan_overlay(
                 schemaic_core::sql::contains_write(&plan_sql.get_untracked(), plan_dialect());
 
             let analyze_control = if is_write {
-                text("Analyze unavailable (statement writes data)")
+                text(tr!("plan-analyze-unavailable"))
                     .style(|s| s.font_size(font_label()).color(theme::text_faint()))
                     .into_any()
             } else {
                 h_stack((
                     focusable_toggle(plan_analyze, ring.clone(), 10),
                     v_stack((
+                        // `EXPLAIN ANALYZE`'s keyword, never translated (AGENTS.md).
                         text("Analyze").style(|s| s.font_size(font_body()).color(theme::text())),
-                        text("Executes the statement to measure real timings")
+                        text(tr!("plan-analyze-hint"))
                             .style(|s| s.font_size(font_label()).color(theme::text_faint())),
                     ))
                     .style(|s| s.flex_col().gap(theme::scaled(1.0))),
@@ -157,16 +159,18 @@ pub(crate) fn plan_overlay(
             let body = dyn_container(
                 move || (plan_state.get(), theme::ui_scale()),
                 move |(st, _)| match st {
-                    PlanState::Idle | PlanState::Running => {
-                        container(loading_dots("Explaining", theme::text_dim, font_body))
-                            .style(|s| {
-                                s.height(theme::scaled(180.0))
-                                    .width_full()
-                                    .items_center()
-                                    .justify_center()
-                            })
-                            .into_any()
-                    }
+                    PlanState::Idle | PlanState::Running => container(loading_dots(
+                        tr!("plan-explaining"),
+                        theme::text_dim,
+                        font_body,
+                    ))
+                    .style(|s| {
+                        s.height(theme::scaled(180.0))
+                            .width_full()
+                            .items_center()
+                            .justify_center()
+                    })
+                    .into_any(),
                     PlanState::Failed(e) => autohide(scroll(text(e).style(|s| {
                         s.color(theme::error())
                             .font_size(font_body())
@@ -180,7 +184,7 @@ pub(crate) fn plan_overlay(
             .style(|s| s.width_full().flex_col());
 
             let panel = v_stack((
-                modal_title_borderless("Query plan", close.clone(), ring.clone()),
+                modal_title_borderless(tr!("plan-title"), close.clone(), ring.clone()),
                 body,
                 toolbar,
             ))
@@ -252,7 +256,7 @@ fn plan_warnings(plan: &QueryPlan) -> AnyView {
         .collect();
 
     v_stack((
-        text("Potential issues").style(|s| {
+        text(tr!("plan-potential-issues")).style(|s| {
             s.font_size(font_label())
                 .font_bold()
                 .color(theme::text_dim())
@@ -426,7 +430,7 @@ fn ask_ai_button(
     let loaded_now = move || matches!(plan_state.get_untracked(), PlanState::Loaded(_));
     let face = h_stack((
         icons::icon(icons::SPARKLES, 15.0).style(|s| s.flex_shrink(0.0_f32)),
-        text("Ask AI").style(|s| s.font_size(font_body())),
+        text(tr!("plan-ask-ai")).style(|s| s.font_size(font_body())),
     ))
     .style(move |s| {
         let loaded = matches!(plan_state.get(), PlanState::Loaded(_));

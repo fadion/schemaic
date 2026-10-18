@@ -26799,6 +26799,14 @@ existing prose was left alone.
     arrives as the same tabular `QueryPlan` (under `core::plan`), and the two warning kinds only
     it produces, `MissingIndex` and `ServerWarning`, take the warning colour through the `_ =>`
     arm that keeps `theme::error` for `FullScan` alone.
+    **Its words are the catalogue's** (`plan-*`, roadmap phase 3) — the title (through
+    `modal_title_borderless`), the Analyze toggle's hint and the line that replaces the toggle for
+    a write (`plan-analyze-unavailable`, which keeps the word *Analyze*), *Explaining* under the
+    loading dots, *Potential issues* and *Ask AI*. The toggle's own **Analyze** label stays a
+    literal — it is `EXPLAIN ANALYZE`'s keyword, which AGENTS.md's spelling rule and the roadmap's
+    never-translated list both name — as do the plan's columns and rows (the server's), each
+    warning's message (core's prose, phase 4) and the prompt `ask_ai` sends the AI panel, English
+    as all AI text is. No test: no line here is composed from parts.
   - `properties.rs` — the **table properties** modal (`properties_overlay`), opened by setting
     `overlay.properties` — from a Table or View row's context menu, or from the RESULTS title bar's
     Properties icon for a result that names one table; an effect in the modal calls
@@ -40241,8 +40249,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`),
   Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`), Import
   Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`), the ER diagram
-  (`erd_view.rs`), Server variables (`server_vars_view.rs`) and the snippet editor
-  (`snippet_edit.rs`) are converted;
+  (`erd_view.rs`), Server variables (`server_vars_view.rs`), the snippet editor
+  (`snippet_edit.rs`) and the Query plan modal (`plan_view.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

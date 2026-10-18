@@ -1734,3 +1734,16 @@ snippet-edit-shortcut = Expansion shortcut
 snippet-edit-shortcut-none = none
 snippet-edit-query = Query
 snippet-edit-save = Save
+
+## Query plan modal (plan_view.rs)
+## The Analyze toggle names EXPLAIN ANALYZE and is never translated; the plan's
+## columns, rows and warnings are the server's and core's.
+
+plan-title = Query plan
+# Shown in place of the Analyze toggle; "Analyze" is the SQL keyword.
+plan-analyze-unavailable = Analyze unavailable (statement writes data)
+plan-analyze-hint = Executes the statement to measure real timings
+# Animated with trailing dots while it lasts.
+plan-explaining = Explaining
+plan-potential-issues = Potential issues
+plan-ask-ai = Ask AI
