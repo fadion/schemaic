@@ -10248,8 +10248,8 @@ mod ring_tests {
             NAV_TAB,
             crate::table_designer::LIST_TAB,
             // Form fields: spaced by 10 within a section, by 100 between them.
-            // 200/210/220 and 300/310 are the Settings modal; 21 and 31 are a
-            // suggestion chevron sitting one past its field.
+            // 200/210/220 and 300–330 are the Settings modal (330 its Language);
+            // 21 and 31 are a suggestion chevron sitting one past its field.
             5,
             10,
             21,
@@ -10260,6 +10260,7 @@ mod ring_tests {
             200,
             220,
             310,
+            330,
             FIXED_TAB_END,
             // Growing blocks, and the footer they must stay clear of.
             VALUE_TAB,

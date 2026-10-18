@@ -288,7 +288,9 @@ start with a failing test, then the code that makes it pass.
   function descriptions in `pg_builtins.rs`, which a live test compares to the server's; SQLite's
   *tokenizer*); and **persisted names** — serde keys and file names like `color`,
   `prominent_color`, `favorites.json`, `db_colors.json` — which saved data already uses.
-  Identifiers are code, not prose, and keep whatever they have.
+  Identifiers are code, not prose, and keep whatever they have. As labels move into the string
+  catalogue (`tr!`, `crates/schemaic-ui/i18n/en-GB/schemaic.ftl`), the rule moves with them:
+  that file is British English, and it is the source every translation is made from.
 
 ## Never bulk-rewrite source with a script
 

@@ -249,8 +249,8 @@ pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style 
 }
 
 // A small dim group heading over a setting's control, on any Settings page.
-fn settings_group_label(t: &'static str) -> impl IntoView {
-    text(t).style(form_label_style)
+fn settings_group_label(t: impl Into<String>) -> impl IntoView {
+    text(t.into()).style(form_label_style)
 }
 
 /// The interface-scale picker: four segments, no popup.
@@ -2342,7 +2342,7 @@ fn appearance_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         ring.clone(),
         310,
     );
-    let scale_dd = scale_picker(ui_scale, ring, 320);
+    let scale_dd = scale_picker(ui_scale, ring.clone(), 320);
     let ui_section = v_stack((settings_group_label("Interface theme"), ui_dd)).style(ctrl);
     let editor_section = v_stack((settings_group_label("Editor theme"), editor_dd)).style(ctrl);
     // No hint under this one, unlike the settings that carry a
@@ -2355,7 +2355,40 @@ fn appearance_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         ui_section,
         editor_section,
         scale_section,
+        language_section(layout.ui_language, ring, 330),
     ))
+}
+
+/// *Language*: the system's, or a shipped catalogue by its own name.
+///
+/// **It applies on the next start**, unlike every other control on this page —
+/// labels are built with their text and nothing re-renders for a setting changed
+/// once — so the hint below says so, and says it only when the choice would draw
+/// a different language from the one on screen (`LanguageChoice::needs_restart`).
+fn language_section(
+    choice: RwSignal<crate::i18n::LanguageChoice>,
+    ring: FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
+    use crate::i18n::{LanguageChoice, tr};
+    let dd = focusable_dropdown(
+        choice,
+        LanguageChoice::options(),
+        LanguageChoice::label,
+        ring,
+        tabindex,
+    );
+    let hint = dyn_container(
+        move || choice.get().needs_restart(),
+        |restart| {
+            if restart {
+                form_hint(tr!("settings-language-restart")).into_any()
+            } else {
+                empty().into_any()
+            }
+        },
+    );
+    v_stack((settings_group_label(tr!("settings-language")), dd, hint)).style(ctrl)
 }
 
 // ── Shortcuts: keyboard-reference modal ──────────────────────────────────────

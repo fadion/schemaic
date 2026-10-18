@@ -32,6 +32,7 @@ mod event_editor;
 pub mod fonts;
 mod grid;
 mod history_panel;
+pub mod i18n;
 pub mod icons;
 mod import_view;
 mod inline_diff;
@@ -6064,6 +6065,10 @@ pub struct LayoutUi {
     /// `theme::set_ui_scale`. Not the editor or terminal font — those have their
     /// own size settings (see [`theme::UiScale`]).
     pub ui_scale: RwSignal<theme::UiScale>,
+    /// The *Language* setting. Persisted only — the interface language is read
+    /// once at launch (`i18n::init`), so moving this drives nothing until the
+    /// next start, and Settings says so.
+    pub ui_language: RwSignal<i18n::LanguageChoice>,
     /// Editor font size (px); drives `theme::set_editor_font`.
     pub editor_font: RwSignal<f32>,
     /// Editor tab width (columns); drives `theme::set_editor_tab_width`.

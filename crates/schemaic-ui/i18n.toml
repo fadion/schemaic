@@ -1,0 +1,10 @@
+# The interface's string catalogue — read by `fl!` at compile time and by
+# `i18n::LOADER` at run time. British English is the source; every other
+# language falls back to it message by message.
+fallback_language = "en-GB"
+
+[fluent]
+assets_dir = "i18n"
+# One catalogue for every crate that draws the interface, named for the app
+# rather than for whichever crate's `fl!` reads it.
+domain = "schemaic"

@@ -50,7 +50,7 @@ existing prose was left alone.
 - [Crates](#crates) — the module map, one entry per source file
 - [Architecture invariants](#architecture-invariants-dont-regress-these) — the rules re-introducing
   which is a regression
-- [UI conventions](#ui-conventions) — cursors, labels, colours, theming
+- [UI conventions](#ui-conventions) — cursors, labels, colours, theming, the string catalogue
 - [Floem 0.2 gotchas](#floem-02-gotchas-learned-the-hard-way) — the framework hazards, learned the
   hard way (focus, Tab, scroll, overlays, transitions)
 - [Popup menus](#popup-menus-menu_panel) — `menu_panel`, submenus, dismissal, edge-flipping
@@ -11074,7 +11074,9 @@ existing prose was left alone.
     import's picker has no filter, and the envelope key is what `parse` checks.
     **`PORTABLE_KEYS` is an allowlist of `UiState` field names, and that it is an allowlist is the
     point**: a field added to `UiState` later stays home until somebody decides it travels, where a
-    denylist would export it the day it lands. What travels is the themes and scale, the editor,
+    denylist would export it the day it lands. What travels is the themes and scale, the interface
+    language (`ui_language` — refused, through the app's `normalise`, when it names a language this
+    build does not offer, since `LanguageChoice::from_key` reads that as `system`), the editor,
     formatting, the row limit and statement timeout, `confirm_writes`, `live_validate`,
     `notify_finished`, `restore_tabs` and the assistant's effort, instructions, schema scope and
     gutter. What stays is the panel widths, the history panel's *Current | All* switch
@@ -11129,6 +11131,37 @@ existing prose was left alone.
     snippets never take the same id — with `last_used` cleared and `source` `User`
     (`merged_snippets_get_fresh_ids_and_never_collide`). `summary(changed, snippets)` is the
     phrase the confirmation names after *changes* — *3 settings and adds 1 snippet*.
+  - `locale.rs` — **which language the interface is drawn in**, decided once at launch. It answers
+    a question only the GUI asks: the CLI, the MCP server and everything sent to an AI harness stay
+    English, because scripts parse the first and a model reads the second, so nothing in core
+    renders through it (`ui/i18n.rs` is the half that does; the conventions are under *UI
+    conventions*, *The string catalogue*). `UiLanguage` is `EnGb`, `De` and `Pseudo`, with `key()`
+    the persisted spelling and what `SCHEMAIC_LOCALE` takes, `catalogue()` the directory its `.ftl`
+    lives in — `Pseudo` answers `en-GB`'s, being the English catalogue transformed — and
+    `endonym()` the language's name **in itself**, which is deliberately not in any catalogue: a
+    picker lists each language the same way in every language, so a reader lost in the wrong one
+    can still find their own. `from_key` reads the primary subtag case-insensitively, so `de-AT`,
+    `de_AT` and POSIX's `de_AT.UTF-8` are all German and `en-US` is the one English there is
+    (`keys_round_trip_and_tolerate_case_and_region`).
+    **`resolve(env, setting, os)` takes three sources in order, and only the first is
+    unconditional.** `SCHEMAIC_LOCALE` is a developer's, so it reaches whatever it names — a
+    catalogue still being written, and the pseudo-locale — and one it does not know falls through
+    rather than failing the launch (`the_environment_wins_and_reaches_unshipped_catalogues`). The
+    *Language* setting and then the OS's preferred languages, in preference order with an unknown
+    one passed over, reach only **`SHIPPED`** catalogues, and nothing matching is `EnGb`: a language
+    whose catalogue is half written would otherwise draw a half-translated interface for everyone
+    whose system is set to it, which is worse than English. `SHIPPED` is `[EnGb]` today — a language
+    joins it when its catalogue is complete, not when it is started — and
+    `the_system_never_reaches_an_unshipped_catalogue` asserts German is *not* on it, with *update
+    this test when German ships* as its message, so shipping German fails that test on purpose. The
+    pseudo-locale is never reached from the setting either, a hand-edited settings file not being a
+    way into a developer tool (`the_pseudo_locale_is_the_environment_s_alone`). The private
+    `resolve_in` takes the shipped list as a parameter so the ordering can be tested with German
+    counted as shipped (`the_system_is_read_in_preference_order`,
+    `a_shipped_setting_overrides_the_system_either_way`) while it is not. `SYSTEM_KEY` (`system`) is
+    the setting's "follow the operating system", and `UiState::ui_language`'s default; that field is
+    a `String`, not the enum, so a key a newer build wrote reads as the system's choice instead of
+    failing the whole `ui_state.json`.
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`, capped at `MAX_PER_CONN` (200, was 50) entries per connection.
     **Not higher, because both readers walk all of them**: the history panel builds a highlighted
@@ -24936,9 +24969,64 @@ existing prose was left alone.
     would execute the block in whatever tab is in front, which is the connection the insert had just
     declined to open on. The `bool` exists for that one question; the refusal itself is reported by
     the action.
+  - `i18n.rs` — **the interface's string catalogue**: Fluent, through `i18n-embed` (feature
+    `fluent-system`) and `i18n-embed-fl`, over the language `core::locale` chose. The catalogues
+    are `crates/schemaic-ui/i18n/<tag>/schemaic.ftl` — `en-GB` the source, `de` machine-drafted and
+    unreviewed — embedded in the binary by `rust-embed`, and `crates/schemaic-ui/i18n.toml` names
+    `en-GB` the fallback and the Fluent domain `schemaic`, after the app rather than the crate, so
+    that every crate drawing the interface can share the one catalogue. Only this crate reads it
+    today: `LOADER` and `tr!` are `pub(crate)`. **`tr!` is `fl!` against `LOADER`**, so a message
+    id and its argument names are checked against the `en-GB` file at compile time and a missing key
+    is a build error rather than a blank label — but *only* against `en-GB`, which is why the tests
+    below read the other files. `LOADER` is a `LazyLock<FluentLanguageLoader>` holding `en-GB` until
+    `init` says otherwise, and in every test, so English output never depends on the machine running
+    the suite (`the_global_loader_is_english_until_init`).
+    **`init(env, os, setting)` runs once, before any view is built**, and a second call is ignored
+    (a `OnceLock`): a label is built with its text and nothing re-renders when the setting moves, so
+    a language applied after the first view would leave that view English. The app reads all three
+    inputs — `SCHEMAIC_LOCALE`, `sys_locale::get_locales()` and the persisted key — and calls it in
+    `app_view` straight after `load_ui_state`, logging the answer, so this crate never touches the
+    environment. `active()` is the language on screen and
+    `would_draw(key)` what a *Language* setting of `key` would draw on this machine, from the `env`
+    and `os` `init` was handed rather than asking the OS again.
+    **`configure` loads a catalogue and *then* calls `set_use_isolating(false)`, and the order is
+    load-bearing**: a load swaps in fresh bundles and the flag is a setting of the bundles, so set
+    first it is silently undone. Fluent wraps every placeable in U+2068/U+2069 by default, so a
+    right-to-left value cannot reorder the sentence around it; with the marks on, every English
+    message that takes an argument differs from the literal it replaced by two invisible characters
+    — which the suite's English assertions would catch and a user would copy out of a message.
+    `a_message_with_an_argument_carries_no_isolation_marks` pins it, and was seen red with
+    `System (\u{2068}English\u{2069})` before the call. What it gives up is that protection, for
+    right-to-left data put into a message as much as for a right-to-left language; there is no
+    right-to-left interface in this phase (`docs/roadmap.md`).
+    **The pseudo-locale is `en-GB` with a transform** (`bundle.set_transform`), `pseudo`:
+    `fluent-pseudo`'s accented and lengthened text, then bracketed, so a box that cuts either end
+    shows which end it cut. Fluent applies it to a message's text pieces and never to the values put
+    into it, which are data rather than the interface's words, so a string still left as a literal is
+    the one that reads plain (`the_pseudo_locale_marks_the_words_and_spares_the_values`).
+    **Two catalogue tests stand in for what `fl!` cannot see.** At run time a malformed `.ftl` is
+    only logged and its broken messages fall back to English, unseen, so
+    `every_catalogue_parses_cleanly` parses every embedded file strictly with `fluent-syntax` (a
+    dev-dependency) and requires at least two of them; and
+    `no_translation_outlives_its_english_message` fails on an id a translation has and `en-GB` has
+    not — dead weight that reads as live, and usually a renamed id whose new name is untranslated.
+    Nothing tests the other direction: a message missing from a translation falls back to English by
+    design, and keeping an incomplete catalogue out of users' hands is `SHIPPED`'s job.
+    **`LanguageChoice` is the setting as Settings offers it** — `System` or `Fixed(UiLanguage)`,
+    `options()` being `System` then `SHIPPED`, never the pseudo-locale. `from_key` reads a key it
+    does not offer (a newer build's, a hand edit, an unshipped catalogue) as `System`, which is also
+    what `resolve` makes of it (`the_language_setting_offers_only_what_ships`). `label()` names a
+    language by its endonym and the system entry as `System (English)` —
+    `settings-language-system` over the endonym the system would resolve to. `needs_restart()` is
+    `would_draw(key) != active()`, so choosing English on an English system changes the setting and
+    says nothing (`a_choice_that_draws_what_is_on_screen_needs_no_restart`).
   - `settings.rs` — the Settings modal (its sections are General / Editor / Code formatting /
-    Query / **Terminal** / **AI assistant** / **Appearance**, the last holding the two theme pickers
-    and the **interface scale**) and the Shortcuts reference, **and the
+    Query / **Terminal** / **AI assistant** / **Appearance**, the last holding the two theme pickers,
+    the **interface scale** and the **Language** dropdown — `language_section`, tabindex 330, with
+    *The language change takes effect the next time Schemaic starts.* under it only while
+    `LanguageChoice::needs_restart`, since unlike everything else on that page it applies at the
+    next launch; its signal is `LayoutUi::ui_language`, persisted and mirrored by nothing live) and
+    the Shortcuts reference, **and the
     four shared controls every modal's form is
     built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
     floem's), `focusable_dropdown` and the picker-agnostic **`in_ring_picker`** under it — the box
@@ -39602,6 +39690,33 @@ Re-introducing the anti-patterns these guard against is a regression:
     invalidator closes itself on the next layout.
   - Derived metrics sum the **scaled parts** rather than scaling the sum (`consts::leaf_pad`), so an
     indent lands on the pixel the glyphs it aligns under actually occupy — at 80% those differ by one.
+- **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
+  value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). Only the *Language*
+  setting's own three messages have moved so far — every other label is still an English literal
+  until phase 3 of the roadmap's *Interface translation* converts it — and only the GUI is
+  translated: CLI, MCP and AI text stays English, as do SQL, persisted names and key names.
+  - **Where and how a message is written.** `crates/schemaic-ui/i18n/en-GB/schemaic.ftl` is the
+    source, in British spelling, and a new message goes there first, since `fl!` checks ids and
+    argument names against that file alone. Ids are kebab-case and start with the area they belong
+    to (`settings-language-restart`). A translation lives beside it at `i18n/<tag>/schemaic.ftl` and falls back to `en-GB` message
+    by message.
+  - **Isolation marks are off**, set after every catalogue load, because Fluent's default
+    U+2068/U+2069 around each placeable made an English message with an argument differ from the
+    literal it replaced (`a_message_with_an_argument_carries_no_isolation_marks`). Converting a
+    label must leave English output byte-identical: the roadmap's every phase promises it, because
+    the suite's assertions on English wording are the regression net for the whole conversion.
+  - **The language is read once, at launch**, before any view, and never changes while the app
+    runs; nothing takes a reactive dependency on it, which spares every label one for a setting
+    changed once. The setting says so where it is changed.
+  - **`SCHEMAIC_LOCALE` reaches what Settings cannot**: `SCHEMAIC_LOCALE=de` for a catalogue still
+    being written, `SCHEMAIC_LOCALE=pseudo` for the pseudo-locale, whose accented, lengthened and
+    bracketed text shows every box too narrow for a longer language and every string nobody moved
+    into the catalogue (the one left plain). The setting and the OS reach only `locale::SHIPPED`,
+    which a language joins when its catalogue is complete.
+  - **Two tests guard what the compiler cannot**: `every_catalogue_parses_cleanly`, because a
+    malformed translation is only logged at run time and falls back to English unseen; and
+    `no_translation_outlives_its_english_message`, for a renamed or deleted English id. A message
+    a translation lacks is not caught, by design.
 - **Reactive text**: use `dyn_container` (no `floem::views::label`).
 - **There is no accessibility tree, and there is nothing in this repository that can add one.**
   Floem 0.2.0 ships no AccessKit integration and no a11y surface of any kind — grepping the crate

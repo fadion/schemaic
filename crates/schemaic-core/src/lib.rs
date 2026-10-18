@@ -44,6 +44,7 @@ pub mod init_sql;
 pub mod intel;
 pub mod jsontree;
 pub mod launch;
+pub mod locale;
 pub mod model;
 pub mod monitor;
 pub mod mssql_builtins;

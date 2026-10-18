@@ -47,6 +47,10 @@ strings table, every user-facing string an English literal at its call site.
   no label re-renders when it changes, which spares two to three thousand call sites a reactive
   dependency for a setting changed once. Changing it says so where the user changed it:
   *The language change takes effect the next time Schemaic starts.*
+- **Settings offers a language only once its catalogue is complete** (`locale::SHIPPED`), and
+  so does the OS: a German system gets English until German ships, never a half-German
+  interface. While a catalogue is being written it is reached with `SCHEMAIC_LOCALE=de`, as the
+  pseudo-locale is with `SCHEMAIC_LOCALE=pseudo`.
 
 ### Never translated
 
@@ -61,15 +65,14 @@ otherwise.
 Each phase leaves English output byte-identical, so the existing suite — several hundred
 assertions pin English wording — stays the regression net throughout.
 
-1. **Infrastructure.** Add the crates, an `en-GB` catalogue, a loader chosen from the OS locale
-   with a Settings override, and a **pseudo-locale** (accented letters, ~40% padding, bracketed)
-   for a run that shows every clipped box and every string nobody extracted at once. There is no
-   screenshot harness, so this is the layout check.
 2. **Labels that are identities.** Before anything is translated, every place that compares
-   displayed English to decide behaviour becomes an id: `sql::NO_DATABASE_SELECTED`, which the
-   front ends recognise by its text; the menu code that matches on `"Favourite" | "Unfavourite" |
-   "Colour" | "Hide"` in `overlays.rs`; `text::human_count`'s `k`/`m`/`b`, which
-   `model::goto_row_index` parses back.
+   displayed English to decide behaviour becomes an id: the editor's context menu, which drops
+   its *Plan* entry on an engine without plans by matching `label == "Plan"`
+   (`editor_pane.rs`); `text::human_count`'s `k`/`m`/`b`, which `model::goto_row_index` parses
+   back. `sql::NO_DATABASE_SELECTED` is matched by text only in the CLI, which stays English, so
+   it waits for phase 4's typed messages. The `"Favourite" | "Unfavourite" | "Colour" | "Hide"`
+   match in `overlays.rs` is a test (`menu_order_gate`) reading source literals, not behaviour;
+   it and its siblings are retargeted in phase 3, with the ellipsis gate.
 3. **UI literals** in `schemaic-ui` and `schemaic-app` — on the order of two to three thousand,
    heaviest in `widgets.rs`, `overlays.rs`, `lib.rs`, `grid.rs` and `shortcuts.rs`. Mechanical,
    one file per session, by hand: the rule against scripted edits applies in full. Retarget
@@ -91,7 +94,7 @@ assertions pin English wording — stays the regression net throughout.
 6. **Layout for longer text.** German, Finnish and Russian run 30–100% longer than English.
    Roughly sixty fixed-width boxes sit beside text — the connection form, the import and compare
    panes, the find bar, `widgets::fact_row`'s fixed label column — and each either measures its
-   text or ellipsises. The pseudo-locale from phase 1 finds them.
+   text or ellipsises. The pseudo-locale (`SCHEMAIC_LOCALE=pseudo`) finds them.
 7. **Locale formatting** — thousands separators, decimals, `history::relative_time`'s "… ago".
    Nothing is locale-aware today. Decide whether it is worth `icu4x` before starting.
 

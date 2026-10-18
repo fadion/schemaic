@@ -2037,6 +2037,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // reads the *old* global AI flag out of it; tab restore further down needs it
     // too (`restore_tabs`).
     let ui_state = persist::load_ui_state();
+    // **The interface language, before any view is built** — a label is built
+    // with its text and never re-reads it, so a language chosen after the first
+    // view would leave that view in English. Read once: the setting applies on
+    // the next start. The environment variable is a developer's way into the
+    // pseudo-locale and unshipped catalogues (`schemaic_core::locale`).
+    let ui_language_at_launch = schemaic_ui::i18n::init(
+        std::env::var("SCHEMAIC_LOCALE").ok(),
+        sys_locale::get_locales().collect(),
+        &ui_state.ui_language,
+    );
+    tracing::info!(language = ui_language_at_launch.key(), "interface language");
     // **Every key this build does not recognise, held for the save.** Captured
     // here rather than read off `ui_state` at the save, because the struct is
     // consumed field by field on the way down — the same reason
@@ -2630,6 +2641,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let ui_theme = RwSignal::new(UiThemeKind::from_key(&ui_state.ui_theme));
     let editor_theme = RwSignal::new(EditorThemeKind::from_key(&ui_state.editor_theme));
     let ui_scale = RwSignal::new(UiScale::from_key(&ui_state.ui_scale));
+    // Persisted only: nothing mirrors it live, since the language was chosen above.
+    let ui_language = RwSignal::new(schemaic_ui::i18n::LanguageChoice::from_key(
+        &ui_state.ui_language,
+    ));
     schemaic_ui::theme::init(
         ui_theme.get_untracked(),
         editor_theme.get_untracked(),
@@ -8659,6 +8674,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 ui_theme: ui_theme.get_untracked().key().to_string(),
                 editor_theme: editor_theme.get_untracked().key().to_string(),
                 ui_scale: ui_scale.get_untracked().key().to_string(),
+                ui_language: ui_language.get_untracked().key().to_string(),
                 editor_font_size: editor_font.get_untracked(),
                 row_limit: row_limit.get_untracked(),
                 statement_timeout_secs: statement_timeout.get_untracked(),
@@ -8764,6 +8780,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             ui_theme.get();
             editor_theme.get();
             ui_scale.get();
+            ui_language.get();
             save_ui(persist::Saving::Replacing);
         });
     }
@@ -11758,6 +11775,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         ui_theme.set(UiThemeKind::from_key(&st.ui_theme));
         editor_theme.set(EditorThemeKind::from_key(&st.editor_theme));
         ui_scale.set(UiScale::from_key(&st.ui_scale));
+        ui_language.set(schemaic_ui::i18n::LanguageChoice::from_key(&st.ui_language));
         editor_font.set(schemaic_ui::theme::clamped_editor_font(st.editor_font_size));
         tab_width.set(schemaic_ui::theme::clamped_tab_width(st.tab_width));
         soft_tabs.set(st.soft_tabs);
@@ -11831,6 +11849,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     s.editor_theme =
                                         EditorThemeKind::from_key(&s.editor_theme).key().into();
                                     s.ui_scale = UiScale::from_key(&s.ui_scale).key().into();
+                                    s.ui_language =
+                                        schemaic_ui::i18n::LanguageChoice::from_key(&s.ui_language)
+                                            .key()
+                                            .into();
                                     s.editor_font_size =
                                         schemaic_ui::theme::clamped_editor_font(s.editor_font_size);
                                     s.tab_width =
@@ -15122,6 +15144,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             ui_theme,
             editor_theme,
             ui_scale,
+            ui_language,
             editor_font,
             tab_width,
             soft_tabs,

@@ -53,6 +53,21 @@ unicode-segmentation = "1.13"
 # and a combining mark as none (`grid::grid_chars`). Already in the tree at this
 # version — no extra compile.
 unicode-width = "0.2"
+# The interface's string catalogue (`i18n`): Fluent through i18n-embed, whose
+# `fl!` checks a message id and its argument names against the `en-GB`
+# catalogue at compile time, so a missing key is a build error rather than a
+# blank label. The catalogues are embedded (`rust-embed`); `fluent-pseudo` is
+# the pseudo-locale's transform. GUI only — see `docs/roadmap.md`.
+i18n-embed = { version = "0.16", features = ["fluent-system"] }
+i18n-embed-fl = "0.10"
+rust-embed = "8"
+fluent-pseudo = "0.3"
+
+[dev-dependencies]
+# Parses every embedded catalogue strictly in a test: at run time a malformed
+# `.ftl` is only logged, and its broken messages fall back to English unseen.
+# Already in the tree under i18n-embed, same version.
+fluent-syntax = "0.12"
 
 [lints]
 workspace = true

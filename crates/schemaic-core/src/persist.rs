@@ -150,6 +150,10 @@ fn default_editor_theme() -> String {
 fn default_ui_scale() -> String {
     "normal".to_string()
 }
+/// Interface language — follow the operating system (`locale::SYSTEM_KEY`).
+fn default_ui_language() -> String {
+    crate::locale::SYSTEM_KEY.to_string()
+}
 fn default_editor_font() -> f32 {
     14.0
 }
@@ -320,6 +324,12 @@ pub struct UiState {
     /// have their own size settings).
     #[serde(default = "default_ui_scale")]
     pub ui_scale: String,
+    /// Interface language key: `system`, or a language's
+    /// `locale::UiLanguage::key`. A string, not the enum, so a key a newer build
+    /// wrote reads as `system` (`locale::resolve`) instead of failing the file.
+    /// Read once at launch; a change applies on the next start.
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
     /// SQL-editor font size (px).
     #[serde(default = "default_editor_font")]
     pub editor_font_size: f32,
@@ -503,6 +513,7 @@ impl Default for UiState {
             ui_theme: default_ui_theme(),
             editor_theme: default_editor_theme(),
             ui_scale: default_ui_scale(),
+            ui_language: default_ui_language(),
             editor_font_size: default_editor_font(),
             row_limit: default_row_limit(),
             confirm_writes: true,

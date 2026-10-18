@@ -34,6 +34,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # zbus on `async-io`, never `tokio` — the same rule
 # `secrets::tests::zbus_is_not_on_its_tokio_backend` holds every zbus to.
 notify-rust = "4.18"
+# The operating system's preferred languages, for the interface language at
+# launch (`schemaic_ui::i18n::init`). Already in the tree through cosmic-text,
+# same version.
+sys-locale = "0.3"
 
 # The OS keyring moved to `schemaic-conn` with `secrets.rs`, so the headless CLI
 # can reach a saved connection without linking floem. The backend notes that used
