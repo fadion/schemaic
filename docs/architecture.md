@@ -28952,7 +28952,7 @@ existing prose was left alone.
     is `core::ddl::grant_change`, pure and unit-tested rather than four arms in the render.
     **The Action dropdown is over a `bool`**: `GrantDraft::revoke` stays the `bool` that
     `PrivilegeChange` and `ddl::grant_change` read and that their tests pin, and the free
-    `action_label(bool) -> &'static str` gives it its two words. An enum invented for the form would
+    `action_label(bool) -> String` gives it its two words. An enum invented for the form would
     be a second spelling of the same fact sitting one conversion away from the tested one.
     It opens pre-picked to the widest level **below the whole server** (`users::default_grant_level`,
     asked of the account — a SQL Server login, whose one level is the server, opens there:
@@ -29025,6 +29025,24 @@ existing prose was left alone.
     passes it today, a SQL Server login included now that the server level exists. The Role field's
     shortcut is `users::role_suggestions`: a login's server roles are not in the browser's list, so a
     SQL Server login is offered the fixed server roles instead.
+    **Its words are the catalogue's** (`account-editor-*`, roadmap phase 3) — both forms' labels,
+    sections, toggles, placeholders and the chevrons' empty notes — with Cancel and Preview SQL the
+    shared `dialog-cancel`/`editor-preview-sql`. The titles are whole messages,
+    `account-editor-title-{create,reset}` and `account-editor-title-privileges` with `$account`, and
+    SQL Server's *Also a user in {database}* is `account-editor-also-user`
+    (`the_composed_lines_read_as_they_did_in_english`). **The dropdowns' words are drawn here** (the
+    core-words rule under *UI conventions*): the Kind list wears `users_view::principal_kind_label`,
+    made `pub(crate)` for it, and the Subject and Level lists `grant_subject_label` and
+    `grant_level_label` in place of `GrantSubject::label`/`GrantLevelKind::label`, with
+    `english_names_every_grant_subject_and_level_as_core_does` holding English equal to core's.
+    `grant_level_label` also names the qualifier field (*Database*/*Schema*) and the Table or
+    Sequence name field, so a field reads in the Level dropdown's own words rather than a second
+    spelling of them. `action_label` returns a `String` for the same reason, `suggested_field`'s
+    `empty_note` is a `String`, and the Host and *For login* placeholders go through
+    `FieldCfg::placeholder_of`. What stays English: *Microsoft Entra*, a product's name; the
+    identifier placeholders (`account_name`, `role_name`, `database_name`, `schema_name`, `name`);
+    the privilege tags, which are SQL keywords; and core's prose — `users::password_hint` and
+    `users::account_form_blocker`'s sentences, phase 4.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`). The two roles are drawn **asymmetrically**, and deliberately: the user's
     question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while the assistant's turn
@@ -40014,7 +40032,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`database_editor.rs`), the script import (`script_view.rs`), the schema comparison
   (`compare_view.rs`), the routine editor (`routine_editor.rs`), the event editor
   (`event_editor.rs`), the trigger editor (`trigger_editor.rs`), the object editor
-  (`object_editor.rs`) and the Users and privileges browser (`users_view.rs`) are converted; every other
+  (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
+  grant forms (`account_editor.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -40039,12 +40058,15 @@ Re-introducing the anti-patterns these guard against is a regression:
     `compare_view::compare_kind_group`/`compare_kind_word`/`empty_rows_message` for
     `compare::CompareKind::group_label`/`label` and `EmptyRows::message`,
     `event_editor::event_status_label` for `schema::EventStatus::label`, and
-    `users_view::principal_kind_label` for `users::PrincipalKind::label` —
+    `users_view::principal_kind_label` for `users::PrincipalKind::label`, and
+    `account_editor::grant_subject_label`/`grant_level_label` for `users::GrantSubject::label`/
+    `GrantLevelKind::label` —
     with a test holding its English equal to core's for every variant
     (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`,
     `english_names_every_kill_as_core_does`, `english_names_every_chart_kind_as_core_does`,
     `english_names_every_compare_kind_as_core_does`, `english_says_every_empty_reason_as_core_does`,
-    `english_names_every_event_status_as_core_does`, `english_names_every_principal_kind_as_core_does`).
+    `english_names_every_event_status_as_core_does`, `english_names_every_principal_kind_as_core_does`,
+    `english_names_every_grant_subject_and_level_as_core_does`).
     Where the word is a phrase core composes rather than a label, core answers with a value or
     keeps the composition and lets the caller word the part that is language: `history::ago` hands
     back an `Ago` that `i18n::relative_time` says from `ago-*` (the history and snippet rows, the

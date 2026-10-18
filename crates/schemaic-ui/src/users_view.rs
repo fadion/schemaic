@@ -637,7 +637,7 @@ fn detail_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: Focu
 /// What kind of account this is — `PrincipalKind::label`'s word in the
 /// interface's language; `english_names_every_principal_kind_as_core_does`
 /// holds them equal.
-fn principal_kind_label(kind: schemaic_core::users::PrincipalKind) -> String {
+pub(crate) fn principal_kind_label(kind: schemaic_core::users::PrincipalKind) -> String {
     use schemaic_core::users::PrincipalKind;
     match kind {
         PrincipalKind::User => tr!("users-kind-user"),

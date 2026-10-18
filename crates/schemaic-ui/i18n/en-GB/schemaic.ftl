@@ -1145,3 +1145,43 @@ object-editor-base-type = Base type
 object-editor-nullable = Nullable
 object-editor-nullable-hint = A column of this type accepts NULL unless the column says otherwise.
 object-editor-schemas = Schemas
+
+## Account and grant editors (Users and privileges)
+
+account-editor-title-create = Create account
+account-editor-title-reset = Reset password
+# $account is the account as the server names it ('app'@'%', app).
+account-editor-title-privileges = Privileges — { $account }
+account-editor-account = Account
+account-editor-kind = Kind
+account-editor-name = Name
+account-editor-host = Host
+# MySQL's own default for an unqualified CREATE USER; % is the wildcard and stays.
+account-editor-host-placeholder = % (any host)
+# SQL Server: the login a database user is made FOR.
+account-editor-for-login = For login
+account-editor-for-login-placeholder = login — empty for a user without one
+# SQL Server: a new login can bring a user of its own name into this database.
+account-editor-also-user = Also a user in { $database }
+account-editor-password = Password
+account-editor-confirm = Confirm
+account-editor-action = Action
+account-editor-action-grant = Grant
+account-editor-action-revoke = Revoke
+account-editor-subject = Subject
+account-editor-subject-privileges = Privileges
+account-editor-subject-role = Role
+account-editor-role = Role
+account-editor-no-roles = This server has no roles
+account-editor-with-admin-option = With admin option
+account-editor-level = Level
+account-editor-level-global = Whole server
+account-editor-level-database = Database
+account-editor-level-schema = Schema
+account-editor-level-table = Table
+account-editor-level-sequence = Sequence
+account-editor-no-suggestions = No suggestions
+account-editor-section-privileges = Privileges
+account-editor-with-grant-option = With grant option
+account-editor-needs-role = Name a role.
+account-editor-needs-privileges = Pick a level, name what it applies to, and tick a privilege.

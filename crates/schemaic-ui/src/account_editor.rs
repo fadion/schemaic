@@ -54,6 +54,7 @@ use schemaic_core::users::{
     self, AccountDraft, GrantDraft, GrantLevelKind, GrantSubject, Principal, PrincipalKind,
 };
 
+use crate::i18n::tr;
 use crate::table_designer::suggest_field;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, focus_root_with_ring,
@@ -491,7 +492,7 @@ fn suggested_field<D: Clone + 'static>(
     options: impl Fn() -> Vec<String> + Clone + 'static,
     // What the chevron's menu says when `options` answers nothing — see
     // `suggest_chevron`.
-    empty_note: &'static str,
+    empty_note: String,
     ring: &FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut D, &str) + 'static,
@@ -648,7 +649,7 @@ fn account_form(
     if let Some(account) = &target.resetting {
         rows.push(
             form_setting(
-                "Account",
+                tr!("account-editor-account"),
                 text(account.display())
                     .style(|s| s.font_size(theme::font_body()).color(theme::text()))
                     .into_any(),
@@ -667,13 +668,13 @@ fn account_form(
     let kind = seed.kind;
     rows.push(
         form_setting(
-            "Kind",
+            tr!("account-editor-kind"),
             bound_dropdown(
                 draft,
                 kind,
                 // SQL Server's login first, since a user is mapped to one.
                 schemaic_core::users::account_kinds(target.dialect, target.scope).to_vec(),
-                PrincipalKind::label,
+                crate::users_view::principal_kind_label,
                 ring.clone(),
                 8,
                 |d, v| d.kind = v,
@@ -684,7 +685,7 @@ fn account_form(
 
     rows.push(
         form_setting(
-            "Name",
+            tr!("account-editor-name"),
             bound_field(
                 draft,
                 seed.name.clone(),
@@ -707,7 +708,7 @@ fn account_form(
     if hosts && kind == PrincipalKind::User {
         rows.push(
             form_setting(
-                "Host",
+                tr!("account-editor-host"),
                 bound_field(
                     draft,
                     seed.host.clone(),
@@ -715,7 +716,7 @@ fn account_form(
                         // The default MySQL itself applies to an unqualified
                         // `CREATE USER`, said rather than left blank so the
                         // account that gets made is not a surprise.
-                        placeholder: "% (any host)",
+                        placeholder_of: Some(Rc::new(|| tr!("account-editor-host-placeholder"))),
                         focus: Some((ring.clone(), 20)),
                         ..Default::default()
                     },
@@ -752,12 +753,14 @@ fn account_form(
     if split && kind == PrincipalKind::User && !external {
         rows.push(
             form_setting(
-                "For login",
+                tr!("account-editor-for-login"),
                 bound_field(
                     draft,
                     seed.login.clone(),
                     FieldCfg {
-                        placeholder: "login — empty for a user without one",
+                        placeholder_of: Some(Rc::new(|| {
+                            tr!("account-editor-for-login-placeholder")
+                        })),
                         focus: Some((ring.clone(), 20)),
                         ..Default::default()
                     },
@@ -770,7 +773,10 @@ fn account_form(
     if split && kind == PrincipalKind::Login {
         rows.push(
             form_setting_owned(
-                format!("Also a user in {}", target.database),
+                tr!(
+                    "account-editor-also-user",
+                    database = target.database.clone()
+                ),
                 bound_toggle(draft, seed.also_user, ring.clone(), 20, |d, v| {
                     d.also_user = v
                 }),
@@ -826,13 +832,13 @@ fn password_row(d: crate::DdlUi, ring: FocusRing, dialect: SqlDialect) -> AnyVie
     let confirm = d.account_confirm;
     v_stack((
         form_setting(
-            "Password",
+            tr!("account-editor-password"),
             crate::connection_form::masked_edit_field(pw, ring.clone(), 30)
                 .style(|s| s.width(field_w()))
                 .into_any(),
         ),
         form_setting(
-            "Confirm",
+            tr!("account-editor-confirm"),
             crate::connection_form::masked_edit_field(confirm, ring, 31)
                 .style(|s| s.width(field_w()))
                 .into_any(),
@@ -987,7 +993,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                     );
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -995,7 +1001,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,
@@ -1022,8 +1028,8 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                 // apart because "Create account" over a form that will emit an
                 // `ALTER` is the one thing the title may not do.
                 match target.resetting.is_some() {
-                    true => "Reset password".to_string(),
-                    false => "Create account".to_string(),
+                    true => tr!("account-editor-title-reset"),
+                    false => tr!("account-editor-title-create"),
                 },
                 ShellParts {
                     body: body.into_any(),
@@ -1056,8 +1062,33 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
 /// A `fn` rather than a closure because [`bound_dropdown`]'s `label` is one, and
 /// spelled out rather than derived so the affirmative reads as the affirmative:
 /// `false` is *Grant*.
-fn action_label(revoke: bool) -> &'static str {
-    if revoke { "Revoke" } else { "Grant" }
+fn action_label(revoke: bool) -> String {
+    if revoke {
+        tr!("account-editor-action-revoke")
+    } else {
+        tr!("account-editor-action-grant")
+    }
+}
+
+/// What the Subject dropdown calls a [`GrantSubject`] — `GrantSubject::label`'s
+/// word, drawn here so it can be translated while core keeps its English.
+fn grant_subject_label(subject: GrantSubject) -> String {
+    match subject {
+        GrantSubject::Privileges => tr!("account-editor-subject-privileges"),
+        GrantSubject::Role => tr!("account-editor-subject-role"),
+    }
+}
+
+/// What the Level dropdown calls a [`GrantLevelKind`] — `GrantLevelKind::label`'s
+/// word, as [`grant_subject_label`] is for the subject.
+fn grant_level_label(level: GrantLevelKind) -> String {
+    match level {
+        GrantLevelKind::Global => tr!("account-editor-level-global"),
+        GrantLevelKind::Database => tr!("account-editor-level-database"),
+        GrantLevelKind::Schema => tr!("account-editor-level-schema"),
+        GrantLevelKind::Table => tr!("account-editor-level-table"),
+        GrantLevelKind::Sequence => tr!("account-editor-level-sequence"),
+    }
 }
 
 fn grant_form(
@@ -1077,7 +1108,7 @@ fn grant_form(
     // of the same fact one conversion away from the tested one.
     rows.push(
         form_setting(
-            "Action",
+            tr!("account-editor-action"),
             bound_dropdown(
                 draft,
                 seed.revoke,
@@ -1092,12 +1123,12 @@ fn grant_form(
     );
     rows.push(
         form_setting(
-            "Subject",
+            tr!("account-editor-subject"),
             bound_dropdown(
                 draft,
                 seed.subject,
                 vec![GrantSubject::Privileges, GrantSubject::Role],
-                GrantSubject::label,
+                grant_subject_label,
                 ring.clone(),
                 8,
                 |d, v| d.subject = v,
@@ -1117,7 +1148,7 @@ fn grant_form(
             let member = target.account.clone();
             rows.push(
                 form_setting(
-                    "Role",
+                    tr!("account-editor-role"),
                     suggested_field(
                         overlay,
                         draft,
@@ -1134,7 +1165,7 @@ fn grant_form(
                         // servers have none, so the shortcut has nothing to
                         // shortcut — and a chevron that answered with silence
                         // read as broken.
-                        "This server has no roles",
+                        tr!("account-editor-no-roles"),
                         &ring,
                         10,
                         |d, v| d.role = v.to_string(),
@@ -1147,7 +1178,7 @@ fn grant_form(
             if !seed.revoke && schemaic_core::users::supports_role_admin_option(target.dialect) {
                 rows.push(
                     form_setting(
-                        "With admin option",
+                        tr!("account-editor-with-admin-option"),
                         bound_toggle(draft, seed.with_admin_option, ring.clone(), 20, |d, v| {
                             d.with_admin_option = v
                         }),
@@ -1166,12 +1197,12 @@ fn grant_form(
             if let Some(current) = seed.level {
                 rows.push(
                     form_setting(
-                        "Level",
+                        tr!("account-editor-level"),
                         bound_dropdown(
                             draft,
                             current,
                             levels.to_vec(),
-                            GrantLevelKind::label,
+                            grant_level_label,
                             ring.clone(),
                             10,
                             |d, v| {
@@ -1190,11 +1221,19 @@ fn grant_form(
             }
 
             if let Some(kind) = seed.level {
+                // The field is named for the level it qualifies, in the
+                // level dropdown's own words.
                 let (q_label, q_placeholder) = match (kind, dialect) {
-                    (GrantLevelKind::Database, _) => ("Database", "database_name"),
-                    (GrantLevelKind::Schema, _) => ("Schema", "schema_name"),
-                    (_, SqlDialect::MySql) => ("Database", "database_name"),
-                    _ => ("Schema", "schema_name"),
+                    (GrantLevelKind::Database, _) => {
+                        (grant_level_label(GrantLevelKind::Database), "database_name")
+                    }
+                    (GrantLevelKind::Schema, _) => {
+                        (grant_level_label(GrantLevelKind::Schema), "schema_name")
+                    }
+                    (_, SqlDialect::MySql) => {
+                        (grant_level_label(GrantLevelKind::Database), "database_name")
+                    }
+                    _ => (grant_level_label(GrantLevelKind::Schema), "schema_name"),
                 };
                 if kind != GrantLevelKind::Global {
                     // The database the browser is scoped to is the overwhelmingly
@@ -1211,7 +1250,7 @@ fn grant_form(
                                 seed.qualifier.clone(),
                                 q_placeholder,
                                 move || vec![here.clone()],
-                                "No suggestions",
+                                tr!("account-editor-no-suggestions"),
                                 &ring,
                                 30,
                                 |d, v| d.qualifier = v.to_string(),
@@ -1223,11 +1262,7 @@ fn grant_form(
                 if matches!(kind, GrantLevelKind::Table | GrantLevelKind::Sequence) {
                     rows.push(
                         form_setting(
-                            if kind == GrantLevelKind::Table {
-                                "Table"
-                            } else {
-                                "Sequence"
-                            },
+                            grant_level_label(kind),
                             bound_field(
                                 draft,
                                 seed.name.clone(),
@@ -1243,7 +1278,7 @@ fn grant_form(
                     );
                 }
 
-                rows.push(form_section("Privileges").into_any());
+                rows.push(form_section(tr!("account-editor-section-privileges")).into_any());
                 // **Inline and wrapping, not one per line.** Eighteen is a legal
                 // selection at MySQL's database level, and eighteen rows is a
                 // column of short words taller than the panel — a set you have to
@@ -1266,7 +1301,7 @@ fn grant_form(
                 if !seed.revoke {
                     rows.push(
                         form_setting(
-                            "With grant option",
+                            tr!("account-editor-with-grant-option"),
                             bound_toggle(
                                 draft,
                                 seed.with_grant_option,
@@ -1380,10 +1415,8 @@ pub(crate) fn grant_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVie
                         crate::widgets::nothing().into_any()
                     } else {
                         text(match draft.subject {
-                            GrantSubject::Role => "Name a role.",
-                            GrantSubject::Privileges => {
-                                "Pick a level, name what it applies to, and tick a privilege."
-                            }
+                            GrantSubject::Role => tr!("account-editor-needs-role"),
+                            GrantSubject::Privileges => tr!("account-editor-needs-privileges"),
                         })
                         .style(|s| {
                             s.color(theme::error())
@@ -1405,7 +1438,7 @@ pub(crate) fn grant_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVie
                     let ready = draft.is_ready(&target.account);
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring.clone(),
@@ -1413,7 +1446,7 @@ pub(crate) fn grant_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVie
                             close,
                         ),
                         action_button(
-                            "Preview SQL",
+                            tr!("editor-preview-sql"),
                             ActionKind::Primary,
                             ready,
                             ring,
@@ -1441,7 +1474,7 @@ pub(crate) fn grant_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVie
 
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             modal_shell(
-                format!("Privileges — {}", who.display()),
+                tr!("account-editor-title-privileges", account = who.display()),
                 ShellParts {
                     body: body.into_any(),
                     status: status.into_any(),
@@ -2147,5 +2180,49 @@ mod anchor_gate {
         // what `FORBIDDEN` asserts from the other side.
         assert_eq!(body.matches("if ctx.read_only {").count(), 0);
         assert_eq!(body.matches("read_only: ctx.read_only,").count(), 0);
+    }
+}
+
+/// The dropdowns' words are drawn here so they can be translated, while core's
+/// `label`s stay English for the CLI and the AI — so in English the two have to
+/// agree word for word, or the form and everything else would name one choice
+/// two ways.
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    #[test]
+    fn english_names_every_grant_subject_and_level_as_core_does() {
+        for s in [GrantSubject::Privileges, GrantSubject::Role] {
+            assert_eq!(grant_subject_label(s), s.label(), "{s:?}");
+        }
+        for l in [
+            GrantLevelKind::Global,
+            GrantLevelKind::Database,
+            GrantLevelKind::Schema,
+            GrantLevelKind::Table,
+            GrantLevelKind::Sequence,
+        ] {
+            assert_eq!(grant_level_label(l), l.label(), "{l:?}");
+        }
+    }
+
+    /// `false` is the affirmative, as the draft's `revoke` has it.
+    #[test]
+    fn the_action_reads_grant_for_false() {
+        assert_eq!(action_label(false), "Grant");
+        assert_eq!(action_label(true), "Revoke");
+    }
+
+    #[test]
+    fn the_composed_lines_read_as_they_did_in_english() {
+        assert_eq!(
+            tr!("account-editor-title-privileges", account = "'app'@'%'"),
+            "Privileges — 'app'@'%'"
+        );
+        assert_eq!(
+            tr!("account-editor-also-user", database = "shop"),
+            "Also a user in shop"
+        );
     }
 }
