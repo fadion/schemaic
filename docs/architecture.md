@@ -42688,7 +42688,9 @@ read **once, when the menu opens**, and each entry captures its pair of `DiffSid
   on a text-sized box inside it, and every click outside the words was swallowed (see
   **`.tooltip()` wraps the view** under *Floem 0.2 gotchas*). The query strip is built the same way,
   which is why its tabs never had it. The tooltip carries the full text, the run's
-  age (`i18n::relative_time`) and — for a loaded one — `ResultSet::retained_bytes`.
+  age (`ran_ago`, which scales `ran_at`'s epoch seconds to the millis `i18n::relative_time`
+  reads — handed straight over, a two-minute-old result said "just now" for seventeen hours)
+  and — for a loaded one — `ResultSet::retained_bytes`.
   The last is what makes "keep this result" an informed choice: a pin holds its columns' arenas and
   one 4-byte offset word per cell, which at the 200,000-row default cap is 40 MB across 50 columns
   before a single character of text. Cheap to *hold* (the panel keeps an `Arc`, so nothing is

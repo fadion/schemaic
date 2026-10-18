@@ -9964,7 +9964,7 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
         }];
         let mut foot: Vec<String> = Vec::new();
         if panel.ran_at > 0 {
-            foot.push(crate::i18n::relative_time(panel.ran_at, now_secs()));
+            foot.push(ran_ago(panel.ran_at, now_secs()));
         }
         if let QueryState::Loaded(rs) = &panel.state {
             foot.push(schemaic_core::stats::format_bytes(
@@ -10249,6 +10249,28 @@ fn open_named_object(
             }
         }
     })
+}
+
+/// A result's age for its chip's tooltip, from [`ResultPanel::ran_at`] and
+/// [`now_secs`] — both epoch seconds.
+fn ran_ago(ran_at: u64, now: u64) -> String {
+    // The age arithmetic (`history::ago`) takes millis, as history timestamps are.
+    crate::i18n::relative_time(ran_at.saturating_mul(1000), now.saturating_mul(1000))
+}
+
+#[cfg(test)]
+mod ran_ago_tests {
+    /// **A result's age is read in seconds.** `ran_at` and `now_secs` are
+    /// epoch seconds and the age arithmetic takes millis, so a result run two
+    /// minutes ago read "just now" — and kept reading it for some seventeen
+    /// hours, every bucket after that a thousand times too slow.
+    #[test]
+    fn a_result_run_two_minutes_ago_says_so() {
+        let now = 1_800_000_000;
+        assert_eq!(super::ran_ago(now - 120, now), "2m ago");
+        assert_eq!(super::ran_ago(now - 3 * 3600, now), "3h ago");
+        assert_eq!(super::ran_ago(now, now), "just now");
+    }
 }
 
 /// Now, in epoch seconds — for a result's age in the strip's tooltip, and an
