@@ -42,6 +42,7 @@ use schemaic_core::compare::{
 use schemaic_core::connection::Connection;
 use schemaic_core::diff::{DiffTag, line_diff};
 
+use crate::i18n::tr;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, autohide, check_box, dismiss_layer,
     focus_root_with_ring, in_ring_button, link_button, loading_dots, modal_body_h,
@@ -243,8 +244,7 @@ pub(crate) fn compare_overlay(ctx: CompareCtx) -> impl IntoView {
             })
             .style(|s| s.width_full().flex_col().flex_grow(1.0_f32).min_height(0.0));
 
-            let title =
-                modal_title_owned("Compare schemas".to_string(), close.clone(), ring.clone());
+            let title = modal_title_owned(tr!("compare-title"), close.clone(), ring.clone());
             let footer = footer(ctx.clone(), close.clone(), ring.clone());
 
             let panel = v_stack((title, head, body, footer))
@@ -319,7 +319,7 @@ fn sources_bar(ctx: CompareCtx, t: CompareTarget, ring: FocusRing) -> impl IntoV
             container(
                 label(move || match target.get().and_then(|t| t.right.clone()) {
                     Some(s) => side_label(conns, &s),
-                    None => "Choose a database".to_string(),
+                    None => tr!("compare-choose-database"),
                 })
                 .style(|s| {
                     s.font_family(crate::consts::MONO_FAMILY.to_string())
@@ -388,7 +388,7 @@ fn sources_bar(ctx: CompareCtx, t: CompareTarget, ring: FocusRing) -> impl IntoV
                         // made it the one line in the list set smaller than the
                         // things it sits above.
                         v_stack((
-                            pick_row("‹ back".to_string(), theme::text_muted, move || {
+                            pick_row(tr!("copy-table-back"), theme::text_muted, move || {
                                 o.compare_dbs.set(None)
                             }),
                             rows,
@@ -414,7 +414,7 @@ fn sources_bar(ctx: CompareCtx, t: CompareTarget, ring: FocusRing) -> impl IntoV
                         if conns.is_empty() {
                             // A `step` value and not an early `return`, so it
                             // stays inside the picker's frame.
-                            note("No connection of this engine to compare against.").into_any()
+                            note(tr!("compare-no-connection")).into_any()
                         } else {
                             v_stack_from_iter(conns.into_iter().map(move |c| {
                                 let list_dbs = list_dbs.clone();
@@ -445,7 +445,7 @@ fn sources_bar(ctx: CompareCtx, t: CompareTarget, ring: FocusRing) -> impl IntoV
 
     v_stack((
         h_stack((
-            side_chip(left_label, "will change"),
+            side_chip(left_label, tr!("compare-will-change")),
             // Pointing at the side that changes. A comparison read the wrong way
             // round generates a migration for the wrong server, so the direction
             // is stated rather than implied by which column it is in.
@@ -456,7 +456,7 @@ fn sources_bar(ctx: CompareCtx, t: CompareTarget, ring: FocusRing) -> impl IntoV
             }),
             v_stack((
                 chosen_label,
-                text("source of truth").style(|s| {
+                text(tr!("compare-source-of-truth")).style(|s| {
                     s.font_size(theme::font_hint())
                         .color(theme::text_muted())
                         .padding_left(picker_inset())
@@ -478,7 +478,7 @@ fn sources_bar(ctx: CompareCtx, t: CompareTarget, ring: FocusRing) -> impl IntoV
 }
 
 /// One side, as a name over what will happen to it.
-fn side_chip(label: String, note: &'static str) -> impl IntoView {
+fn side_chip(label: String, note: String) -> impl IntoView {
     v_stack((
         text(label).style(|s| {
             s.font_family(crate::consts::MONO_FAMILY.to_string())
@@ -552,9 +552,9 @@ fn side_label(connections: RwSignal<Vec<Connection>>, side: &CompareSide) -> Str
 
 fn body_for(st: CompareState, o: OverlayUi, ring: FocusRing) -> AnyView {
     match st {
-        CompareState::Idle => note("Choose a database to compare against.").into_any(),
+        CompareState::Idle => note(tr!("compare-idle")).into_any(),
         CompareState::Loading => container(loading_dots(
-            "Reading both schemas",
+            tr!("compare-loading"),
             theme::text_muted,
             theme::font_body,
         ))
@@ -576,7 +576,7 @@ fn failure(msg: String) -> impl IntoView {
     })
 }
 
-fn note(msg: &'static str) -> impl IntoView {
+fn note(msg: String) -> impl IntoView {
     text(msg).style(|s| {
         s.font_size(theme::font_body())
             .color(theme::text_muted())
@@ -613,13 +613,10 @@ fn ready_body(c: Rc<SchemaComparison>, o: OverlayUi, ring: FocusRing) -> impl In
                     // *Include identical* off, was reported as "Nothing matches
                     // that filter" — a claim about the filter over a result the
                     // toggle beside it produced.
-                    return note(
-                        c.empty_reason(RowFilter {
-                            query: &query,
-                            show_same,
-                        })
-                        .message(),
-                    )
+                    return note(empty_rows_message(c.empty_reason(RowFilter {
+                        query: &query,
+                        show_same,
+                    })))
                     .into_any();
                 }
                 v_stack_from_iter(rows.into_iter().map(|r| row_view(r, o)))
@@ -640,7 +637,7 @@ fn ready_body(c: Rc<SchemaComparison>, o: OverlayUi, ring: FocusRing) -> impl In
                     .and_then(|k| c.entries.iter().find(|e| e.key() == k));
                 match entry {
                     Some(e) => diff_pane(e).into_any(),
-                    None => note("Select an object to see both sides.").into_any(),
+                    None => note(tr!("compare-select-object")).into_any(),
                 }
             },
         )
@@ -751,9 +748,12 @@ fn ready_body(c: Rc<SchemaComparison>, o: OverlayUi, ring: FocusRing) -> impl In
 /// The filter box, the identical-objects toggle, and the tick-everything pair.
 fn filter_bar(o: OverlayUi, c: Rc<SchemaComparison>, ring: FocusRing) -> impl IntoView {
     let counts = c.counts();
-    let mut summary = format!(
-        "{} differ · {} only here · {} only there · {} identical",
-        counts.differing, counts.only_left, counts.only_right, counts.same
+    let mut summary = tr!(
+        "compare-summary",
+        differ = counts.differing,
+        only_here = counts.only_left,
+        only_there = counts.only_right,
+        same = counts.same
     );
     // **The uncertain tally, on the one line that is about the whole
     // comparison.** `CompareEntry::uncertain` was drawn only as a per-row hint,
@@ -762,11 +762,8 @@ fn filter_bar(o: OverlayUi, c: Rc<SchemaComparison>, ring: FocusRing) -> impl In
     // invisible: the tree said two schemas agreed about an index it had never
     // fully read.
     if counts.uncertain > 0 {
-        summary.push_str(&format!(
-            " · {} {} the comparison can't vouch for",
-            counts.uncertain,
-            schemaic_core::text::plural(counts.uncertain, "match", "matches")
-        ));
+        summary.push_str(" · ");
+        summary.push_str(&tr!("compare-summary-uncertain", n = counts.uncertain));
     }
 
     // **`edit_field`, not a styled `text_input`.** Hand-rolling the box got the
@@ -779,7 +776,7 @@ fn filter_bar(o: OverlayUi, c: Rc<SchemaComparison>, ring: FocusRing) -> impl In
         edit_field(
             o.compare_query,
             FieldCfg {
-                placeholder: "Filter by name",
+                placeholder_of: Some(Rc::new(|| tr!("compare-filter-placeholder"))),
                 clearable: true,
                 focus: Some((ring.clone(), TAB_FILTER)),
                 ..Default::default()
@@ -793,7 +790,7 @@ fn filter_bar(o: OverlayUi, c: Rc<SchemaComparison>, ring: FocusRing) -> impl In
         let shown = move || o.compare_show_same.get();
         h_stack((
             check_box(shown),
-            text("Include identical")
+            text(tr!("compare-include-identical"))
                 .style(|s| s.font_size(theme::font_label()).color(theme::text_dim())),
         ))
         .on_click_stop(move |_| o.compare_show_same.update(|v| *v = !*v))
@@ -838,20 +835,32 @@ fn filter_bar(o: OverlayUi, c: Rc<SchemaComparison>, ring: FocusRing) -> impl In
                 .flex_shrink(1.0_f32)
         }),
         empty().style(|s| s.flex_grow(1.0_f32).min_width(theme::scaled(8.0))),
-        link_button("Select all", theme::accent, ring.clone(), TAB_ALL, {
-            let keys_now = keys_now.clone();
-            move || {
-                let shown = keys_now();
-                o.compare_selected.update(|sel| sel.extend(shown));
-            }
-        }),
-        link_button("None", theme::text_muted, ring, TAB_NONE, {
-            let keys_now = keys_now.clone();
-            move || {
-                let shown: HashSet<String> = keys_now().into_iter().collect();
-                crate::widgets::retain_if_any(o.compare_selected, move |k| !shown.contains(k));
-            }
-        }),
+        link_button(
+            tr!("compare-select-all"),
+            theme::accent,
+            ring.clone(),
+            TAB_ALL,
+            {
+                let keys_now = keys_now.clone();
+                move || {
+                    let shown = keys_now();
+                    o.compare_selected.update(|sel| sel.extend(shown));
+                }
+            },
+        ),
+        link_button(
+            tr!("compare-select-none"),
+            theme::text_muted,
+            ring,
+            TAB_NONE,
+            {
+                let keys_now = keys_now.clone();
+                move || {
+                    let shown: HashSet<String> = keys_now().into_iter().collect();
+                    crate::widgets::retain_if_any(o.compare_selected, move |k| !shown.contains(k));
+                }
+            },
+        ),
     ))
     .style(|s| {
         s.items_center()
@@ -877,6 +886,54 @@ fn row_view(row: CompareRow<'_>, o: crate::OverlayUi) -> AnyView {
     }
 }
 
+/// A kind's group heading — `CompareKind::group_label`'s word in the
+/// interface's language, and the schema tree's folder name for an object kind
+/// (`i18n::object_kind_group`), so the two still file one object under one
+/// name. `english_names_every_compare_kind_as_core_does` holds both to core.
+fn compare_kind_group(kind: CompareKind) -> String {
+    match kind.object_kind() {
+        Some(k) => crate::i18n::object_kind_group(k),
+        None => match kind {
+            CompareKind::Table => tr!("compare-group-table"),
+            CompareKind::View => tr!("compare-group-view"),
+            // `object_kind()` answers every other kind but these three.
+            _ => tr!("compare-group-trigger"),
+        },
+    }
+}
+
+/// Why the list is empty — `EmptyRows::message`'s sentence in the interface's
+/// language; `english_says_every_empty_reason_as_core_does` holds them equal.
+fn empty_rows_message(reason: schemaic_core::compare::EmptyRows) -> String {
+    use schemaic_core::compare::EmptyRows;
+    match reason {
+        EmptyRows::NothingToCompare => tr!("compare-empty-nothing"),
+        EmptyRows::EverythingAgrees => tr!("compare-empty-agrees"),
+        EmptyRows::AgreesExceptNoted => tr!("compare-empty-agrees-noted"),
+        EmptyRows::NoMatch => tr!("compare-empty-no-match"),
+        EmptyRows::OnlyIdenticalMatched => tr!("compare-empty-only-identical"),
+    }
+}
+
+/// A kind's singular word for the diff pane's heading — `CompareKind::label`'s,
+/// which also keys the expand state and so keeps core's English there.
+fn compare_kind_word(kind: CompareKind) -> String {
+    match kind {
+        CompareKind::Enum => tr!("compare-kind-enum"),
+        CompareKind::Domain => tr!("compare-kind-domain"),
+        CompareKind::XmlSchemaCollection => tr!("compare-kind-xml-schema-collection"),
+        CompareKind::AliasType => tr!("compare-kind-alias-type"),
+        CompareKind::Sequence => tr!("compare-kind-sequence"),
+        CompareKind::Table => tr!("compare-kind-table"),
+        CompareKind::View => tr!("compare-kind-view"),
+        CompareKind::Function => tr!("compare-kind-function"),
+        CompareKind::Procedure => tr!("compare-kind-procedure"),
+        CompareKind::Trigger => tr!("compare-kind-trigger"),
+        CompareKind::Event => tr!("compare-kind-event"),
+        CompareKind::Synonym => tr!("compare-kind-synonym"),
+    }
+}
+
 /// A kind's heading: a chevron, the group's name, and how many are under it.
 ///
 /// **Named as the schema tree names it** (`CompareKind::group_label`):
@@ -890,7 +947,7 @@ fn group_row(
     expanded: bool,
     o: crate::OverlayUi,
 ) -> impl IntoView {
-    let label = kind.group_label();
+    let label = compare_kind_group(kind);
     let count = counts.total().to_string();
     // The expand state's key, which is also `CompareEntry::key`'s prefix —
     // `label()`, not the heading.
@@ -987,11 +1044,11 @@ fn object_row(e: &CompareEntry, o: crate::OverlayUi) -> impl IntoView {
 
     let status = e.status;
     let hint = if e.held_back.is_some() {
-        Some("held back from the plan; the note above says why")
+        Some(tr!("compare-hint-held-back"))
     } else if blocked {
-        Some("body must be re-read before this can be applied")
+        Some(tr!("compare-hint-blocked"))
     } else if e.uncertain {
-        Some("an index this model reads only in part — a match here isn't certain")
+        Some(tr!("compare-hint-uncertain"))
     } else {
         None
     };
@@ -1105,7 +1162,7 @@ fn status_color(s: ObjectStatus) -> floem::peniko::Color {
 /// changed. It is a *reading* of the object, not the plan: the statements come
 /// from the change set, which is why nothing here is copyable as SQL.
 fn diff_pane(e: &CompareEntry) -> impl IntoView {
-    let heading = format!("{} {}", e.kind.label(), e.label());
+    let heading = format!("{} {}", compare_kind_word(e.kind), e.label());
     let lines = line_diff(&e.left_ddl, &e.right_ddl);
     let rows = v_stack_from_iter(lines.into_iter().map(|(tag, line)| {
         let mark = match tag {
@@ -1262,7 +1319,7 @@ fn footer(ctx: CompareCtx, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoVie
             move |enabled| {
                 let (ctx, close, ring) = (ctx.clone(), close.clone(), ring.clone());
                 action_button(
-                    "Preview migration",
+                    tr!("compare-preview-migration"),
                     ActionKind::Primary,
                     enabled,
                     ring,
@@ -1315,4 +1372,76 @@ fn open_plan_preview(ctx: &CompareCtx, close: Rc<dyn Fn()>) {
     // selection the preview no longer reflects.
     (close)();
     crate::ddl_preview::open_preview(ctx.ddl, preview);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_kind_group, compare_kind_word};
+    use crate::i18n::tr;
+    use schemaic_core::compare::CompareKind;
+    use schemaic_core::text::plural;
+
+    /// English names every kind as core's `CompareKind` does, group and
+    /// singular alike. Listed by hand — there is no `CompareKind::ALL` — so a
+    /// new kind is caught by `compare_kind_word`'s exhaustive match instead.
+    #[test]
+    fn english_names_every_compare_kind_as_core_does() {
+        for kind in [
+            CompareKind::Enum,
+            CompareKind::Domain,
+            CompareKind::XmlSchemaCollection,
+            CompareKind::AliasType,
+            CompareKind::Sequence,
+            CompareKind::Synonym,
+            CompareKind::Table,
+            CompareKind::View,
+            CompareKind::Function,
+            CompareKind::Procedure,
+            CompareKind::Trigger,
+            CompareKind::Event,
+        ] {
+            assert_eq!(compare_kind_group(kind), kind.group_label(), "{kind:?}");
+            assert_eq!(compare_kind_word(kind), kind.label(), "{kind:?}");
+        }
+    }
+
+    /// English says why the list is empty as core's `EmptyRows::message` does.
+    #[test]
+    fn english_says_every_empty_reason_as_core_does() {
+        use schemaic_core::compare::EmptyRows;
+        for r in [
+            EmptyRows::NothingToCompare,
+            EmptyRows::EverythingAgrees,
+            EmptyRows::AgreesExceptNoted,
+            EmptyRows::NoMatch,
+            EmptyRows::OnlyIdenticalMatched,
+        ] {
+            assert_eq!(super::empty_rows_message(r), r.message(), "{r:?}");
+        }
+    }
+
+    /// The tally reads as the `format!` it replaced, the uncertain count's
+    /// plural included.
+    #[test]
+    fn the_summary_reads_as_it_did() {
+        assert_eq!(
+            tr!(
+                "compare-summary",
+                differ = 2,
+                only_here = 1,
+                only_there = 0,
+                same = 40
+            ),
+            "2 differ · 1 only here · 0 only there · 40 identical"
+        );
+        for n in [1usize, 3] {
+            assert_eq!(
+                tr!("compare-summary-uncertain", n = n),
+                format!(
+                    "{n} {} the comparison can't vouch for",
+                    plural(n, "match", "matches")
+                )
+            );
+        }
+    }
 }

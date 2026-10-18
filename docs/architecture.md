@@ -31789,9 +31789,18 @@ existing prose was left alone.
     in brackets, *"synonym (1)"*, *"enums (2)"*, beside a tree filing the same objects under
     *Synonyms* and *Types* (`a_compare_group_is_named_as_the_tree_names_it`). `CompareKind::label`
     stays the expand state's key and `CompareEntry::key`'s prefix; only the heading changed.
-    The two agree in English only, for now: the tree draws its folder name from
-    `i18n::object_kind_group`, and this heading still reads core's English until
-    `compare_view.rs` is converted.
+    **They agree in every language because the heading is drawn as the folder is**:
+    `compare_kind_group(kind)` calls `i18n::object_kind_group` for an object kind — the tree's own
+    function, not a second message for the same word — and `compare-group-*` for the three that are
+    not. Core's words are drawn here rather than translated (the core-words rule under *UI
+    conventions*): `compare_kind_word(kind)` is `CompareKind::label`'s singular for the diff pane's
+    heading, while `label` itself keeps core's English as the key above, and
+    `empty_rows_message(reason)` is `EmptyRows::message`'s sentence
+    (`english_names_every_compare_kind_as_core_does`, `english_says_every_empty_reason_as_core_does`
+    — the first listing the kinds by hand, there being no `CompareKind::ALL`, so a new kind is
+    caught by `compare_kind_word`'s exhaustive `match` instead). The rest of the modal's words are
+    `compare-*` messages; the tally is one message with all four counts, which
+    `the_summary_reads_as_it_did` holds to the `format!` it replaced.
     **What the comparison noted is shown above the tree**, one line each, under the banner a
     foreign-key cycle takes: `SchemaComparison::notes` — an alias type's bound rule or default the
     target lacks, a source object a case-insensitive target cannot hold beside another — reached the
@@ -31806,6 +31815,8 @@ existing prose was left alone.
     line is the instruction for the one difference no plan carries, and a comparison holding only
     that difference plans nothing, so Preview is never enabled and the omitted list it would have
     been read in is never shown.
+    Those notes are core's prose and stay English in every language until phase 4 of the roadmap's
+    *Interface translation* reaches core's sentences.
     **The module names no `Ui` — it is off `whole_ui_gate`'s list, 8 to zero — and the split is
     `import_view.rs`'s.** The renderers take `OverlayUi`, being the eight `compare_*` signals and
     nothing else: `open_compare`, `reset`, `body_for`, `ready_body` and `filter_bar`. The four that
@@ -39922,7 +39933,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`chart_view.rs`), the view editor (`view_editor.rs`), the properties panel (`properties.rs`),
   the three workspace panel headers (`lib.rs`'s `term-*` and `results-*`, `editor_pane.rs`'s
   `query-*`), the Copy to modal (`copy_table_view.rs`), the Create database/schema/extension form
-  (`database_editor.rs`) and the script import (`script_view.rs`) are converted; every other
+  (`database_editor.rs`), the script import (`script_view.rs`) and the schema comparison
+  (`compare_view.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -39943,10 +39955,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
     core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
     `history_panel::bucket_title` for `history::Bucket::label`, `activity_panel::kill_label`
-    for `activity::KillKind::label`, and `chart_view::chart_kind_label` for `chart::ChartKind::label` —
+    for `activity::KillKind::label`, `chart_view::chart_kind_label` for `chart::ChartKind::label`,
+    and `compare_view::compare_kind_group`/`compare_kind_word`/`empty_rows_message` for
+    `compare::CompareKind::group_label`/`label` and `EmptyRows::message` —
     with a test holding its English equal to core's for every variant
     (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`,
-    `english_names_every_kill_as_core_does`, `english_names_every_chart_kind_as_core_does`).
+    `english_names_every_kill_as_core_does`, `english_names_every_chart_kind_as_core_does`,
+    `english_names_every_compare_kind_as_core_does`, `english_says_every_empty_reason_as_core_does`).
     Where the word is a phrase core composes rather than a label, core answers with a value or
     keeps the composition and lets the caller word the part that is language: `history::ago` hands
     back an `Ago` that `i18n::relative_time` says from `ago-*` (the history and snippet rows, the

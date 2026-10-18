@@ -80,7 +80,7 @@ assertions pin English wording — stays the regression net throughout.
    **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`, `schema_tree.rs`,
    `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`, `activity_panel.rs`, `ai_panel.rs`,
    `chart_view.rs`, `view_editor.rs`, `properties.rs`, `copy_table_view.rs`,
-   `database_editor.rs`, `script_view.rs`; and, ahead of their files, the three
+   `database_editor.rs`, `script_view.rs`, `compare_view.rs`; and, ahead of their files, the three
    workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
    `editor_pane.rs`'s query header (`query-*`). The schema editors share
    `editor-preview-sql` and `editor-change-count`, and `dialog-close` joins the dialog words. The
@@ -122,7 +122,9 @@ assertions pin English wording — stays the regression net throughout.
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
    `ObjectKind`, `history::Bucket` (`history_panel::bucket_title`), `activity::KillKind`
-   (`activity_panel::kill_label`) and `chart::ChartKind` (`chart_view::chart_kind_label`). Where a
+   (`activity_panel::kill_label`), `chart::ChartKind` (`chart_view::chart_kind_label`) and
+   `compare::CompareKind` and `EmptyRows` (`compare_view::compare_kind_group`,
+   `compare_kind_word`, `empty_rows_message`). Where a
    core function composes a line around one counted word, it takes the word from the caller
    instead (`history::outcome_line_with`, which `i18n::outcome_line` calls);
    `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the

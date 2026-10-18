@@ -6354,12 +6354,13 @@ pub(crate) fn check_box(checked: impl Fn() -> bool + Clone + 'static) -> impl In
 /// keyboard user cannot reach is a control only half the users have, and these
 /// two are the only way to change the selection without clicking every row.
 pub(crate) fn link_button(
-    label: &'static str,
+    label: impl Into<String>,
     color: fn() -> floem::peniko::Color,
     ring: FocusRing,
     tabindex: u32,
     action: impl Fn() + Clone + 'static,
 ) -> AnyView {
+    let label: String = label.into();
     let clicked = action.clone();
     in_ring_button(
         // **The colour lives on the container, not on the text.** `color` is

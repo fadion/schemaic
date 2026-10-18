@@ -869,3 +869,54 @@ script-durability-rolled-back = { $file } opened its own transaction, so the ser
 script-durability-applied = { $file } opened no transaction, so every statement that ran is still applied.
 script-durability-applied-before = Any statement that ran before { $file } opened its own transaction is still applied; what ran inside the transaction was rolled back.
 script-durability-unknown = Any statement that already ran is still applied unless { $file } opened its own transaction.
+
+## Schema comparison modal
+
+compare-title = Compare schemas
+compare-choose-database = Choose a database
+compare-no-connection = No connection of this engine to compare against.
+# Under the left side's name: it is the side the plan alters.
+compare-will-change = will change
+# Under the right side's name: it is the side the plan copies from.
+compare-source-of-truth = source of truth
+compare-idle = Choose a database to compare against.
+compare-loading = Reading both schemas
+compare-select-object = Select an object to see both sides.
+compare-summary = { $differ } differ · { $only_here } only here · { $only_there } only there · { $same } identical
+compare-summary-uncertain = { $n } { $n ->
+    [one] match
+   *[other] matches
+} the comparison can't vouch for
+compare-filter-placeholder = Filter by name
+compare-include-identical = Include identical
+compare-select-all = Select all
+compare-select-none = None
+compare-hint-held-back = held back from the plan; the note above says why
+compare-hint-blocked = body must be re-read before this can be applied
+compare-hint-uncertain = an index this model reads only in part — a match here isn't certain
+compare-preview-migration = Preview migration
+# Group headings that are not object kinds (those are kind-group-*).
+compare-group-table = Tables
+compare-group-view = Views
+compare-group-trigger = Triggers
+# The diff pane heads an object with its kind's word: CompareKind's own.
+compare-kind-enum = enum
+compare-kind-domain = domain
+compare-kind-xml-schema-collection = XML schema collection
+compare-kind-alias-type = alias type
+compare-kind-sequence = sequence
+compare-kind-table = table
+compare-kind-view = view
+compare-kind-function = function
+compare-kind-procedure = procedure
+compare-kind-trigger = trigger
+compare-kind-event = event
+compare-kind-synonym = synonym
+
+## Schema comparison modal › why the list is empty (core's EmptyRows)
+
+compare-empty-nothing = Neither database holds anything to compare.
+compare-empty-agrees = These two schemas match, object for object.
+compare-empty-agrees-noted = Every object agrees, but not everything could be compared — see the notes above.
+compare-empty-no-match = Nothing matches that filter.
+compare-empty-only-identical = Everything matching that filter is identical — turn on Include identical to see it.

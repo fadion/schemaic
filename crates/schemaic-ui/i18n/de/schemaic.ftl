@@ -797,3 +797,50 @@ script-durability-rolled-back = { $file } hat eine eigene Transaktion geöffnet,
 script-durability-applied = { $file } hat keine Transaktion geöffnet, daher ist jede Anweisung, die lief, weiterhin übernommen.
 script-durability-applied-before = Jede Anweisung, die lief, bevor { $file } eine eigene Transaktion öffnete, ist weiterhin übernommen; was innerhalb der Transaktion lief, wurde zurückgerollt.
 script-durability-unknown = Jede bereits gelaufene Anweisung ist weiterhin übernommen, es sei denn, { $file } hat eine eigene Transaktion geöffnet.
+
+## Schema comparison modal
+
+compare-title = Schemas vergleichen
+compare-choose-database = Datenbank wählen
+compare-no-connection = Keine Verbindung dieser Engine zum Vergleichen.
+compare-will-change = wird geändert
+compare-source-of-truth = maßgebliche Quelle
+compare-idle = Wähle eine Datenbank zum Vergleichen.
+compare-loading = Beide Schemas werden gelesen
+compare-select-object = Wähle ein Objekt, um beide Seiten zu sehen.
+compare-summary = { $differ } abweichend · { $only_here } nur hier · { $only_there } nur dort · { $same } identisch
+compare-summary-uncertain = { $n ->
+    [one] { $n } Übereinstimmung
+   *[other] { $n } Übereinstimmungen
+}, für die der Vergleich nicht bürgen kann
+compare-filter-placeholder = Nach Namen filtern
+compare-include-identical = Identische einbeziehen
+compare-select-all = Alle auswählen
+compare-select-none = Keine
+compare-hint-held-back = aus dem Plan zurückgehalten; der Hinweis oben sagt, warum
+compare-hint-blocked = der Rumpf muss neu gelesen werden, bevor dies angewendet werden kann
+compare-hint-uncertain = ein Index, den dieses Modell nur teilweise liest – eine Übereinstimmung hier ist nicht sicher
+compare-preview-migration = Migrationsvorschau
+compare-group-table = Tabellen
+compare-group-view = Sichten
+compare-group-trigger = Trigger
+compare-kind-enum = Enum
+compare-kind-domain = Domäne
+compare-kind-xml-schema-collection = XML-Schemaauflistung
+compare-kind-alias-type = Aliastyp
+compare-kind-sequence = Sequenz
+compare-kind-table = Tabelle
+compare-kind-view = Sicht
+compare-kind-function = Funktion
+compare-kind-procedure = Prozedur
+compare-kind-trigger = Trigger
+compare-kind-event = Ereignis
+compare-kind-synonym = Synonym
+
+## Schema comparison modal › why the list is empty
+
+compare-empty-nothing = Keine der beiden Datenbanken enthält etwas zum Vergleichen.
+compare-empty-agrees = Diese beiden Schemas stimmen Objekt für Objekt überein.
+compare-empty-agrees-noted = Jedes Objekt stimmt überein, aber nicht alles ließ sich vergleichen – siehe die Hinweise oben.
+compare-empty-no-match = Nichts passt zu diesem Filter.
+compare-empty-only-identical = Alles, was zu diesem Filter passt, ist identisch – schalte „Identische einbeziehen“ ein, um es zu sehen.
