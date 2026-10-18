@@ -2545,9 +2545,10 @@ fn object_group_node(
                 .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
-        // The folder's name — `ObjectKind::group_label`, the schema
-        // comparison's group heading too.
-        text(kind.group_label()).style(|s| s.font_size(theme::font_body()).color(theme::text())),
+        // The folder's name — `ObjectKind::group_label`'s word, the schema
+        // comparison's group heading too, in the interface's language.
+        text(crate::i18n::object_kind_group(kind))
+            .style(|s| s.font_size(theme::font_body()).color(theme::text())),
         capsule(count.to_string()),
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))

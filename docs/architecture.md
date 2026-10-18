@@ -25039,6 +25039,16 @@ existing prose was left alone.
     `settings-language-system` over the endonym the system would resolve to. `needs_restart()` is
     `would_draw(key) != active()`, so choosing English on an English system changes the setting and
     says nothing (`a_choice_that_draws_what_is_on_screen_needs_no_restart`).
+    **Core's words are drawn here, not translated from core.** `object_kind(kind)` and
+    `object_kind_group(kind)` are `ObjectKind::label`'s *sequence* and `group_label`'s *Sequences*
+    in the interface's language (`kind-*`, `kind-group-*`): core's words stay English because the
+    CLI, the MCP server and the AI prompts read them, so the interface keeps its own beside them,
+    one exhaustive `match` per word. `english_names_every_object_kind_as_core_does` holds English
+    equal to core's for every `ObjectKind::ALL`, which is what keeps the converted sites
+    byte-identical in English and fails on a new kind with no message. Not every use of core's word
+    moves: the schema tree's `objgrp:`/`obj:` expansion keys (`object_group_key`, `object_key`) are
+    persisted and must not change with the language, and the tree's *AI explain* prompts are
+    English by rule — both keep `ObjectKind::label`/`group_label`.
   - `settings.rs` — the Settings modal (its sections are General / Editor / Code formatting /
     Query / **Terminal** / **AI assistant** / **Appearance**, the last holding the two theme pickers,
     the **interface scale** and the **Language** dropdown — `language_section`, tabindex 330, with
@@ -28989,10 +28999,12 @@ existing prose was left alone.
     one dialog so other files can take them; and the transaction prompt's body is one message per
     variant (`tx-prompt-body`, `tx-prompt-body-aborted`) with the statement count's plural inside
     it, where it was a `1 statement`/`{n} statements` match spliced into a `format!`
-    (`the_transaction_prompt_is_one_sentence_with_its_count` pins the English). Some words reaching
-    these popups are still another module's English: `ObjectKind::label()` inside *Create {kind}*
-    and *Edit {kind}*, `ExportFormat::label`, `activity::interval_label`, the colour presets' names
-    (`lib.rs`'s `CONN_COLOR_PRESETS`) and `stats::truncate_prompt`.
+    (`the_transaction_prompt_is_one_sentence_with_its_count` pins the English). The `{kind}` inside
+    *Create {kind}* and *Edit {kind}* — and `CreateKind::label`'s fallback for an object kind — is
+    `i18n::object_kind`, the catalogue's `kind-*` rather than `ObjectKind::label()`. Some words
+    reaching these popups are still another module's English: `ExportFormat::label`,
+    `activity::interval_label`, the colour presets' names (`lib.rs`'s `CONN_COLOR_PRESETS`) and
+    `stats::truncate_prompt`.
     **A PostgreSQL foreign table is offered what its server takes** (`object_entries` over
     `TableShape::ForeignTable`): its Drop, which `object_drop_change` makes `DROP FOREIGN TABLE`;
     not Edit table, since the designer's keys and indexes are refused on one (*cannot create index
@@ -31702,6 +31714,9 @@ existing prose was left alone.
     in brackets, *"synonym (1)"*, *"enums (2)"*, beside a tree filing the same objects under
     *Synonyms* and *Types* (`a_compare_group_is_named_as_the_tree_names_it`). `CompareKind::label`
     stays the expand state's key and `CompareEntry::key`'s prefix; only the heading changed.
+    The two agree in English only, for now: the tree draws its folder name from
+    `i18n::object_kind_group`, and this heading still reads core's English until
+    `compare_view.rs` is converted.
     **What the comparison noted is shown above the tree**, one line each, under the banner a
     foreign-key cycle takes: `SchemaComparison::notes` — an alias type's bound rule or default the
     target lacks, a source object a case-insensitive target cannot hold beside another — reached the
@@ -39162,8 +39177,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   characters of `history::preview` where the match is the panel's alone, across a line break the
   preview collapses or on the database or tab name, which `body_snippet` cannot find — over
   `history · {relative_time} · {db}`. Those secondary words — *snippet*, *open tab*, *history*,
-  *view body*, *{kind} body*, *trigger on {table}* — are the catalogue's (`palette-row-*`); the
-  `{kind}` (`ObjectKind::label`) and `relative_time` inside them are still core's English.
+  *view body*, *{kind} body*, *trigger on {table}* — are the catalogue's (`palette-row-*`), and so
+  is the `{kind}` inside them and on an object row's `{database} · {kind}` line
+  (`i18n::object_kind`); `relative_time` is still core's English.
   **Activating a history row opens the statement in a new tab through
   `HistoryActions::open`, exactly as the panel's row does, and does not run it**, so neither tier
   goes anywhere near the write guard. Both glyphs are `text_muted` — `icons::FILE` for a tab and
@@ -39836,6 +39852,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     argument names against that file alone. Ids are kebab-case and start with the area they belong
     to (`settings-language-restart`). A translation lives beside it at `i18n/<tag>/schemaic.ftl` and falls back to `en-GB` message
     by message.
+  - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
+    core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label` —
+    with a test holding its English equal to core's for every variant
+    (`english_names_every_object_kind_as_core_does`). Core's own stays English for the CLI, the
+    MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
+    tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.
   - **Isolation marks are off**, set after every catalogue load, because Fluent's default
     U+2068/U+2069 around each placeable made an English message with an argument differ from the
     literal it replaced (`a_message_with_an_argument_carries_no_isolation_marks`). Converting a

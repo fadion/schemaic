@@ -139,6 +139,49 @@ impl LanguageChoice {
     }
 }
 
+// ── Core's words, in the interface's language ───────────────────────────────
+// Core names things in English for every surface — the CLI, the MCP server and
+// the AI prompts, which stay English. Where core's word is a property of a
+// typed value rather than finished prose, the interface draws its own here
+// instead of translating core's text, and English agrees with core byte for
+// byte (`english_names_every_object_kind_as_core_does`).
+
+/// What an object kind is called in a sentence — `ObjectKind::label`'s word:
+/// "sequence", "procedure".
+pub(crate) fn object_kind(kind: schemaic_core::ddl::ObjectKind) -> String {
+    use schemaic_core::ddl::ObjectKind;
+    match kind {
+        ObjectKind::Enum => tr!("kind-type"),
+        ObjectKind::Domain => tr!("kind-domain"),
+        ObjectKind::Sequence => tr!("kind-sequence"),
+        ObjectKind::Function => tr!("kind-function"),
+        ObjectKind::Procedure => tr!("kind-procedure"),
+        ObjectKind::Event => tr!("kind-event"),
+        ObjectKind::Synonym => tr!("kind-synonym"),
+        ObjectKind::AliasType => tr!("kind-alias-type"),
+        ObjectKind::XmlSchemaCollection => tr!("kind-xml-schema-collection"),
+        ObjectKind::Extension => tr!("kind-extension"),
+    }
+}
+
+/// The heading a set of them is listed under — `ObjectKind::group_label`'s
+/// word: "Sequences", "Procedures".
+pub(crate) fn object_kind_group(kind: schemaic_core::ddl::ObjectKind) -> String {
+    use schemaic_core::ddl::ObjectKind;
+    match kind {
+        ObjectKind::Enum => tr!("kind-group-type"),
+        ObjectKind::Domain => tr!("kind-group-domain"),
+        ObjectKind::Sequence => tr!("kind-group-sequence"),
+        ObjectKind::Function => tr!("kind-group-function"),
+        ObjectKind::Procedure => tr!("kind-group-procedure"),
+        ObjectKind::Event => tr!("kind-group-event"),
+        ObjectKind::Synonym => tr!("kind-group-synonym"),
+        ObjectKind::AliasType => tr!("kind-group-alias-type"),
+        ObjectKind::XmlSchemaCollection => tr!("kind-group-xml-schema-collection"),
+        ObjectKind::Extension => tr!("kind-group-extension"),
+    }
+}
+
 /// Load `lang`'s catalogue (with `en-GB` behind it, message by message) into
 /// `loader` and set it up. Split from [`init`] so a test can do it to a loader
 /// of its own rather than to the one every other test reads.
@@ -290,6 +333,22 @@ mod tests {
         }
         assert_eq!(LanguageChoice::System.label(), "System (English)");
         assert_eq!(LanguageChoice::Fixed(UiLanguage::EnGb).label(), "English");
+    }
+
+    /// **English names every object kind exactly as core does**, so the
+    /// interface's words and the CLI's, the MCP server's and the AI prompts'
+    /// — which stay core's — agree byte for byte in English. Asked over
+    /// `ObjectKind::ALL`, so a new kind with no message fails here as well as
+    /// at the exhaustive match.
+    #[test]
+    fn english_names_every_object_kind_as_core_does() {
+        for kind in schemaic_core::ddl::ObjectKind::ALL {
+            assert_eq!(object_kind(kind), kind.label(), "{kind:?}");
+            assert_eq!(object_kind_group(kind), kind.group_label(), "{kind:?}");
+        }
+        let de = loader(UiLanguage::De);
+        assert_eq!(de.get("kind-procedure"), "Prozedur");
+        assert_eq!(de.get("kind-group-procedure"), "Prozeduren");
     }
 
     #[test]

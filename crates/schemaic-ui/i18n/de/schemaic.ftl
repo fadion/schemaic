@@ -426,3 +426,26 @@ tree-count-partitions = { $n ->
     [one] { $n } Partition
    *[other] { $n } Partitionen
 }
+
+## Object kinds
+
+kind-type = Typ
+kind-domain = Domäne
+kind-sequence = Sequenz
+kind-function = Funktion
+kind-procedure = Prozedur
+kind-event = Ereignis
+kind-synonym = Synonym
+kind-alias-type = Aliastyp
+kind-xml-schema-collection = XML-Schemaauflistung
+kind-extension = Erweiterung
+kind-group-type = Typen
+kind-group-domain = Domänen
+kind-group-sequence = Sequenzen
+kind-group-function = Funktionen
+kind-group-procedure = Prozeduren
+kind-group-event = Ereignisse
+kind-group-synonym = Synonyme
+kind-group-alias-type = Aliastypen
+kind-group-xml-schema-collection = XML-Schemaauflistungen
+kind-group-extension = Erweiterungen

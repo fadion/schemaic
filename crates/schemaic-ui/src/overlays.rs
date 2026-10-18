@@ -587,9 +587,9 @@ impl CreateKind {
             CreateKind::Object(ObjectKind::Function) => tr!("tree-create-function"),
             CreateKind::Object(ObjectKind::Procedure) => tr!("tree-create-procedure"),
             CreateKind::Object(ObjectKind::Event) => tr!("tree-create-event"),
-            // No Create entry makes any other kind; core's own word for it is
-            // the honest fallback rather than a blank row.
-            CreateKind::Object(kind) => kind.label().to_string(),
+            // No Create entry makes any other kind; the kind's own word is the
+            // honest fallback rather than a blank row.
+            CreateKind::Object(kind) => crate::i18n::object_kind(kind),
             CreateKind::Extension => tr!("tree-create-extension"),
             CreateKind::Database => tr!("tree-create-database"),
             CreateKind::Schema => tr!("tree-create-schema"),
@@ -2045,10 +2045,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // sequences, synonyms and more, and the menu is the only thing that says
                         // which of them the row under the cursor is.
                         entries.push(
-                            // `kind.label()` is core's word for the kind,
-                            // English until core's labels are (roadmap phase 4).
                             MenuEntry::action(
-                                tr!("tree-edit-kind", kind = kind.label()),
+                                tr!("tree-edit-kind", kind = crate::i18n::object_kind(kind)),
                                 move || {
                                     crate::object_editor::open_for_object(
                                         ui.conn,
@@ -2247,7 +2245,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // object row's "Edit type".
                         entries.push(
                             MenuEntry::action(
-                                tr!("tree-create-kind", kind = kind.label()),
+                                tr!("tree-create-kind", kind = crate::i18n::object_kind(kind)),
                                 move || {
                                     crate::object_editor::open_for_new(
                                         ui.conn,
@@ -3725,7 +3723,7 @@ fn object_result_item(
     let primary = schemaic_core::schema::display_name(item.schema(), item.name());
     // The kind rides in the secondary line because a type and a table may share a
     // name — without it the two rows would read identically.
-    let secondary = format!("{database} · {}", kind.label());
+    let secondary = format!("{database} · {}", crate::i18n::object_kind(kind));
     let name = item.name().to_string();
     let schema = item.schema().map(str::to_string);
     // Tab-completion inserts the bare name — the qualifier isn't what you're
@@ -3901,8 +3899,6 @@ fn body_result_item(
             close.clone(),
         )
     };
-    // `kind().label()` is core's word for the kind ("procedure"), English until
-    // core's labels are translated (roadmap phase 4).
     let (mut row, what) = match hit.owner {
         BodyOwner::View { schema, name } => (
             table_row(TableSource::new(database.clone(), schema, name)),
@@ -3910,12 +3906,18 @@ fn body_result_item(
         ),
         BodyOwner::Routine(r) => {
             let item = ObjectItem::Routine(r);
-            let what = tr!("palette-row-body", kind = item.kind().label());
+            let what = tr!(
+                "palette-row-body",
+                kind = crate::i18n::object_kind(item.kind())
+            );
             (object_row(item), what)
         }
         BodyOwner::Event(e) => {
             let item = ObjectItem::Event(e);
-            let what = tr!("palette-row-body", kind = item.kind().label());
+            let what = tr!(
+                "palette-row-body",
+                kind = crate::i18n::object_kind(item.kind())
+            );
             (object_row(item), what)
         }
         BodyOwner::Trigger {

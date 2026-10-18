@@ -456,3 +456,28 @@ tree-count-partitions = { $n ->
     [one] { $n } partition
    *[other] { $n } partitions
 }
+
+## Object kinds — the interface's words for core's `ObjectKind`
+## English must read exactly as core's `label`/`group_label` (a test holds it).
+## The singular is used inside a sentence, so it is lower case in English.
+
+kind-type = type
+kind-domain = domain
+kind-sequence = sequence
+kind-function = function
+kind-procedure = procedure
+kind-event = event
+kind-synonym = synonym
+kind-alias-type = alias type
+kind-xml-schema-collection = XML schema collection
+kind-extension = extension
+kind-group-type = Types
+kind-group-domain = Domains
+kind-group-sequence = Sequences
+kind-group-function = Functions
+kind-group-procedure = Procedures
+kind-group-event = Events
+kind-group-synonym = Synonyms
+kind-group-alias-type = Alias types
+kind-group-xml-schema-collection = XML schema collections
+kind-group-extension = Extensions

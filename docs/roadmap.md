@@ -109,6 +109,12 @@ assertions pin English wording — stays the regression net throughout.
    `ImportError` and `ParamError` through `Display`, and `FilterError::BadCondition` not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
    so its prose lives at its construction sites and it is the weakest of the four to start from.
+   **A word that is a property of a typed value needs none of that and goes early**: the
+   interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
+   keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
+   `ObjectKind`; `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
+   like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
+   keys) and AI prompts keep core's English.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-3 or phase-4 file is converted rather than as
    a pass of their own.
