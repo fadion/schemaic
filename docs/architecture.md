@@ -27316,6 +27316,19 @@ existing prose was left alone.
     structured change routes around, or a parser whose wrong guess emits a `REVOKE` that takes away
     more than the line the user clicked. The grant form serves both directions instead, which is
     what its Action toggle is for.
+    **Its words are the catalogue's** (`users-*`, roadmap phase 3) — the search placeholder, the
+    list's notes, sections, the system-account note, the action row, the write-gate notes, Copy
+    privileges and the statements-capped note — with the title the tree's own `tree-users`, Drop
+    and Refresh `tree-drop`/`tree-refresh`, and Close `dialog-close`; the Privileges button reuses
+    `users-section-privileges`, the heading of the section it edits. The footer's count is a Fluent
+    plural, and `{shown} of {n} accounts` while a filter is narrowing it. The kind under an
+    account's name is `principal_kind_label(PrincipalKind)`, `PrincipalKind::label`'s words drawn
+    here (the core-words rule under *UI conventions*).
+    `english_names_every_principal_kind_as_core_does` holds English equal to core's for all three
+    kinds and pins the count and the no-match note — the
+    last because the source spelled its quotes as `\u{201c}` escapes, which a literal comparison
+    cannot see, and the catalogue spells them typographically. The local `section` takes a `String`.
+    `Grants::note` and the fetch errors stay English: core's prose and the server's text.
     - The two requests are tracked apart — `UsersState` for the list, `GrantsState` for one
       account's privileges — for the reason the properties modal's exact `COUNT(*)` is tracked apart
       from its statistics: a failure to read one account's grants must not replace a list of accounts
@@ -39962,8 +39975,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   the three workspace panel headers (`lib.rs`'s `term-*` and `results-*`, `editor_pane.rs`'s
   `query-*`), the Copy to modal (`copy_table_view.rs`), the Create database/schema/extension form
   (`database_editor.rs`), the script import (`script_view.rs`), the schema comparison
-  (`compare_view.rs`), the routine editor (`routine_editor.rs`) and the event editor
-  (`event_editor.rs`) are converted; every other
+  (`compare_view.rs`), the routine editor (`routine_editor.rs`), the event editor
+  (`event_editor.rs`) and the Users and privileges browser (`users_view.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -39985,12 +39998,15 @@ Re-introducing the anti-patterns these guard against is a regression:
     core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
     `history_panel::bucket_title` for `history::Bucket::label`, `activity_panel::kill_label`
     for `activity::KillKind::label`, `chart_view::chart_kind_label` for `chart::ChartKind::label`,
-    and `compare_view::compare_kind_group`/`compare_kind_word`/`empty_rows_message` for
-    `compare::CompareKind::group_label`/`label` and `EmptyRows::message` —
+    `compare_view::compare_kind_group`/`compare_kind_word`/`empty_rows_message` for
+    `compare::CompareKind::group_label`/`label` and `EmptyRows::message`,
+    `event_editor::event_status_label` for `schema::EventStatus::label`, and
+    `users_view::principal_kind_label` for `users::PrincipalKind::label` —
     with a test holding its English equal to core's for every variant
     (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`,
     `english_names_every_kill_as_core_does`, `english_names_every_chart_kind_as_core_does`,
-    `english_names_every_compare_kind_as_core_does`, `english_says_every_empty_reason_as_core_does`).
+    `english_names_every_compare_kind_as_core_does`, `english_says_every_empty_reason_as_core_does`,
+    `english_names_every_event_status_as_core_does`, `english_names_every_principal_kind_as_core_does`).
     Where the word is a phrase core composes rather than a label, core answers with a value or
     keeps the composition and lets the caller word the part that is language: `history::ago` hands
     back an `Ago` that `i18n::relative_time` says from `ago-*` (the history and snippet rows, the

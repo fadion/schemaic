@@ -917,3 +917,32 @@ routine-editor-data-access = Datenzugriff
 routine-editor-definer = Definer
 routine-editor-reading-source = Quelltext der Routine wird gelesen…
 routine-editor-source-stale = Der echte Quelltext der Routine kam erst an, nachdem du zu tippen begonnen hattest, daher beruht dieser Rumpf auf der Kopie des Katalogs – die nicht dem entspricht, was der Server hält. Schließe und öffne erneut, um ihn zu bearbeiten.
+
+## Users and privileges browser
+
+users-search-placeholder = Konten durchsuchen
+users-loading-accounts = Konten werden geladen
+users-unsupported = Die Engine dieser Verbindung hat keine Benutzerkonten.
+users-none = Dieser Server meldet keine Konten.
+users-no-match = Kein Konto passt zu „{ $needle }“.
+users-pick-account = Wähle ein Konto, um zu sehen, was es darf.
+users-section-attributes = Attribute
+users-section-privileges = Rechte
+users-kind-user = Benutzer
+users-kind-role = Rolle
+users-kind-login = Anmeldung
+users-maintained-by-server = vom Server verwaltet
+users-loading-privileges = Rechte werden geladen
+users-no-privileges = Dieses Konto hat keine Rechte.
+users-statements-capped = Die ersten { $shown } von { $total } Anweisungen werden angezeigt. „Rechte kopieren“ nimmt alle.
+users-new-account = Neues Konto
+users-system-account = Dieses Konto gehört dem Server, daher ändert Schemaic es nicht.
+users-reset-password = Passwort zurücksetzen
+users-gate-no-database = Öffne einen Abfrage-Tab auf einer Datenbank, um Rechte zu ändern – die Anweisung muss in einer laufen.
+users-gate-read-only = Diese Verbindung ist schreibgeschützt.
+users-count = { $n ->
+    [one] { $n } Konto
+   *[other] { $n } Konten
+}
+users-count-filtered = { $shown } von { $n } Konten
+users-copy-privileges = Rechte kopieren

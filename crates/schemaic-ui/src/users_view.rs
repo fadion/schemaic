@@ -35,11 +35,11 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::connection::Connection;
-use schemaic_core::text::plural;
 use schemaic_core::users::{Grants, Principal, PrincipalKind, WriteGate};
 
 use schemaic_core::intel::SqlDialect;
 
+use crate::i18n::tr;
 use crate::theme::{font_body, font_hint};
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, dismiss_layer,
@@ -286,11 +286,7 @@ pub(crate) fn users_overlay(ctx: UsersCtx) -> impl IntoView {
                     .items_start()
             });
 
-            let title = modal_title_owned(
-                "Users and privileges".to_string(),
-                close.clone(),
-                ring.clone(),
-            );
+            let title = modal_title_owned(tr!("tree-users"), close.clone(), ring.clone());
 
             let panel = v_stack((title, body)).on_click_stop(|_| {}).style(|s| {
                 panel_style(s)
@@ -334,7 +330,7 @@ fn list_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: FocusR
         edit_field(
             filter,
             FieldCfg {
-                placeholder: "Search accounts",
+                placeholder_of: Some(Rc::new(|| tr!("users-search-placeholder"))),
                 clearable: true,
                 focus: Some((ring.clone(), 10)),
                 ..Default::default()
@@ -365,13 +361,15 @@ fn list_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: FocusR
     let list = dyn_container(
         move || state.get(),
         move |st| match st {
-            UsersState::Loading => {
-                list_note(icons::CLOCK, theme::text_faint, "Loading accounts".into())
-            }
+            UsersState::Loading => list_note(
+                icons::CLOCK,
+                theme::text_faint,
+                tr!("users-loading-accounts"),
+            ),
             UsersState::Unsupported => list_note(
                 icons::CIRCLE_QUESTION,
                 theme::text_faint,
-                "This connection's engine has no user accounts.".into(),
+                tr!("users-unsupported"),
             ),
             UsersState::Failed(e) => list_note(icons::TRIANGLE_ALERT, theme::error, e),
             UsersState::Loaded(list) => {
@@ -414,9 +412,9 @@ fn list_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: FocusR
                                 icons::CIRCLE_QUESTION,
                                 theme::text_faint,
                                 if needle.trim().is_empty() {
-                                    "This server reports no accounts.".into()
+                                    tr!("users-none")
                                 } else {
-                                    format!("No account matches \u{201c}{}\u{201d}.", needle.trim())
+                                    tr!("users-no-match", needle = needle.trim().to_string())
                                 },
                             )
                         },
@@ -591,7 +589,7 @@ fn detail_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: Focu
             None => note(
                 icons::CIRCLE_QUESTION,
                 theme::text_faint,
-                "Pick an account to see what it may do.".into(),
+                tr!("users-pick-account"),
             ),
             Some(p) => {
                 // **Collected and filtered, never an `empty()` placeholder.** The
@@ -610,7 +608,7 @@ fn detail_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: Focu
                 ));
                 if !p.attributes.is_empty() {
                     sections.push(section(
-                        "Attributes",
+                        tr!("users-section-attributes"),
                         p.attributes
                             .iter()
                             .map(|(k, v)| detail(k.clone(), v.clone()))
@@ -636,6 +634,18 @@ fn detail_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: Focu
     .into_any()
 }
 
+/// What kind of account this is — `PrincipalKind::label`'s word in the
+/// interface's language; `english_names_every_principal_kind_as_core_does`
+/// holds them equal.
+fn principal_kind_label(kind: schemaic_core::users::PrincipalKind) -> String {
+    use schemaic_core::users::PrincipalKind;
+    match kind {
+        PrincipalKind::User => tr!("users-kind-user"),
+        PrincipalKind::Role => tr!("users-kind-role"),
+        PrincipalKind::Login => tr!("users-kind-login"),
+    }
+}
+
 /// The account's own name and what kind of thing it is.
 fn heading(p: &Principal) -> AnyView {
     // **No database here**, deliberately. It would read as the scope of what
@@ -646,9 +656,13 @@ fn heading(p: &Principal) -> AnyView {
     let sub = if p.system {
         // Said once, at the top: the server owns this account, so what it may do
         // is not an administrator's choice.
-        format!("{} · maintained by the server", p.kind.label())
+        format!(
+            "{} · {}",
+            principal_kind_label(p.kind),
+            tr!("users-maintained-by-server")
+        )
     } else {
-        p.kind.label().to_string()
+        principal_kind_label(p.kind)
     };
     v_stack((
         text(p.display()).style(|s| {
@@ -681,7 +695,7 @@ fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
             vec![note(
                 icons::CLOCK,
                 theme::text_faint,
-                "Loading privileges".into(),
+                tr!("users-loading-privileges"),
             )]
         }
         GrantsState::Failed(e) => vec![note(icons::TRIANGLE_ALERT, theme::error, e)],
@@ -696,7 +710,7 @@ fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
                 vec![note(
                     icons::CIRCLE_QUESTION,
                     theme::text_faint,
-                    "This account holds no privileges.".into(),
+                    tr!("users-no-privileges"),
                 )]
             } else {
                 statements
@@ -717,10 +731,10 @@ fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
                 rows.push(note(
                     icons::CIRCLE_QUESTION,
                     theme::text_faint,
-                    format!(
-                        "Showing the first {STATEMENT_CAP} of {} statements. \
-                         Copy privileges takes all of them.",
-                        statements.len()
+                    tr!(
+                        "users-statements-capped",
+                        shown = STATEMENT_CAP,
+                        total = statements.len()
                     ),
                 ));
             }
@@ -730,7 +744,7 @@ fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
             rows
         }
     };
-    section("Privileges", rows)
+    section(tr!("users-section-privileges"), rows)
 }
 
 /// One `GRANT` statement, rendered the way the app renders SQL everywhere it is
@@ -903,7 +917,7 @@ fn new_account_row(
         container(
             h_stack((
                 icons::icon(icons::CIRCLE_PLUS, 16.0),
-                text("New account").style(|s| s.font_size(font_body())),
+                text(tr!("users-new-account")).style(|s| s.font_size(font_body())),
             ))
             .style(move |s| {
                 s.flex_row()
@@ -961,7 +975,7 @@ fn actions_row(
         return Some(note(
             icons::CIRCLE_QUESTION,
             theme::text_faint,
-            "This account belongs to the server, so Schemaic will not change it.".into(),
+            tr!("users-system-account"),
         ));
     }
     let enabled = gate.enabled();
@@ -970,7 +984,7 @@ fn actions_row(
     let grant_target = target.clone();
     let grant_who = p.clone();
     let grant = action_button(
-        "Privileges",
+        tr!("users-section-privileges"),
         ActionKind::Quiet,
         enabled,
         ring.clone(),
@@ -1006,7 +1020,7 @@ fn actions_row(
         let reset_target = target.clone();
         let reset_who = p.clone();
         action_button(
-            "Reset password",
+            tr!("users-reset-password"),
             ActionKind::Quiet,
             enabled,
             ring.clone(),
@@ -1038,53 +1052,60 @@ fn actions_row(
     let plan_conn_id = target.conn_id;
     // 14, after Reset password at 13 — the tab order follows the row, and Drop
     // stays last of the three because it is the destructive one.
-    let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 14, move || {
-        // **The launch guards itself, in the step that launches it.** `enabled`
-        // is a `bool` captured when this row was built, so the disabled button
-        // *was* the whole guard — verbatim what `widgets::accept_launch`'s
-        // contract forbids, on the one destructive action of the three (its two
-        // neighbours refuse read-only inside `open_for_new` / `open_for_grant`).
-        //
-        // **And of the plan's connection, not the active one.** `edit_ctx`
-        // answers about whichever connection the tree points at, while
-        // `plan_conn_id` below is the one the account lives on — so after a
-        // connection switch this asked about the wrong server, in both
-        // directions. `read_only_of` is the one answer to that question.
-        if !crate::widgets::accept_launch(false, launch_read_only(conn.connections, plan_conn_id)) {
-            return;
-        }
-        let database = drop_target.database.clone().unwrap_or_default();
-        let who = drop_who.clone();
-        // **Straight to the preview.** A confirm asked first with the change's
-        // own risk sentence (`Change::risks`), and the preview said it again
-        // over Apply — the same question twice. The preview's warning is that
-        // sentence, in the target's dialect: the account on the server this
-        // browser was opened on, not whichever the switcher points at.
-        crate::ddl_preview::preview_account(
-            ddl,
-            crate::ddl_preview::PlanTarget {
-                conn_id: plan_conn_id,
-                database,
-                dialect: risk_dialect,
-                // Read, not a literal `false`. `PlanTarget`'s own doc says the
-                // struct exists so no call site comes to pass a constant beside
-                // a live `conn_id`, and this was the site that did — which is
-                // why the preview opened with Apply enabled and inert.
-                read_only: launch_read_only(conn.connections, plan_conn_id),
-            },
-            &who.display(),
-            vec![schemaic_core::ddl::Change::DropAccount(Box::new(
-                who.clone(),
-            ))],
-        );
-    });
+    let drop = action_button(
+        tr!("tree-drop"),
+        ActionKind::Danger,
+        enabled,
+        ring,
+        14,
+        move || {
+            // **The launch guards itself, in the step that launches it.** `enabled`
+            // is a `bool` captured when this row was built, so the disabled button
+            // *was* the whole guard — verbatim what `widgets::accept_launch`'s
+            // contract forbids, on the one destructive action of the three (its two
+            // neighbours refuse read-only inside `open_for_new` / `open_for_grant`).
+            //
+            // **And of the plan's connection, not the active one.** `edit_ctx`
+            // answers about whichever connection the tree points at, while
+            // `plan_conn_id` below is the one the account lives on — so after a
+            // connection switch this asked about the wrong server, in both
+            // directions. `read_only_of` is the one answer to that question.
+            if !crate::widgets::accept_launch(
+                false,
+                launch_read_only(conn.connections, plan_conn_id),
+            ) {
+                return;
+            }
+            let database = drop_target.database.clone().unwrap_or_default();
+            let who = drop_who.clone();
+            // **Straight to the preview.** A confirm asked first with the change's
+            // own risk sentence (`Change::risks`), and the preview said it again
+            // over Apply — the same question twice. The preview's warning is that
+            // sentence, in the target's dialect: the account on the server this
+            // browser was opened on, not whichever the switcher points at.
+            crate::ddl_preview::preview_account(
+                ddl,
+                crate::ddl_preview::PlanTarget {
+                    conn_id: plan_conn_id,
+                    database,
+                    dialect: risk_dialect,
+                    // Read, not a literal `false`. `PlanTarget`'s own doc says the
+                    // struct exists so no call site comes to pass a constant beside
+                    // a live `conn_id`, and this was the site that did — which is
+                    // why the preview opened with Apply enabled and inert.
+                    read_only: launch_read_only(conn.connections, plan_conn_id),
+                },
+                &who.display(),
+                vec![schemaic_core::ddl::Change::DropAccount(Box::new(
+                    who.clone(),
+                ))],
+            );
+        },
+    );
 
     let why = match gate {
-        WriteGate::NoDatabase => Some(
-            "Open a query tab on a database to change privileges — the statement has to run in \
-             one.",
-        ),
-        WriteGate::ReadOnly => Some("This connection is read-only."),
+        WriteGate::NoDatabase => Some(tr!("users-gate-no-database")),
+        WriteGate::ReadOnly => Some(tr!("users-gate-read-only")),
         _ => None,
     };
     // Built from an iterator rather than a tuple because the middle button is
@@ -1105,7 +1126,7 @@ fn actions_row(
             .into_any(),
     ];
     if let Some(why) = why {
-        rows.push(note(icons::CIRCLE_QUESTION, theme::text_faint, why.into()));
+        rows.push(note(icons::CIRCLE_QUESTION, theme::text_faint, why));
     }
     Some(
         v_stack_from_iter(rows)
@@ -1123,7 +1144,7 @@ fn actions_row(
 
 /// This panel's rows at its own gap — see [`crate::widgets::fact_section`],
 /// which is the shared view the properties modal wears too.
-fn section(title: &'static str, rows: Vec<AnyView>) -> AnyView {
+fn section(title: String, rows: Vec<AnyView>) -> AnyView {
     crate::widgets::fact_section(title, rows, section_gap)
 }
 
@@ -1185,9 +1206,9 @@ fn footer(
             // unfiltered list saying "40 of 40" invites a hunt for the missing
             // ones.
             if shown == total {
-                format!("{total} {}", plural(total, "account", "accounts"))
+                tr!("users-count", n = total)
             } else {
-                format!("{shown} of {total} accounts")
+                tr!("users-count-filtered", shown = shown, n = total)
             }
         }
         _ => String::new(),
@@ -1210,7 +1231,7 @@ fn footer(
         status,
         h_stack((
             action_button(
-                "Refresh",
+                tr!("tree-refresh"),
                 ActionKind::Quiet,
                 true,
                 ring.clone(),
@@ -1218,7 +1239,7 @@ fn footer(
                 refresh,
             ),
             action_button(
-                "Copy privileges",
+                tr!("users-copy-privileges"),
                 ActionKind::Quiet,
                 true,
                 ring.clone(),
@@ -1226,7 +1247,7 @@ fn footer(
                 copy,
             ),
             action_button(
-                "Close",
+                tr!("dialog-close"),
                 ActionKind::Neutral,
                 true,
                 ring,
@@ -1241,6 +1262,38 @@ fn footer(
 
 #[cfg(test)]
 mod tests {
+    /// English names every account kind as core's `PrincipalKind::label` does,
+    /// and the footer's count reads as the `format!` it replaced.
+    #[test]
+    fn english_names_every_principal_kind_as_core_does() {
+        use crate::i18n::tr;
+        use schemaic_core::text::plural;
+        use schemaic_core::users::PrincipalKind;
+        for k in [
+            PrincipalKind::User,
+            PrincipalKind::Role,
+            PrincipalKind::Login,
+        ] {
+            assert_eq!(super::principal_kind_label(k), k.label(), "{k:?}");
+        }
+        for n in [1usize, 40] {
+            assert_eq!(
+                tr!("users-count", n = n),
+                format!("{n} {}", plural(n, "account", "accounts"))
+            );
+        }
+        assert_eq!(
+            tr!("users-count-filtered", shown = 3, n = 40),
+            "3 of 40 accounts"
+        );
+        // Written with `\u{201c}` escapes before, so the literal comparison
+        // cannot see it; the quotes are typographic in the catalogue.
+        assert_eq!(
+            tr!("users-no-match", needle = "app"),
+            "No account matches \u{201c}app\u{201d}."
+        );
+    }
+
     /// The browser's read-only term stays in the `dyn_container` **key**.
     ///
     /// `target_read_only`'s own doc says it reads "tracked", and that is true of

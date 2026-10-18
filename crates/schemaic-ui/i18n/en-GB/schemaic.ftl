@@ -1002,3 +1002,37 @@ routine-editor-data-access = Data access
 routine-editor-definer = Definer
 routine-editor-reading-source = Reading the routine's source…
 routine-editor-source-stale = The routine's real source arrived after you started typing, so this Body is built on the catalogue's copy — which isn't what the server holds. Close and reopen to edit it.
+
+## Users and privileges browser (its title is tree-users)
+
+users-search-placeholder = Search accounts
+users-loading-accounts = Loading accounts
+users-unsupported = This connection's engine has no user accounts.
+users-none = This server reports no accounts.
+# $needle is the filter text as typed.
+users-no-match = No account matches “{ $needle }”.
+users-pick-account = Pick an account to see what it may do.
+users-section-attributes = Attributes
+users-section-privileges = Privileges
+# PrincipalKind's words, as core's label names them.
+users-kind-user = User
+users-kind-role = Role
+users-kind-login = Login
+# After the account's kind, for one the server itself owns.
+users-maintained-by-server = maintained by the server
+users-loading-privileges = Loading privileges
+users-no-privileges = This account holds no privileges.
+# $shown is the cap on statements drawn, $total how many there are.
+users-statements-capped = Showing the first { $shown } of { $total } statements. Copy privileges takes all of them.
+users-new-account = New account
+users-system-account = This account belongs to the server, so Schemaic will not change it.
+users-reset-password = Reset password
+users-gate-no-database = Open a query tab on a database to change privileges — the statement has to run in one.
+users-gate-read-only = This connection is read-only.
+users-count = { $n } { $n ->
+    [one] account
+   *[other] accounts
+}
+# While a filter narrows the list: $shown of $n.
+users-count-filtered = { $shown } of { $n } accounts
+users-copy-privileges = Copy privileges
