@@ -26901,6 +26901,18 @@ existing prose was left alone.
     Mounted in the workspace group directly after `properties_overlay`, and counted by
     `workspace_modals_up` whenever it is open — it raises nothing, so it is a plain term like
     `vars_open`.
+    **Its words are the catalogue's** (`used-by-*`, roadmap phase 3) — the title (`$object`, also
+    the Copy text's first line), Copy, the not-loaded and nothing-in notes (`$database`), the
+    limits line, *· dropped with it* (`$detail`) and the Copy text's *Nothing uses it.*; Close is
+    the shared `dialog-close`. The kind words are core's, drawn here by the typed-value rule:
+    `dependent_heading(DependentKind, n)` is one whole message per kind with a plural on `$count`,
+    replacing `kind.noun(n)` capitalised with the count spliced on (the `capitalised` helper is
+    gone), and `dependent_noun` the Copy text's singular in place of `kind.noun(1)`.
+    `english_words_every_dependent_kind_as_core_does` holds both to core's composition for every
+    kind in both numbers, and `the_composed_lines_read_as_they_did_in_english` pins the rest. The
+    Copy text (`as_markdown`) is translated with the screen — it is what the user copies of what
+    they read, not a file format — and keeps its Markdown punctuation. A dependent's `detail`
+    (core's prose, phase 4) and the names stay English.
   - `chart_view.rs` — the **Chart** modal (`chart_overlay`): a bar, line or histogram of the result
     on screen, over `core::chart`, opened by setting `overlay.chart` to a `ChartTarget { rs:
     Arc<ResultSet>, title }` (re-exported as `schemaic_ui::ChartTarget`; the app creates the signal
@@ -40250,7 +40262,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`), Import
   Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`), the ER diagram
   (`erd_view.rs`), Server variables (`server_vars_view.rs`), the snippet editor
-  (`snippet_edit.rs`) and the Query plan modal (`plan_view.rs`) are converted;
+  (`snippet_edit.rs`), the Query plan modal (`plan_view.rs`) and the Used by modal
+  (`used_by_view.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

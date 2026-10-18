@@ -1508,3 +1508,40 @@ plan-analyze-hint = Führt die Anweisung aus, um echte Laufzeiten zu messen
 plan-explaining = Wird erklärt
 plan-potential-issues = Mögliche Probleme
 plan-ask-ai = KI fragen
+used-by-title = Verwendet von — { $object }
+used-by-copy = Kopieren
+used-by-not-loaded = Das Schema von { $database } ist noch nicht geladen – klappe es im Baum auf und frage dann erneut.
+used-by-nothing-in = Nichts in { $database } verwendet es.
+used-by-nothing = Nichts verwendet es.
+used-by-limits = Gefunden durch Lesen der Definitionen in dieser Datenbank: zur Laufzeit erzeugtes SQL und andere Datenbanken werden nicht erfasst.
+used-by-dropped-with-it = { $detail } · wird mit gelöscht
+used-by-heading-view = { $count ->
+    [one] Sicht ({ $count })
+   *[other] Sichten ({ $count })
+}
+used-by-heading-routine = { $count ->
+    [one] Routine ({ $count })
+   *[other] Routinen ({ $count })
+}
+used-by-heading-trigger = { $count ->
+    [one] Trigger ({ $count })
+   *[other] Trigger ({ $count })
+}
+used-by-heading-event = { $count ->
+    [one] Ereignis ({ $count })
+   *[other] Ereignisse ({ $count })
+}
+used-by-heading-foreign-key = { $count ->
+    [one] Fremdschlüssel ({ $count })
+   *[other] Fremdschlüssel ({ $count })
+}
+used-by-heading-expression = { $count ->
+    [one] Tabellenausdruck ({ $count })
+   *[other] Tabellenausdrücke ({ $count })
+}
+used-by-noun-view = Sicht
+used-by-noun-routine = Routine
+used-by-noun-trigger = Trigger
+used-by-noun-event = Ereignis
+used-by-noun-foreign-key = Fremdschlüssel
+used-by-noun-expression = Tabellenausdruck

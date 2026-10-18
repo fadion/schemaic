@@ -11,8 +11,9 @@ use floem::AnyView;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
-use schemaic_core::used_by::{Dependent, Target};
+use schemaic_core::used_by::{Dependent, DependentKind, Target};
 
+use crate::i18n::tr;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, autohide, dismiss_layer,
     focus_root_with_ring, modal_body_h, modal_footer_split, modal_pad_h, modal_title_owned,
@@ -96,14 +97,14 @@ pub(crate) fn used_by_overlay(overlay: OverlayUi, schema: SchemaUi, conn: ConnUi
             let body = body(&t, found.as_deref());
             let copy_text = found.as_deref().map(|d| as_markdown(&t, d));
             let title = modal_title_owned(
-                format!("Used by — {}", t.display()),
+                tr!("used-by-title", object = t.display()),
                 close.clone(),
                 ring.clone(),
             );
             let done = close.clone();
             let footer = modal_footer_split(
                 action_button(
-                    "Copy",
+                    tr!("used-by-copy"),
                     ActionKind::Quiet,
                     copy_text.is_some(),
                     ring.clone(),
@@ -115,7 +116,7 @@ pub(crate) fn used_by_overlay(overlay: OverlayUi, schema: SchemaUi, conn: ConnUi
                     },
                 ),
                 action_button(
-                    "Close",
+                    tr!("dialog-close"),
                     ActionKind::Primary,
                     true,
                     ring.clone(),
@@ -161,15 +162,12 @@ fn body(t: &UsedByTarget, found: Option<&[Dependent]>) -> AnyView {
         None => sections.push(note(
             icons::TRIANGLE_ALERT,
             theme::text_dim,
-            format!(
-                "{}'s schema has not loaded yet — expand it in the tree, then ask again.",
-                t.database
-            ),
+            tr!("used-by-not-loaded", database = t.database.clone()),
         )),
         Some([]) => sections.push(note(
             icons::CIRCLE_CHECK,
             theme::text_dim,
-            format!("Nothing in {} uses it.", t.database),
+            tr!("used-by-nothing-in", database = t.database.clone()),
         )),
         Some(deps) => {
             let mut start = 0;
@@ -182,7 +180,7 @@ fn body(t: &UsedByTarget, found: Option<&[Dependent]>) -> AnyView {
                 let group = &deps[start..end];
                 let rows: Vec<AnyView> = group.iter().map(row).collect();
                 sections.push(crate::widgets::fact_section_owned(
-                    format!("{} ({})", capitalised(kind.noun(group.len())), group.len()),
+                    dependent_heading(kind, group.len()),
                     rows,
                     || theme::scaled(6.0),
                 ));
@@ -193,16 +191,13 @@ fn body(t: &UsedByTarget, found: Option<&[Dependent]>) -> AnyView {
     // What a scan of definitions cannot see, said once under the answer.
     if found.is_some() {
         sections.push(
-            text(
-                "Found by reading definitions in this database: SQL built at run time, and \
-                 other databases, are not seen.",
-            )
-            .style(|s| {
-                s.font_size(theme::font_hint())
-                    .color(theme::text_faint())
-                    .width_full()
-            })
-            .into_any(),
+            text(tr!("used-by-limits"))
+                .style(|s| {
+                    s.font_size(theme::font_hint())
+                        .color(theme::text_faint())
+                        .width_full()
+                })
+                .into_any(),
         );
     }
     let content =
@@ -227,7 +222,7 @@ fn row(d: &Dependent) -> AnyView {
         // and goes with a drop, so it is no breakage — said, since the list
         // is read before one.
         text(if d.goes_with_it {
-            format!("{} · dropped with it", d.detail)
+            tr!("used-by-dropped-with-it", detail = d.detail.clone())
         } else {
             d.detail.clone()
         })
@@ -246,19 +241,38 @@ fn row(d: &Dependent) -> AnyView {
     .into_any()
 }
 
-fn capitalised(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().chain(c).collect(),
-        None => String::new(),
+/// A kind's group heading with its count — `DependentKind::noun`'s word,
+/// capitalised, drawn here so it can be translated: one whole message per
+/// kind, a plural on `$count`.
+fn dependent_heading(kind: DependentKind, n: usize) -> String {
+    match kind {
+        DependentKind::View => tr!("used-by-heading-view", count = n),
+        DependentKind::Routine => tr!("used-by-heading-routine", count = n),
+        DependentKind::Trigger => tr!("used-by-heading-trigger", count = n),
+        DependentKind::Event => tr!("used-by-heading-event", count = n),
+        DependentKind::ForeignKey => tr!("used-by-heading-foreign-key", count = n),
+        DependentKind::Expression => tr!("used-by-heading-expression", count = n),
+    }
+}
+
+/// A kind in the singular, as the Copy text's list item names it —
+/// `DependentKind::noun(1)`'s word, drawn here.
+fn dependent_noun(kind: DependentKind) -> String {
+    match kind {
+        DependentKind::View => tr!("used-by-noun-view"),
+        DependentKind::Routine => tr!("used-by-noun-routine"),
+        DependentKind::Trigger => tr!("used-by-noun-trigger"),
+        DependentKind::Event => tr!("used-by-noun-event"),
+        DependentKind::ForeignKey => tr!("used-by-noun-foreign-key"),
+        DependentKind::Expression => tr!("used-by-noun-expression"),
     }
 }
 
 /// The list as Markdown, for Copy.
 fn as_markdown(t: &UsedByTarget, deps: &[Dependent]) -> String {
-    let mut out = format!("Used by — {}\n", t.display());
+    let mut out = format!("{}\n", tr!("used-by-title", object = t.display()));
     if deps.is_empty() {
-        out.push_str("\nNothing uses it.\n");
+        out.push_str(&format!("\n{}\n", tr!("used-by-nothing")));
     }
     for d in deps {
         let detail = if d.detail.is_empty() {
@@ -266,7 +280,69 @@ fn as_markdown(t: &UsedByTarget, deps: &[Dependent]) -> String {
         } else {
             format!(" — {}", d.detail)
         };
-        out.push_str(&format!("- {} `{}`{detail}\n", d.kind.noun(1), d.name));
+        out.push_str(&format!(
+            "- {} `{}`{detail}\n",
+            dependent_noun(d.kind),
+            d.name
+        ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dependent_heading, dependent_noun};
+    use crate::i18n::tr;
+    use schemaic_core::used_by::DependentKind;
+
+    /// The headings and nouns are core's in English: each heading reads as
+    /// `DependentKind::noun` capitalised with the count beside it, in both
+    /// numbers, and each noun as its singular.
+    #[test]
+    fn english_words_every_dependent_kind_as_core_does() {
+        let capitalised = |s: &str| {
+            let mut c = s.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect::<String>())
+                .unwrap_or_default()
+        };
+        for kind in [
+            DependentKind::View,
+            DependentKind::Routine,
+            DependentKind::Trigger,
+            DependentKind::Event,
+            DependentKind::ForeignKey,
+            DependentKind::Expression,
+        ] {
+            for n in [1, 3] {
+                assert_eq!(
+                    dependent_heading(kind, n),
+                    format!("{} ({n})", capitalised(kind.noun(n))),
+                    "{kind:?}"
+                );
+            }
+            assert_eq!(dependent_noun(kind), kind.noun(1), "{kind:?}");
+        }
+    }
+
+    /// The composed lines read as they did in English before the catalogue.
+    #[test]
+    fn the_composed_lines_read_as_they_did_in_english() {
+        assert_eq!(
+            tr!("used-by-title", object = "shop.orders"),
+            "Used by \u{2014} shop.orders"
+        );
+        assert_eq!(
+            tr!("used-by-not-loaded", database = "shop"),
+            "shop's schema has not loaded yet \u{2014} expand it in the tree, then ask again."
+        );
+        assert_eq!(
+            tr!("used-by-nothing-in", database = "shop"),
+            "Nothing in shop uses it."
+        );
+        assert_eq!(
+            tr!("used-by-dropped-with-it", detail = "on orders"),
+            "on orders · dropped with it"
+        );
+    }
 }

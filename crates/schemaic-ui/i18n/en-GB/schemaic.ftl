@@ -1747,3 +1747,50 @@ plan-analyze-hint = Executes the statement to measure real timings
 plan-explaining = Explaining
 plan-potential-issues = Potential issues
 plan-ask-ai = Ask AI
+
+## Used by modal (used_by_view.rs)
+## A dependent's detail ("on lines") is core's and stays as it is for now.
+
+# $object is what was asked about (shop.orders). Also the Copy text's first line.
+used-by-title = Used by — { $object }
+used-by-copy = Copy
+used-by-not-loaded = { $database }'s schema has not loaded yet — expand it in the tree, then ask again.
+used-by-nothing-in = Nothing in { $database } uses it.
+# The Copy text when nothing does.
+used-by-nothing = Nothing uses it.
+used-by-limits = Found by reading definitions in this database: SQL built at run time, and other databases, are not seen.
+# $detail is what core says about the dependent (on lines).
+used-by-dropped-with-it = { $detail } · dropped with it
+# Each kind's group heading with its count. English must read as core's
+# DependentKind::noun, capitalised (a test holds it).
+used-by-heading-view = { $count ->
+    [one] View ({ $count })
+   *[other] Views ({ $count })
+}
+used-by-heading-routine = { $count ->
+    [one] Routine ({ $count })
+   *[other] Routines ({ $count })
+}
+used-by-heading-trigger = { $count ->
+    [one] Trigger ({ $count })
+   *[other] Triggers ({ $count })
+}
+used-by-heading-event = { $count ->
+    [one] Event ({ $count })
+   *[other] Events ({ $count })
+}
+used-by-heading-foreign-key = { $count ->
+    [one] Foreign key ({ $count })
+   *[other] Foreign keys ({ $count })
+}
+used-by-heading-expression = { $count ->
+    [one] Table expression ({ $count })
+   *[other] Table expressions ({ $count })
+}
+# A kind in the singular, as the Copy text's list names it.
+used-by-noun-view = view
+used-by-noun-routine = routine
+used-by-noun-trigger = trigger
+used-by-noun-event = event
+used-by-noun-foreign-key = foreign key
+used-by-noun-expression = table expression
