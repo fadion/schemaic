@@ -42662,7 +42662,15 @@ this bundle's.
   changed together, and neither `grid_cells` nor its callers may become a per-frame path. Those
   reads sit in a `create_memo` rather than in the `dyn_container` key itself, and what the memo
   carries is a `StagedFace` and not a raw `CellEdit`; both halves are load-bearing and the
-  `dyn_container` gotcha says why. Ctrl+C
+  `dyn_container` gotcha says why. What the memo and the builder both produce is
+  `grid::cell_preview` — one spelling of what the cell shows: the value cut after
+  `CELL_PREVIEW_CHARS` (200) and its `\r`/`\n`/`\t` flattened to spaces, cut *before* it flattens so a
+  1 MiB value is not copied whole to paint 200 characters (`preview_cut` reads at most 201). **The cut
+  lands on a grapheme-cluster boundary** (`grapheme_floor`, over `unicode-segmentation`'s
+  `GraphemeCursor`), backing off when the 200th character falls inside a cluster: cut there, a letter
+  lost its combining mark and an emoji sequence painted as a fragment of itself. A single cluster
+  longer than the whole cap is cut at the cap rather than leaving the cell blank
+  (`cell_preview_never_splits_a_letter_from_its_mark`). Ctrl+C
   passes `formatted = false` and an attachment passes `true`, which is the *Copy formatted* entry's
   reason for existing. **How a cell is *weighted* is a decision too**, and it is `grid::cell_ink` →
   `CellInk` (`Staged`, `StagedNull`, `Absent`, `Fk`, `Plain`) rather than an `if` chain inside the

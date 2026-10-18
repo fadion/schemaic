@@ -44,6 +44,10 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 # `image-*` features and cargo unions them. Adding a format there is what makes
 # it measurable here, which is the coupling `blob::BlobKind` already states.
 image = { version = "0.25", default-features = false }
+# Grapheme-cluster boundaries, so a cut cell preview never splits a letter from
+# its combining mark (`grid::cell_preview`). Already in the tree via floem,
+# cosmic-text and winit, same version — no extra compile.
+unicode-segmentation = "1.13"
 
 [lints]
 workspace = true

@@ -12233,33 +12233,57 @@ const CELL_PREVIEW_CHARS: usize = 200;
 /// `min` — the cap has to bound the *walk*.**"
 ///
 /// The substitution is 1:1 per character, so it commutes with the cut and the
-/// answer is unchanged — which is what [`preview_chars`] is asserted against.
+/// answer is unchanged — which is what the walk's test asserts against.
+///
+/// **The cut lands on a grapheme-cluster boundary**, backed off from the 200th
+/// character when that falls inside one, so a letter never loses its combining
+/// mark and an emoji sequence is shown whole or not at all. The one exception is
+/// a single cluster longer than the whole cap, which is cut where the cap falls
+/// rather than leaving the cell blank.
 fn cell_preview(s: &str) -> String {
-    preview_chars(s.chars())
+    let flatten = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if matches!(c, '\r' | '\n' | '\t') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+    let Some(cut) = preview_cut(s.char_indices()) else {
+        return flatten(s);
+    };
+    let mut out = flatten(&s[..grapheme_floor(s, cut)]);
+    out.push('…');
+    out
 }
 
-/// [`cell_preview`] over a character stream, so a test can count what it pulls.
+/// Where [`cell_preview`] cuts — the byte offset of the character after the
+/// first `CELL_PREVIEW_CHARS` — or `None` when the value has no more than that.
 ///
-/// At most `CELL_PREVIEW_CHARS + 1` characters are read: the 201st only decides
-/// the ellipsis, and is never appended itself. That bound is the point of the
-/// function, and it is not observable through `&str`.
-fn preview_chars(chars: impl Iterator<Item = char>) -> String {
-    let mut it = chars;
-    let mut out: String = it
-        .by_ref()
-        .take(CELL_PREVIEW_CHARS)
-        .map(|c| {
-            if matches!(c, '\r' | '\n' | '\t') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    if it.next().is_some() {
-        out.push('…');
+/// Over a character stream so a test can count what it pulls: at most
+/// `CELL_PREVIEW_CHARS + 1` characters are read, the last only to learn that
+/// there is more. That bound is the point, and it is not observable through
+/// `&str`.
+fn preview_cut(mut chars: impl Iterator<Item = (usize, char)>) -> Option<usize> {
+    chars.nth(CELL_PREVIEW_CHARS).map(|(at, _)| at)
+}
+
+/// `at`, or the grapheme-cluster boundary before it when `at` falls inside a
+/// cluster. A cluster starting at `0` leaves `at` alone: there is no boundary
+/// worth backing off to, and an empty preview would read as an empty value.
+fn grapheme_floor(s: &str, at: usize) -> usize {
+    use unicode_segmentation::GraphemeCursor;
+    let mut cursor = GraphemeCursor::new(at, s.len(), true);
+    if cursor.is_boundary(s, 0) != Ok(false) {
+        return at;
     }
-    out
+    match cursor.prev_boundary(s, 0) {
+        Ok(Some(b)) if b > 0 => b,
+        _ => at,
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -12296,14 +12320,13 @@ mod preview_walk_tests {
     fn cell_preview_cuts_before_it_flattens() {
         let n = std::cell::Cell::new(0usize);
         let big = "x".repeat(1_000_000);
-        let got = preview_chars(big.chars().inspect(|_| n.set(n.get() + 1)));
+        let got = preview_cut(big.char_indices().inspect(|_| n.set(n.get() + 1)));
         assert_eq!(
             n.get(),
             CELL_PREVIEW_CHARS + 1,
-            "the whole cell was walked to produce {} characters",
-            got.chars().count()
+            "the whole cell was walked to find a cut at {got:?}"
         );
-        assert_eq!(got, reference(&big));
+        assert_eq!(cell_preview(&big), reference(&big));
 
         // The answer, over everything that makes this awkward.
         for s in [
@@ -12322,6 +12345,43 @@ mod preview_walk_tests {
 
         // Idempotent — the builder calls it over a value the memo already cut.
         let once = cell_preview(&"x".repeat(5_000));
+        assert_eq!(cell_preview(&once), once);
+    }
+
+    /// **The cut never lands inside a grapheme cluster.** Counting `char`s put
+    /// it between a base letter and its combining mark, or inside an emoji
+    /// sequence, so the preview showed a bare letter or half a family — on any
+    /// table holding decomposed text, which macOS file names and much imported
+    /// data are.
+    #[test]
+    fn cell_preview_never_splits_a_letter_from_its_mark() {
+        let xs = |n: usize| "x".repeat(n);
+        let cut = |n: usize| format!("{}…", xs(n));
+
+        // 'e' + COMBINING ACUTE ACCENT, the mark at the 201st character.
+        let s = format!("{}e\u{301}tail", xs(CELL_PREVIEW_CHARS - 1));
+        assert_eq!(cell_preview(&s), cut(CELL_PREVIEW_CHARS - 1));
+
+        // A ZWJ family (five characters, one cluster) across the cap.
+        let s = format!("{}👨\u{200D}👩\u{200D}👧z", xs(CELL_PREVIEW_CHARS - 2));
+        assert_eq!(cell_preview(&s), cut(CELL_PREVIEW_CHARS - 2));
+
+        // CR LF is one cluster too: no lone flattened CR before the ellipsis.
+        let s = format!("{}\r\nb", xs(CELL_PREVIEW_CHARS - 1));
+        assert_eq!(cell_preview(&s), cut(CELL_PREVIEW_CHARS - 1));
+
+        // A cut that already falls on a boundary is where it always was.
+        let s = format!("{}é", xs(CELL_PREVIEW_CHARS));
+        assert_eq!(cell_preview(&s), cut(CELL_PREVIEW_CHARS));
+
+        // One cluster longer than the whole cap is still cut rather than
+        // emptied: a blank cell would read as an empty value.
+        let s = format!("a{}", "\u{301}".repeat(500));
+        assert_eq!(cell_preview(&s).chars().count(), CELL_PREVIEW_CHARS + 1);
+
+        // Idempotent over a backed-off answer, as over any other.
+        let s = format!("{}e\u{301}tail", xs(CELL_PREVIEW_CHARS - 1));
+        let once = cell_preview(&s);
         assert_eq!(cell_preview(&once), once);
     }
 }
