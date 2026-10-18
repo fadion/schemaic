@@ -762,10 +762,31 @@ pub fn matches_query(entry: &HistoryEntry, query: &str) -> bool {
 /// doesn't open with a stray `· `.
 ///
 /// In core rather than in the view builder, beside the `format_duration` it
-/// calls: it is three composition decisions (which facts, the `+` on a capped
-/// count, where the separator goes) and each has a wrong answer that reads as a
-/// number the query never produced.
+/// calls: it is composition decisions (which facts, whether the count is marked
+/// capped, where the separator goes) and each has a wrong answer that reads as a
+/// number the query never produced. The `+` that marks a capped count is the
+/// count's *wording*, so a caller of [`outcome_line_with`] supplies it.
 pub fn outcome_line(entry: &HistoryEntry) -> Option<String> {
+    outcome_line_with(entry, |n, capped| {
+        // `200000+ rows` when the fetch stopped at the cap: that number is what
+        // came back, not what the query returned, and only the `+` says so once
+        // the grid is gone. Always plural there — the count means "at least this
+        // many", so it is never one.
+        if capped {
+            format!("{n}+ rows")
+        } else {
+            format!("{n} {}", crate::text::plural(n as usize, "row", "rows"))
+        }
+    })
+}
+
+/// [`outcome_line`] with the row count worded by `rows(count, capped)` — the
+/// composition (which facts, where the separator goes, nothing counted on a
+/// failure) stays here, and the interface supplies the words in its language.
+pub fn outcome_line_with(
+    entry: &HistoryEntry,
+    rows: impl Fn(u64, bool) -> String,
+) -> Option<String> {
     if entry.outcome == Outcome::Unknown {
         return None;
     }
@@ -777,18 +798,7 @@ pub fn outcome_line(entry: &HistoryEntry) -> Option<String> {
         facts.push(format_duration(ms));
     }
     if let Some(n) = entry.rows.filter(|_| !failed) {
-        // `200000+ rows` when the fetch stopped at the cap: that number is what
-        // came back, not what the query returned, and only the `+` says so once
-        // the grid is gone. Always plural there — the count means "at least this
-        // many", so it is never one.
-        if entry.rows_capped {
-            facts.push(format!("{n}+ rows"));
-        } else {
-            facts.push(format!(
-                "{n} {}",
-                crate::text::plural(n as usize, "row", "rows")
-            ));
-        }
+        facts.push(rows(n, entry.rows_capped));
     }
     Some(match (facts.is_empty(), failed) {
         (true, _) => String::new(),
@@ -797,21 +807,52 @@ pub fn outcome_line(entry: &HistoryEntry) -> Option<String> {
     })
 }
 
+/// How long ago a timestamp was, in [`relative_time`]'s coarse buckets — the
+/// value, so the interface can say it in its own language while this crate's
+/// English (`relative_time`, [`Ago::english`]) stays the CLI's and the tests'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ago {
+    /// Under a minute — and a timestamp from the future (a clock moved back).
+    JustNow,
+    Minutes(u64),
+    Hours(u64),
+    Days(u64),
+    Weeks(u64),
+}
+
+impl Ago {
+    /// The English, `5m ago` and its siblings.
+    pub fn english(self) -> String {
+        match self {
+            Ago::JustNow => "just now".to_string(),
+            Ago::Minutes(n) => format!("{n}m ago"),
+            Ago::Hours(n) => format!("{n}h ago"),
+            Ago::Days(n) => format!("{n}d ago"),
+            Ago::Weeks(n) => format!("{n}w ago"),
+        }
+    }
+}
+
+/// [`Ago`] for a history timestamp, given the current time (both unix millis).
+pub fn ago(ts: u64, now: u64) -> Ago {
+    let secs = now.saturating_sub(ts) / 1000;
+    if secs < 60 {
+        Ago::JustNow
+    } else if secs < 3600 {
+        Ago::Minutes(secs / 60)
+    } else if secs < 86_400 {
+        Ago::Hours(secs / 3600)
+    } else if secs < 7 * 86_400 {
+        Ago::Days(secs / 86_400)
+    } else {
+        Ago::Weeks(secs / (7 * 86_400))
+    }
+}
+
 /// Human "time ago" for a history timestamp, given the current time (both unix
 /// millis). Coarse buckets — seconds / minutes / hours / days / weeks.
 pub fn relative_time(ts: u64, now: u64) -> String {
-    let secs = now.saturating_sub(ts) / 1000;
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else if secs < 7 * 86_400 {
-        format!("{}d ago", secs / 86_400)
-    } else {
-        format!("{}w ago", secs / (7 * 86_400))
-    }
+    ago(ts, now).english()
 }
 
 #[cfg(test)]
@@ -1948,6 +1989,50 @@ mod tests {
         assert_eq!(
             preview("SELECT *\n  FROM   film\nWHERE id = 1"),
             "SELECT * FROM film WHERE id = 1"
+        );
+    }
+
+    /// **The interval as a value**, so the interface can say it in its own
+    /// language: the same coarse buckets `relative_time` writes, and
+    /// `relative_time` is its English.
+    #[test]
+    fn ago_is_the_bucket_relative_time_writes() {
+        let now = 10_000_000_000;
+        assert_eq!(ago(now, now), Ago::JustNow);
+        assert_eq!(ago(now - 59_000, now), Ago::JustNow);
+        assert_eq!(ago(now - 5 * 60_000, now), Ago::Minutes(5));
+        assert_eq!(ago(now - 3 * 3_600_000, now), Ago::Hours(3));
+        assert_eq!(ago(now - 2 * 86_400_000, now), Ago::Days(2));
+        assert_eq!(ago(now - 14 * 86_400_000, now), Ago::Weeks(2));
+        // A timestamp from the future (a clock moved back) is "just now".
+        assert_eq!(ago(now + 5_000, now), Ago::JustNow);
+        for back in [0, 61_000, 7_200_000, 90_000_000, 2_000_000_000] {
+            assert_eq!(
+                relative_time(now - back, now),
+                ago(now - back, now).english()
+            );
+        }
+    }
+
+    /// **`outcome_line_with` composes; the caller words the count.** The
+    /// English `outcome_line` is that composition with English words, so the
+    /// facts, whether a count is capped and the separators stay one decision —
+    /// the `+` that marks it is the caller's wording.
+    #[test]
+    fn outcome_line_takes_its_row_words_from_the_caller() {
+        let words = |n: u64, capped: bool| format!("{n}{} Zeilen", if capped { "+" } else { "" });
+        assert_eq!(
+            outcome_line_with(&finished(Some(100), false, true), words).as_deref(),
+            Some("5ms · 100 Zeilen")
+        );
+        assert_eq!(
+            outcome_line_with(&finished(Some(200_000), true, true), words).as_deref(),
+            Some("5ms · 200000+ Zeilen")
+        );
+        // A failure keeps its trailing separator and counts nothing.
+        assert_eq!(
+            outcome_line_with(&finished(Some(9), false, false), words),
+            outcome_line(&finished(Some(9), false, false))
         );
     }
 

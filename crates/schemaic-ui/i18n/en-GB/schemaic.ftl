@@ -705,3 +705,24 @@ props-section-indexes = Indexes
 # $pct is a whole-number percentage. VACUUM is a SQL keyword.
 props-vacuum-note = { $pct }% of this table's row versions are dead and not yet reclaimed. A VACUUM would return that space.
 props-copy = Copy
+
+## Shared panel search box
+
+panel-search-placeholder = Search…
+
+## How long ago — history::ago's buckets (English must read as core's relative_time)
+
+ago-just-now = just now
+ago-minutes = { $n }m ago
+ago-hours = { $n }h ago
+ago-days = { $n }d ago
+ago-weeks = { $n }w ago
+
+## A history row's outcome line — the row count (core composes the line)
+
+outcome-rows = { $n ->
+    [one] { $n } row
+   *[other] { $n } rows
+}
+# The fetch stopped at its cap: "at least this many", so always plural.
+outcome-rows-capped = { $n }+ rows

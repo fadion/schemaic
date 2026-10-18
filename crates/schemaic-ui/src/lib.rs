@@ -9964,10 +9964,7 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
         }];
         let mut foot: Vec<String> = Vec::new();
         if panel.ran_at > 0 {
-            foot.push(schemaic_core::history::relative_time(
-                panel.ran_at,
-                now_secs(),
-            ));
+            foot.push(crate::i18n::relative_time(panel.ran_at, now_secs()));
         }
         if let QueryState::Loaded(rs) = &panel.state {
             foot.push(schemaic_core::stats::format_bytes(

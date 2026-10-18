@@ -5067,12 +5067,10 @@ fn history_items(
             // on the database or tab name).
             let line = schemaic_core::body_search::body_snippet(&entry.sql, needle)
                 .unwrap_or_else(|| history::preview(&entry.sql).chars().take(60).collect());
-            // `relative_time` is core's prose ("5 min ago"), English until
-            // locale formatting (roadmap phase 7).
             let mut secondary = format!(
                 "{} · {}",
                 tr!("palette-row-history"),
-                history::relative_time(entry.ts, now)
+                crate::i18n::relative_time(entry.ts, now)
             );
             if let Some(db) = &entry.database {
                 secondary.push_str(" · ");

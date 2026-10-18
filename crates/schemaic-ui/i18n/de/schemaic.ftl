@@ -650,3 +650,29 @@ props-section-partitioning = Partitionierung
 props-section-indexes = Indizes
 props-vacuum-note = { $pct } % der Zeilenversionen dieser Tabelle sind tot und noch nicht freigegeben. Ein VACUUM würde diesen Platz zurückgeben.
 props-copy = Kopieren
+
+## Shared panel search box
+
+panel-search-placeholder = Suchen…
+
+## How long ago
+
+ago-just-now = gerade eben
+ago-minutes = vor { $n } Min.
+ago-hours = vor { $n } Std.
+ago-days = { $n ->
+    [one] vor { $n } Tag
+   *[other] vor { $n } Tagen
+}
+ago-weeks = { $n ->
+    [one] vor { $n } Woche
+   *[other] vor { $n } Wochen
+}
+
+## A history row's outcome line
+
+outcome-rows = { $n ->
+    [one] { $n } Zeile
+   *[other] { $n } Zeilen
+}
+outcome-rows-capped = { $n }+ Zeilen

@@ -119,7 +119,9 @@ assertions pin English wording — stays the regression net throughout.
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
    `ObjectKind`, `history::Bucket` (`history_panel::bucket_title`), `activity::KillKind`
-   (`activity_panel::kill_label`) and `chart::ChartKind` (`chart_view::chart_kind_label`);
+   (`activity_panel::kill_label`) and `chart::ChartKind` (`chart_view::chart_kind_label`). Where a
+   core function composes a line around one counted word, it takes the word from the caller
+   instead (`history::outcome_line_with`, which `i18n::outcome_line` calls);
    `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
    like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English.
@@ -130,7 +132,9 @@ assertions pin English wording — stays the regression net throughout.
    Roughly sixty fixed-width boxes sit beside text — the connection form, the import and compare
    panes, the find bar, `widgets::fact_row`'s fixed label column — and each either measures its
    text or ellipsises. The pseudo-locale (`SCHEMAIC_LOCALE=pseudo`) finds them.
-7. **Locale formatting** — thousands separators, decimals, `history::relative_time`'s "… ago".
+7. **Locale formatting** — thousands separators and decimals. (The "… ago" is done: core's
+   `history::ago` is the interval as a value, `i18n::relative_time` says it in the interface's
+   language, and `relative_time` stays core's English.)
    Nothing is locale-aware today. Decide whether it is worth `icu4x` before starting.
 
 ### Data in any script — in scope regardless of locale

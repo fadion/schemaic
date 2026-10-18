@@ -241,7 +241,7 @@ fn snippet_row(
     // worth showing on a row nobody has touched.
     let right = match (snip.source, snip.last_used) {
         (Source::Builtin, _) => tr!("snippets-builtin"),
-        (_, Some(ts)) => schemaic_core::history::relative_time(ts, now_millis()),
+        (_, Some(ts)) => crate::i18n::relative_time(ts, now_millis()),
         (_, None) => String::new(),
     };
     // The abbrev, when it has one — a chip and nothing else. Setting it lives in
@@ -392,6 +392,9 @@ fn snippet_row(
                         .font_size(font_label())
                         .color(theme::text_faint())
                         .padding_horiz(theme::scaled(6.0))
+                        // Air above and below the name, so the outline does not
+                        // sit on the glyphs.
+                        .padding_vert(theme::scaled(2.0))
                         .background(theme::bg_editor())
                         .border(1.0)
                         .border_color(theme::border())

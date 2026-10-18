@@ -11162,7 +11162,7 @@ existing prose was left alone.
     the setting's "follow the operating system", and `UiState::ui_language`'s default; that field is
     a `String`, not the enum, so a key a newer build wrote reads as the system's choice instead of
     failing the whole `ui_state.json`.
-  - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
+  - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`ago`/`relative_time`),
     persisted to `history.json`, capped at `MAX_PER_CONN` (200, was 50) entries per connection.
     **Not higher, because both readers walk all of them**: the history panel builds a highlighted
     row for every visible entry in a `dyn_container` over `banded_list` — no virtual list — and
@@ -11211,7 +11211,11 @@ existing prose was left alone.
     query run twenty minutes ago shouldn't leave "today" because midnight passed. They share
     `relative_time`'s arithmetic on purpose: a row's "3d ago" is read directly under its header,
     and a test pins the two together (exactly — the pin accepted either suffix under EARLIER and
-    was therefore vacuous, since the two functions cross over at the same threshold anyway).
+    was therefore vacuous, since the two functions cross over at the same threshold anyway). That
+    arithmetic is `ago(ts, now)`, which answers an `Ago` (`JustNow`/`Minutes`/`Hours`/`Days`/
+    `Weeks`) rather than text, and `relative_time` is `ago(..).english()`, byte for byte what it
+    wrote before (`ago_is_the_bucket_relative_time_writes`): the value is what lets the interface
+    say "5m ago" in its own language without re-deriving the buckets.
     `push` returns whether it recorded anything, so a credential-bearing statement doesn't cost a
     whole atomic rewrite of the file for nothing, and `drop_runs` deletes the entries of runs that
     never happened: a batch stops at its first failure and reports the rest `Cancelled` without
@@ -11260,7 +11264,10 @@ existing prose was left alone.
     that is already gone should not spend that write. `RunResult::loaded`/
     `failed` own the rows-vs-`affected` choice and the `rows_capped` rule, and `outcome_line` the
     facts line's composition, so both are in core rather than in a view builder: a wrong
-    `rows_capped` writes a number into a log read long after the grid it came from. `preview`
+    `rows_capped` writes a number into a log read long after the grid it came from. That
+    composition is `outcome_line_with(entry, rows)` — which facts, the separators, nothing counted
+    on a failure — with the row count worded by the caller's `rows(count, capped)`; `outcome_line`
+    is it with English words (`outcome_line_takes_its_row_words_from_the_caller`). `preview`
     clamps at `PREVIEW_MAX` while `matches_query` searches the unclamped text, through
     `text_ops::contains_collapsed_ignore_ascii_case` so the collapse the panel draws happens during
     the comparison rather than into a `String` first — `max_height` and
@@ -24705,7 +24712,8 @@ existing prose was left alone.
     `fact_section_owned` is `fact_section` under a heading built at run time — the *Used by* modal's
     *"Views (3)"*, where the count is the heading — and `fact_section` delegates to it, so there is
     still one section view; its title is `impl Into<String>`, for the properties panel's `tr!` headings.
-    Also the right-hand panels' shared list chrome — `panel_search`, `panel_group_header` (a band's
+    Also the right-hand panels' shared list chrome — `panel_search` (its *Search…* is
+    `panel-search-placeholder`, through `FieldCfg::placeholder_of`), `panel_group_header` (a band's
     title and count; its colour and border rulings are on the function) and **`banded_list`, which
     makes those bands sticky**: the band under the top edge keeps its header pinned while its rows
     scroll, and the next header pushes it out as it arrives. It takes `(title, count, rows)` per
@@ -39223,7 +39231,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `history · {relative_time} · {db}`. Those secondary words — *snippet*, *open tab*, *history*,
   *view body*, *{kind} body*, *trigger on {table}* — are the catalogue's (`palette-row-*`), and so
   is the `{kind}` inside them and on an object row's `{database} · {kind}` line
-  (`i18n::object_kind`); `relative_time` is still core's English.
+  (`i18n::object_kind`), and so is the age, through `i18n::relative_time`.
   **Activating a history row opens the statement in a new tab through
   `HistoryActions::open`, exactly as the panel's row does, and does not run it**, so neither tier
   goes anywhere near the write guard. Both glyphs are `text_muted` — `icons::FILE` for a tab and
@@ -39907,6 +39915,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     with a test holding its English equal to core's for every variant
     (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`,
     `english_names_every_kill_as_core_does`, `english_names_every_chart_kind_as_core_does`).
+    Where the word is a phrase core composes rather than a label, core answers with a value or
+    keeps the composition and lets the caller word the part that is language: `history::ago` hands
+    back an `Ago` that `i18n::relative_time` says from `ago-*` (the history and snippet rows, the
+    palette's history rows, a result chip's tooltip), and `history::outcome_line_with` keeps which
+    facts and where the separators go while `i18n::outcome_line` supplies `outcome-rows`/
+    `outcome-rows-capped` — `english_says_ago_and_rows_as_core_does` holding both to core's English.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.
@@ -42674,7 +42688,7 @@ read **once, when the menu opens**, and each entry captures its pair of `DiffSid
   on a text-sized box inside it, and every click outside the words was swallowed (see
   **`.tooltip()` wraps the view** under *Floem 0.2 gotchas*). The query strip is built the same way,
   which is why its tabs never had it. The tooltip carries the full text, the run's
-  age (`history::relative_time`) and — for a loaded one — `ResultSet::retained_bytes`.
+  age (`i18n::relative_time`) and — for a loaded one — `ResultSet::retained_bytes`.
   The last is what makes "keep this result" an informed choice: a pin holds its columns' arenas and
   one 4-byte offset word per cell, which at the 200,000-row default cap is 40 MB across 50 columns
   before a single character of text. Cheap to *hold* (the panel keeps an `Arc`, so nothing is

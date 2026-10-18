@@ -346,7 +346,7 @@ fn history_row(
     let entry_menu = entry.clone();
     let preview = history::preview_for_highlight(&entry.sql, dialect);
     let db = entry.database.clone().unwrap_or_else(|| "—".to_string());
-    let when = history::relative_time(entry.ts, now);
+    let when = crate::i18n::relative_time(entry.ts, now);
     // Key for the DB-identity dot (only drawn when this run's database has a colour).
     let dot_conn = entry.conn_id;
     let dot_db = entry.database.clone();
@@ -456,7 +456,7 @@ fn history_row(
         // The composition is `history::outcome_line`'s, in core beside the
         // `format_duration` it calls and under test; this only paints it.
         let failed = entry.outcome == history::Outcome::Failed;
-        history::outcome_line(&entry).map(|lead| {
+        crate::i18n::outcome_line(&entry).map(|lead| {
             let row = h_stack((
                 text(lead).style(|s| {
                     s.font_size(font_label())

@@ -5629,7 +5629,7 @@ pub(crate) fn panel_search(filter: RwSignal<String>) -> impl IntoView {
     crate::edit_field(
         filter,
         crate::FieldCfg {
-            placeholder: "Search…",
+            placeholder_of: Some(Rc::new(|| crate::i18n::tr!("panel-search-placeholder"))),
             background: theme::bg_chrome,
             clearable: true,
             ..Default::default()

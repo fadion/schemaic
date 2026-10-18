@@ -182,6 +182,31 @@ pub(crate) fn object_kind_group(kind: schemaic_core::ddl::ObjectKind) -> String 
     }
 }
 
+/// "5m ago" — `history::relative_time` in the interface's language, from the
+/// interval core works out (`history::ago`).
+pub(crate) fn relative_time(ts: u64, now: u64) -> String {
+    use schemaic_core::history::{Ago, ago};
+    match ago(ts, now) {
+        Ago::JustNow => tr!("ago-just-now"),
+        Ago::Minutes(n) => tr!("ago-minutes", n = n),
+        Ago::Hours(n) => tr!("ago-hours", n = n),
+        Ago::Days(n) => tr!("ago-days", n = n),
+        Ago::Weeks(n) => tr!("ago-weeks", n = n),
+    }
+}
+
+/// A history row's outcome line — `history::outcome_line`'s composition, with
+/// the row count worded here.
+pub(crate) fn outcome_line(entry: &schemaic_core::history::HistoryEntry) -> Option<String> {
+    schemaic_core::history::outcome_line_with(entry, |n, capped| {
+        if capped {
+            tr!("outcome-rows-capped", n = n)
+        } else {
+            tr!("outcome-rows", n = n)
+        }
+    })
+}
+
 /// Load `lang`'s catalogue (with `en-GB` behind it, message by message) into
 /// `loader` and set it up. Split from [`init`] so a test can do it to a loader
 /// of its own rather than to the one every other test reads.
@@ -380,6 +405,37 @@ mod tests {
             "23% of this table's row versions are dead and not yet reclaimed. A VACUUM \
              would return that space."
         );
+    }
+
+    /// English says how long ago, and how many rows, exactly as core does.
+    #[test]
+    fn english_says_ago_and_rows_as_core_does() {
+        let now = 10_000_000_000u64;
+        for back in [0u64, 61_000, 7_200_000, 90_000_000, 2_000_000_000] {
+            assert_eq!(
+                relative_time(now - back, now),
+                schemaic_core::history::relative_time(now - back, now)
+            );
+        }
+        // The count words, through the same composition core's English uses.
+        let words = |n: u64, capped: bool| {
+            if capped {
+                tr!("outcome-rows-capped", n = n)
+            } else {
+                tr!("outcome-rows", n = n)
+            }
+        };
+        for (n, capped) in [(0u64, false), (1, false), (100, false), (200_000, true)] {
+            let english = if capped {
+                format!("{n}+ rows")
+            } else {
+                format!(
+                    "{n} {}",
+                    schemaic_core::text::plural(n as usize, "row", "rows")
+                )
+            };
+            assert_eq!(words(n, capped), english);
+        }
     }
 
     #[test]
