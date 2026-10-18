@@ -364,7 +364,7 @@ tree-drop-foreign-key = Fremdschlüssel löschen
 tree-ai-explain = Mit KI erklären
 tree-users = Benutzer und Rechte
 tree-server-variables = Servervariablen
-tree-gear-create-database = Datenbank erstellen
+tree-new-database = Datenbank erstellen
 tree-show-table-sizes = Tabellengrößen anzeigen
 
 ## Connection switcher
@@ -397,3 +397,32 @@ error-modal-title = Fehler
 error-modal-none = Kein Fehler.
 error-modal-ai-fix = KI-Korrektur
 error-modal-explain = Erklären
+
+## Schema tree › the panel
+
+tree-panel-title = SCHEMA
+tree-tip-databases = Datenbanken ein- oder ausblenden
+tree-tip-options = Schema-Optionen
+tree-search-placeholder = Suchen…
+tree-loading = Wird geladen
+tree-no-tables = Keine Tabellen
+tree-failed-to-connect = Verbindung fehlgeschlagen
+tree-failed-view = Anzeigen
+tree-single-user-unread = Einzelbenutzer – nicht gelesen
+tree-single-user-read = Lesen
+tree-count-tables = { $n ->
+    [one] { $n } Tabelle
+   *[other] { $n } Tabellen
+}
+tree-count-cols = { $n ->
+    [one] { $n } Spalte
+   *[other] { $n } Spalten
+}
+tree-count-keys = { $n ->
+    [one] { $n } Schlüssel
+   *[other] { $n } Schlüssel
+}
+tree-count-partitions = { $n ->
+    [one] { $n } Partition
+   *[other] { $n } Partitionen
+}

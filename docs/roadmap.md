@@ -71,17 +71,18 @@ assertions pin English wording — stays the regression net throughout.
    heaviest in `widgets.rs`, `overlays.rs`, `lib.rs`, `grid.rs` and `shortcuts.rs`. Mechanical,
    one file per session, by hand: the rule against scripted edits applies in full.
    `source_gate::no_menu_label_ends_in_an_ellipsis` already reads a `tr!` label's text in every
-   catalogue, and `overlays.rs`'s `menu_order_gate` keys its skeleton on message ids; the mirror
-   of that gate in `schema_tree.rs` still matches English labels and moves to ids with that file.
+   catalogue, and `overlays.rs`'s `menu_order_gate` keys its skeleton on message ids — the one
+   table `schema_tree.rs`'s blank-space menu is placed by too.
    `schemaic-app` has no `i18n.toml` yet and `tr!` is
    `pub(crate)` to `schemaic-ui`; the app's first converted file decides how it reaches the
    loader.
 
-   **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`. A palette command's typed name
-   is its translated label lowercased, and its English name (`Command::id`) matches in every
-   language too, as VS Code's translated palette does. Shared words live under `dialog-*`
-   (Cancel, Yes, No) and the schema tree's menus under `tree-*`, which `schema_tree.rs`'s
-   blank-space menu should reuse for the actions it shares with them.
+   **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`, `schema_tree.rs`. A palette
+   command's typed name is its translated label lowercased, and its English name
+   (`Command::id`) matches in every language too, as VS Code's translated palette does. Shared
+   words live under `dialog-*` (Cancel, Yes, No), and the schema tree's menus and panel under
+   `tree-*`. `section_title` and `loading_dots` take owned text now, so the other panels'
+   headings can follow.
    **How a file goes**, as those settled it: a helper taking
    `&'static str` widens to `impl Into<String>` (every literal caller still compiles); a
    placeholder goes through `FieldCfg::placeholder_of(|| tr!(…))`, whose `placeholder` is still

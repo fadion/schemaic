@@ -10,6 +10,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::i18n::tr;
+
 use floem::AnyView;
 use floem::action::exec_after;
 use floem::event::{Event, EventListener, EventPropagation};
@@ -26,7 +28,6 @@ use schemaic_core::schema::{
     ColumnInfo, ColumnTypeClass, DbSchema, IndexInfo, ObjectItem, SchemaState, TableInfo,
     TableShape, TableSource, classify_column_type, db_visible, name_survives, object_name_matches,
 };
-use schemaic_core::text::plural;
 
 use crate::consts::*;
 use crate::tooltip::TooltipExt;
@@ -1003,7 +1004,7 @@ fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
     .map(|e| {
         let ui = ui.clone();
         let refresh = ui.schema_actions.refresh_schema.clone();
-        widgets::MenuEntry::action(e.label, move || match e.kind {
+        widgets::MenuEntry::action(e.kind.label(), move || match e.kind {
             // The read-only refusal lives in `open_for_new` itself, so every
             // one of this action's four homes is guarded by construction
             // rather than by each remembering to ask.
@@ -1049,11 +1050,36 @@ pub(crate) enum BlankKind {
     ServerVariables,
 }
 
-/// One blank-space entry as data: its label, what it does, and whether it is
-/// inert.
+impl BlankKind {
+    /// The entry's label — the gear's own message for each, since the two
+    /// menus are two homes for the same actions.
+    pub(crate) fn label(self) -> String {
+        match self {
+            BlankKind::CreateDatabase => tr!("tree-new-database"),
+            BlankKind::Refresh => tr!("tree-refresh"),
+            BlankKind::Users => tr!("tree-users"),
+            BlankKind::ServerVariables => tr!("tree-server-variables"),
+        }
+    }
+
+    /// The message id [`BlankKind::label`] draws, for the skeleton gate, which
+    /// places entries by id (`overlays::menu_order_gate::group`).
+    /// `every_blank_entry_label_is_its_id` holds the two together.
+    #[cfg(test)]
+    fn id(self) -> &'static str {
+        match self {
+            BlankKind::CreateDatabase => "tree-new-database",
+            BlankKind::Refresh => "tree-refresh",
+            BlankKind::Users => "tree-users",
+            BlankKind::ServerVariables => "tree-server-variables",
+        }
+    }
+}
+
+/// One blank-space entry as data: what it does, and whether it is inert. Its
+/// label is [`BlankKind::label`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct BlankEntry {
-    pub label: &'static str,
     pub kind: BlankKind,
     pub disabled: bool,
 }
@@ -1119,7 +1145,6 @@ pub(crate) fn blank_space_entries(
     // Never dimmed: re-reading the schema is a read, and a read-only
     // connection is the one most worth re-reading.
     out.push(BlankEntry {
-        label: "Refresh",
         kind: BlankKind::Refresh,
         disabled: false,
     });
@@ -1137,7 +1162,6 @@ pub(crate) fn blank_space_entries(
         // a read-only one: browsing accounts writes nothing, and the write
         // actions inside the browser gate themselves.
         out.push(BlankEntry {
-            label: "Users and privileges",
             kind: BlankKind::Users,
             disabled: down,
         });
@@ -1146,14 +1170,12 @@ pub(crate) fn blank_space_entries(
         // Group 2 beside the browser, and gated as it is: a read, so a down
         // connection dims it and a read-only one does not.
         out.push(BlankEntry {
-            label: "Server variables",
             kind: BlankKind::ServerVariables,
             disabled: down,
         });
     }
     if databases {
         out.push(BlankEntry {
-            label: "Create database",
             kind: BlankKind::CreateDatabase,
             disabled: read_only || down,
         });
@@ -1646,7 +1668,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // the style, leaving `on_move`/`on_resize` on the padded container inside.
     // That box is what the dropdown hangs off; anchoring to a bare glyph would
     // put the menu 3px under the icon's ink rather than under its hitbox.
-    .tooltip(|| text("Show or hide databases").style(crate::widgets::tooltip_style));
+    .tooltip(|| text(tr!("tree-tip-databases")).style(crate::widgets::tooltip_style));
     let gear_hov = RwSignal::new(false);
     // `MENU`, not the sliders every other panel's settings button wears: those
     // open a settings modal and this opens a dropdown, so the same glyph
@@ -1677,7 +1699,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             .padding_horiz(theme::scaled(5.0))
             .padding_vert(theme::scaled(3.0))
     })
-    .tooltip(|| text("Schema options").style(crate::widgets::tooltip_style));
+    .tooltip(|| text(tr!("tree-tip-options")).style(crate::widgets::tooltip_style));
     // Title left, icon group right. `justify_between` pins the group's right edge
     // to the panel edge (a lone flex-grow spacer under-fills here — its default
     // `flex_basis: auto` leaves ~18px unclaimed — so we don't rely on it). The
@@ -1745,19 +1767,23 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         move || reading.get(),
         move |busy| {
             if !busy {
-                return section_title("SCHEMA").into_any();
+                return section_title(tr!("tree-panel-title")).into_any();
             }
             // Same face as `section_title` — it styles the text itself, and
             // this styles the box the dots live in, so the two are set here
             // rather than shared through a helper that would have to return a
             // view either way.
-            container(loading_dots("SCHEMA", theme::text_muted, theme::font_title))
-                .style(|s| {
-                    s.font_bold()
-                        .padding_horiz(theme::scaled(12.0))
-                        .padding_vert(theme::scaled(8.0))
-                })
-                .into_any()
+            container(loading_dots(
+                tr!("tree-panel-title"),
+                theme::text_muted,
+                theme::font_title,
+            ))
+            .style(|s| {
+                s.font_bold()
+                    .padding_horiz(theme::scaled(12.0))
+                    .padding_vert(theme::scaled(8.0))
+            })
+            .into_any()
         },
     );
     let title_row = h_stack((title, icons_group))
@@ -2063,7 +2089,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
             match state {
                 // Animated dots (matches info_row's layout) while the schema loads.
                 SchemaState::Loading => container(loading_dots(
-                    "Loading",
+                    tr!("tree-loading"),
                     theme::text_muted,
                     theme::font_label,
                 ))
@@ -2181,7 +2207,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         return if filtering {
                             objects.into_any()
                         } else if none {
-                            v_stack((info_row("No tables", theme::text_muted), objects))
+                            v_stack((info_row(tr!("tree-no-tables"), theme::text_muted), objects))
                                 .style(|s| s.flex_col())
                                 .into_any()
                         } else {
@@ -2297,10 +2323,7 @@ fn schema_node(
             false,
             1.0,
         ),
-        capsule(format!(
-            "{table_count} {}",
-            plural(table_count, "table", "tables")
-        )),
+        capsule(tr!("tree-count-tables", n = table_count)),
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
     .on_secondary_click_stop({
@@ -2355,7 +2378,7 @@ fn schema_node(
                     return if filtering {
                         objects.into_any()
                     } else if none {
-                        info_row("No tables", theme::text_muted).into_any()
+                        info_row(tr!("tree-no-tables"), theme::text_muted).into_any()
                     } else {
                         objects.into_any()
                     };
@@ -3112,14 +3135,10 @@ fn table_node(
 // and "· P partitions" where it has any.
 fn count_row(cols: usize, keys: usize, parts: usize, indent_levels: u32) -> impl IntoView {
     h_stack((
-        capsule(format!("{cols} {}", plural(cols, "col", "cols"))),
-        capsule(format!("{keys} {}", plural(keys, "key", "keys"))),
+        capsule(tr!("tree-count-cols", n = cols)),
+        capsule(tr!("tree-count-keys", n = keys)),
         if parts > 0 {
-            capsule(format!(
-                "{parts} {}",
-                plural(parts, "partition", "partitions")
-            ))
-            .into_any()
+            capsule(tr!("tree-count-partitions", n = parts)).into_any()
         } else {
             empty().into_any()
         },
@@ -3568,9 +3587,9 @@ fn failed_row(
 ) -> impl IntoView {
     container(
         h_stack((
-            text("Failed to connect")
+            text(tr!("tree-failed-to-connect"))
                 .style(|s| s.color(theme::error()).font_size(theme::font_label())),
-            text("View")
+            text(tr!("tree-failed-view"))
                 .on_click_stop(move |_| {
                     // The server's refusal, so worth an "Explain" — but not a
                     // statement failure, so no "AI fix".
@@ -3613,14 +3632,16 @@ fn failed_row(
 fn unread_row(read: impl Fn() + 'static) -> impl IntoView {
     container(
         h_stack((
-            text("Single-user — not read")
+            text(tr!("tree-single-user-unread"))
                 .style(|s| s.color(theme::text_muted()).font_size(theme::font_label())),
-            text("Read").on_click_stop(move |_| read()).style(|s| {
-                s.color(theme::accent())
-                    .font_size(theme::font_label())
-                    .margin_left(theme::scaled(8.0))
-                    .hover(|s| s.color(theme::accent_hover()))
-            }),
+            text(tr!("tree-single-user-read"))
+                .on_click_stop(move |_| read())
+                .style(|s| {
+                    s.color(theme::accent())
+                        .font_size(theme::font_label())
+                        .margin_left(theme::scaled(8.0))
+                        .hover(|s| s.color(theme::accent_hover()))
+                }),
         ))
         .style(|s| s.flex_row().items_center()),
     )
@@ -3658,7 +3679,7 @@ fn schema_search(filter: RwSignal<String>) -> impl IntoView {
     edit_field(
         filter,
         FieldCfg {
-            placeholder: "Search…",
+            placeholder_of: Some(Rc::new(|| tr!("tree-search-placeholder"))),
             background: theme::bg_chrome,
             clearable: true,
             ..Default::default()
@@ -4896,11 +4917,54 @@ mod tests {
 
     use schemaic_core::intel::SqlDialect;
 
-    fn blank_labels(d: SqlDialect, read_only: bool) -> Vec<&'static str> {
+    fn blank_labels(d: SqlDialect, read_only: bool) -> Vec<String> {
         blank_space_entries(d, read_only, true, false)
             .into_iter()
-            .map(|e| e.label)
+            .map(|e| e.kind.label())
             .collect()
+    }
+
+    /// **The count capsules say what `text::plural` said**, for every count
+    /// that picks a form: one, none and many. They were a number spliced
+    /// before `plural(n, "table", "tables")` and are now one Fluent plural
+    /// each, written over several lines of the catalogue.
+    #[test]
+    fn the_count_capsules_read_as_they_did() {
+        use crate::i18n::tr;
+        use schemaic_core::text::plural;
+        for n in [0usize, 1, 2, 12] {
+            assert_eq!(
+                tr!("tree-count-tables", n = n),
+                format!("{n} {}", plural(n, "table", "tables"))
+            );
+            assert_eq!(
+                tr!("tree-count-cols", n = n),
+                format!("{n} {}", plural(n, "col", "cols"))
+            );
+            assert_eq!(
+                tr!("tree-count-keys", n = n),
+                format!("{n} {}", plural(n, "key", "keys"))
+            );
+            assert_eq!(
+                tr!("tree-count-partitions", n = n),
+                format!("{n} {}", plural(n, "partition", "partitions"))
+            );
+        }
+    }
+
+    /// The id the skeleton gate places an entry by is the message its label
+    /// draws — or the gate would be ordering one entry and the menu showing
+    /// another.
+    #[test]
+    fn every_blank_entry_label_is_its_id() {
+        for kind in [
+            BlankKind::CreateDatabase,
+            BlankKind::Refresh,
+            BlankKind::Users,
+            BlankKind::ServerVariables,
+        ] {
+            assert_eq!(kind.label(), crate::i18n::LOADER.get(kind.id()), "{kind:?}");
+        }
     }
 
     /// Four entries, and all four about the panel rather than about anything
@@ -5051,8 +5115,8 @@ mod tests {
     /// The labels an entry list carries, in order — asserted on rather than
     /// indices, so a third entry cannot silently shift what the older tests
     /// below were checking.
-    fn labels(entries: &[BlankEntry]) -> Vec<&'static str> {
-        entries.iter().map(|e| e.label).collect()
+    fn labels(entries: &[BlankEntry]) -> Vec<String> {
+        entries.iter().map(|e| e.kind.label()).collect()
     }
 
     /// Is the entry with this label dimmed? **Panics when it is absent**, which
@@ -5061,7 +5125,7 @@ mod tests {
     fn disabled(entries: &[BlankEntry], label: &str) -> bool {
         entries
             .iter()
-            .find(|e| e.label == label)
+            .find(|e| e.kind.label() == label)
             .unwrap_or_else(|| panic!("no `{label}` entry in {:?}", labels(entries)))
             .disabled
     }
@@ -5076,23 +5140,25 @@ mod tests {
     /// cross-group drift the gate exists to catch.
     ///
     /// Asserted over the values rather than over the source, because unlike the
-    /// context menus these entries *are* data.
+    /// context menus these entries *are* data — and placed by **that gate's own
+    /// table**, by message id, rather than by a copy of its numbers kept here:
+    /// a copy keyed on English labels could disagree with it in silence.
     #[test]
     fn blank_space_is_a_subsequence_of_the_skeleton() {
-        // The skeleton groups these two labels sit in — the numbers in
-        // `overlays::menu_order_gate::group`, which this must not disagree with.
-        let group = |label: &str| match label {
-            "Refresh" | "Users and privileges" | "Server variables" => 2,
-            "Create database" => 4,
-            other => panic!(
-                "`{other}` has no place in the menu skeleton — put it in a group in                  `overlays::menu_order_gate::group` first, and mirror the number here"
-            ),
+        let group = |kind: BlankKind| {
+            crate::overlays::menu_order_gate::group(kind.id()).unwrap_or_else(|| {
+                panic!(
+                    "`{}` has no place in the menu skeleton — put it in a group in \
+                     `overlays::menu_order_gate::group` first",
+                    kind.id()
+                )
+            })
         };
         for d in SqlDialect::ALL {
             for read_only in [false, true] {
                 let groups: Vec<u8> = blank_space_entries(d, read_only, true, false)
                     .iter()
-                    .map(|e| group(e.label))
+                    .map(|e| group(e.kind))
                     .collect();
                 assert!(
                     groups.windows(2).all(|w| w[0] <= w[1]),

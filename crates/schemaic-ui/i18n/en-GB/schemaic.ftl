@@ -389,7 +389,8 @@ tree-drop-foreign-key = Drop foreign key
 tree-ai-explain = AI explain
 tree-users = Users and privileges
 tree-server-variables = Server variables
-tree-gear-create-database = Create database
+# The gear's and the tree's blank-space entry; under Create ▸ it is just "Database".
+tree-new-database = Create database
 tree-show-table-sizes = Show table sizes
 
 ## Connection switcher
@@ -423,3 +424,35 @@ error-modal-title = Error
 error-modal-none = No error.
 error-modal-ai-fix = AI fix
 error-modal-explain = Explain
+
+## Schema tree › the panel
+
+tree-panel-title = SCHEMA
+tree-tip-databases = Show or hide databases
+tree-tip-options = Schema options
+tree-search-placeholder = Search…
+tree-loading = Loading
+tree-no-tables = No tables
+tree-failed-to-connect = Failed to connect
+# Opens the full error, as the editor's and the grid's error bars do.
+tree-failed-view = View
+# A single-user database the load left unread on purpose.
+tree-single-user-unread = Single-user — not read
+tree-single-user-read = Read
+# The capsules beside a database or namespace, and under a table.
+tree-count-tables = { $n ->
+    [one] { $n } table
+   *[other] { $n } tables
+}
+tree-count-cols = { $n ->
+    [one] { $n } col
+   *[other] { $n } cols
+}
+tree-count-keys = { $n ->
+    [one] { $n } key
+   *[other] { $n } keys
+}
+tree-count-partitions = { $n ->
+    [one] { $n } partition
+   *[other] { $n } partitions
+}

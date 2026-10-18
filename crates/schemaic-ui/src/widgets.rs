@@ -5601,8 +5601,8 @@ pub(crate) fn control_surface(s: floem::style::Style) -> floem::style::Style {
         .border_radius(CONTROL_RADIUS)
 }
 
-pub(crate) fn section_title(t: &'static str) -> impl IntoView {
-    text(t).style(|s| {
+pub(crate) fn section_title(t: impl Into<String>) -> impl IntoView {
+    text(t.into()).style(|s| {
         s.font_size(theme::font_title())
             .font_bold()
             .color(theme::text_muted())
@@ -6185,10 +6185,12 @@ pub(crate) fn loading_dots_w(prefix: &str, px: f32) -> f64 {
 /// stops when the view's scope is disposed (`try_update` → `None`), so it can't
 /// outlive a `dyn_container` rebuild (same pattern as the AI elapsed timer).
 pub(crate) fn loading_dots(
-    prefix: &'static str,
+    prefix: impl Into<String>,
     color: fn() -> floem::peniko::Color,
     font_size: fn() -> f32,
 ) -> impl IntoView {
+    // Shared, not cloned per tick: the label is rebuilt on every step.
+    let prefix: Rc<str> = prefix.into().into();
     let step = RwSignal::new(1usize);
     // Reserve the full `prefix...` width up front so the label keeps a fixed size
     // as the dots cycle (1→2→3) — otherwise it reflows, jittering when centred (the
@@ -6214,12 +6216,13 @@ pub(crate) fn loading_dots(
     dyn_container(
         move || step.get(),
         move |n| {
+            let prefix = prefix.clone();
             text(format!("{prefix}{}", ".".repeat(n)))
                 .style(move |s| {
                     let px = font_size();
                     s.color(color())
                         .font_size(px)
-                        .min_width(loading_dots_w(prefix, px))
+                        .min_width(loading_dots_w(&prefix, px))
                 })
                 .into_any()
         },

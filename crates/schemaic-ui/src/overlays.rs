@@ -1371,7 +1371,7 @@ impl GearKind {
             GearKind::CollapseAll => tr!("tree-collapse-all"),
             GearKind::Users => tr!("tree-users"),
             GearKind::ServerVariables => tr!("tree-server-variables"),
-            GearKind::CreateDatabase => tr!("tree-gear-create-database"),
+            GearKind::CreateDatabase => tr!("tree-new-database"),
             GearKind::ShowTableSizes => tr!("tree-show-table-sizes"),
         }
     }
@@ -8318,7 +8318,7 @@ mod sqlite_create_menu_tests {
 /// afterwards — which rewrites every arm of a 700-line `match` and is a change to
 /// make with the app running.
 #[cfg(test)]
-mod menu_order_gate {
+pub(crate) mod menu_order_gate {
     use std::path::{Path, PathBuf};
 
     fn this_file() -> PathBuf {
@@ -8618,7 +8618,10 @@ fn ",
     /// **Keyed on message ids**, not on what the entries say: the builder spells
     /// every label `tr!("tree-…")`, so the first literal the scan reads is the
     /// id — which is also what keeps this table true in every language.
-    fn group(label: &str) -> Option<u8> {
+    ///
+    /// **One table for every menu.** `schema_tree`'s blank-space menu places
+    /// its entries by asking this function, rather than mirroring its numbers.
+    pub(crate) fn group(label: &str) -> Option<u8> {
         Some(match label {
             // 1. Open — what a double-click would have done.
             "tree-open-in-cli" | "tree-open" | "tree-open-in-new-tab" => 1,
@@ -8649,7 +8652,7 @@ fn ",
             | "tree-generate-ddl"
             // Not a context-menu row today — it is raised from the SCHEMA gear
             // and from the tree's blank space, and `schema_tree`'s own half of
-            // this gate mirrors the number from here. It is in the table because
+            // this gate asks this table for its number. It is in the table because
             // that is what the table is for: a label with no group fails, so a
             // second menu cannot place an entry this one has never heard of.
             | "tree-users"
@@ -8696,7 +8699,10 @@ fn ",
             | "tree-truncate"
             | "tree-drop"
             | "tree-drop-index"
-            | "tree-drop-foreign-key" => 4,
+            | "tree-drop-foreign-key"
+            // The gear's and the blank space's `Create database` — not a
+            // context-menu row, in the table for `tree-users`' reason above.
+            | "tree-new-database" => 4,
             _ => return None,
         })
     }

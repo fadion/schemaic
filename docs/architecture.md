@@ -28480,8 +28480,9 @@ existing prose was left alone.
     test module could not reach it, while its sibling had already been split out after an ordering
     inversion no test could see. `GearEntry` carries a `GearKind` discriminant rather than a bare
     label, for `BlankKind`'s reason: routing on the string with a catch-all arm makes a sixth entry
-    render as a row that does nothing. It now carries no label at all, and neither does
-    `CreateEntry`: `GearKind::label()` and `CreateKind::label()` draw it from the kind, so an entry
+    render as a row that does nothing. It now carries no label at all, and neither do
+    `CreateEntry` and `BlankEntry`: `GearKind::label()`, `CreateKind::label()` and
+    `BlankKind::label()` draw it from the kind, so an entry
     holds no text a test or a route could key on, and the tests read `e.kind.label()`. **Whether a row is *inert* is a second question with a
     different lifetime, and that is why it is `GearKind::disabled_when(read_only, down)` rather than
     a field `gear_entries` fills.** Which rows exist is settled when the menu opens — the engine's
@@ -29093,6 +29094,18 @@ existing prose was left alone.
     `BUDGET`'s said it was carried "for `table_colors` alone" (true of half of `table_node`). It
     was reached in three functions for six things, one of them an `active_conn` the struct already
     had a field for. Nothing checks a comment; the field list is checked by the compiler.
+    **Every word the panel writes itself comes from the catalogue** (`tree-*`, roadmap phase 3):
+    the `SCHEMA` title, in the loading dots too; the two header tooltips; the search placeholder,
+    through `FieldCfg::placeholder_of`; *Loading*, *No tables*, `failed_row`'s *Failed to connect*
+    and *View*; `unread_row`'s text and *Read* link; and the count capsules. Those were a number
+    spliced before `text::plural(n, "table", "tables")` and are now one Fluent plural each
+    (`tree-count-tables`/`-cols`/`-keys`/`-partitions`); `the_count_capsules_read_as_they_did`
+    pins each against
+    `plural`'s output at 0, 1, 2 and 12. For the title, `widgets::section_title` and
+    `widgets::loading_dots` take `impl Into<String>` (the dots hold the prefix as an `Rc<str>`),
+    so every literal caller elsewhere still compiles. **Two things stay English on purpose**: the
+    key row's `UNIQUE`/`FOREIGN`/`INDEX` tags, which are SQL keywords, and the AI-explain prompts,
+    AI text being English throughout.
     **The filter box's text is the app's signal, `SchemaUi::schema_filter`, not the panel's**,
     because it outlives the session (`UiState::schema_filter`); it was a panel-local
     `RwSignal::new(String::new())` until the filter was persisted. The debounced `filter` mirror the
@@ -29147,7 +29160,11 @@ existing prose was left alone.
     out to be asserted like `overlays::create_children`, and it returns `BlankEntry`s carrying a
     `BlankKind` rather than bare labels, because the builder routes on the discriminant: on labels
     with a catch-all arm a third entry falls into whichever branch was written last and renders as
-    a live row that does nothing.
+    a live row that does nothing. A `BlankEntry` is `{ kind, disabled }` and holds no text:
+    `BlankKind::label()` draws it from the kind, out of the SCHEMA gear's own messages
+    (`tree-refresh`, `tree-users`, `tree-server-variables`, `tree-new-database`), since the two
+    menus are two homes for the same actions. `tree-new-database` was `tree-gear-create-database`
+    until both menus used it; under Create ▸ the entry is the noun alone, `tree-create-database`.
     **The early return now asks whether the engine has anything here beyond `Refresh`** —
     `databases || users || settings`, where it first asked `supports_database_editing` alone. **That
     is the rule SQLite's menu is held to, and it now passes it**: having neither a database to
@@ -29169,7 +29186,8 @@ existing prose was left alone.
     gated the same way, being a read of the server too.
     `blank_space_is_a_subsequence_of_the_skeleton` is
     this menu's own half of `overlays::menu_order_gate`, which cannot see a menu built in this file,
-    and walks every dialect in `SqlDialect::ALL`, SQLite's menu included;
+    and walks every dialect in `SqlDialect::ALL`, SQLite's menu included, placing each entry by
+    that gate's own `group` table rather than a copy of it;
     see that gate for what it does and does not reach. The tests look entries up **by label**
     (`labels`/`disabled`, the second panicking when the row is absent) rather than by index, so a
     new entry cannot silently shift what an older assertion checks, and an assertion about a row
@@ -39799,8 +39817,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     indent lands on the pixel the glyphs it aligns under actually occupy — at 80% those differ by one.
 - **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
   value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). The Settings modal
-  (`settings.rs`), the shortcut table it draws (`shortcuts.rs`) and the popups of `overlays.rs`
-  are converted; every other
+  (`settings.rs`), the shortcut table it draws (`shortcuts.rs`), the popups of `overlays.rs` and
+  the schema panel (`schema_tree.rs`) are converted; every other
   label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is
@@ -41965,11 +41983,16 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   the gate in `schema_tree::blank_space_is_a_subsequence_of_the_skeleton`, asserted over the entry
   **values** rather than over the source, since unlike the context menus those entries are data,
   and walked for every dialect in `SqlDialect::ALL`. It
-  mirrors the group number for each of its labels from `group` here by hand — still by English
-  label, `schema_tree.rs` not being converted, against the ids here — which is why
-  `Users and privileges` and `Server variables` (group 2 both, the second a read of the server
-  like the first) are in this table at all: neither is **a context-menu row today**, but an
-  unknown label fails, so a second menu cannot place an entry this one has never heard of. The
+  places each entry by calling `group` here with the entry's message id (`BlankKind::id`, test-only)
+  — which is why `menu_order_gate` is a `pub(crate) mod` and `group` a `pub(crate) fn`. It used to
+  mirror the numbers by hand, keyed on English labels against this table's ids, and a copy like
+  that can disagree with the original in silence; now there is one table for every menu, and
+  `every_blank_entry_label_is_its_id` holds the id to the message `BlankKind::label` actually
+  draws, or the gate would be ordering one entry while the menu showed another. That is why
+  `tree-users`, `tree-server-variables` (group 2 both, the second a read of the server like the
+  first) and `tree-new-database` (group 4) are in this table at all: none is **a context-menu row
+  today**, but an unknown id fails, so a second menu cannot place an entry this one has never
+  heard of. The
   vacuity guard (`arms.len() == 7`) counts arms of the builder the gate already reads, so it cannot
   notice a third source either.
   **`Export` is the one label the gate skips outright**, and it is an exemption rather than a third
