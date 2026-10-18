@@ -1579,7 +1579,7 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
 /// was false in the chrome every modal wears. (The shared error modal is a
 /// fifth when it shows one of Schemaic's own notices, which offers no action.)
 pub(crate) fn modal_title(
-    title: &'static str,
+    title: impl Into<String>,
     close: Rc<dyn Fn()>,
     ring: FocusRing,
 ) -> impl IntoView {

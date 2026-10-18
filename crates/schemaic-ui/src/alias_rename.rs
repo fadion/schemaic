@@ -15,6 +15,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use schemaic_core::intel::AliasRenameRefusal;
 
+use crate::i18n::tr;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
     form_setting, modal_footer, modal_pad_h, modal_title, modal_w, panel_style,
@@ -28,8 +29,8 @@ use crate::{FieldCfg, edit_field, theme};
 pub struct AliasRenameRequest {
     /// What is renamed, as the dialog's title and field say it — *Rename
     /// alias* and *Rename CTE* share the dialog.
-    pub title: &'static str,
-    pub placeholder: &'static str,
+    pub title: String,
+    pub placeholder: String,
     pub name: String,
     pub apply: AliasRenameApply,
     /// Gives the keyboard back to the editor, however the dialog closes —
@@ -88,11 +89,14 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
             let submit = rename.clone();
             let form = v_stack((
                 form_setting(
-                    "New name",
+                    tr!("alias-rename-new-name"),
                     edit_field(
                         name,
                         FieldCfg {
-                            placeholder: req.placeholder,
+                            placeholder_of: Some(Rc::new({
+                                let p = req.placeholder.clone();
+                                move || p.clone()
+                            })),
                             focus: Some((ring.clone(), 10)),
                             autofocus: true,
                             on_submit: Some(Rc::new(move || (submit)())),
@@ -135,7 +139,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
                     let cancel = cancel.clone();
                     h_stack((
                         action_button(
-                            "Cancel",
+                            tr!("dialog-cancel"),
                             ActionKind::Neutral,
                             true,
                             ring_actions.clone(),
@@ -143,7 +147,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
                             move || cancel(),
                         ),
                         action_button(
-                            "Rename",
+                            tr!("alias-rename-rename"),
                             ActionKind::Primary,
                             ready,
                             ring_actions.clone(),
@@ -157,7 +161,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
             ));
 
             let panel = v_stack((
-                modal_title(req.title, close.clone(), root_ring.clone()),
+                modal_title(req.title.clone(), close.clone(), root_ring.clone()),
                 form,
                 footer,
             ))

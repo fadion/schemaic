@@ -26260,6 +26260,15 @@ existing prose was left alone.
     any of them is open, `ddl_modals_up` has an `alias_rename` arm, and the file is on
     `PAINTS_A_BACKDROP`. Left out of the predicate it would paint nothing, for the reason the snippet
     editor's entry gives.
+    **Its words are the catalogue's** (`alias-rename-*`, roadmap phase 3) — *New name* and Rename
+    here; Cancel is the shared `dialog-cancel`. The two titles and placeholders belong to the
+    openers: `AliasRenameRequest::title` and `placeholder` are `String`s (they were
+    `&'static str`), and the editor's two entries in `editor_pane.rs`, its only constructors, pass
+    `alias-rename-title-alias`/`-cte` and `alias-rename-placeholder-alias`/`-cte` ahead of that
+    file's own conversion. The placeholder reaches the field through `FieldCfg::placeholder_of`, and
+    the title goes to `widgets::modal_title`, which takes `impl Into<String>` — this was its last
+    caller with a `&'static str`. A refusal's text is `AliasRenameRefusal::message`, core's prose,
+    left for phase 4. No test: nothing here is composed.
   - `usages_view.rs` — the SQL editor's *Find usages* list (`usages_overlay`, raised by
     `OverlayUi::usages` with a `UsagesRequest`, which `lib.rs` re-exports for the app): a modal
     titled *N usages of name* (*usage* for one), whose rows are a line number and that line's text
@@ -40284,8 +40293,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`erd_view.rs`), Server variables (`server_vars_view.rs`), the snippet editor
   (`snippet_edit.rs`), the Query plan modal (`plan_view.rs`), the Used by modal
   (`used_by_view.rs`), the interface themes' names (`themes.rs`), the AI panel's reply
-  renderer's own controls (`markdown.rs`) and the grid's cell pickers and calendar
-  (`cell_editors.rs`) are converted;
+  renderer's own controls (`markdown.rs`), the grid's cell pickers and calendar
+  (`cell_editors.rs`) and the Rename alias / Rename CTE dialog (`alias_rename.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

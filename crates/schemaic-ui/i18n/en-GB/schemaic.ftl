@@ -1849,3 +1849,13 @@ cell-weekday-thu = Th
 cell-weekday-fri = Fr
 cell-weekday-sat = Sa
 cell-weekday-sun = Su
+
+## Rename alias / Rename CTE dialog (alias_rename.rs; its two openers are the
+## editor's menu entries in editor_pane.rs). CTE is a SQL term.
+
+alias-rename-title-alias = Rename alias
+alias-rename-title-cte = Rename CTE
+alias-rename-placeholder-alias = Alias
+alias-rename-placeholder-cte = CTE name
+alias-rename-new-name = New name
+alias-rename-rename = Rename

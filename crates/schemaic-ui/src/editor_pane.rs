@@ -5554,8 +5554,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         Ok(())
                     };
                     alias_rename.set(Some(crate::AliasRenameRequest {
-                        title: "Rename alias",
-                        placeholder: "Alias",
+                        title: crate::i18n::tr!("alias-rename-title-alias"),
+                        placeholder: crate::i18n::tr!("alias-rename-placeholder-alias"),
                         name,
                         apply: Rc::new(apply),
                         back,
@@ -5596,8 +5596,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         Ok(())
                     };
                     alias_rename.set(Some(crate::AliasRenameRequest {
-                        title: "Rename CTE",
-                        placeholder: "CTE name",
+                        title: crate::i18n::tr!("alias-rename-title-cte"),
+                        placeholder: crate::i18n::tr!("alias-rename-placeholder-cte"),
                         name,
                         apply: Rc::new(apply),
                         back,

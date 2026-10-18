@@ -86,7 +86,8 @@ assertions pin English wording — stays the regression net throughout.
    `dump_view.rs`, `monitor_view.rs`, `result_diff_view.rs`, `ddl_preview.rs`,
    `connection_import.rs`, `blob_view.rs`, `erd_view.rs`, `server_vars_view.rs`,
    `snippet_edit.rs`, `plan_view.rs`, `used_by_view.rs`, `themes.rs` (its one pair, Dark and
-   Light; `tooltip.rs` had nothing a user reads), `markdown.rs`, `cell_editors.rs`; and, ahead
+   Light; `tooltip.rs` had nothing a user reads), `markdown.rs`, `cell_editors.rs`,
+   `alias_rename.rs`; and, ahead
    of their files, the three
    workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
    `editor_pane.rs`'s query header (`query-*`). The schema editors share
@@ -102,7 +103,7 @@ assertions pin English wording — stays the regression net throughout.
    `tree-*`. `section_title` and `loading_dots` take owned text now, so the other panels'
    headings can follow.
    **Left, in order** — delete a name as its file lands: the remaining modals by size,
-   `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`; then the four large files' remainders, `grid.rs`, `lib.rs`,
+   `usages_view.rs`, `erd_raster.rs`; then the four large files' remainders, `grid.rs`, `lib.rs`,
    `widgets.rs` and `editor_pane.rs`, each more than one session; then `schemaic-app`
    (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`, `agent_cli.rs`,
    `antigravity.rs`), whose first file settles how it reaches the loader (above). A file with
