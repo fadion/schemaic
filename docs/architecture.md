@@ -26284,6 +26284,11 @@ existing prose was left alone.
     for the reason `alias_rename.rs` gives. As the tuple element's third member it is in
     `ddl_modals_up` (its `usages` arm) and on `PAINTS_A_BACKDROP`, for the reason the snippet
     editor's entry gives.
+    **Its words are the catalogue's** (`usages-*`, roadmap phase 3) — the title, `usages-title`, is
+    one message with a plural on `$count` and the name as `$name`, where it used to splice *usage*
+    or *usages* into an English sentence; Close is the shared `dialog-close`.
+    `the_title_reads_as_it_did_in_english` pins both numbers. The rows' line numbers and statement
+    text are the buffer's, and stay as they are.
   - `source_gate.rs` — the shared machinery behind the crate's *source gates*:
     the tests that read the crate's own `.rs` files and fail on a spelling production code must not
     contain (a floem `Dropdown`, a captured `Color`, a raw pixel inset, an unguarded `exec_after`,
@@ -40294,7 +40299,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`snippet_edit.rs`), the Query plan modal (`plan_view.rs`), the Used by modal
   (`used_by_view.rs`), the interface themes' names (`themes.rs`), the AI panel's reply
   renderer's own controls (`markdown.rs`), the grid's cell pickers and calendar
-  (`cell_editors.rs`) and the Rename alias / Rename CTE dialog (`alias_rename.rs`) are converted;
+  (`cell_editors.rs`), the Rename alias / Rename CTE dialog (`alias_rename.rs`) and the Find
+  usages list (`usages_view.rs`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

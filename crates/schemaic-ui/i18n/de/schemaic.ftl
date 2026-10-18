@@ -1587,3 +1587,7 @@ alias-rename-placeholder-alias = Alias
 alias-rename-placeholder-cte = Name der CTE
 alias-rename-new-name = Neuer Name
 alias-rename-rename = Umbenennen
+usages-title = { $count ->
+    [one] { $count } Verwendung von { $name }
+   *[other] { $count } Verwendungen von { $name }
+}

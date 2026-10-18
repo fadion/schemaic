@@ -10,6 +10,7 @@ use std::rc::Rc;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
+use crate::i18n::tr;
 use crate::theme;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, NAV_TAB, action_button, cursor_row, dismiss_layer,
@@ -104,7 +105,7 @@ pub(crate) fn usages_overlay(open: RwSignal<Option<UsagesRequest>>) -> impl Into
             );
             let done = close.clone();
             let footer = modal_footer(action_button(
-                "Close",
+                tr!("dialog-close"),
                 ActionKind::Primary,
                 true,
                 ring.clone(),
@@ -113,11 +114,7 @@ pub(crate) fn usages_overlay(open: RwSignal<Option<UsagesRequest>>) -> impl Into
             ));
             let panel = v_stack((
                 modal_title_owned(
-                    format!(
-                        "{n} {} of {}",
-                        if n == 1 { "usage" } else { "usages" },
-                        req.name
-                    ),
+                    tr!("usages-title", count = n, name = req.name.clone()),
                     close.clone(),
                     root_ring.clone(),
                 ),
@@ -154,4 +151,17 @@ fn text_line(t: String) -> impl IntoView {
             .font_size(theme::font_body())
             .text_ellipsis()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::i18n::tr;
+
+    /// The title reads as it did in English before the catalogue, in both
+    /// numbers.
+    #[test]
+    fn the_title_reads_as_it_did_in_english() {
+        assert_eq!(tr!("usages-title", count = 1, name = "o"), "1 usage of o");
+        assert_eq!(tr!("usages-title", count = 5, name = "o"), "5 usages of o");
+    }
 }

@@ -1859,3 +1859,11 @@ alias-rename-placeholder-alias = Alias
 alias-rename-placeholder-cte = CTE name
 alias-rename-new-name = New name
 alias-rename-rename = Rename
+
+## The editor's usages list (usages_view.rs)
+
+# $name is what was looked up (an alias, a CTE, a column).
+usages-title = { $count ->
+    [one] { $count } usage of { $name }
+   *[other] { $count } usages of { $name }
+}
