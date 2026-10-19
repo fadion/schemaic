@@ -2015,29 +2015,29 @@ pub fn account_form_blocker(
     draft: &AccountDraft,
     confirm: &str,
     resetting: bool,
-) -> Option<&'static str> {
+) -> Option<AccountBlocker> {
     if resetting && draft.password.is_empty() {
-        return Some("A password is required.");
+        return Some(AccountBlocker::PasswordRequired);
     }
     if !resetting && draft.name.trim().is_empty() {
-        return Some("A name is required.");
+        return Some(AccountBlocker::NameRequired);
     }
     // An Entra user is signed in by Entra: no login stands behind it and no
     // password is its own. Held back rather than either silently dropped —
     // the fields can hold a value typed before the toggle hid them.
     if !resetting && draft.external {
         if draft.kind != PrincipalKind::User {
-            return Some("Only a database user is made from Microsoft Entra.");
+            return Some(AccountBlocker::EntraOnlyUser);
         }
         if !draft.login.trim().is_empty() || !draft.password.is_empty() {
-            return Some("An Entra user has no login or password here — Entra signs it in.");
+            return Some(AccountBlocker::EntraHasNoPassword);
         }
         return None;
     }
     // A SQL Server login is a SQL login by its password; there is no
     // passwordless one to make here.
     if draft.kind == PrincipalKind::Login && draft.password.is_empty() {
-        return Some("A login needs a password.");
+        return Some(AccountBlocker::LoginNeedsPassword);
     }
     // A SQL Server user `FOR LOGIN` signs in with the login's password; a
     // password of its own is a contained user's, which has no login. Held
@@ -2048,17 +2048,71 @@ pub fn account_form_blocker(
         && !draft.login.trim().is_empty()
         && !draft.password.is_empty()
     {
-        return Some("A user for a login signs in with the login's password — leave this blank.");
+        return Some(AccountBlocker::UserForLoginHasNoPassword);
     }
     if matches!(draft.kind, PrincipalKind::User | PrincipalKind::Login) && draft.password != confirm
     {
         return Some(if confirm.is_empty() {
-            "Type the password again to confirm it."
+            AccountBlocker::ConfirmPassword
         } else {
-            "The two passwords differ."
+            AccountBlocker::PasswordsDiffer
         });
     }
     None
+}
+
+/// What [`account_form_blocker`] holds Preview back for — a value the
+/// interface words; [`Self::message`] is the English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountBlocker {
+    /// A password reset with no password typed.
+    PasswordRequired,
+    /// A new account with no name.
+    NameRequired,
+    /// Microsoft Entra makes a database user and nothing else.
+    EntraOnlyUser,
+    /// An Entra user given a login or a password.
+    EntraHasNoPassword,
+    /// A SQL Server login with no password.
+    LoginNeedsPassword,
+    /// A SQL Server user for a login given a password of its own.
+    UserForLoginHasNoPassword,
+    /// The confirmation is empty.
+    ConfirmPassword,
+    /// The confirmation does not match.
+    PasswordsDiffer,
+}
+
+impl AccountBlocker {
+    /// The footer's sentence in English.
+    pub fn message(self) -> &'static str {
+        match self {
+            AccountBlocker::PasswordRequired => "A password is required.",
+            AccountBlocker::NameRequired => "A name is required.",
+            AccountBlocker::EntraOnlyUser => "Only a database user is made from Microsoft Entra.",
+            AccountBlocker::EntraHasNoPassword => {
+                "An Entra user has no login or password here — Entra signs it in."
+            }
+            AccountBlocker::LoginNeedsPassword => "A login needs a password.",
+            AccountBlocker::UserForLoginHasNoPassword => {
+                "A user for a login signs in with the login's password — leave this blank."
+            }
+            AccountBlocker::ConfirmPassword => "Type the password again to confirm it.",
+            AccountBlocker::PasswordsDiffer => "The two passwords differ.",
+        }
+    }
+
+    /// Every blocker, for the tests that hold a rendering to [`Self::message`].
+    pub const ALL: [AccountBlocker; 8] = [
+        AccountBlocker::PasswordRequired,
+        AccountBlocker::NameRequired,
+        AccountBlocker::EntraOnlyUser,
+        AccountBlocker::EntraHasNoPassword,
+        AccountBlocker::LoginNeedsPassword,
+        AccountBlocker::UserForLoginHasNoPassword,
+        AccountBlocker::ConfirmPassword,
+        AccountBlocker::PasswordsDiffer,
+    ];
 }
 
 /// The New account form's draft and confirmation **as the form shows them** —
@@ -2212,14 +2266,42 @@ pub fn supports_password_verifier(dialect: SqlDialect) -> bool {
 /// previewed SQL — the statement that runs — will show. The one field in the
 /// app whose value can reach a screenshot, so it says so where it is typed.
 pub fn password_hint(dialect: SqlDialect) -> &'static str {
+    password_hint_kind(dialect).message()
+}
+
+/// Which line [`password_hint`] says — the choice, for the interface to word.
+pub fn password_hint_kind(dialect: SqlDialect) -> PasswordHint {
     if supports_password_verifier(dialect) {
-        "The previewed SQL, which is the statement that runs, carries a hash of the \
-         password in the form this server stores, not the password itself — unless it \
-         has characters the login would normalise (full-width letters, ligatures, \
-         no-break spaces), or the server runs a password-check extension, which are \
-         sent as typed."
+        PasswordHint::SentHashed
     } else {
-        "The password appears in the previewed SQL, which is the statement that runs."
+        PasswordHint::SentAsTyped
+    }
+}
+
+/// [`password_hint_kind`]'s answer; [`Self::message`] is the English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordHint {
+    /// The preview carries a verifier, bar the cases sent as typed.
+    SentHashed,
+    /// The preview carries the password itself.
+    SentAsTyped,
+}
+
+impl PasswordHint {
+    /// The line in English.
+    pub fn message(self) -> &'static str {
+        match self {
+            PasswordHint::SentHashed => {
+                "The previewed SQL, which is the statement that runs, carries a hash of the \
+                 password in the form this server stores, not the password itself — unless it \
+                 has characters the login would normalise (full-width letters, ligatures, \
+                 no-break spaces), or the server runs a password-check extension, which are \
+                 sent as typed."
+            }
+            PasswordHint::SentAsTyped => {
+                "The password appears in the previewed SQL, which is the statement that runs."
+            }
+        }
     }
 }
 
@@ -4475,11 +4557,11 @@ mod tests {
         // And the footer says which thing is missing.
         assert_eq!(
             account_form_blocker(&user, "", false),
-            Some("Type the password again to confirm it.")
+            Some(AccountBlocker::ConfirmPassword)
         );
         assert_eq!(
             account_form_blocker(&user, "hunter3", false),
-            Some("The two passwords differ.")
+            Some(AccountBlocker::PasswordsDiffer)
         );
         assert_eq!(account_form_blocker(&user, "hunter2", false), None);
     }
@@ -5182,7 +5264,7 @@ mod mssql_tests {
                     let (shown, confirm) = account_form_as_shown(d, &typed, "px", scope, false);
                     let why = account_form_blocker(&shown, &confirm, false);
                     assert!(
-                        why.is_none_or(|w| !w.to_ascii_lowercase().contains("password")),
+                        why.is_none_or(|w| !w.message().to_ascii_lowercase().contains("password")),
                         "{d:?} {kind:?}: {why:?}"
                     );
                 }
@@ -5226,7 +5308,7 @@ mod mssql_tests {
                 // A login is the login it shows: it still needs its password.
                 assert_eq!(
                     account_form_blocker(&shown, &confirm, false),
-                    Some("A login needs a password.")
+                    Some(AccountBlocker::LoginNeedsPassword)
                 );
             }
         }
@@ -5243,7 +5325,8 @@ mod mssql_tests {
         };
         let (shown, confirm) = account_form_as_shown(MS, &typed_login, "", entra, false);
         assert!(
-            account_form_blocker(&shown, &confirm, false).is_some_and(|w| w.contains("Entra")),
+            account_form_blocker(&shown, &confirm, false)
+                == Some(AccountBlocker::EntraHasNoPassword),
             "the toggle's own blocker stands"
         );
         // A connection that cannot make one never draws it, whatever the kind.

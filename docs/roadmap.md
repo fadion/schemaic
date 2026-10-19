@@ -141,8 +141,7 @@ assertions pin English wording — stays the regression net throughout.
      `secrets::save_connections`' answer; **the SSH tunnel's** `TunnelFailures::refusal`.
    - **The drop and truncate confirms** — `stats::truncate_prompt`, `drop_preview`.
    - **Smaller ones** — `activity::Session::note`; `stats::index_facts`, `unused_note`,
-     `Freshness::note`; `ddl::index_hints`' `message`; `users::password_hint`,
-     `account_form_blocker`, the grants list's `note`; `edit::copy_split_note`;
+     `Freshness::note`; `ddl::index_hints`' `message`; the grants list's `note`; `edit::copy_split_note`;
      `result_diff`'s and the AI panel's summaries.
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text`.

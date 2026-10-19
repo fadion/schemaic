@@ -846,7 +846,10 @@ fn password_row(d: crate::DdlUi, ring: FocusRing, dialect: SqlDialect) -> AnyVie
         // The one field in the app whose value can reach a screenshot, so it
         // says so where it is typed — and per engine, since on PostgreSQL the
         // preview shows a hash instead (`users::password_hint`).
-        text(schemaic_core::users::password_hint(dialect)).style(|s| {
+        text(password_hint_text(
+            schemaic_core::users::password_hint_kind(dialect),
+        ))
+        .style(|s| {
             s.font_size(theme::font_hint())
                 .color(theme::text_faint())
                 .width_full()
@@ -971,7 +974,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                     })
                 },
                 move |missing| match missing {
-                    Some(why) => text(why)
+                    Some(why) => text(account_blocker_text(why))
                         .style(|s| s.color(theme::error()).font_size(theme::font_label()))
                         .into_any(),
                     None => crate::widgets::nothing().into_any(),
@@ -1088,6 +1091,34 @@ fn grant_level_label(level: GrantLevelKind) -> String {
         GrantLevelKind::Schema => tr!("account-editor-level-schema"),
         GrantLevelKind::Table => tr!("account-editor-level-table"),
         GrantLevelKind::Sequence => tr!("account-editor-level-sequence"),
+    }
+}
+
+/// Why the account form holds Preview back — core's
+/// [`AccountBlocker`](schemaic_core::users::AccountBlocker) in the
+/// interface's language.
+fn account_blocker_text(why: schemaic_core::users::AccountBlocker) -> String {
+    use schemaic_core::users::AccountBlocker;
+    match why {
+        AccountBlocker::PasswordRequired => tr!("account-editor-password-required"),
+        AccountBlocker::NameRequired => tr!("account-editor-name-required"),
+        AccountBlocker::EntraOnlyUser => tr!("account-editor-entra-only-user"),
+        AccountBlocker::EntraHasNoPassword => tr!("account-editor-entra-no-password"),
+        AccountBlocker::LoginNeedsPassword => tr!("account-editor-login-needs-password"),
+        AccountBlocker::UserForLoginHasNoPassword => tr!("account-editor-user-for-login-password"),
+        AccountBlocker::ConfirmPassword => tr!("account-editor-confirm-password"),
+        AccountBlocker::PasswordsDiffer => tr!("account-editor-passwords-differ"),
+    }
+}
+
+/// The line under the password field — core's
+/// [`PasswordHint`](schemaic_core::users::PasswordHint) in the interface's
+/// language.
+fn password_hint_text(hint: schemaic_core::users::PasswordHint) -> String {
+    use schemaic_core::users::PasswordHint;
+    match hint {
+        PasswordHint::SentHashed => tr!("account-editor-password-hashed"),
+        PasswordHint::SentAsTyped => tr!("account-editor-password-as-typed"),
     }
 }
 
@@ -2204,6 +2235,19 @@ mod word_tests {
             GrantLevelKind::Sequence,
         ] {
             assert_eq!(grant_level_label(l), l.label(), "{l:?}");
+        }
+    }
+
+    /// Every Preview blocker and both password lines read in English exactly
+    /// as core's `message`.
+    #[test]
+    fn english_says_every_blocker_and_password_line_as_core_does() {
+        use schemaic_core::users::{AccountBlocker, PasswordHint};
+        for why in AccountBlocker::ALL {
+            assert_eq!(account_blocker_text(why), why.message(), "{why:?}");
+        }
+        for hint in [PasswordHint::SentHashed, PasswordHint::SentAsTyped] {
+            assert_eq!(password_hint_text(hint), hint.message(), "{hint:?}");
         }
     }
 

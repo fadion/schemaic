@@ -1292,6 +1292,21 @@ account-editor-section-privileges = Privileges
 account-editor-with-grant-option = With grant option
 account-editor-needs-role = Name a role.
 account-editor-needs-privileges = Pick a level, name what it applies to, and tick a privilege.
+# Why Preview is held back, under the form (core's users::AccountBlocker).
+# Microsoft Entra is a product name.
+account-editor-password-required = A password is required.
+account-editor-name-required = A name is required.
+account-editor-entra-only-user = Only a database user is made from Microsoft Entra.
+account-editor-entra-no-password = An Entra user has no login or password here — Entra signs it in.
+account-editor-login-needs-password = A login needs a password.
+account-editor-user-for-login-password = A user for a login signs in with the login's password — leave this blank.
+account-editor-confirm-password = Type the password again to confirm it.
+account-editor-passwords-differ = The two passwords differ.
+# Under the password field: what of the password the previewed SQL shows
+# (core's users::PasswordHint) — a hash of it on PostgreSQL, the password
+# itself elsewhere.
+account-editor-password-hashed = The previewed SQL, which is the statement that runs, carries a hash of the password in the form this server stores, not the password itself — unless it has characters the login would normalise (full-width letters, ligatures, no-break spaces), or the server runs a password-check extension, which are sent as typed.
+account-editor-password-as-typed = The password appears in the previewed SQL, which is the statement that runs.
 
 ## Table designer
 

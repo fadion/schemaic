@@ -1153,6 +1153,16 @@ account-editor-section-privileges = Berechtigungen
 account-editor-with-grant-option = Mit Grant-Option
 account-editor-needs-role = Nenne eine Rolle.
 account-editor-needs-privileges = Wähle eine Ebene, nenne, worauf sie sich bezieht, und markiere eine Berechtigung.
+account-editor-password-required = Ein Passwort ist erforderlich.
+account-editor-name-required = Ein Name ist erforderlich.
+account-editor-entra-only-user = Aus Microsoft Entra wird nur ein Datenbankbenutzer erstellt.
+account-editor-entra-no-password = Ein Entra-Benutzer hat hier kein Login und kein Passwort — Entra meldet ihn an.
+account-editor-login-needs-password = Ein Login braucht ein Passwort.
+account-editor-user-for-login-password = Ein Benutzer für ein Login meldet sich mit dem Passwort des Logins an — lass dies leer.
+account-editor-confirm-password = Gib das Passwort zur Bestätigung erneut ein.
+account-editor-passwords-differ = Die beiden Passwörter stimmen nicht überein.
+account-editor-password-hashed = Das Vorschau-SQL, also die Anweisung, die ausgeführt wird, enthält einen Hash des Passworts in der Form, die dieser Server speichert, nicht das Passwort selbst — es sei denn, es enthält Zeichen, die die Anmeldung normalisieren würde (Vollbreitenbuchstaben, Ligaturen, geschützte Leerzeichen), oder der Server verwendet eine Passwortprüfungserweiterung; dann wird es wie eingegeben gesendet.
+account-editor-password-as-typed = Das Passwort erscheint im Vorschau-SQL, also in der Anweisung, die ausgeführt wird.
 
 ## Table designer
 

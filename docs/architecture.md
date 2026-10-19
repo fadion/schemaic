@@ -10823,8 +10823,9 @@ existing prose was left alone.
     `rolpassword` PostgreSQL 16.15 stored for `correct horse ~ battery!` as `zz_md5_oracle` under
     `password_encryption = 'md5'`; `md-5` became a direct dependency of core for it, the crate and
     version `postgres-protocol` already had in the lock.
-    `password_hint(dialect)` is the line under the form's password field and says which of the two
-    the preview will show: on a verifier engine a hash in the form this server stores and not the
+    `password_hint(dialect)` is the line under the form's password field (its choice
+    `password_hint_kind`, a `PasswordHint` the interface words) and says which of the two the
+    preview will show: on a verifier engine a hash in the form this server stores and not the
     password, unless it has characters the login would normalise (full-width letters, ligatures,
     no-break spaces) or the server runs a password-check extension; elsewhere the password itself.
     `a_password_saslprep_would_rewrite_is_sent_as_typed_even_when_salted` (`ｆｕｌｌ`) and
@@ -10833,8 +10834,9 @@ existing prose was left alone.
     a salt changes nothing on MySQL, a salted role still takes no clause and a salted blank reset
     still has no statement.
     `account_form_ready(draft, confirm, resetting)` is the account form's Preview gate and
-    `account_form_blocker` the sentence under it — one function behind both, so the button and the
-    reason cannot disagree about what is missing: a reset needs a password ("A password is
+    `account_form_blocker` the reason under it — an `AccountBlocker`, whose `message` is the English
+    and which the interface words — one function behind both, so the button and the reason cannot
+    disagree about what is missing: a reset needs a password ("A password is
     required."), a create a name ("A name is required."), and a user — never a role, which has no
     password row to confirm — a second copy equal to the first ("Type the password again to confirm
     it." while it is empty, "The two passwords differ." once it is not). A create may still leave
@@ -29441,8 +29443,10 @@ existing prose was left alone.
     `empty_note` is a `String`, and the Host and *For login* placeholders go through
     `FieldCfg::placeholder_of`. What stays English: *Microsoft Entra*, a product's name; the
     identifier placeholders (`account_name`, `role_name`, `database_name`, `schema_name`, `name`);
-    the privilege tags, which are SQL keywords; and core's prose — `users::password_hint` and
-    `users::account_form_blocker`'s sentences, phase 4.
+    and the privilege tags, which are SQL keywords. Core's two decisions are worded here:
+    `account_form_blocker` answers an `AccountBlocker` and `password_hint_kind` a `PasswordHint`,
+    which `account_blocker_text` and `password_hint_text` say from `account-editor-*`
+    (`english_says_every_blocker_and_password_line_as_core_does` holds them to core's `message`).
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`). The two roles are drawn **asymmetrically**, and deliberately: the user's
     question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while the assistant's turn
