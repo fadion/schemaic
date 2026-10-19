@@ -4955,7 +4955,7 @@ existing prose was left alone.
     dump's writer loop for the reason `dump_verdict` does: written out at the call site it is a fold
     nothing can test, the caller needing a `Db`, a runtime handle and two channels to reach.
     None of the three is an error — the file is written and the rows in it are real — so the one
-    thing that must not happen is a *surprise* going unsaid, which is `export_note(tally, name,
+    thing that must not happen is a *surprise* going unsaid, which is `export_said(tally, name,
     streaming)`'s job: silent for a clean non-streamed save, and **never silent about any of the
     three losses**. A blanked or cut column is a surprise anywhere — the value was there, the file
     holds less of it than the screen does, and nothing on screen says so.
@@ -4968,8 +4968,9 @@ existing prose was left alone.
     anyone `<7 bytes>` for them; the file has an empty field where the bytes were, which is also how
     every text format writes NULL, and re-importing it writes empty over the blobs.
     Gating the clause on `streaming` looks like the fix and is not, which is the part worth knowing
-    before touching it: **every production caller passes `true`** — the grid's, the dump's and
-    `files_note` alike, because the grid export reports into a modal that stays up until it is
+    before touching it: **every production caller that writes a file passes `true`** — the grid's,
+    the dump's and `files_note` alike (only the grid's clipboard copy passes `false`, having no
+    modal to confirm it), because the grid export reports into a modal that stays up until it is
     dismissed and a confirmation saying nothing about a clean save would be a dialog reporting
     silence. So the flag no longer means "no grid was mounted", and a clause hung on it would read
     as exempting the grid save while exempting nothing. The clause is said unconditionally instead,
@@ -4981,6 +4982,14 @@ existing prose was left alone.
     thing in the sentence. **The tally itself is unchanged** — `withheld` was always populated,
     `has_caveat` has always counted it and the SQL writer's `-- NOTE: binary column … exported as
     NULL` has always read it; it is only the sentence that moved.
+    **The decision is a value and the sentence is its English.** `export_said` answers an
+    `ExportNote` — `rows`, the destination's `name` and the three column lists — and
+    `ExportNote::caveats()` yields each non-empty loss as a `(Caveat, &[String])` in the order it
+    is said, `Withheld`, `Blanked`, `Cut`. Its `Display` is the old sentence, ` — ` before the
+    first caveat and `; ` between, and `export_note` is now only `export_said(…).map(to_string)`,
+    kept for core's tests, the CLI's dump report and `dump::done_note`'s caller. The interface
+    words the value itself (`i18n::export_note`, under *The string catalogue*), so the rules about
+    *what* is said stay here, tested, and only the words move.
     `export_failure_note(message, partial)` is the same rule on the other side, and what it has to
     say changed with `part_path`: the destination is no longer opened until the export succeeds, so
     the sentence is not "your file is a fragment" but `— <name> was not changed; the rows that were
@@ -4992,6 +5001,9 @@ existing prose was left alone.
     pointing at it directs the user to an empty file. Both are pinned across every format by
     `neither_note_points_at_an_empty_sibling`, which asserts the `.part` sentence appears exactly
     where `writes_incrementally` says and that the *destination survived* half is said either way.
+    Neither was given a typed value: their inputs — a message, a name, a flag — are already plain,
+    so the interface words the same arguments (`i18n::export_failure_note`/`export_cancel_note`)
+    and these two stay the English.
     **`part_file(path)` is `part_path` over a whole path** — the sibling with the suffix on its file
     name, a path with no file name coming back unchanged for the create to refuse — lifted from
     `dump::part_of`, then the app's, so that `schemaic export`, a crate with no access to the app,
@@ -5110,7 +5122,8 @@ existing prose was left alone.
     (`withheld_columns_names_the_blob_and_nothing_else`). Its callers are the CLI's
     `format::withheld_warning` and the grid's clipboard renderer `render_order` — Copy ▸ JSON/CSV
     and the gutter's *Copy as* of those — which puts the caveat on `commit_note` through
-    `export_note(…, "the clipboard", false)`; the clipboard used to write `null` or an empty field
+    `export_said(…, "the clipboard", false)` (the destination `export-dest-clipboard` in the
+    interface's language); the clipboard used to write `null` or an empty field
     for a withheld blob and say nothing, and a JSON `null` reads as a NULL.
     **`export_column_in_list(rs, order, ci, dialect)` and `export_values(rs, order, dialect)` are
     two clipboard shapes with no `ExportFormat` variant**, like `export_jsonl`: the enum is matched
@@ -5133,7 +5146,10 @@ existing prose was left alone.
     or *Nothing copied* when nothing was left — and the grid's `sql_copy_text` puts it on
     `commit_note` even when the text is empty
     (`a_binary_columns_in_list_withholds_its_values_and_names_the_column`,
-    `values_tuples_name_the_binary_columns_they_write_as_null`). **Both take `script_literal`, as *Copy as SQL INSERT* does**:
+    `values_tuples_name_the_binary_columns_they_write_as_null`). The decision is `SqlCopy::said`,
+    which answers a `SqlCopyNote` (`AsNull`, `NothingCopied`, `LeftOut`) with the columns; `note`
+    is `said().map(sentence)`, `SqlCopyNote::sentence` the English, and the grid words the value
+    itself (`sql_copy_note`). **Both take `script_literal`, as *Copy as SQL INSERT* does**:
     a copy lands wherever it is pasted, a `sqlcmd` script included, so a SQL Server value holding
     `$(` is cut there as it is in the `INSERT`
     (`the_in_list_and_values_copies_keep_sqlcmd_out_of_a_value`). **And a tuple cannot leave a column
@@ -27204,8 +27220,8 @@ existing prose was left alone.
     slot as the monitor's is kept out. The outcome arms are spelled out as `save_log` spells its
     own — `Done` the grid's sentence, `Cancelled` nothing, `Failed` the pipeline's message as it
     came — because the day `Cancelled` can arrive, reading it as `Done` would claim a file that was
-    never wholly written. **`Done(tally)` speaks through `export::export_note(&tally, &name,
-    true)`**, as the grid's export does: the rows written and any caveat — an XLSX cell cut to the
+    never wholly written. **`Done(tally)` speaks through `export::export_said(&tally, &name,
+    true)`**, worded by `i18n::export_note` as the grid's export is: the rows written and any caveat — an XLSX cell cut to the
     format's limit — which a bare *Saved* would hide in a file that promises whole values. A
     sentence with a caveat (`tally.has_caveat()`) is reported as a failure is, so it stays up rather
     than fading, and after the modal has closed it reaches the shared error modal rather than being
@@ -27932,8 +27948,10 @@ existing prose was left alone.
     the format names (`ExportFormat::label`, a `$format` placeable); the save dialog's file-type
     name `SQL` (`FileSpec::name` is a `&'static str`); and core's prose —
     `dump::drop_before_create_hint`, `fk_guard_hint`, `done_note`, `cancel_note`,
-    `folder_replace_prompt`, `export::export_note`, `export_failure_note` and the `files_*_note`s
-    (phase 4).
+    `folder_replace_prompt`, the `export::export_note` the done line still passes `done_note`, and
+    the `files_*_note`s (phase 4). A single-file dump's failure is already worded here, through
+    `i18n::export_failure_note`; the grid export's outcome lines in the progress box are the
+    grid's, worded the same way (*Data grid*).
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
     designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
@@ -40408,8 +40426,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals, `format_bytes`, the grid's export notes and `dump.rs`'s "Export failed: …" lines,
-    which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
+    translation* — among it `launch::*`'s refusals, `format_bytes`, the dump's and the folder
+    export's notes (`dump::done_note`, `dump::cancel_note`, `export::files_*`) and the dump
+    writers' "Export failed: …" lines, which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
     English too: `KeywordCase::label` (core).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
@@ -40513,6 +40532,20 @@ Re-introducing the anti-patterns these guard against is a regression:
     a `Fn(SessionState) -> &str` — and the counts line takes `ActivitySummary::figure`, the count
     with the `+` a capped list earns, and words the noun from `activity-count-*`
     (`activity_panel.rs`), held by `english_counts_and_names_every_state_as_core_does`.
+    A single-file export's notes are the case of a sentence whose clauses come and go:
+    `export::export_said` answers an `ExportNote` and `i18n::export_note` words it — `export-note-rows`
+    for the head, each `caveats()` entry from `export-note-withheld`/`-blanked`/`-cut` (`$limit`
+    is `XLSX_MAX_CELL_CHARS` passed as a string), joined with `"; "` in code and placed after the
+    head by `export-note-with-caveats` (`$head`, `$caveats`). The failure and cancel notes had no
+    value to type, their inputs being plain already, so `i18n::export_failure_note` and
+    `export_cancel_note` take the same arguments core's do (`export-failure-partial`,
+    `export-cancelled-partial`/`-nothing`), and the grid words `SqlCopy::said` by `sql_copy_words`
+    (`copy-sql-*`). The grid's destinations *the clipboard* and *the file*, a `$name` in those
+    sentences, are `export-dest-clipboard`/`-file`. `english_says_every_export_note_as_core_does`
+    (four row counts, all eight combinations of the three losses, one and two columns),
+    `english_says_every_failed_or_cancelled_export_as_core_does` and
+    `english_says_every_sql_copy_note_as_core_does` (`core_words_tests`) hold the English. As with
+    *Restore from file*, the separator is the code's.
     **A sentence with optional parts is one message with a selector per part, not fragments
     assembled in code** — the lock-wait card's is the pattern. `activity-lock-wait-sentence` takes
     `$waited`/`$held` as an age or as `none` where the server withheld one (no age reads as that),
@@ -40523,8 +40556,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     do.
     **A typed message's renderer lives beside the code that shows it** — `alias_rename.rs`,
     `install_cli.rs`, `settings.rs`, `grid.rs`, the app's `main.rs` — and `ui/i18n.rs` holds only the ones another file or crate
-    calls: `param_error` for the app, and `statement_timeout`, which `settings.rs`,
-    `connection_form.rs` and the app all call.
+    calls: `param_error` for the app, `statement_timeout`, which `settings.rs`,
+    `connection_form.rs` and the app all call, and the three export notes, which `grid.rs`,
+    `result_diff_view.rs` and `dump_view.rs` share.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.
@@ -43661,7 +43695,8 @@ this bundle's.
   it to an empty string. **`render_order` is
   also where a clipboard copy gets its target and its caveat**: an `INSERT` is shaped by
   `export::insert_shape`, so it names the rows' own table rather than the tab's sticky `source`,
-  and a JSON or CSV copy puts `export_note` over `withheld_columns` on `commit_note`, the string
+  and a JSON or CSV copy puts `export_said` over `withheld_columns`, worded by `i18n::export_note`,
+  on `commit_note`, the string
   having nowhere to carry a withheld blob but a `null` that reads as NULL. `save_export` shapes the
   file through `insert_shape` too, **one block at a time**, as `render_order` does. **The saved
   `.sql` file takes `insert_blocks_all` too**, and until it did the clipboard and the file disagreed
@@ -44558,7 +44593,8 @@ this bundle's.
   `ResultSet::capped_columns`, the cells past a column's 512 MiB text arena, which read back as the
   empty string. Nothing had ever read that flag, so a streamed chunk that overran the arena wrote a
   file with holes in it and reported a full row count. The success sentence is
-  `export::export_note(&tally, &name, true)` and it goes into the modal's `done`. **The `true` is a
+  `export::export_said(&tally, &name, true)`, worded by `i18n::export_note` — `name` being
+  `export-dest-file` for a path with no file name — and it goes into the modal's `done`. **The `true` is a
   change of mind about who is reporting**, that argument having been `streaming`: the rule was that
   silence is the default and a caveat overrides it, so a clean `Fetched` save said nothing, the
   screen already showing what it wrote and a note on every save being a note nobody reads. A modal

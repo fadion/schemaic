@@ -16,6 +16,7 @@
 //! streaming API to target. Both share one implementation, so the two paths can't
 //! drift — a test asserts they agree byte-for-byte in every format.
 
+use std::fmt;
 use std::io::{self, Write};
 
 use crate::intel::SqlDialect;
@@ -1556,23 +1557,56 @@ impl SqlCopy {
     /// narrows what it matches — down to *nothing copied at all* when the
     /// column held only bytes, the case where the clipboard still holds
     /// whatever was there before.
+    ///
+    /// The English of [`SqlCopy::said`]: the interface words that value itself.
     pub fn note(&self) -> Option<String> {
+        self.said().map(|(note, cols)| note.sentence(cols))
+    }
+
+    /// [`SqlCopy::note`]'s decision: which of its three things happened, and
+    /// to which columns — `None` when nothing was withheld.
+    pub fn said(&self) -> Option<(SqlCopyNote, &[String])> {
         if self.withheld.is_empty() {
             return None;
         }
-        let cols = self.withheld.join(", ");
-        let holds = crate::text::plural(self.withheld.len(), "holds", "hold");
-        Some(if self.as_null {
-            format!(
-                "Copied to the clipboard — {cols} {holds} bytes SQL text cannot carry: written as NULL"
-            )
+        let note = if self.as_null {
+            SqlCopyNote::AsNull
         } else if self.text.is_empty() {
-            format!("Nothing copied — {cols} {holds} bytes SQL text cannot carry")
+            SqlCopyNote::NothingCopied
         } else {
-            format!(
-                "Copied to the clipboard — {cols} {holds} bytes SQL text cannot carry: those values are left out"
-            )
-        })
+            SqlCopyNote::LeftOut
+        };
+        Some((note, &self.withheld))
+    }
+}
+
+/// What happened to the withheld cells of a [`SqlCopy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlCopyNote {
+    /// Copied, the withheld cells written as `NULL` (a tuple).
+    AsNull,
+    /// Nothing copied: the column held only bytes.
+    NothingCopied,
+    /// Copied, the withheld values left out (an `IN` list).
+    LeftOut,
+}
+
+impl SqlCopyNote {
+    /// The English sentence for the withheld columns `cols`.
+    pub fn sentence(self, cols: &[String]) -> String {
+        let cols_s = cols.join(", ");
+        let holds = crate::text::plural(cols.len(), "holds", "hold");
+        match self {
+            SqlCopyNote::AsNull => format!(
+                "Copied to the clipboard — {cols_s} {holds} bytes SQL text cannot carry: written as NULL"
+            ),
+            SqlCopyNote::NothingCopied => {
+                format!("Nothing copied — {cols_s} {holds} bytes SQL text cannot carry")
+            }
+            SqlCopyNote::LeftOut => format!(
+                "Copied to the clipboard — {cols_s} {holds} bytes SQL text cannot carry: those values are left out"
+            ),
+        }
     }
 }
 
@@ -2688,8 +2722,9 @@ pub fn withheld_columns(rs: &ResultSet, order: &[usize]) -> Vec<String> {
 /// blobs.
 ///
 /// Gating the clause on `streaming` looks like the fix and is not: **every
-/// production caller passes `true`** — `grid.rs`, `dump_view.rs` and
-/// [`files_note`] alike, since a modal that stays up *is* the confirmation and
+/// production caller that writes a file passes `true`** — `grid.rs`,
+/// `dump_view.rs` and [`files_note`] alike (only the grid's clipboard copy
+/// passes `false`, which has no modal to confirm it), since a modal that stays up *is* the confirmation and
 /// one that said nothing after a fetched export would be a dialog reporting
 /// silence. So the flag no longer means "no grid was mounted", and a clause
 /// hung on it would read as exempting the grid save while exempting nothing.
@@ -2700,57 +2735,101 @@ pub fn withheld_columns(rs: &ResultSet, order: &[usize]) -> Vec<String> {
 /// then what happened to them — because a user comparing the file to the screen
 /// needs to know *which* part of it to distrust, and "some data was lost" tells
 /// them nothing.
+///
+/// The English of [`export_said`]: the interface words that value itself.
 pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<String> {
+    export_said(t, name, streaming).map(|n| n.to_string())
+}
+
+/// [`export_note`]'s decision as a value: whether anything is said, and what —
+/// the rows and where they went, then each loss that has columns in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportNote {
+    pub rows: u64,
+    /// The destination as the sentence names it.
+    pub name: String,
+    pub withheld: Vec<String>,
+    pub blanked: Vec<String>,
+    pub cut: Vec<String>,
+}
+
+impl ExportNote {
+    /// The losses in the order they are said, each with its columns; an empty
+    /// one is left out.
+    pub fn caveats(&self) -> impl Iterator<Item = (Caveat, &[String])> {
+        [
+            (Caveat::Withheld, self.withheld.as_slice()),
+            (Caveat::Blanked, self.blanked.as_slice()),
+            (Caveat::Cut, self.cut.as_slice()),
+        ]
+        .into_iter()
+        .filter(|(_, cols)| !cols.is_empty())
+    }
+}
+
+/// One loss [`ExportNote`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caveat {
+    /// Bytes the format cannot carry: the cells are empty.
+    Withheld,
+    /// Too large to hold in full: later rows are blank.
+    Blanked,
+    /// Cut to [`XLSX_MAX_CELL_CHARS`].
+    Cut,
+}
+
+impl fmt::Display for ExportNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = self.rows as usize;
+        write!(
+            f,
+            "Exported {} {} to {}",
+            crate::text::human_count(n),
+            crate::text::plural(n, "row", "rows"),
+            self.name
+        )?;
+        // The seam is per-clause and computed from what has already been
+        // said, not from a sibling category: a clause that only ever appeared
+        // after another one would otherwise open with `; ` the day it is the
+        // first.
+        for (i, (caveat, cols)) in self.caveats().enumerate() {
+            f.write_str(if i == 0 { " — " } else { "; " })?;
+            let joined = cols.join(", ");
+            match caveat {
+                Caveat::Withheld => write!(
+                    f,
+                    "{joined} {} bytes this format cannot carry: those cells are empty",
+                    crate::text::plural(cols.len(), "holds", "hold"),
+                )?,
+                Caveat::Blanked => write!(
+                    f,
+                    "{joined} too large to hold in full: later rows are blank"
+                )?,
+                // The exact figure, not `human_count`'s "32.77k": this is a
+                // hard limit a user may want to check a column against, and a
+                // rounded one answers no question they would ask it.
+                Caveat::Cut => write!(
+                    f,
+                    "{joined} cut to Excel's {XLSX_MAX_CELL_CHARS}-character cell limit"
+                )?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// See [`export_note`], whose rules this is.
+pub fn export_said(t: &ExportTally, name: &str, streaming: bool) -> Option<ExportNote> {
     if !streaming && !t.has_caveat() {
         return None;
     }
-    let n = t.rows as usize;
-    let mut s = format!(
-        "Exported {} {} to {name}",
-        crate::text::human_count(n),
-        crate::text::plural(n, "row", "rows")
-    );
-    // The seam is per-clause and computed from what has already been said, not
-    // from a sibling category: a clause that only ever appeared after another
-    // one would otherwise open with `; ` the day it is the first.
-    let mut said = false;
-    let mut clause = |s: &mut String, text: String| {
-        s.push_str(if said { "; " } else { " — " });
-        s.push_str(&text);
-        said = true;
-    };
-    if !t.withheld.is_empty() {
-        clause(
-            &mut s,
-            format!(
-                "{} {} bytes this format cannot carry: those cells are empty",
-                t.withheld.join(", "),
-                crate::text::plural(t.withheld.len(), "holds", "hold"),
-            ),
-        );
-    }
-    if !t.blanked.is_empty() {
-        clause(
-            &mut s,
-            format!(
-                "{} too large to hold in full: later rows are blank",
-                t.blanked.join(", ")
-            ),
-        );
-    }
-    if !t.cut.is_empty() {
-        // The exact figure, not `human_count`'s "32.77k": this is a hard limit
-        // a user may want to check a column against, and a rounded one answers
-        // no question they would ask it.
-        clause(
-            &mut s,
-            format!(
-                "{} cut to Excel's {XLSX_MAX_CELL_CHARS}-character cell limit",
-                t.cut.join(", "),
-            ),
-        );
-    }
-    Some(s)
+    Some(ExportNote {
+        rows: t.rows,
+        name: name.to_string(),
+        withheld: t.withheld.clone(),
+        blanked: t.blanked.clone(),
+        cut: t.cut.clone(),
+    })
 }
 
 /// The scratch name an export writes to before it is finished: the destination

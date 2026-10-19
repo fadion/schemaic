@@ -346,7 +346,8 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
                 }
                 d.running.set(false);
                 d.progress.set(None);
-                // A failure is `export::export_failure_note` verbatim: it makes
+                // A failure is `export::export_failure_note`'s sentence (worded
+                // by `i18n::export_failure_note`): it makes
                 // exactly the promise this path makes — the destination is
                 // untouched, and what was written is in the sibling.
                 //
@@ -395,7 +396,7 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
                         .error
                         .set(Some(schemaic_core::dump::cancel_note(&name, partial))),
                     DumpOutcome::Failed { message, partial } => {
-                        d.error.set(Some(schemaic_core::export::export_failure_note(
+                        d.error.set(Some(crate::i18n::export_failure_note(
                             &message,
                             partial.then_some(name.as_str()),
                         )))

@@ -3116,7 +3116,7 @@ fn render_inserts(gs: GridState, blocks: Vec<(ResultSet, Vec<usize>)>) -> String
 /// clipboard** — which is why a withheld blob is said on the bar here: the
 /// string has nowhere to carry it, and a JSON `null` reads as a NULL.
 fn render_order(gs: GridState, rs: &ResultSet, order: &[usize], format: ExportFormat) -> String {
-    use schemaic_core::export::{ExportTally, export_note, insert_shape, withheld_columns};
+    use schemaic_core::export::{ExportTally, export_said, insert_shape, withheld_columns};
     let source = gs.source.get_untracked();
     let tab = source
         .as_ref()
@@ -3133,8 +3133,8 @@ fn render_order(gs: GridState, rs: &ResultSet, order: &[usize], format: ExportFo
             withheld: withheld_columns(rs, order),
             ..Default::default()
         };
-        if let Some(note) = export_note(&tally, "the clipboard", false) {
-            gs.commit_note.set(Some(note));
+        if let Some(note) = export_said(&tally, &tr!("export-dest-clipboard"), false) {
+            gs.commit_note.set(Some(crate::i18n::export_note(&note)));
         }
     }
     format.render(
@@ -3264,10 +3264,27 @@ fn copy_as_menu(gs: GridState, pos: usize, sel: Block) -> MenuEntry {
 /// IN list of a binary key copies nothing, and the clipboard still holding
 /// what it held before is the surprise the note is for.
 fn sql_copy_text(gs: GridState, copy: schemaic_core::export::SqlCopy) -> String {
-    if let Some(note) = copy.note() {
+    if let Some(note) = sql_copy_note(&copy) {
         gs.commit_note.set(Some(note));
     }
     copy.text
+}
+
+/// `SqlCopy::note` in the interface's language.
+fn sql_copy_note(copy: &schemaic_core::export::SqlCopy) -> Option<String> {
+    let (note, cols) = copy.said()?;
+    Some(sql_copy_words(note, cols))
+}
+
+/// `SqlCopyNote::sentence` in the interface's language.
+fn sql_copy_words(note: schemaic_core::export::SqlCopyNote, cols: &[String]) -> String {
+    use schemaic_core::export::SqlCopyNote;
+    let (joined, n) = (cols.join(", "), cols.len());
+    match note {
+        SqlCopyNote::AsNull => tr!("copy-sql-as-null", cols = joined, n = n),
+        SqlCopyNote::NothingCopied => tr!("copy-sql-nothing", cols = joined, n = n),
+        SqlCopyNote::LeftOut => tr!("copy-sql-left-out", cols = joined, n = n),
+    }
 }
 
 /// The Download icon's menu: a format per entry, or — when there is more of the
@@ -3539,7 +3556,7 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
         gs.export_modal.done.set(None);
         gs.export_modal.error.set(None);
         gs.export_modal.target.set(Some(crate::ExportTarget {
-            name: shown.clone().unwrap_or_else(|| "the file".to_string()),
+            name: shown.clone().unwrap_or_else(|| tr!("export-dest-file")),
             // **The denominator each scope can honestly give.** A fetched export
             // knows exactly what it holds; a streamed one is re-reading the
             // server and has only the catalogue's guess, which is the figure the
@@ -3579,7 +3596,7 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
             // after a re-run used to land on a disposed signal and be lost
             // entirely. Here it cannot be.
             Rc::new(move |outcome| {
-                let name = shown.clone().unwrap_or_else(|| "the file".to_string());
+                let name = shown.clone().unwrap_or_else(|| tr!("export-dest-file"));
                 let e = gs.export_modal;
                 // **Only the export that raised the modal may write into it.**
                 // The case is a second request refused synchronously by the
@@ -3593,8 +3610,9 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
                     return;
                 }
                 match outcome {
-                    // **The sentence is `export_note`'s**, in `core::export`
-                    // where it is tested — and asked with `true`, so it always
+                    // **The sentence is `export_said`'s**, in `core::export`
+                    // where it is tested, worded by `i18n::export_note` — and
+                    // asked with `true`, so it always
                     // states the row count. That argument used to be `streaming`,
                     // because a bar had nothing to add about a snapshot the
                     // screen was already showing; a modal that stays up *is* the
@@ -3602,12 +3620,13 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
                     // export would be a dialog reporting silence.
                     crate::ExportOutcome::Done(tally) => {
                         // `expect`, not a second sentence behind `unwrap_or_else`:
-                        // `export_note` returns `None` only for `streaming: false`
+                        // `export_said` returns `None` only for `streaming: false`
                         // with no caveat, and this asks with `true`. A fallback
                         // here would be a success message no input can reach and
                         // no test can cover, left to drift from the real one.
-                        let msg = schemaic_core::export::export_note(&tally, &name, true)
-                            .expect("export_note always speaks when asked with `true`");
+                        let note = schemaic_core::export::export_said(&tally, &name, true)
+                            .expect("export_said always speaks when asked with `true`");
+                        let msg = crate::i18n::export_note(&note);
                         e.done.try_update(|v| *v = Some(msg));
                     }
                     // **Into `error`, not `done`** — stopping was the user's own
@@ -3623,10 +3642,8 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
                     // holds nothing and the sentence would point at an empty
                     // file — see `ExportFormat::writes_incrementally`.
                     crate::ExportOutcome::Cancelled => {
-                        let msg = schemaic_core::export::export_cancel_note(
-                            &name,
-                            format.writes_incrementally(),
-                        );
+                        let msg =
+                            crate::i18n::export_cancel_note(&name, format.writes_incrementally());
                         e.error.try_update(|v| *v = Some(msg));
                     }
                     // The same two facts the Cancel arm states, for the same
@@ -3634,7 +3651,7 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
                     // case where the user is least likely to look, which is
                     // exactly why it now holds the window until dismissed.
                     crate::ExportOutcome::Failed { message, partial } => {
-                        let msg = schemaic_core::export::export_failure_note(
+                        let msg = crate::i18n::export_failure_note(
                             &message,
                             partial.then_some(name.as_str()),
                         );
@@ -16652,7 +16669,27 @@ mod clear_tests {
 
 #[cfg(test)]
 mod core_words_tests {
-    use super::{attach_scope_text, rows_read_text};
+    use super::{attach_scope_text, rows_read_text, sql_copy_words};
+
+    /// **A Copy as SQL note reads in English exactly as core's**, each of the
+    /// three outcomes over one column and several.
+    #[test]
+    fn english_says_every_sql_copy_note_as_core_does() {
+        use schemaic_core::export::SqlCopyNote;
+        for note in [
+            SqlCopyNote::AsNull,
+            SqlCopyNote::NothingCopied,
+            SqlCopyNote::LeftOut,
+        ] {
+            for cols in [vec!["avatar".to_string()], vec!["a".into(), "b".into()]] {
+                assert_eq!(
+                    sql_copy_words(note, &cols),
+                    note.sentence(&cols),
+                    "{note:?}"
+                );
+            }
+        }
+    }
     use schemaic_core::model::AttachScope;
     use schemaic_core::stats::{RowCount, rows_read};
 

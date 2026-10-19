@@ -219,7 +219,74 @@ pub(crate) fn outcome_line(entry: &schemaic_core::history::HistoryEntry) -> Opti
 // CLI, MCP and the core tests, held equal to the interface's by a test per
 // type. Each renderer lives beside the code that shows it
 // (`alias_rename::refusal_message`, the app's `install_cli`); here only what
-// another crate calls.
+// another file or crate calls.
+
+/// The sentence a finished export says — `export::export_note` in the
+/// interface's language: the rows and where they went, then each loss joined
+/// as core joins them (` — ` before the first, `; ` between).
+pub(crate) fn export_note(note: &schemaic_core::export::ExportNote) -> String {
+    use schemaic_core::export::{Caveat, XLSX_MAX_CELL_CHARS};
+    let n = note.rows as usize;
+    let head = tr!(
+        "export-note-rows",
+        rows = schemaic_core::text::human_count(n),
+        n = n,
+        name = note.name.as_str()
+    );
+    let caveats: Vec<String> = note
+        .caveats()
+        .map(|(caveat, cols)| {
+            let joined = cols.join(", ");
+            match caveat {
+                Caveat::Withheld => tr!("export-note-withheld", cols = joined, n = cols.len()),
+                Caveat::Blanked => tr!("export-note-blanked", cols = joined),
+                Caveat::Cut => tr!(
+                    "export-note-cut",
+                    cols = joined,
+                    limit = XLSX_MAX_CELL_CHARS.to_string()
+                ),
+            }
+        })
+        .collect();
+    if caveats.is_empty() {
+        head
+    } else {
+        tr!(
+            "export-note-with-caveats",
+            head = head,
+            caveats = caveats.join("; ")
+        )
+    }
+}
+
+/// What a failed export says — `export::export_failure_note` in the
+/// interface's language. `message` already says it failed; this adds where the
+/// rows went when the write had begun.
+pub(crate) fn export_failure_note(message: &str, partial: Option<&str>) -> String {
+    match partial {
+        Some(name) => tr!(
+            "export-failure-partial",
+            message = message,
+            name = name,
+            part = schemaic_core::export::part_path(name)
+        ),
+        None => message.to_string(),
+    }
+}
+
+/// What a cancelled export says — `export::export_cancel_note` in the
+/// interface's language.
+pub(crate) fn export_cancel_note(name: &str, partial: bool) -> String {
+    if partial {
+        tr!(
+            "export-cancelled-partial",
+            name = name,
+            part = schemaic_core::export::part_path(name)
+        )
+    } else {
+        tr!("export-cancelled-nothing", name = name)
+    }
+}
 
 /// A statement timeout in words — `persist::statement_timeout_label` in the
 /// interface's language. Public for the app, whose timed-out message quotes
@@ -408,6 +475,50 @@ mod tests {
         }
         assert_eq!(LanguageChoice::System.label(), "System (English)");
         assert_eq!(LanguageChoice::Fixed(UiLanguage::EnGb).label(), "English");
+    }
+
+    /// **An export's note reads in English exactly as core's** — the head's
+    /// singular and plural, every combination of the three losses (so every
+    /// seam), one column and several.
+    #[test]
+    fn english_says_every_export_note_as_core_does() {
+        use schemaic_core::export::{ExportTally, export_said};
+        let cols = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("c{i}")).collect() };
+        for rows in [0, 1, 16_384, 2_000_000] {
+            for mask in 0..8u8 {
+                for width in [1, 2] {
+                    let pick = |bit: u8| if mask & bit != 0 { cols(width) } else { vec![] };
+                    let tally = ExportTally {
+                        rows,
+                        withheld: pick(1),
+                        blanked: pick(2),
+                        cut: pick(4),
+                    };
+                    let note = export_said(&tally, "out.csv", true).expect("streaming");
+                    assert_eq!(export_note(&note), note.to_string(), "{note:?}");
+                }
+            }
+        }
+    }
+
+    /// The same for a failed and a cancelled export, with and without the
+    /// `.part` sibling.
+    #[test]
+    fn english_says_every_failed_or_cancelled_export_as_core_does() {
+        use schemaic_core::export as core;
+        let message = "Export failed: No space left on device (os error 28)";
+        for partial in [None, Some("orders.csv")] {
+            assert_eq!(
+                export_failure_note(message, partial),
+                core::export_failure_note(message, partial)
+            );
+        }
+        for partial in [false, true] {
+            assert_eq!(
+                export_cancel_note("orders.csv", partial),
+                core::export_cancel_note("orders.csv", partial)
+            );
+        }
     }
 
     /// **A statement timeout reads in English exactly as core's label**, in

@@ -1748,6 +1748,34 @@ grid-rollback-tab = { $tab } zurückrollen
 grid-find-placeholder = In Ergebnissen suchen
 grid-figure-copied = Kopiert
 grid-goto-label = Gehe zu Zeile:
+export-dest-clipboard = die Zwischenablage
+export-dest-file = die Datei
+export-note-rows = { $n ->
+    [one] { $rows } Zeile in { $name } exportiert
+   *[other] { $rows } Zeilen in { $name } exportiert
+}
+export-note-with-caveats = { $head } — { $caveats }
+export-note-withheld = { $n ->
+    [one] { $cols } enthält Bytes, die dieses Format nicht tragen kann: Diese Zellen sind leer
+   *[other] { $cols } enthalten Bytes, die dieses Format nicht tragen kann: Diese Zellen sind leer
+}
+export-note-blanked = { $cols } zu groß, um vollständig gehalten zu werden: spätere Zeilen sind leer
+export-note-cut = { $cols } auf Excels Zellgrenze von { $limit } Zeichen gekürzt
+export-failure-partial = { $message } — { $name } wurde nicht verändert; die geschriebenen Zeilen stehen in { $part }
+export-cancelled-partial = Export abgebrochen — { $name } wurde nicht verändert; die geschriebenen Zeilen stehen in { $part }
+export-cancelled-nothing = Export abgebrochen — { $name } wurde nicht verändert.
+copy-sql-as-null = { $n ->
+    [one] In die Zwischenablage kopiert — { $cols } enthält Bytes, die SQL-Text nicht tragen kann: als NULL geschrieben
+   *[other] In die Zwischenablage kopiert — { $cols } enthalten Bytes, die SQL-Text nicht tragen kann: als NULL geschrieben
+}
+copy-sql-nothing = { $n ->
+    [one] Nichts kopiert — { $cols } enthält Bytes, die SQL-Text nicht tragen kann
+   *[other] Nichts kopiert — { $cols } enthalten Bytes, die SQL-Text nicht tragen kann
+}
+copy-sql-left-out = { $n ->
+    [one] In die Zwischenablage kopiert — { $cols } enthält Bytes, die SQL-Text nicht tragen kann: diese Werte sind ausgelassen
+   *[other] In die Zwischenablage kopiert — { $cols } enthalten Bytes, die SQL-Text nicht tragen kann: diese Werte sind ausgelassen
+}
 grid-fill-nothing = Nichts auszufüllen: Die ausgewählten Spalten sind nicht beschreibbar, oder die zu kopierende Zelle ist der nicht gesetzte Wert einer neuen Zeile oder ein vorgemerktes DEFAULT.
 grid-fill-skipped = { $count ->
     [one] { $filled } Zelle ausgefüllt, { $skipped } in zum Löschen markierten Zeilen übersprungen.

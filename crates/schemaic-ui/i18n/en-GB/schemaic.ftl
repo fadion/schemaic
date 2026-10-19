@@ -2089,9 +2089,48 @@ grid-find-placeholder = Find in results
 grid-figure-copied = Copied
 grid-goto-label = Go to row:
 
-## The results grid's clipboard, fill, attach and export (grid.rs). The
-## export's own notes (rows written, columns withheld) are core's and stay
-## English for now; so does "the clipboard" or "the file" they name.
+## The results grid's clipboard, fill, attach and export (grid.rs).
+
+# Where an export went, when it has no file name of its own to say.
+export-dest-clipboard = the clipboard
+export-dest-file = the file
+# A finished export (core's ExportNote; English must read exactly as its
+# Display). $rows is the count as written (16k), $n the number; $name the file,
+# folder or export-dest-* it went to.
+export-note-rows = { $n ->
+    [one] Exported { $rows } row to { $name }
+   *[other] Exported { $rows } rows to { $name }
+}
+# The rows line followed by what could not be carried: $caveats is one or more
+# export-note-withheld/-blanked/-cut, joined by "; ".
+export-note-with-caveats = { $head } — { $caveats }
+# $cols lists the columns, joined by ", "; $n counts them.
+export-note-withheld = { $n ->
+    [one] { $cols } holds bytes this format cannot carry: those cells are empty
+   *[other] { $cols } hold bytes this format cannot carry: those cells are empty
+}
+export-note-blanked = { $cols } too large to hold in full: later rows are blank
+# $limit is Excel's cell limit in characters (32767).
+export-note-cut = { $cols } cut to Excel's { $limit }-character cell limit
+# A failed or cancelled export. $message already says it failed; $name is the
+# file, untouched, and $part its .part sibling holding what was written.
+export-failure-partial = { $message } — { $name } was not changed; the rows that were written are in { $part }
+export-cancelled-partial = Export cancelled — { $name } was not changed; the rows that were written are in { $part }
+export-cancelled-nothing = Export cancelled — { $name } was not changed.
+# Copy as SQL with binary columns (core's SqlCopyNote). $cols lists them, $n
+# counts them; NULL is SQL.
+copy-sql-as-null = { $n ->
+    [one] Copied to the clipboard — { $cols } holds bytes SQL text cannot carry: written as NULL
+   *[other] Copied to the clipboard — { $cols } hold bytes SQL text cannot carry: written as NULL
+}
+copy-sql-nothing = { $n ->
+    [one] Nothing copied — { $cols } holds bytes SQL text cannot carry
+   *[other] Nothing copied — { $cols } hold bytes SQL text cannot carry
+}
+copy-sql-left-out = { $n ->
+    [one] Copied to the clipboard — { $cols } holds bytes SQL text cannot carry: those values are left out
+   *[other] Copied to the clipboard — { $cols } hold bytes SQL text cannot carry: those values are left out
+}
 
 grid-fill-nothing = Nothing to fill: the selected columns can't be written, or the cell to copy is a new row's unset value or a staged DEFAULT.
 # $filled and $skipped are counts written out (1,204); $count is $filled as a

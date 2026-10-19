@@ -634,16 +634,16 @@ fn save_diff(
             // was never wholly written. The message is used as the pipeline
             // produced it — it already begins "Export failed: …".
             Rc::new(move |outcome| match outcome {
-                // **The sentence is `export_note`'s**, as the grid's export
-                // is: it states the rows written and whatever the file holds
+                // **The sentence is `export_said`'s**, worded by
+                // `i18n::export_note` as the grid's export is: it states the rows written and whatever the file holds
                 // less of — an XLSX cell cut to the format's limit — which a
                 // bare "Saved" would hide in a file that promises whole
                 // values. Asked with `true`, it always speaks. A caveat stays
                 // up, as a failure does, rather than fading.
                 crate::ExportOutcome::Done(tally) => {
-                    let msg = schemaic_core::export::export_note(&tally, &name, true)
-                        .expect("export_note always speaks when asked with `true`");
-                    (say)(msg, tally.has_caveat())
+                    let note = schemaic_core::export::export_said(&tally, &name, true)
+                        .expect("export_said always speaks when asked with `true`");
+                    (say)(crate::i18n::export_note(&note), tally.has_caveat())
                 }
                 crate::ExportOutcome::Cancelled => {}
                 crate::ExportOutcome::Failed { message, .. } => (say)(message, true),
