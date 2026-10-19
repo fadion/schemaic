@@ -2425,6 +2425,16 @@ restore-confirm = Run { $path } into { $database } on { $connection }? What it c
 restore-read-only = This connection is read-only in Schemaic, so nothing is restored into it.
 restore-engine-not-here = This engine's backups are not restored from here.
 restore-unreadable = { $path } could not be read before restoring it, so nothing was run: { $error }
+# Why a restore was refused (core's RestoreRefusal; English must read exactly
+# as its Display). $switches lists up to three restore-switch(-unnamed)
+# entries, joined by ", "; $more counts the rest. $path is the file, $database
+# the database the restore was pointed at.
+restore-refused = { $path } moves to another database as it runs — { $switches } — so restored into { $database } it would write there instead. Nothing was run. Restore it into the database it names, or remove those lines from a copy of the file.
+restore-refused-more = { $path } moves to another database as it runs — { $switches }, and { $more } more — so restored into { $database } it would write there instead. Nothing was run. Restore it into the database it names, or remove those lines from a copy of the file.
+# One line that moves the restore. $how is what does it, as SQL writes it
+# (USE, \connect, CREATE DATABASE): never translated. $name is the database.
+restore-switch = { $how } `{ $name }` on line { $line }
+restore-switch-unnamed = a { $how } on line { $line } that names no database Schemaic can read
 
 ## Closing tabs and a tab's SQL file — open, save, reload (main.rs). $name is
 ## a tab's or a file's name; $path a file path; $size a size as the app

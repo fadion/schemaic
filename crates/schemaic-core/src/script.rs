@@ -1487,7 +1487,11 @@ fn command_database(args: &str, dialect: SqlDialect) -> Option<String> {
 /// itself is no move; any other — or one whose database cannot be read — is
 /// refused, the lines named, so the user can restore into the database the
 /// file names or edit them out.
-pub fn restore_refusal(file: &str, target: &str, switches: &[DatabaseSwitch]) -> Option<String> {
+pub fn restore_refusal(
+    file: &str,
+    target: &str,
+    switches: &[DatabaseSwitch],
+) -> Option<RestoreRefusal> {
     let elsewhere: Vec<&DatabaseSwitch> = switches
         .iter()
         .filter(|s| s.database.as_deref() != Some(target))
@@ -1495,27 +1499,62 @@ pub fn restore_refusal(file: &str, target: &str, switches: &[DatabaseSwitch]) ->
     if elsewhere.is_empty() {
         return None;
     }
-    let shown: Vec<String> = elsewhere
-        .iter()
-        .take(3)
-        .map(|s| match &s.database {
-            Some(db) => format!("{} `{db}` on line {}", s.how, s.line),
-            None => format!(
-                "a {} on line {} that names no database Schemaic can read",
-                s.how, s.line
-            ),
-        })
-        .collect();
-    let more = match elsewhere.len() {
-        n if n > 3 => format!(", and {} more", n - 3),
-        _ => String::new(),
-    };
-    Some(format!(
-        "{file} moves to another database as it runs — {}{more} — so restored into {target} it \
-         would write there instead. Nothing was run. Restore it into the database it names, or \
-         remove those lines from a copy of the file.",
-        shown.join(", ")
-    ))
+    Some(RestoreRefusal {
+        file: file.to_string(),
+        target: target.to_string(),
+        shown: elsewhere
+            .iter()
+            .take(RestoreRefusal::SHOWN)
+            .map(|s| (*s).clone())
+            .collect(),
+        more: elsewhere.len().saturating_sub(RestoreRefusal::SHOWN),
+    })
+}
+
+/// [`restore_refusal`]'s answer: the switches it names, and how many more
+/// there are. Worded by the interface; [`std::fmt::Display`] is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreRefusal {
+    pub file: String,
+    pub target: String,
+    /// The first [`Self::SHOWN`] switches away from `target`, in file order.
+    pub shown: Vec<DatabaseSwitch>,
+    /// How many after those.
+    pub more: usize,
+}
+
+impl RestoreRefusal {
+    /// How many switches the refusal names before counting the rest.
+    pub const SHOWN: usize = 3;
+}
+
+impl std::fmt::Display for RestoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown: Vec<String> = self
+            .shown
+            .iter()
+            .map(|s| match &s.database {
+                Some(db) => format!("{} `{db}` on line {}", s.how, s.line),
+                None => format!(
+                    "a {} on line {} that names no database Schemaic can read",
+                    s.how, s.line
+                ),
+            })
+            .collect();
+        let more = match self.more {
+            0 => String::new(),
+            n => format!(", and {n} more"),
+        };
+        write!(
+            f,
+            "{} moves to another database as it runs — {}{more} — so restored into {} it would \
+             write there instead. Nothing was run. Restore it into the database it names, or \
+             remove those lines from a copy of the file.",
+            self.file,
+            shown.join(", "),
+            self.target
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1571,7 +1610,8 @@ mod tests {
             "shop_copy",
             &database_switches(dump.as_bytes(), SqlDialect::MySql).unwrap(),
         )
-        .expect("refused");
+        .expect("refused")
+        .to_string();
         assert!(
             refusal.contains("shop_copy") && refusal.contains("USE `shop`"),
             "{refusal}"
@@ -1591,6 +1631,20 @@ mod tests {
         assert_eq!(restore_refusal("own.sql", "shop_copy", &found), None);
         // Case is part of a MySQL database's name on Linux.
         assert!(restore_refusal("own.sql", "Shop_Copy", &found).is_some());
+    }
+
+    /// Three switches are named and the rest counted, so a dump of forty
+    /// databases does not become a forty-clause sentence.
+    #[test]
+    fn a_refusal_names_three_switches_and_counts_the_rest() {
+        let script: String = (1..=5).map(|i| format!("USE `db{i}`;\n")).collect();
+        let found = database_switches(script.as_bytes(), SqlDialect::MySql).unwrap();
+        let why = restore_refusal("all.sql", "shop", &found).expect("refused");
+        assert_eq!(why.shown.len(), 3);
+        assert_eq!(why.more, 2);
+        let said = why.to_string();
+        assert!(said.contains("USE `db3` on line 3, and 2 more —"), "{said}");
+        assert!(!said.contains("db4"), "{said}");
     }
 
     /// The `mysql` client's own commands switch too, without a terminator:

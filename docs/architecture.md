@@ -16448,9 +16448,11 @@ existing prose was left alone.
     (`a_pg_dump_create_script_names_its_connect`). A statement outgrowing `MAX_PENDING_BYTES` is
     `InvalidData`: a file with no terminator, which the client could not run as a script either.
     `restore_refusal(file, target, switches)` is the decision: a switch naming another database, or
-    one it cannot read, refuses, naming up to three of the lines and saying nothing was run
-    (`a_databases_dump_names_the_database_it_switches_to`,
-    `an_unreadable_connect_is_refused_rather_than_trusted`); a switch to the target itself is no
+    one it cannot read, refuses with a `RestoreRefusal` — the first `RestoreRefusal::SHOWN` (three)
+    of those switches as values and a count of the rest, which the app words, its `Display` being
+    the English saying nothing was run (`a_databases_dump_names_the_database_it_switches_to`,
+    `an_unreadable_connect_is_refused_rather_than_trusted`,
+    `a_refusal_names_three_switches_and_counts_the_rest`); a switch to the target itself is no
     move, compared case-sensitively, case being part of a MySQL database's name on Linux
     (`a_dump_of_one_database_or_of_the_target_itself_is_not_refused`). Why it exists is the
     write-guard invariant's restore paragraph.
@@ -38097,7 +38099,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   copy untouched. So where the restore runs a script (`launch::restore_runs_a_script`) `restore_db`
   reads the **whole** file on `handle.spawn_blocking` (`script::database_switches`) and refuses in
   the panel, nothing run and no question asked, when a line names another database or one it
-  cannot read (`script::restore_refusal`); a file it cannot read, or one with no terminator, is
+  cannot read (`script::restore_refusal`, worded by the app's `restore_refusal_text`); a file it
+  cannot read, or one with no terminator, is
   refused the same way. **What this does not cover**: the client re-reads the file at the yes, so
   one replaced between the scan and the run is not re-checked — the question the script runner's
   `FileStamp` answers (`core/script.rs`), left open here.
@@ -40375,7 +40378,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals, `script::restore_refusal`,
+    translation* — among it `launch::*`'s refusals,
     `statement_timeout_label` (which the timeout message quotes as the
     dropdown shows it), `format_bytes`, the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
     whose state words the search box also matches) and `dump.rs`'s "Export failed: …" lines,
@@ -40454,8 +40457,15 @@ Re-introducing the anti-patterns these guard against is a regression:
     core prints them — `human_count`, `RowCount::label` — since formatting a number for the
     locale is phase 7; `rows_read_clause` and `attach_scope_label` remain only as the English
     wrappers core's tests read.
+    *Restore from file*'s refusal is the first that joins a list: `script::RestoreRefusal` keeps
+    its named switches as `DatabaseSwitch` values rather than text, and the app's
+    `restore_refusal_text` words each from `restore-switch`/`-unnamed` — `$how` being the SQL that
+    moves the restore (`USE`, `\connect`, `CREATE DATABASE`), never translated — joins them with
+    `", "` in code, and words the sentence from `restore-refused`/`-more`, held by
+    `english_refuses_every_restore_as_core_does` (`app_tests`). The separator is the code's, not
+    the catalogue's, so a language that joins a list otherwise cannot say so.
     **A typed message's renderer lives beside the code that shows it** — `alias_rename.rs`,
-    `install_cli.rs`, `settings.rs` — and `ui/i18n.rs` holds only the ones another file or crate
+    `install_cli.rs`, `settings.rs`, `grid.rs`, the app's `main.rs` — and `ui/i18n.rs` holds only the ones another file or crate
     calls.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the

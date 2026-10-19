@@ -14510,7 +14510,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Ok(switches) => match schemaic_core::script::restore_refusal(
                                     &shown, &target, &switches,
                                 ) {
-                                    Some(why) => (refused)(Err(why), "restore refusal"),
+                                    Some(why) => (refused)(
+                                        Err(restore_refusal_text(&why)),
+                                        "restore refusal",
+                                    ),
                                     None => ask(),
                                 },
                             }
@@ -15787,6 +15790,46 @@ fn open_url(url: &str) {
     let _ = cmd.spawn();
 }
 
+/// Why *Restore from file* will not run the file — core's
+/// `script::RestoreRefusal` in the interface's language. The switches it names
+/// are worded one by one and joined, the rest counted.
+fn restore_refusal_text(why: &schemaic_core::script::RestoreRefusal) -> String {
+    let switches = why
+        .shown
+        .iter()
+        .map(|s| match &s.database {
+            Some(name) => tr!(
+                "restore-switch",
+                how = s.how.as_str(),
+                name = name.as_str(),
+                line = s.line
+            ),
+            None => tr!(
+                "restore-switch-unnamed",
+                how = s.how.as_str(),
+                line = s.line
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (path, database) = (why.file.as_str(), why.target.as_str());
+    match why.more {
+        0 => tr!(
+            "restore-refused",
+            path = path,
+            switches = switches,
+            database = database
+        ),
+        more => tr!(
+            "restore-refused-more",
+            path = path,
+            switches = switches,
+            more = more,
+            database = database
+        ),
+    }
+}
+
 #[cfg(test)]
 mod app_tests {
     use std::cell::RefCell;
@@ -15805,6 +15848,33 @@ mod app_tests {
     use schemaic_core::connection::Connection;
     use schemaic_ui::{InlineAiState, TestState};
     use tokio_util::sync::CancellationToken;
+
+    /// **A restore refusal reads in English exactly as core's
+    /// `RestoreRefusal` says it** — named and unnamed switches, with and
+    /// without a remainder.
+    #[test]
+    fn english_refuses_every_restore_as_core_does() {
+        use schemaic_core::script::{DatabaseSwitch, RestoreRefusal};
+        let switch = |database: Option<&str>, how: &str, line| DatabaseSwitch {
+            database: database.map(str::to_string),
+            how: how.to_string(),
+            line,
+        };
+        let shown = vec![
+            switch(Some("shop"), "USE", 9),
+            switch(None, "\\connect", 12),
+            switch(Some("other"), "CREATE DATABASE", 1_204),
+        ];
+        for more in [0, 1, 37] {
+            let why = RestoreRefusal {
+                file: "all.sql".into(),
+                target: "shop_copy".into(),
+                shown: shown.clone(),
+                more,
+            };
+            assert_eq!(super::restore_refusal_text(&why), why.to_string(), "{more}");
+        }
+    }
 
     /// **The raw `run` binding has exactly two callers, and both hold an
     /// approved statement.**
