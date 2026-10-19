@@ -365,7 +365,7 @@ fn headline(stats: &TableStats) -> AnyView {
     // asking rather than deciding here.
     let row_tile = tile(
         rows.map(RowCount::label).unwrap_or_else(|| "—".to_string()),
-        stats.row_caption(),
+        row_caption_text(stats),
     );
     let size_tile = tile(
         stats
@@ -779,6 +779,16 @@ fn index_row(idx: &IndexStats) -> AnyView {
         .into_any()
 }
 
+/// The caption under the row figure — `TableStats::row_caption` in the
+/// interface's language.
+fn row_caption_text(stats: &TableStats) -> String {
+    match stats.row_count() {
+        Some(rc) if rc.is_estimate() => tr!("props-rows-estimated"),
+        Some(_) => tr!("props-rows-counted"),
+        None => tr!("props-rows-not-reported"),
+    }
+}
+
 /// The staleness caveat — [`stats::Freshness::note`] in the interface's
 /// language.
 fn freshness_note(stats: &TableStats) -> Option<AnyView> {
@@ -994,5 +1004,17 @@ mod tests {
             assert_eq!(ours, stats::index_facts(&ix), "{scans:?}");
         }
         assert_eq!(tr!("props-index-unused"), stats::unused_note());
+        for (rows, exact_rows) in [(None, None), (Some(40), None), (Some(40), Some(42))] {
+            let t = TableStats {
+                rows,
+                exact_rows,
+                ..TableStats::default()
+            };
+            assert_eq!(
+                row_caption_text(&t),
+                t.row_caption(),
+                "{rows:?} {exact_rows:?}"
+            );
+        }
     }
 }

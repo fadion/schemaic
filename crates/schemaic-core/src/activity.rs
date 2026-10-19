@@ -322,15 +322,39 @@ impl SessionInfo {
     /// middle of a chain, and what it is waiting for is what has to be resolved
     /// first.
     pub fn note(&self) -> Option<String> {
+        self.note_kind().map(SessionNote::message)
+    }
+
+    /// [`Self::note`]'s choice as a value, for the interface to word.
+    pub fn note_kind(&self) -> Option<SessionNote<'_>> {
         if !self.blocked_by.is_empty() {
-            let ids = join_ids(&self.blocked_by);
-            return Some(format!("waiting on a lock held by {ids}"));
+            return Some(SessionNote::WaitingOn(&self.blocked_by));
         }
         if !self.blocks.is_empty() {
-            let n = self.blocks.len();
-            return Some(format!("blocks {n} {}", plural(n, "session", "sessions")));
+            return Some(SessionNote::Blocks(self.blocks.len()));
         }
         None
+    }
+}
+
+/// [`SessionInfo::note_kind`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionNote<'a> {
+    /// Waiting on a lock the sessions with these ids hold.
+    WaitingOn(&'a [i64]),
+    /// Blocking this many sessions.
+    Blocks(usize),
+}
+
+impl SessionNote<'_> {
+    /// The note in English.
+    pub fn message(self) -> String {
+        match self {
+            SessionNote::WaitingOn(ids) => {
+                format!("waiting on a lock held by {}", join_ids(ids))
+            }
+            SessionNote::Blocks(n) => format!("blocks {n} {}", plural(n, "session", "sessions")),
+        }
     }
 }
 

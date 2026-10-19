@@ -47,6 +47,23 @@ fn sqlite_has_no_sessions() -> String {
     tr!("activity-sqlite-no-sessions")
 }
 
+/// The line under a session's state — core's `SessionInfo::note` in the
+/// interface's language, the ids joined here.
+fn session_note_text(note: schemaic_core::activity::SessionNote<'_>) -> String {
+    use schemaic_core::activity::SessionNote;
+    match note {
+        SessionNote::WaitingOn(ids) => {
+            let ids = ids
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            tr!("activity-waiting-on", ids = ids)
+        }
+        SessionNote::Blocks(n) => tr!("activity-blocks", n = n),
+    }
+}
+
 /// A kill entry's label — `KillKind::label`'s words in the interface's
 /// language; `english_names_every_kill_as_core_does` holds the two equal.
 fn kill_label(kind: KillKind) -> String {
@@ -873,7 +890,7 @@ fn session_row(
     ))
     .style(|s| s.items_center().width_full());
 
-    let note_view: Option<floem::AnyView> = s.note().map(|n| {
+    let note_view: Option<floem::AnyView> = s.note_kind().map(session_note_text).map(|n| {
         text(n)
             .style(|s| {
                 s.font_size(font_label())
@@ -1296,6 +1313,20 @@ mod tests {
     fn english_names_every_kill_as_core_does() {
         for kind in [KillKind::Query, KillKind::Session] {
             assert_eq!(super::kill_label(kind), kind.label(), "{kind:?}");
+        }
+    }
+
+    /// A session's note reads in English exactly as core's.
+    #[test]
+    fn english_says_every_session_note_as_core_does() {
+        use schemaic_core::activity::SessionNote;
+        for note in [
+            SessionNote::WaitingOn(&[1148]),
+            SessionNote::WaitingOn(&[1148, 1150, 7]),
+            SessionNote::Blocks(1),
+            SessionNote::Blocks(3),
+        ] {
+            assert_eq!(super::session_note_text(note), note.message(), "{note:?}");
         }
     }
 

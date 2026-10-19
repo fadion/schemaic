@@ -26986,7 +26986,9 @@ existing prose was left alone.
     **The panel's own words are the catalogue's** (`activity-*`), SQLite's
     no-sessions note included — `sqlite_has_no_sessions()`, a constant before it. The two kill
     entries are `kill_label(KillKind)`, `KillKind::label`'s words drawn here (the core-words rule
-    under *UI conventions*). Each "N more … match — narrow the search" note is one Fluent plural
+    under *UI conventions*), and the line under a session's state is `session_note_text` over
+    `SessionInfo::note_kind`'s `SessionNote` (`activity-waiting-on`, `activity-blocks`, the ids
+    joined here; `english_says_every_session_note_as_core_does`). Each "N more … match — narrow the search" note is one Fluent plural
     where it was a `format!` around two `text::plural`s, and
     `the_undrawn_notes_read_as_they_did` holds the English to the old sentence for 1, 2 and 350.
     **The counts line and the state words are worded here too, and together** (`activity-count-*`,
@@ -27090,10 +27092,10 @@ existing prose was left alone.
       reaches Fluent, which would otherwise print the fraction (`the_shared_counts_read_as_they_did`
       holds both to the old English). Core's index facts and freshness caveat are worded here:
       `index_fact_text` over `stats::index_fact_list`'s `IndexFact`s, `freshness_text` over
-      `Freshness`, and `props-index-unused` for `unused_note`, their figures (`format_bytes`,
-      `RowCount::label`, `format_age`) still core's until phase 7
-      (`english_says_every_stats_note_as_core_does`). What core words stays English until phase
-      4: `row_caption` and the copied Markdown.
+      `Freshness`, `props-index-unused` for `unused_note` and `row_caption_text` for the row
+      tile's `row_caption`, their figures (`format_bytes`, `RowCount::label`, `format_age`)
+      still core's until phase 7 (`english_says_every_stats_note_as_core_does`). The copied
+      Markdown stays core's English.
   - `used_by_view.rs` — the **Used by** modal (`used_by_overlay`), over `core::used_by`, opened by
     setting `overlay.used_by` to a `UsedByTarget { database, schema, name, column, routine }`
     (re-exported as `schemaic_ui::UsedByTarget`; the app creates the signal beside `properties`)

@@ -612,6 +612,11 @@ activity-lock-held-by = gehalten von { $ids }
 activity-copy-statement = Anweisung kopieren
 activity-cancel-query = Abfrage abbrechen
 activity-kill-session = Sitzung beenden
+activity-waiting-on = wartet auf eine Sperre von { $ids }
+activity-blocks = { $n ->
+        [one] blockiert { $n } Sitzung
+       *[other] blockiert { $n } Sitzungen
+    }
 activity-read-only-cancel = Diese Verbindung ist als schreibgeschützt markiert, daher bricht Schemaic darauf keine Abfragen ab. Hebe den Schreibschutz zuerst in den Einstellungen der Verbindung auf.
 activity-read-only-terminate = Diese Verbindung ist als schreibgeschützt markiert, daher beendet Schemaic darauf keine Sitzungen. Hebe den Schreibschutz zuerst in den Einstellungen der Verbindung auf.
 
@@ -682,6 +687,9 @@ props-reading = Statistiken werden gelesen
 props-no-stats-view = Eine Sicht hat keinen eigenen Speicher, daher meldet der Server keine Statistiken für sie.
 props-no-stats-table = Der Server hat für diese Tabelle keine Statistiken gemeldet.
 props-on-disk = auf der Festplatte
+props-rows-estimated = Zeilen (geschätzt)
+props-rows-counted = Zeilen (gezählt)
+props-rows-not-reported = Zeilen — nicht gemeldet
 props-counting = Wird gezählt
 props-count-rows = Zeilen zählen
 props-count-slow = Ein vollständiger Durchlauf der Tabelle. Bei einer großen langsam.

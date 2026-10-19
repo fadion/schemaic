@@ -681,6 +681,13 @@ activity-copy-statement = Copy statement
 # KillKind's words, as core's label names them.
 activity-cancel-query = Cancel query
 activity-kill-session = Kill session
+# The line under a session's state (core's activity::SessionNote). $ids are
+# session ids, joined by commas.
+activity-waiting-on = waiting on a lock held by { $ids }
+activity-blocks = { $n ->
+        [one] blocks { $n } session
+       *[other] blocks { $n } sessions
+    }
 # A kill refused on a read-only connection (core's activity::read_only_refusal).
 activity-read-only-cancel = This connection is marked read-only, so Schemaic won't cancel queries on it. Clear read-only in the connection's settings first.
 activity-read-only-terminate = This connection is marked read-only, so Schemaic won't terminate sessions on it. Clear read-only in the connection's settings first.
@@ -765,6 +772,11 @@ props-no-stats-view = A view has no storage of its own, so the server reports no
 props-no-stats-table = The server reported no statistics for this table.
 # Under the size figure.
 props-on-disk = on disk
+# Under the row figure: whether the server estimated it or Schemaic counted it
+# (core's TableStats::row_caption).
+props-rows-estimated = rows (estimated)
+props-rows-counted = rows (counted)
+props-rows-not-reported = rows — not reported
 props-counting = Counting
 props-count-rows = Count rows
 props-count-slow = A full scan of the table. Slow on a large one.
