@@ -115,7 +115,10 @@ assertions pin English wording — stays the regression net throughout.
    `goto-line-label`). `schemaic-app` has begun: `main.rs`'s database-CLI and backup-tool
    launchers (`cli-*`; the "no client" case is `Unreached::Absent`, a value the caller names,
    where it was a `const` line the callers compared against) and the connection gate's
-   refusals (`gate-*`: the plan modal's three, the run's, the grid commit's). A large file goes **a
+   refusals (`gate-*`: the plan modal's three, the run's, the grid commit's), and the terminal's
+   own lines with Back up / Restore (`term-shell-failed`, `term-cli-read-only`, `backup-*`,
+   `restore-*`; a file dialog's type filter, which floem takes only as `&'static str`, goes
+   through `tr_static!`, a per-site `OnceLock`). A large file goes **a
    section at a time** — a function or a cluster of them — committed per section as
    `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded here as
    it lands, so the next session knows where to pick up without re-sweeping what is done. The

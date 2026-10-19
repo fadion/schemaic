@@ -22,6 +22,17 @@ macro_rules! tr {
     };
 }
 
+/// [`tr!`] as a `&'static str`, for the API that takes nothing else — floem's
+/// `FileSpec::name`, a file dialog's type filter. Each use site keeps its own
+/// cell and fills it once: the language is fixed at launch, so the first answer
+/// is every answer, and nothing is leaked per dialog opened.
+macro_rules! tr_static {
+    ($id:literal) => {{
+        static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| tr!($id)).as_str()
+    }};
+}
+
 mod agent_cli;
 mod ai;
 mod antigravity;
@@ -13917,9 +13928,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // level only: a `message_shell` that itself fails is a
                         // genuine nothing-to-show, and recursing would spawn a
                         // message about failing to spawn a message.
-                        let cfg = message_shell(&format!(
-                            "Couldn't start {}: {e}. Pick another shell in Settings, Terminal.",
-                            cfg.program
+                        let cfg = message_shell(&tr!(
+                            "term-shell-failed",
+                            program = cfg.program.clone(),
+                            error = e.to_string()
                         ));
                         if let Ok(t) =
                             schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone())
@@ -14158,10 +14170,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // from the status bar while a menu stands open.
             if connections.with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn.id))
             {
-                let cfg = message_shell(
-                    "This connection is read-only in Schemaic. Its command-line client \
-                     would not be, so it is not opened here.",
-                );
+                let cfg = message_shell(&tr!("term-cli-read-only"));
                 (install_terminal)(&cfg, None, "read-only refusal message shell");
                 return;
             }
@@ -14304,11 +14313,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn.id))
             {
                 (run_in_panel)(
-                    Err(
-                        "This connection is read-only in Schemaic, and this engine's backup \
-                         is written by the server, so none was taken."
-                            .to_string(),
-                    ),
+                    Err(tr!("backup-read-only-server")),
                     "read-only refusal message shell",
                 );
                 return;
@@ -14324,14 +14329,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
             let (ext, exts, kind): (&str, &'static [&'static str], &str) = match engine {
                 schemaic_db::Engine::Postgres => {
-                    ("dump", &["dump"], "PostgreSQL custom-format dump")
+                    ("dump", &["dump"], tr_static!("backup-kind-pg-dump"))
                 }
-                schemaic_db::Engine::MySql => ("sql", &["sql"], "SQL script"),
-                _ => ("db", &["db"], "SQLite database"),
+                schemaic_db::Engine::MySql => ("sql", &["sql"], tr_static!("backup-kind-sql")),
+                _ => ("db", &["db"], tr_static!("backup-kind-sqlite")),
             };
             let name = schemaic_core::launch::backup_file_name(&db, &stamp, ext);
             let opts = FileDialogOptions::new()
-                .title("Back up database")
+                .title(tr!("backup-dialog-title"))
                 .default_name(name)
                 .allowed_types(vec![FileSpec {
                     name: kind,
@@ -14355,7 +14360,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             Ok(d) => d,
                             Err(e) => {
                                 (run_in_panel)(
-                                    Err(format!("The backup did not start: {e}")),
+                                    Err(tr!("backup-not-started", error = e.to_string())),
                                     "backup report",
                                 );
                                 return;
@@ -14365,8 +14370,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let shown = path.clone();
                         let report = create_ext_action(cx, move |r: Result<(), String>| {
                             let line = match r {
-                                Ok(()) => format!("Backed up to {shown}."),
-                                Err(e) => format!("The backup failed: {e}"),
+                                Ok(()) => tr!("backup-done", path = shown.clone()),
+                                Err(e) => tr!("backup-failed", error = e),
                             };
                             (run_in_panel)(Ok(message_shell(&line)), "backup report");
                         });
@@ -14407,10 +14412,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             if connections.with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn.id))
             {
                 (run_in_panel)(
-                    Err(
-                        "This connection is read-only in Schemaic, so nothing is restored into it."
-                            .to_string(),
-                    ),
+                    Err(tr!("restore-read-only")),
                     "read-only refusal message shell",
                 );
                 return;
@@ -14419,7 +14421,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let (handle, log_write) = (handle.clone(), log_write.clone());
             let db = db.clone();
             floem::file_action::open_file(
-                FileDialogOptions::new().title("Restore from file"),
+                FileDialogOptions::new().title(tr!("restore-title")),
                 move |file| {
                     let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
                         return; // cancelled
@@ -14432,64 +14434,62 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let log_write = log_write.clone();
                     // **Asked first**: a restore writes over what is there, and
                     // nothing undoes it.
-                    let ask: Rc<dyn Fn()> =
-                        Rc::new(move || {
-                            let (reach, run_in_panel, log_write) =
-                                (reach.clone(), run_in_panel.clone(), log_write.clone());
-                            let (db_c, path_c, conn) = (db_c.clone(), path_c.clone(), conn.clone());
-                            let (path, db) = (path_c.clone(), db_c.clone());
-                            confirm.set(Some(Confirm {
-                        title: "Restore from file".to_string(),
-                        message: format!(
-                            "Run {path} into {db} on {}? What it creates or replaces cannot \
-                             be undone. It runs in the terminal, where Ctrl+C stops it.",
-                            conn.name
-                        ),
-                        resolve: Rc::new(move |yes| {
-                            if !yes {
-                                return;
-                            }
-                            // **Asked again at the yes**: the flag can move from
-                            // the status bar while the dialog and the question
-                            // stood open (`widgets::accept_launch`'s rule).
-                            if connections.with_untracked(|cs| {
-                                schemaic_core::connection::read_only_of(cs, conn.id)
-                            }) {
-                                (run_in_panel)(
-                                    Err("This connection is read-only in Schemaic, so nothing \
-                                         is restored into it."
-                                        .to_string()),
-                                    "read-only refusal message shell",
-                                );
-                                return;
-                            }
-                            let built = reach(conn.clone()).and_then(|c| {
-                                match schemaic_db::Engine::from_db_type(&c.db_type) {
-                                    schemaic_db::Engine::Postgres => {
-                                        pg_restore_shell(&c, &db_c, &path_c)
-                                    }
-                                    schemaic_db::Engine::MySql => {
-                                        mysql_restore_shell(&c, &db_c, &path_c)
-                                    }
-                                    schemaic_db::Engine::MsSql | schemaic_db::Engine::Sqlite => {
-                                        Err("This engine's backups are not restored from here."
-                                            .to_string())
-                                    }
+                    let ask: Rc<dyn Fn()> = Rc::new(move || {
+                        let (reach, run_in_panel, log_write) =
+                            (reach.clone(), run_in_panel.clone(), log_write.clone());
+                        let (db_c, path_c, conn) = (db_c.clone(), path_c.clone(), conn.clone());
+                        let (path, db) = (path_c.clone(), db_c.clone());
+                        confirm.set(Some(Confirm {
+                            title: tr!("restore-title"),
+                            message: tr!(
+                                "restore-confirm",
+                                path = path.clone(),
+                                database = db.clone(),
+                                connection = conn.name.clone()
+                            ),
+                            resolve: Rc::new(move |yes| {
+                                if !yes {
+                                    return;
                                 }
-                            });
-                            // Logged as it launches: the terminal's client,
-                            // not Schemaic, sees how it ends.
-                            if built.is_ok() {
-                                (log_write)(
-                                    conn.id,
-                                    dialect,
-                                    launch::restore_log_entry(&conn.name, &db_c, &path_c),
-                                );
-                            }
-                            (run_in_panel)(built, "restore");
-                        }),
-                    }));
-                        });
+                                // **Asked again at the yes**: the flag can move from
+                                // the status bar while the dialog and the question
+                                // stood open (`widgets::accept_launch`'s rule).
+                                if connections.with_untracked(|cs| {
+                                    schemaic_core::connection::read_only_of(cs, conn.id)
+                                }) {
+                                    (run_in_panel)(
+                                        Err(tr!("restore-read-only")),
+                                        "read-only refusal message shell",
+                                    );
+                                    return;
+                                }
+                                let built = reach(conn.clone()).and_then(|c| {
+                                    match schemaic_db::Engine::from_db_type(&c.db_type) {
+                                        schemaic_db::Engine::Postgres => {
+                                            pg_restore_shell(&c, &db_c, &path_c)
+                                        }
+                                        schemaic_db::Engine::MySql => {
+                                            mysql_restore_shell(&c, &db_c, &path_c)
+                                        }
+                                        schemaic_db::Engine::MsSql
+                                        | schemaic_db::Engine::Sqlite => {
+                                            Err(tr!("restore-engine-not-here"))
+                                        }
+                                    }
+                                });
+                                // Logged as it launches: the terminal's client,
+                                // not Schemaic, sees how it ends.
+                                if built.is_ok() {
+                                    (log_write)(
+                                        conn.id,
+                                        dialect,
+                                        launch::restore_log_entry(&conn.name, &db_c, &path_c),
+                                    );
+                                }
+                                (run_in_panel)(built, "restore");
+                            }),
+                        }));
+                    });
                     if !launch::restore_runs_a_script(&path, dialect) {
                         return ask();
                     }
@@ -14504,10 +14504,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         move |read: Result<Vec<schemaic_core::script::DatabaseSwitch>, String>| {
                             match read {
                                 Err(e) => (refused)(
-                                    Err(format!(
-                                        "{shown} could not be read before restoring it, so \
-                                         nothing was run: {e}"
-                                    )),
+                                    Err(tr!("restore-unreadable", path = shown.clone(), error = e)),
                                     "restore refusal",
                                 ),
                                 Ok(switches) => match schemaic_core::script::restore_refusal(
@@ -17278,6 +17275,17 @@ mod app_tests {
         // Each names what did *not* happen; a modal that only says "error" is
         // the thing being replaced.
         assert!(a.contains("was not run") && b.contains("was not run"));
+    }
+
+    /// **`tr_static!` is the message, read once per site.** A file dialog's type
+    /// filter takes only a `&'static str`; the cell is what keeps a dialog
+    /// opened a hundred times from leaking a hundred copies.
+    #[test]
+    fn a_static_label_is_the_message_and_is_kept_once() {
+        let first = || tr_static!("backup-kind-sql");
+        let (a, b) = (first(), first());
+        assert_eq!(a, "SQL script");
+        assert!(std::ptr::eq(a, b), "the second call read a new copy");
     }
 
     /// **The pill and the session read one mapping.** These are the two halves of

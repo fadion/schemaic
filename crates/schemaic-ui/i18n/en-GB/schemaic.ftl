@@ -2318,3 +2318,28 @@ gate-not-connected = Not connected to { $name }. The server didn't answer — ch
 gate-this-connection = this connection
 gate-run-tab-moved-on = You switched tabs while the connection was being re-checked, so the statement was not run. It was checked against the tab it was typed in, and running it here would run it somewhere else. Go back to that tab and run it again.
 gate-commit-not-connected = Not connected — the commit was not attempted. Staged edits are kept.
+
+## The terminal panel's own lines, and Back up / Restore (main.rs). Most are
+## printed in the panel through a shell's echo, which turns quotes and most
+## symbols into spaces — keep to letters and plain punctuation. $error is the
+## operating system's or the engine's own text; $path a file path.
+
+# $program is the shell's program, as Settings › Terminal names it.
+term-shell-failed = Couldn't start { $program }: { $error }. Pick another shell in Settings, Terminal.
+term-cli-read-only = This connection is read-only in Schemaic. Its command-line client would not be, so it is not opened here.
+backup-read-only-server = This connection is read-only in Schemaic, and this engine's backup is written by the server, so none was taken.
+backup-dialog-title = Back up database
+# The save dialog's file-type filter, one per engine's backup format.
+backup-kind-pg-dump = PostgreSQL custom-format dump
+backup-kind-sql = SQL script
+backup-kind-sqlite = SQLite database
+backup-not-started = The backup did not start: { $error }
+backup-done = Backed up to { $path }.
+backup-failed = The backup failed: { $error }
+# The open dialog's title, and the question asked before a restore runs.
+restore-title = Restore from file
+# $database is the database restored into; $connection the connection's name.
+restore-confirm = Run { $path } into { $database } on { $connection }? What it creates or replaces cannot be undone. It runs in the terminal, where Ctrl+C stops it.
+restore-read-only = This connection is read-only in Schemaic, so nothing is restored into it.
+restore-engine-not-here = This engine's backups are not restored from here.
+restore-unreadable = { $path } could not be read before restoring it, so nothing was run: { $error }
