@@ -140,7 +140,8 @@ assertions pin English wording — stays the regression net throughout.
    - **Startup notices** — `persist`'s recovery notices, `secrets`' `notice`/`cli_notice`, and
      `secrets::save_connections`' answer.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
-   - **Smaller ones** — `ddl::index_hints`' `message`; the grants list's `note`;
+   - **The table designer's refusals** — `TableDraft::validate`'s sentences, which hold Preview.
+   - **Smaller ones** — the grants list's `note`;
      `result_diff`'s and the AI panel's summaries.
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text`.

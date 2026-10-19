@@ -1192,22 +1192,31 @@ pub enum IndexHint {
 impl IndexHint {
     /// The sentence the designer shows for it.
     pub fn message(&self, draft: &TableDraft) -> String {
+        let subject = self.subject(draft);
         match self {
-            IndexHint::Redundant { index, covered_by } => format!(
-                "Index {} is covered by {covered_by}: every lookup it serves, that one serves too.",
-                draft
-                    .indexes
-                    .get(*index)
-                    .map_or("?", |ix| ix.info.name.as_str())
+            IndexHint::Redundant { covered_by, .. } => format!(
+                "Index {subject} is covered by {covered_by}: every lookup it serves, that one \
+                 serves too."
             ),
-            IndexHint::UnindexedForeignKey { fk } => format!(
-                "Foreign key {} has no index starting with its columns, so a delete or key \
-                 update on the table it references scans this one.",
-                draft
-                    .foreign_keys
-                    .get(*fk)
-                    .map_or("?", |f| f.info.name.as_str())
+            IndexHint::UnindexedForeignKey { .. } => format!(
+                "Foreign key {subject} has no index starting with its columns, so a delete or key \
+                 update on the table it references scans this one."
             ),
+        }
+    }
+
+    /// The name of the index or foreign key the hint is about, `?` for one
+    /// the draft no longer holds.
+    pub fn subject<'a>(&self, draft: &'a TableDraft) -> &'a str {
+        match self {
+            IndexHint::Redundant { index, .. } => draft
+                .indexes
+                .get(*index)
+                .map_or("?", |ix| ix.info.name.as_str()),
+            IndexHint::UnindexedForeignKey { fk } => draft
+                .foreign_keys
+                .get(*fk)
+                .map_or("?", |f| f.info.name.as_str()),
         }
     }
 }

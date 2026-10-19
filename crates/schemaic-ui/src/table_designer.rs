@@ -2091,6 +2091,22 @@ fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
 // ── the Foreign keys section ─────────────────────────────────────────────────
 
+/// An index hint's sentence — `IndexHint::message` in the interface's
+/// language. `PRIMARY KEY`, a cover's name when it is the key, is SQL.
+fn index_hint_text(hint: &ddl::IndexHint, draft: &ddl::TableDraft) -> String {
+    let subject = hint.subject(draft);
+    match hint {
+        ddl::IndexHint::Redundant { covered_by, .. } => tr!(
+            "designer-hint-redundant",
+            index = subject,
+            cover = covered_by.as_str()
+        ),
+        ddl::IndexHint::UnindexedForeignKey { .. } => {
+            tr!("designer-hint-unindexed-fk", fk = subject)
+        }
+    }
+}
+
 /// The designer's index advice for `draft` (`ddl::index_hints`), on the
 /// designer's own engine; none before a target is set.
 fn hints_of(d: DdlUi, draft: &ddl::TableDraft) -> Vec<ddl::IndexHint> {
@@ -2702,7 +2718,7 @@ pub(crate) fn table_designer_overlay(
                     // the whole sentence on hover; the list rows mark the rest.
                     let hint = ddl::index_hints(&draft, status_target.dialect)
                         .first()
-                        .map(|h| h.message(&draft));
+                        .map(|h| index_hint_text(h, &draft));
                     match hint {
                         None => count.into_any(),
                         Some(m) => {
@@ -2929,6 +2945,32 @@ mod tests {
 #[cfg(test)]
 mod word_tests {
     use super::*;
+
+    /// Both index hints read in English exactly as core's `message` — a
+    /// subject the draft holds and one it no longer does.
+    #[test]
+    fn english_says_every_index_hint_as_core_does() {
+        let mut draft = ddl::TableDraft::default();
+        draft.indexes.push(ddl::IndexDraft::default());
+        draft.indexes[0].info.name = "ix_a".into();
+        for hint in [
+            ddl::IndexHint::Redundant {
+                index: 0,
+                covered_by: "PRIMARY KEY".into(),
+            },
+            ddl::IndexHint::Redundant {
+                index: 5,
+                covered_by: "ix_ab".into(),
+            },
+            ddl::IndexHint::UnindexedForeignKey { fk: 0 },
+        ] {
+            assert_eq!(
+                index_hint_text(&hint, &draft),
+                hint.message(&draft),
+                "{hint:?}"
+            );
+        }
+    }
 
     #[test]
     fn english_words_the_identity_toggle_as_core_does_on_every_engine() {

@@ -7959,7 +7959,7 @@ existing prose was left alone.
     **Index advice is `index_hints(draft, dialect) -> Vec<IndexHint>`, and it never enters
     `validate`** — `validate` is what blocks Preview, and an `IndexHint` is advice, never a refusal.
     Redundant indexes come first, in list order, then unindexed foreign keys; each carries its own
-    sentence (`IndexHint::message`). **Only a plain index is offered as redundant**: not unique —
+    sentence (`IndexHint::message`, over `subject`, the name of what it is about). **Only a plain index is offered as redundant**: not unique —
     it enforces what its cover may not — with no predicate, no `INCLUDE`, and not columnstore, XML
     or spatial — and not `lossy`, which is neither advised against nor taken as a cover: it is how
     introspection records what the model could not read (PostgreSQL's operator class, MySQL's
@@ -28476,7 +28476,9 @@ existing prose was left alone.
     the foreign-key detail and both titles. What stays English: the referential actions in the On
     delete/On update dropdowns (`NO ACTION`, `CASCADE`, …), which are SQL keywords; the samples
     above; a new item's name (`column`, `{table}_idx`, `fk_{table}`, `{table}_chk`); and core's
-    prose — `ddl::index_hints`' messages and `TableDraft::validate`'s sentences, phase 4.
+    prose — `TableDraft::validate`'s sentences, phase 4. An index hint is worded here,
+    `index_hint_text` over the `IndexHint` and its `subject` (`designer-hint-*`,
+    `english_says_every_index_hint_as_core_does`).
   - `view_editor.rs` — the **view** modal (tree "Edit" on a view, "Create view" on a database/
     schema node *and* on the editor's right-click when the statement under the caret can be a
     view body — `ddl::can_be_view_body`, which seeds the draft with it), over `core::ddl`'s

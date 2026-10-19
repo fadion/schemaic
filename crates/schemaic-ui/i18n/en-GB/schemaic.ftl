@@ -1381,6 +1381,10 @@ designer-on-update = On update
 # The faint detail beside an index in the list.
 designer-index-unique-detail = unique
 designer-index-redundant-detail = redundant
+# The designer's index advice, under the change count (core's ddl::IndexHint).
+# $index, $fk and $cover are names; $cover may be the SQL PRIMARY KEY.
+designer-hint-redundant = Index { $index } is covered by { $cover }: every lookup it serves, that one serves too.
+designer-hint-unindexed-fk = Foreign key { $fk } has no index starting with its columns, so a delete or key update on the table it references scans this one.
 designer-no-index = No index selected. The primary key lives on the columns.
 designer-columns = Columns
 designer-index-columns-hint-single = The one xml, geometry or geography column it indexes.
