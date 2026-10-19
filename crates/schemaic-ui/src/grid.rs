@@ -869,8 +869,9 @@ impl GridState {
             .with_untracked(|gq| schemaic_core::filter::requery(gq, change, self.has_staged()));
         let gq = match next {
             Ok(gq) => gq,
-            Err(why) => {
-                self.view_err.set(Some(ModalError::app(why)));
+            Err(schemaic_core::filter::HoldsStagedWork) => {
+                self.view_err
+                    .set(Some(ModalError::app(crate::i18n::staged_requery_note())));
                 return false;
             }
         };
@@ -9279,9 +9280,8 @@ fn grid_toolbar(
                 // re-run lands in the same panel, and the landing clears the
                 // staged edits with the rows they were made on.
                 if gs.has_staged() {
-                    gs.view_err.set(Some(ModalError::app(
-                        schemaic_core::filter::STAGED_REQUERY_MSG,
-                    )));
+                    gs.view_err
+                        .set(Some(ModalError::app(crate::i18n::staged_requery_note())));
                     return;
                 }
                 let Some(sql) = gs.current_statement() else {

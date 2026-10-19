@@ -129,8 +129,9 @@ assertions pin English wording — stays the regression net throughout.
      passes on too.
    - **Transactions** — `tx::run_failed_message`, `failed_message`, `run_cancelled_message`,
      `cancelled_message`, `not_sent_message`.
-   - **Filters** — `filter::STAGED_REQUERY_MSG`, `STAGED_LANDING_MSG`, `REREAD_WITHOUT_FILTER_MSG`,
-     and `FilterError::BadCondition` (below).
+   - **Filters** — `FilterError::BadCondition` (below). (The three fixed notices are done:
+     `i18n::staged_requery_note`, `staged_landing_note`, `reread_without_filter_note`.)
+   - **The grid's duplicate-rows question** — its title is the catalogue's, its question core's.
    - **Write-back** — `Rollback::note` and `one_row_verdict`'s text, fused into a `DbError::Query`
      in `schemaic-db`; the hardest, since the sentence is built below core.
    - **The plan view's warnings** (`plan.rs`) and **the editor's offline diagnostics**

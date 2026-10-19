@@ -2372,6 +2372,14 @@ grid-rows-affected = { $count ->
 }
 grid-rerun-would-write = Can't re-run this statement — it would write to the database
 grid-filter-not-simple = Can't filter this query — not a simple single-table SELECT
+# A filter, sort or page change asked for over staged edits (core's
+# filter::STAGED_REQUERY_MSG). No full stop, as core's has none.
+grid-staged-requery = Commit or discard your changes first — re-reading the rows would throw them away
+# When a re-read lands over edits staged while it ran (filter::STAGED_LANDING_MSG).
+grid-staged-landing = Edits were staged while the table was being re-read, so they were kept and the table was not refreshed — commit or discard them, then refresh.
+# After a commit, when the filter calls a function Schemaic does not re-run
+# on its own (filter::REREAD_WITHOUT_FILTER_MSG).
+grid-reread-without-filter = The filter calls a function Schemaic does not re-run unasked, so after the commit the table was re-read without the filter and sort.
 grid-hidden-columns-tip = { $count ->
     [one] { $count } hidden column — click to show all, or right-click a header to choose
    *[other] { $count } hidden columns — click to show all, or right-click a header to choose

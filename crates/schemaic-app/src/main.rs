@@ -3657,7 +3657,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                         if landing == schemaic_core::filter::ViewLanding::KeptForStaged {
                             view_err.set(Some(ModalError::app(
-                                schemaic_core::filter::STAGED_LANDING_MSG,
+                                schemaic_ui::i18n::staged_landing_note(),
                             )));
                             return;
                         }
@@ -6180,7 +6180,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // For the landing to show (`Tab::view_note`): the
                             // re-read clears `view_err` as it starts and lands.
                             tab.view_note.set(Some(ModalError::app(
-                                schemaic_core::filter::REREAD_WITHOUT_FILTER_MSG,
+                                schemaic_ui::i18n::reread_without_filter_note(),
                             )));
                         }
                         apply_view_into(req, panel);
@@ -16265,7 +16265,7 @@ mod app_tests {
         .expect("this file's own source");
         let body = schemaic_ui::source_gate::production_code(&src);
         let at = body
-            .find("schemaic_core::filter::REREAD_WITHOUT_FILTER_MSG")
+            .find("schemaic_ui::i18n::reread_without_filter_note()")
             .expect("the commit's note — this gate is stale");
         let before = &body[at.saturating_sub(160)..at];
         assert!(before.contains("tab.view_note.set("), "{before}");

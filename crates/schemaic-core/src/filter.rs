@@ -458,6 +458,12 @@ pub fn page_turns(page: u64, more: bool, staged: bool) -> [PageTurn; 2] {
 pub const STAGED_REQUERY_MSG: &str =
     "Commit or discard your changes first — re-reading the rows would throw them away";
 
+/// [`requery`]'s refusal: the grid holds staged work. A value rather than
+/// [`STAGED_REQUERY_MSG`] itself, so the interface words it in its own
+/// language; the constant is the English it is held to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoldsStagedWork;
+
 /// The query a filter, sort or page change asks for — `current` with `change`
 /// applied — or, **over staged work, a refusal and no change at all**.
 ///
@@ -472,9 +478,9 @@ pub fn requery(
     current: &GridQuery,
     change: impl FnOnce(&mut GridQuery),
     staged: bool,
-) -> Result<GridQuery, &'static str> {
+) -> Result<GridQuery, HoldsStagedWork> {
     if staged {
-        return Err(STAGED_REQUERY_MSG);
+        return Err(HoldsStagedWork);
     }
     let mut next = current.clone();
     change(&mut next);
@@ -1493,15 +1499,15 @@ mod tests {
                 page: 0,
             })
         );
-        assert_eq!(requery(&gq, filter, true), Err(STAGED_REQUERY_MSG));
+        assert_eq!(requery(&gq, filter, true), Err(HoldsStagedWork));
         // Not even a change that changes nothing: pressing Enter on the same
         // filter re-runs it all the same.
-        assert_eq!(requery(&gq, |_| {}, true), Err(STAGED_REQUERY_MSG));
+        assert_eq!(requery(&gq, |_| {}, true), Err(HoldsStagedWork));
         assert_eq!(requery(&gq, |_| {}, false), Ok(gq.clone()));
         // Clearing the filter is a re-run too.
         assert_eq!(
             requery(&gq, |q| q.filter.clear(), true),
-            Err(STAGED_REQUERY_MSG)
+            Err(HoldsStagedWork)
         );
         assert!(STAGED_REQUERY_MSG.starts_with("Commit or discard your changes"));
     }

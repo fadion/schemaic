@@ -358,6 +358,26 @@ pub fn param_error(e: &schemaic_core::params::ParamError) -> String {
     }
 }
 
+/// Why the grid will not re-read over staged work — core's
+/// `filter::HoldsStagedWork`, whose English is `filter::STAGED_REQUERY_MSG`.
+pub(crate) fn staged_requery_note() -> String {
+    tr!("grid-staged-requery")
+}
+
+/// A re-read that landed over edits staged while it ran —
+/// `filter::STAGED_LANDING_MSG` in the interface's language. Public for the
+/// app, whose landing says it.
+pub fn staged_landing_note() -> String {
+    tr!("grid-staged-landing")
+}
+
+/// A commit's re-read that dropped the filter and sort —
+/// `filter::REREAD_WITHOUT_FILTER_MSG` in the interface's language. Public
+/// for the app, whose post-commit re-read says it.
+pub fn reread_without_filter_note() -> String {
+    tr!("grid-reread-without-filter")
+}
+
 /// Why a pasted string is not a connection URL — core's
 /// [`UrlError`](schemaic_core::conn_import::UrlError) in the interface's
 /// language. **Unredacted**, so reached only through [`skip_reason_shown`],
@@ -440,6 +460,19 @@ fn pseudo(s: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// **The grid's three filter notices read in English exactly as core's
+    /// constants.**
+    #[test]
+    fn english_says_every_filter_notice_as_core_does() {
+        use schemaic_core::filter;
+        assert_eq!(staged_requery_note(), filter::STAGED_REQUERY_MSG);
+        assert_eq!(staged_landing_note(), filter::STAGED_LANDING_MSG);
+        assert_eq!(
+            reread_without_filter_note(),
+            filter::REREAD_WITHOUT_FILTER_MSG
+        );
+    }
 
     /// **Every URL error and skip reason reads in English exactly as core's
     /// `message` says it** — redaction included, so a password a parser

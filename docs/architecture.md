@@ -3904,8 +3904,8 @@ existing prose was left alone.
     offset the statement itself starts at, since that is where `with_page` moves on from — `LIMIT 10
     OFFSET 5` shows *Rows 6–15* (`the_pager_counts_from_the_statements_own_offset`).
     **`requery` is the question every filter, sort and page change asks first** — `current` with
-    the caller's `change` applied, or, over staged work, `Err(STAGED_REQUERY_MSG)` with the change
-    never made, since the re-run's landing would replace the rows the staged edits are indexed by.
+    the caller's `change` applied, or, over staged work, `Err(HoldsStagedWork)` with the change
+    never made (a value the interface words, `STAGED_REQUERY_MSG` its English), since the re-run's landing would replace the rows the staged edits are indexed by.
     It is answered before the change rather than after it so that a refused filter cannot leave the
     bar or a header describing a query that never ran; `page_turns` is the same rule for the
     pager's chevrons, which dim rather than refuse (the grid's side of both is under *Data grid*).
@@ -33791,8 +33791,8 @@ existing prose was left alone.
   the one function, where they used to ask only whether `base_sql` was `Some` (*Architecture
   invariants*, the write guard). **Nor does the click run over staged work**: it re-runs into the
   same panel, whose landing clears the staged edits, new rows and deletions with the rows they sat
-  on, so it asks `GridState::has_staged` first and refuses with `filter::STAGED_REQUERY_MSG` in the
-  bottom bar, as `apply_grid_query` does (the pager's entry under *Data grid* has why). Clearing the
+  on, so it asks `GridState::has_staged` first and refuses with `i18n::staged_requery_note`
+  (`filter::STAGED_REQUERY_MSG`'s words) in the bottom bar, as `apply_grid_query` does (the pager's entry under *Data grid* has why). Clearing the
   override on a fresh manual run is the other half: a raised cap belongs to the result it was
   raised for, and carrying it forward would be the global setting the user didn't change.
   **The export is the other way past the cap, and it is a different shape.** `export_file` branches
@@ -38107,7 +38107,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   failed `read_only_reason`'s allowlist, so the commit had no re-read at all — the inserted row
   vanished from the grid and the deleted one came back
   (`a_commit_rereads_without_a_filter_the_gate_cannot_vouch_for`). Where it fell back, `grid_query`
-  takes the query it stands for and the bar says so (`filter::REREAD_WITHOUT_FILTER_MSG`) —
+  takes the query it stands for and the bar says so (`schemaic_ui::i18n::reread_without_filter_note`,
+  `filter::REREAD_WITHOUT_FILTER_MSG` in the interface's language) —
   **through `Tab::view_note`, which the re-read's landing shows after its own clear**: written
   straight to `view_err` before the re-read ran, the note was cleared by the very re-run it
   announced, as it started and again as it landed, so the filter bar emptied with no word of why
@@ -40772,8 +40773,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     **A typed message's renderer lives beside the code that shows it** — `alias_rename.rs`,
     `install_cli.rs`, `settings.rs`, `grid.rs`, the app's `main.rs` — and `ui/i18n.rs` holds only the ones another file or crate
     calls: `param_error` for the app, `statement_timeout`, which `settings.rs`,
-    `connection_form.rs` and the app all call, and the three export notes, which `grid.rs`,
-    `result_diff_view.rs` and `dump_view.rs` share.
+    `connection_form.rs` and the app all call, the three export notes, which `grid.rs`,
+    `result_diff_view.rs` and `dump_view.rs` share, `skip_reason_shown`, which the import modal
+    and the app's paste field share, and the grid's three filter notices — `staged_requery_note`
+    for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded
+    from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork`.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.
@@ -44628,8 +44632,8 @@ this bundle's.
   *Exclude* all re-ran regardless, and the landing (`Tab::bump_panel_load` →
   `PanelView::clear_staged`) dropped the staged trio without a word. So the guard is now on the
   action as well: `apply_grid_query` asks `filter::requery(current, change, staged)` **before**
-  making the change, and over staged work leaves `grid_query` untouched, puts
-  `filter::STAGED_REQUERY_MSG` — *Commit or discard your changes first — re-reading the rows would
+  making the change, and over staged work (`Err(HoldsStagedWork)`) leaves `grid_query` untouched,
+  puts `i18n::staged_requery_note` — `filter::STAGED_REQUERY_MSG`'s words, *Commit or discard your changes first — re-reading the rows would
   throw them away* — in the bottom error bar (`view_err`), and returns `false`
   (`a_requery_does_not_run_over_staged_changes`). **The three refusals after it do the same**:
   `grid_query` is written only once the re-run is approved and on its way, so the write guard, an
@@ -44654,7 +44658,8 @@ this bundle's.
   page and later re-read replaying it, a commit's re-read failing on it — and a landing that
   replaced the rows cleared edits staged *while it ran*, unasked. Now a refusal puts back
   `Tab::grid_query_shown`, the query the shown rows came from, and a landing onto staged edits
-  keeps the rows, the edits and that query, saying `filter::STAGED_LANDING_MSG`
+  keeps the rows, the edits and that query, saying `i18n::staged_landing_note`
+  (`filter::STAGED_LANDING_MSG`'s words)
   (`a_view_landing_keeps_the_shown_query_unless_it_shows_the_rows`). **And a run from the editor
   asks**: Run and Run All replaced the result holding staged edits, and they went with it, so the
   run guard folds `Tab::staged_on_replaced_panels` into its verdict
