@@ -358,6 +358,80 @@ pub fn param_error(e: &schemaic_core::params::ParamError) -> String {
     }
 }
 
+/// What a run cost its transaction — core's [`TxNote`] in the interface's
+/// language.
+///
+/// [`TxNote`]: schemaic_core::tx::TxNote
+fn tx_note_text(note: schemaic_core::tx::TxNote) -> String {
+    use schemaic_core::tx::TxNote;
+    match note {
+        TxNote::CommittedBeforeDdl => tr!("tx-committed-before-ddl"),
+        TxNote::RolledBackByServer => tr!("tx-rolled-back-by-server"),
+        TxNote::Doomed => tr!("tx-doomed"),
+        TxNote::AfterOwnCommit => tr!("tx-after-own-commit"),
+        TxNote::LostOnCommit { stmts } => tr!("tx-lost-on-commit", stmts = stmts),
+        TxNote::LostOnImplicitCommit { stmts } => {
+            tr!("tx-lost-on-implicit-commit", stmts = stmts)
+        }
+        TxNote::LostRolledBack { stmts, mysql: true } => {
+            tr!("tx-lost-rolled-back-mysql", stmts = stmts)
+        }
+        TxNote::LostRolledBack {
+            stmts,
+            mysql: false,
+        } => {
+            tr!("tx-lost-rolled-back", stmts = stmts)
+        }
+    }
+}
+
+/// `message` and, after a blank line, `note`'s words — as core's
+/// `tx::failed_message` and its siblings put theirs together.
+fn with_tx_note(message: &str, note: Option<schemaic_core::tx::TxNote>) -> String {
+    match note {
+        Some(note) => format!("{message}\n\n{}", tx_note_text(note)),
+        None => message.to_string(),
+    }
+}
+
+/// Core's `tx::run_failed_message` in the interface's language: `message`
+/// (the server's, or the app's own) and what the failure cost the
+/// transaction. Public for the app's run paths.
+pub fn run_failed_message(
+    message: &str,
+    stmt: schemaic_core::tx::StmtOutcome,
+    before: schemaic_core::tx::TxState,
+    engine: schemaic_core::tx::TxEngine,
+    sql: &str,
+) -> String {
+    with_tx_note(
+        message,
+        schemaic_core::tx::run_failure_note(stmt, before, engine, sql),
+    )
+}
+
+/// Core's `tx::run_cancelled_message` in the interface's language, or `None`
+/// when *Cancelled* is the whole truth. Public for the app's run paths.
+pub fn run_cancelled_message(
+    stmt: Option<schemaic_core::tx::StmtOutcome>,
+    before: schemaic_core::tx::TxState,
+    engine: schemaic_core::tx::TxEngine,
+    sql: &str,
+) -> Option<String> {
+    schemaic_core::tx::run_cancelled_note(stmt, before, engine, sql)
+        .map(|note| with_tx_note(&tr!("tx-cancelled"), Some(note)))
+}
+
+/// Core's `tx::not_sent_message` in the interface's language. Public for the
+/// app's run paths.
+pub fn not_sent_message(timed_out: bool) -> String {
+    if timed_out {
+        tr!("tx-not-sent-timeout")
+    } else {
+        tr!("tx-not-sent-cancelled")
+    }
+}
+
 /// Why the grid will not re-read over staged work — core's
 /// `filter::HoldsStagedWork`, whose English is `filter::STAGED_REQUERY_MSG`.
 pub(crate) fn staged_requery_note() -> String {
@@ -460,6 +534,69 @@ fn pseudo(s: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// **A failed, cancelled or never-sent run reads in English exactly as
+    /// core's `tx` messages say it** — every outcome, over every transaction
+    /// state, engine and kind of statement that picks a different note, the
+    /// counts 0, 1 and several among them.
+    #[test]
+    fn english_says_every_transaction_note_as_core_does() {
+        use schemaic_core::tx::{self, StmtOutcome::*, TxEngine, TxState};
+        let outcomes = [
+            Ok,
+            Failed,
+            FailedIsolated,
+            Cancelled,
+            CancelledIsolated,
+            FailedAndCommitted,
+            FailedAndRolledBack,
+            FailedAndDoomed,
+            FailedAfterCommit,
+            OkAndClosed,
+            Untouched,
+            ConnectionLost,
+            NotSent,
+        ];
+        let befores = [
+            TxState::Idle,
+            TxState::Lost,
+            TxState::Open { stmts: 0 },
+            TxState::Open { stmts: 1 },
+            TxState::Open { stmts: 2 },
+            TxState::Poisoned { stmts: 1 },
+            TxState::Poisoned { stmts: 1_234 },
+        ];
+        let engines = [TxEngine::MySql, TxEngine::Postgres, TxEngine::MsSql];
+        let sqls = [
+            "SELECT 1",
+            "COMMIT",
+            "ALTER TABLE t ADD c INT",
+            "UPDATE t SET a = 1; COMMIT",
+        ];
+        for o in outcomes {
+            for b in befores {
+                for e in engines {
+                    for s in sqls {
+                        let at = format!("{o:?} {b:?} {e:?} {s}");
+                        assert_eq!(
+                            run_failed_message("boom", o, b, e, s),
+                            tx::run_failed_message("boom", o, b, e, s),
+                            "{at}"
+                        );
+                        assert_eq!(
+                            run_cancelled_message(Some(o), b, e, s),
+                            tx::run_cancelled_message(Some(o), b, e, s),
+                            "{at}"
+                        );
+                    }
+                }
+            }
+        }
+        for timed_out in [true, false] {
+            assert_eq!(not_sent_message(timed_out), tx::not_sent_message(timed_out));
+        }
+        assert_eq!(tr!("tx-cancelled"), tx::CANCELLED);
+    }
 
     /// **The grid's three filter notices read in English exactly as core's
     /// constants.**

@@ -2854,6 +2854,43 @@ ai-fill-no-value = The AI returned no value.
 conn-gone = connection no longer exists
 tx-session-not-ready = the transaction connection isn't ready — switch to Auto-commit and back
 tx-session-open-failed = couldn't open a transaction connection: { $error }
+
+## What a failed or cancelled run cost its transaction (core's tx::TxNote),
+## shown after the error and a blank line. MySQL, SQL Server, COMMIT, DDL,
+## MyISAM and MEMORY are names and keywords, never translated; Rollback is
+## the button. $stmts counts the statements run in the transaction.
+
+# In place of an error, for a cancelled run (tx::CANCELLED).
+tx-cancelled = The statement was cancelled.
+tx-committed-before-ddl = The transaction this ran in is gone: MySQL commits before it runs a DDL statement, so the statements already in it are permanent and Rollback will not undo them.
+tx-rolled-back-by-server = The transaction this ran in is gone: SQL Server rolled it back, so every statement in it since it began is undone.
+tx-doomed = The transaction this ran in can no longer commit: SQL Server marked it uncommittable, so Rollback is the only way on, and it undoes every statement in it.
+tx-after-own-commit = The transaction this ran in has ended, and this ran a COMMIT of its own before it failed, so what came before that COMMIT is likely committed rather than undone. Check the data before running any of it again.
+tx-lost-on-commit = The connection was lost with a transaction open. It was lost on a COMMIT, so whether { $stmts ->
+        [0] the transaction was
+        [one] the { $stmts } statement run in it since it began was
+       *[other] the { $stmts } statements run in it since it began were
+    } committed or rolled back is unknown: the server may have committed before the connection dropped. Check the data before running any of it again.
+tx-lost-on-implicit-commit = The connection was lost with a transaction open. MySQL commits an open transaction before it runs this statement, so { $stmts ->
+        [0] nothing had run in it yet, so there was nothing to commit
+        [one] the { $stmts } statement run in it since it began was most likely committed then, and is permanent
+       *[other] the { $stmts } statements run in it since it began were most likely committed then, and are permanent
+    }. Check the data before running any of it again.
+tx-lost-rolled-back = The connection was lost with a transaction open. The server rolls an unfinished transaction back when its connection ends, so { $stmts ->
+        [0] nothing had run in it yet
+        [one] the { $stmts } statement run in it since it began is undone
+       *[other] the { $stmts } statements run in it since it began are undone
+    }.
+# As above on MySQL, where a write to a non-transactional table stays.
+tx-lost-rolled-back-mysql = The connection was lost with a transaction open. The server rolls an unfinished transaction back when its connection ends, so { $stmts ->
+        [0] nothing had run in it yet
+        [one] the { $stmts } statement run in it since it began is undone — except a write to a table that does not support transactions (MyISAM, MEMORY), which no rollback undoes
+       *[other] the { $stmts } statements run in it since it began are undone — except a write to a table that does not support transactions (MyISAM, MEMORY), which no rollback undoes
+    }.
+# A run whose statement never left the client (tx::not_sent_message): the
+# statement timeout fired, or the user pressed Stop, while it waited.
+tx-not-sent-timeout = The statement timeout fired while this run was still waiting for the tab's connection. An earlier operation on it — a commit, or the re-fetch after one — had not finished, so the statement was never sent to the server. Nothing ran, and the transaction is exactly where it was.
+tx-not-sent-cancelled = This run was cancelled while it was still waiting for the tab's connection. An earlier operation on it — a commit, or the re-fetch after one — had not finished, so the statement was never sent to the server. Nothing ran, and the transaction is exactly where it was.
 # A new snippet's name when no tab gives it one.
 snippet-default-name = Snippet
 snippet-delete-title = Delete snippet

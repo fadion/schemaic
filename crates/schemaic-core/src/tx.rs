@@ -916,29 +916,137 @@ pub fn text_commits(engine: TxEngine, sql: &str) -> bool {
 /// error rarely says — and a doomed one is still open but can only be rolled
 /// back, which the pill shows and the error does not explain.
 pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
-    match stmt {
-        StmtOutcome::FailedAndCommitted => format!(
-            "{message}\n\nThe transaction this ran in is gone: MySQL commits before it \
-             runs a DDL statement, so the statements already in it are permanent and \
-             Rollback will not undo them."
-        ),
-        StmtOutcome::FailedAndRolledBack => format!(
-            "{message}\n\nThe transaction this ran in is gone: SQL Server rolled it back, \
-             so every statement in it since it began is undone."
-        ),
-        StmtOutcome::FailedAndDoomed => format!(
-            "{message}\n\nThe transaction this ran in can no longer commit: SQL Server \
-             marked it uncommittable, so Rollback is the only way on, and it undoes \
-             every statement in it."
-        ),
-        StmtOutcome::FailedAfterCommit => format!(
-            "{message}\n\nThe transaction this ran in has ended, and this ran a COMMIT of \
-             its own before it failed, so what came before that COMMIT is likely \
-             committed rather than undone. Check the data before running any of it again."
-        ),
-        _ => message.to_string(),
+    with_note(message, failure_note(stmt))
+}
+
+/// `message`, and `note`'s disclosure after a blank line when there is one —
+/// how every message here is put together, and how the interface puts its
+/// own wording together too.
+fn with_note(message: &str, note: Option<TxNote>) -> String {
+    match note {
+        Some(note) => format!("{message}\n\n{}", note.message()),
+        None => message.to_string(),
     }
 }
+
+/// What a failed or cancelled run cost its transaction — the half of
+/// [`failed_message`], [`run_failed_message`] and [`cancelled_message`] that
+/// the error itself cannot say. **A value, not a sentence**, so the interface
+/// words it in its own language; [`TxNote::message`] is the English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxNote {
+    /// [`StmtOutcome::FailedAndCommitted`]: MySQL committed before a DDL.
+    CommittedBeforeDdl,
+    /// [`StmtOutcome::FailedAndRolledBack`]: SQL Server rolled it back.
+    RolledBackByServer,
+    /// [`StmtOutcome::FailedAndDoomed`]: SQL Server marked it uncommittable.
+    Doomed,
+    /// [`StmtOutcome::FailedAfterCommit`]: the run's own `COMMIT` ended it.
+    AfterOwnCommit,
+    /// The connection died on a `COMMIT`: whether the `stmts` statements
+    /// (none counted: the transaction) were committed is unknown.
+    LostOnCommit { stmts: u32 },
+    /// The connection died on a MySQL statement that commits first: the
+    /// `stmts` statements were most likely committed.
+    LostOnImplicitCommit { stmts: u32 },
+    /// The connection died on anything else: the `stmts` statements are
+    /// undone — on MySQL (`mysql`) bar a non-transactional table's writes.
+    LostRolledBack { stmts: u32, mysql: bool },
+}
+
+impl TxNote {
+    /// The disclosure in English.
+    pub fn message(self) -> String {
+        const HEAD: &str = "The connection was lost with a transaction open.";
+        const CHECK: &str = "Check the data before running any of it again.";
+        let them = |n: u32| {
+            format!(
+                "the {n} {} run in it since it began",
+                crate::text::plural(n as usize, "statement", "statements"),
+            )
+        };
+        match self {
+            TxNote::CommittedBeforeDdl => "The transaction this ran in is gone: MySQL commits \
+                 before it runs a DDL statement, so the statements already in it are permanent \
+                 and Rollback will not undo them."
+                .to_string(),
+            TxNote::RolledBackByServer => "The transaction this ran in is gone: SQL Server \
+                 rolled it back, so every statement in it since it began is undone."
+                .to_string(),
+            TxNote::Doomed => "The transaction this ran in can no longer commit: SQL Server \
+                 marked it uncommittable, so Rollback is the only way on, and it undoes every \
+                 statement in it."
+                .to_string(),
+            TxNote::AfterOwnCommit => "The transaction this ran in has ended, and this ran a \
+                 COMMIT of its own before it failed, so what came before that COMMIT is likely \
+                 committed rather than undone. Check the data before running any of it again."
+                .to_string(),
+            TxNote::LostOnCommit { stmts } => {
+                let was = if stmts > 1 { "were" } else { "was" };
+                let what = match stmts {
+                    0 => "the transaction".to_string(),
+                    n => them(n),
+                };
+                format!(
+                    "{HEAD} It was lost on a COMMIT, so whether {what} {was} committed or rolled \
+                     back is unknown: the server may have committed before the connection \
+                     dropped. {CHECK}"
+                )
+            }
+            TxNote::LostOnImplicitCommit { stmts } => {
+                let what = match stmts {
+                    0 => "nothing had run in it yet, so there was nothing to commit".to_string(),
+                    1 => format!(
+                        "{} was most likely committed then, and is permanent",
+                        them(1)
+                    ),
+                    n => format!(
+                        "{} were most likely committed then, and are permanent",
+                        them(n)
+                    ),
+                };
+                format!(
+                    "{HEAD} MySQL commits an open transaction before it runs this statement, so \
+                     {what}. {CHECK}"
+                )
+            }
+            TxNote::LostRolledBack { stmts, mysql } => {
+                let what = match stmts {
+                    0 => "nothing had run in it yet".to_string(),
+                    1 => format!("{} is undone", them(1)),
+                    n => format!("{} are undone", them(n)),
+                };
+                let caveat = if mysql && stmts > 0 {
+                    " — except a write to a table that does not support transactions \
+                     (MyISAM, MEMORY), which no rollback undoes"
+                } else {
+                    ""
+                };
+                format!(
+                    "{HEAD} The server rolls an unfinished transaction back when its connection \
+                     ends, so {what}{caveat}."
+                )
+            }
+        }
+    }
+}
+
+/// [`failed_message`]'s disclosure for `stmt`, or `None` when the error says
+/// everything.
+pub fn failure_note(stmt: StmtOutcome) -> Option<TxNote> {
+    match stmt {
+        StmtOutcome::FailedAndCommitted => Some(TxNote::CommittedBeforeDdl),
+        StmtOutcome::FailedAndRolledBack => Some(TxNote::RolledBackByServer),
+        StmtOutcome::FailedAndDoomed => Some(TxNote::Doomed),
+        StmtOutcome::FailedAfterCommit => Some(TxNote::AfterOwnCommit),
+        _ => None,
+    }
+}
+
+/// What a cancelled run says in place of the error it has none of — the
+/// message [`cancelled_message`] and [`run_cancelled_message`] attach their
+/// disclosure to.
+pub const CANCELLED: &str = "The statement was cancelled.";
 
 /// [`failed_message`] for a run on a pinned session, given `before` — the
 /// tab's [`TxState`] as the run was sent.
@@ -972,62 +1080,33 @@ pub fn run_failed_message(
     engine: TxEngine,
     sql: &str,
 ) -> String {
+    with_note(message, run_failure_note(stmt, before, engine, sql))
+}
+
+/// [`run_failed_message`]'s disclosure, or `None` — [`failure_note`] given
+/// `before`, with the lost connection's three answers its doc describes.
+pub fn run_failure_note(
+    stmt: StmtOutcome,
+    before: TxState,
+    engine: TxEngine,
+    sql: &str,
+) -> Option<TxNote> {
     if stmt != StmtOutcome::ConnectionLost || !before.is_open() {
-        return failed_message(message, stmt);
+        return failure_note(stmt);
     }
-    let n = before.stmts();
-    let them = match n {
-        0 => None,
-        n => Some(format!(
-            "the {n} {} run in it since it began",
-            crate::text::plural(n as usize, "statement", "statements"),
-        )),
-    };
-    let head = "The connection was lost with a transaction open.";
-    let check = "Check the data before running any of it again.";
+    let stmts = before.stmts();
     let kw = crate::sql::leading_keyword(sql, crate::intel::SqlDialect::MySql);
     let commits = matches!(kw.as_deref(), Some("COMMIT" | "END")) || text_commits(engine, sql);
-    if commits {
-        let was = if n > 1 { "were" } else { "was" };
-        let what = them.unwrap_or_else(|| "the transaction".to_string());
-        return format!(
-            "{message}\n\n{head} It was lost on a COMMIT, so whether {what} {was} committed \
-             or rolled back is unknown: the server may have committed before the connection \
-             dropped. {check}"
-        );
-    }
-    if implicit_commit(engine, sql) {
-        let what = them.map_or_else(
-            || "nothing had run in it yet, so there was nothing to commit".to_string(),
-            |t| {
-                let (were, are) = if n == 1 {
-                    ("was", "is")
-                } else {
-                    ("were", "are")
-                };
-                format!("{t} {were} most likely committed then, and {are} permanent")
-            },
-        );
-        return format!(
-            "{message}\n\n{head} MySQL commits an open transaction before it runs this \
-             statement, so {what}. {check}"
-        );
-    }
-    let what = match &them {
-        None => "nothing had run in it yet".to_string(),
-        Some(t) => format!("{t} {} undone", if n == 1 { "is" } else { "are" }),
-    };
-    let caveat = match (engine, &them) {
-        (TxEngine::MySql, Some(_)) => {
-            " — except a write to a table that does not support transactions \
-             (MyISAM, MEMORY), which no rollback undoes"
+    Some(if commits {
+        TxNote::LostOnCommit { stmts }
+    } else if implicit_commit(engine, sql) {
+        TxNote::LostOnImplicitCommit { stmts }
+    } else {
+        TxNote::LostRolledBack {
+            stmts,
+            mysql: engine == TxEngine::MySql,
         }
-        _ => "",
-    };
-    format!(
-        "{message}\n\n{head} The server rolls an unfinished transaction back when its \
-         connection ends, so {what}{caveat}."
-    )
+    })
 }
 
 /// [`cancelled_message`] given `before`, as [`run_failed_message`] is
@@ -1040,15 +1119,22 @@ pub fn run_cancelled_message(
     engine: TxEngine,
     sql: &str,
 ) -> Option<String> {
+    run_cancelled_note(stmt, before, engine, sql).map(|n| with_note(CANCELLED, Some(n)))
+}
+
+/// [`run_cancelled_message`]'s disclosure, or `None` when the bare word
+/// *Cancelled* is the whole truth.
+pub fn run_cancelled_note(
+    stmt: Option<StmtOutcome>,
+    before: TxState,
+    engine: TxEngine,
+    sql: &str,
+) -> Option<TxNote> {
     match stmt {
-        Some(StmtOutcome::ConnectionLost) if before.is_open() => Some(run_failed_message(
-            "The statement was cancelled.",
-            StmtOutcome::ConnectionLost,
-            before,
-            engine,
-            sql,
-        )),
-        _ => cancelled_message(stmt),
+        Some(StmtOutcome::ConnectionLost) if before.is_open() => {
+            run_failure_note(StmtOutcome::ConnectionLost, before, engine, sql)
+        }
+        _ => cancelled_note(stmt),
     }
 }
 
@@ -1074,15 +1160,12 @@ pub fn run_cancelled_message(
 /// without it — the same argument [`failed_message`] itself makes for being one
 /// function.
 pub fn cancelled_message(stmt: Option<StmtOutcome>) -> Option<String> {
-    match stmt {
-        Some(
-            s @ (StmtOutcome::FailedAndCommitted
-            | StmtOutcome::FailedAndRolledBack
-            | StmtOutcome::FailedAndDoomed
-            | StmtOutcome::FailedAfterCommit),
-        ) => Some(failed_message("The statement was cancelled.", s)),
-        _ => None,
-    }
+    cancelled_note(stmt).map(|n| with_note(CANCELLED, Some(n)))
+}
+
+/// [`cancelled_message`]'s disclosure, or `None`.
+pub fn cancelled_note(stmt: Option<StmtOutcome>) -> Option<TxNote> {
+    stmt.and_then(failure_note)
 }
 
 /// Did the statement timeout stop the **statement**, or something before it?

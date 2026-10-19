@@ -298,7 +298,7 @@ existing prose was left alone.
     re-offered a fix for "the statement was not sent" with every other test green — so
     `app_tests::a_runs_own_notes_reach_the_bar_as_schemaics` reads `main.rs` for it: every
     `QueryState::Failed(` built from `not_sent_message(`/`timeout_message(` opens with
-    `ModalError::app(`, and every `tx::cancelled_message(` lands as `Failed(ModalError::app(m))`,
+    `ModalError::app(`, and every `i18n::run_cancelled_message(` lands as `Failed(ModalError::app(m))`,
     with floors on both counts. `ModalError::new(text, source)` is the
     constructor for a producer already holding a source. The editor's error bar asks the same
     `resolve_kept(None, Some(err), kept)` for its own *Explain* and *AI fix* as the modal's
@@ -11750,8 +11750,20 @@ existing prose was left alone.
     left out of step, under `db::mssql` — is `run_failed_message` of "The statement was cancelled.",
     where `cancelled_message`, which has no arm for it, answered the bare *Cancelled*; anything else
     is `cancelled_message`'s (`a_stop_that_lost_the_connection_says_the_transaction_went_with_it`).
-    Both run paths call it, and it is the name the main.rs source gate over a Stop's disclosure
-    matches.
+    **What the app shows is not these functions' English but the interface's wording of the same
+    choice.** Each disclosure is a `TxNote` (`Copy`) — `CommittedBeforeDdl`, `RolledBackByServer`,
+    `Doomed`, `AfterOwnCommit`, and the lost connection's three, `LostOnCommit`,
+    `LostOnImplicitCommit` and `LostRolledBack`, each carrying the `stmts` count and the last a
+    `mysql` flag for the MyISAM caveat — picked by `failure_note`, `run_failure_note`,
+    `cancelled_note` and `run_cancelled_note`, with `TxNote::message` the English and `CANCELLED`
+    the sentence a Stop's note follows. The four `*_message` functions are now the private
+    `with_note` over their chooser — the message, a blank line, the note — so every decision above
+    stays here and is tested here, and their output is byte-identical to before. Both run paths
+    call `ui::i18n`'s `run_failed_message`, `run_cancelled_message` and `not_sent_message` instead,
+    which take core's arguments, ask core's choosers and word only the answer from `tx-*` (under
+    *UI conventions*' string catalogue); `i18n::run_cancelled_message(` is therefore the name the
+    main.rs source gate over a Stop's disclosure matches. Core's English stays for core's own tests
+    and the live tier, whose `tests/live/mssql.rs` reads `failed_message`.
     **And `Lost` has no way back on the tab itself.** `can_commit` and `can_rollback` are both false
     there, so the footer hides Commit and Rollback alike, and a dead MySQL or PostgreSQL connection
     is never re-dialled — `Session::alive` only classifies, because reconnecting silently would hand
@@ -40752,6 +40764,18 @@ Re-introducing the anti-patterns these guard against is a regression:
     password, the worded sentence goes through `conn_import::redact_shown` whole, as core's
     `message` does its English; `english_says_every_import_refusal_as_core_does` holds the two
     equal and fails without the redaction (under `connection_import.rs`).
+    A Manual tab's run disclosures are the case where the choice is the hard part and the words
+    the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
+    `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and
+    `i18n::tx_note_text` words each variant from `tx-*`. The counted three are each one message
+    with a `$stmts` selector of `[0]`, `[one]` and `*[other]`, so every count is a whole sentence —
+    core's English turns *was*/*were* and *nothing had run* on the same number — and
+    `LostRolledBack { mysql: true }` is a message of its own, `tx-lost-rolled-back-mysql`, rather
+    than the caveat appended as a fragment. `tx-cancelled` is `tx::CANCELLED`, and the not-sent
+    pair `tx-not-sent-timeout`/`-cancelled` need no type, `not_sent_message` taking only a `bool`.
+    `english_says_every_transaction_note_as_core_does` holds the interface's three functions equal
+    to core's over all thirteen outcomes, seven states (counts 0, 1, 2 and 1234), the three engines
+    and four statements that pick different notes.
     A message core *chooses* by engine capability takes the same shape with the choice as the
     value: the Export modal's replay-toggle hints were whole `&'static str`s picked per dialect, and
     are now `dump::DropHint` (`drop_hint`) and `FkHint` (`fk_guard_says_drops`), each with a
@@ -40777,7 +40801,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `result_diff_view.rs` and `dump_view.rs` share, `skip_reason_shown`, which the import modal
     and the app's paste field share, and the grid's three filter notices — `staged_requery_note`
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded
-    from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork`.
+    from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork` — and,
+    public for the app's run paths, `run_failed_message`, `run_cancelled_message` and
+    `not_sent_message`, with core's signatures.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.

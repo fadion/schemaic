@@ -96,7 +96,9 @@ assertions pin English wording — stays the regression net throughout.
    `refusal_text` — with no `Display`, so a `to_string()` cannot keep one English), and
    connection import's `conn_import::UrlError` and `SkipReason` (`i18n::url_error_text`,
    `skip_reason_shown`, which passes its sentence through core's `redact_shown` as `message`
-   is redacted). Of the other existing enums, `ImportError`
+   is redacted), and the run paths' transaction disclosures (`tx::TxNote`, chosen by
+   `run_failure_note`/`run_cancelled_note`, worded by `i18n::run_failed_message`,
+   `run_cancelled_message` and `not_sent_message`). Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
    so its prose lives at its construction sites and it is the weakest to convert.
@@ -127,8 +129,6 @@ assertions pin English wording — stays the regression net throughout.
    - **The run guard** — `RunVerdict::Block`/`Confirm`'s `String`s (read-only, `NO_DATABASE_SELECTED`,
      "modifies data", `filter::with_staged_question`'s suffix), which `ScriptRequest::approved`
      passes on too.
-   - **Transactions** — `tx::run_failed_message`, `failed_message`, `run_cancelled_message`,
-     `cancelled_message`, `not_sent_message`.
    - **Filters** — `FilterError::BadCondition` (below). (The three fixed notices are done:
      `i18n::staged_requery_note`, `staged_landing_note`, `reread_without_filter_note`.)
    - **The grid's duplicate-rows question** — its title is the catalogue's, its question core's.

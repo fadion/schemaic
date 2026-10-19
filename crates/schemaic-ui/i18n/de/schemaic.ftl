@@ -2222,6 +2222,33 @@ ai-fill-no-value = Die KI hat keinen Wert zurückgegeben.
 conn-gone = Die Verbindung existiert nicht mehr
 tx-session-not-ready = Die Transaktionsverbindung ist nicht bereit – wechsle zu Auto-Commit und zurück
 tx-session-open-failed = Die Transaktionsverbindung konnte nicht geöffnet werden: { $error }
+tx-cancelled = Die Anweisung wurde abgebrochen.
+tx-committed-before-ddl = Die Transaktion, in der dies lief, ist beendet: MySQL schreibt fest, bevor es eine DDL-Anweisung ausführt, daher sind die Anweisungen darin dauerhaft, und Rollback macht sie nicht rückgängig.
+tx-rolled-back-by-server = Die Transaktion, in der dies lief, ist beendet: SQL Server hat sie zurückgerollt, daher ist jede Anweisung darin seit ihrem Beginn rückgängig gemacht.
+tx-doomed = Die Transaktion, in der dies lief, kann nicht mehr festgeschrieben werden: SQL Server hat sie als nicht festschreibbar markiert, daher bleibt nur Rollback, und das macht jede Anweisung darin rückgängig.
+tx-after-own-commit = Die Transaktion, in der dies lief, ist beendet, und dies hat vor dem Fehler ein eigenes COMMIT ausgeführt, daher ist, was vor diesem COMMIT kam, wahrscheinlich festgeschrieben statt rückgängig gemacht. Prüfe die Daten, bevor du etwas davon erneut ausführst.
+tx-lost-on-commit = Die Verbindung ging bei offener Transaktion verloren. Sie ging bei einem COMMIT verloren, daher ist unbekannt, ob { $stmts ->
+        [0] die Transaktion
+        [one] die { $stmts } Anweisung, die seit ihrem Beginn darin lief,
+       *[other] die { $stmts } Anweisungen, die seit ihrem Beginn darin liefen,
+    } festgeschrieben oder zurückgerollt wurde: Der Server hat möglicherweise festgeschrieben, bevor die Verbindung abbrach. Prüfe die Daten, bevor du etwas davon erneut ausführst.
+tx-lost-on-implicit-commit = Die Verbindung ging bei offener Transaktion verloren. MySQL schreibt eine offene Transaktion fest, bevor es diese Anweisung ausführt, daher { $stmts ->
+        [0] lief darin noch nichts, und es gab nichts festzuschreiben
+        [one] wurde die { $stmts } Anweisung, die seit ihrem Beginn darin lief, höchstwahrscheinlich dabei festgeschrieben und ist dauerhaft
+       *[other] wurden die { $stmts } Anweisungen, die seit ihrem Beginn darin liefen, höchstwahrscheinlich dabei festgeschrieben und sind dauerhaft
+    }. Prüfe die Daten, bevor du etwas davon erneut ausführst.
+tx-lost-rolled-back = Die Verbindung ging bei offener Transaktion verloren. Der Server rollt eine unvollendete Transaktion zurück, wenn ihre Verbindung endet, daher { $stmts ->
+        [0] lief darin noch nichts
+        [one] ist die { $stmts } Anweisung, die seit ihrem Beginn darin lief, rückgängig gemacht
+       *[other] sind die { $stmts } Anweisungen, die seit ihrem Beginn darin liefen, rückgängig gemacht
+    }.
+tx-lost-rolled-back-mysql = Die Verbindung ging bei offener Transaktion verloren. Der Server rollt eine unvollendete Transaktion zurück, wenn ihre Verbindung endet, daher { $stmts ->
+        [0] lief darin noch nichts
+        [one] ist die { $stmts } Anweisung, die seit ihrem Beginn darin lief, rückgängig gemacht — außer einem Schreibzugriff auf eine Tabelle ohne Transaktionen (MyISAM, MEMORY), den kein Rollback rückgängig macht
+       *[other] sind die { $stmts } Anweisungen, die seit ihrem Beginn darin liefen, rückgängig gemacht — außer einem Schreibzugriff auf eine Tabelle ohne Transaktionen (MyISAM, MEMORY), den kein Rollback rückgängig macht
+    }.
+tx-not-sent-timeout = Das Anweisungs-Timeout lief ab, während dieser Lauf noch auf die Verbindung des Tabs wartete. Ein früherer Vorgang darauf — ein Commit oder das erneute Abrufen danach — war nicht beendet, daher wurde die Anweisung nie an den Server gesendet. Nichts lief, und die Transaktion ist genau, wo sie war.
+tx-not-sent-cancelled = Dieser Lauf wurde abgebrochen, während er noch auf die Verbindung des Tabs wartete. Ein früherer Vorgang darauf — ein Commit oder das erneute Abrufen danach — war nicht beendet, daher wurde die Anweisung nie an den Server gesendet. Nichts lief, und die Transaktion ist genau, wo sie war.
 snippet-default-name = Snippet
 snippet-delete-title = Snippet löschen
 snippet-delete-question = „{ $name }“ löschen? Das lässt sich nicht rückgängig machen.

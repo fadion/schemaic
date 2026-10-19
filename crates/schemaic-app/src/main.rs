@@ -3773,7 +3773,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // killed one has spent it — and nothing else on screen says so.
                 // `None` (no session) can't have had a transaction to spend.
                 let note = |m: String| match stmt {
-                    Some(o) => tx::run_failed_message(&m, o, tx_before, engine, &sql),
+                    Some(o) => {
+                        schemaic_ui::i18n::run_failed_message(&m, o, tx_before, engine, &sql)
+                    }
                     None => m,
                 };
                 let state = match res {
@@ -3793,7 +3795,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // first for that reason.
                     Err(DbError::Cancelled) if stmt == Some(StmtOutcome::NotSent) => {
                         tracing::info!("run cancelled before the statement was sent");
-                        QueryState::Failed(ModalError::app(tx::not_sent_message(timed_out)))
+                        QueryState::Failed(ModalError::app(schemaic_ui::i18n::not_sent_message(
+                            timed_out,
+                        )))
                     }
                     // A timeout and the Cancel button arrive as the same error,
                     // so the watchdog's flag is the only thing that can tell the
@@ -3809,7 +3813,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // which discloses exactly that, is reached only when the
                     // *clock* stopped the run. See `tx::cancelled_message`.
                     Err(DbError::Cancelled) => {
-                        match tx::run_cancelled_message(stmt, tx_before, engine, &sql) {
+                        match schemaic_ui::i18n::run_cancelled_message(
+                            stmt, tx_before, engine, &sql,
+                        ) {
                             Some(m) => {
                                 tracing::info!("query cancelled after an implicit commit");
                                 QueryState::Failed(ModalError::app(m))
@@ -4408,9 +4414,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
                                 Err(DbError::Cancelled) if out.stmt == StmtOutcome::NotSent => {
                                     stopped = true;
-                                    QueryState::Failed(ModalError::app(tx::not_sent_message(
-                                        timed_out,
-                                    )))
+                                    QueryState::Failed(ModalError::app(
+                                        schemaic_ui::i18n::not_sent_message(timed_out),
+                                    ))
                                 }
                                 // The sources are `run_query_core`'s: a timeout
                                 // and a cancel are Schemaic's own words, a
@@ -4419,19 +4425,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     if tx::timeout_reached(Some(out.stmt), timed_out) =>
                                 {
                                     stopped = true;
-                                    QueryState::Failed(ModalError::app(tx::run_failed_message(
-                                        &timeout_message(timeout),
-                                        out.stmt,
-                                        before,
-                                        engine,
-                                        sql,
-                                    )))
+                                    QueryState::Failed(ModalError::app(
+                                        schemaic_ui::i18n::run_failed_message(
+                                            &timeout_message(timeout),
+                                            out.stmt,
+                                            before,
+                                            engine,
+                                            sql,
+                                        ),
+                                    ))
                                 }
                                 // The same pair as `run_query_core`'s, and the
                                 // same hole: see `tx::cancelled_message`.
                                 Err(DbError::Cancelled) => {
                                     stopped = true;
-                                    match tx::run_cancelled_message(
+                                    match schemaic_ui::i18n::run_cancelled_message(
                                         Some(out.stmt),
                                         before,
                                         engine,
@@ -4444,7 +4452,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Err(e) => {
                                     stopped = true;
                                     QueryState::Failed(ModalError::new(
-                                        tx::run_failed_message(
+                                        schemaic_ui::i18n::run_failed_message(
                                             &e.to_string(),
                                             out.stmt,
                                             before,
@@ -16365,7 +16373,7 @@ mod app_tests {
         );
         // A Stop's disclosure is matched, then wrapped, one line on.
         let mut stops = 0usize;
-        for (at, _) in body.match_indices("tx::run_cancelled_message(") {
+        for (at, _) in body.match_indices("i18n::run_cancelled_message(") {
             stops += 1;
             let after = &body[at..(at + 400).min(body.len())];
             assert!(
