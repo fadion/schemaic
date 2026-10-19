@@ -146,11 +146,10 @@ assertions pin English wording — stays the regression net throughout.
      (`compare::omission_note`) and the AI proposal errors (`propose::resolve_target`/`apply`).
      The largest group; a test in `ddl_preview.rs` matches `"gone — "` on the English.
    - **The `DbError`s still shown by `to_string()`** — the app's `db_error_shown` words
-     the prefixes everywhere but where one string serves two readers: the schema tree's
-     load failures (`SchemaState::Failed`, `LoadFailure::Server`), which reach a modal that
-     offers *Explain*, and the DDL modal's failure, which its write-log entry keeps. Each
-     needs the English carried beside the wording (`ModalError::shown`, the copy's
-     `CopyFailed`), not a translation in its place. So do the run paths' own notices
+     the prefixes everywhere but where one string serves two readers: the DDL modal's
+     failure, which its write-log entry keeps. It needs the English carried beside the
+     wording (`ModalError::shown`, the copy's `CopyFailed`, `LoadFailure::Server`'s
+     `shown`), not a translation in its place. So do the run paths' own notices
      (`timeout_message`, the cancel and not-sent notices): their translation is a
      `ModalError::app`'s `text`, which the write log records.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.

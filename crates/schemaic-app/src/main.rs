@@ -9624,7 +9624,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // for the Export modal, which does.
                 let st = match db.fetch_schema(&database, CancellationToken::new()).await {
                     Ok(s) => SchemaState::Loaded(Arc::new(s)),
-                    Err(e) => SchemaState::Failed(e.to_string()),
+                    Err(e) => SchemaState::Failed(
+                        ModalError::server(e.to_string()).shown_as(db_error_shown(&e)),
+                    ),
                 };
                 send_schema(st);
             });
@@ -9902,7 +9904,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 match db.list_databases().await {
                     Ok(listed) => send(Ok((tunnel_port, new_handle, listed))),
                     // The tunnel this load opened, if any, closes here with it.
-                    Err(e) => send(Err(LoadFailure::Server(e.to_string()))),
+                    Err(e) => send(Err(LoadFailure::Server {
+                        text: e.to_string(),
+                        shown: db_error_shown(&e),
+                    })),
                 }
             });
         })

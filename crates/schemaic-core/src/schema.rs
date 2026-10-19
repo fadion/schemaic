@@ -8268,7 +8268,9 @@ pub enum SchemaState {
     /// Introspection query is in flight.
     Loading,
     Loaded(std::sync::Arc<DbSchema>),
-    Failed(String),
+    /// The read failed: the error its *View* opens — the server's, so worth
+    /// an *Explain* — in English, worded for the window as its `shown`.
+    Failed(crate::model::ModalError),
     /// Listed, and deliberately not read: a load does not read this database
     /// unasked ([`unasked_reads`] — a single-user one, whose one connection
     /// the read would take). Read when the user asks, by the node's own
@@ -9117,7 +9119,7 @@ mod schema_state_tests {
     #[test]
     fn a_failed_database_goes_back_to_loading() {
         assert!(matches!(
-            SchemaState::Failed("gone".into()).begin_refresh(),
+            SchemaState::Failed(crate::model::ModalError::server("gone")).begin_refresh(),
             Some(SchemaState::Loading)
         ));
     }

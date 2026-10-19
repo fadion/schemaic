@@ -304,8 +304,10 @@ existing prose was left alone.
     `db_for`/`session_for` refusals `App`, a failed `BEGIN` `Server` — the server's words, but not
     about a statement of the user's. The schema tree's per-database Refresh raises its `db_for`
     refusal as `ModalError::app` too, rather than writing it into the node's `SchemaState::Failed`,
-    whose row labels every failure the server's (it holds a bare `String`, fed by the fetch's error
-    as well) and so offered *Explain* on "SSH tunnel is not established yet". **That makes the `DbError` variant the provenance, so
+    whose row labelled every failure the server's (it held a bare `String`, fed by the fetch's error
+    as well) and so offered *Explain* on "SSH tunnel is not established yet". `Failed` holds a
+    `ModalError` now — the fetch's failure alone, `Server`, its English as `text` and
+    `db_error_shown`'s wording as `shown` — which `failed_row` hands the modal as it is. **That makes the `DbError` variant the provenance, so
     `schemaic-db` has to write the right one**: it wrote its own refusals and its own set-up
     statements' failures as `Query`/`Connect`, so the single run folded a failed lazy `BEGIN` into
     the statement's result and the bar offered *AI fix* over a healthy `SELECT` — while Run All,
@@ -12760,13 +12762,18 @@ existing prose was left alone.
     answered "SSH tunnel is not established yet", for good, over a tunnel that had in fact been
     refused, the sentence masking the one cause worth reading; it was reported from macOS, where the
     tunnel evidently never opened. `LoadFailure` says which step failed — `Tunnel` (connect, host key,
-    key file, agent, authentication) or `Server` (the tunnel opened, the server behind it failed the
-    load, and the tunnel closed with it) — and is the error half of the app's `ConnectResult`, which
+    key file, agent, authentication) or `Server { text, shown }` (the tunnel opened, the server
+    behind it failed the load, and the tunnel closed with it: its `DbError` as `to_string()` and as
+    the app's `db_error_shown`) — and is the error half of the app's `ConnectResult`, which
     was a `String`. `TunnelFailures` holds each connection's last one, and `refusal` is the sentence:
     the old one while nothing is recorded, otherwise the reason and *Refresh the schema to try
     again* — the only retry there is, since nothing re-opens a tunnel on its own. `refusal_of` is
     the same answer as a `TunnelRefusal` (the reason borrowed, its closing full stop off), which the
-    app says through `ui::i18n::tunnel_refusal` (`tunnel-*`); `refusal` is its English. `Server` is kept
+    app says through `ui::i18n::tunnel_refusal` (`tunnel-*`); `refusal` is its English. A server's
+    failure is both there too, `TunnelRefusal::Server { why, shown }`: `refusal` reads `why` and
+    `tunnel_refusal` reads `shown`, so the window says the server's failure as it says it everywhere
+    else and core's sentence keeps the English (`a_server_failure_is_refused_in_english_and_shown_as_worded`;
+    `the_tunnel_refusal_says_the_servers_failure_as_shown` in `ui::i18n`). `Server` is kept
     apart because calling it a tunnel failure would send the user to fix SSH settings that work
     (`a_server_failure_behind_the_tunnel_is_not_called_a_tunnel_failure`, in `tunnel_failure_tests`).
     The app's bookkeeping is the half the type cannot pin: `load_schema` clears the entry when it is
@@ -30005,7 +30012,10 @@ existing prose was left alone.
     `widgets::loading_dots` take `impl Into<String>` (the dots hold the prefix as an `Rc<str>`),
     so every literal caller elsewhere still compiles. **Two things stay English on purpose**: the
     key row's `UNIQUE`/`FOREIGN`/`INDEX` tags, which are SQL keywords, and the AI-explain prompts,
-    AI text being English throughout.
+    AI text being English throughout. That is why `failed_row`'s *View* opens the
+    `SchemaState::Failed`'s own `ModalError` as it came rather than building one: it used to make
+    `ModalError::server(msg)` from a bare string, which could carry the English or the wording but
+    not both, so the modal draws the wording (`shown`) and *Explain* sends the English (`text`).
     **The filter box's text is the app's signal, `SchemaUi::schema_filter`, not the panel's**,
     because it outlives the session (`UiState::schema_filter`); it was a panel-local
     `RwSignal::new(String::new())` until the filter was persisted. The debounced `filter` mirror the
@@ -41315,7 +41325,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     list, the blob panel, Server Activity's locks, sessions and kill, compare's database list and
     `compare-reading-failed`, the properties panel's table statistics, the account browser's
     principals and grants, the server variables viewer, the connection test's ping, the SQLite
-    backup and the live monitor. **`db_error_shown` is for the eye alone**: nothing that is logged,
+    backup and the live monitor — and the schema tree's two load failures, a database's read as its
+    `SchemaState::Failed` and the listing behind a tunnel as `LoadFailure::Server`'s `shown` (under
+    `connection.rs`), each beside its English. **`db_error_shown` is for the eye alone**: nothing that is logged,
     persisted or sent to a model reads it. `english_shows_every_db_error_as_it_displays`
     (`app_tests`) holds it, and `modal_error_shown`'s `displayed()` and `text`, equal to
     `to_string()` over a `Connect`, a `Query`, a `QueryAt`, `Cancelled`, a `Refused` and two
@@ -41329,9 +41341,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and a
     database-layer refusal's own text inside `Refused` (SQL
     Server's blank-string and code-page refusals — the note after it is worded). And, until the
-    roadmap's next step, every `DbError` still taken as `to_string()`, prefix and all: the schema
-    tree's load failures (`SchemaState::Failed`, `LoadFailure::Server`), which reach a modal
-    offering *Explain*; the DDL modal's failure, one string shared with its write-log entry; the
+    roadmap's next step, every `DbError` still taken as `to_string()`, prefix and all: the DDL modal's failure, one string shared with its write-log entry; the
     copy's settle failure, a `DdlError`; the squiggle's diagnostic
     (`intel::db_error_diagnostic`), whose text the AI fix prompt reads; and the run paths' own
     `App` notes, whose `text` is the interface's wording and is what the write log records (under
@@ -42066,6 +42076,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   replaces the `Arc`. It holds the `Arc` rather than reducing it to a pointer, so a later allocation
   cannot reuse the address, compare equal and leave a stale subtree; that is the one way this
   optimisation can go wrong, and `erd_view::EdgeGeometry` is the same shape for the same reason.
+  `Failed` compares its whole `ModalError`, `shown` included, so the same English worded anew is a
+  new row to draw (`a_schema_key_compares_the_catalogue_by_identity` has that case).
   **And only the key closure is wrapped in an effect — the *builder* is called outside it**, so a
   scaled metric read there subscribes nothing and freezes at the scale the view was built at. Two
   sites paid for that. `schema_tree`'s `SchemaTreeCtx` therefore carries `indent_levels: u32`, a

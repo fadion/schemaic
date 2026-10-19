@@ -2106,8 +2106,10 @@ pub enum LoadFailure {
     /// key file, agent, authentication).
     Tunnel(String),
     /// The tunnel opened, but the server behind it failed the load, and the
-    /// tunnel was closed with it.
-    Server(String),
+    /// tunnel was closed with it: the error in English (`text`), and as the
+    /// window words it (`shown`) — the refusal the interface says reads the
+    /// second, [`TunnelRefusal::message`] the first.
+    Server { text: String, shown: String },
 }
 
 /// The last load failure of each SSH connection, by connection id — what an
@@ -2145,7 +2147,10 @@ impl TunnelFailures {
         match self.0.get(&conn_id) {
             None => TunnelRefusal::StillOpening,
             Some(LoadFailure::Tunnel(why)) => TunnelRefusal::Tunnel(why.trim_end_matches('.')),
-            Some(LoadFailure::Server(why)) => TunnelRefusal::Server(why.trim_end_matches('.')),
+            Some(LoadFailure::Server { text, shown }) => TunnelRefusal::Server {
+                why: text.trim_end_matches('.'),
+                shown: shown.trim_end_matches('.'),
+            },
         }
     }
 }
@@ -2157,8 +2162,9 @@ pub enum TunnelRefusal<'a> {
     StillOpening,
     /// The tunnel would not open: the SSH error.
     Tunnel(&'a str),
-    /// The server behind the tunnel failed the load: its error.
-    Server(&'a str),
+    /// The server behind the tunnel failed the load: its error, in English
+    /// and as the window words it.
+    Server { why: &'a str, shown: &'a str },
 }
 
 impl TunnelRefusal<'_> {
@@ -2170,7 +2176,7 @@ impl TunnelRefusal<'_> {
             TunnelRefusal::Tunnel(why) => {
                 format!("The SSH tunnel could not be opened: {why}. {RETRY}")
             }
-            TunnelRefusal::Server(why) => {
+            TunnelRefusal::Server { why, .. } => {
                 format!("Could not connect through the SSH tunnel: {why}. {RETRY}")
             }
         }
@@ -2182,6 +2188,36 @@ mod tunnel_failure_tests {
     use super::{LoadFailure, TunnelFailures};
 
     const STILL_OPENING: &str = "SSH tunnel is not established yet";
+
+    /// A server's failure as an English window would show it.
+    fn server(text: &str) -> LoadFailure {
+        LoadFailure::Server {
+            text: text.into(),
+            shown: text.into(),
+        }
+    }
+
+    /// **The refusal is the English**, whatever the window worded the
+    /// server's failure as — and a closing full stop comes off both.
+    #[test]
+    fn a_server_failure_is_refused_in_english_and_shown_as_worded() {
+        let mut f = TunnelFailures::default();
+        f.record(
+            7,
+            LoadFailure::Server {
+                text: "connection failed: Access denied.".into(),
+                shown: "Verbindung fehlgeschlagen: Access denied.".into(),
+            },
+        );
+        assert_eq!(
+            f.refusal_of(7),
+            super::TunnelRefusal::Server {
+                why: "connection failed: Access denied",
+                shown: "Verbindung fehlgeschlagen: Access denied",
+            }
+        );
+        assert!(!f.refusal(7).contains("Verbindung"), "{}", f.refusal(7));
+    }
 
     #[test]
     fn a_tunnel_still_opening_says_so() {
@@ -2204,10 +2240,7 @@ mod tunnel_failure_tests {
     #[test]
     fn a_server_failure_behind_the_tunnel_is_not_called_a_tunnel_failure() {
         let mut f = TunnelFailures::default();
-        f.record(
-            7,
-            LoadFailure::Server("Access denied for user 'app'".into()),
-        );
+        f.record(7, server("Access denied for user 'app'"));
         let msg = f.refusal(7);
         assert!(msg.contains("Access denied for user 'app'"), "{msg}");
         assert!(msg.contains("through the SSH tunnel"), "{msg}");
@@ -2242,7 +2275,7 @@ mod tunnel_failure_tests {
     fn the_latest_failure_is_the_one_reported() {
         let mut f = TunnelFailures::default();
         f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
-        f.record(7, LoadFailure::Server("Unknown database 'app'".into()));
+        f.record(7, server("Unknown database 'app'"));
         let msg = f.refusal(7);
         assert!(msg.contains("Unknown database 'app'"), "{msg}");
         assert!(!msg.contains("authentication"), "{msg}");

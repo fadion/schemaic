@@ -3582,7 +3582,7 @@ fn tree_row_static(s: floem::style::Style, pad_left: f64) -> floem::style::Style
 /// pattern for "there is more to this error than the room here allows", and one
 /// modal that can already be selected from and copied.
 fn failed_row(
-    msg: String,
+    err: schemaic_core::model::ModalError,
     open: RwSignal<bool>,
     detail: RwSignal<Option<schemaic_core::model::ModalError>>,
 ) -> impl IntoView {
@@ -3593,8 +3593,10 @@ fn failed_row(
             text(tr!("tree-failed-view"))
                 .on_click_stop(move |_| {
                     // The server's refusal, so worth an "Explain" — but not a
-                    // statement failure, so no "AI fix".
-                    detail.set(Some(schemaic_core::model::ModalError::server(msg.clone())));
+                    // statement failure, so no "AI fix". Its source is the
+                    // producer's (`SchemaState::Failed`), its English what
+                    // Explain sends.
+                    detail.set(Some(err.clone()));
                     open.set(true);
                 })
                 .style(|s| {
@@ -4507,13 +4509,21 @@ mod tests {
             SchemaKey(SchemaState::Loading),
             SchemaKey(SchemaState::Loading)
         );
+        use schemaic_core::model::ModalError;
         assert_ne!(
-            SchemaKey(SchemaState::Failed("gone".into())),
-            SchemaKey(SchemaState::Failed("denied".into()))
+            SchemaKey(SchemaState::Failed(ModalError::server("gone"))),
+            SchemaKey(SchemaState::Failed(ModalError::server("denied")))
+        );
+        // The same English worded anew is a new row to draw.
+        assert_ne!(
+            SchemaKey(SchemaState::Failed(ModalError::server("gone"))),
+            SchemaKey(SchemaState::Failed(
+                ModalError::server("gone").shown_as("weg")
+            ))
         );
         assert_ne!(
             SchemaKey(SchemaState::Loading),
-            SchemaKey(SchemaState::Failed(String::new()))
+            SchemaKey(SchemaState::Failed(ModalError::server("")))
         );
     }
 

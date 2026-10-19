@@ -454,7 +454,7 @@ pub fn tunnel_refusal(
     match failures.refusal_of(conn_id) {
         TunnelRefusal::StillOpening => tr!("tunnel-still-opening"),
         TunnelRefusal::Tunnel(why) => tr!("tunnel-could-not-open", error = why),
-        TunnelRefusal::Server(why) => tr!("tunnel-server-failed", error = why),
+        TunnelRefusal::Server { shown, .. } => tr!("tunnel-server-failed", error = shown),
     }
 }
 
@@ -1282,10 +1282,34 @@ mod tests {
         use schemaic_core::connection::{LoadFailure, TunnelFailures};
         let mut f = TunnelFailures::default();
         f.record(1, LoadFailure::Tunnel("Host key mismatch.".into()));
-        f.record(2, LoadFailure::Server("Access denied for user 'u'".into()));
+        let denied = "connection failed: Access denied for user 'u'";
+        f.record(
+            2,
+            LoadFailure::Server {
+                text: denied.into(),
+                shown: denied.into(),
+            },
+        );
         for id in [0, 1, 2] {
             assert_eq!(tunnel_refusal(&f, id), f.refusal(id), "{id}");
         }
+    }
+
+    /// **The window says a server's failure as the window worded it**, and
+    /// core's refusal — the English — as the error said it.
+    #[test]
+    fn the_tunnel_refusal_says_the_servers_failure_as_shown() {
+        use schemaic_core::connection::{LoadFailure, TunnelFailures};
+        let mut f = TunnelFailures::default();
+        f.record(
+            2,
+            LoadFailure::Server {
+                text: "connection failed: Access denied".into(),
+                shown: "Verbindung fehlgeschlagen: Access denied".into(),
+            },
+        );
+        assert!(tunnel_refusal(&f, 2).contains("Verbindung fehlgeschlagen: Access denied"));
+        assert!(f.refusal(2).contains("connection failed: Access denied"));
     }
 
     /// **A refused kill and an incomparable pair read in English exactly as
