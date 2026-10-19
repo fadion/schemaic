@@ -2940,6 +2940,44 @@ conn-delete-question = This deletes the connection, its stored password, its sav
 conn-delete-keyring-kept = Schemaic could not reach the OS keyring, so the deleted connection's stored password and SSH secrets are **still in it**.
 conn-delete-keyring-later = They will be removed the next time a connection is deleted or saved while the keyring is reachable. No new connection can be given them in the meantime — connection ids are never reused.
 
+## Startup notices (core's persist::Notice), shown in the error modal when the
+## app starts or a save answers. Each message is one line; a notice shows its
+## lines one under the other. ** marks bold, * italic and ` code.
+
+# A config file that did not parse. $name is the file's name; $error is the
+# parser's own text and stays as written.
+notice-unreadable = { $name } could not be read ({ $error }).
+notice-unreadable-kept = The unreadable file was kept as { $name }.corrupt; Schemaic fell back to its backup, or to defaults if the backup was unreadable too.
+# Added for connections.json alone.
+notice-unreadable-swept = That copy can hold passwords in the clear, so it is removed the next time you delete a connection — recover anything you need from it before then.
+# A config file that was gone and came back off a sibling copy; $from is that
+# copy's suffix (.bak, .tmp), so { $name }{ $from } is its file name.
+notice-missing = { $name } was missing.
+notice-missing-restored = Schemaic recovered it from { $name }{ $from }, which was still there. It will be written back the next time this setting changes — until then that sibling is the only copy.
+# The keyring would not answer at startup; $n secrets are unreadable, and
+# $error is the keyring's own message.
+notice-keyring-unread = { $n ->
+    [one] Schemaic could not read { $n } saved secret from the OS keyring.
+   *[other] Schemaic could not read { $n } saved secrets from the OS keyring.
+}
+notice-keyring-unread-why = { $n ->
+    [one] Schemaic could not read { $n } saved secret from the OS keyring ({ $error }).
+   *[other] Schemaic could not read { $n } saved secrets from the OS keyring ({ $error }).
+}
+notice-keyring-unread-kept = Those passwords are unavailable this session and were **not** deleted — leave the fields blank and they will come back once the keyring is reachable. Typing a new one saves over the stored secret.
+# A save the keyring would not take: $n passwords written to the file instead.
+notice-in-the-clear = { $n ->
+    [one] Schemaic could not reach the OS keyring, so { $n } password was saved **in plain text** in `connections.json`.
+   *[other] Schemaic could not reach the OS keyring, so { $n } passwords were saved **in plain text** in `connections.json`.
+}
+notice-in-the-clear-where = That file is in the folder Settings → General's *Open folder* button opens, beside the log — check before sharing it. Saving again once the keyring is reachable moves them back in.
+# A save that could not delete $n passwords the user cleared.
+notice-undeleted = { $n ->
+    [one] { $n } cleared password is still in the OS keyring — Schemaic could not delete it.
+   *[other] { $n } cleared passwords are still in the OS keyring — Schemaic could not delete them.
+}
+notice-undeleted-after = The field is blank on disk, but the next launch will fill it back in. Save again once the keyring is reachable.
+
 ## The rest of main.rs's own words — the inline AI's and the AI fill's
 ## failures, a Manual tab's connection, snippets, Copy table, Compare schemas,
 ## the table monitor and the statement timeout. $error is the engine's, the

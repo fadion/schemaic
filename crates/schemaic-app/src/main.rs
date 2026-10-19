@@ -11227,7 +11227,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         // once per session, so a keyring that stays down does not raise a modal
         // on every read-only toggle.
         if let Some(notice) = secrets::save_connections(&file, saving) {
-            error_modal_text.set(Some(ModalError::app(notice)));
+            error_modal_text.set(Some(ModalError::app(schemaic_ui::i18n::notice_text(
+                &notice,
+            ))));
             error_modal_open.set(true);
         }
     };
@@ -12516,11 +12518,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             if !secrets::forget_connection(id) {
                 // Two messages because the notice keeps its line break, and a
                 // catalogue message is one line.
-                persist::queue_notice(format!(
+                persist::queue_notice(persist::Notice::Said(format!(
                     "{}\n{}",
                     tr!("conn-delete-keyring-kept"),
                     tr!("conn-delete-keyring-later")
-                ));
+                )));
             }
             // …and its saved AI conversation, which would otherwise linger and
             // resurface under whatever connection reuses the id.

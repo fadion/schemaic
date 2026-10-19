@@ -225,26 +225,21 @@ impl Hydration {
     /// **Both halves of the sentence are load-bearing.** "Unavailable this
     /// session" is why the connections stopped working; "were not deleted" is
     /// what stops the user retyping a half-remembered password over a stored one
-    /// that is perfectly intact. The wording lives here, with the fact, rather
+    /// that is perfectly intact. The decision lives here, with the fact, rather
     /// than in whichever surface happens to show it — this used to have a
     /// documented caller that did not exist, and the failure reached neither a
     /// banner nor a log line.
-    pub fn notice(&self) -> Option<String> {
+    ///
+    /// A [`Notice`](crate::persist::Notice), since the startup modal says it in
+    /// the interface's language; its `message` is the English.
+    pub fn notice(&self) -> Option<crate::persist::Notice> {
         if !self.any_unreadable() {
             return None;
         }
-        let n = self.unreadable.len();
-        let reason = match &self.error {
-            Some(e) => format!(" ({e})"),
-            None => String::new(),
-        };
-        Some(format!(
-            "Schemaic could not read {n} saved {} from the OS keyring{reason}.\n\
-             Those passwords are unavailable this session and were **not** deleted — \
-             leave the fields blank and they will come back once the keyring is reachable. \
-             Typing a new one saves over the stored secret.",
-            crate::text::plural(n, "secret", "secrets"),
-        ))
+        Some(crate::persist::Notice::KeyringUnreadable {
+            secrets: self.unreadable.len(),
+            error: self.error.clone(),
+        })
     }
 
     /// [`Hydration::notice`] for the headless CLI's stderr: plain text, the
@@ -543,30 +538,14 @@ impl Sanitized {
     /// One sentence per fact, and each names the consequence rather than the
     /// mechanism: the user cannot act on "the keyring returned an error", and
     /// can act on "your passwords are in a file you are about to send someone".
-    pub fn notice(&self) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
-        if !self.in_the_clear.is_empty() {
-            let n = self.in_the_clear.len();
-            parts.push(format!(
-                "Schemaic could not reach the OS keyring, so {n} {} \
-                 saved **in plain text** in `connections.json`.\n\
-                 That file is in the folder Settings → General's *Open folder* button opens, \
-                 beside the log — check before sharing it. Saving again once the keyring is \
-                 reachable moves them back in.",
-                crate::text::plural(n, "password was", "passwords were"),
-            ));
-        }
-        if !self.undeleted.is_empty() {
-            let n = self.undeleted.len();
-            parts.push(format!(
-                "{n} cleared {} still in the OS keyring — Schemaic could not delete {}.\n\
-                 The field is blank on disk, but the next launch will fill it back in. \
-                 Save again once the keyring is reachable.",
-                crate::text::plural(n, "password is", "passwords are"),
-                crate::text::plural(n, "it", "them"),
-            ));
-        }
-        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    ///
+    /// A [`Notice`](crate::persist::Notice), as [`Hydration::notice`] is.
+    pub fn notice(&self) -> Option<crate::persist::Notice> {
+        let (in_the_clear, undeleted) = (self.in_the_clear.len(), self.undeleted.len());
+        (in_the_clear > 0 || undeleted > 0).then_some(crate::persist::Notice::KeyringSave {
+            in_the_clear,
+            undeleted,
+        })
     }
 }
 
@@ -959,7 +938,10 @@ mod tests {
             hydration.error.is_some(),
             "the backend's reason is what the user is told"
         );
-        let notice = hydration.notice().expect("there is something to say");
+        let notice = hydration
+            .notice()
+            .expect("there is something to say")
+            .message();
         assert!(
             notice.contains("not** deleted"),
             "the half that stops the user retyping over an intact secret: {notice}"
@@ -995,7 +977,7 @@ mod tests {
             "the fallback itself is unchanged — the credential is not lost"
         );
         assert_eq!(out.in_the_clear, vec![(7, SecretKind::DbPassword)]);
-        let notice = out.notice().expect("there is something to say");
+        let notice = out.notice().expect("there is something to say").message();
         assert!(notice.contains("plain text"), "{notice}");
         assert!(notice.contains("connections.json"), "{notice}");
 
@@ -1041,7 +1023,7 @@ mod tests {
             !out.undeleted.contains(&(7, SecretKind::SshPassword)),
             "an entry that was never there is not a refused clear"
         );
-        let notice = out.notice().expect("there is something to say");
+        let notice = out.notice().expect("there is something to say").message();
         assert!(notice.contains("still in the OS keyring"), "{notice}");
         assert_eq!(
             store.stored("conn.7.password").as_deref(),

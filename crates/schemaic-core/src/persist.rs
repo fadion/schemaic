@@ -20,11 +20,11 @@ use crate::connection::Connection;
 /// preferences simply vanished. The load path is called from a dozen places
 /// before the UI exists, so it records here instead of returning a notice, and
 /// the app drains it once at startup with [`take_recoveries`].
-static RECOVERIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static RECOVERIES: Mutex<Vec<Notice>> = Mutex::new(Vec::new());
 
-/// Take (and clear) the recovery notices recorded so far — one line per file
-/// that failed to parse. The app shows these in the error modal at startup.
-pub fn take_recoveries() -> Vec<String> {
+/// Take (and clear) the recovery notices recorded so far — one per file that
+/// failed to parse. The app shows these in the error modal at startup.
+pub fn take_recoveries() -> Vec<Notice> {
     RECOVERIES
         .lock()
         .map(|mut v| std::mem::take(&mut *v))
@@ -1343,22 +1343,124 @@ fn corrupt_sibling_is_swept(path: &Path) -> bool {
 /// instruction — *your data is in this file, go and get it* — and for
 /// `connections.json` the next connection delete takes the file away; a user
 /// told only the first half plans around a file that will not be there.
-fn recovery_notice(path: &Path, err: &str) -> String {
-    let name = path
-        .file_name()
+fn recovery_notice(path: &Path, err: &str) -> Notice {
+    Notice::Unreadable {
+        name: notice_name(path),
+        error: err.to_string(),
+        swept: corrupt_sibling_is_swept(path),
+    }
+}
+
+/// A store's name as a notice says it: the file name, or the whole path for
+/// one that has none.
+fn notice_name(path: &Path) -> String {
+    path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    let temporary = if corrupt_sibling_is_swept(path) {
-        "\nThat copy can hold passwords in the clear, so it is removed the next time you \
-         delete a connection — recover anything you need from it before then."
-    } else {
-        ""
-    };
-    format!(
-        "{name} could not be read ({err}).\n\
-         The unreadable file was kept as {name}.corrupt; Schemaic fell back to its backup, or \
-         to defaults if the backup was unreadable too.{temporary}"
-    )
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// A startup notice, waiting in [`RECOVERIES`] for the modal — a value rather
+/// than a sentence, because the queue is filled in core, before the window
+/// exists, and read by an interface that says it in its own language.
+/// [`Notice::message`] is the English.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Notice {
+    /// A config file that did not parse ([`recovery_notice`]): `name` is the
+    /// file's, `error` the parser's own text, and `swept` whether a later
+    /// save removes the `.corrupt` copy ([`corrupt_sibling_is_swept`]).
+    Unreadable {
+        name: String,
+        error: String,
+        swept: bool,
+    },
+    /// A config file that was gone and came back off its `from` sibling
+    /// ([`missing_notice`]).
+    Missing { name: String, from: &'static str },
+    /// The keyring would not answer for `secrets` saved secrets — see
+    /// [`crate::secrets::Hydration::notice`]. `error` is the backend's own
+    /// message, when it gave one.
+    KeyringUnreadable {
+        secrets: usize,
+        error: Option<String>,
+    },
+    /// A save the keyring did not fully take — see
+    /// [`crate::secrets::Sanitized::notice`]. At least one count is non-zero.
+    KeyringSave {
+        in_the_clear: usize,
+        undeleted: usize,
+    },
+    /// Text its caller has already worded, in the interface's language.
+    Said(String),
+}
+
+impl Notice {
+    /// The notice in English.
+    pub fn message(&self) -> String {
+        match self {
+            Notice::Unreadable { name, error, swept } => {
+                let temporary = if *swept {
+                    "\nThat copy can hold passwords in the clear, so it is removed the next \
+                     time you delete a connection — recover anything you need from it before \
+                     then."
+                } else {
+                    ""
+                };
+                format!(
+                    "{name} could not be read ({error}).\n\
+                     The unreadable file was kept as {name}.corrupt; Schemaic fell back to its \
+                     backup, or to defaults if the backup was unreadable too.{temporary}"
+                )
+            }
+            Notice::Missing { name, from } => format!(
+                "{name} was missing.\n\
+                 Schemaic recovered it from {name}{from}, which was still there. It will be \
+                 written back the next time this setting changes — until then that sibling is \
+                 the only copy."
+            ),
+            Notice::KeyringUnreadable { secrets: n, error } => {
+                let reason = match error {
+                    Some(e) => format!(" ({e})"),
+                    None => String::new(),
+                };
+                format!(
+                    "Schemaic could not read {n} saved {} from the OS keyring{reason}.\n\
+                     Those passwords are unavailable this session and were **not** deleted — \
+                     leave the fields blank and they will come back once the keyring is \
+                     reachable. Typing a new one saves over the stored secret.",
+                    crate::text::plural(*n, "secret", "secrets"),
+                )
+            }
+            Notice::KeyringSave {
+                in_the_clear,
+                undeleted,
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if *in_the_clear > 0 {
+                    let n = *in_the_clear;
+                    parts.push(format!(
+                        "Schemaic could not reach the OS keyring, so {n} {} \
+                         saved **in plain text** in `connections.json`.\n\
+                         That file is in the folder Settings → General's *Open folder* button \
+                         opens, beside the log — check before sharing it. Saving again once the \
+                         keyring is reachable moves them back in.",
+                        crate::text::plural(n, "password was", "passwords were"),
+                    ));
+                }
+                if *undeleted > 0 {
+                    let n = *undeleted;
+                    parts.push(format!(
+                        "{n} cleared {} still in the OS keyring — Schemaic could not delete {}.\n\
+                         The field is blank on disk, but the next launch will fill it back in. \
+                         Save again once the keyring is reachable.",
+                        crate::text::plural(n, "password is", "passwords are"),
+                        crate::text::plural(n, "it", "them"),
+                    ));
+                }
+                parts.join("\n\n")
+            }
+            Notice::Said(text) => text.clone(),
+        }
+    }
 }
 
 /// Queue a startup notice for the modal that drains [`RECOVERIES`].
@@ -1368,7 +1470,7 @@ fn recovery_notice(path: &Path, err: &str) -> String {
 /// on — and one channel is better than each loader inventing its own. The
 /// keyring is the second caller: a locked one is *the* reason connections stop
 /// authenticating, and it used to reach neither a banner nor a log line.
-pub fn queue_notice(notice: String) {
+pub fn queue_notice(notice: Notice) {
     if let Ok(mut v) = RECOVERIES.lock() {
         v.push(notice);
     }
@@ -1381,16 +1483,11 @@ pub fn queue_notice(notice: String) {
 /// something outside Schemaic removed the file, and the copy it was recovered
 /// from is the only one until the next save lands. A user who does not know
 /// that has no reason to take a backup, and no reason to wonder why it went.
-fn missing_notice(path: &Path, from: &str) -> String {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    format!(
-        "{name} was missing.\n\
-         Schemaic recovered it from {name}{from}, which was still there. It will be written \
-         back the next time this setting changes — until then that sibling is the only copy."
-    )
+fn missing_notice(path: &Path, from: &'static str) -> Notice {
+    Notice::Missing {
+        name: notice_name(path),
+        from,
+    }
 }
 
 /// The filesystem operations the save/load dance needs, behind a seam.
@@ -2101,11 +2198,12 @@ pub fn clear_connections_backup() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AI_DISABLED_KEY, ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState,
-        Saving, UiState, ai_harness_to_persist, classify, legacy_ai_run_queries_in,
-        migrate_legacy_once, missing_notice, private_dir_in, read_bytes, read_unrecovered, recover,
-        recovery_notice, remove_secret_siblings, sibling, statement_timeout,
-        statement_timeout_label, take_recoveries, usable_base, write_bytes, write_secret_store,
+        AI_DISABLED_KEY, ConnectionsFile, FileStore, Load, Notice, RECOVERIES, Recovered,
+        RightPanelState, Saving, UiState, ai_harness_to_persist, classify,
+        legacy_ai_run_queries_in, migrate_legacy_once, missing_notice, private_dir_in, read_bytes,
+        read_unrecovered, recover, recovery_notice, remove_secret_siblings, sibling,
+        statement_timeout, statement_timeout_label, take_recoveries, usable_base, write_bytes,
+        write_secret_store,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -3545,7 +3643,10 @@ mod tests {
         assert!(fs.get("/cfg/ui.json.corrupt").is_some());
         // …and the user is told, in the notice the startup modal drains.
         let notices = take_recoveries();
-        assert!(notices.iter().any(|n| n.contains("ui.json")), "{notices:?}");
+        assert!(
+            notices.iter().any(|n| n.message().contains("ui.json")),
+            "{notices:?}"
+        );
     }
 
     #[test]
@@ -3618,7 +3719,10 @@ mod tests {
         // stay silent here: no warning, no notice, no `.corrupt`.
         let notices = take_recoveries();
         assert_eq!(notices, vec![missing_notice(Path::new(CFG), ".bak")]);
-        assert!(notices[0].contains("ui.json was missing"), "{notices:?}");
+        assert!(
+            notices[0].message().contains("ui.json was missing"),
+            "{notices:?}"
+        );
     }
 
     #[test]
@@ -4024,7 +4128,8 @@ mod tests {
         let n = recovery_notice(
             Path::new("/cfg/connections.json"),
             "unknown variant `agent`",
-        );
+        )
+        .message();
         assert!(n.contains("connections.json could not be read"), "{n}");
         assert!(n.contains("unknown variant `agent`"), "{n}");
         assert!(n.contains("connections.json.corrupt"), "{n}");
@@ -4044,7 +4149,9 @@ mod tests {
         write_secret_store(&fs, Path::new(CFG), &vec!["a", "b"], Saving::Replacing);
         write_secret_store(&fs, Path::new(CFG), &vec!["a"], Saving::Erasing);
         assert!(
-            !recovery_notice(Path::new(CFG), "eof").contains("delete a connection"),
+            !recovery_notice(Path::new(CFG), "eof")
+                .message()
+                .contains("delete a connection"),
             "the notice promises nothing about this store, so the sweep may not touch it"
         );
         assert!(
@@ -4066,18 +4173,29 @@ mod tests {
         let creds = recovery_notice(
             Path::new("/cfg/connections.json"),
             "unexpected end of input",
-        );
+        )
+        .message();
         assert!(creds.contains("delete a connection"), "{creds}");
-        let ordinary = recovery_notice(Path::new("/cfg/snippets.json"), "unexpected end of input");
+        let ordinary =
+            recovery_notice(Path::new("/cfg/snippets.json"), "unexpected end of input").message();
         assert!(!ordinary.contains("delete a connection"), "{ordinary}");
     }
 
     #[test]
     fn take_recoveries_drains_what_was_queued() {
         let _guard = recovery_lock();
-        RECOVERIES.lock().unwrap().push("first".to_string());
-        RECOVERIES.lock().unwrap().push("second".to_string());
-        assert_eq!(take_recoveries(), vec!["first", "second"]);
+        RECOVERIES
+            .lock()
+            .unwrap()
+            .push(Notice::Said("first".into()));
+        RECOVERIES
+            .lock()
+            .unwrap()
+            .push(Notice::Said("second".into()));
+        assert_eq!(
+            take_recoveries(),
+            vec![Notice::Said("first".into()), Notice::Said("second".into())]
+        );
         // Drained, so a second startup pass shows nothing.
         assert!(take_recoveries().is_empty());
     }

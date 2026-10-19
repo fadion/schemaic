@@ -98,7 +98,9 @@ assertions pin English wording — stays the regression net throughout.
    `skip_reason_shown`, which passes its sentence through core's `redact_shown` as `message`
    is redacted), and the run paths' transaction disclosures (`tx::TxNote`, chosen by
    `run_failure_note`/`run_cancelled_note`, worded by `i18n::run_failed_message`,
-   `run_cancelled_message` and `not_sent_message`). Of the other existing enums, `ImportError`
+   `run_cancelled_message` and `not_sent_message`), and the startup notices
+   (`persist::Notice`, the queue's value now, which `secrets`' `notice`s and
+   `save_connections`' answer return too; `i18n::notice_text`). Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
    so its prose lives at its construction sites and it is the weakest to convert.
@@ -136,8 +138,6 @@ assertions pin English wording — stays the regression net throughout.
    - **The plan view's warnings** (`plan.rs`) and **the editor's offline diagnostics**
      (`intel::Diagnostic::message`).
    - **Import** — `ImportError`'s `Display` and `import::xlsx_size_refusal`.
-   - **Startup notices** — `persist`'s recovery notices, `secrets`' `notice`/`cli_notice`, and
-     `secrets::save_connections`' answer.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
    - **The table designer's refusals** — `TableDraft::validate`'s sentences, which hold Preview.
    - **The users browser's notes** — `users::Principals::note` and `Grants::note`, which

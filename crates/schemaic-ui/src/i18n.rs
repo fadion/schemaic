@@ -548,6 +548,73 @@ pub fn skip_reason_shown(reason: &schemaic_core::conn_import::SkipReason) -> Str
     redact_shown(&words)
 }
 
+/// A startup notice — core's [`Notice::message`](schemaic_core::persist::Notice::message)
+/// in the interface's language; a parser's or keyring's own text inside it
+/// as written. Public for the app, which shows a save's answer directly.
+pub fn notice_text(notice: &schemaic_core::persist::Notice) -> String {
+    use schemaic_core::persist::Notice;
+    match notice {
+        Notice::Unreadable { name, error, swept } => {
+            let mut text = format!(
+                "{}\n{}",
+                tr!(
+                    "notice-unreadable",
+                    name = name.as_str(),
+                    error = error.as_str()
+                ),
+                tr!("notice-unreadable-kept", name = name.as_str())
+            );
+            if *swept {
+                text.push('\n');
+                text.push_str(&tr!("notice-unreadable-swept"));
+            }
+            text
+        }
+        Notice::Missing { name, from } => {
+            // Bound first: `tr!` pastes `.into()` after an argument, so `*from`
+            // would read as `*(from.into())`.
+            let from: &str = from;
+            format!(
+                "{}\n{}",
+                tr!("notice-missing", name = name.as_str()),
+                tr!("notice-missing-restored", name = name.as_str(), from = from)
+            )
+        }
+        Notice::KeyringUnreadable { secrets, error } => {
+            let n = *secrets;
+            let first = match error {
+                Some(e) => tr!("notice-keyring-unread-why", n = n, error = e.as_str()),
+                None => tr!("notice-keyring-unread", n = n),
+            };
+            format!("{first}\n{}", tr!("notice-keyring-unread-kept"))
+        }
+        Notice::KeyringSave {
+            in_the_clear,
+            undeleted,
+        } => {
+            let mut parts = Vec::new();
+            if *in_the_clear > 0 {
+                let n = *in_the_clear;
+                parts.push(format!(
+                    "{}\n{}",
+                    tr!("notice-in-the-clear", n = n),
+                    tr!("notice-in-the-clear-where")
+                ));
+            }
+            if *undeleted > 0 {
+                let n = *undeleted;
+                parts.push(format!(
+                    "{}\n{}",
+                    tr!("notice-undeleted", n = n),
+                    tr!("notice-undeleted-after")
+                ));
+            }
+            parts.join("\n\n")
+        }
+        Notice::Said(text) => text.clone(),
+    }
+}
+
 /// Load `lang`'s catalogue (with `en-GB` behind it, message by message) into
 /// `loader` and set it up. Split from [`init`] so a test can do it to a loader
 /// of its own rather than to the one every other test reads.
@@ -585,6 +652,52 @@ fn pseudo(s: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// **Every startup notice reads in English exactly as core's
+    /// `persist::Notice::message`** — a file that did not parse (the
+    /// credential file, whose copy is swept, and another), one that came back
+    /// off either sibling, the keyring failing one secret and several with and
+    /// without its reason, a save it refused one way, the other and both, and
+    /// text its caller already worded.
+    #[test]
+    fn english_says_every_startup_notice_as_core_does() {
+        use schemaic_core::persist::Notice;
+        let mut notices = vec![
+            Notice::Unreadable {
+                name: "connections.json".into(),
+                error: "EOF while parsing".into(),
+                swept: true,
+            },
+            Notice::Unreadable {
+                name: "ui.json".into(),
+                error: "expected value".into(),
+                swept: false,
+            },
+            Notice::Missing {
+                name: "ui.json".into(),
+                from: ".bak",
+            },
+            Notice::Missing {
+                name: "tabs.json".into(),
+                from: ".tmp",
+            },
+            Notice::Said("Already worded.".into()),
+        ];
+        for secrets in [1, 3] {
+            for error in [None, Some("keyring locked".to_string())] {
+                notices.push(Notice::KeyringUnreadable { secrets, error });
+            }
+        }
+        for (in_the_clear, undeleted) in [(1, 0), (2, 0), (0, 1), (0, 4), (3, 1)] {
+            notices.push(Notice::KeyringSave {
+                in_the_clear,
+                undeleted,
+            });
+        }
+        for n in notices {
+            assert_eq!(notice_text(&n), n.message(), "{n:?}");
+        }
+    }
 
     /// **A failed, cancelled or never-sent run reads in English exactly as
     /// core's `tx` messages say it** — every outcome, over every transaction

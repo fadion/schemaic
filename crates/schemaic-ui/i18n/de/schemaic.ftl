@@ -2278,6 +2278,30 @@ conn-delete-title = „{ $name }“ löschen
 conn-delete-question = Dies löscht die Verbindung, ihr gespeichertes Passwort, ihre gespeicherte KI-Unterhaltung, ihren Abfrageverlauf und ihre Tabs. Das lässt sich nicht rückgängig machen.
 conn-delete-keyring-kept = Schemaic konnte den Schlüsselbund des Betriebssystems nicht erreichen, daher sind das gespeicherte Passwort und die SSH-Geheimnisse der gelöschten Verbindung **noch darin**.
 conn-delete-keyring-later = Sie werden entfernt, sobald das nächste Mal eine Verbindung gelöscht oder gespeichert wird, während der Schlüsselbund erreichbar ist. Bis dahin kann keine neue Verbindung sie erhalten – Verbindungs-IDs werden nie wiederverwendet.
+notice-unreadable = { $name } konnte nicht gelesen werden ({ $error }).
+notice-unreadable-kept = Die unlesbare Datei wurde als { $name }.corrupt aufbewahrt; Schemaic ist auf ihre Sicherung zurückgefallen, oder auf die Standardwerte, falls auch die Sicherung unlesbar war.
+notice-unreadable-swept = Diese Kopie kann Passwörter im Klartext enthalten und wird daher entfernt, wenn du das nächste Mal eine Verbindung löschst – hol dir vorher alles heraus, was du daraus brauchst.
+notice-missing = { $name } fehlte.
+notice-missing-restored = Schemaic hat sie aus { $name }{ $from } wiederhergestellt, das noch vorhanden war. Sie wird zurückgeschrieben, sobald sich diese Einstellung das nächste Mal ändert – bis dahin ist diese Kopie die einzige.
+notice-keyring-unread = { $n ->
+    [one] Schemaic konnte { $n } gespeichertes Geheimnis nicht aus dem Schlüsselbund des Betriebssystems lesen.
+   *[other] Schemaic konnte { $n } gespeicherte Geheimnisse nicht aus dem Schlüsselbund des Betriebssystems lesen.
+}
+notice-keyring-unread-why = { $n ->
+    [one] Schemaic konnte { $n } gespeichertes Geheimnis nicht aus dem Schlüsselbund des Betriebssystems lesen ({ $error }).
+   *[other] Schemaic konnte { $n } gespeicherte Geheimnisse nicht aus dem Schlüsselbund des Betriebssystems lesen ({ $error }).
+}
+notice-keyring-unread-kept = Diese Passwörter sind in dieser Sitzung nicht verfügbar und wurden **nicht** gelöscht – lass die Felder leer, dann kommen sie zurück, sobald der Schlüsselbund erreichbar ist. Ein neu eingegebenes überschreibt das gespeicherte Geheimnis.
+notice-in-the-clear = { $n ->
+    [one] Schemaic konnte den Schlüsselbund des Betriebssystems nicht erreichen, daher wurde { $n } Passwort **im Klartext** in `connections.json` gespeichert.
+   *[other] Schemaic konnte den Schlüsselbund des Betriebssystems nicht erreichen, daher wurden { $n } Passwörter **im Klartext** in `connections.json` gespeichert.
+}
+notice-in-the-clear-where = Diese Datei liegt in dem Ordner, den die Schaltfläche *Ordner öffnen* unter Einstellungen → Allgemein öffnet, neben dem Protokoll – prüfe sie, bevor du sie weitergibst. Erneutes Speichern, sobald der Schlüsselbund erreichbar ist, verschiebt sie wieder dorthin.
+notice-undeleted = { $n ->
+    [one] { $n } geleertes Passwort ist noch im Schlüsselbund des Betriebssystems – Schemaic konnte es nicht löschen.
+   *[other] { $n } geleerte Passwörter sind noch im Schlüsselbund des Betriebssystems – Schemaic konnte sie nicht löschen.
+}
+notice-undeleted-after = Das Feld ist auf der Festplatte leer, aber der nächste Start füllt es wieder. Speichere erneut, sobald der Schlüsselbund erreichbar ist.
 inline-ai-no-sql = Kein SQL zurückgegeben
 inline-ai-not-sql = Das Modell hat kein SQL zurückgegeben
 inline-ai-failed = Generierung fehlgeschlagen

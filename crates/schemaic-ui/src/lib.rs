@@ -8448,6 +8448,7 @@ pub fn report_recoveries(
         return;
     }
     // Schemaic's own notice about its own files — nothing for "Explain" to add.
+    let notices: Vec<String> = notices.iter().map(i18n::notice_text).collect();
     text.set(Some(schemaic_core::model::ModalError::app(
         notices.join("\n\n"),
     )));

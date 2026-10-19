@@ -219,7 +219,7 @@ pub fn hydrate_for_cli(conn: &mut Connection, supplied: &[SecretKind]) -> Vec<St
 /// `saving` travels straight through to [`persist::save_connections`]; see it
 /// for why a save that *drops* a connection must not leave a `.bak`.
 #[must_use = "a `Some` is what the user is told; dropping it is how this went unsurfaced before"]
-pub fn save_connections(file: &ConnectionsFile, saving: Saving) -> Option<String> {
+pub fn save_connections(file: &ConnectionsFile, saving: Saving) -> Option<persist::Notice> {
     // **`into_inner`, not `unwrap_or_default`.** A poisoned mutex used to hand
     // the save a *default* `Hydration` — nothing marked unreadable — and the
     // save then read every empty field as a password the user had cleared and
@@ -249,14 +249,14 @@ pub fn save_connections(file: &ConnectionsFile, saving: Saving) -> Option<String
 
 /// Has this notice not been shown yet this session?
 ///
-/// Keyed on the text rather than on a flag per kind, so a save that starts
-/// carrying a *different* problem is still heard.
-fn told_once(notice: &str) -> bool {
-    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+/// Keyed on the whole notice rather than on a flag per kind, so a save that
+/// starts carrying a *different* problem is still heard.
+fn told_once(notice: &persist::Notice) -> bool {
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<persist::Notice>>> = OnceLock::new();
     SEEN.get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(notice.to_string())
+        .insert(notice.clone())
 }
 
 /// Forget a deleted connection's stored secrets. Returns whether they are all

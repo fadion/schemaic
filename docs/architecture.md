@@ -14282,7 +14282,7 @@ existing prose was left alone.
     **A promise the app breaks by design is written as the qualified thing it is.**
     `corrupt_sibling_is_swept(path)` answers whether a later save will take this store's `.corrupt`
     out from under the user — true for `connections.json` alone — and `recovery_notice` asks it and
-    appends a second sentence for that store: the copy can hold passwords in the clear, so it is
+    records the answer as the notice's `swept`, which says a second sentence for that store: the copy can hold passwords in the clear, so it is
     removed the next time you delete a connection, recover anything you need from it first. The other
     stores' notice must **not** carry that warning, because for them it is now false
     (`only_the_credential_store_warns_that_its_corrupt_copy_is_temporary`). **`write_secret_store`
@@ -14459,6 +14459,16 @@ existing prose was left alone.
     drawn has the same problem — there is no surface yet to say anything on — so one channel beats
     each loader inventing its own, and `conn/secrets.rs` is the second caller (a locked keyring is
     *the* reason connections stop authenticating and used to reach neither a banner nor a log line).
+    **What it queues is a `Notice`, not a sentence**, because the queue is filled in core before the
+    window exists and drained by an interface that says it in its own language.
+    `Unreadable { name, error, swept }` and `Missing { name, from }` are what `recovery_notice` and
+    `missing_notice` build (`notice_name` is the file name both say), `KeyringUnreadable` and
+    `KeyringSave` are `Hydration::notice`'s and `Sanitized::notice`'s (under `core/secrets.rs`), and
+    `Said` carries text its caller has already worded in the interface's language — the app's
+    `conn-delete-keyring-*` notice after a failed `forget_connection`. `Notice::message` is the
+    English, the sentences this queue used to hold, and the interface's `i18n::notice_text` is held
+    to it (*The string catalogue*). Like `launch::Refusal` it has no `Display`, on purpose, so a
+    `to_string()` that would stay English in every language does not compile.
     **The drain is no longer startup-only**, and believing it was is what made the contract false for
     `diagrams.json`. The app drained the queue exactly once, after the `Ui` literal, under the
     comment *"Every config file has been loaded by now."* — and three loads are lazy and run long
@@ -14468,7 +14478,8 @@ existing prose was left alone.
     simply gone. On the save side it is worse than silent: with the `.bak` unreadable too, the very
     next drag's `save_json` writes the defaulted empty file over the recovered nothing, so the notice
     has to reach the user *before* that save, which is where the call sits.
-    `schemaic_ui::report_recoveries(text, open)` is the one reporter and the startup site calls it
+    `schemaic_ui::report_recoveries(text, open)` is the one reporter — it words each drained notice
+    through `i18n::notice_text` and joins them with a blank line — and the startup site calls it
     too rather than keeping a second spelling; it takes the two signals rather than an `OverlayUi`
     because the app's own lazy load is in a closure built long before the `Ui` literal exists, and it
     is cheap on an empty queue so a lazy loader can call it unconditionally. **All three lazy sites
@@ -14499,7 +14510,7 @@ existing prose was left alone.
     has to be queued before the caller can get that far.
     The lesson generalises: a rule that cannot be checked positionally can sometimes be made
     *structural* instead, by reshaping the code until there is one site, and then it can.
-    `recovery_notice` is the corrupt-file sentence — plus, for the one store whose `.corrupt` a later
+    `recovery_notice` is the corrupt-file notice — plus, for the one store whose `.corrupt` a later
     save sweeps, the qualification `corrupt_sibling_is_swept` decides above; `missing_notice` is the
     vanished-file one, and
     it says the disappearance rather than repairing it quietly, because the sibling the file came
@@ -14571,7 +14582,7 @@ existing prose was left alone.
     answer for a save and the wrong one for a file handed to someone else, so
     `conn_import::export_connections` blanks the secrets itself in a copy of the hydrated list and
     never reads the file this module writes.
-    **Both directions of a store failure now come back as a sentence, because the machine where the
+    **Both directions of a store failure now come back as a notice, because the machine where the
     keyring rule is quietly untrue is exactly the machine whose user needs to hear it.**
     `SecretStore::delete` returns a `bool` — *definitely gone*, which covers a delete that succeeded
     and one that found nothing — where it used to return `()` under "best effort", while its sibling
@@ -14584,7 +14595,9 @@ existing prose was left alone.
     reported **only** for a field this load read a value out of — on a machine with no keyring at
     all, every empty field asks for a delete and every refusal is meaningless, which would be three
     false alarms per connection on exactly the machines that already have a real problem.
-    `Hydration::notice` is the read-side sentence and both halves of it are load-bearing:
+    `Hydration::notice` is the read-side notice — `persist::Notice::KeyringUnreadable`, the count
+    and the backend's message, its English in `Notice::message` — and both halves of what it says
+    are load-bearing:
     *unavailable this session* is why the connections stopped working, *were not deleted* is what
     stops the user retyping a half-remembered password over a stored one that is perfectly intact.
     `Hydration::cli_notice` is the same fact for the headless CLI's stderr — plain text, the
@@ -14602,7 +14615,8 @@ existing prose was left alone.
     method and should find the secret there.
     `Sanitized { file, in_the_clear, undeleted }` is the write-side counterpart — the sanitized file
     plus the two facts the save established, which used to be discarded at the only call site — and
-    its `notice()` names the consequence rather than the mechanism: *your passwords are in a file
+    its `notice()`, `Notice::KeyringSave` with the two counts, names the consequence rather than the
+    mechanism: *your passwords are in a file
     you are about to send someone* (the folder Settings → General's **Open folder** button opens,
     beside the log), and *the next launch will fill this cleared field back in*. `forget` returns
     whether a deleted connection's entries are all definitely gone, which matters because ids are
@@ -14616,8 +14630,9 @@ existing prose was left alone.
     while credentials were destroyed — the seam at a trait impl rather than at a function call, and
     that file was at zero coverage. On the store side `load_connections` puts `Hydration::notice` on
     `persist::queue_notice` (the startup channel the config-recovery modal drains),
-    `save_connections` returns `Option<String>` and `main.rs`'s `persist_conns` shows it in the
-    error modal — once per session per distinct notice, because the alternative is a modal on every
+    `save_connections` returns `Option<persist::Notice>` and `main.rs`'s `persist_conns` shows it
+    in the error modal through `i18n::notice_text` — once per session per distinct notice,
+    `told_once` remembering the `Notice` value itself (it derives `Hash`), because the alternative is a modal on every
     read-only toggle and every connection switch for as long as the keyring is down. And the
     process-level `last_hydration` is read with `into_inner` rather than `unwrap_or_default`: a
     poisoned mutex used to hand the save a *default* `Hydration` with nothing marked unreadable, so
@@ -40623,7 +40638,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     translation* — among it `format_bytes` and `AuthMode::transport_refusal`, which reaches the
     user as a database error from `schemaic-db` and goes with the error messages. The notes under
     the connection form's fields are no longer among it (`connection_form.rs`), nor are
-    `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below).
+    `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below), nor the
+    startup and keyring notices (`persist::Notice`, below).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40782,6 +40798,19 @@ Re-introducing the anti-patterns these guard against is a regression:
     `Display`, since no headless surface says these, so the `why.to_string()` that would stay
     English in every language does not compile. `english_says_every_launcher_refusal_as_core_does`
     (`app_tests`) holds `refusal_text` equal to `message` for every variant of `Refusal::ALL`.
+    The startup notices are the case where the words are queued before there is anyone to say
+    them. `persist::RECOVERIES` holds `persist::Notice` values — a file unreadable or missing, a
+    keyring that would not answer, a save it did not fully take — and, like `Refusal`, `Notice`
+    has `message` and no `Display` (under `core/persist.rs`). `i18n::notice_text` words each from
+    `notice-unreadable`/`-kept`/`-swept`, `notice-missing`/`-restored`,
+    `notice-keyring-unread`/`-why`/`-kept`, `notice-in-the-clear`/`-where` and
+    `notice-undeleted`/`-after`, one message per line joined with `"\n"` and the save's two
+    paragraphs with `"\n\n"`, as core's English breaks them; a parser's or keyring's own text
+    inside goes in as written. `report_recoveries` and the app's mid-session save both show it,
+    and `Notice::Said` is the one variant it passes through, its text already worded by the
+    caller. `english_says_every_startup_notice_as_core_does` holds it equal to `message` for both
+    `swept` states, both siblings, the keyring read with and without its reason and the save's
+    refusals one way, the other and both. `Hydration::cli_notice` is the CLI's and stays English.
     The connection import's refusals are the case where the words carry a secret. `conn_import`'s
     `SkipReason` held finished English in `Unreadable(String)` and now carries values — `BadUrl`
     with the `UrlError`, `NotAnExport`, `NewerExport` with the version — and
