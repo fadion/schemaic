@@ -901,7 +901,7 @@ impl GridState {
                     .map(Some)
                     .ok_or_else(|| tr!("grid-rerun-would-write")),
                 Ok(None) => Err(tr!("grid-filter-not-simple")),
-                Err(FilterError::BadCondition(msg)) => Err(msg),
+                Err(e) => Err(filter_error_text(&e)),
             },
         };
         match rerun {
@@ -2882,6 +2882,17 @@ fn attach_scope_text(scope: schemaic_core::model::AttachScope) -> String {
                 cols = cols
             )
         }
+    }
+}
+
+/// Why the typed filter cannot be applied — core's `FilterError::message` in
+/// the interface's language; `sqlparser`'s own reading of the condition
+/// stays as it wrote it.
+fn filter_error_text(e: &FilterError) -> String {
+    match e {
+        FilterError::BadCondition(text) => text.clone(),
+        FilterError::BracketInName => tr!("grid-filter-bracket-in-name"),
+        FilterError::TrailingInput => tr!("grid-filter-trailing-input"),
     }
 }
 
@@ -16693,7 +16704,24 @@ mod clear_tests {
 
 #[cfg(test)]
 mod core_words_tests {
-    use super::{attach_scope_text, duplicate_question, rows_read_text, sql_copy_words};
+    use super::{
+        attach_scope_text, duplicate_question, filter_error_text, rows_read_text, sql_copy_words,
+    };
+
+    /// **The filter field's refusal reads in English exactly as core's
+    /// `FilterError::message`** — Schemaic's two sentences, and the parser's
+    /// text passed through.
+    #[test]
+    fn english_refuses_every_filter_as_core_does() {
+        use schemaic_core::filter::FilterError;
+        for e in [
+            FilterError::BadCondition("Expected: an expression, found: =".into()),
+            FilterError::BracketInName,
+            FilterError::TrailingInput,
+        ] {
+            assert_eq!(filter_error_text(&e), e.message(), "{e:?}");
+        }
+    }
 
     /// **The duplicate confirmation's question reads in English exactly as
     /// core's `duplicate_prompt`** — at the floor, and past a thousand, where

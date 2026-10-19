@@ -103,11 +103,9 @@ assertions pin English wording — stays the regression net throughout.
    carries beside `Read`'s library text, `MemoryWarning`, `IssueTail`;
    `i18n::import_error_text`, `read_refusal_text`), and the plan modal's warnings
    (`plan::PlanNote`, `ServerWarning`; `plan_view::plan_note_text`), and the run guard
-   (`sql::GuardReason`, `Unsafe`, which `RunVerdict` carries; `i18n::guard_reason_text`). Of the
-   other existing enums,
-   `FilterError::BadCondition` renders not at all
-   — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
-   so its prose lives at its construction sites and it is the weakest to convert.
+   (`sql::GuardReason`, `Unsafe`, which `RunVerdict` carries; `i18n::guard_reason_text`), and
+   the filter field's refusals (`FilterError::BracketInName`, `TrailingInput` beside
+   `BadCondition`'s parser text; `grid::filter_error_text`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -135,8 +133,6 @@ assertions pin English wording — stays the regression net throughout.
    - **The read-only gate's reasons** — `sql::read_only_refusal`'s sentences, shared by the MCP
      server and `schemaic query`, which the editor's guard shows inside
      `GuardReason::ReadOnlyRefused` on SQL Server.
-   - **Filters** — `FilterError::BadCondition` (below). (The three fixed notices are done:
-     `i18n::staged_requery_note`, `staged_landing_note`, `reread_without_filter_note`.)
    - **Write-back** — `Rollback::note` and `one_row_verdict`'s text, fused into a `DbError::Query`
      in `schemaic-db`; the hardest, since the sentence is built below core.
    - **SQL Server's plan table** — the headings `showplan` writes as the table's columns and

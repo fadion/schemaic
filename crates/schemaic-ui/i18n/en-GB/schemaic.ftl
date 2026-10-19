@@ -2521,6 +2521,11 @@ grid-rows-affected = { $count ->
 }
 grid-rerun-would-write = Can't re-run this statement — it would write to the database
 grid-filter-not-simple = Can't filter this query — not a simple single-table SELECT
+# Under the filter field when the typed condition can't be used (core's
+# filter::FilterError); a condition that doesn't parse shows the parser's own
+# text instead. The ] is SQL Server's bracket.
+grid-filter-bracket-in-name = a name containing `]` cannot be filtered here
+grid-filter-trailing-input = unexpected trailing input after condition
 # A filter, sort or page change asked for over staged edits (core's
 # filter::STAGED_REQUERY_MSG). No full stop, as core's has none.
 grid-staged-requery = Commit or discard your changes first — re-reading the rows would throw them away

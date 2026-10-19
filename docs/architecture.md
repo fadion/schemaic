@@ -40714,7 +40714,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     startup and keyring notices (`persist::Notice`, below), nor the file import's refusals, memory
     warnings and problem-list tail (`import::ReadRefusal`, below), nor the plan modal's warnings
     (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below) — though
-    `read_only_reason`'s own sentence inside one still is.
+    `read_only_reason`'s own sentence inside one still is — nor the filter field's two refusals
+    (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40929,6 +40930,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_says_every_guard_reason_as_core_does` holds every reason equal to `message`, each
     keyword an `Unsafe` carries, and the staged question alone and after another over one change
     and three. What the guard decides did not move — only how its reason is carried.
+    The grid filter's refusals are the file import's case again, smaller. `FilterError::BadCondition`
+    held `sqlparser`'s text and two sentences of Schemaic's built at their sites — `build_query`'s
+    doubled-bracket refusal and `parse_condition`'s trailing input — and now holds only the
+    parser's, the two being `BracketInName` and `TrailingInput` (under `core::filter`), with
+    `message` the English and no `Display`. `grid.rs`'s `filter_error_text` words them from
+    `grid-filter-bracket-in-name`/`-trailing-input` and passes the parser's text through, for the
+    filter apply; `english_refuses_every_filter_as_core_does` (`core_words_tests`) holds it equal
+    to `message` for all three.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and
@@ -45368,7 +45377,7 @@ this bundle's.
   **It was reachable, not theoretical**: `cycle_server_sort` hands its new order to
   `apply_grid_query`, which used to write it to `grid_query` and *then* take one of three exits
   that set `view_err` and re-ran nothing — `build_query`
-  answering `Ok(None)` on a statement it cannot rewrite, a `BadCondition`, and the write guard's
+  answering `Ok(None)` on a statement it cannot rewrite, a `FilterError`, and the write guard's
   `RerunRequest::approved` refusing. All four refusals, `filter::requery`'s staged-work one
   included, now come **before** the write, so a refused sort leaves the chevron on the order that
   is still on screen; the closure stays because the chevron must follow the write a dispatched

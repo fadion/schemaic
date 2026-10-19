@@ -2036,6 +2036,8 @@ grid-rows-affected = { $count ->
 }
 grid-rerun-would-write = Diese Anweisung kann nicht erneut ausgeführt werden — sie würde in die Datenbank schreiben
 grid-filter-not-simple = Diese Abfrage kann nicht gefiltert werden — kein einfaches SELECT auf eine Tabelle
+grid-filter-bracket-in-name = ein Name mit `]` kann hier nicht gefiltert werden
+grid-filter-trailing-input = unerwartete weitere Eingabe nach der Bedingung
 grid-staged-requery = Übernimm oder verwirf zuerst deine Änderungen — ein erneutes Lesen der Zeilen würde sie verwerfen
 grid-staged-landing = Während die Tabelle neu gelesen wurde, wurden Änderungen vorgemerkt; sie wurden behalten und die Tabelle nicht aktualisiert — übernimm oder verwirf sie, dann aktualisiere.
 grid-reread-without-filter = Der Filter ruft eine Funktion auf, die Schemaic nicht ungefragt erneut ausführt, daher wurde die Tabelle nach dem Commit ohne Filter und Sortierung neu gelesen.

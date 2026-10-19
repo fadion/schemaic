@@ -54,6 +54,26 @@ pub enum FilterError {
     /// The user's `WHERE` fragment didn't parse (message is the parser's, shown
     /// inline under the filter field). The base query is left as-is.
     BadCondition(String),
+    /// The fragment names a SQL Server bracketed name holding a `]`, which
+    /// cannot survive the rewrite (see [`build_query`]).
+    BracketInName,
+    /// The fragment parsed as a condition with more after it — `id = 5; DROP
+    /// …` — rather than being silently cut to its first part.
+    TrailingInput,
+}
+
+impl FilterError {
+    /// What the filter field says, in English: the parser's text, or one of
+    /// Schemaic's own sentences.
+    pub fn message(&self) -> String {
+        match self {
+            FilterError::BadCondition(text) => text.clone(),
+            FilterError::BracketInName => {
+                "a name containing `]` cannot be filtered here".to_string()
+            }
+            FilterError::TrailingInput => "unexpected trailing input after condition".to_string(),
+        }
+    }
 }
 
 /// Rewrite `base_sql` with the given filter condition and/or sort, returning the
@@ -63,7 +83,9 @@ pub enum FilterError {
 /// - `Ok(None)` — `base_sql` isn't a structurally-rewritable single-table
 ///   `SELECT` (join / CTE / set-operation / derived table / non-`SELECT` /
 ///   multi-statement); the caller should treat the result as not filterable.
-/// - `Err(BadCondition)` — the filter fragment didn't parse; don't run.
+/// - `Err(_)` — the filter fragment didn't parse (`BadCondition`), ran on past
+///   its condition (`TrailingInput`), or names a bracketed `]` the rewrite
+///   cannot carry (`BracketInName`); don't run.
 ///
 /// The base statement's projection and `LIMIT`/`OFFSET` are preserved, and so
 /// is its `ORDER BY` — whole when `sort` is empty, and otherwise after the sort
@@ -81,9 +103,7 @@ pub fn build_query(
     // would come back as `[a]b]`, a different statement. Refused rather than
     // rewritten into one.
     if spells_a_doubled_bracket(filter, dialect) {
-        return Err(FilterError::BadCondition(
-            "a name containing `]` cannot be filtered here".to_string(),
-        ));
+        return Err(FilterError::BracketInName);
     }
     if spells_a_doubled_bracket(base_sql, dialect) {
         return Ok(None);
@@ -801,9 +821,7 @@ fn parse_condition(cond: &str, dialect: SqlDialect) -> Result<Expr, FilterError>
     let mut parser = Parser::new(&*d).try_with_sql(cond).map_err(bad)?;
     let expr = parser.parse_expr().map_err(bad)?;
     if parser.peek_token().token != Token::EOF {
-        return Err(FilterError::BadCondition(
-            "unexpected trailing input after condition".to_string(),
-        ));
+        return Err(FilterError::TrailingInput);
     }
     Ok(expr)
 }
@@ -1815,9 +1833,7 @@ mod tests {
         assert_eq!(build("SELECT * FROM [a]]]", "x = 1", &[], ms), None);
         assert_eq!(
             build_query("SELECT * FROM t", "[a]]b] = 1", &[], ms),
-            Err(FilterError::BadCondition(
-                "a name containing `]` cannot be filtered here".to_string()
-            ))
+            Err(FilterError::BracketInName)
         );
         assert!(build("SELECT * FROM [t]", "x = 1", &[], ms).is_some());
     }
@@ -2422,7 +2438,7 @@ mod tests {
             SqlDialect::MySql,
         )
         .unwrap_err();
-        assert!(matches!(err, FilterError::BadCondition(_)));
+        assert_eq!(err, FilterError::TrailingInput);
     }
 
     #[test]
