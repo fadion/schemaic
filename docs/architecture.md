@@ -32640,8 +32640,10 @@ existing prose was left alone.
     fields, the *Copy data* toggle and its notes, the refusals it raises itself, the preview's
     *Copy of {table}*, progress, the stop note and *Copied N rows.*, a plural
     (`the_shared_counts_read_as_they_did` pins 0, 1 and 3) — with Cancel, Preview SQL, Stop and
-    Close the shared `dialog-cancel`, `editor-preview-sql`, `dialog-stop` and `dialog-close`. What
-    stays English: `copy_table::refusal`, core's prose until phase 4; the app's failure sentences
+    Close the shared `dialog-cancel`, `editor-preview-sql`, `dialog-stop` and `dialog-close`.
+    `copy_table::refusal` answers a `CopyRefusal`, which `copy_refusal_text` words
+    (`copy-table-unnamed`, `-choose-database`, `-onto-itself`), held to its `message` by
+    `english_says_every_copy_refusal_as_core_does`. What stays English: the app's failure sentences
     above, which arrive whole; and the `<table>_copy` default, which is an identifier.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
     surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);

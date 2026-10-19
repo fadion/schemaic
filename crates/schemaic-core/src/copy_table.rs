@@ -47,12 +47,12 @@ pub struct CopyTarget {
 /// Why the copy cannot be made as asked, or `None`. `same_database` — the
 /// target is the source's own connection and database — makes the source's
 /// own name a clash.
-pub fn refusal(src: &TableInfo, to: &CopyTarget, same_database: bool) -> Option<&'static str> {
+pub fn refusal(src: &TableInfo, to: &CopyTarget, same_database: bool) -> Option<CopyRefusal> {
     if to.name.trim().is_empty() {
-        return Some("Name the copy.");
+        return Some(CopyRefusal::Unnamed);
     }
     if to.database.trim().is_empty() {
-        return Some("Choose the database to copy into.");
+        return Some(CopyRefusal::NoDatabase);
     }
     let same_ns = match (&src.schema, &to.schema) {
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
@@ -60,9 +60,34 @@ pub fn refusal(src: &TableInfo, to: &CopyTarget, same_database: bool) -> Option<
         _ => false,
     };
     if same_database && same_ns && src.name.eq_ignore_ascii_case(&to.name) {
-        return Some("A table can't be copied onto itself — give the copy another name.");
+        return Some(CopyRefusal::OntoItself);
     }
     None
+}
+
+/// [`refusal`]'s answer — a value the interface words; [`Self::message`] is
+/// the English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyRefusal {
+    /// The copy has no name.
+    Unnamed,
+    /// No database to copy into is chosen.
+    NoDatabase,
+    /// The copy would land on the source itself.
+    OntoItself,
+}
+
+impl CopyRefusal {
+    /// The refusal in English.
+    pub fn message(self) -> &'static str {
+        match self {
+            CopyRefusal::Unnamed => "Name the copy.",
+            CopyRefusal::NoDatabase => "Choose the database to copy into.",
+            CopyRefusal::OntoItself => {
+                "A table can't be copied onto itself — give the copy another name."
+            }
+        }
+    }
 }
 
 /// The table the copy creates: the source's columns, key, indexes and checks,
@@ -858,11 +883,14 @@ mod tests {
         let t = orders();
         assert_eq!(refusal(&t, &to("orders_copy"), true), None);
         assert_eq!(refusal(&t, &to("orders"), false), None, "another database");
-        assert!(refusal(&t, &to("ORDERS"), true).is_some());
-        assert!(refusal(&t, &to("  "), true).is_some());
+        assert_eq!(
+            refusal(&t, &to("ORDERS"), true),
+            Some(CopyRefusal::OntoItself)
+        );
+        assert_eq!(refusal(&t, &to("  "), true), Some(CopyRefusal::Unnamed));
         let mut nowhere = to("x");
         nowhere.database = String::new();
-        assert!(refusal(&t, &nowhere, false).is_some());
+        assert_eq!(refusal(&t, &nowhere, false), Some(CopyRefusal::NoDatabase));
         let mut elsewhere = to("orders");
         elsewhere.schema = Some("archive".into());
         assert_eq!(refusal(&t, &elsewhere, true), None, "another schema");

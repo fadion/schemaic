@@ -857,6 +857,9 @@ copy-table-data-hint = Copy the rows once the table is created. Off copies the s
 copy-table-what-with-rows = The structure and the rows. Foreign keys and triggers are not copied, and a generated column is computed afresh.
 copy-table-what-structure = The structure only. Foreign keys and triggers are not copied.
 copy-table-choose-database = Choose the database to copy into.
+# Under the form when Copy is refused (core's copy_table::CopyRefusal).
+copy-table-unnamed = Name the copy.
+copy-table-onto-itself = A table can't be copied onto itself — give the copy another name.
 copy-table-connection-changed = The active connection changed — reopen Copy to from the table.
 # $database is the source database's name.
 copy-table-schema-not-loaded = { $database }'s schema is not loaded — expand it in the tree, then try again.

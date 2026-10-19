@@ -371,7 +371,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
             };
             let same_database = dst_conn == src.conn_id && to.database == src.database;
             if let Some(why) = copy_table::refusal(&info, &to, same_database) {
-                return refusal.set(Some(why.to_string()));
+                return refusal.set(Some(copy_refusal_text(why)));
             }
             refusal.set(None);
             let dialect = ctx.conn.dialect.get_untracked();
@@ -624,4 +624,33 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
                 .justify_center()
                 .background(theme::modal_backdrop())
         })
+}
+
+/// Why the copy cannot be made as asked — core's `copy_table::CopyRefusal`
+/// in the interface's language.
+fn copy_refusal_text(why: copy_table::CopyRefusal) -> String {
+    use copy_table::CopyRefusal;
+    match why {
+        CopyRefusal::Unnamed => tr!("copy-table-unnamed"),
+        CopyRefusal::NoDatabase => tr!("copy-table-choose-database"),
+        CopyRefusal::OntoItself => tr!("copy-table-onto-itself"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Every refusal reads in English exactly as core's `message`.**
+    #[test]
+    fn english_says_every_copy_refusal_as_core_does() {
+        use copy_table::CopyRefusal;
+        for why in [
+            CopyRefusal::Unnamed,
+            CopyRefusal::NoDatabase,
+            CopyRefusal::OntoItself,
+        ] {
+            assert_eq!(copy_refusal_text(why), why.message(), "{why:?}");
+        }
+    }
 }
