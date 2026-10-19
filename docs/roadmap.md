@@ -147,9 +147,9 @@ assertions pin English wording — stays the regression net throughout.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
    - **The object editors' refusals** — every draft's `validate` (`ddl.rs`), the sentences that
      hold Preview, each given a typed `problems()` as `DatabaseDraft`, `ViewDraft`,
-     `EventDraft` and the object editor's drafts (`ObjectProblem`) already have: the table
-     designer's (`TableDraft`, ~40) and the trigger editor's (`TriggerDraft`,
-     `TriggerSetDraft`, ~45) are the bulk, then the routine's (with `RoutineDraft::name_clash`).
+     `EventDraft`, `RoutineDraft` and the object editor's drafts (`ObjectProblem`) already
+     have: what is left is the table designer's (`TableDraft`, ~40) and the trigger editor's
+     (`TriggerDraft`, `TriggerSetDraft`, ~45).
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

@@ -1162,6 +1162,42 @@ routine-editor-data-access = Data access
 routine-editor-definer = Definer
 routine-editor-reading-source = Reading the routine's source…
 routine-editor-source-stale = The routine's real source arrived after you started typing, so this Body is built on the catalogue's copy — which isn't what the server holds. Close and reopen to edit it.
+# What stops a function or procedure being emitted (core's
+# ddl::RoutineProblem), in the footer; a message per kind where the sentence
+# names it.
+routine-problem-function-no-name = The function needs a name.
+routine-problem-procedure-no-name = The procedure needs a name.
+routine-problem-function-no-language = The function needs a language (plpgsql, sql).
+routine-problem-procedure-no-language = The procedure needs a language (plpgsql, sql).
+routine-problem-no-return-type = The function needs a return type.
+routine-problem-procedure-returns = A procedure returns nothing — clear the return type.
+routine-problem-function-no-body = The function needs a body.
+routine-problem-procedure-no-body = The procedure needs a body.
+routine-problem-bare-parameter = SQL Server names every parameter with @ — @sku varchar(20), @n int OUTPUT.
+# SQL Server: a routine of this shape refusing WITH $option (SQL); -native when
+# it refuses it only once the routine is natively compiled.
+routine-problem-procedure-refuses = A procedure can't take WITH { $option }.
+routine-problem-scalar-refuses = A scalar function can't take WITH { $option }.
+routine-problem-inline-refuses = An inline table-valued function can't take WITH { $option }.
+routine-problem-multi-refuses = A multi-statement table-valued function can't take WITH { $option }.
+routine-problem-procedure-refuses-native = A procedure can't take WITH { $option } once it is natively compiled.
+routine-problem-scalar-refuses-native = A scalar function can't take WITH { $option } once it is natively compiled.
+routine-problem-inline-refuses-native = An inline table-valued function can't take WITH { $option } once it is natively compiled.
+routine-problem-multi-refuses-native = A multi-statement table-valued function can't take WITH { $option } once it is natively compiled.
+routine-problem-native-needs-schemabinding = A natively compiled routine needs WITH SCHEMABINDING — SQL Server requires the two together.
+routine-problem-inline-with-execute-as = INLINE = ON can't be combined with EXECUTE AS — a function that runs as someone else is never inlined.
+# $was is the procedure's name; $group its numbered members (orders;2, orders;3).
+routine-problem-numbered-rename = { $was } heads a numbered procedure group ({ $group }), and renaming it would drop them all. Keep the name to edit it.
+routine-problem-trigger-function-args = A trigger function takes no declared arguments — they arrive in TG_ARGV.
+# The draft's $name is one another routine already has. -refused where the
+# server refuses the whole plan; -destroys where applying it drops $original
+# first; -destroys-new for a routine not yet created.
+routine-clash-function-refused = A function called { $name } is already here. On this engine a rename is a drop and a create, so the server refuses this one and nothing changes — pick another name, or drop { $name } first.
+routine-clash-procedure-refused = A procedure called { $name } is already here. On this engine a rename is a drop and a create, so the server refuses this one and nothing changes — pick another name, or drop { $name } first.
+routine-clash-function-destroys = A function called { $name } is already here. On this engine a rename is a drop and a create, so applying this would destroy { $original } and leave { $name } as it was.
+routine-clash-procedure-destroys = A procedure called { $name } is already here. On this engine a rename is a drop and a create, so applying this would destroy { $original } and leave { $name } as it was.
+routine-clash-function-destroys-new = A function called { $name } is already here. On this engine a rename is a drop and a create, so applying this would destroy the original and leave { $name } as it was.
+routine-clash-procedure-destroys-new = A procedure called { $name } is already here. On this engine a rename is a drop and a create, so applying this would destroy the original and leave { $name } as it was.
 
 ## Users and privileges browser (its title is tree-users)
 

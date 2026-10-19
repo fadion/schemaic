@@ -1948,6 +1948,137 @@ pub struct RoutineDraft {
     pub info: RoutineInfo,
 }
 
+/// What stops a [`RoutineDraft`] being emitted ([`RoutineDraft::problems`]) — a
+/// value, so the editor can say it in the interface's language;
+/// [`RoutineProblem::message`] is the English. A `kind` is the routine's,
+/// which the English names as a word ([`RoutineKind::label`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoutineProblem {
+    NoName {
+        kind: RoutineKind,
+    },
+    /// PostgreSQL: no `LANGUAGE`.
+    NoLanguage {
+        kind: RoutineKind,
+    },
+    /// A function with no return type.
+    NoReturnType,
+    /// A procedure with a return type, which is a syntax error.
+    ProcedureReturns,
+    NoBody {
+        kind: RoutineKind,
+    },
+    /// SQL Server: a parameter not named with `@`.
+    BareParameter,
+    /// SQL Server: this `shape` takes no `WITH option` (its SQL) — or, when
+    /// `native`, not once the routine is natively compiled.
+    RefusedOption {
+        shape: crate::schema::TsqlShape,
+        option: String,
+        native: bool,
+    },
+    /// SQL Server: `NATIVE_COMPILATION` without `SCHEMABINDING`.
+    NativeNeedsSchemaBinding,
+    /// SQL Server: `INLINE = ON` with `EXECUTE AS`.
+    InlineWithExecuteAs,
+    /// SQL Server: renaming `was`, which heads a numbered procedure `group`
+    /// (its members' names, joined with `", "`).
+    NumberedRename {
+        was: String,
+        group: String,
+    },
+    /// PostgreSQL: a trigger function with declared arguments.
+    TriggerFunctionArgs,
+}
+
+impl RoutineProblem {
+    /// The problem in English.
+    pub fn message(&self) -> String {
+        use RoutineProblem as P;
+        match self {
+            P::NoName { kind } => format!("The {} needs a name.", kind.label()),
+            P::NoLanguage { kind } => {
+                format!("The {} needs a language (plpgsql, sql).", kind.label())
+            }
+            P::NoReturnType => "The function needs a return type.".to_string(),
+            P::ProcedureReturns => {
+                "A procedure returns nothing — clear the return type.".to_string()
+            }
+            P::NoBody { kind } => format!("The {} needs a body.", kind.label()),
+            P::BareParameter => {
+                "SQL Server names every parameter with @ — @sku varchar(20), @n int OUTPUT."
+                    .to_string()
+            }
+            P::RefusedOption {
+                shape,
+                option,
+                native: true,
+            } => format!(
+                "{} can't take WITH {option} once it is natively compiled.",
+                shape.label_capitalised()
+            ),
+            P::RefusedOption {
+                shape,
+                option,
+                native: false,
+            } => format!("{} can't take WITH {option}.", shape.label_capitalised()),
+            P::NativeNeedsSchemaBinding => {
+                "A natively compiled routine needs WITH SCHEMABINDING — SQL Server requires the \
+                 two together."
+                    .to_string()
+            }
+            P::InlineWithExecuteAs => {
+                "INLINE = ON can't be combined with EXECUTE AS — a function that runs as someone \
+                 else is never inlined."
+                    .to_string()
+            }
+            P::NumberedRename { was, group } => format!(
+                "{was} heads a numbered procedure group ({group}), and renaming it would drop \
+                 them all. Keep the name to edit it."
+            ),
+            P::TriggerFunctionArgs => {
+                "A trigger function takes no declared arguments — they arrive in TG_ARGV."
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// A routine draft landing on a name another routine already has
+/// ([`RoutineDraft::clash`]) — the value behind [`RoutineDraft::name_clash`]'s
+/// English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutineClash {
+    pub kind: RoutineKind,
+    /// The name the draft wants.
+    pub name: String,
+    /// The plan runs as one transaction, so the server refuses it and nothing
+    /// changes; otherwise applying it destroys `original`.
+    pub whole: bool,
+    /// The routine being renamed, `None` for a new one.
+    pub original: Option<String>,
+}
+
+impl RoutineClash {
+    /// The clash in English.
+    pub fn message(&self) -> String {
+        let (what, want) = (self.kind.label(), &self.name);
+        if self.whole {
+            format!(
+                "A {what} called {want} is already here. On this engine a rename is a drop and \
+                 a create, so the server refuses this one and nothing changes — pick another \
+                 name, or drop {want} first."
+            )
+        } else {
+            let original = self.original.as_deref().unwrap_or("the original");
+            format!(
+                "A {what} called {want} is already here. On this engine a rename is a drop and \
+                 a create, so applying this would destroy {original} and leave {want} as it was."
+            )
+        }
+    }
+}
+
 impl RoutineDraft {
     pub fn from_info(f: &RoutineInfo) -> RoutineDraft {
         RoutineDraft {
@@ -2044,26 +2175,26 @@ impl RoutineDraft {
     /// Takes the dialect because two of the rules are per-engine and one of them
     /// used to be asserted for both: a `LANGUAGE` clause is required on
     /// PostgreSQL and does not exist on MySQL.
-    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+    pub fn problems(&self, dialect: SqlDialect) -> Vec<RoutineProblem> {
         let f = &self.info;
-        let what = f.kind.label();
+        let kind = f.kind;
         let mut out = Vec::new();
         if f.name.trim().is_empty() {
-            out.push(format!("The {what} needs a name."));
+            out.push(RoutineProblem::NoName { kind });
         }
         if routine_takes_language(dialect) && f.language.trim().is_empty() {
-            out.push(format!("The {what} needs a language (plpgsql, sql)."));
+            out.push(RoutineProblem::NoLanguage { kind });
         }
         // A procedure has no return type on either engine, and `RETURNS` on one
         // is a syntax error rather than a harmless extra.
         if f.kind == RoutineKind::Function && f.returns.trim().is_empty() {
-            out.push("The function needs a return type.".to_string());
+            out.push(RoutineProblem::NoReturnType);
         }
         if f.kind == RoutineKind::Procedure && !f.returns.trim().is_empty() {
-            out.push("A procedure returns nothing — clear the return type.".to_string());
+            out.push(RoutineProblem::ProcedureReturns);
         }
         if f.body.trim().is_empty() {
-            out.push(format!("The {what} needs a body."));
+            out.push(RoutineProblem::NoBody { kind });
         }
         match dialect {
             // T-SQL names every parameter with `@`; a bare name is the first
@@ -2073,10 +2204,7 @@ impl RoutineDraft {
                     .iter()
                     .any(|p| !p.starts_with('@'))
                 {
-                    out.push(
-                        "SQL Server names every parameter with @ — @sku varchar(20), @n int OUTPUT."
-                            .to_string(),
-                    );
+                    out.push(RoutineProblem::BareParameter);
                 }
                 // Each shape's `WITH` list is its own (`TsqlShape::allows`),
                 // and the server's refusal names neither the option nor why.
@@ -2085,18 +2213,10 @@ impl RoutineDraft {
                     if !shape.allows(opt, &f.tsql.options) {
                         // Refused for the rest of the list, not the shape: a
                         // natively compiled module's (Msg 10794).
-                        out.push(if shape.allows(opt, &[]) {
-                            format!(
-                                "{} can't take WITH {} once it is natively compiled.",
-                                shape.label_capitalised(),
-                                opt.sql()
-                            )
-                        } else {
-                            format!(
-                                "{} can't take WITH {}.",
-                                shape.label_capitalised(),
-                                opt.sql()
-                            )
+                        out.push(RoutineProblem::RefusedOption {
+                            shape,
+                            option: opt.sql(),
+                            native: shape.allows(opt, &[]),
                         });
                     }
                 }
@@ -2107,18 +2227,10 @@ impl RoutineDraft {
                     && !f.tsql.has_option(&O::SchemaBinding)
                     && shape.allows(&O::NativeCompilation, &f.tsql.options)
                 {
-                    out.push(
-                        "A natively compiled routine needs WITH SCHEMABINDING — SQL Server \
-                         requires the two together."
-                            .to_string(),
-                    );
+                    out.push(RoutineProblem::NativeNeedsSchemaBinding);
                 }
                 if f.tsql.inline() == Some(true) && f.tsql.execute_as().is_some() {
-                    out.push(
-                        "INLINE = ON can't be combined with EXECUTE AS — a function that runs \
-                         as someone else is never inlined."
-                            .to_string(),
-                    );
+                    out.push(RoutineProblem::InlineWithExecuteAs);
                 }
                 // A rename is a drop and a create here, and the drop takes the
                 // whole group — see `numbered_group_refusal`, which refuses the
@@ -2127,24 +2239,27 @@ impl RoutineDraft {
                     && was != f.name
                     && !f.tsql.numbered.is_empty()
                 {
-                    out.push(format!(
-                        "{was} heads a numbered procedure group ({}), and renaming it would \
-                         drop them all. Keep the name to edit it.",
-                        f.tsql.numbered_names(was)
-                    ));
+                    out.push(RoutineProblem::NumberedRename {
+                        was: was.to_string(),
+                        group: f.tsql.numbered_names(was),
+                    });
                 }
             }
             SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
         }
         // Not a syntax error — it creates fine and then fails on every write.
         if f.is_trigger_function() && !f.arguments.trim().is_empty() {
-            out.push(
-                "A trigger function takes no declared arguments — they arrive in \
-                 TG_ARGV."
-                    .to_string(),
-            );
+            out.push(RoutineProblem::TriggerFunctionArgs);
         }
         out
+    }
+
+    /// [`RoutineDraft::problems`] in English.
+    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+        self.problems(dialect)
+            .iter()
+            .map(RoutineProblem::message)
+            .collect()
     }
 
     /// Would applying this draft land on a routine that is already there?
@@ -2171,6 +2286,16 @@ impl RoutineDraft {
         taken: &[String],
         dialect: SqlDialect,
     ) -> Option<String> {
+        self.clash(current, taken, dialect).map(|c| c.message())
+    }
+
+    /// [`RoutineDraft::name_clash`]'s decision, as a value a front end words.
+    pub fn clash(
+        &self,
+        current: Option<&RoutineInfo>,
+        taken: &[String],
+        dialect: SqlDialect,
+    ) -> Option<RoutineClash> {
         if overloads_routines(dialect) {
             return None;
         }
@@ -2195,25 +2320,14 @@ impl RoutineDraft {
         let whole = ddl_is_transactional(dialect)
             && !self.info.tsql.has_option(&Native)
             && !current.is_some_and(|c| c.tsql.has_option(&Native));
-        let what = self.info.kind.label();
-        let original = current.map_or("the original", |c| c.name.as_str());
         taken
             .iter()
             .any(|t| t.trim().eq_ignore_ascii_case(want))
-            .then(|| {
-                if whole {
-                    format!(
-                        "A {what} called {want} is already here. On this engine a rename is \
-                         a drop and a create, so the server refuses this one and nothing \
-                         changes — pick another name, or drop {want} first."
-                    )
-                } else {
-                    format!(
-                        "A {what} called {want} is already here. On this engine a rename is \
-                         a drop and a create, so applying this would destroy {original} and \
-                         leave {want} as it was."
-                    )
-                }
+            .then(|| RoutineClash {
+                kind: self.info.kind,
+                name: want.to_string(),
+                whole,
+                original: current.map(|c| c.name.clone()),
             })
     }
 }

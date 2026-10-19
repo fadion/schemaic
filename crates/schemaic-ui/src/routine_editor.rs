@@ -947,6 +947,81 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
         .into_any()
 }
 
+/// What stops the draft being emitted — core's `RoutineProblem::message` in the
+/// interface's language: a message per routine kind and per SQL Server shape
+/// rather than core's word spliced in; option names are SQL.
+fn routine_problem_text(p: &ddl::RoutineProblem) -> String {
+    use ddl::RoutineProblem as P;
+    use schemaic_core::schema::{RoutineKind as K, TsqlShape as S};
+    match p {
+        P::NoName { kind: K::Function } => tr!("routine-problem-function-no-name"),
+        P::NoName { kind: K::Procedure } => tr!("routine-problem-procedure-no-name"),
+        P::NoLanguage { kind: K::Function } => tr!("routine-problem-function-no-language"),
+        P::NoLanguage { kind: K::Procedure } => tr!("routine-problem-procedure-no-language"),
+        P::NoReturnType => tr!("routine-problem-no-return-type"),
+        P::ProcedureReturns => tr!("routine-problem-procedure-returns"),
+        P::NoBody { kind: K::Function } => tr!("routine-problem-function-no-body"),
+        P::NoBody { kind: K::Procedure } => tr!("routine-problem-procedure-no-body"),
+        P::BareParameter => tr!("routine-problem-bare-parameter"),
+        P::RefusedOption {
+            shape,
+            option,
+            native,
+        } => {
+            let option = option.as_str();
+            match (shape, native) {
+                (S::Procedure, false) => tr!("routine-problem-procedure-refuses", option = option),
+                (S::Scalar, false) => tr!("routine-problem-scalar-refuses", option = option),
+                (S::InlineTable, false) => tr!("routine-problem-inline-refuses", option = option),
+                (S::MultiStatementTable, false) => {
+                    tr!("routine-problem-multi-refuses", option = option)
+                }
+                (S::Procedure, true) => {
+                    tr!("routine-problem-procedure-refuses-native", option = option)
+                }
+                (S::Scalar, true) => tr!("routine-problem-scalar-refuses-native", option = option),
+                (S::InlineTable, true) => {
+                    tr!("routine-problem-inline-refuses-native", option = option)
+                }
+                (S::MultiStatementTable, true) => {
+                    tr!("routine-problem-multi-refuses-native", option = option)
+                }
+            }
+        }
+        P::NativeNeedsSchemaBinding => tr!("routine-problem-native-needs-schemabinding"),
+        P::InlineWithExecuteAs => tr!("routine-problem-inline-with-execute-as"),
+        P::NumberedRename { was, group } => tr!(
+            "routine-problem-numbered-rename",
+            was = was.as_str(),
+            group = group.as_str()
+        ),
+        P::TriggerFunctionArgs => tr!("routine-problem-trigger-function-args"),
+    }
+}
+
+/// The draft lands on a routine already there — core's `RoutineClash::message`
+/// in the interface's language.
+fn routine_clash_text(c: &ddl::RoutineClash) -> String {
+    use schemaic_core::schema::RoutineKind as K;
+    let name = c.name.as_str();
+    match (c.kind, c.whole, c.original.as_deref()) {
+        (K::Function, true, _) => tr!("routine-clash-function-refused", name = name),
+        (K::Procedure, true, _) => tr!("routine-clash-procedure-refused", name = name),
+        (K::Function, false, Some(o)) => {
+            tr!("routine-clash-function-destroys", name = name, original = o)
+        }
+        (K::Procedure, false, Some(o)) => {
+            tr!(
+                "routine-clash-procedure-destroys",
+                name = name,
+                original = o
+            )
+        }
+        (K::Function, false, None) => tr!("routine-clash-function-destroys-new", name = name),
+        (K::Procedure, false, None) => tr!("routine-clash-procedure-destroys-new", name = name),
+    }
+}
+
 // ── the modal ────────────────────────────────────────────────────────────────
 
 /// The change set the draft currently describes — the same call the preview
@@ -1100,14 +1175,14 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
                     if stale {
                         return say(tr!("routine-editor-source-stale"));
                     }
-                    let errs = draft.validate(dialect);
+                    let errs = draft.problems(dialect);
                     if let Some(first) = errs.first() {
-                        return say(first.clone());
+                        return say(routine_problem_text(first));
                     }
                     if let Some(clash) =
-                        draft.name_clash(status_target.current.as_ref(), &taken_status, dialect)
+                        draft.clash(status_target.current.as_ref(), &taken_status, dialect)
                     {
-                        return say(clash);
+                        return say(routine_clash_text(&clash));
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(tr!("editor-change-count", n = n))
@@ -1153,9 +1228,9 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
                     // 1304 with the original already gone.
                     let ready = !pending
                         && !stale
-                        && draft.validate(dialect).is_empty()
+                        && draft.problems(dialect).is_empty()
                         && draft
-                            .name_clash(target.current.as_ref(), &taken_actions, dialect)
+                            .clash(target.current.as_ref(), &taken_actions, dialect)
                             .is_none()
                         && !cs.is_empty();
                     let subject = draft.info.name.clone();
@@ -1227,4 +1302,64 @@ pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoVie
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Every problem and every clash reads in English exactly as core's
+    /// `message`** — each kind's own sentences, every shape refusing an option
+    /// alone and once natively compiled, and a clash refused, destroying a
+    /// named original and destroying a new one's.
+    #[test]
+    fn english_says_every_routine_problem_as_core_does() {
+        use ddl::{RoutineClash, RoutineProblem as P};
+        use schemaic_core::schema::{RoutineKind as K, TsqlShape as S};
+        let mut problems = vec![
+            P::NoReturnType,
+            P::ProcedureReturns,
+            P::BareParameter,
+            P::NativeNeedsSchemaBinding,
+            P::InlineWithExecuteAs,
+            P::NumberedRename {
+                was: "orders".into(),
+                group: "orders;2, orders;3".into(),
+            },
+            P::TriggerFunctionArgs,
+        ];
+        for kind in [K::Function, K::Procedure] {
+            problems.push(P::NoName { kind });
+            problems.push(P::NoLanguage { kind });
+            problems.push(P::NoBody { kind });
+        }
+        for shape in [
+            S::Procedure,
+            S::Scalar,
+            S::InlineTable,
+            S::MultiStatementTable,
+        ] {
+            for native in [false, true] {
+                problems.push(P::RefusedOption {
+                    shape,
+                    option: "RECOMPILE".into(),
+                    native,
+                });
+            }
+        }
+        for p in problems {
+            assert_eq!(routine_problem_text(&p), p.message(), "{p:?}");
+        }
+        for kind in [K::Function, K::Procedure] {
+            for (whole, original) in [(true, None), (false, Some("old")), (false, None)] {
+                let c = RoutineClash {
+                    kind,
+                    name: "taken".into(),
+                    whole,
+                    original: original.map(str::to_string),
+                };
+                assert_eq!(routine_clash_text(&c), c.message(), "{c:?}");
+            }
+        }
+    }
 }

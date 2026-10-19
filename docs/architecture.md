@@ -8961,7 +8961,7 @@ existing prose was left alone.
     COMMENT" over a plan that sets it again, and named the new name as the one dropped. The comment
     half now asks `recreate_restates_routine_comment` (MySQL's `CREATE` carries a `COMMENT` clause,
     SQL Server's plan sets it after; PostgreSQL's `COMMENT ON` is not repeated), the sentence names
-    the name the server holds, and `RoutineDraft::name_clash` asks `ddl_is_transactional` for its
+    the name the server holds, and `RoutineDraft::clash` (behind `name_clash`) asks `ddl_is_transactional` for its
     consequence — on MySQL the `DROP` commits before the `CREATE` is refused, so the rename destroys
     the original; SQL Server's `run_ddl` is one transaction, so the refused `CREATE` takes the
     `DROP` back and nothing changes, which is what it now says
@@ -28980,7 +28980,14 @@ existing prose was left alone.
     words in them, so those two go through `FieldCfg::placeholder_of`, Returns' still a `match` on
     the dialect; the rest are SQL samples and stay, as do the keyword choices (`VOLATILE`,
     `CONTAINS SQL`, `INLINE = ON`, …). The local `bound_toggle` takes its label and hint as
-    `String`. `RoutineDraft::validate` and `name_clash`'s sentences are core's prose, phase 4.
+    `String`. The footer's refusals and Preview's readiness read `RoutineDraft::problems` and
+    `clash`, not their English wrappers `validate` and `name_clash` (the editors' refusals, under
+    `i18n.rs`): `routine_problem_text` words each problem from `routine-problem-*`, a message per
+    routine kind where the sentence names the kind and per `TsqlShape` × natively compiled for a
+    refused `WITH` option, whose name stays SQL; `routine_clash_text` words the clash from
+    `routine-clash-{function,procedure}-{refused,destroys,destroys-new}` — *destroys-new* the
+    sentence for a clash with no `original` to name. Both are held by
+    `english_says_every_routine_problem_as_core_does`, the clash against `RoutineClash::message`.
   - `event_editor.rs` — the **scheduled event** modal, over `core::ddl`'s `EventDraft`, on the
     one engine that has them. Reached from the schema tree's Events folder (row **Edit**),
     from the database and namespace **Create ▸ Event** submenus, and from Find-Anywhere.
@@ -40752,8 +40759,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `read_only_reason`'s own sentence inside one still is — nor the filter field's two refusals
     (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is, nor the
     account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor the database, view,
-    event and object editors' refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`/
-    `ObjectProblem`, below) — the other drafts' `validate` sentences still are.
+    event, object and routine editors' refusals (`ddl::DatabaseProblem`/`ViewProblem`/
+    `EventProblem`/`ObjectProblem`/`RoutineProblem`, below) — the other drafts' `validate`
+    sentences still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40984,14 +40992,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     `users-note-*`, joining sentences with a space in code as core does, held by
     `english_says_every_users_note_as_core_does`; the live tests read `message()`.
     The object editors' refusals are the case where core's English has more readers than the
-    interface does, and the database, view, event and object editors are the first four; the shape
+    interface does, and the database, view, event, object and routine editors are the first five; the shape
     below is the one the remaining drafts are to take. A draft's `validate` stays core's English — still
     a `Vec<String>`, because core's many tests (and the live ones) read it — and becomes a thin
     wrapper over a typed
     `problems()`, one enum per draft — or per editor, where one editor holds several drafts —
     whose `message()` is that English byte for byte and which has
     no `Display`. The editor words `problems()` from the catalogue and asks
-    `problems().is_empty()` for Preview's readiness, so these four editors no longer read
+    `problems().is_empty()` for Preview's readiness, so these five editors no longer read
     `validate` at all. `DatabaseDraft::problems` answers `DatabaseProblem` (`NoName`, `BadCollation`),
     `ViewDraft::problems(dialect)` answers `ViewProblem` (`NoName`, `NoSelect`, `NotAQuery`,
     `Materialized`, `Hidden`, `Verbatim`) — `view_not_editable_reason` now answering
@@ -41003,15 +41011,26 @@ Re-introducing the anti-patterns these guard against is a regression:
     its figures are carried as each draft holds them — a PostgreSQL sequence's as `i64`, SQL
     Server's `StartedOutside` start as the text typed — and SQL Server's not-a-whole-number
     refusal is one `NotWhole { field: SequenceField }`, which the interface words as a whole
-    message per field. The event's name clash
+    message per field. `RoutineDraft::problems(dialect)` answers `RoutineProblem` (`NoName`,
+    `NoLanguage` and `NoBody`, each carrying the `RoutineKind` its sentence names; `NoReturnType`,
+    `ProcedureReturns`, `BareParameter`, `RefusedOption { shape, option, native }` with the option
+    as its SQL, `NativeNeedsSchemaBinding`, `InlineWithExecuteAs`, `NumberedRename { was, group }`
+    with the group's names already joined, `TriggerFunctionArgs`). The event's name clash
     is not a problem but a decision of its own: `EventDraft::clashes` is it, `name_clash` the
     English `Option<String>` wrapped round it, and the editor words a clash from
-    `event-name-clash` with `$name` the draft's trimmed name. Each editor's renderer sits beside it
-    (`database_problem_text`, `view_problem_text`, `event_problem_text`/`event_clash_text`,
-    `object_problem_text`), held by `english_says_every_database_problem_as_core_does`,
+    `event-name-clash` with `$name` the draft's trimmed name. The routine's is the same shape with
+    more to say: `RoutineDraft::clash` answers a `RoutineClash` (`kind`, `name`, `whole` — the
+    plan runs as one transaction, so the server refuses it and nothing changes — and the
+    `original` a rename would destroy, `None` for a new routine, which the English calls *the
+    original*), with `name_clash` its English and the decision itself unchanged. Each editor's
+    renderer sits beside it (`database_problem_text`, `view_problem_text`,
+    `event_problem_text`/`event_clash_text`, `object_problem_text`,
+    `routine_problem_text`/`routine_clash_text`), held by
+    `english_says_every_database_problem_as_core_does`,
     `english_says_every_view_problem_as_core_does`,
-    `english_says_every_event_problem_as_core_does` and
-    `english_says_every_object_problem_as_core_does`. Those tests walk a hand-written list of
+    `english_says_every_event_problem_as_core_does`,
+    `english_says_every_object_problem_as_core_does` and
+    `english_says_every_routine_problem_as_core_does`. Those tests walk a hand-written list of
     variants rather than an `ALL`, so a new variant fails the renderer's exhaustive `match` at
     compile time but is not held to its English until someone adds it to the list.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words

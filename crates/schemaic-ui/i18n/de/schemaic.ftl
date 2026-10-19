@@ -1027,6 +1027,33 @@ routine-editor-data-access = Datenzugriff
 routine-editor-definer = Definer
 routine-editor-reading-source = Quelltext der Routine wird gelesen…
 routine-editor-source-stale = Der echte Quelltext der Routine kam erst an, nachdem du zu tippen begonnen hattest, daher beruht dieser Rumpf auf der Kopie des Katalogs – die nicht dem entspricht, was der Server hält. Schließe und öffne erneut, um ihn zu bearbeiten.
+routine-problem-function-no-name = Die Funktion braucht einen Namen.
+routine-problem-procedure-no-name = Die Prozedur braucht einen Namen.
+routine-problem-function-no-language = Die Funktion braucht eine Sprache (plpgsql, sql).
+routine-problem-procedure-no-language = Die Prozedur braucht eine Sprache (plpgsql, sql).
+routine-problem-no-return-type = Die Funktion braucht einen Rückgabetyp.
+routine-problem-procedure-returns = Eine Prozedur gibt nichts zurück — leere den Rückgabetyp.
+routine-problem-function-no-body = Die Funktion braucht einen Rumpf.
+routine-problem-procedure-no-body = Die Prozedur braucht einen Rumpf.
+routine-problem-bare-parameter = SQL Server benennt jeden Parameter mit @ — @sku varchar(20), @n int OUTPUT.
+routine-problem-procedure-refuses = Eine Prozedur kann WITH { $option } nicht annehmen.
+routine-problem-scalar-refuses = Eine Skalarfunktion kann WITH { $option } nicht annehmen.
+routine-problem-inline-refuses = Eine Inline-Tabellenwertfunktion kann WITH { $option } nicht annehmen.
+routine-problem-multi-refuses = Eine Tabellenwertfunktion mit mehreren Anweisungen kann WITH { $option } nicht annehmen.
+routine-problem-procedure-refuses-native = Eine Prozedur kann WITH { $option } nicht annehmen, sobald sie nativ kompiliert ist.
+routine-problem-scalar-refuses-native = Eine Skalarfunktion kann WITH { $option } nicht annehmen, sobald sie nativ kompiliert ist.
+routine-problem-inline-refuses-native = Eine Inline-Tabellenwertfunktion kann WITH { $option } nicht annehmen, sobald sie nativ kompiliert ist.
+routine-problem-multi-refuses-native = Eine Tabellenwertfunktion mit mehreren Anweisungen kann WITH { $option } nicht annehmen, sobald sie nativ kompiliert ist.
+routine-problem-native-needs-schemabinding = Eine nativ kompilierte Routine braucht WITH SCHEMABINDING — SQL Server verlangt beides zusammen.
+routine-problem-inline-with-execute-as = INLINE = ON lässt sich nicht mit EXECUTE AS kombinieren — eine Funktion, die als jemand anderes läuft, wird nie inline ausgeführt.
+routine-problem-numbered-rename = { $was } führt eine nummerierte Prozedurgruppe an ({ $group }), und eine Umbenennung würde sie alle löschen. Behalte den Namen, um sie zu bearbeiten.
+routine-problem-trigger-function-args = Eine Triggerfunktion nimmt keine deklarierten Argumente — sie kommen in TG_ARGV an.
+routine-clash-function-refused = Eine Funktion namens { $name } ist hier bereits vorhanden. Auf dieser Engine ist eine Umbenennung ein Löschen und Anlegen, daher lehnt der Server dies ab und nichts ändert sich — wähle einen anderen Namen oder lösche { $name } zuerst.
+routine-clash-procedure-refused = Eine Prozedur namens { $name } ist hier bereits vorhanden. Auf dieser Engine ist eine Umbenennung ein Löschen und Anlegen, daher lehnt der Server dies ab und nichts ändert sich — wähle einen anderen Namen oder lösche { $name } zuerst.
+routine-clash-function-destroys = Eine Funktion namens { $name } ist hier bereits vorhanden. Auf dieser Engine ist eine Umbenennung ein Löschen und Anlegen, daher würde das Anwenden { $original } zerstören und { $name } unverändert lassen.
+routine-clash-procedure-destroys = Eine Prozedur namens { $name } ist hier bereits vorhanden. Auf dieser Engine ist eine Umbenennung ein Löschen und Anlegen, daher würde das Anwenden { $original } zerstören und { $name } unverändert lassen.
+routine-clash-function-destroys-new = Eine Funktion namens { $name } ist hier bereits vorhanden. Auf dieser Engine ist eine Umbenennung ein Löschen und Anlegen, daher würde das Anwenden das Original zerstören und { $name } unverändert lassen.
+routine-clash-procedure-destroys-new = Eine Prozedur namens { $name } ist hier bereits vorhanden. Auf dieser Engine ist eine Umbenennung ein Löschen und Anlegen, daher würde das Anwenden das Original zerstören und { $name } unverändert lassen.
 
 ## Users and privileges browser
 
