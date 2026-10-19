@@ -1922,9 +1922,25 @@ grid-menu-delete-rows = { $count ->
 }
 grid-menu-undo-delete = Undo delete
 grid-menu-ai-summary = AI summary
-# $scope is what would be sent, as core phrases it (3 rows × 2 columns from
-# shop.orders); it stays English for now.
+# $scope is what would be sent: one of the grid-attach-scope-* messages below.
 grid-attach-to-chat = Attach { $scope } to chat
+# What an attachment covers (core's AttachScope; English must read exactly as
+# its Display). Whole rows, some columns of one row, or both counted.
+grid-attach-scope-rows = { $rows ->
+    [one] { $rows } row
+   *[other] { $rows } rows
+}
+grid-attach-scope-columns = { $cols ->
+    [one] { $cols } column
+   *[other] { $cols } columns
+}
+grid-attach-scope-rows-and-columns = { $rows ->
+    [one] { $rows } row
+   *[other] { $rows } rows
+} and { $cols ->
+    [one] { $cols } column
+   *[other] { $cols } columns
+}
 grid-menu-freeze = Freeze
 grid-menu-unfreeze = Unfreeze
 grid-menu-hide-column = Hide column
@@ -1939,8 +1955,8 @@ grid-menu-sql-in-list = SQL IN list
 ## The results grid's toolbar (grid.rs) — the status line, the commit and row
 ## controls, and the copy, save, AI and chart icons.
 
-# The status line. $rows is core's phrase for what was read (1,000 of ~4.2m
-# rows (capped)), which stays English for now; $ms is the run time.
+# The status line. $rows is one of the grid-rows-read-* messages below; $ms is
+# the run time.
 grid-stats = { $rows } · { $cols ->
     [one] { $cols } col
    *[other] { $cols } cols
@@ -1950,6 +1966,22 @@ grid-stats-in-database = { $database } · { $rows } · { $cols ->
     [one] { $cols } col
    *[other] { $cols } cols
 } · { $ms } ms
+# What was read (core's RowsRead; English must read exactly as its Display).
+# $read and $total are figures as printed (200k, ~292.02k, 4,213,551); $n is
+# the number the noun follows — the total's, where one is named. "capped": the
+# read stopped at the row limit.
+grid-rows-read = { $n ->
+    [one] { $read } row
+   *[other] { $read } rows
+}
+grid-rows-read-capped = { $n ->
+    [one] { $read } row
+   *[other] { $read } rows
+} (capped)
+grid-rows-read-of-total = { $n ->
+    [one] { $read } of { $total } row
+   *[other] { $read } of { $total } rows
+}
 # Beside the status line for a result kept (pinned) on its panel.
 grid-kept-note = · kept — read-only
 # $columns lists the columns whose values ran past what the grid holds.

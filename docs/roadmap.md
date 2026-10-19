@@ -80,7 +80,8 @@ assertions pin English wording — stays the regression net throughout.
    per variant, core's `message()`/`Display` kept as the English and a test holding the two
    equal; a list is joined UI-side before it is handed in. The renderer lives beside the code
    that shows it, `ui/i18n.rs` holding only the ones used across files. Done for
-   `AliasRenameRefusal`, `ParamError` and `cli_install` (`Refusal`, `Report`, `RowHint`).
+   `AliasRenameRefusal`, `ParamError`, `cli_install` (`Refusal`, `Report`, `RowHint`),
+   `stats::RowsRead` and `model::AttachScope`.
    **`launch::*`'s refusals take a session of their own**: the largest group, and propagated
    through `?` inside the command builders, so the typed refusal reaches into them. Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
@@ -103,8 +104,7 @@ assertions pin English wording — stays the regression net throughout.
    keys) and AI prompts keep core's English. What the converted views and the app pass through
    unchanged today is this phase's list to work from: `launch::*`'s refusals,
    `script::restore_refusal`, `statement_timeout_label` (quoted by the
-   timeout message as its dropdown shows it), `stats::rows_read_clause`,
-   `model::attach_scope_label`, the grid's export notes, the activity panel's counts line — and
+   timeout message as its dropdown shows it), the grid's export notes, the activity panel's counts line — and
    two that are not core's but need the same split: `schemaic-cli`'s `dump.rs` "Export failed: …"
    lines, which the dump modal shows and the headless CLI shares, and `schemaic-ai`'s
    `Agent::label`, whose *Disabled* the AI settings' dropdown shows.

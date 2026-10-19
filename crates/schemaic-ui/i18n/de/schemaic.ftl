@@ -1629,6 +1629,21 @@ grid-menu-delete-rows = { $count ->
 grid-menu-undo-delete = Löschen rückgängig machen
 grid-menu-ai-summary = KI-Zusammenfassung
 grid-attach-to-chat = { $scope } an den Chat anhängen
+grid-attach-scope-rows = { $rows ->
+    [one] { $rows } Zeile
+   *[other] { $rows } Zeilen
+}
+grid-attach-scope-columns = { $cols ->
+    [one] { $cols } Spalte
+   *[other] { $cols } Spalten
+}
+grid-attach-scope-rows-and-columns = { $rows ->
+    [one] { $rows } Zeile
+   *[other] { $rows } Zeilen
+} und { $cols ->
+    [one] { $cols } Spalte
+   *[other] { $cols } Spalten
+}
 grid-menu-freeze = Fixieren
 grid-menu-unfreeze = Fixierung aufheben
 grid-menu-hide-column = Spalte ausblenden
@@ -1647,6 +1662,18 @@ grid-stats-in-database = { $database } · { $rows } · { $cols ->
     [one] { $cols } Spalte
    *[other] { $cols } Spalten
 } · { $ms } ms
+grid-rows-read = { $n ->
+    [one] { $read } Zeile
+   *[other] { $read } Zeilen
+}
+grid-rows-read-capped = { $n ->
+    [one] { $read } Zeile
+   *[other] { $read } Zeilen
+} (begrenzt)
+grid-rows-read-of-total = { $n ->
+    [one] { $read } von { $total } Zeile
+   *[other] { $read } von { $total } Zeilen
+}
 grid-kept-note = · behalten — schreibgeschützt
 grid-arena-note = · { $columns } zu groß, um vollständig gehalten zu werden — spätere Zeilen bleiben leer
 grid-sorted-subset = · sortierte Teilmenge (begrenzt) — nicht die vollständige Reihenfolge

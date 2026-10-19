@@ -22,6 +22,7 @@
 //! fills it lives in the db crate.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::intel::SqlDialect;
 use crate::schema::TableShape;
@@ -730,25 +731,15 @@ pub fn catalogue_key(
     }
 }
 
-/// The row figure the results toolbar prints: `1,000` on its own, or
-/// `1,000 of ~4.2m` when the loaded rows are a capped read of a whole table whose
-/// total is in hand.
+/// The total, if naming it beside `loaded` **says something a reader can
+/// see** — bigger, *and* rendered differently: `1,000 of ~4.2m` when the
+/// loaded rows are a capped read of a whole table whose total is in hand.
 ///
 /// **`total` is only ever the whole statement's total.** Whether it *is* one is
 /// [`crate::intel::full_table_source`]'s question, asked before this is called;
 /// all that is decided here is whether the figure adds anything. A total at or
 /// below what was already read says nothing the line doesn't — and would print
 /// `1,000 of ~400`, which reads as a bug rather than as the stale estimate it is.
-fn rows_read_of(loaded: usize, total: Option<RowCount>) -> String {
-    let read = human_count(loaded);
-    match names_a_bigger_total(loaded, total) {
-        Some(t) => format!("{read} of {}", t.label()),
-        None => read,
-    }
-}
-
-/// The total, if naming it beside `loaded` **says something a reader can
-/// see** — bigger, *and* rendered differently.
 ///
 /// The two conditions were one. `human_count` keeps two decimals of its unit,
 /// so its resolution is 10 rows at `k` and 10,000 at `m`: a 200,004-row table
@@ -778,12 +769,44 @@ fn names_a_bigger_total(loaded: usize, total: Option<RowCount>) -> Option<RowCou
 /// and `(capped)` after it spends nine characters restating it. On a line that
 /// already crowds the toolbar buttons off a narrow panel that is nine characters
 /// too many. The word stays for the case with no comparison to make: no total,
-/// or one too stale to print (`rows_read_of`'s rule), where it is the only
+/// or one too stale to print (`names_a_bigger_total`'s rule), where it is the only
 /// thing that says the result is partial.
 ///
 /// The noun follows the last figure named, which is the total when there is one:
 /// `1 of ~4.2m row` is the wrong noun, and so is `0 of 1 rows`.
+///
+/// The English of [`rows_read`]: the interface words that value itself.
 pub fn rows_read_clause(loaded: usize, total: Option<RowCount>, truncated: bool) -> String {
+    rows_read(loaded, total, truncated).to_string()
+}
+
+/// [`rows_read_clause`]'s decision as a value — which figures the segment
+/// names and whether `(capped)` is said — for the interface to word. The
+/// figures are [`human_count`]'s and [`RowCount::label`]'s, as printed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowsRead {
+    /// Every row the statement returned: `42 rows`.
+    All { read: String, n: u64 },
+    /// A capped read with no total worth naming: `200k rows (capped)`.
+    Capped { read: String, n: u64 },
+    /// A capped read beside the total it stopped short of:
+    /// `200k of ~292.02k rows`. `n` is the total's, which the noun follows.
+    OfTotal { read: String, total: String, n: u64 },
+}
+
+impl fmt::Display for RowsRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let noun = |n: u64| crate::text::plural(n as usize, "row", "rows");
+        match self {
+            RowsRead::All { read, n } => write!(f, "{read} {}", noun(*n)),
+            RowsRead::Capped { read, n } => write!(f, "{read} {} (capped)", noun(*n)),
+            RowsRead::OfTotal { read, total, n } => write!(f, "{read} of {total} {}", noun(*n)),
+        }
+    }
+}
+
+/// See [`rows_read_clause`], whose rules this is.
+pub fn rows_read(loaded: usize, total: Option<RowCount>, truncated: bool) -> RowsRead {
     // **The premise is enforced here rather than documented above it.** A total
     // is in hand only for a capped read — `grid_view`'s `scanned` is gated on
     // `truncated` before the catalogue is asked — and that gate lives in a view
@@ -794,21 +817,28 @@ pub fn rows_read_clause(loaded: usize, total: Option<RowCount>, truncated: bool)
     // rows were withheld, with no `(capped)` to hint a cap was ever involved.
     // An uncapped read has nothing to compare itself to, so it does not.
     let total = truncated.then_some(total).flatten();
-    let figure = rows_read_of(loaded, total);
-    // Whether the total was *named* is what decides both the noun and the
-    // notice, and only `rows_read_of` knows it — asking `total.is_some()` here
-    // would count a stale figure it dropped, or one that renders as the figure
-    // beside it. One predicate, shared, so the line cannot say `of ~200k` and
-    // then decide the comparison did not happen (or the reverse, which is how
-    // `(capped)` went missing).
-    let named = names_a_bigger_total(loaded, total);
-    let noun = crate::text::plural(named.map_or(loaded, |t| t.value() as usize), "row", "rows");
-    let cap = if truncated && named.is_none() {
-        " (capped)"
-    } else {
-        ""
-    };
-    format!("{figure} {noun}{cap}")
+    let read = human_count(loaded);
+    // Whether the total was *named* is what decides the figure, the noun and
+    // the notice at once — asking `total.is_some()` here would count a stale
+    // figure `names_a_bigger_total` dropped, or one that renders as the figure
+    // beside it. One predicate, one match, so the line cannot say `of ~200k`
+    // and then decide the comparison did not happen (or the reverse, which is
+    // how `(capped)` went missing).
+    match names_a_bigger_total(loaded, total) {
+        Some(t) => RowsRead::OfTotal {
+            read,
+            total: t.label(),
+            n: t.value(),
+        },
+        None if truncated => RowsRead::Capped {
+            read,
+            n: loaded as u64,
+        },
+        None => RowsRead::All {
+            read,
+            n: loaded as u64,
+        },
+    }
 }
 
 /// How much bigger the next read of a capped result should be.
@@ -1807,24 +1837,39 @@ mod tests {
     #[test]
     fn the_total_is_added_to_the_rows_read_when_it_says_something() {
         assert_eq!(
-            rows_read_of(1_000, Some(RowCount::Estimate(4_200_000))),
-            "1k of ~4.2m"
+            rows_read(1_000, Some(RowCount::Estimate(4_200_000)), true),
+            RowsRead::OfTotal {
+                read: "1k".into(),
+                total: "~4.2m".into(),
+                n: 4_200_000
+            }
         );
         assert_eq!(
-            rows_read_of(1_000, Some(RowCount::Exact(4_213_551))),
-            "1k of 4,213,551"
+            rows_read(1_000, Some(RowCount::Exact(4_213_551)), true),
+            RowsRead::OfTotal {
+                read: "1k".into(),
+                total: "4,213,551".into(),
+                n: 4_213_551
+            }
         );
     }
 
     #[test]
     fn a_total_that_says_nothing_is_left_out() {
+        let capped = RowsRead::Capped {
+            read: "1k".into(),
+            n: 1_000,
+        };
         // Nothing in hand.
-        assert_eq!(rows_read_of(1_000, None), "1k");
+        assert_eq!(rows_read(1_000, None, true), capped);
         // A stale estimate below what was already read would print
         // `1k of ~400`, which reads as a bug rather than as a stale figure.
-        assert_eq!(rows_read_of(1_000, Some(RowCount::Estimate(400))), "1k");
+        assert_eq!(
+            rows_read(1_000, Some(RowCount::Estimate(400)), true),
+            capped
+        );
         // Equal is not more: the read already accounts for every row.
-        assert_eq!(rows_read_of(1_000, Some(RowCount::Exact(1_000))), "1k");
+        assert_eq!(rows_read(1_000, Some(RowCount::Exact(1_000)), true), capped);
     }
 
     /// **`(capped)` cannot go missing because the two figures happen to
@@ -2148,7 +2193,7 @@ mod tests {
     }
 
     /// A stale estimate below what was already read says nothing — the same
-    /// rule `rows_read_of` follows, and for the same reason: offering to "read
+    /// rule `rows_read` follows, and for the same reason: offering to "read
     /// all ~400 rows" of a result already showing 1,000 reads as a bug.
     #[test]
     fn a_stale_total_is_ignored_rather_than_offered() {

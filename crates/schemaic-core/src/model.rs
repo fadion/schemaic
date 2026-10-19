@@ -1622,16 +1622,46 @@ pub fn row_range_selection(
 /// *column* of one row, not "1 row" (which reads as the whole row), and a
 /// selection covering every column **is** whole rows, where naming the columns
 /// as well is noise. Between those, both halves matter and both are said.
+///
+/// The English of [`attach_scope`]: the interface words that value itself.
 pub fn attach_scope_label(rows: usize, cols: usize, ncols: usize) -> String {
-    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    attach_scope(rows, cols, ncols).to_string()
+}
+
+/// What an attachment covers, as [`attach_scope_label`] decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachScope {
+    /// Whole rows — every column selected.
+    Rows(usize),
+    /// Some columns of one row.
+    Columns(usize),
+    /// Some columns of several rows: `(rows, columns)`.
+    RowsAndColumns(usize, usize),
+}
+
+impl std::fmt::Display for AttachScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        match *self {
+            AttachScope::Rows(r) => f.write_str(&plural(r, "row")),
+            AttachScope::Columns(c) => f.write_str(&plural(c, "column")),
+            AttachScope::RowsAndColumns(r, c) => {
+                write!(f, "{} and {}", plural(r, "row"), plural(c, "column"))
+            }
+        }
+    }
+}
+
+/// See [`attach_scope_label`], whose rules this is.
+pub fn attach_scope(rows: usize, cols: usize, ncols: usize) -> AttachScope {
     // Every column selected → whole rows, however many.
     if ncols > 0 && cols >= ncols {
-        return plural(rows, "row");
+        return AttachScope::Rows(rows);
     }
     if rows == 1 {
-        return plural(cols, "column");
+        return AttachScope::Columns(cols);
     }
-    format!("{} and {}", plural(rows, "row"), plural(cols, "column"))
+    AttachScope::RowsAndColumns(rows, cols)
 }
 
 /// Where a Go-to-row jump lands: the selection to make, and the column to scroll

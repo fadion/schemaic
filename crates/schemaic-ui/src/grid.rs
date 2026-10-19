@@ -2830,7 +2830,7 @@ fn ai_offered(gs: GridState) -> bool {
 }
 
 /// What the *current selection* would send, as the phrase the attach entry reads
-/// — `core::model::attach_scope_label` over the selected rectangle, with the row
+/// — `core::model::attach_scope` over the selected rectangle, with the row
 /// count capped at what an attachment actually carries.
 fn selection_scope_label(gs: GridState) -> String {
     let (r0, c0, r1, c1) = gs.bounds_untracked().unwrap_or((0, 0, 0, 0));
@@ -2855,17 +2855,57 @@ fn attach_scope(rows: usize, (c0, c1): (usize, usize), layout: &ColLayout, ncols
         .into_iter()
         .filter(|c| (c0..=c1).contains(c))
         .count();
-    schemaic_core::model::attach_scope_label(
+    attach_scope_text(schemaic_core::model::attach_scope(
         rows.min(schemaic_core::prompt::ATTACH_ROW_CAP),
         cols,
         ncols,
-    )
+    ))
+}
+
+/// Core's `AttachScope` in the interface's language.
+fn attach_scope_text(scope: schemaic_core::model::AttachScope) -> String {
+    use schemaic_core::model::AttachScope;
+    match scope {
+        AttachScope::Rows(rows) => tr!("grid-attach-scope-rows", rows = rows),
+        AttachScope::Columns(cols) => tr!("grid-attach-scope-columns", cols = cols),
+        AttachScope::RowsAndColumns(rows, cols) => {
+            tr!(
+                "grid-attach-scope-rows-and-columns",
+                rows = rows,
+                cols = cols
+            )
+        }
+    }
+}
+
+/// The toolbar's row segment — core's `stats::RowsRead` in the interface's
+/// language.
+fn rows_read_text(said: &schemaic_core::stats::RowsRead) -> String {
+    use schemaic_core::stats::RowsRead;
+    // `n` by value: `tr!` pastes an argument in front of `.into()`, so a
+    // `*n` would parse as `*(n.into())`.
+    match *said {
+        RowsRead::All { ref read, n } => tr!("grid-rows-read", read = read.as_str(), n = n),
+        RowsRead::Capped { ref read, n } => {
+            tr!("grid-rows-read-capped", read = read.as_str(), n = n)
+        }
+        RowsRead::OfTotal {
+            ref read,
+            ref total,
+            n,
+        } => tr!(
+            "grid-rows-read-of-total",
+            read = read.as_str(),
+            total = total.as_str(),
+            n = n
+        ),
+    }
 }
 
 /// Label for the whole-result attach action, counting what would actually be
 /// sent — a result over the cap says so *before* the click.
 ///
-/// Phrased by `attach_scope_label` like the selection one, so the two entries
+/// Phrased by `attach_scope` like the selection one, so the two entries
 /// can't come to describe the same thing differently.
 fn attach_label(gs: GridState) -> String {
     let ncols = gs.rs.get_untracked().col_count();
@@ -9023,7 +9063,7 @@ fn grid_toolbar(
     // settled at build time: a capped result's total arrives from a catalogue
     // query, and the line reads `1,000 of ~4.2m rows` once it does. The row
     // segment — figure, noun, and the `(capped)` notice when the figure hasn't
-    // already made it — is `stats::rows_read_clause`'s whole job, because it is
+    // already made it — is `stats::rows_read`'s whole job, because it is
     // the composition of those three that has to read well, not each alone.
     //
     // **This is the segment that gives way when the strip runs out of room**
@@ -9032,7 +9072,11 @@ fn grid_toolbar(
     // narrow panel eats the database name and the timing before it touches an
     // action or a warning.
     let stats = label(move || {
-        let rows = schemaic_core::stats::rows_read_clause(nrows, row_total.get(), truncated);
+        let rows = rows_read_text(&schemaic_core::stats::rows_read(
+            nrows,
+            row_total.get(),
+            truncated,
+        ));
         let ms = elapsed_ms.to_string();
         match &database {
             None => tr!("grid-stats", rows = rows, cols = ncols, ms = ms),
@@ -16603,5 +16647,48 @@ mod clear_tests {
             offenders.join("
 ")
         );
+    }
+}
+
+#[cfg(test)]
+mod core_words_tests {
+    use super::{attach_scope_text, rows_read_text};
+    use schemaic_core::model::AttachScope;
+    use schemaic_core::stats::{RowCount, rows_read};
+
+    /// **The toolbar's row segment reads in English exactly as core's
+    /// `RowsRead` says it** — every shape: a plain count, `(capped)` with no
+    /// total, a named total, and the noun following the last figure.
+    #[test]
+    fn english_reads_every_row_segment_as_core_does() {
+        for (loaded, total, truncated) in [
+            (42, None, false),
+            (1, None, false),
+            (0, None, false),
+            (200_000, None, true),
+            (200_000, Some(RowCount::Estimate(292_020)), true),
+            (1_000, Some(RowCount::Exact(4_213_551)), true),
+            (0, Some(RowCount::Exact(1)), true),
+            (1_000, Some(RowCount::Estimate(400)), true),
+        ] {
+            let said = rows_read(loaded, total, truncated);
+            assert_eq!(rows_read_text(&said), said.to_string(), "{said:?}");
+        }
+    }
+
+    /// The attach entry's phrase, every shape and both numbers of each noun.
+    #[test]
+    fn english_scopes_every_attachment_as_core_does() {
+        for scope in [
+            AttachScope::Rows(1),
+            AttachScope::Rows(3),
+            AttachScope::Columns(1),
+            AttachScope::Columns(3),
+            AttachScope::RowsAndColumns(3, 1),
+            AttachScope::RowsAndColumns(3, 2),
+            AttachScope::RowsAndColumns(2, 0),
+        ] {
+            assert_eq!(attach_scope_text(scope), scope.to_string(), "{scope:?}");
+        }
     }
 }

@@ -17788,11 +17788,15 @@ existing prose was left alone.
         whose `None` namespace means "this engine has none", `find`'s means "the statement didn't
         say", so it matches by name alone and **only when exactly one table carries it**: an
         unqualified PostgreSQL name resolves through `search_path`, which the client does not know.
-      - `rows_read_clause` is the toolbar's whole row segment — figure, noun, and the `(capped)`
+      - `rows_read` is the toolbar's whole row segment — figure, noun, and the `(capped)`
         notice — and the reason it is one function rather than three fragments the view assembles
-        is that only the composition can decide whether the notice is still needed. Its private
-        half `rows_read_of` prints `1k` alone or `1k of ~4.2m`, dropping a total at or below what
-        was already read (`1k of ~400` reads as a bug rather than as the stale estimate it is);
+        is that only the composition can decide whether the notice is still needed. It answers
+        with a `RowsRead` — `All { read, n }`, `Capped { read, n }` or `OfTotal { read, total, n }`,
+        the figures as `human_count` and `RowCount::label` print them, `n` the number the noun
+        follows — which the grid words (*The string catalogue*); its `Display` is the English, and
+        `rows_read_clause` is that `Display` as a function, kept for core's own tests. `OfTotal`
+        names a total only when it is bigger than what was already read (`1k of ~400` reads as a
+        bug rather than as the stale estimate it is);
         **`names_a_bigger_total` is that test, and it asks two things where it used to ask one** —
         bigger, *and rendered differently*. `human_count` keeps two decimals of its unit, so its
         resolution is 10 rows at `k` and 10,000 at `m`: a 200,004-row table read at the 200,000 cap
@@ -33565,7 +33569,7 @@ existing prose was left alone.
   already covers it, says *"read all rows"* instead. That case shipped wrong — a 200k read of a
   ~292k table stepped to a million and the toolbar read "read 1m rows", on a line that had just
   described the table as ~292.02k. It then shipped wrong the other way: *"read all ~292.02k rows"*
-  named the total a second time, three words from where `rows_read_clause` had already printed it,
+  named the total a second time, three words from where `rows_read` had already printed it,
   and the pair was the widest thing on the strip. **The offer names a figure only when the figure
   is its own** — the step is a number that appears nowhere else on the line, and dropping it would
   leave "read more" implying a cursor the row cap has none of; "all" needs no number, because
@@ -33579,7 +33583,7 @@ existing prose was left alone.
   rounded. The padding is free, because the cap cuts off a stream that ends when the table does: one
   set above the real count is never reached. What bounds it is the step it replaced — *"read all
   rows"* never asks for more than the numbered offer it was chosen over. A total at or below the
-  rows already read is stale and says nothing, the same rule `rows_read_of` follows. The offer is a
+  rows already read is stale and says nothing, the same rule `rows_read` follows. The offer is a
   `label`, not a `text`, for the same reason `stats` beside it is one — the total arrives from a
   catalogue query after the strip is built — and the click re-asks rather than capturing, so the
   cap always matches the words the user just read.
@@ -40373,8 +40377,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
     translation* — among it `launch::*`'s refusals, `script::restore_refusal`,
     `statement_timeout_label` (which the timeout message quotes as the
-    dropdown shows it), `format_bytes`, `stats::rows_read_clause`, `model::attach_scope_label`,
-    the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
+    dropdown shows it), `format_bytes`, the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
     whose state words the search box also matches) and `dump.rs`'s "Export failed: …" lines,
     which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
     English too: `Agent::label` (`schemaic-ai`), `KeywordCase::label` (core).
@@ -40400,7 +40403,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     source, in British spelling, and a new message goes there first, since `fl!` checks ids and
     argument names against that file alone. Ids are kebab-case and start with the area they belong
     to (`settings-language-restart`). A translation lives beside it at `i18n/<tag>/schemaic.ftl` and falls back to `en-GB` message
-    by message.
+    by message. **Pass `tr!` an owned value, never a dereference**: `fl!` pastes each argument
+    expression in front of `.into()`, so `n = *n` parses as `*(n.into())` and fails as E0282,
+    "type annotations needed", pointing into `i18n.rs` rather than at the call. Bind the field by
+    value in the `match` instead, as `rows_read_text` does.
   - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
     core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
     `history_panel::bucket_title` for `history::Bucket::label`, `activity_panel::kill_label`
@@ -40440,6 +40446,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     `install_cli::refusal`/`report` word from `install-refuse-*`/`install-report-*` and
     `settings::cli_hint` from `install-hint-*`, held by `english_refuses_every_install_as_core_does`,
     `english_reports_every_install_as_core_does` and `english_hints_every_cli_row_as_core_does`.
+    The grid words two more: `stats::RowsRead`, the toolbar's row segment, by `rows_read_text`
+    from `grid-rows-read`/`-capped`/`-of-total`, and `model::AttachScope`, the phrase inside both
+    *Attach … to chat* entries, by `attach_scope_text` from `grid-attach-scope-rows`/`-columns`/
+    `-rows-and-columns`, held by `english_reads_every_row_segment_as_core_does` and
+    `english_scopes_every_attachment_as_core_does` (`core_words_tests`). Their figures arrive as
+    core prints them — `human_count`, `RowCount::label` — since formatting a number for the
+    locale is phase 7; `rows_read_clause` and `attach_scope_label` remain only as the English
+    wrappers core's tests read.
     **A typed message's renderer lives beside the code that shows it** — `alias_rename.rs`,
     `install_cli.rs`, `settings.rs` — and `ui/i18n.rs` holds only the ones another file or crate
     calls.
@@ -44264,8 +44278,8 @@ this bundle's.
   size column happened to be on and that database expanded, which is the tree's refetch and not this
   one. A repeated ask is free: the slot is the guard. The wording of the segment — including
   whether `(capped)` is still worth saying once the comparison is there, and which figure the noun
-  agrees with — belongs to `stats::rows_read_clause`, not to the view; the view supplies
-  `truncated` and the total and prints what comes back. The cap itself is unchanged and is still a
+  agrees with — belongs to `stats::rows_read`, not to the view; the view supplies
+  `truncated` and the total and words the `RowsRead` that comes back (`rows_read_text`). The cap itself is unchanged and is still a
   **client-side stream cutoff**, not a `LIMIT`; this only says how much of the table went past it.
 - **A table tab pages; the pager is the `LIMIT`/`OFFSET` the cap is not.** `grid_toolbar`'s
   `pager` sits after the read-more offer — `· ‹ Rows 101–200 ›`, the words from
