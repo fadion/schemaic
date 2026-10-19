@@ -115,8 +115,35 @@ assertions pin English wording — stays the regression net throughout.
    (`settings::keyword_case_label`, `comma_style_label`, `statement_gap_label`), and so are
    `connection`'s pickers (`Environment`, `AiData`, `SslMode`, `SshAuth`, `AuthMode`). Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
-   unchanged today is this phase's list to work from: `format_bytes` and
-   `history::format_duration`, which wait on phase 7's number formatting.
+   unchanged today is this phase's list to work from (surveyed 2026-10-19; it once claimed only
+   the number formatting was left, which was never true):
+   - **The DDL preview modal's body** — `ddl::Change::summary`, `risk_heading`, `destructive`,
+     `unsupported`, `used_by::change_warnings`/`drop_warning`, the compare plan's `omitted`
+     (`compare::omission_note`) and the AI proposal errors (`propose::resolve_target`/`apply`).
+     The largest group; a test in `ddl_preview.rs` matches `"gone — "` on the English.
+   - **The run guard** — `RunVerdict::Block`/`Confirm`'s `String`s (read-only, `NO_DATABASE_SELECTED`,
+     "modifies data", `filter::with_staged_question`'s suffix), which `ScriptRequest::approved`
+     passes on too.
+   - **Transactions** — `tx::run_failed_message`, `failed_message`, `run_cancelled_message`,
+     `cancelled_message`, `not_sent_message`.
+   - **Filters** — `filter::STAGED_REQUERY_MSG`, `STAGED_LANDING_MSG`, `REREAD_WITHOUT_FILTER_MSG`,
+     and `FilterError::BadCondition` (below).
+   - **Write-back** — `Rollback::note` and `one_row_verdict`'s text, fused into a `DbError::Query`
+     in `schemaic-db`; the hardest, since the sentence is built below core.
+   - **The plan view's warnings** (`plan.rs`) and **the editor's offline diagnostics**
+     (`intel::Diagnostic::message`).
+   - **Import** — `ImportError`'s `Display` and `import::xlsx_size_refusal`; **connection import**
+     — `conn_import::UrlError::message`, `SkipReason::message`, `row_overflow_sentence`.
+   - **Startup notices** — `persist`'s recovery notices, `secrets`' `notice`/`cli_notice`, and
+     `secrets::save_connections`' answer; **the SSH tunnel's** `TunnelFailures::refusal`.
+   - **The drop and truncate confirms** — `stats::truncate_prompt`, `drop_preview`.
+   - **Smaller ones** — `compare::comparable`, `selection_note`; `copy_table::refusal`;
+     `activity::read_only_refusal`, `Session::note`; `stats::index_facts`, `unused_note`,
+     `Freshness::note`; `ddl::index_hints`' `message`; `users::password_hint`,
+     `account_form_blocker`, the grants list's `note`; `edit::copy_split_note`;
+     `result_diff`'s and the AI panel's summaries.
+   - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
+     `transcript::elapsed_text`.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).
