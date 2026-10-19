@@ -1539,7 +1539,7 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
             edit_field(
                 value,
                 FieldCfg {
-                    placeholder: "value",
+                    placeholder_of: Some(Rc::new(|| tr!("params-value-placeholder"))),
                     // A `Raw` value is SQL and reads as code; the other two are
                     // data. Same rule the DDL preview's fields follow.
                     mono: matches!(k, params::ParamKind::Raw),
@@ -1591,7 +1591,7 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
                 .margin_left(theme::scaled(7.0))
                 .hover(|s| s.color(theme::text()).border_color(theme::text_faint()))
         })
-        .tooltip(|| text("Text, number, NULL, or raw SQL — click to change").style(tooltip_style));
+        .tooltip(|| text(tr!("params-kind-tip")).style(tooltip_style));
 
     // Name, then the kind, then the field: the chip qualifies the name — it says
     // what `:age` *is* — and the field is the answer to both. Behind the field it

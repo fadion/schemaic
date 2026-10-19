@@ -2212,3 +2212,10 @@ cmdk-placeholder = Ask the AI Assistant for help.
 # Keep or drop the suggested edit shown as a diff.
 cmdk-accept = Accept
 cmdk-reject = Reject
+
+## The editor's bind-parameter row (editor_pane.rs). The kind chip's own
+## labels (abc, 123, NULL, SQL) are symbols and stay.
+
+params-value-placeholder = value
+# On the kind chip; NULL and SQL are the chip's own words.
+params-kind-tip = Text, number, NULL, or raw SQL — click to change

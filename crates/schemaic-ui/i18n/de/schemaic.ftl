@@ -1803,3 +1803,5 @@ widgets-spinner-verbs = Abwägen, Ausbrüten, Backen, Basteln, Berechnen, Bummel
 cmdk-placeholder = Bitte den KI-Assistenten um Hilfe.
 cmdk-accept = Übernehmen
 cmdk-reject = Verwerfen
+params-value-placeholder = Wert
+params-kind-tip = Text, Zahl, NULL oder rohes SQL — zum Ändern klicken
