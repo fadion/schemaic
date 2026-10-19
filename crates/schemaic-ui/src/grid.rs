@@ -2737,11 +2737,8 @@ fn fill_selection(gs: GridState, fill: schemaic_core::edit::Fill) {
         fill,
     );
     if plan.is_empty() {
-        gs.commit_err.set(Some(ModalError::app(
-            "Nothing to fill: the selected columns can't be written, or the cell to copy is a new \
-             row's unset value or a staged DEFAULT."
-                .to_string(),
-        )));
+        gs.commit_err
+            .set(Some(ModalError::app(tr!("grid-fill-nothing"))));
         return;
     }
     let nrows = rs.row_count();
@@ -2764,11 +2761,11 @@ fn fill_selection(gs: GridState, fill: schemaic_core::edit::Fill) {
     // After staging, because `stage` clears the bar.
     if skipped > 0 {
         let n = schemaic_core::text::human_count;
-        gs.commit_note.set(Some(format!(
-            "Filled {} {}, skipping {} in rows marked for deletion.",
-            n(staged),
-            schemaic_core::text::plural(staged, "cell", "cells"),
-            n(skipped)
+        gs.commit_note.set(Some(tr!(
+            "grid-fill-skipped",
+            count = staged,
+            filled = n(staged),
+            skipped = n(skipped)
         )));
     }
 }
@@ -2911,27 +2908,11 @@ fn attach_to_chat(gs: GridState, whole: bool) {
     if columns.is_empty() || rows.is_empty() {
         return;
     }
-    // The summary is what survives to disk, and what the user reads back later
-    // to know what they sent — so it counts what was *taken*, not what was
-    // selected, and names the source when the result has one.
-    let source = source_table(gs, None)
-        .map(|t| format!(" from {t}"))
-        .unwrap_or_default();
-    let capped = if total > rows.len() {
-        format!(" (the first {} of {total} selected)", rows.len())
-    } else {
-        String::new()
-    };
-    let summary = format!(
-        "{} {} × {} {}{source}{capped}",
+    let summary = attach_summary(
         rows.len(),
-        if rows.len() == 1 { "row" } else { "rows" },
         columns.len(),
-        if columns.len() == 1 {
-            "column"
-        } else {
-            "columns"
-        },
+        source_table(gs, None).as_deref(),
+        total,
     );
     if let Some(f) = gs.attach.get_untracked() {
         (f)(schemaic_core::transcript::Attachment {
@@ -2944,6 +2925,32 @@ fn attach_to_chat(gs: GridState, whole: bool) {
             columns,
             rows,
         });
+    }
+}
+
+/// What an attachment's chip says it holds — `rows` × `cols` as taken, the
+/// table they were read from when there is one, and the selection's size when
+/// the cap took less than it. The summary is what survives to disk and what the
+/// user reads back later to know what they sent, so it counts what was *taken*.
+fn attach_summary(rows: usize, cols: usize, table: Option<&str>, total: usize) -> String {
+    let summary = match table {
+        Some(t) => tr!(
+            "grid-attach-summary-from",
+            rows = rows,
+            cols = cols,
+            table = t
+        ),
+        None => tr!("grid-attach-summary", rows = rows, cols = cols),
+    };
+    if total > rows {
+        tr!(
+            "grid-attach-summary-capped",
+            summary = summary,
+            taken = rows,
+            total = total
+        )
+    } else {
+        summary
     }
 }
 
@@ -3063,11 +3070,7 @@ fn render_inserts(gs: GridState, blocks: Vec<(ResultSet, Vec<usize>)>) -> String
         .collect::<Vec<_>>()
         .join("\n");
     if out.is_empty() {
-        gs.commit_note.set(Some(
-            "Nothing to copy as SQL — the selected cells of the new row have no value yet, \
-             and take the server's default."
-                .to_string(),
-        ));
+        gs.commit_note.set(Some(tr!("grid-copy-sql-unset")));
     }
     out
 }
@@ -3161,7 +3164,7 @@ enum KeyedCopy {
 /// them through has to stay clear of every write gate, and is not this.
 fn copy_keyed_sql(gs: GridState, pos: usize, sel: Block, what: KeyedCopy) -> String {
     let result = if let Some(why) = gs.model_withheld.get_untracked() {
-        Err(why)
+        Err(why.to_string())
     } else if gs.row_gestures_are_safe() {
         let model = gs.edit_model.get_untracked();
         let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
@@ -3173,11 +3176,12 @@ fn copy_keyed_sql(gs: GridState, pos: usize, sel: Block, what: KeyedCopy) -> Str
             KeyedCopy::Update => cells.updates_at(&model, sel, pos, layout, gs.dialect),
             KeyedCopy::WhereIn => cells.where_in_at(&model, sel, pos, layout, gs.dialect),
         }
+        .map_err(|why| why.to_string())
     } else {
-        Err("Nothing to copy as SQL: these rows come from a query over more than one table.")
+        Err(tr!("grid-copy-sql-joined"))
     };
     result.unwrap_or_else(|why| {
-        gs.commit_note.set(Some(why.to_string()));
+        gs.commit_note.set(Some(why));
         String::new()
     })
 }
@@ -3292,9 +3296,9 @@ fn export_menu(
     let fetched = exported_row_count(gs);
     vec![
         MenuEntry::sub(
-            format!(
-                "Fetched rows ({})",
-                schemaic_core::text::human_count(fetched)
+            tr!(
+                "grid-export-fetched-rows",
+                count = schemaic_core::text::human_count(fetched)
             ),
             per_format(false),
         ),
@@ -3365,7 +3369,7 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
         format,
     );
     let opts = FileDialogOptions::new()
-        .title("Export results")
+        .title(tr!("grid-export-dialog-title"))
         .default_name(default_name)
         .allowed_types(vec![FileSpec {
             name: format.label(),
@@ -3471,9 +3475,7 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
             m.done.with_untracked(Option::is_some),
             m.error.with_untracked(Option::is_some),
         ) {
-            gs.commit_note.set(Some(
-                "An export is already running — nothing was written.".to_string(),
-            ));
+            gs.commit_note.set(Some(tr!("grid-export-already-running")));
             return;
         }
         let run = next_export_id();
@@ -16088,6 +16090,47 @@ mod catalogue_tests {
         assert_eq!(
             tr!("grid-arena-note", columns = "body, blob"),
             "· body, blob too large to hold in full — later rows show blank"
+        );
+    }
+
+    /// An attachment's summary reads as it did when it was assembled in place,
+    /// in each of its shapes.
+    #[test]
+    fn the_attach_summary_reads_as_it_did_in_english() {
+        assert_eq!(attach_summary(1, 1, None, 1), "1 row × 1 column");
+        assert_eq!(
+            attach_summary(3, 2, Some("shop.orders"), 3),
+            "3 rows × 2 columns from shop.orders"
+        );
+        assert_eq!(
+            attach_summary(200, 4, None, 5000),
+            "200 rows × 4 columns (the first 200 of 5000 selected)"
+        );
+        assert_eq!(
+            attach_summary(200, 1, Some("t"), 201),
+            "200 rows × 1 column from t (the first 200 of 201 selected)"
+        );
+    }
+
+    /// The fill note counts its cells as it did.
+    #[test]
+    fn the_fill_note_reads_as_it_did_in_english() {
+        assert_eq!(
+            tr!("grid-fill-skipped", count = 1, filled = "1", skipped = "2"),
+            "Filled 1 cell, skipping 2 in rows marked for deletion."
+        );
+        assert_eq!(
+            tr!(
+                "grid-fill-skipped",
+                count = 1204,
+                filled = "1,204",
+                skipped = "1"
+            ),
+            "Filled 1,204 cells, skipping 1 in rows marked for deletion."
+        );
+        assert_eq!(
+            tr!("grid-export-fetched-rows", count = "200k"),
+            "Fetched rows (200k)"
         );
     }
 

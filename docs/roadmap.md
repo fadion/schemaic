@@ -115,7 +115,10 @@ assertions pin English wording — stays the regression net throughout.
    toolbar — the status line, the commit, row, copy, save, AI and chart controls (`grid-stats`
    and the rest of the `grid-*` ids in that block; the filter bar's `WHERE` is SQL); the bars
    under it — error, lock wait, find, selection readout, go to row (the wait and note bars'
-   sentences are core's).
+   sentences are core's); the clipboard, fill, attach and export paths — fill's notes, the
+   attachment's summary (`attach_summary`), *Copy as* SQL's refusals, the export menu's
+   *Fetched rows* and the Save dialog (the export notes, and the "the clipboard" / "the file"
+   they name, are core's).
    **Left, in order** — delete a name as its file lands: the four large files' remainders,
    `grid.rs`, `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,

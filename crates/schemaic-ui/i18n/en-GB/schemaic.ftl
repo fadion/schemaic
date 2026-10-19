@@ -1986,3 +1986,40 @@ grid-find-placeholder = Find in results
 # Stands in for a figure of the selection readout just after it is clicked.
 grid-figure-copied = Copied
 grid-goto-label = Go to row:
+
+## The results grid's clipboard, fill, attach and export (grid.rs). The
+## export's own notes (rows written, columns withheld) are core's and stay
+## English for now; so does "the clipboard" or "the file" they name.
+
+grid-fill-nothing = Nothing to fill: the selected columns can't be written, or the cell to copy is a new row's unset value or a staged DEFAULT.
+# $filled and $skipped are counts written out (1,204); $count is $filled as a
+# number, for the plural.
+grid-fill-skipped = { $count ->
+    [one] Filled { $filled } cell, skipping { $skipped } in rows marked for deletion.
+   *[other] Filled { $filled } cells, skipping { $skipped } in rows marked for deletion.
+}
+# What a chat attachment's chip says it holds, kept with the conversation.
+grid-attach-summary = { $rows ->
+    [one] { $rows } row
+   *[other] { $rows } rows
+} × { $cols ->
+    [one] { $cols } column
+   *[other] { $cols } columns
+}
+# The same, for rows read from one table; $table is its name.
+grid-attach-summary-from = { $rows ->
+    [one] { $rows } row
+   *[other] { $rows } rows
+} × { $cols ->
+    [one] { $cols } column
+   *[other] { $cols } columns
+} from { $table }
+# $summary is one of the two above, when the selection ran past what is sent.
+grid-attach-summary-capped = { $summary } (the first { $taken } of { $total } selected)
+grid-copy-sql-unset = Nothing to copy as SQL — the selected cells of the new row have no value yet, and take the server's default.
+grid-copy-sql-joined = Nothing to copy as SQL: these rows come from a query over more than one table.
+# The export menu's scope for the rows already read; $count is written out.
+grid-export-fetched-rows = Fetched rows ({ $count })
+# The Save dialog's title.
+grid-export-dialog-title = Export results
+grid-export-already-running = An export is already running — nothing was written.

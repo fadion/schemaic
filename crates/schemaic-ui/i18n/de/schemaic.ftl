@@ -1673,3 +1673,28 @@ grid-rollback-tab = { $tab } zurückrollen
 grid-find-placeholder = In Ergebnissen suchen
 grid-figure-copied = Kopiert
 grid-goto-label = Gehe zu Zeile:
+grid-fill-nothing = Nichts auszufüllen: Die ausgewählten Spalten sind nicht beschreibbar, oder die zu kopierende Zelle ist der nicht gesetzte Wert einer neuen Zeile oder ein vorgemerktes DEFAULT.
+grid-fill-skipped = { $count ->
+    [one] { $filled } Zelle ausgefüllt, { $skipped } in zum Löschen markierten Zeilen übersprungen.
+   *[other] { $filled } Zellen ausgefüllt, { $skipped } in zum Löschen markierten Zeilen übersprungen.
+}
+grid-attach-summary = { $rows ->
+    [one] { $rows } Zeile
+   *[other] { $rows } Zeilen
+} × { $cols ->
+    [one] { $cols } Spalte
+   *[other] { $cols } Spalten
+}
+grid-attach-summary-from = { $rows ->
+    [one] { $rows } Zeile
+   *[other] { $rows } Zeilen
+} × { $cols ->
+    [one] { $cols } Spalte
+   *[other] { $cols } Spalten
+} aus { $table }
+grid-attach-summary-capped = { $summary } (die ersten { $taken } von { $total } ausgewählten)
+grid-copy-sql-unset = Nichts als SQL zu kopieren — die ausgewählten Zellen der neuen Zeile haben noch keinen Wert und erhalten den Standardwert des Servers.
+grid-copy-sql-joined = Nichts als SQL zu kopieren: Diese Zeilen stammen aus einer Abfrage über mehr als eine Tabelle.
+grid-export-fetched-rows = Abgerufene Zeilen ({ $count })
+grid-export-dialog-title = Ergebnisse exportieren
+grid-export-already-running = Es läuft bereits ein Export — es wurde nichts geschrieben.
