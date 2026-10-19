@@ -41,6 +41,20 @@ pub struct AliasRenameRequest {
 /// The editor's rename to a name, or why it will not.
 pub type AliasRenameApply = Rc<dyn Fn(&str) -> Result<(), AliasRenameRefusal>>;
 
+/// What the dialog says under the field when it will not rename to `new_name`
+/// — `AliasRenameRefusal::message` in the interface's language. Said of an
+/// alias and a CTE alike.
+fn refusal_message(why: AliasRenameRefusal, new_name: &str) -> String {
+    match why {
+        AliasRenameRefusal::NoAlias => tr!("alias-rename-no-alias"),
+        AliasRenameRefusal::Empty => tr!("alias-rename-empty"),
+        AliasRenameRefusal::Conflict => tr!("alias-rename-conflict", name = new_name.trim()),
+        AliasRenameRefusal::Unsure => tr!("alias-rename-unsure"),
+        AliasRenameRefusal::Changed => tr!("alias-rename-changed"),
+        AliasRenameRefusal::ReadOnly => tr!("alias-rename-read-only"),
+    }
+}
+
 fn panel_w() -> f64 {
     modal_w(420.0)
 }
@@ -74,7 +88,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
                 let typed = name.get_untracked();
                 match (req.apply)(&typed) {
                     Ok(()) => done(),
-                    Err(why) => refusal.set(Some(crate::i18n::alias_rename_refusal(why, &typed))),
+                    Err(why) => refusal.set(Some(refusal_message(why, &typed))),
                 }
             });
             // A refusal answers the name it was given; editing the name
@@ -189,4 +203,20 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Every refusal reads in English exactly as core's `message`**, which
+    /// core's own tests read (phase 4's typed messages).
+    #[test]
+    fn english_refuses_every_alias_rename_as_core_does() {
+        use AliasRenameRefusal::*;
+        for why in [NoAlias, Empty, Conflict, Unsure, Changed, ReadOnly] {
+            // Blanks round the name are not part of it, here as in core.
+            assert_eq!(refusal_message(why, " t2 "), why.message(" t2 "), "{why:?}");
+        }
+    }
 }

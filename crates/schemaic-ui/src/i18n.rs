@@ -214,26 +214,12 @@ pub(crate) fn outcome_line(entry: &schemaic_core::history::HistoryEntry) -> Opti
 
 // ── Core's typed messages ───────────────────────────────────────────────────
 // Phase 4: where core says *why* in a typed value rather than a finished
-// sentence, the interface words it here — one arm per variant, its fields as
-// the message's arguments — and core's own rendering stays the English for the
-// CLI, MCP and the core tests, held equal to this one by a test per type.
-
-/// Why *Rename alias* (or *Rename CTE*) will not rename to `new_name` —
-/// `AliasRenameRefusal::message` in the interface's language.
-pub(crate) fn alias_rename_refusal(
-    why: schemaic_core::intel::AliasRenameRefusal,
-    new_name: &str,
-) -> String {
-    use schemaic_core::intel::AliasRenameRefusal;
-    match why {
-        AliasRenameRefusal::NoAlias => tr!("alias-rename-no-alias"),
-        AliasRenameRefusal::Empty => tr!("alias-rename-empty"),
-        AliasRenameRefusal::Conflict => tr!("alias-rename-conflict", name = new_name.trim()),
-        AliasRenameRefusal::Unsure => tr!("alias-rename-unsure"),
-        AliasRenameRefusal::Changed => tr!("alias-rename-changed"),
-        AliasRenameRefusal::ReadOnly => tr!("alias-rename-read-only"),
-    }
-}
+// sentence, the interface words it — one arm per variant, its fields as the
+// message's arguments — and core's own rendering stays the English for the
+// CLI, MCP and the core tests, held equal to the interface's by a test per
+// type. Each renderer lives beside the code that shows it
+// (`alias_rename::refusal_message`, the app's `install_cli`); here only what
+// another crate calls.
 
 /// Why a run holds for its bind parameters — `ParamError`'s `Display` in the
 /// interface's language. Public for the app, which raises the hold.
@@ -411,27 +397,18 @@ mod tests {
         assert_eq!(LanguageChoice::Fixed(UiLanguage::EnGb).label(), "English");
     }
 
-    /// **A refusal core types reads in English exactly as core's own
-    /// rendering** — the first of phase 4's typed messages. Core's `message`
-    /// stays the English the core tests read; this holds the interface's to it.
+    /// A name quoted inside a message takes the language's own quotation
+    /// marks, which are the catalogue's text, not the argument's.
     #[test]
-    fn english_refuses_every_alias_rename_as_core_does() {
-        use schemaic_core::intel::AliasRenameRefusal::*;
-        for why in [NoAlias, Empty, Conflict, Unsure, Changed, ReadOnly] {
-            // Blanks round the name are not part of it, here as in core.
-            assert_eq!(
-                alias_rename_refusal(why, " t2 "),
-                why.message(" t2 "),
-                "{why:?}"
-            );
-        }
+    fn german_quotes_a_conflicting_alias_name_its_own_way() {
         let de = loader(UiLanguage::De);
         let args = HashMap::from([("name", "t2")]);
         assert!(de.get_args("alias-rename-conflict", args).contains("„t2“"));
     }
 
-    /// The same for a typed message with arguments: the names list is joined
-    /// here (`:a, :b`), as core's `Display` joins it, and handed in whole.
+    /// **A typed message reads in English exactly as core's own rendering**
+    /// (phase 4). The names list is joined here (`:a, :b`), as core's
+    /// `Display` joins it, and handed in whole.
     #[test]
     fn english_says_every_parameter_error_as_core_does() {
         use schemaic_core::params::ParamError;
