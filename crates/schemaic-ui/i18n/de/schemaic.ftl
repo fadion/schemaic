@@ -1343,6 +1343,7 @@ dump-replace-prompt = { $n ->
    *[other] { $n } Dateien in { $folder } werden ersetzt und können nicht wiederhergestellt werden: { $names }.
 }
 dump-replace-prompt-more = { $n } Dateien in { $folder } werden ersetzt und können nicht wiederhergestellt werden: { $names } und { $more } weitere.
+dump-done-export = { $note }.
 dump-done-tables = { $n ->
     [one] { $n } Tabelle geschrieben.
    *[other] { $n } Tabellen geschrieben.

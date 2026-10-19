@@ -929,7 +929,7 @@ pub fn done_note(
         export_note
             .map(str::trim)
             .filter(|n| !n.is_empty())
-            .map(str::to_string),
+            .map(|n| format!("{n}.")),
     );
     // A ticked table the dump's own fresh introspection could not find is the
     // difference between a backup and a file that looks like one, so it goes
@@ -976,6 +976,9 @@ pub fn done_note(
 /// and a PostgreSQL table in `sales` is `schema "sales" does not exist`.
 /// `mysqldump --databases` emits the same `CREATE DATABASE IF NOT EXISTS`, for
 /// the same reason.
+    // **`export_note` does not end its own sentence** — its single-file caller
+    // is the last clause of one — so it is ended here, as `files_note` ends
+    // it; the next sentence ran on into it.
 ///
 /// `IF NOT EXISTS` throughout, because the *other* use case — replaying onto the
 /// database it came from — must not start with an error either.
@@ -9419,7 +9422,7 @@ mod tests {
         );
         let note = done_note(
             2,
-            Some("Binary column [b] was exported as NULL."),
+            Some("Exported 2 rows to x.sql — b holds bytes this format cannot carry"),
             &["dbo.gone".to_string()],
             &["dbo.emp (a system-versioned temporal table)".to_string()],
             &["dbo.knows".to_string()],
@@ -9427,7 +9430,7 @@ mod tests {
         );
         assert!(!note.contains("  ") && !note.ends_with(' '), "{note}");
         for part in [
-            "Wrote 2 tables. Binary column [b] was exported as NULL.",
+            "Wrote 2 tables. Exported 2 rows to x.sql — b holds bytes this format cannot carry.",
             "1 ticked table not found and is not in the file: dbo.gone.",
             "1 object the export asked for is not in the file: dbo.emp (a system-versioned \
              temporal table).",
@@ -9494,6 +9497,29 @@ mod tests {
         let file = file_of(&plan(
             &s,
             "shop",
+    /// **The export's note ends its own sentence here**, as `files_note`'s
+    /// does: `export_note` writes none, because its single-file caller is the
+    /// last clause of one, and the next sentence ran on — "…those cells are
+    /// empty 1 ticked table not found…". Asked of `export_note`'s real output,
+    /// since the fixture above already ended in a full stop and hid it.
+    #[test]
+    fn the_export_note_is_a_sentence_of_its_own_in_the_done_note() {
+        let tally = crate::export::ExportTally {
+            rows: 115_000,
+            withheld: vec!["avatar".into()],
+            ..Default::default()
+        };
+        let export = crate::export::export_note(&tally, "shop.sql", true);
+        let none: [String; 0] = [];
+        let alone = done_note(2, export.as_deref(), &none, &none, &none, &none);
+        assert!(alone.ends_with("those cells are empty."), "{alone}");
+        let followed = done_note(2, export.as_deref(), &["ghost".into()], &none, &none, &none);
+        assert!(
+            followed.contains("those cells are empty. 1 ticked table"),
+            "{followed}"
+        );
+    }
+
             &all(&s),
             DumpOptions::default(),
             SqlDialect::MsSql,

@@ -27958,7 +27958,8 @@ existing prose was left alone.
     pins the titles, counts, progress line and destination lines in English. **The outcome
     sentences are worded here too**, each by a function taking exactly the arguments of the core
     one it mirrors, so no new core type was needed: `dump_done_note` for `dump::done_note`
-    (`dump-done-tables`, then `i18n::export_note` of `export_said`'s value, then
+    (`dump-done-tables`, then `i18n::export_note` of `export_said`'s value inside
+    `dump-done-export` (`{ $note }.`, the full stop core's `done_note` adds), then
     `dump-done-missing`/`-left-out`/`-rows-left-out`/`-refused`, joined by a space in code as core
     joins them), `dump_cancel_note` for `dump::cancel_note` (`dump-cancelled-partial`, or the
     shared `export-cancelled-nothing`), `files_done_note`/`files_cancel_note`/`files_failure_note`
@@ -36793,6 +36794,12 @@ existing prose was left alone.
     sentence of its own with one space between — the `format!` it replaced put a space after the
     tally whatever followed, so a quiet dump read "Wrote 2 tables. " and a short one had two
     spaces in it (`the_done_note_says_what_the_file_is_short_of_in_single_spaced_sentences`).
+    **The export's caveat is ended here, not by `export_note`**, which writes no full stop because
+    its single-file caller is the last clause of a sentence — `export::files_note` already ended it,
+    `done_note` did not, and the next sentence ran on into it: "…those cells are empty 1 ticked
+    table not found…". The old test's fixture note carried its own full stop, which is how it hid;
+    `the_export_note_is_a_sentence_of_its_own_in_the_done_note` asks of `export_note`'s real output,
+    and the CLI's dump report, which calls `done_note`, is mended with it.
     **Beside it rides an `ExportTally`, not a row count.** `write` folds each table's tally into one
     through `ExportTally::absorb` — rows summed, and a withheld or blanked column named once however
     many tables it appears in, the rule `ExportTally::note` already follows within a single export —

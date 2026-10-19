@@ -1329,7 +1329,7 @@ fn dump_done_note(
     refused: &[String],
 ) -> String {
     let mut parts = vec![tr!("dump-done-tables", n = tables)];
-    parts.extend(note.map(crate::i18n::export_note));
+    parts.extend(note.map(|n| tr!("dump-done-export", note = crate::i18n::export_note(n))));
     if !missing.is_empty() {
         let (n, names) = (missing.len(), missing.join(", "));
         parts.push(tr!("dump-done-missing", n = n, names = names));

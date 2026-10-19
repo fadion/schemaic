@@ -1520,6 +1520,8 @@ dump-replace-prompt-more = { $n } files in { $folder } will be replaced, and the
 # What a finished dump says (core's dump::done_note): each an own sentence,
 # joined by a space. The export's own note (export-note-*) follows the first.
 # $n counts, $names lists. A graph edge table is SQL Server's.
+# $note is the export's note (export-note-*), made a sentence of its own.
+dump-done-export = { $note }.
 dump-done-tables = { $n ->
     [one] Wrote { $n } table.
    *[other] Wrote { $n } tables.
