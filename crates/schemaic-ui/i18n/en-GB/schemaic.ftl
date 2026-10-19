@@ -2067,3 +2067,39 @@ grid-cell-auto = <auto>
 grid-cell-required = <required>
 grid-seed-title = Seed rows
 grid-seed-generate = Generate
+
+## The status bar (lib.rs's footer) — its panel toggles, the editor's
+## segments, the transaction controls and the resource readings.
+
+# The panel toggles' tooltips: each names its panel, in sentence case.
+footer-panel-schema = Schema
+footer-panel-ai = AI assistant
+footer-panel-history = Query history
+footer-panel-snippets = Snippet library
+footer-panel-activity = Server activity
+footer-panel-terminal = Terminal
+# A toggle's tooltip in place of its name while the window is too narrow.
+footer-panel-narrow = The window is too narrow for this panel — widen it to bring the panel back.
+# The caret's position in the editor.
+footer-cursor = Ln { $line }, Col { $col }
+# The indentation segment; $width is the indent's width.
+footer-indent-spaces = Spaces: { $width }
+footer-indent-tabs = Tabs: { $width }
+footer-spaces = Spaces
+footer-tabs = Tabs
+footer-wrap = Wrap
+footer-no-wrap = No wrap
+footer-read-only = Read-only
+footer-write-mode = Write mode
+# The tab's transaction mode.
+footer-tx-auto = Auto-commit
+footer-tx-manual = Manual
+# While a manual transaction is open; $count is the statements run in it.
+footer-tx-open = { $count } Open
+footer-tx-aborted = Tx aborted — rollback to continue
+footer-tx-lost = Transaction lost
+footer-commit = Commit
+footer-rollback = Rollback
+# $value is the reading (12%, 1.4 GB).
+footer-cpu = CPU: { $value }
+footer-ram = RAM: { $value }

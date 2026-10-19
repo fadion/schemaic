@@ -114,8 +114,10 @@ assertions pin English wording — stays the regression net throughout.
    phrase in the status line (`stats::rows_read_clause`), the attach scope
    (`model::attach_scope_label`), the export notes and the "the clipboard" / "the file" they
    name, the lock-wait sentence, the duplicate prompt — which is phase 4's.
-   **Within the large files:** nothing yet in `lib.rs`, `widgets.rs` or `editor_pane.rs`
-   beyond the headers and openers named above.
+   **Within the large files:** beyond the headers and openers named above, `lib.rs`'s status
+   bar (`footer`, `footer-*`: the panel toggles and their narrow-window tip, the editor's
+   segments, the transaction controls — the interface's own `tx_mode_label` and `tx_pill_text`
+   for core's — and CPU/RAM). Nothing yet in `widgets.rs` or `editor_pane.rs`.
    **Left, in order** — delete a name as its file lands: the three large files' remainders,
    `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,

@@ -8306,8 +8306,9 @@ pub(crate) fn right_panel_allowed() -> bool {
 /// Worded as the way *out*, not as a diagnosis: the state is transient and the
 /// user fixes it by dragging an edge, so the tip names that rather than the
 /// breakpoint arithmetic behind it.
-pub(crate) const PANEL_NARROW_TIP: &str = "The window is too narrow for this panel — widen it to \
-                                           bring the panel back.";
+pub(crate) fn panel_narrow_tip() -> String {
+    tr!("footer-panel-narrow")
+}
 
 /// How a footer panel toggle should look and behave right now.
 ///
@@ -8317,13 +8318,13 @@ pub(crate) const PANEL_NARROW_TIP: &str = "The window is too narrow for this pan
 /// they drift are both bad: a dimmed toggle that explains nothing, and a live
 /// toggle claiming the window is too narrow. Computed together, neither is
 /// reachable.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct PanelToggle {
     /// Does the click do anything — and is the glyph drawn at full strength?
     pub enabled: bool,
     /// The tooltip: the panel's name, or — when the window has taken the panel
-    /// away — [`PANEL_NARROW_TIP`] instead.
-    pub tip: &'static str,
+    /// away — [`panel_narrow_tip`] instead.
+    pub tip: String,
 }
 
 /// `panel` — the panel's name, as its own title reads (in sentence case).
@@ -8342,16 +8343,16 @@ pub(crate) struct PanelToggle {
 /// since a narrow window silences nothing.
 ///
 /// Narrow wins when both apply: it is the half the user can act on.
-pub(crate) fn panel_toggle(panel: &'static str, fits: bool, offered: bool) -> PanelToggle {
+pub(crate) fn panel_toggle(panel: impl Into<String>, fits: bool, offered: bool) -> PanelToggle {
     if !fits {
         return PanelToggle {
             enabled: false,
-            tip: PANEL_NARROW_TIP,
+            tip: panel_narrow_tip(),
         };
     }
     PanelToggle {
         enabled: offered,
-        tip: panel,
+        tip: panel.into(),
     }
 }
 
@@ -12884,6 +12885,27 @@ fn collapsing_seg(
         })
 }
 
+/// The status bar's word for a tab's transaction mode — the interface's own
+/// for core's [`TxMode::label`](schemaic_core::tx::TxMode::label).
+fn tx_mode_label(mode: schemaic_core::tx::TxMode) -> String {
+    match mode {
+        schemaic_core::tx::TxMode::Auto => tr!("footer-tx-auto"),
+        schemaic_core::tx::TxMode::Manual => tr!("footer-tx-manual"),
+    }
+}
+
+/// The status bar's pill for an open (or broken) transaction, or `None` when
+/// there is none — the interface's own for core's
+/// [`pill_text`](schemaic_core::tx::pill_text).
+fn tx_pill_text(state: TxState) -> Option<String> {
+    match state {
+        TxState::Idle => None,
+        TxState::Open { stmts } => Some(tr!("footer-tx-open", count = stmts)),
+        TxState::Poisoned { .. } => Some(tr!("footer-tx-aborted")),
+        TxState::Lost => Some(tr!("footer-tx-lost")),
+    }
+}
+
 fn footer(ui: Ui) -> impl IntoView {
     let schema_visible = ui.layout.schema_visible;
     let right_panel = ui.layout.right_panel;
@@ -12971,7 +12993,8 @@ fn footer(ui: Ui) -> impl IntoView {
     // has taken it away. Each toggle reads the predicate for the panel *it*
     // opens — the schema tree has a narrower breakpoint than the right column,
     // so the two disable at different widths.
-    let schema_toggle = move || panel_toggle("Schema", schema_panel_allowed(), true);
+    let schema_toggle =
+        move || panel_toggle(tr!("footer-panel-schema"), schema_panel_allowed(), true);
     let schema_icon = toggle_icon(
         icons::FOLDER_TREE,
         move || schema_toggle().enabled,
@@ -13003,7 +13026,7 @@ fn footer(ui: Ui) -> impl IntoView {
     let ai_x = RwSignal::new(0.0_f64);
     // The plain right-column toggles share one answer but their names: the only
     // thing that can take their panel away is the window.
-    let right_toggle = move |panel: &'static str| panel_toggle(panel, right_panel_allowed(), true);
+    let right_toggle = move |panel: String| panel_toggle(panel, right_panel_allowed(), true);
     // Server Activity has a second reason to be inert, and `panel_toggle` is what
     // keeps the two from being confused: the engine gate stops the panel being
     // *opened* where it has nothing to show — never its being closed, since a
@@ -13012,7 +13035,7 @@ fn footer(ui: Ui) -> impl IntoView {
     // narrow window overrides both, because that is the reason the user can act on.
     let activity_toggle = move || {
         panel_toggle(
-            "Server activity",
+            tr!("footer-panel-activity"),
             right_panel_allowed(),
             activity_ok.get() || right_panel.get() == RightPanel::Activity,
         )
@@ -13020,30 +13043,30 @@ fn footer(ui: Ui) -> impl IntoView {
     let right_group = h_stack((
         toggle_icon_view(
             icons::icon_wh(icons::AI_LOGO, 16.0, 10.0).style(|s| s.flex_shrink(0.0_f32)),
-            move || right_toggle("AI assistant").enabled,
+            move || right_toggle(tr!("footer-panel-ai")).enabled,
             move || right_panel.get() == RightPanel::Ai && right_panel_allowed(),
             move || set_right(RightPanel::Ai),
         )
         // Before the tooltip wrapper, so the x published here stays the
         // icon's own — `.tooltip()` allocates a fresh `ViewId` around it.
         .on_move(move |p| ai_x.set(p.x))
-        .tooltip(move || text(right_toggle("AI assistant").tip)),
+        .tooltip(move || text(right_toggle(tr!("footer-panel-ai")).tip)),
         toggle_icon(
             icons::TIMELINE,
-            move || right_toggle("Query history").enabled,
+            move || right_toggle(tr!("footer-panel-history")).enabled,
             move || right_panel.get() == RightPanel::History && right_panel_allowed(),
             move || set_right(RightPanel::History),
         )
-        .tooltip(move || text(right_toggle("Query history").tip)),
+        .tooltip(move || text(right_toggle(tr!("footer-panel-history")).tip)),
         // The snippet library, next to the history it is the counterpart of: one
         // is what ran, the other is what you keep.
         toggle_icon(
             icons::BOOKMARK,
-            move || right_toggle("Snippet library").enabled,
+            move || right_toggle(tr!("footer-panel-snippets")).enabled,
             move || right_panel.get() == RightPanel::Snippets && right_panel_allowed(),
             move || set_right(RightPanel::Snippets),
         )
-        .tooltip(move || text(right_toggle("Snippet library").tip)),
+        .tooltip(move || text(right_toggle(tr!("footer-panel-snippets")).tip)),
         // Server Activity. Inert on a connection whose engine has no sessions —
         // the toggle is the panel's front door, and a SQLite connection has
         // nothing behind it (`activity::supports_activity`). That case is named
@@ -13057,12 +13080,12 @@ fn footer(ui: Ui) -> impl IntoView {
         .tooltip(move || text(activity_toggle().tip)),
         toggle_icon(
             icons::TERMINAL,
-            move || right_toggle("Terminal").enabled,
+            move || right_toggle(tr!("footer-panel-terminal")).enabled,
             move || right_panel.get() == RightPanel::Terminal && right_panel_allowed(),
             move || set_right(RightPanel::Terminal),
         )
         .style(|s| s.margin_right(theme::scaled(5.0)))
-        .tooltip(move || text(right_toggle("Terminal").tip)),
+        .tooltip(move || text(right_toggle(tr!("footer-panel-terminal")).tip)),
     ))
     .style(|s| s.flex_row().items_center().gap(theme::scaled(10.0)));
 
@@ -13075,7 +13098,7 @@ fn footer(ui: Ui) -> impl IntoView {
     let cursor_seg = dyn_container(
         move || cursor_lc.get(),
         move |(l, c)| {
-            text(format!("Ln {l}, Col {c}"))
+            text(tr!("footer-cursor", line = l, col = c))
                 .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },
@@ -13099,29 +13122,30 @@ fn footer(ui: Ui) -> impl IntoView {
     // tinted (chip accent). Clicking again while open toggles it shut.
     let tabs_seg = status_menu_seg(
         move || {
-            format!(
-                "{}: {}",
-                if soft_tabs.get() { "Spaces" } else { "Tabs" },
-                tab_width.get()
-            )
+            let width = tab_width.get();
+            if soft_tabs.get() {
+                tr!("footer-indent-spaces", width = width)
+            } else {
+                tr!("footer-indent-tabs", width = width)
+            }
         },
         move || {
             let soft = soft_tabs.get_untracked();
             let w = tab_width.get_untracked();
             let mut entries = vec![
                 if soft {
-                    MenuEntry::action_colored("Spaces", theme::chip_active, move || {
+                    MenuEntry::action_colored(tr!("footer-spaces"), theme::chip_active, move || {
                         soft_tabs.set(true)
                     })
                 } else {
-                    MenuEntry::action("Spaces", move || soft_tabs.set(true))
+                    MenuEntry::action(tr!("footer-spaces"), move || soft_tabs.set(true))
                 },
                 if !soft {
-                    MenuEntry::action_colored("Tabs", theme::chip_active, move || {
+                    MenuEntry::action_colored(tr!("footer-tabs"), theme::chip_active, move || {
                         soft_tabs.set(false)
                     })
                 } else {
-                    MenuEntry::action("Tabs", move || soft_tabs.set(false))
+                    MenuEntry::action(tr!("footer-tabs"), move || soft_tabs.set(false))
                 },
                 MenuEntry::Separator,
             ];
@@ -13145,9 +13169,13 @@ fn footer(ui: Ui) -> impl IntoView {
     let wrap_seg = dyn_container(
         move || word_wrap.get(),
         move |w| {
-            text(if w { "Wrap" } else { "No wrap" })
-                .style(|s| s.font_size(theme::font_status()))
-                .into_any()
+            text(if w {
+                tr!("footer-wrap")
+            } else {
+                tr!("footer-no-wrap")
+            })
+            .style(|s| s.font_size(theme::font_status()))
+            .into_any()
         },
     )
     .on_click_stop(move |_| word_wrap.update(|w| *w = !*w))
@@ -13210,9 +13238,13 @@ fn footer(ui: Ui) -> impl IntoView {
     let ro_seg = dyn_container(
         move || read_only.get(),
         move |ro| {
-            text(if ro { "Read-only" } else { "Write mode" })
-                .style(|s| s.font_size(theme::font_status()))
-                .into_any()
+            text(if ro {
+                tr!("footer-read-only")
+            } else {
+                tr!("footer-write-mode")
+            })
+            .style(|s| s.font_size(theme::font_status()))
+            .into_any()
         },
     )
     .on_click_stop(move |_| {
@@ -13289,7 +13321,7 @@ fn footer(ui: Ui) -> impl IntoView {
     let mode_seg = dyn_container(
         move || tx_mode.get(),
         move |m| {
-            text(m.label())
+            text(tx_mode_label(m))
                 .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },
@@ -13336,7 +13368,7 @@ fn footer(ui: Ui) -> impl IntoView {
     let tx_pill = dyn_container(
         move || tx_state.get(),
         move |st| {
-            text(schemaic_core::tx::pill_text(st).unwrap_or_default())
+            text(tx_pill_text(st).unwrap_or_default())
                 .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },
@@ -13363,7 +13395,7 @@ fn footer(ui: Ui) -> impl IntoView {
     let rollback_tx = ui.tab_actions.rollback_tx.clone();
     // Plain text segments like everything else in the bar (no padding or pill
     // chrome), so `margin_left(15)` is a true 15px gap matching the rest.
-    let tx_action = move |label: &'static str,
+    let tx_action = move |label: String,
                           color: fn() -> Color,
                           hover: fn() -> Color,
                           visible: Box<dyn Fn() -> bool>,
@@ -13381,14 +13413,14 @@ fn footer(ui: Ui) -> impl IntoView {
             })
     };
     let commit_seg = tx_action(
-        "Commit",
+        tr!("footer-commit"),
         theme::tx_commit,
         theme::tx_commit_hover,
         Box::new(move || tx_state.get().can_commit()),
         commit_tx,
     );
     let rollback_seg = tx_action(
-        "Rollback",
+        tr!("footer-rollback"),
         theme::tx_rollback,
         theme::tx_rollback_hover,
         Box::new(move || tx_state.get().can_rollback()),
@@ -13414,12 +13446,12 @@ fn footer(ui: Ui) -> impl IntoView {
     let ram_label = create_memo(move |_| resources.get().ram_label());
     let cpu_seg = dyn_container(
         move || cpu_label.get(),
-        move |c| footer_text(format!("CPU: {c}")),
+        move |c| footer_text(tr!("footer-cpu", value = c)),
     )
     .style(|s| s.margin_left(theme::scaled(40.0)));
     let ram_seg = dyn_container(
         move || ram_label.get(),
-        move |r| footer_text(format!("RAM: {r}")),
+        move |r| footer_text(tr!("footer-ram", value = r)),
     )
     .style(|s| s.margin_left(theme::scaled(15.0)));
 
@@ -15380,8 +15412,53 @@ mod conn_node_scope_tests {
 }
 
 #[cfg(test)]
+mod footer_words_tests {
+    use super::{tr, tx_mode_label, tx_pill_text};
+    use schemaic_core::tx::{TxMode, TxState, pill_text};
+
+    /// The transaction words say in English what core's say, which they
+    /// replace in the status bar.
+    #[test]
+    fn the_transaction_words_read_as_core_says_them_in_english() {
+        for mode in [TxMode::Auto, TxMode::Manual] {
+            assert_eq!(tx_mode_label(mode), mode.label(), "{mode:?}");
+        }
+        for state in [
+            TxState::Idle,
+            TxState::Open { stmts: 0 },
+            TxState::Open { stmts: 1 },
+            TxState::Open { stmts: 42 },
+            TxState::Poisoned { stmts: 3 },
+            TxState::Lost,
+        ] {
+            assert_eq!(tx_pill_text(state), pill_text(state), "{state:?}");
+        }
+    }
+
+    /// The segments built around a value read as they did when they were
+    /// formatted in place.
+    #[test]
+    fn the_status_segments_read_as_they_did_in_english() {
+        assert_eq!(tr!("footer-cursor", line = 12, col = 3), "Ln 12, Col 3");
+        assert_eq!(tr!("footer-indent-spaces", width = 4), "Spaces: 4");
+        assert_eq!(tr!("footer-indent-tabs", width = 2), "Tabs: 2");
+        assert_eq!(tr!("footer-cpu", value = "12%"), "CPU: 12%");
+        assert_eq!(tr!("footer-ram", value = "1.4 GB"), "RAM: 1.4 GB");
+    }
+}
+
+#[cfg(test)]
 mod panel_toggle_tests {
-    use super::{PANEL_NARROW_TIP, panel_toggle};
+    use super::{panel_narrow_tip, panel_toggle};
+
+    /// The narrow-window sentence reads as it did before the catalogue.
+    #[test]
+    fn the_narrow_tip_reads_as_it_did_in_english() {
+        assert_eq!(
+            panel_narrow_tip(),
+            "The window is too narrow for this panel — widen it to bring the panel back."
+        );
+    }
 
     /// A live toggle names the panel it opens — an icon alone did not say
     /// which panel was behind it until it was clicked (issue #11).
@@ -15396,7 +15473,7 @@ mod panel_toggle_tests {
     fn a_window_too_narrow_disables_the_toggle_and_says_why() {
         let t = panel_toggle("Terminal", false, true);
         assert!(!t.enabled);
-        assert_eq!(t.tip, PANEL_NARROW_TIP);
+        assert_eq!(t.tip, panel_narrow_tip());
     }
 
     /// The pre-existing decision, kept: Server Activity on an engine with no
@@ -15416,7 +15493,7 @@ mod panel_toggle_tests {
     fn narrow_speaks_even_when_the_panel_is_also_unoffered() {
         let t = panel_toggle("Server activity", false, false);
         assert!(!t.enabled);
-        assert_eq!(t.tip, PANEL_NARROW_TIP);
+        assert_eq!(t.tip, panel_narrow_tip());
     }
 
     /// **The invariant the single call exists to hold**, over every input: the
@@ -15429,7 +15506,7 @@ mod panel_toggle_tests {
             for offered in [true, false] {
                 let t = panel_toggle("Terminal", fits, offered);
                 assert!(
-                    !(t.enabled && t.tip == PANEL_NARROW_TIP),
+                    !(t.enabled && t.tip == panel_narrow_tip()),
                     "fits={fits} offered={offered} produced {t:?}"
                 );
             }
