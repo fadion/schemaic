@@ -169,6 +169,18 @@ settings-query-validate = Live database validation
 settings-query-validate-hint = Check the statement under the cursor against the database as you type (a non-executing PREPARE) to surface exact errors. Adds a DB round-trip on each pause.
 settings-query-notify = Notify when a run finishes in the background
 settings-query-notify-hint = Show a desktop notification when a query, script, export or dump that took a second or more ends while Schemaic is not the active window. The taskbar button is highlighted either way. The notification never includes the SQL.
+# That notification's title, by what ended and how (core's history::finished_note;
+# English must read exactly as it does), and its body: $duration as the app
+# writes one (850ms, 12.3s, 12m 34s).
+notify-query-finished = Query finished
+notify-query-failed = Query failed
+notify-script-finished = Script finished
+notify-script-failed = Script failed
+notify-export-finished = Export finished
+notify-export-failed = Export failed
+notify-dump-finished = Dump finished
+notify-dump-failed = Dump failed
+notify-took = Took { $duration }.
 settings-query-write-log = Keep values in the write log
 # write_log.jsonl and "schemaic exec" are a file name and a command: never translated.
 settings-query-write-log-hint = Every write Schemaic or schemaic exec runs is appended to write_log.jsonl in the settings folder, and never cleared. Values in its SQL are masked unless this is on; a password is masked either way.

@@ -3371,13 +3371,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // their launch; they skip a stopped run themselves and pass `false`. With
     // *Notify when a run finishes in the
     // background* on, the same moment also shows a desktop notification
-    // (`notify::show`, worded by `history::finished_note`).
+    // (`notify::show`, worded by `notify::finished_note`).
     let call_back_after = move |what: Finished, failed: bool, took_ms: u64, stopped: bool| {
         if schemaic_core::history::wants_attention(took_ms, window_focused.get_untracked(), stopped)
         {
             floem::WindowIdExt::request_attention(&window, floem::Urgency::Informational);
             if notify_finished.get_untracked() {
-                let (title, body) = schemaic_core::history::finished_note(what, failed, took_ms);
+                let (title, body) = notify::finished_note(what, failed, took_ms);
                 notify::show(title, body);
             }
         }

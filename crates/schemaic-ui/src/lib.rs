@@ -6136,7 +6136,7 @@ pub struct LayoutUi {
     /// PREPARE) as you type. Drives the editor's Tier-2 diagnostics.
     pub live_validate: RwSignal<bool>,
     /// Show a desktop notification when a run that flashes the taskbar ends
-    /// (`history::finished_note`). Persisted; off by default.
+    /// (the app's `notify::finished_note`). Persisted; off by default.
     pub notify_finished: RwSignal<bool>,
     /// Show the SQL editor's inline predictions (`intel::predict`). Persisted.
     pub editor_predictions: RwSignal<bool>,

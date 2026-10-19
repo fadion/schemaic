@@ -90,7 +90,8 @@ assertions pin English wording — stays the regression net throughout.
    every export outcome: the single-file notes (`export::ExportNote`, `SqlCopyNote`), the dump
    and folder notes (plain arguments, `dump_view`) and the writers' failures
    (`dump::ExportFailure`, carried through the writer threads to the modal), and the dump
-   modal's toggle hints (`dump::DropHint`, `FkHint`).
+   modal's toggle hints (`dump::DropHint`, `FkHint`), and the finished-run notification
+   (`notify::finished_note`, plain arguments).
    **`launch::*`'s refusals take a session of their own**: the largest group, and propagated
    through `?` inside the command builders, so the typed refusal reaches into them. Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
@@ -113,8 +114,8 @@ assertions pin English wording — stays the regression net throughout.
    `sqlfmt`'s `KeywordCase`, `CommaStyle` and `StatementGap` labels are done
    (`settings::keyword_case_label`, `comma_style_label`, `statement_gap_label`). Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
-   unchanged today is this phase's list to work from: `launch::*`'s refusals, `format_bytes`,
-   and `history::finished_note`'s notification titles ("Export failed", "Query failed").
+   unchanged today is this phase's list to work from: `launch::*`'s refusals, and
+   `format_bytes` and `history::format_duration`, which wait on phase 7's number formatting.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).

@@ -1,6 +1,7 @@
 //! The desktop notification for a run that ended behind another window, when
 //! the user has asked for one (Settings → *Notify when a run finishes in the
-//! background*). What it says is `history::finished_note`; when it is shown is
+//! background*). What it says is `finished_note` — `history::finished_note`
+//! in the interface's language; when it is shown is
 //! `history::wants_attention`, the same question the taskbar flash asks.
 //!
 //! **Each platform needs the app's identity to put a name on it**, and each
@@ -19,6 +20,25 @@
 //! notification daemon that never answers must not freeze the window.
 
 use schemaic_core::APP_ID;
+use schemaic_core::history::Finished;
+
+/// The notification's title and body — `history::finished_note` in the
+/// interface's language: what ended and how, then how long it took (the
+/// duration as `history::format_duration` writes it).
+pub(crate) fn finished_note(what: Finished, failed: bool, took_ms: u64) -> (String, String) {
+    let title = match (what, failed) {
+        (Finished::Query, false) => tr!("notify-query-finished"),
+        (Finished::Query, true) => tr!("notify-query-failed"),
+        (Finished::Script, false) => tr!("notify-script-finished"),
+        (Finished::Script, true) => tr!("notify-script-failed"),
+        (Finished::Export, false) => tr!("notify-export-finished"),
+        (Finished::Export, true) => tr!("notify-export-failed"),
+        (Finished::Dump, false) => tr!("notify-dump-finished"),
+        (Finished::Dump, true) => tr!("notify-dump-failed"),
+    };
+    let took = schemaic_core::history::format_duration(took_ms);
+    (title, tr!("notify-took", duration = took))
+}
 
 /// Show `title` / `body`, best effort: a failure is logged and nothing else —
 /// the taskbar has been asked for the window's attention either way.
@@ -129,5 +149,33 @@ mod win {
             std::fs::write(&path, ICON).ok()?;
         }
         Some(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use schemaic_core::history::Finished;
+
+    /// **The notification reads in English exactly as core's
+    /// `finished_note`** — every kind of run, finished and failed, and each
+    /// width of duration.
+    #[test]
+    fn english_says_every_finished_run_as_core_does() {
+        for what in [
+            Finished::Query,
+            Finished::Script,
+            Finished::Export,
+            Finished::Dump,
+        ] {
+            for failed in [false, true] {
+                for took_ms in [450, 12_300, 754_000] {
+                    assert_eq!(
+                        super::finished_note(what, failed, took_ms),
+                        schemaic_core::history::finished_note(what, failed, took_ms),
+                        "{what:?} {failed}"
+                    );
+                }
+            }
+        }
     }
 }

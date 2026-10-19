@@ -11367,7 +11367,9 @@ existing prose was left alone.
     call-back's question, and
     `finished_note(Finished, failed, took_ms)` the wording of the desktop notification that can
     follow it — *Query finished* / *Script failed* and so on over `Took 12.3s.` through
-    `format_duration` (`a_finished_note_names_what_ended_and_how_long_it_took`). **It never
+    `format_duration` (`a_finished_note_names_what_ended_and_how_long_it_took`) — the English;
+    what the notification shows is the app's `notify::finished_note`, which words the same
+    arguments from the catalogue. **It never
     carries the statement**, for this module's credential reason one step further out: a
     notification outlives the run in the system's notification history, readable by anyone at the
     machine, and the SQL may carry the very values it wrote. `Finished` is four kinds — `Query`
@@ -34116,7 +34118,7 @@ existing prose was left alone.
   `call_back_after` takes `(Finished, failed, took_ms, stopped)` rather than the time alone, and when
   `wants_attention` says yes and the `notify_finished` signal is on (Settings → Query, *Notify
   when a run finishes in the background*; `persist::UiState::notify_finished`, `serde`-defaulted
-  off and autosaved as `live_validate` is) it hands `history::finished_note`'s title and body to
+  off and autosaved as `live_validate` is) it hands `notify::finished_note`'s title and body to
   `notify::show`. Each caller says what ended and whether it failed: the single run
   `Finished::Query` with `!ok`, Run Everything `Query` failed if any statement's `RunResult` is
   not `ok`, `script_run` `Script`, both `export_file` paths and `files_run` `Export`, `dump_run`
@@ -35900,7 +35902,11 @@ existing prose was left alone.
   - `notify.rs` — the opt-in **desktop notification** for a run that ended behind another window:
     `show(title, body)`, called from `main.rs`'s `call_back_after` only after
     `history::wants_attention` has said yes and only with *Notify when a run finishes in the
-    background* on; the words are `history::finished_note`'s. Through `notify-rust` 4.18 — a
+    background* on. The words are `finished_note`'s: `history::finished_note`'s arguments worded
+    from `notify-{query,script,export,dump}-{finished,failed}` and `notify-took`, whose `$duration`
+    is still core's `format_duration` (formatting for the locale is phase 7), and
+    `english_says_every_finished_run_as_core_does` holds the English equal to core's for every kind,
+    outcome and width of duration. Through `notify-rust` 4.18 — a
     WinRT toast on Windows (`tauri-winrt-notification`, over the `windows` 0.62 already in the
     tree), the notification centre on macOS, `org.freedesktop.Notifications` on Linux. **It runs on
     a `std::thread` of its own** because on Linux it is a blocking D-Bus call, and a notification
@@ -40625,7 +40631,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     arguments of the core function they mirror (`dump::done_note`/`cancel_note`/
     `folder_replace_prompt`, `export::files_*`) — those stay English, for the CLI's dump report and
     core's tests — and `english_says_every_dump_outcome_as_core_does` and
-    `english_says_every_folder_outcome_as_core_does` hold the two equal.
+    `english_says_every_folder_outcome_as_core_does` hold the two equal. So is the desktop
+    notification: the app's `notify::finished_note` takes `history::finished_note`'s arguments
+    and words them from `notify-*` (under `notify.rs`).
     Their failures are the case of a typed message that has to travel before anyone words it:
     `dump::ExportFailure` is built in the writer threads and the read (`cli/dump.rs`), carried
     through `WriteEnd`, `DumpVerdict` and the two outcome enums, and worded only at the one view
