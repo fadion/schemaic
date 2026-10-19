@@ -8208,7 +8208,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let input = edit_field(
                     find_query,
                     FieldCfg {
-                        placeholder: "Find",
+                        placeholder_of: Some(Rc::new(|| tr!("find-placeholder"))),
                         autofocus: true,
                         font_size: theme::font_body,
                         border_radius: 6.0,
@@ -8234,7 +8234,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         // A pattern that does not compile takes the count's
                         // place, in the error colour, with the reason on hover.
                         if let Some(why) = err {
-                            return text("Invalid")
+                            return text(tr!("find-invalid"))
                                 .style(|s| {
                                     s.font_size(theme::font_label())
                                         .color(theme::error())
@@ -8268,7 +8268,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // two-letter glyph each, lit with `chip_active` when on — the
                 // status bar's toggle colours — and `chip_idle` when off.
                 let opt_toggle = |glyph: &'static str,
-                                  tip: &'static str,
+                                  tip: String,
                                   on: fn(&FindOptions) -> bool,
                                   flip: fn(&mut FindOptions)| {
                     container(text(glyph))
@@ -8287,30 +8287,26 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 })
                                 .hover(|s| s.color(theme::chip_active()))
                         })
-                        .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
+                        .tooltip(move || text(tip.clone()).style(crate::widgets::tooltip_style))
                 };
                 let case_btn = opt_toggle(
                     "Aa",
-                    "Match case",
+                    tr!("find-match-case"),
                     |o| o.match_case,
                     |o| o.match_case = !o.match_case,
                 );
                 let word_btn = opt_toggle(
                     "W",
-                    "Whole word",
+                    tr!("find-whole-word"),
                     |o| o.whole_word,
                     |o| o.whole_word = !o.whole_word,
                 );
-                let regex_btn = opt_toggle(
-                    ".*",
-                    "Regular expression",
-                    |o| o.regex,
-                    |o| o.regex = !o.regex,
-                );
+                let regex_btn =
+                    opt_toggle(".*", tr!("find-regex"), |o| o.regex, |o| o.regex = !o.regex);
                 // *In selection*: lit while a scope is set. Pressing it takes
                 // the editor's selection as the scope, or drops the scope it
                 // has; with nothing selected there is nothing to take.
-                let scope_btn = container(text("Sel"))
+                let scope_btn = container(text(tr!("find-scope")))
                     .on_click_stop({
                         let ed = ed_find.clone();
                         move |_| {
@@ -8338,7 +8334,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             })
                             .hover(|s| s.color(theme::chip_active()))
                     })
-                    .tooltip(|| text("Find in selection").style(crate::widgets::tooltip_style));
+                    .tooltip(|| {
+                        text(tr!("find-in-selection-tip")).style(crate::widgets::tooltip_style)
+                    });
                 // A flex spacer pins the counter + nav + × to the right edge.
                 let row1 = h_stack((
                     input,
@@ -8359,7 +8357,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // with centred text so they line up with the 26px field when the row
                 // is top-aligned (`items_start`, which keeps the reveal from spilling
                 // upward over the find row).
-                let text_btn = |label: &'static str, on: Rc<dyn Fn()>| {
+                let text_btn = |label: String, on: Rc<dyn Fn()>| {
                     container(text(label).style(|s| s.font_size(theme::font_label())))
                         .on_click_stop(move |_| (on)())
                         .style(|s| {
@@ -8374,7 +8372,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let rinput = edit_field(
                     find_replace,
                     FieldCfg {
-                        placeholder: "Replace",
+                        placeholder_of: Some(Rc::new(|| tr!("find-replace-placeholder"))),
                         font_size: theme::font_body,
                         border_radius: 6.0,
                         height: Some(field_input_h),
@@ -8391,8 +8389,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // `Aa` and `All` follows it at the same spacing the toggles keep.
                 let replace_row = h_stack((
                     rinput,
-                    text_btn("Replace", replace_one.clone()),
-                    text_btn("All", replace_all_cb.clone()),
+                    text_btn(tr!("find-replace"), replace_one.clone()),
+                    text_btn(tr!("find-replace-all"), replace_all_cb.clone()),
                 ))
                 .style(move |s| {
                     let s = s
@@ -8473,7 +8471,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .hover(|s| s.color(theme::text()))
                     });
                 h_stack((
-                    text("Go to:")
+                    text(tr!("goto-line-label"))
                         .style(|s| s.font_size(theme::font_label()).color(theme::text_dim())),
                     input,
                     close_btn,

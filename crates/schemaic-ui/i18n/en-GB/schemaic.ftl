@@ -2256,3 +2256,21 @@ editor-several-carets = Several carets and nothing selected: select what to run,
 
 editor-run-current = Run Current
 editor-run-everything = Run Everything
+
+## The editor's find / replace bar and go to line (editor_pane.rs). The option
+## glyphs Aa, W and .* stay as they are.
+
+find-placeholder = Find
+# In place of the match count while the pattern is not a valid regex.
+find-invalid = Invalid
+find-match-case = Match case
+find-whole-word = Whole word
+find-regex = Regular expression
+# The in-selection toggle's short glyph; keep it as short.
+find-scope = Sel
+find-in-selection-tip = Find in selection
+find-replace-placeholder = Replace
+find-replace = Replace
+# Replaces every match.
+find-replace-all = All
+goto-line-label = Go to:
