@@ -6986,8 +6986,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     })
                 };
                 let panel = focus_root(v_stack((
-                    row(0, "Run Current", run_current),
-                    row(1, "Run Everything", run_everything),
+                    row(0, &tr!("editor-run-current"), run_current),
+                    row(1, &tr!("editor-run-everything"), run_everything),
                 )))
                 .on_key_down(
                     Key::Named(NamedKey::ArrowDown),

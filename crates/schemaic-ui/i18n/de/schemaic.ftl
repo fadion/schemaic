@@ -1819,3 +1819,5 @@ editor-menu-find-usages = Verwendungen finden
 editor-menu-create-view = Sicht erstellen
 cmdk-optimise-label = Diese Abfrage optimieren
 editor-several-carets = Mehrere Cursor und keine Auswahl: Wähle aus, was ausgeführt werden soll, oder lass nur einen Cursor übrig
+editor-run-current = Aktuelle ausführen
+editor-run-everything = Alle ausführen

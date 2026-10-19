@@ -2251,3 +2251,8 @@ editor-menu-create-view = Create view
 cmdk-optimise-label = Optimise this query
 # Refused at Ctrl+Enter with several carets and no selection.
 editor-several-carets = Several carets and nothing selected: select what to run, or leave one caret
+
+## The editor's run menu (Ctrl+Enter with several statements; editor_pane.rs).
+
+editor-run-current = Run Current
+editor-run-everything = Run Everything

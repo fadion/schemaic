@@ -130,7 +130,8 @@ assertions pin English wording — stays the regression net throughout.
    (`editor-error-view`, `editor-run-anyway`, `editor-diag-fix`; Explain and AI fix are the
    error modal's messages, and `error_bar_fits_explain` measures the same ones); the context
    menu (`editor-menu-*`, the multi-caret refusal `editor-several-carets`, and Optimise's box
-   label `cmdk-optimise-label` — the intent sent beside it stays English).
+   label `cmdk-optimise-label` — the intent sent beside it stays English); the run menu
+   (`editor-run-current`, `editor-run-everything`).
    **Left, in order** — delete a name as its file lands: the last large file's remainder,
    `editor_pane.rs`; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,
