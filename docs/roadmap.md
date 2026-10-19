@@ -11,8 +11,10 @@ file rather than ticked off.
 
 ## Interface translation
 
-Translate the GUI into languages other than English. Nothing exists yet: no localisation crate, no
-strings table, every user-facing string an English literal at its call site.
+Translate the GUI into languages other than English. The catalogue, the loader and every view's
+own words are in place (`docs/architecture.md`, *The string catalogue*), with a German catalogue
+reached through `SCHEMAIC_LOCALE=de`; what is left is the prose built outside the views, the
+layout for longer text and locale formatting.
 
 ### Decided
 
@@ -67,108 +69,6 @@ everywhere (letters, arrows, `Tab`, `Esc`, `F6`) and macOS's `Cmd` have no messa
 Each phase leaves English output byte-identical, so the existing suite — several hundred
 assertions pin English wording — stays the regression net throughout.
 
-3. **UI literals** in `schemaic-ui` and `schemaic-app` — on the order of two to three thousand,
-   heaviest in `widgets.rs`, `overlays.rs`, `lib.rs`, `grid.rs` and `shortcuts.rs`. Mechanical,
-   one file per session, by hand: the rule against scripted edits applies in full.
-   `source_gate::no_menu_label_ends_in_an_ellipsis` already reads a `tr!` label's text in every
-   catalogue, and `overlays.rs`'s `menu_order_gate` keys its skeleton on message ids — the one
-   table `schema_tree.rs`'s blank-space menu is placed by too.
-   `schemaic-app` reaches the loader through its own `tr!` (top of `main.rs`, visible to every
-   module), `fl!` against the now-public `schemaic_ui::i18n::LOADER`; its `i18n.toml` points
-   at `schemaic-ui`'s catalogues, because `fl!` checks ids against the *calling* crate's
-   config, and its `build.rs` reruns on a catalogue change for the same reason. The app's
-   messages go in the same two `.ftl` files.
-
-   **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`, `schema_tree.rs`,
-   `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`, `activity_panel.rs`, `ai_panel.rs`,
-   `chart_view.rs`, `view_editor.rs`, `properties.rs`, `copy_table_view.rs`,
-   `database_editor.rs`, `script_view.rs`, `compare_view.rs`, `event_editor.rs`,
-   `routine_editor.rs`, `users_view.rs`, `trigger_editor.rs`, `object_editor.rs`,
-   `account_editor.rs`, `table_designer.rs`, `connection_form.rs`, `import_view.rs`,
-   `dump_view.rs`, `monitor_view.rs`, `result_diff_view.rs`, `ddl_preview.rs`,
-   `connection_import.rs`, `blob_view.rs`, `erd_view.rs`, `server_vars_view.rs`,
-   `snippet_edit.rs`, `plan_view.rs`, `used_by_view.rs`, `themes.rs` (its one pair, Dark and
-   Light; `tooltip.rs` had nothing a user reads), `markdown.rs`, `cell_editors.rs`,
-   `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`, `grid.rs`, `lib.rs`, `widgets.rs`,
-   `editor_pane.rs`. Some went ahead of their files: the three workspace panel headers —
-   `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and `editor_pane.rs`'s
-   query header (`query-*`) — and `editor_pane.rs`'s *Rename alias* / *Rename CTE* dialog
-   (`alias-rename-*`). The schema editors share
-   `editor-preview-sql` and `editor-change-count`, and `dialog-close` joins the dialog words. The
-   activity panel's counts line ("18 sessions · 4 running") and its session-state words stay
-   core's English with phase 4: the total is core's `ActivitySummary::total_label`, and the
-   state word is also what the search box matches. A palette
-   command's typed name is its translated label lowercased, and its English name
-   (`Command::id`) matches in every language too, as VS Code's translated palette does. Shared
-   words live under `dialog-*` (Cancel, Yes, No, and `dialog-read-only` — the sentence beside a
-   disabled write button, which the import modal and the DDL preview share), and the schema
-   tree's menus and panel under
-   `tree-*`. `section_title` and `loading_dots` take owned text now, so the other panels'
-   headings can follow.
-   **Where it stands** (2026-10-19): `schemaic-ui` is done — every small file, and the four
-   large ones: `grid.rs` (six sections, `grid-*`), `lib.rs` (seven: `footer-*`, `lib-*`,
-   `header-*`, `colour-*`, `disk-*`, `results-*`, `search-everywhere-placeholder`),
-   `widgets.rs` (two: `widgets-nothing-to-choose`, and `widgets-spinner-verbs` — a
-   comma-separated list each language writes for itself, as many verbs as it likes, which the
-   loader-width test measures in every catalogue) and `editor_pane.rs` (six: `cmdk-*`,
-   `params-*`, the error and guard bars, `editor-menu-*`, the run menu, `find-*` and
-   `goto-line-label`). In `schemaic-app`, `main.rs` is done (eight sections: `cli-*`,
-   `gate-*`, the terminal's lines with `backup-*`/`restore-*`, `tab-close-*`/`file-*`,
-   `export-*`/`dump-failed`/`blob-*`, `settings-*`/`connections-*`/`import-*`/`conn-delete-*`,
-   and the rest — inline AI, a Manual tab's session, snippets, Copy table, Compare, the
-   monitor, the statement timeout); so is `install_cli.rs` (`install-*`). The "no client"
-   case is `Unreached::Absent`, a value the caller names, where it was a `const` line the
-   callers compared against; a file dialog's type filter, which floem takes only as
-   `&'static str`, goes through `tr_static!`, a per-site `OnceLock`; core's
-   `sqlfile::SQL_FILTER_NAME` and `settings_bundle::summary` went, being interface words only
-   the app read. What `main.rs` leaves: what it sends the model (the AI fill and seed system
-   prompts), what it writes to the write log (a persisted record), log and `tracing` lines,
-   the internal "export cancelled", and core's prose it passes through — `launch::*`'s
-   refusals, `script::restore_refusal`, `cli_install::report_*`, `statement_timeout_label`
-   (the timeout message quotes it as the dropdown shows it), `format_bytes` — and
-   `schemaic-cli`'s `dump.rs` "Export failed: …" lines, which the headless CLI shares: all
-   phase 4's.
-   A large file goes **a
-   section at a time** — a function or a cluster of them — committed per section as
-   `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded here as
-   it lands, so the next session knows where to pick up without re-sweeping what is done. The
-   file leaves *Left* only when a whole-file sweep finds nothing.
-   What `grid.rs` leaves English on purpose: SQL (`WHERE`, `<null>`, `<default>`,
-   `SQL VALUES`/`UPDATE`/`WHERE IN`), the export formats' names, and core's prose — the row
-   phrase in the status line (`stats::rows_read_clause`), the attach scope
-   (`model::attach_scope_label`), the export notes and the "the clipboard" / "the file" they
-   name, the lock-wait sentence, the duplicate prompt — which is phase 4's. What `lib.rs`
-   leaves: persisted keys, font names, the terminal's escape sequences, and
-   `ContainerKind::label`, which nothing calls since the database editor drew its own words.
-   Two of its conversions reach other files: `ai_off_note()` (once the `AI_OFF_NOTE` const) is
-   read by the app crate's AI refusals, and `CONN_COLOR_PRESETS` stays `const` with its names
-   as `fn() -> String`. What `editor_pane.rs` leaves: everything it sends the model (the
-   Explain prompt, the Optimise intent — whose box label `cmdk-optimise-label` is translated
-   and compared against the box, so the English intent still goes out), the find options'
-   glyphs `Aa`, `W` and `.*`, and the parameter chip's `abc`/`123`/`NULL`/`SQL`. Its error
-   bar's Explain and AI fix are the error modal's messages, which `error_bar_fits_explain`
-   measures, and its Rename alias / Rename CTE entries the rename dialog's titles.
-   **Left:** nothing — `schemaic-app` is done too: `ai.rs` and `antigravity.rs` (the session's
-   notes and refusals, `ai-*`, while every prompt sent to the model and `--mcp-serve`'s errors
-   to an agent's stderr stay English), `conn_sources.rs` (`import-source-*`, `docker-*`),
-   `script.rs` and `cursor.rs`'s one line; `notify.rs` and `agent_cli.rs` had nothing. A file with
-   no literal a user reads drops off without a commit. The list came from a sweep for
-   capitalised string literals, so sweep a file whole before calling it done; a sentence that
-   starts lower-case, or spans a `\` continuation, slips past a quick one.
-   **How a file goes**, as those settled it: a helper taking
-   `&'static str` widens to `impl Into<String>` (every literal caller still compiles); a
-   placeholder goes through `FieldCfg::placeholder_of(|| tr!(…))`, whose `placeholder` is still
-   `&'static str`; a sentence assembled from parts becomes whole messages, one per variant; a
-   count becomes a Fluent plural. Every message is one line in the `.ftl` — a continued Fluent
-   value keeps its line break, where the Rust `\` it replaces kept none. German is written in the
-   same change. A `const` table of labels keeps its identity and loses its text: a string the
-   code or a test matches on becomes an enum with a `label()` (`shortcuts::Group`), and the text
-   becomes a `fn() -> String` closure calling `tr!` (`shortcuts::Describe`), so the table stays
-   `const` and the id is still checked at compile time. Text that is not the file's own stays: labels a dropdown takes from another
-   module or crate (`TermCursor::label`, `Agent::label`, `KeywordCase::label`), and core's
-   prose (`statement_timeout_label`, the install status), which is phase 4. Afterwards, compare
-   each placeable-free message against the file's literals at `HEAD` with `\` continuations
-   joined — the suite pins too little of a page's wording to show a changed word.
 4. **Messages built in `schemaic-core`.** The hard part. Around 130 functions return finished
    English prose (`run_verdict`, the DDL preview notes, `Rollback::note`, `tx`, `dump`, `compare`,
    `stats`, `import`, `conn_import`, `users`), and core cannot — and should not — reach a UI
@@ -195,10 +95,17 @@ assertions pin English wording — stays the regression net throughout.
    instead (`history::outcome_line_with`, which `i18n::outcome_line` calls);
    `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
    like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
-   keys) and AI prompts keep core's English.
+   keys) and AI prompts keep core's English. What the converted views and the app pass through
+   unchanged today is this phase's list to work from: `launch::*`'s refusals,
+   `script::restore_refusal`, `cli_install::report_*`, `statement_timeout_label` (quoted by the
+   timeout message as its dropdown shows it), `stats::rows_read_clause`,
+   `model::attach_scope_label`, the grid's export notes, the activity panel's counts line — and
+   two that are not core's but need the same split: `schemaic-cli`'s `dump.rs` "Export failed: …"
+   lines, which the dump modal shows and the headless CLI shares, and `schemaic-ai`'s
+   `Agent::label`, whose *Disabled* the AI settings' dropdown shows.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
-   folded into whole Fluent messages as their phase-3 or phase-4 file is converted rather than as
-   a pass of their own.
+   folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
+   their own (the views' own were folded as they were converted).
 6. **Layout for longer text.** German, Finnish and Russian run 30–100% longer than English.
    Roughly sixty fixed-width boxes sit beside text — the connection form, the import and compare
    panes, the find bar, `widgets::fact_row`'s fixed label column — and each either measures its

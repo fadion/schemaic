@@ -24999,7 +24999,7 @@ existing prose was left alone.
     would execute the block in whatever tab is in front, which is the connection the insert had just
     declined to open on. The `bool` exists for that one question; the refusal itself is reported by
     the action.
-    **Its words are the catalogue's** (`md-*`, roadmap phase 3) — a code block's *CODE* label when
+    **Its words are the catalogue's** (`md-*`) — a code block's *CODE* label when
     it names no language (`md-code-block`; *SQL*, and a named language upper-cased, stay as they
     are), its Copy/Insert/Run links (`code_action_link` takes a `String`), and the proposal card's
     title (`$table`), its change count (`md-proposal-count`, a plural on `$count` in place of
@@ -25512,15 +25512,16 @@ existing prose was left alone.
     so a chord like `Strg+Umschalt+C / Strg+Umschalt+V` stays whole; a 12px gap replaced the
     spacer between them. The panel widened from `modal_w(420)` to `modal_w(460)` for German's
     longer rows and chords as well — the wrap is for the row that still does not fit.
-    **Every word the modal writes itself comes from the catalogue** — the first file roadmap phase
-    3 converted: labels, hints, placeholders, section names and the Settings and Shortcuts titles
+    **Every word the modal writes itself comes from the catalogue** — the first file converted to
+    it: labels, hints, placeholders, section names and the Settings and Shortcuts titles
     are `tr!` over `settings-*`/`shortcuts-*` messages (`ui/i18n.rs`), with German beside them, and
     English output was compared message by message against the literals they replaced. The
     Shortcuts modal's headings and rows are `shortcuts.rs`'s, converted after it (below), which is
     why `shortcut_group` takes a `shortcuts::Group` and renders `group.label()` and `shortcut_row`
-    takes an owned description. Text no converted file owns stays English for now: the options a
-    dropdown takes from elsewhere — `TermCursor::label`, `Agent::label`,
-    `KeywordCase::label`, core's `statement_timeout_label` — wait for their own file or for phase 4.
+    takes an owned description. `TermCursor::label` is `lib.rs`'s and came with that file; the
+    options a dropdown takes from another crate stay English: `Agent::label` (`schemaic-ai`'s, so
+    its *Disabled* beside the product names), and core's `KeywordCase::label` and
+    `statement_timeout_label`, which wait for phase 4.
     That is why its builders take owned text: `focusable_toggle_row`, `focusable_toggle_row_when`,
     `toggle_row_layout` and `settings_group_label` take `impl Into<String>`, so a literal caller
     still compiles and a `tr!` result passes as well; `SettingsSection::label()` answers a
@@ -25949,7 +25950,7 @@ existing prose was left alone.
     dialled, and the note says how to skip the Browser — the bare host and the instance's own port.
     The label is **hidden**, not merely empty, when the note is `None`: an empty label still takes
     a line and the column's gap.
-    **Its words are the catalogue's** (`connections-*`, roadmap phase 3) — the title (through
+    **Its words are the catalogue's** (`connections-*`) — the title (through
     `modal_title_owned`), the list's New/Import/Export rows and its right-click Duplicate/Delete,
     the footer's Delete/Test/Save, the four section headings, every field label, toggle and hint,
     the five file pickers' window titles (`connections-*-dialog`) and the *Browse…* inside a path
@@ -26098,7 +26099,7 @@ existing prose was left alone.
     again was already narrow and only had to say so**, and six of six were, which is why a file's
     number says nothing about how hard it is to move — this 6 took minutes where `overlays.rs`'s
     remaining 4 are immovable.
-    **Its words are the catalogue's** (`conn-import-*`, roadmap phase 3) — the title (through
+    **Its words are the catalogue's** (`conn-import-*`) — the title (through
     `modal_title_owned`), the URL field's label, hint and *Add*, the three source buttons and their
     busy words, `empty_message`'s three sentences (it returns `String` now), the plural found count
     (`conn-import-found`, pinned by `the_found_count_reads_as_it_did_in_english`), Select all/None,
@@ -26230,7 +26231,7 @@ existing prose was left alone.
     the predicate doesn't know about resolves its `inset(0)` against a zero-by-zero box and paints
     nothing, which is exactly how the event editor once shipped invisible. It shares its tuple
     element with *Rename alias* and *Find usages* (`alias_rename.rs` and `usages_view.rs`, next).
-    **Its words are the catalogue's** (`snippet-edit-*`, roadmap phase 3) — the title (`$name`),
+    **Its words are the catalogue's** (`snippet-edit-*`) — the title (`$name`),
     the *Name*, *Expansion shortcut* and *Query* labels, the name field's and the shortcut field's
     placeholders (both through `FieldCfg::placeholder_of`; the shortcut's is the word *none*), and
     Save; Cancel is the shared `dialog-cancel`. `the_title_reads_as_it_did_in_english` pins the
@@ -26266,7 +26267,7 @@ existing prose was left alone.
     any of them is open, `ddl_modals_up` has an `alias_rename` arm, and the file is on
     `PAINTS_A_BACKDROP`. Left out of the predicate it would paint nothing, for the reason the snippet
     editor's entry gives.
-    **Its words are the catalogue's** (`alias-rename-*`, roadmap phase 3) — *New name* and Rename
+    **Its words are the catalogue's** (`alias-rename-*`) — *New name* and Rename
     here; Cancel is the shared `dialog-cancel`. The two titles and placeholders belong to the
     openers: `AliasRenameRequest::title` and `placeholder` are `String`s (they were
     `&'static str`), and the editor's two entries in `editor_pane.rs`, its only constructors, pass
@@ -26290,7 +26291,7 @@ existing prose was left alone.
     for the reason `alias_rename.rs` gives. As the tuple element's third member it is in
     `ddl_modals_up` (its `usages` arm) and on `PAINTS_A_BACKDROP`, for the reason the snippet
     editor's entry gives.
-    **Its words are the catalogue's** (`usages-*`, roadmap phase 3) — the title, `usages-title`, is
+    **Its words are the catalogue's** (`usages-*`) — the title, `usages-title`, is
     one message with a plural on `$count` and the name as `$name`, where it used to splice *usage*
     or *usages* into an English sentence; Close is the shared `dialog-close`.
     `the_title_reads_as_it_did_in_english` pins both numbers. The rows' line numbers and statement
@@ -26809,7 +26810,7 @@ existing prose was left alone.
     is running), absent where the engine has no statement for it as on a session row, and both
     kills are dimmed on a read-only connection and on a lock a server process holds
     (`LockInfo::killable`).
-    **The panel's own words are the catalogue's** (`activity-*`, roadmap phase 3), SQLite's
+    **The panel's own words are the catalogue's** (`activity-*`), SQLite's
     no-sessions note included — `sqlite_has_no_sessions()`, a constant before it. The two kill
     entries are `kill_label(KillKind)`, `KillKind::label`'s words drawn here (the core-words rule
     under *UI conventions*). Each "N more … match — narrow the search" note is one Fluent plural
@@ -26827,7 +26828,7 @@ existing prose was left alone.
     arrives as the same tabular `QueryPlan` (under `core::plan`), and the two warning kinds only
     it produces, `MissingIndex` and `ServerWarning`, take the warning colour through the `_ =>`
     arm that keeps `theme::error` for `FullScan` alone.
-    **Its words are the catalogue's** (`plan-*`, roadmap phase 3) — the title (through
+    **Its words are the catalogue's** (`plan-*`) — the title (through
     `modal_title_borderless`), the Analyze toggle's hint and the line that replaces the toggle for
     a write (`plan-analyze-unavailable`, which keeps the word *Analyze*), *Explaining* under the
     loading dots, *Potential issues* and *Ask AI*. The toggle's own **Analyze** label stays a
@@ -26902,7 +26903,7 @@ existing prose was left alone.
       emptiness check leaves it out for a table that is neither.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
-    - **The panel's own words are the catalogue's** (`props-*`, roadmap phase 3), so `section`,
+    - **The panel's own words are the catalogue's** (`props-*`), so `section`,
       `section_with_gap`, `detail` and `swatch` take a `String`. The structure counts are Fluent
       plurals and the vacuum note a message, its percentage rounded with `{pct:.0}` before it
       reaches Fluent, which would otherwise print the fraction (`the_shared_counts_read_as_they_did`
@@ -26929,7 +26930,7 @@ existing prose was left alone.
     Mounted in the workspace group directly after `properties_overlay`, and counted by
     `workspace_modals_up` whenever it is open — it raises nothing, so it is a plain term like
     `vars_open`.
-    **Its words are the catalogue's** (`used-by-*`, roadmap phase 3) — the title (`$object`, also
+    **Its words are the catalogue's** (`used-by-*`) — the title (`$object`, also
     the Copy text's first line), Copy, the not-loaded and nothing-in notes (`$database`), the
     limits line, *· dropped with it* (`$detail`) and the Copy text's *Nothing uses it.*; Close is
     the shared `dialog-close`. The kind words are core's, drawn here by the typed-value rule:
@@ -27040,7 +27041,7 @@ existing prose was left alone.
     chart it was said of**: an effect over `kind`, `value` and `label` clears it when a picker
     changes — skipping its first run, which is the build, not a change — or *"Nothing to save."*
     would stand, as a failure does, over a column that can now be saved.
-    **Its own words are the catalogue's** (`chart-*`, roadmap phase 3), **Close** `dialog-close`,
+    **Its own words are the catalogue's** (`chart-*`), **Close** `dialog-close`,
     and the kinds `chart_kind_label(ChartKind)` (the core-words rule under *UI conventions*). *Row
     number* is `row_number()`, a message where it was the constant `ROW_NUMBER`, and it is a
     **value as well as a label**: the picker hands back the text it shows, so a pick is compared
@@ -27188,7 +27189,7 @@ existing prose was left alone.
     Mounted in the workspace group directly after `chart_overlay`, counted by
     `workspace_modals_up` as a plain term (`diff_open`) — it raises nothing — and on
     `modal_backdrop_gate::PAINTS_A_BACKDROP`.
-    **Its words are the catalogue's** (`diff-*`, roadmap phase 3) — the title, the four filter
+    **Its words are the catalogue's** (`diff-*`) — the title, the four filter
     pills, *Match rows by*, the export tooltip, *Nothing to export.*, the export dialog's window
     title, the saved notice's fallback file name (`diff-unnamed-file`), the cards' `diff-ran-at`
     (`$time`) and `diff-side-facts` (a plural on `$count`, with `$ms`), the *Change* header and the
@@ -27421,7 +27422,7 @@ existing prose was left alone.
     structured change routes around, or a parser whose wrong guess emits a `REVOKE` that takes away
     more than the line the user clicked. The grant form serves both directions instead, which is
     what its Action toggle is for.
-    **Its words are the catalogue's** (`users-*`, roadmap phase 3) — the search placeholder, the
+    **Its words are the catalogue's** (`users-*`) — the search placeholder, the
     list's notes, sections, the system-account note, the action row, the write-gate notes, Copy
     privileges and the statements-capped note — with the title the tree's own `tree-users`, Drop
     and Refresh `tree-drop`/`tree-refresh`, and Close `dialog-close`; the Privileges button reuses
@@ -27490,7 +27491,7 @@ existing prose was left alone.
     the unsupported sentence, the failure in the error colour, and *No matching settings.* The
     footer counts *N settings*, or *x of N settings* while the search is narrowing them, beside
     Refresh and Close; Escape and the dismiss layer close it too.
-    **Its words are the catalogue's** (`server-vars-*`, roadmap phase 3) — the title
+    **Its words are the catalogue's** (`server-vars-*`) — the title
     (`$connection`), the search placeholder (through `FieldCfg::placeholder_of`), the *Variables |
     Status* pills (`kind_switch`'s `tab` takes a `String`), the loading, unsupported and no-match
     notes, the past-the-cap line `server-vars-more` (a plural on `$count`, which replaced
@@ -27578,7 +27579,7 @@ existing prose was left alone.
     `max_issues` together. The section sits inside the body's own scroll, so the cut was never a
     layout requirement — 20 was a bare literal, and its whole cost was that the disclosure beneath
     it answered about the other cap (see `core::import`).
-    **Its words are the catalogue's** (`import-*`, roadmap phase 3) — the title (`import-title`,
+    **Its words are the catalogue's** (`import-*`) — the title (`import-title`,
     `$table`), the four section headings, every field, toggle and hint, the file picker's button and
     window title, *Skip* in the mapping dropdown (`target_label`), the nothing-mapped and
     values-withheld notes, the footer's Next/Reading…/Back/Import/Importing… and the cancelled line;
@@ -27650,7 +27651,7 @@ existing prose was left alone.
     `stop` is `ctx.cancel`, the closure `ui.schema_actions.script_cancel` was. What came *off*
     `ScriptCtx` before it shipped, and why that is the mirror of `DumpCtx`'s near-miss, is under
     `lib.rs`'s `whole_ui_gate`.
-    **Its words are the catalogue's** (`script-*`, roadmap phase 3) — title, file row, hints, the
+    **Its words are the catalogue's** (`script-*`) — title, file row, hints, the
     probe summary and its red warnings, the transaction line, progress, Run, the outcome sentences
     and `durability_sentence`'s four, with Stop and Close the shared `dialog-stop`/`dialog-close`.
     **A count is two arguments, not one**: `$count` is the figure as shown — `Probe::count_label`'s,
@@ -27873,7 +27874,7 @@ existing prose was left alone.
     all, on the argument that the grid's bar told the whole story in one strip; that bar has no
     export state any more. The state behind it (`ExportUi`, the single `exit` closure both its exits
     run, and who may write into it) is in *Data grid*.
-    **Its words are the catalogue's** (`dump-*` and `export-progress-*`, roadmap phase 3). The
+    **Its words are the catalogue's** (`dump-*` and `export-progress-*`). The
     export modal's: the title through `dump_title` — two whole messages, `dump-title-schema` and
     `dump-title`, rather than a namespace spliced in — the save and folder dialogs' window titles
     (`dump-sql-dialog`, `dump-folder-dialog` with `$format`), the folder hint, the picker's count
@@ -27919,7 +27920,7 @@ existing prose was left alone.
     `suggested_field` and the domain's base Type all go through it now, as does the connection
     form's Folder. The chevron's *nothing to suggest* row is the caller's: `suggest_field` takes it
     as `impl Into<String>` and `suggest_chevron` as a `String`, so a `tr!` note passes as readily as
-    a literal (roadmap phase 3).
+    a literal.
     The preview's SQL box is a read-only monospace `edit_field` that **wraps**: it was `no_wrap`,
     and an `edit_field` has no wheel to scroll sideways (only the editor pane wires Shift+wheel, see
     the Floem gotchas), so the end of a long statement — a selective XML index's paths, a rebuild's
@@ -28203,7 +28204,7 @@ existing prose was left alone.
     `ddl::accounts`**, because SQL Server's New account form can raise two: a login and the user it
     brings, which it sends as one plan under one preview and one Apply. The account form passes
     `account_editor::preview_changes`; the grant form and the browser's Drop pass one change each.
-    **The preview's words are the catalogue's** (`preview-*`, roadmap phase 3) — the title through
+    **The preview's words are the catalogue's** (`preview-*`) — the title through
     `preview_title`, one whole message `preview-title` (`$connection`, `$subject`) whose subject is
     `database.subject` when `qualified` and the bare subject otherwise, so its tests pass unchanged;
     the change-list heading `preview-changes`, a plural on `$count` that replaced `text::plural`;
@@ -28233,7 +28234,7 @@ existing prose was left alone.
     `None` — a name the draft doesn't hold — is dropped **silently** and the designer opens on the
     `Table` tab, which is what it did before it was asked at all: the request that failed is the
     landing, not the edit.
-    **Its words are the catalogue's** (`designer-*`, roadmap phase 3) — the tab strip, sections,
+    **Its words are the catalogue's** (`designer-*`) — the tab strip, sections,
     fields, toggles and their hints, the Indexes rows' *unique*/*redundant* details and the Foreign
     keys row's *→ {table} · no index* (`designer-fk-detail-unindexed`) — with Cancel, Preview SQL
     and the change count the shared `dialog-cancel`, `editor-preview-sql` and
@@ -28320,7 +28321,7 @@ existing prose was left alone.
     covered by nothing here. The four doors are called from `overlays.rs` (the tree's Edit view and Create ▸
     View), `properties.rs` (the properties modal's Edit) and `lib.rs`'s `create_view` callback (the
     editor's *Create view from this query*).
-    **Its words are the catalogue's** (`view-editor-*`, roadmap phase 3) — labels, sections, the
+    **Its words are the catalogue's** (`view-editor-*`) — labels, sections, the
     column-names placeholder, the re-create toggle and its hint, both titles — with **Cancel**
     `dialog-cancel` and the footer's other two named for no one editor: `editor-preview-sql`, which
     the Copy to modal, the database editor and the routine and event editors now share, and
@@ -28578,7 +28579,7 @@ existing prose was left alone.
     **empty on PostgreSQL**, where the name is scoped to the table and avoiding a sibling's would
     propose `new_trigger_2` for no reason the user can see; empty too until the database's schema has
     loaded. Only `blank_trigger` reads it, and only to pick a name.
-    **Its words are the catalogue's** (`trigger-editor-*`, roadmap phase 3) — the title, the
+    **Its words are the catalogue's** (`trigger-editor-*`) — the title, the
     preview's subject, the empty-selection hint, the three read-only explanations, sections,
     fields, the TRUNCATE and NOT FOR REPLICATION hints, the function picker's *Edit* / *New
     function*, *Arguments* and *Add argument* — with Cancel, Preview SQL and the change count the
@@ -28648,7 +28649,7 @@ existing prose was left alone.
     editor has none, and the title is where the inheritance is disclosed. It clears every sibling
     overlay's target on open **except the trigger editor's**, which is the handoff described
     above.
-    **Its words are the catalogue's** (`routine-editor-*`, roadmap phase 3) — sections, fields,
+    **Its words are the catalogue's** (`routine-editor-*`) — sections, fields,
     every option toggle and its hint, Inlining's *Automatic*, *Settings* and *Add setting*, the
     titles and notes, and the comment placeholder, which is the new shared
     `editor-comment-placeholder` — with Cancel, Preview SQL and the change count the shared
@@ -28702,7 +28703,7 @@ existing prose was left alone.
     nobody edited.
     It shares one tuple element with the trigger and routine overlays (Floem's 16-arity
     `ViewTuple` limit) and clears both of their targets on open, as they clear its.
-    **Its words are the catalogue's** (`event-editor-*`, roadmap phase 3) — sections, fields, the
+    **Its words are the catalogue's** (`event-editor-*`) — sections, fields, the
     schedule picker, the preserve toggle and its hint, the titles, the source-reading and stale
     notes — with Cancel, Preview SQL, the change count and the comment placeholder the shared
     `dialog-cancel`, `editor-preview-sql`, `editor-change-count` and `editor-comment-placeholder`.
@@ -28782,7 +28783,7 @@ existing prose was left alone.
     Server, Database, Schema and Object (`TsqlObject::synonym_fields`, under `schema.rs`); an alias
     type a *Base type* and a Nullable toggle; a collection one multi-line, monospaced *Schemas*
     field.
-    **Its words are the catalogue's** (`object-editor-*`, roadmap phase 3) — sections, fields,
+    **Its words are the catalogue's** (`object-editor-*`) — sections, fields,
     toggles and their hints, the notes and placeholders that have words in them — with Cancel,
     Preview SQL and the change count the shared `dialog-cancel`, `editor-preview-sql` and
     `editor-change-count`, and the value rows' arrows the new shared `editor-row-move-up` /
@@ -28925,7 +28926,7 @@ existing prose was left alone.
     `container_preview`); and it leaves through
     `preview_container` like a schema — `is_server_level` is false for it, so it runs inside the
     database through `Db::run_ddl`.
-    **Its words are the catalogue's** (`database-editor-*`, roadmap phase 3) — sections, fields, the
+    **Its words are the catalogue's** (`database-editor-*`) — sections, fields, the
     *server default* and *you* placeholders and each chevron's empty note, with Cancel and Preview
     SQL the shared `dialog-cancel`/`editor-preview-sql`. **The title is one message per kind and
     placement** — `database-editor-title-{database,schema,extension}` and the `-schema-in`/
@@ -29223,7 +29224,7 @@ existing prose was left alone.
     passes it today, a SQL Server login included now that the server level exists. The Role field's
     shortcut is `users::role_suggestions`: a login's server roles are not in the browser's list, so a
     SQL Server login is offered the fixed server roles instead.
-    **Its words are the catalogue's** (`account-editor-*`, roadmap phase 3) — both forms' labels,
+    **Its words are the catalogue's** (`account-editor-*`) — both forms' labels,
     sections, toggles, placeholders and the chevrons' empty notes — with Cancel and Preview SQL the
     shared `dialog-cancel`/`editor-preview-sql`. The titles are whole messages,
     `account-editor-title-{create,reset}` and `account-editor-title-privileges` with `$account`, and
@@ -29293,7 +29294,7 @@ existing prose was left alone.
     assistant's replies"*, because that renderer and that setting are about replies rather than
     about any one vendor's.
     **Off is said before anything else is.** With `AiUi::enabled` false the empty conversation reads
-    `AI_OFF_NOTE` (*"The AI assistant is off. Pick an Agent CLI in AI settings to turn it on."*)
+    `ai_off_note()` (*"The AI assistant is off. Pick an Agent CLI in AI settings to turn it on."*)
     rather than *"`<Harness>` not connected."*, and the message box is the pure
     `input_state_of(enabled, reachable, db_down)` → `InputState::{Live, Off, DbDown, Unreachable}`,
     in which **off wins over everything**: with the assistant switched off, a down database or a
@@ -29305,11 +29306,12 @@ existing prose was left alone.
     the panel is there to say that it is off. The transcript stays on screen, but the last reply's
     Regenerate icon does not: it has nothing to send to (the off rule under *Architecture
     invariants*).
-    **The panel's own words are the catalogue's** (`ai-*`, roadmap phase 3): the title, tooltips,
+    **The panel's own words are the catalogue's** (`ai-*`): the title, tooltips,
     empty-state lines, placeholder and disabled-box notes (`ai_input_disabled` takes a `String`),
     *YOU* in `bubble_speaker_label`, and a tool result's *(+N more lines)* cut. What stays English
     is not the panel's to translate: the agents' product names and `harness::speaker_label`'s, every
-    prompt sent to the agent, and `AI_OFF_NOTE`, which lives in `lib.rs` and moves with that file.
+    prompt sent to the agent. The off note is `lib.rs`'s `ai_off_note()` (`lib-ai-off-note`), once
+    the `AI_OFF_NOTE` const, translated there for the panel and the app's AI refusals alike.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, the date picker's calendar (`date_pick_overlay`, whose panel is
     `cell_editors::calendar_panel` — up here because the field it drops from sits inside a scrolling
@@ -29361,7 +29363,7 @@ existing prose was left alone.
     table `DROP TABLE` treats it as — and both now ride into the preview's warning through
     `stats::drop_warning`. **Truncate still asks first** (`stats::truncate_prompt`): it is
     not a drop, and it keeps its confirm-then-preview.
-    **Its words are the catalogue's** (phase 3 of the roadmap's *Interface translation*). The
+    **Its words are the catalogue's** (`tree-*`, `dialog-*`, `tx-prompt-*`). The
     context menu and the SCHEMA gear share `tree-*`, so an action both offer cannot be worded two
     ways; the confirm dialog's buttons are `dialog-cancel`/`dialog-yes`/`dialog-no`, named for no
     one dialog so other files can take them; and the transaction prompt's body is one message per
@@ -29371,8 +29373,8 @@ existing prose was left alone.
     *Create {kind}* and *Edit {kind}* — and `CreateKind::label`'s fallback for an object kind — is
     `i18n::object_kind`, the catalogue's `kind-*` rather than `ObjectKind::label()`. Some words
     reaching these popups are still another module's English: `ExportFormat::label`,
-    `activity::interval_label`, the colour presets' names (`lib.rs`'s `CONN_COLOR_PRESETS`) and
-    `stats::truncate_prompt`.
+    `activity::interval_label` and `stats::truncate_prompt`. The colour presets' names
+    (`lib.rs`'s `CONN_COLOR_PRESETS`) were the fourth until `lib.rs` drew them from `colour-*`.
     **A PostgreSQL foreign table is offered what its server takes** (`object_entries` over
     `TableShape::ForeignTable`): its Drop, which `object_drop_change` makes `DROP FOREIGN TABLE`;
     not Edit table, since the designer's keys and indexes are refused on one (*cannot create index
@@ -29474,7 +29476,7 @@ existing prose was left alone.
     `BUDGET`'s said it was carried "for `table_colors` alone" (true of half of `table_node`). It
     was reached in three functions for six things, one of them an `active_conn` the struct already
     had a field for. Nothing checks a comment; the field list is checked by the compiler.
-    **Every word the panel writes itself comes from the catalogue** (`tree-*`, roadmap phase 3):
+    **Every word the panel writes itself comes from the catalogue** (`tree-*`):
     the `SCHEMA` title, in the loading dots too; the two header tooltips; the search placeholder,
     through `FieldCfg::placeholder_of`; *Loading*, *No tables*, `failed_row`'s *Failed to connect*
     and *View*; `unread_row`'s text and *Read* link; and the count capsules. Those were a number
@@ -30229,7 +30231,7 @@ existing prose was left alone.
     Escape closed the row panel out from under an open calendar. While it is up the toggle is lit,
     and **it pins its own hover**: it is the calendar's dismissal then, and `field_box`'s hover tint
     would otherwise repaint the accent border grey under the pointer.
-    **Its words are the catalogue's** (`cell-*`, roadmap phase 3) — the unset picker's *Choose…*
+    **Its words are the catalogue's** (`cell-*`) — the unset picker's *Choose…*
     (`pick_field`'s and `pick_cell_face`'s alike), the calendar's header (`cell-calendar-month`,
     `$month` and `$year`, the year passed as text so a later number-formatting phase cannot group
     it) and the footer's *Now*/*Today*. The month names and weekday initials are core's words drawn
@@ -31622,7 +31624,7 @@ existing prose was left alone.
     `NOTICE_LINGER`; a failure stays until dismissed, since it is the only place the reason is
     written down. The fade is `flash_seq`-guarded and `try_get_untracked`-read for the same two
     reasons the find flash is.
-    **Its words are the catalogue's** (`erd-*`, roadmap phase 3) — the title
+    **Its words are the catalogue's** (`erd-*`) — the title
     (`widgets::modal_title_borderless` takes `impl Into<String>`, so its literal callers still
     compile), *Scope* (which `toolbar_metrics` measures through the same message, so the label and
     the width budgeted for it cannot disagree), the three count chips (`chips`: `erd-chip-tables`,
@@ -31671,7 +31673,7 @@ existing prose was left alone.
     is too large to rasterise (W×H)"* — *Image*, because a chart's PNG comes through it as well as
     a diagram's. It touches no signal and no file, so the app runs it on a worker
     thread (`export_erd`) and writes the bytes it returns.
-    **Its words are the catalogue's** (`raster-*`, roadmap phase 3) — its three refusals, which
+    **Its words are the catalogue's** (`raster-*`) — its three refusals, which
     reach the user as the export's failure notice: `raster-invalid-svg` and `raster-png-failed`
     with the library's own `$error`, and `raster-too-large` with `$width` and `$height` passed as
     text. Off the UI thread is no obstacle: `tr!` reads `i18n::LOADER`, a `LazyLock` static.
@@ -31867,7 +31869,7 @@ existing prose was left alone.
     invariant for the shape.
     It is pure and tested inline, which is what keeps the copy honest: the two caveats co-occurring
     is precisely the case a per-state `match` got wrong.
-    **Its words are the catalogue's** (`monitor-*`, roadmap phase 3) — the title, the badge's three
+    **Its words are the catalogue's** (`monitor-*`) — the title, the badge's three
     words (`badge_state` returns `(String, fn() -> Color)`), the four filter pills (`count_pill`
     takes its name as `impl Into<String>`, as Compare results' pills now pass it too), the Pause/
     Resume, Clear and Export tooltips, the interval labels (`interval_label`, `monitor-interval`
@@ -32107,7 +32109,7 @@ existing prose was left alone.
     cancel exists to avoid. The new token also has to *replace* the stored one rather than only
     cancel it: keeping the stale token there pointed the new panel's Escape at a read that was
     already over.
-    **Its words are the catalogue's** (`blob-*`, roadmap phase 3) — the pane switch's labels
+    **Its words are the catalogue's** (`blob-*`) — the pane switch's labels
     (`pane_label` returns `String`), the Reading…/NULL-cell notes, the preview's three refusals
     (`blob-preview-too-large` with `$width`/`$height`, `blob-preview-truncated`,
     `blob-preview-unreadable`), `save_offer`'s refusal (`blob-save-truncated`), Load from file and
@@ -32433,7 +32435,7 @@ existing prose was left alone.
     `e` carries `Rollback::note` saying so, so the sentence used to contradict its own error. After
     it, *"{n} rows were copied, but the table's counter was not moved past them, so the next insert
     may collide: {e}"*.
-    **The modal's own words are the catalogue's** (`copy-table-*`, roadmap phase 3) — title,
+    **The modal's own words are the catalogue's** (`copy-table-*`) — title,
     fields, the *Copy data* toggle and its notes, the refusals it raises itself, the preview's
     *Copy of {table}*, progress, the stop note and *Copied N rows.*, a plural
     (`the_shared_counts_read_as_they_did` pins 0, 1 and 3) — with Cancel, Preview SQL, Stop and
@@ -32445,7 +32447,7 @@ existing prose was left alone.
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
     `scale_at`/`scale_font_at` rounding; `icons.rs` sizes every glyph, scaling the **base** size its
     callers pass.
-    **Its words are the catalogue's** (`theme-dark`/`theme-light`, roadmap phase 3) —
+    **Its words are the catalogue's** (`theme-dark`/`theme-light`) —
     `UiThemeKind::label`, the interface-theme dropdown's, answers a `String`; `key` is what is
     persisted, so nothing saved changes. `EditorThemeKind::label` stays a literal: product names.
     **The editor's font size and tab width are healed where they are *loaded*, not only where they
@@ -38151,7 +38153,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   default, and what an unrecognised persisted key loads as) is checked by the five app actions every
   AI path goes through. `ai_send` returns before anything else, and with it go the grid's AI
   summary, the plan modal's and the palette's Ask AI and the schema tree's AI explain;
-  `inline_ai_run` (Ctrl+K) answers `InlineAiState::Failed(AI_OFF_NOTE)`; `ai_fill` and `ai_seed`
+  `inline_ai_run` (Ctrl+K) answers `InlineAiState::Failed(ai_off_note())`; `ai_fill` and `ai_seed`
   answer `Failed` with the same note. **`ai_regenerate` refuses on its own, before it touches the
   transcript** (on `ai_busy || !ai_enabled`): it used to lean on `ai_send`'s guard, but it cuts the
   last question and its answer *first* and then hands the question on — so off, the turn was
@@ -38174,7 +38176,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   had said no. Each is tracked in the `GridAiJobs` slot (its `JoinHandle`, and the grid's `done`
   wrapped in a `OnceReply`), and the effect empties it through `stop_grid_ai_jobs`: each task is
   aborted, which reaps its CLI by the same `kill_on_drop`, and each grid answered
-  `Failed(AI_OFF_NOTE)`, so its busy pulse clears and a seed's skeleton rows roll back. **The
+  `Failed(ai_off_note())`, so its busy pulse clears and a seed's skeleton rows roll back. **The
   `OnceReply` is load-bearing**: the grid's `done` is not idempotent (a second `Value` stages
   twice), and a task can finish and queue its result just as *Disabled* is picked — that result
   then finds the reply spent, so nothing stages after the switch. The slot is taken out of its
@@ -40308,35 +40310,69 @@ Re-introducing the anti-patterns these guard against is a regression:
   - Derived metrics sum the **scaled parts** rather than scaling the sum (`consts::leaf_pad`), so an
     indent lands on the pixel the glyphs it aligns under actually occupy — at 80% those differ by one.
 - **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
-  value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). The Settings modal
-  (`settings.rs`), the shortcut table it draws (`shortcuts.rs`), the popups of `overlays.rs` and
-  the schema panel (`schema_tree.rs`), Query History (`history_panel.rs`), the snippet library
-  (`snippet_panel.rs`), the tab strip's menu and tooltip (`tabs.rs`), Server Activity
-  (`activity_panel.rs`), the AI Assistant panel (`ai_panel.rs`), the Chart modal
-  (`chart_view.rs`), the view editor (`view_editor.rs`), the properties panel (`properties.rs`),
-  the three workspace panel headers (`lib.rs`'s `term-*` and `results-*`, `editor_pane.rs`'s
-  `query-*`), the Copy to modal (`copy_table_view.rs`), the Create database/schema/extension form
-  (`database_editor.rs`), the script import (`script_view.rs`), the schema comparison
-  (`compare_view.rs`), the routine editor (`routine_editor.rs`), the event editor
-  (`event_editor.rs`), the trigger editor (`trigger_editor.rs`), the object editor
-  (`object_editor.rs`), the Users and privileges browser (`users_view.rs`) and its account and
-  grant forms (`account_editor.rs`), the table designer (`table_designer.rs`), Manage
-  Connections (`connection_form.rs`), the file import (`import_view.rs`) and the database export
-  and the grid export's progress box (`dump_view.rs`), the Live monitor (`monitor_view.rs`),
-  Compare results (`result_diff_view.rs`), the DDL preview (`ddl_preview.rs`), Import
-  Connections (`connection_import.rs`), the binary-cell panel (`blob_view.rs`), the ER diagram
-  (`erd_view.rs`), Server variables (`server_vars_view.rs`), the snippet editor
-  (`snippet_edit.rs`), the Query plan modal (`plan_view.rs`), the Used by modal
-  (`used_by_view.rs`), the interface themes' names (`themes.rs`), the AI panel's reply
-  renderer's own controls (`markdown.rs`), the grid's cell pickers and calendar
-  (`cell_editors.rs`), the Rename alias / Rename CTE dialog (`alias_rename.rs`), the Find
-  usages list (`usages_view.rs`), the PNG rasteriser's refusals (`erd_raster.rs`), the terminal
-  panel's DB-client lines (`schemaic-app`'s `main.rs`, `cli-*`) and Settings › Install's
-  failures (`install_cli.rs`, `install-*`) are converted;
-  every other label is still an English literal until phase 3 of the
-  roadmap's *Interface translation* converts its file — that entry keeps the list of what is
-  converted and the recipe a file follows, so neither is repeated here. Only the GUI is
-  translated: CLI, MCP and AI text stays English, as do SQL, persisted names and key names.
+  value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). **Every file of
+  `schemaic-ui` and `schemaic-app` now draws what a user reads from the catalogue**, so a new word
+  a user reads goes in through `tr!` as well, with its German in the same change — a literal is
+  the odd one out now, and the pseudo-locale (below) is what shows one left plain. The app reaches
+  the one loader through its own `tr!` (the `schemaic-app` entry says why it cannot borrow the UI
+  crate's), and the app's messages live in the same two `.ftl` files. Only the GUI is translated:
+  CLI, MCP and AI text stays English, as do SQL, persisted names and key names.
+  - **How a file draws from it** — the shape the whole conversion settled on, file by file, and
+    the one a new view follows. A helper taking `&'static str` widens to `impl Into<String>`, so
+    every literal caller still compiles and a `tr!` result passes too (`section_title`,
+    `loading_dots`, the settings rows). A placeholder goes through `FieldCfg::placeholder_of(||
+    tr!(…))`, `placeholder` itself staying `&'static str`. A sentence assembled from parts becomes
+    whole messages, one per variant, since a translator can reorder a whole sentence and not a
+    splice; a count becomes a Fluent plural rather than `text::plural`. **A message's text is one
+    line in the `.ftl`** — a plural's selector arms aside, which are syntax and draw no break: a
+    continued Fluent value keeps its line break, where the Rust `\` it replaced kept none, so
+    wrapping a long message in the catalogue changes what is drawn. Where a real line break *is*
+    wanted, it is two messages joined in code, as `main.rs`'s keyring notice on deleting a
+    connection joins `conn-delete-keyring-kept` and `conn-delete-keyring-later`. **A `const` table
+    of labels keeps its identity and loses its text**: a string the code or a test matches on
+    becomes an enum with a `label()` (`shortcuts::Group`), and the text a `fn() -> String`
+    non-capturing closure over `tr!` (`shortcuts::Describe`, `CONN_COLOR_PRESETS`' names), so the
+    table stays `const` and the id is still checked at compile time. **An API that takes only
+    `&'static str`** — floem's `FileSpec::name`, a file dialog's type filter — gets the app's
+    `tr_static!` (top of `main.rs`): a `OnceLock` per use site, filled once, which is sound only
+    because the language is fixed at launch, and leaks nothing per dialog opened. A word core gives
+    as a property of a typed value is drawn UI-side (below); core's *prose* is not the view's to
+    translate and stays as it comes.
+  - **Shared words have shared ids**, so one action cannot be worded two ways: `dialog-*` for
+    the words no one dialog owns (`dialog-cancel`, `dialog-yes`, `dialog-no`, `dialog-close`,
+    `dialog-stop`, and `dialog-read-only`, the sentence beside a disabled write button that the
+    import modal and the DDL preview share), `tree-*` for the schema tree's menus and panel, which
+    the context menu and the SCHEMA gear both draw, and `editor-preview-sql` and
+    `editor-change-count` for the schema editors' footers. A palette command's typed name is its
+    translated label lowercased, and its English `Command::id` matches in every language too
+    (under `overlays.rs`).
+  - **What stays English on purpose**, so a sweep for capitalised literals does not "fix" it: SQL
+    and its sentinels (`WHERE`, `<null>`, `<default>`, `SQL VALUES`/`UPDATE`/`WHERE IN`, the
+    parameter chip's `abc`/`123`/`NULL`/`SQL`); the export formats' names; persisted keys and file
+    names; font names; the terminal's escape sequences; the find options' glyphs `Aa`, `W` and
+    `.*`; product names (the agents', *Microsoft Entra*); **everything sent to an AI model** — the
+    Explain prompt, the Optimise intent (whose box label `cmdk-optimise-label` *is* translated and
+    compared against the box, so the English intent still goes out), the AI fill and seed system
+    prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
+    stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
+    the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
+    translation* — among it `launch::*`'s refusals, `script::restore_refusal`,
+    `cli_install::report_*`, `statement_timeout_label` (which the timeout message quotes as the
+    dropdown shows it), `format_bytes`, `stats::rows_read_clause`, `model::attach_scope_label`,
+    the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
+    whose state words the search box also matches) and `dump.rs`'s "Export failed: …" lines,
+    which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
+    English too: `Agent::label` (`schemaic-ai`), `KeywordCase::label` (core).
+  - **Four checks read the catalogue where the compiler cannot reach it.**
+    `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
+    verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
+    verb in every catalogue against the slot Ctrl+K reserves for the loader;
+    `error_bar_fits_explain` measures the error modal's own `error-modal-explain` and
+    `error-modal-ai-fix` labels, so a longer language drops *Explain* where it actually crowds;
+    `overlays::menu_order_gate` keys its skeleton on message ids rather than words, so it holds in
+    every language (under *Popup menus*); and
+    `source_gate::no_menu_label_ends_in_an_ellipsis` reads a `tr!` label's text in every catalogue,
+    since a translation that adds the dots is the same habit in another language.
   - **Nothing decides behaviour by an English label** — decide where the thing is built, or give
     it an id. A comparison against a literal simply turns false once the label is translated, with
     nothing to say so: the editor's context menu built *Plan* on every engine and then removed it
