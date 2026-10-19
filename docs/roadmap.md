@@ -146,9 +146,11 @@ assertions pin English wording — stays the regression net throughout.
      mid-load; the write-back's problem, smaller.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
    - **The object editors' refusals** — every draft's `validate` (`ddl.rs`), the sentences that
-     hold Preview: the table designer's (`TableDraft`, ~40) and the trigger editor's (~40) are the
-     bulk, then the routine, view, event, database and smaller object drafts — some 140 in all,
-     an enum per draft.
+     hold Preview, each given a typed `problems()` as `DatabaseDraft`, `ViewDraft` and
+     `EventDraft` already have: the table designer's (`TableDraft`, ~40) and the trigger
+     editor's (`TriggerDraft`, `TriggerSetDraft`, ~45) are the bulk, then the routine's (with
+     `RoutineDraft::name_clash`) and the object editor's (`EnumDraft`, `DomainDraft`,
+     `SequenceDraft`, `TsqlObjectDraft`, `ObjectDraft`).
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

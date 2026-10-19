@@ -911,6 +911,29 @@ pub struct DatabaseDraft {
     pub owner: Option<String>,
 }
 
+/// What stops a [`DatabaseDraft`] being applied
+/// ([`DatabaseDraft::problems`]) — a value, so the form can say it in the
+/// interface's language; [`DatabaseProblem::message`] is the English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatabaseProblem {
+    NoName,
+    /// A collation that is not a bare name ([`is_collation_name`]).
+    BadCollation,
+}
+
+impl DatabaseProblem {
+    /// The problem in English.
+    pub fn message(&self) -> String {
+        match self {
+            DatabaseProblem::NoName => "The name can't be empty.",
+            DatabaseProblem::BadCollation => {
+                "A collation name holds only letters, digits and underscores."
+            }
+        }
+        .to_string()
+    }
+}
+
 impl DatabaseDraft {
     /// A blank draft, with every per-engine option left to the server.
     pub fn blank(name: impl Into<String>) -> DatabaseDraft {
@@ -930,10 +953,10 @@ impl DatabaseDraft {
     /// refuses what the server would have accepted. What a client can be sure
     /// of is that a database with no name is not a request, and that a
     /// collation that is not a bare name ([`is_collation_name`]) is none.
-    pub fn validate(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<DatabaseProblem> {
         let mut out = Vec::new();
         if self.name.trim().is_empty() {
-            out.push("The name can't be empty.".to_string());
+            out.push(DatabaseProblem::NoName);
         }
         // The one option a client *can* judge: SQL Server takes a collation as a
         // bare name, unquotable, so a name that is not one cannot be written at
@@ -943,9 +966,17 @@ impl DatabaseDraft {
             .as_deref()
             .is_some_and(|c| !c.trim().is_empty() && !is_collation_name(c.trim()))
         {
-            out.push("A collation name holds only letters, digits and underscores.".to_string());
+            out.push(DatabaseProblem::BadCollation);
         }
         out
+    }
+
+    /// [`DatabaseDraft::problems`] in English.
+    pub fn validate(&self) -> Vec<String> {
+        self.problems()
+            .iter()
+            .map(DatabaseProblem::message)
+            .collect()
     }
 
     /// `CREATE DATABASE …`, with only the clauses this draft actually sets.
@@ -1045,6 +1076,50 @@ pub struct ViewDraft {
     pub force_recreate: bool,
 }
 
+/// What stops a [`ViewDraft`] being emitted ([`ViewDraft::problems`]) — a
+/// value, so the editor can say it in the interface's language;
+/// [`ViewProblem::message`] is the English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewProblem {
+    NoName,
+    NoSelect,
+    /// A body whose head is no query.
+    NotAQuery,
+    /// A PostgreSQL materialized view, which has no `CREATE OR REPLACE`.
+    Materialized,
+    /// SQL Server: a definition encrypted or hidden from this login
+    /// ([`view_not_editable_reason`]).
+    Hidden,
+    /// SQL Server: a header Schemaic cannot restate.
+    Verbatim,
+}
+
+impl ViewProblem {
+    /// The problem in English.
+    pub fn message(&self) -> String {
+        match self {
+            ViewProblem::NoName => "The view needs a name.",
+            ViewProblem::NoSelect => "A view needs a SELECT to define it.",
+            ViewProblem::NotAQuery => {
+                "A view's body has to be a query — it starts with SELECT, WITH, VALUES or TABLE."
+            }
+            ViewProblem::Materialized => {
+                "Schemaic can't edit a materialized view — PostgreSQL has no CREATE OR REPLACE \
+                 for one."
+            }
+            ViewProblem::Hidden => {
+                "This view's definition is encrypted or hidden from this login, so it can be \
+                 removed here but not edited."
+            }
+            ViewProblem::Verbatim => {
+                "This view's header says something Schemaic can't restate, so it can be removed \
+                 here but not edited."
+            }
+        }
+        .to_string()
+    }
+}
+
 impl ViewDraft {
     /// The draft that describes an introspected view exactly — the editor's
     /// starting point, and the input to the round-trip gate. `None` for a base
@@ -1077,33 +1152,34 @@ impl ViewDraft {
     /// Empty means "emittable", **not** "the server will accept it" — whether the
     /// body's tables and columns exist is the server's judgement, as everywhere
     /// else here.
-    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+    pub fn problems(&self, dialect: SqlDialect) -> Vec<ViewProblem> {
         let mut out = Vec::new();
         if self.name.trim().is_empty() {
-            out.push("The view needs a name.".to_string());
+            out.push(ViewProblem::NoName);
         }
         let body = self.select.trim();
         if body.is_empty() {
-            out.push("A view needs a SELECT to define it.".to_string());
+            out.push(ViewProblem::NoSelect);
         } else if !can_be_view_body(body, dialect) {
             // Head-keyword only: anything past that is the parser's job, and a
             // body it can't parse mid-edit still has to be emittable.
-            out.push(
-                "A view's body has to be a query — it starts with SELECT, WITH, VALUES or TABLE."
-                    .to_string(),
-            );
+            out.push(ViewProblem::NotAQuery);
         }
         if self.options.materialized {
-            out.push(
-                "Schemaic can't edit a materialized view — PostgreSQL has no \
-                 CREATE OR REPLACE for one."
-                    .to_string(),
-            );
+            out.push(ViewProblem::Materialized);
         }
         if let Some(why) = view_not_editable_reason(&self.options) {
-            out.push(why.to_string());
+            out.push(why);
         }
         out
+    }
+
+    /// [`ViewDraft::problems`] in English.
+    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+        self.problems(dialect)
+            .iter()
+            .map(ViewProblem::message)
+            .collect()
     }
 }
 
@@ -2161,6 +2237,34 @@ pub struct EventDraft {
     pub info: EventInfo,
 }
 
+/// What stops an [`EventDraft`] being emitted ([`EventDraft::problems`]) — a
+/// value, as [`ViewProblem`] is; [`EventProblem::message`] is the English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventProblem {
+    NoName,
+    /// A one-off event with no time to run at.
+    NoTime,
+    /// A repeating event with no interval.
+    NoInterval,
+    /// A repeating event with no interval unit.
+    NoUnit,
+    NoBody,
+}
+
+impl EventProblem {
+    /// The problem in English.
+    pub fn message(&self) -> String {
+        match self {
+            EventProblem::NoName => "The event needs a name.",
+            EventProblem::NoTime => "A one-off event needs a time to run at.",
+            EventProblem::NoInterval => "A repeating event needs an interval.",
+            EventProblem::NoUnit => "A repeating event needs an interval unit (DAY, HOUR…).",
+            EventProblem::NoBody => "The event needs a body.",
+        }
+        .to_string()
+    }
+}
+
 impl EventDraft {
     pub fn from_info(e: &EventInfo) -> EventDraft {
         EventDraft {
@@ -2193,30 +2297,33 @@ impl EventDraft {
 
     /// Problems that would make the generated SQL nonsense. Whether the body
     /// runs is the server's judgement, as it is for a routine.
-    pub fn validate(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<EventProblem> {
         let e = &self.info;
         let mut out = Vec::new();
         if e.name.trim().is_empty() {
-            out.push("The event needs a name.".to_string());
+            out.push(EventProblem::NoName);
         }
         match &e.schedule {
-            EventSchedule::At(at) if at.trim().is_empty() => {
-                out.push("A one-off event needs a time to run at.".to_string());
-            }
+            EventSchedule::At(at) if at.trim().is_empty() => out.push(EventProblem::NoTime),
             EventSchedule::Every { value, unit, .. } => {
                 if value.trim().is_empty() {
-                    out.push("A repeating event needs an interval.".to_string());
+                    out.push(EventProblem::NoInterval);
                 }
                 if unit.trim().is_empty() {
-                    out.push("A repeating event needs an interval unit (DAY, HOUR…).".to_string());
+                    out.push(EventProblem::NoUnit);
                 }
             }
             EventSchedule::At(_) => {}
         }
         if e.body.trim().is_empty() {
-            out.push("The event needs a body.".to_string());
+            out.push(EventProblem::NoBody);
         }
         out
+    }
+
+    /// [`EventDraft::problems`] in English.
+    pub fn validate(&self) -> Vec<String> {
+        self.problems().iter().map(EventProblem::message).collect()
     }
 
     /// Would applying this draft land on an event that is already there?
@@ -2230,17 +2337,21 @@ impl EventDraft {
     /// Case-insensitively compared and case-insensitively self-excluding,
     /// because MySQL's event names are.
     pub fn name_clash(&self, current: Option<&EventInfo>, taken: &[String]) -> Option<String> {
+        self.clashes(current, taken)
+            .then(|| format!("An event called {} is already here.", self.info.name.trim()))
+    }
+
+    /// [`EventDraft::name_clash`]'s decision, for a front end that words the
+    /// sentence itself — the name it names is `info.name`, trimmed.
+    pub fn clashes(&self, current: Option<&EventInfo>, taken: &[String]) -> bool {
         let want = self.info.name.trim();
         if want.is_empty() {
-            return None;
+            return false;
         }
         if current.is_some_and(|c| c.name.eq_ignore_ascii_case(want)) {
-            return None;
+            return false;
         }
-        taken
-            .iter()
-            .any(|t| t.trim().eq_ignore_ascii_case(want))
-            .then(|| format!("An event called {want} is already here."))
+        taken.iter().any(|t| t.trim().eq_ignore_ascii_case(want))
     }
 }
 
@@ -12135,17 +12246,11 @@ pub fn view_is_editable(t: &crate::schema::TableInfo) -> bool {
 
 /// Why a view with these options cannot be edited, when its definition was
 /// not read — see [`view_is_editable`]. `None` for every view that was.
-pub fn view_not_editable_reason(o: &ViewOptions) -> Option<&'static str> {
+pub fn view_not_editable_reason(o: &ViewOptions) -> Option<ViewProblem> {
     if o.tsql.hidden {
-        Some(
-            "This view's definition is encrypted or hidden from this login, so it can be \
-             removed here but not edited.",
-        )
+        Some(ViewProblem::Hidden)
     } else if o.tsql.verbatim {
-        Some(
-            "This view's header says something Schemaic can't restate, so it can be removed \
-             here but not edited.",
-        )
+        Some(ViewProblem::Verbatim)
     } else {
         None
     }

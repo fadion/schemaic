@@ -8906,8 +8906,8 @@ existing prose was left alone.
     (`a_view_header_the_parts_cannot_restate_is_unreadable`); `db::mssql` marks such a view
     `TsqlView::verbatim` (under `schema.rs`). **`view_is_editable` is the one gate over a view's
     refusals** — a view, not materialized, and `view_not_editable_reason` silent, which it is
-    unless the view is `verbatim` or `hidden` — and `ViewDraft::validate` pushes the same reason,
-    for a caller that did not ask the gate. The encrypted case is the one that shipped: its
+    unless the view is `verbatim` or `hidden`, when it answers `ViewProblem::Hidden`/`Verbatim` —
+    and `ViewDraft::problems` pushes the same value, for a caller that did not ask the gate. The encrypted case is the one that shipped: its
     definition is NULL, so **Edit view** opened on an empty body, and a body typed there was
     applied as a plain `CREATE OR ALTER VIEW`, dropping the encryption, the binding and every
     index without a word (`a_sql_server_view_it_cannot_read_is_not_edited`; live,
@@ -28644,8 +28644,10 @@ existing prose was left alone.
     `editor-change-count`, shared with the routine and event editors' footers, whose `[0]` case is
     *No changes*
     (`the_shared_counts_read_as_they_did` pins 0, 1 and 7). The `view_name` and `SELECT …`
-    placeholders and the `CASCADED`/`LOCAL`/`DEFINER`/`INVOKER` choices are SQL and stay;
-    `ViewDraft::validate`'s errors are core's prose, phase 4.
+    placeholders and the `CASCADED`/`LOCAL`/`DEFINER`/`INVOKER` choices are SQL and stay. The
+    footer's refusal and Preview's readiness read `ViewDraft::problems`, worded by
+    `view_problem_text` from `view-problem-*` (the editors' refusals, under `i18n.rs`), held by
+    `english_says_every_view_problem_as_core_does`.
   - `ui/window_chrome.rs` — the client-side window decorations: the caption buttons (minimize /
     maximize-restore / close), the drag strip, and the eight resize zones. Draws what
     `core::window_chrome::Chrome` decides, and contains no `cfg!(target_os = …)` of its own.
@@ -28988,7 +28990,7 @@ existing prose was left alone.
     correction doesn't tear the modal down, and the same `ddl_preview` ending. What differs are
     four consequences of `ALTER EVENT` being in-place: there is no drop-and-create, so a rename
     can't destroy the original and the footer's clash message says only that the name is taken;
-    the three Preview refusals (`event_source_pending`, `event_body_stale`, `name_clash`) cost a
+    the three Preview refusals (`event_source_pending`, `event_body_stale`, `clashes`) cost a
     *rejected statement* rather than a lost object, and are still made because an error after
     Apply is a worse way to learn this than a footer; **the schedule is the one part of the form
     that rebuilds itself**, keyed on the shape (`EVERY` vs `AT`) alone and never on the draft, with
@@ -29030,8 +29032,12 @@ existing prose was left alone.
     words drawn here (the core-words rule under `i18n.rs`), which the Status picker's `find` reads
     the pick back through — `english_names_every_event_status_as_core_does` holds English equal to
     core's. The local `bound_toggle` takes `String`s. The identifier and SQL placeholders
-    (`nightly_purge`, the `DELETE` example, `root@localhost`, the timestamp literal, `DAY`) stay;
-    `EventDraft::validate` and `name_clash`'s sentences are core's prose, phase 4.
+    (`nightly_purge`, the `DELETE` example, `root@localhost`, the timestamp literal, `DAY`) stay.
+    The footer's refusals and Preview's readiness read `EventDraft::problems` and `clashes`, not
+    their English wrappers `validate` and `name_clash`: `event_problem_text` words each problem
+    from `event-problem-*`, and `event_clash_text` the clash from `event-name-clash`, `$name` the
+    draft's trimmed name (the editors' refusals, under `i18n.rs`) — both held by
+    `english_says_every_event_problem_as_core_does`, the clash against `name_clash` itself.
   - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s
     `ObjectDraft`, and SQL Server's **sequence / synonym / alias type / XML schema collection**
     in the same modal. Reached from a tree object's **Edit**, from a database or schema node's
@@ -29249,8 +29255,10 @@ existing prose was left alone.
     `-extension-in` pair that take `$database` — where it had been `format!("Create {}",
     ContainerKind::label())` beside a separate *Create schema in {db}*: a sentence assembled from an
     English noun cannot be translated. `optional_field` takes its placeholder and note as `String`
-    for the same reason. The identifier placeholders (`database_name`, `extension_name`, …) stay,
-    and `DatabaseDraft::validate`'s errors are core's prose, phase 4.
+    for the same reason. The identifier placeholders (`database_name`, `extension_name`, …) stay.
+    The status line and Preview's readiness read `DatabaseDraft::problems`, worded by
+    `database_problem_text` from `database-problem-*` (the editors' refusals, under `i18n.rs`),
+    held by `english_says_every_database_problem_as_core_does`.
   - `account_editor.rs` — the Users and privileges browser's **write half**: two overlays in one
     module, `account_editor_overlay` (create an account, or reset one's password) and
     `grant_editor_overlay` (grant or
@@ -40737,7 +40745,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below) — though
     `read_only_reason`'s own sentence inside one still is — nor the filter field's two refusals
     (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is, nor the
-    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below).
+    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor the database, view
+    and event editors' refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`, below) —
+    the other drafts' `validate` sentences still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40967,6 +40977,29 @@ Re-introducing the anti-patterns these guard against is a regression:
     `core::users`), with `message()` the English and no `Display`. `users_view.rs` words them from
     `users-note-*`, joining sentences with a space in code as core does, held by
     `english_says_every_users_note_as_core_does`; the live tests read `message()`.
+    The object editors' refusals are the case where core's English has more readers than the
+    interface does, and the database, view and event editors are the first three; the shape below
+    is the one the remaining drafts are to take. A draft's `validate` stays core's English — still
+    a `Vec<String>`, because core's many tests (and the live ones) read it — and becomes a thin
+    wrapper over a typed
+    `problems()`, one enum per draft whose `message()` is that English byte for byte and which has
+    no `Display`. The editor words `problems()` from the catalogue and asks
+    `problems().is_empty()` for Preview's readiness, so these three editors no longer read
+    `validate` at all. `DatabaseDraft::problems` answers `DatabaseProblem` (`NoName`, `BadCollation`),
+    `ViewDraft::problems(dialect)` answers `ViewProblem` (`NoName`, `NoSelect`, `NotAQuery`,
+    `Materialized`, `Hidden`, `Verbatim`) — `view_not_editable_reason` now answering
+    `Option<ViewProblem>` (`Hidden`/`Verbatim`) where it answered a `&'static str`, while
+    `view_is_editable` still asks only `is_none()` — and `EventDraft::problems` answers
+    `EventProblem` (`NoName`, `NoTime`, `NoInterval`, `NoUnit`, `NoBody`). The event's name clash
+    is not a problem but a decision of its own: `EventDraft::clashes` is it, `name_clash` the
+    English `Option<String>` wrapped round it, and the editor words a clash from
+    `event-name-clash` with `$name` the draft's trimmed name. Each editor's renderer sits beside it
+    (`database_problem_text`, `view_problem_text`, `event_problem_text`/`event_clash_text`), held
+    by `english_says_every_database_problem_as_core_does`,
+    `english_says_every_view_problem_as_core_does` and
+    `english_says_every_event_problem_as_core_does`. Those tests walk a hand-written list of
+    variants rather than an `ALL`, so a new variant fails the renderer's exhaustive `match` at
+    compile time but is not held to its English until someone adds it to the list.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and

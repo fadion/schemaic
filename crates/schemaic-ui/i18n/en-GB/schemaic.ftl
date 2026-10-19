@@ -748,6 +748,13 @@ editor-change-count = { $n ->
 
 # $view is database.schema.view (or database.view).
 view-editor-title-edit = Edit view { $view }
+# What stops a view being emitted (core's ddl::ViewProblem), in the footer.
+view-problem-no-name = The view needs a name.
+view-problem-no-select = A view needs a SELECT to define it.
+view-problem-not-a-query = A view's body has to be a query — it starts with SELECT, WITH, VALUES or TABLE.
+view-problem-materialized = Schemaic can't edit a materialized view — PostgreSQL has no CREATE OR REPLACE for one.
+view-problem-hidden = This view's definition is encrypted or hidden from this login, so it can be removed here but not edited.
+view-problem-verbatim = This view's header says something Schemaic can't restate, so it can be removed here but not edited.
 # $location is the database, or database.schema.
 view-editor-title-create = Create view in { $location }
 view-editor-section-view = View
@@ -913,6 +920,10 @@ copy-table-stopped = Stopped before every row was copied. The table was created.
 ## Database, schema and extension editor
 
 database-editor-title-database = Create database
+# What stops a database or schema being created (core's ddl::DatabaseProblem),
+# in the form's status line.
+database-problem-no-name = The name can't be empty.
+database-problem-bad-collation = A collation name holds only letters, digits and underscores.
 database-editor-title-schema = Create schema
 database-editor-title-extension = Create extension
 # $database is the database the schema or extension goes into.
@@ -1098,6 +1109,14 @@ event-editor-definer = Definer
 event-editor-comment = Comment
 event-editor-reading-source = Reading the event's source…
 event-editor-source-stale = The event's real source arrived after you started typing, so this Body is built on the catalogue's copy — which isn't what the server holds. Close and reopen to edit it.
+# What stops an event being emitted (core's ddl::EventProblem), in the footer.
+event-problem-no-name = The event needs a name.
+event-problem-no-time = A one-off event needs a time to run at.
+event-problem-no-interval = A repeating event needs an interval.
+event-problem-no-unit = A repeating event needs an interval unit (DAY, HOUR…).
+event-problem-no-body = The event needs a body.
+# The draft's name is one an event in the same database already has.
+event-name-clash = An event called { $name } is already here.
 
 ## Routine editor
 

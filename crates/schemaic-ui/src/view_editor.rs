@@ -464,6 +464,20 @@ fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
     .into_any()
 }
 
+/// What stops the draft being emitted — core's `ViewProblem::message` in the
+/// interface's language.
+fn view_problem_text(p: ddl::ViewProblem) -> String {
+    use ddl::ViewProblem;
+    match p {
+        ViewProblem::NoName => tr!("view-problem-no-name"),
+        ViewProblem::NoSelect => tr!("view-problem-no-select"),
+        ViewProblem::NotAQuery => tr!("view-problem-not-a-query"),
+        ViewProblem::Materialized => tr!("view-problem-materialized"),
+        ViewProblem::Hidden => tr!("view-problem-hidden"),
+        ViewProblem::Verbatim => tr!("view-problem-verbatim"),
+    }
+}
+
 // ── the modal ────────────────────────────────────────────────────────────────
 
 /// The change set the draft currently describes — the same call the preview
@@ -573,9 +587,9 @@ pub(crate) fn view_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
                     let Some(status_target) = target else {
                         return empty().into_any();
                     };
-                    let errs = draft.validate(status_target.dialect);
+                    let errs = draft.problems(status_target.dialect);
                     if let Some(first) = errs.first() {
-                        return crate::widgets::footer_error(first.clone());
+                        return crate::widgets::footer_error(view_problem_text(*first));
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(tr!("editor-change-count", n = n))
@@ -602,7 +616,7 @@ pub(crate) fn view_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
                     };
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
-                    let ready = draft.validate(target.dialect).is_empty() && !cs.is_empty();
+                    let ready = draft.problems(target.dialect).is_empty() && !cs.is_empty();
                     h_stack((
                         action_button(
                             tr!("dialog-cancel"),
@@ -667,4 +681,25 @@ pub(crate) fn view_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every problem reads in English exactly as core's `ViewProblem::message`.
+    #[test]
+    fn english_says_every_view_problem_as_core_does() {
+        use ddl::ViewProblem;
+        for p in [
+            ViewProblem::NoName,
+            ViewProblem::NoSelect,
+            ViewProblem::NotAQuery,
+            ViewProblem::Materialized,
+            ViewProblem::Hidden,
+            ViewProblem::Verbatim,
+        ] {
+            assert_eq!(view_problem_text(p), p.message(), "{p:?}");
+        }
+    }
 }

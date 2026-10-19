@@ -666,6 +666,12 @@ editor-change-count = { $n ->
 ## View editor
 
 view-editor-title-edit = Sicht { $view } bearbeiten
+view-problem-no-name = Die Sicht braucht einen Namen.
+view-problem-no-select = Eine Sicht braucht ein SELECT, das sie definiert.
+view-problem-not-a-query = Der Rumpf einer Sicht muss eine Abfrage sein — er beginnt mit SELECT, WITH, VALUES oder TABLE.
+view-problem-materialized = Schemaic kann keine materialisierte Sicht bearbeiten — PostgreSQL hat dafür kein CREATE OR REPLACE.
+view-problem-hidden = Die Definition dieser Sicht ist verschlüsselt oder für diesen Login verborgen, daher kann sie hier entfernt, aber nicht bearbeitet werden.
+view-problem-verbatim = Der Kopf dieser Sicht enthält etwas, das Schemaic nicht wiedergeben kann, daher kann sie hier entfernt, aber nicht bearbeitet werden.
 view-editor-title-create = Sicht in { $location } erstellen
 view-editor-section-view = Sicht
 view-editor-section-definition = Definition
@@ -817,6 +823,8 @@ copy-table-stopped = Angehalten, bevor alle Zeilen kopiert waren. Die Tabelle wu
 ## Database, schema and extension editor
 
 database-editor-title-database = Datenbank erstellen
+database-problem-no-name = Der Name darf nicht leer sein.
+database-problem-bad-collation = Ein Sortierungsname enthält nur Buchstaben, Ziffern und Unterstriche.
 database-editor-title-schema = Schema erstellen
 database-editor-title-extension = Erweiterung erstellen
 database-editor-title-schema-in = Schema in { $database } erstellen
@@ -966,6 +974,12 @@ event-editor-status = Status
 event-editor-status-enabled = Aktiviert
 event-editor-status-disabled = Deaktiviert
 event-editor-status-replica = Auf dem Replikat deaktiviert
+event-problem-no-name = Das Ereignis braucht einen Namen.
+event-problem-no-time = Ein einmaliges Ereignis braucht einen Ausführungszeitpunkt.
+event-problem-no-interval = Ein wiederkehrendes Ereignis braucht ein Intervall.
+event-problem-no-unit = Ein wiederkehrendes Ereignis braucht eine Intervalleinheit (DAY, HOUR…).
+event-problem-no-body = Das Ereignis braucht einen Rumpf.
+event-name-clash = Ein Ereignis namens { $name } ist hier bereits vorhanden.
 event-editor-preserve = Nach Abschluss behalten
 event-editor-preserve-hint = ON COMPLETION PRESERVE. Aus ist MySQLs Vorgabe und bedeutet, dass der Server das Ereignis löscht, sobald sein letzter Lauf vorbei ist – bei einem einmaligen also gleich nach dem Lauf.
 event-editor-definer = Definer

@@ -848,6 +848,25 @@ fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
         .into_any()
 }
 
+/// What stops the draft being emitted — core's `EventProblem::message` in the
+/// interface's language.
+fn event_problem_text(p: ddl::EventProblem) -> String {
+    use ddl::EventProblem;
+    match p {
+        EventProblem::NoName => tr!("event-problem-no-name"),
+        EventProblem::NoTime => tr!("event-problem-no-time"),
+        EventProblem::NoInterval => tr!("event-problem-no-interval"),
+        EventProblem::NoUnit => tr!("event-problem-no-unit"),
+        EventProblem::NoBody => tr!("event-problem-no-body"),
+    }
+}
+
+/// The draft lands on an event already there — core's
+/// `EventDraft::name_clash` in the interface's language.
+fn event_clash_text(draft: &EventDraft) -> String {
+    tr!("event-name-clash", name = draft.info.name.trim())
+}
+
 // ── the modal ────────────────────────────────────────────────────────────────
 
 /// The change set the draft currently describes — the same call the preview
@@ -962,14 +981,12 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                     if stale {
                         return say(tr!("event-editor-source-stale"));
                     }
-                    let errs = draft.validate();
+                    let errs = draft.problems();
                     if let Some(first) = errs.first() {
-                        return say(first.clone());
+                        return say(event_problem_text(*first));
                     }
-                    if let Some(clash) =
-                        draft.name_clash(status_target.current.as_ref(), &taken_status)
-                    {
-                        return say(clash);
+                    if draft.clashes(status_target.current.as_ref(), &taken_status) {
+                        return say(event_clash_text(&draft));
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(tr!("editor-change-count", n = n))
@@ -1006,10 +1023,8 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                     // error is a worse way to find out than a footer.
                     let ready = !pending
                         && !stale
-                        && draft.validate().is_empty()
-                        && draft
-                            .name_clash(target.current.as_ref(), &taken_actions)
-                            .is_none()
+                        && draft.problems().is_empty()
+                        && !draft.clashes(target.current.as_ref(), &taken_actions)
                         && !cs.is_empty();
                     let subject = draft.info.name.clone();
                     h_stack((
@@ -1084,6 +1099,29 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every problem, and the name clash, read in English exactly as core's
+    /// `EventProblem::message` and `EventDraft::name_clash`.
+    #[test]
+    fn english_says_every_event_problem_as_core_does() {
+        use ddl::EventProblem;
+        for p in [
+            EventProblem::NoName,
+            EventProblem::NoTime,
+            EventProblem::NoInterval,
+            EventProblem::NoUnit,
+            EventProblem::NoBody,
+        ] {
+            assert_eq!(event_problem_text(p), p.message(), "{p:?}");
+        }
+        let mut draft = EventDraft::default();
+        draft.info.name = " nightly ".into();
+        let taken = vec!["nightly".to_string()];
+        assert_eq!(
+            Some(event_clash_text(&draft)),
+            draft.name_clash(None, &taken)
+        );
+    }
 
     /// English names every status as core's `EventStatus::label` does.
     #[test]

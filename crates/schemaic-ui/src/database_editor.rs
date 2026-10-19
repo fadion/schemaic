@@ -538,6 +538,15 @@ fn form(
         .into_any()
 }
 
+/// What stops the draft being applied — core's `DatabaseProblem::message` in
+/// the interface's language.
+fn database_problem_text(p: ddl::DatabaseProblem) -> String {
+    match p {
+        ddl::DatabaseProblem::NoName => tr!("database-problem-no-name"),
+        ddl::DatabaseProblem::BadCollation => tr!("database-problem-bad-collation"),
+    }
+}
+
 // ── the modal ────────────────────────────────────────────────────────────────
 
 /// Takes the two child bundles it reads rather than the root one: `DdlUi` for
@@ -605,8 +614,8 @@ pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl Into
             // appear.
             let status = dyn_container(
                 move || d.database_draft.get(),
-                move |draft| match draft.validate().pop() {
-                    Some(first) => text(first)
+                move |draft| match draft.problems().pop() {
+                    Some(first) => text(database_problem_text(first))
                         .style(|s| {
                             s.color(theme::error())
                                 .font_size(theme::font_label())
@@ -624,7 +633,7 @@ pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl Into
                 move |draft| {
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
-                    let ready = draft.validate().is_empty();
+                    let ready = draft.problems().is_empty();
                     h_stack((
                         action_button(
                             tr!("dialog-cancel"),
@@ -695,6 +704,17 @@ pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl Into
 mod tests {
     use super::*;
     use schemaic_core::intel::SqlDialect;
+
+    /// Both problems read in English exactly as core's `DatabaseProblem::message`.
+    #[test]
+    fn english_says_every_database_problem_as_core_does() {
+        for p in [
+            ddl::DatabaseProblem::NoName,
+            ddl::DatabaseProblem::BadCollation,
+        ] {
+            assert_eq!(database_problem_text(p), p.message(), "{p:?}");
+        }
+    }
 
     fn draft(name: &str) -> DatabaseDraft {
         DatabaseDraft::blank(name)
