@@ -87,7 +87,7 @@ assertions pin English wording — stays the regression net throughout.
    `connection_import.rs`, `blob_view.rs`, `erd_view.rs`, `server_vars_view.rs`,
    `snippet_edit.rs`, `plan_view.rs`, `used_by_view.rs`, `themes.rs` (its one pair, Dark and
    Light; `tooltip.rs` had nothing a user reads), `markdown.rs`, `cell_editors.rs`,
-   `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`, `grid.rs`; and, ahead
+   `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`, `grid.rs`, `lib.rs`; and, ahead
    of their files, the three
    workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
    `editor_pane.rs`'s query header (`query-*`) — and `editor_pane.rs`'s two *Rename alias* /
@@ -103,8 +103,10 @@ assertions pin English wording — stays the regression net throughout.
    tree's menus and panel under
    `tree-*`. `section_title` and `loading_dots` take owned text now, so the other panels'
    headings can follow.
-   **Where it stands** (2026-10-19): every small file is done, and so is `grid.rs` (six
-   sections, `grid-*`); the next session starts on `lib.rs`. A large file goes **a section at
+   **Where it stands** (2026-10-19): every small file is done, and so are `grid.rs` (six
+   sections, `grid-*`) and `lib.rs` (seven: `footer-*`, `lib-*`, `header-*`, `colour-*`,
+   `disk-*`, `results-*`, `search-everywhere-placeholder`); the next session starts on
+   `widgets.rs`. A large file goes **a section at
    a time** — a function or a cluster of them — committed per section as
    `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded on the
    *Within the large files* line below, so the next session knows where to pick up without
@@ -113,22 +115,16 @@ assertions pin English wording — stays the regression net throughout.
    `SQL VALUES`/`UPDATE`/`WHERE IN`), the export formats' names, and core's prose — the row
    phrase in the status line (`stats::rows_read_clause`), the attach scope
    (`model::attach_scope_label`), the export notes and the "the clipboard" / "the file" they
-   name, the lock-wait sentence, the duplicate prompt — which is phase 4's.
-   **Within the large files:** beyond the headers and openers named above, `lib.rs`'s status
-   bar (`footer`, `footer-*`: the panel toggles and their narrow-window tip, the editor's
-   segments, the transaction controls — the interface's own `tx_mode_label` and `tx_pill_text`
-   for core's — and CPU/RAM); its shared words (`lib-*`: a new tab's *Query N*, a result's
-   *Result N*, `ai_off_note()` — the app's AI refusals read it too — and `TestLine::text`);
-   the settings choices it defines (`AiEffort`, `SchemaScope`, `TermCursor`'s `label`, which
-   Settings' dropdowns read; their persisted keys stay); the header and its disconnected
-   notice (`header-*`) and the identity colours' names (`colour-*`; `CONN_COLOR_PRESETS`
-   stays `const`, its names `fn() -> String`); the changed-on-disk banner (`disk-*`) and the
-   results area's run hint, failed and cancelled lines (`results-run-hint` and the two after
-   it); the results strip — the pinned total, a chip's tooltip and its menu
-   (`results-pinned-*`, `results-chip-*`, `results-menu-*`).
-   Nothing yet in `widgets.rs` or `editor_pane.rs`.
-   **Left, in order** — delete a name as its file lands: the three large files' remainders,
-   `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
+   name, the lock-wait sentence, the duplicate prompt — which is phase 4's. What `lib.rs`
+   leaves: persisted keys, font names, the terminal's escape sequences, and
+   `ContainerKind::label`, which nothing calls since the database editor drew its own words.
+   Two of its conversions reach other files: `ai_off_note()` (once the `AI_OFF_NOTE` const) is
+   read by the app crate's AI refusals, and `CONN_COLOR_PRESETS` stays `const` with its names
+   as `fn() -> String`.
+   **Within the large files:** nothing yet in `widgets.rs` or `editor_pane.rs` beyond the
+   headers and openers named above.
+   **Left, in order** — delete a name as its file lands: the two large files' remainders,
+   `widgets.rs` and `editor_pane.rs`, each more than one session; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,
    `agent_cli.rs`, `antigravity.rs`), whose first file settles how it reaches the loader
    (above). A file with

@@ -13585,7 +13585,7 @@ pub(crate) fn search_box(
     edit_field(
         query,
         FieldCfg {
-            placeholder: "Search everywhere",
+            placeholder_of: Some(Rc::new(|| tr!("search-everywhere-placeholder"))),
             autofocus: true,
             font_size: palette_font,
             border_radius: 8.0,

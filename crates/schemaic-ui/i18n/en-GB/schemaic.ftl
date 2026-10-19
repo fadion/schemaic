@@ -2190,3 +2190,7 @@ results-menu-close = Close
 results-menu-compare-with = Compare with { $result }
 results-menu-close-others = Close other results
 results-menu-close-all = Close all results
+
+## Find Anywhere's search field (lib.rs's search_box).
+
+search-everywhere-placeholder = Search everywhere
