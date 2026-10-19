@@ -1160,7 +1160,7 @@ fn plan_refused(plan_state: RwSignal<PlanState>, moved_on: &Rc<dyn Fn()>) -> Rc<
         if why == Refusal::TabMovedOn {
             (moved_on)();
         }
-        plan_state.set(PlanState::Failed(plan_refusal_text(why).to_string()));
+        plan_state.set(PlanState::Failed(plan_refusal_text(why)));
     })
 }
 
@@ -1171,21 +1171,11 @@ fn plan_refused(plan_state: RwSignal<PlanState>, moved_on: &Rc<dyn Fn()>) -> Rc<
 /// `plan_state` (its `db_for` failure, its timeout — whose own comment says
 /// "nothing is coming to replace this state"), and these two are the exits that
 /// happen before `run_plan` is reached at all.
-fn plan_refusal_text(why: Refusal) -> &'static str {
+fn plan_refusal_text(why: Refusal) -> String {
     match why {
-        Refusal::NotConnected => {
-            "Not connected — the plan was not run. The server didn't answer the \
-             health check, so nothing was sent to it."
-        }
-        Refusal::ConnectionChanged => {
-            "You switched connection while Schemaic was checking that it was \
-             reachable, so the plan was not run. Switch back and ask again."
-        }
-        Refusal::TabMovedOn => {
-            "You switched tabs while the connection was being re-checked, so the \
-             plan was not run. It describes the tab it was asked from — go back \
-             to that tab and ask again."
-        }
+        Refusal::NotConnected => tr!("gate-plan-not-connected"),
+        Refusal::ConnectionChanged => tr!("gate-plan-connection-changed"),
+        Refusal::TabMovedOn => tr!("gate-plan-tab-moved-on"),
     }
 }
 
@@ -9146,7 +9136,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         .find(|c| c.id == active_conn.get_untracked())
                         .map(|c| c.name.clone())
                 })
-                .unwrap_or_else(|| "this connection".to_string());
+                .unwrap_or_else(|| tr!("gate-this-connection"));
             (check_conn_then)(Some(Rc::new(move |answer: CheckAnswer| {
                 // **The connection moved out from under the action.** Refusing
                 // is right — running it would send it to a server the user has
@@ -9156,10 +9146,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // `PlanState::Running` before the gate sees it, span for ever.
                 // `refused()` is what puts that state machine back.
                 if answer == CheckAnswer::ConnectionChanged {
-                    error_modal_text.set(Some(ModalError::app(format!(
-                        "Didn't run against {name} — you switched connection while \
-                         Schemaic was checking that it was reachable. Switch back \
-                         and try again."
+                    error_modal_text.set(Some(ModalError::app(tr!(
+                        "gate-connection-changed",
+                        name = name.clone()
                     ))));
                     error_modal_open.set(true);
                     refused(Refusal::ConnectionChanged);
@@ -9178,10 +9167,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // silently do nothing.
                     // Schemaic's sentence, not the server's: it carries no
                     // server text for "Explain" to work from.
-                    error_modal_text.set(Some(ModalError::app(format!(
-                        "Not connected to {name}. The server didn't answer — check \
-                         that it's running and that this connection's settings are \
-                         right."
+                    error_modal_text.set(Some(ModalError::app(tr!(
+                        "gate-not-connected",
+                        name = name.clone()
                     ))));
                     error_modal_open.set(true);
                     refused(Refusal::NotConnected);
@@ -9239,12 +9227,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // the defect, and running *nothing* silently is how the defect went
     // unnoticed for as long as it did.
     let run_moved_on: Rc<dyn Fn()> = Rc::new(move || {
-        error_modal_text.set(Some(ModalError::app(
-            "You switched tabs while the connection was being re-checked, so the \
-             statement was not run. It was checked against the tab it was typed \
-             in, and running it here would run it somewhere else. Go back to that \
-             tab and run it again.",
-        )));
+        error_modal_text.set(Some(ModalError::app(tr!("gate-run-tab-moved-on"))));
         error_modal_open.set(true);
     });
     // The connection-gated but *unguarded* pair. Only the two wrappers below and
@@ -14693,8 +14676,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     if conn_status.get_untracked().is_down() {
                         (g)(Rc::new(|| {}));
                         done(schemaic_core::model::CommitDone::Failed(ModalError::app(
-                            "Not connected — the commit was not attempted. Staged \
-                             edits are kept.",
+                            tr!("gate-commit-not-connected"),
                         )));
                         return;
                     }

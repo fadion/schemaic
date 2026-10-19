@@ -2304,3 +2304,17 @@ install-remove = Couldn't remove { $path }: { $error }
 # Asked of the wrong platform's install, which the Settings row never offers.
 install-path-is-windows = A user PATH entry is a Windows install; this platform links instead.
 install-link-is-unix = Linking the command is a macOS and Linux install.
+
+## The connection gate's refusals (main.rs) — what a run, a query plan or a
+## grid commit says when the check that the server is reachable stops it.
+
+gate-plan-not-connected = Not connected — the plan was not run. The server didn't answer the health check, so nothing was sent to it.
+gate-plan-connection-changed = You switched connection while Schemaic was checking that it was reachable, so the plan was not run. Switch back and ask again.
+gate-plan-tab-moved-on = You switched tabs while the connection was being re-checked, so the plan was not run. It describes the tab it was asked from — go back to that tab and ask again.
+# $name is the connection's name, or gate-this-connection.
+gate-connection-changed = Didn't run against { $name } — you switched connection while Schemaic was checking that it was reachable. Switch back and try again.
+gate-not-connected = Not connected to { $name }. The server didn't answer — check that it's running and that this connection's settings are right.
+# Stands in for $name above when the connection has no name to give.
+gate-this-connection = this connection
+gate-run-tab-moved-on = You switched tabs while the connection was being re-checked, so the statement was not run. It was checked against the tab it was typed in, and running it here would run it somewhere else. Go back to that tab and run it again.
+gate-commit-not-connected = Not connected — the commit was not attempted. Staged edits are kept.
