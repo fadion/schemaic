@@ -26,7 +26,9 @@
 
 use std::path::{Path, PathBuf};
 
-use schemaic_core::dump::{DumpOutcome, DumpProgress, DumpRequest, FilesOutcome, FilesRequest};
+use schemaic_core::dump::{
+    DumpOutcome, DumpProgress, DumpRequest, ExportFailure, FilesOutcome, FilesRequest,
+};
 use schemaic_core::dump::{DumpStep, DumpVerdict, ReadEnd, WriteEnd, dump_verdict, plan};
 use schemaic_core::export::{ExportFormat, ExportTally, PullChunks};
 use schemaic_db::{Db, DbError, ExportChunk};
@@ -40,22 +42,29 @@ use tokio_util::sync::CancellationToken;
 /// the user "the rows that were written are in shop.sql.part" about a file that
 /// had never been opened.
 ///
-/// `From<String>` is what makes this cheap: every later `?` in a writer is a
-/// failure *after* the create, so it converts with `opened: true` and no site
-/// changes.
+/// `From<ExportFailure>` is what makes this cheap: every later `?` in a writer
+/// is a failure *after* the create, so it converts with `opened: true` and no
+/// site changes.
 #[derive(Clone, Debug)]
 pub(crate) struct WriteFail {
-    pub message: String,
+    pub message: ExportFailure,
     pub opened: bool,
 }
 
-impl From<String> for WriteFail {
-    fn from(message: String) -> Self {
+impl From<ExportFailure> for WriteFail {
+    fn from(message: ExportFailure) -> Self {
         WriteFail {
             message,
             opened: true,
         }
     }
+}
+
+/// An error in its own words, as the failure a writer or the read reports —
+/// the one spelling of "Export failed: {e}", whose words are core's
+/// (`ExportFailure`'s `Display`) or the interface's.
+fn failed_with(e: impl std::fmt::Display) -> ExportFailure {
+    ExportFailure::Failed(e.to_string())
 }
 
 /// What the writer task is fed, in file order.
@@ -102,7 +111,7 @@ pub async fn run(
     progress: Progress,
     chunk_rows: usize,
 ) -> DumpOutcome {
-    let failed = |message: String, partial: bool| DumpOutcome::Failed { message, partial };
+    let failed = |message: ExportFailure, partial: bool| DumpOutcome::Failed { message, partial };
     // Read in the zone the file replays in (`dump::literal_mode_guard_sql`),
     // so a MySQL `TIMESTAMP` — a row's, or a column default `SHOW CREATE`
     // prints in the session's zone — is the instant it was (`Db::for_rows`).
@@ -122,7 +131,7 @@ pub async fn run(
         // spawned thirty lines below, so nothing has been created and the note
         // must not point at a `.part` that does not exist.
         Err(DbError::Cancelled) => return DumpOutcome::Cancelled { partial: false },
-        Err(e) => return failed(format!("Export failed: {e}"), false),
+        Err(e) => return failed(failed_with(e), false),
     };
     // **What a replay's drops take besides the objects** — owners, grants,
     // row security — read only for a file that drops, so the file can put
@@ -139,10 +148,7 @@ pub async fn run(
     }
     let dump = plan(&schema, &req.database, &req.tables, req.opts, req.dialect);
     if dump.steps.is_empty() {
-        return failed(
-            "Nothing to export — no table matched the selection.".to_string(),
-            false,
-        );
+        return failed(ExportFailure::NothingMatched, false);
     }
 
     let (path, part) = (req.path.clone(), part_of(&req.path));
@@ -309,7 +315,7 @@ pub async fn run_files(
         }
         Err(e) => {
             return FilesOutcome::Failed {
-                message: format!("Export failed: {e}"),
+                message: failed_with(e),
                 files: 0,
                 missing: Vec::new(),
                 replaced: Vec::new(),
@@ -325,7 +331,7 @@ pub async fn run_files(
     );
     if plan.files.is_empty() {
         return FilesOutcome::Failed {
-            message: "Nothing to export — no table matched the selection.".to_string(),
+            message: ExportFailure::NothingMatched,
             files: 0,
             replaced: Vec::new(),
             // The interesting case for this arm: every ticked table went missing
@@ -459,8 +465,8 @@ pub async fn run_files(
         // **`dump_verdict`, not a second copy of it.** These five arms were
         // written out again here, and the copy diverged in the one arm the
         // extraction exists to protect: `WriteEnd::Failed` carries the writer's
-        // own words, which already begin "Export failed:", and re-prefixing them
-        // produced "Export failed: Export failed: No space left on device (os
+        // own failure, which already says it failed (an `ExportFailure`), and
+        // re-prefixing its words produced "Export failed: Export failed: No space left on device (os
         // error 28) — 3 files already written to out are kept."
         //
         // The writer's refusal to publish a truncated file is folded into the
@@ -550,7 +556,7 @@ fn write_one(
         Ok(f) => std::io::BufWriter::new(f),
         Err(e) => {
             return Err(WriteFail {
-                message: format!("Export failed: {e}"),
+                message: failed_with(e),
                 opened: false,
             });
         }
@@ -574,15 +580,15 @@ fn write_one(
             Some((source.0.as_str(), source.1.as_deref(), source.2.as_str())),
             dialect,
         )
-        .map_err(|e| format!("Export failed: {e}"))?;
-    w.flush().map_err(|e| format!("Export failed: {e}"))?;
+        .map_err(failed_with)?;
+    w.flush().map_err(failed_with)?;
     drop(w);
     // **Only now** does the file appear under its real name — and not at all if
     // this was cancelled. See `write`: a cancel reaches here as an ordinary end
     // of stream, so publishing first and declaring the cancel afterwards would
     // leave a truncated table looking exactly like a finished one.
     if token.is_cancelled() {
-        return Err("Export cancelled.".to_string().into());
+        return Err(ExportFailure::Cancelled.into());
     }
     std::fs::rename(part, path).map_err(|e| {
         // **It must not point at the `.part`.** This message used to say "the
@@ -590,10 +596,10 @@ fn write_one(
         // deletes that file three lines later — so the one sentence telling the
         // user where their rows were named a path that no longer existed by the
         // time they read it.
-        format!(
-            "Export failed: {} could not be published: {e}",
-            path.display()
-        )
+        ExportFailure::NotPublished {
+            path: path.display().to_string(),
+            error: e.to_string(),
+        }
     })?;
     Ok(tally)
 }
@@ -613,7 +619,7 @@ fn write(
         Ok(f) => std::io::BufWriter::new(f),
         Err(e) => {
             return Err(WriteFail {
-                message: format!("Export failed: {e}"),
+                message: failed_with(e),
                 opened: false,
             });
         }
@@ -628,7 +634,7 @@ fn write(
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             Msg::Text(sql) => {
-                writeln!(w, "{sql}\n").map_err(|e| format!("Export failed: {e}"))?;
+                writeln!(w, "{sql}\n").map_err(failed_with)?;
             }
             Msg::Table {
                 source,
@@ -652,15 +658,15 @@ fn write(
                     &server,
                     dialect,
                 )
-                .map_err(|e| format!("Export failed: {e}"))?;
+                .map_err(failed_with)?;
                 // The fold is `ExportTally::absorb`'s, beside `note`, which
                 // answers the same question one level down.
                 total.absorb(tally);
-                writeln!(w).map_err(|e| format!("Export failed: {e}"))?;
+                writeln!(w).map_err(failed_with)?;
             }
         }
     }
-    w.flush().map_err(|e| format!("Export failed: {e}"))?;
+    w.flush().map_err(failed_with)?;
     drop(w);
     // **Only now** does the destination change — and not at all if this was
     // cancelled. A cancel arrives as an ordinary end of stream, so the check has
@@ -668,14 +674,12 @@ fn write(
     // would rename a truncated file over the user's, which is the whole reason
     // the sibling exists.
     if token.is_cancelled() {
-        return Err("Export cancelled.".to_string().into());
+        return Err(ExportFailure::Cancelled.into());
     }
-    std::fs::rename(part, path).map_err(|e| {
-        format!(
-            "The export wrote {} but could not rename it to {}: {e}",
-            part.display(),
-            path.display()
-        )
+    std::fs::rename(part, path).map_err(|e| ExportFailure::NotRenamed {
+        part: part.display().to_string(),
+        path: path.display().to_string(),
+        error: e.to_string(),
     })?;
     Ok(total)
 }

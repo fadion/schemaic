@@ -2626,13 +2626,21 @@ file-reload-title = Reload from disk
 file-reload-unsaved = “{ $name }” has unsaved changes. Reloading discards them. Reload anyway?
 
 ## The export and dump runners' failures, and a binary cell's load and save
-## (main.rs). The dump's own failures from schemaic-cli stay English for now.
-## $error is the operating system's, the engine's or the writer's own text.
+## (main.rs), and the dump writers' (core's ExportFailure, worded in
+## dump_view.rs; English must read exactly as its Display). $error is the
+## operating system's, the engine's or the writer's own text.
 
 export-already-running = An export is already running. Cancel it or wait for it to finish.
 export-failed = Export failed: { $error }
 # The background task writing the file stopped without an answer.
 export-worker-died = Export failed: worker died: { $error }
+# A folder export's table file could not be renamed into place; $path is it.
+export-not-published = Export failed: { $path } could not be published: { $error }
+# A dump's finished .part file ($part) could not be renamed over $path.
+export-not-renamed = The export wrote { $part } but could not rename it to { $path }: { $error }
+export-nothing-matched = Nothing to export — no table matched the selection.
+# Stopped by the user just before the file was put in place.
+export-stopped = Export cancelled.
 dump-failed = Dump failed: { $error }
 # $size is the file's size, $most the cap, both as the app writes a size (64 MB).
 blob-load-too-large = That file is { $size } — the most that can be loaded is { $most }.

@@ -5466,7 +5466,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // Refused before the write, so it must not claim a file
                         // it never touched.
                         return (done)(DumpOutcome::Failed {
-                            message: tr!("dump-failed", error = e.to_string()),
+                            message: schemaic_core::dump::ExportFailure::Worded(tr!(
+                                "dump-failed",
+                                error = e.to_string()
+                            )),
                             partial: false,
                         });
                     }
@@ -5523,7 +5526,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // message must not send the user to a folder nothing was
                         // written to.
                         return (done)(FilesOutcome::Failed {
-                            message: tr!("export-failed", error = e.to_string()),
+                            message: schemaic_core::dump::ExportFailure::Worded(tr!(
+                                "export-failed",
+                                error = e.to_string()
+                            )),
                             files: 0,
                             // Refused before a plan existed, so nothing is known
                             // to be missing — `missing` is the plan's answer —

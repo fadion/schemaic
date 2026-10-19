@@ -78,13 +78,18 @@ assertions pin English wording — stays the regression net throughout.
    renders; core keeps an English rendering for the CLI and MCP. **The shape is settled**
    (reviewed 2026-10-19): an enum per area, its fields the message's arguments, one `tr!` arm
    per variant, core's `message()`/`Display` kept as the English and a test holding the two
-   equal; a list is joined UI-side before it is handed in. The renderer lives beside the code
+   equal; a list is joined UI-side before it is handed in. Where core's function already takes
+   only plain values (a name, a count, a flag, a list), no type is needed: the renderer takes
+   the same arguments and the test holds the two equal. The renderer lives beside the code
    that shows it, `ui/i18n.rs` holding only the ones used across files. Done for
    `AliasRenameRefusal`, `ParamError`, `cli_install` (`Refusal`, `Report`, `RowHint`),
    `stats::RowsRead`, `model::AttachScope`, `script::RestoreRefusal` and
    `persist::TimeoutSpan`, and the activity panel's state words and counts line (core handed
    the words through `activity::matches_query_with`, since the search box matches them) and its
-   lock-wait card (`activity::LockWait`, one message with a selector per optional part).
+   lock-wait card (`activity::LockWait`, one message with a selector per optional part), and
+   every export outcome: the single-file notes (`export::ExportNote`, `SqlCopyNote`), the dump
+   and folder notes (plain arguments, `dump_view`) and the writers' failures
+   (`dump::ExportFailure`, carried through the writer threads to the modal).
    **`launch::*`'s refusals take a session of their own**: the largest group, and propagated
    through `?` inside the command builders, so the typed refusal reaches into them. Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
@@ -106,10 +111,9 @@ assertions pin English wording — stays the regression net throughout.
    `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
    like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
-   unchanged today is this phase's list to work from: `launch::*`'s refusals, the grid's export
-   notes — and
-   one that is not core's but needs the same split: `schemaic-cli`'s `dump.rs` "Export failed: …"
-   lines, which the dump modal shows and the headless CLI shares.
+   unchanged today is this phase's list to work from: `launch::*`'s refusals, `format_bytes`,
+   `KeywordCase::label`, the dump modal's `dump::drop_before_create_hint` and `fk_guard_hint`,
+   and `history::finished_note`'s notification titles ("Export failed", "Query failed").
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).

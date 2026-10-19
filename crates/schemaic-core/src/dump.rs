@@ -44,6 +44,8 @@
 //! no `ALTER TABLE … ADD CONSTRAINT` to add them with. The question is asked of
 //! the *table*, not of the engine — the data answers it directly.
 
+use std::fmt;
+
 use crate::ddl::{Change, ChangeSet, ObjectKind};
 use crate::export::{ExportFormat, export_file_names, ident_sql, qualified_table};
 use crate::intel::SqlDialect;
@@ -226,9 +228,63 @@ pub enum WriteEnd {
     /// *before* any fragment exists — and the note told the user "the rows that
     /// were written are in shop.sql.part" about a file that had never been
     /// opened, on the one arm where they are least likely to look twice.
-    Failed { message: String, opened: bool },
+    Failed {
+        message: ExportFailure,
+        opened: bool,
+    },
     /// The worker task itself did not come back.
     Died(String),
+}
+
+/// Why a dump or a folder export stopped short — the writer's account, the
+/// reader's, or the run's before either started. The interface words each
+/// variant itself; [`fmt::Display`] is the English the CLI's report and the
+/// tests read.
+///
+/// **Every variant already says it failed**, so nothing that shows one adds
+/// a prefix of its own: a second "Export failed:" has shipped once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportFailure {
+    /// A disk, permission, render or server error, in its own words.
+    Failed(String),
+    /// The worker task did not come back.
+    WorkerDied(String),
+    /// A folder export's table file could not be renamed into place.
+    NotPublished { path: String, error: String },
+    /// A dump's `.part` file could not be renamed over the destination.
+    NotRenamed {
+        part: String,
+        path: String,
+        error: String,
+    },
+    /// The selection named no table the database has.
+    NothingMatched,
+    /// Stopped just before the rename.
+    Cancelled,
+    /// A sentence the interface has already worded — a refusal before the run
+    /// began. The CLI never builds one.
+    Worded(String),
+}
+
+impl fmt::Display for ExportFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExportFailure::Failed(e) => write!(f, "Export failed: {e}"),
+            ExportFailure::WorkerDied(e) => write!(f, "Export failed: worker died: {e}"),
+            ExportFailure::NotPublished { path, error } => {
+                write!(f, "Export failed: {path} could not be published: {error}")
+            }
+            ExportFailure::NotRenamed { part, path, error } => write!(
+                f,
+                "The export wrote {part} but could not rename it to {path}: {error}"
+            ),
+            ExportFailure::NothingMatched => {
+                f.write_str("Nothing to export — no table matched the selection.")
+            }
+            ExportFailure::Cancelled => f.write_str("Export cancelled."),
+            ExportFailure::Worded(s) => f.write_str(s),
+        }
+    }
 }
 
 /// What to report about a finished dump.
@@ -250,7 +306,7 @@ pub enum DumpVerdict {
     },
     /// `partial` means a `.part` fragment is on disk and worth naming.
     Failed {
-        message: String,
+        message: ExportFailure,
         partial: bool,
     },
 }
@@ -273,7 +329,7 @@ pub fn dump_verdict(read: ReadEnd, write: WriteEnd) -> DumpVerdict {
     // `true` for every failure while its own doc says it "means a `.part`
     // fragment is on disk and worth naming" — a claim the code never made. The
     // writer is the only thing that knows, so it says.
-    let failed = |message: String, partial: bool| DumpVerdict::Failed { message, partial };
+    let failed = |message: ExportFailure, partial: bool| DumpVerdict::Failed { message, partial };
     match (read, write) {
         // The writer is the only thing that knows whether a fragment exists —
         // the same rule `partial` follows on the `Failed` arms. `Wrote` reaches
@@ -285,10 +341,10 @@ pub fn dump_verdict(read: ReadEnd, write: WriteEnd) -> DumpVerdict {
         (ReadEnd::Cancelled, _) => DumpVerdict::Cancelled { partial: true },
         (_, WriteEnd::Failed { message, opened }) => failed(message, opened),
         // The worker died mid-run, so whatever it had opened is still there.
-        (_, WriteEnd::Died(e)) => failed(format!("Export failed: worker died: {e}"), true),
+        (_, WriteEnd::Died(e)) => failed(ExportFailure::WorkerDied(e), true),
         // The *reader* failed, which means the writer was running and had its
         // file.
-        (ReadEnd::Failed(e), _) => failed(format!("Export failed: {e}"), true),
+        (ReadEnd::Failed(e), _) => failed(ExportFailure::Failed(e), true),
         (ReadEnd::Clean, WriteEnd::Wrote) => DumpVerdict::Done,
     }
 }
@@ -925,6 +981,9 @@ pub fn done_note(
         "Wrote {tables} {}.",
         crate::text::plural(tables, "table", "tables")
     )];
+    // **`export_note` does not end its own sentence** — its single-file caller
+    // is the last clause of one — so it is ended here, as `files_note` ends
+    // it; the next sentence ran on into it.
     parts.extend(
         export_note
             .map(str::trim)
@@ -976,9 +1035,6 @@ pub fn done_note(
 /// and a PostgreSQL table in `sales` is `schema "sales" does not exist`.
 /// `mysqldump --databases` emits the same `CREATE DATABASE IF NOT EXISTS`, for
 /// the same reason.
-    // **`export_note` does not end its own sentence** — its single-file caller
-    // is the last clause of one — so it is ended here, as `files_note` ends
-    // it; the next sentence ran on into it.
 ///
 /// `IF NOT EXISTS` throughout, because the *other* use case — replaying onto the
 /// database it came from — must not start with an error either.
@@ -4441,7 +4497,7 @@ pub enum FilesOutcome {
     /// empty, and a message that did not say so would send the user looking for
     /// nothing.
     Failed {
-        message: String,
+        message: ExportFailure,
         files: usize,
         missing: Vec<String>,
         replaced: Vec<String>,
@@ -4508,11 +4564,9 @@ pub enum DumpOutcome {
     /// here before `part_of` is computed and before the writer is spawned, so
     /// nothing was ever created — and the modal's sentence was unconditional,
     /// sending the user to look for a `shop.sql.part` that is not there.
-    Cancelled {
-        partial: bool,
-    },
+    Cancelled { partial: bool },
     Failed {
-        message: String,
+        message: ExportFailure,
         partial: bool,
     },
 }
@@ -8234,7 +8288,7 @@ mod tests {
         for write in [
             WriteEnd::Wrote,
             WriteEnd::Failed {
-                message: "disk full".to_string(),
+                message: ExportFailure::Failed("disk full".to_string()),
                 opened: true,
             },
             WriteEnd::Died("panic".to_string()),
@@ -8256,7 +8310,7 @@ mod tests {
             dump_verdict(
                 ReadEnd::Cancelled,
                 WriteEnd::Failed {
-                    message: "permission denied".to_string(),
+                    message: ExportFailure::Failed("permission denied".to_string()),
                     opened: false,
                 }
             ),
@@ -8266,7 +8320,7 @@ mod tests {
             dump_verdict(
                 ReadEnd::Cancelled,
                 WriteEnd::Failed {
-                    message: "disk full".to_string(),
+                    message: ExportFailure::Failed("disk full".to_string()),
                     opened: true,
                 }
             ),
@@ -8326,12 +8380,12 @@ mod tests {
             dump_verdict(
                 ReadEnd::Clean,
                 WriteEnd::Failed {
-                    message: "Export failed: Access is denied. (os error 5)".to_string(),
+                    message: ExportFailure::Failed("Access is denied. (os error 5)".to_string()),
                     opened: false,
                 }
             ),
             DumpVerdict::Failed {
-                message: "Export failed: Access is denied. (os error 5)".to_string(),
+                message: ExportFailure::Failed("Access is denied. (os error 5)".to_string()),
                 partial: false,
             }
         );
@@ -8341,12 +8395,12 @@ mod tests {
             dump_verdict(
                 ReadEnd::Clean,
                 WriteEnd::Failed {
-                    message: "Export failed: disk full".to_string(),
+                    message: ExportFailure::Failed("disk full".to_string()),
                     opened: true,
                 }
             ),
             DumpVerdict::Failed {
-                message: "Export failed: disk full".to_string(),
+                message: ExportFailure::Failed("disk full".to_string()),
                 partial: true,
             }
         );
@@ -8362,12 +8416,12 @@ mod tests {
             dump_verdict(
                 ReadEnd::Failed("connection reset".to_string()),
                 WriteEnd::Failed {
-                    message: "Export failed: disk full".to_string(),
+                    message: ExportFailure::Failed("disk full".to_string()),
                     opened: true,
                 }
             ),
             DumpVerdict::Failed {
-                message: "Export failed: disk full".to_string(),
+                message: ExportFailure::Failed("disk full".to_string()),
                 partial: true,
             }
         );
@@ -8375,7 +8429,7 @@ mod tests {
         assert_eq!(
             dump_verdict(ReadEnd::Clean, WriteEnd::Died("panicked".to_string())),
             DumpVerdict::Failed {
-                message: "Export failed: worker died: panicked".to_string(),
+                message: ExportFailure::WorkerDied("panicked".to_string()),
                 partial: true,
             }
         );
@@ -8386,9 +8440,49 @@ mod tests {
                 WriteEnd::Wrote
             ),
             DumpVerdict::Failed {
-                message: "Export failed: connection reset".to_string(),
+                message: ExportFailure::Failed("connection reset".to_string()),
                 partial: true,
             }
+        );
+    }
+
+    /// **Each failure says once that it failed**, in the words the CLI prints
+    /// and the interface's English is held to — so nothing that shows one adds
+    /// a prefix of its own.
+    #[test]
+    fn every_export_failure_reads_as_it_did() {
+        let said = |f: ExportFailure| f.to_string();
+        assert_eq!(
+            said(ExportFailure::Failed("disk full".into())),
+            "Export failed: disk full"
+        );
+        assert_eq!(
+            said(ExportFailure::WorkerDied("panicked".into())),
+            "Export failed: worker died: panicked"
+        );
+        assert_eq!(
+            said(ExportFailure::NotPublished {
+                path: "out/orders.csv".into(),
+                error: "Access is denied.".into()
+            }),
+            "Export failed: out/orders.csv could not be published: Access is denied."
+        );
+        assert_eq!(
+            said(ExportFailure::NotRenamed {
+                part: "shop.sql.part".into(),
+                path: "shop.sql".into(),
+                error: "in use".into()
+            }),
+            "The export wrote shop.sql.part but could not rename it to shop.sql: in use"
+        );
+        assert_eq!(
+            said(ExportFailure::NothingMatched),
+            "Nothing to export — no table matched the selection."
+        );
+        assert_eq!(said(ExportFailure::Cancelled), "Export cancelled.");
+        assert_eq!(
+            said(ExportFailure::Worded("Dump failed: x".into())),
+            "Dump failed: x"
         );
     }
 
@@ -9446,6 +9540,29 @@ mod tests {
         );
     }
 
+    /// **The export's note ends its own sentence here**, as `files_note`'s
+    /// does: `export_note` writes none, because its single-file caller is the
+    /// last clause of one, and the next sentence ran on — "…those cells are
+    /// empty 1 ticked table not found…". Asked of `export_note`'s real output,
+    /// since the fixture above already ended in a full stop and hid it.
+    #[test]
+    fn the_export_note_is_a_sentence_of_its_own_in_the_done_note() {
+        let tally = crate::export::ExportTally {
+            rows: 115_000,
+            withheld: vec!["avatar".into()],
+            ..Default::default()
+        };
+        let export = crate::export::export_note(&tally, "shop.sql", true);
+        let none: [String; 0] = [];
+        let alone = done_note(2, export.as_deref(), &none, &none, &none, &none);
+        assert!(alone.ends_with("those cells are empty."), "{alone}");
+        let followed = done_note(2, export.as_deref(), &["ghost".into()], &none, &none, &none);
+        assert!(
+            followed.contains("those cells are empty. 1 ticked table"),
+            "{followed}"
+        );
+    }
+
     /// A SQL Server function in `dbo`, for the ordering tests below.
     fn tsql_function(
         name: &str,
@@ -9497,29 +9614,6 @@ mod tests {
         let file = file_of(&plan(
             &s,
             "shop",
-    /// **The export's note ends its own sentence here**, as `files_note`'s
-    /// does: `export_note` writes none, because its single-file caller is the
-    /// last clause of one, and the next sentence ran on — "…those cells are
-    /// empty 1 ticked table not found…". Asked of `export_note`'s real output,
-    /// since the fixture above already ended in a full stop and hid it.
-    #[test]
-    fn the_export_note_is_a_sentence_of_its_own_in_the_done_note() {
-        let tally = crate::export::ExportTally {
-            rows: 115_000,
-            withheld: vec!["avatar".into()],
-            ..Default::default()
-        };
-        let export = crate::export::export_note(&tally, "shop.sql", true);
-        let none: [String; 0] = [];
-        let alone = done_note(2, export.as_deref(), &none, &none, &none, &none);
-        assert!(alone.ends_with("those cells are empty."), "{alone}");
-        let followed = done_note(2, export.as_deref(), &["ghost".into()], &none, &none, &none);
-        assert!(
-            followed.contains("those cells are empty. 1 ticked table"),
-            "{followed}"
-        );
-    }
-
             &all(&s),
             DumpOptions::default(),
             SqlDialect::MsSql,

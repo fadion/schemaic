@@ -398,7 +398,7 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
                     }
                     DumpOutcome::Failed { message, partial } => {
                         d.error.set(Some(crate::i18n::export_failure_note(
-                            &message,
+                            &export_failure_text(&message),
                             partial.then_some(name.as_str()),
                         )))
                     }
@@ -546,7 +546,11 @@ fn launch_files(ctx: &DumpCtx, req: FilesRequest, name: String) {
                         missing,
                         replaced,
                     } => d.error.set(Some(files_failure_note(
-                        &message, files, &name, &missing, &replaced,
+                        &export_failure_text(&message),
+                        files,
+                        &name,
+                        &missing,
+                        &replaced,
                     ))),
                     // **Nothing was written**, so this is a question and not a
                     // report. Its English is `core::dump::folder_replace_prompt`'s,
@@ -1349,6 +1353,30 @@ fn dump_done_note(
     parts.join(" ")
 }
 
+/// Why a dump or a folder export stopped short — `dump::ExportFailure` in the
+/// interface's language. Each already says it failed; nothing adds a prefix.
+fn export_failure_text(failure: &schemaic_core::dump::ExportFailure) -> String {
+    use schemaic_core::dump::ExportFailure;
+    match failure {
+        ExportFailure::Failed(e) => tr!("export-failed", error = e.as_str()),
+        ExportFailure::WorkerDied(e) => tr!("export-worker-died", error = e.as_str()),
+        ExportFailure::NotPublished { path, error } => tr!(
+            "export-not-published",
+            path = path.as_str(),
+            error = error.as_str()
+        ),
+        ExportFailure::NotRenamed { part, path, error } => tr!(
+            "export-not-renamed",
+            part = part.as_str(),
+            path = path.as_str(),
+            error = error.as_str()
+        ),
+        ExportFailure::NothingMatched => tr!("export-nothing-matched"),
+        ExportFailure::Cancelled => tr!("export-stopped"),
+        ExportFailure::Worded(s) => s.clone(),
+    }
+}
+
 /// `dump::cancel_note` in the interface's language.
 fn dump_cancel_note(name: &str, partial: bool) -> String {
     if partial {
@@ -1513,6 +1541,35 @@ mod core_words_tests {
             assert_eq!(
                 dump_cancel_note("shop.sql", partial),
                 dump::cancel_note("shop.sql", partial)
+            );
+        }
+    }
+
+    /// **Why an export stopped short reads in English exactly as core's
+    /// `ExportFailure` says it**, every variant — the CLI prints that one.
+    #[test]
+    fn english_says_every_export_failure_as_core_does() {
+        use schemaic_core::dump::ExportFailure;
+        for failure in [
+            ExportFailure::Failed("No space left on device (os error 28)".into()),
+            ExportFailure::WorkerDied("panicked".into()),
+            ExportFailure::NotPublished {
+                path: "out/orders.csv".into(),
+                error: "Access is denied.".into(),
+            },
+            ExportFailure::NotRenamed {
+                part: "shop.sql.part".into(),
+                path: "shop.sql".into(),
+                error: "in use".into(),
+            },
+            ExportFailure::NothingMatched,
+            ExportFailure::Cancelled,
+            ExportFailure::Worded("Dump failed: refused".into()),
+        ] {
+            assert_eq!(
+                super::export_failure_text(&failure),
+                failure.to_string(),
+                "{failure:?}"
             );
         }
     }

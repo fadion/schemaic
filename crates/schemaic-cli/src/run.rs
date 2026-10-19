@@ -669,7 +669,7 @@ async fn run_dump(
         }
         Some(DumpOutcome::Failed { message, partial }) => {
             warn(&schemaic_core::export::export_failure_note(
-                &message,
+                &message.to_string(),
                 partial.then_some(name.as_str()),
             ));
             Exit::Failed

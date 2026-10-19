@@ -6177,6 +6177,22 @@ existing prose was left alone.
     as destroyed **with its published sibling**, since the rename that publishes `orders.csv` is what
     consumes `orders.csv.part`; a fragment whose table the run never reached is still sitting there
     and is not named. See `cli/dump.rs` for the two contradictory sentences that made it necessary.
+    **Why a dump or a folder export stopped short is a value, `ExportFailure`**, and `dump_verdict`
+    — the reader's and the writer's endings resolved into the one the user is told about, for both
+    drivers (`cli/dump.rs` has why cancel is the reader's to declare) — answers one: it builds
+    `WorkerDied` and `Failed` where it used to `format!` the sentence, and passes the writer's own
+    (`WriteEnd::Failed::message`) through. `DumpVerdict::Failed`, `DumpOutcome::Failed` and
+    `FilesOutcome::Failed` carry it where each held a `String`, so its tests compare typed values,
+    the one view that shows it words it (`dump_view`'s `export_failure_text`), and the CLI prints
+    its `Display` — the old English byte for byte (`every_export_failure_reads_as_it_did`). **Every
+    variant already says it failed**, so nothing that shows one adds a prefix: the folder export
+    once re-prefixed the writer's words into *Export failed: Export failed: No space left on
+    device*. `NotRenamed` — a dump's `.part` that could not be renamed over its destination — has no
+    *Export failed:* of its own and never had, its sentence (*The export wrote … but could not
+    rename it to …*) saying so itself. `Worded` is the one variant that is not a fact: a sentence
+    the interface has already written — the app's two refusals before a run begins, `dump-failed`
+    and `export-failed` when the connection cannot be had — passed through as it stands. The CLI
+    never builds one.
     **`Listing`/`PickerBody`/`picker_body` are here for that same reason** — what the table picker
     says when it has no rows is a decision, and it was a `bool` plus an `if` in the view that told a
     failed read from an empty database wrongly. `dump_view.rs`'s entry has the bug in full.
@@ -27968,13 +27984,19 @@ existing prose was left alone.
     (`dump-replace-prompt`/`-more`), naming `dump::FOLDER_REPLACE_SHOWN` files — `pub` so the eight
     is written once. `english_says_every_dump_outcome_as_core_does` and
     `english_says_every_folder_outcome_as_core_does` (`core_words_tests`) hold the English equal to
-    core's, which stays English for the CLI's dump report and core's tests. A single-file dump's
-    failure is worded through `i18n::export_failure_note`; the grid export's outcome lines in the progress box are the
+    core's, which stays English for the CLI's dump report and core's tests. **Why a run stopped
+    short arrives typed**, a `dump::ExportFailure`, and `export_failure_text` words it — the
+    existing `export-failed` and `export-worker-died`, then `export-not-published`,
+    `export-not-renamed`, `export-nothing-matched` and `export-stopped`, adding no prefix since
+    every variant already says it failed — while `Worded`, a refusal the app wrote before the run
+    began, passes through as it stands. The result goes into `i18n::export_failure_note` for a dump
+    and `files_failure_note` for a folder, and `english_says_every_export_failure_as_core_does`
+    holds every variant equal to core's `Display`, which the CLI prints. The grid export's outcome
+    lines in the progress box are the
     grid's, worded the same way (*Data grid*). What stays English: the format names
     (`ExportFormat::label`, a `$format` placeable); the save dialog's file-type name `SQL`
-    (`FileSpec::name` is a `&'static str`); core's `dump::drop_before_create_hint` and
-    `fk_guard_hint` (phase 4); and the writers' `Export failed: …` message a failure carries, which
-    a folder export that finished no file shows as it stands.
+    (`FileSpec::name` is a `&'static str`); and core's `dump::drop_before_create_hint` and
+    `fk_guard_hint` (phase 4).
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
     designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
@@ -36826,9 +36848,18 @@ existing prose was left alone.
     same fact: `files_run` and `dump_run` are launched from the one modal, which refuses a second run
     while either is going, so the two can never be in flight together — and separate slots would only
     create the case where the footer's Stop reaches neither. Its progress rides the dump's channel
-    for the same reason: it is the same footer line counting the same `3 of 12`. The sentences this
-    module produces are worded for the interface — `Export failed: {e}`, and
-    `Nothing to export — no table matched the selection.` for a plan with no steps.
+    for the same reason: it is the same footer line counting the same `3 of 12`. **This module
+    writes no failure sentence**: why a run stopped short is a `core::dump::ExportFailure`, and the
+    two front ends word it — the modal through `dump_view`'s `export_failure_text`, the CLI by
+    printing its `Display`. `WriteFail.message` holds one, its `From<ExportFailure>` (until phase 4
+    of *Interface translation*, `From<String>`) still converting every later `?` with
+    `opened: true`, and the private `failed_with(e)` is the one spelling of
+    `ExportFailure::Failed(e.to_string())` behind every `map_err` but the two renames', so
+    *Export failed:* is spelled
+    nowhere here — it is `ExportFailure`'s `Display` and the catalogue's `export-failed`. A plan
+    with no steps is `NothingMatched`, a stop caught just before a rename `Cancelled`, a table file
+    that cannot be renamed into place `NotPublished`, and a dump's `.part` that cannot be renamed
+    over its destination `NotRenamed`.
     **`run_files` is the file-per-table sibling of `run`**, over `core::dump::file_plan`, and it
     keeps every one of the guarantees above **per file**: a freshly introspected schema, rows
     streamed rather than gathered, a `.part` sibling (`write_one`) renamed over the destination only
@@ -36895,15 +36926,17 @@ existing prose was left alone.
     sitting there and is still not named, which is unchanged.
     **The per-file resolution is `core::dump::dump_verdict` too, not a second copy of it.** Those
     five arms were written out again here and the copy diverged in the one arm the extraction exists
-    to protect: `WriteEnd::Failed` carries the writer's own words, which already begin
-    *"Export failed:"*, and re-prefixing them produced *"Export failed: Export failed: No space left
-    on device (os error 28) — 3 files already written to out are kept."* The writer's refusal to
+    to protect: `WriteEnd::Failed` carries the writer's own failure, which already says
+    *"Export failed:"*, and re-prefixing it produced *"Export failed: Export failed: No space left
+    on device (os error 28) — 3 files already written to out are kept."* That failure is an
+    `ExportFailure` now rather than the writer's text, and the rule is its type's: every variant
+    already says it failed, so nothing that shows one adds a prefix. The writer's refusal to
     publish a truncated file is folded into the **read** end before asking, because that is what it
     is — a cancel whose only witness is the token, a stop that landed between the last chunk and the
     rename never reaching the reader at all. And `write_one`'s rename failure no longer names the
     `.part` file: the caller's `sweep()` deletes it three lines later, so the one sentence telling
     the user where their rows went named a path that no longer existed by the time they read it. It
-    names the destination instead.
+    names the destination instead (`ExportFailure::NotPublished`, whose `path` is it).
   - `cli/compare.rs` — `schemaic compare`'s decisions, apart from the reading so they are tested
     without a server: which objects the script covers, and what is said about it. **No differ of its
     own** — the comparison is `core::compare`'s, the one the app's *Compare with* builds,
@@ -37270,7 +37303,7 @@ existing prose was left alone.
     clause, and exits 0 — unless `missing` is not empty, which `exit_for_dump_done` makes
     `Exit::Failed`, since a file a table short looks like a whole one to a script reading `$?`
     (`a_dump_that_left_a_named_table_out_does_not_exit_ok`); a failure prints
-    `export::export_failure_note`, naming the `.part` only where `partial` says one exists, and a deadline says it was exceeded and adds
+    `export::export_failure_note` over `dump::ExportFailure`'s `Display`, naming the `.part` only where `partial` says one exists, and a deadline says it was exceeded and adds
     `dump::cancel_note` — both `Exit::Failed`. **The deadline's note names the `.part` only where
     there is one** (`dump_timeout_note`): the run's own `DumpOutcome::Cancelled { partial }` when it
     unwound in time, and past the unwind grace, where `with_deadline` returns `None` and the run has
@@ -40456,8 +40489,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals, `format_bytes` and the dump writers'
-    "Export failed: …" lines, which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
+    translation* — among it `launch::*`'s refusals and `format_bytes`. A label a dropdown takes from another crate stays that crate's
     English too: `KeywordCase::label` (core).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
@@ -40582,6 +40614,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     `folder_replace_prompt`, `export::files_*`) — those stay English, for the CLI's dump report and
     core's tests — and `english_says_every_dump_outcome_as_core_does` and
     `english_says_every_folder_outcome_as_core_does` hold the two equal.
+    Their failures are the case of a typed message that has to travel before anyone words it:
+    `dump::ExportFailure` is built in the writer threads and the read (`cli/dump.rs`), carried
+    through `WriteEnd`, `DumpVerdict` and the two outcome enums, and worded only at the one view
+    that shows it, `dump_view`'s `export_failure_text`, before `i18n::export_failure_note` or
+    `files_failure_note` puts it in its sentence. A refusal the interface has already worded — the
+    app's two before a run, when the connection cannot be had — rides the same field as
+    `ExportFailure::Worded` and passes through untouched. `english_says_every_export_failure_as_core_does`
+    holds every variant equal to the `Display` the CLI prints.
     **A sentence with optional parts is one message with a selector per part, not fragments
     assembled in code** — the lock-wait card's is the pattern. `activity-lock-wait-sentence` takes
     `$waited`/`$held` as an age or as `none` where the server withheld one (no age reads as that),
