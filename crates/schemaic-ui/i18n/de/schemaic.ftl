@@ -1969,6 +1969,10 @@ grid-hidden-columns-tip = { $count ->
    *[other] { $count } ausgeblendete Spalten — klicken, um alle anzuzeigen, oder Rechtsklick auf eine Spaltenüberschrift zur Auswahl
 }
 grid-copied-staged-sql = Die vorgemerkten Änderungen wurden als SQL kopiert.
+grid-copy-split = { $n ->
+        [one] { $n } kopierte Zelle enthält einen Tabulator oder Zeilenumbruch — beim Einfügen wird sie als mehr als eine Zelle gelesen.
+       *[other] { $n } kopierte Zellen enthalten einen Tabulator oder Zeilenumbruch — beim Einfügen wird jede davon als mehr als eine Zelle gelesen.
+    }
 grid-duplicate-title = Zeilen duplizieren
 grid-nullable-tip = Nullable
 grid-cell-auto = <auto>
@@ -2144,6 +2148,9 @@ install-hint-adds-folder = Schemaic im Terminal über seinen Namen starten. Füg
 install-hint-links = Schemaic im Terminal über seinen Namen starten. Verlinkt es nach ~/.local/bin.
 install-hint-folder-on-path = Schemaic im Terminal über seinen Namen starten. Sein Ordner, { $dir }, ist bereits in deinem Benutzer-PATH.
 install-hint-comes-with-app = Schemaic im Terminal über seinen Namen starten. Der Befehl schemaic kommt mit der App, unter { $path }.
+tunnel-still-opening = Der SSH-Tunnel ist noch nicht aufgebaut
+tunnel-could-not-open = Der SSH-Tunnel konnte nicht geöffnet werden: { $error }. Aktualisiere das Schema, um es erneut zu versuchen.
+tunnel-server-failed = Die Verbindung durch den SSH-Tunnel ist fehlgeschlagen: { $error }. Aktualisiere das Schema, um es erneut zu versuchen.
 gate-plan-not-connected = Nicht verbunden – der Plan wurde nicht ausgeführt. Der Server hat auf die Verbindungsprüfung nicht geantwortet, daher wurde nichts an ihn gesendet.
 gate-plan-connection-changed = Du hast die Verbindung gewechselt, während Schemaic geprüft hat, ob sie erreichbar ist, daher wurde der Plan nicht ausgeführt. Wechsle zurück und frag erneut.
 gate-plan-tab-moved-on = Du hast den Tab gewechselt, während die Verbindung erneut geprüft wurde, daher wurde der Plan nicht ausgeführt. Er beschreibt den Tab, in dem er angefordert wurde – geh zu diesem Tab zurück und frag erneut.

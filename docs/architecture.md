@@ -12642,7 +12642,9 @@ existing prose was left alone.
     load, and the tunnel closed with it) — and is the error half of the app's `ConnectResult`, which
     was a `String`. `TunnelFailures` holds each connection's last one, and `refusal` is the sentence:
     the old one while nothing is recorded, otherwise the reason and *Refresh the schema to try
-    again* — the only retry there is, since nothing re-opens a tunnel on its own. `Server` is kept
+    again* — the only retry there is, since nothing re-opens a tunnel on its own. `refusal_of` is
+    the same answer as a `TunnelRefusal` (the reason borrowed, its closing full stop off), which the
+    app says through `ui::i18n::tunnel_refusal` (`tunnel-*`); `refusal` is its English. `Server` is kept
     apart because calling it a tunnel failure would send the user to fix SSH settings that work
     (`a_server_failure_behind_the_tunnel_is_not_called_a_tunnel_failure`, in `tunnel_failure_tests`).
     The app's bookkeeping is the half the type cannot pin: `load_schema` clears the entry when it is
@@ -40813,7 +40815,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork` — and,
     public for the app's run paths, `run_failed_message`, `run_cancelled_message` and
     `not_sent_message`, with core's signatures, and for the app's kill and compare actions,
-    `activity_read_only_refusal` and `compare_incomparable`, plain arguments as core's take.
+    `activity_read_only_refusal` and `compare_incomparable`, plain arguments as core's take, and
+    `tunnel_refusal` for its connection lookups.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.
@@ -43912,8 +43915,8 @@ this bundle's.
   `pending_cell_text` are gone. **A copy also says what the format could not carry**, because it is
   the only step that still can: `tsv_block` returns `edit::TsvBlock { text, split }` — `tsv` is now
   a wrapper that throws the count away — counting, from the same string it writes, the cells holding
-  a tab or a newline of their own, and `copy_selection` puts `edit::copy_split_note(split)` on
-  `commit_note`, the ordinary note surface rather than the red one, since the copy succeeded. Once
+  a tab or a newline of their own, and `copy_selection` puts `edit::copy_split_note(split)` — in
+  the interface's words, `copy_split_note_text` (`grid-copy-split`) — on `commit_note`, the ordinary note surface rather than the red one, since the copy succeeded. Once
   the block is on the clipboard a separator and a cell's own tab are the same byte, so no paste can
   tell them apart, and a split cell keeps the row count right so the paste's counters stay quiet
   while every later column of that row shifts left by one — green, and one Commit from a real

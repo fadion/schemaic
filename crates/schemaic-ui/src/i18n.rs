@@ -432,6 +432,22 @@ pub fn not_sent_message(timed_out: bool) -> String {
     }
 }
 
+/// What an operation that finds no SSH tunnel says — core's
+/// `TunnelFailures::refusal` in the interface's language, the failure's own
+/// text inside it as written. Public for the app, whose connection lookup and
+/// terminal say it.
+pub fn tunnel_refusal(
+    failures: &schemaic_core::connection::TunnelFailures,
+    conn_id: u64,
+) -> String {
+    use schemaic_core::connection::TunnelRefusal;
+    match failures.refusal_of(conn_id) {
+        TunnelRefusal::StillOpening => tr!("tunnel-still-opening"),
+        TunnelRefusal::Tunnel(why) => tr!("tunnel-could-not-open", error = why),
+        TunnelRefusal::Server(why) => tr!("tunnel-server-failed", error = why),
+    }
+}
+
 /// Why a kill is refused on a read-only connection — core's
 /// `activity::read_only_refusal` in the interface's language. Public for the
 /// app, whose kill action says it.
@@ -621,6 +637,20 @@ mod tests {
             assert_eq!(not_sent_message(timed_out), tx::not_sent_message(timed_out));
         }
         assert_eq!(tr!("tx-cancelled"), tx::CANCELLED);
+    }
+
+    /// **The tunnel refusal reads in English exactly as core's** — still
+    /// opening, an SSH failure and a server's, a closing full stop on the
+    /// failure taken off as core takes it.
+    #[test]
+    fn english_says_the_tunnel_refusal_as_core_does() {
+        use schemaic_core::connection::{LoadFailure, TunnelFailures};
+        let mut f = TunnelFailures::default();
+        f.record(1, LoadFailure::Tunnel("Host key mismatch.".into()));
+        f.record(2, LoadFailure::Server("Access denied for user 'u'".into()));
+        for id in [0, 1, 2] {
+            assert_eq!(tunnel_refusal(&f, id), f.refusal(id), "{id}");
+        }
     }
 
     /// **A refused kill and an incomparable pair read in English exactly as

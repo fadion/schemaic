@@ -2135,17 +2135,44 @@ impl TunnelFailures {
 
     /// What an operation on this connection says when it finds no tunnel.
     pub fn refusal(&self, conn_id: u64) -> String {
-        const RETRY: &str = "Refresh the schema to try again.";
+        self.refusal_of(conn_id).message()
+    }
+
+    /// [`Self::refusal`]'s answer as a value, for the interface to word: the
+    /// failure's own text (the SSH library's or the server's, which stays as
+    /// written) with its closing full stop taken off.
+    pub fn refusal_of(&self, conn_id: u64) -> TunnelRefusal<'_> {
         match self.0.get(&conn_id) {
-            None => "SSH tunnel is not established yet".to_string(),
-            Some(LoadFailure::Tunnel(why)) => format!(
-                "The SSH tunnel could not be opened: {}. {RETRY}",
-                why.trim_end_matches('.')
-            ),
-            Some(LoadFailure::Server(why)) => format!(
-                "Could not connect through the SSH tunnel: {}. {RETRY}",
-                why.trim_end_matches('.')
-            ),
+            None => TunnelRefusal::StillOpening,
+            Some(LoadFailure::Tunnel(why)) => TunnelRefusal::Tunnel(why.trim_end_matches('.')),
+            Some(LoadFailure::Server(why)) => TunnelRefusal::Server(why.trim_end_matches('.')),
+        }
+    }
+}
+
+/// What an operation that finds no tunnel says ([`TunnelFailures::refusal_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelRefusal<'a> {
+    /// The tunnel is still opening.
+    StillOpening,
+    /// The tunnel would not open: the SSH error.
+    Tunnel(&'a str),
+    /// The server behind the tunnel failed the load: its error.
+    Server(&'a str),
+}
+
+impl TunnelRefusal<'_> {
+    /// The refusal in English.
+    pub fn message(self) -> String {
+        const RETRY: &str = "Refresh the schema to try again.";
+        match self {
+            TunnelRefusal::StillOpening => "SSH tunnel is not established yet".to_string(),
+            TunnelRefusal::Tunnel(why) => {
+                format!("The SSH tunnel could not be opened: {why}. {RETRY}")
+            }
+            TunnelRefusal::Server(why) => {
+                format!("Could not connect through the SSH tunnel: {why}. {RETRY}")
+            }
         }
     }
 }

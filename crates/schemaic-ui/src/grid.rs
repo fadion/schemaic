@@ -2604,10 +2604,16 @@ fn copy_selection(gs: GridState) {
     // every later column of the row — and once the block is on the clipboard
     // nothing can tell the separator from the content, so no paste can report
     // it. The bottom bar's note surface, not the red one: the copy succeeded.
-    if let Some(note) = schemaic_core::edit::copy_split_note(block.split) {
+    if let Some(note) = copy_split_note_text(block.split) {
         gs.commit_note.set(Some(note));
     }
     let _ = floem::Clipboard::set_contents(block.text);
+}
+
+/// Core's `edit::copy_split_note` in the interface's language: how many
+/// copied cells a paste will read as more than one, or `None` for none.
+fn copy_split_note_text(split: usize) -> Option<String> {
+    (split > 0).then(|| tr!("grid-copy-split", n = split))
 }
 
 /// Paste the clipboard over the selection, staged as ordinary green edits.
@@ -13278,6 +13284,17 @@ mod clipboard_gate {
     /// place that both knows and can speak. A unit test on `copy_split_note`
     /// guards nothing without this: the sentence was right the moment it was
     /// written, and the whole defect was that nobody asked for it.
+    #[test]
+    fn english_says_the_copy_split_note_as_core_does() {
+        for n in [0, 1, 2, 40] {
+            assert_eq!(
+                super::copy_split_note_text(n),
+                schemaic_core::edit::copy_split_note(n),
+                "{n}"
+            );
+        }
+    }
+
     #[test]
     fn a_copy_that_the_clipboard_format_cannot_carry_says_so() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

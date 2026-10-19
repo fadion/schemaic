@@ -2416,6 +2416,12 @@ grid-hidden-columns-tip = { $count ->
    *[other] { $count } hidden columns — click to show all, or right-click a header to choose
 }
 grid-copied-staged-sql = Copied the staged changes as SQL.
+# After a copy whose cells hold a tab or a line break, which the clipboard's
+# tab-separated text cannot carry (core's edit::copy_split_note).
+grid-copy-split = { $n ->
+        [one] { $n } copied cell contains a tab or a line break — a paste will read it as more than one cell.
+       *[other] { $n } copied cells contain a tab or a line break — a paste will read each of them as more than one cell.
+    }
 # The confirmation's title; its question is core's and stays English for now.
 grid-duplicate-title = Duplicate rows
 # A column header's tooltip on the mark for a column that allows NULL.
@@ -2729,6 +2735,13 @@ install-hint-comes-with-app = Run Schemaic from a terminal by name. The schemaic
 
 ## The connection gate's refusals (main.rs) — what a run, a query plan or a
 ## grid commit says when the check that the server is reachable stops it.
+
+# An operation on an SSH connection that finds no tunnel (core's
+# TunnelFailures::refusal). $error is the SSH library's or the server's own
+# text, with no closing full stop.
+tunnel-still-opening = SSH tunnel is not established yet
+tunnel-could-not-open = The SSH tunnel could not be opened: { $error }. Refresh the schema to try again.
+tunnel-server-failed = Could not connect through the SSH tunnel: { $error }. Refresh the schema to try again.
 
 gate-plan-not-connected = Not connected — the plan was not run. The server didn't answer the health check, so nothing was sent to it.
 gate-plan-connection-changed = You switched connection while Schemaic was checking that it was reachable, so the plan was not run. Switch back and ask again.

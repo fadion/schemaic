@@ -2464,7 +2464,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let tunnel = if conn.uses_tunnel() {
                 match tunnels.borrow().get(&conn_id).map(|h| h.port()) {
                     Some(p) => Some(p),
-                    None => return Err(tunnel_failures.borrow().refusal(conn_id)),
+                    None => {
+                        return Err(schemaic_ui::i18n::tunnel_refusal(
+                            &tunnel_failures.borrow(),
+                            conn_id,
+                        ));
+                    }
                 }
             } else {
                 None
@@ -14244,7 +14249,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         ..conn
                     },
                     None => {
-                        let cfg = message_shell(&tunnel_failures.borrow().refusal(conn.id));
+                        let cfg = message_shell(&schemaic_ui::i18n::tunnel_refusal(
+                            &tunnel_failures.borrow(),
+                            conn.id,
+                        ));
                         // A message, not a session — nothing to badge. And a
                         // failure to spawn even *that* is logged now; this was
                         // the site that swallowed it.
@@ -14318,7 +14326,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     port,
                     ..conn
                 }),
-                None => Err(tunnel_failures.borrow().refusal(conn.id)),
+                None => Err(schemaic_ui::i18n::tunnel_refusal(
+                    &tunnel_failures.borrow(),
+                    conn.id,
+                )),
             }
         })
     };
