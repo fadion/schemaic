@@ -214,7 +214,7 @@ fn approve_verdict(
     stderr: &str,
 ) -> Result<(), String> {
     match ended {
-        None => Err("`mcp enable` did not finish".to_string()),
+        None => Err(tr!("ai-cursor-enable-unfinished")),
         Some((true, _)) => Ok(()),
         Some((false, code)) => Err(schemaic_ai::cli_failure_message(
             schemaic_ai::harness::Harness::Cursor,

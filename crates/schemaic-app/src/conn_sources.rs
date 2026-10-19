@@ -121,15 +121,18 @@ pub enum SourceError {
 impl SourceError {
     /// The sentence for the modal, naming the file and what to do about it.
     pub fn message(&self, path: &Path) -> String {
-        let p = path.display();
+        let p = path.display().to_string();
         match self {
-            SourceError::NotAFile => format!("{p} is not a file."),
-            SourceError::TooBig(bytes) => format!(
-                "{p} is {}, past the {} this reads.",
-                schemaic_core::stats::format_bytes(*bytes),
-                schemaic_core::stats::format_bytes(MAX_BYTES),
+            SourceError::NotAFile => tr!("import-source-not-a-file", path = p),
+            SourceError::TooBig(bytes) => tr!(
+                "import-source-too-big",
+                path = p,
+                size = schemaic_core::stats::format_bytes(*bytes),
+                most = schemaic_core::stats::format_bytes(MAX_BYTES)
             ),
-            SourceError::Unreadable(why) => format!("{p} could not be read: {why}"),
+            SourceError::Unreadable(why) => {
+                tr!("import-source-unreadable", path = p, error = why.clone())
+            }
         }
     }
 }
@@ -301,9 +304,7 @@ fn docker_launcher() -> Result<(PathBuf, &'static [&'static str], &'static str),
     {
         return Ok((wsl, &["-e", "docker"], "docker (WSL)"));
     }
-    Err(refused
-        .unwrap_or("Docker was not found — neither on PATH nor in WSL.")
-        .to_string())
+    Err(refused.map_or_else(|| tr!("docker-not-found"), str::to_string))
 }
 
 /// Run `program` with `args`, no shell and no console window, and answer its
@@ -325,7 +326,7 @@ fn run_bounded(program: &Path, args: &[String]) -> Result<String, String> {
     }
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Docker could not be started: {e}"))?;
+        .map_err(|e| tr!("docker-not-started", error = e.to_string()))?;
     // Drained on their own threads, so a large `inspect` cannot fill the pipe
     // and stall the child while this waits for it to exit.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
@@ -356,10 +357,10 @@ fn run_bounded(program: &Path, args: &[String]) -> Result<String, String> {
             Ok(None) if started.elapsed() > DOCKER_TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Docker did not answer within 15 seconds.".to_string());
+                return Err(tr!("docker-timed-out", secs = DOCKER_TIMEOUT.as_secs()));
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(e) => return Err(format!("Docker could not be waited on: {e}")),
+            Err(e) => return Err(tr!("docker-not-waited", error = e.to_string())),
         }
     };
     let stdout = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
@@ -369,8 +370,8 @@ fn run_bounded(program: &Path, args: &[String]) -> Result<String, String> {
     let stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
     let first = stderr.lines().map(str::trim).find(|l| !l.is_empty());
     Err(match first {
-        Some(line) => format!("Docker answered: {line}"),
-        None => format!("Docker exited with {status}."),
+        Some(line) => tr!("docker-answered", error = line),
+        None => tr!("docker-exited", status = status.to_string()),
     })
 }
 

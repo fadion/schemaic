@@ -2496,3 +2496,27 @@ ai-session-ended-badly = The AI session ended unexpectedly: { $error }
 ai-session-ended = The { $cli } session ended. Ask again to start a new one.
 ai-session-restart-failed = The { $cli } session could not be restarted after stopping ({ $error }), so it has ended. Ask again to start a new one.
 ai-session-not-accepting = The { $cli } session is no longer accepting questions. Ask again to start a new one.
+
+## Import Connections' sources (conn_sources.rs) — a picked file it cannot
+## read, and Docker. $path is a file path; $size and $most sizes as the app
+## writes one (1.2 MB); $error the operating system's or Docker's own text.
+
+import-source-not-a-file = { $path } is not a file.
+import-source-too-big = { $path } is { $size }, past the { $most } this reads.
+import-source-unreadable = { $path } could not be read: { $error }
+docker-not-found = Docker was not found — neither on PATH nor in WSL.
+docker-not-started = Docker could not be started: { $error }
+docker-timed-out = Docker did not answer within { $secs } seconds.
+docker-not-waited = Docker could not be waited on: { $error }
+# $error is the first line Docker wrote to its error output.
+docker-answered = Docker answered: { $error }
+# $status is the process's exit status as the system words it.
+docker-exited = Docker exited with { $status }.
+
+## A script import's reader (script.rs), and Cursor's tool approval (cursor.rs).
+
+# $error is the system's own text.
+script-reader-stopped = the file reader stopped unexpectedly: { $error }
+script-changed-since-read = This file changed on disk after it was read, so the summary above is not what would run. Choose it again.
+# mcp enable is the Cursor CLI command; never translated.
+ai-cursor-enable-unfinished = `mcp enable` did not finish
