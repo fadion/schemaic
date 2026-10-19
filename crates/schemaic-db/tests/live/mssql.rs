@@ -10645,7 +10645,10 @@ async fn the_account_scope_is_read_with_the_list() {
     assert!(listed.scope.entra_users, "signed in through the Azure CLI");
     assert_eq!(logins, 0, "{:#?}", listed.list);
     assert!(
-        listed.note.as_deref().is_some_and(|n| n.contains("master")),
+        listed
+            .note
+            .as_ref()
+            .is_some_and(|n| n.message().contains("master")),
         "{:?}",
         listed.note
     );

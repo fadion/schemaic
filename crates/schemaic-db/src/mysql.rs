@@ -109,10 +109,10 @@ pub(crate) async fn fetch_grants(db: &Db, principal: &Principal) -> Result<Grant
         // **A note, not `None`.** `SHOW GRANTS` is direct-only on both
         // servers, so everything the account holds through a granted role is
         // absent from this list — and on a role-provisioned server that is
-        // most of it. See `users::my_scope_note`.
+        // most of it. See `users::GrantsNote::MyScope`.
         .map(|statements| Grants {
             statements,
-            note: Some(users::my_scope_note()),
+            note: Some(users::GrantsNote::MyScope),
         });
     let _ = conn.disconnect().await;
     out
@@ -331,7 +331,7 @@ async fn collect_my_users(conn: &mut Conn) -> Result<users::Principals, DbError>
     // why the *absence* has to be carried out rather than inferred from a count.
     Ok(users::Principals {
         list: users::from_mysql_rows(&rows),
-        note: Some(users::my_own_account_only_note()),
+        note: Some(users::PrincipalsNote::MyOwnAccountOnly),
         // MySQL/MariaDB take no verifier, so there is no policy to honour.
         password_policy: None,
         scope: users::AccountScope::default(),

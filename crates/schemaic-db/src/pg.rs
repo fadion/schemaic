@@ -3571,12 +3571,12 @@ pub(crate) async fn fetch_grants(
         ),
     )
     .await?;
-    let extra = implicit.first().and_then(|r| {
+    let implicit = implicit.first().and_then(|r| {
         users::pg_implicit_note(
             &principal.name,
             pg_bool(r, 0),
             opt(r, 1).and_then(|s| s.parse().ok()).unwrap_or(0),
-            scope.as_deref().unwrap_or("this cluster"),
+            scope.as_deref(),
         )
     });
 
@@ -3584,9 +3584,9 @@ pub(crate) async fn fetch_grants(
     statements.extend(users::pg_grant_statements(&principal.name, &acl));
     Ok(Grants {
         statements,
-        note: Some(match scope.as_deref() {
-            Some(d) => users::pg_scope_note(d, extra.as_deref()),
-            None => users::pg_no_database_note(extra.as_deref()),
+        note: Some(users::GrantsNote::PgScope {
+            database: scope.clone(),
+            implicit,
         }),
     })
 }

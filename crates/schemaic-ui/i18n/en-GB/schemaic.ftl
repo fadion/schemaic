@@ -1163,6 +1163,37 @@ users-kind-login = Login
 users-maintained-by-server = maintained by the server
 users-loading-privileges = Loading privileges
 users-no-privileges = This account holds no privileges.
+# What the account list does not cover (core's users::PrincipalsNote), under it.
+# SQL Server's sentences can appear together, one after the other.
+users-note-my-own-account = This connection cannot read mysql.user, so this is not the server's account list — it is the one account this connection can see, its own. Connect as an account with SELECT on the mysql database to browse the rest.
+users-note-ms-logins-elsewhere = Azure SQL Database keeps its logins in master, and they are not managed here: listed are the database's users and roles.
+users-note-ms-logins-only = Only the server's logins are listed: pick a database to see its users and roles.
+users-note-ms-short = This login lacks VIEW ANY DEFINITION, so the server shows it only the principals it may see — the list may be short.
+# What a privilege list does not cover (core's users::GrantsNote), under it.
+users-note-my-scope = Privileges held through a granted role are not expanded: SHOW GRANTS lists what is granted directly to the account, and the roles it is a member of, but not what those roles themselves hold. Open the role's own privileges to see those.
+# PostgreSQL's, over $database; or, with none selected, -no-database. What the
+# role holds implicitly (-superuser, -predefined, -owns) goes before it.
+users-note-pg-scope = Schema, table and sequence privileges are those in { $database } — PostgreSQL keeps them in each database's own catalogue, so privileges in other databases are not listed. EXECUTE on functions and procedures, and privileges granted on a single column, are not listed either. Privileges held through role membership or granted to PUBLIC are not expanded, and neither are the privileges a role holds by owning an object or by being a superuser.
+users-note-pg-no-database = Schema, table and sequence privileges are not listed: PostgreSQL keeps them in each database's own catalogue, and this connection has no database selected. Open a query tab on a database to see them. EXECUTE on functions and procedures, and privileges granted on a single column, are not listed either. Privileges held through role membership or granted to PUBLIC are not expanded, and neither are the privileges a role holds by owning an object or by being a superuser.
+users-note-pg-superuser = This role is a SUPERUSER: it bypasses every permission check, so it holds every privilege on every object whether or not anything below says so.
+# $role is one of PostgreSQL's pg_* roles.
+users-note-pg-predefined = { $role } is one of PostgreSQL's predefined roles: what it can do is built into the server rather than granted, so it is recorded in no catalogue this reads.
+# $n objects the role owns in $database; -cluster with no database selected.
+users-note-pg-owns = { $n ->
+    [one] This role owns { $n } object in { $database } (schemas, tables, sequences or the database itself). An owner holds every privilege on what it owns, and PostgreSQL records no grant for that, so none of it is listed below.
+   *[other] This role owns { $n } objects in { $database } (schemas, tables, sequences or the database itself). An owner holds every privilege on what it owns, and PostgreSQL records no grant for that, so none of it is listed below.
+}
+users-note-pg-owns-cluster = { $n ->
+    [one] This role owns { $n } object in this cluster (schemas, tables, sequences or the database itself). An owner holds every privilege on what it owns, and PostgreSQL records no grant for that, so none of it is listed below.
+   *[other] This role owns { $n } objects in this cluster (schemas, tables, sequences or the database itself). An owner holds every privilege on what it owns, and PostgreSQL records no grant for that, so none of it is listed below.
+}
+# SQL Server: $n permissions the list could not render, on $classes — the
+# server's own securable-class names, joined with ", ".
+users-note-ms-unshown = { $n ->
+    [one] { $n } permission is not shown here, on { $classes }: the server reports it on a securable this list cannot name.
+   *[other] { $n } permissions are not shown here, on { $classes }: the server reports them on securables this list cannot name.
+}
+users-note-ms-pick-database = A database user's permissions are that database's — pick one to see them.
 # $shown is the cap on statements drawn, $total how many there are.
 users-statements-capped = Showing the first { $shown } of { $total } statements. Copy privileges takes all of them.
 users-new-account = New account

@@ -1030,6 +1030,28 @@ users-kind-login = Anmeldung
 users-maintained-by-server = vom Server verwaltet
 users-loading-privileges = Rechte werden geladen
 users-no-privileges = Dieses Konto hat keine Rechte.
+users-note-my-own-account = Diese Verbindung kann mysql.user nicht lesen, daher ist dies nicht die Kontenliste des Servers — es ist das eine Konto, das diese Verbindung sehen kann, ihr eigenes. Verbinde dich mit einem Konto mit SELECT auf der Datenbank mysql, um die übrigen zu durchsuchen.
+users-note-ms-logins-elsewhere = Azure SQL Database bewahrt seine Logins in master auf, und sie werden hier nicht verwaltet: Aufgeführt sind die Benutzer und Rollen der Datenbank.
+users-note-ms-logins-only = Nur die Logins des Servers werden aufgeführt: Wähle eine Datenbank, um ihre Benutzer und Rollen zu sehen.
+users-note-ms-short = Diesem Login fehlt VIEW ANY DEFINITION, daher zeigt ihm der Server nur die Prinzipale, die es sehen darf — die Liste kann unvollständig sein.
+users-note-my-scope = Über eine zugewiesene Rolle gehaltene Rechte werden nicht aufgelöst: SHOW GRANTS listet, was dem Konto direkt gewährt ist, und die Rollen, denen es angehört, aber nicht, was diese Rollen selbst halten. Öffne die Rechte der Rolle, um diese zu sehen.
+users-note-pg-scope = Schema-, Tabellen- und Sequenzrechte sind die in { $database } — PostgreSQL hält sie im Katalog jeder einzelnen Datenbank, daher werden Rechte in anderen Datenbanken nicht aufgeführt. EXECUTE auf Funktionen und Prozeduren sowie auf eine einzelne Spalte gewährte Rechte werden ebenfalls nicht aufgeführt. Über Rollenmitgliedschaft gehaltene oder PUBLIC gewährte Rechte werden nicht aufgelöst, ebenso wenig die Rechte, die eine Rolle als Besitzer eines Objekts oder als Superuser hält.
+users-note-pg-no-database = Schema-, Tabellen- und Sequenzrechte werden nicht aufgeführt: PostgreSQL hält sie im Katalog jeder einzelnen Datenbank, und diese Verbindung hat keine Datenbank ausgewählt. Öffne einen Abfrage-Tab auf einer Datenbank, um sie zu sehen. EXECUTE auf Funktionen und Prozeduren sowie auf eine einzelne Spalte gewährte Rechte werden ebenfalls nicht aufgeführt. Über Rollenmitgliedschaft gehaltene oder PUBLIC gewährte Rechte werden nicht aufgelöst, ebenso wenig die Rechte, die eine Rolle als Besitzer eines Objekts oder als Superuser hält.
+users-note-pg-superuser = Diese Rolle ist SUPERUSER: Sie umgeht jede Rechteprüfung und hält daher jedes Recht auf jedes Objekt, ob unten etwas davon steht oder nicht.
+users-note-pg-predefined = { $role } ist eine der vordefinierten Rollen von PostgreSQL: Was sie kann, ist in den Server eingebaut statt gewährt und daher in keinem Katalog verzeichnet, den diese Ansicht liest.
+users-note-pg-owns = { $n ->
+    [one] Diese Rolle besitzt { $n } Objekt in { $database } (Schemas, Tabellen, Sequenzen oder die Datenbank selbst). Ein Besitzer hält jedes Recht auf das, was er besitzt, und PostgreSQL verzeichnet dafür keine Gewährung, daher wird nichts davon unten aufgeführt.
+   *[other] Diese Rolle besitzt { $n } Objekte in { $database } (Schemas, Tabellen, Sequenzen oder die Datenbank selbst). Ein Besitzer hält jedes Recht auf das, was er besitzt, und PostgreSQL verzeichnet dafür keine Gewährung, daher wird nichts davon unten aufgeführt.
+}
+users-note-pg-owns-cluster = { $n ->
+    [one] Diese Rolle besitzt { $n } Objekt in diesem Cluster (Schemas, Tabellen, Sequenzen oder die Datenbank selbst). Ein Besitzer hält jedes Recht auf das, was er besitzt, und PostgreSQL verzeichnet dafür keine Gewährung, daher wird nichts davon unten aufgeführt.
+   *[other] Diese Rolle besitzt { $n } Objekte in diesem Cluster (Schemas, Tabellen, Sequenzen oder die Datenbank selbst). Ein Besitzer hält jedes Recht auf das, was er besitzt, und PostgreSQL verzeichnet dafür keine Gewährung, daher wird nichts davon unten aufgeführt.
+}
+users-note-ms-unshown = { $n ->
+    [one] { $n } Berechtigung wird hier nicht angezeigt, auf { $classes }: Der Server meldet sie auf einem sicherungsfähigen Element, das diese Liste nicht benennen kann.
+   *[other] { $n } Berechtigungen werden hier nicht angezeigt, auf { $classes }: Der Server meldet sie auf sicherungsfähigen Elementen, die diese Liste nicht benennen kann.
+}
+users-note-ms-pick-database = Die Berechtigungen eines Datenbankbenutzers sind die dieser Datenbank — wähle eine, um sie zu sehen.
 users-statements-capped = Die ersten { $shown } von { $total } Anweisungen werden angezeigt. „Rechte kopieren“ nimmt alle.
 users-new-account = Neues Konto
 users-system-account = Dieses Konto gehört dem Server, daher ändert Schemaic es nicht.

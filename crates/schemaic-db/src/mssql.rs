@@ -5046,7 +5046,9 @@ pub(crate) async fn fetch_principals(
     db: &Db,
     database: Option<&str>,
 ) -> Result<schemaic_core::users::Principals, DbError> {
-    use schemaic_core::users::{MsLoginRow, MsUserRow, Principals, from_mssql_rows};
+    use schemaic_core::users::{
+        MsListed, MsLoginRow, MsUserRow, Principals, PrincipalsNote, from_mssql_rows,
+    };
     let flag = |r: &[Option<String>], i: usize| cell(r, i) == "1";
     let database = database.filter(|d| !d.is_empty());
     let mut client = connect(db, database).await?;
@@ -5124,29 +5126,19 @@ pub(crate) async fn fetch_principals(
         .is_some_and(|r| flag(r, 0)),
         None => false,
     };
-    let mut notes: Vec<String> = Vec::new();
-    if logins_elsewhere {
-        notes.push(
-            "Azure SQL Database keeps its logins in master, and they are not managed here: \
-             listed are the database's users and roles."
-                .to_string(),
-        );
+    let listed = if logins_elsewhere {
+        MsListed::LoginsElsewhere
     } else if database.is_none() {
-        notes.push(
-            "Only the server's logins are listed: pick a database to see its users and roles."
-                .to_string(),
-        );
-    }
-    if !sees_all {
-        notes.push(
-            "This login lacks VIEW ANY DEFINITION, so the server shows it only the \
-             principals it may see — the list may be short."
-                .to_string(),
-        );
-    }
+        MsListed::LoginsOnly
+    } else {
+        MsListed::Everything
+    };
     Ok(Principals {
         list: from_mssql_rows(&logins, &users),
-        note: (!notes.is_empty()).then(|| notes.join(" ")),
+        note: (listed != MsListed::Everything || !sees_all).then_some(PrincipalsNote::Ms {
+            listed,
+            short: !sees_all,
+        }),
         password_policy: None,
         scope: schemaic_core::users::AccountScope {
             contained,
@@ -5165,8 +5157,8 @@ pub(crate) async fn fetch_grants(
     principal: &schemaic_core::users::Principal,
 ) -> Result<schemaic_core::users::Grants, DbError> {
     use schemaic_core::users::{
-        Grants, MsPermRow, PrincipalKind, mssql_grant_statements, mssql_server_role_statements,
-        mssql_unshown_note,
+        Grants, GrantsNote, MsPermRow, PrincipalKind, mssql_grant_statements,
+        mssql_server_role_statements, mssql_unshown_note,
     };
     let text = |r: &Vec<Option<String>>, i: usize| r.get(i).cloned().flatten();
     let first = |rows: Vec<Vec<Option<String>>>| -> Vec<String> {
@@ -5202,10 +5194,7 @@ pub(crate) async fn fetch_grants(
     let Some(database) = database.filter(|d| !d.is_empty()) else {
         return Ok(Grants {
             statements: Vec::new(),
-            note: Some(
-                "A database user's permissions are that database's — pick one to see them."
-                    .to_string(),
-            ),
+            note: Some(GrantsNote::MsPickDatabase),
         });
     };
     let mut client = connect(db, Some(database)).await?;

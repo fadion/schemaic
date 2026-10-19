@@ -10589,28 +10589,32 @@ existing prose was left alone.
     was the half of that reasoning nobody had checked. `pg::fetch_grants` reads four ACL columns and
     `pg_proc.proacl` and `pg_attribute.attacl` are two of the ones it does not, so a role holding
     nothing but an `EXECUTE` grant and a column grant was shown an empty privilege list under a note
-    that named only the *database* scope as the thing it could not answer for. Both
-    `pg_scope_note` and `pg_no_database_note` now name EXECUTE on functions and procedures, and
+    that named only the *database* scope as the thing it could not answer for. Both forms of
+    `GrantsNote::PgScope`, with a database and without, now name EXECUTE on functions and procedures, and
     privileges granted on a single column, as not listed. The grantee is taken **unquoted** and quoted here with
     `export::ident_if_needed` (`pg_ident`) — SQL the user only reads — which is exactly what keeps it
     from being confused with `account_sql`'s unconditional quoting for SQL that runs.
-    `Grants { statements, note }` is the honesty half, and `pg_scope_note` writes the note:
+    `Grants { statements, note }` is the honesty half, and `GrantsNote::PgScope` is PostgreSQL's note:
     PostgreSQL keeps schema, table and sequence privileges in the catalogue of the database holding
     the object, so one connection answers for one database and the note names which
-    (`pg_no_database_note` is the same sentence for a connection with none selected, where those
+    (its `database: None` form is the same sentence for a connection with none selected, where those
     queries are not run at all). A privilege
     screen that is quietly partial is the one way this feature can mislead.
     **`Principals { list, note }` is that same shape for the account list, and it exists because a
     `Vec<Principal>` had no channel for "the wide reads were refused, this is one account out of
     eight".** An ordinary application account — no `SELECT` on `mysql` — browsed a list of exactly
     itself, rendered as a complete list under a footer reading "1 account".
-    `my_own_account_only_note` is what the MySQL ladder's last rung sets, and `Principals::complete`
+    `PrincipalsNote::MyOwnAccountOnly` is what the MySQL ladder's last rung sets, and `Principals::complete`
     is the constructor for every rung above it, so the absence is carried out rather than inferred
-    from a count. **MySQL's grant list carries a note too** — `my_scope_note`: `SHOW GRANTS` is
+    from a count. **MySQL's grant list carries a note too** — `GrantsNote::MyScope`: `SHOW GRANTS` is
     documented on both servers as **direct grants only**, so a privilege held through a granted role
     does not appear and no `USING` form is issued here that would expand one. The list shipped with
     `note: None`, so a role-based setup — the normal way a modern MySQL 8 or MariaDB installation is
     provisioned — showed an account with almost nothing on it and said nothing about why.
+    **Both notes are values, not sentences** — `PrincipalsNote` and `GrantsNote`, one variant per
+    thing a list can leave out, each with a `message()` that is the English byte for byte and no
+    `Display` — so the browser words them in the interface's language (under `users_view.rs`). A
+    variant carries only what is the server's: a database, a role or a securable class's name.
     **`pg_implicit_note` is what an ACL query cannot see, and it is stated rather than emitted as a
     `GRANT`.** `aclexplode` reads only *explicit* entries, and three of the commonest ways a role
     holds power leave none: a superuser bypasses every check, an owner holds every privilege on what
@@ -10619,12 +10623,15 @@ existing prose was left alone.
     an owner of fourteen tables got one statement about a database they were not looking at under a
     note that enumerated its omissions and did not include these. A line shaped like a `GRANT` would
     be a lie in the other direction — there is no statement that would produce these and none that
-    would revoke them — so it is prose, passed as the `extra` argument both scope notes now take and
+    would revoke them — so it is prose, a `PgImplicit` carried as `PgScope`'s `implicit` and
     placed **first**, because "this role is a superuser" changes how the rest of the screen should
-    be read. The superuser sentence subsumes the other two and returns alone; `is_pg_predefined` is
+    be read. The superuser sentence subsumes the other two and returns alone. `Held`'s `database`
+    is `None` with no database selected, where the English says *this cluster* — a literal `pg.rs`
+    used to pass in as though it were the database's name. `is_pg_predefined` is
     the same `pg_` prefix test `pg::roles` uses to keep those roles out of a *grantable* list, and
     they are kept in the browser deliberately, which is exactly why their powers have to be
-    accounted for. Both notes now also admit ownership and superuser among their omissions.
+    accounted for. Both forms of the scope note now also admit ownership and superuser among their
+    omissions.
     **SQL Server has no `SHOW GRANTS` either, so `mssql_grant_statements` writes its list** from
     `MsPermRow`s — `sys.database_permissions` for a user or role, `sys.server_permissions` for a
     login — one statement per row, in catalogue order and ungrouped: `GRANT`, `GRANT … WITH GRANT
@@ -10642,7 +10649,7 @@ existing prose was left alone.
     `IMPERSONATE ON LOGIN::sa` — sysadmin one `EXECUTE AS` away — read as holding `CONNECT SQL`.
     A row that still cannot be rendered — a class with no keyword here, such as an availability
     group, or a securable whose name did not resolve — is left out rather than guessed, and
-    **`mssql_unshown_note` counts it** into `Grants::note`, naming the classes, as
+    **`mssql_unshown_note` counts it** into `Grants::note` (`GrantsNote::MsUnshown`), naming the classes, as
     `pg_implicit_note` does for what PostgreSQL's reader never reads
     (`every_securable_class_reads_back_as_t_sql`, `a_permission_that_cannot_be_rendered_is_reported`).
     Role memberships follow as
@@ -18480,7 +18487,7 @@ existing prose was left alone.
   which a properly-provisioned account has not got, while `USER_PRIVILEGES` shows it its own row: one
   account is a poor list, but it is a true one and it is the account the person opening this is most
   likely asking about — **and reaching it is news, so that rung is the one that sets
-  `Principals::note`** (`users::my_own_account_only_note`). The three `if let Ok` rungs above it
+  `Principals::note`** (`users::PrincipalsNote::MyOwnAccountOnly`). The three `if let Ok` rungs above it
   discard their errors deliberately, a denied read being the expected case, which is exactly why the
   absence has to be carried out rather than inferred from a count of one.
   **The two widest rungs no longer project the same shape, and that is the compiler holding them
@@ -18523,15 +18530,15 @@ existing prose was left alone.
   `pg_database.datacl`, `pg_namespace.nspacl` and `pg_class.relacl` (relkinds `r p v m f S`, filtered
   rather than left open so an index or a composite type can't reach the statement builder, and `S`
   the only one taking the `SEQUENCE` keyword). Three of those see **one database only**, which is
-  what `users::pg_scope_note` says on screen — and the two per-database ones are **not run at all**
+  what `users::GrantsNote::PgScope` says on screen — and the two per-database ones are **not run at all**
   with no database selected, since the client then stands on PostgreSQL's *maintenance* database and
-  would answer for a database the user did not choose; `pg_no_database_note` says that instead. The
+  would answer for a database the user did not choose; its `database: None` form says that instead. The
   three ACL queries `ORDER BY … is_grantable, privilege_type`, which is what makes
   `pg_grant_statements`' one-pass grouping — comparing each row against the group before it — see
   each `(object, grantable)` group whole. The fifth query is not an ACL read at all: it asks for
   `rolsuper` and a count of the objects this role owns (`pg_database.datdba` +
   `pg_namespace.nspowner` + `pg_class.relowner`), which feeds `users::pg_implicit_note` and rides
-  into whichever scope note applies as its `extra`. Every one of them compares against the role's own oid,
+  into the scope note as its `implicit`. Every one of them compares against the role's own oid,
   so a role dropped since the list was fetched yields an empty answer rather than an error. `pg_bool`
   is the small reader `simple_query`'s text protocol needs, which spells a boolean `t`/`f`.
   **`Db::fetch_principals` takes a `database` because SQL Server's accounts are half one
@@ -20260,9 +20267,12 @@ existing prose was left alone.
   server, and on every edition. **It also asks `HAS_PERMS_BY_NAME(…, 'VIEW ANY DEFINITION')`**,
   because a login without that permission is shown only the principals it may see — itself and
   little else — with no error to say so, which is the MySQL ladder's "one account out of eight"
-  in another catalogue; the note says the list may be short. `mssql::fetch_grants` reads a login's
+  in another catalogue; the note says the list may be short. The listing's note is one
+  `PrincipalsNote::Ms { listed, short }` — `MsListed` for which principals it holds, `short` for
+  that permission's absence — rather than those sentences joined inline. `mssql::fetch_grants` reads a login's
   server permissions and server roles on a connection to no database, and a user's or role's
-  database permissions and roles in the browser's database, noting when there is none; both fold
+  database permissions and roles in the browser's database, noting when there is none
+  (`GrantsNote::MsPickDatabase`); both fold
   through `users::mssql_grant_statements`, and both read **every class**: `SERVER_PERMISSIONS`
   names a login, server role or endpoint securable, `DATABASE_PERMISSIONS` a schema-scoped one
   through `OBJECT_SCHEMA_NAME`/`OBJECT_NAME` (which name master's `sys.xp_cmdshell` too) and the
@@ -27557,7 +27567,8 @@ existing prose was left alone.
     Two panes: a filtered account list (`users::filter_indices` over `matches`, one field over the
     whole `app@host` display name, asked **once** and read by both the rows and the footer's count)
     on the left, and the selected account's attributes and `GRANT` statements on the right. A
-    `Principals::note` — the MySQL ladder reaching its last rung — is rendered as a faint row
+    `Principals::note` — the MySQL ladder reaching its last rung, or SQL Server's partial
+    listing — is rendered as a faint row
     **under** the list, the way the privileges pane renders `Grants::note`, because the footer's
     "1 account" is exactly as confident about a denied read as about a server with one account.
     **The list column runs the full height of the body and the footer belongs to the right column**,
@@ -27691,7 +27702,17 @@ existing prose was left alone.
     kinds and pins the count and the no-match note — the
     last because the source spelled its quotes as `\u{201c}` escapes, which a literal comparison
     cannot see, and the catalogue spells them typographically. The local `section` takes a `String`.
-    `Grants::note` and the fetch errors stay English: core's prose and the server's text.
+    The two notes — `Principals::note` under the account list, `Grants::note` under the privileges —
+    are core's `PrincipalsNote`/`GrantsNote` values, worded by `principals_note_text`,
+    `grants_note_text` and `pg_implicit_text` from `users-note-*`. Where core's English is several
+    sentences — SQL Server's listing and short-list notes, PostgreSQL's implicit holdings ahead of
+    its scope note — each is a message of its own, joined with a space in code as core joins them.
+    The owned-object count and `-ms-unshown` are plurals, and with no database selected the count is
+    `-pg-owns-cluster`, a whole message, rather than *this cluster* handed in as `$database`.
+    Database, role and securable-class names go in as the server spells them, the classes joined
+    with `", "` in code. `english_says_every_users_note_as_core_does` holds every one equal to
+    `message()` — every `MsListed`/`short` pair that has a note, and PostgreSQL's scope with a
+    database and without under each implicit holding. The fetch errors stay English: the server's text.
     - The two requests are tracked apart — `UsersState` for the list, `GrantsState` for one
       account's privileges — for the reason the properties modal's exact `COUNT(*)` is tracked apart
       from its statistics: a failure to read one account's grants must not replace a list of accounts
@@ -40715,7 +40736,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     warnings and problem-list tail (`import::ReadRefusal`, below), nor the plan modal's warnings
     (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below) — though
     `read_only_reason`'s own sentence inside one still is — nor the filter field's two refusals
-    (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is.
+    (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is, nor the
+    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40938,6 +40960,13 @@ Re-introducing the anti-patterns these guard against is a regression:
     `grid-filter-bracket-in-name`/`-trailing-input` and passes the parser's text through, for the
     filter apply; `english_refuses_every_filter_as_core_does` (`core_words_tests`) holds it equal
     to `message` for all three.
+    The account browser's notes are the case where the English was not all core's to begin with.
+    `Grants::note` and `Principals::note` held finished English — from core's `*_note` functions,
+    and from `schemaic-db` itself: SQL Server's sentences joined inline in `mssql.rs`, PostgreSQL's
+    *this cluster* passed in by `pg.rs` — and now hold a `users::GrantsNote`/`PrincipalsNote` (under
+    `core::users`), with `message()` the English and no `Display`. `users_view.rs` words them from
+    `users-note-*`, joining sentences with a space in code as core does, held by
+    `english_says_every_users_note_as_core_does`; the live tests read `message()`.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and

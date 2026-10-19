@@ -431,7 +431,11 @@ fn list_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: FocusR
                 // exactly as confident about a denied read as about a server
                 // with one account.
                 if let Some(n) = list.note {
-                    rows.push(list_note(icons::CIRCLE_QUESTION, theme::text_faint, n));
+                    rows.push(list_note(
+                        icons::CIRCLE_QUESTION,
+                        theme::text_faint,
+                        principals_note_text(&n),
+                    ));
                 }
                 v_stack_from_iter(rows)
                     .style(|s| s.flex_col().width_full().gap(row_gap()))
@@ -634,6 +638,79 @@ fn detail_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: Focu
     .into_any()
 }
 
+/// The account list's note — core's `PrincipalsNote::message` in the
+/// interface's language, SQL Server's sentences joined with a space as core
+/// joins them.
+fn principals_note_text(n: &schemaic_core::users::PrincipalsNote) -> String {
+    use schemaic_core::users::{MsListed, PrincipalsNote};
+    match *n {
+        PrincipalsNote::MyOwnAccountOnly => tr!("users-note-my-own-account"),
+        PrincipalsNote::Ms { listed, short } => {
+            let mut notes = Vec::new();
+            match listed {
+                MsListed::Everything => {}
+                MsListed::LoginsElsewhere => notes.push(tr!("users-note-ms-logins-elsewhere")),
+                MsListed::LoginsOnly => notes.push(tr!("users-note-ms-logins-only")),
+            }
+            if short {
+                notes.push(tr!("users-note-ms-short"));
+            }
+            notes.join(" ")
+        }
+    }
+}
+
+/// The privilege list's note — core's `GrantsNote::message` in the interface's
+/// language. Database, role and securable-class names are the server's.
+fn grants_note_text(n: &schemaic_core::users::GrantsNote) -> String {
+    use schemaic_core::users::GrantsNote;
+    match n {
+        GrantsNote::MyScope => tr!("users-note-my-scope"),
+        GrantsNote::PgScope { database, implicit } => {
+            let base = match database {
+                Some(d) => tr!("users-note-pg-scope", database = d.as_str()),
+                None => tr!("users-note-pg-no-database"),
+            };
+            match implicit {
+                Some(i) => format!("{} {base}", pg_implicit_text(i)),
+                None => base,
+            }
+        }
+        GrantsNote::MsUnshown { count, classes } => {
+            let n = *count;
+            tr!("users-note-ms-unshown", n = n, classes = classes.join(", "))
+        }
+        GrantsNote::MsPickDatabase => tr!("users-note-ms-pick-database"),
+    }
+}
+
+/// What a PostgreSQL role holds that no ACL records — core's
+/// `PgImplicit::message` in the interface's language.
+fn pg_implicit_text(i: &schemaic_core::users::PgImplicit) -> String {
+    use schemaic_core::users::PgImplicit;
+    match i {
+        PgImplicit::Superuser => tr!("users-note-pg-superuser"),
+        PgImplicit::Held {
+            predefined,
+            owns,
+            database,
+        } => {
+            let mut out = Vec::new();
+            if let Some(role) = predefined {
+                out.push(tr!("users-note-pg-predefined", role = role.as_str()));
+            }
+            let n = *owns;
+            if n > 0 {
+                out.push(match database {
+                    Some(d) => tr!("users-note-pg-owns", n = n, database = d.as_str()),
+                    None => tr!("users-note-pg-owns-cluster", n = n),
+                });
+            }
+            out.join(" ")
+        }
+    }
+}
+
 /// What kind of account this is — `PrincipalKind::label`'s word in the
 /// interface's language; `english_names_every_principal_kind_as_core_does`
 /// holds them equal.
@@ -739,7 +816,11 @@ fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
                 ));
             }
             if let Some(n) = n {
-                rows.push(note(icons::CIRCLE_QUESTION, theme::text_faint, n));
+                rows.push(note(
+                    icons::CIRCLE_QUESTION,
+                    theme::text_faint,
+                    grants_note_text(&n),
+                ));
             }
             rows
         }
@@ -1262,6 +1343,66 @@ fn footer(
 
 #[cfg(test)]
 mod tests {
+    /// **Every note under the account list and the privilege list reads in
+    /// English exactly as core's `message`** — MySQL's, PostgreSQL's over a
+    /// database and none with each thing a role may hold implicitly, and SQL
+    /// Server's every combination of what is listed and whether it is short.
+    #[test]
+    fn english_says_every_users_note_as_core_does() {
+        use super::{grants_note_text, principals_note_text};
+        use schemaic_core::users::{GrantsNote, MsListed, PgImplicit, PrincipalsNote};
+        let mut principals = vec![PrincipalsNote::MyOwnAccountOnly];
+        for listed in [
+            MsListed::Everything,
+            MsListed::LoginsElsewhere,
+            MsListed::LoginsOnly,
+        ] {
+            for short in [false, true] {
+                if listed != MsListed::Everything || short {
+                    principals.push(PrincipalsNote::Ms { listed, short });
+                }
+            }
+        }
+        for n in principals {
+            assert_eq!(principals_note_text(&n), n.message(), "{n:?}");
+        }
+        let mut grants = vec![
+            GrantsNote::MyScope,
+            GrantsNote::MsPickDatabase,
+            GrantsNote::MsUnshown {
+                count: 1,
+                classes: vec!["TYPE".into()],
+            },
+            GrantsNote::MsUnshown {
+                count: 3,
+                classes: vec!["AVAILABILITY GROUP".into(), "TYPE".into()],
+            },
+        ];
+        let held = |predefined: Option<&str>, owns, database: Option<&str>| PgImplicit::Held {
+            predefined: predefined.map(str::to_string),
+            owns,
+            database: database.map(str::to_string),
+        };
+        for database in [Some("warehouse"), None] {
+            for implicit in [
+                None,
+                Some(PgImplicit::Superuser),
+                Some(held(Some("pg_read_all_data"), 0, database)),
+                Some(held(None, 1, database)),
+                Some(held(None, 14, database)),
+                Some(held(Some("pg_monitor"), 3, database)),
+            ] {
+                grants.push(GrantsNote::PgScope {
+                    database: database.map(str::to_string),
+                    implicit,
+                });
+            }
+        }
+        for n in grants {
+            assert_eq!(grants_note_text(&n), n.message(), "{n:?}");
+        }
+    }
+
     /// English names every account kind as core's `PrincipalKind::label` does,
     /// and the footer's count reads as the `format!` it replaced.
     #[test]

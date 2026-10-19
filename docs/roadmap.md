@@ -105,7 +105,9 @@ assertions pin English wording — stays the regression net throughout.
    (`plan::PlanNote`, `ServerWarning`; `plan_view::plan_note_text`), and the run guard
    (`sql::GuardReason`, `Unsafe`, which `RunVerdict` carries; `i18n::guard_reason_text`), and
    the filter field's refusals (`FilterError::BracketInName`, `TrailingInput` beside
-   `BadCondition`'s parser text; `grid::filter_error_text`).
+   `BadCondition`'s parser text; `grid::filter_error_text`), and the users browser's notes
+   (`users::PrincipalsNote`, `GrantsNote`, `PgImplicit`, which `schemaic-db` now fills as
+   values; `users_view::principals_note_text`, `grants_note_text`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -147,9 +149,6 @@ assertions pin English wording — stays the regression net throughout.
      hold Preview: the table designer's (`TableDraft`, ~40) and the trigger editor's (~40) are the
      bulk, then the routine, view, event, database and smaller object drafts — some 140 in all,
      an enum per draft.
-   - **The users browser's notes** — `users::Principals::note` and `Grants::note`, which
-     `schemaic-db` fills as sentences (`users::my_scope_note` and its siblings) — the
-     write-back's problem, smaller.
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

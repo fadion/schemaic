@@ -132,12 +132,16 @@ pub async fn a_grant_list_says_which_database_it_covers_when_it_covers_only_one(
         .fetch_grants(Some(&scratch.database), &me)
         .await
         .unwrap_or_else(|e| panic!("fetch_grants on {}: {e}", target.endpoint()));
-    let note = grants.note.as_deref().unwrap_or_else(|| {
-        panic!(
-            "{}: a partial grant list qualified itself with nothing",
-            target.endpoint()
-        )
-    });
+    let note = grants
+        .note
+        .as_ref()
+        .map(|n| n.message())
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: a partial grant list qualified itself with nothing",
+                target.endpoint()
+            )
+        });
     if target.grants_are_database_scoped {
         assert!(
             note.contains(&scratch.database),
@@ -182,12 +186,16 @@ pub async fn a_grant_list_with_no_database_says_it_is_covering_none(target: &'st
         // not complete, and it used to say `note: None`, which claimed it was.
         // `SHOW GRANTS` is direct-only on both servers, so everything held
         // through a granted role is missing from it.
-        let note = grants.note.as_deref().unwrap_or_else(|| {
-            panic!(
-                "{}: a direct-only grant list said nothing about the roles it does not expand",
-                target.endpoint()
-            )
-        });
+        let note = grants
+            .note
+            .as_ref()
+            .map(|n| n.message())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: a direct-only grant list said nothing about the roles it does not expand",
+                    target.endpoint()
+                )
+            });
         assert!(
             note.contains("role"),
             "{}: the note does not name what it leaves out: {note}",
