@@ -6743,14 +6743,14 @@ impl AiEffort {
             AiEffort::Max => "max",
         }
     }
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            AiEffort::Minimal => "Minimal",
-            AiEffort::Low => "Low",
-            AiEffort::Medium => "Medium",
-            AiEffort::High => "High",
-            AiEffort::Extra => "Extra",
-            AiEffort::Max => "Max",
+            AiEffort::Minimal => tr!("lib-effort-minimal"),
+            AiEffort::Low => tr!("lib-effort-low"),
+            AiEffort::Medium => tr!("lib-effort-medium"),
+            AiEffort::High => tr!("lib-effort-high"),
+            AiEffort::Extra => tr!("lib-effort-extra"),
+            AiEffort::Max => tr!("lib-effort-max"),
         }
     }
     /// Parse a persisted level. Unknown falls back to `Medium`, as it always has:
@@ -6956,11 +6956,11 @@ pub enum SchemaScope {
 }
 impl SchemaScope {
     pub const ALL: [SchemaScope; 3] = [SchemaScope::Active, SchemaScope::All, SchemaScope::None];
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            SchemaScope::Active => "Active database only",
-            SchemaScope::All => "All databases",
-            SchemaScope::None => "None",
+            SchemaScope::Active => tr!("lib-schema-scope-active"),
+            SchemaScope::All => tr!("lib-schema-scope-all"),
+            SchemaScope::None => tr!("lib-schema-scope-none"),
         }
     }
     /// Persisted key.
@@ -6989,11 +6989,11 @@ pub enum TermCursor {
 }
 impl TermCursor {
     pub const ALL: [TermCursor; 3] = [TermCursor::Block, TermCursor::Bar, TermCursor::Underline];
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            TermCursor::Block => "Block",
-            TermCursor::Bar => "Bar",
-            TermCursor::Underline => "Underline",
+            TermCursor::Block => tr!("lib-cursor-block"),
+            TermCursor::Bar => tr!("lib-cursor-bar"),
+            TermCursor::Underline => tr!("lib-cursor-underline"),
         }
     }
     pub fn key(self) -> &'static str {
@@ -15416,6 +15416,17 @@ mod conn_node_scope_tests {
 mod catalogue_tests {
     use super::{TestLine, ai_off_note, tr, tx_mode_label, tx_pill_text};
     use schemaic_core::tx::{TxMode, TxState, pill_text};
+
+    /// Settings' dropdown entries read as they did before the catalogue.
+    #[test]
+    fn the_settings_choices_read_as_they_did_in_english() {
+        let effort: Vec<String> = super::AiEffort::ALL.iter().map(|e| e.label()).collect();
+        assert_eq!(effort, ["Minimal", "Low", "Medium", "High", "Extra", "Max"]);
+        let scope: Vec<String> = super::SchemaScope::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(scope, ["Active database only", "All databases", "None"]);
+        let cursor: Vec<String> = super::TermCursor::ALL.iter().map(|c| c.label()).collect();
+        assert_eq!(cursor, ["Block", "Bar", "Underline"]);
+    }
 
     /// The shared words read as they did before the catalogue.
     #[test]

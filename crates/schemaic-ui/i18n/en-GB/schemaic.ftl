@@ -2118,3 +2118,23 @@ lib-ai-off-note = The AI assistant is off. Pick an Agent CLI in AI settings to t
 lib-test-testing = Testing…
 lib-test-connected = Connected
 lib-test-failed = Connection failed
+
+## The settings choices lib.rs defines — Settings' dropdowns show them. Their
+## persisted keys (minimal, xhigh, active, block…) are not here.
+
+# The AI assistant's effort levels.
+lib-effort-minimal = Minimal
+lib-effort-low = Low
+lib-effort-medium = Medium
+lib-effort-high = High
+lib-effort-extra = Extra
+lib-effort-max = Max
+# How much database structure each AI message carries. Settings › AI's hint
+# names "None"; keep the two the same.
+lib-schema-scope-active = Active database only
+lib-schema-scope-all = All databases
+lib-schema-scope-none = None
+# The terminal's cursor shapes.
+lib-cursor-block = Block
+lib-cursor-bar = Bar
+lib-cursor-underline = Underline
