@@ -1273,6 +1273,53 @@ editor-row-remove = Remove
 
 # $table is database.schema.table (or database.table).
 trigger-editor-title = Triggers on { $table }
+# What stops a trigger being emitted (core's ddl::TriggerProblem), in the
+# footer. $engine is a product name (SQLite, SQL Server, MySQL); $event an
+# event's SQL (INSERT, UPDATE, DELETE); the rest of the SQL stays as written.
+trigger-problem-no-name = The trigger needs a name.
+trigger-problem-no-table = A trigger needs a table to fire on.
+trigger-problem-no-event = A trigger needs at least one event to fire on.
+trigger-problem-pg-no-function = A PostgreSQL trigger needs a function to execute.
+trigger-problem-pg-body = A PostgreSQL trigger runs a function, not a body — pick or write one to execute.
+trigger-problem-truncate-row-level = A TRUNCATE trigger has to be FOR EACH STATEMENT.
+trigger-problem-instead-of-row-only = An INSTEAD OF trigger has to be FOR EACH ROW.
+trigger-problem-instead-of-view-only = Only a view can have an INSTEAD OF trigger — a table takes BEFORE or AFTER.
+trigger-problem-pg-view-row-timing = A view's BEFORE or AFTER trigger has to be FOR EACH STATEMENT — use INSTEAD OF to act on rows.
+trigger-problem-update-of-without-update = UPDATE OF names columns on an UPDATE trigger.
+trigger-problem-pg-instead-of-columns = An INSTEAD OF trigger takes no column list — PostgreSQL fires it on any UPDATE of the view.
+trigger-problem-one-event = { $engine } fires a trigger on one event — make a separate trigger per event.
+trigger-problem-no-truncate = { $engine } has no TRUNCATE trigger.
+trigger-problem-sqlite-view-timing = A view's trigger has to be INSTEAD OF — SQLite has no BEFORE or AFTER trigger on a view.
+trigger-problem-sqlite-row-only = SQLite has only FOR EACH ROW triggers — there is no statement-level one.
+trigger-problem-no-body = A { $engine } trigger needs a body.
+trigger-problem-sqlite-not-block = A SQLite trigger's body has to be a BEGIN … END block holding at least one statement.
+trigger-problem-runs-body = A { $engine } trigger runs a body, not a function — write the statements to run.
+trigger-problem-ms-no-before = SQL Server has no BEFORE trigger — use INSTEAD OF to act before the write.
+trigger-problem-ms-view-timing = A view's trigger has to be INSTEAD OF on SQL Server.
+trigger-problem-ms-statement-only = SQL Server fires a trigger once per statement — read the rows from inserted and deleted.
+trigger-problem-ms-instead-of-rank = An INSTEAD OF trigger can't have a firing order — set each event back to any order.
+# SQL Server: a firing order set on an event the trigger doesn't fire on.
+trigger-problem-first-without-event = It fires first on { $event }, which it isn't a trigger for.
+trigger-problem-last-without-event = It fires last on { $event }, which it isn't a trigger for.
+trigger-problem-no-when = { $engine } has no WHEN condition — put the test inside the body with IF.
+trigger-problem-ms-no-update-of = SQL Server has no UPDATE OF — test UPDATE(column) inside the body.
+trigger-problem-my-no-view = MySQL takes no trigger on a view.
+trigger-problem-my-no-instead-of = MySQL has no INSTEAD OF trigger — those are PostgreSQL's.
+trigger-problem-my-no-update-of = MySQL has no UPDATE OF — a trigger sees every column.
+# $name is a trigger's name.
+trigger-problem-constraint-trigger = Schemaic can't edit the constraint trigger { $name } — it doesn't model the deferral settings one carries.
+trigger-problem-not-editable = Schemaic can't edit the trigger { $name } — its definition is encrypted, hidden from this login, or uses an option Schemaic doesn't model. Change it in SQL instead.
+trigger-problem-twice = Two triggers are both called { $name }.
+# SQL Server: $n triggers set to fire first (or last) on $event; $names are all
+# but the last, joined with ", ".
+trigger-problem-first-clash = { $n ->
+    [2] Only one trigger can fire first on { $event } — { $names } and { $last } are both set to.
+   *[other] Only one trigger can fire first on { $event } — { $names } and { $last } are all set to.
+}
+trigger-problem-last-clash = { $n ->
+    [2] Only one trigger can fire last on { $event } — { $names } and { $last } are both set to.
+   *[other] Only one trigger can fire last on { $event } — { $names } and { $last } are all set to.
+}
 # The DDL preview's subject: a plan can touch several of a table's triggers.
 trigger-editor-preview-subject = triggers on { $table }
 trigger-editor-none-selected = No trigger selected.

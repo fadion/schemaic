@@ -8822,7 +8822,8 @@ existing prose was left alone.
     changes, which is all it took for `supports_trigger_editing(MsSql)` to answer yes
     (`sql_server_offers_the_trigger_editor`, `an_edited_sql_server_trigger_is_altered_in_place`,
     `a_renamed_sql_server_trigger_is_dropped_and_created`).
-    **`TriggerDraft::validate` is one exhaustive `match dialect` now**, because of what the old shape
+    **`TriggerDraft::problems` is one exhaustive `match dialect` now** (`validate` its English
+    wrapper — the editors' refusals, under `i18n.rs`), because of what the old shape
     would have done: it was an `if pg … else if sqlite … else` chain, and the `else` validated a SQL
     Server draft as MySQL's — refusing a second event and every `INSTEAD OF` — the moment the editor
     opened there. The SQL Server arm is T-SQL's grammar: no `BEFORE`, a view takes only `INSTEAD OF`
@@ -28907,8 +28908,15 @@ existing prose was left alone.
     `table_designer::empty_hint`'s message, takes `impl Into<String>`). The NOT FOR REPLICATION
     toggle's own label is the SQL clause and stays, as do the SQL samples and keyword choices
     (`INSERT`/`UPDATE`/`DELETE`, `FOR EACH ROW`, `BEGIN … END`). The list's `+`/`−` are
-    `table_designer::list_actions`' and were converted with that file; `TriggerDraft::validate`'s
-    sentences are core's prose, phase 4.
+    `table_designer::list_actions`' and were converted with that file. The footer's refusal and
+    Preview's readiness read `TriggerSetDraft::problems`, not its English wrapper `validate` (the
+    editors' refusals, under `i18n.rs`): `trigger_problem_text` words each problem from
+    `trigger-problem-*`, `$engine` a product name and `$event` an event's SQL. A firing rank's word
+    is a message of its own — `-first-without-event`/`-last-without-event`, `-first-clash`/
+    `-last-clash` — rather than `FiringRank::label`'s English *first*/*last* going in as a
+    variable; the clash's *both*/*all* is a selector on `$n` (`[2]` exactly), and its names are
+    joined with ", " in code, as core joins them. Held by
+    `english_says_every_trigger_problem_as_core_does`.
   - `routine_editor.rs` — the **stored routine** modal: one form for a function or a procedure,
     over `core::ddl`'s `RoutineDraft`, on the three engines that have them. Reached from the schema
     tree's Functions/Procedures folders (row **Edit**, folder **Create**), from the database and
@@ -40992,14 +41000,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     `users-note-*`, joining sentences with a space in code as core does, held by
     `english_says_every_users_note_as_core_does`; the live tests read `message()`.
     The object editors' refusals are the case where core's English has more readers than the
-    interface does, and the database, view, event, object and routine editors are the first five; the shape
+    interface does, and the database, view, event, object, routine and trigger editors are the first six; the shape
     below is the one the remaining drafts are to take. A draft's `validate` stays core's English — still
     a `Vec<String>`, because core's many tests (and the live ones) read it — and becomes a thin
     wrapper over a typed
     `problems()`, one enum per draft — or per editor, where one editor holds several drafts —
     whose `message()` is that English byte for byte and which has
     no `Display`. The editor words `problems()` from the catalogue and asks
-    `problems().is_empty()` for Preview's readiness, so these five editors no longer read
+    `problems().is_empty()` for Preview's readiness, so these six editors no longer read
     `validate` at all. `DatabaseDraft::problems` answers `DatabaseProblem` (`NoName`, `BadCollation`),
     `ViewDraft::problems(dialect)` answers `ViewProblem` (`NoName`, `NoSelect`, `NotAQuery`,
     `Materialized`, `Hidden`, `Verbatim`) — `view_not_editable_reason` now answering
@@ -41015,7 +41023,16 @@ Re-introducing the anti-patterns these guard against is a regression:
     `NoLanguage` and `NoBody`, each carrying the `RoutineKind` its sentence names; `NoReturnType`,
     `ProcedureReturns`, `BareParameter`, `RefusedOption { shape, option, native }` with the option
     as its SQL, `NativeNeedsSchemaBinding`, `InlineWithExecuteAs`, `NumberedRename { was, group }`
-    with the group's names already joined, `TriggerFunctionArgs`). The event's name clash
+    with the group's names already joined, `TriggerFunctionArgs`). The trigger editor's two drafts
+    share one `TriggerProblem`, answered by `TriggerDraft::problems(dialect, host)` and
+    `TriggerSetDraft::problems(current, dialect, host)`, the per-engine arms and their order
+    unchanged: an engine's own refusals are its own variants (`PgNoFunction`, `MsNoBefore`,
+    `MyNoView`, …, with `InsteadOfViewOnly` and `UpdateOfWithoutUpdate` shared by PostgreSQL and
+    SQLite), and a refusal several engines make in the same words carries the product name as
+    `engine: &'static str` (`OneEvent`, `NoTruncate`, `NoBody`, `RunsBody`, `NoWhen`); the set's
+    own are `ConstraintTrigger`, `NotEditable` and `Twice`, each with the `name`, and `RankClash
+    { rank, event, head, last }`, which keeps the names before the last as a list — the interface
+    joins them, and counts them for *both* or *all*. The event's name clash
     is not a problem but a decision of its own: `EventDraft::clashes` is it, `name_clash` the
     English `Option<String>` wrapped round it, and the editor words a clash from
     `event-name-clash` with `$name` the draft's trimmed name. The routine's is the same shape with
@@ -41025,12 +41042,13 @@ Re-introducing the anti-patterns these guard against is a regression:
     original*), with `name_clash` its English and the decision itself unchanged. Each editor's
     renderer sits beside it (`database_problem_text`, `view_problem_text`,
     `event_problem_text`/`event_clash_text`, `object_problem_text`,
-    `routine_problem_text`/`routine_clash_text`), held by
+    `routine_problem_text`/`routine_clash_text`, `trigger_problem_text`), held by
     `english_says_every_database_problem_as_core_does`,
     `english_says_every_view_problem_as_core_does`,
     `english_says_every_event_problem_as_core_does`,
-    `english_says_every_object_problem_as_core_does` and
-    `english_says_every_routine_problem_as_core_does`. Those tests walk a hand-written list of
+    `english_says_every_object_problem_as_core_does`,
+    `english_says_every_routine_problem_as_core_does` and
+    `english_says_every_trigger_problem_as_core_does`. Those tests walk a hand-written list of
     variants rather than an `ALL`, so a new variant fails the renderer's exhaustive `match` at
     compile time but is not held to its English until someone adds it to the list.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words

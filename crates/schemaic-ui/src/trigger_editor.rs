@@ -1432,6 +1432,85 @@ fn pg_action(
     .into_any()
 }
 
+/// What stops the draft being emitted — core's `TriggerProblem::message` in the
+/// interface's language. Engine names, events and the rest of the SQL go in as
+/// they are; a firing rank's word is a message of its own.
+fn trigger_problem_text(p: &ddl::TriggerProblem) -> String {
+    use ddl::TriggerProblem as P;
+    use schemaic_core::schema::FiringRank as R;
+    match p {
+        P::NoName => tr!("trigger-problem-no-name"),
+        P::NoTable => tr!("trigger-problem-no-table"),
+        P::NoEvent => tr!("trigger-problem-no-event"),
+        P::PgNoFunction => tr!("trigger-problem-pg-no-function"),
+        P::PgBody => tr!("trigger-problem-pg-body"),
+        P::TruncateRowLevel => tr!("trigger-problem-truncate-row-level"),
+        P::InsteadOfRowOnly => tr!("trigger-problem-instead-of-row-only"),
+        P::InsteadOfViewOnly => tr!("trigger-problem-instead-of-view-only"),
+        P::PgViewRowTiming => tr!("trigger-problem-pg-view-row-timing"),
+        P::UpdateOfWithoutUpdate => tr!("trigger-problem-update-of-without-update"),
+        P::PgInsteadOfColumns => tr!("trigger-problem-pg-instead-of-columns"),
+        P::OneEvent { engine } => tr!("trigger-problem-one-event", engine = engine.to_string()),
+        P::NoTruncate { engine } => {
+            tr!("trigger-problem-no-truncate", engine = engine.to_string())
+        }
+        P::SqliteViewTiming => tr!("trigger-problem-sqlite-view-timing"),
+        P::SqliteRowOnly => tr!("trigger-problem-sqlite-row-only"),
+        P::NoBody { engine } => tr!("trigger-problem-no-body", engine = engine.to_string()),
+        P::SqliteNotBlock => tr!("trigger-problem-sqlite-not-block"),
+        P::RunsBody { engine } => tr!("trigger-problem-runs-body", engine = engine.to_string()),
+        P::MsNoBefore => tr!("trigger-problem-ms-no-before"),
+        P::MsViewTiming => tr!("trigger-problem-ms-view-timing"),
+        P::MsStatementOnly => tr!("trigger-problem-ms-statement-only"),
+        P::MsInsteadOfRank => tr!("trigger-problem-ms-instead-of-rank"),
+        P::MsRankWithoutEvent { rank, event } => match rank {
+            R::First => tr!(
+                "trigger-problem-first-without-event",
+                event = event.to_string()
+            ),
+            R::Last => tr!(
+                "trigger-problem-last-without-event",
+                event = event.to_string()
+            ),
+        },
+        P::NoWhen { engine } => tr!("trigger-problem-no-when", engine = engine.to_string()),
+        P::MsNoUpdateOf => tr!("trigger-problem-ms-no-update-of"),
+        P::MyNoView => tr!("trigger-problem-my-no-view"),
+        P::MyNoInsteadOf => tr!("trigger-problem-my-no-instead-of"),
+        P::MyNoUpdateOf => tr!("trigger-problem-my-no-update-of"),
+        P::ConstraintTrigger { name } => {
+            tr!("trigger-problem-constraint-trigger", name = name.as_str())
+        }
+        P::NotEditable { name } => tr!("trigger-problem-not-editable", name = name.as_str()),
+        P::Twice { name } => tr!("trigger-problem-twice", name = name.as_str()),
+        P::RankClash {
+            rank,
+            event,
+            head,
+            last,
+        } => {
+            let (event, names, last) = (event.to_string(), head.join(", "), last.as_str());
+            let n = head.len() + 1;
+            match rank {
+                R::First => tr!(
+                    "trigger-problem-first-clash",
+                    event = event,
+                    names = names,
+                    last = last,
+                    n = n
+                ),
+                R::Last => tr!(
+                    "trigger-problem-last-clash",
+                    event = event,
+                    names = names,
+                    last = last,
+                    n = n
+                ),
+            }
+        }
+    }
+}
+
 // ── the modal ────────────────────────────────────────────────────────────────
 
 /// The change set the trigger draft currently describes — the same call the
@@ -1684,13 +1763,13 @@ pub(crate) fn trigger_editor_overlay(
             let status = dyn_container(
                 move || d.trigger_draft.get(),
                 move |draft| {
-                    let errs = draft.validate(
+                    let errs = draft.problems(
                         &status_target.current,
                         status_target.dialect,
                         status_target.host(),
                     );
                     if let Some(first) = errs.first() {
-                        return crate::widgets::footer_error(first.clone());
+                        return crate::widgets::footer_error(trigger_problem_text(first));
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(tr!("editor-change-count", n = n))
@@ -1714,7 +1793,7 @@ pub(crate) fn trigger_editor_overlay(
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
                     let ready = draft
-                        .validate(&target.current, target.dialect, target.host())
+                        .problems(&target.current, target.dialect, target.host())
                         .is_empty()
                         && !cs.is_empty();
                     h_stack((
@@ -1854,6 +1933,71 @@ mod one_answer_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every problem reads in English exactly as core's
+    /// `TriggerProblem::message`** — each engine's own, the shared ones under
+    /// every engine that says them, both firing ranks, and a rank clash of two
+    /// triggers and of three.
+    #[test]
+    fn english_says_every_trigger_problem_as_core_does() {
+        use ddl::TriggerProblem as P;
+        use schemaic_core::schema::FiringRank as R;
+        let mut problems = vec![
+            P::NoName,
+            P::NoTable,
+            P::NoEvent,
+            P::PgNoFunction,
+            P::PgBody,
+            P::TruncateRowLevel,
+            P::InsteadOfRowOnly,
+            P::InsteadOfViewOnly,
+            P::PgViewRowTiming,
+            P::UpdateOfWithoutUpdate,
+            P::PgInsteadOfColumns,
+            P::SqliteViewTiming,
+            P::SqliteRowOnly,
+            P::SqliteNotBlock,
+            P::MsNoBefore,
+            P::MsViewTiming,
+            P::MsStatementOnly,
+            P::MsInsteadOfRank,
+            P::MsNoUpdateOf,
+            P::MyNoView,
+            P::MyNoInsteadOf,
+            P::MyNoUpdateOf,
+            P::ConstraintTrigger {
+                name: "audit_fk".into(),
+            },
+            P::NotEditable {
+                name: "secret".into(),
+            },
+            P::Twice { name: "t1".into() },
+        ];
+        for engine in ["SQLite", "SQL Server", "MySQL"] {
+            problems.push(P::OneEvent { engine });
+            problems.push(P::NoTruncate { engine });
+            problems.push(P::NoBody { engine });
+            problems.push(P::RunsBody { engine });
+            problems.push(P::NoWhen { engine });
+        }
+        for rank in [R::First, R::Last] {
+            problems.push(P::MsRankWithoutEvent {
+                rank,
+                event: "DELETE",
+            });
+            for head in [vec!["a".to_string()], vec!["a".into(), "b".into()]] {
+                problems.push(P::RankClash {
+                    rank,
+                    event: "INSERT",
+                    head,
+                    last: "c".into(),
+                });
+            }
+        }
+        for p in problems {
+            assert_eq!(trigger_problem_text(&p), p.message(), "{p:?}");
+        }
+    }
 
     /// **The return trip is what makes the shared session counter harmless
     /// here.** Opening the nested function editor bumps `DdlUi::session` like

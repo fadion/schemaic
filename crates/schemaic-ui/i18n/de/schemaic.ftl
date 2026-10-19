@@ -1113,6 +1113,46 @@ editor-row-remove = Entfernen
 ## Trigger editor
 
 trigger-editor-title = Trigger auf { $table }
+trigger-problem-no-name = Der Trigger braucht einen Namen.
+trigger-problem-no-table = Ein Trigger braucht eine Tabelle, auf der er auslöst.
+trigger-problem-no-event = Ein Trigger braucht mindestens ein Ereignis, auf das er auslöst.
+trigger-problem-pg-no-function = Ein PostgreSQL-Trigger braucht eine auszuführende Funktion.
+trigger-problem-pg-body = Ein PostgreSQL-Trigger führt eine Funktion aus, keinen Rumpf — wähle oder schreibe eine.
+trigger-problem-truncate-row-level = Ein TRUNCATE-Trigger muss FOR EACH STATEMENT sein.
+trigger-problem-instead-of-row-only = Ein INSTEAD-OF-Trigger muss FOR EACH ROW sein.
+trigger-problem-instead-of-view-only = Nur eine Sicht kann einen INSTEAD-OF-Trigger haben — eine Tabelle nimmt BEFORE oder AFTER.
+trigger-problem-pg-view-row-timing = Ein BEFORE- oder AFTER-Trigger einer Sicht muss FOR EACH STATEMENT sein — nutze INSTEAD OF, um auf Zeilen zu wirken.
+trigger-problem-update-of-without-update = UPDATE OF nennt Spalten eines UPDATE-Triggers.
+trigger-problem-pg-instead-of-columns = Ein INSTEAD-OF-Trigger nimmt keine Spaltenliste — PostgreSQL löst ihn bei jedem UPDATE der Sicht aus.
+trigger-problem-one-event = { $engine } löst einen Trigger auf ein Ereignis aus — lege pro Ereignis einen eigenen Trigger an.
+trigger-problem-no-truncate = { $engine } hat keinen TRUNCATE-Trigger.
+trigger-problem-sqlite-view-timing = Der Trigger einer Sicht muss INSTEAD OF sein — SQLite hat keinen BEFORE- oder AFTER-Trigger auf einer Sicht.
+trigger-problem-sqlite-row-only = SQLite hat nur FOR-EACH-ROW-Trigger — es gibt keinen auf Anweisungsebene.
+trigger-problem-no-body = Ein { $engine }-Trigger braucht einen Rumpf.
+trigger-problem-sqlite-not-block = Der Rumpf eines SQLite-Triggers muss ein BEGIN … END-Block mit mindestens einer Anweisung sein.
+trigger-problem-runs-body = Ein { $engine }-Trigger führt einen Rumpf aus, keine Funktion — schreibe die auszuführenden Anweisungen.
+trigger-problem-ms-no-before = SQL Server hat keinen BEFORE-Trigger — nutze INSTEAD OF, um vor dem Schreiben zu handeln.
+trigger-problem-ms-view-timing = Der Trigger einer Sicht muss auf SQL Server INSTEAD OF sein.
+trigger-problem-ms-statement-only = SQL Server löst einen Trigger einmal pro Anweisung aus — lies die Zeilen aus inserted und deleted.
+trigger-problem-ms-instead-of-rank = Ein INSTEAD-OF-Trigger kann keine Auslösereihenfolge haben — setze jedes Ereignis auf beliebige Reihenfolge zurück.
+trigger-problem-first-without-event = Er löst als erster bei { $event } aus, wofür er kein Trigger ist.
+trigger-problem-last-without-event = Er löst als letzter bei { $event } aus, wofür er kein Trigger ist.
+trigger-problem-no-when = { $engine } hat keine WHEN-Bedingung — setze den Test mit IF in den Rumpf.
+trigger-problem-ms-no-update-of = SQL Server hat kein UPDATE OF — prüfe UPDATE(spalte) im Rumpf.
+trigger-problem-my-no-view = MySQL nimmt keinen Trigger auf einer Sicht.
+trigger-problem-my-no-instead-of = MySQL hat keinen INSTEAD-OF-Trigger — die gibt es in PostgreSQL.
+trigger-problem-my-no-update-of = MySQL hat kein UPDATE OF — ein Trigger sieht jede Spalte.
+trigger-problem-constraint-trigger = Schemaic kann den Constraint-Trigger { $name } nicht bearbeiten — es bildet die Verzögerungseinstellungen nicht ab, die er trägt.
+trigger-problem-not-editable = Schemaic kann den Trigger { $name } nicht bearbeiten — seine Definition ist verschlüsselt, für diesen Login verborgen oder nutzt eine Option, die Schemaic nicht abbildet. Ändere ihn stattdessen in SQL.
+trigger-problem-twice = Zwei Trigger heißen beide { $name }.
+trigger-problem-first-clash = { $n ->
+    [2] Nur ein Trigger kann als erster bei { $event } auslösen — { $names } und { $last } sind beide so eingestellt.
+   *[other] Nur ein Trigger kann als erster bei { $event } auslösen — { $names } und { $last } sind alle so eingestellt.
+}
+trigger-problem-last-clash = { $n ->
+    [2] Nur ein Trigger kann als letzter bei { $event } auslösen — { $names } und { $last } sind beide so eingestellt.
+   *[other] Nur ein Trigger kann als letzter bei { $event } auslösen — { $names } und { $last } sind alle so eingestellt.
+}
 trigger-editor-preview-subject = Trigger auf { $table }
 trigger-editor-none-selected = Kein Trigger ausgewählt.
 trigger-editor-readonly-constraint = Dies ist ein Constraint-Trigger. Schemaic bildet dessen Verzögerungseinstellungen nicht ab, daher kann er hier entfernt, aber nicht bearbeitet werden – ändere ihn stattdessen in SQL.

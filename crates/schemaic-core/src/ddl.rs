@@ -1434,6 +1434,208 @@ pub struct TriggerDraft {
     pub info: TriggerInfo,
 }
 
+/// What stops a [`TriggerDraft`] or a [`TriggerSetDraft`] being emitted
+/// ([`TriggerDraft::problems`], [`TriggerSetDraft::problems`]) — a value, so the
+/// editor can say it in the interface's language; [`TriggerProblem::message`]
+/// is the English. An `engine` is a product name (`"SQLite"`, `"SQL Server"`,
+/// `"MySQL"`) where several engines refuse the same thing in the same words;
+/// an `event` is its SQL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TriggerProblem {
+    NoName,
+    NoTable,
+    NoEvent,
+    /// PostgreSQL: no function to execute.
+    PgNoFunction,
+    /// PostgreSQL: a body where a function belongs.
+    PgBody,
+    /// PostgreSQL: a `TRUNCATE` trigger at row level.
+    TruncateRowLevel,
+    /// PostgreSQL: an `INSTEAD OF` trigger at statement level.
+    InsteadOfRowOnly,
+    /// PostgreSQL and SQLite: `INSTEAD OF` on a table.
+    InsteadOfViewOnly,
+    /// PostgreSQL: a row-level `BEFORE`/`AFTER` trigger on a view.
+    PgViewRowTiming,
+    /// PostgreSQL and SQLite: `UPDATE OF` columns without an `UPDATE` event.
+    UpdateOfWithoutUpdate,
+    /// PostgreSQL: an `INSTEAD OF` trigger with a column list.
+    PgInsteadOfColumns,
+    /// SQLite and MySQL: more than one event.
+    OneEvent {
+        engine: &'static str,
+    },
+    /// SQLite, SQL Server and MySQL: a `TRUNCATE` event.
+    NoTruncate {
+        engine: &'static str,
+    },
+    /// SQLite: a view's trigger that is not `INSTEAD OF`.
+    SqliteViewTiming,
+    /// SQLite: a statement-level trigger.
+    SqliteRowOnly,
+    /// SQLite, SQL Server and MySQL: an empty body.
+    NoBody {
+        engine: &'static str,
+    },
+    /// SQLite: a body that is no `BEGIN … END` block.
+    SqliteNotBlock,
+    /// SQLite, SQL Server and MySQL: a function where a body belongs.
+    RunsBody {
+        engine: &'static str,
+    },
+    /// SQL Server: a `BEFORE` trigger.
+    MsNoBefore,
+    /// SQL Server: a view's trigger that is not `INSTEAD OF`.
+    MsViewTiming,
+    /// SQL Server: a row-level trigger.
+    MsStatementOnly,
+    /// SQL Server: a firing order on an `INSTEAD OF` trigger.
+    MsInsteadOfRank,
+    /// SQL Server: a firing order on an event the trigger does not fire on.
+    MsRankWithoutEvent {
+        rank: crate::schema::FiringRank,
+        event: &'static str,
+    },
+    /// SQL Server and MySQL: a `WHEN` condition.
+    NoWhen {
+        engine: &'static str,
+    },
+    /// SQL Server: an `UPDATE OF` column list.
+    MsNoUpdateOf,
+    /// MySQL: a trigger on a view.
+    MyNoView,
+    /// MySQL: an `INSTEAD OF` trigger.
+    MyNoInsteadOf,
+    /// MySQL: an `UPDATE OF` column list.
+    MyNoUpdateOf,
+    /// The set: a constraint trigger being changed.
+    ConstraintTrigger {
+        name: String,
+    },
+    /// The set: SQL Server's unreadable or hidden trigger being changed.
+    NotEditable {
+        name: String,
+    },
+    /// The set: two triggers with one name.
+    Twice {
+        name: String,
+    },
+    /// The set, SQL Server: more than one trigger set to fire `rank` on
+    /// `event` — `head` the first names, joined with `", "`, then `last`.
+    RankClash {
+        rank: crate::schema::FiringRank,
+        event: &'static str,
+        head: Vec<String>,
+        last: String,
+    },
+}
+
+impl TriggerProblem {
+    /// The problem in English.
+    pub fn message(&self) -> String {
+        use TriggerProblem as P;
+        match self {
+            P::NoName => "The trigger needs a name.".to_string(),
+            P::NoTable => "A trigger needs a table to fire on.".to_string(),
+            P::NoEvent => "A trigger needs at least one event to fire on.".to_string(),
+            P::PgNoFunction => "A PostgreSQL trigger needs a function to execute.".to_string(),
+            P::PgBody => "A PostgreSQL trigger runs a function, not a body — pick or write one \
+                          to execute."
+                .to_string(),
+            P::TruncateRowLevel => "A TRUNCATE trigger has to be FOR EACH STATEMENT.".to_string(),
+            P::InsteadOfRowOnly => "An INSTEAD OF trigger has to be FOR EACH ROW.".to_string(),
+            P::InsteadOfViewOnly => {
+                "Only a view can have an INSTEAD OF trigger — a table takes BEFORE or AFTER."
+                    .to_string()
+            }
+            P::PgViewRowTiming => {
+                "A view's BEFORE or AFTER trigger has to be FOR EACH STATEMENT — use INSTEAD OF \
+                 to act on rows."
+                    .to_string()
+            }
+            P::UpdateOfWithoutUpdate => "UPDATE OF names columns on an UPDATE trigger.".to_string(),
+            P::PgInsteadOfColumns => {
+                "An INSTEAD OF trigger takes no column list — PostgreSQL fires it on any UPDATE \
+                 of the view."
+                    .to_string()
+            }
+            P::OneEvent { engine } => format!(
+                "{engine} fires a trigger on one event — make a separate trigger per event."
+            ),
+            P::NoTruncate { engine } => format!("{engine} has no TRUNCATE trigger."),
+            P::SqliteViewTiming => {
+                "A view's trigger has to be INSTEAD OF — SQLite has no BEFORE or AFTER trigger \
+                 on a view."
+                    .to_string()
+            }
+            P::SqliteRowOnly => {
+                "SQLite has only FOR EACH ROW triggers — there is no statement-level one."
+                    .to_string()
+            }
+            P::NoBody { engine } => format!("A {engine} trigger needs a body."),
+            P::SqliteNotBlock => {
+                "A SQLite trigger's body has to be a BEGIN … END block holding at least one \
+                 statement."
+                    .to_string()
+            }
+            P::RunsBody { engine } => format!(
+                "A {engine} trigger runs a body, not a function — write the statements to run."
+            ),
+            P::MsNoBefore => {
+                "SQL Server has no BEFORE trigger — use INSTEAD OF to act before the write."
+                    .to_string()
+            }
+            P::MsViewTiming => "A view's trigger has to be INSTEAD OF on SQL Server.".to_string(),
+            P::MsStatementOnly => {
+                "SQL Server fires a trigger once per statement — read the rows from inserted \
+                 and deleted."
+                    .to_string()
+            }
+            P::MsInsteadOfRank => {
+                "An INSTEAD OF trigger can't have a firing order — set each event back to any \
+                 order."
+                    .to_string()
+            }
+            P::MsRankWithoutEvent { rank, event } => format!(
+                "It fires {} on {event}, which it isn't a trigger for.",
+                rank.label()
+            ),
+            P::NoWhen { engine } => {
+                format!("{engine} has no WHEN condition — put the test inside the body with IF.")
+            }
+            P::MsNoUpdateOf => {
+                "SQL Server has no UPDATE OF — test UPDATE(column) inside the body.".to_string()
+            }
+            P::MyNoView => "MySQL takes no trigger on a view.".to_string(),
+            P::MyNoInsteadOf => {
+                "MySQL has no INSTEAD OF trigger — those are PostgreSQL's.".to_string()
+            }
+            P::MyNoUpdateOf => "MySQL has no UPDATE OF — a trigger sees every column.".to_string(),
+            P::ConstraintTrigger { name } => format!(
+                "Schemaic can't edit the constraint trigger {name} — it doesn't model the \
+                 deferral settings one carries."
+            ),
+            P::NotEditable { name } => format!(
+                "Schemaic can't edit the trigger {name} — its definition is encrypted, hidden \
+                 from this login, or uses an option Schemaic doesn't model. Change it in SQL \
+                 instead."
+            ),
+            P::Twice { name } => format!("Two triggers are both called {name}."),
+            P::RankClash {
+                rank,
+                event,
+                head,
+                last,
+            } => format!(
+                "Only one trigger can fire {} on {event} — {} and {last} are {} set to.",
+                rank.label(),
+                head.join(", "),
+                if head.len() == 1 { "both" } else { "all" }
+            ),
+        }
+    }
+}
+
 impl TriggerDraft {
     /// The draft that describes an introspected trigger exactly — the editor's
     /// starting point, and the input to the round-trip gate.
@@ -1469,18 +1671,19 @@ impl TriggerDraft {
     /// engines, because the model deliberately holds both shapes: introspection
     /// must never have to lie about what a server reported, so the refusal lives
     /// here instead.
-    pub fn validate(&self, dialect: SqlDialect, host: TriggerHost) -> Vec<String> {
+    pub fn problems(&self, dialect: SqlDialect, host: TriggerHost) -> Vec<TriggerProblem> {
+        use TriggerProblem as P;
         let t = &self.info;
         let view = host == TriggerHost::View;
         let mut out = Vec::new();
         if t.name.trim().is_empty() {
-            out.push("The trigger needs a name.".to_string());
+            out.push(P::NoName);
         }
         if t.table.trim().is_empty() {
-            out.push("A trigger needs a table to fire on.".to_string());
+            out.push(P::NoTable);
         }
         if t.events.is_empty() {
-            out.push("A trigger needs at least one event to fire on.".to_string());
+            out.push(P::NoEvent);
         }
         // A constraint trigger's *existence* is fine — see
         // `TriggerSetDraft::validate`, which is where the refusal lives now,
@@ -1495,21 +1698,17 @@ impl TriggerDraft {
             SqlDialect::Postgres => {
                 match &t.action {
                     TriggerAction::Function { name, .. } if name.trim().is_empty() => {
-                        out.push("A PostgreSQL trigger needs a function to execute.".to_string())
+                        out.push(P::PgNoFunction)
                     }
-                    TriggerAction::Body(_) => out.push(
-                        "A PostgreSQL trigger runs a function, not a body — pick or write \
-                     one to execute."
-                            .to_string(),
-                    ),
+                    TriggerAction::Body(_) => out.push(P::PgBody),
                     _ => {}
                 }
                 // TRUNCATE fires once per statement; there are no rows to hand it.
                 if t.events.contains(&TriggerEvent::Truncate) && t.level == TriggerLevel::Row {
-                    out.push("A TRUNCATE trigger has to be FOR EACH STATEMENT.".to_string());
+                    out.push(P::TruncateRowLevel);
                 }
                 if t.timing == TriggerTiming::InsteadOf && t.level != TriggerLevel::Row {
-                    out.push("An INSTEAD OF trigger has to be FOR EACH ROW.".to_string());
+                    out.push(P::InsteadOfRowOnly);
                 }
                 // What the timing may be depends on what it fires on, and the two
                 // rules are exact opposites — measured on 16.14, verbatim:
@@ -1518,32 +1717,20 @@ impl TriggerDraft {
                 // triggers`. A statement-level `BEFORE`/`AFTER` on a view is fine,
                 // so this is narrower than "a view only takes INSTEAD OF".
                 if t.timing == TriggerTiming::InsteadOf && !view {
-                    out.push(
-                        "Only a view can have an INSTEAD OF trigger — a table takes \
-                     BEFORE or AFTER."
-                            .to_string(),
-                    );
+                    out.push(P::InsteadOfViewOnly);
                 }
                 if view && t.timing != TriggerTiming::InsteadOf && t.level == TriggerLevel::Row {
-                    out.push(
-                        "A view's BEFORE or AFTER trigger has to be FOR EACH STATEMENT \
-                     — use INSTEAD OF to act on rows."
-                            .to_string(),
-                    );
+                    out.push(P::PgViewRowTiming);
                 }
                 // `create_sql` writes `UPDATE OF` only under an UPDATE event, so
                 // a column list on any other would be dropped without a word.
                 if !t.update_columns.is_empty() && !t.events.contains(&TriggerEvent::Update) {
-                    out.push("UPDATE OF names columns on an UPDATE trigger.".to_string());
+                    out.push(P::UpdateOfWithoutUpdate);
                 }
                 // `INSTEAD OF triggers cannot have column lists`, measured on
                 // 16.15 — though SQLite's can, so this is PostgreSQL's alone.
                 if !t.update_columns.is_empty() && t.timing == TriggerTiming::InsteadOf {
-                    out.push(
-                        "An INSTEAD OF trigger takes no column list — PostgreSQL fires it on \
-                     any UPDATE of the view."
-                            .to_string(),
-                    );
+                    out.push(P::PgInsteadOfColumns);
                 }
             }
             SqlDialect::Sqlite => {
@@ -1553,56 +1740,33 @@ impl TriggerDraft {
                 // rest. They are refused here rather than at Apply because the
                 // modal can say which control is wrong, and because a `DROP` has
                 // already run by the time a `CREATE` fails.
+                let engine = "SQLite";
                 if t.events.len() > 1 {
-                    out.push(
-                        "SQLite fires a trigger on one event — make a separate trigger per event."
-                            .to_string(),
-                    );
+                    out.push(P::OneEvent { engine });
                 }
                 if t.events.contains(&TriggerEvent::Truncate) {
-                    out.push("SQLite has no TRUNCATE trigger.".to_string());
+                    out.push(P::NoTruncate { engine });
                 }
                 // The two halves are exact opposites, as they are on PostgreSQL, but
                 // stricter: a view takes *only* INSTEAD OF here, at either level.
                 if t.timing == TriggerTiming::InsteadOf && !view {
-                    out.push(
-                        "Only a view can have an INSTEAD OF trigger — a table takes \
-                     BEFORE or AFTER."
-                            .to_string(),
-                    );
+                    out.push(P::InsteadOfViewOnly);
                 }
                 if view && t.timing != TriggerTiming::InsteadOf {
-                    out.push(
-                        "A view's trigger has to be INSTEAD OF — SQLite has no BEFORE or \
-                     AFTER trigger on a view."
-                            .to_string(),
-                    );
+                    out.push(P::SqliteViewTiming);
                 }
                 if t.level != TriggerLevel::Row {
-                    out.push(
-                        "SQLite has only FOR EACH ROW triggers — there is no statement-level one."
-                            .to_string(),
-                    );
+                    out.push(P::SqliteRowOnly);
                 }
                 if !t.update_columns.is_empty() && !t.events.contains(&TriggerEvent::Update) {
-                    out.push("UPDATE OF names columns on an UPDATE trigger.".to_string());
+                    out.push(P::UpdateOfWithoutUpdate);
                 }
                 match &t.action {
-                    TriggerAction::Body(b) if b.trim().is_empty() => {
-                        out.push("A SQLite trigger needs a body.".to_string())
-                    }
+                    TriggerAction::Body(b) if b.trim().is_empty() => out.push(P::NoBody { engine }),
                     // Not a style rule: SQLite's grammar has no bare-statement form,
                     // and `BEGIN END` with nothing between is a syntax error too.
-                    TriggerAction::Body(b) if !is_begin_end_block(b) => out.push(
-                        "A SQLite trigger's body has to be a BEGIN … END block holding at \
-                     least one statement."
-                            .to_string(),
-                    ),
-                    TriggerAction::Function { .. } => out.push(
-                        "A SQLite trigger runs a body, not a function — write the statements \
-                     to run."
-                            .to_string(),
-                    ),
+                    TriggerAction::Body(b) if !is_begin_end_block(b) => out.push(P::SqliteNotBlock),
+                    TriggerAction::Function { .. } => out.push(P::RunsBody { engine }),
                     _ => {}
                 }
             }
@@ -1612,111 +1776,83 @@ impl TriggerDraft {
                 // is the only one a view takes, a trigger fires once per statement
                 // with its rows in `inserted` and `deleted`, and column tests are
                 // `UPDATE(col)` inside the body rather than a clause.
+                let engine = "SQL Server";
                 if t.timing == TriggerTiming::Before {
-                    out.push(
-                    "SQL Server has no BEFORE trigger — use INSTEAD OF to act before the write."
-                        .to_string(),
-                );
+                    out.push(P::MsNoBefore);
                 }
                 if view && t.timing != TriggerTiming::InsteadOf {
-                    out.push("A view's trigger has to be INSTEAD OF on SQL Server.".to_string());
+                    out.push(P::MsViewTiming);
                 }
                 if t.level != TriggerLevel::Statement {
-                    out.push(
-                        "SQL Server fires a trigger once per statement — read the rows from \
-                     inserted and deleted."
-                            .to_string(),
-                    );
+                    out.push(P::MsStatementOnly);
                 }
                 if t.events.contains(&TriggerEvent::Truncate) {
-                    out.push("SQL Server has no TRUNCATE trigger.".to_string());
+                    out.push(P::NoTruncate { engine });
                 }
                 // `sp_settriggerorder`'s own refusals: no order at all for an
                 // `INSTEAD OF` trigger (Msg 15133), none on an event the
                 // trigger does not fire on (Msg 15125).
                 if t.timing == TriggerTiming::InsteadOf && !t.tsql.rank.is_empty() {
-                    out.push(
-                        "An INSTEAD OF trigger can't have a firing order — set each event \
-                         back to any order."
-                            .to_string(),
-                    );
+                    out.push(P::MsInsteadOfRank);
                 }
                 for (event, rank) in &t.tsql.rank {
                     if !t.events.contains(event) {
-                        out.push(format!(
-                            "It fires {} on {}, which it isn't a trigger for.",
-                            rank.label(),
-                            event.sql()
-                        ));
+                        out.push(P::MsRankWithoutEvent {
+                            rank: *rank,
+                            event: event.sql(),
+                        });
                     }
                 }
                 if t.condition.as_deref().is_some_and(|c| !c.trim().is_empty()) {
-                    out.push(
-                        "SQL Server has no WHEN condition — put the test inside the body with IF."
-                            .to_string(),
-                    );
+                    out.push(P::NoWhen { engine });
                 }
                 if !t.update_columns.is_empty() {
-                    out.push(
-                        "SQL Server has no UPDATE OF — test UPDATE(column) inside the body."
-                            .to_string(),
-                    );
+                    out.push(P::MsNoUpdateOf);
                 }
                 match &t.action {
-                    TriggerAction::Body(b) if b.trim().is_empty() => {
-                        out.push("A SQL Server trigger needs a body.".to_string())
-                    }
-                    TriggerAction::Function { .. } => out.push(
-                        "A SQL Server trigger runs a body, not a function — write the statements \
-                     to run."
-                            .to_string(),
-                    ),
+                    TriggerAction::Body(b) if b.trim().is_empty() => out.push(P::NoBody { engine }),
+                    TriggerAction::Function { .. } => out.push(P::RunsBody { engine }),
                     _ => {}
                 }
             }
             SqlDialect::MySql => {
                 // `ERROR 1347: 'db.v' is not BASE TABLE` — no timing makes one
                 // legal, which is what `supports_view_triggers` answers.
+                let engine = "MySQL";
                 if view {
-                    out.push("MySQL takes no trigger on a view.".to_string());
+                    out.push(P::MyNoView);
                 }
                 if t.events.len() > 1 {
-                    out.push(
-                        "MySQL fires a trigger on one event — make a separate trigger per event."
-                            .to_string(),
-                    );
+                    out.push(P::OneEvent { engine });
                 }
                 if t.events.contains(&TriggerEvent::Truncate) {
-                    out.push("MySQL has no TRUNCATE trigger.".to_string());
+                    out.push(P::NoTruncate { engine });
                 }
                 if t.timing == TriggerTiming::InsteadOf {
-                    out.push(
-                        "MySQL has no INSTEAD OF trigger — those are PostgreSQL's.".to_string(),
-                    );
+                    out.push(P::MyNoInsteadOf);
                 }
                 if t.condition.as_deref().is_some_and(|c| !c.trim().is_empty()) {
-                    out.push(
-                        "MySQL has no WHEN condition — put the test inside the body with IF."
-                            .to_string(),
-                    );
+                    out.push(P::NoWhen { engine });
                 }
                 if !t.update_columns.is_empty() {
-                    out.push("MySQL has no UPDATE OF — a trigger sees every column.".to_string());
+                    out.push(P::MyNoUpdateOf);
                 }
                 match &t.action {
-                    TriggerAction::Body(b) if b.trim().is_empty() => {
-                        out.push("A MySQL trigger needs a body.".to_string())
-                    }
-                    TriggerAction::Function { .. } => out.push(
-                        "A MySQL trigger runs a body, not a function — write the statements \
-                     to run."
-                            .to_string(),
-                    ),
+                    TriggerAction::Body(b) if b.trim().is_empty() => out.push(P::NoBody { engine }),
+                    TriggerAction::Function { .. } => out.push(P::RunsBody { engine }),
                     _ => {}
                 }
             }
         }
         out
+    }
+
+    /// [`TriggerDraft::problems`] in English.
+    pub fn validate(&self, dialect: SqlDialect, host: TriggerHost) -> Vec<String> {
+        self.problems(dialect, host)
+            .iter()
+            .map(TriggerProblem::message)
+            .collect()
     }
 }
 
@@ -1845,13 +1981,13 @@ impl TriggerSetDraft {
     /// trigger lock the whole modal: the form renders `errs.first()` and gates
     /// `ready` on the set being empty, so Preview SQL was permanently disabled
     /// and the only way out was to select that trigger and drop it.
-    pub fn validate(
+    pub fn problems(
         &self,
         current: &[TriggerInfo],
         dialect: SqlDialect,
         host: TriggerHost,
-    ) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+    ) -> Vec<TriggerProblem> {
+        let mut out: Vec<TriggerProblem> = Vec::new();
         for t in &self.triggers {
             // An untouched member says nothing: it is already on the server in
             // exactly this shape, so nothing this plan does can be wrong about
@@ -1866,22 +2002,17 @@ impl TriggerSetDraft {
                 continue;
             }
             if t.info.constraint {
-                out.push(format!(
-                    "Schemaic can't edit the constraint trigger {} — it doesn't model \
-                     the deferral settings one carries.",
-                    t.info.name
-                ));
+                out.push(TriggerProblem::ConstraintTrigger {
+                    name: t.info.name.clone(),
+                });
             } else if !t.info.is_editable() {
                 // SQL Server's unreadable or hidden trigger: see
                 // `TriggerInfo::is_editable`.
-                out.push(format!(
-                    "Schemaic can't edit the trigger {} — its definition is encrypted, \
-                     hidden from this login, or uses an option Schemaic doesn't model. \
-                     Change it in SQL instead.",
-                    t.info.name
-                ));
+                out.push(TriggerProblem::NotEditable {
+                    name: t.info.name.clone(),
+                });
             }
-            out.extend(t.validate(dialect, host));
+            out.extend(t.problems(dialect, host));
         }
         let mut seen: Vec<&str> = Vec::new();
         for t in &self.triggers {
@@ -1893,7 +2024,9 @@ impl TriggerSetDraft {
             // table — but within one table both refuse a duplicate, and that is
             // the only scope this set covers.
             if seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-                out.push(format!("Two triggers are both called {name}."));
+                out.push(TriggerProblem::Twice {
+                    name: name.to_string(),
+                });
             } else {
                 seen.push(name);
             }
@@ -1917,16 +2050,28 @@ impl TriggerSetDraft {
             if let [head @ .., last] = names.as_slice()
                 && !head.is_empty()
             {
-                out.push(format!(
-                    "Only one trigger can fire {} on {} — {} and {last} are {} set to.",
-                    rank.label(),
-                    event.sql(),
-                    head.join(", "),
-                    if head.len() == 1 { "both" } else { "all" }
-                ));
+                out.push(TriggerProblem::RankClash {
+                    rank,
+                    event: event.sql(),
+                    head: head.iter().map(|n| n.to_string()).collect(),
+                    last: last.to_string(),
+                });
             }
         }
         out
+    }
+
+    /// [`TriggerSetDraft::problems`] in English.
+    pub fn validate(
+        &self,
+        current: &[TriggerInfo],
+        dialect: SqlDialect,
+        host: TriggerHost,
+    ) -> Vec<String> {
+        self.problems(current, dialect, host)
+            .iter()
+            .map(TriggerProblem::message)
+            .collect()
     }
 }
 
