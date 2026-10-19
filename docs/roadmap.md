@@ -119,7 +119,8 @@ assertions pin English wording — stays the regression net throughout.
    failures (`model::WriteFailure` — a `WriteCause` with the `Rollback` it achieved, which
    `DbError::Write` carries; `i18n::write_failure_text`, the app's `db_error_shown`) with the
    rows' own failure inside them (`import::RowError`, the row source's error, and
-   `copy_table::CopyStop`).
+   `copy_table::CopyStop`), and `DbError`'s own prefixes (`i18n::db_query_failed`,
+   `db_connection_failed`, `db_query_cancelled`, through the app's `db_error_shown`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -144,9 +145,14 @@ assertions pin English wording — stays the regression net throughout.
      `unsupported`, `used_by::change_warnings`/`drop_warning`, the compare plan's `omitted`
      (`compare::omission_note`) and the AI proposal errors (`propose::resolve_target`/`apply`).
      The largest group; a test in `ddl_preview.rs` matches `"gone — "` on the English.
-   - **`DbError`'s own prefixes** — *query failed:*, *connection failed:*, *query cancelled* —
-     which every surface showing a `DbError` by `to_string()` still says in English
-     (`write-query-failed` words it for a write path's failure alone).
+   - **The `DbError`s still shown by `to_string()`** — the app's `db_error_shown` words
+     the prefixes everywhere but where one string serves two readers: the schema tree's
+     load failures (`SchemaState::Failed`, `LoadFailure::Server`), which reach a modal that
+     offers *Explain*, and the DDL modal's failure, which its write-log entry keeps. Each
+     needs the English carried beside the wording (`ModalError::shown`, the copy's
+     `CopyFailed`), not a translation in its place. So do the run paths' own notices
+     (`timeout_message`, the cancel and not-sent notices): their translation is a
+     `ModalError::app`'s `text`, which the write log records.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.

@@ -483,11 +483,18 @@ error-modal-none = No error.
 error-modal-ai-fix = AI fix
 error-modal-explain = Explain
 
+## A database error's own words, around the server's (schemaic-db's DbError).
+## $error is the server's or the driver's message, which stays as it came.
+
+# A statement the server refused; for a write path's failure, $error also
+# carries what the rollback achieved.
+db-query-failed = query failed: { $error }
+db-connection-failed = connection failed: { $error }
+db-query-cancelled = query cancelled
+
 ## A write path's failure — the grid's Commit, an import, a copy (core's
 ## model::WriteFailure). The server's words in $error stay the server's.
 
-# A statement's failure; $error is the cause and the rollback's note.
-write-query-failed = query failed: { $error }
 # The 1-row safety net: a statement that changed $affected rows rather than
 # one. $table is db.table or db.schema.table, as written.
 write-one-row-delete = delete on { $table } affected { $affected } rows (expected exactly 1)

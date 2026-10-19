@@ -770,6 +770,24 @@ fn row_error_text(e: &schemaic_core::import::RowError) -> String {
     }
 }
 
+/// A statement the server refused, `error` its own words — `schemaic-db`'s
+/// `DbError::Query`, *query failed:* in English. Public for the app, which
+/// holds the `DbError`; this crate does not.
+pub fn db_query_failed(error: String) -> String {
+    tr!("db-query-failed", error = error)
+}
+
+/// A connection the server or the network refused — `DbError::Connect`,
+/// *connection failed:* in English.
+pub fn db_connection_failed(error: String) -> String {
+    tr!("db-connection-failed", error = error)
+}
+
+/// A statement the user or a timeout stopped — `DbError::Cancelled`.
+pub fn db_query_cancelled() -> String {
+    tr!("db-query-cancelled")
+}
+
 /// A write path's failure — core's
 /// [`WriteFailure::message`](schemaic_core::model::WriteFailure::message), what
 /// `DbError::Write` displays, in the interface's language. Public for the
@@ -813,7 +831,7 @@ pub fn write_failure_text(f: &schemaic_core::model::WriteFailure) -> String {
     };
     let error = format!("{cause}{note}");
     if f.cause.is_statements() {
-        tr!("write-query-failed", error = error)
+        db_query_failed(error)
     } else {
         error
     }

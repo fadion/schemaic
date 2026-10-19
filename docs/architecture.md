@@ -369,7 +369,8 @@ existing prose was left alone.
     wording went into `text` — so under a non-English interface *Explain* sent the model a
     translation. A producer with a wording sets it with `shown_as`, which leaves `text` alone;
     `about_another_statement` changes the source and keeps `shown`
-    (`the_actions_act_on_the_english_whatever_is_shown`).
+    (`the_actions_act_on_the_english_whatever_is_shown`). The editor's run paths had the same fault
+    over their transaction notes, and keep the two apart the same way now (under `core::tx`).
   - `access.rs` — **what a dump's replay drops besides the objects, and the statements that put it
     back**: `ReplayAccess { tables, routines }`, on `DbSchema::replay_access`, each half `None`
     where it was not read. It is read by the dump runner alone, for a file that drops
@@ -11877,8 +11878,16 @@ existing prose was left alone.
     call `ui::i18n`'s `run_failed_message`, `run_cancelled_message` and `not_sent_message` instead,
     which take core's arguments, ask core's choosers and word only the answer from `tx-*` (under
     *UI conventions*' string catalogue); `i18n::run_cancelled_message(` is therefore the name the
-    main.rs source gate over a Stop's disclosure matches. Core's English stays for core's own tests
-    and the live tier, whose `tests/live/mssql.rs` reads `failed_message`.
+    main.rs source gate over a Stop's disclosure matches. **A failure's wording is its `shown`,
+    never its `text`**: `run_query_core`'s error arm and Run All's session loop build the
+    `ModalError`'s `text` from this module's `run_failed_message` over the error's English
+    `to_string()`, and only `shown_as` from `i18n::run_failed_message` over the app's
+    `db_error_shown`. They used to put the interface's wording in `text`, so under a German
+    interface *Explain* sent the model the note in German and the write log (`ran_of`) recorded it
+    so. The not-sent, timeout and cancel notes have not been split yet: each is still worded
+    straight into a `ModalError::app`'s `text`, which the write log keeps. Core's English otherwise
+    stays for core's own tests and the live tier, whose `tests/live/mssql.rs` reads
+    `failed_message`.
     **And `Lost` has no way back on the tab itself.** `can_commit` and `can_rollback` are both false
     there, so the footer hides Commit and Rollback alike, and a dead MySQL or PostgreSQL connection
     is never re-dialled — `Session::alive` only classifies, because reconnecting silently would hand
@@ -18926,8 +18935,9 @@ existing prose was left alone.
   below), which reaches the interface as a `Write` even where PostgreSQL and SQLite return it
   bare. A server error PostgreSQL's write paths return bare, through
   `db_err`, is still a `Query`, as is one under SQL Server's savepoint, which carries no note
-  (`WriteScope::failure`, under `mssql.rs`), and both still read "query failed:" in English in
-  every language. `modal_source_tests` has no `Write` case; the SQL Server import's live tests
+  (`WriteScope::failure`, under `mssql.rs`), and both reach the window as any `Query` does, its
+  "query failed:" worded by `db_error_shown` and the server's words inside left as they came.
+  `modal_source_tests` has no `Write` case; the SQL Server import's live tests
   match the variant (`an_imported_blank_number_is_refused_not_stored_as_zero`).
   **The server refusing a statement Schemaic sent for itself is `Connect`, not `Query`** — its words, but about SQL the user did not write, and theirs
   was never sent: `enforce_session`'s "could not prepare the session: …",
@@ -18938,10 +18948,11 @@ existing prose was left alone.
   "connection failed: could not …". **`modal_about_another_statement`** is
   `ModalError::new(to_string(), modal_source()).about_another_statement()`, for an error raised by
   something that is not the editor's statement (a grid Commit, `end_tx`); it is one composition
-  because the commit arm had restated it by hand and got `Refused` wrong. The grid Commit now asks
-  the app's `modal_error_shown`, its twin *shown as* `db_error_shown` words it
-  (`ModalError::shown_as`), so a `Write` reaches the modal in the interface's language with the
-  same source — while its `text` stays `to_string()`, the English *Explain* sends the model.
+  because the commit arm had restated it by hand and got `Refused` wrong. The grid Commit, `end_tx`
+  and a failed `Session::open_enforced` now ask the app's `modal_error_shown`, its twin *shown as*
+  `db_error_shown` words it (`ModalError::shown_as`), so the error reaches the modal in the
+  interface's language with the same source — while its `text` stays `to_string()`, the English
+  *Explain* sends the model.
   `app/main.rs`'s run paths ask it of the `DbError` a run ends in rather than
   choosing a source per site, which is how a refused connection stopped being offered a fix into
   the buffer. Those paths answer `Cancelled` in arms of their own first — the not-sent, timeout and
@@ -40957,8 +40968,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     `RoutineProblem`/`TriggerProblem`/`TableProblem`, below), though every draft's `validate`
     still answers core's English, nor the editor's diagnostics (`intel::DiagMessage`, below),
     though the parser's detail in a syntax error and the server's own error still are, nor a
-    write path's failure (`model::WriteFailure`, below), though the server's words inside it and
-    a write error that never became one still are.
+    write path's failure (`model::WriteFailure`, below), though the server's words inside it
+    still are, nor `DbError`'s own *query failed:*, *connection failed:* and *query cancelled*
+    wherever the app shows an error through `db_error_shown` (below) — the sites still on
+    `to_string()` are listed there.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41275,7 +41288,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `core::model` and `schemaic-db`'s `lib.rs`), whose `Display` is that same English.
     `i18n::write_failure_text` words it from `write-*`: the 1-row miss a message per `WriteAction`
     (`write-one-row-delete`/`-update`/`-insert`), the batch count `write-batch-inserted`/`-affected`,
-    the two Stops, each `Rollback` its own `write-rollback-*`, and `write-query-failed` wrapping
+    the two Stops, each `Rollback` its own `write-rollback-*`, and `db-query-failed`
+    (`write-query-failed` until a `DbError::Query` came to be worded with it too) wrapping
     the lot exactly when `WriteCause::is_statements` says core's English would. A `Row` is the
     private `row_error_text`'s: a record's `Issue` is `write-row-issue`, or `write-row-issue-empty`
     for a blank field, with what is wrong from `issue_kind_message` — the import modal's own words
@@ -41283,11 +41297,29 @@ Re-introducing the anti-patterns these guard against is a regression:
     `CopyStop` its `write-copy-*`, a message apiece for a column named and unnamed. **The three
     rollback messages open with `{" "}`**, because Fluent drops a value's leading blank and the
     clause is appended straight after the cause; written as plain text they lose the space.
-    The app's `db_error_shown` asks it for a `Write` and `to_string()` for anything else, and
-    `modal_error_shown` is `modal_about_another_statement` *shown as* that text
-    (`ModalError::shown_as`); the Commit's `CommitDone::Failed`, the import's
-    `ImportOutcome::Failed` and the copy's failure take them, while every log keeps `to_string()`,
-    English. **The wording never replaces the English; it rides beside it.** The first cut did
+    The app's `db_error_shown` asks it for a `Write`, and words every other `DbError` variant
+    itself from the section *A database error's own words* — `Query` and `QueryAt` as
+    `db-query-failed` (`i18n::db_query_failed`), `Connect` as `db-connection-failed`, `Cancelled`
+    as `db-query-cancelled` — with the server's or driver's message inside as it came, and a
+    `Refused` as written, since that variant is already the whole sentence (under `schemaic-db`'s
+    `lib.rs`). `modal_error_shown` is `modal_about_another_statement` *shown as* that text
+    (`ModalError::shown_as`), and `db_error_pair` is `(to_string(), db_error_shown)` for a caller
+    that raises its error as text. The Commit's `CommitDone::Failed`, a Manual tab's `end_tx`, a
+    failed session open, the import's `ImportOutcome::Failed` and the copy's `CopyFailed` take
+    them, while every log keeps `to_string()`, English; the session-open modal's
+    `tx-session-open-failed` sentence is that error's `shown` alone, its `text` the bare English
+    error. The run paths set it as `shown` too: a failed lazy `BEGIN`, the fresh-connection batch's
+    per-statement failure and, inside the transaction note, the editor run's and Run All's session
+    failures (under `core::tx`). So does every surface that only displays a `DbError` — the plan
+    modal's `PlanState::Failed`, the export's read failure inside `export-failed`, the dump's table
+    list, the blob panel, Server Activity's locks, sessions and kill, compare's database list and
+    `compare-reading-failed`, the properties panel's table statistics, the account browser's
+    principals and grants, the server variables viewer, the connection test's ping, the SQLite
+    backup and the live monitor. **`db_error_shown` is for the eye alone**: nothing that is logged,
+    persisted or sent to a model reads it. `english_shows_every_db_error_as_it_displays`
+    (`app_tests`) holds it, and `modal_error_shown`'s `displayed()` and `text`, equal to
+    `to_string()` over a `Connect`, a `Query`, a `QueryAt`, `Cancelled`, a `Refused` and two
+    `Write`s. **The wording never replaces the English; it rides beside it.** The first cut did
     replace it, twice: `modal_error_shown` put the worded text in `ModalError::text`, which
     *Explain* and *AI fix* send, so a German interface sent the model German; and the copy's failure
     was one `db_error_shown` string for both the modal and `write_log::Entry::ended`, so it wrote
@@ -41296,9 +41328,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     English: the server's or driver's
     words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and a
     database-layer refusal's own text inside `Refused` (SQL
-    Server's blank-string and code-page refusals — the note after it is worded); and every write
-    failure that is not a `Write` — PostgreSQL's server errors on these paths, a SQL Server batch
-    under a Manual tab's savepoint — whose "query failed:" stays English in every language.
+    Server's blank-string and code-page refusals — the note after it is worded). And, until the
+    roadmap's next step, every `DbError` still taken as `to_string()`, prefix and all: the schema
+    tree's load failures (`SchemaState::Failed`, `LoadFailure::Server`), which reach a modal
+    offering *Explain*; the DDL modal's failure, one string shared with its write-log entry; the
+    copy's settle failure, a `DdlError`; the squiggle's diagnostic
+    (`intel::db_error_diagnostic`), whose text the AI fix prompt reads; and the run paths' own
+    `App` notes, whose `text` is the interface's wording and is what the write log records (under
+    `core::tx`).
     `english_says_every_write_failure_as_core_does` holds it equal to `message` over every cause,
     every 1-row miss with and without a schema, each batch count both ways, every `IssueKind`
     with and without text, a `Read` and each `CopyStop`, and each with every rollback outcome and
@@ -41341,7 +41378,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `result_diff_view.rs` and `dump_view.rs` share, `skip_reason_shown`, which the import modal
     and the app's paste field share, `read_refusal_text` and `import_error_text` for the app's
     import probe, check and load, `write_failure_text` for the app's Commit, import and copy
-    failures, and the grid's three filter notices — `staged_requery_note`
+    failures, `db_query_failed`, `db_connection_failed` and `db_query_cancelled` for the app's
+    `db_error_shown`, the crate holding no `DbError`, and the grid's three filter notices — `staged_requery_note`
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded
     from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork` — and,
     public for the app's run paths, `run_failed_message`, `run_cancelled_message` and

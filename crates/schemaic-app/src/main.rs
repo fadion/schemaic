@@ -399,14 +399,28 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// `e` as the interface says it: a write path's failure ([`DbError::Write`])
-/// in the interface's language, anything else as it displays. The log keeps
-/// `to_string()`, which is English.
+/// `e` as the window shows it: `DbError`'s own words — *query failed:*,
+/// *connection failed:*, *query cancelled*, a write path's failure — in the
+/// interface's language, the server's words inside as they came, and a
+/// refusal (already the catalogue's, or this crate's English) as written.
+/// **For the eye only**: the log, the write log, the CLI and anything sent to
+/// a model keep `to_string()`, which is English; a `ModalError` carries this
+/// as its `shown` beside that `text` ([`modal_error_shown`]).
 fn db_error_shown(e: &DbError) -> String {
+    use schemaic_ui::i18n;
     match e {
-        DbError::Write(f) => schemaic_ui::i18n::write_failure_text(f),
-        e => e.to_string(),
+        DbError::Query(m) | DbError::QueryAt { message: m, .. } => i18n::db_query_failed(m.clone()),
+        DbError::Connect(m) => i18n::db_connection_failed(m.clone()),
+        DbError::Cancelled => i18n::db_query_cancelled(),
+        DbError::Refused(m) => m.clone(),
+        DbError::Write(f) => i18n::write_failure_text(f),
     }
+}
+
+/// An error raised as `Result<_, String>` by a caller that has already turned
+/// its `DbError` into text: the window's wording beside the English.
+fn db_error_pair(e: &DbError) -> (String, String) {
+    (e.to_string(), db_error_shown(e))
 }
 
 /// [`DbError::modal_about_another_statement`], shown as [`db_error_shown`]
@@ -3806,6 +3820,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     None => m,
                 };
+                // `note` in English, for the error's `text` — what *Explain*
+                // sends and the write log keeps.
+                let note_en = |m: String| match stmt {
+                    Some(o) => tx::run_failed_message(&m, o, tx_before, engine, &sql),
+                    None => m,
+                };
                 let state = match res {
                     Ok(rs) => {
                         tracing::info!(
@@ -3865,7 +3885,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // editor places its squiggle by it. A filter re-run's
                         // error drops it again (`about_another_statement`).
                         QueryState::Failed(
-                            ModalError::new(note(e.to_string()), source).at(e.position()),
+                            ModalError::new(note_en(e.to_string()), source)
+                                .shown_as(note(db_error_shown(&e)))
+                                .at(e.position()),
                         )
                     }
                 };
@@ -4001,7 +4023,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         PlanState::Failed(timeout_message(timeout))
                     }
                     Err(DbError::Cancelled) => return, // superseded — leave state alone
-                    Err(e) => PlanState::Failed(e.to_string()),
+                    Err(e) => PlanState::Failed(db_error_shown(&e)),
                 };
                 send((seq, st));
             });
@@ -4384,10 +4406,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         if let Err(e) = s.ensure_tx().await {
                             // The BEGIN failed, not a statement of the user's —
                             // `Session::ensure_tx` already says so (`Connect`).
-                            states[0] = QueryState::Failed(ModalError::new(
-                                e.to_string(),
-                                e.modal_source(),
-                            ));
+                            states[0] = QueryState::Failed(
+                                ModalError::new(e.to_string(), e.modal_source())
+                                    .shown_as(db_error_shown(&e)),
+                            );
                             took[0] = clock.elapsed().as_millis() as u64;
                             send((states, outcomes, took, token.is_cancelled()));
                             return;
@@ -4414,10 +4436,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // half here.
                             if let Err(e) = s.ensure_tx().await {
                                 // As above: the BEGIN's failure, not statement i's.
-                                states[i] = QueryState::Failed(ModalError::new(
-                                    e.to_string(),
-                                    e.modal_source(),
-                                ));
+                                states[i] = QueryState::Failed(
+                                    ModalError::new(e.to_string(), e.modal_source())
+                                        .shown_as(db_error_shown(&e)),
+                                );
                                 took[i] = clock.elapsed().as_millis() as u64;
                                 stopped = true;
                                 continue;
@@ -4479,16 +4501,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                                 Err(e) => {
                                     stopped = true;
-                                    QueryState::Failed(ModalError::new(
-                                        schemaic_ui::i18n::run_failed_message(
-                                            &e.to_string(),
-                                            out.stmt,
-                                            before,
-                                            engine,
-                                            sql,
+                                    QueryState::Failed(
+                                        ModalError::new(
+                                            tx::run_failed_message(
+                                                &e.to_string(),
+                                                out.stmt,
+                                                before,
+                                                engine,
+                                                sql,
+                                            ),
+                                            tx::run_error_source(e.modal_source(), Some(out.stmt)),
+                                        )
+                                        .shown_as(
+                                            schemaic_ui::i18n::run_failed_message(
+                                                &db_error_shown(&e),
+                                                out.stmt,
+                                                before,
+                                                engine,
+                                                sql,
+                                            ),
                                         ),
-                                        tx::run_error_source(e.modal_source(), Some(out.stmt)),
-                                    ))
+                                    )
                                 }
                             };
                         }
@@ -4519,10 +4552,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                         ModalError::app(timeout_message(timeout)),
                                     ),
                                     Err(DbError::Cancelled) => QueryState::Cancelled,
-                                    Err(e) => QueryState::Failed(ModalError::new(
-                                        e.to_string(),
-                                        e.modal_source(),
-                                    )),
+                                    Err(e) => QueryState::Failed(
+                                        ModalError::new(e.to_string(), e.modal_source())
+                                            .shown_as(db_error_shown(&e)),
+                                    ),
                                 };
                             },
                             enforce,
@@ -5439,7 +5472,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 (_, Err(e)) => {
                                     failed(tr!("export-worker-died", error = e.to_string()))
                                 }
-                                (Err(e), _) => failed(tr!("export-failed", error = e.to_string())),
+                                (Err(e), _) => {
+                                    failed(tr!("export-failed", error = db_error_shown(&e)))
+                                }
                                 (Ok(_), Ok(Ok(tally))) => ExportOutcome::Done(tally),
                             });
                         });
@@ -5510,7 +5545,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 })
                                 .collect::<Vec<_>>()
                         })
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| db_error_shown(&e));
                     report(out);
                 });
             },
@@ -5942,7 +5977,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             }
                         }
                         Ok(None) => schemaic_ui::BlobState::Empty,
-                        Err(e) => schemaic_ui::BlobState::Failed(e.to_string()),
+                        Err(e) => schemaic_ui::BlobState::Failed(db_error_shown(&e)),
                     });
                 });
             },
@@ -6464,7 +6499,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     };
                     // `Session::commit`'s "already aborted" is its own report,
                     // and was offered *Explain* while hard-coded as the server's.
-                    done(r.err().map(|e| e.modal_about_another_statement()));
+                    done(r.err().map(|e| modal_error_shown(&e)));
                 });
             },
         )
@@ -6585,10 +6620,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(_) if mode.is_none() => {}
                     Err(e) => {
                         tab.tx_mode.set(TxMode::Auto);
-                        error_modal_text.set(Some(ModalError::new(
-                            tr!("tx-session-open-failed", error = e.text.clone()),
-                            e.source,
-                        )));
+                        // The sentence around the error is for the eye; what
+                        // *Explain* sends is the error itself, in English.
+                        let shown = tr!("tx-session-open-failed", error = e.displayed());
+                        error_modal_text.set(Some(e.shown_as(shown)));
                         error_modal_open.set(true);
                     }
                 }
@@ -6600,7 +6635,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // Its own source: the SQLite backstop and an `sql_mode`
                         // that would not pin are Schemaic's sentences, and were
                         // offered *Explain* while this was hard-coded `server`.
-                        .map_err(|e| e.modal_about_another_statement()),
+                        .map_err(|e| modal_error_shown(&e)),
                 );
             });
         })
@@ -6791,7 +6826,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     },
                 );
                 handle.spawn(async move {
-                    report(db.fetch_locks().await.map_err(|e| e.to_string()));
+                    report(db.fetch_locks().await.map_err(|e| db_error_shown(&e)));
                 });
                 return;
             }
@@ -6823,7 +6858,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 },
             );
             handle.spawn(async move {
-                report(db.fetch_sessions().await.map_err(|e| e.to_string()));
+                report(db.fetch_sessions().await.map_err(|e| db_error_shown(&e)));
             });
         })
     };
@@ -7078,7 +7113,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             }
                         });
                         handle.spawn(async move {
-                            report(db.kill_session(id, kind).await.map_err(|e| e.to_string()));
+                            report(
+                                db.kill_session(id, kind)
+                                    .await
+                                    .map_err(|e| db_error_shown(&e)),
+                            );
                         });
                     }),
                 }));
@@ -10133,7 +10172,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             });
             handle.spawn(async move {
-                report(db.fetch_databases().await.map_err(|e| e.to_string()));
+                report(db.fetch_databases().await.map_err(|e| db_error_shown(&e)));
             });
         })
     };
@@ -10280,7 +10319,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             }
                         }
                         Err(DbError::Cancelled) => Err((None, None)),
-                        Err(e) => Err((None, Some((e.to_string(), db_error_shown(&e))))),
+                        Err(e) => Err((None, Some(db_error_pair(&e)))),
                     };
                     report(outcome);
                 });
@@ -10427,7 +10466,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             tr!(
                                 "compare-reading-failed",
                                 database = ldb.clone(),
-                                error = e.to_string()
+                                error = db_error_shown(&e)
                             )
                         })
                 };
@@ -10439,7 +10478,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             tr!(
                                 "compare-reading-failed",
                                 database = rdb.clone(),
-                                error = e.to_string()
+                                error = db_error_shown(&e)
                             )
                         })
                 };
@@ -10532,7 +10571,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let res = db
                     .fetch_table_stats(&target.database)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| db_error_shown(&e));
                 report(res);
             });
         })
@@ -10711,7 +10750,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let res = db
                     .fetch_principals(database.as_deref())
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| db_error_shown(&e));
                 report(res);
             });
         })
@@ -10757,7 +10796,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let res = db
                         .fetch_grants(target.database.as_deref(), &principal)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| db_error_shown(&e));
                     report(res);
                 });
             },
@@ -10810,7 +10849,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     },
                 );
                 handle.spawn(async move {
-                    let res = db.fetch_server_vars(kind).await.map_err(|e| e.to_string());
+                    let res = db
+                        .fetch_server_vars(kind)
+                        .await
+                        .map_err(|e| db_error_shown(&e));
                     report(res);
                 });
             },
@@ -11633,7 +11675,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let res = db
                     .ping(schemaic_db::PING_TIMEOUT)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| db_error_shown(&e));
                 drop(tunnel);
                 send(res);
             });
@@ -14457,7 +14499,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 handle_db
                                     .backup_to_file(&path)
                                     .await
-                                    .map_err(|e| e.to_string()),
+                                    .map_err(|e| db_error_shown(&e)),
                             );
                         });
                     }
@@ -15427,7 +15469,7 @@ fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
                 CancellationToken::new(),
             )
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| db_error_shown(&e));
         send(out);
     });
 }
@@ -15928,6 +15970,40 @@ mod app_tests {
     use schemaic_core::connection::Connection;
     use schemaic_ui::{InlineAiState, TestState};
     use tokio_util::sync::CancellationToken;
+
+    /// **Every database error the window shows reads in English exactly as it
+    /// displays** — the prefixes the interface words (a connection that failed,
+    /// a query that failed, with and without a position, a cancel), a refusal
+    /// and a write path's failure — so the log, the CLI and the AI, which keep
+    /// `to_string()`, say what the English window says.
+    #[test]
+    fn english_shows_every_db_error_as_it_displays() {
+        use super::{DbError, db_error_shown, modal_error_shown};
+        use schemaic_core::model::{Rollback, WriteCause, WriteFailure};
+        for e in [
+            DbError::Connect("Access denied for user 'u'@'h'".into()),
+            DbError::Query("Unknown column 'x' in 'field list'".into()),
+            DbError::QueryAt {
+                message: "column \"x\" does not exist".into(),
+                at: 8,
+            },
+            DbError::Cancelled,
+            DbError::Refused("Read-only connection.".into()),
+            DbError::Write(WriteFailure {
+                cause: WriteCause::Server("Duplicate entry".into()),
+                undone: Some(Rollback::Complete),
+            }),
+            DbError::Write(WriteFailure {
+                cause: WriteCause::CommitCancelled,
+                undone: Some(Rollback::Unknown),
+            }),
+        ] {
+            assert_eq!(db_error_shown(&e), e.to_string(), "{e:?}");
+            let m = modal_error_shown(&e);
+            assert_eq!(m.displayed(), e.to_string(), "{e:?}");
+            assert_eq!(m.text, e.to_string(), "{e:?}");
+        }
+    }
 
     /// **A restore refusal reads in English exactly as core's
     /// `RestoreRefusal` says it** — named and unnamed switches, with and
