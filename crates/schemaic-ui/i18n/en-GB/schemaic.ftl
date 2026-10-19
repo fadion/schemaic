@@ -609,6 +609,27 @@ activity-count-running = { $figure } running
 activity-count-blocked = { $figure } blocked
 activity-count-idle-in-tx = { $figure } idle in txn
 activity-lock-wait = Lock wait
+# The card's sentence (core's activity::LockWait; English must read exactly as
+# its Display). $waiter and $holder are session ids, $waiter_who and
+# $holder_who who they are (user@client). $waited and $held are ages such as
+# "4m 12s", or "none" where the server withheld one. $doing is the holder's
+# state, $others how many other sessions also hold a lock the waiter needs.
+activity-lock-wait-sentence = Session { $waiter } ({ $waiter_who }) { $waited ->
+        [none] is waiting for
+       *[other] has been waiting { $waited } for
+    } a lock held by session { $holder } ({ $holder_who }), { $doing ->
+        [idle-in-tx] idle in transaction
+        [blocked] itself blocked
+        [running] running
+       *[idle] idle
+    }{ $held ->
+        [none] {""}
+       *[other] {" "}for { $held }
+    }.{ $others ->
+        [0] {""}
+        [one] {" "}{ $others } other session also holds a lock it needs.
+       *[other] {" "}{ $others } other sessions also hold a lock it needs.
+    }
 # $id is the blocking session's id.
 activity-kill-holder = Kill { $id }
 activity-terminate-tip = Terminate session { $id }

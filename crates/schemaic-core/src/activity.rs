@@ -665,45 +665,79 @@ pub fn lock_wait(sessions: &[SessionInfo]) -> Option<(&SessionInfo, &SessionInfo
 /// naming one of them as *the* holder invites a kill that leaves the waiter
 /// blocked by the other two, with the banner immediately re-rendering the next
 /// one and nothing having said more existed.
+///
+/// The English of [`lock_wait_said`]: the interface words that value itself.
 pub fn lock_wait_text(waiter: &SessionInfo, holder: &SessionInfo) -> String {
-    let holder_doing = match holder.state {
-        SessionState::IdleInTx => "idle in transaction",
-        SessionState::Blocked => "itself blocked",
-        SessionState::Running => "running",
-        SessionState::Idle => "idle",
-    };
-    let others = waiter.blocked_by.len().saturating_sub(1);
-    let and_others = if others == 0 {
-        String::new()
-    } else {
-        format!(
-            " {others} other {} also hold{} a lock it needs.",
-            plural(others, "session", "sessions"),
-            if others == 1 { "s" } else { "" }
-        )
-    };
+    lock_wait_said(waiter, holder).to_string()
+}
+
+/// What [`lock_wait_text`] says, as values: the two sessions, the holder's
+/// state, both ages as [`format_age`] prints them, and how many other holders
+/// there are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockWait {
+    pub waiter: i64,
+    pub waiter_who: String,
+    /// How long the waiter has waited; `None` where the server withheld it.
+    pub waited: Option<String>,
+    pub holder: i64,
+    pub holder_who: String,
+    pub holder_state: SessionState,
+    /// How long the holder has held it; `None` where the server withheld it.
+    pub held: Option<String>,
+    /// Other sessions holding a lock the waiter needs.
+    pub others: usize,
+}
+
+impl std::fmt::Display for LockWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let holder_doing = match self.holder_state {
+            SessionState::IdleInTx => "idle in transaction",
+            SessionState::Blocked => "itself blocked",
+            SessionState::Running => "running",
+            SessionState::Idle => "idle",
+        };
+        let waiting = match &self.waited {
+            Some(age) => format!("has been waiting {age} for"),
+            None => "is waiting for".to_string(),
+        };
+        write!(
+            f,
+            "Session {} ({}) {waiting} a lock held by session {} ({}), {holder_doing}",
+            self.waiter, self.waiter_who, self.holder, self.holder_who,
+        )?;
+        if let Some(age) = &self.held {
+            write!(f, " for {age}")?;
+        }
+        f.write_str(".")?;
+        match self.others {
+            0 => Ok(()),
+            n => write!(
+                f,
+                " {n} other {} also hold{} a lock it needs.",
+                plural(n, "session", "sessions"),
+                if n == 1 { "s" } else { "" }
+            ),
+        }
+    }
+}
+
+/// See [`lock_wait_text`], whose rules this is.
+pub fn lock_wait_said(waiter: &SessionInfo, holder: &SessionInfo) -> LockWait {
     // **An age the server withheld is left out of the sentence, not drawn as a
     // number.** Either side can be masked (`SessionInfo::seconds`), and "has
     // been waiting 0s for a lock" was a claim nothing had made.
-    let waiting = match waiter.seconds {
-        Some(_) => format!("has been waiting {} for", format_age(waiter.seconds)),
-        None => "is waiting for".to_string(),
-    };
-    let held_for = match holder.seconds {
-        Some(_) => format!(" for {}", format_age(holder.seconds)),
-        None => String::new(),
-    };
-    format!(
-        "Session {} ({}) {} a lock held by session {} ({}), {}{}.{}",
-        waiter.id,
-        waiter.who(),
-        waiting,
-        holder.id,
-        holder.who(),
-        holder_doing,
-        held_for,
-        and_others,
-    )
+    let age = |s: &SessionInfo| s.seconds.map(|_| format_age(s.seconds));
+    LockWait {
+        waiter: waiter.id,
+        waiter_who: waiter.who(),
+        waited: age(waiter),
+        holder: holder.id,
+        holder_who: holder.who(),
+        holder_state: holder.state,
+        held: age(holder),
+        others: waiter.blocked_by.len().saturating_sub(1),
+    }
 }
 
 /// Is this `information_schema.INNODB_TRX.trx_state` a thread waiting on a lock?

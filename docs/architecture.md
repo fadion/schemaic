@@ -10159,7 +10159,11 @@ existing prose was left alone.
     visible for a backend the account isn't privileged to inspect. `lock_wait`/`lock_wait_text` pick
     the wait worth a banner and write its sentence — deliberately `None` when the holder isn't in
     the snapshot, since a banner offering to kill a session that isn't there is worse than no
-    banner.
+    banner. The sentence's decisions are `lock_wait_said`, which answers a `LockWait` — both ids and
+    `who()`s, the holder's state, `waited`/`held` as `format_age` prints them (`None` where the
+    server withheld the age) and `others`, the other holders — whose `Display` is the English
+    `lock_wait_text` wraps, so the panel can word it (`activity_panel.rs`). It is not called
+    `lock_wait` because that name is the picker's.
     **`is_lock_wait` is the one spelling of the server's `LOCK WAIT` word**, because two readers ask
     it: `mysql_state`, which marks the row `Blocked`, and `wait_graph_is_worth_fetching`, which
     decides whether the lock-wait query runs at all. Those two disagreeing would be a panel that
@@ -26852,8 +26856,11 @@ existing prose was left alone.
     all four once per filter pass rather than once per row per keystroke, and the filter hands them
     to `activity::matches_query_with`, so a search for the translated word finds the row wearing it.
     `english_counts_and_names_every_state_as_core_does` holds all of it to core's `total_label`,
-    `state_label` and `SessionState::label`. `activity::lock_wait_text`, the lock-wait card's
-    sentence, is still core's English.
+    `state_label` and `SessionState::label`. The lock-wait card's sentence is `lock_wait_sentence`,
+    which words `activity::lock_wait_said`'s `LockWait` as the one message
+    `activity-lock-wait-sentence` (under *The string catalogue*), held to core's `Display` by
+    `english_says_every_lock_wait_as_core_does` across every holder state, each age present or
+    withheld, and none, one or three other holders — 48 sentences.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
     read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
@@ -40429,7 +40436,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     by message. **Pass `tr!` an owned value, never a dereference**: `fl!` pastes each argument
     expression in front of `.into()`, so `n = *n` parses as `*(n.into())` and fails as E0282,
     "type annotations needed", pointing into `i18n.rs` rather than at the call. Bind the field by
-    value in the `match` instead, as `rows_read_text` does.
+    value in the `match` instead, as `rows_read_text` does. **Write a variant's leading space as
+    `{" "}`, and a variant that says nothing as `{""}`**: Fluent trims the whitespace a variant
+    starts with, so `[other]  for { $held }` would glue *for* to the word before it, and an empty
+    variant needs something to stand in it — `activity-lock-wait-sentence` has both.
   - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
     core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
     `history_panel::bucket_title` for `history::Bucket::label`, `activity_panel::kill_label`
@@ -40503,6 +40513,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     a `Fn(SessionState) -> &str` — and the counts line takes `ActivitySummary::figure`, the count
     with the `+` a capped list earns, and words the noun from `activity-count-*`
     (`activity_panel.rs`), held by `english_counts_and_names_every_state_as_core_does`.
+    **A sentence with optional parts is one message with a selector per part, not fragments
+    assembled in code** — the lock-wait card's is the pattern. `activity-lock-wait-sentence` takes
+    `$waited`/`$held` as an age or as `none` where the server withheld one (no age reads as that),
+    `$doing` as the holder's state (`idle-in-tx`, `blocked`, `running`, `idle`) and `$others` with
+    an exact `[0]` variant ahead of `[one]`/`[other]`. A translation has to be able to move the
+    parts, not only reword them: the German makes the holder a relative clause with its verb last
+    (`die Sitzung { $holder } … hält`), which no English-ordered run of fragments could have let it
+    do.
     **A typed message's renderer lives beside the code that shows it** — `alias_rename.rs`,
     `install_cli.rs`, `settings.rs`, `grid.rs`, the app's `main.rs` — and `ui/i18n.rs` holds only the ones another file or crate
     calls: `param_error` for the app, and `statement_timeout`, which `settings.rs`,

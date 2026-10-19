@@ -561,6 +561,22 @@ activity-count-running = { $figure } laufend
 activity-count-blocked = { $figure } blockiert
 activity-count-idle-in-tx = { $figure } Leerlauf in Txn
 activity-lock-wait = Sperrwartezeit
+activity-lock-wait-sentence = Sitzung { $waiter } ({ $waiter_who }) { $waited ->
+        [none] wartet
+       *[other] wartet seit { $waited }
+    } auf eine Sperre, die Sitzung { $holder } ({ $holder_who }) hält, { $doing ->
+        [idle-in-tx] im Leerlauf in einer Transaktion
+        [blocked] selbst blockiert
+        [running] laufend
+       *[idle] im Leerlauf
+    }{ $held ->
+        [none] {""}
+       *[other] {" "}seit { $held }
+    }.{ $others ->
+        [0] {""}
+        [one] {" "}{ $others } weitere Sitzung hält ebenfalls eine Sperre, die sie braucht.
+       *[other] {" "}{ $others } weitere Sitzungen halten ebenfalls eine Sperre, die sie braucht.
+    }
 activity-kill-holder = { $id } beenden
 activity-terminate-tip = Sitzung { $id } beenden
 activity-read-only-tip = Diese Verbindung ist als schreibgeschützt markiert.
