@@ -141,10 +141,11 @@ assertions pin English wording — stays the regression net throughout.
      `secrets::save_connections`' answer.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
    - **The table designer's refusals** — `TableDraft::validate`'s sentences, which hold Preview.
-   - **Smaller ones** — the grants list's `note`;
-     `result_diff`'s and the AI panel's summaries.
+   - **The users browser's notes** — `users::Principals::note` and `Grants::note`, which
+     `schemaic-db` fills as sentences (`users::my_scope_note` and its siblings) — the
+     write-back's problem, smaller.
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
-     `transcript::elapsed_text`.
+     `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).

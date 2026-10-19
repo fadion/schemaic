@@ -652,12 +652,45 @@ fn save_diff(
     });
 }
 
+/// `ResultDiff::summary` in the interface's language: each kind with rows,
+/// in the filter pills' order, then the unchanged count and any column left
+/// uncompared, joined by ` · `.
+fn diff_summary_text(diff: &schemaic_core::result_diff::ResultDiff) -> String {
+    let mut parts = Vec::new();
+    if diff.is_identical() {
+        parts.push(tr!("diff-summary-identical", n = diff.same));
+    } else {
+        let (changed, added, removed) = (
+            diff.changed.len(),
+            diff.right_only.len(),
+            diff.left_only.len(),
+        );
+        if changed > 0 {
+            parts.push(tr!("diff-summary-changed", n = changed));
+        }
+        if added > 0 {
+            parts.push(tr!("diff-summary-added", n = added));
+        }
+        if removed > 0 {
+            parts.push(tr!("diff-summary-removed", n = removed));
+        }
+        parts.push(tr!("diff-summary-unchanged", n = diff.same));
+    }
+    if !diff.uncompared.is_empty() {
+        parts.push(tr!(
+            "diff-summary-not-compared",
+            columns = diff.uncompared.join(", ")
+        ));
+    }
+    parts.join(" · ")
+}
+
 /// The footer's line: what the comparison found, or nothing beside an error
 /// the table already shows.
 fn summary_line(computed: RwSignal<Rc<Computed>>) -> impl IntoView {
     label(move || {
         computed.with(|c| match &c.outcome {
-            Ok(o) => o.diff.summary(),
+            Ok(o) => diff_summary_text(&o.diff),
             Err(_) => String::new(),
         })
     })
@@ -1070,9 +1103,53 @@ fn table_row(change: RowChange, row_cells: &[DiffCell], widths: &Widths) -> impl
 
 #[cfg(test)]
 mod tests {
-    use super::diff_notes;
+    use super::{diff_notes, diff_summary_text};
     use crate::i18n::tr;
     use schemaic_core::result_diff::ResultDiff;
+
+    /// The footer's headline reads in English exactly as core's `summary` —
+    /// identical (one row and several), each kind alone and together, and
+    /// with a column left uncompared.
+    #[test]
+    fn english_says_the_diff_summary_as_core_does() {
+        use schemaic_core::result_diff::Changed;
+        let changed = |n: usize| {
+            (0..n)
+                .map(|i| Changed {
+                    left: i,
+                    right: i,
+                    columns: vec!["a".into()],
+                })
+                .collect::<Vec<_>>()
+        };
+        let cases = [
+            ResultDiff {
+                same: 1,
+                ..ResultDiff::default()
+            },
+            ResultDiff {
+                same: 40,
+                uncompared: vec!["pw_hash".into(), "photo".into()],
+                ..ResultDiff::default()
+            },
+            ResultDiff {
+                changed: changed(2),
+                same: 40,
+                ..ResultDiff::default()
+            },
+            ResultDiff {
+                changed: changed(1),
+                right_only: vec![3, 4, 5],
+                left_only: vec![9],
+                same: 0,
+                uncompared: vec!["pw_hash".into()],
+                ..ResultDiff::default()
+            },
+        ];
+        for d in &cases {
+            assert_eq!(diff_summary_text(d), d.summary(), "{d:?}");
+        }
+    }
 
     /// The notes and the cards' facts read as they did in English before the
     /// catalogue, the side letters following a swap.

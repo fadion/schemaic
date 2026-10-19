@@ -1557,6 +1557,15 @@ diff-side-facts = { $count ->
 }
 diff-only-in = Nur in { $side }: { $columns }
 diff-uncompared = Binär, nicht verglichen: { $columns }
+diff-summary-identical = { $n ->
+        [one] Keine Unterschiede · { $n } Zeile unverändert
+       *[other] Keine Unterschiede · { $n } Zeilen unverändert
+    }
+diff-summary-changed = { $n } geändert
+diff-summary-added = { $n } hinzugefügt
+diff-summary-removed = { $n } entfernt
+diff-summary-unchanged = { $n } unverändert
+diff-summary-not-compared = { $columns } nicht verglichen
 diff-repeated-keys = { $count ->
     [one] { $count } Zeile wiederholt einen auf ihrer Seite schon vergebenen Schlüssel und wird ausgelassen.
    *[other] { $count } Zeilen wiederholen einen auf ihrer Seite schon vergebenen Schlüssel und werden ausgelassen.

@@ -1824,6 +1824,18 @@ diff-side-facts = { $count ->
 # comma-separated list of column names.
 diff-only-in = Only in { $side }: { $columns }
 diff-uncompared = Binary, not compared: { $columns }
+# The footer's headline (core's ResultDiff::summary), its parts joined by a
+# middle dot: each kind with rows, then the unchanged count, then any binary
+# column left out ($columns, comma-separated names).
+diff-summary-identical = { $n ->
+        [one] No differences · { $n } row unchanged
+       *[other] No differences · { $n } rows unchanged
+    }
+diff-summary-changed = { $n } changed
+diff-summary-added = { $n } added
+diff-summary-removed = { $n } removed
+diff-summary-unchanged = { $n } unchanged
+diff-summary-not-compared = { $columns } not compared
 diff-repeated-keys = { $count ->
     [one] { $count } row repeats a key already taken on its side, and is left out.
    *[other] { $count } rows repeat a key already taken on its side, and are left out.

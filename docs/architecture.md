@@ -27388,9 +27388,10 @@ existing prose was left alone.
     `diff-only-in` (`$side`, the letter, and `$columns`), `diff-uncompared`, the plural
     `diff-repeated-keys` — which replaced a sentence spliced from two `plural` calls — and
     `diff-capped`. `the_composed_lines_read_as_they_did_in_english` pins them and the card lines in
-    English. English stays: the A/B letters; `RowChange::label`'s CHANGED/ADDED/REMOVED, core's
-    word, which the export file writes too and which sizes the *Change* column; core's
-    `ResultDiff::summary` (phase 4); the export menu's `ExportFormat::label`s; the suggested file
+    English. The footer's headline is `diff_summary_text`, core's `ResultDiff::summary` worded part
+    by part (`diff-summary-*`, joined by ` · `; `english_says_the_diff_summary_as_core_does`).
+    English stays: the A/B letters; `RowChange::label`'s CHANGED/ADDED/REMOVED, core's
+    word, which the export file writes too and which sizes the *Change* column; the export menu's `ExportFormat::label`s; the suggested file
     name `comparison`; and the arrow.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
     It lists the server's accounts, shows one account's privileges, and is where the five write
