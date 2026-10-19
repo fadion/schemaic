@@ -1302,7 +1302,7 @@ fn footer(ctx: CompareCtx, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoVie
             .with(|sel| c.differences().filter(|e| is_planned(e, sel)).count())
     });
 
-    let status = label(move || schemaic_core::compare::selection_note(planned.get()))
+    let status = label(move || selection_note_text(planned.get()))
         .style(|s| s.font_size(theme::font_hint()).color(theme::text_muted()));
 
     let preview = {
@@ -1374,9 +1374,27 @@ fn open_plan_preview(ctx: &CompareCtx, close: Rc<dyn Fn()>) {
     crate::ddl_preview::open_preview(ctx.ddl, preview);
 }
 
+/// How many objects the plan holds — core's `compare::selection_note` in the
+/// interface's language.
+fn selection_note_text(planned: usize) -> String {
+    tr!("compare-selected", n = planned)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compare_kind_group, compare_kind_word};
+    use super::{compare_kind_group, compare_kind_word, selection_note_text};
+
+    /// The selection line reads in English exactly as core's.
+    #[test]
+    fn english_counts_the_selection_as_core_does() {
+        for n in [0, 1, 2, 37] {
+            assert_eq!(
+                selection_note_text(n),
+                schemaic_core::compare::selection_note(n),
+                "{n}"
+            );
+        }
+    }
     use crate::i18n::tr;
     use schemaic_core::compare::CompareKind;
     use schemaic_core::text::plural;

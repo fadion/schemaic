@@ -610,6 +610,8 @@ activity-lock-held-by = gehalten von { $ids }
 activity-copy-statement = Anweisung kopieren
 activity-cancel-query = Abfrage abbrechen
 activity-kill-session = Sitzung beenden
+activity-read-only-cancel = Diese Verbindung ist als schreibgeschützt markiert, daher bricht Schemaic darauf keine Abfragen ab. Hebe den Schreibschutz zuerst in den Einstellungen der Verbindung auf.
+activity-read-only-terminate = Diese Verbindung ist als schreibgeschützt markiert, daher beendet Schemaic darauf keine Sitzungen. Hebe den Schreibschutz zuerst in den Einstellungen der Verbindung auf.
 
 ## AI assistant panel
 
@@ -888,6 +890,12 @@ compare-hint-held-back = aus dem Plan zurückgehalten; der Hinweis oben sagt, wa
 compare-hint-blocked = der Rumpf muss neu gelesen werden, bevor dies angewendet werden kann
 compare-hint-uncertain = ein Index, den dieses Modell nur teilweise liest – eine Übereinstimmung hier ist nicht sicher
 compare-preview-migration = Migrationsvorschau
+compare-selected = { $n ->
+        [0] Nichts ausgewählt.
+        [one] { $n } Objekt ausgewählt
+       *[other] { $n } Objekte ausgewählt
+    }
+compare-incomparable = { $left } und { $right } lassen sich nicht vergleichen. Typnamen, Standardwerte und Indexformen lassen sich nicht zwischen Engines übertragen, daher wäre jede aus dem Unterschied erzeugte Migration falsch.
 compare-group-table = Tabellen
 compare-group-view = Sichten
 compare-group-trigger = Trigger

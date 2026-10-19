@@ -6953,7 +6953,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 if !schemaic_ui::may_launch_destructive(false, read_only) {
                     // Per kind: this refusal answered *Cancel query* with a sentence
                     // about terminating sessions, which is a different action.
-                    activity_kill_error.set(Some(schemaic_core::activity::read_only_refusal(kind)));
+                    activity_kill_error
+                        .set(Some(schemaic_ui::i18n::activity_read_only_refusal(kind)));
                     return;
                 }
                 let dialect = db.engine().dialect();
@@ -6991,7 +6992,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         });
                         if !schemaic_ui::may_launch_destructive(false, read_only) {
                             activity_kill_error
-                                .set(Some(schemaic_core::activity::read_only_refusal(kind)));
+                                .set(Some(schemaic_ui::i18n::activity_read_only_refusal(kind)));
                             return;
                         }
                         let db = db.clone();
@@ -10326,8 +10327,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // to then say "these can't be compared" would be the same answer,
             // slower.
             let (ld, rd) = (left_db.engine().dialect(), right_db.engine().dialect());
-            if let Err(why) = schemaic_core::compare::comparable(ld, rd) {
-                compare_state.set(schemaic_ui::CompareState::Failed(why));
+            if schemaic_core::compare::comparable(ld, rd).is_err() {
+                compare_state.set(schemaic_ui::CompareState::Failed(
+                    schemaic_ui::i18n::compare_incomparable(ld, rd),
+                ));
                 return;
             }
 

@@ -32405,7 +32405,7 @@ existing prose was left alone.
     signals and left two full sweeps reading a catalogue nobody would see. The token is the app's, so
     the modal asks for the cancellation rather than holding one of its own. The dialect refusal happens **before either round
     trip**, through `compare::comparable` (see its entry for why that is by dialect and not by
-    engine).
+    engine), its refusal worded by `ui::i18n::compare_incomparable` (`compare-incomparable`).
     **The five view-state signals are kept apart from the comparison, for the properties modal's
     reason** — `compare_selected` (ticked entry keys), `compare_expanded` (open group labels),
     `compare_focus` (whose text the diff pane shows), `compare_query`, `compare_show_same`. They
@@ -32505,9 +32505,10 @@ existing prose was left alone.
     `plan_of` and then `emit()` on every checkbox tick — cloning a `ChangeSet` per selected object
     and rendering the whole migration's SQL synchronously on the UI thread to display a number. It
     now counts the entries the predicate accepts, reading the selection with `with` so the `HashSet`
-    is not cloned, and the sentence beside the button is `compare::selection_note(planned)` — the
-    same plural rule as the preview's subject, one function away rather than hand-rolled a hundred
-    lines from it; the statement count lives in the
+    is not cloned, and the sentence beside the button is `compare::selection_note(planned)`, said
+    in the interface's language by `selection_note_text` (`compare-selected`, held to it by
+    `english_counts_the_selection_as_core_does`) — the same plural rule as the preview's subject,
+    one function away rather than hand-rolled a hundred lines from it; the statement count lives in the
     preview, which is the only place it can be had without emitting. The button is keyed on a
     separate `Memo<bool>` rather than on the count, because `dyn_container` has no equality check of
     its own and was tearing the button — and with it its focus-ring registration — down on every tick
@@ -34108,7 +34109,9 @@ existing prose was left alone.
   from the sessions snapshot, which is not polled while Locks is shown and can hold an earlier
   session under a reused id — and an id that list no longer holds asks nothing too. Everything
   after the lookup — both guards, the target, the confirm — is the same for both. A `db_for`
-  failure at the click is said in `activity_kill_error` rather than returning in silence.
+  failure at the click is said in `activity_kill_error` rather than returning in silence, and so
+  is the read-only refusal, per kind, in `ui::i18n::activity_read_only_refusal`'s words (core's
+  `activity::read_only_refusal` is the English it is held to).
   **Opening and saving a tab's `.sql` file** is `TabsActions::open_sql_file`/`save_sql_file`/
   `save_sql_file_as`/`reload_sql_file` (Ctrl+O / Ctrl+S / Ctrl+Shift+S, bound in `NavKeys::handle`
   so they work at the workspace root and inside the editor alike, and offered as Open File / Save
@@ -40805,7 +40808,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded
     from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork` — and,
     public for the app's run paths, `run_failed_message`, `run_cancelled_message` and
-    `not_sent_message`, with core's signatures.
+    `not_sent_message`, with core's signatures, and for the app's kill and compare actions,
+    `activity_read_only_refusal` and `compare_incomparable`, plain arguments as core's take.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.

@@ -432,6 +432,31 @@ pub fn not_sent_message(timed_out: bool) -> String {
     }
 }
 
+/// Why a kill is refused on a read-only connection — core's
+/// `activity::read_only_refusal` in the interface's language. Public for the
+/// app, whose kill action says it.
+pub fn activity_read_only_refusal(kind: schemaic_core::activity::KillKind) -> String {
+    use schemaic_core::activity::KillKind;
+    match kind {
+        KillKind::Query => tr!("activity-read-only-cancel"),
+        KillKind::Session => tr!("activity-read-only-terminate"),
+    }
+}
+
+/// Why two schemas cannot be compared — core's `compare::comparable` refusal
+/// in the interface's language. The engines' names are product names. Public
+/// for the app, which asks before reading either schema.
+pub fn compare_incomparable(
+    left: schemaic_core::intel::SqlDialect,
+    right: schemaic_core::intel::SqlDialect,
+) -> String {
+    tr!(
+        "compare-incomparable",
+        left = left.engine_label(),
+        right = right.engine_label()
+    )
+}
+
 /// Why the grid will not re-read over staged work — core's
 /// `filter::HoldsStagedWork`, whose English is `filter::STAGED_REQUERY_MSG`.
 pub(crate) fn staged_requery_note() -> String {
@@ -596,6 +621,36 @@ mod tests {
             assert_eq!(not_sent_message(timed_out), tx::not_sent_message(timed_out));
         }
         assert_eq!(tr!("tx-cancelled"), tx::CANCELLED);
+    }
+
+    /// **A refused kill and an incomparable pair read in English exactly as
+    /// core says them** — both kill kinds, and every pair of engines.
+    #[test]
+    fn english_refuses_a_kill_and_a_comparison_as_core_does() {
+        use schemaic_core::activity::{self, KillKind};
+        use schemaic_core::intel::SqlDialect;
+        for kind in [KillKind::Query, KillKind::Session] {
+            assert_eq!(
+                activity_read_only_refusal(kind),
+                activity::read_only_refusal(kind),
+                "{kind:?}"
+            );
+        }
+        let all = [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ];
+        for l in all {
+            for r in all.into_iter().filter(|r| *r != l) {
+                assert_eq!(
+                    Err(compare_incomparable(l, r)),
+                    schemaic_core::compare::comparable(l, r),
+                    "{l:?} {r:?}"
+                );
+            }
+        }
     }
 
     /// **The grid's three filter notices read in English exactly as core's

@@ -677,6 +677,9 @@ activity-copy-statement = Copy statement
 # KillKind's words, as core's label names them.
 activity-cancel-query = Cancel query
 activity-kill-session = Kill session
+# A kill refused on a read-only connection (core's activity::read_only_refusal).
+activity-read-only-cancel = This connection is marked read-only, so Schemaic won't cancel queries on it. Clear read-only in the connection's settings first.
+activity-read-only-terminate = This connection is marked read-only, so Schemaic won't terminate sessions on it. Clear read-only in the connection's settings first.
 
 ## AI assistant panel
 ## The panel's own words only — prompts sent to the agent stay English.
@@ -989,6 +992,16 @@ compare-hint-held-back = held back from the plan; the note above says why
 compare-hint-blocked = body must be re-read before this can be applied
 compare-hint-uncertain = an index this model reads only in part — a match here isn't certain
 compare-preview-migration = Preview migration
+# Beside Preview migration: how many objects the plan holds (core's
+# compare::selection_note). Only the empty one ends in a full stop.
+compare-selected = { $n ->
+        [0] Nothing selected.
+        [one] { $n } object selected
+       *[other] { $n } objects selected
+    }
+# Two engines' schemas cannot be compared (core's compare::comparable).
+# $left and $right are engine names (MySQL, PostgreSQL…).
+compare-incomparable = { $left } and { $right } can't be compared. Type names, defaults and index shapes don't carry across engines, so any migration generated from the difference would be wrong.
 # Group headings that are not object kinds (those are kind-group-*).
 compare-group-table = Tables
 compare-group-view = Views

@@ -140,8 +140,7 @@ assertions pin English wording — stays the regression net throughout.
    - **Startup notices** — `persist`'s recovery notices, `secrets`' `notice`/`cli_notice`, and
      `secrets::save_connections`' answer; **the SSH tunnel's** `TunnelFailures::refusal`.
    - **The drop and truncate confirms** — `stats::truncate_prompt`, `drop_preview`.
-   - **Smaller ones** — `compare::comparable`, `selection_note`;
-     `activity::read_only_refusal`, `Session::note`; `stats::index_facts`, `unused_note`,
+   - **Smaller ones** — `activity::Session::note`; `stats::index_facts`, `unused_note`,
      `Freshness::note`; `ddl::index_hints`' `message`; `users::password_hint`,
      `account_form_blocker`, the grants list's `note`; `edit::copy_split_note`;
      `result_diff`'s and the AI panel's summaries.
