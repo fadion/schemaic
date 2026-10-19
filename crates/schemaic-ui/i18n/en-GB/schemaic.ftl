@@ -2138,3 +2138,24 @@ lib-schema-scope-none = None
 lib-cursor-block = Block
 lib-cursor-bar = Bar
 lib-cursor-underline = Underline
+
+## The window's header (lib.rs) — the connection switcher, its tools and the
+## disconnected notice — and the identity colours' names.
+
+header-no-connection = No connection
+header-new-connection = New connection
+# $keys is the shortcut (Ctrl+P), in the keyboard's own legends.
+header-find-anywhere-tip = Find Anywhere ({ $keys })
+header-shortcuts-tip = Keyboard shortcuts
+header-settings-tip = Settings
+header-disconnected = Disconnected
+header-retry = Retry
+# The preset identity colours, as a database's or table's Colour menu names them.
+colour-red = Red
+colour-orange = Orange
+colour-amber = Amber
+colour-green = Green
+colour-teal = Teal
+colour-blue = Blue
+colour-purple = Purple
+colour-pink = Pink

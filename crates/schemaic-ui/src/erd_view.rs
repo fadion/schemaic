@@ -3099,6 +3099,7 @@ mod tests {
             let t = kind.build();
             let plain = contrast_ratio(t.border, t.erd_canvas);
             for (name, hex, _) in crate::CONN_COLOR_PRESETS {
+                let name = name();
                 let tint = theme::parse_hex(hex).expect("a preset is a valid hex");
                 let r = contrast_ratio(
                     tinted_border(tint, t.erd_node_header, t.erd_canvas),

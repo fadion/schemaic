@@ -1805,7 +1805,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let dbc = db_colors;
                             let db = db_name.clone();
                             let hex = hex.to_string();
-                            MenuEntry::action_icon(*name, (icons::DOT, *cfn), move || {
+                            MenuEntry::action_icon(name(), (icons::DOT, *cfn), move || {
                                 let cid = active_conn.get_untracked();
                                 dbc.update(|r| {
                                     schemaic_core::db_color::upsert(r, cid, &db, Some(hex.clone()))
@@ -2531,7 +2531,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 let db = database.clone();
                                 let tbl = key.clone();
                                 let hex = hex.to_string();
-                                MenuEntry::action_icon(*name, (icons::DOT, *cfn), move || {
+                                MenuEntry::action_icon(name(), (icons::DOT, *cfn), move || {
                                     let cid = active_conn.get_untracked();
                                     tc.update(|r| {
                                         schemaic_core::db_color::table_upsert(

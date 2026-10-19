@@ -866,6 +866,7 @@ mod tests {
         for kind in UiThemeKind::ALL {
             let t = kind.build();
             for (name, hex, _) in crate::CONN_COLOR_PRESETS {
+                let name = name();
                 let tint = crate::theme::parse_hex(hex).expect("a preset is a valid hex");
                 let bg = over(tint.multiply_alpha(alpha), t.erd_node_header);
                 for hit in [false, true] {
@@ -916,6 +917,7 @@ mod tests {
     fn the_env_badge_label_is_legible_on_every_connection_preset() {
         let mut bad = Vec::new();
         for (name, hex, _) in crate::CONN_COLOR_PRESETS {
+            let name = name();
             let fill = crate::theme::parse_hex(hex).expect("a preset is a valid hex");
             // Through the accessor, so this measures the decision rather than a
             // copy of it.

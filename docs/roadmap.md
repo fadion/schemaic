@@ -120,7 +120,9 @@ assertions pin English wording — stays the regression net throughout.
    for core's — and CPU/RAM); its shared words (`lib-*`: a new tab's *Query N*, a result's
    *Result N*, `ai_off_note()` — the app's AI refusals read it too — and `TestLine::text`);
    the settings choices it defines (`AiEffort`, `SchemaScope`, `TermCursor`'s `label`, which
-   Settings' dropdowns read; their persisted keys stay).
+   Settings' dropdowns read; their persisted keys stay); the header and its disconnected
+   notice (`header-*`) and the identity colours' names (`colour-*`; `CONN_COLOR_PRESETS`
+   stays `const`, its names `fn() -> String`).
    Nothing yet in `widgets.rs` or `editor_pane.rs`.
    **Left, in order** — delete a name as its file lands: the three large files' remainders,
    `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then

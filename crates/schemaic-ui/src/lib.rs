@@ -7666,7 +7666,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
             cs.iter()
                 .find(|c| c.id == active_conn.get())
                 .map(|c| schemaic_core::connection::elide_name(&c.name, consts::CONN_NAME_CHARS))
-                .unwrap_or_else(|| "No connection".to_string())
+                .unwrap_or_else(|| tr!("header-no-connection"))
         })
     };
     // **The full name, on hover.** Eliding at 15 characters removed the one
@@ -7748,16 +7748,19 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
             }
             let new_conn = new_conn.clone();
             container(
-                h_stack((icons::icon(icons::PLUS, 16.0), text("New connection")))
-                    // One colour on the row, inherited by the label and by the
-                    // `currentColor` glyph — the update chip beside it is built the
-                    // same way, and it is what makes the pair read as one object.
-                    .style(|s| {
-                        s.flex_row()
-                            .items_center()
-                            .gap(theme::scaled(6.0))
-                            .color(theme::accent())
-                    }),
+                h_stack((
+                    icons::icon(icons::PLUS, 16.0),
+                    text(tr!("header-new-connection")),
+                ))
+                // One colour on the row, inherited by the label and by the
+                // `currentColor` glyph — the update chip beside it is built the
+                // same way, and it is what makes the pair read as one object.
+                .style(|s| {
+                    s.flex_row()
+                        .items_center()
+                        .gap(theme::scaled(6.0))
+                        .color(theme::accent())
+                }),
             )
             .on_click_stop(move |_| {
                 // Draft first, then open: the modal reads the draft as it builds,
@@ -7870,9 +7873,9 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 .hover(|s| s.color(theme::text()))
         })
         .tooltip(|| {
-            text(format!(
-                "Find Anywhere ({})",
-                crate::shortcuts::keys_label("Ctrl+P")
+            text(tr!(
+                "header-find-anywhere-tip",
+                keys = crate::shortcuts::keys_label("Ctrl+P").into_owned()
             ))
             .style(widgets::tooltip_style)
         });
@@ -7887,7 +7890,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
         })
-        .tooltip(|| text("Keyboard shortcuts").style(widgets::tooltip_style));
+        .tooltip(|| text(tr!("header-shortcuts-tip")).style(widgets::tooltip_style));
 
     // App settings (theme picker), 20px, sitting just right of the search glyph.
     let settings = icons::icon(icons::SETTINGS, 20.0)
@@ -7898,7 +7901,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
         })
-        .tooltip(|| text("Settings").style(widgets::tooltip_style));
+        .tooltip(|| text(tr!("header-settings-tip")).style(widgets::tooltip_style));
     // The glyph cluster, then the window's caption buttons hard against the right
     // edge — the header *is* the title bar now. `settings` keeps its 20px right
     // margin, which becomes the gap between the app's glyphs and the OS-ish
@@ -8020,14 +8023,14 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
 /// entirely otherwise (`.hide()`/`.flex()`, not opacity, so it costs no layout
 /// space when healthy).
 fn disconnected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>) -> impl IntoView {
-    let label = text("Disconnected").style(|s| {
+    let label = text(tr!("header-disconnected")).style(|s| {
         s.font_size(toolbar_font())
             .color(theme::error())
             .margin_left(theme::scaled(15.0))
     });
     // Same chrome as the ER-diagram toolbar buttons (`control_surface`), so the
     // app has one button vocabulary rather than a bespoke one per surface.
-    let retry = text("Retry")
+    let retry = text(tr!("header-retry"))
         .on_click_stop(move |_| (recheck)())
         .style(|s| {
             control_surface(s)
@@ -8243,21 +8246,38 @@ pub(crate) fn favorite_star(
 
 /// One identity-colour preset: `(display name, #rrggbb hex, parsed-colour
 /// accessor)`. The accessor is a `fn` pointer because menu icon/label colours are
-/// `fn`s (so they can follow theme switches), so each preset needs a concrete one.
-pub(crate) type ColorPreset = (&'static str, &'static str, fn() -> floem::peniko::Color);
+/// `fn`s (so they can follow theme switches), so each preset needs a concrete one;
+/// the name is one too, drawn from the catalogue, so the table stays `const`.
+pub(crate) type ColorPreset = (fn() -> String, &'static str, fn() -> floem::peniko::Color);
 
 /// Preset identity colours — saturated mid-tones that read on both themes. Single
 /// source for the connection-form swatches, the auto-assign pool, and the database
 /// colour picker.
 pub(crate) const CONN_COLOR_PRESETS: &[ColorPreset] = &[
-    ("Red", "#E05252", || parse_preset("#E05252")),
-    ("Orange", "#E08A4B", || parse_preset("#E08A4B")),
-    ("Amber", "#E0C24B", || parse_preset("#E0C24B")),
-    ("Green", "#52C77A", || parse_preset("#52C77A")),
-    ("Teal", "#43C6C6", || parse_preset("#43C6C6")),
-    ("Blue", "#5B8DEF", || parse_preset("#5B8DEF")),
-    ("Purple", "#9B6DE0", || parse_preset("#9B6DE0")),
-    ("Pink", "#E06D9B", || parse_preset("#E06D9B")),
+    (|| tr!("colour-red"), "#E05252", || parse_preset("#E05252")),
+    (
+        || tr!("colour-orange"),
+        "#E08A4B",
+        || parse_preset("#E08A4B"),
+    ),
+    (
+        || tr!("colour-amber"),
+        "#E0C24B",
+        || parse_preset("#E0C24B"),
+    ),
+    (
+        || tr!("colour-green"),
+        "#52C77A",
+        || parse_preset("#52C77A"),
+    ),
+    (|| tr!("colour-teal"), "#43C6C6", || parse_preset("#43C6C6")),
+    (|| tr!("colour-blue"), "#5B8DEF", || parse_preset("#5B8DEF")),
+    (
+        || tr!("colour-purple"),
+        "#9B6DE0",
+        || parse_preset("#9B6DE0"),
+    ),
+    (|| tr!("colour-pink"), "#E06D9B", || parse_preset("#E06D9B")),
 ];
 
 fn parse_preset(hex: &str) -> floem::peniko::Color {
@@ -15416,6 +15436,26 @@ mod conn_node_scope_tests {
 mod catalogue_tests {
     use super::{TestLine, ai_off_note, tr, tx_mode_label, tx_pill_text};
     use schemaic_core::tx::{TxMode, TxState, pill_text};
+
+    /// The identity colours keep their names, in their order, and the header's
+    /// Find Anywhere tooltip names its key as it did.
+    #[test]
+    fn the_header_and_colour_names_read_as_they_did_in_english() {
+        let names: Vec<String> = super::CONN_COLOR_PRESETS
+            .iter()
+            .map(|(n, _, _)| n())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Red", "Orange", "Amber", "Green", "Teal", "Blue", "Purple", "Pink"
+            ]
+        );
+        assert_eq!(
+            tr!("header-find-anywhere-tip", keys = "Ctrl+P"),
+            "Find Anywhere (Ctrl+P)"
+        );
+    }
 
     /// Settings' dropdown entries read as they did before the catalogue.
     #[test]
