@@ -1932,3 +1932,27 @@ conn-delete-title = „{ $name }“ löschen
 conn-delete-question = Dies löscht die Verbindung, ihr gespeichertes Passwort, ihre gespeicherte KI-Unterhaltung, ihren Abfrageverlauf und ihre Tabs. Das lässt sich nicht rückgängig machen.
 conn-delete-keyring-kept = Schemaic konnte den Schlüsselbund des Betriebssystems nicht erreichen, daher sind das gespeicherte Passwort und die SSH-Geheimnisse der gelöschten Verbindung **noch darin**.
 conn-delete-keyring-later = Sie werden entfernt, sobald das nächste Mal eine Verbindung gelöscht oder gespeichert wird, während der Schlüsselbund erreichbar ist. Bis dahin kann keine neue Verbindung sie erhalten – Verbindungs-IDs werden nie wiederverwendet.
+inline-ai-no-sql = Kein SQL zurückgegeben
+inline-ai-not-sql = Das Modell hat kein SQL zurückgegeben
+inline-ai-failed = Generierung fehlgeschlagen
+ai-fill-no-value = Die KI hat keinen Wert zurückgegeben.
+conn-gone = Die Verbindung existiert nicht mehr
+tx-session-not-ready = Die Transaktionsverbindung ist nicht bereit – wechsle zu Auto-Commit und zurück
+tx-session-open-failed = Die Transaktionsverbindung konnte nicht geöffnet werden: { $error }
+snippet-default-name = Snippet
+snippet-delete-title = Snippet löschen
+snippet-delete-question = „{ $name }“ löschen? Das lässt sich nicht rückgängig machen.
+copy-target-read-only = Die Zielverbindung ist schreibgeschützt, daher wurden keine Zeilen kopiert.
+copy-target-gone = Die Zielverbindung existiert nicht mehr, daher wurden keine Zeilen kopiert.
+copy-not-started = Es wurden keine Zeilen kopiert: { $error }
+copy-counter-not-moved = { $count ->
+        [one] { $count } Zeile wurde kopiert, aber der Zähler der Tabelle wurde nicht über sie hinaus verschoben, daher kann die nächste Einfügung kollidieren: { $error }
+       *[other] { $count } Zeilen wurden kopiert, aber der Zähler der Tabelle wurde nicht über sie hinaus verschoben, daher kann die nächste Einfügung kollidieren: { $error }
+    }
+copy-stopped = Das Kopieren wurde wegen eines Fehlers abgebrochen: { $error }
+compare-reading-failed = { $database } lesen: { $error }
+monitor-no-row-key = Kein Zeilenschlüssel für diese Tabelle – Änderungen lassen sich nicht verfolgen.
+monitor-restarted = Die Spalten der Tabelle haben sich geändert, daher wurde die Änderungsverfolgung ab hier neu gestartet.
+timeout-cancelled-app = Abgebrochen: Die Anweisung lief länger als das Anweisungs-Timeout von { $timeout }. Ändere oder deaktiviere es unter Einstellungen → Abfrage.
+timeout-cancelled-connection = Abgebrochen: Die Anweisung lief länger als das Anweisungs-Timeout von { $timeout }. Ändere oder deaktiviere es in den Einstellungen dieser Verbindung.
+ai-chat-no-database = Die Datenbank ist nicht erreichbar, daher kann der Assistent für diese Verbindung nicht gestartet werden. Prüfe die Verbindung und versuch es erneut.

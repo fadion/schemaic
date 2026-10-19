@@ -2430,3 +2430,38 @@ conn-delete-question = This deletes the connection, its stored password, its sav
 # The ** marks bold.
 conn-delete-keyring-kept = Schemaic could not reach the OS keyring, so the deleted connection's stored password and SSH secrets are **still in it**.
 conn-delete-keyring-later = They will be removed the next time a connection is deleted or saved while the keyring is reachable. No new connection can be given them in the meantime — connection ids are never reused.
+
+## The rest of main.rs's own words — the inline AI's and the AI fill's
+## failures, a Manual tab's connection, snippets, Copy table, Compare schemas,
+## the table monitor and the statement timeout. $error is the engine's, the
+## agent's or the operating system's own text.
+
+inline-ai-no-sql = No SQL returned
+inline-ai-not-sql = The model did not return SQL
+# The agent failed and said nothing.
+inline-ai-failed = generation failed
+ai-fill-no-value = The AI returned no value.
+# The connection an action was asked of was deleted meanwhile.
+conn-gone = connection no longer exists
+tx-session-not-ready = the transaction connection isn't ready — switch to Auto-commit and back
+tx-session-open-failed = couldn't open a transaction connection: { $error }
+# A new snippet's name when no tab gives it one.
+snippet-default-name = Snippet
+snippet-delete-title = Delete snippet
+snippet-delete-question = Delete “{ $name }”? This can't be undone.
+copy-target-read-only = The target connection is read-only, so no rows were copied.
+copy-target-gone = The target connection is gone, so no rows were copied.
+copy-not-started = No rows were copied: { $error }
+copy-counter-not-moved = { $count ->
+        [one] { $count } row was copied, but the table's counter was not moved past it, so the next insert may collide: { $error }
+       *[other] { $count } rows were copied, but the table's counter was not moved past them, so the next insert may collide: { $error }
+    }
+copy-stopped = The copy stopped on an error: { $error }
+# $database is the side of the comparison that could not be read.
+compare-reading-failed = Reading { $database }: { $error }
+monitor-no-row-key = No row key for this table — changes can't be tracked.
+monitor-restarted = The table's columns changed, so change tracking restarted from here.
+# $timeout is the setting's value as its dropdown shows it, lower-cased (15 minutes).
+timeout-cancelled-app = Cancelled: the statement ran longer than the { $timeout } statement timeout. Change or turn it off in Settings → Query.
+timeout-cancelled-connection = Cancelled: the statement ran longer than the { $timeout } statement timeout. Change or turn it off in this connection's settings.
+ai-chat-no-database = Can't reach the database, so the assistant can't be started for this connection. Check the connection and try again.

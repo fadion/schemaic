@@ -112,22 +112,22 @@ assertions pin English wording — stays the regression net throughout.
    comma-separated list each language writes for itself, as many verbs as it likes, which the
    loader-width test measures in every catalogue) and `editor_pane.rs` (six: `cmdk-*`,
    `params-*`, the error and guard bars, `editor-menu-*`, the run menu, `find-*` and
-   `goto-line-label`). `schemaic-app` has begun: `main.rs`'s database-CLI and backup-tool
-   launchers (`cli-*`; the "no client" case is `Unreached::Absent`, a value the caller names,
-   where it was a `const` line the callers compared against) and the connection gate's
-   refusals (`gate-*`: the plan modal's three, the run's, the grid commit's), and the terminal's
-   own lines with Back up / Restore (`term-shell-failed`, `term-cli-read-only`, `backup-*`,
-   `restore-*`; a file dialog's type filter, which floem takes only as `&'static str`, goes
-   through `tr_static!`, a per-site `OnceLock`), and closing tabs with the SQL file's open,
-   save and reload (`tab-close-*`, `file-*`; core's `SQL_FILTER_NAME` went, its word now
-   `file-sql-filter`), and the export and dump runners' failures with a binary cell's load
-   and save (`export-*`, `dump-failed`, `blob-load-*`, `blob-save-failed`). The dump modal
-   still shows `schemaic-cli`'s own "Export failed: …" lines from `dump.rs`, which the
-   headless CLI shares — phase 4's, like core's prose; so is the write log's "file …, n
-   statements ran", a persisted record. Then Export / Import settings, Export connections,
-   Import Connections' file and Docker sources and deleting a connection (`settings-*`,
-   `connections-*`, `import-*`, `conn-delete-*`, `file-write-failed`; core's
-   `settings_bundle::summary` went, its counts now plurals inside `settings-import-question`).
+   `goto-line-label`). In `schemaic-app`, `main.rs` is done (eight sections: `cli-*`,
+   `gate-*`, the terminal's lines with `backup-*`/`restore-*`, `tab-close-*`/`file-*`,
+   `export-*`/`dump-failed`/`blob-*`, `settings-*`/`connections-*`/`import-*`/`conn-delete-*`,
+   and the rest — inline AI, a Manual tab's session, snippets, Copy table, Compare, the
+   monitor, the statement timeout); so is `install_cli.rs` (`install-*`). The "no client"
+   case is `Unreached::Absent`, a value the caller names, where it was a `const` line the
+   callers compared against; a file dialog's type filter, which floem takes only as
+   `&'static str`, goes through `tr_static!`, a per-site `OnceLock`; core's
+   `sqlfile::SQL_FILTER_NAME` and `settings_bundle::summary` went, being interface words only
+   the app read. What `main.rs` leaves: what it sends the model (the AI fill and seed system
+   prompts), what it writes to the write log (a persisted record), log and `tracing` lines,
+   the internal "export cancelled", and core's prose it passes through — `launch::*`'s
+   refusals, `script::restore_refusal`, `cli_install::report_*`, `statement_timeout_label`
+   (the timeout message quotes it as the dropdown shows it), `format_bytes` — and
+   `schemaic-cli`'s `dump.rs` "Export failed: …" lines, which the headless CLI shares: all
+   phase 4's.
    A large file goes **a
    section at a time** — a function or a cluster of them — committed per section as
    `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded here as
@@ -149,10 +149,8 @@ assertions pin English wording — stays the regression net throughout.
    bar's Explain and AI fix are the error modal's messages, which `error_bar_fits_explain`
    measures, and its Rename alias / Rename CTE entries the rename dialog's titles.
    **Left, in order** — delete a name as its file lands:
-   `schemaic-app` (`main.rs`, `ai.rs`, `conn_sources.rs`, `agent_cli.rs`, `antigravity.rs`;
-   `install_cli.rs` is done — its failures, `install-*`, its success reports being core's
-   `cli_install::report_*` — and `notify.rs` had nothing, its title and body being its
-   callers'). A file with
+   `schemaic-app`'s `ai.rs`, `conn_sources.rs`, `agent_cli.rs` and `antigravity.rs`
+   (`notify.rs` had nothing, its title and body being its callers'). A file with
    no literal a user reads drops off without a commit. The list came from a sweep for
    capitalised string literals, so sweep a file whole before calling it done; a sentence that
    starts lower-case, or spans a `\` continuation, slips past a quick one.

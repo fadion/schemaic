@@ -1352,7 +1352,7 @@ fn inline_outcome(reply: Result<String, String>, dialect: SqlDialect) -> InlineA
         Ok(text) => {
             let sql = extract_sql(&text);
             if sql.trim().is_empty() {
-                return InlineAiState::Failed("No SQL returned".to_string());
+                return InlineAiState::Failed(tr!("inline-ai-no-sql"));
             }
             // Fences off, now prove it is SQL. The tool the model runs in can put
             // a line of its own on stdout, and Ctrl+K's output goes straight into
@@ -1360,7 +1360,7 @@ fn inline_outcome(reply: Result<String, String>, dialect: SqlDialect) -> InlineA
             // offered. See `intel::sql_reply` for what it will and won't shave off.
             match schemaic_core::intel::sql_reply(&sql, dialect) {
                 Some(sql) => InlineAiState::Ready(sql),
-                None => InlineAiState::Failed("The model did not return SQL".to_string()),
+                None => InlineAiState::Failed(tr!("inline-ai-not-sql")),
             }
         }
         // One line: the bar this lands in is a single row, and a CLI's stderr can
@@ -1369,8 +1369,7 @@ fn inline_outcome(reply: Result<String, String>, dialect: SqlDialect) -> InlineA
             why.lines()
                 .next()
                 .filter(|l| !l.trim().is_empty())
-                .unwrap_or("generation failed")
-                .to_string(),
+                .map_or_else(|| tr!("inline-ai-failed"), str::to_string),
         ),
     }
 }
@@ -2432,7 +2431,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(move |conn_id: u64| {
             let conn = connections
                 .with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).cloned())
-                .ok_or_else(|| "connection no longer exists".to_string())?;
+                .ok_or_else(|| tr!("conn-gone"))?;
             let tunnel = if conn.uses_tunnel() {
                 match tunnels.borrow().get(&conn_id).map(|h| h.port()) {
                     Some(p) => Some(p),
@@ -2459,10 +2458,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             TxMode::Auto => Ok(None),
             TxMode::Manual => match sessions.borrow().get(&tab.id).cloned() {
                 Some(s) => Ok(Some(s)),
-                None => Err(
-                    "the transaction connection isn't ready — switch to Auto-commit and back"
-                        .to_string(),
-                ),
+                None => Err(tr!("tx-session-not-ready")),
             },
         })
     };
@@ -3280,7 +3276,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let create = snippet_store.create.clone();
         Rc::new(move || {
             let body = editor_snippet_text()?;
-            let name = active_tab().map_or_else(|| "Snippet".to_string(), |t| t.title());
+            let name = active_tab().map_or_else(|| tr!("snippet-default-name"), |t| t.title());
             Some((create)(name, body, active_conn.get_untracked()))
         })
     };
@@ -3340,8 +3336,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             };
             let remove = remove.clone();
             confirm.set(Some(Confirm {
-                title: "Delete snippet".to_string(),
-                message: format!("Delete “{}”? This can't be undone.", snip.name),
+                title: tr!("snippet-delete-title"),
+                message: tr!("snippet-delete-question", name = snip.name.clone()),
                 resolve: Rc::new(move |yes| {
                     if yes {
                         (remove)(id);
@@ -6519,7 +6515,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(e) => {
                         tab.tx_mode.set(TxMode::Auto);
                         error_modal_text.set(Some(ModalError::new(
-                            format!("couldn't open a transaction connection: {}", e.text),
+                            tr!("tx-session-open-failed", error = e.text.clone()),
                             e.source,
                         )));
                         error_modal_open.set(true);
@@ -10110,21 +10106,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     )
                 });
                 if read_only {
-                    return done(CopyOutcome::Failed(
-                        "The target connection is read-only, so no rows were copied.".into(),
-                    ));
+                    return done(CopyOutcome::Failed(tr!("copy-target-read-only")));
                 }
                 // A target connection deleted while its `CREATE` ran: nothing
                 // to log the write against, and nothing to write to.
                 let Some(dialect) = dialect else {
-                    return done(CopyOutcome::Failed(
-                        "The target connection is gone, so no rows were copied.".into(),
-                    ));
+                    return done(CopyOutcome::Failed(tr!("copy-target-gone")));
                 };
                 let (src, dst) = match (db_for(req.src_conn), db_for(req.dst_conn)) {
                     (Ok(s), Ok(d)) => (s, d),
                     (Err(e), _) | (_, Err(e)) => {
-                        return done(CopyOutcome::Failed(format!("No rows were copied: {e}")));
+                        return done(CopyOutcome::Failed(tr!("copy-not-started", error = e)));
                     }
                 };
                 let token = CancellationToken::new();
@@ -10174,17 +10166,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             done(match res {
                                 Ok(n) => CopyOutcome::Done(n),
                                 Err((_, None)) => CopyOutcome::Cancelled,
-                                Err((Some(n), Some(e))) => CopyOutcome::Failed(format!(
-                                    "{n} rows were copied, but the table's counter was not moved \
-                                 past them, so the next insert may collide: {e}"
+                                Err((Some(n), Some(e))) => CopyOutcome::Failed(tr!(
+                                    "copy-counter-not-moved",
+                                    count = n,
+                                    error = e
                                 )),
                                 // **Not "the table is empty"**: the rows are one
                                 // transaction, but a table whose engine ignores the
                                 // rollback (a MyISAM or Aria copy of one) keeps
                                 // what arrived, and the error's own note says so.
-                                Err((None, Some(e))) => CopyOutcome::Failed(format!(
-                                    "The copy stopped on an error: {e}"
-                                )),
+                                Err((None, Some(e))) => {
+                                    CopyOutcome::Failed(tr!("copy-stopped", error = e))
+                                }
                             });
                         },
                     )
@@ -10361,13 +10354,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     left_db
                         .fetch_schema(&ldb, token.clone())
                         .await
-                        .map_err(|e| format!("Reading {ldb}: {e}"))
+                        .map_err(|e| {
+                            tr!(
+                                "compare-reading-failed",
+                                database = ldb.clone(),
+                                error = e.to_string()
+                            )
+                        })
                 };
                 let right = async {
                     right_db
                         .fetch_schema(&rdb, token.clone())
                         .await
-                        .map_err(|e| format!("Reading {rdb}: {e}"))
+                        .map_err(|e| {
+                            tr!(
+                                "compare-reading-failed",
+                                database = rdb.clone(),
+                                error = e.to_string()
+                            )
+                        })
                 };
                 match tokio::try_join!(left, right) {
                     Ok((l, r)) => report(Ok((Box::new(l), Box::new(r)))),
@@ -13015,11 +13020,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         v.push(ChatMessage {
                             role: Role::Error,
                             text: String::new(),
-                            segs: vec![schemaic_core::transcript::Seg::Text(
-                                "Can't reach the database, so the assistant can't be started \
-                                 for this connection. Check the connection and try again."
-                                    .to_string(),
-                            )],
+                            segs: vec![schemaic_core::transcript::Seg::Text(tr!(
+                                "ai-chat-no-database"
+                            ))],
                             stats: None,
                             pending: false,
                             attachment: None,
@@ -13538,7 +13541,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                                 schemaic_core::seed::FillOutcome::Null => AiFillResult::Null,
                                 schemaic_core::seed::FillOutcome::Empty => {
-                                    AiFillResult::Failed("The AI returned no value.".into())
+                                    AiFillResult::Failed(tr!("ai-fill-no-value"))
                                 }
                             },
                             Err(why) => AiFillResult::Failed(why),
@@ -15437,9 +15440,7 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                         *ctx.key_cols.borrow_mut() = t.key_cols.clone();
                     }
                     _ => {
-                        ctx.error.set(Some(
-                            "No row key for this table — changes can't be tracked.".to_string(),
-                        ));
+                        ctx.error.set(Some(tr!("monitor-no-row-key")));
                         // The loop ends here, and the badge has to say so:
                         // it read only `paused`, and stayed a green Watching.
                         ctx.stopped.set(true);
@@ -15451,10 +15452,7 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
             // visible in it. The next poll's diff is against the new baseline,
             // so this clears itself.
             if restarted {
-                ctx.error.set(Some(
-                    "The table's columns changed, so change tracking restarted from here."
-                        .to_string(),
-                ));
+                ctx.error.set(Some(tr!("monitor-restarted")));
             } else {
                 ctx.error.set(None);
             }
@@ -15727,16 +15725,12 @@ impl Drop for RunTimeout {
 /// dropdown uses*, and where to change it — the connection's own setting when
 /// it was that one, since the app's may be off or different.
 fn timeout_message(t: schemaic_core::connection::StatementTimeout) -> String {
-    let place = if t.per_connection {
-        "this connection's settings"
+    let timeout = persist::statement_timeout_label(t.secs).to_lowercase();
+    if t.per_connection {
+        tr!("timeout-cancelled-connection", timeout = timeout)
     } else {
-        "Settings → Query"
-    };
-    format!(
-        "Cancelled: the statement ran longer than the {} statement timeout. \
-         Change or turn it off in {place}.",
-        persist::statement_timeout_label(t.secs).to_lowercase()
-    )
+        tr!("timeout-cancelled-app", timeout = timeout)
+    }
 }
 
 /// Reveal the app's config directory — `schemaic.log` and the rest of the state
