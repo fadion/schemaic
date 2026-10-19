@@ -7317,7 +7317,13 @@ async fn an_imported_blank_number_is_refused_not_stored_as_zero() {
     let err = import_into(&s, &["id", "qty"], &mut rows, CancellationToken::new())
         .await
         .expect_err("refused");
-    assert!(matches!(err, DbError::Refused(_)), "{err:?}");
+    assert!(
+        matches!(
+            &err,
+            DbError::Write(f) if matches!(f.cause, schemaic_core::model::WriteCause::Refused(_))
+        ),
+        "{err:?}"
+    );
     assert!(
         err.to_string().contains("Row 3") && err.to_string().contains("qty"),
         "{err}"
@@ -7356,7 +7362,13 @@ async fn text_a_varchar_cannot_hold_is_refused_not_stored_as_question_marks() {
     let err = import_into(&s, &["id", "name"], &mut rows, CancellationToken::new())
         .await
         .expect_err("refused");
-    assert!(matches!(err, DbError::Refused(_)), "{err:?}");
+    assert!(
+        matches!(
+            &err,
+            DbError::Write(f) if matches!(f.cause, schemaic_core::model::WriteCause::Refused(_))
+        ),
+        "{err:?}"
+    );
     assert!(
         err.to_string().contains("Row 3") && err.to_string().contains('Ω'),
         "{err}"

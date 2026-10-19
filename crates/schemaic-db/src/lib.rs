@@ -133,6 +133,12 @@ pub enum DbError {
     /// whose words these are, so it says so here.
     #[error("{0}")]
     Refused(String),
+    /// A write path failed — the grid's write-back, an import, a copy — and
+    /// here is what its rollback achieved, as a value the interface can say in
+    /// its own language. Displayed as the `Query` or `Refused` it replaced
+    /// ([`schemaic_core::model::WriteFailure::message`]).
+    #[error("{}", .0.message())]
+    Write(schemaic_core::model::WriteFailure),
 }
 
 impl DbError {
@@ -151,16 +157,29 @@ impl DbError {
             DbError::Query(_) | DbError::QueryAt { .. } => ErrorSource::Statement,
             DbError::Connect(_) => ErrorSource::Server,
             DbError::Cancelled | DbError::Refused(_) => ErrorSource::App,
+            DbError::Write(f) if f.cause.is_statements() => ErrorSource::Statement,
+            DbError::Write(_) => ErrorSource::App,
         }
+    }
+
+    /// A write path's failure with what its rollback achieved — see
+    /// [`DbError::Write`].
+    pub(crate) fn write(
+        cause: schemaic_core::model::WriteCause,
+        undone: Option<schemaic_core::model::Rollback>,
+    ) -> DbError {
+        DbError::Write(schemaic_core::model::WriteFailure { cause, undone })
     }
 
     /// Where the server placed the error, as [`DbError::QueryAt::at`] says.
     pub fn position(&self) -> Option<usize> {
         match self {
             DbError::QueryAt { at, .. } => Some(*at),
-            DbError::Query(_) | DbError::Connect(_) | DbError::Cancelled | DbError::Refused(_) => {
-                None
-            }
+            DbError::Query(_)
+            | DbError::Connect(_)
+            | DbError::Cancelled
+            | DbError::Refused(_)
+            | DbError::Write(_) => None,
         }
     }
 
@@ -199,6 +218,27 @@ mod modal_source_tests {
             DbError::Refused("x".into()).modal_source(),
             ErrorSource::App
         );
+        // A write path's failure is the statement's when its cause is, and
+        // Schemaic's account of a Stop or a refusal of its own otherwise —
+        // the `Query` and `Refused` it replaced.
+        use schemaic_core::model::{Rollback, WriteCause};
+        for (cause, source) in [
+            (WriteCause::Server("x".into()), ErrorSource::Statement),
+            (
+                WriteCause::Batch {
+                    rows: 2,
+                    wrote: 1,
+                    affected: false,
+                },
+                ErrorSource::Statement,
+            ),
+            (WriteCause::CommitCancelled, ErrorSource::App),
+            (WriteCause::ImportCancelled, ErrorSource::App),
+            (WriteCause::Refused("x".into()), ErrorSource::App),
+        ] {
+            let e = DbError::write(cause, Some(Rollback::Unknown));
+            assert_eq!(e.modal_source(), source, "{e}");
+        }
     }
 
     /// Off the editor, a statement's failure is the server's words about SQL

@@ -45,7 +45,7 @@ use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     CellEdit, Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow,
     RefetchTemplate, ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value,
-    WriteStep, binary_display, one_row_verdict,
+    WriteCause, WriteStep, binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, EventInfo, EventSchedule, EventSource, EventStatus,
@@ -3832,18 +3832,19 @@ mod schema_tests {
             if code.starts_with("//") || !code.contains("return Err(") {
                 continue;
             }
-            // The whole `return` statement, which may be several lines: either
-            // spelling of the note counts — the explicit one, or
-            // `cancelled_import`, which is a wrapper over it.
+            // The whole `return` statement, which may be several lines: any
+            // spelling of the rollback's outcome counts — the explicit
+            // `Some(undone)` a `DbError::write` carries, or `cancelled_import`
+            // and `with_partial_rollback`, which are wrappers over it.
             let stmt: String = lines[n..]
                 .iter()
-                .take(8)
+                .take(10)
                 .copied()
                 .collect::<Vec<_>>()
                 .join(" ");
-            let says = stmt.contains("undone.note()")
+            let says = stmt.contains("Some(undone)")
                 || stmt.contains("cancelled_import(")
-                || stmt.contains(".note()");
+                || stmt.contains("with_partial_rollback(");
             if !says {
                 offenders.push(format!("import_on +{n}: {code}"));
             }
@@ -3857,9 +3858,9 @@ mod schema_tests {
         );
         // The floor: a negative assertion over a body it could not find passes.
         assert!(
-            body.matches("undone.note()").count() >= 3,
+            body.matches("Some(undone)").count() >= 3,
             "only {} notes in `import_on` — did they get renamed? Rewrite this              gate rather than letting it pass by finding nothing.",
-            body.matches("undone.note()").count()
+            body.matches("Some(undone)").count()
         );
         // And nothing propagates a failure out with `?` instead, which is what
         // the `COMMIT` exit did.
@@ -5847,6 +5848,7 @@ fn err_clone(e: &DbError) -> DbError {
         },
         DbError::Cancelled => DbError::Cancelled,
         DbError::Refused(s) => DbError::Refused(s.clone()),
+        DbError::Write(f) => DbError::Write(f.clone()),
     }
 }
 
@@ -6450,7 +6452,7 @@ mod explain_tests {
 fn cancelled_import(undone: Rollback) -> DbError {
     match undone {
         Rollback::Complete => DbError::Cancelled,
-        undone => DbError::Refused(format!("Import cancelled{}", undone.note())),
+        undone => DbError::write(WriteCause::ImportCancelled, Some(undone)),
     }
 }
 
@@ -6463,7 +6465,19 @@ fn cancelled_import(undone: Rollback) -> DbError {
 fn cancelled_write(undone: Rollback) -> DbError {
     match undone {
         Rollback::Complete => DbError::Cancelled,
-        undone => DbError::Refused(format!("Commit cancelled{}", undone.note())),
+        undone => DbError::write(WriteCause::CommitCancelled, Some(undone)),
+    }
+}
+
+/// An import's reader or statement-building error `e`, with what the rollback
+/// after it achieved — **only worth saying when it isn't what the message
+/// implies**, so a complete rollback leaves `e` as it was, and only a
+/// [`DbError::Query`] has a sentence to carry the note.
+fn with_partial_rollback(e: DbError, undone: Rollback) -> DbError {
+    match (e, undone) {
+        (e, Rollback::Complete) => e,
+        (DbError::Query(msg), undone) => DbError::write(WriteCause::Server(msg), Some(undone)),
+        (e, _) => e,
     }
 }
 
@@ -6500,14 +6514,7 @@ async fn import_on(
             Ok(None) => break,
             Err(e) => {
                 let undone = rollback(conn, "ROLLBACK").await;
-                return Err(match (e, undone) {
-                    // Only worth saying when it isn't what the message implies.
-                    (e, Rollback::Complete) => e,
-                    (DbError::Query(msg), undone) => {
-                        DbError::Query(format!("{msg}{}", undone.note()))
-                    }
-                    (e, _) => e,
-                });
+                return Err(with_partial_rollback(e, undone));
             }
         };
         let sql = match target.insert_sql(&batch, dialect) {
@@ -6515,13 +6522,7 @@ async fn import_on(
             Ok(None) => continue,
             Err(e) => {
                 let undone = rollback(conn, "ROLLBACK").await;
-                return Err(match (e, undone) {
-                    (e, Rollback::Complete) => e,
-                    (DbError::Query(msg), undone) => {
-                        DbError::Query(format!("{msg}{}", undone.note()))
-                    }
-                    (e, _) => e,
-                });
+                return Err(with_partial_rollback(e, undone));
             }
         };
         // **The killed statement is awaited, not dropped** — the same rule
@@ -6549,18 +6550,22 @@ async fn import_on(
             Some(Err(e)) => {
                 let msg = e.to_string();
                 let undone = rollback(conn, "ROLLBACK").await;
-                return Err(DbError::Query(format!("{msg}{}", undone.note())));
+                return Err(DbError::write(WriteCause::Server(msg), Some(undone)));
             }
             None => return Err(cancelled_import(rollback(conn, "ROLLBACK").await)),
         }
         let affected = conn.affected_rows();
         if affected != batch.len() as u64 {
-            let n = batch.len();
+            let rows = batch.len();
             let undone = rollback(conn, "ROLLBACK").await;
-            return Err(DbError::Query(format!(
-                "a batch of {n} rows inserted {affected}{}",
-                undone.note()
-            )));
+            return Err(DbError::write(
+                WriteCause::Batch {
+                    rows,
+                    wrote: affected,
+                    affected: false,
+                },
+                Some(undone),
+            ));
         }
         total += affected;
     }
@@ -6582,7 +6587,7 @@ async fn import_on(
     if let Err(e) = conn.query_drop("COMMIT").await {
         let msg = qerr(e).to_string();
         let undone = rollback(conn, "ROLLBACK").await;
-        return Err(DbError::Query(format!("{msg}{}", undone.note())));
+        return Err(DbError::write(WriteCause::Server(msg), Some(undone)));
     }
     Ok(total)
 }
@@ -6667,12 +6672,12 @@ pub(crate) async fn write_on(
         if let Err(e) = sent {
             let msg = e.to_string();
             let undone = rollback(conn, scope.rollback_sql()).await;
-            return Err(DbError::Query(format!("{msg}{}", undone.note())));
+            return Err(DbError::write(WriteCause::Server(msg), Some(undone)));
         }
         let affected = conn.affected_rows();
-        if let Err(msg) = one_row_verdict(step, affected) {
+        if let Err(miss) = one_row_verdict(step, affected) {
             let undone = rollback(conn, scope.rollback_sql()).await;
-            return Err(DbError::Query(format!("{msg}{}", undone.note())));
+            return Err(DbError::write(WriteCause::OneRow(miss), Some(undone)));
         }
         Ok(affected)
     }
@@ -6696,7 +6701,7 @@ pub(crate) async fn write_on(
     if let Err(e) = conn.query_drop(scope.commit_sql()).await {
         let msg = e.to_string();
         let undone = rollback(conn, scope.rollback_sql()).await;
-        return Err(DbError::Query(format!("{msg}{}", undone.note())));
+        return Err(DbError::write(WriteCause::Server(msg), Some(undone)));
     }
     Ok(total)
 }
@@ -8037,7 +8042,8 @@ mod write_tests {
             DbError::Cancelled
         ));
         match cancelled_write(Rollback::Incomplete) {
-            DbError::Refused(msg) => {
+            e @ DbError::Write(_) => {
+                let msg = e.to_string();
                 assert!(msg.starts_with("Commit cancelled"), "{msg}");
                 assert!(
                     msg.contains("remain"),

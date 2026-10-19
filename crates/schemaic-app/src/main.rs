@@ -402,6 +402,22 @@ fn main() -> std::process::ExitCode {
 /// Decode the bundled PNG into a window icon (title bar / taskbar, both OSes).
 /// Returns `None` if the image can't be decoded, in which case the window just
 /// uses the platform default.
+/// `e` as the interface says it: a write path's failure ([`DbError::Write`])
+/// in the interface's language, anything else as it displays. The log keeps
+/// `to_string()`, which is English.
+fn db_error_shown(e: &DbError) -> String {
+    match e {
+        DbError::Write(f) => schemaic_ui::i18n::write_failure_text(f),
+        e => e.to_string(),
+    }
+}
+
+/// [`DbError::modal_about_another_statement`], worded by [`db_error_shown`].
+fn modal_error_shown(e: &DbError) -> schemaic_core::model::ModalError {
+    schemaic_core::model::ModalError::new(db_error_shown(e), e.modal_source())
+        .about_another_statement()
+}
+
 fn app_icon() -> Option<Icon> {
     let bytes = include_bytes!("../../../assets/icon.png");
     let img = image::load_from_memory(bytes).ok()?.into_rgba8();
@@ -4810,7 +4826,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     report(match outcome {
                         Ok(n) => schemaic_ui::ImportOutcome::Done(n),
                         Err(DbError::Cancelled) => schemaic_ui::ImportOutcome::Cancelled,
-                        Err(e) => schemaic_ui::ImportOutcome::Failed(e.to_string()),
+                        Err(e) => schemaic_ui::ImportOutcome::Failed(db_error_shown(&e)),
                     });
                 });
             },
@@ -6265,7 +6281,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // over SQL Schemaic wrote. A cancel, or a Stop that could
                         // not undo everything, is Schemaic's account of the
                         // user's own act, with nothing in it to explain.
-                        finish(CommitDone::Failed(e.modal_about_another_statement()));
+                        finish(CommitDone::Failed(modal_error_shown(&e)));
                         return;
                     }
                     match refetch {
@@ -10262,7 +10278,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             }
                         }
                         Err(DbError::Cancelled) => Err((None, None)),
-                        Err(e) => Err((None, Some(e.to_string()))),
+                        Err(e) => Err((None, Some(db_error_shown(&e)))),
                     };
                     report(outcome);
                 });

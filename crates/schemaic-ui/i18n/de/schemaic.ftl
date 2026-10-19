@@ -437,6 +437,17 @@ error-modal-title = Fehler
 error-modal-none = Kein Fehler.
 error-modal-ai-fix = KI-Korrektur
 error-modal-explain = Erklären
+write-query-failed = Abfrage fehlgeschlagen: { $error }
+write-one-row-delete = Löschen in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
+write-one-row-update = Aktualisieren in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
+write-one-row-insert = Einfügen in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
+write-batch-inserted = ein Stapel von { $rows } Zeilen fügte { $wrote } ein
+write-batch-affected = ein Stapel von { $rows } Zeilen betraf { $wrote }
+write-commit-cancelled = Commit abgebrochen
+write-import-cancelled = Import abgebrochen
+write-rollback-complete = {" "}— alle Änderungen zurückgerollt
+write-rollback-incomplete = {" "}— der Rollback hat sie NICHT rückgängig gemacht: Die Speicher-Engine dieser Tabelle ist nicht transaktional, die bereits geschriebenen Zeilen bleiben also bestehen. Prüfe die Tabelle, bevor du es erneut versuchst.
+write-rollback-unknown = {" "}— und der Rollback konnte nicht bestätigt werden: Die Verbindung brach ab, bevor der Server antwortete. Zeilen können noch vorhanden sein oder nicht. Prüfe die Tabelle, bevor du es erneut versuchst.
 
 ## Schema tree › the panel
 

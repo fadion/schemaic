@@ -53,8 +53,8 @@ use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     CellEdit, Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
-    ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep,
-    binary_display, one_row_verdict,
+    ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteCause,
+    WriteStep, binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, Parallel, RoutineInfo,
@@ -4502,11 +4502,14 @@ async fn import_on(
         if affected != batch.len() as u64 {
             let _ = client.batch_execute("ROLLBACK").await;
             // Always `Complete` here — every PostgreSQL table is transactional.
-            return Err(DbError::Query(format!(
-                "a batch of {} rows inserted {affected}{}",
-                batch.len(),
-                Rollback::Complete.note()
-            )));
+            return Err(DbError::write(
+                WriteCause::Batch {
+                    rows: batch.len(),
+                    wrote: affected,
+                    affected: false,
+                },
+                Some(Rollback::Complete),
+            ));
         }
         total += affected;
     }
@@ -4594,16 +4597,16 @@ pub(crate) async fn write_on(
                 return Err(db_err(&e));
             }
         };
-        if let Err(msg) = one_row_verdict(step, n) {
+        if let Err(miss) = one_row_verdict(step, n) {
             let _ = client.batch_execute(scope.rollback_sql()).await;
             // Every PostgreSQL table is transactional, so the undo is real and
             // the note is always `Complete` — unlike MySQL, where the engine
             // decides. The clause still comes from the shared `Rollback` so the
             // two executors keep one wording.
-            return Err(DbError::Query(format!(
-                "{msg}{}",
-                Rollback::Complete.note()
-            )));
+            return Err(DbError::write(
+                WriteCause::OneRow(miss),
+                Some(Rollback::Complete),
+            ));
         }
         Ok(n)
     }

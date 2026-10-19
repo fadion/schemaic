@@ -115,7 +115,9 @@ assertions pin English wording — stays the regression net throughout.
    `DatabaseProblem`), and the editor's squiggles (`intel::DiagMessage`, `FlowError`, which
    `Diagnostic::what` carries; `editor_pane::diag_message_text`, the AI fix prompt keeping
    `Diagnostic::message`'s English), and SQL Server's plan table (`plan::PlanWording`, beside
-   the English cells the AI and the CLI read; `plan_view::shown_table`).
+   the English cells the AI and the CLI read; `plan_view::shown_table`), and the write paths'
+   failures (`model::WriteFailure` — a `WriteCause` with the `Rollback` it achieved, which
+   `DbError::Write` carries; `i18n::write_failure_text`, the app's `db_error_shown`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -140,11 +142,13 @@ assertions pin English wording — stays the regression net throughout.
      `unsupported`, `used_by::change_warnings`/`drop_warning`, the compare plan's `omitted`
      (`compare::omission_note`) and the AI proposal errors (`propose::resolve_target`/`apply`).
      The largest group; a test in `ddl_preview.rs` matches `"gone — "` on the English.
-   - **Write-back** — `Rollback::note` and `one_row_verdict`'s text, fused into a `DbError::Query`
-     in `schemaic-db`; the hardest, since the sentence is built below core.
    - **Import's load backstop** — `RowCtx::row`'s `line N, column M: …` for a file that
      changed under the check, an `Err(String)` the row iterator hands the database layer
-     mid-load; the write-back's problem, smaller.
+     mid-load, which reaches the modal as `WriteCause::Server`'s text; typing the iterator's
+     error (`RowSource`, `ChunkRows`' `chunk_refusal`) is what is left.
+   - **`DbError`'s own prefixes** — *query failed:*, *connection failed:*, *query cancelled* —
+     which every surface showing a `DbError` by `to_string()` still says in English
+     (`write-query-failed` words it for a write path's failure alone).
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.

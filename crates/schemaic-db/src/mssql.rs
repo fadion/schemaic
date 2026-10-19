@@ -37,7 +37,7 @@ use schemaic_core::export::language_safe_datetime;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     CellEdit, Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
-    ResultBuilder, ResultSet, Rollback, RowInsert, Value, WriteStep, binary_display,
+    ResultBuilder, ResultSet, Rollback, RowInsert, Value, WriteCause, WriteStep, binary_display,
     one_row_verdict, type_is_binary,
 };
 use schemaic_core::schema::{DbSchema, ListedDatabase, TableInfo};
@@ -4031,7 +4031,7 @@ pub(crate) async fn import_rows(
         }
         if let Some(msg) = import_blank_refusal(target.columns, &facts, &batch, total) {
             let undone = rollback(&mut client).await;
-            return Err(DbError::Refused(format!("{msg}{}", undone.note())));
+            return Err(DbError::write(WriteCause::Refused(msg), Some(undone)));
         }
         let check = import_code_page_check(target.columns, &facts, &batch, total);
         let refusal = match check.refusal {
@@ -4043,7 +4043,7 @@ pub(crate) async fn import_rows(
         };
         if let Some(msg) = refusal {
             let undone = rollback(&mut client).await;
-            return Err(DbError::Refused(format!("{msg}{}", undone.note())));
+            return Err(DbError::write(WriteCause::Refused(msg), Some(undone)));
         }
         let batch = language_safe_batch(target.columns, &facts, batch);
         let sql = match target.insert_sql(&batch, MS) {
@@ -4074,8 +4074,12 @@ pub(crate) async fn import_rows(
             Err(e) => return Err(failed(&mut client, err_text(e)).await),
         };
         if affected != batch.len() as u64 {
-            let msg = format!("a batch of {} rows inserted {affected}", batch.len());
-            return Err(failed(&mut client, msg).await);
+            let cause = WriteCause::Batch {
+                rows: batch.len(),
+                wrote: affected,
+                affected: false,
+            };
+            return Err(failed_as(&mut client, cause).await);
         }
         total += affected;
     }
@@ -5265,7 +5269,7 @@ async fn rollback(client: &mut MsClient) -> Rollback {
 fn cancelled_write(undone: Rollback) -> DbError {
     match undone {
         Rollback::Complete => DbError::Cancelled,
-        undone => DbError::Refused(format!("Commit cancelled{}", undone.note())),
+        undone => DbError::write(WriteCause::CommitCancelled, Some(undone)),
     }
 }
 
@@ -5274,7 +5278,7 @@ fn cancelled_write(undone: Rollback) -> DbError {
 fn cancelled_import(undone: Rollback) -> DbError {
     match undone {
         Rollback::Complete => DbError::Cancelled,
-        undone => DbError::Refused(format!("Import cancelled{}", undone.note())),
+        undone => DbError::write(WriteCause::ImportCancelled, Some(undone)),
     }
 }
 
@@ -5287,10 +5291,16 @@ fn err_text(e: DbError) -> String {
     }
 }
 
-/// A failed step's error with what the rollback achieved appended.
+/// A failed step's error, the server's words `msg`, with what the rollback
+/// achieved.
 async fn failed(client: &mut MsClient, msg: String) -> DbError {
+    failed_as(client, WriteCause::Server(msg)).await
+}
+
+/// [`failed`] for any cause.
+async fn failed_as(client: &mut MsClient, cause: WriteCause) -> DbError {
     let undone = rollback(client).await;
-    DbError::Query(format!("{msg}{}", undone.note()))
+    DbError::write(cause, Some(undone))
 }
 
 /// The savepoint a pinned session's write batches run under (its reads are not
@@ -5355,10 +5365,11 @@ impl WriteScope {
     /// A failed step's error. Under a savepoint the rollback note is left off:
     /// the session answers for what survived, from `write_on`'s `undone`,
     /// and "rolled back all changes" would claim the user's whole transaction.
-    fn failure(self, msg: String, undone: Rollback) -> DbError {
-        match self {
-            WriteScope::Own => DbError::Query(format!("{msg}{}", undone.note())),
-            WriteScope::Savepoint => DbError::Query(msg),
+    fn failure(self, cause: WriteCause, undone: Rollback) -> DbError {
+        match (self, cause) {
+            (WriteScope::Own, cause) => DbError::write(cause, Some(undone)),
+            (WriteScope::Savepoint, WriteCause::Server(msg)) => DbError::Query(msg),
+            (WriteScope::Savepoint, cause) => DbError::write(cause, None),
         }
     }
 
@@ -5457,7 +5468,7 @@ pub(crate) async fn write_on(
             && let Err(e) = drain(client, &format!("SET IDENTITY_INSERT {t} ON")).await
         {
             let u = scope.undo_into(client, None, undone).await;
-            return Err(scope.failure(err_text(e), u));
+            return Err(scope.failure(WriteCause::Server(err_text(e)), u));
         }
         let affected = match execute_counted(client, &statement_for(step, &facts), cancel).await {
             Ok(Ran::Counted(n)) => n,
@@ -5479,18 +5490,18 @@ pub(crate) async fn write_on(
             }
             Err(e) => {
                 let u = scope.undo_into(client, identity.as_deref(), undone).await;
-                return Err(scope.failure(err_text(e), u));
+                return Err(scope.failure(WriteCause::Server(err_text(e)), u));
             }
         };
         if let Some(t) = &identity
             && let Err(e) = drain(client, &format!("SET IDENTITY_INSERT {t} OFF")).await
         {
             let u = scope.undo_into(client, identity.as_deref(), undone).await;
-            return Err(scope.failure(err_text(e), u));
+            return Err(scope.failure(WriteCause::Server(err_text(e)), u));
         }
-        if let Err(msg) = one_row_verdict(step, affected) {
+        if let Err(miss) = one_row_verdict(step, affected) {
             let u = scope.undo_into(client, None, undone).await;
-            return Err(scope.failure(msg, u));
+            return Err(scope.failure(WriteCause::OneRow(miss), u));
         }
         total += affected;
     }
@@ -5498,7 +5509,7 @@ pub(crate) async fn write_on(
         && let Err(e) = drain(client, "COMMIT TRANSACTION").await
     {
         let u = scope.undo_into(client, None, undone).await;
-        return Err(scope.failure(err_text(e), u));
+        return Err(scope.failure(WriteCause::Server(err_text(e)), u));
     }
     Ok(total)
 }

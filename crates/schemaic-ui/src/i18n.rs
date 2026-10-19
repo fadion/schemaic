@@ -704,6 +704,54 @@ pub fn guard_reason_text(r: &schemaic_core::sql::GuardReason) -> String {
     }
 }
 
+/// A write path's failure — core's
+/// [`WriteFailure::message`](schemaic_core::model::WriteFailure::message), what
+/// `DbError::Write` displays, in the interface's language. Public for the
+/// app's grid Commit, import and copy, which word it before it reaches a
+/// modal. The server's words inside stay the server's.
+pub fn write_failure_text(f: &schemaic_core::model::WriteFailure) -> String {
+    use schemaic_core::model::{Rollback, WriteAction, WriteCause};
+    let cause = match &f.cause {
+        WriteCause::Server(m) | WriteCause::Refused(m) => m.clone(),
+        WriteCause::OneRow(miss) => {
+            let (table, affected) = (miss.table.as_str(), miss.affected);
+            match miss.action {
+                WriteAction::Delete => {
+                    tr!("write-one-row-delete", table = table, affected = affected)
+                }
+                WriteAction::Update => {
+                    tr!("write-one-row-update", table = table, affected = affected)
+                }
+                WriteAction::Insert => {
+                    tr!("write-one-row-insert", table = table, affected = affected)
+                }
+            }
+        }
+        &WriteCause::Batch {
+            rows,
+            wrote,
+            affected: false,
+        } => tr!("write-batch-inserted", rows = rows, wrote = wrote),
+        &WriteCause::Batch { rows, wrote, .. } => {
+            tr!("write-batch-affected", rows = rows, wrote = wrote)
+        }
+        WriteCause::CommitCancelled => tr!("write-commit-cancelled"),
+        WriteCause::ImportCancelled => tr!("write-import-cancelled"),
+    };
+    let note = match f.undone {
+        None => String::new(),
+        Some(Rollback::Complete) => tr!("write-rollback-complete"),
+        Some(Rollback::Incomplete) => tr!("write-rollback-incomplete"),
+        Some(Rollback::Unknown) => tr!("write-rollback-unknown"),
+    };
+    let error = format!("{cause}{note}");
+    if f.cause.is_statements() {
+        tr!("write-query-failed", error = error)
+    } else {
+        error
+    }
+}
+
 /// What the read-only gate refused a statement for — core's
 /// `sql::ReadOnlyReason::message` in the interface's language, said inside the
 /// guard's read-only refusal. The keywords and names inside stay as SQL; the
@@ -837,6 +885,57 @@ mod tests {
         }
         for r in reasons {
             assert_eq!(guard_reason_text(&r), r.message(), "{r:?}");
+        }
+    }
+
+    /// **Every write path's failure reads in English exactly as core's
+    /// `WriteFailure::message`** — what `DbError::Write` displays: each cause,
+    /// every miss of the 1-row net with and without a schema, each batch
+    /// count, and each with every rollback outcome and none.
+    #[test]
+    fn english_says_every_write_failure_as_core_does() {
+        use schemaic_core::model::{OneRowMiss, Rollback, WriteAction, WriteCause, WriteFailure};
+        let mut causes = vec![
+            WriteCause::Server("Duplicate entry '1' for key 'PRIMARY'".into()),
+            WriteCause::CommitCancelled,
+            WriteCause::ImportCancelled,
+            WriteCause::Refused("Column `name` cannot hold an empty string".into()),
+        ];
+        for action in [
+            WriteAction::Delete,
+            WriteAction::Update,
+            WriteAction::Insert,
+        ] {
+            for (table, affected) in [("db.city", 0), ("db.public.city", 2), ("db.t", 1)] {
+                causes.push(WriteCause::OneRow(OneRowMiss {
+                    action,
+                    table: table.into(),
+                    affected,
+                }));
+            }
+        }
+        for (rows, wrote) in [(500, 499), (1, 0), (2, 1)] {
+            for affected in [false, true] {
+                causes.push(WriteCause::Batch {
+                    rows,
+                    wrote,
+                    affected,
+                });
+            }
+        }
+        for cause in causes {
+            for undone in [
+                None,
+                Some(Rollback::Complete),
+                Some(Rollback::Incomplete),
+                Some(Rollback::Unknown),
+            ] {
+                let f = WriteFailure {
+                    cause: cause.clone(),
+                    undone,
+                };
+                assert_eq!(write_failure_text(&f), f.message(), "{f:?}");
+            }
         }
     }
 

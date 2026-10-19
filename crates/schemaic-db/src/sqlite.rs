@@ -88,7 +88,8 @@ use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::model::CellTag;
 use schemaic_core::model::{
     CellEdit, Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
-    ResultBuilder, ResultSet, Rollback, Value, WriteStep, binary_display, one_row_verdict,
+    ResultBuilder, ResultSet, Rollback, Value, WriteCause, WriteStep, binary_display,
+    one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
@@ -1209,8 +1210,9 @@ pub(crate) async fn commit_writes(
             // rollback runs and so cannot know, which is why the caller appends
             // the note — and why all three executors share one wording. Always
             // `Complete` here: SQLite has no non-transactional table type.
-            one_row_verdict(step, affected)
-                .map_err(|m| DbError::Query(format!("{m}{}", Rollback::Complete.note())))?;
+            one_row_verdict(step, affected).map_err(|miss| {
+                DbError::write(WriteCause::OneRow(miss), Some(Rollback::Complete))
+            })?;
             total += affected;
         }
         txn.commit().map_err(query_err)?;
@@ -1609,11 +1611,14 @@ pub(crate) async fn import_rows(
                     // with divergent wordings and no test, which is what
                     // `Rollback::note` exists to stop happening again. Always
                     // `Complete` — every SQLite table is transactional.
-                    return Err(DbError::Query(format!(
-                        "a batch of {} rows affected {affected}{}",
-                        batch.len(),
-                        Rollback::Complete.note()
-                    )));
+                    return Err(DbError::write(
+                        WriteCause::Batch {
+                            rows: batch.len(),
+                            wrote: affected,
+                            affected: true,
+                        },
+                        Some(Rollback::Complete),
+                    ));
                 }
                 batch.clear();
                 Ok(affected)

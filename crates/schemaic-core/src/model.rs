@@ -1314,12 +1314,12 @@ pub enum WriteStep<'a> {
 }
 
 impl WriteStep<'_> {
-    /// How the statement is named in the 1-row guard's error message.
-    pub fn action(&self) -> &'static str {
+    /// Which statement this is, for the 1-row guard's message.
+    pub fn action(&self) -> WriteAction {
         match self {
-            WriteStep::Delete(_) => "delete on",
-            WriteStep::Update(_) => "update on",
-            WriteStep::Insert(_) => "insert into",
+            WriteStep::Delete(_) => WriteAction::Delete,
+            WriteStep::Update(_) => WriteAction::Update,
+            WriteStep::Insert(_) => WriteAction::Insert,
         }
     }
 
@@ -1368,19 +1368,19 @@ impl WriteStep<'_> {
 ///
 /// Pure so both engines share one verdict *and* one message — it used to be
 /// written inline in each executor, with two divergent wordings and no test.
-/// `Err` carries the message; the caller wraps it in its own error type.
-/// The message states what the guard saw and stops there: it is reached
-/// *before* the rollback runs, so it can't know what the rollback achieved.
-/// The caller appends [`Rollback::note`] once it does.
-pub fn one_row_verdict(step: WriteStep<'_>, affected: u64) -> Result<(), String> {
+/// `Err` carries what the guard saw ([`OneRowMiss`]); the caller makes it a
+/// [`WriteCause::OneRow`]. It states what the guard saw and stops there: it is
+/// reached *before* the rollback runs, so it can't know what the rollback
+/// achieved. The caller adds the [`Rollback`] once it does.
+pub fn one_row_verdict(step: WriteStep<'_>, affected: u64) -> Result<(), OneRowMiss> {
     if affected == 1 {
         return Ok(());
     }
-    Err(format!(
-        "{} {} affected {affected} rows (expected exactly 1)",
-        step.action(),
-        step.qualified(),
-    ))
+    Err(OneRowMiss {
+        action: step.action(),
+        table: step.qualified(),
+        affected,
+    })
 }
 
 /// What a write path's rollback actually achieved.
@@ -1438,6 +1438,113 @@ impl Rollback {
                  table before retrying."
             }
         }
+    }
+}
+
+/// A write path's failure — the grid's write-back, an import, a copy — as a
+/// value: what went wrong, and what the rollback after it achieved. The
+/// interface says it in its own language; [`WriteFailure::message`] is the
+/// English, which is what `schemaic-db`'s `DbError::Write` displays.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteFailure {
+    pub cause: WriteCause,
+    /// What the rollback achieved, when the message says so — `None` where
+    /// the path reports the cause alone.
+    pub undone: Option<Rollback>,
+}
+
+/// What made a write path fail ([`WriteFailure`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteCause {
+    /// The server's, the driver's or the file reader's own words.
+    Server(String),
+    /// The 1-row safety net ([`one_row_verdict`]).
+    OneRow(OneRowMiss),
+    /// A batch of `rows` rows that wrote `wrote`; `affected` where the engine
+    /// counts what a statement affected rather than what it inserted.
+    Batch {
+        rows: usize,
+        wrote: u64,
+        affected: bool,
+    },
+    /// The user stopped a Commit.
+    CommitCancelled,
+    /// The user stopped an import.
+    ImportCancelled,
+    /// A refusal of the database layer's own, made before a batch was sent
+    /// (SQL Server's blank-string and code-page checks), in its English.
+    Refused(String),
+}
+
+impl WriteCause {
+    /// Is this a statement's failure — the server's answer or what a statement
+    /// did — rather than the user's own Stop or Schemaic's refusal? The error
+    /// modal offers to explain only the first, and the English says "query
+    /// failed:" before it.
+    pub fn is_statements(&self) -> bool {
+        !matches!(
+            self,
+            WriteCause::CommitCancelled | WriteCause::ImportCancelled | WriteCause::Refused(_)
+        )
+    }
+}
+
+impl WriteFailure {
+    /// The failure in English, as the error says it whole.
+    pub fn message(&self) -> String {
+        let cause = match &self.cause {
+            WriteCause::Server(m) | WriteCause::Refused(m) => m.clone(),
+            WriteCause::OneRow(miss) => miss.message(),
+            &WriteCause::Batch {
+                rows,
+                wrote,
+                affected,
+            } => format!(
+                "a batch of {rows} rows {} {wrote}",
+                if affected { "affected" } else { "inserted" }
+            ),
+            WriteCause::CommitCancelled => "Commit cancelled".to_string(),
+            WriteCause::ImportCancelled => "Import cancelled".to_string(),
+        };
+        let note = self.undone.map_or("", Rollback::note);
+        if self.cause.is_statements() {
+            format!("query failed: {cause}{note}")
+        } else {
+            format!("{cause}{note}")
+        }
+    }
+}
+
+/// What the 1-row safety net saw ([`one_row_verdict`]): a statement on `table`
+/// that affected `affected` rows rather than one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OneRowMiss {
+    pub action: WriteAction,
+    /// `db.table`, or `db.schema.table`, unquoted.
+    pub table: String,
+    pub affected: u64,
+}
+
+/// Which statement a [`WriteStep`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAction {
+    Delete,
+    Update,
+    Insert,
+}
+
+impl OneRowMiss {
+    /// The miss in English.
+    pub fn message(&self) -> String {
+        let action = match self.action {
+            WriteAction::Delete => "delete on",
+            WriteAction::Update => "update on",
+            WriteAction::Insert => "insert into",
+        };
+        format!(
+            "{action} {} affected {} rows (expected exactly 1)",
+            self.table, self.affected
+        )
     }
 }
 
@@ -3124,7 +3231,9 @@ mod tests {
     fn one_row_verdict_rejects_a_key_that_matched_nothing() {
         // The row moved or was already gone — applying the rest of the batch on
         // top of that would commit a half-understood edit.
-        let e = one_row_verdict(WriteStep::Update(&upd("city")), 0).unwrap_err();
+        let e = one_row_verdict(WriteStep::Update(&upd("city")), 0)
+            .unwrap_err()
+            .message();
         assert!(e.contains("update on db.city"), "{e}");
         assert!(e.contains("affected 0 rows"), "{e}");
     }
@@ -3133,7 +3242,9 @@ mod tests {
     fn the_verdict_itself_claims_nothing_about_the_rollback() {
         // It runs *before* the rollback, so it can't know. The claim used to be
         // baked into this message and was false on a non-transactional table.
-        let e = one_row_verdict(WriteStep::Update(&upd("city")), 0).unwrap_err();
+        let e = one_row_verdict(WriteStep::Update(&upd("city")), 0)
+            .unwrap_err()
+            .message();
         assert!(!e.contains("rolled back"), "{e}");
     }
 
@@ -3196,11 +3307,59 @@ mod tests {
     #[test]
     fn the_note_reads_as_one_sentence_with_the_verdict() {
         let verdict = one_row_verdict(WriteStep::Update(&upd("city")), 2).unwrap_err();
-        let full = format!("{verdict}{}", Rollback::Complete.note());
+        let full = WriteFailure {
+            cause: WriteCause::OneRow(verdict),
+            undone: Some(Rollback::Complete),
+        };
         assert_eq!(
-            full,
-            "update on db.city affected 2 rows (expected exactly 1) — rolled back all changes"
+            full.message(),
+            "query failed: update on db.city affected 2 rows (expected exactly 1) — \
+             rolled back all changes"
         );
+    }
+
+    /// **A write failure reads as the error it replaced**, prefix and note:
+    /// a statement's failure after "query failed:", a Stop as the sentence
+    /// alone, and the rollback's note only where the path gave one.
+    #[test]
+    fn a_write_failure_says_what_its_error_used_to() {
+        let f = |cause, undone| WriteFailure { cause, undone }.message();
+        assert_eq!(
+            f(WriteCause::Server("Duplicate entry".into()), None),
+            "query failed: Duplicate entry"
+        );
+        assert_eq!(
+            f(
+                WriteCause::Batch {
+                    rows: 500,
+                    wrote: 499,
+                    affected: false
+                },
+                Some(Rollback::Complete)
+            ),
+            "query failed: a batch of 500 rows inserted 499 — rolled back all changes"
+        );
+        assert_eq!(
+            f(
+                WriteCause::Batch {
+                    rows: 2,
+                    wrote: 1,
+                    affected: true
+                },
+                None
+            ),
+            "query failed: a batch of 2 rows affected 1"
+        );
+        assert_eq!(
+            f(WriteCause::CommitCancelled, Some(Rollback::Unknown)),
+            format!("Commit cancelled{}", Rollback::Unknown.note())
+        );
+        assert_eq!(
+            f(WriteCause::ImportCancelled, Some(Rollback::Incomplete)),
+            format!("Import cancelled{}", Rollback::Incomplete.note())
+        );
+        assert!(!WriteCause::CommitCancelled.is_statements());
+        assert!(WriteCause::Server(String::new()).is_statements());
     }
 
     // ── Which storage engines can honour a rollback ──
@@ -3239,7 +3398,9 @@ mod tests {
     fn one_row_verdict_rejects_a_key_that_was_not_unique() {
         // The corruption case: two rows matched, so committing would silently
         // rewrite a row the user never saw.
-        let e = one_row_verdict(WriteStep::Delete(&del("city")), 2).unwrap_err();
+        let e = one_row_verdict(WriteStep::Delete(&del("city")), 2)
+            .unwrap_err()
+            .message();
         assert!(e.contains("delete on db.city"), "{e}");
         assert!(e.contains("affected 2 rows"), "{e}");
         assert!(one_row_verdict(WriteStep::Insert(&ins("city")), 7).is_err());
@@ -3249,7 +3410,9 @@ mod tests {
     fn one_row_verdict_names_the_namespace_when_there_is_one() {
         let mut e = upd("city");
         e.schema = Some("public".into());
-        let msg = one_row_verdict(WriteStep::Update(&e), 0).unwrap_err();
+        let msg = one_row_verdict(WriteStep::Update(&e), 0)
+            .unwrap_err()
+            .message();
         assert!(msg.contains("db.public.city"), "{msg}");
     }
 
@@ -3263,14 +3426,15 @@ mod tests {
             deletes: vec![del("d1")],
         };
         let plan = w.plan();
-        let names: Vec<(&str, &str)> = plan.iter().map(|s| (s.action(), s.table())).collect();
+        let names: Vec<(WriteAction, &str)> =
+            plan.iter().map(|s| (s.action(), s.table())).collect();
         assert_eq!(
             names,
             vec![
-                ("delete on", "d1"),
-                ("update on", "u1"),
-                ("update on", "u2"),
-                ("insert into", "i1"),
+                (WriteAction::Delete, "d1"),
+                (WriteAction::Update, "u1"),
+                (WriteAction::Update, "u2"),
+                (WriteAction::Insert, "i1"),
             ]
         );
     }

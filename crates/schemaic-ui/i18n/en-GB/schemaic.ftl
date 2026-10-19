@@ -483,6 +483,27 @@ error-modal-none = No error.
 error-modal-ai-fix = AI fix
 error-modal-explain = Explain
 
+## A write path's failure — the grid's Commit, an import, a copy (core's
+## model::WriteFailure). The server's words in $error stay the server's.
+
+# A statement's failure; $error is the cause and the rollback's note.
+write-query-failed = query failed: { $error }
+# The 1-row safety net: a statement that changed $affected rows rather than
+# one. $table is db.table or db.schema.table, as written.
+write-one-row-delete = delete on { $table } affected { $affected } rows (expected exactly 1)
+write-one-row-update = update on { $table } affected { $affected } rows (expected exactly 1)
+write-one-row-insert = insert into { $table } affected { $affected } rows (expected exactly 1)
+# A batch of $rows rows that wrote $wrote.
+write-batch-inserted = a batch of { $rows } rows inserted { $wrote }
+write-batch-affected = a batch of { $rows } rows affected { $wrote }
+write-commit-cancelled = Commit cancelled
+write-import-cancelled = Import cancelled
+# What the rollback achieved, appended to the failure, so each starts with its
+# own separator.
+write-rollback-complete = {" "}— rolled back all changes
+write-rollback-incomplete = {" "}— the rollback did NOT undo them: this table's storage engine is not transactional, so the rows already written remain. Check the table before retrying.
+write-rollback-unknown = {" "}— and the rollback could not be confirmed: the connection failed before the server answered. Rows may or may not remain. Check the table before retrying.
+
 ## Schema tree › the panel
 
 tree-panel-title = SCHEMA

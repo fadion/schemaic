@@ -210,9 +210,28 @@ existing prose was left alone.
     that is never *editable*, which is why it is a flag and not simply another key column. The
     write path's shared decisions live here so the
     three engines can't drift: `GridWrite::plan` (the deletes → updates → inserts order),
-    `one_row_verdict` (the 1-row safety net's verdict *and* its message),
+    `one_row_verdict` (the 1-row safety net's verdict, a miss answered as a `OneRowMiss`),
     `Rollback`/`engine_is_transactional` (what a rollback actually achieved — see the invariant
-    below), and `drop_committed` (which staged edits a commit un-stages).
+    below), `WriteFailure` (what a failed write reports) and `drop_committed` (which staged edits
+    a commit un-stages).
+    **`WriteFailure { cause, undone }` is a write path's failure as a value rather than a
+    sentence** — the grid's Commit, an import, a copy — so the interface can say it in its own
+    language. `WriteCause` is what went wrong: `Server` (the server's, the driver's or the file
+    reader's own words), `OneRow` (the net's `OneRowMiss` — its `action`, a `WriteAction` where
+    `WriteStep::action` used to answer the English *delete on*/*update on*/*insert into*, the
+    unquoted `table` and the count), `Batch { rows, wrote, affected }` (an import batch that wrote
+    another number, `affected` where the engine counts what a statement affected rather than what
+    it inserted), `CommitCancelled`, `ImportCancelled`, and `Refused` (a refusal of the database
+    layer's own, made before a batch was sent); `undone` is the `Rollback`, `None` where the path
+    reports the cause alone. `message()` is the English the errors displayed before it existed,
+    byte for byte: the cause, then `Rollback::note` — unchanged, still the English clause with
+    its own leading separator — and `query failed: ` in front exactly when
+    `WriteCause::is_statements` (`Server`, `OneRow`, `Batch`), never over a Stop or Schemaic's own
+    refusal. That one predicate also decides the error modal's source for `DbError::Write` (under
+    `schemaic-db`'s `lib.rs`), so the prefix and the offer of *Explain* cannot disagree.
+    `a_write_failure_says_what_its_error_used_to` and
+    `the_note_reads_as_one_sentence_with_the_verdict` pin the English; the interface's wording is
+    held to it by `english_says_every_write_failure_as_core_does` (*The string catalogue*).
     **`CellEdit` is what one staged cell holds** — `Null | Text | Bytes | Default` — and it replaced
     the `Option<String>` that had room for exactly two of the first three. `Text` is what was typed
     or pasted, bound as a string parameter and coerced by the server to whatever the column is;
@@ -18855,12 +18874,29 @@ existing prose was left alone.
   `Session::open_enforced`'s refusal of a read-only SQL Server connection (under `mssql.rs`),
   `mysql::unpinnable_mode` — `enforce_session`'s refusal when the server puts a quote-moving
   `sql_mode` back — and its refusal of a client character set that can hide a quote,
-  `session::aborted_commit`, which `Session::commit` answers over a block that was
-  already aborted, and the non-`Complete` arms of `mysql::cancelled_import`/`cancelled_write`
-  ("Import/Commit cancelled — …"). It renders **as written**, `#[error("{0}")]` with no prefix:
+  and `session::aborted_commit`, which `Session::commit` answers over a block that was
+  already aborted. It renders **as written**, `#[error("{0}")]` with no prefix:
   each is already the whole sentence, and "query failed:" in front of "Commit cancelled — …" named
-  a failure that was the user's own act. **The server refusing a statement Schemaic sent for
-  itself is `Connect`, not `Query`** — its words, but about SQL the user did not write, and theirs
+  a failure that was the user's own act.
+  **`Write(WriteFailure)` is a write path's failure carrying what its rollback achieved**
+  (`core::model::WriteFailure`), built by the crate-private `DbError::write(cause, undone)` at
+  every exit that used to append `Rollback::note` to a `Query` or `Refused` string: MySQL's
+  `write_on` and `import_on`, PostgreSQL's and SQLite's one-row verdicts and import batch counts,
+  SQL Server's `failed`/`failed_as` and `WriteScope::failure`, and the non-`Complete` arms of
+  `cancelled_import`/`cancelled_write` on MySQL and SQL Server ("Import/Commit cancelled — …",
+  MySQL's two having been `Refused` producers until then). It displays as `WriteFailure::message`, **byte for byte the
+  `Query` or `Refused` it replaced**, so the log and every test reading `to_string()` saw no
+  change — the CLI and the MCP server reach none of these paths — and what changed is that the
+  app can word it (`db_error_shown`, under `app/main.rs`).
+  Its `modal_source` follows the same predicate as the English prefix —
+  `WriteCause::is_statements`, `Statement` where the message says "query failed:", `App` over a
+  Stop or a refusal — so it lands where the variant it replaced did. **Only the exits that carry
+  a rollback became `Write`**: a server error PostgreSQL's write paths return bare, through
+  `db_err`, is still a `Query`, as is one under SQL Server's savepoint, which carries no note
+  (`WriteScope::failure`, under `mssql.rs`), and both still read "query failed:" in English in
+  every language. `modal_source_tests` has no `Write` case; the SQL Server import's live tests
+  match the variant (`an_imported_blank_number_is_refused_not_stored_as_zero`).
+  **The server refusing a statement Schemaic sent for itself is `Connect`, not `Query`** — its words, but about SQL the user did not write, and theirs
   was never sent: `enforce_session`'s "could not prepare the session: …",
   `pg::read_only_setup_failed` ("could not make the session read-only: …", for `pg::fetch_query`'s
   enforced path and `Session::open`'s PostgreSQL arm) and `session::begin_failed`, which rewrites a
@@ -18869,7 +18905,9 @@ existing prose was left alone.
   "connection failed: could not …". **`modal_about_another_statement`** is
   `ModalError::new(to_string(), modal_source()).about_another_statement()`, for an error raised by
   something that is not the editor's statement (a grid Commit, `end_tx`); it is one composition
-  because the commit arm had restated it by hand and got `Refused` wrong.
+  because the commit arm had restated it by hand and got `Refused` wrong. The grid Commit now asks
+  the app's `modal_error_shown`, its twin with the text from `db_error_shown`, so a `Write` reaches
+  the modal in the interface's language with the same source.
   `app/main.rs`'s run paths ask it of the `DbError` a run ends in rather than
   choosing a source per site, which is how a refused connection stopped being offered a fix into
   the buffer. Those paths answer `Cancelled` in arms of their own first — the not-sent, timeout and
@@ -20719,8 +20757,10 @@ existing prose was left alone.
   MySQL's desynchronised-stream defect, on this engine. Unacknowledged, nothing is sent and the
   verdict is `Rollback::Unknown`; the server rolls back when the connection closes, but this side
   did not see it. Either way the answer goes through this module's own `cancelled_write` — MySQL's
-  shape, `DbError::Cancelled` only for a confirmed rollback, a *Commit cancelled* sentence carrying
-  `Rollback::note` otherwise. **The first version rolled back after every Stop and reported
+  shape, `DbError::Cancelled` only for a confirmed rollback, a `DbError::Write` of
+  `WriteCause::CommitCancelled` carrying the `Rollback` otherwise. Every other failure of the batch
+  leaves through `failed` (the server's words) or `failed_as` (any `WriteCause`), which roll back
+  and carry what that achieved. **The first version rolled back after every Stop and reported
   `Complete` off an attention that had never been acknowledged**: before patch 5 every such
   attention failed (above), so each of those confirmations had been read off a stream nobody knew
   the position of.
@@ -20734,7 +20774,10 @@ existing prose was left alone.
   `WriteScope::Own` is everything above. `WriteScope::Savepoint` is `SAVE TRANSACTION schemaic_w`
   (`SAVEPOINT`) inside the tab's transaction, undone by `ROLLBACK TRANSACTION schemaic_w`, never
   committed — the transaction is the caller's to end — and its errors carry no rollback note, since
-  "rolled back all changes" there would claim the user's whole transaction. **Its undo also
+  "rolled back all changes" there would claim the user's whole transaction. `WriteScope::failure`
+  is that choice: under `Own` a `DbError::Write` with the `Rollback`; under `Savepoint` the
+  server's words stay a bare `DbError::Query`, as they were, and any other cause — the 1-row miss —
+  is a `Write` whose `undone` is `None`. **Its undo also
   switches off an `IDENTITY_INSERT` the batch left on**: a savepoint rollback leaves session
   settings alone, and on a pinned connection the setting would outlive the batch and refuse the
   tab's next ordinary insert into that table (Msg 545). **What the undo achieved goes out through
@@ -20851,7 +20894,10 @@ existing prose was left alone.
   row (1-based, counted across batches) and the column, and the import rolls back
   (`an_imported_blank_number_is_refused_not_stored_as_zero`). `import_code_page_check` follows it
   on the same terms, naming the row and the character, the server asked after it for the IBM code
-  pages. An identity column among the
+  pages. Both refuse inside the transaction, after earlier batches may have run, so unlike the
+  grid's — a `DbError::Refused` before anything opens — each is a `DbError::Write` of
+  `WriteCause::Refused` carrying what the rollback achieved: Schemaic's sentence, so no *Explain*,
+  and no "query failed:" in front (the live tests above assert that variant). An identity column among the
   import's columns runs the **whole** import under `IDENTITY_INSERT` (`import_sets_identity`),
   switched off before the `COMMIT` — once rather than per statement as the grid's is, since every
   batch writes the same columns. **Stop is asked twice per batch** — at the top of the loop and
@@ -21811,6 +21857,15 @@ existing prose was left alone.
   the future rather than dropping it, the same "the killed statement is awaited, not dropped" rule
   `run_script_mysql` states. `cancelled_import(Rollback)` is the one place that outcome becomes an
   error, so `Cancelled` is reserved for a rollback that completed and anything else carries the note.
+  Its other exits each roll back and say what that achieved, as a `DbError::Write`: a statement's
+  error and a short batch count build one directly, and a reader's or statement builder's error
+  goes through `with_partial_rollback`, which leaves it untouched after a complete rollback — the
+  message already implies one — and otherwise makes a `Query`'s text a `WriteCause::Server` with
+  the `Rollback`. `every_import_exit_says_what_the_rollback_achieved` reads `import_on`'s source
+  and fails on a `return Err(` whose next ten lines name none of `Some(undone)`,
+  `cancelled_import(` and `with_partial_rollback(`, with a floor of three `Some(undone)`. **The `COMMIT` exit says "query failed:" twice** — its text is
+  `qerr(e).to_string()`, already prefixed, inside a `Server` that prefixes again — and that was
+  kept on purpose, byte-identical to the error it replaced; fixing it is a change of its own.
   PostgreSQL's arm is unchanged — it still races the whole of its own `import_on` — and its
   `Cancelled` really does mean nothing was written, every PostgreSQL table being transactional.
   `a_cancelled_import_rolls_back_and_says_so` and
@@ -27932,7 +27987,9 @@ existing prose was left alone.
     holding each to core's `message`. Why a file cannot be read is worded by the app, which owns the
     probe, the check and the load, through `i18n::read_refusal_text` for the probe's
     `xlsx_size_refusal` and `i18n::import_error_text` for every `ImportError` the three return, in
-    place of `e.to_string()`. What stays English: the format names (`ImportFormat::label`); a
+    place of `e.to_string()`. How the load *failed* is the app's too: `ImportOutcome::Failed` takes
+    `db_error_shown`, so a `DbError::Write` — the cancelled sentence, the batch count, the rollback
+    clause — is `i18n::write_failure_text`'s (*The string catalogue*). What stays English: the format names (`ImportFormat::label`); a
     library's own text inside `ImportError::Read` and an io error's OS text; the load's per-row
     backstop, `RowCtx::row`'s *line N, column M: …* `Err(String)`, which travels through the db layer
     as text; the preview's `NULL` cell, a SQL keyword; the `—` for a missing column; and a target's
@@ -32854,8 +32911,11 @@ existing prose was left alone.
     Close the shared `dialog-cancel`, `editor-preview-sql`, `dialog-stop` and `dialog-close`.
     `copy_table::refusal` answers a `CopyRefusal`, which `copy_refusal_text` words
     (`copy-table-unnamed`, `-choose-database`, `-onto-itself`), held to its `message` by
-    `english_says_every_copy_refusal_as_core_does`. What stays English: the app's failure sentences
-    above, which arrive whole; and the `<table>_copy` default, which is an identifier.
+    `english_says_every_copy_refusal_as_core_does`. The failure sentences above are `copy-stopped`
+    and `copy-counter-not-moved`, and the copy's own error inside the first is `db_error_shown`'s,
+    so a `DbError::Write` — the rollback clause included — is worded too. What stays English: any
+    other error inside them, the settle's `run_ddl` failure among them, which arrive whole; and the
+    `<table>_copy` default, which is an identifier.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
     surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
@@ -39499,8 +39559,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
   rollback's outcome (`let _ = conn.query_drop("ROLLBACK")` was the bug): roll back through
-  `rollback()`, which reads `SHOW WARNINGS`, and append `core::model::Rollback::note()` to the
-  error. **`Rollback` has three arms, and the third is there because two of them were one sentence.**
+  `rollback()`, which reads `SHOW WARNINGS`, and carry the answer in the error — the `undone` of a
+  `DbError::Write(WriteFailure)`, whose English appends `core::model::Rollback::note()` and whose
+  interface wording says the same in the user's language. **`Rollback` has three arms, and the third is there because two of them were one sentence.**
   `Incomplete` is warning 1196 and nothing else — it is the only thing that licenses *"this table's
   storage engine is not transactional, so the rows already written remain"*, which is a claim about
   the engine. A `ROLLBACK` down a socket that is already gone establishes nothing of the kind: the
@@ -39569,16 +39630,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   rather than shrinking the window to nothing. That is the same defect the first half had been
   repaired for one commit earlier and this half kept.
   `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
-  know what it achieved, so **every** executor appends the clause once it does: SQLite's was the one
-  that didn't, and a user reading *"UPDATE main.t affected 2 rows (expected exactly 1)"* with nothing
-  after it had no way to know the other three staged edits went back too. Its import likewise takes
-  `Rollback::Complete.note()` rather than a third hand-written wording of the sentence `Rollback`
-  exists to unify. `engine_is_transactional` is the predicate (unknown ⇒ not transactional,
+  know what it achieved, so its `Err` is a `OneRowMiss` and **every** executor adds the
+  `Rollback` once it does, building `WriteCause::OneRow(miss)` with `Some(undone)`: SQLite's was
+  the one that didn't, and a user reading *"UPDATE main.t affected 2 rows (expected exactly 1)"*
+  with nothing after it had no way to know the other three staged edits went back too. Its import
+  likewise reports `Rollback::Complete` rather than a third hand-written wording of the sentence
+  `Rollback` exists to unify. **A value, not a sentence, is what lets the report be both honest
+  and translated**: the clause used to be appended to a `String` in `schemaic-db`, so the one
+  sentence whose whole job is to say what survived could only ever say it in English.
+  `WriteFailure::message` is still that English byte for byte, which is what the log, the tests
+  and every `to_string()` read. `engine_is_transactional` is the predicate (unknown ⇒ not transactional,
   same rule as `pg_replaceable`); the import modal warns from it before the load starts. Commits
   with inserts/deletes full-re-run the query (membership/order changed); pure-UPDATE commits splice
   in place. Both halves of that rule are **pure and tested in `core::model`**, and both engines'
   executors call them: `GridWrite::plan` is the statement order and `one_row_verdict` is the
-  per-statement verdict *and* its message — so neither can drift between MySQL and PostgreSQL, and
+  per-statement verdict, `OneRowMiss::message` its English — so neither can drift between MySQL and PostgreSQL, and
   a change to `affected != 1` fails a test rather than passing silently.
   **The net counts rows, and cannot see which table they were in** — a limit worth knowing before
   relying on it. A statement aimed at the *wrong* table that affects exactly one row passes
@@ -40834,7 +40900,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`/`ObjectProblem`/
     `RoutineProblem`/`TriggerProblem`/`TableProblem`, below), though every draft's `validate`
     still answers core's English, nor the editor's diagnostics (`intel::DiagMessage`, below),
-    though the parser's detail in a syntax error and the server's own error still are.
+    though the parser's detail in a syntax error and the server's own error still are, nor a
+    write path's failure (`model::WriteFailure`, below), though the server's words inside it and
+    a write error that never became one still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41144,6 +41212,28 @@ Re-introducing the anti-patterns these guard against is a regression:
     the interface's language. `Syntax`'s parser detail and `Server`'s text pass through as they
     came. `english_says_every_diagnostic_as_core_does` holds the two equal, over a hand-written
     list like the editors' above.
+    A write path's failure is the case where the value had to be carried through a layer that only
+    knew strings. The grid's Commit, an import and a copy failed with a `DbError::Query` or
+    `Refused` whose text `schemaic-db` had already finished — the cause, `Rollback::note` appended,
+    "query failed:" in front — and now fail with `DbError::Write(WriteFailure)` (under
+    `core::model` and `schemaic-db`'s `lib.rs`), whose `Display` is that same English.
+    `i18n::write_failure_text` words it from `write-*`: the 1-row miss a message per `WriteAction`
+    (`write-one-row-delete`/`-update`/`-insert`), the batch count `write-batch-inserted`/`-affected`,
+    the two Stops, each `Rollback` its own `write-rollback-*`, and `write-query-failed` wrapping
+    the lot exactly when `WriteCause::is_statements` says core's English would. **The three
+    rollback messages open with `{" "}`**, because Fluent drops a value's leading blank and the
+    clause is appended straight after the cause; written as plain text they lose the space.
+    The app's `db_error_shown` asks it for a `Write` and `to_string()` for anything else, and
+    `modal_error_shown` is `modal_about_another_statement` over that text; the Commit's
+    `CommitDone::Failed`, the import's `ImportOutcome::Failed` and the copy's failure take them,
+    while the log keeps `to_string()`, English. What stays English: the server's, driver's or
+    reader's words inside `Server`, and a database-layer refusal's own text inside `Refused` (SQL
+    Server's blank-string and code-page refusals — the note after it is worded); and every write
+    failure that is not a `Write` — PostgreSQL's server errors on these paths, a SQL Server batch
+    under a Manual tab's savepoint — whose "query failed:" stays English in every language.
+    `english_says_every_write_failure_as_core_does` holds it equal to `message` over every cause,
+    every 1-row miss with and without a schema, each batch count both ways, and each with every
+    rollback outcome and none.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and
@@ -41181,7 +41271,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `connection_form.rs` and the app all call, the three export notes, which `grid.rs`,
     `result_diff_view.rs` and `dump_view.rs` share, `skip_reason_shown`, which the import modal
     and the app's paste field share, `read_refusal_text` and `import_error_text` for the app's
-    import probe, check and load, and the grid's three filter notices — `staged_requery_note`
+    import probe, check and load, `write_failure_text` for the app's Commit, import and copy
+    failures, and the grid's three filter notices — `staged_requery_note`
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded
     from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork` — and,
     public for the app's run paths, `run_failed_message`, `run_cancelled_message` and
@@ -44931,10 +45022,12 @@ this bundle's.
   `QueryState::Failed` once `ModalError::about_another_statement` has turned a `Statement` into
   one: the re-run's SQL is Schemaic's, and a fix from the modal would land in the editor's buffer
   (a re-run's own `App` note, a timeout say, stays `App`). `App`: a `commit_writes` that ended in `DbError::Cancelled` (the user
-  stopped it, and "query cancelled" has nothing in it to explain) or in `DbError::Refused` — "Commit
-  cancelled — …", this crate's account of a Stop whose rollback did not undo everything, which the
+  stopped it, and "query cancelled" has nothing in it to explain) or in "Commit cancelled — …",
+  this crate's account of a Stop whose rollback did not undo everything — a `DbError::Refused`
+  once, a `DbError::Write` of `WriteCause::CommitCancelled` now — which the
   arm's hand-written "`Cancelled` is `App`, everything else `Server`" had offered *Explain* on; the
-  arm now asks `DbError::modal_about_another_statement` instead — a paste that landed nothing,
+  arm now asks the app's `modal_error_shown`, `DbError::modal_about_another_statement` with the
+  text in the interface's language, instead — a paste that landed nothing,
   the row panel's and the JSON editor's
   refusals, AI fill/seed failures, the filter row's three refusals (a `BadCondition` is
   `sqlparser`'s reading of the typed condition, not the database's), the `db_for`/`session_for`
