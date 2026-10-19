@@ -13323,7 +13323,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(move |req: InlineAiRequest| {
             // Refused at the action, as `ai_send` is — see there.
             if !ai_enabled.get_untracked() {
-                inline_ai.set(InlineAiState::Failed(schemaic_ui::AI_OFF_NOTE.to_string()));
+                inline_ai.set(InlineAiState::Failed(schemaic_ui::ai_off_note()));
                 return;
             }
             inline_ai.set(InlineAiState::Busy);
@@ -13449,7 +13449,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 use schemaic_ui::AiFillResult;
                 // Refused at the action, as `ai_send` is — see there.
                 if !ai_enabled.get_untracked() {
-                    (done)(AiFillResult::Failed(schemaic_ui::AI_OFF_NOTE.to_string()));
+                    (done)(AiFillResult::Failed(schemaic_ui::ai_off_note()));
                     return;
                 }
                 let db = match db_for(req.conn_id) {
@@ -13545,7 +13545,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     finish(res);
                 });
                 grid_ai_jobs.borrow_mut().track(task, reply, || {
-                    AiFillResult::Failed(schemaic_ui::AI_OFF_NOTE.to_string())
+                    AiFillResult::Failed(schemaic_ui::ai_off_note())
                 });
             },
         )
@@ -13563,7 +13563,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 use schemaic_ui::AiSeedResult;
                 // Refused at the action, as `ai_send` is — see there.
                 if !ai_enabled.get_untracked() {
-                    (done)(AiSeedResult::Failed(schemaic_ui::AI_OFF_NOTE.to_string()));
+                    (done)(AiSeedResult::Failed(schemaic_ui::ai_off_note()));
                     return;
                 }
                 let db = match db_for(req.conn_id) {
@@ -13642,7 +13642,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     finish(res);
                 });
                 grid_ai_jobs.borrow_mut().track(task, reply, || {
-                    AiSeedResult::Failed(schemaic_ui::AI_OFF_NOTE.to_string())
+                    AiSeedResult::Failed(schemaic_ui::ai_off_note())
                 });
             },
         )

@@ -375,7 +375,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                     move || (enabled.get(), available.get(), panel_harness.get()),
                     move |(on, ok, h)| {
                         let msg = match (on, ok) {
-                            (false, _) => crate::AI_OFF_NOTE.to_string(),
+                            (false, _) => crate::ai_off_note(),
                             (true, true) => tr!("ai-empty-ask"),
                             // The harness's product name (Claude Code, Codex).
                             (true, false) => tr!("ai-empty-not-connected", cli = h.label()),

@@ -117,7 +117,9 @@ assertions pin English wording — stays the regression net throughout.
    **Within the large files:** beyond the headers and openers named above, `lib.rs`'s status
    bar (`footer`, `footer-*`: the panel toggles and their narrow-window tip, the editor's
    segments, the transaction controls — the interface's own `tx_mode_label` and `tx_pill_text`
-   for core's — and CPU/RAM). Nothing yet in `widgets.rs` or `editor_pane.rs`.
+   for core's — and CPU/RAM); its shared words (`lib-*`: a new tab's *Query N*, a result's
+   *Result N*, `ai_off_note()` — the app's AI refusals read it too — and `TestLine::text`).
+   Nothing yet in `widgets.rs` or `editor_pane.rs`.
    **Left, in order** — delete a name as its file lands: the three large files' remainders,
    `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,

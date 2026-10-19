@@ -2103,3 +2103,18 @@ footer-rollback = Rollback
 # $value is the reading (12%, 1.4 GB).
 footer-cpu = CPU: { $value }
 footer-ram = RAM: { $value }
+
+## lib.rs's shared words — a new tab's title, a result's default name, the
+## AI-off note and the connection test's status line.
+
+# A query tab with no name and no file; $n numbers it. Also the file name a
+# first Save suggests.
+lib-tab-default-title = Query { $n }
+# A result chip whose statement has no text to show; $n numbers it.
+lib-result-default-label = Result { $n }
+# What every AI surface says while the assistant is off.
+lib-ai-off-note = The AI assistant is off. Pick an Agent CLI in AI settings to turn it on.
+# Beside the connection form's Test button.
+lib-test-testing = Testing…
+lib-test-connected = Connected
+lib-test-failed = Connection failed

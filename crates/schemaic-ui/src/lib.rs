@@ -2505,7 +2505,7 @@ impl Tab {
         }
         match self.path.get() {
             Some(p) => schemaic_core::sqlfile::tab_title(&p),
-            None => format!("Query {}", self.label),
+            None => tr!("lib-tab-default-title", n = self.label),
         }
     }
 
@@ -3099,7 +3099,7 @@ impl ResultPanel {
             cx,
             id,
             label: if preview.trim().is_empty() {
-                format!("Result {ordinal}")
+                tr!("lib-result-default-label", n = ordinal)
             } else {
                 preview
             },
@@ -3119,7 +3119,7 @@ impl ResultPanel {
         ResultPanel {
             cx,
             id,
-            label: "Result 1".to_string(),
+            label: tr!("lib-result-default-label", n = 1),
             sql: String::new(),
             state: QueryState::Idle,
             pinned: false,
@@ -3819,8 +3819,9 @@ pub enum InlineAiState {
 /// the panel's empty state, and the refusal an AI action gives if it is
 /// reached anyway. One string, so the panel and a refusal name the same way
 /// back.
-pub const AI_OFF_NOTE: &str =
-    "The AI assistant is off. Pick an Agent CLI in AI settings to turn it on.";
+pub fn ai_off_note() -> String {
+    tr!("lib-ai-off-note")
+}
 
 /// One inline-AI request from the editor's Ctrl+K prompt.
 pub struct InlineAiRequest {
@@ -3902,7 +3903,7 @@ pub struct AiUi {
     /// dropdown's *Disabled*, and what a new install starts with. While it is
     /// off no AI action is offered anywhere: the menu entries, buttons and the
     /// Ctrl+K bar are absent rather than greyed, and the panel says so
-    /// ([`AI_OFF_NOTE`]) with its gear still the way back in. [`Self::harness`]
+    /// ([`ai_off_note`]) with its gear still the way back in. [`Self::harness`]
     /// is still held, and is what turning it on lands on until the user picks.
     ///
     /// Hiding is the courtesy, not the guard: the app's send, inline, fill and
@@ -5435,12 +5436,12 @@ pub enum TestLine {
 }
 
 impl TestLine {
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> String {
         match self {
-            TestLine::Testing => "Testing…",
-            TestLine::Connected => "Connected",
-            TestLine::Failed(msg) if msg.is_empty() => "Connection failed",
-            TestLine::Failed(msg) => msg,
+            TestLine::Testing => tr!("lib-test-testing"),
+            TestLine::Connected => tr!("lib-test-connected"),
+            TestLine::Failed(msg) if msg.is_empty() => tr!("lib-test-failed"),
+            TestLine::Failed(msg) => msg.clone(),
         }
     }
 }
@@ -15412,9 +15413,27 @@ mod conn_node_scope_tests {
 }
 
 #[cfg(test)]
-mod footer_words_tests {
-    use super::{tr, tx_mode_label, tx_pill_text};
+mod catalogue_tests {
+    use super::{TestLine, ai_off_note, tr, tx_mode_label, tx_pill_text};
     use schemaic_core::tx::{TxMode, TxState, pill_text};
+
+    /// The shared words read as they did before the catalogue.
+    #[test]
+    fn the_shared_words_read_as_they_did_in_english() {
+        assert_eq!(tr!("lib-tab-default-title", n = 3), "Query 3");
+        assert_eq!(tr!("lib-result-default-label", n = 1), "Result 1");
+        assert_eq!(
+            ai_off_note(),
+            "The AI assistant is off. Pick an Agent CLI in AI settings to turn it on."
+        );
+        assert_eq!(TestLine::Testing.text(), "Testing…");
+        assert_eq!(TestLine::Connected.text(), "Connected");
+        assert_eq!(TestLine::Failed(String::new()).text(), "Connection failed");
+        assert_eq!(
+            TestLine::Failed("Access denied".into()).text(),
+            "Access denied"
+        );
+    }
 
     /// The transaction words say in English what core's say, which they
     /// replace in the status bar.
