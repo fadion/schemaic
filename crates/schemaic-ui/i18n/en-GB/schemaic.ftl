@@ -26,6 +26,9 @@ settings-term-blink-hint = Blink the cursor while the terminal is focused.
 ## Settings › AI
 
 settings-ai-agent = Agent CLI
+# The Agent CLI dropdown's off choice (the others are product names). English
+# must read as schemaic-ai's Agent::label.
+settings-ai-disabled = Disabled
 settings-ai-off-hint = Nothing is sent to any agent, no agent CLI is started, and no AI action is offered. Pick a CLI to turn the assistant on.
 # $cli is the agent CLI's product name (Claude Code, Codex).
 settings-ai-cli-path = { $cli } path

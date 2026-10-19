@@ -854,11 +854,9 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         }
         enabled.set(pick.enabled);
     });
-    // `Agent` is `Copy` and `Agent::label` is a plain
-    // `fn(Agent) -> &'static str`, so it satisfies this widget's bounds
-    // directly — no wrapper, and one `Agent` shared with the rest of
-    // the workspace rather than a UI-side mirror of it.
-    let agent_dd = focusable_dropdown(agent, Agent::ALL, Agent::label, ring.clone(), 5);
+    // One `Agent` shared with the rest of the workspace rather than a
+    // UI-side mirror of it; only its words are the interface's (`agent_label`).
+    let agent_dd = focusable_dropdown(agent, Agent::ALL, agent_label, ring.clone(), 5);
     // Each group is a label + its controls (6px gap); groups are spaced
     // a page's 16 apart, as every other section's are.
     let group = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
@@ -1414,6 +1412,15 @@ pub(crate) const STATEMENT_TIMEOUTS: [u64; 6] = [0, 60, 300, 900, 1_800, 3_600];
 /// "15 minutes" is how the dropdown and the error come to disagree.
 fn statement_timeout_label(secs: u64) -> String {
     schemaic_core::persist::statement_timeout_label(secs)
+}
+
+/// The Agent CLI dropdown's text — `Agent::label` in the interface's language.
+/// A harness is a product name and stays as it is; *Disabled* is ours.
+fn agent_label(agent: Agent) -> String {
+    match agent {
+        Agent::Disabled => tr!("settings-ai-disabled"),
+        Agent::Cli(h) => h.label().to_string(),
+    }
 }
 
 /// The Command line row's hint — core's `cli_install::RowHint` in the
@@ -2481,11 +2488,21 @@ pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, WRAP_WIDTHS, cli_hint,
+        EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, WRAP_WIDTHS, agent_label, cli_hint,
         editor_font_label, log_hint, row_limit_label, should_ask_for_a_notice,
         statement_timeout_label, term_font_label, thousands, wrap_width_label,
     };
     use crate::consts::TERM_FONT_SIZES;
+
+    /// **The Agent CLI dropdown reads in English exactly as `Agent::label`**,
+    /// which the AI crate's own tests read.
+    #[test]
+    fn english_names_every_agent_as_the_ai_crate_does() {
+        use schemaic_ai::harness::Agent;
+        for agent in Agent::ALL {
+            assert_eq!(agent_label(agent), agent.label(), "{agent:?}");
+        }
+    }
 
     /// **The Command line row's hint reads in English exactly as core's
     /// `RowHint` says it**, every variant.

@@ -25308,12 +25308,14 @@ existing prose was left alone.
     **The AI assistant page is where the harness is chosen, and half its controls follow that
     choice.** It was a modal of its own until it joined Settings, which is the history several
     paragraphs below still speak in. The
-    *Agent CLI* dropdown is `focusable_dropdown(agent, Agent::ALL, Agent::label, …)` over the
+    *Agent CLI* dropdown is `focusable_dropdown(agent, Agent::ALL, agent_label, …)` over the
     workspace's **one** `Agent` — `schemaic-ui` depends on `schemaic-ai` for it, deliberately, and
     the Cargo.toml comment carries the reason: a UI-side mirror converted at the app boundary is two
-    definitions free to drift, which is precisely what `AiModel::from_cli` was. `Agent` is `Copy`
-    and `label` is a plain `fn(Agent) -> &'static str`, so it meets the widget's bounds with no
-    wrapper. `agent` is a modal-local `RwSignal<Agent>` seeded from `Agent::of(enabled, harness)`
+    definitions free to drift, which is precisely what `AiModel::from_cli` was. Only the words are
+    the interface's: `agent_label` answers `settings-ai-disabled` for *Disabled* and a harness's own
+    `label()` — a product name, never translated — for a CLI, and
+    `english_names_every_agent_as_the_ai_crate_does` holds it equal to `Agent::label` for every
+    value in `Agent::ALL`. `agent` is a modal-local `RwSignal<Agent>` seeded from `Agent::of(enabled, harness)`
     and written back on a pick through `Agent::apply`, whose `AgentPick` the effect only performs:
     *Disabled* sets `AiUi::enabled` false and keeps the harness, so turning the assistant back on by
     picking the same CLI costs nothing; a CLI sets the harness **only if it differs** — the app's
@@ -25533,9 +25535,9 @@ existing prose was left alone.
     Shortcuts modal's headings and rows are `shortcuts.rs`'s, converted after it (below), which is
     why `shortcut_group` takes a `shortcuts::Group` and renders `group.label()` and `shortcut_row`
     takes an owned description. `TermCursor::label` is `lib.rs`'s and came with that file; the
-    options a dropdown takes from another crate stay English: `Agent::label` (`schemaic-ai`'s, so
-    its *Disabled* beside the product names), and core's `KeywordCase::label` and
-    `statement_timeout_label`, which wait for phase 4.
+    Agent CLI dropdown's *Disabled* is `agent_label`'s (above); and the options a dropdown takes
+    from core stay English: `KeywordCase::label` and `statement_timeout_label`, which wait for
+    phase 4.
     That is why its builders take owned text: `focusable_toggle_row`, `focusable_toggle_row_when`,
     `toggle_row_layout` and `settings_group_label` take `impl Into<String>`, so a literal caller
     still compiles and a `tr!` result passes as well; `SettingsSection::label()` answers a
@@ -40383,7 +40385,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     dropdown shows it), `format_bytes`, the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
     whose state words the search box also matches) and `dump.rs`'s "Export failed: …" lines,
     which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
-    English too: `Agent::label` (`schemaic-ai`), `KeywordCase::label` (core).
+    English too: `KeywordCase::label` (core).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40420,7 +40422,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `users_view::principal_kind_label` for `users::PrincipalKind::label`, and
     `account_editor::grant_subject_label`/`grant_level_label` for `users::GrantSubject::label`/
     `GrantLevelKind::label`, and `table_designer::identity_wording`/`storage_label` for
-    `ddl::identity_wording` and `ddl::IndexStorage::label` —
+    `ddl::identity_wording` and `ddl::IndexStorage::label`, and — the one from `schemaic-ai` rather
+    than core — `settings::agent_label` for `harness::Agent::label`, whose harnesses keep their
+    product names and only *Disabled* is drawn —
     with a test holding its English equal to core's for every variant
     (`english_names_every_object_kind_as_core_does`, `english_titles_every_band_as_core_does`,
     `english_names_every_kill_as_core_does`, `english_names_every_chart_kind_as_core_does`,
@@ -40428,7 +40432,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_names_every_event_status_as_core_does`, `english_names_every_principal_kind_as_core_does`,
     `english_names_every_grant_subject_and_level_as_core_does`,
     `english_words_the_identity_toggle_as_core_does_on_every_engine`,
-    `english_names_every_index_kind_as_core_does_and_each_apart`).
+    `english_names_every_index_kind_as_core_does_and_each_apart`,
+    `english_names_every_agent_as_the_ai_crate_does`).
     Where the word is a phrase core composes rather than a label, core answers with a value or
     keeps the composition and lets the caller word the part that is language: `history::ago` hands
     back an `Ago` that `i18n::relative_time` says from `ago-*` (the history and snippet rows, the

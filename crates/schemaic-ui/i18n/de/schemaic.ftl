@@ -23,6 +23,7 @@ settings-term-blink-hint = Den Cursor blinken lassen, solange das Terminal den F
 ## Settings › AI
 
 settings-ai-agent = Agent-CLI
+settings-ai-disabled = Deaktiviert
 settings-ai-off-hint = Nichts wird an einen Agenten gesendet, keine Agent-CLI wird gestartet und keine KI-Aktion angeboten. Wähle eine CLI, um den Assistenten einzuschalten.
 settings-ai-cli-path = Pfad zu { $cli }
 settings-ai-cli-path-placeholder = Leer lassen für automatische Erkennung

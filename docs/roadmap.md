@@ -96,7 +96,8 @@ assertions pin English wording — stays the regression net throughout.
    `compare_kind_word`, `empty_rows_message`), `users::PrincipalKind`
    (`users_view::principal_kind_label`), and `GrantSubject` and `GrantLevelKind`
    (`account_editor::grant_subject_label`, `grant_level_label`), `ddl::IndexStorage` and
-   `ddl::identity_wording` (`table_designer::storage_label`, `identity_wording`). Where a
+   `ddl::identity_wording` (`table_designer::storage_label`, `identity_wording`), and
+   `schemaic-ai`'s `Agent::label` (`settings::agent_label`). Where a
    core function composes a line around one counted word, it takes the word from the caller
    instead (`history::outcome_line_with`, which `i18n::outcome_line` calls);
    `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
@@ -105,9 +106,8 @@ assertions pin English wording — stays the regression net throughout.
    unchanged today is this phase's list to work from: `launch::*`'s refusals,
    `statement_timeout_label` (quoted by the
    timeout message as its dropdown shows it), the grid's export notes, the activity panel's counts line — and
-   two that are not core's but need the same split: `schemaic-cli`'s `dump.rs` "Export failed: …"
-   lines, which the dump modal shows and the headless CLI shares, and `schemaic-ai`'s
-   `Agent::label`, whose *Disabled* the AI settings' dropdown shows.
+   one that is not core's but needs the same split: `schemaic-cli`'s `dump.rs` "Export failed: …"
+   lines, which the dump modal shows and the headless CLI shares.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).
