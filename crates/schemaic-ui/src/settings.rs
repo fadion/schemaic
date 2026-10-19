@@ -1415,6 +1415,37 @@ fn statement_timeout_label(secs: u64) -> String {
     crate::i18n::statement_timeout(secs)
 }
 
+/// The keyword, function and type case dropdowns' text — `KeywordCase::label`
+/// in the interface's language.
+fn keyword_case_label(case: schemaic_core::sqlfmt::KeywordCase) -> String {
+    use schemaic_core::sqlfmt::KeywordCase;
+    match case {
+        KeywordCase::Keep => tr!("settings-format-case-keep"),
+        KeywordCase::Upper => tr!("settings-format-case-upper"),
+        KeywordCase::Lower => tr!("settings-format-case-lower"),
+    }
+}
+
+/// The Commas dropdown's text — `CommaStyle::label` in the interface's language.
+fn comma_style_label(style: schemaic_core::sqlfmt::CommaStyle) -> String {
+    use schemaic_core::sqlfmt::CommaStyle;
+    match style {
+        CommaStyle::Trailing => tr!("settings-format-commas-trailing"),
+        CommaStyle::Leading => tr!("settings-format-commas-leading"),
+    }
+}
+
+/// The Between statements dropdown's text — `StatementGap::label` in the
+/// interface's language.
+fn statement_gap_label(gap: schemaic_core::sqlfmt::StatementGap) -> String {
+    use schemaic_core::sqlfmt::StatementGap;
+    match gap {
+        StatementGap::One => tr!("settings-format-gap-one"),
+        StatementGap::None => tr!("settings-format-gap-none"),
+        StatementGap::Keep => tr!("settings-format-case-keep"),
+    }
+}
+
 /// The Agent CLI dropdown's text — `Agent::label` in the interface's language.
 /// A harness is a product name and stays as it is; *Disabled* is ours.
 fn agent_label(agent: Agent) -> String {
@@ -2153,7 +2184,7 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     let case_dd = focusable_dropdown(
         keyword_case,
         schemaic_core::sqlfmt::KeywordCase::ALL,
-        schemaic_core::sqlfmt::KeywordCase::label,
+        keyword_case_label,
         ring.clone(),
         160,
     );
@@ -2166,7 +2197,7 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     let function_case_dd = focusable_dropdown(
         function_case,
         schemaic_core::sqlfmt::KeywordCase::ALL,
-        schemaic_core::sqlfmt::KeywordCase::label,
+        keyword_case_label,
         ring.clone(),
         163,
     );
@@ -2179,7 +2210,7 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     let type_case_dd = focusable_dropdown(
         type_case,
         schemaic_core::sqlfmt::KeywordCase::ALL,
-        schemaic_core::sqlfmt::KeywordCase::label,
+        keyword_case_label,
         ring.clone(),
         166,
     );
@@ -2192,7 +2223,7 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     let commas_dd = focusable_dropdown(
         comma_style,
         schemaic_core::sqlfmt::CommaStyle::ALL,
-        schemaic_core::sqlfmt::CommaStyle::label,
+        comma_style_label,
         ring.clone(),
         170,
     );
@@ -2205,7 +2236,7 @@ fn formatting_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     let gap_dd = focusable_dropdown(
         statement_gap,
         schemaic_core::sqlfmt::StatementGap::ALL,
-        schemaic_core::sqlfmt::StatementGap::label,
+        statement_gap_label,
         ring.clone(),
         180,
     );
@@ -2494,6 +2525,21 @@ mod tests {
         statement_timeout_label, term_font_label, thousands, wrap_width_label,
     };
     use crate::consts::TERM_FONT_SIZES;
+
+    /// **The formatting dropdowns read in English exactly as core's labels** —
+    /// the three case lists, *Commas* and *Between statements*.
+    #[test]
+    fn english_names_every_formatting_choice_as_core_does() {
+        for case in schemaic_core::sqlfmt::KeywordCase::ALL {
+            assert_eq!(super::keyword_case_label(case), case.label(), "{case:?}");
+        }
+        for style in schemaic_core::sqlfmt::CommaStyle::ALL {
+            assert_eq!(super::comma_style_label(style), style.label(), "{style:?}");
+        }
+        for gap in schemaic_core::sqlfmt::StatementGap::ALL {
+            assert_eq!(super::statement_gap_label(gap), gap.label(), "{gap:?}");
+        }
+    }
 
     /// **The Agent CLI dropdown reads in English exactly as `Agent::label`**,
     /// which the AI crate's own tests read.

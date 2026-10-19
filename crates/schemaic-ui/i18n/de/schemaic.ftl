@@ -106,6 +106,13 @@ settings-editor-guides-hint = Auf jeder Einrückungsebene eine blasse senkrechte
 ## Settings › Code formatting
 
 settings-format-keyword-case = Schreibweise der Schlüsselwörter
+settings-format-case-keep = Wie eingegeben
+settings-format-case-upper = Großbuchstaben
+settings-format-case-lower = Kleinbuchstaben
+settings-format-commas-trailing = Am Zeilenende
+settings-format-commas-leading = Am Zeilenanfang
+settings-format-gap-one = Eine Leerzeile
+settings-format-gap-none = Keine Leerzeile
 settings-format-keyword-case-hint = Wie „Code formatieren“ Schlüsselwörter wie SELECT und FROM schreibt. Namen, Zeichenketten und Kommentare behalten ihre Schreibweise.
 settings-format-function-case = Schreibweise der Funktionen
 settings-format-function-case-hint = Wie „Code formatieren“ die eingebauten Funktionen der Datenbank wie COUNT und COALESCE schreibt, wo sie aufgerufen werden. Eigene Funktionen behalten ihre Schreibweise.

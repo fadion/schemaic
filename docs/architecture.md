@@ -25589,8 +25589,14 @@ existing prose was left alone.
     takes an owned description. `TermCursor::label` is `lib.rs`'s and came with that file; the
     Agent CLI dropdown's *Disabled* is `agent_label`'s (above); the *Statement timeout* dropdown's
     `statement_timeout_label` is `i18n::statement_timeout`'s, the renderer the app's timed-out
-    message quotes too (*The string catalogue*); and the one option list a dropdown takes from core
-    still in English is `KeywordCase::label`, which waits for phase 4.
+    message quotes too (*The string catalogue*); and the three option lists core's `sqlfmt` types
+    name — the keyword, function and type case dropdowns', *Commas*' and *Between statements*' —
+    are drawn UI-side as properties of a typed value (*The string catalogue*):
+    `keyword_case_label` from `settings-format-case-*`, `comma_style_label` from
+    `settings-format-commas-trailing`/`-leading`, and `statement_gap_label` from
+    `settings-format-gap-one`/`-none`, its *As typed* reusing `settings-format-case-keep`.
+    `english_names_every_formatting_choice_as_core_does` holds all three equal to core's `label` in
+    English. No dropdown here shows another crate's text any more.
     That is why its builders take owned text: `focusable_toggle_row`, `focusable_toggle_row_when`,
     `toggle_row_layout` and `settings_group_label` take `impl Into<String>`, so a literal caller
     still compiles and a `tr!` result passes as well; `SettingsSection::label()` answers a
@@ -32717,8 +32723,8 @@ existing prose was left alone.
     one editor setting here that paints nothing. **Function case** and **Type case** follow it
     (focus order 163 and 166, both *As typed* by default — `UiState::format_function_case`/
     `format_type_case`, pinned by `format_function_and_type_case_default_as_typed_and_keep_a_choice`;
-    `LayoutUi::function_case`/`type_case`), reusing `KeywordCase::ALL` and `label` for their choices
-    rather than a list of their own. **Commas** sits after them (*End of line* by
+    `LayoutUi::function_case`/`type_case`), reusing `KeywordCase::ALL` and `keyword_case_label` for
+    their choices rather than a list of their own. **Commas** sits after them (*End of line* by
     default — `UiState::format_comma_style`, pinned by
     `format_comma_style_defaults_to_end_of_line_and_keeps_a_choice`; `LayoutUi::comma_style`), and
     **Between statements** after that (*One blank line* by default, focus order 180 —
@@ -40489,8 +40495,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals and `format_bytes`. A label a dropdown takes from another crate stays that crate's
-    English too: `KeywordCase::label` (core).
+    translation* — among it `launch::*`'s refusals and `format_bytes`.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40530,7 +40535,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `users_view::principal_kind_label` for `users::PrincipalKind::label`, and
     `account_editor::grant_subject_label`/`grant_level_label` for `users::GrantSubject::label`/
     `GrantLevelKind::label`, and `table_designer::identity_wording`/`storage_label` for
-    `ddl::identity_wording` and `ddl::IndexStorage::label`, and — the one from `schemaic-ai` rather
+    `ddl::identity_wording` and `ddl::IndexStorage::label`, and `settings::keyword_case_label`/
+    `comma_style_label`/`statement_gap_label` for `sqlfmt::KeywordCase::label`/`CommaStyle::label`/
+    `StatementGap::label`, and — the one from `schemaic-ai` rather
     than core — `settings::agent_label` for `harness::Agent::label`, whose harnesses keep their
     product names and only *Disabled* is drawn —
     with a test holding its English equal to core's for every variant
@@ -40541,6 +40548,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_names_every_grant_subject_and_level_as_core_does`,
     `english_words_the_identity_toggle_as_core_does_on_every_engine`,
     `english_names_every_index_kind_as_core_does_and_each_apart`,
+    `english_names_every_formatting_choice_as_core_does`,
     `english_names_every_agent_as_the_ai_crate_does`).
     Where the word is a phrase core composes rather than a label, core answers with a value or
     keeps the composition and lets the caller word the part that is language: `history::ago` hands

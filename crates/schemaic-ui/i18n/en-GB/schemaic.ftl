@@ -113,6 +113,17 @@ settings-editor-guides-hint = Draw a faint vertical line at each indent level.
 ## Settings › Code formatting (SQL keywords stay as they are written)
 
 settings-format-keyword-case = Keyword case
+# The keyword, function and type case dropdowns' choices (core's KeywordCase;
+# English must read exactly as its label).
+settings-format-case-keep = As typed
+settings-format-case-upper = Upper case
+settings-format-case-lower = Lower case
+# The Commas and Between statements dropdowns' choices (core's CommaStyle and
+# StatementGap); the latter's "As typed" is settings-format-case-keep.
+settings-format-commas-trailing = End of line
+settings-format-commas-leading = Start of line
+settings-format-gap-one = One blank line
+settings-format-gap-none = No blank line
 settings-format-keyword-case-hint = How Format Code writes keywords such as SELECT and FROM. Names, strings and comments keep their case.
 settings-format-function-case = Function case
 settings-format-function-case-hint = How Format Code writes the engine's own functions, such as COUNT and COALESCE, where they are called. Your own functions keep their case.

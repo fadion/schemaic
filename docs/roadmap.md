@@ -108,11 +108,12 @@ assertions pin English wording — stays the regression net throughout.
    `schemaic-ai`'s `Agent::label` (`settings::agent_label`). Where a
    core function composes a line around one counted word, it takes the word from the caller
    instead (`history::outcome_line_with`, which `i18n::outcome_line` calls);
-   `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
-   like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
+   `ExportFormat::label`, `activity::interval_label` and the like are the same case, and
+   `sqlfmt`'s `KeywordCase`, `CommaStyle` and `StatementGap` labels are done
+   (`settings::keyword_case_label`, `comma_style_label`, `statement_gap_label`). Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
    unchanged today is this phase's list to work from: `launch::*`'s refusals, `format_bytes`,
-   `KeywordCase::label`, the dump modal's `dump::drop_before_create_hint` and `fk_guard_hint`,
+   the dump modal's `dump::drop_before_create_hint` and `fk_guard_hint`,
    and `history::finished_note`'s notification titles ("Export failed", "Query failed").
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
