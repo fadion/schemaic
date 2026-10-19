@@ -40328,8 +40328,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`used_by_view.rs`), the interface themes' names (`themes.rs`), the AI panel's reply
   renderer's own controls (`markdown.rs`), the grid's cell pickers and calendar
   (`cell_editors.rs`), the Rename alias / Rename CTE dialog (`alias_rename.rs`), the Find
-  usages list (`usages_view.rs`), the PNG rasteriser's refusals (`erd_raster.rs`) and the terminal
-  panel's DB-client lines (`schemaic-app`'s `main.rs`, `cli-*`) are converted;
+  usages list (`usages_view.rs`), the PNG rasteriser's refusals (`erd_raster.rs`), the terminal
+  panel's DB-client lines (`schemaic-app`'s `main.rs`, `cli-*`) and Settings › Install's
+  failures (`install_cli.rs`, `install-*`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

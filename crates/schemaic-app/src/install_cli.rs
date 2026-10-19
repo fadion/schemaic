@@ -104,8 +104,8 @@ pub(crate) fn on_uninstall() {
 }
 
 fn probe() -> Result<Probe, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Can't tell where Schemaic is running from: {e}"))?;
+    let exe =
+        std::env::current_exe().map_err(|e| tr!("install-no-exe-path", error = e.to_string()))?;
     let console_shim = exe
         .parent()
         .is_some_and(|dir| dir.join(cli_install::WINDOWS_SHIM).is_file());
@@ -157,12 +157,12 @@ fn env_lookup(name: &str) -> Option<String> {
 
 #[cfg(not(windows))]
 fn add_user_path(_dir: &Path) -> Result<String, String> {
-    Err("A user PATH entry is a Windows install; this platform links instead.".to_string())
+    Err(tr!("install-path-is-windows"))
 }
 
 #[cfg(not(windows))]
 fn remove_user_path(_dir: &Path) -> Result<String, String> {
-    Err("A user PATH entry is a Windows install; this platform links instead.".to_string())
+    Err(tr!("install-path-is-windows"))
 }
 
 /// Append `dir` to `HKCU\Environment\Path`, then tell running programs.
@@ -277,9 +277,9 @@ mod win {
                 }
             };
             if rc != 0 {
-                return Err(format!(
-                    "Couldn't open your user environment in the registry: {}",
-                    os_error(rc)
+                return Err(tr!(
+                    "install-registry-open",
+                    error = os_error(rc).to_string()
                 ));
             }
             // Owned from here, so every early return below closes it.
@@ -309,7 +309,7 @@ mod win {
                 return Ok(path);
             }
             if rc != 0 {
-                return Err(format!("Couldn't read your user PATH: {}", os_error(rc)));
+                return Err(tr!("install-path-read", error = os_error(rc).to_string()));
             }
             schemaic_core::cli_install::user_path_type(ty)?;
             // Rounded up to whole u16s, plus room for a terminator the stored
@@ -328,7 +328,7 @@ mod win {
                 )
             };
             if rc != 0 {
-                return Err(format!("Couldn't read your user PATH: {}", os_error(rc)));
+                return Err(tr!("install-path-read", error = os_error(rc).to_string()));
             }
             buf.truncate(len as usize / 2);
             // Asked again of the type this read returned: the value could have
@@ -357,7 +357,7 @@ mod win {
                 )
             };
             if rc != 0 {
-                return Err(format!("Couldn't write your user PATH: {}", os_error(rc)));
+                return Err(tr!("install-path-write", error = os_error(rc).to_string()));
             }
             Ok(())
         }
@@ -388,12 +388,12 @@ mod win {
 
 #[cfg(not(unix))]
 fn link_command(_link: &Path, _target: &Path, _probe: &Probe) -> Result<String, String> {
-    Err("Linking the command is a macOS and Linux install.".to_string())
+    Err(tr!("install-link-is-unix"))
 }
 
 #[cfg(not(unix))]
 fn unlink_command(_link: &Path, _target: &Path) -> Result<String, String> {
-    Err("Linking the command is a macOS and Linux install.".to_string())
+    Err(tr!("install-link-is-unix"))
 }
 
 /// What is at `link` right now, in the shape `cli_install` decides on.
@@ -402,10 +402,19 @@ fn existing_at(link: &Path) -> Result<cli_install::Existing, String> {
     use cli_install::Existing;
     match std::fs::symlink_metadata(link) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Existing::Nothing),
-        Err(e) => Err(format!("Couldn't look at {}: {e}", link.display())),
+        Err(e) => Err(tr!(
+            "install-look-at",
+            path = link.display().to_string(),
+            error = e.to_string()
+        )),
         Ok(meta) if meta.file_type().is_symlink() => Ok(Existing::Link {
-            to: std::fs::read_link(link)
-                .map_err(|e| format!("Couldn't read the link at {}: {e}", link.display()))?,
+            to: std::fs::read_link(link).map_err(|e| {
+                tr!(
+                    "install-read-link",
+                    path = link.display().to_string(),
+                    error = e.to_string()
+                )
+            })?,
             // `exists` follows the link.
             live: link.exists(),
         }),
@@ -422,15 +431,30 @@ fn link_command(link: &Path, target: &Path, probe: &Probe) -> Result<String, Str
         LinkStep::Refuse(why) => return Err(why),
         step => {
             if let Some(dir) = link.parent() {
-                std::fs::create_dir_all(dir)
-                    .map_err(|e| format!("Couldn't create {}: {e}", dir.display()))?;
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    tr!(
+                        "install-create",
+                        path = dir.display().to_string(),
+                        error = e.to_string()
+                    )
+                })?;
             }
             if step == LinkStep::Replace {
-                std::fs::remove_file(link)
-                    .map_err(|e| format!("Couldn't remove the old {}: {e}", link.display()))?;
+                std::fs::remove_file(link).map_err(|e| {
+                    tr!(
+                        "install-remove-old",
+                        path = link.display().to_string(),
+                        error = e.to_string()
+                    )
+                })?;
             }
-            std::os::unix::fs::symlink(target, link)
-                .map_err(|e| format!("Couldn't create {}: {e}", link.display()))?;
+            std::os::unix::fs::symlink(target, link).map_err(|e| {
+                tr!(
+                    "install-create",
+                    path = link.display().to_string(),
+                    error = e.to_string()
+                )
+            })?;
             tracing::info!(link = %link.display(), target = %target.display(), "linked the CLI");
         }
     }
@@ -451,8 +475,13 @@ fn unlink_command(link: &Path, target: &Path) -> Result<String, String> {
         UnlinkStep::Absent => Ok(cli_install::report_link_absent(link)),
         UnlinkStep::Refuse(why) => Err(why),
         UnlinkStep::Remove => {
-            std::fs::remove_file(link)
-                .map_err(|e| format!("Couldn't remove {}: {e}", link.display()))?;
+            std::fs::remove_file(link).map_err(|e| {
+                tr!(
+                    "install-remove",
+                    path = link.display().to_string(),
+                    error = e.to_string()
+                )
+            })?;
             tracing::info!(link = %link.display(), "unlinked the CLI");
             Ok(cli_install::report_unlinked(link))
         }

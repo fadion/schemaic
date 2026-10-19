@@ -2287,3 +2287,20 @@ cli-no-tool = No { $tool } found on PATH.
 cli-no-either-tool = No { $first } or { $second } found on PATH.
 cli-no-either-client = No { $first } or { $second } client found on PATH.
 cli-sqlcmd-windows-in-wsl = Windows sign-in needs a Windows sqlcmd, and the one found is inside WSL. Install sqlcmd on Windows, or open the connection in a query tab.
+
+## Settings › Install's failures (install_cli.rs). What it reports on success
+## is core's and stays English for now. $error is the operating system's own
+## text; $path a file path.
+
+install-no-exe-path = Can't tell where Schemaic is running from: { $error }
+install-registry-open = Couldn't open your user environment in the registry: { $error }
+install-path-read = Couldn't read your user PATH: { $error }
+install-path-write = Couldn't write your user PATH: { $error }
+install-look-at = Couldn't look at { $path }: { $error }
+install-read-link = Couldn't read the link at { $path }: { $error }
+install-create = Couldn't create { $path }: { $error }
+install-remove-old = Couldn't remove the old { $path }: { $error }
+install-remove = Couldn't remove { $path }: { $error }
+# Asked of the wrong platform's install, which the Settings row never offers.
+install-path-is-windows = A user PATH entry is a Windows install; this platform links instead.
+install-link-is-unix = Linking the command is a macOS and Linux install.
