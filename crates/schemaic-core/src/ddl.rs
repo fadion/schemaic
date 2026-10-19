@@ -241,6 +241,253 @@ pub struct TableDraft {
     pub partition_of: Option<crate::schema::PartitionOf>,
 }
 
+/// What stops a [`TableDraft`] being emitted ([`TableDraft::problems`]) — a
+/// value, so the designer can say it in the interface's language;
+/// [`TableProblem::message`] is the English. Every name is the draft's own: an
+/// `index`, a `column`, a foreign key's `fk`, a check's `name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableProblem {
+    NoName,
+    NoColumns,
+    ColumnNoName,
+    ColumnTwice {
+        name: String,
+    },
+    ColumnNoType {
+        name: String,
+    },
+    /// The primary key names something that is no column.
+    KeyNotColumn {
+        column: String,
+    },
+    IndexNoName,
+    IndexTwice {
+        name: String,
+    },
+    IndexNoColumns {
+        index: String,
+    },
+    /// SQL Server: an XML or spatial index over more or fewer than one column.
+    XmlOneColumn {
+        index: String,
+    },
+    /// SQL Server: an XML or spatial index that is unique, includes or filters.
+    XmlNoOptions {
+        index: String,
+    },
+    /// SQL Server: a secondary XML index with no `USING XML INDEX … FOR …`.
+    XmlNoUsing {
+        index: String,
+    },
+    /// SQL Server: a selective XML index with no `FOR (…)` paths.
+    SelectiveNoPaths {
+        index: String,
+    },
+    /// SQL Server: a secondary XML index whose `parent` is gone.
+    XmlParentGone {
+        index: String,
+        parent: String,
+    },
+    /// An `ORDER` on an index that is no columnstore.
+    NotOrderable {
+        index: String,
+    },
+    OrderNotColumn {
+        index: String,
+        column: String,
+    },
+    /// A nonclustered columnstore ordered by a column it does not store.
+    OrderNotStored {
+        index: String,
+        column: String,
+    },
+    ColumnstoreUnique {
+        index: String,
+    },
+    ColumnstoreInclude {
+        index: String,
+    },
+    ColumnstoreSorted {
+        index: String,
+    },
+    ClusteredColumnstoreFiltered {
+        index: String,
+    },
+    /// `INCLUDE` on a clustered index.
+    ClusteredInclude {
+        index: String,
+    },
+    /// `INCLUDE` on a unique constraint where it takes none.
+    UniqueInclude {
+        index: String,
+    },
+    /// A filter on a clustered index.
+    ClusteredFiltered {
+        index: String,
+    },
+    /// SQLite: a filter on the index behind a `UNIQUE` constraint.
+    ConstraintFiltered {
+        index: String,
+    },
+    /// A filter on an index that cannot be partial here.
+    NotPartial {
+        index: String,
+    },
+    IndexNotColumn {
+        index: String,
+        column: String,
+    },
+    IncludeNotColumn {
+        index: String,
+        column: String,
+    },
+    /// More than one clustered structure: the primary key (`key`) and/or
+    /// these clustered `indexes`.
+    ClusterClash {
+        key: bool,
+        indexes: Vec<String>,
+    },
+    FkNoName,
+    FkTwice {
+        name: String,
+    },
+    FkNoTable {
+        fk: String,
+    },
+    /// A foreign key whose columns do not pair with what it references.
+    FkUnpaired {
+        fk: String,
+    },
+    FkNotColumn {
+        fk: String,
+        column: String,
+    },
+    CheckNoName,
+    CheckTwice {
+        name: String,
+    },
+    CheckNoPredicate {
+        name: String,
+    },
+    /// SQLite: a `WITHOUT ROWID` table with no primary key.
+    WithoutRowidNoKey,
+    /// SQLite: a `STRICT` table's `column` of a type it does not take.
+    StrictType {
+        column: String,
+        data_type: String,
+    },
+}
+
+impl TableProblem {
+    /// The problem in English.
+    pub fn message(&self) -> String {
+        use TableProblem as P;
+        match self {
+            P::NoName => "The table needs a name.".to_string(),
+            P::NoColumns => "A table needs at least one column.".to_string(),
+            P::ColumnNoName => "Every column needs a name.".to_string(),
+            P::ColumnTwice { name } => format!("Two columns are both called {name}."),
+            P::ColumnNoType { name } => format!("Column {name} needs a type."),
+            P::KeyNotColumn { column } => {
+                format!("The primary key names {column}, which isn't a column.")
+            }
+            P::IndexNoName => "Every index needs a name.".to_string(),
+            P::IndexTwice { name } => format!("Two indexes are both called {name}."),
+            P::IndexNoColumns { index } => format!("Index {index} has no columns."),
+            P::XmlOneColumn { index } => format!("Index {index} must name exactly one column."),
+            P::XmlNoOptions { index } => format!(
+                "Index {index} can't be unique, include columns or be filtered: an XML or \
+                 spatial index takes none of those."
+            ),
+            P::XmlNoUsing { index } => format!(
+                "Index {index} needs its USING XML INDEX … FOR … clause: a secondary XML index \
+                 is built on a primary or selective one."
+            ),
+            P::SelectiveNoPaths { index } => format!(
+                "Index {index} needs its FOR (…) paths: a selective XML index is the paths it \
+                 promotes."
+            ),
+            P::XmlParentGone { index, parent } => format!(
+                "Index {index} is built on {parent}, which isn't a primary or selective XML \
+                 index of this table: it goes when its parent does."
+            ),
+            P::NotOrderable { index } => {
+                format!("Index {index} can't be ordered: only a columnstore index has an ORDER.")
+            }
+            P::OrderNotColumn { index, column } => {
+                format!("Index {index} orders by {column}, which isn't a column.")
+            }
+            P::OrderNotStored { index, column } => {
+                format!("Index {index} orders by {column}, which it doesn't store.")
+            }
+            P::ColumnstoreUnique { index } => format!(
+                "Index {index} can't be unique: a columnstore index stores columns, not keys."
+            ),
+            P::ColumnstoreInclude { index } => format!(
+                "Index {index} can't include columns: a columnstore index lists every column it \
+                 stores."
+            ),
+            P::ColumnstoreSorted { index } => format!(
+                "Index {index} can't sort its columns: a columnstore column has no direction."
+            ),
+            P::ClusteredColumnstoreFiltered { index } => format!(
+                "Index {index} can't be filtered: a clustered columnstore index stores every row."
+            ),
+            P::ClusteredInclude { index } => format!(
+                "Index {index} can't include columns: a clustered index holds every column \
+                 already."
+            ),
+            P::UniqueInclude { index } => format!(
+                "Index {index} can't include columns: a unique constraint has no INCLUDE here."
+            ),
+            P::ClusteredFiltered { index } => {
+                format!("Index {index} can't be filtered: a clustered index covers every row.")
+            }
+            P::ConstraintFiltered { index } => format!(
+                "Index {index} can't be filtered: it backs a UNIQUE constraint, which takes no \
+                 condition here. Drop it and add a unique index with the condition."
+            ),
+            P::NotPartial { index } => {
+                format!("Index {index} can't be filtered: this index can't be partial here.")
+            }
+            P::IndexNotColumn { index, column } => {
+                format!("Index {index} names {column}, which isn't a column.")
+            }
+            P::IncludeNotColumn { index, column } => {
+                format!("Index {index} includes {column}, which isn't a column.")
+            }
+            P::ClusterClash { key, indexes } => {
+                let mut what: Vec<String> = indexes.iter().map(|n| format!("index {n}")).collect();
+                if *key {
+                    what.insert(0, "the primary key".to_string());
+                }
+                format!(
+                    "A table holds only one clustered index, and {} each cluster it - make all \
+                     but one nonclustered.",
+                    what.join(" and ")
+                )
+            }
+            P::FkNoName => "Every foreign key needs a name.".to_string(),
+            P::FkTwice { name } => format!("Two foreign keys are both called {name}."),
+            P::FkNoTable { fk } => format!("Foreign key {fk} references no table."),
+            P::FkUnpaired { fk } => {
+                format!("Foreign key {fk} must pair each column with one it references.")
+            }
+            P::FkNotColumn { fk, column } => {
+                format!("Foreign key {fk} names {column}, which isn't a column.")
+            }
+            P::CheckNoName => "Every check constraint needs a name.".to_string(),
+            P::CheckTwice { name } => format!("Two check constraints are both called {name}."),
+            P::CheckNoPredicate { name } => format!("Check {name} has no predicate."),
+            P::WithoutRowidNoKey => "A WITHOUT ROWID table needs a primary key.".to_string(),
+            P::StrictType { column, data_type } => format!(
+                "STRICT tables take only INT, INTEGER, REAL, TEXT, BLOB or ANY — {column} is \
+                 {data_type}."
+            ),
+        }
+    }
+}
+
 impl TableDraft {
     /// The draft that describes an introspected table exactly — the designer's
     /// starting point, and the input to the round-trip gate (diffing this
@@ -564,24 +811,29 @@ impl TableDraft {
     /// Takes the dialect because one of its rules is not the same on all three —
     /// see [`requires_named_checks`], and [`TriggerDraft::validate`] for the
     /// precedent.
-    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+    pub fn problems(&self, dialect: SqlDialect) -> Vec<TableProblem> {
+        use TableProblem as P;
         let mut out = Vec::new();
         if self.name.trim().is_empty() {
-            out.push("The table needs a name.".to_string());
+            out.push(P::NoName);
         }
         if self.columns.is_empty() {
-            out.push("A table needs at least one column.".to_string());
+            out.push(P::NoColumns);
         }
         let mut seen: HashSet<String> = HashSet::new();
         for c in &self.columns {
             let name = c.info.name.trim();
             if name.is_empty() {
-                out.push("Every column needs a name.".to_string());
+                out.push(P::ColumnNoName);
             } else if !seen.insert(name.to_ascii_lowercase()) {
-                out.push(format!("Two columns are both called {name}."));
+                out.push(P::ColumnTwice {
+                    name: name.to_string(),
+                });
             }
             if c.info.type_name.trim().is_empty() {
-                out.push(format!("Column {name} needs a type."));
+                out.push(P::ColumnNoType {
+                    name: name.to_string(),
+                });
             }
         }
         let names: HashSet<String> = self
@@ -592,43 +844,38 @@ impl TableDraft {
         let known = |c: &String| names.contains(&c.to_ascii_lowercase());
         for c in &self.primary_key {
             if !known(c) {
-                out.push(format!("The primary key names {c}, which isn't a column."));
+                out.push(P::KeyNotColumn { column: c.clone() });
             }
         }
         let mut index_names: HashSet<String> = HashSet::new();
         for ix in &self.indexes {
+            let index = || ix.info.name.clone();
             if ix.info.name.trim().is_empty() {
-                out.push("Every index needs a name.".to_string());
+                out.push(P::IndexNoName);
             } else if !index_names.insert(ix.info.name.to_ascii_lowercase()) {
-                out.push(format!("Two indexes are both called {}.", ix.info.name));
+                out.push(P::IndexTwice { name: index() });
             }
             // A clustered columnstore index stores every column and names none.
             if ix.info.columns.is_empty() && !ix.info.is_clustered_columnstore() {
-                out.push(format!("Index {} has no columns.", ix.info.name));
+                out.push(P::IndexNoColumns { index: index() });
             }
             // An XML or spatial index is over one column, with none of a
             // rowstore index's options; a secondary XML one names its primary.
             if ix.info.is_tsql_xml_or_spatial() {
-                let name = &ix.info.name;
                 if ix.info.columns.len() != 1 {
-                    out.push(format!("Index {name} must name exactly one column."));
+                    out.push(P::XmlOneColumn { index: index() });
                 }
                 if ix.info.unique || !ix.info.include.is_empty() || ix.info.predicate.is_some() {
-                    out.push(format!(
-                        "Index {name} can't be unique, include columns or be filtered: an XML \
-                         or spatial index takes none of those."
-                    ));
+                    out.push(P::XmlNoOptions { index: index() });
                 }
                 let no_clause = ix.info.using.as_deref().is_none_or(|u| u.trim().is_empty());
                 match ix.info.method.as_deref() {
-                    Some(crate::schema::TSQL_XML) if no_clause => out.push(format!(
-                        "Index {name} needs its USING XML INDEX … FOR … clause: a secondary XML \
-                         index is built on a primary or selective one."
-                    )),
-                    Some(crate::schema::TSQL_SELECTIVE_XML) if no_clause => out.push(format!(
-                        "Index {name} needs its FOR (…) paths: a selective XML index is the \
-                         paths it promotes."
-                    )),
+                    Some(crate::schema::TSQL_XML) if no_clause => {
+                        out.push(P::XmlNoUsing { index: index() })
+                    }
+                    Some(crate::schema::TSQL_SELECTIVE_XML) if no_clause => {
+                        out.push(P::SelectiveNoPaths { index: index() })
+                    }
                     _ => {}
                 }
                 // Its parent by its name or, renamed in this draft, by the one
@@ -643,27 +890,24 @@ impl TableDraft {
                                     .is_some_and(|o| o.eq_ignore_ascii_case(&parent)))
                     });
                     if !stands {
-                        out.push(format!(
-                            "Index {name} is built on {parent}, which isn't a primary or \
-                             selective XML index of this table: it goes when its parent does."
-                        ));
+                        out.push(P::XmlParentGone {
+                            index: index(),
+                            parent,
+                        });
                     }
                 }
             }
             // An `ORDER` is a columnstore index's alone, and a nonclustered
             // one sorts only by columns it stores (Msg 1911).
             if !ix.info.order.is_empty() && !ix.info.is_columnstore() {
-                out.push(format!(
-                    "Index {} can't be ordered: only a columnstore index has an ORDER.",
-                    ix.info.name
-                ));
+                out.push(P::NotOrderable { index: index() });
             }
             for c in &ix.info.order {
                 if !known(c) {
-                    out.push(format!(
-                        "Index {} orders by {c}, which isn't a column.",
-                        ix.info.name
-                    ));
+                    out.push(P::OrderNotColumn {
+                        index: index(),
+                        column: c.clone(),
+                    });
                 } else if ix.info.is_columnstore()
                     && !ix.info.is_clustered_columnstore()
                     && !ix
@@ -672,41 +916,27 @@ impl TableDraft {
                         .iter()
                         .any(|k| k.name.eq_ignore_ascii_case(c))
                 {
-                    out.push(format!(
-                        "Index {} orders by {c}, which it doesn't store.",
-                        ix.info.name
-                    ));
+                    out.push(P::OrderNotStored {
+                        index: index(),
+                        column: c.clone(),
+                    });
                 }
             }
             // A columnstore index stores columns, not keys: T-SQL takes
             // neither `UNIQUE` nor `INCLUDE` on one.
             if ix.info.is_columnstore() {
                 if ix.info.unique {
-                    out.push(format!(
-                        "Index {} can't be unique: a columnstore index stores columns, not keys.",
-                        ix.info.name
-                    ));
+                    out.push(P::ColumnstoreUnique { index: index() });
                 }
                 if !ix.info.include.is_empty() {
-                    out.push(format!(
-                        "Index {} can't include columns: a columnstore index lists every column \
-                         it stores.",
-                        ix.info.name
-                    ));
+                    out.push(P::ColumnstoreInclude { index: index() });
                 }
                 // Msg 35302 and Msg 102, measured on 2022 (S3.1-L1-02).
                 if ix.info.columns.iter().any(|c| c.descending) {
-                    out.push(format!(
-                        "Index {} can't sort its columns: a columnstore column has no direction.",
-                        ix.info.name
-                    ));
+                    out.push(P::ColumnstoreSorted { index: index() });
                 }
                 if ix.info.is_clustered_columnstore() && ix.info.predicate.is_some() {
-                    out.push(format!(
-                        "Index {} can't be filtered: a clustered columnstore index stores every \
-                         row.",
-                        ix.info.name
-                    ));
+                    out.push(P::ClusteredColumnstoreFiltered { index: index() });
                 }
             } else if !ix.info.include.is_empty()
                 && !ix.info.is_tsql_xml_or_spatial()
@@ -715,16 +945,9 @@ impl TableDraft {
                 // What `index_takes_include` keeps the designer's field off,
                 // for a draft built any other way (S3.1-L1-01/03).
                 out.push(if ix.info.clustered == Some(true) {
-                    format!(
-                        "Index {} can't include columns: a clustered index holds every column \
-                         already.",
-                        ix.info.name
-                    )
+                    P::ClusteredInclude { index: index() }
                 } else {
-                    format!(
-                        "Index {} can't include columns: a unique constraint has no INCLUDE here.",
-                        ix.info.name
-                    )
+                    P::UniqueInclude { index: index() }
                 });
             }
             // What `index_takes_filter` keeps the designer's field off, for a
@@ -736,21 +959,11 @@ impl TableDraft {
                 && !index_takes_filter(&ix.info, dialect)
             {
                 out.push(if ix.info.clustered == Some(true) {
-                    format!(
-                        "Index {} can't be filtered: a clustered index covers every row.",
-                        ix.info.name
-                    )
+                    P::ClusteredFiltered { index: index() }
                 } else if is_sqlite_constraint_index(&ix.info) && supports_partial_index(dialect) {
-                    format!(
-                        "Index {} can't be filtered: it backs a UNIQUE constraint, which takes \
-                         no condition here. Drop it and add a unique index with the condition.",
-                        ix.info.name
-                    )
+                    P::ConstraintFiltered { index: index() }
                 } else {
-                    format!(
-                        "Index {} can't be filtered: this index can't be partial here.",
-                        ix.info.name
-                    )
+                    P::NotPartial { index: index() }
                 });
             }
             for c in &ix.info.columns {
@@ -758,20 +971,20 @@ impl TableDraft {
                 // nothing to look up — `(lower(email))` is the index's *value*,
                 // not a reference to something in the table above.
                 if !c.expression && !known(&c.name) {
-                    out.push(format!(
-                        "Index {} names {}, which isn't a column.",
-                        ix.info.name, c.name
-                    ));
+                    out.push(P::IndexNotColumn {
+                        index: index(),
+                        column: c.name.clone(),
+                    });
                 }
             }
             // Not refused here: a key column in the list as well, which SQL
             // Server refuses (Msg 1909) and PostgreSQL accepts — the server's
             // question, asked by the server.
             for c in ix.info.include.iter().filter(|c| !known(c)) {
-                out.push(format!(
-                    "Index {} includes {c}, which isn't a column.",
-                    ix.info.name
-                ));
+                out.push(P::IncludeNotColumn {
+                    index: index(),
+                    column: c.clone(),
+                });
             }
         }
         // **One clustered structure per table**: the key, where it clusters by
@@ -780,22 +993,17 @@ impl TableDraft {
         let key_clusters = !self.primary_key.is_empty()
             && key_clusters_by_default(dialect)
             && self.primary_key_clustered != Some(false);
-        let clustered: Vec<&str> = self
+        let clustered: Vec<String> = self
             .indexes
             .iter()
             .filter(|i| !i.info.is_primary() && i.info.clustered == Some(true))
-            .map(|i| i.info.name.as_str())
+            .map(|i| i.info.name.clone())
             .collect();
         if usize::from(key_clusters) + clustered.len() > 1 {
-            let mut what: Vec<String> = clustered.iter().map(|n| format!("index {n}")).collect();
-            if key_clusters {
-                what.insert(0, "the primary key".to_string());
-            }
-            out.push(format!(
-                "A table holds only one clustered index, and {} each cluster it - make all but \
-                 one nonclustered.",
-                what.join(" and ")
-            ));
+            out.push(P::ClusterClash {
+                key: key_clusters,
+                indexes: clustered,
+            });
         }
         // Foreign keys were the last section without a uniqueness arm, though
         // both siblings have one — so `ADD CONSTRAINT` with a name already in
@@ -804,29 +1012,24 @@ impl TableDraft {
         // the user sees it.
         let mut fk_names: HashSet<String> = HashSet::new();
         for fk in &self.foreign_keys {
+            let name = || fk.info.name.clone();
             if fk.info.name.trim().is_empty() {
-                out.push("Every foreign key needs a name.".to_string());
+                out.push(P::FkNoName);
             } else if !fk_names.insert(fk.info.name.to_ascii_lowercase()) {
-                out.push(format!(
-                    "Two foreign keys are both called {}.",
-                    fk.info.name
-                ));
+                out.push(P::FkTwice { name: name() });
             }
             if fk.info.ref_table.trim().is_empty() {
-                out.push(format!("Foreign key {} references no table.", fk.info.name));
+                out.push(P::FkNoTable { fk: name() });
             }
             if fk.info.columns.is_empty() || fk.info.columns.len() != fk.info.ref_columns.len() {
-                out.push(format!(
-                    "Foreign key {} must pair each column with one it references.",
-                    fk.info.name
-                ));
+                out.push(P::FkUnpaired { fk: name() });
             }
             for c in &fk.info.columns {
                 if !known(c) {
-                    out.push(format!(
-                        "Foreign key {} names {c}, which isn't a column.",
-                        fk.info.name
-                    ));
+                    out.push(P::FkNotColumn {
+                        fk: name(),
+                        column: c.clone(),
+                    });
                 }
             }
         }
@@ -838,13 +1041,17 @@ impl TableDraft {
             let name = ck.info.name.trim();
             if name.is_empty() {
                 if requires_named_checks(dialect) {
-                    out.push("Every check constraint needs a name.".to_string());
+                    out.push(P::CheckNoName);
                 }
             } else if !check_names.insert(name.to_ascii_lowercase()) {
-                out.push(format!("Two check constraints are both called {name}."));
+                out.push(P::CheckTwice {
+                    name: name.to_string(),
+                });
             }
             if ck.info.expression.trim().is_empty() {
-                out.push(format!("Check {name} has no predicate."));
+                out.push(P::CheckNoPredicate {
+                    name: name.to_string(),
+                });
             }
         }
         // **The two clauses the model carries and nothing checked.** `TableDraft`
@@ -859,21 +1066,28 @@ impl TableDraft {
         // rebuild has already dropped the original table by the time a `CREATE`
         // fails.
         if requires_rowid_key(dialect) && self.without_rowid && self.primary_key.is_empty() {
-            out.push("A WITHOUT ROWID table needs a primary key.".to_string());
+            out.push(P::WithoutRowidNoKey);
         }
         if self.strict {
             for c in &self.columns {
                 let ty = c.info.type_name.trim();
                 if !ty.is_empty() && !strict_type_allowed(dialect, ty) {
-                    out.push(format!(
-                        "STRICT tables take only INT, INTEGER, REAL, TEXT, BLOB or ANY — \
-                         {} is {ty}.",
-                        c.info.name.trim()
-                    ));
+                    out.push(P::StrictType {
+                        column: c.info.name.trim().to_string(),
+                        data_type: ty.to_string(),
+                    });
                 }
             }
         }
         out
+    }
+
+    /// [`TableDraft::problems`] in English.
+    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+        self.problems(dialect)
+            .iter()
+            .map(TableProblem::message)
+            .collect()
     }
 }
 

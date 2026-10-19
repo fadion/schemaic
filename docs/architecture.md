@@ -28577,10 +28577,11 @@ existing prose was left alone.
     every dialect, and `the_tabs_and_the_composed_lines_read_as_they_did_in_english` pins the tabs,
     the foreign-key detail and both titles. What stays English: the referential actions in the On
     delete/On update dropdowns (`NO ACTION`, `CASCADE`, …), which are SQL keywords; the samples
-    above; a new item's name (`column`, `{table}_idx`, `fk_{table}`, `{table}_chk`); and core's
-    prose — `TableDraft::validate`'s sentences, phase 4. An index hint is worded here,
-    `index_hint_text` over the `IndexHint` and its `subject` (`designer-hint-*`,
-    `english_says_every_index_hint_as_core_does`).
+    above; and a new item's name (`column`, `{table}_idx`, `fk_{table}`, `{table}_chk`). An index
+    hint is worded here, `index_hint_text` over the `IndexHint` and its `subject`
+    (`designer-hint-*`, `english_says_every_index_hint_as_core_does`), and so are the draft's
+    refusals: the footer and Preview's readiness read `TableDraft::problems`, never `validate`, and
+    `table_problem_text` words each `TableProblem` from `table-problem-*` (under `i18n.rs`).
   - `view_editor.rs` — the **view** modal (tree "Edit" on a view, "Create view" on a database/
     schema node *and* on the editor's right-click when the statement under the caret can be a
     view body — `ddl::can_be_view_body`, which seeds the draft with it), over `core::ddl`'s
@@ -40766,10 +40767,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below) — though
     `read_only_reason`'s own sentence inside one still is — nor the filter field's two refusals
     (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is, nor the
-    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor the database, view,
-    event, object and routine editors' refusals (`ddl::DatabaseProblem`/`ViewProblem`/
-    `EventProblem`/`ObjectProblem`/`RoutineProblem`, below) — the other drafts' `validate`
-    sentences still are.
+    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor any object editor's
+    refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`/`ObjectProblem`/
+    `RoutineProblem`/`TriggerProblem`/`TableProblem`, below), though every draft's `validate`
+    still answers core's English.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41000,15 +41001,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     `users-note-*`, joining sentences with a space in code as core does, held by
     `english_says_every_users_note_as_core_does`; the live tests read `message()`.
     The object editors' refusals are the case where core's English has more readers than the
-    interface does, and the database, view, event, object, routine and trigger editors are the first six; the shape
-    below is the one the remaining drafts are to take. A draft's `validate` stays core's English — still
+    interface does, and every editor — database, view, event, object, routine, trigger and the
+    table designer — now takes the shape below. A draft's `validate` stays core's English — still
     a `Vec<String>`, because core's many tests (and the live ones) read it — and becomes a thin
     wrapper over a typed
     `problems()`, one enum per draft — or per editor, where one editor holds several drafts —
     whose `message()` is that English byte for byte and which has
     no `Display`. The editor words `problems()` from the catalogue and asks
-    `problems().is_empty()` for Preview's readiness, so these six editors no longer read
-    `validate` at all. `DatabaseDraft::problems` answers `DatabaseProblem` (`NoName`, `BadCollation`),
+    `problems().is_empty()` for Preview's readiness, so no editor reads `validate` any more. `DatabaseDraft::problems` answers `DatabaseProblem` (`NoName`, `BadCollation`),
     `ViewDraft::problems(dialect)` answers `ViewProblem` (`NoName`, `NoSelect`, `NotAQuery`,
     `Materialized`, `Hidden`, `Verbatim`) — `view_not_editable_reason` now answering
     `Option<ViewProblem>` (`Hidden`/`Verbatim`) where it answered a `&'static str`, while
@@ -41032,7 +41032,15 @@ Re-introducing the anti-patterns these guard against is a regression:
     `engine: &'static str` (`OneEvent`, `NoTruncate`, `NoBody`, `RunsBody`, `NoWhen`); the set's
     own are `ConstraintTrigger`, `NotEditable` and `Twice`, each with the `name`, and `RankClash
     { rank, event, head, last }`, which keeps the names before the last as a list — the interface
-    joins them, and counts them for *both* or *all*. The event's name clash
+    joins them, and counts them for *both* or *all*. `TableDraft::problems(dialect)` answers
+    `TableProblem`, a variant per refusal carrying the draft's own names (`index`, `column`, `fk`,
+    a check's `name`, an XML index's `parent`; `StrictType` the `column` and its `data_type`), SQL
+    Server's XML, spatial and columnstore rules among them. Its `ClusterClash { key, indexes }`
+    keeps what clusters as a flag and a list, because core's English builds the sentence's subject
+    from them (*the primary key and index a and index b*): the interface builds the same from
+    `table-problem-cluster-key` and `-cluster-index`, joins them in code with a spaced
+    `table-problem-cluster-and`, and hands the result to `table-problem-cluster-clash` as
+    `$clustered`. The event's name clash
     is not a problem but a decision of its own: `EventDraft::clashes` is it, `name_clash` the
     English `Option<String>` wrapped round it, and the editor words a clash from
     `event-name-clash` with `$name` the draft's trimmed name. The routine's is the same shape with
@@ -41042,13 +41050,16 @@ Re-introducing the anti-patterns these guard against is a regression:
     original*), with `name_clash` its English and the decision itself unchanged. Each editor's
     renderer sits beside it (`database_problem_text`, `view_problem_text`,
     `event_problem_text`/`event_clash_text`, `object_problem_text`,
-    `routine_problem_text`/`routine_clash_text`, `trigger_problem_text`), held by
+    `routine_problem_text`/`routine_clash_text`, `trigger_problem_text`, `table_problem_text`),
+    held by
     `english_says_every_database_problem_as_core_does`,
     `english_says_every_view_problem_as_core_does`,
     `english_says_every_event_problem_as_core_does`,
     `english_says_every_object_problem_as_core_does`,
-    `english_says_every_routine_problem_as_core_does` and
-    `english_says_every_trigger_problem_as_core_does`. Those tests walk a hand-written list of
+    `english_says_every_routine_problem_as_core_does`,
+    `english_says_every_trigger_problem_as_core_does` and
+    `english_says_every_table_problem_as_core_does` (the clustered clash with and without the key,
+    over one index and two). Those tests walk a hand-written list of
     variants rather than an `ALL`, so a new variant fails the renderer's exhaustive `match` at
     compile time but is not held to its English until someone adds it to the list.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words

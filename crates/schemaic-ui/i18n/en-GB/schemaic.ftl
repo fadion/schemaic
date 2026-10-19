@@ -1554,6 +1554,54 @@ designer-index-redundant-detail = redundant
 # The designer's index advice, under the change count (core's ddl::IndexHint).
 # $index, $fk and $cover are names; $cover may be the SQL PRIMARY KEY.
 designer-hint-redundant = Index { $index } is covered by { $cover }: every lookup it serves, that one serves too.
+# What stops a table design being emitted (core's ddl::TableProblem), in the
+# footer. $name, $index, $column, $fk and $parent are the draft's own names;
+# the SQL in them stays as written.
+table-problem-no-name = The table needs a name.
+table-problem-no-columns = A table needs at least one column.
+table-problem-column-no-name = Every column needs a name.
+table-problem-column-twice = Two columns are both called { $name }.
+table-problem-column-no-type = Column { $name } needs a type.
+table-problem-key-not-column = The primary key names { $column }, which isn't a column.
+table-problem-index-no-name = Every index needs a name.
+table-problem-index-twice = Two indexes are both called { $name }.
+table-problem-index-no-columns = Index { $index } has no columns.
+table-problem-xml-one-column = Index { $index } must name exactly one column.
+table-problem-xml-no-options = Index { $index } can't be unique, include columns or be filtered: an XML or spatial index takes none of those.
+table-problem-xml-no-using = Index { $index } needs its USING XML INDEX … FOR … clause: a secondary XML index is built on a primary or selective one.
+table-problem-selective-no-paths = Index { $index } needs its FOR (…) paths: a selective XML index is the paths it promotes.
+table-problem-xml-parent-gone = Index { $index } is built on { $parent }, which isn't a primary or selective XML index of this table: it goes when its parent does.
+table-problem-not-orderable = Index { $index } can't be ordered: only a columnstore index has an ORDER.
+table-problem-order-not-column = Index { $index } orders by { $column }, which isn't a column.
+table-problem-order-not-stored = Index { $index } orders by { $column }, which it doesn't store.
+table-problem-columnstore-unique = Index { $index } can't be unique: a columnstore index stores columns, not keys.
+table-problem-columnstore-include = Index { $index } can't include columns: a columnstore index lists every column it stores.
+table-problem-columnstore-sorted = Index { $index } can't sort its columns: a columnstore column has no direction.
+table-problem-clustered-columnstore-filtered = Index { $index } can't be filtered: a clustered columnstore index stores every row.
+table-problem-clustered-include = Index { $index } can't include columns: a clustered index holds every column already.
+table-problem-unique-include = Index { $index } can't include columns: a unique constraint has no INCLUDE here.
+table-problem-clustered-filtered = Index { $index } can't be filtered: a clustered index covers every row.
+table-problem-constraint-filtered = Index { $index } can't be filtered: it backs a UNIQUE constraint, which takes no condition here. Drop it and add a unique index with the condition.
+table-problem-not-partial = Index { $index } can't be filtered: this index can't be partial here.
+table-problem-index-not-column = Index { $index } names { $column }, which isn't a column.
+table-problem-include-not-column = Index { $index } includes { $column }, which isn't a column.
+# More than one clustered structure. $clustered lists them — the -key and
+# -index phrases below, joined with -and between each.
+table-problem-cluster-clash = A table holds only one clustered index, and { $clustered } each cluster it - make all but one nonclustered.
+table-problem-cluster-key = the primary key
+table-problem-cluster-index = index { $index }
+table-problem-cluster-and = and
+table-problem-fk-no-name = Every foreign key needs a name.
+table-problem-fk-twice = Two foreign keys are both called { $name }.
+table-problem-fk-no-table = Foreign key { $fk } references no table.
+table-problem-fk-unpaired = Foreign key { $fk } must pair each column with one it references.
+table-problem-fk-not-column = Foreign key { $fk } names { $column }, which isn't a column.
+table-problem-check-no-name = Every check constraint needs a name.
+table-problem-check-twice = Two check constraints are both called { $name }.
+table-problem-check-no-predicate = Check { $name } has no predicate.
+table-problem-without-rowid-no-key = A WITHOUT ROWID table needs a primary key.
+# SQLite: $column of a STRICT table has $data_type, which it doesn't take.
+table-problem-strict-type = STRICT tables take only INT, INTEGER, REAL, TEXT, BLOB or ANY — { $column } is { $data_type }.
 designer-hint-unindexed-fk = Foreign key { $fk } has no index starting with its columns, so a delete or key update on the table it references scans this one.
 designer-no-index = No index selected. The primary key lives on the columns.
 designer-columns = Columns

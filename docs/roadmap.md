@@ -107,7 +107,10 @@ assertions pin English wording — stays the regression net throughout.
    the filter field's refusals (`FilterError::BracketInName`, `TrailingInput` beside
    `BadCondition`'s parser text; `grid::filter_error_text`), and the users browser's notes
    (`users::PrincipalsNote`, `GrantsNote`, `PgImplicit`, which `schemaic-db` now fills as
-   values; `users_view::principals_note_text`, `grants_note_text`).
+   values; `users_view::principals_note_text`, `grants_note_text`), and every object editor's
+   refusals (each draft's `validate` the English over a typed `problems()`: `TableProblem`,
+   `TriggerProblem`, `RoutineProblem`, `ObjectProblem`, `ViewProblem`, `EventProblem`,
+   `DatabaseProblem`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -145,11 +148,6 @@ assertions pin English wording — stays the regression net throughout.
      changed under the check, an `Err(String)` the row iterator hands the database layer
      mid-load; the write-back's problem, smaller.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
-   - **The object editors' refusals** — every draft's `validate` (`ddl.rs`), the sentences that
-     hold Preview, each given a typed `problems()` as `DatabaseDraft`, `ViewDraft`,
-     `EventDraft`, `RoutineDraft`, the trigger drafts (`TriggerProblem`) and the object
-     editor's (`ObjectProblem`) already have: what is left is the table designer's
-     (`TableDraft`, ~40).
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

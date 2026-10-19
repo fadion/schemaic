@@ -2562,6 +2562,109 @@ fn swap_selected(d: DdlUi, delta: isize) {
     d.rev.update(|r| *r += 1);
 }
 
+/// What stops the draft being emitted — core's `TableProblem::message` in the
+/// interface's language. Names are the draft's; the SQL in them stays.
+fn table_problem_text(p: &ddl::TableProblem) -> String {
+    use ddl::TableProblem as P;
+    fn s(v: &str) -> &str {
+        v
+    }
+    match p {
+        P::NoName => tr!("table-problem-no-name"),
+        P::NoColumns => tr!("table-problem-no-columns"),
+        P::ColumnNoName => tr!("table-problem-column-no-name"),
+        P::ColumnTwice { name } => tr!("table-problem-column-twice", name = s(name)),
+        P::ColumnNoType { name } => tr!("table-problem-column-no-type", name = s(name)),
+        P::KeyNotColumn { column } => tr!("table-problem-key-not-column", column = s(column)),
+        P::IndexNoName => tr!("table-problem-index-no-name"),
+        P::IndexTwice { name } => tr!("table-problem-index-twice", name = s(name)),
+        P::IndexNoColumns { index } => tr!("table-problem-index-no-columns", index = s(index)),
+        P::XmlOneColumn { index } => tr!("table-problem-xml-one-column", index = s(index)),
+        P::XmlNoOptions { index } => tr!("table-problem-xml-no-options", index = s(index)),
+        P::XmlNoUsing { index } => tr!("table-problem-xml-no-using", index = s(index)),
+        P::SelectiveNoPaths { index } => {
+            tr!("table-problem-selective-no-paths", index = s(index))
+        }
+        P::XmlParentGone { index, parent } => tr!(
+            "table-problem-xml-parent-gone",
+            index = s(index),
+            parent = s(parent)
+        ),
+        P::NotOrderable { index } => tr!("table-problem-not-orderable", index = s(index)),
+        P::OrderNotColumn { index, column } => tr!(
+            "table-problem-order-not-column",
+            index = s(index),
+            column = s(column)
+        ),
+        P::OrderNotStored { index, column } => tr!(
+            "table-problem-order-not-stored",
+            index = s(index),
+            column = s(column)
+        ),
+        P::ColumnstoreUnique { index } => {
+            tr!("table-problem-columnstore-unique", index = s(index))
+        }
+        P::ColumnstoreInclude { index } => {
+            tr!("table-problem-columnstore-include", index = s(index))
+        }
+        P::ColumnstoreSorted { index } => {
+            tr!("table-problem-columnstore-sorted", index = s(index))
+        }
+        P::ClusteredColumnstoreFiltered { index } => tr!(
+            "table-problem-clustered-columnstore-filtered",
+            index = s(index)
+        ),
+        P::ClusteredInclude { index } => tr!("table-problem-clustered-include", index = s(index)),
+        P::UniqueInclude { index } => tr!("table-problem-unique-include", index = s(index)),
+        P::ClusteredFiltered { index } => {
+            tr!("table-problem-clustered-filtered", index = s(index))
+        }
+        P::ConstraintFiltered { index } => {
+            tr!("table-problem-constraint-filtered", index = s(index))
+        }
+        P::NotPartial { index } => tr!("table-problem-not-partial", index = s(index)),
+        P::IndexNotColumn { index, column } => tr!(
+            "table-problem-index-not-column",
+            index = s(index),
+            column = s(column)
+        ),
+        P::IncludeNotColumn { index, column } => tr!(
+            "table-problem-include-not-column",
+            index = s(index),
+            column = s(column)
+        ),
+        P::ClusterClash { key, indexes } => {
+            let mut what: Vec<String> = indexes
+                .iter()
+                .map(|n| tr!("table-problem-cluster-index", index = n.as_str()))
+                .collect();
+            if *key {
+                what.insert(0, tr!("table-problem-cluster-key"));
+            }
+            let and = format!(" {} ", tr!("table-problem-cluster-and"));
+            tr!("table-problem-cluster-clash", clustered = what.join(&and))
+        }
+        P::FkNoName => tr!("table-problem-fk-no-name"),
+        P::FkTwice { name } => tr!("table-problem-fk-twice", name = s(name)),
+        P::FkNoTable { fk } => tr!("table-problem-fk-no-table", fk = s(fk)),
+        P::FkUnpaired { fk } => tr!("table-problem-fk-unpaired", fk = s(fk)),
+        P::FkNotColumn { fk, column } => tr!(
+            "table-problem-fk-not-column",
+            fk = s(fk),
+            column = s(column)
+        ),
+        P::CheckNoName => tr!("table-problem-check-no-name"),
+        P::CheckTwice { name } => tr!("table-problem-check-twice", name = s(name)),
+        P::CheckNoPredicate { name } => tr!("table-problem-check-no-predicate", name = s(name)),
+        P::WithoutRowidNoKey => tr!("table-problem-without-rowid-no-key"),
+        P::StrictType { column, data_type } => tr!(
+            "table-problem-strict-type",
+            column = s(column),
+            data_type = s(data_type)
+        ),
+    }
+}
+
 // ── the modal ────────────────────────────────────────────────────────────────
 
 /// The change set the draft currently describes — the same call the preview
@@ -2696,9 +2799,9 @@ pub(crate) fn table_designer_overlay(
             let status = dyn_container(
                 move || d.draft.get(),
                 move |draft| {
-                    let errs = draft.validate(status_target.dialect);
+                    let errs = draft.problems(status_target.dialect);
                     if let Some(first) = errs.first() {
-                        return crate::widgets::footer_error(first.clone());
+                        return crate::widgets::footer_error(table_problem_text(first));
                     }
                     let n = change_set(&status_target, &draft).len();
                     let count = text(tr!("editor-change-count", n = n))
@@ -2753,7 +2856,7 @@ pub(crate) fn table_designer_overlay(
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
-                    let ready = draft.validate(target.dialect).is_empty() && !cs.is_empty();
+                    let ready = draft.problems(target.dialect).is_empty() && !cs.is_empty();
                     h_stack((
                         action_button(
                             tr!("dialog-cancel"),
@@ -2945,6 +3048,93 @@ mod tests {
 #[cfg(test)]
 mod word_tests {
     use super::*;
+
+    /// **Every problem reads in English exactly as core's
+    /// `TableProblem::message`** — each variant, and the clustered clash with
+    /// and without the key, over one index and two.
+    #[test]
+    fn english_says_every_table_problem_as_core_does() {
+        use ddl::TableProblem as P;
+        let ix = || "ix_a".to_string();
+        let col = || "email".to_string();
+        let mut problems = vec![
+            P::NoName,
+            P::NoColumns,
+            P::ColumnNoName,
+            P::ColumnTwice { name: col() },
+            P::ColumnNoType { name: col() },
+            P::KeyNotColumn { column: col() },
+            P::IndexNoName,
+            P::IndexTwice { name: ix() },
+            P::IndexNoColumns { index: ix() },
+            P::XmlOneColumn { index: ix() },
+            P::XmlNoOptions { index: ix() },
+            P::XmlNoUsing { index: ix() },
+            P::SelectiveNoPaths { index: ix() },
+            P::XmlParentGone {
+                index: ix(),
+                parent: "pxml".into(),
+            },
+            P::NotOrderable { index: ix() },
+            P::OrderNotColumn {
+                index: ix(),
+                column: col(),
+            },
+            P::OrderNotStored {
+                index: ix(),
+                column: col(),
+            },
+            P::ColumnstoreUnique { index: ix() },
+            P::ColumnstoreInclude { index: ix() },
+            P::ColumnstoreSorted { index: ix() },
+            P::ClusteredColumnstoreFiltered { index: ix() },
+            P::ClusteredInclude { index: ix() },
+            P::UniqueInclude { index: ix() },
+            P::ClusteredFiltered { index: ix() },
+            P::ConstraintFiltered { index: ix() },
+            P::NotPartial { index: ix() },
+            P::IndexNotColumn {
+                index: ix(),
+                column: col(),
+            },
+            P::IncludeNotColumn {
+                index: ix(),
+                column: col(),
+            },
+            P::FkNoName,
+            P::FkTwice {
+                name: "fk_a".into(),
+            },
+            P::FkNoTable { fk: "fk_a".into() },
+            P::FkUnpaired { fk: "fk_a".into() },
+            P::FkNotColumn {
+                fk: "fk_a".into(),
+                column: col(),
+            },
+            P::CheckNoName,
+            P::CheckTwice {
+                name: "ck_a".into(),
+            },
+            P::CheckNoPredicate {
+                name: "ck_a".into(),
+            },
+            P::WithoutRowidNoKey,
+            P::StrictType {
+                column: col(),
+                data_type: "VARCHAR(20)".into(),
+            },
+        ];
+        for (key, indexes) in [
+            (true, vec![ix()]),
+            (false, vec![ix(), "ix_b".to_string()]),
+            (true, vec![ix(), "ix_b".to_string()]),
+        ] {
+            problems.push(P::ClusterClash { key, indexes });
+        }
+        for p in problems {
+            assert_eq!(table_problem_text(&p), p.message(), "{p:?}");
+        }
+    }
 
     /// Both index hints read in English exactly as core's `message` — a
     /// subject the draft holds and one it no longer does.
