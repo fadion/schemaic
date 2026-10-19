@@ -1992,9 +1992,26 @@ pub struct ModalError {
     /// (`intel::run_error_diagnostic`). `None` from every other engine, and
     /// from every surface but a run.
     pub at: Option<usize>,
+    /// The error as the interface's language words it, where that differs —
+    /// **for the eye only** ([`ModalError::displayed`]). *Explain*, *AI fix*,
+    /// the write log and the code that finds the error in the statement read
+    /// `text`, the English, so a model is never sent a translation and a log
+    /// is never written in one.
+    pub shown: Option<String>,
 }
 
 impl ModalError {
+    /// The same error, shown as `shown`; its `text` stays what acts on it.
+    pub fn shown_as(self, shown: impl Into<String>) -> Self {
+        Self {
+            shown: Some(shown.into()),
+            ..self
+        }
+    }
+    /// What a bar or the modal shows: the wording, or the text.
+    pub fn displayed(&self) -> &str {
+        self.shown.as_deref().unwrap_or(&self.text)
+    }
     pub fn statement(text: impl Into<String>) -> Self {
         Self::new(text, ErrorSource::Statement)
     }
@@ -2013,7 +2030,9 @@ impl ModalError {
     /// nothing to do about them.
     pub fn worth_viewing(&self, fits_chars: usize) -> bool {
         let c = ErrorModalContent::resolve(Some(self.clone()), None);
-        c.explain.is_some() || c.fix.is_some() || crate::text::hides_detail(&self.text, fits_chars)
+        c.explain.is_some()
+            || c.fix.is_some()
+            || crate::text::hides_detail(self.displayed(), fits_chars)
     }
     /// The same error, reported somewhere its statement is not the editor's —
     /// a grid filter/sort re-run, whose SQL Schemaic built. A statement's
@@ -2022,7 +2041,10 @@ impl ModalError {
     /// sources already say that.
     pub fn about_another_statement(self) -> Self {
         match self.source {
-            ErrorSource::Statement => Self::server(self.text),
+            ErrorSource::Statement => Self {
+                source: ErrorSource::Server,
+                ..self
+            },
             ErrorSource::Server | ErrorSource::App => self,
         }
     }
@@ -2034,6 +2056,7 @@ impl ModalError {
             text: text.into(),
             source,
             at: None,
+            shown: None,
         }
     }
     /// The same error, with the server's position ([`ModalError::at`]).
@@ -2077,7 +2100,13 @@ impl ErrorModalContent {
         kept: bool,
     ) -> Self {
         let kept = kept && over.is_none();
-        let Some(ModalError { text, source, .. }) = over.or(tab_error) else {
+        let Some(ModalError {
+            text,
+            source,
+            shown,
+            ..
+        }) = over.or(tab_error)
+        else {
             return Self::default();
         };
         // A match, not `!= App`: a fourth source has to decide its own actions
@@ -2091,7 +2120,7 @@ impl ErrorModalContent {
         Self {
             explain: explain.then(|| text.clone()),
             fix: fix.then(|| text.clone()),
-            shown: Some(text),
+            shown: Some(shown.unwrap_or(text)),
         }
     }
 
@@ -2116,6 +2145,42 @@ mod tests {
     use super::*;
 
     // ── the error modal's actions ───────────────────────────────────────────
+
+    /// **What an error is shown as is not what the AI is sent.** An error
+    /// worded in the interface's language is for the eye; *Explain* and *AI
+    /// fix* hand the model `text`, the English, whatever the bar and the modal
+    /// show — and an error with no wording of its own shows its text.
+    #[test]
+    fn the_actions_act_on_the_english_whatever_is_shown() {
+        let e = ModalError::statement("query failed: Unknown column 'x'")
+            .shown_as("Abfrage fehlgeschlagen: Unknown column 'x'");
+        assert_eq!(e.displayed(), "Abfrage fehlgeschlagen: Unknown column 'x'");
+        let c = ErrorModalContent::resolve(Some(e.clone()), None);
+        assert_eq!(
+            c.shown.as_deref(),
+            Some("Abfrage fehlgeschlagen: Unknown column 'x'")
+        );
+        assert_eq!(
+            c.explain.as_deref(),
+            Some("query failed: Unknown column 'x'")
+        );
+        assert_eq!(c.fix.as_deref(), Some("query failed: Unknown column 'x'"));
+        // Off the editor the wording survives the change of source.
+        let other = e.about_another_statement();
+        assert_eq!(
+            other.displayed(),
+            "Abfrage fehlgeschlagen: Unknown column 'x'"
+        );
+        assert_eq!(other.text, "query failed: Unknown column 'x'");
+        let plain = ModalError::server("connection refused");
+        assert_eq!(plain.displayed(), "connection refused");
+        assert_eq!(
+            ErrorModalContent::resolve(Some(plain), None)
+                .shown
+                .as_deref(),
+            Some("connection refused")
+        );
+    }
 
     /// **A kept failure is a snapshot of a statement that may no longer be in
     /// the buffer**, and both actions resolve against the buffer: *AI fix* asked

@@ -4372,7 +4372,11 @@ pub(crate) fn grid_error_bar(
         };
         // Collapse to a single line (a multi-line server error would spill out
         // the top); the full text stays available in the View modal.
-        let one_line = msg.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let one_line = msg
+            .displayed()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         // View when the bar is hiding something — a server error with a DETAIL
         // under it — **or when the modal has an action this bar does not**: the
         // server's words get "Explain" there. See `ModalError::worth_viewing`.

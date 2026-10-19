@@ -358,6 +358,18 @@ existing prose was left alone.
     Schemaic's own ("Not connected — the commit was not attempted") and only the producer knows
     which; `settle_after_switch` passes it through untouched, source and all
     (`a_failure_survives_a_switch_unchanged` checks both).
+    **A `ModalError`'s `text` is always English; a translation goes in `shown`**, which is for the
+    eye alone. `displayed()` — the wording, else the text — is what the editor's error bar and the
+    grid's bottom bar draw and what `worth_viewing` measures, and `resolve_kept` hands it on as
+    `ErrorModalContent::shown`, while `explain` and `fix` go on carrying `text`. Everything that
+    *acts* on the error reads `text`: *Explain* and *AI fix* send it to the model, the statement
+    *Explain* attaches is located in it (`explain_range` reads `fix`), and the write log records it
+    (`ran_of` on a `QueryState::Failed`). The two used to be one field, and when the grid Commit's
+    failure began to be worded from the catalogue (`modal_error_shown`, under `app/main.rs`) the
+    wording went into `text` — so under a non-English interface *Explain* sent the model a
+    translation. A producer with a wording sets it with `shown_as`, which leaves `text` alone;
+    `about_another_statement` changes the source and keeps `shown`
+    (`the_actions_act_on_the_english_whatever_is_shown`).
   - `access.rs` — **what a dump's replay drops besides the objects, and the statements that put it
     back**: `ReplayAccess { tables, routines }`, on `DbSchema::replay_access`, each half `None`
     where it was not read. It is read by the dump runner alone, for a file that drops
@@ -18927,8 +18939,9 @@ existing prose was left alone.
   `ModalError::new(to_string(), modal_source()).about_another_statement()`, for an error raised by
   something that is not the editor's statement (a grid Commit, `end_tx`); it is one composition
   because the commit arm had restated it by hand and got `Refused` wrong. The grid Commit now asks
-  the app's `modal_error_shown`, its twin with the text from `db_error_shown`, so a `Write` reaches
-  the modal in the interface's language with the same source.
+  the app's `modal_error_shown`, its twin *shown as* `db_error_shown` words it
+  (`ModalError::shown_as`), so a `Write` reaches the modal in the interface's language with the
+  same source — while its `text` stays `to_string()`, the English *Explain* sends the model.
   `app/main.rs`'s run paths ask it of the `DbError` a run ends in rather than
   choosing a source per site, which is how a refused connection stopped being offered a fix into
   the buffer. Those paths answer `Cancelled` in arms of their own first — the not-sent, timeout and
@@ -31228,7 +31241,9 @@ existing prose was left alone.
     bar and the modal offer it, on the same `ErrorModalContent::resolve` answer, and both send a
     statement with the question only when the error also earns a fix — the modal's rule, which the
     bar's `explain_error` now shares, so over a refused connection the bar neither sends nor
-    highlights a statement the error is not about. On the bar the two AI actions sit **together at
+    highlights a statement the error is not about. What either sends is the error's `text`, English
+    whatever language the bar and the modal show it in (`ModalError::shown`, under `core::model`).
+    On the bar the two AI actions sit **together at
     the far edge**, which is what the sparkle marks — *View* opens a window, those two reach a model — and the bar is
     **responsive about them**: `error_bar_fits_explain` measures every gap and label to the right of
     the message and asks whether they fit in the share the message's own `max_width_pct` leaves them
@@ -32950,7 +32965,10 @@ existing prose was left alone.
     (`copy-table-unnamed`, `-choose-database`, `-onto-itself`), held to its `message` by
     `english_says_every_copy_refusal_as_core_does`. The failure sentences above are `copy-stopped`
     and `copy-counter-not-moved`, and the copy's own error inside the first is `db_error_shown`'s,
-    so a `DbError::Write` — the rollback clause included — is worded too. What stays English: any
+    so a `DbError::Write` — the rollback clause included — is worded too. That is the modal's
+    copy only: the write log's entry takes the same error's `to_string()`, carried beside it as the
+    app's `CopyFailed` `(logged, shown)`, because one string for both wrote a German interface's
+    wording into the persisted log. What stays English: any
     other error inside them, the settle's `run_ddl` failure among them, which arrive whole; and the
     `<table>_copy` default, which is an identifier.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
@@ -34536,7 +34554,8 @@ existing prose was left alone.
   is a `tracing::warn!` and nothing else — the write it records has already happened, and must not
   be reported as failing because its record did. `log_landed` hands a run's entry to the sink as
   `write_log::Entry::landed` ends it, through the thin `ran_of(&QueryState)` — `Loaded` its
-  `affected`, `Failed` the engine's message, `Cancelled` cancelled, which may still have written, a
+  `affected`, `Failed` the engine's message — the `ModalError`'s English `text`, never its `shown`
+  wording — `Cancelled` cancelled, which may still have written, a
   sent statement not being unsent; `Idle`/`Running` nothing. Its `aborted_before` is whether the
   tab's transaction was `TxState::Poisoned` when the statement ran, which is what turns a typed
   `COMMIT` PostgreSQL reported as a success into the `failed` line it really was (under
@@ -41265,9 +41284,16 @@ Re-introducing the anti-patterns these guard against is a regression:
     rollback messages open with `{" "}`**, because Fluent drops a value's leading blank and the
     clause is appended straight after the cause; written as plain text they lose the space.
     The app's `db_error_shown` asks it for a `Write` and `to_string()` for anything else, and
-    `modal_error_shown` is `modal_about_another_statement` over that text; the Commit's
-    `CommitDone::Failed`, the import's `ImportOutcome::Failed` and the copy's failure take them,
-    while the log keeps `to_string()`, English. What stays English: the server's or driver's
+    `modal_error_shown` is `modal_about_another_statement` *shown as* that text
+    (`ModalError::shown_as`); the Commit's `CommitDone::Failed`, the import's
+    `ImportOutcome::Failed` and the copy's failure take them, while every log keeps `to_string()`,
+    English. **The wording never replaces the English; it rides beside it.** The first cut did
+    replace it, twice: `modal_error_shown` put the worded text in `ModalError::text`, which
+    *Explain* and *AI fix* send, so a German interface sent the model German; and the copy's failure
+    was one `db_error_shown` string for both the modal and `write_log::Entry::ended`, so it wrote
+    German into the persisted write log. The copy now carries both, `(logged, shown)` in the app's
+    `CopyFailed`, and a `ModalError`'s `text` is English by rule (under `core::model`). What stays
+    English: the server's or driver's
     words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and a
     database-layer refusal's own text inside `Refused` (SQL
     Server's blank-string and code-page refusals — the note after it is worded); and every write
@@ -45069,8 +45095,9 @@ this bundle's.
   this crate's account of a Stop whose rollback did not undo everything — a `DbError::Refused`
   once, a `DbError::Write` of `WriteCause::CommitCancelled` now — which the
   arm's hand-written "`Cancelled` is `App`, everything else `Server`" had offered *Explain* on; the
-  arm now asks the app's `modal_error_shown`, `DbError::modal_about_another_statement` with the
-  text in the interface's language, instead — a paste that landed nothing,
+  arm now asks the app's `modal_error_shown`, `DbError::modal_about_another_statement` shown in
+  the interface's language — the bar draws `ModalError::displayed()`, while the `text` *Explain*
+  sends stays English — instead; a paste that landed nothing,
   the row panel's and the JSON editor's
   refusals, AI fill/seed failures, the filter row's three refusals (a `BadCondition` is
   `sqlparser`'s reading of the typed condition, not the database's), the `db_for`/`session_for`

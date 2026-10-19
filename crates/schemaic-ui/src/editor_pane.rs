@@ -6778,7 +6778,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Collapse to a single line: a multi-line error otherwise makes the
                 // text taller than the bar and spills out the top (`text_ellipsis`
                 // only trims one line). The full text is still in the View modal.
-                let one_line = msg.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let one_line = msg
+                    .displayed()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 // Which of the two AI actions this error earns — the modal's
                 // own answer, so a run Schemaic refused before sending offers
                 // neither here either, a refused connection no fix, and a kept

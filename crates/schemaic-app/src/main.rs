@@ -399,9 +399,6 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Decode the bundled PNG into a window icon (title bar / taskbar, both OSes).
-/// Returns `None` if the image can't be decoded, in which case the window just
-/// uses the platform default.
 /// `e` as the interface says it: a write path's failure ([`DbError::Write`])
 /// in the interface's language, anything else as it displays. The log keeps
 /// `to_string()`, which is English.
@@ -412,12 +409,22 @@ fn db_error_shown(e: &DbError) -> String {
     }
 }
 
-/// [`DbError::modal_about_another_statement`], worded by [`db_error_shown`].
+/// [`DbError::modal_about_another_statement`], shown as [`db_error_shown`]
+/// words it — its `text` stays the English, which *Explain* sends the model
+/// and the write log keeps.
 fn modal_error_shown(e: &DbError) -> schemaic_core::model::ModalError {
-    schemaic_core::model::ModalError::new(db_error_shown(e), e.modal_source())
-        .about_another_statement()
+    e.modal_about_another_statement()
+        .shown_as(db_error_shown(e))
 }
 
+/// How a copy ended short: the rows committed before what failed, when the
+/// settle failed after them, and what failed — `(logged, shown)`, the write
+/// log's English and the modal's wording — or `None` for a Stop.
+type CopyFailed = (Option<u64>, Option<(String, String)>);
+
+/// Decode the bundled PNG into a window icon (title bar / taskbar, both OSes).
+/// Returns `None` if the image can't be decoded, in which case the window just
+/// uses the platform default.
 fn app_icon() -> Option<Icon> {
     let bytes = include_bytes!("../../../assets/icon.png");
     let img = image::load_from_memory(bytes).ok()?.into_rgba8();
@@ -10207,45 +10214,40 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let report = {
                     let (copy_token, log_write, dst_conn) =
                         (copy_token.clone(), log_write.clone(), req.dst_conn);
-                    create_ext_action(
-                        cx,
-                        move |res: Result<u64, (Option<u64>, Option<String>)>| {
-                            use schemaic_core::write_log::Outcome;
-                            schemaic_core::copy_table::release(
-                                &mut copy_token.borrow_mut(),
-                                launch,
-                            );
-                            // `(committed, message)`: the rows that were in before
-                            // what failed — the settle runs after they committed —
-                            // and what did.
-                            let entry = match &res {
-                                Ok(n) => entry.clone().ended(Ok(Some(*n))),
-                                Err((committed, Some(e))) => {
-                                    let mut entry = entry.clone().ended(Err(e.clone()));
-                                    entry.rows = *committed;
-                                    entry
-                                }
-                                Err((_, None)) => entry.clone().ended_as(Outcome::Cancelled, None),
-                            };
-                            (log_write)(dst_conn, dialect, entry);
-                            done(match res {
-                                Ok(n) => CopyOutcome::Done(n),
-                                Err((_, None)) => CopyOutcome::Cancelled,
-                                Err((Some(n), Some(e))) => CopyOutcome::Failed(tr!(
-                                    "copy-counter-not-moved",
-                                    count = n,
-                                    error = e
-                                )),
-                                // **Not "the table is empty"**: the rows are one
-                                // transaction, but a table whose engine ignores the
-                                // rollback (a MyISAM or Aria copy of one) keeps
-                                // what arrived, and the error's own note says so.
-                                Err((None, Some(e))) => {
-                                    CopyOutcome::Failed(tr!("copy-stopped", error = e))
-                                }
-                            });
-                        },
-                    )
+                    create_ext_action(cx, move |res: Result<u64, CopyFailed>| {
+                        use schemaic_core::write_log::Outcome;
+                        schemaic_core::copy_table::release(&mut copy_token.borrow_mut(), launch);
+                        // `(committed, (logged, shown))`: the rows that were in
+                        // before what failed — the settle runs after they
+                        // committed — and what did, in the log's English and
+                        // as the modal words it.
+                        let entry = match &res {
+                            Ok(n) => entry.clone().ended(Ok(Some(*n))),
+                            Err((committed, Some((logged, _)))) => {
+                                let mut entry = entry.clone().ended(Err(logged.clone()));
+                                entry.rows = *committed;
+                                entry
+                            }
+                            Err((_, None)) => entry.clone().ended_as(Outcome::Cancelled, None),
+                        };
+                        (log_write)(dst_conn, dialect, entry);
+                        done(match res {
+                            Ok(n) => CopyOutcome::Done(n),
+                            Err((_, None)) => CopyOutcome::Cancelled,
+                            Err((Some(n), Some((_, e)))) => CopyOutcome::Failed(tr!(
+                                "copy-counter-not-moved",
+                                count = n,
+                                error = e
+                            )),
+                            // **Not "the table is empty"**: the rows are one
+                            // transaction, but a table whose engine ignores the
+                            // rollback (a MyISAM or Aria copy of one) keeps
+                            // what arrived, and the error's own note says so.
+                            Err((None, Some((_, e)))) => {
+                                CopyOutcome::Failed(tr!("copy-stopped", error = e))
+                            }
+                        });
+                    })
                 };
                 let tx = copy_tx.clone();
                 handle.spawn(async move {
@@ -10274,11 +10276,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         Ok(n) => {
                             match dst.run_ddl(&req.target.database, &req.settle, token).await {
                                 Ok(()) => Ok(n),
-                                Err(e) => Err((Some(n), Some(e.to_string()))),
+                                Err(e) => Err((Some(n), Some((e.to_string(), e.to_string())))),
                             }
                         }
                         Err(DbError::Cancelled) => Err((None, None)),
-                        Err(e) => Err((None, Some(db_error_shown(&e)))),
+                        Err(e) => Err((None, Some((e.to_string(), db_error_shown(&e))))),
                     };
                     report(outcome);
                 });
