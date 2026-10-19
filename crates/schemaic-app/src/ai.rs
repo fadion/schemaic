@@ -744,11 +744,9 @@ const RUN_DIR_PREFIX: &str = "schemaic-run-";
 /// finds itself. One wording for all three spawn paths, on the same grounds
 /// [`no_tools_note`] gives: the failure was that each said something different,
 /// and two of them said nothing.
-const NO_CWD: &str = "**The assistant could not start.** Schemaic gives every agent process a \
-     private working directory of its own, and neither the system temp \
-     directory nor the config directory would take one — so there is nowhere to \
-     run it that is not somebody else's directory. Check that the temp \
-     directory is writable and try again.";
+fn no_cwd() -> String {
+    tr!("ai-no-cwd")
+}
 
 /// `mkdir` — **not** `mkdir -p` — at `0o700` where the platform has modes.
 ///
@@ -985,10 +983,9 @@ pub(crate) fn inline_plan(
     inline_gate(harness, p.constraint)?;
     let output = schemaic_ai::harness::inline_output(harness);
     let last_message = match output {
-        schemaic_ai::harness::InlineOutput::LastMessageFile => Some(
-            inline_reply_path()
-                .ok_or_else(|| "Couldn't create a temporary file for the reply.".to_string())?,
-        ),
+        schemaic_ai::harness::InlineOutput::LastMessageFile => {
+            Some(inline_reply_path().ok_or_else(|| tr!("ai-no-reply-file"))?)
+        }
         schemaic_ai::harness::InlineOutput::Stdout => None,
     };
     let env = inline_env(harness)?;
@@ -1077,24 +1074,13 @@ fn inline_env(harness: Harness) -> Result<Vec<(std::ffi::OsString, std::ffi::OsS
     match harness {
         Harness::OpenCode => crate::opencode::OpenCodeConfig::write_inline()
             .map(|c| c.env())
-            .ok_or_else(|| {
-                "Couldn't write OpenCode's configuration, so the generation was not started \
-                 (without it the CLI would run with its own tools enabled)."
-                    .to_string()
-            }),
+            .ok_or_else(|| tr!("ai-inline-no-opencode-config")),
         Harness::Copilot => crate::copilot::CopilotHome::write_inline()
             .map(|h| h.env())
-            .ok_or_else(|| {
-                "Couldn't create GitHub Copilot's private home directory, so the generation \
-                 was not started (without it the CLI would load your own Copilot \
-                 configuration, including its MCP servers and hooks)."
-                    .to_string()
-            }),
-        Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::Cursor => Err(format!(
-            "{} is marked as isolated by its environment, but Schemaic has no way to \
-             set that environment up, so the generation was not started.",
-            harness.label()
-        )),
+            .ok_or_else(|| tr!("ai-inline-no-copilot-home")),
+        Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::Cursor => {
+            Err(tr!("ai-inline-no-env-writer", cli = harness.label()))
+        }
     }
 }
 
@@ -1110,25 +1096,17 @@ fn inline_env(harness: Harness) -> Result<Vec<(std::ffi::OsString, std::ffi::OsS
 /// closed.
 fn inline_cwd(harness: Harness) -> Result<PathBuf, String> {
     if !harness.restricts_by_workspace_rules() {
-        return session_cwd().ok_or_else(|| NO_CWD.to_string());
+        return session_cwd().ok_or_else(no_cwd);
     }
     match harness {
         Harness::Cursor => crate::cursor::CursorWorkspace::write_inline()
             .map(|w| w.root().to_path_buf())
-            .ok_or_else(|| {
-                "Couldn't write Cursor's permissions file, so the generation was not \
-                 started (without it the CLI writes files unprompted)."
-                    .to_string()
-            }),
+            .ok_or_else(|| tr!("ai-inline-no-cursor-rules")),
         Harness::Claude
         | Harness::Codex
         | Harness::Antigravity
         | Harness::OpenCode
-        | Harness::Copilot => Err(format!(
-            "{} is marked as restricted by a permissions file, but Schemaic has no way \
-             to write one for it, so the generation was not started.",
-            harness.label()
-        )),
+        | Harness::Copilot => Err(tr!("ai-inline-no-rules-writer", cli = harness.label())),
     }
 }
 
@@ -1574,11 +1552,7 @@ fn refuse_every_turn(
 /// line, and nothing again — while the system prompt kept telling the model it
 /// has `list_schema`, `describe_table` and `run_query`.
 fn no_tools_note(cause: &str) -> String {
-    format!(
-        "**This session has no database tools.** {cause}, so the assistant \
-         cannot look anything up — it can only answer from the schema outline \
-         already in its prompt. Closing and reopening the panel will try again."
-    )
+    tr!("ai-no-tools", cause = cause)
 }
 
 /// Why a session of `harness` must not start, when the directory that
@@ -1594,37 +1568,21 @@ fn no_tools_note(cause: &str) -> String {
 /// [`Harness::env_seal`] or [`Harness::restricts_by_workspace_rules`] — and
 /// `a_harness_restricted_by_a_directory_refuses_without_it` holds that over
 /// every harness.
-fn isolation_refusal(harness: Harness, wrote: bool) -> Option<&'static str> {
+fn isolation_refusal(harness: Harness, wrote: bool) -> Option<String> {
     if wrote {
         return None;
     }
     match harness {
-        Harness::OpenCode => Some(
-            "Schemaic could not write the configuration that restricts \
-             OpenCode, so the assistant is disabled — running it without \
-             that file would give the session a shell. Check that the \
-             app's data directory is writable.",
-        ),
+        Harness::OpenCode => Some(tr!("ai-refused-no-opencode-config")),
         // **Refused too, though the seal would hold.** The allowlist is on
         // the command line and survives a missing home; what does not is
         // the isolation, and without it the CLI starts every server in the
         // user's own `mcp-config.json` and loads their hooks, which are
         // commands.
-        Harness::Copilot => Some(
-            "Schemaic could not create GitHub Copilot's private home \
-             directory, so the assistant is disabled — without it the CLI \
-             would load your own Copilot configuration, including its MCP \
-             servers and hooks. Check that the app's data directory is \
-             writable.",
-        ),
+        Harness::Copilot => Some(tr!("ai-refused-no-copilot-home")),
         // **Refused, because a missing file fails open.** Measured: with no
         // permissions file a headless Cursor turn wrote a file unprompted.
-        Harness::Cursor => Some(
-            "Schemaic could not write the permissions file that keeps Cursor \
-             from writing files and running commands, so the assistant is \
-             disabled — without it Cursor writes files unprompted. Check that \
-             the app's data directory is writable.",
-        ),
+        Harness::Cursor => Some(tr!("ai-refused-no-cursor-rules")),
         Harness::Claude | Harness::Codex | Harness::Antigravity => None,
     }
 }
@@ -1754,7 +1712,7 @@ pub(crate) fn start_ai_session(
     // one directory for the whole session, which is what the non-persistent
     // branch already wanted.
     let Some(cwd) = session_cwd() else {
-        let why = NO_CWD.to_string();
+        let why = no_cwd();
         let _ = ai_tx.send(AiStreamMsg {
             segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
             done: true,
@@ -1827,10 +1785,7 @@ pub(crate) fn start_ai_session(
             (Harness::Codex, None) => {
                 overrides = schemaic_ai::harness::codex_isolation_only();
                 tracing::warn!("no endpoint file for Codex; this session has no database tools");
-                degraded = Some(no_tools_note(
-                    "Schemaic could not create the private file that tells the assistant \
-                     how to reach your database",
-                ));
+                degraded = Some(no_tools_note(&tr!("ai-no-endpoint-file")));
             }
             // **OpenCode's whole configuration is a directory**, written here
             // rather than per turn: the contents do not change between turns of
@@ -1860,10 +1815,7 @@ pub(crate) fn start_ai_session(
             // not the one-shots': it is still a conversation to resume.
             (Harness::Copilot, None) => {
                 copilot_home = crate::copilot::CopilotHome::write(&exe, None);
-                degraded = Some(no_tools_note(
-                    "Schemaic could not create the private file that tells the assistant \
-                     how to reach your database",
-                ));
+                degraded = Some(no_tools_note(&tr!("ai-no-endpoint-file")));
             }
             // **Cursor's working directory is its restriction**: the
             // permissions file that refuses its writers, and our server beside
@@ -1875,10 +1827,7 @@ pub(crate) fn start_ai_session(
                 let allowed: Vec<String> = allowed.iter().map(|t| t.to_string()).collect();
                 cursor_ws = crate::cursor::CursorWorkspace::write(&exe, ep.as_deref(), &allowed);
                 if ep.is_none() {
-                    degraded = Some(no_tools_note(
-                        "Schemaic could not create the private file that tells the assistant \
-                         how to reach your database",
-                    ));
+                    degraded = Some(no_tools_note(&tr!("ai-no-endpoint-file")));
                 }
             }
             _ => {}
@@ -1909,7 +1858,6 @@ pub(crate) fn start_ai_session(
         .is_some();
         let refused = isolation_refusal(harness, wrote);
         if let Some(why) = refused {
-            let why = why.to_string();
             let _ = ai_tx.send(AiStreamMsg {
                 segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
                 done: true,
@@ -1973,9 +1921,7 @@ pub(crate) fn start_ai_session(
                         .unwrap_or_else(|e| Err(e.to_string()));
                 if let Err(e) = approved {
                     tracing::warn!("could not approve the Schemaic MCP server with Cursor: {e}");
-                    degraded = Some(no_tools_note(&format!(
-                        "Schemaic could not approve its database tools with Cursor ({e})"
-                    )));
+                    degraded = Some(no_tools_note(&tr!("ai-cursor-not-approved", error = e)));
                 }
             }
             if let Some(why) = degraded {
@@ -2083,11 +2029,11 @@ pub(crate) fn start_ai_session(
                 let mut child = match child {
                     Ok(c) => c,
                     Err(e) => {
-                        pump.fail(format!(
-                            "Couldn't launch the `{}` CLI ({e}). Ensure {} is installed, \
-                             or give it a path in Settings → AI.",
-                            harness.bin(),
-                            harness.label()
+                        pump.fail(tr!(
+                            "ai-launch-failed-turn",
+                            bin = harness.bin(),
+                            error = e.to_string(),
+                            cli = harness.label()
                         ));
                         continue;
                     }
@@ -2228,10 +2174,7 @@ pub(crate) fn start_ai_session(
                         let joined = raw.join("\n");
                         let why =
                             schemaic_ai::cli_failure_message(harness, code, &joined, &stderr_text);
-                        pump.fail(format!(
-                            "The {} turn ended unexpectedly: {why}",
-                            harness.label()
-                        ));
+                        pump.fail(tr!("ai-turn-ended", cli = harness.label(), error = why));
                     }
                 }
             }
@@ -2334,10 +2277,7 @@ pub(crate) fn start_ai_session(
             tracing::warn!(
                 "no endpoint plumbing for {harness:?}; this session has no database tools"
             );
-            degraded = Some(no_tools_note(
-                "Schemaic could not create the private file that tells the assistant \
-                 how to reach your database",
-            ));
+            degraded = Some(no_tools_note(&tr!("ai-no-endpoint-file")));
         }
         let _registration = match (needs_agy, agy_install) {
             (false, _) => None,
@@ -2362,10 +2302,11 @@ pub(crate) fn start_ai_session(
                     // one connection, so a second window gets no tools rather
                     // than repointing the first one's — and "could not register"
                     // would send the user looking for a broken install.
-                    let why = reg.as_ref().and_then(|r| r.blocked_reason()).unwrap_or(
-                        "Schemaic could not register its database tools with Antigravity",
-                    );
-                    degraded = Some(no_tools_note(why));
+                    let why = reg
+                        .as_ref()
+                        .and_then(|r| r.blocked_reason())
+                        .map_or_else(|| tr!("ai-antigravity-not-registered"), str::to_string);
+                    degraded = Some(no_tools_note(&why));
                 }
                 reg
             }
@@ -2387,11 +2328,11 @@ pub(crate) fn start_ai_session(
             Ok(c) => c,
             Err(e) => {
                 let _ = ai_tx.send(AiStreamMsg {
-                    segs: vec![schemaic_core::transcript::Seg::Text(format!(
-                        "Couldn't launch the `{}` CLI ({e}). Ensure {} is installed \
-                         (or set its path in Settings → AI).",
-                        harness.bin(),
-                        harness.label()
+                    segs: vec![schemaic_core::transcript::Seg::Text(tr!(
+                        "ai-launch-failed-session",
+                        bin = harness.bin(),
+                        error = e.to_string(),
+                        cli = harness.label()
                     ))],
                     done: true,
                     is_error: true,
@@ -2496,11 +2437,10 @@ pub(crate) fn start_ai_session(
                             // settings have not changed, so every later question
                             // was a discarded `Err` and the bubble spun.
                             Err(e) => {
-                                let why = format!(
-                                    "The {} session could not be restarted after \
-                                     stopping ({e}), so it has ended. Ask again to \
-                                     start a new one.",
-                                    harness.label()
+                                let why = tr!(
+                                    "ai-session-restart-failed",
+                                    cli = harness.label(),
+                                    error = e.to_string()
                                 );
                                 pump.fail(why.clone());
                                 refuse_every_turn(
@@ -2542,11 +2482,7 @@ pub(crate) fn start_ai_session(
                             // spinning on a turn nothing was ever going to
                             // answer, and `needs_respawn` rebuilds nothing when
                             // the settings have not changed.
-                            let why = format!(
-                                "The {} session is no longer accepting questions. \
-                                 Ask again to start a new one.",
-                                harness.label()
-                            );
+                            let why = tr!("ai-session-not-accepting", cli = harness.label());
                             pump.fail(why.clone());
                             refuse_every_turn(
                                 &tokio::runtime::Handle::current(),
@@ -2619,19 +2555,19 @@ pub(crate) fn start_ai_session(
                         // one, with `pump`'s live accumulator in scope on the
                         // very line and not consulted.
                         let why = match ended_badly {
-                            true => format!(
-                                "The AI session ended unexpectedly: {}",
-                                schemaic_ai::cli_failure_message(
-                                    harness, code, &raw, &stderr_text
+                            true => tr!(
+                                "ai-session-ended-badly",
+                                error = schemaic_ai::cli_failure_message(
+                                    harness,
+                                    code,
+                                    &raw,
+                                    &stderr_text
                                 )
                             ),
                             // A clean exit with nothing to report is still the
                             // end of the session, and the panel is still
                             // waiting — it just has no CLI failure to name.
-                            false => format!(
-                                "The {} session ended. Ask again to start a new one.",
-                                harness.label()
-                            ),
+                            false => tr!("ai-session-ended", cli = harness.label()),
                         };
                         pump.fail(why.clone());
                         let _ = child.kill().await;
@@ -4260,7 +4196,7 @@ mod tests {
             !body.contains(&conditional),
             "a spawn sets its working directory behind an `if let Some` — a \
              session that cannot get a private directory must be refused \
-             (`NO_CWD`), not run in whatever directory the app was launched from"
+             (`no_cwd`), not run in whatever directory the app was launched from"
         );
         // And every `Command` built here does set one. Counted rather than
         // matched pairwise: a new spawn shows up as an imbalance.

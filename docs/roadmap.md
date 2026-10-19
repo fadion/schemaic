@@ -149,8 +149,10 @@ assertions pin English wording — stays the regression net throughout.
    bar's Explain and AI fix are the error modal's messages, which `error_bar_fits_explain`
    measures, and its Rename alias / Rename CTE entries the rename dialog's titles.
    **Left, in order** — delete a name as its file lands:
-   `schemaic-app`'s `ai.rs`, `conn_sources.rs`, `agent_cli.rs` and `antigravity.rs`
-   (`notify.rs` had nothing, its title and body being its callers'). A file with
+   `schemaic-app`'s `conn_sources.rs` and `agent_cli.rs` (`notify.rs` had nothing, its title
+   and body being its callers'; `ai.rs` and `antigravity.rs` are done — the session's notes
+   and refusals, `ai-*`, while every prompt sent to the model and `--mcp-serve`'s errors to
+   an agent's stderr stay English). A file with
    no literal a user reads drops off without a commit. The list came from a sweep for
    capitalised string literals, so sweep a file whole before calling it done; a sentence that
    starts lower-case, or spans a `\` continuation, slips past a quick one.

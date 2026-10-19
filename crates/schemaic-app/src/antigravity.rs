@@ -495,7 +495,7 @@ pub(crate) struct AgyRegistration {
     installed: bool,
     /// Why this session has no database tools, when the reason is an *ownership*
     /// one rather than a failed command — so the panel can say which.
-    blocked: Option<&'static str>,
+    blocked: Option<String>,
 }
 
 /// May a session in this claim state write the **machine-global** MCP
@@ -513,15 +513,10 @@ fn may_register(claimed: &Claimed) -> bool {
 }
 
 /// The line the panel shows for a session [`may_register`] refused.
-fn blocked_reason(claimed: &Claimed) -> &'static str {
+fn blocked_reason(claimed: &Claimed) -> String {
     match claimed {
-        Claimed::Shared => {
-            "Another Schemaic window is already using Antigravity. \
-             Antigravity keeps one machine-wide MCP registration, which can \
-             point at only one connection, so this window's assistant has no \
-             database tools"
-        }
-        _ => "Schemaic could not claim Antigravity's configuration for this session",
+        Claimed::Shared => tr!("ai-antigravity-shared"),
+        _ => tr!("ai-antigravity-not-claimed"),
     }
 }
 
@@ -635,8 +630,8 @@ impl AgyRegistration {
     /// Why this session has no database tools, when [`may_register`] refused it
     /// — `None` when it installed, or when the failure was a command that did
     /// not take.
-    pub(crate) fn blocked_reason(&self) -> Option<&'static str> {
-        self.blocked
+    pub(crate) fn blocked_reason(&self) -> Option<&str> {
+        self.blocked.as_deref()
     }
 }
 

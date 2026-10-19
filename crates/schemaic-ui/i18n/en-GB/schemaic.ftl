@@ -2465,3 +2465,34 @@ monitor-restarted = The table's columns changed, so change tracking restarted fr
 timeout-cancelled-app = Cancelled: the statement ran longer than the { $timeout } statement timeout. Change or turn it off in Settings → Query.
 timeout-cancelled-connection = Cancelled: the statement ran longer than the { $timeout } statement timeout. Change or turn it off in this connection's settings.
 ai-chat-no-database = Can't reach the database, so the assistant can't be started for this connection. Check the connection and try again.
+
+## The AI session's own notes and refusals (ai.rs, antigravity.rs) — what the
+## panel and the inline AI say when an agent CLI cannot start or stops. What
+## is sent to the model stays English. $cli is the agent CLI's product name
+## (Claude Code, Codex); $bin its program name; $error the CLI's or the
+## operating system's own text. ** marks bold.
+
+ai-no-cwd = **The assistant could not start.** Schemaic gives every agent process a private working directory of its own, and neither the system temp directory nor the config directory would take one — so there is nowhere to run it that is not somebody else's directory. Check that the temp directory is writable and try again.
+ai-no-reply-file = Couldn't create a temporary file for the reply.
+ai-inline-no-opencode-config = Couldn't write OpenCode's configuration, so the generation was not started (without it the CLI would run with its own tools enabled).
+ai-inline-no-copilot-home = Couldn't create GitHub Copilot's private home directory, so the generation was not started (without it the CLI would load your own Copilot configuration, including its MCP servers and hooks).
+ai-inline-no-env-writer = { $cli } is marked as isolated by its environment, but Schemaic has no way to set that environment up, so the generation was not started.
+ai-inline-no-cursor-rules = Couldn't write Cursor's permissions file, so the generation was not started (without it the CLI writes files unprompted).
+ai-inline-no-rules-writer = { $cli } is marked as restricted by a permissions file, but Schemaic has no way to write one for it, so the generation was not started.
+# $cause is one of the ai-no-tools causes below: a clause, without a full stop.
+ai-no-tools = **This session has no database tools.** { $cause }, so the assistant cannot look anything up — it can only answer from the schema outline already in its prompt. Closing and reopening the panel will try again.
+ai-no-endpoint-file = Schemaic could not create the private file that tells the assistant how to reach your database
+ai-cursor-not-approved = Schemaic could not approve its database tools with Cursor ({ $error })
+ai-antigravity-not-registered = Schemaic could not register its database tools with Antigravity
+ai-antigravity-shared = Another Schemaic window is already using Antigravity. Antigravity keeps one machine-wide MCP registration, which can point at only one connection, so this window's assistant has no database tools
+ai-antigravity-not-claimed = Schemaic could not claim Antigravity's configuration for this session
+ai-refused-no-opencode-config = Schemaic could not write the configuration that restricts OpenCode, so the assistant is disabled — running it without that file would give the session a shell. Check that the app's data directory is writable.
+ai-refused-no-copilot-home = Schemaic could not create GitHub Copilot's private home directory, so the assistant is disabled — without it the CLI would load your own Copilot configuration, including its MCP servers and hooks. Check that the app's data directory is writable.
+ai-refused-no-cursor-rules = Schemaic could not write the permissions file that keeps Cursor from writing files and running commands, so the assistant is disabled — without it Cursor writes files unprompted. Check that the app's data directory is writable.
+ai-launch-failed-turn = Couldn't launch the `{ $bin }` CLI ({ $error }). Ensure { $cli } is installed, or give it a path in Settings → AI.
+ai-launch-failed-session = Couldn't launch the `{ $bin }` CLI ({ $error }). Ensure { $cli } is installed (or set its path in Settings → AI).
+ai-turn-ended = The { $cli } turn ended unexpectedly: { $error }
+ai-session-ended-badly = The AI session ended unexpectedly: { $error }
+ai-session-ended = The { $cli } session ended. Ask again to start a new one.
+ai-session-restart-failed = The { $cli } session could not be restarted after stopping ({ $error }), so it has ended. Ask again to start a new one.
+ai-session-not-accepting = The { $cli } session is no longer accepting questions. Ask again to start a new one.
