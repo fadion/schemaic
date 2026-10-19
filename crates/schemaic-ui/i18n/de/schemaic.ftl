@@ -1901,3 +1901,34 @@ dump-failed = Dump fehlgeschlagen: { $error }
 blob-load-too-large = Diese Datei ist { $size } groß – höchstens { $most } lassen sich laden.
 blob-load-failed = Laden fehlgeschlagen: { $error }
 blob-save-failed = Speichern fehlgeschlagen: { $error }
+file-write-failed = { $path } konnte nicht geschrieben werden: { $error }
+settings-export-title = Einstellungen exportieren
+settings-import-title = Einstellungen importieren
+settings-file-filter = Schemaic-Einstellungen
+settings-import-nothing = Nichts zu importieren: Jede Einstellung in { $path } stimmt bereits mit deiner überein, und es kommen keine Snippets hinzu.
+settings-import-question = { $path } ändert { $changed ->
+        [one] { $changed } Einstellung
+       *[other] { $changed } Einstellungen
+    } und fügt { $snippets ->
+        [one] { $snippets } Snippet
+       *[other] { $snippets } Snippets
+    } hinzu. Die geänderten Einstellungen ersetzen deine aktuellen Werte; die Snippets kommen neben deine.
+settings-import-unreadable = konnte nicht gelesen werden: { $error }
+connections-export-title = Verbindungen exportieren
+connections-file-filter = Schemaic-Verbindungen
+connections-replace-title = „{ $file }“ ersetzen
+connections-replace-question = Eine Datei namens „{ $file }“ liegt bereits in diesem Ordner. Der Export hängt diese Endung an den eingegebenen Namen an, daher hat der Speicherdialog nicht danach gefragt. Das Ersetzen lässt sich nicht rückgängig machen.
+import-choose-file-title = Verbindungsdatei wählen
+import-no-containers = Es laufen keine Datenbank-Container.
+import-added = { $count ->
+        [one] { $count } Verbindung hinzugefügt.
+       *[other] { $count } Verbindungen hinzugefügt.
+    }
+import-added-foreign = { $count ->
+        [one] { $count } Verbindung hinzugefügt.
+       *[other] { $count } Verbindungen hinzugefügt.
+    } Schreibschutz und Umgebungs-Badge werden aus einem anderen Client nicht übernommen – lege sie unter Verbindungen verwalten für alles fest, worauf es ankommt.
+conn-delete-title = „{ $name }“ löschen
+conn-delete-question = Dies löscht die Verbindung, ihr gespeichertes Passwort, ihre gespeicherte KI-Unterhaltung, ihren Abfrageverlauf und ihre Tabs. Das lässt sich nicht rückgängig machen.
+conn-delete-keyring-kept = Schemaic konnte den Schlüsselbund des Betriebssystems nicht erreichen, daher sind das gespeicherte Passwort und die SSH-Geheimnisse der gelöschten Verbindung **noch darin**.
+conn-delete-keyring-later = Sie werden entfernt, sobald das nächste Mal eine Verbindung gelöscht oder gespeichert wird, während der Schlüsselbund erreichbar ist. Bis dahin kann keine neue Verbindung sie erhalten – Verbindungs-IDs werden nie wiederverwendet.

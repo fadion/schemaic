@@ -269,14 +269,6 @@ pub fn merge_snippets(existing: &mut Vec<Snippet>, incoming: Vec<Snippet>) -> us
     added
 }
 
-/// The phrase the confirmation says after "changes": how many settings would
-/// change and how many snippets would be added.
-pub fn summary(changed: usize, snippets: usize) -> String {
-    let settings = crate::text::plural(changed, "setting", "settings");
-    let snips = crate::text::plural(snippets, "snippet", "snippets");
-    format!("{changed} {settings} and adds {snippets} {snips}")
-}
-
 /// The `keys` fields of `value` as written, those it has.
 fn pick(value: &impl Serialize, keys: &[&str]) -> Map<String, Value> {
     let all = serde_json::to_value(value).unwrap_or(Value::Null);
@@ -526,12 +518,6 @@ mod tests {
         assert_eq!(applied.ui_theme, state.ui_theme);
         assert_eq!(applied.editor_font_size, state.editor_font_size);
         assert_eq!(applied.row_limit, 77);
-    }
-
-    #[test]
-    fn the_summary_counts_both_halves_in_words() {
-        assert_eq!(summary(1, 0), "1 setting and adds 0 snippets");
-        assert_eq!(summary(3, 1), "3 settings and adds 1 snippet");
     }
 
     #[test]

@@ -25276,8 +25276,9 @@ existing prose was left alone.
     refused) and `TermCursor::from_key(..).key()` — and its change count is added to the settings
     count, so the confirmation's *N settings* covers both halves. Nothing to change at all is said through `file_error` (*Nothing to import: …*) rather
     than asked about; otherwise the shared `Confirm` — *Import settings*, "{path} changes
-    {summary}. The settings it changes replace your current values; the snippets are added beside
-    yours." — and only on yes
+    N settings and adds M snippets. The settings it changes replace your current values; the
+    snippets are added beside yours.", one catalogue message with both counts as plurals
+    (`settings-import-question`, through `settings_import_question`) — and only on yes
     `apply_settings` sets each portable signal, the four terminal signals are set from the
     `apply_keys` answer, `save_ui(Replacing)` runs, and `SnippetStore::import` merges the snippets.
     Nothing writes `terminal.json` here: the terminal's own save effect, subscribed to those four

@@ -124,7 +124,11 @@ assertions pin English wording — stays the regression net throughout.
    and save (`export-*`, `dump-failed`, `blob-load-*`, `blob-save-failed`). The dump modal
    still shows `schemaic-cli`'s own "Export failed: …" lines from `dump.rs`, which the
    headless CLI shares — phase 4's, like core's prose; so is the write log's "file …, n
-   statements ran", a persisted record. A large file goes **a
+   statements ran", a persisted record. Then Export / Import settings, Export connections,
+   Import Connections' file and Docker sources and deleting a connection (`settings-*`,
+   `connections-*`, `import-*`, `conn-delete-*`, `file-write-failed`; core's
+   `settings_bundle::summary` went, its counts now plurals inside `settings-import-question`).
+   A large file goes **a
    section at a time** — a function or a cluster of them — committed per section as
    `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded here as
    it lands, so the next session knows where to pick up without re-sweeping what is done. The

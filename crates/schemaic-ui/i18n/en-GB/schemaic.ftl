@@ -2387,3 +2387,46 @@ dump-failed = Dump failed: { $error }
 blob-load-too-large = That file is { $size } — the most that can be loaded is { $most }.
 blob-load-failed = Load failed: { $error }
 blob-save-failed = Save failed: { $error }
+
+## Settings › Export / Import settings, Export connections, Import
+## Connections' file and Docker sources, and deleting a connection (main.rs).
+## $path is a file path; $file a file's name; $error the operating system's
+## own text.
+
+file-write-failed = Couldn't write { $path }: { $error }
+settings-export-title = Export settings
+settings-import-title = Import settings
+# The export dialog's file-type filter.
+settings-file-filter = Schemaic settings
+settings-import-nothing = Nothing to import: every setting in { $path } already matches yours, and it adds no snippets.
+# $changed settings would change; $snippets snippets would be added.
+settings-import-question = { $path } changes { $changed ->
+        [one] { $changed } setting
+       *[other] { $changed } settings
+    } and adds { $snippets ->
+        [one] { $snippets } snippet
+       *[other] { $snippets } snippets
+    }. The settings it changes replace your current values; the snippets are added beside yours.
+# After the file's path and a colon.
+settings-import-unreadable = couldn't read it: { $error }
+connections-export-title = Export connections
+connections-file-filter = Schemaic connections
+connections-replace-title = Replace “{ $file }”
+connections-replace-question = A file named “{ $file }” is already in that folder. The export adds that ending to the name you typed, so the save dialog did not ask about it. Replacing it can't be undone.
+import-choose-file-title = Choose a connections file
+import-no-containers = No database containers are running.
+import-added = { $count ->
+        [one] Added { $count } connection.
+       *[other] Added { $count } connections.
+    }
+# Said when a connection came from another client (DBeaver, DataGrip…).
+import-added-foreign = { $count ->
+        [one] Added { $count } connection.
+       *[other] Added { $count } connections.
+    } Read-only and the environment badge are not carried over from another client — set them in Manage connections for anything that matters.
+conn-delete-title = Delete “{ $name }”
+conn-delete-question = This deletes the connection, its stored password, its saved AI conversation, its query history and its tabs. It can't be undone.
+# A notice shown after a delete; its two lines are shown one under the other.
+# The ** marks bold.
+conn-delete-keyring-kept = Schemaic could not reach the OS keyring, so the deleted connection's stored password and SSH secrets are **still in it**.
+conn-delete-keyring-later = They will be removed the next time a connection is deleted or saved while the keyring is reachable. No new connection can be given them in the meantime — connection ids are never reused.

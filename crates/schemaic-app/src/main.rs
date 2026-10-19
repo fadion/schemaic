@@ -1190,6 +1190,19 @@ fn plan_refusal_text(why: Refusal) -> String {
     }
 }
 
+/// What *Import settings* asks before it applies `file`: how many settings
+/// would change and how many snippets would be added, as one catalogue
+/// message — both counts are plurals in it, where the phrase between them was
+/// once core's English (`settings_bundle::summary`) dropped into a sentence.
+fn settings_import_question(file: &str, changed: usize, snippets: usize) -> String {
+    tr!(
+        "settings-import-question",
+        path = file,
+        changed = changed,
+        snippets = snippets
+    )
+}
+
 /// Wrap a one-argument action behind the live-connection gate.
 ///
 /// The argument is cloned per invocation because the gate may hold the action
@@ -11611,9 +11624,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     match result {
                         Ok(scan) => {
                             if scan.found.is_empty() && scan.skipped.is_empty() {
-                                import_ui
-                                    .docker_note
-                                    .set(Some("No database containers are running.".to_string()));
+                                import_ui.docker_note.set(Some(tr!("import-no-containers")));
                             }
                             add_import_result(import_ui, scan);
                         }
@@ -11737,10 +11748,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(move || {
             use floem::file::{FileDialogOptions, FileSpec};
             let opts = FileDialogOptions::new()
-                .title("Export settings")
+                .title(tr!("settings-export-title"))
                 .default_name(schemaic_core::settings_bundle::BUNDLE_FILE_SUFFIX)
                 .allowed_types(vec![FileSpec {
-                    name: "Schemaic settings",
+                    name: tr_static!("settings-file-filter"),
                     extensions: &["json"],
                 }]);
             let text = snippets.with_untracked(|s| {
@@ -11760,8 +11771,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 });
                 handle.spawn_blocking(move || {
                     report(
-                        schemaic_core::persist::write_file_atomic(&path, text.as_bytes())
-                            .map_err(|e| format!("Couldn't write {}: {e}", path.display())),
+                        schemaic_core::persist::write_file_atomic(&path, text.as_bytes()).map_err(
+                            |e| {
+                                tr!(
+                                    "file-write-failed",
+                                    path = path.display().to_string(),
+                                    error = e.to_string()
+                                )
+                            },
+                        ),
                     );
                 });
             });
@@ -11818,7 +11836,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let (apply_settings, import_snippets) =
                 (apply_settings.clone(), import_snippets.clone());
             floem::file_action::open_file(
-                FileDialogOptions::new().title("Import settings"),
+                FileDialogOptions::new().title(tr!("settings-import-title")),
                 move |file| {
                     let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
                         return; // cancelled
@@ -11883,23 +11901,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 )
                             });
                             if changed == 0 && adds == 0 {
-                                return (file_error)(format!(
-                                    "Nothing to import: every setting in {shown} already \
-                                     matches yours, and it adds no snippets."
+                                return (file_error)(tr!(
+                                    "settings-import-nothing",
+                                    path = shown.clone()
                                 ));
                             }
-                            let what = schemaic_core::settings_bundle::summary(changed, adds);
                             let (save_ui, apply_settings, import_snippets) = (
                                 save_ui.clone(),
                                 apply_settings.clone(),
                                 import_snippets.clone(),
                             );
                             confirm.set(Some(Confirm {
-                                title: "Import settings".to_string(),
-                                message: format!(
-                                    "{shown} changes {what}. The settings it changes replace \
-                                     your current values; the snippets are added beside yours."
-                                ),
+                                title: tr!("settings-import-title"),
+                                message: settings_import_question(&shown, changed, adds),
                                 resolve: Rc::new(move |yes| {
                                     if yes {
                                         (apply_settings)(&applied);
@@ -11917,7 +11931,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     );
                     handle.spawn_blocking(move || {
                         let read = std::fs::read(&path)
-                            .map_err(|e| format!("couldn't read it: {e}"))
+                            .map_err(|e| tr!("settings-import-unreadable", error = e.to_string()))
                             .and_then(|bytes| {
                                 schemaic_core::settings_bundle::parse(
                                     &schemaic_core::text::decode_text_file(&bytes),
@@ -11943,10 +11957,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(move || {
             use floem::file::{FileDialogOptions, FileSpec};
             let opts = FileDialogOptions::new()
-                .title("Export connections")
+                .title(tr!("connections-export-title"))
                 .default_name(conn_import::EXPORT_FILE_SUFFIX)
                 .allowed_types(vec![FileSpec {
-                    name: "Schemaic connections",
+                    name: tr_static!("connections-file-filter"),
                     extensions: &["json"],
                 }]);
             let handle = handle.clone();
@@ -11984,7 +11998,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     handle.spawn_blocking(move || {
                         report(
                             schemaic_core::persist::write_file_atomic(&path, text.as_bytes())
-                                .map_err(|e| format!("Couldn't write {}: {e}", path.display())),
+                                .map_err(|e| {
+                                    tr!(
+                                        "file-write-failed",
+                                        path = path.display().to_string(),
+                                        error = e.to_string()
+                                    )
+                                }),
                         );
                     });
                 });
@@ -11998,12 +12018,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     confirm.set(Some(Confirm {
-                        title: format!("Replace “{file}”"),
-                        message: format!(
-                            "A file named “{file}” is already in that folder. The export \
-                             adds that ending to the name you typed, so the save dialog did \
-                             not ask about it. Replacing it can't be undone."
-                        ),
+                        title: tr!("connections-replace-title", file = file.clone()),
+                        message: tr!("connections-replace-question", file = file.clone()),
                         resolve: Rc::new(move |yes| {
                             if yes {
                                 (write)();
@@ -12027,7 +12043,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             use floem::file_action::open_file;
             let handle = handle.clone();
             open_file(
-                FileDialogOptions::new().title("Choose a connections file"),
+                FileDialogOptions::new().title(tr!("import-choose-file-title")),
                 move |picked| {
                     let Some(path) = picked.and_then(|i| i.path.first().cloned()) else {
                         return;
@@ -12216,18 +12232,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Said once, here, rather than as a note on every row: it is true
             // of all of them, and a badge repeated twelve times is read zero
             // times.
-            let added_line = match added {
-                1 => "Added 1 connection.".to_string(),
-                n => format!("Added {n} connections."),
-            };
             import_ui.done.set(Some(if any_foreign {
-                format!(
-                    "{added_line} Read-only and the environment badge are not carried over \
-                     from another client — set them in Manage connections for anything that \
-                     matters."
-                )
+                tr!("import-added-foreign", count = added)
             } else {
-                added_line
+                tr!("import-added", count = added)
             }));
         })
     };
@@ -12450,14 +12458,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // the material is still at rest in the OS keyring, under an account
             // nothing will read again.
             if !secrets::forget_connection(id) {
-                persist::queue_notice(
-                    "Schemaic could not reach the OS keyring, so the deleted connection's \
-                     stored password and SSH secrets are **still in it**.\n\
-                     They will be removed the next time a connection is deleted or saved \
-                     while the keyring is reachable. No new connection can be given them \
-                     in the meantime — connection ids are never reused."
-                        .to_string(),
-                );
+                // Two messages because the notice keeps its line break, and a
+                // catalogue message is one line.
+                persist::queue_notice(format!(
+                    "{}\n{}",
+                    tr!("conn-delete-keyring-kept"),
+                    tr!("conn-delete-keyring-later")
+                ));
             }
             // …and its saved AI conversation, which would otherwise linger and
             // resurface under whatever connection reuses the id.
@@ -12739,10 +12746,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
             let delete = delete_conn_now.clone();
             confirm.set(Some(Confirm {
-                title: format!("Delete “{name}”"),
-                message: "This deletes the connection, its stored password, its saved AI \
-                          conversation, its query history and its tabs. It can't be undone."
-                    .to_string(),
+                title: tr!("conn-delete-title", name = name.clone()),
+                message: tr!("conn-delete-question"),
                 resolve: Rc::new(move |yes| {
                     if yes {
                         (delete)(id);
@@ -17278,6 +17283,32 @@ mod app_tests {
         let (a, b) = (first(), first());
         assert_eq!(a, "SQL script");
         assert!(std::ptr::eq(a, b), "the second call read a new copy");
+    }
+
+    /// **The counted sentences read as they did in English.** Import settings'
+    /// question took its middle from core's `settings_bundle::summary`, and the
+    /// import's report built "Added N connection(s)." by hand; both are whole
+    /// catalogue messages now, and these are the strings they produced.
+    #[test]
+    fn the_import_counts_read_as_they_did() {
+        assert_eq!(
+            super::settings_import_question("x.json", 1, 0),
+            "x.json changes 1 setting and adds 0 snippets. The settings it changes \
+             replace your current values; the snippets are added beside yours."
+        );
+        assert_eq!(
+            super::settings_import_question("x.json", 3, 1),
+            "x.json changes 3 settings and adds 1 snippet. The settings it changes \
+             replace your current values; the snippets are added beside yours."
+        );
+        assert_eq!(tr!("import-added", count = 1), "Added 1 connection.");
+        assert_eq!(tr!("import-added", count = 4), "Added 4 connections.");
+        assert_eq!(
+            tr!("import-added-foreign", count = 1),
+            "Added 1 connection. Read-only and the environment badge are not carried \
+             over from another client — set them in Manage connections for anything \
+             that matters."
+        );
     }
 
     /// **The pill and the session read one mapping.** These are the two halves of
