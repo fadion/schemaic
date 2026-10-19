@@ -1338,6 +1338,54 @@ dump-export = Exportieren
 dump-progress = Schreibe { $table } – { $index } von { $total }, bisher { $rows } Zeilen
 dump-reading-schema = Schema wird gelesen
 dump-replace-files = Dateien ersetzen
+dump-replace-prompt = { $n ->
+    [one] { $n } Datei in { $folder } wird ersetzt und kann nicht wiederhergestellt werden: { $names }.
+   *[other] { $n } Dateien in { $folder } werden ersetzt und können nicht wiederhergestellt werden: { $names }.
+}
+dump-replace-prompt-more = { $n } Dateien in { $folder } werden ersetzt und können nicht wiederhergestellt werden: { $names } und { $more } weitere.
+dump-done-tables = { $n ->
+    [one] { $n } Tabelle geschrieben.
+   *[other] { $n } Tabellen geschrieben.
+}
+dump-done-missing = { $n ->
+    [one] { $n } ausgewählte Tabelle wurde nicht gefunden und ist nicht in der Datei: { $names }.
+   *[other] { $n } ausgewählte Tabellen wurden nicht gefunden und sind nicht in der Datei: { $names }.
+}
+dump-done-left-out = { $n ->
+    [one] { $n } angefordertes Objekt ist nicht in der Datei: { $names }.
+   *[other] { $n } angeforderte Objekte sind nicht in der Datei: { $names }.
+}
+dump-done-rows-left-out = { $n ->
+    [one] Die Zeilen der Graph-Kantentabelle { $names } sind nicht in der Datei; sie wird leer angelegt.
+   *[other] Die Zeilen der Graph-Kantentabellen { $names } sind nicht in der Datei; sie werden leer angelegt.
+}
+dump-done-refused = { $n ->
+    [one] Ein erneutes Einspielen in eine Datenbank, die dies bereits enthält, bricht ab, bevor es etwas löscht: Die Datei kann es nicht so zurücksetzen, wie es ist: { $names }.
+   *[other] Ein erneutes Einspielen in eine Datenbank, die eines davon bereits enthält, bricht ab, bevor es etwas löscht: Die Datei kann sie nicht so zurücksetzen, wie sie sind: { $names }.
+}
+dump-cancelled-partial = Export abgebrochen — { $name } wurde nicht verändert; was geschrieben war, steht in { $part }
+files-done = { $n ->
+    [one] { $n } Datei geschrieben.
+   *[other] { $n } Dateien geschrieben.
+}
+files-done-with-note = { $head } { $note }.
+files-cancelled-none = Export abgebrochen — keine Datei wurde fertiggestellt, daher wurde nichts in { $folder } geschrieben.
+files-cancelled = { $n ->
+    [one] Export abgebrochen — { $n } Datei wurde in { $folder } fertiggestellt; die Tabelle in Arbeit blieb ungeschrieben.
+   *[other] Export abgebrochen — { $n } Dateien wurden in { $folder } fertiggestellt; die Tabelle in Arbeit blieb ungeschrieben.
+}
+files-failed-kept = { $n ->
+    [one] { $message } — { $n } bereits in { $folder } geschriebene Datei bleibt erhalten.
+   *[other] { $message } — { $n } bereits in { $folder } geschriebene Dateien bleiben erhalten.
+}
+files-replaced = { $n ->
+    [one] { $n } vorhandene Datei wurde ersetzt: { $names }.
+   *[other] { $n } vorhandene Dateien wurden ersetzt: { $names }.
+}
+files-missing = { $n ->
+    [one] { $n } ausgewählte Tabelle wurde nicht gefunden und ergab keine Datei: { $names }.
+   *[other] { $n } ausgewählte Tabellen wurden nicht gefunden und ergaben keine Datei: { $names }.
+}
 export-progress-of-about = { $rows } von ~{ $total } Zeilen
 export-progress-of = { $rows } von { $total } Zeilen
 export-progress-rows = { $count ->

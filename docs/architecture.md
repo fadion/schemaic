@@ -4987,9 +4987,9 @@ existing prose was left alone.
     `ExportNote::caveats()` yields each non-empty loss as a `(Caveat, &[String])` in the order it
     is said, `Withheld`, `Blanked`, `Cut`. Its `Display` is the old sentence, ` — ` before the
     first caveat and `; ` between, and `export_note` is now only `export_said(…).map(to_string)`,
-    kept for core's tests, the CLI's dump report and `dump::done_note`'s caller. The interface
-    words the value itself (`i18n::export_note`, under *The string catalogue*), so the rules about
-    *what* is said stay here, tested, and only the words move.
+    kept for core's tests and the CLI's dump report, which hands it to `dump::done_note`. The
+    interface words the value itself (`i18n::export_note`, under *The string catalogue*), so the
+    rules about *what* is said stay here, tested, and only the words move.
     `export_failure_note(message, partial)` is the same rule on the other side, and what it has to
     say changed with `part_path`: the destination is no longer opened until the export succeeds, so
     the sentence is not "your file is a fragment" but `— <name> was not changed; the rows that were
@@ -5042,7 +5042,10 @@ existing prose was left alone.
     table second, or not at all when no file finished. `files_failure_note(message, files, folder,
     missing, replaced)`
     follows `export_failure_note`'s `None` rule through `files == 0`: an export refused before the
-    first file lands must not send the user to a folder nothing was written to.
+    first file lands must not send the user to a folder nothing was written to. The arms are
+    decided and tested here, and the three stay their English: the modal words the same arguments
+    itself (`dump_view.rs`'s `files_*_note`), held equal to these by
+    `english_says_every_folder_outcome_as_core_does`.
     **`export_file_names(tables, format)` is what names those files**, and what it adds over
     `suggested_filename` — whose sanitizing rule it reuses rather than repeating — is the part a
     single file never needed: **uniqueness**. Two distinct tables can sanitize to one name (`a:b` and
@@ -5745,8 +5748,8 @@ existing prose was left alone.
     stays. Names are matched with their qualifier read off the text (`names_object`), so a view
     over `sales.emp` is not taken for one over `dbo.emp` — `pub(crate)`, because `core::used_by`
     asks the same question of every body in a schema. The lot is `DumpPlan::left_out`, named
-    in the header and, through `dump::done_note`, in the modal's report beside the missing tables
-    (`what_reads_a_table_left_out_of_the_file_is_left_out_with_it`; live,
+    in the header and, through `dump::done_note` (worded alike by `dump_view`'s `dump_done_note`),
+    in the modal's report beside the missing tables (`what_reads_a_table_left_out_of_the_file_is_left_out_with_it`; live,
     `a_dump_leaves_out_what_reads_a_table_it_cannot_restate`). A graph edge is restated, empty, and the header says why: an edge names
     the nodes it joins by node id, and a restore gives every node a new one; a node's rows are
     carried (`a_table_the_file_cannot_restate_is_named_and_left_out`; the live round trip's node
@@ -6163,7 +6166,12 @@ existing prose was left alone.
     prompt never contained. Consent covers exactly what it named; anything else is a new question.
     And `folder_replace_prompt` writes the question, beside the three
     report sentences and for the same reason — a message with arms (one file, a few, more than fit)
-    is a decision, and not one to make inside a callback the suite cannot reach.
+    is a decision, and not one to make inside a callback the suite cannot reach. The modal no
+    longer shows this English: it words the same arguments itself
+    (`dump_view::folder_replace_prompt`), held equal to this by
+    `english_says_every_folder_outcome_as_core_does`, and
+    `FOLDER_REPLACE_SHOWN` — the eight it names before *and N more* — is `pub` so the two read one
+    constant.
     `destroyed(colliding, published)` is the fourth and belongs to the *report* rather than the ask —
     of the files the export was going to replace, the ones it actually has — and it counts a `.part`
     as destroyed **with its published sibling**, since the rename that publishes `orders.csv` is what
@@ -27777,13 +27785,15 @@ existing prose was left alone.
     re-read *after* the dialog closes because floem's dialog is not window-modal and the modal stays
     live behind it, the launch goes through `accept_dialog_launch` because by then the modal that
     asked may be gone, and the outcome checks `generation` because closing the modal does not stop the
-    export. Its three sentences are `export::files_note`/`files_cancel_note`/`files_failure_note`
-    rather than the dump's, because all three are about a folder.
+    export. Its three sentences are `files_done_note`/`files_cancel_note`/`files_failure_note` —
+    `export::files_note`/`files_cancel_note`/`files_failure_note` worded here — rather than the
+    dump's, because all three are about a folder.
     **Starting the export is `launch_files`, split out of `run_files` so it can be re-entered**,
     which is what the replace confirm needs: a directory dialog has no "replace?" and the file names
     are `file_plan`'s to choose, so the first run computes the collisions, writes nothing and comes
     back `FilesOutcome::WouldReplace`. The view then raises the **shared** `Confirm` — not a fourth
-    bespoke overlay — with `dump::folder_replace_prompt` as its body, and Yes re-launches through
+    bespoke overlay — with `folder_replace_prompt` (`dump::folder_replace_prompt`'s arguments,
+    worded here) as its body, and Yes re-launches through
     `launch_files` with `FilesRequest::approved`, which re-reads the folder and is the more correct
     answer anyway, since it may have changed while the question stood. `approved` is **never** true
     on the launch the picker starts, the folder's contents being knowable only off the UI thread.
@@ -27853,7 +27863,8 @@ existing prose was left alone.
     abbreviation the grid uses — falling back to an animated `Reading the schema`
     (`widgets::loading_dots`) before the first table, where there is nothing to count yet and a
     static label and a hung one look identical. The **outcome** replaces it in that slot: the green
-    `Wrote 5 tables.` followed by `export::export_note` — the grid's own caveat wording, reused
+    `Wrote 5 tables.` followed by `i18n::export_note` of `export::export_said` — the grid's own
+    caveat wording, reused
     rather than restated, so a file that lost a column at the text arena's cap says so instead of
     reading as a clean success — and the red failure or cancel sentence. **That wording carries the
     withheld half again**, and a dump is one of the cases it was restored for: the clause naming
@@ -27866,7 +27877,7 @@ existing prose was left alone.
     of what was ticked looks exactly like a complete one. `DumpUi::done` is therefore the
     finished `String` rather than the counts for the view to word: it is built in the outcome
     callback, which is the last place the destination's file name is still in scope, and
-    `export_note` names that file. Both used to sit at the
+    `export_said` names that file. Both used to sit at the
     bottom of the modal's scrolling body, where the thing whose whole purpose is being seen could
     land below the fold; nothing about the run is written there now. The progress line is its
     **own** `dyn_container` inside the footer's, because it ticks once per table and rebuilding the
@@ -27944,14 +27955,25 @@ existing prose was left alone.
     (`script_view`'s two-argument count, above) — *Starting*, and the destination line,
     `export-progress-file` or `export-progress-writing` (`$name`). Stop and Close in both footers
     are the shared `dialog-stop`/`dialog-close`. `the_composed_lines_read_as_they_did_in_english`
-    pins the titles, counts, progress line and destination lines in English. What stays English:
-    the format names (`ExportFormat::label`, a `$format` placeable); the save dialog's file-type
-    name `SQL` (`FileSpec::name` is a `&'static str`); and core's prose —
-    `dump::drop_before_create_hint`, `fk_guard_hint`, `done_note`, `cancel_note`,
-    `folder_replace_prompt`, the `export::export_note` the done line still passes `done_note`, and
-    the `files_*_note`s (phase 4). A single-file dump's failure is already worded here, through
-    `i18n::export_failure_note`; the grid export's outcome lines in the progress box are the
-    grid's, worded the same way (*Data grid*).
+    pins the titles, counts, progress line and destination lines in English. **The outcome
+    sentences are worded here too**, each by a function taking exactly the arguments of the core
+    one it mirrors, so no new core type was needed: `dump_done_note` for `dump::done_note`
+    (`dump-done-tables`, then `i18n::export_note` of `export_said`'s value, then
+    `dump-done-missing`/`-left-out`/`-rows-left-out`/`-refused`, joined by a space in code as core
+    joins them), `dump_cancel_note` for `dump::cancel_note` (`dump-cancelled-partial`, or the
+    shared `export-cancelled-nothing`), `files_done_note`/`files_cancel_note`/`files_failure_note`
+    for `export`'s three (`files-*`, with `files_tail` standing in for core's private
+    `replaced_clause`/`missing_clause`), and `folder_replace_prompt` for `dump`'s
+    (`dump-replace-prompt`/`-more`), naming `dump::FOLDER_REPLACE_SHOWN` files — `pub` so the eight
+    is written once. `english_says_every_dump_outcome_as_core_does` and
+    `english_says_every_folder_outcome_as_core_does` (`core_words_tests`) hold the English equal to
+    core's, which stays English for the CLI's dump report and core's tests. A single-file dump's
+    failure is worded through `i18n::export_failure_note`; the grid export's outcome lines in the progress box are the
+    grid's, worded the same way (*Data grid*). What stays English: the format names
+    (`ExportFormat::label`, a `$format` placeable); the save dialog's file-type name `SQL`
+    (`FileSpec::name` is a `&'static str`); core's `dump::drop_before_create_hint` and
+    `fk_guard_hint` (phase 4); and the writers' `Export failed: …` message a failure carries, which
+    a folder export that finished no file shows as it stands.
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
     designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
@@ -36748,8 +36770,8 @@ existing prose was left alone.
     in shop.sql.part* regardless and sent the user to look for a file that was never opened. That is
     the identical false claim already removed from the `Failed` arm one line over, which this enum
     had not followed. The writer stays the only thing that knows, so the cancel arm reads
-    `WriteEnd::Failed`'s `opened` rather than assuming, and the view is routed through
-    `export::export_cancel_note`, which already had both sentences and already took `partial`.
+    `WriteEnd::Failed`'s `opened` rather than assuming, and the sentence is `dump::cancel_note`,
+    which takes `partial` — worded in the modal by `dump_view`'s `dump_cancel_note`.
     **One check the export path has no need of**: after the join, `token.is_cancelled()` is asked
     directly, because a cancel that arrives while no table is streaming — anywhere in a
     structure-only dump — never reaches the reader's error, and the writer's refusal to
@@ -36766,7 +36788,8 @@ existing prose was left alone.
     covers, and its `missing` is what the fresh introspection could not find at all. Its
     `refused` is `DumpPlan::refused`, what a replay of the file will not replace, its `left_out`
     what the file leaves out though the export asked for it, and its `rows_left_out` the graph
-    edges created without their rows; the modal's sentence is `dump::done_note`, each part a
+    edges created without their rows; the sentence is `dump::done_note` (the modal's is
+    `dump_view::dump_done_note`, its English held equal), each part a
     sentence of its own with one space between — the `format!` it replaced put a space after the
     tally whatever followed, so a quiet dump read "Wrote 2 tables. " and a short one had two
     spaces in it (`the_done_note_says_what_the_file_is_short_of_in_single_spaced_sentences`).
@@ -37236,7 +37259,7 @@ existing prose was left alone.
     runs under `with_deadline`**, the dump's own `--timeout` (an hour by default, `export`'s figure) rather than the login's, and its token is the
     run's, so the deadline is a cancel the driver honours and not a dropped future. Progress is a
     `dump::Progress` that prints `i of n — table` to stderr, a line per streamed table. A finished
-    dump prints `dump::done_note`, the modal's own sentence, over `export::export_note`'s tally
+    dump prints `dump::done_note`, the modal's sentence in English, over `export::export_note`'s tally
     clause, and exits 0 — unless `missing` is not empty, which `exit_for_dump_done` makes
     `Exit::Failed`, since a file a table short looks like a whole one to a script reading `$?`
     (`a_dump_that_left_a_named_table_out_does_not_exit_ok`); a failure prints
@@ -40426,9 +40449,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals, `format_bytes`, the dump's and the folder
-    export's notes (`dump::done_note`, `dump::cancel_note`, `export::files_*`) and the dump
-    writers' "Export failed: …" lines, which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
+    translation* — among it `launch::*`'s refusals, `format_bytes` and the dump writers'
+    "Export failed: …" lines, which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
     English too: `KeywordCase::label` (core).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
@@ -40546,6 +40568,13 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_says_every_failed_or_cancelled_export_as_core_does` and
     `english_says_every_sql_copy_note_as_core_does` (`core_words_tests`) hold the English. As with
     *Restore from file*, the separator is the code's.
+    The Export modal's dump and folder notes are the same plain-arguments case, and their
+    renderers sit beside their one caller rather than in `i18n.rs`: `dump_view.rs`'s
+    `dump_done_note`, `dump_cancel_note`, `files_*_note` and `folder_replace_prompt` each take the
+    arguments of the core function they mirror (`dump::done_note`/`cancel_note`/
+    `folder_replace_prompt`, `export::files_*`) — those stay English, for the CLI's dump report and
+    core's tests — and `english_says_every_dump_outcome_as_core_does` and
+    `english_says_every_folder_outcome_as_core_does` hold the two equal.
     **A sentence with optional parts is one message with a selector per part, not fragments
     assembled in code** — the lock-wait card's is the pattern. `activity-lock-wait-sentence` takes
     `$waited`/`$held` as an age or as `none` where the server withheld one (no age reads as that),

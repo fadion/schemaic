@@ -361,11 +361,12 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
                 // that comes from `part_path` — the one function that knows the
                 // suffix — in both spellings.
                 //
-                // It is `dump::cancel_note` rather than a `format!` here for the
-                // reason `dump_verdict` is not written out in this file: the
-                // sentence had two halves and only one of them was ever said. A
-                // cancel during the schema read creates no `.part` at all, and
-                // this pointed at one regardless.
+                // Its arms are `dump::cancel_note`'s, decided and tested there and
+                // worded here by `dump_cancel_note`, for the reason `dump_verdict`
+                // is not written out in this file: the sentence had two halves
+                // and only one of them was ever said. A cancel during the schema
+                // read creates no `.part` at all, and this pointed at one
+                // regardless.
                 match outcome {
                     // **Through `export_note`, which is where a caveat is
                     // worded.** The tally carries what the file could not hold —
@@ -384,17 +385,17 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
                         refused,
                         left_out,
                         rows_left_out,
-                    } => d.done.set(Some(schemaic_core::dump::done_note(
+                    } => d.done.set(Some(dump_done_note(
                         tables,
-                        schemaic_core::export::export_note(&tally, &name, true).as_deref(),
+                        schemaic_core::export::export_said(&tally, &name, true).as_ref(),
                         &missing,
                         &left_out,
                         &rows_left_out,
                         &refused,
                     ))),
-                    DumpOutcome::Cancelled { partial } => d
-                        .error
-                        .set(Some(schemaic_core::dump::cancel_note(&name, partial))),
+                    DumpOutcome::Cancelled { partial } => {
+                        d.error.set(Some(dump_cancel_note(&name, partial)))
+                    }
                     DumpOutcome::Failed { message, partial } => {
                         d.error.set(Some(crate::i18n::export_failure_note(
                             &message,
@@ -517,46 +518,47 @@ fn launch_files(ctx: &DumpCtx, req: FilesRequest, name: String) {
                 }
                 d.running.set(false);
                 d.progress.set(None);
-                // All three sentences are `core::export`'s, beside the ones the
-                // dump and the grid use — a report about a folder is a decision
-                // with arms (nothing finished, some finished, a table ticked and
-                // never found), and it is not one to make inside a callback the
-                // suite cannot reach.
+                // All three sentences' arms are `core::export`'s `files_*`, beside
+                // the ones the dump and the grid use — a report about a folder is
+                // a decision with arms (nothing finished, some finished, a table
+                // ticked and never found), and it is not one to make inside a
+                // callback the suite cannot reach. The `files_*_note`s below word
+                // them, held to core's English by `core_words_tests`.
                 match outcome {
                     FilesOutcome::Done {
                         files,
                         tally,
                         missing,
                         replaced,
-                    } => d.done.set(Some(schemaic_core::export::files_note(
+                    } => d.done.set(Some(files_done_note(
                         files, &tally, &name, &missing, &replaced,
                     ))),
                     FilesOutcome::Cancelled {
                         files,
                         missing,
                         replaced,
-                    } => d.error.set(Some(schemaic_core::export::files_cancel_note(
-                        files, &name, &missing, &replaced,
-                    ))),
+                    } => d
+                        .error
+                        .set(Some(files_cancel_note(files, &name, &missing, &replaced))),
                     FilesOutcome::Failed {
                         message,
                         files,
                         missing,
                         replaced,
-                    } => d.error.set(Some(schemaic_core::export::files_failure_note(
+                    } => d.error.set(Some(files_failure_note(
                         &message, files, &name, &missing, &replaced,
                     ))),
                     // **Nothing was written**, so this is a question and not a
-                    // report. `core::dump::folder_replace_prompt` writes it, for
-                    // the same reason the three notes above are not written
-                    // here.
+                    // report. Its English is `core::dump::folder_replace_prompt`'s,
+                    // worded here by `folder_replace_prompt` as the three notes
+                    // above are.
                     FilesOutcome::WouldReplace { replaced } => {
                         let ctx = ctx_retry.clone();
                         let req = req_retry.clone();
                         let name = name_retry.clone();
                         ctx_retry.overlay.confirm.set(Some(crate::Confirm {
                             title: tr!("dump-replace-files"),
-                            message: schemaic_core::dump::folder_replace_prompt(&name, &replaced),
+                            message: folder_replace_prompt(&name, &replaced),
                             resolve: Rc::new(move |yes| {
                                 if !yes {
                                     return;
@@ -1309,6 +1311,244 @@ fn watch_connection(d: DumpUi, conn: ConnUi) {
             d.target.set(None);
         }
     });
+}
+
+// ── Core's export sentences, in the interface's language ────────────────────
+// Each takes the arguments core's own takes (`dump::done_note`,
+// `dump::cancel_note`, `dump::folder_replace_prompt`, `export::files_*`) and
+// reads in English exactly as it does — the tests below hold them together.
+// Sentences are joined by a space in code, as core joins them.
+
+/// `dump::done_note` in the interface's language.
+fn dump_done_note(
+    tables: usize,
+    note: Option<&schemaic_core::export::ExportNote>,
+    missing: &[String],
+    left_out: &[String],
+    rows_left_out: &[String],
+    refused: &[String],
+) -> String {
+    let mut parts = vec![tr!("dump-done-tables", n = tables)];
+    parts.extend(note.map(crate::i18n::export_note));
+    if !missing.is_empty() {
+        let (n, names) = (missing.len(), missing.join(", "));
+        parts.push(tr!("dump-done-missing", n = n, names = names));
+    }
+    if !left_out.is_empty() {
+        let (n, names) = (left_out.len(), left_out.join(", "));
+        parts.push(tr!("dump-done-left-out", n = n, names = names));
+    }
+    if !rows_left_out.is_empty() {
+        let (n, names) = (rows_left_out.len(), rows_left_out.join(", "));
+        parts.push(tr!("dump-done-rows-left-out", n = n, names = names));
+    }
+    if !refused.is_empty() {
+        let (n, names) = (refused.len(), refused.join(", "));
+        parts.push(tr!("dump-done-refused", n = n, names = names));
+    }
+    parts.join(" ")
+}
+
+/// `dump::cancel_note` in the interface's language.
+fn dump_cancel_note(name: &str, partial: bool) -> String {
+    if partial {
+        tr!(
+            "dump-cancelled-partial",
+            name = name,
+            part = schemaic_core::export::part_path(name)
+        )
+    } else {
+        tr!("export-cancelled-nothing", name = name)
+    }
+}
+
+/// `export::files_note` in the interface's language.
+fn files_done_note(
+    files: usize,
+    tally: &schemaic_core::export::ExportTally,
+    folder: &str,
+    missing: &[String],
+    replaced: &[String],
+) -> String {
+    let head = tr!("files-done", n = files);
+    let mut s = match schemaic_core::export::export_said(tally, folder, true) {
+        Some(note) => tr!(
+            "files-done-with-note",
+            head = head,
+            note = crate::i18n::export_note(&note)
+        ),
+        None => head,
+    };
+    files_tail(&mut s, missing, replaced);
+    s
+}
+
+/// `export::files_cancel_note` in the interface's language.
+fn files_cancel_note(
+    files: usize,
+    folder: &str,
+    missing: &[String],
+    replaced: &[String],
+) -> String {
+    let mut s = if files == 0 {
+        tr!("files-cancelled-none", folder = folder)
+    } else {
+        tr!("files-cancelled", n = files, folder = folder)
+    };
+    files_tail(&mut s, missing, replaced);
+    s
+}
+
+/// `export::files_failure_note` in the interface's language.
+fn files_failure_note(
+    message: &str,
+    files: usize,
+    folder: &str,
+    missing: &[String],
+    replaced: &[String],
+) -> String {
+    let mut s = if files == 0 {
+        message.to_string()
+    } else {
+        tr!(
+            "files-failed-kept",
+            message = message,
+            n = files,
+            folder = folder
+        )
+    };
+    files_tail(&mut s, missing, replaced);
+    s
+}
+
+/// The replaced files and the tables never found, each its own sentence after
+/// a folder export's first — `export`'s `replaced_clause` and `missing_clause`.
+fn files_tail(s: &mut String, missing: &[String], replaced: &[String]) {
+    if !replaced.is_empty() {
+        s.push(' ');
+        s.push_str(&tr!(
+            "files-replaced",
+            n = replaced.len(),
+            names = replaced.join(", ")
+        ));
+    }
+    if !missing.is_empty() {
+        s.push(' ');
+        s.push_str(&tr!(
+            "files-missing",
+            n = missing.len(),
+            names = missing.join(", ")
+        ));
+    }
+}
+
+/// `dump::folder_replace_prompt` in the interface's language.
+fn folder_replace_prompt(folder: &str, replaced: &[String]) -> String {
+    use schemaic_core::dump::FOLDER_REPLACE_SHOWN;
+    let n = replaced.len();
+    let names = replaced
+        .iter()
+        .take(FOLDER_REPLACE_SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match n.saturating_sub(FOLDER_REPLACE_SHOWN) {
+        0 => tr!("dump-replace-prompt", n = n, folder = folder, names = names),
+        more => tr!(
+            "dump-replace-prompt-more",
+            n = n,
+            folder = folder,
+            names = names,
+            more = more
+        ),
+    }
+}
+
+#[cfg(test)]
+mod core_words_tests {
+    use super::{
+        dump_cancel_note, dump_done_note, files_cancel_note, files_done_note, files_failure_note,
+        folder_replace_prompt,
+    };
+    use schemaic_core::export::{ExportTally, export_note, export_said};
+    use schemaic_core::{dump, export};
+
+    fn names(n: usize, stem: &str) -> Vec<String> {
+        (1..=n).map(|i| format!("{stem}{i}")).collect()
+    }
+
+    fn tally() -> ExportTally {
+        ExportTally {
+            rows: 115_000,
+            withheld: vec!["avatar".into()],
+            ..Default::default()
+        }
+    }
+
+    /// **A dump's done and cancel lines read in English exactly as core's** —
+    /// every list empty, one and several, with and without the export's note.
+    #[test]
+    fn english_says_every_dump_outcome_as_core_does() {
+        for tables in [1, 5] {
+            for k in [0, 1, 3] {
+                for with_note in [false, true] {
+                    let note = with_note.then(|| export_said(&tally(), "shop.sql", true).unwrap());
+                    let english =
+                        with_note.then(|| export_note(&tally(), "shop.sql", true).unwrap());
+                    let (m, l, r, f) = (
+                        names(k, "ghost"),
+                        names(k, "v"),
+                        names(k, "edge"),
+                        names(k, "t"),
+                    );
+                    assert_eq!(
+                        dump_done_note(tables, note.as_ref(), &m, &l, &r, &f),
+                        dump::done_note(tables, english.as_deref(), &m, &l, &r, &f),
+                        "{tables} {k} {with_note}"
+                    );
+                }
+            }
+        }
+        for partial in [false, true] {
+            assert_eq!(
+                dump_cancel_note("shop.sql", partial),
+                dump::cancel_note("shop.sql", partial)
+            );
+        }
+    }
+
+    /// The same for a folder export's done, cancelled and failed lines, and
+    /// the question asked before it replaces files — up to and past the eight
+    /// it names.
+    #[test]
+    fn english_says_every_folder_outcome_as_core_does() {
+        let message = "Export failed: No space left on device (os error 28)";
+        for files in [0, 1, 12] {
+            for k in [0, 1, 2] {
+                let (m, r) = (names(k, "ghost"), names(k, "f"));
+                assert_eq!(
+                    files_done_note(files, &tally(), "out", &m, &r),
+                    export::files_note(files, &tally(), "out", &m, &r),
+                );
+                assert_eq!(
+                    files_cancel_note(files, "out", &m, &r),
+                    export::files_cancel_note(files, "out", &m, &r),
+                );
+                assert_eq!(
+                    files_failure_note(message, files, "out", &m, &r),
+                    export::files_failure_note(message, files, "out", &m, &r),
+                );
+            }
+        }
+        for n in [1, 2, 8, 9, 20] {
+            let replaced = names(n, "t");
+            assert_eq!(
+                folder_replace_prompt("out", &replaced),
+                dump::folder_replace_prompt("out", &replaced),
+                "{n}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

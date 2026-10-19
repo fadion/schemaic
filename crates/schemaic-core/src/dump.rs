@@ -4206,15 +4206,23 @@ pub fn folder_verdict(consented: Option<&[String]>, colliding: &[String]) -> Fol
     }
 }
 
+/// How many of the files to be replaced [`folder_replace_prompt`] names
+/// before counting the rest.
+pub const FOLDER_REPLACE_SHOWN: usize = 8;
+
 /// The question [`FolderVerdict::Ask`] asks, as the confirm modal wants it.
 ///
 /// Here rather than in the view for the reason every other export sentence is:
 /// a report with arms (one file, a few, more than fit) is a decision, and not
-/// one to make inside a callback the suite cannot reach.
+/// one to make inside a callback the suite cannot reach. The interface words
+/// the same arguments itself, naming [`FOLDER_REPLACE_SHOWN`] of them.
 pub fn folder_replace_prompt(folder: &str, replaced: &[String]) -> String {
-    const SHOWN: usize = 8;
     let n = replaced.len();
-    let named: Vec<&str> = replaced.iter().take(SHOWN).map(String::as_str).collect();
+    let named: Vec<&str> = replaced
+        .iter()
+        .take(FOLDER_REPLACE_SHOWN)
+        .map(String::as_str)
+        .collect();
     let list = named.join(", ");
     let more = n.saturating_sub(named.len());
     let tail = if more > 0 {

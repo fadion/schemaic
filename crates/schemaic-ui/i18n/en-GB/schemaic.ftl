@@ -1509,6 +1509,65 @@ dump-progress = Writing { $table } — { $index } of { $total }, { $rows } rows 
 dump-reading-schema = Reading the schema
 # The title of the prompt asking whether to overwrite files already in the folder.
 dump-replace-files = Replace files
+# Its question (core's dump::folder_replace_prompt; English must read exactly
+# as it does). $n counts the files, $names lists up to eight, $more the rest;
+# $folder is the folder.
+dump-replace-prompt = { $n ->
+    [one] { $n } file in { $folder } will be replaced, and it cannot be recovered: { $names }.
+   *[other] { $n } files in { $folder } will be replaced, and they cannot be recovered: { $names }.
+}
+dump-replace-prompt-more = { $n } files in { $folder } will be replaced, and they cannot be recovered: { $names }, and { $more } more.
+# What a finished dump says (core's dump::done_note): each an own sentence,
+# joined by a space. The export's own note (export-note-*) follows the first.
+# $n counts, $names lists. A graph edge table is SQL Server's.
+dump-done-tables = { $n ->
+    [one] Wrote { $n } table.
+   *[other] Wrote { $n } tables.
+}
+dump-done-missing = { $n ->
+    [one] { $n } ticked table not found and is not in the file: { $names }.
+   *[other] { $n } ticked tables not found and are not in the file: { $names }.
+}
+dump-done-left-out = { $n ->
+    [one] { $n } object the export asked for is not in the file: { $names }.
+   *[other] { $n } objects the export asked for are not in the file: { $names }.
+}
+dump-done-rows-left-out = { $n ->
+    [one] The rows of graph edge table { $names } are not in the file; it is created empty.
+   *[other] The rows of graph edge tables { $names } are not in the file; they are created empty.
+}
+dump-done-refused = { $n ->
+    [one] A replay onto a database that already holds this stops before it drops anything: the file cannot put it back as it is: { $names }.
+   *[other] A replay onto a database that already holds any of these stops before it drops anything: the file cannot put them back as they are: { $names }.
+}
+# A cancelled dump that had begun writing. $part is the .part file.
+dump-cancelled-partial = Export cancelled — { $name } was not changed; what had been written is in { $part }
+# A folder export's outcome (core's export::files_*). $n counts files, $folder
+# is the folder; replaced and missing files follow as sentences of their own.
+files-done = { $n ->
+    [one] Wrote { $n } file.
+   *[other] Wrote { $n } files.
+}
+# $head is files-done, $note the export's note (export-note-*).
+files-done-with-note = { $head } { $note }.
+files-cancelled-none = Export cancelled — no file was finished, so nothing was written to { $folder }.
+files-cancelled = { $n ->
+    [one] Export cancelled — { $n } file was finished in { $folder }; the table in progress was left unwritten.
+   *[other] Export cancelled — { $n } files were finished in { $folder }; the table in progress was left unwritten.
+}
+# $message already says the export failed.
+files-failed-kept = { $n ->
+    [one] { $message } — { $n } file already written to { $folder } is kept.
+   *[other] { $message } — { $n } files already written to { $folder } are kept.
+}
+files-replaced = { $n ->
+    [one] { $n } existing file was replaced: { $names }.
+   *[other] { $n } existing files were replaced: { $names }.
+}
+files-missing = { $n ->
+    [one] { $n } ticked table not found and was no file: { $names }.
+   *[other] { $n } ticked tables not found and were no file: { $names }.
+}
 
 ## Grid export's progress box (dump_view.rs)
 ## $rows and $total are abbreviated counts (9.4k, ~180k).
