@@ -6650,18 +6650,252 @@ impl Severity {
     }
 }
 
-/// One editor diagnostic: a byte range to underline, its severity, and the hover
-/// message.
+/// One editor diagnostic: a byte range to underline, its severity, and what
+/// the hover says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub range: (usize, usize),
     pub severity: Severity,
-    pub message: String,
+    /// What is wrong, as a value: the editor's hover says it in the
+    /// interface's language, and [`Diagnostic::message`] is the English the
+    /// AI fix prompt reads.
+    pub what: DiagMessage,
     /// Alt+Enter's quick fix: the text that replaces **exactly `range`** —
     /// the nearest keyword for a typo, `x IS NULL` for `x = NULL`. `None` where
     /// there is no one answer. Its own range would have to be shifted
     /// wherever `range` is (the per-statement cache moves it), so it has none.
     pub fix: Option<String>,
+}
+
+impl Diagnostic {
+    /// What the diagnostic says, in English.
+    pub fn message(&self) -> String {
+        self.what.message()
+    }
+}
+
+/// What a [`Diagnostic`] says. The `String` fields are SQL — the names and
+/// words the statement spelt — or text that is not Schemaic's to translate:
+/// the parser's detail and the server's error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiagMessage {
+    /// A statement the parser refused, with its error's `detail` when it
+    /// gave one — the parser's own English, after Schemaic's prefix.
+    Syntax { detail: Option<String> },
+    /// The server's error, in the server's words.
+    Server(String),
+    /// A reserved `word` used as an alias, to be quoted with `quote`.
+    ReservedAlias { word: String, quote: AliasQuote },
+    /// A `table` the catalogue does not hold, in the `database` the statement
+    /// wrote, with the nearest name the catalogue does hold.
+    TableNotFound {
+        table: String,
+        database: Option<String>,
+        suggestion: Option<String>,
+    },
+    /// A `column` its `table` (when there is one to name) does not hold, with
+    /// the nearest one it does.
+    ColumnNotFound {
+        column: String,
+        table: Option<String>,
+        suggestion: Option<String>,
+    },
+    /// A `name` qualifying a column where its table is aliased as `alias`.
+    AliasedAs { name: String, alias: String },
+    /// An unqualified `column` two sources hold.
+    AmbiguousColumn { column: String },
+    /// An inner `JOIN` with no `ON` or `USING`.
+    JoinWithoutCondition,
+    /// A comma join in a `SELECT` with no `WHERE`.
+    CommaJoinWithoutWhere,
+    /// A selected `column` neither grouped nor aggregated.
+    NotGrouped { column: String },
+    /// An `INSERT` row of `values` values under a list of `columns`.
+    InsertRowWidth { columns: usize, values: usize },
+    /// A row of `values` values for `table`, which takes `needed` without a
+    /// column list — fewer than it has.
+    RowWidthWithoutList {
+        table: String,
+        needed: usize,
+        values: usize,
+    },
+    /// A row of `values` values for `table`, which has `columns`.
+    RowWidthOfTable {
+        table: String,
+        columns: usize,
+        values: usize,
+    },
+    /// A nullable `column` on the left of `NOT IN (subquery)`.
+    NullableNotIn { column: String },
+    /// An `UPDATE` with no `WHERE`.
+    UpdateWithoutWhere,
+    /// A `DELETE` with no `WHERE`.
+    DeleteWithoutWhere,
+    /// `= NULL` or `<> NULL`, where `fix` (`IS NULL`, `IS NOT NULL`) is meant.
+    NullComparison { fix: String },
+    /// A `word` near a keyword.
+    MisspelledKeyword { word: String },
+    /// A `word` near a function's name.
+    MisspelledFunction { word: String },
+    /// A T-SQL batch's control flow.
+    Flow(FlowError),
+}
+
+/// How an engine quotes an identifier — the remedy for a reserved alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AliasQuote {
+    /// MySQL and MariaDB.
+    Backticks,
+    /// PostgreSQL and SQLite.
+    DoubleQuotes,
+    /// SQL Server.
+    Brackets,
+}
+
+/// A T-SQL control-flow error ([`TsqlFlow`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowError {
+    MergeNeedsSemicolon,
+    IfWithoutStatement,
+    ElseWithoutStatement,
+    WhileWithoutStatement,
+    EndTryWithoutBeginTry,
+    EndCatchWithoutBeginCatch,
+    EndWithoutBegin,
+    ThrowNeedsSemicolon,
+    EndTryWithoutCatch,
+    IfWithoutStatementBeforeElse,
+    ElseWithoutIf,
+    BeginCatchWithoutEndTry,
+    BeginTryWithoutEndTry,
+    BeginCatchWithoutEndCatch,
+    BeginWithoutEnd,
+}
+
+impl DiagMessage {
+    /// The message in English.
+    pub fn message(&self) -> String {
+        use crate::text::plural;
+        let suggest = |s: &Option<String>| {
+            s.as_ref()
+                .map(|n| format!(" — did you mean `{n}`?"))
+                .unwrap_or_default()
+        };
+        let within =
+            |s: &Option<String>| s.as_ref().map(|n| format!(" in `{n}`")).unwrap_or_default();
+        match self {
+            DiagMessage::Syntax { detail: None } => "Syntax error".to_string(),
+            DiagMessage::Syntax { detail: Some(d) } => format!("Syntax error: {d}"),
+            DiagMessage::Server(m) => m.clone(),
+            DiagMessage::ReservedAlias { word, quote } => {
+                let quote = match quote {
+                    AliasQuote::Backticks => "backticks",
+                    AliasQuote::DoubleQuotes => "double quotes",
+                    AliasQuote::Brackets => "brackets",
+                };
+                format!(
+                    "`{word}` is a reserved keyword and can't be used as an alias (quote it with {quote})"
+                )
+            }
+            DiagMessage::TableNotFound {
+                table,
+                database,
+                suggestion,
+            } => format!(
+                "Table `{table}` not found{}{}",
+                within(database),
+                suggest(suggestion)
+            ),
+            DiagMessage::ColumnNotFound {
+                column,
+                table,
+                suggestion,
+            } => format!(
+                "Column `{column}` not found{}{}",
+                within(table),
+                suggest(suggestion)
+            ),
+            DiagMessage::AliasedAs { name, alias } => {
+                format!("`{name}` is aliased as `{alias}` here — qualify with `{alias}`")
+            }
+            DiagMessage::AmbiguousColumn { column } => format!("Column `{column}` is ambiguous"),
+            DiagMessage::JoinWithoutCondition => "JOIN has no ON/USING condition — this is a \
+                                                  cross join; use CROSS JOIN if that's intended"
+                .to_string(),
+            DiagMessage::CommaJoinWithoutWhere => "Comma join with no WHERE — this is a cross \
+                                                   join; add a WHERE, or use CROSS JOIN if \
+                                                   that's intended"
+                .to_string(),
+            DiagMessage::NotGrouped { column } => {
+                format!("Column `{column}` must appear in GROUP BY or be used in an aggregate")
+            }
+            &DiagMessage::InsertRowWidth { columns, values } => format!(
+                "INSERT names {columns} {} but this row has {values} {}",
+                plural(columns, "column", "columns"),
+                plural(values, "value", "values"),
+            ),
+            DiagMessage::RowWidthWithoutList {
+                table,
+                needed,
+                values,
+            } => format!(
+                "`{table}` takes {needed} {} without a column list but this row has {values}",
+                plural(*needed, "value", "values"),
+            ),
+            DiagMessage::RowWidthOfTable {
+                table,
+                columns,
+                values,
+            } => format!(
+                "`{table}` has {columns} {} but this row has {values} {}",
+                plural(*columns, "column", "columns"),
+                plural(*values, "value", "values"),
+            ),
+            DiagMessage::NullableNotIn { column } => format!(
+                "`{column}` can be NULL, and `NOT IN` matches no row once the subquery \
+                 returns one — add `WHERE {column} IS NOT NULL` to it, or use NOT EXISTS"
+            ),
+            DiagMessage::UpdateWithoutWhere => {
+                "UPDATE without WHERE changes every row in the table".to_string()
+            }
+            DiagMessage::DeleteWithoutWhere => {
+                "DELETE without WHERE removes every row in the table".to_string()
+            }
+            DiagMessage::NullComparison { fix } => {
+                format!("A comparison with NULL is never true — use {fix}")
+            }
+            DiagMessage::MisspelledKeyword { word } => {
+                format!("`{word}` looks like a misspelled keyword")
+            }
+            DiagMessage::MisspelledFunction { word } => {
+                format!("`{word}` looks like a misspelled function")
+            }
+            DiagMessage::Flow(f) => f.message().to_string(),
+        }
+    }
+}
+
+impl FlowError {
+    /// The error in English.
+    pub fn message(self) -> &'static str {
+        match self {
+            FlowError::MergeNeedsSemicolon => "`MERGE` must end with `;`",
+            FlowError::IfWithoutStatement => "`IF` has no statement to run",
+            FlowError::ElseWithoutStatement => "`ELSE` has no statement to run",
+            FlowError::WhileWithoutStatement => "`WHILE` has no statement to run",
+            FlowError::EndTryWithoutBeginTry => "`END TRY` without a matching `BEGIN TRY`",
+            FlowError::EndCatchWithoutBeginCatch => "`END CATCH` without a matching `BEGIN CATCH`",
+            FlowError::EndWithoutBegin => "`END` without a matching `BEGIN`",
+            FlowError::ThrowNeedsSemicolon => "The statement before `THROW` must end with `;`",
+            FlowError::EndTryWithoutCatch => "`END TRY` must be followed by `BEGIN CATCH`",
+            FlowError::IfWithoutStatementBeforeElse => "`IF` has no statement before its `ELSE`",
+            FlowError::ElseWithoutIf => "`ELSE` without an `IF` before it",
+            FlowError::BeginCatchWithoutEndTry => "`BEGIN CATCH` must follow an `END TRY`",
+            FlowError::BeginTryWithoutEndTry => "`BEGIN TRY` has no matching `END TRY`",
+            FlowError::BeginCatchWithoutEndCatch => "`BEGIN CATCH` has no matching `END CATCH`",
+            FlowError::BeginWithoutEnd => "`BEGIN` has no matching `END`",
+        }
+    }
 }
 
 /// Convert a 1-based (line, column) — as reported by a `sqlparser` / DB error
@@ -7572,14 +7806,6 @@ fn in_case_of(typed: &str, name: &str) -> String {
     }
 }
 
-/// [`nearest_name`] as the tail of a "not found" message — empty when there
-/// is no one name to suggest.
-fn did_you_mean<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
-    nearest_name(name, candidates)
-        .map(|n| format!(" — did you mean `{n}`?"))
-        .unwrap_or_default()
-}
-
 /// Catalog-aware offline diagnostics: instant, no DB round-trip. For each
 /// statement in `sql`:
 /// - parses it with `dialect`; a parse failure on a *completed* statement (one
@@ -7879,7 +8105,7 @@ fn range_diagnostics(
                 && !ends_with_semicolon
                 && !is_typing_tail
             {
-                flow_error(out, merge, "`MERGE` must end with `;`");
+                flow_error(out, merge, FlowError::MergeNeedsSemicolon);
             }
         }
     }
@@ -8073,11 +8299,11 @@ enum Frame {
 }
 
 /// An error [`TsqlFlow`] reports, over `range`.
-fn flow_error(out: &mut Vec<Diagnostic>, range: (usize, usize), message: &str) {
+fn flow_error(out: &mut Vec<Diagnostic>, range: (usize, usize), error: FlowError) {
     out.push(Diagnostic {
         range,
         severity: Severity::Error,
-        message: message.to_string(),
+        what: DiagMessage::Flow(error),
         fix: None,
     });
 }
@@ -8128,14 +8354,14 @@ impl TsqlFlow {
     fn drain(&mut self, out: &mut Vec<Diagnostic>) {
         loop {
             self.settle();
-            let message = match self.top() {
-                Some(Frame::IfBody) => "`IF` has no statement to run",
-                Some(Frame::ElseBody) => "`ELSE` has no statement to run",
-                Some(Frame::WhileBody) => "`WHILE` has no statement to run",
+            let error = match self.top() {
+                Some(Frame::IfBody) => FlowError::IfWithoutStatement,
+                Some(Frame::ElseBody) => FlowError::ElseWithoutStatement,
+                Some(Frame::WhileBody) => FlowError::WhileWithoutStatement,
                 _ => return,
             };
             if let Some((_, at)) = self.open.pop() {
-                flow_error(out, at, message);
+                flow_error(out, at, error);
             }
             self.complete();
         }
@@ -8147,10 +8373,10 @@ impl TsqlFlow {
     /// what it names.
     fn close(&mut self, frame: Frame, at: (usize, usize), out: &mut Vec<Diagnostic>) -> bool {
         self.drain(out);
-        let message = match frame {
-            Frame::Try => "`END TRY` without a matching `BEGIN TRY`",
-            Frame::Catch => "`END CATCH` without a matching `BEGIN CATCH`",
-            _ => "`END` without a matching `BEGIN`",
+        let error = match frame {
+            Frame::Try => FlowError::EndTryWithoutBeginTry,
+            Frame::Catch => FlowError::EndCatchWithoutBeginCatch,
+            _ => FlowError::EndWithoutBegin,
         };
         match self.top() {
             Some(f) if f == frame => {
@@ -8159,11 +8385,11 @@ impl TsqlFlow {
             }
             Some(Frame::Block | Frame::Try | Frame::Catch) => {
                 self.open.pop();
-                flow_error(out, at, message);
+                flow_error(out, at, error);
                 false
             }
             _ => {
-                flow_error(out, at, message);
+                flow_error(out, at, error);
                 false
             }
         }
@@ -8178,7 +8404,7 @@ impl TsqlFlow {
             && !u.after_semicolon
             && !self.throw_follows
         {
-            flow_error(out, u.at, "The statement before `THROW` must end with `;`");
+            flow_error(out, u.at, FlowError::ThrowNeedsSemicolon);
         }
         self.throw_follows = match u.kind {
             UnitKind::Condition => true,
@@ -8192,7 +8418,7 @@ impl TsqlFlow {
                 self.open.push((Frame::Catch, u.at2));
                 return;
             }
-            flow_error(out, end_try, "`END TRY` must be followed by `BEGIN CATCH`");
+            flow_error(out, end_try, FlowError::EndTryWithoutCatch);
             if begin_catch {
                 // Read as the `CATCH` it was meant for: one mistake, one error.
                 self.open.push((Frame::Catch, u.at2));
@@ -8229,10 +8455,10 @@ impl TsqlFlow {
                 (Some("ELSE"), _) => match self.open.last_mut() {
                     Some(top) if top.0 == Frame::IfElse => *top = (Frame::ElseBody, u.at),
                     Some(top) if top.0 == Frame::IfBody => {
-                        flow_error(out, top.1, "`IF` has no statement before its `ELSE`");
+                        flow_error(out, top.1, FlowError::IfWithoutStatementBeforeElse);
                         *top = (Frame::ElseBody, u.at);
                     }
-                    _ => flow_error(out, u.at, "`ELSE` without an `IF` before it"),
+                    _ => flow_error(out, u.at, FlowError::ElseWithoutIf),
                 },
                 (Some("BEGIN"), Some("TRY")) => {
                     self.settle();
@@ -8240,7 +8466,7 @@ impl TsqlFlow {
                 }
                 (Some("BEGIN"), Some("CATCH")) => {
                     self.settle();
-                    flow_error(out, u.at2, "`BEGIN CATCH` must follow an `END TRY`");
+                    flow_error(out, u.at2, FlowError::BeginCatchWithoutEndTry);
                     self.open.push((Frame::Catch, u.at2));
                 }
                 (Some("BEGIN"), _) => {
@@ -8276,15 +8502,15 @@ impl TsqlFlow {
         if report {
             self.drain(out);
             if let Some(end_try) = self.catch_owed.take() {
-                flow_error(out, end_try, "`END TRY` must be followed by `BEGIN CATCH`");
+                flow_error(out, end_try, FlowError::EndTryWithoutCatch);
             }
             for &(frame, at) in &self.open {
-                let message = match frame {
-                    Frame::Try => "`BEGIN TRY` has no matching `END TRY`",
-                    Frame::Catch => "`BEGIN CATCH` has no matching `END CATCH`",
-                    _ => "`BEGIN` has no matching `END`",
+                let error = match frame {
+                    Frame::Try => FlowError::BeginTryWithoutEndTry,
+                    Frame::Catch => FlowError::BeginCatchWithoutEndCatch,
+                    _ => FlowError::BeginWithoutEnd,
                 };
-                flow_error(out, at, message);
+                flow_error(out, at, error);
             }
         }
         *self = TsqlFlow::new();
@@ -8829,7 +9055,7 @@ fn unit_diagnostics(
             out.push(Diagnostic {
                 range,
                 severity: Severity::Error,
-                message: friendly_syntax_message(&msg),
+                what: friendly_syntax_message(&msg),
                 fix: None,
             });
         }
@@ -11348,9 +11574,9 @@ fn alias_checks(
     // The remedy names this engine's quote: backticks were SQL Server's and
     // PostgreSQL's advice too, and neither accepts them.
     let quote = match dialect {
-        SqlDialect::MySql => "backticks",
-        SqlDialect::Postgres | SqlDialect::Sqlite => "double quotes",
-        SqlDialect::MsSql => "brackets",
+        SqlDialect::MySql => AliasQuote::Backticks,
+        SqlDialect::Postgres | SqlDialect::Sqlite => AliasQuote::DoubleQuotes,
+        SqlDialect::MsSql => AliasQuote::Brackets,
     };
     let calls = enclosing_calls(&toks);
     let declaring = declaring_contexts(&toks, dialect);
@@ -11358,9 +11584,10 @@ fn alias_checks(
         out.push(Diagnostic {
             range: (at, at + kw.len()),
             severity: Severity::Error,
-            message: format!(
-                "`{kw}` is a reserved keyword and can't be used as an alias (quote it with {quote})"
-            ),
+            what: DiagMessage::ReservedAlias {
+                word: kw.to_string(),
+                quote,
+            },
             fix: None,
         });
     };
@@ -11623,22 +11850,18 @@ fn table_existence_checks(
             continue;
         };
         if let TableStatus::NotFound = catalog.table_status(&r) {
-            let where_db = l
-                .written_qualifier()
-                .map(|d| format!(" in `{d}`"))
-                .unwrap_or_default();
             // Quoted where the engine folds the bare spelling: `OrderItems`
             // unquoted is `orderitems` on PostgreSQL, which names no table.
             let suggestion = nearest_name(&r.name, catalog.table_names(r.db.as_deref()))
                 .map(|n| crate::export::ident_if_needed(n, dialect));
-            let hint = suggestion
-                .as_ref()
-                .map(|n| format!(" — did you mean `{n}`?"))
-                .unwrap_or_default();
             out.push(Diagnostic {
                 range: l.pos,
                 severity: Severity::Error,
-                message: format!("Table `{}` not found{where_db}{hint}", r.name),
+                what: DiagMessage::TableNotFound {
+                    table: r.name.clone(),
+                    database: l.written_qualifier().map(|d| d.to_string()),
+                    suggestion: suggestion.clone(),
+                },
                 // `pos` is the name token alone, so the qualifier stays.
                 fix: suggestion,
             });
@@ -11677,11 +11900,15 @@ fn qualified_column_checks(
             // The engine's own undeclared columns are in no catalogue.
             && !dialect.is_implicit_column(col)
         {
-            let hint = did_you_mean(col, cols.iter().map(String::as_str));
             out.push(Diagnostic {
                 range: (w[2].at, w[2].end),
                 severity: Severity::Error,
-                message: format!("Column `{col}` not found in `{}`{hint}", table.name),
+                what: DiagMessage::ColumnNotFound {
+                    column: col.to_string(),
+                    table: Some(table.name.clone()),
+                    suggestion: nearest_name(col, cols.iter().map(String::as_str))
+                        .map(str::to_string),
+                },
                 fix: nearest_name(col, cols.iter().map(String::as_str))
                     .map(|n| crate::export::ident_if_needed(n, dialect)),
             });
@@ -11716,7 +11943,9 @@ mod colres {
     };
     use sqlparser::tokenizer::Span;
 
-    use super::{Catalog, Diagnostic, Severity, TableRef, TableStatus, offset_of_line_col};
+    use super::{
+        Catalog, DiagMessage, Diagnostic, Severity, TableRef, TableStatus, offset_of_line_col,
+    };
 
     /// The columns a FROM source exposes, or `Open` when they can't be enumerated.
     #[derive(Clone)]
@@ -12315,15 +12544,17 @@ mod colres {
                                 Cols::Known(cols) => {
                                     let mut d = err(
                                         r,
-                                        &format!(
-                                            "Column `{}` not found in `{}`{}",
-                                            r.col,
-                                            src.table.clone().unwrap_or_else(|| q.clone()),
-                                            super::did_you_mean(
-                                                &r.col,
-                                                cols.iter().map(String::as_str)
+                                        DiagMessage::ColumnNotFound {
+                                            column: r.col.clone(),
+                                            table: Some(
+                                                src.table.clone().unwrap_or_else(|| q.clone()),
                                             ),
-                                        ),
+                                            suggestion: super::nearest_name(
+                                                &r.col,
+                                                cols.iter().map(String::as_str),
+                                            )
+                                            .map(str::to_string),
+                                        },
                                     );
                                     // The message's "did you mean", as the fix —
                                     // in the catalogue's case, not the key's.
@@ -12357,7 +12588,10 @@ mod colres {
                         let alias = src.quals.first().cloned().unwrap_or_default();
                         return Some(err(
                             r,
-                            &format!("`{q}` is aliased as `{alias}` here — qualify with `{alias}`"),
+                            DiagMessage::AliasedAs {
+                                name: q.clone(),
+                                alias,
+                            },
                         ));
                     }
                 }
@@ -12383,7 +12617,12 @@ mod colres {
                     // Two known sources with the column → ambiguous, unless a
                     // `USING`/`NATURAL` join coalesced it into a single output column.
                     if known_matches >= 2 && !s.natural && !s.coalesced.contains(&r.col) {
-                        return Some(err(r, &format!("Column `{}` is ambiguous", r.col)));
+                        return Some(err(
+                            r,
+                            DiagMessage::AmbiguousColumn {
+                                column: r.col.clone(),
+                            },
+                        ));
                     }
                     if known_matches >= 1 {
                         return None; // resolved unambiguously in this scope
@@ -12417,9 +12656,9 @@ mod colres {
                 }
                 // Not found and no open source anywhere in the chain → flag. Name the
                 // table only when the innermost scope has a single base-table source.
-                let where_tbl = match chain[0].sources.as_slice() {
-                    [Src { table: Some(t), .. }] => format!(" in `{t}`"),
-                    _ => String::new(),
+                let table = match chain[0].sources.as_slice() {
+                    [Src { table: Some(t), .. }] => Some(t.clone()),
+                    _ => None,
                 };
                 // The suggestion is from what the innermost scope can see — the
                 // message's "did you mean" and Alt+Enter's fix alike.
@@ -12435,10 +12674,14 @@ mod colres {
                         })
                         .flatten(),
                 );
-                let hint = suggestion
-                    .map(|n| format!(" — did you mean `{n}`?"))
-                    .unwrap_or_default();
-                let mut d = err(r, &format!("Column `{}` not found{where_tbl}{hint}", r.col));
+                let mut d = err(
+                    r,
+                    DiagMessage::ColumnNotFound {
+                        column: r.col.clone(),
+                        table,
+                        suggestion: suggestion.map(str::to_string),
+                    },
+                );
                 d.fix = suggestion.map(|n| {
                     let n = chain[0]
                         .sources
@@ -12469,11 +12712,11 @@ mod colres {
         set.iter().any(|c| c.to_lowercase() == key)
     }
 
-    fn err(r: &Ref, message: &str) -> Diagnostic {
+    fn err(r: &Ref, what: DiagMessage) -> Diagnostic {
         Diagnostic {
             range: r.range,
             severity: Severity::Error,
-            message: message.to_string(),
+            what,
             fix: None,
         }
     }
@@ -12553,9 +12796,7 @@ mod colres {
                     out.push(Diagnostic {
                         range: to_range(stmt, lo, join.relation.span()),
                         severity: Severity::Hint,
-                        message: "JOIN has no ON/USING condition — this is a cross join; \
-                                  use CROSS JOIN if that's intended"
-                            .to_string(),
+                        what: DiagMessage::JoinWithoutCondition,
                         fix: None,
                     });
                 }
@@ -12582,9 +12823,7 @@ mod colres {
                     out.push(Diagnostic {
                         range: to_range(stmt, lo, twj.relation.span()),
                         severity: Severity::Hint,
-                        message: "Comma join with no WHERE — this is a cross join; add a \
-                                  WHERE, or use CROSS JOIN if that's intended"
-                            .to_string(),
+                        what: DiagMessage::CommaJoinWithoutWhere,
                         fix: None,
                     });
                 }
@@ -12731,9 +12970,9 @@ mod colres {
             out.push(Diagnostic {
                 range: to_range(stmt, lo, span),
                 severity: Severity::Warning,
-                message: format!(
-                    "Column `{name}` must appear in GROUP BY or be used in an aggregate"
-                ),
+                what: DiagMessage::NotGrouped {
+                    column: name.to_string(),
+                },
                 fix: None,
             });
         }
@@ -15833,7 +16072,7 @@ mod lints {
     };
 
     use super::colres::to_range;
-    use super::{Catalog, Diagnostic, Severity, SqlDialect, TableRef};
+    use super::{Catalog, DiagMessage, Diagnostic, Severity, SqlDialect, TableRef};
 
     /// Every lint over `asts`, parsed from `stmt`, which starts at `lo`;
     /// `in_body` when they are statements of a T-SQL routine's body. `raw` is
@@ -15904,11 +16143,10 @@ mod lints {
             out.push(Diagnostic {
                 range: to_range(stmt, lo, span),
                 severity: Severity::Error,
-                message: format!(
-                    "INSERT names {n} {} but this row has {m} {}",
-                    crate::text::plural(n, "column", "columns"),
-                    crate::text::plural(m, "value", "values"),
-                ),
+                what: DiagMessage::InsertRowWidth {
+                    columns: n,
+                    values: m,
+                },
                 fix: None,
             });
         }
@@ -15996,10 +16234,9 @@ mod lints {
                 out.push(Diagnostic {
                     range: to_range(stmt, lo, col_expr.span()),
                     severity: Severity::Warning,
-                    message: format!(
-                        "`{col}` can be NULL, and `NOT IN` matches no row once the subquery \
-                         returns one — add `WHERE {col} IS NOT NULL` to it, or use NOT EXISTS"
-                    ),
+                    what: DiagMessage::NullableNotIn {
+                        column: col.to_string(),
+                    },
                     fix: None,
                 });
             }
@@ -16150,24 +16387,23 @@ mod lints {
                 continue;
             }
             let span = row.opening_token.0.span.union(&row.closing_token.0.span);
-            let message = if skipping {
-                format!(
-                    "`{}` takes {needed} {} without a column list but this row has {m}",
-                    r.name,
-                    crate::text::plural(needed, "value", "values"),
-                )
+            let what = if skipping {
+                DiagMessage::RowWidthWithoutList {
+                    table: r.name.clone(),
+                    needed,
+                    values: m,
+                }
             } else {
-                format!(
-                    "`{}` has {all} {} but this row has {m} {}",
-                    r.name,
-                    crate::text::plural(all, "column", "columns"),
-                    crate::text::plural(m, "value", "values"),
-                )
+                DiagMessage::RowWidthOfTable {
+                    table: r.name.clone(),
+                    columns: all,
+                    values: m,
+                }
             };
             out.push(Diagnostic {
                 range: to_range(stmt, lo, span),
                 severity: Severity::Error,
-                message,
+                what,
                 fix: None,
             });
         }
@@ -16199,7 +16435,7 @@ mod lints {
         out: &mut Vec<Diagnostic>,
     ) {
         let joins = |t: &[TableWithJoins]| t.iter().any(|t| !t.joins.is_empty());
-        let (token, message) = match ast {
+        let (token, what) = match ast {
             Statement::Update(u)
                 if u.selection.is_none()
                     && u.limit.is_none()
@@ -16210,10 +16446,7 @@ mod lints {
                         }
                     }) =>
             {
-                (
-                    &u.update_token,
-                    "UPDATE without WHERE changes every row in the table",
-                )
+                (&u.update_token, DiagMessage::UpdateWithoutWhere)
             }
             Statement::Delete(d)
                 if d.selection.is_none()
@@ -16223,10 +16456,7 @@ mod lints {
                         FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
                     }) =>
             {
-                (
-                    &d.delete_token,
-                    "DELETE without WHERE removes every row in the table",
-                )
+                (&d.delete_token, DiagMessage::DeleteWithoutWhere)
             }
             _ => return,
         };
@@ -16242,7 +16472,7 @@ mod lints {
         out.push(Diagnostic {
             range,
             severity: Severity::Warning,
-            message: message.to_string(),
+            what,
             fix: None,
         });
     }
@@ -16306,7 +16536,9 @@ mod lints {
                 out.push(Diagnostic {
                     range,
                     severity: Severity::Warning,
-                    message: format!("A comparison with NULL is never true — use {fix}"),
+                    what: DiagMessage::NullComparison {
+                        fix: fix.to_string(),
+                    },
                     fix: replacement,
                 });
             }
@@ -16484,7 +16716,9 @@ fn typo_checks(
                 out.push(Diagnostic {
                     range: (s, j),
                     severity: Severity::Warning,
-                    message: format!("`{word}` looks like a misspelled keyword"),
+                    what: DiagMessage::MisspelledKeyword {
+                        word: word.to_string(),
+                    },
                     fix: nearest_name(word, SQL_KEYWORDS.iter().chain(STMT_KEYWORDS).copied())
                         .map(|kw| in_case_of(word, kw)),
                 });
@@ -16587,7 +16821,9 @@ fn function_typo_checks(
                 out.push(Diagnostic {
                     range: (s, j),
                     severity: Severity::Warning,
-                    message: format!("`{word}` looks like a misspelled function"),
+                    what: DiagMessage::MisspelledFunction {
+                        word: word.to_string(),
+                    },
                     fix: nearest_name(word, index.lower.iter().map(|n| &**n))
                         .map(|f| in_case_of(word, f)),
                 });
@@ -16676,16 +16912,14 @@ fn is_adjacent_transposition(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Tidy a raw `sqlparser` error into a short editor message.
-fn friendly_syntax_message(msg: &str) -> String {
+fn friendly_syntax_message(msg: &str) -> DiagMessage {
     let m = msg
         .trim()
         .strip_prefix("sql parser error:")
         .unwrap_or(msg)
         .trim();
-    if m.is_empty() {
-        "Syntax error".to_string()
-    } else {
-        format!("Syntax error: {m}")
+    DiagMessage::Syntax {
+        detail: (!m.is_empty()).then(|| m.to_string()),
     }
 }
 
@@ -18593,7 +18827,7 @@ pub fn run_error_diagnostic(
         return Some(Diagnostic {
             range,
             severity: Severity::Error,
-            message: clean_db_message(message),
+            what: DiagMessage::Server(clean_db_message(message)),
             fix: None,
         });
     }
@@ -18638,7 +18872,7 @@ pub fn db_error_diagnostic(
     Diagnostic {
         range,
         severity: Severity::Error,
-        message: clean_db_message(message),
+        what: DiagMessage::Server(clean_db_message(message)),
         fix: None,
     }
 }
@@ -18851,7 +19085,7 @@ pub fn problems_in_range(diags: &[Diagnostic], lo: usize, hi: usize) -> Vec<Stri
     let mut kept: Vec<&Diagnostic> = Vec::with_capacity(hits.len());
     for d in hits {
         let said = kept.iter().any(|k| {
-            k.message == d.message
+            k.message() == d.message()
                 || (k.range == d.range
                     && k.severity == Severity::Error
                     && d.severity == Severity::Error)
@@ -18860,7 +19094,8 @@ pub fn problems_in_range(diags: &[Diagnostic], lo: usize, hi: usize) -> Vec<Stri
             kept.push(d);
         }
     }
-    kept.into_iter().map(|d| d.message.clone()).collect()
+    // Core's English, in every interface language: the model reads it.
+    kept.into_iter().map(Diagnostic::message).collect()
 }
 
 /// How many lines [`sql_reply`] will strip from each end of a model's reply
@@ -27324,7 +27559,7 @@ mod tests {
             assert!(
                 d.is_empty(),
                 "valid data-modifying CTE squiggled on {dialect:?}: {:?}",
-                d.iter().map(|x| &x.message).collect::<Vec<_>>()
+                d.iter().map(|x| x.message()).collect::<Vec<_>>()
             );
         }
     }
@@ -27342,15 +27577,15 @@ mod tests {
         let sql = "SELECT * FROM gone; \
                    WITH gone AS (DELETE FROM employees RETURNING *) SELECT * FROM gone;";
         let d = diag_d(sql, SqlDialect::Postgres);
-        let msgs: Vec<&String> = d.iter().map(|x| &x.message).collect();
+        let msgs: Vec<String> = d.iter().map(|x| x.message()).collect();
         // Statement 1's `gone` is a real unknown table: nothing declares it there.
         assert_eq!(
-            d.iter().filter(|x| x.message.contains("gone")).count(),
+            d.iter().filter(|x| x.message().contains("gone")).count(),
             1,
             "exactly the first statement's `gone`: {msgs:?}"
         );
         // ...and it is the *first* one, by position.
-        let at = d.iter().find(|x| x.message.contains("gone")).unwrap();
+        let at = d.iter().find(|x| x.message().contains("gone")).unwrap();
         assert!(
             at.range.0 < sql.find("WITH").unwrap(),
             "the flagged `gone` is the second statement's: {msgs:?}"
@@ -27361,10 +27596,10 @@ mod tests {
                    SELECT * FROM gone;";
         let d = diag_d(sql, SqlDialect::Postgres);
         assert_eq!(
-            d.iter().filter(|x| x.message.contains("gone")).count(),
+            d.iter().filter(|x| x.message().contains("gone")).count(),
             1,
             "the CTE leaked into the statement after it: {:?}",
-            d.iter().map(|x| &x.message).collect::<Vec<_>>()
+            d.iter().map(|x| x.message()).collect::<Vec<_>>()
         );
     }
 
@@ -27379,9 +27614,9 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::Postgres);
             assert!(
-                !d.iter().any(|x| x.message.contains("RETURNING")),
+                !d.iter().any(|x| x.message().contains("RETURNING")),
                 "RETURNING read as an alias in {sql:?}: {:?}",
-                d.iter().map(|x| &x.message).collect::<Vec<_>>()
+                d.iter().map(|x| x.message()).collect::<Vec<_>>()
             );
         }
     }
@@ -27396,9 +27631,9 @@ mod tests {
             SqlDialect::Postgres,
         );
         assert!(
-            d.iter().any(|x| x.message.contains("gnoe")),
+            d.iter().any(|x| x.message().contains("gnoe")),
             "a misspelled table must still be flagged: {:?}",
-            d.iter().map(|x| &x.message).collect::<Vec<_>>()
+            d.iter().map(|x| x.message()).collect::<Vec<_>>()
         );
     }
 
@@ -27486,7 +27721,7 @@ mod tests {
         // The namespace is known, so the catalog can actually judge its columns.
         let d = pg_diag("SELECT nope FROM sales.orders");
         assert!(
-            d.iter().any(|d| d.message.contains("nope")),
+            d.iter().any(|d| d.message().contains("nope")),
             "expected an unknown-column diagnostic, got {d:?}"
         );
     }
@@ -27495,7 +27730,7 @@ mod tests {
     fn diag_missing_table_in_a_known_schema_is_flagged() {
         let d = pg_diag("SELECT * FROM sales.ghosts");
         assert!(
-            d.iter().any(|d| d.message.contains("ghosts")),
+            d.iter().any(|d| d.message().contains("ghosts")),
             "expected an unknown-table diagnostic, got {d:?}"
         );
     }
@@ -27526,7 +27761,7 @@ mod tests {
         assert!(diag("SELECT id FROM company.employees").is_empty());
         let d = diag("SELECT id FROM company.ghosts");
         assert!(
-            d.iter().any(|d| d.message.contains("ghosts")),
+            d.iter().any(|d| d.message().contains("ghosts")),
             "expected an unknown-table diagnostic, got {d:?}"
         );
     }
@@ -27545,7 +27780,7 @@ mod tests {
         let d = diag("SELECT * FROM employes");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Severity::Error);
-        assert!(d[0].message.contains("Table `employes` not found"));
+        assert!(d[0].message().contains("Table `employes` not found"));
         // The squiggle covers the table name, not the whole statement.
         assert_eq!(
             &"SELECT * FROM employes"[d[0].range.0..d[0].range.1],
@@ -27567,7 +27802,7 @@ mod tests {
             let d = diag_d(sql, dialect);
             let found = d
                 .iter()
-                .find(|x| x.message.contains("not found"))
+                .find(|x| x.message().contains("not found"))
                 .unwrap_or_else(|| panic!("no unknown-table diagnostic for {sql}"));
             let quote = if dialect == SqlDialect::Postgres {
                 '"'
@@ -27590,7 +27825,7 @@ mod tests {
         let d = diag_d(sql, SqlDialect::Postgres);
         let found = d
             .iter()
-            .find(|x| x.message.contains("not found"))
+            .find(|x| x.message().contains("not found"))
             .expect("unknown table");
         assert_eq!(&sql[found.range.0..found.range.1], r#""we""ird""#);
     }
@@ -27600,7 +27835,7 @@ mod tests {
         let d = diag("SELECT e.salery FROM employees e");
         assert_eq!(d.len(), 1);
         assert!(
-            d[0].message
+            d[0].message()
                 .contains("Column `salery` not found in `employees`")
         );
         assert_eq!(
@@ -27650,8 +27885,8 @@ mod tests {
         let msg = |sql: &str| -> Vec<String> {
             diag(sql)
                 .into_iter()
-                .filter(|d| d.message.contains("not found"))
-                .map(|d| d.message)
+                .filter(|d| d.message().contains("not found"))
+                .map(|d| d.message())
                 .collect()
         };
         assert_eq!(
@@ -27695,7 +27930,7 @@ mod tests {
         let msg = |sql: &str, d| -> Vec<String> {
             diagnostics(sql, &cat, d)
                 .into_iter()
-                .map(|x| x.message)
+                .map(|x| x.message())
                 .collect()
         };
         assert_eq!(
@@ -27720,8 +27955,8 @@ mod tests {
     fn col_errors(sql: &str) -> Vec<String> {
         diag(sql)
             .into_iter()
-            .filter(|d| d.message.starts_with("Column "))
-            .map(|d| d.message)
+            .filter(|d| d.message().starts_with("Column "))
+            .map(|d| d.message())
             .collect()
     }
 
@@ -27884,8 +28119,8 @@ mod tests {
         let aliased_away = |sql: &str| -> Vec<String> {
             diag(sql)
                 .into_iter()
-                .filter(|d| d.message.contains("is aliased as"))
-                .map(|d| d.message)
+                .filter(|d| d.message().contains("is aliased as"))
+                .map(|d| d.message())
                 .collect()
         };
         assert_eq!(
@@ -27925,8 +28160,8 @@ mod tests {
     fn col_errors_d(sql: &str, dialect: SqlDialect) -> Vec<String> {
         diag_d(sql, dialect)
             .into_iter()
-            .filter(|d| d.message.starts_with("Column "))
-            .map(|d| d.message)
+            .filter(|d| d.message().starts_with("Column "))
+            .map(|d| d.message())
             .collect()
     }
 
@@ -28065,7 +28300,7 @@ mod tests {
         assert!(
             implicit
                 .iter()
-                .all(|d| d.severity == Severity::Warning && d.message.contains("GROUP BY")),
+                .all(|d| d.severity == Severity::Warning && d.message().contains("GROUP BY")),
             "{implicit:?}"
         );
     }
@@ -28076,7 +28311,7 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Severity::Error);
         assert!(
-            d[0].message
+            d[0].message()
                 .contains("Column `salery` not found in `employees`")
         );
         assert_eq!(
@@ -28267,7 +28502,7 @@ mod tests {
         let d = diag(sql);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Severity::Error);
-        assert!(d[0].message.contains("ambiguous"), "{}", d[0].message);
+        assert!(d[0].message().contains("ambiguous"), "{}", d[0].message());
         // The squiggle covers the offending column.
         assert_eq!(&sql[d[0].range.0..d[0].range.1], "name");
         // Comma-join is the same shape.
@@ -28308,8 +28543,8 @@ mod tests {
     fn gb_warnings(sql: &str) -> Vec<String> {
         diag(sql)
             .into_iter()
-            .filter(|d| d.severity == Severity::Warning && d.message.contains("GROUP BY"))
-            .map(|d| d.message)
+            .filter(|d| d.severity == Severity::Warning && d.message().contains("GROUP BY"))
+            .map(|d| d.message())
             .collect()
     }
 
@@ -28333,7 +28568,7 @@ mod tests {
         let cat = Catalog::build(&[("company", schema)], Some("company"));
         diagnostics(sql, &cat, dialect)
             .into_iter()
-            .filter(|d| d.message.contains("GROUP BY"))
+            .filter(|d| d.message().contains("GROUP BY"))
             .map(|d| sql[d.range.0..d.range.1].to_string())
             .collect()
     }
@@ -28411,7 +28646,7 @@ mod tests {
         let sql = "SELECT dept_id, name FROM employees GROUP BY dept_id";
         let w: Vec<_> = diag(sql)
             .into_iter()
-            .filter(|x| x.severity == Severity::Warning && x.message.contains("GROUP BY"))
+            .filter(|x| x.severity == Severity::Warning && x.message().contains("GROUP BY"))
             .collect();
         assert_eq!(w.len(), 1);
         assert_eq!(&sql[w[0].range.0..w[0].range.1], "name");
@@ -28437,13 +28672,13 @@ mod tests {
         assert!(
             diag_pk("SELECT id, name, salary FROM employees GROUP BY id")
                 .iter()
-                .all(|d| !d.message.contains("GROUP BY"))
+                .all(|d| !d.message().contains("GROUP BY"))
         );
         // Grouping by a non-PK column still flags the ungrouped projection.
         assert!(
             diag_pk("SELECT id, name FROM employees GROUP BY dept_id")
                 .iter()
-                .any(|d| d.message.contains("GROUP BY"))
+                .any(|d| d.message().contains("GROUP BY"))
         );
     }
 
@@ -28471,8 +28706,8 @@ mod tests {
             SqlDialect::Postgres,
         )
         .into_iter()
-        .filter(|d| d.message.contains("GROUP BY"))
-        .map(|d| d.message)
+        .filter(|d| d.message().contains("GROUP BY"))
+        .map(|d| d.message())
         .collect();
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -28502,7 +28737,7 @@ mod tests {
     fn cross_warnings(sql: &str) -> Vec<Diagnostic> {
         diag(sql)
             .into_iter()
-            .filter(|d| d.message.contains("cross join"))
+            .filter(|d| d.message().contains("cross join"))
             .collect()
     }
 
@@ -28546,7 +28781,7 @@ mod tests {
     fn lint_hits(sql: &str, dialect: SqlDialect, needle: &str) -> Vec<String> {
         diag_d(sql, dialect)
             .into_iter()
-            .filter(|d| d.severity != Severity::Error && d.message.contains(needle))
+            .filter(|d| d.severity != Severity::Error && d.message().contains(needle))
             .map(|d| sql[d.range.0..d.range.1].to_string())
             .collect()
     }
@@ -28581,7 +28816,7 @@ mod tests {
         assert_eq!(hits, ["DELETE"]);
         let at = diag(sql)
             .into_iter()
-            .find(|d| d.message.contains("every row"))
+            .find(|d| d.message().contains("every row"))
             .unwrap();
         assert_eq!(at.range.0, sql.rfind("DELETE").unwrap());
         // A write that joins is filtered by its join.
@@ -28625,7 +28860,7 @@ mod tests {
             let sql = "INSERT INTO employees (id, name) VALUES (1, 'a'), (2);";
             let errs: Vec<String> = diag_d(sql, d)
                 .into_iter()
-                .filter(|x| x.severity == Severity::Error && x.message.contains("INSERT names"))
+                .filter(|x| x.severity == Severity::Error && x.message().contains("INSERT names"))
                 .map(|x| sql[x.range.0..x.range.1].to_string())
                 .collect();
             assert_eq!(errs, ["(2)"], "{d:?}");
@@ -28633,7 +28868,7 @@ mod tests {
             assert!(
                 diag_d(ok, d)
                     .iter()
-                    .all(|x| !x.message.contains("INSERT names")),
+                    .all(|x| !x.message().contains("INSERT names")),
                 "{d:?}"
             );
             // No column list: the table's own count is the next test's.
@@ -28641,7 +28876,7 @@ mod tests {
             assert!(
                 diag_d(bare, d)
                     .iter()
-                    .all(|x| !x.message.contains("INSERT names")),
+                    .all(|x| !x.message().contains("INSERT names")),
                 "{d:?}"
             );
         }
@@ -28652,7 +28887,7 @@ mod tests {
     fn bare_insert_errors(sql: &str, dialect: SqlDialect) -> Vec<String> {
         diag_d(sql, dialect)
             .into_iter()
-            .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
+            .filter(|x| x.severity == Severity::Error && x.message().contains("this row has"))
             .map(|x| sql[x.range.0..x.range.1].to_string())
             .collect()
     }
@@ -28687,8 +28922,8 @@ mod tests {
             SqlDialect::MySql,
         )
         .into_iter()
-        .find(|x| x.message.contains("this row has"))
-        .map(|x| x.message);
+        .find(|x| x.message().contains("this row has"))
+        .map(|x| x.message());
         assert_eq!(
             msg.as_deref(),
             Some("`departments` has 2 columns but this row has 3 values")
@@ -28712,7 +28947,7 @@ mod tests {
         let errs = |sql: &str, d| -> Vec<String> {
             diagnostics(sql, &cat, d)
                 .into_iter()
-                .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
+                .filter(|x| x.severity == Severity::Error && x.message().contains("this row has"))
                 .map(|x| sql[x.range.0..x.range.1].to_string())
                 .collect()
         };
@@ -28759,7 +28994,7 @@ mod tests {
         let errs = |sql: &str| -> usize {
             diagnostics(sql, &cat, d)
                 .into_iter()
-                .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
+                .filter(|x| x.severity == Severity::Error && x.message().contains("this row has"))
                 .count()
         };
         assert_eq!(errs("INSERT INTO g VALUES (7, 1, 3);"), 0);
@@ -28781,8 +29016,8 @@ mod tests {
         let errs = |sql: &str| -> Vec<String> {
             diagnostics(sql, &cat, SqlDialect::MySql)
                 .into_iter()
-                .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
-                .map(|x| x.message)
+                .filter(|x| x.severity == Severity::Error && x.message().contains("this row has"))
+                .map(|x| x.message())
                 .collect()
         };
         assert!(errs("INSERT INTO z_inv VALUES (1, 2);").is_empty());
@@ -28818,8 +29053,8 @@ mod tests {
         let errs = |sql: &str, d: SqlDialect| -> Vec<String> {
             diagnostics(sql, &cat, d)
                 .into_iter()
-                .filter(|x| x.severity == Severity::Error && x.message.contains("this row has"))
-                .map(|x| x.message)
+                .filter(|x| x.severity == Severity::Error && x.message().contains("this row has"))
+                .map(|x| x.message())
                 .collect()
         };
         assert_eq!(
@@ -29059,7 +29294,7 @@ mod tests {
         let hits = |sql: &str| -> Vec<String> {
             diagnostics(sql, &cat, SqlDialect::Postgres)
                 .into_iter()
-                .filter(|d| d.severity == Severity::Warning && d.message.contains("NOT IN"))
+                .filter(|d| d.severity == Severity::Warning && d.message().contains("NOT IN"))
                 .map(|d| sql[d.range.0..d.range.1].to_string())
                 .collect()
         };
@@ -29174,7 +29409,7 @@ mod tests {
         // Unknown INSIDE the subquery is flagged (positioned within it).
         let sql = "SELECT id FROM employees WHERE id IN (SELECT bogus FROM departments)";
         let d = diag(sql);
-        assert!(d.iter().any(|x| x.message.contains("`bogus`")));
+        assert!(d.iter().any(|x| x.message().contains("`bogus`")));
         assert_eq!(&sql[d[0].range.0..d[0].range.1], "bogus");
         // A clean nested query has no errors.
         assert!(
@@ -29272,19 +29507,21 @@ mod tests {
         // An unknown column in the FIRST branch is flagged there.
         let a = "SELECT nope FROM employees UNION SELECT id FROM departments";
         let da = diag(a);
-        assert!(da.iter().any(|x| x.message.contains("`nope`")));
+        assert!(da.iter().any(|x| x.message().contains("`nope`")));
         assert_eq!(&a[da[0].range.0..da[0].range.1], "nope");
         // …and in the SECOND branch, positioned within it.
         let b = "SELECT id FROM employees UNION SELECT bogus FROM departments";
         let db = diag(b);
-        assert!(db.iter().any(|x| x.message.contains("`bogus`")));
+        assert!(db.iter().any(|x| x.message().contains("`bogus`")));
         assert_eq!(&b[db[0].range.0..db[0].range.1], "bogus");
         // A column valid in one branch's table but not the other is only flagged in
         // the branch where it's actually unknown (`salary` ∈ employees, ∉ departments).
         let c = "SELECT salary FROM employees UNION SELECT salary FROM departments";
         let dc = diag(c);
         assert_eq!(
-            dc.iter().filter(|x| x.message.contains("`salary`")).count(),
+            dc.iter()
+                .filter(|x| x.message().contains("`salary`"))
+                .count(),
             1
         );
         assert_eq!(&c[dc[0].range.0..dc[0].range.1], "salary");
@@ -29297,9 +29534,9 @@ mod tests {
         let d = diag("SELECT nope FROM nonexistent");
         assert!(
             d.iter()
-                .any(|x| x.message.contains("Table `nonexistent` not found"))
+                .any(|x| x.message().contains("Table `nonexistent` not found"))
         );
-        assert!(!d.iter().any(|x| x.message.starts_with("Column ")));
+        assert!(!d.iter().any(|x| x.message().starts_with("Column ")));
         // A derived table over an unknown table is likewise open.
         assert!(col_errors("SELECT whatever FROM (SELECT * FROM mystery) sub").is_empty());
     }
@@ -29309,7 +29546,7 @@ mod tests {
         // No loaded schema → can't judge columns → no false positives.
         let cat = Catalog::build(&[], Some("company"));
         let d = diagnostics("SELECT whatever FROM anything", &cat, SqlDialect::MySql);
-        assert!(!d.iter().any(|x| x.message.starts_with("Column ")));
+        assert!(!d.iter().any(|x| x.message().starts_with("Column ")));
     }
 
     #[test]
@@ -29318,7 +29555,7 @@ mod tests {
         let d = diag("SELECT FROM WHERE;");
         assert!(
             d.iter()
-                .any(|x| x.severity == Severity::Error && x.message.starts_with("Syntax error"))
+                .any(|x| x.severity == Severity::Error && x.message().starts_with("Syntax error"))
         );
     }
 
@@ -29326,7 +29563,7 @@ mod tests {
     fn diag_suppresses_syntax_on_typing_tail() {
         // The final, unterminated fragment being typed must not throw a red error.
         let d = diag("SELECT id FROM employees WHERE ");
-        assert!(!d.iter().any(|x| x.message.starts_with("Syntax error")));
+        assert!(!d.iter().any(|x| x.message().starts_with("Syntax error")));
     }
 
     #[test]
@@ -29334,7 +29571,9 @@ mod tests {
         // First statement valid, second references an unknown table.
         let d = diag("SELECT * FROM employees; SELECT * FROM nope;");
         assert_eq!(
-            d.iter().filter(|x| x.message.contains("not found")).count(),
+            d.iter()
+                .filter(|x| x.message().contains("not found"))
+                .count(),
             1
         );
     }
@@ -29366,7 +29605,7 @@ mod tests {
         let flagged = |sql: &str| -> Vec<String> {
             diagnostics(sql, &cat, SqlDialect::MySql)
                 .into_iter()
-                .filter(|d| d.message.contains("misspelled keyword"))
+                .filter(|d| d.message().contains("misspelled keyword"))
                 .map(|d| sql[d.range.0..d.range.1].to_string())
                 .collect()
         };
@@ -29387,7 +29626,7 @@ mod tests {
         let flagged_real = |sql: &str| -> Vec<String> {
             diagnostics(sql, &with_real, SqlDialect::MySql)
                 .into_iter()
-                .filter(|d| d.message.contains("misspelled keyword"))
+                .filter(|d| d.message().contains("misspelled keyword"))
                 .map(|d| sql[d.range.0..d.range.1].to_string())
                 .collect()
         };
@@ -29402,8 +29641,8 @@ mod tests {
         let mut got: Vec<String> =
             diagnostics("SELECT wheer FROM orders", &empty, SqlDialect::MySql)
                 .into_iter()
-                .filter(|d| d.message.contains("misspelled keyword"))
-                .map(|d| d.message)
+                .filter(|d| d.message().contains("misspelled keyword"))
+                .map(|d| d.message())
                 .collect();
         got.sort();
         assert_eq!(
@@ -29425,7 +29664,7 @@ mod tests {
         let flagged = |sql: &str| -> Vec<String> {
             diagnostics(sql, &cat, SqlDialect::MySql)
                 .into_iter()
-                .filter(|d| d.message.contains("misspelled keyword"))
+                .filter(|d| d.message().contains("misspelled keyword"))
                 .map(|d| sql[d.range.0..d.range.1].to_string())
                 .collect()
         };
@@ -29454,7 +29693,7 @@ mod tests {
         let flagged = |sql: &str| -> Vec<String> {
             diagnostics(sql, &cat, SqlDialect::MySql)
                 .into_iter()
-                .filter(|d| d.message.contains("misspelled keyword"))
+                .filter(|d| d.message().contains("misspelled keyword"))
                 .map(|d| sql[d.range.0..d.range.1].to_string())
                 .collect()
         };
@@ -29501,7 +29740,7 @@ mod tests {
         let flagged = |sql: &str, dialect: SqlDialect| -> Vec<String> {
             diagnostics(sql, &cat, dialect)
                 .into_iter()
-                .filter(|d| d.message.contains("misspelled keyword"))
+                .filter(|d| d.message().contains("misspelled keyword"))
                 .map(|d| sql[d.range.0..d.range.1].to_string())
                 .collect()
         };
@@ -29592,7 +29831,7 @@ mod tests {
         .map(|(d, sql)| {
             let hits: Vec<_> = diagnostics(sql, &cat, d)
                 .into_iter()
-                .filter(|x| x.message.contains("misspelled keyword"))
+                .filter(|x| x.message().contains("misspelled keyword"))
                 .map(|x| sql[x.range.0..x.range.1].to_string())
                 .collect();
             (d, sql, hits)
@@ -29604,7 +29843,7 @@ mod tests {
         assert!(
             diagnostics("SELECT * FROM t WHERE altr = 1", &cat, SqlDialect::MsSql)
                 .iter()
-                .any(|x| x.message.contains("misspelled keyword"))
+                .any(|x| x.message().contains("misspelled keyword"))
         );
     }
 
@@ -29699,7 +29938,7 @@ mod tests {
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         let d = diagnostics(sql, &cat, dialect)
             .into_iter()
-            .find(|d| d.message.contains("comparison with NULL"))?;
+            .find(|d| d.message().contains("comparison with NULL"))?;
         let fix = d.fix?;
         Some(format!("{}{fix}{}", &sql[..d.range.0], &sql[d.range.1..]))
     }
@@ -29835,7 +30074,7 @@ mod tests {
         let sql = "SELECT COUTN(*) FROM employees";
         let w: Vec<_> = diag(sql)
             .into_iter()
-            .filter(|x| x.message.contains("misspelled function"))
+            .filter(|x| x.message().contains("misspelled function"))
             .collect();
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].severity, Severity::Warning);
@@ -29843,13 +30082,13 @@ mod tests {
         assert!(
             diag("SELECT LENGHT(name) FROM employees")
                 .iter()
-                .any(|x| x.message.contains("misspelled function"))
+                .any(|x| x.message().contains("misspelled function"))
         );
         // A dropped letter (`SUBSTRIN`) too.
         assert!(
             diag("SELECT SUBSTRIN(name, 1) FROM employees")
                 .iter()
-                .any(|x| x.message.contains("misspelled function"))
+                .any(|x| x.message().contains("misspelled function"))
         );
     }
 
@@ -29867,8 +30106,8 @@ mod tests {
         ] {
             let msgs: Vec<String> = diag(sql)
                 .into_iter()
-                .filter(|x| x.message.contains("misspelled function"))
-                .map(|x| x.message)
+                .filter(|x| x.message().contains("misspelled function"))
+                .map(|x| x.message())
                 .collect();
             assert!(msgs.is_empty(), "false positive: {sql} -> {msgs:?}");
         }
@@ -30102,7 +30341,7 @@ mod tests {
         d.iter().any(|x| {
             x.severity == Severity::Error
                 && &sql[x.range.0..x.range.1] == tok
-                && x.message.contains("reserved keyword")
+                && x.message().contains("reserved keyword")
         })
     }
 
@@ -30192,7 +30431,7 @@ mod tests {
         assert!(
             diag(ok)
                 .iter()
-                .any(|d| d.message.contains("`rank` is a reserved")),
+                .any(|d| d.message().contains("`rank` is a reserved")),
             "{:?}",
             diag(ok)
         );
@@ -30209,7 +30448,7 @@ mod tests {
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         let flagged = |ds: Vec<Diagnostic>| {
             ds.iter()
-                .any(|d| d.message.contains("`current_role` is a reserved"))
+                .any(|d| d.message().contains("`current_role` is a reserved"))
         };
         assert!(flagged(diagnostics(sql, &cat, SqlDialect::MySql)));
         assert!(!flagged(diag(sql)), "{:?}", diag(sql));
@@ -30340,7 +30579,7 @@ mod tests {
         let typos = |sql: &str, d: SqlDialect| {
             diag_d(sql, d)
                 .into_iter()
-                .filter(|x| x.message.contains("looks like a misspelled"))
+                .filter(|x| x.message().contains("looks like a misspelled"))
                 .map(|x| sql[x.range.0..x.range.1].to_string())
                 .collect::<Vec<_>>()
         };
@@ -30403,7 +30642,7 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::MySql);
             assert!(
-                !d.iter().any(|x| x.message.contains("reserved keyword")),
+                !d.iter().any(|x| x.message().contains("reserved keyword")),
                 "{sql}: {d:?}"
             );
         }
@@ -30417,7 +30656,7 @@ mod tests {
         ] {
             assert!(
                 diag(sql).iter().any(|x| {
-                    &sql[x.range.0..x.range.1] == "or" && x.message.contains("reserved keyword")
+                    &sql[x.range.0..x.range.1] == "or" && x.message().contains("reserved keyword")
                 }),
                 "missed: {sql}"
             );
@@ -30438,7 +30677,7 @@ mod tests {
             assert!(
                 !diag(sql)
                     .iter()
-                    .any(|x| x.message.contains("reserved keyword")),
+                    .any(|x| x.message().contains("reserved keyword")),
                 "false positive: {sql}"
             );
         }
@@ -30456,7 +30695,7 @@ mod tests {
             assert!(
                 diag(sql)
                     .iter()
-                    .any(|x| x.message.contains("reserved keyword")),
+                    .any(|x| x.message().contains("reserved keyword")),
                 "missed reserved word: {sql}"
             );
         }
@@ -30785,7 +31024,7 @@ mod tests {
             .filter_map(|q| {
                 let d = diag_bare(q);
                 (!d.is_empty()).then(|| {
-                    let msgs: Vec<&str> = d.iter().map(|x| x.message.as_str()).collect();
+                    let msgs: Vec<String> = d.iter().map(|x| x.message()).collect();
                     format!("  {q}\n      -> {msgs:?}")
                 })
             })
@@ -30851,7 +31090,7 @@ mod tests {
             ran += 1;
             let d = diag(q);
             if !d.is_empty() {
-                let msgs: Vec<&str> = d.iter().map(|x| x.message.as_str()).collect();
+                let msgs: Vec<String> = d.iter().map(|x| x.message()).collect();
                 failures.push(format!("  [MySql] {q}\n      -> {msgs:?}"));
             }
         }
@@ -30860,7 +31099,7 @@ mod tests {
                 ran += 1;
                 let d = diag_d(q, dialect);
                 if !d.is_empty() {
-                    let msgs: Vec<&str> = d.iter().map(|x| x.message.as_str()).collect();
+                    let msgs: Vec<String> = d.iter().map(|x| x.message()).collect();
                     failures.push(format!("  [{dialect:?}] {q}\n      -> {msgs:?}"));
                 }
             }
@@ -30916,7 +31155,7 @@ mod tests {
             assert!(
                 !diag(sql)
                     .iter()
-                    .any(|x| x.message.contains("reserved keyword")),
+                    .any(|x| x.message().contains("reserved keyword")),
                 "false positive: {sql}"
             );
         }
@@ -30932,7 +31171,7 @@ mod tests {
             assert!(
                 !diag(sql)
                     .iter()
-                    .any(|x| x.message.contains("reserved keyword")),
+                    .any(|x| x.message().contains("reserved keyword")),
                 "false positive: {sql}"
             );
         }
@@ -31506,7 +31745,7 @@ mod tests {
     fn column_flags(sql: &str, dialect: SqlDialect) -> Vec<String> {
         diag_d(sql, dialect)
             .into_iter()
-            .filter(|d| d.message.starts_with("Column"))
+            .filter(|d| d.message().starts_with("Column"))
             .map(|d| sql[d.range.0..d.range.1].to_string())
             .collect()
     }
@@ -31743,12 +31982,12 @@ mod tests {
         assert!(
             !diag("SELECT id AS ord FROM employees")
                 .iter()
-                .any(|x| x.message.contains("reserved keyword"))
+                .any(|x| x.message().contains("reserved keyword"))
         );
         assert!(
             !diag("SELECT * FROM employees emp")
                 .iter()
-                .any(|x| x.message.contains("reserved keyword"))
+                .any(|x| x.message().contains("reserved keyword"))
         );
     }
 
@@ -31762,7 +32001,7 @@ mod tests {
             assert!(
                 !diag(sql)
                     .iter()
-                    .any(|x| x.message.contains("reserved keyword")),
+                    .any(|x| x.message().contains("reserved keyword")),
                 "false positive on: {sql}"
             );
         }
@@ -31777,8 +32016,8 @@ mod tests {
         let reserved = |sql: &str, d| -> Vec<String> {
             diag_d(sql, d)
                 .into_iter()
-                .filter(|x| x.message.contains("reserved keyword"))
-                .map(|x| x.message)
+                .filter(|x| x.message().contains("reserved keyword"))
+                .map(|x| x.message())
                 .collect()
         };
         let (my, ms, pg) = (SqlDialect::MySql, SqlDialect::MsSql, SqlDialect::Postgres);
@@ -31924,7 +32163,7 @@ mod tests {
         ] {
             let d = diag(sql);
             assert!(
-                d.iter().any(|x| x.message.contains("nosuchtbl")),
+                d.iter().any(|x| x.message().contains("nosuchtbl")),
                 "{sql} no longer names its table: {d:?}"
             );
         }
@@ -31934,7 +32173,7 @@ mod tests {
             SqlDialect::Postgres,
         );
         assert!(
-            d.iter().any(|x| x.message.contains("nosuchtbl")),
+            d.iter().any(|x| x.message().contains("nosuchtbl")),
             "a data-modifying CTE's INSERT lost its table: {d:?}"
         );
     }
@@ -32136,7 +32375,8 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::Postgres);
             assert!(
-                !d.iter().any(|x| x.message.contains("misspelled function")),
+                !d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql} on Postgres: {d:?}"
             );
         }
@@ -32144,7 +32384,7 @@ mod tests {
         assert!(
             diag("SELECT COUTN(*) FROM employees")
                 .iter()
-                .any(|x| x.message.contains("misspelled function"))
+                .any(|x| x.message().contains("misspelled function"))
         );
     }
 
@@ -32175,7 +32415,7 @@ mod tests {
                 SqlDialect::MsSql
             )
             .iter()
-            .any(|x| x.message.contains("misspelled function"))
+            .any(|x| x.message().contains("misspelled function"))
         );
     }
 
@@ -32612,7 +32852,7 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::MsSql);
             assert!(
-                d.iter().any(|x| x.message.starts_with(want)),
+                d.iter().any(|x| x.message().starts_with(want)),
                 "{sql}: {d:?}"
             );
         }
@@ -32636,7 +32876,7 @@ mod tests {
         // A `DO` with no body is still the error it is.
         let d = diag_d("DO;\nSELECT 1;", SqlDialect::Postgres);
         assert!(
-            d.iter().any(|x| x.message.starts_with("Syntax error")),
+            d.iter().any(|x| x.message().starts_with("Syntax error")),
             "{d:?}"
         );
     }
@@ -32684,7 +32924,7 @@ mod tests {
             let d = diag_d(sql, dialect);
             assert!(
                 d.iter()
-                    .any(|x| x.message == format!("Table `{want}` not found")),
+                    .any(|x| x.message() == format!("Table `{want}` not found")),
                 "{dialect:?} {sql}: {d:?}"
             );
         }
@@ -32803,7 +33043,7 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::MsSql);
             assert!(
-                d.iter().any(|x| x.message.starts_with(want)),
+                d.iter().any(|x| x.message().starts_with(want)),
                 "{sql}: {d:?}"
             );
         }
@@ -32886,7 +33126,7 @@ mod tests {
                 diag_whole(sql, SqlDialect::MsSql),
             ] {
                 assert!(
-                    d.iter().any(|x| x.message.starts_with(want)),
+                    d.iter().any(|x| x.message().starts_with(want)),
                     "{sql}: {d:?}"
                 );
             }
@@ -32903,7 +33143,7 @@ mod tests {
         let alias_errors = |sql: &str, dialect: SqlDialect| -> Vec<String> {
             diag_d(sql, dialect)
                 .into_iter()
-                .filter(|x| x.message.contains("reserved keyword"))
+                .filter(|x| x.message().contains("reserved keyword"))
                 .map(|x| sql[x.range.0..x.range.1].to_string())
                 .collect()
         };
@@ -32936,7 +33176,7 @@ mod tests {
         assert!(
             diag_d("SELECT * FROM employees WHERE;", SqlDialect::MsSql)
                 .iter()
-                .any(|x| x.message.starts_with("Syntax error"))
+                .any(|x| x.message().starts_with("Syntax error"))
         );
     }
 
@@ -32968,7 +33208,7 @@ mod tests {
         let alias_errors = |sql: &str, dialect: SqlDialect| -> Vec<String> {
             diag_d(sql, dialect)
                 .into_iter()
-                .filter(|x| x.message.contains("reserved keyword"))
+                .filter(|x| x.message().contains("reserved keyword"))
                 .map(|x| sql[x.range.0..x.range.1].to_string())
                 .collect()
         };
@@ -33015,7 +33255,7 @@ mod tests {
         assert!(
             diag_d("SELECT id FROM nosuchtable;", SqlDialect::MsSql)
                 .iter()
-                .any(|x| x.message.contains("not found"))
+                .any(|x| x.message().contains("not found"))
         );
     }
 
@@ -33038,7 +33278,7 @@ mod tests {
         for dialect in [SqlDialect::Postgres, SqlDialect::MsSql, SqlDialect::MySql] {
             let d = diag_d("INSERT INTO nosuchtable (a) VALUES (1);", dialect);
             assert!(
-                d.iter().any(|x| x.message.contains("not found")),
+                d.iter().any(|x| x.message().contains("not found")),
                 "{dialect:?}: {d:?}"
             );
         }
@@ -33074,7 +33314,7 @@ mod tests {
         let messages = |sql: &str| -> Vec<String> {
             diagnostics(sql, &cat, SqlDialect::MsSql)
                 .into_iter()
-                .map(|x| x.message)
+                .map(|x| x.message())
                 .collect()
         };
         for sql in [
@@ -33199,7 +33439,7 @@ mod tests {
             assert!(d(sql).is_empty(), "{sql}: {:?}", d(sql));
         }
         let messages =
-            |sql: &str| -> Vec<String> { d(sql).into_iter().map(|x| x.message).collect() };
+            |sql: &str| -> Vec<String> { d(sql).into_iter().map(|x| x.message()).collect() };
         // The alias slot after a three-part name is still checked.
         assert_eq!(
             messages("SELECT id FROM company.dbo.employees or WHERE id = 1;"),
@@ -33239,7 +33479,7 @@ mod tests {
         let messages = |sql: &str| -> Vec<String> {
             diagnostics(sql, &cat, SqlDialect::MsSql)
                 .into_iter()
-                .map(|x| x.message)
+                .map(|x| x.message())
                 .collect()
         };
         for sql in [
@@ -33403,7 +33643,7 @@ mod tests {
             let d = diag_d(sql, dialect);
             assert!(
                 d.iter()
-                    .any(|x| x.message == format!("Table `{table}` not found")),
+                    .any(|x| x.message() == format!("Table `{table}` not found")),
                 "{sql} on {dialect:?}: {d:?}"
             );
         }
@@ -33419,7 +33659,7 @@ mod tests {
     fn missing_tables(sql: &str, dialect: SqlDialect) -> Vec<String> {
         diag_d(sql, dialect)
             .into_iter()
-            .filter(|x| x.message.starts_with("Table `"))
+            .filter(|x| x.message().starts_with("Table `"))
             .map(|x| sql[x.range.0..x.range.1].to_string())
             .collect()
     }
@@ -33747,7 +33987,7 @@ mod tests {
         let alias_errors = |sql: &str| -> Vec<String> {
             diag_d(sql, SqlDialect::MsSql)
                 .into_iter()
-                .filter(|x| x.message.contains("reserved keyword"))
+                .filter(|x| x.message().contains("reserved keyword"))
                 .map(|x| sql[x.range.0..x.range.1].to_string())
                 .collect()
         };
@@ -33774,7 +34014,7 @@ mod tests {
         assert!(
             diag_d("SELECT id FROM inserted;", SqlDialect::MySql)
                 .iter()
-                .any(|x| x.message.contains("not found"))
+                .any(|x| x.message().contains("not found"))
         );
     }
 
@@ -33803,7 +34043,7 @@ mod tests {
                 SqlDialect::MsSql
             )
             .iter()
-            .any(|x| x.message.starts_with("Syntax error"))
+            .any(|x| x.message().starts_with("Syntax error"))
         );
         // A `WITH` the construct does not follow is still an error.
         assert!(
@@ -33812,7 +34052,7 @@ mod tests {
                 SqlDialect::MsSql
             )
             .iter()
-            .any(|x| x.message.starts_with("Syntax error"))
+            .any(|x| x.message().starts_with("Syntax error"))
         );
     }
 
@@ -33831,7 +34071,7 @@ mod tests {
         let sql = "SELECT 1\nSELECT FROM employees WHERE\nSELECT 2";
         let found = d(sql);
         assert!(
-            found.iter().any(|x| x.message.starts_with("Syntax error")
+            found.iter().any(|x| x.message().starts_with("Syntax error")
                 && x.range.0 > sql.find('\n').unwrap()
                 && x.range.1 <= sql.rfind('\n').unwrap()),
             "{found:?}"
@@ -33989,7 +34229,7 @@ mod tests {
             diag_whole(sql, SqlDialect::MsSql),
         ] {
             assert!(
-                d.iter().any(|x| x.message.starts_with("Syntax error")),
+                d.iter().any(|x| x.message().starts_with("Syntax error")),
                 "{sql}: {d:?}"
             );
         }
@@ -34002,7 +34242,7 @@ mod tests {
         let errors = |d: Vec<Diagnostic>| -> Vec<(String, String)> {
             d.into_iter()
                 .filter(|x| x.severity == Severity::Error)
-                .map(|x| (x.message, sql[x.range.0..x.range.1].to_string()))
+                .map(|x| (x.message(), sql[x.range.0..x.range.1].to_string()))
                 .collect()
         };
         let split = errors(diag_d(sql, SqlDialect::MsSql));
@@ -34169,7 +34409,7 @@ mod tests {
             diag_d(sql, SqlDialect::MsSql)
                 .into_iter()
                 .filter(|x| x.severity == Severity::Error)
-                .map(|x| x.message)
+                .map(|x| x.message())
                 .collect()
         };
         assert_eq!(
@@ -34359,7 +34599,7 @@ mod tests {
         let syntax = |sql: &str| {
             diag_d(sql, SqlDialect::MsSql)
                 .iter()
-                .any(|x| x.message.starts_with("Syntax error"))
+                .any(|x| x.message().starts_with("Syntax error"))
         };
         // sqlparser takes `ORDER BY FROM` for a column named `from`; the server
         // answers Msg 156. Either way it is an error, and it was reported as
@@ -34383,7 +34623,7 @@ mod tests {
         let msgs = |sql: &str| -> Vec<String> {
             diag_d(sql, SqlDialect::MsSql)
                 .into_iter()
-                .map(|x| x.message)
+                .map(|x| x.message())
                 .collect()
         };
         assert_eq!(
@@ -34409,7 +34649,7 @@ mod tests {
             let d = diag_d("SELECT id AS select FROM employees;", dialect);
             assert!(
                 d.iter()
-                    .any(|x| x.message.ends_with(&format!("(quote it with {quote})"))),
+                    .any(|x| x.message().ends_with(&format!("(quote it with {quote})"))),
                 "{dialect:?}: {d:?}"
             );
         }
@@ -34441,7 +34681,8 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::Sqlite);
             assert!(
-                !d.iter().any(|x| x.message.contains("misspelled function")),
+                !d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql} on Sqlite: {d:?}"
             );
         }
@@ -34453,7 +34694,8 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::Sqlite);
             assert!(
-                d.iter().any(|x| x.message.contains("misspelled function")),
+                d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql} on Sqlite was not flagged: {d:?}"
             );
         }
@@ -34485,7 +34727,8 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::Postgres);
             assert!(
-                !d.iter().any(|x| x.message.contains("misspelled function")),
+                !d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql} on Postgres: {d:?}"
             );
         }
@@ -34497,7 +34740,8 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::Postgres);
             assert!(
-                d.iter().any(|x| x.message.contains("misspelled function")),
+                d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql} on Postgres was not flagged: {d:?}"
             );
         }
@@ -34549,7 +34793,8 @@ mod tests {
         ] {
             let d = diag_d(sql, SqlDialect::Sqlite);
             assert!(
-                !d.iter().any(|x| x.message.contains("misspelled function")),
+                !d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql} on Sqlite: {d:?}"
             );
         }
@@ -34706,7 +34951,10 @@ mod tests {
             }
         }
         let d = diag_d("SELECT calculé_x(id) FROM employees", SqlDialect::Postgres);
-        assert!(!d.iter().any(|x| x.message.contains("misspelled function")));
+        assert!(
+            !d.iter()
+                .any(|x| x.message().contains("misspelled function"))
+        );
     }
 
     /// The catalogs answer per dialect, and no engine borrows another's.
@@ -34908,7 +35156,8 @@ mod tests {
             let sql = format!("SELECT {name}(id) FROM employees");
             let d = diag_d(&sql, SqlDialect::Postgres);
             assert!(
-                !d.iter().any(|x| x.message.contains("misspelled function")),
+                !d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql} on Postgres: {d:?}"
             );
         }
@@ -34942,7 +35191,7 @@ mod tests {
             assert!(
                 diagnostics(&sql, &bare, SqlDialect::Postgres)
                     .iter()
-                    .any(|x| x.message.contains("misspelled function")),
+                    .any(|x| x.message().contains("misspelled function")),
                 "{name} no longer near-misses the catalog, so this test's \
                  premise is gone and its population needs re-measuring"
             );
@@ -34956,7 +35205,8 @@ mod tests {
             let sql = format!("SELECT {name}(a) FROM employees");
             let d = diagnostics(&sql, &cat, SqlDialect::Postgres);
             assert!(
-                !d.iter().any(|x| x.message.contains("misspelled function")),
+                !d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql}: an extension function the server really has is still \
                  called a misspelling: {d:?}"
             );
@@ -35009,7 +35259,8 @@ mod tests {
         ] {
             let d = diag(sql);
             assert!(
-                !d.iter().any(|x| x.message.contains("misspelled function")),
+                !d.iter()
+                    .any(|x| x.message().contains("misspelled function")),
                 "{sql}: {d:?}"
             );
         }
@@ -35018,7 +35269,7 @@ mod tests {
         assert!(
             diag("SELECT SUBSTRIN(name, 1) FROM employees")
                 .iter()
-                .any(|x| x.message.contains("misspelled function"))
+                .any(|x| x.message().contains("misspelled function"))
         );
     }
 
@@ -35041,7 +35292,8 @@ mod tests {
         let sql = "SELECT lengths(name) FROM employees";
         let d = diagnostics(sql, &cat, SqlDialect::MySql);
         assert!(
-            !d.iter().any(|x| x.message.contains("misspelled function")),
+            !d.iter()
+                .any(|x| x.message().contains("misspelled function")),
             "{d:?}"
         );
         // Without the routine in the catalog it *is* a near-miss of `LENGTH`,
@@ -35054,7 +35306,7 @@ mod tests {
         assert!(
             diagnostics(sql, &cat, SqlDialect::MySql)
                 .iter()
-                .any(|x| x.message.contains("misspelled function"))
+                .any(|x| x.message().contains("misspelled function"))
         );
     }
 
@@ -35073,11 +35325,11 @@ mod tests {
         let sql = "SELECT * FROM employees e JOIN (SELECT id FROM departments WHERE nope=1) d";
         let d = diag(sql);
         assert!(
-            d.iter().any(|x| x.message.contains("nope")),
+            d.iter().any(|x| x.message().contains("nope")),
             "the unknown column was swallowed: {d:?}"
         );
         assert!(
-            d.iter().any(|x| x.message.contains("ON/USING")),
+            d.iter().any(|x| x.message().contains("ON/USING")),
             "and the warning must still be reported: {d:?}"
         );
     }
@@ -35092,11 +35344,11 @@ mod tests {
         let d = diag(sql);
         assert!(
             d.iter()
-                .any(|x| x.severity == Severity::Warning && x.message.contains("NULL")),
+                .any(|x| x.severity == Severity::Warning && x.message().contains("NULL")),
             "the NULL comparison was swallowed: {d:?}"
         );
         assert!(
-            d.iter().any(|x| x.message.contains("ON/USING")),
+            d.iter().any(|x| x.message().contains("ON/USING")),
             "and the hint must still be reported: {d:?}"
         );
     }
@@ -35108,7 +35360,7 @@ mod tests {
         let d = |lo: usize, hi: usize, severity, msg: &str| Diagnostic {
             range: (lo, hi),
             severity,
-            message: msg.to_string(),
+            what: DiagMessage::Server(msg.to_string()),
             fix: None,
         };
         let outer_warn = d(0, 100, Severity::Warning, "outer warning");
@@ -35117,7 +35369,7 @@ mod tests {
         let inner_warn = d(10, 20, Severity::Warning, "inner warning");
 
         let msgs =
-            |v: Vec<Diagnostic>| -> Vec<String> { v.into_iter().map(|x| x.message).collect() };
+            |v: Vec<Diagnostic>| -> Vec<String> { v.into_iter().map(|x| x.message()).collect() };
         // A warning cannot hide an error inside it — the bug.
         assert_eq!(
             msgs(dedup_diagnostics(vec![
@@ -35178,7 +35430,7 @@ mod tests {
         );
         // And the stronger claims still hide a hint inside them.
         for outer in [outer_warn.clone(), outer_err.clone()] {
-            let kept = outer.message.clone();
+            let kept = outer.message();
             assert_eq!(
                 msgs(dedup_diagnostics(vec![outer, inner_hint.clone()])),
                 [kept]
@@ -35298,7 +35550,7 @@ mod tests {
                 .map(|i| Diagnostic {
                     range: (i * 10, i * 10 + 5),
                     severity: Severity::Error,
-                    message: String::new(),
+                    what: DiagMessage::Server(String::new()),
                     fix: None,
                 })
                 .collect::<Vec<_>>()
@@ -36126,7 +36378,7 @@ mod tests {
         let msg = "You have an error in your SQL syntax; check the manual that corresponds to your MariaDB server version for the right syntax to use near 'FRM employees' at line 1";
         let d = db_error_diagnostic(sql, 0, sql.len(), msg);
         assert_eq!(&sql[d.range.0..d.range.1], "FRM");
-        assert!(!d.message.contains("check the manual")); // boilerplate stripped
+        assert!(!d.message().contains("check the manual")); // boilerplate stripped
     }
 
     #[test]
@@ -36404,7 +36656,7 @@ mod tests {
         let d = |lo: usize, hi: usize, m: &str| Diagnostic {
             range: (lo, hi),
             severity: Severity::Warning,
-            message: m.to_string(),
+            what: DiagMessage::Server(m.to_string()),
             fix: None,
         };
         let diags = vec![
@@ -36430,7 +36682,7 @@ mod tests {
         let d = |lo: usize, hi: usize, m: &str| Diagnostic {
             range: (lo, hi),
             severity: Severity::Error,
-            message: m.to_string(),
+            what: DiagMessage::Server(m.to_string()),
             fix: None,
         };
         let diags = vec![
@@ -36503,7 +36755,7 @@ mod tests {
         let not_found = |sql: &str, d| -> Vec<String> {
             diag_d(sql, d)
                 .into_iter()
-                .filter(|x| x.message.starts_with("Table"))
+                .filter(|x| x.message().starts_with("Table"))
                 .map(|x| sql[x.range.0..x.range.1].to_string())
                 .collect()
         };
@@ -36519,7 +36771,7 @@ mod tests {
             assert!(
                 !diag_d(sql, d)
                     .iter()
-                    .any(|x| x.message.starts_with("Column")),
+                    .any(|x| x.message().starts_with("Column")),
                 "{d:?}"
             );
             let sql = "CREATE VIEW v_recent AS SELECT id FROM employees;\nSELECT id FROM v_recent;";
@@ -36549,8 +36801,8 @@ mod tests {
             let cat = Catalog::build(&[("company", &schema)], Some("company"));
             diagnostics(sql, &cat, d)
                 .into_iter()
-                .filter(|x| x.message.starts_with("Table"))
-                .map(|x| x.message)
+                .filter(|x| x.message().starts_with("Table"))
+                .map(|x| x.message())
                 .collect()
         };
         let ms = SqlDialect::MsSql;
@@ -37116,9 +37368,9 @@ mod tests {
         assert_eq!(d.range.0, sql.rfind("salery").unwrap());
         assert_eq!(d.severity, Severity::Error);
         assert!(
-            d.message.starts_with("query failed: Unknown column"),
+            d.message().starts_with("query failed: Unknown column"),
             "{}",
-            d.message
+            d.message()
         );
     }
 
@@ -37202,7 +37454,7 @@ mod tests {
         let d = |sev: Severity, m: &str| Diagnostic {
             range: (7, 13),
             severity: sev,
-            message: m.to_string(),
+            what: DiagMessage::Server(m.to_string()),
             fix: None,
         };
         let diags = vec![
@@ -37217,7 +37469,7 @@ mod tests {
         let diags = vec![Diagnostic {
             range: (12, 12),
             severity: Severity::Warning,
-            message: "missing something".to_string(),
+            what: DiagMessage::Server("missing something".to_string()),
             fix: None,
         }];
         assert_eq!(problems_in_range(&diags, 10, 20).len(), 1);
@@ -37233,7 +37485,7 @@ mod tests {
         let diags = vec![Diagnostic {
             range: (40, 40),
             severity: Severity::Warning,
-            message: "missing something".to_string(),
+            what: DiagMessage::Server("missing something".to_string()),
             fix: None,
         }];
         assert!(problems_in_range(&diags, 10, 40).is_empty());

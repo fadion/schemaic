@@ -231,7 +231,7 @@ async fn no_name_this_server_can_call_is_squiggled_under_correct_sql() {
                 schemaic_core::intel::SqlDialect::MySql,
             )
             .iter()
-            .any(|d| d.message.contains("misspelled function"))
+            .any(|d| d.message().contains("misspelled function"))
         })
         .map(|n| (*n).clone())
         .collect();

@@ -2988,6 +2988,80 @@ guard-drop-partition = DROP PARTITION deletes the partition and every row in it.
 # A squiggle's tooltip, under its message: the fix a key would make. $keys is
 # the key (Alt+Enter); $fix is what it does.
 editor-diag-fix = { $keys }: { $fix }
+# What a squiggle says (core's intel::DiagMessage). Names in backticks and SQL
+# keywords stay as the statement spelt them.
+diag-syntax = Syntax error
+# $detail is the SQL parser's own message, which stays English.
+diag-syntax-detail = Syntax error: { $detail }
+# A reserved word used as an alias, and how this engine quotes a name.
+diag-reserved-alias-backticks = `{ $word }` is a reserved keyword and can't be used as an alias (quote it with backticks)
+diag-reserved-alias-double-quotes = `{ $word }` is a reserved keyword and can't be used as an alias (quote it with double quotes)
+diag-reserved-alias-brackets = `{ $word }` is a reserved keyword and can't be used as an alias (quote it with brackets)
+# $within is "some" when the statement named the database ($database), and
+# $suggested when there is a near name to offer ($suggestion).
+diag-table-not-found = Table `{ $table }` not found{ $within ->
+        [some] {" "}in `{ $database }`
+       *[none] {""}
+    }{ $suggested ->
+        [some] {" "}— did you mean `{ $suggestion }`?
+       *[none] {""}
+    }
+# $within is "some" when there is one table to name ($table).
+diag-column-not-found = Column `{ $column }` not found{ $within ->
+        [some] {" "}in `{ $table }`
+       *[none] {""}
+    }{ $suggested ->
+        [some] {" "}— did you mean `{ $suggestion }`?
+       *[none] {""}
+    }
+diag-aliased-as = `{ $name }` is aliased as `{ $alias }` here — qualify with `{ $alias }`
+diag-ambiguous-column = Column `{ $column }` is ambiguous
+diag-join-without-condition = JOIN has no ON/USING condition — this is a cross join; use CROSS JOIN if that's intended
+diag-comma-join-without-where = Comma join with no WHERE — this is a cross join; add a WHERE, or use CROSS JOIN if that's intended
+diag-not-grouped = Column `{ $column }` must appear in GROUP BY or be used in an aggregate
+diag-insert-row-width = INSERT names { $columns } { $columns ->
+        [one] column
+       *[other] columns
+    } but this row has { $values } { $values ->
+        [one] value
+       *[other] values
+    }
+# A row for a table without a column list, where the table takes $needed
+# values (fewer than it has).
+diag-row-width-without-list = `{ $table }` takes { $needed } { $needed ->
+        [one] value
+       *[other] values
+    } without a column list but this row has { $values }
+diag-row-width-of-table = `{ $table }` has { $columns } { $columns ->
+        [one] column
+       *[other] columns
+    } but this row has { $values } { $values ->
+        [one] value
+       *[other] values
+    }
+diag-nullable-not-in = `{ $column }` can be NULL, and `NOT IN` matches no row once the subquery returns one — add `WHERE { $column } IS NOT NULL` to it, or use NOT EXISTS
+diag-update-without-where = UPDATE without WHERE changes every row in the table
+diag-delete-without-where = DELETE without WHERE removes every row in the table
+# $fix is IS NULL or IS NOT NULL.
+diag-null-comparison = A comparison with NULL is never true — use { $fix }
+diag-misspelled-keyword = `{ $word }` looks like a misspelled keyword
+diag-misspelled-function = `{ $word }` looks like a misspelled function
+# A T-SQL batch's control flow (core's intel::FlowError).
+diag-flow-merge-needs-semicolon = `MERGE` must end with `;`
+diag-flow-if-without-statement = `IF` has no statement to run
+diag-flow-else-without-statement = `ELSE` has no statement to run
+diag-flow-while-without-statement = `WHILE` has no statement to run
+diag-flow-end-try-without-begin-try = `END TRY` without a matching `BEGIN TRY`
+diag-flow-end-catch-without-begin-catch = `END CATCH` without a matching `BEGIN CATCH`
+diag-flow-end-without-begin = `END` without a matching `BEGIN`
+diag-flow-throw-needs-semicolon = The statement before `THROW` must end with `;`
+diag-flow-end-try-without-catch = `END TRY` must be followed by `BEGIN CATCH`
+diag-flow-if-without-statement-before-else = `IF` has no statement before its `ELSE`
+diag-flow-else-without-if = `ELSE` without an `IF` before it
+diag-flow-begin-catch-without-end-try = `BEGIN CATCH` must follow an `END TRY`
+diag-flow-begin-try-without-end-try = `BEGIN TRY` has no matching `END TRY`
+diag-flow-begin-catch-without-end-catch = `BEGIN CATCH` has no matching `END CATCH`
+diag-flow-begin-without-end = `BEGIN` has no matching `END`
 
 ## The editor's context menu (editor_pane.rs). AI fix is the error modal's
 ## message, Format code the shortcut's, and Rename alias / Rename CTE the

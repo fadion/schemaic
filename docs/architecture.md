@@ -1609,7 +1609,9 @@ existing prose was left alone.
     "fix these 2 problems". They never report it in the same words (`Column … not found` against the
     server's `Unknown column …`), so a dedup on text never fired: the key is the **token** — two
     errors on the identical range are one problem, and the first (the offline one, which the caller
-    puts first and which carries the "did you mean") speaks for it. Both of its arms are **half-open**, the zero-width one
+    puts first and which carries the "did you mean") speaks for it. The text it compares and
+    returns is `Diagnostic::message()`, core's English, in every interface language, since the
+    model reads it. Both of its arms are **half-open**, the zero-width one
     included: a point sitting on a statement boundary belongs to the range that starts there, and
     read inclusively it was reported for both neighbours at once.
     **A keyword's position is not its meaning, and the diagnostics' worst false positives were all
@@ -2510,8 +2512,11 @@ existing prose was left alone.
     **A "not found" names what was probably meant, but only when exactly one name is that near.**
     `nearest_name` measures with the keyword-typo checker's own yardstick — `sql::edit_distance`,
     one edit, two from seven characters on, case ignored, behind the same length pre-filter — and
-    the private `did_you_mean` renders its answer as the message's tail,
-    `` — did you mean `employees`?``, or as nothing. All four not-found sites carry it:
+    its answer rides the diagnostic as the `suggestion` of `DiagMessage::TableNotFound`/
+    `ColumnNotFound`, which `DiagMessage::message` renders as the tail
+    `` — did you mean `employees`?``, or as nothing (the private `did_you_mean` that once spliced
+    the tail into a finished string at each site is gone, so the interface can word it — below).
+    All four not-found sites carry it:
     `table_existence_checks`, from `Catalog::table_names` (the names a reference under that
     qualifier could name, opaque synonyms included, **in the server's spelling** through
     `Catalog::spelling` and quoted by `ident_if_needed` — the lower-cased key suggested `orderitems`
@@ -2529,6 +2534,23 @@ existing prose was left alone.
     lower-cased and the resolver lower-cases a source's columns, so a mixed-case PostgreSQL table is
     suggested in lower case, which is not the name to type; only the flat column check, reading
     `columns_of` directly, suggests the server's own spelling.
+    **A diagnostic says what is wrong as a value, `Diagnostic::what`, not as a sentence.** It held
+    a finished `message: String`, which the squiggle's hover could only show in English once the
+    interface was translated; it is now a `DiagMessage`, a variant per thing a check reports whose
+    fields are the arguments — the names and words the statement spelt (`TableNotFound`'s `table`,
+    `database` and `suggestion`; `NullComparison`'s `fix`), counts (`InsertRowWidth`,
+    `RowWidthWithoutList`, `RowWidthOfTable`), and for a reserved alias the engine's `AliasQuote`
+    (backticks, double quotes, brackets) rather than the word for it. T-SQL's control-flow errors
+    are one variant, `Flow(FlowError)`, whose fifteen variants are what `TsqlFlow` reports through
+    `flow_error`, which takes one. Two variants carry text that is not Schemaic's to translate and
+    pass through as they came: `Syntax { detail }`, the parser's own English after the prefix
+    `friendly_syntax_message` strips (`None` when nothing is left), and `Server`, the server's
+    error as `clean_db_message` tidies it, built by `db_error_diagnostic` and
+    `run_error_diagnostic`. `Diagnostic::message()` — `DiagMessage::message`, and
+    `FlowError::message` under it — is the English, byte for byte the text the field held, and it
+    is what the AI fix prompt reads (`problems_in_range`, above); the editor words `what` itself
+    (under `editor_pane.rs`), held to `message` in English by
+    `english_says_every_diagnostic_as_core_does`.
     **A diagnostic with one right answer carries it as `Diagnostic::fix`**, Alt+Enter's quick fix
     (the key is under `editor_pane.rs`). It is the text that replaces **exactly the diagnostic's own
     `range`**, and has no range of its own on purpose: the per-statement cache shifts `range` when
@@ -30757,7 +30779,17 @@ existing prose was left alone.
     `e` into `selct` and pressing Alt+Enter at once spliced `select` over `selec` — `selectt`
     (`a_fix_for_older_text_is_not_offered`). `syntax_text` starts empty, so a tab's diagnostics
     kept from before the pane mounted fix nothing until the pane's own pass lands. **The key is spent even
-    with nothing to fix**, so a stray Alt+Enter never falls through to a newline. The tip says what
+    with nothing to fix**, so a stray Alt+Enter never falls through to a newline. The tip speaks
+    the interface's language: `tip_message` words the diagnostic's `what` (`intel::DiagMessage`)
+    through the private `diag_message_text`, and a T-SQL control-flow error through
+    `flow_error_text`, from `diag-*` — a message per variant, `diag-table-not-found` and
+    `diag-column-not-found` taking a `$within`/`$suggested` selector (`some`/`none`) for the
+    optional *in …* and *did you mean* parts, the row-width messages a plural per count, a reserved
+    alias a message per `AliasQuote` — while the parser's detail and the server's error pass
+    through as they came. `english_says_every_diagnostic_as_core_does` holds it equal to core's
+    `DiagMessage::message` for every variant: the not-found pair with each optional part present
+    and absent, alone and together, counts at one and several, every quote and every
+    `FlowError`. The tip says what
     the key would do: `diag_hits` builds each message through `tip_message`, which appends a line
     `Alt+Enter: <fix>` (the keycap through `shortcuts::keys_label`) holding **`fix_at`'s answer at
     the squiggle's start**, over the same offline list — never the hovered diagnostic's own `fix`.
@@ -31044,7 +31076,8 @@ existing prose was left alone.
     user approves or rejects a diff and nothing runs. The caller supplies the range, because only the
     caller knows which statement it means — the run error's comes from `intel::error_fix_range` (the
     failing statement, not the buffer), the menu's from `sql::statement_range` at the right-click
-    with `intel::problems_in_range` for the messages — and `prompt::ai_fix_prompt` supplies the
+    with `intel::problems_in_range` for the messages, core's English whatever the interface's
+    language — and `prompt::ai_fix_prompt` supplies the
     words. It **selects the range** as the other two entry points do, and this is the one that needs
     it most: the range is `error_fix_range`'s choice rather than a gesture of the user's, so without
     the selection nothing distinguishes "rewriting this statement" from "rewriting all forty".
@@ -40776,7 +40809,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor any object editor's
     refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`/`ObjectProblem`/
     `RoutineProblem`/`TriggerProblem`/`TableProblem`, below), though every draft's `validate`
-    still answers core's English.
+    still answers core's English, nor the editor's diagnostics (`intel::DiagMessage`, below),
+    though the parser's detail in a syntax error and the server's own error still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41074,6 +41108,15 @@ Re-introducing the anti-patterns these guard against is a regression:
     over one index and two). Those tests walk a hand-written list of
     variants rather than an `ALL`, so a new variant fails the renderer's exhaustive `match` at
     compile time but is not held to its English until someone adds it to the list.
+    The editor's diagnostics are the case where one value has two readers in two languages.
+    `intel::Diagnostic` held a finished `message: String` and now holds `what`, an
+    `intel::DiagMessage` (under `core::intel`), with `Diagnostic::message()` the English byte for
+    byte and no `Display`. The squiggle's hover words it — `editor_pane.rs`'s `tip_message`
+    through `diag_message_text` and `flow_error_text`, from `diag-*` and `diag-flow-*` — while
+    `problems_in_range` hands the AI fix prompt `message()`, so the model reads English whatever
+    the interface's language. `Syntax`'s parser detail and `Server`'s text pass through as they
+    came. `english_says_every_diagnostic_as_core_does` holds the two equal, over a hand-written
+    list like the editors' above.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and

@@ -3421,7 +3421,7 @@ async fn the_t_sql_the_checker_passes_compiles_and_what_it_flags_is_refused() {
         diagnostics(sql, &catalog, MS)
             .into_iter()
             .filter(|d| d.severity == Severity::Error)
-            .map(|d| d.message)
+            .map(|d| d.message())
             .collect::<Vec<_>>()
     };
     let bodies = [

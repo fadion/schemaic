@@ -2352,6 +2352,69 @@ guard-replace-schema = CREATE OR REPLACE SCHEMA löscht das vorhandene Schema un
 guard-truncate-partition = TRUNCATE PARTITION entfernt jede Zeile in den genannten Partitionen.
 guard-drop-partition = DROP PARTITION löscht die Partition und jede Zeile darin.
 editor-diag-fix = { $keys }: { $fix }
+diag-syntax = Syntaxfehler
+diag-syntax-detail = Syntaxfehler: { $detail }
+diag-reserved-alias-backticks = `{ $word }` ist ein reserviertes Schlüsselwort und kann nicht als Alias verwendet werden (setze es in Backticks)
+diag-reserved-alias-double-quotes = `{ $word }` ist ein reserviertes Schlüsselwort und kann nicht als Alias verwendet werden (setze es in doppelte Anführungszeichen)
+diag-reserved-alias-brackets = `{ $word }` ist ein reserviertes Schlüsselwort und kann nicht als Alias verwendet werden (setze es in eckige Klammern)
+diag-table-not-found = Tabelle `{ $table }` nicht gefunden{ $within ->
+        [some] {" "}in `{ $database }`
+       *[none] {""}
+    }{ $suggested ->
+        [some] {" "}— meintest du `{ $suggestion }`?
+       *[none] {""}
+    }
+diag-column-not-found = Spalte `{ $column }` nicht gefunden{ $within ->
+        [some] {" "}in `{ $table }`
+       *[none] {""}
+    }{ $suggested ->
+        [some] {" "}— meintest du `{ $suggestion }`?
+       *[none] {""}
+    }
+diag-aliased-as = `{ $name }` hat hier den Alias `{ $alias }` — qualifiziere mit `{ $alias }`
+diag-ambiguous-column = Spalte `{ $column }` ist mehrdeutig
+diag-join-without-condition = JOIN ohne ON/USING-Bedingung — das ist ein Cross Join; verwende CROSS JOIN, wenn das beabsichtigt ist
+diag-comma-join-without-where = Komma-Join ohne WHERE — das ist ein Cross Join; ergänze ein WHERE oder verwende CROSS JOIN, wenn das beabsichtigt ist
+diag-not-grouped = Spalte `{ $column }` muss in GROUP BY stehen oder in einer Aggregatfunktion verwendet werden
+diag-insert-row-width = INSERT nennt { $columns } { $columns ->
+        [one] Spalte
+       *[other] Spalten
+    }, aber diese Zeile hat { $values } { $values ->
+        [one] Wert
+       *[other] Werte
+    }
+diag-row-width-without-list = `{ $table }` nimmt ohne Spaltenliste { $needed } { $needed ->
+        [one] Wert
+       *[other] Werte
+    }, aber diese Zeile hat { $values }
+diag-row-width-of-table = `{ $table }` hat { $columns } { $columns ->
+        [one] Spalte
+       *[other] Spalten
+    }, aber diese Zeile hat { $values } { $values ->
+        [one] Wert
+       *[other] Werte
+    }
+diag-nullable-not-in = `{ $column }` kann NULL sein, und `NOT IN` trifft keine Zeile mehr, sobald die Unterabfrage eine liefert — ergänze dort `WHERE { $column } IS NOT NULL` oder verwende NOT EXISTS
+diag-update-without-where = UPDATE ohne WHERE ändert jede Zeile der Tabelle
+diag-delete-without-where = DELETE ohne WHERE entfernt jede Zeile der Tabelle
+diag-null-comparison = Ein Vergleich mit NULL ist nie wahr — verwende { $fix }
+diag-misspelled-keyword = `{ $word }` sieht nach einem falsch geschriebenen Schlüsselwort aus
+diag-misspelled-function = `{ $word }` sieht nach einer falsch geschriebenen Funktion aus
+diag-flow-merge-needs-semicolon = `MERGE` muss mit `;` enden
+diag-flow-if-without-statement = `IF` hat keine auszuführende Anweisung
+diag-flow-else-without-statement = `ELSE` hat keine auszuführende Anweisung
+diag-flow-while-without-statement = `WHILE` hat keine auszuführende Anweisung
+diag-flow-end-try-without-begin-try = `END TRY` ohne passendes `BEGIN TRY`
+diag-flow-end-catch-without-begin-catch = `END CATCH` ohne passendes `BEGIN CATCH`
+diag-flow-end-without-begin = `END` ohne passendes `BEGIN`
+diag-flow-throw-needs-semicolon = Die Anweisung vor `THROW` muss mit `;` enden
+diag-flow-end-try-without-catch = Auf `END TRY` muss `BEGIN CATCH` folgen
+diag-flow-if-without-statement-before-else = `IF` hat vor seinem `ELSE` keine Anweisung
+diag-flow-else-without-if = `ELSE` ohne vorangehendes `IF`
+diag-flow-begin-catch-without-end-try = `BEGIN CATCH` muss auf ein `END TRY` folgen
+diag-flow-begin-try-without-end-try = `BEGIN TRY` hat kein passendes `END TRY`
+diag-flow-begin-catch-without-end-catch = `BEGIN CATCH` hat kein passendes `END CATCH`
+diag-flow-begin-without-end = `BEGIN` hat kein passendes `END`
 editor-menu-ask-ai = KI fragen
 editor-menu-explain = Erklären
 editor-menu-optimise = Optimieren

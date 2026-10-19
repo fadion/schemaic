@@ -624,7 +624,7 @@ async fn an_installed_extensions_functions_are_names_the_checker_knows() {
             diagnostics(&sql, &cat, schemaic_core::intel::SqlDialect::Postgres)
                 .iter()
                 .any(|d| {
-                    d.severity == Severity::Warning && d.message.contains("misspelled function")
+                    d.severity == Severity::Warning && d.message().contains("misspelled function")
                 })
         })
         .collect();

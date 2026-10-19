@@ -2670,17 +2670,146 @@ fn tip_message(
     d: &schemaic_core::intel::Diagnostic,
     offline: &[schemaic_core::intel::Diagnostic],
 ) -> String {
+    let message = diag_message_text(&d.what);
     match schemaic_core::intel::fix_at(offline, d.range.0).map(|(_, _, fix)| fix) {
         Some(fix) => format!(
-            "{}\n{}",
-            d.message,
+            "{message}\n{}",
             tr!(
                 "editor-diag-fix",
                 keys = crate::shortcuts::keys_label("Alt+Enter").into_owned(),
                 fix = fix.to_string()
             )
         ),
-        None => d.message.clone(),
+        None => message,
+    }
+}
+
+/// What a diagnostic says — core's `intel::DiagMessage::message` in the
+/// interface's language. The parser's detail and the server's error pass
+/// through as they came; the names and SQL inside stay as the statement spelt
+/// them.
+fn diag_message_text(m: &schemaic_core::intel::DiagMessage) -> String {
+    use schemaic_core::intel::{AliasQuote, DiagMessage};
+    // Bound first: `tr!` pastes `.into()` after an argument.
+    let opt = |o: &Option<String>| o.clone().unwrap_or_default();
+    // Fluent selects on a string: "none" for an absent part.
+    let has = |o: &Option<String>| if o.is_some() { "some" } else { "none" };
+    match m {
+        DiagMessage::Syntax { detail: None } => tr!("diag-syntax"),
+        DiagMessage::Syntax { detail: Some(d) } => {
+            tr!("diag-syntax-detail", detail = d.as_str())
+        }
+        DiagMessage::Server(text) => text.clone(),
+        DiagMessage::ReservedAlias { word, quote } => {
+            let word = word.as_str();
+            match quote {
+                AliasQuote::Backticks => tr!("diag-reserved-alias-backticks", word = word),
+                AliasQuote::DoubleQuotes => tr!("diag-reserved-alias-double-quotes", word = word),
+                AliasQuote::Brackets => tr!("diag-reserved-alias-brackets", word = word),
+            }
+        }
+        DiagMessage::TableNotFound {
+            table,
+            database,
+            suggestion,
+        } => tr!(
+            "diag-table-not-found",
+            table = table.as_str(),
+            within = has(database),
+            database = opt(database),
+            suggested = has(suggestion),
+            suggestion = opt(suggestion)
+        ),
+        DiagMessage::ColumnNotFound {
+            column,
+            table,
+            suggestion,
+        } => tr!(
+            "diag-column-not-found",
+            column = column.as_str(),
+            within = has(table),
+            table = opt(table),
+            suggested = has(suggestion),
+            suggestion = opt(suggestion)
+        ),
+        DiagMessage::AliasedAs { name, alias } => tr!(
+            "diag-aliased-as",
+            name = name.as_str(),
+            alias = alias.as_str()
+        ),
+        DiagMessage::AmbiguousColumn { column } => {
+            tr!("diag-ambiguous-column", column = column.as_str())
+        }
+        DiagMessage::JoinWithoutCondition => tr!("diag-join-without-condition"),
+        DiagMessage::CommaJoinWithoutWhere => tr!("diag-comma-join-without-where"),
+        DiagMessage::NotGrouped { column } => tr!("diag-not-grouped", column = column.as_str()),
+        &DiagMessage::InsertRowWidth { columns, values } => {
+            tr!("diag-insert-row-width", columns = columns, values = values)
+        }
+        DiagMessage::RowWidthWithoutList {
+            table,
+            needed,
+            values,
+        } => {
+            let (needed, values) = (*needed, *values);
+            tr!(
+                "diag-row-width-without-list",
+                table = table.as_str(),
+                needed = needed,
+                values = values
+            )
+        }
+        DiagMessage::RowWidthOfTable {
+            table,
+            columns,
+            values,
+        } => {
+            let (columns, values) = (*columns, *values);
+            tr!(
+                "diag-row-width-of-table",
+                table = table.as_str(),
+                columns = columns,
+                values = values
+            )
+        }
+        DiagMessage::NullableNotIn { column } => {
+            tr!("diag-nullable-not-in", column = column.as_str())
+        }
+        DiagMessage::UpdateWithoutWhere => tr!("diag-update-without-where"),
+        DiagMessage::DeleteWithoutWhere => tr!("diag-delete-without-where"),
+        DiagMessage::NullComparison { fix } => tr!("diag-null-comparison", fix = fix.as_str()),
+        DiagMessage::MisspelledKeyword { word } => {
+            tr!("diag-misspelled-keyword", word = word.as_str())
+        }
+        DiagMessage::MisspelledFunction { word } => {
+            tr!("diag-misspelled-function", word = word.as_str())
+        }
+        &DiagMessage::Flow(f) => flow_error_text(f),
+    }
+}
+
+/// A T-SQL control-flow error — core's `intel::FlowError::message` in the
+/// interface's language. The keywords stay as T-SQL spells them.
+fn flow_error_text(f: schemaic_core::intel::FlowError) -> String {
+    use schemaic_core::intel::FlowError;
+    match f {
+        FlowError::MergeNeedsSemicolon => tr!("diag-flow-merge-needs-semicolon"),
+        FlowError::IfWithoutStatement => tr!("diag-flow-if-without-statement"),
+        FlowError::ElseWithoutStatement => tr!("diag-flow-else-without-statement"),
+        FlowError::WhileWithoutStatement => tr!("diag-flow-while-without-statement"),
+        FlowError::EndTryWithoutBeginTry => tr!("diag-flow-end-try-without-begin-try"),
+        FlowError::EndCatchWithoutBeginCatch => tr!("diag-flow-end-catch-without-begin-catch"),
+        FlowError::EndWithoutBegin => tr!("diag-flow-end-without-begin"),
+        FlowError::ThrowNeedsSemicolon => tr!("diag-flow-throw-needs-semicolon"),
+        FlowError::EndTryWithoutCatch => tr!("diag-flow-end-try-without-catch"),
+        FlowError::IfWithoutStatementBeforeElse => {
+            tr!("diag-flow-if-without-statement-before-else")
+        }
+        FlowError::ElseWithoutIf => tr!("diag-flow-else-without-if"),
+        FlowError::BeginCatchWithoutEndTry => tr!("diag-flow-begin-catch-without-end-try"),
+        FlowError::BeginTryWithoutEndTry => tr!("diag-flow-begin-try-without-end-try"),
+        FlowError::BeginCatchWithoutEndCatch => tr!("diag-flow-begin-catch-without-end-catch"),
+        FlowError::BeginWithoutEnd => tr!("diag-flow-begin-without-end"),
     }
 }
 
@@ -9751,8 +9880,105 @@ mod geometry_tests {
         Diagnostic {
             range,
             severity,
-            message: msg.to_string(),
+            what: schemaic_core::intel::DiagMessage::Server(msg.to_string()),
             fix: fix.map(str::to_string),
+        }
+    }
+
+    /// **Every diagnostic the editor underlines reads in English exactly as
+    /// core's `DiagMessage::message`** — each with and without its optional
+    /// parts, the counts at one and several, every quote and every T-SQL flow
+    /// error.
+    #[test]
+    fn english_says_every_diagnostic_as_core_does() {
+        use schemaic_core::intel::{AliasQuote, DiagMessage, FlowError};
+        let s = |t: &str| t.to_string();
+        let mut all = vec![
+            DiagMessage::Syntax { detail: None },
+            DiagMessage::Syntax {
+                detail: Some(s("Expected: an expression, found: EOF")),
+            },
+            DiagMessage::Server(s("Unknown column 'x' in 'field list'")),
+            DiagMessage::AliasedAs {
+                name: s("orders"),
+                alias: s("o"),
+            },
+            DiagMessage::AmbiguousColumn { column: s("id") },
+            DiagMessage::JoinWithoutCondition,
+            DiagMessage::CommaJoinWithoutWhere,
+            DiagMessage::NotGrouped { column: s("name") },
+            DiagMessage::NullableNotIn { column: s("a") },
+            DiagMessage::UpdateWithoutWhere,
+            DiagMessage::DeleteWithoutWhere,
+            DiagMessage::NullComparison { fix: s("IS NULL") },
+            DiagMessage::MisspelledKeyword { word: s("SELCT") },
+            DiagMessage::MisspelledFunction { word: s("CONCT") },
+        ];
+        for quote in [
+            AliasQuote::Backticks,
+            AliasQuote::DoubleQuotes,
+            AliasQuote::Brackets,
+        ] {
+            all.push(DiagMessage::ReservedAlias {
+                word: s("order"),
+                quote,
+            });
+        }
+        for (place, suggestion) in [
+            (None, None),
+            (Some(s("shop")), None),
+            (None, Some(s("orders"))),
+            (Some(s("shop")), Some(s("orders"))),
+        ] {
+            all.push(DiagMessage::TableNotFound {
+                table: s("ordrs"),
+                database: place.clone(),
+                suggestion: suggestion.clone(),
+            });
+            all.push(DiagMessage::ColumnNotFound {
+                column: s("nmae"),
+                table: place,
+                suggestion,
+            });
+        }
+        for (a, b) in [(1, 1), (1, 2), (3, 1), (3, 4)] {
+            all.push(DiagMessage::InsertRowWidth {
+                columns: a,
+                values: b,
+            });
+            all.push(DiagMessage::RowWidthWithoutList {
+                table: s("t"),
+                needed: a,
+                values: b,
+            });
+            all.push(DiagMessage::RowWidthOfTable {
+                table: s("t"),
+                columns: a,
+                values: b,
+            });
+        }
+        all.extend(
+            [
+                FlowError::MergeNeedsSemicolon,
+                FlowError::IfWithoutStatement,
+                FlowError::ElseWithoutStatement,
+                FlowError::WhileWithoutStatement,
+                FlowError::EndTryWithoutBeginTry,
+                FlowError::EndCatchWithoutBeginCatch,
+                FlowError::EndWithoutBegin,
+                FlowError::ThrowNeedsSemicolon,
+                FlowError::EndTryWithoutCatch,
+                FlowError::IfWithoutStatementBeforeElse,
+                FlowError::ElseWithoutIf,
+                FlowError::BeginCatchWithoutEndTry,
+                FlowError::BeginTryWithoutEndTry,
+                FlowError::BeginCatchWithoutEndCatch,
+                FlowError::BeginWithoutEnd,
+            ]
+            .map(DiagMessage::Flow),
+        );
+        for m in all {
+            assert_eq!(diag_message_text(&m), m.message(), "{m:?}");
         }
     }
 

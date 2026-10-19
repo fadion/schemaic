@@ -9539,7 +9539,7 @@ mod tests {
         ] {
             let d = crate::intel::diagnostics(s, &cat, SqlDialect::MySql);
             assert!(
-                !d.iter().any(|d| d.message.contains("misspelled")),
+                !d.iter().any(|d| d.message().contains("misspelled")),
                 "{s}: {d:?}"
             );
         }
