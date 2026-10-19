@@ -124,7 +124,8 @@ assertions pin English wording — stays the regression net throughout.
    notice (`header-*`) and the identity colours' names (`colour-*`; `CONN_COLOR_PRESETS`
    stays `const`, its names `fn() -> String`); the changed-on-disk banner (`disk-*`) and the
    results area's run hint, failed and cancelled lines (`results-run-hint` and the two after
-   it).
+   it); the results strip — the pinned total, a chip's tooltip and its menu
+   (`results-pinned-*`, `results-chip-*`, `results-menu-*`).
    Nothing yet in `widgets.rs` or `editor_pane.rs`.
    **Left, in order** — delete a name as its file lands: the three large files' remainders,
    `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then

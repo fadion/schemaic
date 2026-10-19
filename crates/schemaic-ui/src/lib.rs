@@ -9890,17 +9890,12 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
         },
         |heavy| match heavy {
             None => empty().into_any(),
-            Some((kept, total)) => text(format!(
-                "{kept} pinned · {}",
-                schemaic_core::stats::format_bytes(total)
+            Some((kept, total)) => text(tr!(
+                "results-pinned-total",
+                count = kept,
+                size = schemaic_core::stats::format_bytes(total)
             ))
-            .tooltip(|| {
-                text(
-                    "Pinned results are held in memory until you close them. \
-                     Close the ones you are done with to give it back.",
-                )
-                .style(crate::widgets::tooltip_style)
-            })
+            .tooltip(|| text(tr!("results-pinned-tip")).style(crate::widgets::tooltip_style))
             .style(|s| {
                 s.font_size(theme::font_label())
                     .color(theme::text_muted())
@@ -9984,7 +9979,7 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
         // actually nothing. (Reachable while a closing panel is still on screen.)
         let panel = result_tabs.with_untracked(|v| v.iter().find(|p| p.id == id).cloned())?;
         let mut lines = vec![if panel.sql.trim().is_empty() {
-            "Nothing has run in this tab yet.".to_string()
+            tr!("results-chip-nothing-run")
         } else {
             panel.sql.clone()
         }];
@@ -9998,7 +9993,7 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
             ));
         }
         if panel.pinned {
-            foot.push("kept — read-only".to_string());
+            foot.push(tr!("results-chip-kept"));
         }
         if !foot.is_empty() {
             lines.push(foot.join(" · "));
@@ -10135,13 +10130,19 @@ fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
     let refs = tab.panel_refs();
     let pinned = refs.iter().any(|(i, p)| *i == id && *p);
     let mut entries = vec![MenuEntry::action(
-        if pinned { "Unpin" } else { "Pin" },
+        if pinned {
+            tr!("results-menu-unpin")
+        } else {
+            tr!("results-menu-pin")
+        },
         move || tab.set_pinned(id, !pinned),
     )];
     // Omitted rather than dimmed when pinned, which is what the query strip does
     // with the same entry: the pin above it is the way to get it back.
     if resultsel::can_close(&refs, id) {
-        entries.push(MenuEntry::action("Close", move || tab.close_panels(&[id])));
+        entries.push(MenuEntry::action(tr!("results-menu-close"), move || {
+            tab.close_panels(&[id])
+        }));
     }
     // **Compare with** each other result of this tab that has rows — a kept
     // one against a fresh run, or two kept ones (`result_diff_view`). The one
@@ -10188,7 +10189,7 @@ fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
             };
             let target = gctx.result_diff;
             entries.push(MenuEntry::action(
-                format!("Compare with {shown}"),
+                tr!("results-menu-compare-with", result = shown),
                 move || {
                     target.set(Some(DiffTarget {
                         left: a.clone(),
@@ -10203,14 +10204,14 @@ fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
     entries.push(
         // Asked again at the click, not captured: the strip can have moved while
         // the menu stood open (a batch landing, another chip closed).
-        MenuEntry::action("Close other results", move || {
+        MenuEntry::action(tr!("results-menu-close-others"), move || {
             tab.close_panels(&resultsel::others_to_close(&tab.panel_refs(), id));
         })
         .disabled(others.is_empty()),
     );
     let all = resultsel::all_to_close(&refs);
     entries.push(
-        MenuEntry::action("Close all results", move || {
+        MenuEntry::action(tr!("results-menu-close-all"), move || {
             tab.close_panels(&resultsel::all_to_close(&tab.panel_refs()));
         })
         .disabled(all.is_empty()),
@@ -15470,6 +15471,19 @@ mod catalogue_tests {
         assert_eq!(
             tr!("results-run-hint", keys = "Ctrl+Enter"),
             "Run a query  (Ctrl+Enter)"
+        );
+    }
+
+    /// The results strip's assembled lines read as they did.
+    #[test]
+    fn the_results_strip_lines_read_as_they_did_in_english() {
+        assert_eq!(
+            tr!("results-pinned-total", count = 3, size = "1.2 GB"),
+            "3 pinned · 1.2 GB"
+        );
+        assert_eq!(
+            tr!("results-menu-compare-with", result = "SELECT * FROM t"),
+            "Compare with SELECT * FROM t"
         );
     }
 

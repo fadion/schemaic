@@ -2171,3 +2171,22 @@ disk-keep-mine = Keep mine
 results-run-hint = Run a query  ({ $keys })
 results-failed = Statement failed.
 results-cancelled = Query cancelled.
+
+## The results strip's chips (lib.rs) — what a pinned result costs, a chip's
+## tooltip and its menu.
+
+# Beside the strip once pinned results hold a lot of memory; $size is how much
+# (1.2 GB).
+results-pinned-total = { $count } pinned · { $size }
+results-pinned-tip = Pinned results are held in memory until you close them. Close the ones you are done with to give it back.
+# A chip's tooltip, in place of a statement, before anything has run.
+results-chip-nothing-run = Nothing has run in this tab yet.
+# A chip's tooltip, for a pinned result.
+results-chip-kept = kept — read-only
+results-menu-pin = Pin
+results-menu-unpin = Unpin
+results-menu-close = Close
+# $result is the other result's chip label, clipped.
+results-menu-compare-with = Compare with { $result }
+results-menu-close-others = Close other results
+results-menu-close-all = Close all results
