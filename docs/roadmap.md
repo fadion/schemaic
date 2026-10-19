@@ -100,8 +100,11 @@ assertions pin English wording — stays the regression net throughout.
    `run_failure_note`/`run_cancelled_note`, worded by `i18n::run_failed_message`,
    `run_cancelled_message` and `not_sent_message`), and the startup notices
    (`persist::Notice`, the queue's value now, which `secrets`' `notice`s and
-   `save_connections`' answer return too; `i18n::notice_text`). Of the other existing enums, `ImportError`
-   renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
+   `save_connections`' answer return too; `i18n::notice_text`), and the import modal's
+   refusals, memory warnings and issue tail (`import::ReadRefusal`, which `ImportError::Refused`
+   carries beside `Read`'s library text, `MemoryWarning`, `IssueTail`;
+   `i18n::import_error_text`, `read_refusal_text`). Of the other existing enums,
+   `FilterError::BadCondition` renders not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
    so its prose lives at its construction sites and it is the weakest to convert.
    **A word that is a property of a typed value needs none of that and goes early**: the
@@ -137,9 +140,14 @@ assertions pin English wording — stays the regression net throughout.
      in `schemaic-db`; the hardest, since the sentence is built below core.
    - **The plan view's warnings** (`plan.rs`) and **the editor's offline diagnostics**
      (`intel::Diagnostic::message`).
-   - **Import** — `ImportError`'s `Display` and `import::xlsx_size_refusal`.
+   - **Import's load backstop** — `RowCtx::row`'s `line N, column M: …` for a file that
+     changed under the check, an `Err(String)` the row iterator hands the database layer
+     mid-load; the write-back's problem, smaller.
    - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
-   - **The table designer's refusals** — `TableDraft::validate`'s sentences, which hold Preview.
+   - **The object editors' refusals** — every draft's `validate` (`ddl.rs`), the sentences that
+     hold Preview: the table designer's (`TableDraft`, ~40) and the trigger editor's (~40) are the
+     bulk, then the routine, view, event, database and smaller object drafts — some 140 in all,
+     an enum per draft.
    - **The users browser's notes** — `users::Principals::note` and `Grants::note`, which
      `schemaic-db` fills as sentences (`users::my_scope_note` and its siblings) — the
      write-back's problem, smaller.

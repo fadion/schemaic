@@ -862,8 +862,11 @@ pub struct ReadConfig {
 /// which is one bad cell in an otherwise workable file.
 #[derive(Debug)]
 pub enum ImportError {
-    /// The file couldn't be parsed as delimited text at all.
+    /// The file couldn't be read at all, in a library's own words — the CSV
+    /// reader's, calamine's, `serde_json`'s, or an io error's OS text.
     Read(String),
+    /// The file can't be read for a reason Schemaic itself states.
+    Refused(ReadRefusal),
     /// Not one file column maps to a table column, so there's nothing to insert.
     /// Caught here rather than emitting `INSERT INTO t () VALUES ()`.
     NoColumnsMapped,
@@ -888,6 +891,7 @@ impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ImportError::Read(e) => write!(f, "Couldn't read the file: {e}"),
+            ImportError::Refused(r) => write!(f, "Couldn't read the file: {}", r.message()),
             ImportError::NoColumnsMapped => {
                 write!(f, "No file columns are mapped to table columns")
             }
@@ -902,6 +906,87 @@ impl std::fmt::Display for ImportError {
 }
 
 impl std::error::Error for ImportError {}
+
+/// Why a file can't be read, in Schemaic's own words — a value rather than a
+/// sentence so the import modal can say it in the interface's language;
+/// [`ReadRefusal::message`] is the English. Reached as
+/// [`ImportError::Refused`], and on its own from [`xlsx_size_refusal`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadRefusal {
+    /// A JSON value that is not an object where a record should be.
+    NotObjects,
+    /// A workbook past [`XLSX_MAX_BYTES`]: its size on disk when that is
+    /// known, `None` when a read through the cap only learned it was over.
+    ///
+    /// One refusal, two callers: [`xlsx_size_refusal`], which is asked before
+    /// the file is opened and can say how big it is, and [`open_xlsx`], which
+    /// is reading through a cap and only knows it was exceeded.
+    Oversize { file_bytes: Option<u64> },
+    /// A workbook whose entries declare more unpacked content than
+    /// `ceiling` — see [`XLSX_MAX_INFLATED_BYTES`]. `unpacked` is the sum so
+    /// far, which is a floor.
+    Inflated {
+        file_bytes: u64,
+        unpacked: u64,
+        ceiling: u64,
+    },
+    /// The sheet the preview was mapped from is not in the workbook any more;
+    /// `sheets` is what it holds.
+    NoSuchSheet { sheet: String, sheets: Vec<String> },
+    /// A workbook with no sheets at all.
+    NoSheets,
+    /// A sheet declaring `width` columns, past [`XLSX_MAX_COLS`].
+    TooWide { width: u64 },
+}
+
+impl ReadRefusal {
+    /// The refusal in English.
+    pub fn message(&self) -> String {
+        use crate::format::human_bytes;
+        match self {
+            ReadRefusal::NotObjects => {
+                "expected JSON objects (an array of them, or one per line)".to_string()
+            }
+            ReadRefusal::Oversize { file_bytes } => {
+                let size = match file_bytes {
+                    Some(n) => format!("This workbook is {}", human_bytes(*n as i64)),
+                    None => format!(
+                        "This workbook is over {}",
+                        human_bytes(XLSX_MAX_BYTES as i64)
+                    ),
+                };
+                format!(
+                    "{size}, and an Excel file has to be read whole before any of it can be \
+                     shown — {} is the most this can open. Export the sheet as CSV and \
+                     import that instead; a CSV loads in constant memory.",
+                    human_bytes(XLSX_MAX_BYTES as i64)
+                )
+            }
+            ReadRefusal::Inflated {
+                file_bytes,
+                unpacked,
+                ceiling,
+            } => format!(
+                "This workbook is {} on disk but unpacks to at least {}, and an Excel file has \
+                 to be read whole before any of it can be shown — {} of unpacked content is the \
+                 most this will open, and it needs more memory than that to hold it. Export the \
+                 sheet as CSV and import that instead; a CSV loads in constant memory.",
+                human_bytes(*file_bytes as i64),
+                human_bytes(*unpacked as i64),
+                human_bytes(*ceiling as i64),
+            ),
+            ReadRefusal::NoSuchSheet { sheet, sheets } => format!(
+                "this workbook has no sheet called \"{sheet}\" — it has {}",
+                sheets.join(", ")
+            ),
+            ReadRefusal::NoSheets => "this workbook has no sheets".to_string(),
+            ReadRefusal::TooWide { width } => format!(
+                "this sheet claims {width} columns; an Excel worksheet holds {XLSX_MAX_COLS}. \
+                 Export it as CSV and import that instead."
+            ),
+        }
+    }
+}
 
 impl From<csv::Error> for ImportError {
     fn from(e: csv::Error) -> Self {
@@ -1336,9 +1421,7 @@ fn json_records<R: std::io::Read>(
             }
         };
         let serde_json::Value::Object(map) = v else {
-            return Err(ImportError::Read(
-                "expected JSON objects (an array of them, or one per line)".into(),
-            ));
+            return Err(ImportError::Refused(ReadRefusal::NotObjects));
         };
         for k in map.keys() {
             if !keys.iter().any(|s| s == k) {
@@ -1420,11 +1503,13 @@ pub const XLSX_MAX_INFLATED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Why this file cannot be opened at all, or `None` — asked from the file's
 /// *size on disk*, before a byte of it is read.
-pub fn xlsx_size_refusal(format: ImportFormat, file_bytes: u64) -> Option<String> {
+pub fn xlsx_size_refusal(format: ImportFormat, file_bytes: u64) -> Option<ReadRefusal> {
     if format != ImportFormat::Xlsx || file_bytes <= XLSX_MAX_BYTES {
         return None;
     }
-    Some(oversize_workbook(Some(file_bytes)))
+    Some(ReadRefusal::Oversize {
+        file_bytes: Some(file_bytes),
+    })
 }
 
 /// The Excel preview **and** the workbook's sheet names, from one read of the
@@ -1500,13 +1585,15 @@ fn open_xlsx_within<R: std::io::Read>(
     let mut r = std::io::Read::take(r, XLSX_MAX_BYTES + 1);
     std::io::Read::read_to_end(&mut r, &mut bytes).map_err(|e| ImportError::Read(e.to_string()))?;
     if bytes.len() as u64 > XLSX_MAX_BYTES {
-        return Err(ImportError::Read(oversize_workbook(None)));
+        return Err(ImportError::Refused(ReadRefusal::Oversize {
+            file_bytes: None,
+        }));
     }
     // The archive's own size said nothing about what opening it costs — see
     // [`XLSX_MAX_INFLATED_BYTES`]. Asked here, between the read and the inflate,
     // because this is the one place both are in scope.
-    if let Some(msg) = inflated_refusal(&bytes, inflated_ceiling) {
-        return Err(ImportError::Read(msg));
+    if let Some(refusal) = inflated_refusal(&bytes, inflated_ceiling) {
+        return Err(ImportError::Refused(refusal));
     }
     calamine::Xlsx::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Read(e.to_string()))
 }
@@ -1534,7 +1621,7 @@ fn open_xlsx_within<R: std::io::Read>(
 ///
 /// The ceiling is a parameter so the decision is testable without building a
 /// two-gigabyte fixture; the one caller passes [`XLSX_MAX_INFLATED_BYTES`].
-fn inflated_refusal(bytes: &[u8], ceiling: u64) -> Option<String> {
+fn inflated_refusal(bytes: &[u8], ceiling: u64) -> Option<ReadRefusal> {
     let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
     let mut total: u64 = 0;
     for i in 0..zin.len() {
@@ -1555,41 +1642,15 @@ fn inflated_refusal(bytes: &[u8], ceiling: u64) -> Option<String> {
             // 16–32, and `<si><t/></si>` pushes it to ~1.85× with no rounding at
             // all. So "the most this can hold in memory" was a promise in the
             // wrong unit, understated by about half. The sentence now says what
-            // the bound is actually about.
-            return Some(format!(
-                "This workbook is {} on disk but unpacks to at least {}, and an Excel file has \
-                 to be read whole before any of it can be shown — {} of unpacked content is the \
-                 most this will open, and it needs more memory than that to hold it. Export the \
-                 sheet as CSV and import that instead; a CSV loads in constant memory.",
-                crate::format::human_bytes(bytes.len() as i64),
-                crate::format::human_bytes(total as i64),
-                crate::format::human_bytes(ceiling as i64),
-            ));
+            // the bound is actually about (`ReadRefusal::Inflated`'s message).
+            return Some(ReadRefusal::Inflated {
+                file_bytes: bytes.len() as u64,
+                unpacked: total,
+                ceiling,
+            });
         }
     }
     None
-}
-
-/// The refusal for a workbook past [`XLSX_MAX_BYTES`], with the size named when
-/// the caller knows it.
-///
-/// One sentence, two callers: [`xlsx_size_refusal`], which is asked before the
-/// file is opened and can say how big it is, and [`open_xlsx`], which is reading
-/// through a cap and only knows it was exceeded.
-fn oversize_workbook(file_bytes: Option<u64>) -> String {
-    let size = match file_bytes {
-        Some(n) => format!("This workbook is {}", crate::format::human_bytes(n as i64)),
-        None => format!(
-            "This workbook is over {}",
-            crate::format::human_bytes(XLSX_MAX_BYTES as i64)
-        ),
-    };
-    format!(
-        "{size}, and an Excel file has to be read whole before any of it can be \
-         shown — {} is the most this can open. Export the sheet as CSV and \
-         import that instead; a CSV loads in constant memory.",
-        crate::format::human_bytes(XLSX_MAX_BYTES as i64)
-    )
 }
 
 /// Walk one worksheet's rows as [`Field`]s, the way [`json_records`] walks a
@@ -1645,17 +1706,17 @@ fn xlsx_rows(
         // one they mapped, silently.
         Some(s) => {
             if !names.iter().any(|n| n == s) {
-                return Err(ImportError::Read(format!(
-                    "this workbook has no sheet called \"{s}\" — it has {}",
-                    names.join(", ")
-                )));
+                return Err(ImportError::Refused(ReadRefusal::NoSuchSheet {
+                    sheet: s.clone(),
+                    sheets: names.to_vec(),
+                }));
             }
             s.clone()
         }
         None => names
             .first()
             .cloned()
-            .ok_or_else(|| ImportError::Read("this workbook has no sheets".into()))?,
+            .ok_or(ImportError::Refused(ReadRefusal::NoSheets))?,
     };
     let mut cells = wb
         .worksheet_cells_reader(&name)
@@ -1870,10 +1931,7 @@ fn sheet_width(dims: calamine::Dimensions) -> Result<usize, ImportError> {
     // *start* for both, and the first row's cells settle which it was.
     let width = u64::from(dims.end.1.saturating_sub(dims.start.1)) + 1;
     if width > XLSX_MAX_COLS {
-        return Err(ImportError::Read(format!(
-            "this sheet claims {width} columns; an Excel worksheet holds {XLSX_MAX_COLS}. \
-             Export it as CSV and import that instead."
-        )));
+        return Err(ImportError::Refused(ReadRefusal::TooWide { width }));
     }
     Ok(width as usize)
 }
@@ -2034,9 +2092,7 @@ pub fn read_json_columns<R: std::io::Read>(r: R) -> Result<Sample, ImportError> 
         columns.extend(map.into_keys());
     }
     if columns.is_empty() {
-        return Err(ImportError::Read(
-            "expected JSON objects (an array of them, or one per line)".into(),
-        ));
+        return Err(ImportError::Refused(ReadRefusal::NotObjects));
     }
     Ok(Sample {
         columns,
@@ -2107,18 +2163,53 @@ pub fn json_load_estimate(file_bytes: u64) -> u64 {
 /// the number up front, next to the other pre-load warnings, is the honest
 /// minimum; converting the same data to CSV is the way out, so the message says
 /// so.
-pub fn json_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<String> {
+pub fn json_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<MemoryWarning> {
     if format != ImportFormat::Json || file_bytes <= JSON_WARN_BYTES {
         return None;
     }
-    let est = json_load_estimate(file_bytes);
-    Some(format!(
-        "This JSON file is {}, and a JSON import is held in memory while it \
-         loads — expect it to need about {}. A CSV of the same data loads in \
-         constant memory.",
-        crate::format::human_bytes(file_bytes as i64),
-        crate::format::human_bytes(est as i64)
-    ))
+    Some(MemoryWarning::Json {
+        file_bytes,
+        estimate: json_load_estimate(file_bytes),
+    })
+}
+
+/// A pre-load memory warning ([`memory_warning`]) — the figures rather than
+/// the sentence, so the import modal can say it in the interface's language;
+/// [`MemoryWarning::message`] is the English. `estimate` is the load's
+/// expected peak, the format's factor against `file_bytes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryWarning {
+    Json { file_bytes: u64, estimate: u64 },
+    Xlsx { file_bytes: u64, estimate: u64 },
+}
+
+impl MemoryWarning {
+    /// The warning in English.
+    pub fn message(&self) -> String {
+        use crate::format::human_bytes;
+        match *self {
+            MemoryWarning::Json {
+                file_bytes,
+                estimate,
+            } => format!(
+                "This JSON file is {}, and a JSON import is held in memory while it \
+                 loads — expect it to need about {}. A CSV of the same data loads in \
+                 constant memory.",
+                human_bytes(file_bytes as i64),
+                human_bytes(estimate as i64)
+            ),
+            MemoryWarning::Xlsx {
+                file_bytes,
+                estimate,
+            } => format!(
+                "This workbook is {}, and an Excel import is held in memory while it \
+                 loads — expect it to need roughly {}, since the file is compressed. \
+                 A CSV of the same sheet loads in constant memory.",
+                human_bytes(file_bytes as i64),
+                human_bytes(estimate as i64)
+            ),
+        }
+    }
 }
 
 /// How much memory an Excel load needs, as a multiple of the file's size.
@@ -2202,18 +2293,14 @@ pub fn xlsx_load_estimate(file_bytes: u64) -> u64 {
 /// is a consequence of its key union, this one is the container format. Saying
 /// the number before the load is the only alternative to discovering it by the
 /// app dying.
-pub fn xlsx_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<String> {
+pub fn xlsx_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<MemoryWarning> {
     if format != ImportFormat::Xlsx || file_bytes <= XLSX_WARN_BYTES {
         return None;
     }
-    let est = xlsx_load_estimate(file_bytes);
-    Some(format!(
-        "This workbook is {}, and an Excel import is held in memory while it \
-         loads — expect it to need roughly {}, since the file is compressed. \
-         A CSV of the same sheet loads in constant memory.",
-        crate::format::human_bytes(file_bytes as i64),
-        crate::format::human_bytes(est as i64)
-    ))
+    Some(MemoryWarning::Xlsx {
+        file_bytes,
+        estimate: xlsx_load_estimate(file_bytes),
+    })
 }
 
 /// The pre-load memory warning for whichever format, or `None`.
@@ -2222,7 +2309,7 @@ pub fn xlsx_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<Stri
 /// asks for.** The JSON warning was reached directly by the modal; adding a
 /// second direct call is how the two drift, and the third format would then have
 /// to be remembered in a third place.
-pub fn memory_warning(format: ImportFormat, file_bytes: u64) -> Option<String> {
+pub fn memory_warning(format: ImportFormat, file_bytes: u64) -> Option<MemoryWarning> {
     json_memory_warning(format, file_bytes).or_else(|| xlsx_memory_warning(format, file_bytes))
 }
 
@@ -2404,15 +2491,43 @@ pub struct Validation {
 /// `max_issues` the old wording said "…and more." over 20 of 200 lines, which
 /// is the same gap one notch worse.
 pub fn issue_tail(shown: usize, total: usize, capped: bool) -> Option<String> {
+    issue_tail_of(shown, total, capped).map(|t| t.message())
+}
+
+/// [`issue_tail`]'s decision as a value, for the import modal to say in the
+/// interface's language; [`IssueTail::message`] is the English.
+pub fn issue_tail_of(shown: usize, total: usize, capped: bool) -> Option<IssueTail> {
     match (total > shown, capped) {
         (false, false) => None,
-        (true, false) => Some(format!("Showing {shown} of {total}.")),
-        (false, true) => Some(format!(
-            "Showing all {total} — the check stopped counting there, so the file holds more."
-        )),
-        (true, true) => Some(format!(
-            "Showing {shown} of the first {total} — the check stopped counting there, so the file holds more."
-        )),
+        (true, false) => Some(IssueTail::Cut { shown, total }),
+        (false, true) => Some(IssueTail::Uncounted { total }),
+        (true, true) => Some(IssueTail::CutAndUncounted { shown, total }),
+    }
+}
+
+/// Which caps an issue list's tail has to name — see [`issue_tail`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IssueTail {
+    /// The list shows `shown` of the `total` the check found.
+    Cut { shown: usize, total: usize },
+    /// The list shows all `total`, and the check stopped counting there.
+    Uncounted { total: usize },
+    /// Both caps at once.
+    CutAndUncounted { shown: usize, total: usize },
+}
+
+impl IssueTail {
+    /// The tail in English.
+    pub fn message(&self) -> String {
+        match *self {
+            IssueTail::Cut { shown, total } => format!("Showing {shown} of {total}."),
+            IssueTail::Uncounted { total } => format!(
+                "Showing all {total} — the check stopped counting there, so the file holds more."
+            ),
+            IssueTail::CutAndUncounted { shown, total } => format!(
+                "Showing {shown} of the first {total} — the check stopped counting there, so the file holds more."
+            ),
+        }
     }
 }
 
@@ -4977,8 +5092,9 @@ mod tests {
             xlsx_size_refusal(ImportFormat::Json, XLSX_MAX_BYTES * 4),
             None
         );
-        let msg =
-            xlsx_size_refusal(ImportFormat::Xlsx, XLSX_MAX_BYTES + 1).expect("past the ceiling");
+        let msg = xlsx_size_refusal(ImportFormat::Xlsx, XLSX_MAX_BYTES + 1)
+            .expect("past the ceiling")
+            .message();
         // The way out is named, as it is in every other message here.
         assert!(msg.contains("CSV"), "{msg}");
 
@@ -5075,7 +5191,9 @@ mod tests {
         assert!(xlsx_size_refusal(ImportFormat::Xlsx, bomb.len() as u64).is_none());
         assert!(memory_warning(ImportFormat::Xlsx, bomb.len() as u64).is_none());
 
-        let msg = inflated_refusal(&bomb, 1024 * 1024).expect("4 MiB is over a 1 MiB ceiling");
+        let msg = inflated_refusal(&bomb, 1024 * 1024)
+            .expect("4 MiB is over a 1 MiB ceiling")
+            .message();
         assert!(msg.contains("unpacks"), "{msg}");
         // An ordinary workbook under the same ceiling is not refused, and the
         // bomb is not refused under a ceiling that fits it — the bound is the
@@ -5155,7 +5273,9 @@ mod tests {
     fn the_inflated_refusal_does_not_promise_a_memory_ceiling() {
         let good = workbook(&[("Sheet1", &[&[Cell::Text("id")], &[Cell::Num(1.0)]])]);
         let bomb = with_entry(&good, "xl/bomb.bin", &vec![b'0'; 4 * 1024 * 1024]);
-        let msg = inflated_refusal(&bomb, 1024 * 1024).expect("over the ceiling");
+        let msg = inflated_refusal(&bomb, 1024 * 1024)
+            .expect("over the ceiling")
+            .message();
         assert!(
             !msg.contains("most this can hold in memory"),
             "the refusal promises a ceiling in the wrong unit: {msg}"
@@ -5204,7 +5324,8 @@ mod tests {
         );
 
         let msg = inflated_refusal(&tampered, 1024 * 1024)
-            .expect("a broken decoy entry turned the ceiling off");
+            .expect("a broken decoy entry turned the ceiling off")
+            .message();
         assert!(msg.contains("unpacks"), "{msg}");
         // And the seam: opening it answers with the bound's own reason.
         let err = match open_xlsx_within(&tampered[..], 1024 * 1024) {
@@ -5595,7 +5716,8 @@ mod tests {
             None
         );
         let msg = memory_warning(ImportFormat::Xlsx, XLSX_WARN_BYTES + 1)
-            .expect("a workbook past the threshold");
+            .expect("a workbook past the threshold")
+            .message();
         assert!(msg.contains("held in memory"), "{msg}");
         assert!(msg.contains("CSV"), "{msg}");
         // The JSON warning still reaches the same entry point — the whole reason
@@ -6139,7 +6261,7 @@ mod tests {
         let json = "[1, 2, 3]";
         assert!(matches!(
             read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10),
-            Err(ImportError::Read(_))
+            Err(ImportError::Refused(ReadRefusal::NotObjects))
         ));
     }
 
@@ -6293,7 +6415,8 @@ mod tests {
     #[test]
     fn a_large_json_file_says_what_it_will_cost() {
         let msg = json_memory_warning(ImportFormat::Json, 600 * 1024 * 1024)
-            .expect("600 MB is past the threshold");
+            .expect("600 MB is past the threshold")
+            .message();
         // The estimate, in a unit a person reads, and why. (600 MB × 5 = 2.9 GiB.)
         assert!(msg.contains("600.0 MB") && msg.contains("2.9 GB"), "{msg}");
         assert!(msg.contains("CSV"), "{msg}");

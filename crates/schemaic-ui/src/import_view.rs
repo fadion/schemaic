@@ -930,6 +930,49 @@ fn preview_table(i: ImportUi) -> impl IntoView {
     )
 }
 
+/// The problem list's tail — core's `import::issue_tail` in the interface's
+/// language, the decision of which caps to name being core's
+/// (`issue_tail_of`).
+fn issue_tail_text(shown: usize, total: usize, capped: bool) -> Option<String> {
+    use import::IssueTail;
+    Some(match import::issue_tail_of(shown, total, capped)? {
+        IssueTail::Cut { shown, total } => tr!("import-tail-cut", shown = shown, total = total),
+        IssueTail::Uncounted { total } => tr!("import-tail-uncounted", total = total),
+        IssueTail::CutAndUncounted { shown, total } => {
+            tr!(
+                "import-tail-cut-and-uncounted",
+                shown = shown,
+                total = total
+            )
+        }
+    })
+}
+
+/// The pre-load memory warning — core's `MemoryWarning::message` in the
+/// interface's language, sizes as core prints them.
+fn memory_warning_text(w: &import::MemoryWarning) -> String {
+    use import::MemoryWarning;
+    use schemaic_core::format::human_bytes;
+    match *w {
+        MemoryWarning::Json {
+            file_bytes,
+            estimate,
+        } => tr!(
+            "import-memory-json",
+            size = human_bytes(file_bytes as i64),
+            estimate = human_bytes(estimate as i64)
+        ),
+        MemoryWarning::Xlsx {
+            file_bytes,
+            estimate,
+        } => tr!(
+            "import-memory-xlsx",
+            size = human_bytes(file_bytes as i64),
+            estimate = human_bytes(estimate as i64)
+        ),
+    }
+}
+
 /// What is wrong with a field — `IssueKind::message`'s words, drawn here so
 /// they can be translated; core keeps its English for the CLI.
 fn issue_kind_message(kind: IssueKind) -> String {
@@ -994,7 +1037,7 @@ fn issue_list(i: ImportUi) -> impl IntoView {
                 })
             }));
             // Both caps, in one sentence, from core — see `issue_tail`.
-            let tail_text = schemaic_core::import::issue_tail(shown, issues.len(), more);
+            let tail_text = issue_tail_text(shown, issues.len(), more);
             let showing = tail_text.is_some();
             let tail = text(tail_text.unwrap_or_default()).style(move |s| {
                 if showing {
@@ -1071,7 +1114,7 @@ fn mapping_step(i: ImportUi, ring: FocusRing) -> impl IntoView {
             let Some(warning) = warning else {
                 return crate::widgets::nothing();
             };
-            text(warning)
+            text(memory_warning_text(&warning))
                 .style(|s| {
                     s.color(theme::plan_warn())
                         .font_size(theme::font_body())
@@ -1581,7 +1624,7 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{issue_kind_message, issue_line};
+    use super::{issue_kind_message, issue_line, issue_tail_text, memory_warning_text};
     use crate::i18n::tr;
     use schemaic_core::import::{Issue, IssueKind};
 
@@ -1601,6 +1644,44 @@ mod tests {
             },
         ] {
             assert_eq!(issue_kind_message(kind), kind.message(), "{kind:?}");
+        }
+    }
+
+    /// **The issue list's tail reads in English exactly as core's
+    /// `issue_tail`** — nothing past the list, the list cut short, the check
+    /// stopped counting, and both at once.
+    #[test]
+    fn english_tells_every_issue_tail_as_core_does() {
+        for (shown, total, capped) in [
+            (20, 20, false),
+            (50, 0, false),
+            (20, 57, false),
+            (1, 2, false),
+            (200, 200, true),
+            (20, 200, true),
+        ] {
+            assert_eq!(
+                issue_tail_text(shown, total, capped),
+                schemaic_core::import::issue_tail(shown, total, capped),
+                "{shown} {total} {capped}"
+            );
+        }
+    }
+
+    /// **The pre-load memory warning reads in English exactly as core's
+    /// `MemoryWarning::message`**, for both formats that hold a load in memory.
+    #[test]
+    fn english_warns_of_every_memory_cost_as_core_does() {
+        use schemaic_core::import::{
+            ImportFormat, JSON_WARN_BYTES, XLSX_WARN_BYTES, memory_warning,
+        };
+        for (format, bytes) in [
+            (ImportFormat::Json, JSON_WARN_BYTES + 1),
+            (ImportFormat::Json, 600 * 1024 * 1024),
+            (ImportFormat::Xlsx, XLSX_WARN_BYTES + 1),
+        ] {
+            let w = memory_warning(format, bytes).expect("past the threshold");
+            assert_eq!(memory_warning_text(&w), w.message(), "{w:?}");
         }
     }
 
@@ -1680,7 +1761,7 @@ mod tests {
     }
 
     /// **The gate.** The problem list's "there is more" line must come from
-    /// `import::issue_tail`, not from this file's own reading of
+    /// `import::issue_tail_of`, not from this file's own reading of
     /// `more_issues`.
     ///
     /// There are two caps and they are not the same one: core stops
@@ -1698,8 +1779,8 @@ mod tests {
                 .expect("this file");
         let body = crate::source_gate::production_code(&src);
         assert!(
-            body.contains("issue_tail("),
-            "the tail must be derived by `import::issue_tail`, which sees both caps"
+            body.contains("issue_tail_of("),
+            "the tail must be derived by `import::issue_tail_of`, which sees both caps"
         );
         assert!(
             !body.contains("…and more."),

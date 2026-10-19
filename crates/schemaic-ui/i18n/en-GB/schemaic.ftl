@@ -1607,6 +1607,37 @@ import-issue-not-a-boolean = not a true/false value
 import-issue-cell-error = the sheet could not evaluate this cell
 import-issue-null-in-not-null = empty, but the column can't be NULL
 import-issue-field-count = has { $found } fields, expected { $expected }
+# The problem list's tail, under the lines it shows (core's import::IssueTail).
+# $shown is how many lines are listed, $total how many the check found; the
+# check stops counting at a cap, which the last two say.
+import-tail-cut = Showing { $shown } of { $total }.
+import-tail-uncounted = Showing all { $total } — the check stopped counting there, so the file holds more.
+import-tail-cut-and-uncounted = Showing { $shown } of the first { $total } — the check stopped counting there, so the file holds more.
+# Before a large load (core's import::MemoryWarning). $size is the file's size
+# and $estimate the memory the load needs, both as printed (600 MiB).
+import-memory-json = This JSON file is { $size }, and a JSON import is held in memory while it loads — expect it to need about { $estimate }. A CSV of the same data loads in constant memory.
+import-memory-xlsx = This workbook is { $size }, and an Excel import is held in memory while it loads — expect it to need roughly { $estimate }, since the file is compressed. A CSV of the same sheet loads in constant memory.
+# Why a file could not be read or planned (core's import::ImportError). $error
+# is either a library's own text, as written, or one of the import-refuse-*
+# sentences below.
+import-read-failed = Couldn't read the file: { $error }
+import-no-columns-mapped = No file columns are mapped to table columns
+# $mib is the preview's cap in MiB.
+import-preview-record-too-large = its first JSON record is larger than the { $mib } MiB the preview reads, so there is nothing to show
+# Schemaic's own reasons (core's import::ReadRefusal). Sizes are as printed
+# (512 MiB); $max is the largest workbook this opens.
+import-refuse-not-objects = expected JSON objects (an array of them, or one per line)
+import-refuse-oversize = This workbook is { $size }, and an Excel file has to be read whole before any of it can be shown — { $max } is the most this can open. Export the sheet as CSV and import that instead; a CSV loads in constant memory.
+import-refuse-oversize-unsized = This workbook is over { $max }, and an Excel file has to be read whole before any of it can be shown — { $max } is the most this can open. Export the sheet as CSV and import that instead; a CSV loads in constant memory.
+# $unpacked is what the workbook's parts declare they unpack to, at least;
+# $ceiling the most unpacked content this opens.
+import-refuse-inflated = This workbook is { $size } on disk but unpacks to at least { $unpacked }, and an Excel file has to be read whole before any of it can be shown — { $ceiling } of unpacked content is the most this will open, and it needs more memory than that to hold it. Export the sheet as CSV and import that instead; a CSV loads in constant memory.
+# $sheet is the sheet the import was set up from; $sheets the ones the
+# workbook holds, joined with ", ".
+import-refuse-no-such-sheet = this workbook has no sheet called "{ $sheet }" — it has { $sheets }
+import-refuse-no-sheets = this workbook has no sheets
+# $width is the sheet's declared column count; $max what a worksheet holds.
+import-refuse-too-wide = this sheet claims { $width } columns; an Excel worksheet holds { $max }. Export it as CSV and import that instead.
 import-cancelled = Import cancelled — the transaction rolled back, so nothing was written.
 import-done = { $count ->
     [one] Imported { $count } row into { $table }.

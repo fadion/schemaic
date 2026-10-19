@@ -5253,7 +5253,10 @@ existing prose was left alone.
     one notch worse. A unit test on the helper alone guards none of this — it was correct in
     isolation the moment it was written and the defect was entirely in *which* of the two numbers
     the view asked about — so the pin is a source gate in the view
-    (`the_problem_list_discloses_its_own_cap_and_not_only_cores`).
+    (`the_problem_list_discloses_its_own_cap_and_not_only_cores`). The decision is
+    `issue_tail_of`, answering an `IssueTail` (`Cut`, `Uncounted`, `CutAndUncounted`) whose
+    `message` is the English; `issue_tail` is now only that English over it, and the view words the
+    value itself, so the gate asks for `issue_tail_of(` (under `import_view.rs`).
     `build_insert` reuses `export::ident_sql`/`sql_literal`, so quoting can't drift
     from the SQL export; it is the statement every engine's load runs, SQL Server's included, which
     renders its batches as literals rather than binding them for a parameter ceiling (under
@@ -5339,6 +5342,14 @@ existing prose was left alone.
     stayed that way. It reopens the file (the first reader is spent by then, and the failure is not
     knowable until it has been) and falls back for that one variant only; a truncated or malformed
     file still fails, on the same bytes, through the second reader.
+    **`Read(String)` now carries only a library's own text** — calamine's, `serde_json`'s, the CSV
+    reader's, an io error's OS text — and every sentence Schemaic writes itself is
+    `ImportError::Refused(ReadRefusal)`: `NotObjects`, `Oversize`, `Inflated`, `NoSuchSheet`,
+    `NoSheets` and `TooWide`, values rather than prose so the modal can say them in the interface's
+    language. `ReadRefusal::message` is the English, byte for byte the sentences `Read` used to be
+    built from, and `ImportError`'s `Display` still prefixes *Couldn't read the file:* to it; neither
+    `ReadRefusal` nor `MemoryWarning` nor `IssueTail` has a `Display` of its own. The interface's
+    words are `i18n::read_refusal_text` and `import_error_text` (under *The string catalogue*).
     **Excel is the third format, and a workbook is a file with several tables in it.**
     `infer_format` takes `xlsx`/`xlsm` and deliberately **not** `.xls`/`.xlsb` — different formats
     this reader cannot open, where guessing would trade a clear "unsupported file" for a parse error
@@ -5388,7 +5399,9 @@ existing prose was left alone.
     ceiling is now **enforced in `open_xlsx`**, which reads through a `std::io::Read::take` at
     `XLSX_MAX_BYTES` (512 MiB) so all three readers inherit it. A guard the *launcher* has to
     remember is a guard the two load-path opens did not have; they went straight to `read_to_end`.
-    `oversize_workbook` is the one sentence both raise, naming the size where the caller knows it.
+    `ReadRefusal::Oversize` is the one refusal both raise — `xlsx_size_refusal` answers it bare, the
+    read inside `ImportError::Refused` — its `file_bytes` the size where the caller knows it and
+    `None` where a read through the cap learned only that it was over.
     **`XLSX_MAX_BYTES` bounds the wrong quantity, though, which is why there is a second ceiling.**
     Both of its enforcement points measure *compressed* bytes — the size on disk and the bytes read
     through the `take` — and `xlsx_memory_warning` is derived from the same figure, while what is
@@ -5519,6 +5532,8 @@ existing prose was left alone.
     the CSV arm is, and `xlsx_records` already streams through a callback.
     The modal asks **`memory_warning(format, bytes)`** and never `json_memory_warning`
     directly: one call site, so a format that needs a warning cannot be given one nothing asks for.
+    All three answer a `MemoryWarning` — `Json` or `Xlsx`, each the file size and the estimate —
+    rather than the sentence, whose English is `message` and whose interface words are the view's.
     **The reader is `calamine`, and an imported `.xlsx` is the first untrusted XML this app has ever
     parsed** — a ZIP of it, from wherever the user got the file. `calamine` depends on quick-xml
     **0.41**, the version that fixes `RUSTSEC-2026-0194`/`0195`, and that is now the only quick-xml
@@ -27778,8 +27793,8 @@ existing prose was left alone.
     are still there (`db::cancelled_import`; the modal renders `DbError::Cancelled` as *nothing was
     written*, so that variant is reserved for a rollback the server confirmed).
     **The problem list renders `ISSUE_LINES` (50) of them and derives its tail from that same
-    number**, through `import::issue_tail`, which is the one function that sees this cap and core's
-    `max_issues` together. The section sits inside the body's own scroll, so the cut was never a
+    number**, through `import::issue_tail_of`, which is the one function that sees this cap and
+    core's `max_issues` together. The section sits inside the body's own scroll, so the cut was never a
     layout requirement — 20 was a bare literal, and its whole cost was that the disclosure beneath
     it answered about the other cap (see `core::import`).
     **Its words are the catalogue's** (`import-*`) — the title (`import-title`,
@@ -27796,10 +27811,20 @@ existing prose was left alone.
     for a property of a typed value has it: `issue_kind_message` stands in for `IssueKind::message`
     (`import-issue-*`), core keeping its English for the CLI, and
     `english_words_every_issue_kind_as_core_does` holds the two equal for every kind;
-    `the_composed_lines_read_as_they_did_in_english` pins the rest. What stays English: the format
-    names (`ImportFormat::label`); core's composed prose, `import::issue_tail` and
-    `import::memory_warning` (phase 4); the preview's `NULL` cell, a SQL keyword; the `—` for a
-    missing column; and a target's `name  (type)`.
+    `the_composed_lines_read_as_they_did_in_english` pins the rest. Core's composed prose is the
+    catalogue's too, from the value core decides: `issue_tail_text` words `import::issue_tail_of`'s
+    `IssueTail` from `import-tail-*`, and `memory_warning_text` the `MemoryWarning`
+    `memory_warning` answers from `import-memory-json`/`-xlsx`, its sizes going in as
+    `format::human_bytes` prints them, since a locale's number formatting is phase 7 —
+    `english_tells_every_issue_tail_as_core_does` and `english_warns_of_every_memory_cost_as_core_does`
+    holding each to core's `message`. Why a file cannot be read is worded by the app, which owns the
+    probe, the check and the load, through `i18n::read_refusal_text` for the probe's
+    `xlsx_size_refusal` and `i18n::import_error_text` for every `ImportError` the three return, in
+    place of `e.to_string()`. What stays English: the format names (`ImportFormat::label`); a
+    library's own text inside `ImportError::Read` and an io error's OS text; the load's per-row
+    backstop, `RowCtx::row`'s *line N, column M: …* `Err(String)`, which travels through the db layer
+    as text; the preview's `NULL` cell, a SQL keyword; the `—` for a missing column; and a target's
+    `name  (type)`.
   - `script_view.rs` — the **script-load** modal, **Import** to the user, over `core::script`; the
     inverse of `dump_view.rs` below, and the entry directly *above* it in the two menus that carry
     both (a database's and a PostgreSQL namespace's), where the group reads
@@ -40639,7 +40664,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     user as a database error from `schemaic-db` and goes with the error messages. The notes under
     the connection form's fields are no longer among it (`connection_form.rs`), nor are
     `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below), nor the
-    startup and keyring notices (`persist::Notice`, below).
+    startup and keyring notices (`persist::Notice`, below), nor the file import's refusals, memory
+    warnings and problem-list tail (`import::ReadRefusal`, below).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40820,6 +40846,16 @@ Re-introducing the anti-patterns these guard against is a regression:
     password, the worded sentence goes through `conn_import::redact_shown` whole, as core's
     `message` does its English; `english_says_every_import_refusal_as_core_does` holds the two
     equal and fails without the redaction (under `connection_import.rs`).
+    The file import's refusals are the case where a library's text and Schemaic's share one
+    channel. `ImportError::Read(String)` held both, and now holds only the library's — every
+    sentence Schemaic writes itself is `ImportError::Refused(ReadRefusal)` (under `core/import.rs`).
+    `i18n::read_refusal_text` words each `ReadRefusal` from `import-refuse-*`, and
+    `import_error_text` the whole error — `import-read-failed` with `$error` the library's text as
+    written or the worded refusal, `import-no-columns-mapped`, `import-preview-record-too-large` —
+    both public for the app, whose probe, check and load show them. The modal's own two,
+    `MemoryWarning` and `IssueTail`, it words beside their one caller (`import_view.rs`).
+    `english_refuses_every_unreadable_file_as_core_does` holds every refusal equal to `message`
+    bare and to `ImportError`'s `Display` inside one.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and
@@ -40855,7 +40891,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     calls: `param_error` for the app, `statement_timeout`, which `settings.rs`,
     `connection_form.rs` and the app all call, the three export notes, which `grid.rs`,
     `result_diff_view.rs` and `dump_view.rs` share, `skip_reason_shown`, which the import modal
-    and the app's paste field share, and the grid's three filter notices — `staged_requery_note`
+    and the app's paste field share, `read_refusal_text` and `import_error_text` for the app's
+    import probe, check and load, and the grid's three filter notices — `staged_requery_note`
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded
     from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork` — and,
     public for the app's run paths, `run_failed_message`, `run_cancelled_message` and

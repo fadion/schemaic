@@ -615,6 +615,67 @@ pub fn notice_text(notice: &schemaic_core::persist::Notice) -> String {
     }
 }
 
+/// Why the import cannot read a file, in Schemaic's own words — core's
+/// [`ReadRefusal::message`](schemaic_core::import::ReadRefusal::message) in the
+/// interface's language, sizes as core prints them. Public for the app, whose
+/// probe refuses a workbook too big to open before reading it.
+pub fn read_refusal_text(r: &schemaic_core::import::ReadRefusal) -> String {
+    use schemaic_core::format::human_bytes;
+    use schemaic_core::import::{ReadRefusal, XLSX_MAX_BYTES, XLSX_MAX_COLS};
+    let max = human_bytes(XLSX_MAX_BYTES as i64);
+    match r {
+        ReadRefusal::NotObjects => tr!("import-refuse-not-objects"),
+        ReadRefusal::Oversize { file_bytes: None } => {
+            tr!("import-refuse-oversize-unsized", max = max)
+        }
+        &ReadRefusal::Oversize {
+            file_bytes: Some(n),
+        } => tr!(
+            "import-refuse-oversize",
+            size = human_bytes(n as i64),
+            max = max
+        ),
+        &ReadRefusal::Inflated {
+            file_bytes,
+            unpacked,
+            ceiling,
+        } => tr!(
+            "import-refuse-inflated",
+            size = human_bytes(file_bytes as i64),
+            unpacked = human_bytes(unpacked as i64),
+            ceiling = human_bytes(ceiling as i64)
+        ),
+        ReadRefusal::NoSuchSheet { sheet, sheets } => tr!(
+            "import-refuse-no-such-sheet",
+            sheet = sheet.as_str(),
+            sheets = sheets.join(", ")
+        ),
+        ReadRefusal::NoSheets => tr!("import-refuse-no-sheets"),
+        &ReadRefusal::TooWide { width } => tr!(
+            "import-refuse-too-wide",
+            width = width.to_string(),
+            max = XLSX_MAX_COLS.to_string()
+        ),
+    }
+}
+
+/// Why a file could not be read or planned — core's
+/// [`ImportError`](schemaic_core::import::ImportError)'s `Display` in the
+/// interface's language, a library's own text inside it as written. Public
+/// for the app, whose probe, check and load report it.
+pub fn import_error_text(e: &schemaic_core::import::ImportError) -> String {
+    use schemaic_core::import::ImportError;
+    match e {
+        ImportError::Read(text) => tr!("import-read-failed", error = text.as_str()),
+        ImportError::Refused(r) => tr!("import-read-failed", error = read_refusal_text(r)),
+        ImportError::NoColumnsMapped => tr!("import-no-columns-mapped"),
+        &ImportError::PreviewRecordTooLarge { cap } => tr!(
+            "import-preview-record-too-large",
+            mib = (cap / (1024 * 1024)).to_string()
+        ),
+    }
+}
+
 /// Load `lang`'s catalogue (with `en-GB` behind it, message by message) into
 /// `loader` and set it up. Split from [`init`] so a test can do it to a loader
 /// of its own rather than to the one every other test reads.
@@ -652,6 +713,47 @@ fn pseudo(s: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// **A file the import cannot read is refused in English exactly as core
+    /// says it** — every `ReadRefusal` on its own (as `xlsx_size_refusal`
+    /// hands one over) and inside an `ImportError`, beside a library's text,
+    /// nothing mapped and a JSON record past the preview.
+    #[test]
+    fn english_refuses_every_unreadable_file_as_core_does() {
+        use schemaic_core::import::{ImportError, ReadRefusal};
+        let refusals = [
+            ReadRefusal::NotObjects,
+            ReadRefusal::Oversize { file_bytes: None },
+            ReadRefusal::Oversize {
+                file_bytes: Some(300 * 1024 * 1024),
+            },
+            ReadRefusal::Inflated {
+                file_bytes: 4 * 1024 * 1024,
+                unpacked: 3 * 1024 * 1024 * 1024,
+                ceiling: 2 * 1024 * 1024 * 1024,
+            },
+            ReadRefusal::NoSuchSheet {
+                sheet: "Q3".into(),
+                sheets: vec!["Q1".into(), "Q2".into()],
+            },
+            ReadRefusal::NoSheets,
+            ReadRefusal::TooWide { width: 20_000 },
+        ];
+        for r in refusals {
+            assert_eq!(read_refusal_text(&r), r.message(), "{r:?}");
+            let e = ImportError::Refused(r);
+            assert_eq!(import_error_text(&e), e.to_string(), "{e:?}");
+        }
+        for e in [
+            ImportError::Read("CSV error: record 3 has 2 fields".into()),
+            ImportError::NoColumnsMapped,
+            ImportError::PreviewRecordTooLarge {
+                cap: 16 * 1024 * 1024,
+            },
+        ] {
+            assert_eq!(import_error_text(&e), e.to_string(), "{e:?}");
+        }
+    }
 
     /// **Every startup notice reads in English exactly as core's
     /// `persist::Notice::message`** — a file that did not parse (the

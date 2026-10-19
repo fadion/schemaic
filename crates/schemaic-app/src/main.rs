@@ -4586,7 +4586,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         if let Some(too_big) =
                             schemaic_core::import::xlsx_size_refusal(req.format, file_bytes)
                         {
-                            return Err(too_big);
+                            return Err(schemaic_ui::i18n::read_refusal_text(&too_big));
                         }
                         let f = std::fs::File::open(&req.path).map_err(|e| e.to_string())?;
                         // One parse of the workbook for both the preview and the
@@ -4599,7 +4599,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     &cfg,
                                     SAMPLE_ROWS,
                                 )
-                                .map_err(|e| e.to_string())?
+                                .map_err(|e| schemaic_ui::i18n::import_error_text(&e))?
                             } else {
                                 // `probe_sample`, not `read_sample`: the
                                 // fallback to a column-only read, when the
@@ -4614,7 +4614,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     &cfg,
                                     SAMPLE_ROWS,
                                 )
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| schemaic_ui::i18n::import_error_text(&e))?;
                                 (sample, Vec::new())
                             };
                         Ok(schemaic_ui::ImportProbeResult {
@@ -4729,7 +4729,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             schemaic_core::import::validate(
                                 f, format, &cfg, &table, &mapping, dialect, MAX_ISSUES,
                             )
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| schemaic_ui::i18n::import_error_text(&e))
                         })
                         .await
                     };
@@ -4773,7 +4773,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             schemaic_core::import::row_iter(
                                 f, format, &cfg, &table, &mapping, dialect,
                             )
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| schemaic_ui::i18n::import_error_text(&e))
                         })
                         .await
                     };
