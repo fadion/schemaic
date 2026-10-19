@@ -40705,14 +40705,18 @@ Re-introducing the anti-patterns these guard against is a regression:
     `install_cli::refusal`/`report` word from `install-refuse-*`/`install-report-*` and
     `settings::cli_hint` from `install-hint-*`, held by `english_refuses_every_install_as_core_does`,
     `english_reports_every_install_as_core_does` and `english_hints_every_cli_row_as_core_does`.
-    The grid words two more: `stats::RowsRead`, the toolbar's row segment, by `rows_read_text`
-    from `grid-rows-read`/`-capped`/`-of-total`, and `model::AttachScope`, the phrase inside both
+    The grid words three more: `stats::RowsRead`, the toolbar's row segment, by `rows_read_text`
+    from `grid-rows-read`/`-capped`/`-of-total`; `model::AttachScope`, the phrase inside both
     *Attach … to chat* entries, by `attach_scope_text` from `grid-attach-scope-rows`/`-columns`/
-    `-rows-and-columns`, held by `english_reads_every_row_segment_as_core_does` and
-    `english_scopes_every_attachment_as_core_does` (`core_words_tests`). Their figures arrive as
-    core prints them — `human_count`, `RowCount::label` — since formatting a number for the
-    locale is phase 7; `rows_read_clause` and `attach_scope_label` remain only as the English
-    wrappers core's tests read.
+    `-rows-and-columns`; and the large-duplicate confirmation's question, which `clone_rows` takes
+    from `duplicate_question` — `grid-duplicate-question`, `$rows` the count and `$n` the plural
+    selector — rather than `edit::duplicate_prompt`. They are held by
+    `english_reads_every_row_segment_as_core_does`, `english_scopes_every_attachment_as_core_does`
+    and `english_asks_the_duplicate_question_as_core_does` (`core_words_tests`). Their figures
+    arrive as core prints them — `human_count`, `RowCount::label`, `stats::group_digits` (made
+    `pub` for this) — since formatting a number for the locale is phase 7; `rows_read_clause`,
+    `attach_scope_label` and `duplicate_prompt` remain only as the English wrappers core's tests
+    read.
     *Restore from file*'s refusal is the first that joins a list: `script::RestoreRefusal` keeps
     its named switches as `DatabaseSwitch` values rather than text, and the app's
     `restore_refusal_text` words each from `restore-switch`/`-unnamed` — `$how` being the SQL that

@@ -6564,7 +6564,7 @@ fn clone_rows(gs: GridState, data_idxs: &[usize]) {
     }
     if schemaic_core::edit::duplicate_needs_confirm(data_idxs.len()) {
         let idxs = data_idxs.to_vec();
-        let message = schemaic_core::edit::duplicate_prompt(idxs.len());
+        let message = duplicate_question(idxs.len());
         gs.confirm.set(Some(crate::Confirm {
             title: tr!("grid-duplicate-title"),
             message,
@@ -6579,6 +6579,13 @@ fn clone_rows(gs: GridState, data_idxs: &[usize]) {
         return;
     }
     stage_cloned_rows(gs, data_idxs);
+}
+
+/// The duplicate confirmation's question — core's `edit::duplicate_prompt`
+/// in the interface's language, the count grouped as core groups it.
+fn duplicate_question(n: usize) -> String {
+    let rows = schemaic_core::stats::group_digits(n as u64);
+    tr!("grid-duplicate-question", rows = rows.as_str(), n = n)
 }
 
 /// The staging half of [`clone_rows`], past its size question.
@@ -16686,7 +16693,22 @@ mod clear_tests {
 
 #[cfg(test)]
 mod core_words_tests {
-    use super::{attach_scope_text, rows_read_text, sql_copy_words};
+    use super::{attach_scope_text, duplicate_question, rows_read_text, sql_copy_words};
+
+    /// **The duplicate confirmation's question reads in English exactly as
+    /// core's `duplicate_prompt`** — at the floor, and past a thousand, where
+    /// the count is grouped. Below the floor nothing asks, and core would say
+    /// "1 rows" where the catalogue's `one` arm does not.
+    #[test]
+    fn english_asks_the_duplicate_question_as_core_does() {
+        for n in [500, 501, 1_000, 25_431] {
+            assert_eq!(
+                duplicate_question(n),
+                schemaic_core::edit::duplicate_prompt(n),
+                "{n}"
+            );
+        }
+    }
 
     /// **A Copy as SQL note reads in English exactly as core's**, each of the
     /// three outcomes over one column and several.

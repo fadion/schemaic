@@ -2006,6 +2006,10 @@ grid-copy-split = { $n ->
        *[other] { $n } kopierte Zellen enthalten einen Tabulator oder Zeilenumbruch — beim Einfügen wird jede davon als mehr als eine Zelle gelesen.
     }
 grid-duplicate-title = Zeilen duplizieren
+grid-duplicate-question = { $n ->
+    [one] { $rows } Zeile duplizieren? Sie wird als ausstehende Zeile vorgemerkt, und nichts wird geschrieben, bis du committest.
+   *[other] { $rows } Zeilen duplizieren? Sie werden als ausstehende Zeilen vorgemerkt, und nichts wird geschrieben, bis du committest.
+}
 grid-nullable-tip = Nullable
 grid-cell-auto = <auto>
 grid-cell-required = <Pflicht>

@@ -2472,8 +2472,14 @@ grid-copy-split = { $n ->
         [one] { $n } copied cell contains a tab or a line break — a paste will read it as more than one cell.
        *[other] { $n } copied cells contain a tab or a line break — a paste will read each of them as more than one cell.
     }
-# The confirmation's title; its question is core's and stays English for now.
+# The confirmation a large duplicate asks first: its title and question (core's
+# edit::duplicate_prompt). $rows is the count as printed (25,431); $n the number
+# the noun follows.
 grid-duplicate-title = Duplicate rows
+grid-duplicate-question = { $n ->
+    [one] Duplicate { $rows } row? It is staged as a pending row and nothing is written until you commit.
+   *[other] Duplicate { $rows } rows? They are staged as pending rows and nothing is written until you commit.
+}
 # A column header's tooltip on the mark for a column that allows NULL.
 grid-nullable-tip = Nullable
 # What a new row's unset cell will become: an auto-increment value, or an
