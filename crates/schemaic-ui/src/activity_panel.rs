@@ -240,9 +240,12 @@ pub(crate) fn activity_panel(
             // — and then `render_slice` discarded all but a hundred and fifty of
             // them. The rows that are actually drawn are cloned below, once
             // each, into the view that owns them.
+            // Matched against the state word the row shows, worded once here
+            // rather than once per row per keystroke.
+            let words = StateWords::new();
             let matched = sessions
                 .iter()
-                .filter(|s| activity::matches_query(s, &q))
+                .filter(|s| activity::matches_query_with(s, &q, |st| words.of(st)))
                 .collect::<Vec<_>>();
             if matched.is_empty() {
                 return list_message(
@@ -453,6 +456,72 @@ fn interval_button(
     })
 }
 
+/// The word a row's state is shown by — `SessionState::label` in the
+/// interface's language, and what the search box matches.
+fn state_word(state: SessionState) -> String {
+    match state {
+        SessionState::Blocked => tr!("activity-state-blocked"),
+        SessionState::IdleInTx => tr!("activity-state-idle-in-tx"),
+        SessionState::Running => tr!("activity-state-running"),
+        SessionState::Idle => tr!("activity-state-idle"),
+    }
+}
+
+/// [`state_word`] for every state, worded once for a whole filter pass.
+struct StateWords([String; 4]);
+
+impl StateWords {
+    fn new() -> Self {
+        Self(
+            [
+                SessionState::Blocked,
+                SessionState::IdleInTx,
+                SessionState::Running,
+                SessionState::Idle,
+            ]
+            .map(state_word),
+        )
+    }
+
+    fn of(&self, state: SessionState) -> &str {
+        &self.0[match state {
+            SessionState::Blocked => 0,
+            SessionState::IdleInTx => 1,
+            SessionState::Running => 2,
+            SessionState::Idle => 3,
+        }]
+    }
+}
+
+/// One state the counts line tallies beside the total.
+#[derive(Clone, Copy, Debug)]
+enum Tally {
+    Running,
+    Blocked,
+    IdleInTx,
+}
+
+/// `18 sessions`, or `500+ sessions` on a capped list —
+/// `ActivitySummary::total_label` in the interface's language, core keeping
+/// the figure (its `+`).
+fn total_text(sum: &activity::ActivitySummary) -> String {
+    tr!(
+        "activity-count-sessions",
+        figure = sum.figure(sum.total),
+        n = sum.total
+    )
+}
+
+/// `4 running` — `ActivitySummary::state_label` in the interface's language.
+fn tally_text(sum: &activity::ActivitySummary, n: usize, tally: Tally) -> String {
+    let figure = sum.figure(n);
+    match tally {
+        Tally::Running => tr!("activity-count-running", figure = figure),
+        Tally::Blocked => tr!("activity-count-blocked", figure = figure),
+        Tally::IdleInTx => tr!("activity-count-idle-in-tx", figure = figure),
+    }
+}
+
 /// `18 sessions   4 running   1 blocked   2 idle in txn` — each figure in the
 /// colour its state wears on the rows below, spaced rather than punctuated.
 ///
@@ -462,34 +531,28 @@ fn interval_button(
 fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
     let sum = activity::summarize(sessions, truncated);
     let mut parts: Vec<floem::AnyView> = vec![
-        text(sum.total_label())
+        text(total_text(&sum))
             .style(|s| s.font_size(font_label()).color(theme::text_muted()))
             .into_any(),
     ];
-    /// One figure in the counts line: how many, what to call them, and the
-    /// colour that state wears on the rows below.
-    ///
-    /// The words stay English with the line's total, which is core's
-    /// (`ActivitySummary::total_label`/`state_label`): translating these alone
-    /// would put German figures beside an English total. They go with core's
-    /// prose (roadmap phase 4), as does `SessionState::label`, which the
-    /// search box also matches.
-    type Figure = (usize, &'static str, fn() -> floem::peniko::Color);
+    /// One figure in the counts line: how many, which tally, and the colour
+    /// that state wears on the rows below.
+    type Figure = (usize, Tally, fn() -> floem::peniko::Color);
     let figures: [Figure; 3] = [
-        (sum.running, "running", theme::status_ok),
-        (sum.blocked, "blocked", theme::error),
-        (sum.idle_in_tx, "idle in txn", theme::status_warn),
+        (sum.running, Tally::Running, theme::status_ok),
+        (sum.blocked, Tally::Blocked, theme::error),
+        (sum.idle_in_tx, Tally::IdleInTx, theme::status_warn),
     ];
-    for (n, word, color) in figures {
+    for (n, tally, color) in figures {
         if n == 0 {
             continue;
         }
-        // Through `state_label`, not `format!`, so the `+` a capped list earns
-        // reaches all four figures and not only the total. This loop used to
-        // print the bare number beside a `500+ sessions` that was honest about
-        // the very same list.
+        // Through `ActivitySummary::figure`, not `n.to_string()`, so the `+` a
+        // capped list earns reaches all four figures and not only the total.
+        // This loop used to print the bare number beside a `500+ sessions`
+        // that was honest about the very same list.
         parts.push(
-            text(sum.state_label(n, word))
+            text(tally_text(&sum, n, tally))
                 .style(move |s| s.font_size(font_label()).color(color()))
                 .into_any(),
         );
@@ -778,7 +841,7 @@ fn session_row(
         _ => String::new(),
     };
     let footer = h_stack((
-        text(s.state.label()).style(move |s| s.font_size(font_label()).color(color())),
+        text(state_word(s.state)).style(move |s| s.font_size(font_label()).color(color())),
         text(where_).style(|s| {
             s.font_size(font_label())
                 .color(theme::text_muted())
@@ -1130,6 +1193,45 @@ mod tests {
     use crate::i18n::tr;
     use schemaic_core::activity::KillKind;
     use schemaic_core::text::plural;
+
+    /// **The rows' state words and the counts line read in English exactly as
+    /// core's** — every state, every tally, the total's singular and plural,
+    /// and the `+` a capped list earns.
+    #[test]
+    fn english_counts_and_names_every_state_as_core_does() {
+        use super::{StateWords, Tally, state_word, tally_text, total_text};
+        use schemaic_core::activity::{SessionState, summarize};
+        let words = StateWords::new();
+        for st in [
+            SessionState::Blocked,
+            SessionState::IdleInTx,
+            SessionState::Running,
+            SessionState::Idle,
+        ] {
+            assert_eq!(state_word(st), st.label(), "{st:?}");
+            assert_eq!(words.of(st), st.label(), "{st:?}");
+        }
+        for truncated in [false, true] {
+            let mut sum = summarize(&[], truncated);
+            for total in [0, 1, 5, 501] {
+                sum.total = total;
+                assert_eq!(total_text(&sum), sum.total_label(), "{total} {truncated}");
+            }
+            for n in [0, 1, 4] {
+                for (tally, word) in [
+                    (Tally::Running, "running"),
+                    (Tally::Blocked, "blocked"),
+                    (Tally::IdleInTx, "idle in txn"),
+                ] {
+                    assert_eq!(
+                        tally_text(&sum, n, tally),
+                        sum.state_label(n, word),
+                        "{tally:?} {n} {truncated}"
+                    );
+                }
+            }
+        }
+    }
 
     /// English names each kill as core's `KillKind::label` does.
     #[test]

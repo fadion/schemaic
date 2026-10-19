@@ -82,7 +82,8 @@ assertions pin English wording — stays the regression net throughout.
    that shows it, `ui/i18n.rs` holding only the ones used across files. Done for
    `AliasRenameRefusal`, `ParamError`, `cli_install` (`Refusal`, `Report`, `RowHint`),
    `stats::RowsRead`, `model::AttachScope`, `script::RestoreRefusal` and
-   `persist::TimeoutSpan`.
+   `persist::TimeoutSpan`, and the activity panel's state words and counts line (core handed
+   the words through `activity::matches_query_with`, since the search box matches them).
    **`launch::*`'s refusals take a session of their own**: the largest group, and propagated
    through `?` inside the command builders, so the typed refusal reaches into them. Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
@@ -105,7 +106,7 @@ assertions pin English wording — stays the regression net throughout.
    like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
    unchanged today is this phase's list to work from: `launch::*`'s refusals, the grid's export
-   notes, the activity panel's counts line — and
+   notes, the activity panel's lock-wait card (`activity::lock_wait_text`) — and
    one that is not core's but needs the same split: `schemaic-cli`'s `dump.rs` "Export failed: …"
    lines, which the dump modal shows and the headless CLI shares.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

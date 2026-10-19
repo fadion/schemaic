@@ -10108,7 +10108,10 @@ existing prose was left alone.
     beside it is not, and it is the unqualified one a person is being asked to act on. The other
     three go through `state_label(n, word)`, which takes the word from the caller because the
     *colour* is the caller's too — the panel draws each figure in the colour that state wears on the
-    rows below — while the `+` is the one thing that must not be spelled there. A zero keeps its
+    rows below — while the `+` is the one thing that must not be spelled there. The interface words
+    the noun itself now, so `figure` — the count and its `+`, nothing else — is public for it, and
+    `total_label`/`state_label` remain as core's English, the wording `activity_panel` is held to.
+    A zero keeps its
     bare shape: the line omits a zero rather than printing `0 blocked` in warning red on a healthy
     server, and that the omitted zero is itself unreliable while `truncated` — the rows past the cap
     could hold every running session on the box — is a real residue of capping the list and a
@@ -10181,7 +10184,10 @@ existing prose was left alone.
     idle-in-transaction holder is what the lock-wait banner points at — so it is the band where
     drawing a statement that is *not running* misleads most.
     *Copy statement* still reads `sql`: it is the one consumer
-    that genuinely wants the last statement, and it is a menu entry rather than a match. The
+    that genuinely wants the last statement, and it is a menu entry rather than a match. The state
+    word it matches is the one the row *shows*, which is the interface's: `matches_query_with`
+    takes it as a `Fn(SessionState) -> &str`, and `matches_query` is that with `SessionState::label`,
+    core's English (`search_matches_the_state_word_it_is_given`). The
     statement is compared **whitespace-collapsed and without allocating**, through
     `text_ops::contains_collapsed_ignore_ascii_case` — `INFO` is the *untruncated* statement where
     `SHOW PROCESSLIST` stops at 100 characters, there are up to `MAX_SESSIONS` of them, this test is
@@ -26838,11 +26844,16 @@ existing prose was left alone.
     under *UI conventions*). Each "N more … match — narrow the search" note is one Fluent plural
     where it was a `format!` around two `text::plural`s, and
     `the_undrawn_notes_read_as_they_did` holds the English to the old sentence for 1, 2 and 350.
-    **The counts line stays on core's English on purpose**: its total is
-    `ActivitySummary::total_label`, so translating the *running*/*blocked*/*idle in txn* words
-    handed to `state_label` alone would set German figures beside an English total; they go with
-    core's prose in phase 4, as do `SessionState::label` — which the search box matches too — and
-    `activity::lock_wait_text`, the lock-wait card's sentence.
+    **The counts line and the state words are worded here too, and together** (`activity-count-*`,
+    `activity-state-*`): `total_text` words the total from `ActivitySummary::figure` (`$figure`,
+    which carries the `+`) and the count (`$n`, which picks the plural), and `tally_text` words the
+    other three by the private `Tally` it is handed, so no translated figure sits beside an English
+    total. `state_word` words a row's state, and the search box matches *that*: `StateWords` words
+    all four once per filter pass rather than once per row per keystroke, and the filter hands them
+    to `activity::matches_query_with`, so a search for the translated word finds the row wearing it.
+    `english_counts_and_names_every_state_as_core_does` holds all of it to core's `total_label`,
+    `state_label` and `SessionState::label`. `activity::lock_wait_text`, the lock-wait card's
+    sentence, is still core's English.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
     read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
@@ -40390,8 +40401,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals, `format_bytes`, the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
-    whose state words the search box also matches) and `dump.rs`'s "Export failed: …" lines,
+    translation* — among it `launch::*`'s refusals, `format_bytes`, the grid's export notes and `dump.rs`'s "Export failed: …" lines,
     which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
     English too: `KeywordCase::label` (core).
   - **Four checks read the catalogue where the compiler cannot reach it.**
@@ -40486,6 +40496,13 @@ Re-introducing the anti-patterns these guard against is a regression:
     `None`) and the app's `timeout_message`, which quotes it back — two spellings of *15 minutes*
     being how the setting and the error come to disagree. `english_says_every_statement_timeout_as_core_does` and
     `english_names_every_timeout_choice_as_core_does` hold the English.
+    Server Activity's state words are the case where a *search* has to follow the translation: the
+    box matches the word a row shows, so translating only the rows would leave the translated word
+    on screen and core's English the one that finds it. Core is handed the words rather than having
+    its output translated, as `outcome_line_with` is — `activity::matches_query_with` takes them as
+    a `Fn(SessionState) -> &str` — and the counts line takes `ActivitySummary::figure`, the count
+    with the `+` a capped list earns, and words the noun from `activity-count-*`
+    (`activity_panel.rs`), held by `english_counts_and_names_every_state_as_core_does`.
     **A typed message's renderer lives beside the code that shows it** — `alias_rename.rs`,
     `install_cli.rs`, `settings.rs`, `grid.rs`, the app's `main.rs` — and `ui/i18n.rs` holds only the ones another file or crate
     calls: `param_error` for the app, and `statement_timeout`, which `settings.rs`,

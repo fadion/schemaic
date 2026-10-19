@@ -504,7 +504,9 @@ impl ActivitySummary {
     /// capping the list, and it is a different fix from this one: it wants a
     /// state tally the *server* computes, not a caveat on a figure the panel
     /// has decided not to draw.
-    fn figure(&self, n: usize) -> String {
+    ///
+    /// Public for the interface, which words the figure's noun itself.
+    pub fn figure(&self, n: usize) -> String {
         let plus = if self.truncated && n > 0 { "+" } else { "" };
         format!("{n}{plus}")
     }
@@ -587,13 +589,24 @@ pub fn should_poll(panel_is_activity: bool, fits: bool, focused: bool) -> bool {
 /// the one consumer that genuinely wants the last statement, and it is a menu
 /// entry rather than a match.
 pub fn matches_query(s: &SessionInfo, query: &str) -> bool {
+    matches_query_with(s, query, SessionState::label)
+}
+
+/// [`matches_query`] against the state word the row actually shows —
+/// `state_word` is the interface's, so a search for a translated state finds
+/// the rows wearing it. `matches_query` is this with core's English.
+pub fn matches_query_with<'w>(
+    s: &SessionInfo,
+    query: &str,
+    state_word: impl Fn(SessionState) -> &'w str,
+) -> bool {
     let q = query.trim();
     if q.is_empty() {
         return true;
     }
     contains_ignore_ascii_case(&s.id.to_string(), q)
         || contains_ignore_ascii_case(&s.who(), q)
-        || contains_ignore_ascii_case(s.state.label(), q)
+        || contains_ignore_ascii_case(state_word(s.state), q)
         || s.database
             .as_deref()
             .is_some_and(|d| contains_ignore_ascii_case(d, q))
@@ -2020,6 +2033,21 @@ mod tests {
             "an empty filter matches everything"
         );
         assert!(!matches_query(&s, "nothing-like-this"));
+    }
+
+    /// **The search matches the state word the row shows**, which is the
+    /// interface's: given its words, a search for one finds the row and core's
+    /// English — not drawn anywhere then — does not.
+    #[test]
+    fn search_matches_the_state_word_it_is_given() {
+        let s = sess(7, SessionState::Running, 0.0);
+        let german = |st: SessionState| match st {
+            SessionState::Running => "Läuft",
+            _ => "Anderes",
+        };
+        assert!(matches_query_with(&s, "läuft", german));
+        assert!(!matches_query_with(&s, "running", german));
+        assert!(matches_query(&s, "running"));
     }
 
     /// **The quiet poll asks nothing.** A wait graph has a waiter in it only

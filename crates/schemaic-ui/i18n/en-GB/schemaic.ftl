@@ -592,6 +592,22 @@ activity-locks-undrawn = { $n } more { $n ->
 }
 # The fetch stopped at its cap, so the list is not the whole server's.
 activity-list-capped = list capped
+# A session's state on its row — also what the search box matches (core's
+# SessionState; English must read exactly as its label).
+activity-state-blocked = Blocked
+activity-state-idle-in-tx = Idle in txn
+activity-state-running = Running
+activity-state-idle = Idle
+# The counts line above the list (English must read as core's
+# ActivitySummary). $figure is the count as core prints it — "500+" on a
+# capped list — and $n the number the plural is chosen by.
+activity-count-sessions = { $n ->
+    [one] { $figure } session
+   *[other] { $figure } sessions
+}
+activity-count-running = { $figure } running
+activity-count-blocked = { $figure } blocked
+activity-count-idle-in-tx = { $figure } idle in txn
 activity-lock-wait = Lock wait
 # $id is the blocking session's id.
 activity-kill-holder = Kill { $id }

@@ -549,6 +549,17 @@ activity-locks-undrawn = { $n ->
    *[other] { $n } weitere passende Sperren – Suche eingrenzen, um sie zu sehen.
 }
 activity-list-capped = Liste gekürzt
+activity-state-blocked = Blockiert
+activity-state-idle-in-tx = Leerlauf in Txn
+activity-state-running = Läuft
+activity-state-idle = Leerlauf
+activity-count-sessions = { $n ->
+    [one] { $figure } Sitzung
+   *[other] { $figure } Sitzungen
+}
+activity-count-running = { $figure } laufend
+activity-count-blocked = { $figure } blockiert
+activity-count-idle-in-tx = { $figure } Leerlauf in Txn
 activity-lock-wait = Sperrwartezeit
 activity-kill-holder = { $id } beenden
 activity-terminate-tip = Sitzung { $id } beenden
