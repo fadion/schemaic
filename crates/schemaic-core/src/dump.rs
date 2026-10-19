@@ -896,30 +896,72 @@ pub fn refuse_if_present_sql(dialect: SqlDialect, object: &str, why: &str) -> Op
 /// owner and grants ([`crate::access::drop_resets_table_access`]), and what
 /// MySQL 8's routine drops revoke: the toggle is where the user consents to
 /// the drop, so it is where they learn it is undone.
+///
+/// The English of [`drop_hint`]: the interface words that value itself.
 pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
+    drop_hint(dialect).text()
+}
+
+/// Which *Drop before create* hint `dialect` gets — the decision
+/// [`drop_before_create_hint`] states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropHint {
+    /// The file drops up front ([`drops_up_front`]).
+    UpFront,
+    /// Routines are replaced in place, beside each table.
+    RoutinesInPlace,
+    /// MySQL 8 drops each routine first; MariaDB replaces in place.
+    RoutinesDroppedFirst,
+    /// No routines to speak of.
+    TablesOnly,
+}
+
+impl DropHint {
+    /// The English hint.
+    pub fn text(self) -> &'static str {
+        match self {
+            DropHint::UpFront => {
+                "Drop each table and view before its CREATE, so the file loads onto a database \
+                 that already holds them. With One transaction it also replaces every routine in \
+                 their schemas, and stops before dropping anything it cannot put back as it is. \
+                 Without One transaction it leaves routines as they are, so a replay onto a \
+                 database that still has them stops at the first one. Each table's owner and \
+                 permissions are put back at the end."
+            }
+            DropHint::RoutinesInPlace => {
+                "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
+                 that already holds these tables. It also replaces every routine in their \
+                 schemas. Each table's owner, grants and row security are put back at the end."
+            }
+            DropHint::RoutinesDroppedFirst => {
+                "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
+                 that already holds these tables. It also replaces every routine and event in \
+                 their schemas: on MySQL each is dropped first, which revokes every grant on it, \
+                 and the file grants them back at its end where your account can read \
+                 mysql.procs_priv."
+            }
+            DropHint::TablesOnly => {
+                "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
+                 that already holds these tables."
+            }
+        }
+    }
+}
+
+/// See [`drop_before_create_hint`], whose rules this is.
+pub fn drop_hint(dialect: SqlDialect) -> DropHint {
     if drops_up_front(dialect) {
-        "Drop each table and view before its CREATE, so the file loads onto a database that \
-         already holds them. With One transaction it also replaces every routine in their \
-         schemas, and stops before dropping anything it cannot put back as it is. Without One \
-         transaction it leaves routines as they are, so a replay onto a database that still \
-         has them stops at the first one. Each table's owner and permissions are put back at \
-         the end."
+        DropHint::UpFront
     } else if crate::ddl::supports_routine_editing(dialect)
         && crate::ddl::replay_replaces_routine_in_place(dialect, ServerFlavour::MySql)
     {
-        "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
-         that already holds these tables. It also replaces every routine in their schemas. \
-         Each table's owner, grants and row security are put back at the end."
+        DropHint::RoutinesInPlace
     } else if crate::ddl::supports_routine_editing(dialect) {
         // The modal does not know the flavour: in place on MariaDB, a `DROP`
         // first on MySQL 8.
-        "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
-         that already holds these tables. It also replaces every routine and event in their \
-         schemas: on MySQL each is dropped first, which revokes every grant on it, and the \
-         file grants them back at its end where your account can read mysql.procs_priv."
+        DropHint::RoutinesDroppedFirst
     } else {
-        "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
-         that already holds these tables."
+        DropHint::TablesOnly
     }
 }
 
@@ -928,12 +970,40 @@ pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
 /// them off regardless, since that is what keeps the drop from deleting rows
 /// outside the file.
 pub fn fk_guard_hint(dialect: SqlDialect) -> &'static str {
+    fk_guard_says_drops(dialect).text()
+}
+
+/// Which *Disable foreign-key checks* hint `dialect` gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FkHint {
+    /// Only what the toggle does.
+    Plain,
+    /// And that a file which drops tables turns the checks off anyway.
+    DropsTurnItOff,
+}
+
+impl FkHint {
+    /// The English hint.
+    pub fn text(self) -> &'static str {
+        match self {
+            FkHint::Plain => {
+                "Off for the duration of the load, so the order rows arrive in can't refuse them."
+            }
+            FkHint::DropsTurnItOff => {
+                "Off for the duration of the load, so the order rows arrive in can't refuse \
+                 them. A file that drops tables turns them off anyway: a drop with them on \
+                 deletes the rows of tables outside the file through their ON DELETE actions."
+            }
+        }
+    }
+}
+
+/// See [`fk_guard_hint`], whose rule this is.
+pub fn fk_guard_says_drops(dialect: SqlDialect) -> FkHint {
     if drop_runs_referential_actions(dialect) {
-        "Off for the duration of the load, so the order rows arrive in can't refuse them. \
-         A file that drops tables turns them off anyway: a drop with them on deletes the \
-         rows of tables outside the file through their ON DELETE actions."
+        FkHint::DropsTurnItOff
     } else {
-        "Off for the duration of the load, so the order rows arrive in can't refuse them."
+        FkHint::Plain
     }
 }
 

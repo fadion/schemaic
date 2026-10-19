@@ -1509,9 +1509,20 @@ dump-other-objects = Other objects
 dump-other-objects-hint = Types, sequences, routines and events these tables lean on.
 dump-section-replaying = Replaying
 dump-drop-before-create = Drop before create
+# Its hint, which differs by engine (core's DropHint; English must read exactly
+# as its text). CREATE and DROP TABLE IF EXISTS are SQL; One transaction is the
+# toggle below (dump-one-transaction); mysql.procs_priv is a table name.
+dump-drop-hint-up-front = Drop each table and view before its CREATE, so the file loads onto a database that already holds them. With One transaction it also replaces every routine in their schemas, and stops before dropping anything it cannot put back as it is. Without One transaction it leaves routines as they are, so a replay onto a database that still has them stops at the first one. Each table's owner and permissions are put back at the end.
+dump-drop-hint-routines-in-place = DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database that already holds these tables. It also replaces every routine in their schemas. Each table's owner, grants and row security are put back at the end.
+dump-drop-hint-routines-dropped-first = DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database that already holds these tables. It also replaces every routine and event in their schemas: on MySQL each is dropped first, which revokes every grant on it, and the file grants them back at its end where your account can read mysql.procs_priv.
+dump-drop-hint-tables-only = DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database that already holds these tables.
 dump-one-transaction = One transaction
 dump-one-transaction-hint = Wrap the load, so a failure leaves nothing behind.
 dump-disable-fk-checks = Disable foreign-key checks
+# Its hint (core's FkHint; English must read exactly as its text). The second
+# is for an engine where dropping a table runs its ON DELETE actions (SQL).
+dump-fk-hint = Off for the duration of the load, so the order rows arrive in can't refuse them.
+dump-fk-hint-drops = Off for the duration of the load, so the order rows arrive in can't refuse them. A file that drops tables turns them off anyway: a drop with them on deletes the rows of tables outside the file through their ON DELETE actions.
 dump-no-fk-guard-hint = This engine has no session switch for foreign-key checks; the file adds the constraints after the data instead.
 dump-export = Export
 # The progress line; $rows is an abbreviated count (9.4k).

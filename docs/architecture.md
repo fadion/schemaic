@@ -5840,8 +5840,9 @@ existing prose was left alone.
     *Disable foreign-key checks* — the stricter-looking choice — had a replay of `customers` empty an
     `orders` the file never names (reproduced: 2 rows → 0) under a success report. MySQL refuses
     such a drop (ERROR 3730), SQL Server too (Msg 3726), and PostgreSQL's `CASCADE` drops a key, not
-    a row, so their toggle stands; `fk_guard_hint` is the toggle's hint and says so where it does
-    not (`a_sqlite_file_that_drops_tables_turns_foreign_keys_off_whatever_the_toggle`).
+    a row, so their toggle stands; the toggle's hint says so where it does not —
+    `fk_guard_says_drops` answers `FkHint::DropsTurnItOff` there, and `fk_guard_hint` is its English
+    (`a_sqlite_file_that_drops_tables_turns_foreign_keys_off_whatever_the_toggle`).
     **The guard's mode is the import's and it pins the zone**: `export::import_mode_sql` — the
     flag off and `NO_AUTO_VALUE_ON_ZERO` on, so a key of 0 restores as 0 — and, saved and put back
     like the mode, `time_zone = '+00:00'` (`export::rows_session_sql`), the zone the rows were read
@@ -27771,7 +27772,8 @@ existing prose was left alone.
     file. The code keeps the `dump` name throughout, for the reason `core::dump`'s entry gives. It
     collects a table selection and — for `Sql` — the six `DumpOptions`, and hands both to
     `SchemaActions::dump_run`; nothing here builds SQL. **The *Drop before create* hint is
-    `dump::drop_before_create_hint(dialect)`**, the only consent the export asks for what a replay
+    `dump::drop_hint(dialect)`**, a `DropHint` that `drop_hint_text` words (core's English being
+    `drop_before_create_hint`) — the only consent the export asks for what a replay
     drops: on SQL Server (`drops_up_front`) the toggle also replaces every routine in the dumped
     schemas, used by the tables or not, while the hint spoke of tables alone — so a replay of an
     older dump silently put older routine code in place of newer. The file's header names those
@@ -27997,12 +27999,14 @@ existing prose was left alone.
     every variant already says it failed — while `Worded`, a refusal the app wrote before the run
     began, passes through as it stands. The result goes into `i18n::export_failure_note` for a dump
     and `files_failure_note` for a folder, and `english_says_every_export_failure_as_core_does`
-    holds every variant equal to core's `Display`, which the CLI prints. The grid export's outcome
+    holds every variant equal to core's `Display`, which the CLI prints. The two replay toggles'
+    hints arrive typed as well — `dump::drop_hint` and `fk_guard_says_drops` — and
+    `drop_hint_text`/`fk_hint_text` word them from `dump-drop-hint-*` and `dump-fk-hint`/`-drops`,
+    held by `english_hints_every_replay_toggle_as_core_does`. The grid export's outcome
     lines in the progress box are the
     grid's, worded the same way (*Data grid*). What stays English: the format names
-    (`ExportFormat::label`, a `$format` placeable); the save dialog's file-type name `SQL`
-    (`FileSpec::name` is a `&'static str`); and core's `dump::drop_before_create_hint` and
-    `fk_guard_hint` (phase 4).
+    (`ExportFormat::label`, a `$format` placeable); and the save dialog's file-type name `SQL`
+    (`FileSpec::name` is a `&'static str`).
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
     designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
@@ -40630,6 +40634,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     app's two before a run, when the connection cannot be had — rides the same field as
     `ExportFailure::Worded` and passes through untouched. `english_says_every_export_failure_as_core_does`
     holds every variant equal to the `Display` the CLI prints.
+    A message core *chooses* by engine capability takes the same shape with the choice as the
+    value: the Export modal's replay-toggle hints were whole `&'static str`s picked per dialect, and
+    are now `dump::DropHint` (`drop_hint`) and `FkHint` (`fk_guard_says_drops`), each with a
+    `text()` that is the old English byte for byte — `drop_before_create_hint` and `fk_guard_hint`
+    remain as its wrappers, for core's tests. The capability decision stays in core; `dump_view`
+    words only the answer.
     **A sentence with optional parts is one message with a selector per part, not fragments
     assembled in code** — the lock-wait card's is the pattern. `activity-lock-wait-sentence` takes
     `$waited`/`$held` as an age or as `none` where the server withheld one (no age reads as that),

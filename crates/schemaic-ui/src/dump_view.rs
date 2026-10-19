@@ -636,7 +636,7 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
         crate::settings::focusable_toggle_row(
             tr!("dump-drop-before-create"),
             // What it drops differs by engine — see the core function.
-            schemaic_core::dump::drop_before_create_hint(dialect),
+            drop_hint_text(schemaic_core::dump::drop_hint(dialect)),
             d.drop_if_exists,
             ring.clone(),
             TAB_OPTS + 30,
@@ -651,7 +651,7 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
         if has_guard {
             crate::settings::focusable_toggle_row(
                 tr!("dump-disable-fk-checks"),
-                schemaic_core::dump::fk_guard_hint(dialect),
+                fk_hint_text(schemaic_core::dump::fk_guard_says_drops(dialect)),
                 d.disable_fk_checks,
                 ring.clone(),
                 TAB_OPTS + 50,
@@ -1353,6 +1353,28 @@ fn dump_done_note(
     parts.join(" ")
 }
 
+/// The *Drop before create* toggle's hint — `dump::DropHint` in the
+/// interface's language.
+fn drop_hint_text(hint: schemaic_core::dump::DropHint) -> String {
+    use schemaic_core::dump::DropHint;
+    match hint {
+        DropHint::UpFront => tr!("dump-drop-hint-up-front"),
+        DropHint::RoutinesInPlace => tr!("dump-drop-hint-routines-in-place"),
+        DropHint::RoutinesDroppedFirst => tr!("dump-drop-hint-routines-dropped-first"),
+        DropHint::TablesOnly => tr!("dump-drop-hint-tables-only"),
+    }
+}
+
+/// The *Disable foreign-key checks* toggle's hint — `dump::FkHint` in the
+/// interface's language.
+fn fk_hint_text(hint: schemaic_core::dump::FkHint) -> String {
+    use schemaic_core::dump::FkHint;
+    match hint {
+        FkHint::Plain => tr!("dump-fk-hint"),
+        FkHint::DropsTurnItOff => tr!("dump-fk-hint-drops"),
+    }
+}
+
 /// Why a dump or a folder export stopped short — `dump::ExportFailure` in the
 /// interface's language. Each already says it failed; nothing adds a prefix.
 fn export_failure_text(failure: &schemaic_core::dump::ExportFailure) -> String {
@@ -1542,6 +1564,24 @@ mod core_words_tests {
                 dump_cancel_note("shop.sql", partial),
                 dump::cancel_note("shop.sql", partial)
             );
+        }
+    }
+
+    /// **The replay toggles' hints read in English exactly as core's**, every
+    /// variant.
+    #[test]
+    fn english_hints_every_replay_toggle_as_core_does() {
+        use schemaic_core::dump::{DropHint, FkHint};
+        for hint in [
+            DropHint::UpFront,
+            DropHint::RoutinesInPlace,
+            DropHint::RoutinesDroppedFirst,
+            DropHint::TablesOnly,
+        ] {
+            assert_eq!(super::drop_hint_text(hint), hint.text(), "{hint:?}");
+        }
+        for hint in [FkHint::Plain, FkHint::DropsTurnItOff] {
+            assert_eq!(super::fk_hint_text(hint), hint.text(), "{hint:?}");
         }
     }
 
