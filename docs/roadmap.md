@@ -113,7 +113,9 @@ assertions pin English wording — stays the regression net throughout.
    menus — a cell's, a row gutter's, a column header's, *Copy as* and *Show hidden columns*
    (`grid-menu-*`, and `grid-attach-to-chat`, which the toolbar's attach label shares); its
    toolbar — the status line, the commit, row, copy, save, AI and chart controls (`grid-stats`
-   and the rest of the `grid-*` ids in that block; the filter bar's `WHERE` is SQL).
+   and the rest of the `grid-*` ids in that block; the filter bar's `WHERE` is SQL); the bars
+   under it — error, lock wait, find, selection readout, go to row (the wait and note bars'
+   sentences are core's).
    **Left, in order** — delete a name as its file lands: the four large files' remainders,
    `grid.rs`, `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,

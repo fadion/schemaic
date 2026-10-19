@@ -1973,3 +1973,16 @@ grid-chart-tip = Chart the results
 grid-chart-empty = Nothing to chart — no rows
 # What the chart's title (Chart — …) calls a result charted from the grid.
 grid-chart-this-result = this result
+
+## The results grid's bars (grid.rs) — the error bar, the lock-wait bar, find,
+## the selection readout and go to row. The wait and note bars' sentences are
+## core's and stay English for now.
+
+# Opens the full error in a modal.
+grid-error-view = View
+# The lock-wait bar's button; $tab is the blocking tab's name, clipped.
+grid-rollback-tab = Roll back { $tab }
+grid-find-placeholder = Find in results
+# Stands in for a figure of the selection readout just after it is clicked.
+grid-figure-copied = Copied
+grid-goto-label = Go to row:

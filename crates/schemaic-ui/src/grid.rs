@@ -4304,7 +4304,7 @@ pub(crate) fn grid_error_bar(
         // server's words get "Explain" there. See `ModalError::worth_viewing`.
         let view: AnyView = if msg.worth_viewing(BAR_ONE_LINE_CHARS) {
             let full = msg;
-            text("View")
+            text(tr!("grid-error-view"))
                 .on_click_stop(move |_| {
                     // The source rides through as its setter chose it: a failed
                     // commit is the server's, a paste that landed nothing or a
@@ -4460,20 +4460,23 @@ fn wait_bar(note: WaitNote, rollback_tx: Rc<dyn Fn(usize)>) -> impl IntoView {
     const TAB_NAME_MAX: usize = 10;
     let action = match note.rollback {
         None => empty().into_any(),
-        Some((tab_id, title)) => text(format!("Roll back {}", truncate(&title, TAB_NAME_MAX)))
-            .on_click_stop(move |_| (rollback_tx)(tab_id))
-            .style(|s| {
-                // Never shrinks: the sentence is the part that may ellipsize, and
-                // `margin_left` is a real gap even when the flex spacer between
-                // them has been squeezed to nothing.
-                s.color(theme::tx_rollback())
-                    .font_size(theme::font_body())
-                    .flex_shrink(0.0_f32)
-                    .margin_left(theme::scaled(12.0))
-                    .margin_right(theme::scaled(8.0))
-                    .hover(|s| s.color(theme::tx_rollback_hover()))
-            })
-            .into_any(),
+        Some((tab_id, title)) => text(tr!(
+            "grid-rollback-tab",
+            tab = truncate(&title, TAB_NAME_MAX)
+        ))
+        .on_click_stop(move |_| (rollback_tx)(tab_id))
+        .style(|s| {
+            // Never shrinks: the sentence is the part that may ellipsize, and
+            // `margin_left` is a real gap even when the flex spacer between
+            // them has been squeezed to nothing.
+            s.color(theme::tx_rollback())
+                .font_size(theme::font_body())
+                .flex_shrink(0.0_f32)
+                .margin_left(theme::scaled(12.0))
+                .margin_right(theme::scaled(8.0))
+                .hover(|s| s.color(theme::tx_rollback_hover()))
+        })
+        .into_any(),
     };
     h_stack((
         text(note.text).style(|s| {
@@ -4528,7 +4531,7 @@ pub(crate) fn grid_find_bar(
             let input = edit_field(
                 find_query,
                 FieldCfg {
-                    placeholder: "Find in results",
+                    placeholder_of: Some(Rc::new(|| tr!("grid-find-placeholder"))),
                     autofocus: true,
                     font_size: theme::font_body,
                     border_radius: 6.0,
@@ -4703,7 +4706,7 @@ fn selection_readout(
                 let copy = f.copy;
                 parts.push(
                     label(move || match copied.get() {
-                        Some((at, _)) if at == i => "Copied".to_string(),
+                        Some((at, _)) if at == i => tr!("grid-figure-copied"),
                         _ => shown.clone(),
                     })
                     .on_click_stop(move |_| {
@@ -4807,7 +4810,7 @@ pub(crate) fn grid_goto_bar(
                         .hover(|s| s.color(theme::text()))
                 });
             h_stack((
-                text("Go to row:")
+                text(tr!("grid-goto-label"))
                     .style(|s| s.font_size(theme::font_label()).color(theme::text_dim())),
                 input,
                 close_btn,
@@ -16085,6 +16088,15 @@ mod catalogue_tests {
         assert_eq!(
             tr!("grid-arena-note", columns = "body, blob"),
             "· body, blob too large to hold in full — later rows show blank"
+        );
+    }
+
+    /// The lock-wait bar's button names the blocking tab as it did.
+    #[test]
+    fn the_rollback_button_reads_as_it_did_in_english() {
+        assert_eq!(
+            tr!("grid-rollback-tab", tab = "Query 3"),
+            "Roll back Query 3"
         );
     }
 }
