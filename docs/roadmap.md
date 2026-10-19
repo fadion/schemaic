@@ -87,7 +87,7 @@ assertions pin English wording — stays the regression net throughout.
    `connection_import.rs`, `blob_view.rs`, `erd_view.rs`, `server_vars_view.rs`,
    `snippet_edit.rs`, `plan_view.rs`, `used_by_view.rs`, `themes.rs` (its one pair, Dark and
    Light; `tooltip.rs` had nothing a user reads), `markdown.rs`, `cell_editors.rs`,
-   `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`; and, ahead
+   `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`, `grid.rs`; and, ahead
    of their files, the three
    workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
    `editor_pane.rs`'s query header (`query-*`) — and `editor_pane.rs`'s two *Rename alias* /
@@ -103,24 +103,21 @@ assertions pin English wording — stays the regression net throughout.
    tree's menus and panel under
    `tree-*`. `section_title` and `loading_dots` take owned text now, so the other panels'
    headings can follow.
-   **Where it stands** (2026-10-19): every small file is done; the next session starts on
-   `grid.rs`. A large file goes **a section at a time** — a function or a cluster of them —
-   committed per section as `feat(i18n): draw <section> of the grid from the catalogue`, and
-   recorded on the *Within the large files* line below, so the next session knows where to pick
-   up without re-sweeping what is done. The file leaves *Left* only when a whole-file sweep
-   finds nothing.
-   **Within the large files:** beyond the headers and openers named above, `grid.rs`'s context
-   menus — a cell's, a row gutter's, a column header's, *Copy as* and *Show hidden columns*
-   (`grid-menu-*`, and `grid-attach-to-chat`, which the toolbar's attach label shares); its
-   toolbar — the status line, the commit, row, copy, save, AI and chart controls (`grid-stats`
-   and the rest of the `grid-*` ids in that block; the filter bar's `WHERE` is SQL); the bars
-   under it — error, lock wait, find, selection readout, go to row (the wait and note bars'
-   sentences are core's); the clipboard, fill, attach and export paths — fill's notes, the
-   attachment's summary (`attach_summary`), *Copy as* SQL's refusals, the export menu's
-   *Fetched rows* and the Save dialog (the export notes, and the "the clipboard" / "the file"
-   they name, are core's); the row panel (`grid-row-*`; its `<null>` is SQL).
-   **Left, in order** — delete a name as its file lands: the four large files' remainders,
-   `grid.rs`, `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
+   **Where it stands** (2026-10-19): every small file is done, and so is `grid.rs` (six
+   sections, `grid-*`); the next session starts on `lib.rs`. A large file goes **a section at
+   a time** — a function or a cluster of them — committed per section as
+   `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded on the
+   *Within the large files* line below, so the next session knows where to pick up without
+   re-sweeping what is done. The file leaves *Left* only when a whole-file sweep finds nothing.
+   What `grid.rs` leaves English on purpose: SQL (`WHERE`, `<null>`, `<default>`,
+   `SQL VALUES`/`UPDATE`/`WHERE IN`), the export formats' names, and core's prose — the row
+   phrase in the status line (`stats::rows_read_clause`), the attach scope
+   (`model::attach_scope_label`), the export notes and the "the clipboard" / "the file" they
+   name, the lock-wait sentence, the duplicate prompt — which is phase 4's.
+   **Within the large files:** nothing yet in `lib.rs`, `widgets.rs` or `editor_pane.rs`
+   beyond the headers and openers named above.
+   **Left, in order** — delete a name as its file lands: the three large files' remainders,
+   `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,
    `agent_cli.rs`, `antigravity.rs`), whose first file settles how it reaches the loader
    (above). A file with

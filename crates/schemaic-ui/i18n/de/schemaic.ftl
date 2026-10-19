@@ -1706,3 +1706,20 @@ grid-row-edit-binary = Bearbeiten
 grid-row-view-binary = Anzeigen
 grid-row-invalid-json = Ungültiges JSON: { $error }
 grid-row-saving = Wird gespeichert
+grid-rows-affected = { $count ->
+    [one] { $count } Zeile betroffen · { $ms } ms
+   *[other] { $count } Zeilen betroffen · { $ms } ms
+}
+grid-rerun-would-write = Diese Anweisung kann nicht erneut ausgeführt werden — sie würde in die Datenbank schreiben
+grid-filter-not-simple = Diese Abfrage kann nicht gefiltert werden — kein einfaches SELECT auf eine Tabelle
+grid-hidden-columns-tip = { $count ->
+    [one] { $count } ausgeblendete Spalte — klicken, um alle anzuzeigen, oder Rechtsklick auf eine Spaltenüberschrift zur Auswahl
+   *[other] { $count } ausgeblendete Spalten — klicken, um alle anzuzeigen, oder Rechtsklick auf eine Spaltenüberschrift zur Auswahl
+}
+grid-copied-staged-sql = Die vorgemerkten Änderungen wurden als SQL kopiert.
+grid-duplicate-title = Zeilen duplizieren
+grid-nullable-tip = Nullable
+grid-cell-auto = <auto>
+grid-cell-required = <Pflicht>
+grid-seed-title = Zeilen erzeugen
+grid-seed-generate = Erzeugen

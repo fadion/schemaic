@@ -230,14 +230,15 @@ fn cmp_key(a: &SortKey, b: &SortKey) -> Ordering {
 // returned no result set (UPDATE/INSERT/DELETE/DDL), an "N rows affected" line.
 pub(crate) fn loaded_view(rs: Arc<ResultSet>, gctx: GridCtx) -> AnyView {
     match rs.affected {
-        Some(n) => {
-            let s = if n == 1 { "" } else { "s" };
-            centered_msg(
-                format!("{n} row{s} affected · {} ms", rs.elapsed_ms),
-                theme::text_dim,
-            )
-            .into_any()
-        }
+        Some(n) => centered_msg(
+            tr!(
+                "grid-rows-affected",
+                count = n,
+                ms = rs.elapsed_ms.to_string()
+            ),
+            theme::text_dim,
+        )
+        .into_any(),
         None => grid_view(rs, gctx).into_any(),
     }
 }
@@ -897,12 +898,8 @@ impl GridState {
                 // reading of the typed condition, not the database's.
                 Ok(Some(sql)) => crate::RerunRequest::approved(sql, self.dialect)
                     .map(Some)
-                    .ok_or_else(|| {
-                        "Can't re-run this statement — it would write to the database".to_string()
-                    }),
-                Ok(None) => {
-                    Err("Can't filter this query — not a simple single-table SELECT".to_string())
-                }
+                    .ok_or_else(|| tr!("grid-rerun-would-write")),
+                Ok(None) => Err(tr!("grid-filter-not-simple")),
                 Err(FilterError::BadCondition(msg)) => Err(msg),
             },
         };
@@ -5250,12 +5247,8 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 .style(|s| s.items_center())
                 .on_click_stop(move |_| gs.hidden.set(Default::default()))
                 .tooltip(move || {
-                    text(format!(
-                        "{n_hidden} hidden {} — click to show all, or right-click a \
-                         header to choose",
-                        if n_hidden == 1 { "column" } else { "columns" }
-                    ))
-                    .style(crate::widgets::tooltip_style)
+                    text(tr!("grid-hidden-columns-tip", count = n_hidden))
+                        .style(crate::widgets::tooltip_style)
                 })
                 .into_any()
             } else {
@@ -6193,8 +6186,7 @@ fn copy_staged_sql(gs: GridState) {
     let rs = gs.rs.get_untracked();
     let sql = schemaic_core::edit::staged_sql(&write, &rs, gs.dialect);
     let _ = floem::Clipboard::set_contents(sql);
-    gs.commit_note
-        .set(Some("Copied the staged changes as SQL.".to_string()));
+    gs.commit_note.set(Some(tr!("grid-copied-staged-sql")));
 }
 
 /// Execute all staged edits (Ctrl+Enter or the toolbar ✓). The app runs them
@@ -6510,7 +6502,7 @@ fn clone_rows(gs: GridState, data_idxs: &[usize]) {
         let idxs = data_idxs.to_vec();
         let message = schemaic_core::edit::duplicate_prompt(idxs.len());
         gs.confirm.set(Some(crate::Confirm {
-            title: "Duplicate rows".to_string(),
+            title: tr!("grid-duplicate-title"),
             message,
             // `alive` again on the way back: the modal outlives the click, and
             // the panel it belongs to can be closed while it is up.
@@ -7022,21 +7014,23 @@ fn seed_popover(gs: GridState) -> impl IntoView {
             };
             let go_btn = go.clone();
             let panel = v_stack((
-                text("Seed rows")
+                text(tr!("grid-seed-title"))
                     .style(|s| s.font_size(theme::font_label()).color(theme::text_muted())),
                 h_stack((
                     field,
-                    container(text("Generate").style(|s| s.font_size(theme::font_body())))
-                        .on_click_stop(move |_| (go_btn)())
-                        .style(|s| {
-                            s.padding_horiz(theme::scaled(12.0))
-                                .padding_vert(theme::scaled(6.0))
-                                .border_radius(6.0)
-                                .color(floem::peniko::Color::WHITE)
-                                .background(theme::seed_button())
-                                .cursor(CursorStyle::Default)
-                                .hover(|s| s.background(theme::seed_button().multiply_alpha(0.85)))
-                        }),
+                    container(
+                        text(tr!("grid-seed-generate")).style(|s| s.font_size(theme::font_body())),
+                    )
+                    .on_click_stop(move |_| (go_btn)())
+                    .style(|s| {
+                        s.padding_horiz(theme::scaled(12.0))
+                            .padding_vert(theme::scaled(6.0))
+                            .border_radius(6.0)
+                            .color(floem::peniko::Color::WHITE)
+                            .background(theme::seed_button())
+                            .cursor(CursorStyle::Default)
+                            .hover(|s| s.background(theme::seed_button().multiply_alpha(0.85)))
+                    }),
                 ))
                 .style(|s| s.gap(theme::scaled(6.0)).items_center()),
                 h_stack((
@@ -10710,7 +10704,7 @@ fn header_cell(
                     .margin_left(theme::scaled(4.0))
                     .flex_shrink(0.0_f32)
             })
-            .tooltip(|| text("Nullable").style(crate::widgets::tooltip_style))
+            .tooltip(|| text(tr!("grid-nullable-tip")).style(crate::widgets::tooltip_style))
             .into_any()
     } else {
         empty().into_any()
@@ -11610,9 +11604,9 @@ fn data_cell(
                 Some(v) => v.display(),
                 None if placeholder => {
                     if auto_inc {
-                        "<auto>".to_string()
+                        tr!("grid-cell-auto")
                     } else if no_default {
-                        "<required>".to_string()
+                        tr!("grid-cell-required")
                     } else if !not_null {
                         "<null>".to_string()
                     } else {
@@ -16157,6 +16151,27 @@ mod catalogue_tests {
         assert_eq!(
             tr!("grid-row-invalid-json", error = "expected value at line 1"),
             "Invalid JSON: expected value at line 1"
+        );
+    }
+
+    /// The affected-rows line and the hidden-columns chip count as they did.
+    #[test]
+    fn the_counted_lines_read_as_they_did_in_english() {
+        assert_eq!(
+            tr!("grid-rows-affected", count = 1, ms = "3"),
+            "1 row affected · 3 ms"
+        );
+        assert_eq!(
+            tr!("grid-rows-affected", count = 0, ms = "12"),
+            "0 rows affected · 12 ms"
+        );
+        assert_eq!(
+            tr!("grid-hidden-columns-tip", count = 1),
+            "1 hidden column — click to show all, or right-click a header to choose"
+        );
+        assert_eq!(
+            tr!("grid-hidden-columns-tip", count = 4),
+            "4 hidden columns — click to show all, or right-click a header to choose"
         );
     }
 

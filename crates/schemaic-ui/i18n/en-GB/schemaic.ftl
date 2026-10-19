@@ -2040,3 +2040,30 @@ grid-row-view-binary = View
 grid-row-invalid-json = Invalid JSON: { $error }
 # Animated with trailing dots while the row is written.
 grid-row-saving = Saving
+
+## The rest of the results grid (grid.rs) — a statement's affected-rows line,
+## the filter's refusals, the hidden-columns chip, new-row cells and the AI
+## seed popover. <null> and <default> in a new row's cell are SQL and stay.
+
+# In place of a grid, for a statement that returned no rows; $ms is the run time.
+grid-rows-affected = { $count ->
+    [one] { $count } row affected · { $ms } ms
+   *[other] { $count } rows affected · { $ms } ms
+}
+grid-rerun-would-write = Can't re-run this statement — it would write to the database
+grid-filter-not-simple = Can't filter this query — not a simple single-table SELECT
+grid-hidden-columns-tip = { $count ->
+    [one] { $count } hidden column — click to show all, or right-click a header to choose
+   *[other] { $count } hidden columns — click to show all, or right-click a header to choose
+}
+grid-copied-staged-sql = Copied the staged changes as SQL.
+# The confirmation's title; its question is core's and stays English for now.
+grid-duplicate-title = Duplicate rows
+# A column header's tooltip on the mark for a column that allows NULL.
+grid-nullable-tip = Nullable
+# What a new row's unset cell will become: an auto-increment value, or an
+# error if left blank. Kept in angle brackets, as <null> and <default> are.
+grid-cell-auto = <auto>
+grid-cell-required = <required>
+grid-seed-title = Seed rows
+grid-seed-generate = Generate
