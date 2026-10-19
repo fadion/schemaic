@@ -122,7 +122,9 @@ assertions pin English wording — stays the regression net throughout.
    the settings choices it defines (`AiEffort`, `SchemaScope`, `TermCursor`'s `label`, which
    Settings' dropdowns read; their persisted keys stay); the header and its disconnected
    notice (`header-*`) and the identity colours' names (`colour-*`; `CONN_COLOR_PRESETS`
-   stays `const`, its names `fn() -> String`).
+   stays `const`, its names `fn() -> String`); the changed-on-disk banner (`disk-*`) and the
+   results area's run hint, failed and cancelled lines (`results-run-hint` and the two after
+   it).
    Nothing yet in `widgets.rs` or `editor_pane.rs`.
    **Left, in order** — delete a name as its file lands: the three large files' remainders,
    `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then

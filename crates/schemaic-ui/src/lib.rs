@@ -9443,7 +9443,7 @@ fn center(ui: Ui) -> impl IntoView {
                 // taking the disk's text is the commit, keeping the tab's own the
                 // discard of the offer. Not the grid's `grid_edit_staged` /
                 // `grid_edit_discard` — those are icon colours and fail as text.
-                let act = |label: &'static str,
+                let act = |label: String,
                            color: fn() -> floem::peniko::Color,
                            hover: fn() -> floem::peniko::Color,
                            on: Rc<dyn Fn()>| {
@@ -9455,17 +9455,17 @@ fn center(ui: Ui) -> impl IntoView {
                 };
                 let reload = reload.clone();
                 h_stack((
-                    text(format!("“{name}” changed on disk."))
+                    text(tr!("disk-changed", name = name.clone()))
                         .style(|s| s.color(theme::text_dim()).min_width(0.0).text_ellipsis()),
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     act(
-                        "Reload",
+                        tr!("disk-reload"),
                         theme::tx_commit,
                         theme::tx_commit_hover,
                         Rc::new(move || (reload)(id)),
                     ),
                     act(
-                        "Keep mine",
+                        tr!("disk-keep-mine"),
                         theme::tx_rollback,
                         theme::tx_rollback_hover,
                         Rc::new(move || {
@@ -9812,9 +9812,9 @@ fn build_result_body(
             // was the one surface still saying Ctrl after `07de2d7` moved the
             // modal, the palette and the ER diagram to Cmd.
             centered_msg(
-                format!(
-                    "Run a query  ({})",
-                    crate::shortcuts::keys_label("Ctrl+Enter")
+                tr!(
+                    "results-run-hint",
+                    keys = crate::shortcuts::keys_label("Ctrl+Enter").into_owned()
                 ),
                 theme::text_muted,
             )
@@ -9827,9 +9827,11 @@ fn build_result_body(
         // `Phase::Failed`. It used to *be* the pane, and one long server error
         // then ran across the window and out over the schema sidebar.
         Some(QueryState::Failed(_)) => {
-            centered_msg("Statement failed.", theme::text_dim).into_any()
+            centered_msg(tr!("results-failed"), theme::text_dim).into_any()
         }
-        Some(QueryState::Cancelled) => centered_msg("Query cancelled.", theme::text_dim).into_any(),
+        Some(QueryState::Cancelled) => {
+            centered_msg(tr!("results-cancelled"), theme::text_dim).into_any()
+        }
         Some(QueryState::Loaded(rs)) => loaded_view(rs, gctx),
     }
 }
@@ -15454,6 +15456,20 @@ mod catalogue_tests {
         assert_eq!(
             tr!("header-find-anywhere-tip", keys = "Ctrl+P"),
             "Find Anywhere (Ctrl+P)"
+        );
+    }
+
+    /// The changed-on-disk banner and the run hint read as they did, the hint's
+    /// double space included.
+    #[test]
+    fn the_banner_and_run_hint_read_as_they_did_in_english() {
+        assert_eq!(
+            tr!("disk-changed", name = "report.sql"),
+            "“report.sql” changed on disk."
+        );
+        assert_eq!(
+            tr!("results-run-hint", keys = "Ctrl+Enter"),
+            "Run a query  (Ctrl+Enter)"
         );
     }
 

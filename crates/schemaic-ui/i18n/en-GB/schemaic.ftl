@@ -2159,3 +2159,15 @@ colour-teal = Teal
 colour-blue = Blue
 colour-purple = Purple
 colour-pink = Pink
+
+## A file-backed tab's changed-on-disk banner, and the results area before a
+## result (lib.rs).
+
+# $name is the file's name.
+disk-changed = “{ $name }” changed on disk.
+disk-reload = Reload
+disk-keep-mine = Keep mine
+# A new tab's results area; $keys is the run shortcut (Ctrl+Enter).
+results-run-hint = Run a query  ({ $keys })
+results-failed = Statement failed.
+results-cancelled = Query cancelled.
