@@ -124,8 +124,8 @@ assertions pin English wording — stays the regression net throughout.
    Two of its conversions reach other files: `ai_off_note()` (once the `AI_OFF_NOTE` const) is
    read by the app crate's AI refusals, and `CONN_COLOR_PRESETS` stays `const` with its names
    as `fn() -> String`.
-   **Within the large files:** nothing yet in `editor_pane.rs` beyond the headers and openers
-   named above.
+   **Within the large files:** beyond the headers and openers named above, `editor_pane.rs`'s
+   inline AI popup (`cmdk-*`; what it sends the model stays English).
    **Left, in order** — delete a name as its file lands: the last large file's remainder,
    `editor_pane.rs`; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,

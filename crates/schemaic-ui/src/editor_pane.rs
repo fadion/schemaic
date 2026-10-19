@@ -58,6 +58,7 @@ use crate::completion::{
     signature_popup, types_a_character, update_signature_help,
 };
 use crate::consts::*;
+use crate::i18n::tr;
 use crate::inline_diff;
 use crate::shortcuts::primary_held;
 use crate::tooltip::TooltipExt;
@@ -1006,7 +1007,7 @@ fn cmdk_popup(
             let input_row = edit_field(
                 cmdk.input,
                 FieldCfg {
-                    placeholder: "Ask the AI Assistant for help.",
+                    placeholder_of: Some(Rc::new(|| tr!("cmdk-placeholder"))),
                     background: bg_transparent,
                     font_size: theme::font_body,
                     multiline: true,
@@ -1152,7 +1153,7 @@ fn cmdk_popup(
                         }
                     };
                     h_stack((
-                        container(text("Accept"))
+                        container(text(tr!("cmdk-accept")))
                             .on_click_stop(move |_| accept_b())
                             .on_event_stop(EventListener::PointerWheel, fwd_wheel)
                             .style(|s| {
@@ -1163,7 +1164,7 @@ fn cmdk_popup(
                                         s.color(theme::diff_add_marker().multiply_alpha(0.8))
                                     })
                             }),
-                        container(text("Reject"))
+                        container(text(tr!("cmdk-reject")))
                             .on_click_stop(move |_| discard_b())
                             .on_event_stop(EventListener::PointerWheel, fwd_wheel)
                             .style(|s| {
