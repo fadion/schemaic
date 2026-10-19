@@ -21863,9 +21863,9 @@ existing prose was left alone.
   message already implies one — and otherwise makes a `Query`'s text a `WriteCause::Server` with
   the `Rollback`. `every_import_exit_says_what_the_rollback_achieved` reads `import_on`'s source
   and fails on a `return Err(` whose next ten lines name none of `Some(undone)`,
-  `cancelled_import(` and `with_partial_rollback(`, with a floor of three `Some(undone)`. **The `COMMIT` exit says "query failed:" twice** — its text is
-  `qerr(e).to_string()`, already prefixed, inside a `Server` that prefixes again — and that was
-  kept on purpose, byte-identical to the error it replaced; fixing it is a change of its own.
+  `cancelled_import(` and `with_partial_rollback(`, with a floor of three `Some(undone)`. The
+  `COMMIT` exit's `Server` holds the driver's own sentence, as every other exit's does: it held
+  `qerr(e).to_string()`, already prefixed, so the modal said "query failed: query failed: …".
   PostgreSQL's arm is unchanged — it still races the whole of its own `import_on` — and its
   `Cancelled` really does mean nothing was written, every PostgreSQL table being transactional.
   `a_cancelled_import_rolls_back_and_says_so` and

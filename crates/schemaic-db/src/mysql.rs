@@ -6585,7 +6585,7 @@ async fn import_on(
     // too, and `Rollback::note` is what turns that into a sentence about the
     // data rather than about the socket.
     if let Err(e) = conn.query_drop("COMMIT").await {
-        let msg = qerr(e).to_string();
+        let msg = e.to_string();
         let undone = rollback(conn, "ROLLBACK").await;
         return Err(DbError::write(WriteCause::Server(msg), Some(undone)));
     }
