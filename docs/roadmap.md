@@ -90,7 +90,8 @@ assertions pin English wording — stays the regression net throughout.
    `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`; and, ahead
    of their files, the three
    workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
-   `editor_pane.rs`'s query header (`query-*`). The schema editors share
+   `editor_pane.rs`'s query header (`query-*`) — and `editor_pane.rs`'s two *Rename alias* /
+   *Rename CTE* openers (`alias-rename-*`). The schema editors share
    `editor-preview-sql` and `editor-change-count`, and `dialog-close` joins the dialog words. The
    activity panel's counts line ("18 sessions · 4 running") and its session-state words stay
    core's English with phase 4: the total is core's `ActivitySummary::total_label`, and the
@@ -102,10 +103,18 @@ assertions pin English wording — stays the regression net throughout.
    tree's menus and panel under
    `tree-*`. `section_title` and `loading_dots` take owned text now, so the other panels'
    headings can follow.
+   **Where it stands** (2026-10-19): every small file is done; the next session starts on
+   `grid.rs`. A large file goes **a section at a time** — a function or a cluster of them —
+   committed per section as `feat(i18n): draw <section> of the grid from the catalogue`, and
+   recorded on the *Within the large files* line below, so the next session knows where to pick
+   up without re-sweeping what is done. The file leaves *Left* only when a whole-file sweep
+   finds nothing.
+   **Within the large files:** nothing yet beyond the headers and openers named above.
    **Left, in order** — delete a name as its file lands: the four large files' remainders,
    `grid.rs`, `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
-   `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`, `agent_cli.rs`,
-   `antigravity.rs`), whose first file settles how it reaches the loader (above). A file with
+   `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,
+   `agent_cli.rs`, `antigravity.rs`), whose first file settles how it reaches the loader
+   (above). A file with
    no literal a user reads drops off without a commit. The list came from a sweep for
    capitalised string literals, so sweep a file whole before calling it done; a sentence that
    starts lower-case, or spans a `\` continuation, slips past a quick one.
