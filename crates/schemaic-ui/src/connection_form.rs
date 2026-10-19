@@ -1190,12 +1190,27 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
 /// The draft's [`AuthMode::tls_note`]: the line saying the sign-in in force
 /// connects at a stronger rung than the one picked, or `None`. Tracked, for
 /// the label and its style.
-fn tls_floor_note(draft: DraftSignals) -> Option<&'static str> {
-    draft
-        .auth
-        .get()
-        .in_force(&draft.db_type.get())
-        .tls_note(draft.tls_mode.get())
+fn tls_floor_note(draft: DraftSignals) -> Option<String> {
+    let auth = draft.auth.get().in_force(&draft.db_type.get());
+    auth.tls_note(draft.tls_mode.get())
+        .map(|_| tls_floor_words(auth))
+}
+
+/// [`AuthMode::tls_note`]'s sentence for `auth`, in the interface's
+/// language — core decides whether one is said, this only how.
+fn tls_floor_words(auth: AuthMode) -> String {
+    match auth {
+        AuthMode::AzureCli => tr!("tls-floor-azure-cli"),
+        AuthMode::AwsIam => tr!("tls-floor-aws-iam"),
+        AuthMode::GcpIam => tr!("tls-floor-gcp-iam"),
+        AuthMode::Password | AuthMode::Windows => tr!("tls-floor-other"),
+    }
+}
+
+/// [`SslMode::caveat`]'s sentence — the one caveat there is: on MySQL and
+/// MariaDB *Verify CA* checks the host name too.
+fn verify_ca_caveat_words() -> String {
+    tr!("tls-verify-ca-checks-host")
 }
 
 /// How the connection to the server is secured: the [`SslMode`] picker, and the
@@ -1241,8 +1256,8 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         label(move || {
             mode.get()
                 .caveat(&draft.db_type.get())
+                .map(|_| verify_ca_caveat_words())
                 .unwrap_or_default()
-                .to_string()
         })
         .style(move |s| {
             let s = s
@@ -1268,7 +1283,7 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         // never silently two different things. A note rather than a write to
         // the picker: an effect cannot tell a pick from a load, and raising
         // on a load would edit a saved connection by opening it.
-        label(move || tls_floor_note(draft).unwrap_or_default().to_string()).style(move |s| {
+        label(move || tls_floor_note(draft).unwrap_or_default()).style(move |s| {
             let s = s
                 .width_full()
                 .font_size(theme::font_hint())
@@ -1610,15 +1625,15 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // an empty label still takes a line and the column's gap.
     let port_note = move || {
         schemaic_core::connection::named_instance_port_note(&draft.db_type.get(), &draft.host.get())
+            .map(|_| tr!("connections-named-instance-port"))
     };
-    let instance_note =
-        label(move || port_note().unwrap_or_default().to_string()).style(move |s| {
-            let s = s
-                .width_full()
-                .font_size(theme::font_hint())
-                .color(theme::text_dim());
-            if port_note().is_none() { s.hide() } else { s }
-        });
+    let instance_note = label(move || port_note().unwrap_or_default()).style(move |s| {
+        let s = s
+            .width_full()
+            .font_size(theme::font_hint())
+            .color(theme::text_dim());
+        if port_note().is_none() { s.hide() } else { s }
+    });
 
     v_stack((
         v_stack((
@@ -2162,8 +2177,8 @@ fn conn_form(
         read_only_toggle,
         label(move || {
             schemaic_core::connection::read_only_caveat(&draft.db_type.get())
+                .map(|_| tr!("connections-read-only-mssql"))
                 .unwrap_or_default()
-                .to_string()
         })
         .style(move |s| {
             s.width_full()
@@ -2392,6 +2407,46 @@ mod tests {
         runs_of_delta, splice_real, windows_sign_in_hint_for,
     };
     use floem::views::editor::core::xi_rope::{Interval, Rope, RopeDelta};
+
+    /// **The notes under the form's fields read in English exactly as core's**
+    /// wherever core says one: the Verify CA caveat, each sign-in's TLS floor,
+    /// SQL Server's read-only and named-instance notes.
+    #[test]
+    fn english_says_every_field_note_as_core_does() {
+        use schemaic_core::connection::{self as core, AuthMode, SslMode};
+        assert_eq!(
+            Some(super::verify_ca_caveat_words().as_str()),
+            SslMode::VerifyCa.caveat("MySQL")
+        );
+        let mut floors = 0;
+        for auth in [
+            AuthMode::Password,
+            AuthMode::Windows,
+            AuthMode::AzureCli,
+            AuthMode::AwsIam,
+            AuthMode::GcpIam,
+        ] {
+            if let Some(english) = auth.tls_note(SslMode::Disable) {
+                assert_eq!(super::tls_floor_words(auth), english, "{auth:?}");
+                floors += 1;
+            }
+        }
+        assert!(floors >= 3, "the cloud sign-ins each have a floor");
+        // Core's arm for the others is unreachable today (their floor is
+        // Disable), so it is held to that arm's text as written.
+        assert_eq!(
+            super::tls_floor_words(AuthMode::Password),
+            "This sign-in connects at a stronger mode than the one picked here."
+        );
+        assert_eq!(
+            core::read_only_caveat("SQL Server"),
+            Some(crate::i18n::tr!("connections-read-only-mssql").as_str())
+        );
+        assert_eq!(
+            core::named_instance_port_note("SQL Server", r"db1\SQLEXPRESS"),
+            Some(crate::i18n::tr!("connections-named-instance-port").as_str())
+        );
+    }
 
     /// **The form's pickers read in English exactly as core's labels** — TLS
     /// with its descriptions, SSH authentication and the sign-in method.

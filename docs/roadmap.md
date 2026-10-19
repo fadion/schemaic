@@ -115,10 +115,8 @@ assertions pin English wording — stays the regression net throughout.
    (`settings::keyword_case_label`, `comma_style_label`, `statement_gap_label`), and so are
    `connection`'s pickers (`Environment`, `AiData`, `SslMode`, `SshAuth`, `AuthMode`). Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
-   unchanged today is this phase's list to work from: `launch::*`'s refusals; the caveats,
-   refusals and notes `connection` writes for the connection form (`SslMode::caveat`,
-   `AuthMode::tls_note`, `transport_refusal`, `external_client_refusal`, `read_only_caveat`,
-   `named_instance_port_note`); and
+   unchanged today is this phase's list to work from: `launch::*`'s refusals, with
+   `AuthMode::external_client_refusal`, which the same terminal launchers return; and
    `format_bytes` and `history::format_duration`, which wait on phase 7's number formatting.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of

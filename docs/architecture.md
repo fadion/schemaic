@@ -12527,9 +12527,13 @@ existing prose was left alone.
     `label`/`hint`, `SslMode`'s `label`/`description`, `SshAuth::label` and `AuthMode::label` stay
     English and are the wording the interface's own is held to — `ui/i18n.rs` and
     `connection_form.rs` draw each from the catalogue (*The string catalogue*) — and
-    `Environment::badge_label` is asked by the top bar only for *whether* there is a badge. The
-    sentences this module writes — `SslMode::caveat`, `AuthMode`'s notes and refusals,
-    `read_only_caveat`, `named_instance_port_note` — still reach the form as they are, English.
+    `Environment::badge_label` is asked by the top bar only for *whether* there is a badge. So,
+    now, are the notes this module writes under the form's fields — `SslMode::caveat`,
+    `AuthMode::tls_note`, `read_only_caveat`, `named_instance_port_note`: the form keeps the
+    decision here and words the answer itself (under `connection_form.rs`). The two refusals still
+    reach the user as they are, English: `AuthMode::transport_refusal` arrives as a database error
+    from `schemaic-db`, and `external_client_refusal` through the app's terminal launchers'
+    `Result<_, &'static str>`, beside `launch::*`'s own.
     **`statement_timeout_secs` is this connection's statement timeout over the app's** (*Settings →
     Query*, `persist::statement_timeout`) — the field's own example is a reporting replica that
     legitimately runs for an hour beside a production primary that never should. It is
@@ -26064,13 +26068,19 @@ existing prose was left alone.
     IAM, Google Cloud IAM and the CLIs named are product names), held to core's `label` and
     `description` by `english_names_every_picker_choice_as_core_does`; the Environment and AI data
     access pickers and the latter's hint take `i18n::environment_label`/`ai_data_label`/
-    `ai_data_hint`, which live there because the top bar and Settings call them too. What stays
+    `ai_data_hint`, which live there because the top bar and Settings call them too. The notes
+    under the fields are the same move for a sentence: core still decides *whether* one is said,
+    and the form maps the answer to its own words with `.map(|_| …)` — `verify_ca_caveat_words`
+    (`tls-verify-ca-checks-host`) for `SslMode::caveat`, `tls_floor_note` through
+    `tls_floor_words(auth)` (`tls-floor-azure-cli`/`-aws-iam`/`-gcp-iam`/`-other`) for
+    `AuthMode::tls_note`, and `connections-read-only-mssql` and `connections-named-instance-port`
+    inline for `read_only_caveat` and `named_instance_port_note` — held to core's text wherever
+    core says one by `english_says_every_field_note_as_core_does`. What stays
     English: the Type picker's engine names (`DbKind::label`), which are product names and are also
     what is persisted as `Connection::db_type` and read by `default_port`/`is_networked`; the
     samples `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules'
-    sentences — the caveats, refusals and notes `connection` writes (`SslMode::caveat`,
-    `AuthMode::tls_note`/`transport_refusal`/`external_client_refusal`, `read_only_caveat`,
-    `named_instance_port_note`), `ssh_config::describe_route`, `SshTunnel::route`'s error,
+    sentences — `connection`'s two sign-in refusals (`AuthMode::transport_refusal`,
+    `external_client_refusal`), which never reach this form, `ssh_config::describe_route`, `SshTunnel::route`'s error,
     `init_sql::check`'s refusal (core's prose, phase 4) and `lib.rs`'s `TestLine::text`.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import connections" — it was
@@ -40531,10 +40541,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals, `format_bytes`, and the caveats, refusals and
-    notes `connection` writes under the connection form's fields (`SslMode::caveat`,
-    `AuthMode::tls_note`/`transport_refusal`/`external_client_refusal`, `read_only_caveat`,
-    `named_instance_port_note`).
+    translation* — among it `launch::*`'s refusals, `format_bytes`, and `connection`'s two sign-in
+    refusals: `AuthMode::transport_refusal`, which reaches the user as a database error from
+    `schemaic-db` and goes with the error messages, and `external_client_refusal`, which the app's
+    terminal launchers return through the same `Result<_, &'static str>` as `launch::*`'s and goes
+    with them. The notes under the connection form's fields are no longer among it
+    (`connection_form.rs`).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40683,7 +40695,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     are now `dump::DropHint` (`drop_hint`) and `FkHint` (`fk_guard_says_drops`), each with a
     `text()` that is the old English byte for byte — `drop_before_create_hint` and `fk_guard_hint`
     remain as its wrappers, for core's tests. The capability decision stays in core; `dump_view`
-    words only the answer.
+    words only the answer. Where core's answer is an `Option` with one sentence per case, it needs
+    no new type: the caller asks it and maps the `Some` to its own words, `.map(|_| …)`, as
+    the top bar does `Environment::badge_label` and the connection form its field notes
+    (`SslMode::caveat`, `AuthMode::tls_note`, `read_only_caveat`, `named_instance_port_note`,
+    under `connection_form.rs`) — core decides whether, the interface words it.
     **A sentence with optional parts is one message with a selector per part, not fragments
     assembled in code** — the lock-wait card's is the pattern. `activity-lock-wait-sentence` takes
     `$waited`/`$held` as an age or as `none` where the server withheld one (no age reads as that),

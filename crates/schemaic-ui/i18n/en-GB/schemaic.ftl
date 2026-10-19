@@ -1385,6 +1385,8 @@ connections-prominent-colour = Prominent colour in editor
 connections-prominent-colour-hint = Frame the query editor in this connection's colour.
 connections-read-only = Read-only
 connections-read-only-hint = Disable cell edits and block write/DDL queries on this connection.
+# Under it on SQL Server (core's connection::read_only_caveat).
+connections-read-only-mssql = SQL Server has no read-only session, so reads run in a transaction Schemaic rolls back. A procedure's effect outside the database survives that; for a guarantee, connect with a login that can only read.
 # "schemaic" and "schemaic mcp" are a command and its subcommand: never translated.
 connections-cli-access = CLI access
 connections-cli-access-hint = Let the schemaic command line, and AI agents through schemaic mcp, use this connection.
@@ -1409,6 +1411,10 @@ connections-init-sql-pragma-hint = Optional. PRAGMA settings run on every connec
 connections-init-sql-set-hint = Optional. SET statements run on every connection Schemaic opens — a search path, a time zone, a role.
 connections-host = Host
 connections-port = Port
+# Under Host and Port for a SQL Server named instance (core's
+# connection::named_instance_port_note). SQL Server Browser is a product name;
+# Port is the field above.
+connections-named-instance-port = A named instance: SQL Server Browser gives its port, so Port is not used. To skip the Browser, set the host without the instance and the port it listens on.
 connections-database = Database
 connections-database-hint = Optional, and the database the connection opens in. Some hosted providers allow only their own and refuse a connection that does not name it.
 connections-authentication = Authentication
@@ -1461,6 +1467,15 @@ tls-prefer-description = Encrypt if the server offers it. No verification.
 tls-require-description = Refuse to connect without encryption. No verification.
 tls-verify-ca-description = Encrypt, and check the certificate against the CA.
 tls-verify-full-description = Encrypt, check the certificate, and check the host name.
+# Under Verify CA on MySQL and MariaDB (core's SslMode::caveat).
+tls-verify-ca-checks-host = On MySQL and MariaDB this also checks the host name, so it behaves as Verify full — a driver limitation, not a setting.
+# When the sign-in method connects at a stronger mode than the one picked
+# (core's AuthMode::tls_note). Root CA is the field below; RDS, Azure SQL and
+# Cloud SQL are product names.
+tls-floor-azure-cli = Microsoft Entra sign-in connects at Verify full whatever is picked here: its token opens every Azure SQL database the account can reach.
+tls-floor-aws-iam = AWS IAM sign-in connects at Require at least: its token must not cross the network in the clear. Verify full needs the RDS CA bundle as Root CA.
+tls-floor-gcp-iam = Google Cloud IAM sign-in connects at Verify CA at least — set Root CA to the instance's server CA: its token opens every Cloud SQL instance the account can reach.
+tls-floor-other = This sign-in connects at a stronger mode than the one picked here.
 connections-ca-certificate = CA certificate
 connections-ca-certificate-dialog = Select CA certificate
 connections-ca-certificate-hint = Leave empty to trust the certificate authorities your operating system trusts, including any your organisation installed. Name a file to trust that one instead.
