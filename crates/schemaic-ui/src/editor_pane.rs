@@ -1038,7 +1038,8 @@ fn cmdk_popup(
             // The verb is picked HERE, once per opening, rather than inside the
             // slot — because the slot has to reserve the spinner's width before
             // the spinner exists. See the `min_width` below.
-            let spinner_verb = pick_spinner_verb();
+            let spinner_verb: Rc<str> = pick_spinner_verb().into();
+            let verb_reserved = spinner_verb.clone();
             let trailing = dyn_container(
                 move || matches!(inline_ai.get(), InlineAiState::Busy),
                 move |busy| {
@@ -1046,7 +1047,7 @@ fn cmdk_popup(
                         // The spinner verb + animated dots the AI panel and the
                         // query runner already use, rather than the design's
                         // pulsing dot — one loader vocabulary across the app.
-                        loading_dots(spinner_verb, theme::text_dim, theme::font_hint).into_any()
+                        loading_dots(&*spinner_verb, theme::text_dim, theme::font_hint).into_any()
                     } else {
                         let submit_click = submit_click.clone();
                         container(icons::icon(icons::PLAY_LUCIDE, 15.0))
@@ -1077,7 +1078,7 @@ fn cmdk_popup(
                     // the reserved space opens to its left, over the field's
                     // transparent tail.
                     .justify_end()
-                    .min_width(loading_dots_w(spinner_verb, theme::font_hint()))
+                    .min_width(loading_dots_w(&verb_reserved, theme::font_hint()))
             });
             let input_row = h_stack((
                 container(icons::icon(icons::SPARKLES, 14.0))

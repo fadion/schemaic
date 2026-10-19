@@ -87,7 +87,7 @@ assertions pin English wording — stays the regression net throughout.
    `connection_import.rs`, `blob_view.rs`, `erd_view.rs`, `server_vars_view.rs`,
    `snippet_edit.rs`, `plan_view.rs`, `used_by_view.rs`, `themes.rs` (its one pair, Dark and
    Light; `tooltip.rs` had nothing a user reads), `markdown.rs`, `cell_editors.rs`,
-   `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`, `grid.rs`, `lib.rs`; and, ahead
+   `alias_rename.rs`, `usages_view.rs`, `erd_raster.rs`, `grid.rs`, `lib.rs`, `widgets.rs`; and, ahead
    of their files, the three
    workspace panel headers — `lib.rs`'s terminal and results headers (`term-*`, `results-*`) and
    `editor_pane.rs`'s query header (`query-*`) — and `editor_pane.rs`'s two *Rename alias* /
@@ -105,8 +105,11 @@ assertions pin English wording — stays the regression net throughout.
    headings can follow.
    **Where it stands** (2026-10-19): every small file is done, and so are `grid.rs` (six
    sections, `grid-*`) and `lib.rs` (seven: `footer-*`, `lib-*`, `header-*`, `colour-*`,
-   `disk-*`, `results-*`, `search-everywhere-placeholder`); the next session starts on
-   `widgets.rs`. A large file goes **a section at
+   `disk-*`, `results-*`, `search-everywhere-placeholder`) and `widgets.rs` (two:
+   `widgets-nothing-to-choose`, and `widgets-spinner-verbs` — a comma-separated list each
+   language writes for itself, as many verbs as it likes, which the loader-width test measures
+   in every catalogue); the next session starts on `editor_pane.rs`. A large file goes **a
+   section at
    a time** — a function or a cluster of them — committed per section as
    `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded on the
    *Within the large files* line below, so the next session knows where to pick up without
@@ -121,10 +124,10 @@ assertions pin English wording — stays the regression net throughout.
    Two of its conversions reach other files: `ai_off_note()` (once the `AI_OFF_NOTE` const) is
    read by the app crate's AI refusals, and `CONN_COLOR_PRESETS` stays `const` with its names
    as `fn() -> String`.
-   **Within the large files:** `widgets.rs`'s empty picker (`widgets-nothing-to-choose`);
-   nothing yet in `editor_pane.rs` beyond the headers and openers named above.
-   **Left, in order** — delete a name as its file lands: the two large files' remainders,
-   `widgets.rs` and `editor_pane.rs`, each more than one session; then
+   **Within the large files:** nothing yet in `editor_pane.rs` beyond the headers and openers
+   named above.
+   **Left, in order** — delete a name as its file lands: the last large file's remainder,
+   `editor_pane.rs`; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,
    `agent_cli.rs`, `antigravity.rs`), whose first file settles how it reaches the loader
    (above). A file with

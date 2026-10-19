@@ -5801,197 +5801,33 @@ pub(crate) fn centered_msg(
     })
 }
 
-/// Whimsical "verb spinner" verbs (Claude Code's set, trimmed of the very long
-/// ones so they fit a compact loader). One is picked at random each time a loader
-/// mounts; `loading_dots` then animates the trailing dots.
-pub(crate) const SPINNER_VERBS: &[&str] = &[
-    "Accomplishing",
-    "Actioning",
-    "Actualising",
-    "Architecting",
-    "Baking",
-    "Beaming",
-    "Beboppin'",
-    "Befuddling",
-    "Billowing",
-    "Blanching",
-    "Bloviating",
-    "Boogieing",
-    "Boondoggling",
-    "Booping",
-    "Bootstrapping",
-    "Brewing",
-    "Burrowing",
-    "Calculating",
-    "Canoodling",
-    "Caramelising",
-    "Cascading",
-    "Catapulting",
-    "Cerebrating",
-    "Channeling",
-    "Channelling",
-    "Choreographing",
-    "Churning",
-    "Clauding",
-    "Coalescing",
-    "Cogitating",
-    "Combobulating",
-    "Composing",
-    "Computing",
-    "Concocting",
-    "Considering",
-    "Contemplating",
-    "Cooking",
-    "Crafting",
-    "Creating",
-    "Crunching",
-    "Crystallising",
-    "Cultivating",
-    "Deciphering",
-    "Deliberating",
-    "Determining",
-    "Dilly-dallying",
-    "Doing",
-    "Doodling",
-    "Drizzling",
-    "Ebbing",
-    "Effecting",
-    "Elucidating",
-    "Embellishing",
-    "Enchanting",
-    "Envisioning",
-    "Evaporating",
-    "Fermenting",
-    "Finagling",
-    "Flambeing",
-    "Flowing",
-    "Flummoxing",
-    "Fluttering",
-    "Forging",
-    "Forming",
-    "Frolicking",
-    "Frosting",
-    "Gallivanting",
-    "Galloping",
-    "Garnishing",
-    "Generating",
-    "Germinating",
-    "Gitifying",
-    "Grooving",
-    "Gusting",
-    "Harmonising",
-    "Hashing",
-    "Hatching",
-    "Herding",
-    "Honking",
-    "Hullaballooing",
-    "Hyperspacing",
-    "Ideating",
-    "Imagining",
-    "Improvising",
-    "Incubating",
-    "Inferring",
-    "Infusing",
-    "Ionising",
-    "Jitterbugging",
-    "Julienning",
-    "Kneading",
-    "Leavening",
-    "Levitating",
-    "Lollygagging",
-    "Manifesting",
-    "Marinating",
-    "Meandering",
-    "Metamorphosing",
-    "Misting",
-    "Moonwalking",
-    "Moseying",
-    "Mulling",
-    "Mustering",
-    "Musing",
-    "Nebulising",
-    "Nesting",
-    "Newspapering",
-    "Noodling",
-    "Nucleating",
-    "Orbiting",
-    "Orchestrating",
-    "Osmosing",
-    "Perambulating",
-    "Percolating",
-    "Perusing",
-    "Philosophising",
-    "Pollinating",
-    "Pondering",
-    "Pontificating",
-    "Pouncing",
-    "Precipitating",
-    "Processing",
-    "Proofing",
-    "Propagating",
-    "Puttering",
-    "Puzzling",
-    "Quantumising",
-    "Razzmatazzing",
-    "Reticulating",
-    "Roosting",
-    "Ruminating",
-    "Sauteing",
-    "Scampering",
-    "Schlepping",
-    "Scurrying",
-    "Seasoning",
-    "Shenaniganing",
-    "Shimmying",
-    "Simmering",
-    "Skedaddling",
-    "Sketching",
-    "Slithering",
-    "Smooshing",
-    "Sock-hopping",
-    "Spelunking",
-    "Spinning",
-    "Sprouting",
-    "Stewing",
-    "Sublimating",
-    "Swirling",
-    "Swooping",
-    "Symbioting",
-    "Synthesising",
-    "Tempering",
-    "Thinking",
-    "Thundering",
-    "Tinkering",
-    "Tomfoolering",
-    "Topsy-turvying",
-    "Transfiguring",
-    "Transmuting",
-    "Twisting",
-    "Undulating",
-    "Unfurling",
-    "Unravelling",
-    "Vibing",
-    "Waddling",
-    "Wandering",
-    "Warping",
-    "Whirlpooling",
-    "Whirring",
-    "Whisking",
-    "Wibbling",
-    "Working",
-    "Wrangling",
-    "Zesting",
-    "Zigzagging",
-];
+/// The whimsical "verb spinner" verbs in a catalogue's comma-separated
+/// `widgets-spinner-verbs` (English is Claude Code's set, trimmed of the very
+/// long ones so they fit a compact loader). A language lists its own, as many as
+/// it likes; one is picked at random each time a loader mounts, and
+/// `loading_dots` then animates the trailing dots.
+pub(crate) fn spinner_verbs(list: &str) -> Vec<&str> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect()
+}
 
 /// Pick a random spinner verb. Seeded off the wall clock (std-only) — good enough
 /// for a cosmetic loader; a fresh verb each time a loader mounts.
-pub(crate) fn pick_spinner_verb() -> &'static str {
+pub(crate) fn pick_spinner_verb() -> String {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as usize)
         .unwrap_or(0);
-    SPINNER_VERBS[seed % SPINNER_VERBS.len()]
+    let list = crate::i18n::tr!("widgets-spinner-verbs");
+    let verbs = spinner_verbs(&list);
+    // The catalogue always lists some; an empty list would be a broken
+    // translation, and the bare dots are what a loader is without a verb.
+    match verbs.len() {
+        0 => String::new(),
+        n => verbs[seed % n].to_string(),
+    }
 }
 
 /// A "verb spinner" loader: a random whimsical verb + animated trailing dots
@@ -7837,23 +7673,64 @@ mod measure_tests {
         );
     }
 
+    /// Every catalogue's spinner verbs, as its `.ftl` spells them — read at
+    /// compile time, so a language the loader would draw is the one measured.
+    fn every_catalogues_spinner_verbs() -> Vec<(&'static str, Vec<&'static str>)> {
+        [
+            ("en-GB", include_str!("../i18n/en-GB/schemaic.ftl")),
+            ("de", include_str!("../i18n/de/schemaic.ftl")),
+        ]
+        .into_iter()
+        .map(|(lang, ftl)| {
+            let list = ftl
+                .lines()
+                .find_map(|l| l.strip_prefix("widgets-spinner-verbs = "))
+                .unwrap_or_else(|| panic!("{lang} lists no spinner verbs"));
+            (lang, spinner_verbs(list))
+        })
+        .collect()
+    }
+
     /// A slot sized with [`loading_dots_w`] holds the loader at **every** dot
-    /// state, for every verb it might pick — that is what lets Ctrl+K's trailing
-    /// slot reserve the spinner's width before the spinner exists, and so keeps
-    /// the question field from being narrowed (and re-wrapped) on submit.
+    /// state, for every verb it might pick in every language — that is what lets
+    /// Ctrl+K's trailing slot reserve the spinner's width before the spinner
+    /// exists, and so keeps the question field from being narrowed (and
+    /// re-wrapped) on submit.
     #[test]
     fn the_reserved_loader_width_fits_every_verb_and_dot_state() {
         crate::fonts::load_fonts();
-        for verb in SPINNER_VERBS {
-            let reserved = loading_dots_w(verb, theme::font_hint());
-            for dots in ["", ".", "..", "..."] {
-                let drawn = measure_text_px_at(&format!("{verb}{dots}"), theme::font_hint());
-                assert!(
-                    reserved >= drawn,
-                    "{verb}{dots}: reserved {reserved} < drawn {drawn}"
-                );
+        for (lang, verbs) in every_catalogues_spinner_verbs() {
+            assert!(!verbs.is_empty(), "{lang} lists no spinner verbs");
+            for verb in verbs {
+                let reserved = loading_dots_w(verb, theme::font_hint());
+                for dots in ["", ".", "..", "..."] {
+                    let drawn = measure_text_px_at(&format!("{verb}{dots}"), theme::font_hint());
+                    assert!(
+                        reserved >= drawn,
+                        "{lang} {verb}{dots}: reserved {reserved} < drawn {drawn}"
+                    );
+                }
             }
         }
+    }
+
+    /// The list splits on its commas and nothing else — an apostrophe or a
+    /// hyphen is part of a verb — and English keeps the 177 it had as a const.
+    #[test]
+    fn the_spinner_verbs_split_on_commas_and_english_keeps_its_set() {
+        assert_eq!(
+            spinner_verbs("Beboppin', Dilly-dallying ,,Zesting"),
+            ["Beboppin'", "Dilly-dallying", "Zesting"]
+        );
+        let english = spinner_verbs(
+            include_str!("../i18n/en-GB/schemaic.ftl")
+                .lines()
+                .find_map(|l| l.strip_prefix("widgets-spinner-verbs = "))
+                .expect("English lists spinner verbs"),
+        );
+        assert_eq!(english.len(), 177);
+        assert_eq!(english.first(), Some(&"Accomplishing"));
+        assert_eq!(english.last(), Some(&"Zigzagging"));
     }
 }
 

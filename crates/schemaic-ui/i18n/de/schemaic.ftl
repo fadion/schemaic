@@ -1799,3 +1799,4 @@ results-menu-close-others = Andere Ergebnisse schließen
 results-menu-close-all = Alle Ergebnisse schließen
 search-everywhere-placeholder = Überall suchen
 widgets-nothing-to-choose = Nichts zur Auswahl
+widgets-spinner-verbs = Abwägen, Ausbrüten, Backen, Basteln, Berechnen, Bummeln, Brauen, Brodeln, Brüten, Destillieren, Entschlüsseln, Entwirren, Ergründen, Erkunden, Fabulieren, Flitzen, Formen, Garen, Gären, Graben, Grübeln, Hexen, Huschen, Improvisieren, Jonglieren, Keimen, Kneten, Knobeln, Köcheln, Kombinieren, Komponieren, Kreiseln, Kristallisieren, Marinieren, Meditieren, Nachdenken, Ordnen, Orchestrieren, Philosophieren, Rechnen, Reifen, Rühren, Schlendern, Schmieden, Schmoren, Schürfen, Schweben, Sichten, Sinnieren, Sortieren, Sprießen, Sprudeln, Stöbern, Tänzeln, Trödeln, Tüfteln, Verdichten, Werkeln, Wirbeln, Wühlen, Würzen, Wuseln, Zaubern, Zwirbeln
