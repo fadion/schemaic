@@ -36,7 +36,8 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::ddl::{
-    self, DomainDraft, EnumDraft, ObjectDraft, ObjectKind, SequenceDraft, TsqlObjectDraft,
+    self, DomainDraft, EnumDraft, ObjectDraft, ObjectKind, ObjectProblem, SequenceDraft,
+    TsqlObjectDraft,
 };
 use schemaic_core::schema::{
     CheckInfo, ObjectItem, SequenceInfo, SequenceOwner, TsqlObject, TsqlObjectKind,
@@ -1532,6 +1533,87 @@ fn tsql_form(ui: DdlUi, d: &TsqlObjectDraft, ring: FocusRing) -> AnyView {
         .into_any()
 }
 
+/// What stops the draft being emitted — core's `ObjectProblem::message` in the
+/// interface's language. Figures go in as core prints them; names and types are
+/// the user's.
+fn object_problem_text(p: &ObjectProblem) -> String {
+    use ObjectProblem as P;
+    use schemaic_core::ddl::SequenceField as F;
+    let s = |n: &i64| n.to_string();
+    match p {
+        P::TypeNoName => tr!("object-problem-type-no-name"),
+        P::DuplicateValue { value } => {
+            tr!("object-problem-duplicate-value", value = value.as_str())
+        }
+        P::EmptyValue => tr!("object-problem-empty-value"),
+        P::DomainNoName => tr!("object-problem-domain-no-name"),
+        P::DomainNoBase => tr!("object-problem-domain-no-base"),
+        P::ConstraintNoName => tr!("object-problem-constraint-no-name"),
+        P::ConstraintNoPredicate { name } => {
+            tr!(
+                "object-problem-constraint-no-predicate",
+                name = name.as_str()
+            )
+        }
+        P::ConstraintTwice { name } => {
+            tr!("object-problem-constraint-twice", name = name.as_str())
+        }
+        P::SequenceNoName => tr!("object-problem-sequence-no-name"),
+        P::ZeroIncrement => tr!("object-problem-zero-increment"),
+        P::MinAboveMax { min, max } => {
+            tr!("object-problem-min-above-max", min = s(min), max = s(max))
+        }
+        P::StartOutside { start, min, max } => tr!(
+            "object-problem-start-outside",
+            start = s(start),
+            min = s(min),
+            max = s(max)
+        ),
+        P::CacheBelowOne => tr!("object-problem-cache-below-one"),
+        P::DoesNotFit {
+            min,
+            max,
+            data_type,
+        } => tr!(
+            "object-problem-does-not-fit",
+            min = s(min),
+            max = s(max),
+            data_type = data_type.as_str()
+        ),
+        P::RestartOutside { restart, min, max } => tr!(
+            "object-problem-restart-outside",
+            restart = s(restart),
+            min = s(min),
+            max = s(max)
+        ),
+        P::CounterOutside { last, min, max } => tr!(
+            "object-problem-counter-outside",
+            last = s(last),
+            min = s(min),
+            max = s(max)
+        ),
+        P::NoName => tr!("object-problem-no-name"),
+        P::TsqlNoType => tr!("object-problem-tsql-no-type"),
+        P::NotWhole { field } => match field {
+            F::Start => tr!("object-problem-start-not-whole"),
+            F::Increment => tr!("object-problem-increment-not-whole"),
+            F::Minimum => tr!("object-problem-minimum-not-whole"),
+            F::Maximum => tr!("object-problem-maximum-not-whole"),
+        },
+        P::TsqlZeroIncrement => tr!("object-problem-tsql-zero-increment"),
+        P::MinNotBelowMax => tr!("object-problem-min-not-below-max"),
+        P::StartedOutside { start } => {
+            tr!("object-problem-started-outside", start = start.as_str())
+        }
+        P::TsqlStartOutside => tr!("object-problem-tsql-start-outside"),
+        P::CacheNotPositive => tr!("object-problem-cache-not-positive"),
+        P::RestartNotWhole => tr!("object-problem-restart-not-whole"),
+        P::TsqlRestartOutside => tr!("object-problem-tsql-restart-outside"),
+        P::SynonymNoTarget => tr!("object-problem-synonym-no-target"),
+        P::AliasNoBase => tr!("object-problem-alias-no-base"),
+    }
+}
+
 // ── the modal ────────────────────────────────────────────────────────────────
 
 /// The modal's title: *Edit sequence db.public.orders_id_seq* for an existing
@@ -1640,7 +1722,10 @@ pub(crate) fn object_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVi
             let status = dyn_container(
                 move || (d.object_draft.get(), d.object_errors.get()),
                 move |(draft, errs)| {
-                    let first = errs.first().cloned().or_else(|| draft.validate().pop());
+                    let first = errs
+                        .first()
+                        .cloned()
+                        .or_else(|| draft.problems().pop().map(|p| object_problem_text(&p)));
                     if let Some(first) = first {
                         return crate::widgets::footer_error(first);
                     }
@@ -1665,7 +1750,7 @@ pub(crate) fn object_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVi
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
-                    let ready = errs.is_empty() && draft.validate().is_empty() && !cs.is_empty();
+                    let ready = errs.is_empty() && draft.problems().is_empty() && !cs.is_empty();
                     h_stack((
                         action_button(
                             tr!("dialog-cancel"),
@@ -1776,6 +1861,72 @@ mod one_funnel_gate {
 mod tests {
     use super::*;
     use schemaic_core::schema::SequenceInfo;
+
+    /// **Every problem reads in English exactly as core's
+    /// `ObjectProblem::message`** — each of the four drafts', figures
+    /// negative and positive, every SQL Server field that can fail to be whole.
+    #[test]
+    fn english_says_every_object_problem_as_core_does() {
+        use ObjectProblem as P;
+        use schemaic_core::ddl::SequenceField as F;
+        let mut problems = vec![
+            P::TypeNoName,
+            P::DuplicateValue {
+                value: format!("{:?}", "a\"b"),
+            },
+            P::EmptyValue,
+            P::DomainNoName,
+            P::DomainNoBase,
+            P::ConstraintNoName,
+            P::ConstraintNoPredicate {
+                name: "email_check".into(),
+            },
+            P::ConstraintTwice {
+                name: "email_check".into(),
+            },
+            P::SequenceNoName,
+            P::ZeroIncrement,
+            P::MinAboveMax { min: 10, max: -5 },
+            P::StartOutside {
+                start: 0,
+                min: 1,
+                max: 100,
+            },
+            P::CacheBelowOne,
+            P::DoesNotFit {
+                min: -1,
+                max: 40_000,
+                data_type: "smallint".into(),
+            },
+            P::RestartOutside {
+                restart: 500,
+                min: 1,
+                max: 100,
+            },
+            P::CounterOutside {
+                last: 500,
+                min: 1,
+                max: 100,
+            },
+            P::NoName,
+            P::TsqlNoType,
+            P::TsqlZeroIncrement,
+            P::MinNotBelowMax,
+            P::StartedOutside { start: "7".into() },
+            P::TsqlStartOutside,
+            P::CacheNotPositive,
+            P::RestartNotWhole,
+            P::TsqlRestartOutside,
+            P::SynonymNoTarget,
+            P::AliasNoBase,
+        ];
+        for field in [F::Start, F::Increment, F::Minimum, F::Maximum] {
+            problems.push(P::NotWhole { field });
+        }
+        for p in problems {
+            assert_eq!(object_problem_text(&p), p.message(), "{p:?}");
+        }
+    }
 
     /// An identity column's counter is shown and can be altered, but the editor
     /// is a dead end for it — its one irreversible action, the drop, is refused

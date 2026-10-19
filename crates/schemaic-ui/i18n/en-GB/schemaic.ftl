@@ -1308,6 +1308,43 @@ object-editor-minimum = Minimum
 object-editor-maximum = Maximum
 # $field is one of the number fields' labels.
 object-editor-not-whole-number = { $field } has to be a whole number.
+# What stops a type, domain or sequence being emitted (core's
+# ddl::ObjectProblem), in the footer. Figures are as printed; $value is an enum
+# label in double quotes; $name a constraint's name; $data_type a SQL type.
+object-problem-type-no-name = The type needs a name.
+object-problem-duplicate-value = The value { $value } is listed more than once.
+object-problem-empty-value = A value can't be empty — PostgreSQL can never remove it.
+object-problem-domain-no-name = The domain needs a name.
+object-problem-domain-no-base = A domain needs a type to be based on.
+object-problem-constraint-no-name = Every constraint needs a name.
+object-problem-constraint-no-predicate = Constraint { $name } has no predicate.
+object-problem-constraint-twice = Constraint { $name } is named twice.
+object-problem-sequence-no-name = The sequence needs a name.
+object-problem-zero-increment = A sequence can't increment by 0.
+object-problem-min-above-max = The minimum ({ $min }) is above the maximum ({ $max }).
+object-problem-start-outside = The start value ({ $start }) is outside { $min }..{ $max }.
+object-problem-cache-below-one = The cache has to be at least 1.
+object-problem-does-not-fit = { $min }..{ $max } doesn't fit in { $data_type }.
+object-problem-restart-outside = Restarting at { $restart } is outside { $min }..{ $max }.
+# $last is where the sequence's counter is now.
+object-problem-counter-outside = The sequence is at { $last }, outside the new { $min }..{ $max }. Give it a restart value inside the range.
+# SQL Server's objects.
+object-problem-no-name = The name can't be empty.
+object-problem-tsql-no-type = A sequence needs a type.
+object-problem-start-not-whole = The start must be a whole number.
+object-problem-increment-not-whole = The increment must be a whole number.
+object-problem-minimum-not-whole = The minimum must be a whole number.
+object-problem-maximum-not-whole = The maximum must be a whole number.
+object-problem-tsql-zero-increment = The increment can't be 0.
+object-problem-min-not-below-max = The minimum must be below the maximum.
+# An existing sequence that started at $start (as typed), outside the new range.
+object-problem-started-outside = It started at { $start }, outside the new range: Restart at a value between the minimum and the maximum.
+object-problem-tsql-start-outside = The start must lie between the minimum and the maximum.
+object-problem-cache-not-positive = The cache size must be a whole number above 0.
+object-problem-restart-not-whole = The restart value must be a whole number.
+object-problem-tsql-restart-outside = The restart value must lie between the minimum and the maximum.
+object-problem-synonym-no-target = A synonym needs the object it stands for.
+object-problem-alias-no-base = An alias type needs a base type.
 object-editor-cycle = Cycle
 object-editor-cycle-hint = Wrap around to the other end of the range instead of failing when the sequence runs out.
 # $last is the value the sequence last handed out.

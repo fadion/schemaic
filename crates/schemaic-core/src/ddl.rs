@@ -2736,6 +2736,159 @@ pub struct EnumDraft {
     pub info: EnumInfo,
 }
 
+/// What stops an [`ObjectDraft`] being emitted — one enum for the four drafts
+/// the object editor holds ([`ObjectDraft::problems`]), a value so the editor
+/// can say it in the interface's language; [`ObjectProblem::message`] is the
+/// English. Figures are carried as the draft holds them: a PostgreSQL
+/// sequence's as numbers, SQL Server's as the text typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectProblem {
+    /// An enum type with no name.
+    TypeNoName,
+    /// An enum label listed twice; `value` is it as Rust's `{:?}` quotes it.
+    DuplicateValue {
+        value: String,
+    },
+    /// An empty enum label, which PostgreSQL can never remove.
+    EmptyValue,
+    DomainNoName,
+    DomainNoBase,
+    /// A domain constraint with no name.
+    ConstraintNoName,
+    ConstraintNoPredicate {
+        name: String,
+    },
+    ConstraintTwice {
+        name: String,
+    },
+    /// A PostgreSQL sequence with no name.
+    SequenceNoName,
+    ZeroIncrement,
+    MinAboveMax {
+        min: i64,
+        max: i64,
+    },
+    StartOutside {
+        start: i64,
+        min: i64,
+        max: i64,
+    },
+    CacheBelowOne,
+    /// The range does not fit the sequence's `data_type`.
+    DoesNotFit {
+        min: i64,
+        max: i64,
+        data_type: String,
+    },
+    RestartOutside {
+        restart: i64,
+        min: i64,
+        max: i64,
+    },
+    /// Where the counter is now (`last`) is outside the new range.
+    CounterOutside {
+        last: i64,
+        min: i64,
+        max: i64,
+    },
+    /// A SQL Server object with no name.
+    NoName,
+    /// A SQL Server sequence with no type.
+    TsqlNoType,
+    /// A SQL Server sequence field that is not a whole number.
+    NotWhole {
+        field: SequenceField,
+    },
+    TsqlZeroIncrement,
+    MinNotBelowMax,
+    /// An existing sequence whose `start` (as typed) is outside the new range.
+    StartedOutside {
+        start: String,
+    },
+    /// A new sequence whose start is outside the range.
+    TsqlStartOutside,
+    CacheNotPositive,
+    RestartNotWhole,
+    TsqlRestartOutside,
+    SynonymNoTarget,
+    AliasNoBase,
+}
+
+/// Which of a SQL Server sequence's figures [`ObjectProblem::NotWhole`] is
+/// about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SequenceField {
+    Start,
+    Increment,
+    Minimum,
+    Maximum,
+}
+
+impl ObjectProblem {
+    /// The problem in English.
+    pub fn message(&self) -> String {
+        use ObjectProblem as P;
+        match self {
+            P::TypeNoName => "The type needs a name.".to_string(),
+            P::DuplicateValue { value } => format!("The value {value} is listed more than once."),
+            P::EmptyValue => "A value can't be empty — PostgreSQL can never remove it.".to_string(),
+            P::DomainNoName => "The domain needs a name.".to_string(),
+            P::DomainNoBase => "A domain needs a type to be based on.".to_string(),
+            P::ConstraintNoName => "Every constraint needs a name.".to_string(),
+            P::ConstraintNoPredicate { name } => format!("Constraint {name} has no predicate."),
+            P::ConstraintTwice { name } => format!("Constraint {name} is named twice."),
+            P::SequenceNoName => "The sequence needs a name.".to_string(),
+            P::ZeroIncrement => "A sequence can't increment by 0.".to_string(),
+            P::MinAboveMax { min, max } => {
+                format!("The minimum ({min}) is above the maximum ({max}).")
+            }
+            P::StartOutside { start, min, max } => {
+                format!("The start value ({start}) is outside {min}..{max}.")
+            }
+            P::CacheBelowOne => "The cache has to be at least 1.".to_string(),
+            P::DoesNotFit {
+                min,
+                max,
+                data_type,
+            } => format!("{min}..{max} doesn't fit in {data_type}."),
+            P::RestartOutside { restart, min, max } => {
+                format!("Restarting at {restart} is outside {min}..{max}.")
+            }
+            P::CounterOutside { last, min, max } => format!(
+                "The sequence is at {last}, outside the new {min}..{max}. Give it a restart \
+                 value inside the range."
+            ),
+            P::NoName => "The name can't be empty.".to_string(),
+            P::TsqlNoType => "A sequence needs a type.".to_string(),
+            P::NotWhole { field } => {
+                let label = match field {
+                    SequenceField::Start => "The start",
+                    SequenceField::Increment => "The increment",
+                    SequenceField::Minimum => "The minimum",
+                    SequenceField::Maximum => "The maximum",
+                };
+                format!("{label} must be a whole number.")
+            }
+            P::TsqlZeroIncrement => "The increment can't be 0.".to_string(),
+            P::MinNotBelowMax => "The minimum must be below the maximum.".to_string(),
+            P::StartedOutside { start } => format!(
+                "It started at {start}, outside the new range: Restart at a value between the \
+                 minimum and the maximum."
+            ),
+            P::TsqlStartOutside => {
+                "The start must lie between the minimum and the maximum.".to_string()
+            }
+            P::CacheNotPositive => "The cache size must be a whole number above 0.".to_string(),
+            P::RestartNotWhole => "The restart value must be a whole number.".to_string(),
+            P::TsqlRestartOutside => {
+                "The restart value must lie between the minimum and the maximum.".to_string()
+            }
+            P::SynonymNoTarget => "A synonym needs the object it stands for.".to_string(),
+            P::AliasNoBase => "An alias type needs a base type.".to_string(),
+        }
+    }
+}
+
 impl EnumDraft {
     pub fn from_info(e: &EnumInfo) -> EnumDraft {
         EnumDraft {
@@ -2756,10 +2909,10 @@ impl EnumDraft {
     }
 
     /// Problems that would make the generated SQL nonsense.
-    pub fn validate(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<ObjectProblem> {
         let mut out = Vec::new();
         if self.info.name.trim().is_empty() {
-            out.push("The type needs a name.".to_string());
+            out.push(ObjectProblem::TypeNoName);
         }
         // An empty enum is legal (`CREATE TYPE t AS ENUM ()`) and useless, so it
         // is allowed rather than rejected — but a *duplicate* label is an error
@@ -2767,18 +2920,25 @@ impl EnumDraft {
         let mut seen: Vec<&str> = Vec::new();
         for v in &self.info.values {
             if seen.contains(&v.as_str()) {
-                out.push(format!("The value {v:?} is listed more than once."));
+                out.push(ObjectProblem::DuplicateValue {
+                    value: format!("{v:?}"),
+                });
             }
             // An **empty** label is legal SQL and almost certainly a blank row
             // left behind. It matters more than the usual blank-field slip:
             // PostgreSQL has no `DROP VALUE`, so the only way to take it back is
             // the full park-create-recast-drop rebuild.
             if v.is_empty() {
-                out.push("A value can't be empty — PostgreSQL can never remove it.".to_string());
+                out.push(ObjectProblem::EmptyValue);
             }
             seen.push(v);
         }
         out
+    }
+
+    /// [`EnumDraft::problems`] in English.
+    pub fn validate(&self) -> Vec<String> {
+        self.problems().iter().map(ObjectProblem::message).collect()
     }
 }
 
@@ -2809,21 +2969,23 @@ impl DomainDraft {
         }
     }
 
-    pub fn validate(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<ObjectProblem> {
         let mut out = Vec::new();
         if self.info.name.trim().is_empty() {
-            out.push("The domain needs a name.".to_string());
+            out.push(ObjectProblem::DomainNoName);
         }
         if self.info.base_type.trim().is_empty() {
-            out.push("A domain needs a type to be based on.".to_string());
+            out.push(ObjectProblem::DomainNoBase);
         }
         let mut seen: Vec<&str> = Vec::new();
         for ck in &self.info.checks {
             if ck.name.trim().is_empty() {
-                out.push("Every constraint needs a name.".to_string());
+                out.push(ObjectProblem::ConstraintNoName);
             }
             if ck.expression.trim().is_empty() {
-                out.push(format!("Constraint {} has no predicate.", ck.name));
+                out.push(ObjectProblem::ConstraintNoPredicate {
+                    name: ck.name.clone(),
+                });
             }
             // A duplicate name is a plan PostgreSQL always rejects
             // (`constraint "email_check2" for domain "email" already exists`),
@@ -2831,11 +2993,18 @@ impl DomainDraft {
             // `{domain}_check{len+1}`, so removing one and adding another
             // re-proposes a name still in the list.
             if seen.contains(&ck.name.as_str()) {
-                out.push(format!("Constraint {} is named twice.", ck.name));
+                out.push(ObjectProblem::ConstraintTwice {
+                    name: ck.name.clone(),
+                });
             }
             seen.push(&ck.name);
         }
         out
+    }
+
+    /// [`DomainDraft::problems`] in English.
+    pub fn validate(&self) -> Vec<String> {
+        self.problems().iter().map(ObjectProblem::message).collect()
     }
 }
 
@@ -2878,44 +3047,41 @@ impl SequenceDraft {
     /// These are checked here rather than left to PostgreSQL because each has a
     /// clear plain-language answer, and because the alternative is a rejected
     /// statement in the middle of a plan.
-    pub fn validate(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<ObjectProblem> {
         let s = &self.info;
+        let (min, max) = (s.min_value, s.max_value);
         let mut out = Vec::new();
         if s.name.trim().is_empty() {
-            out.push("The sequence needs a name.".to_string());
+            out.push(ObjectProblem::SequenceNoName);
         }
         if s.increment == 0 {
-            out.push("A sequence can't increment by 0.".to_string());
+            out.push(ObjectProblem::ZeroIncrement);
         }
-        if s.min_value > s.max_value {
-            out.push(format!(
-                "The minimum ({}) is above the maximum ({}).",
-                s.min_value, s.max_value
-            ));
+        if min > max {
+            out.push(ObjectProblem::MinAboveMax { min, max });
         }
-        if s.start < s.min_value || s.start > s.max_value {
-            out.push(format!(
-                "The start value ({}) is outside {}..{}.",
-                s.start, s.min_value, s.max_value
-            ));
+        if s.start < min || s.start > max {
+            out.push(ObjectProblem::StartOutside {
+                start: s.start,
+                min,
+                max,
+            });
         }
         if s.cache < 1 {
-            out.push("The cache has to be at least 1.".to_string());
+            out.push(ObjectProblem::CacheBelowOne);
         }
         let (tmin, tmax) = SequenceInfo::type_bounds(&s.data_type);
-        if s.min_value < tmin || s.max_value > tmax {
-            out.push(format!(
-                "{}..{} doesn't fit in {}.",
-                s.min_value, s.max_value, s.data_type
-            ));
+        if min < tmin || max > tmax {
+            out.push(ObjectProblem::DoesNotFit {
+                min,
+                max,
+                data_type: s.data_type.clone(),
+            });
         }
-        if let Some(r) = self.restart
-            && (r < s.min_value || r > s.max_value)
+        if let Some(restart) = self.restart
+            && (restart < min || restart > max)
         {
-            out.push(format!(
-                "Restarting at {r} is outside {}..{}.",
-                s.min_value, s.max_value
-            ));
+            out.push(ObjectProblem::RestartOutside { restart, min, max });
         }
         // Where the counter *is* now. PostgreSQL checks the new bounds against
         // it — `ERROR: RESTART value (500) cannot be greater than MAXVALUE
@@ -2926,15 +3092,16 @@ impl SequenceDraft {
         // editor had already called valid.
         if self.restart.is_none()
             && let Some(last) = s.last_value
-            && (last < s.min_value || last > s.max_value)
+            && (last < min || last > max)
         {
-            out.push(format!(
-                "The sequence is at {last}, outside the new {}..{}. Give it a \
-                 restart value inside the range.",
-                s.min_value, s.max_value
-            ));
+            out.push(ObjectProblem::CounterOutside { last, min, max });
         }
         out
+    }
+
+    /// [`SequenceDraft::problems`] in English.
+    pub fn validate(&self) -> Vec<String> {
+        self.problems().iter().map(ObjectProblem::message).collect()
     }
 }
 
@@ -3024,11 +3191,11 @@ impl TsqlObjectDraft {
     /// The numbers are asked as whole numbers of any size (a `decimal(38,0)`
     /// sequence's bounds pass `i64`), compared where they parse; what only the
     /// server can judge — a type name, a target that exists — is left to it.
-    pub fn validate(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<ObjectProblem> {
         use crate::schema::TsqlObjectKind as T;
         let mut out = Vec::new();
         if self.info.name.trim().is_empty() {
-            out.push("The name can't be empty.".to_string());
+            out.push(ObjectProblem::NoName);
         }
         let whole = |s: &str| {
             let s = s.trim();
@@ -3047,20 +3214,20 @@ impl TsqlObjectDraft {
                 ..
             } => {
                 if data_type.trim().is_empty() {
-                    out.push("A sequence needs a type.".to_string());
+                    out.push(ObjectProblem::TsqlNoType);
                 }
-                for (label, v) in [
-                    ("The start", start),
-                    ("The increment", increment),
-                    ("The minimum", min),
-                    ("The maximum", max),
+                for (field, v) in [
+                    (SequenceField::Start, start),
+                    (SequenceField::Increment, increment),
+                    (SequenceField::Minimum, min),
+                    (SequenceField::Maximum, max),
                 ] {
                     if !whole(v) {
-                        out.push(format!("{label} must be a whole number."));
+                        out.push(ObjectProblem::NotWhole { field });
                     }
                 }
                 if n(increment) == Some(0) {
-                    out.push("The increment can't be 0.".to_string());
+                    out.push(ObjectProblem::TsqlZeroIncrement);
                 }
                 // An existing sequence's start is where it restarts — `RESTART
                 // WITH` rewrites it, so a minimum raised to the restart is an
@@ -3071,37 +3238,32 @@ impl TsqlObjectDraft {
                 let existing = self.original.is_some();
                 if let (Some(lo), Some(hi)) = (n(min), n(max)) {
                     if lo >= hi {
-                        out.push("The minimum must be below the maximum.".to_string());
+                        out.push(ObjectProblem::MinNotBelowMax);
                     } else if let Some(s) = n(start)
                         && (s < lo || s > hi)
                         && !(existing && self.restart.is_some())
                     {
                         out.push(if existing {
-                            format!(
-                                "It started at {}, outside the new range: Restart at a value \
-                                 between the minimum and the maximum.",
-                                start.trim()
-                            )
+                            ObjectProblem::StartedOutside {
+                                start: start.trim().to_string(),
+                            }
                         } else {
-                            "The start must lie between the minimum and the maximum.".to_string()
+                            ObjectProblem::TsqlStartOutside
                         });
                     }
                 }
                 if let Some(Some(size)) = cache
                     && !(whole(size) && n(size).is_some_and(|c| c > 0))
                 {
-                    out.push("The cache size must be a whole number above 0.".to_string());
+                    out.push(ObjectProblem::CacheNotPositive);
                 }
                 if let Some(r) = &self.restart {
                     if !whole(r) {
-                        out.push("The restart value must be a whole number.".to_string());
+                        out.push(ObjectProblem::RestartNotWhole);
                     } else if let (Some(r), Some(lo), Some(hi)) = (n(r), n(min), n(max))
                         && (r < lo || r > hi)
                     {
-                        out.push(
-                            "The restart value must lie between the minimum and the maximum."
-                                .to_string(),
-                        );
+                        out.push(ObjectProblem::TsqlRestartOutside);
                     }
                 }
             }
@@ -3110,12 +3272,12 @@ impl TsqlObjectDraft {
                     || target.len() > 4
                     || target.last().is_none_or(|o| o.trim().is_empty())
                 {
-                    out.push("A synonym needs the object it stands for.".to_string());
+                    out.push(ObjectProblem::SynonymNoTarget);
                 }
             }
             T::AliasType { base, .. } => {
                 if base.trim().is_empty() {
-                    out.push("An alias type needs a base type.".to_string());
+                    out.push(ObjectProblem::AliasNoBase);
                 }
             }
             // No rule for an XML schema collection's text: the server is its
@@ -3125,6 +3287,11 @@ impl TsqlObjectDraft {
             T::XmlSchemaCollection { .. } => {}
         }
         out
+    }
+
+    /// [`TsqlObjectDraft::problems`] in English.
+    pub fn validate(&self) -> Vec<String> {
+        self.problems().iter().map(ObjectProblem::message).collect()
     }
 }
 
@@ -3383,13 +3550,18 @@ impl ObjectDraft {
         }
     }
 
-    pub fn validate(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<ObjectProblem> {
         match self {
-            ObjectDraft::Enum(d) => d.validate(),
-            ObjectDraft::Domain(d) => d.validate(),
-            ObjectDraft::Sequence(d) => d.validate(),
-            ObjectDraft::Tsql(d) => d.validate(),
+            ObjectDraft::Enum(d) => d.problems(),
+            ObjectDraft::Domain(d) => d.problems(),
+            ObjectDraft::Sequence(d) => d.problems(),
+            ObjectDraft::Tsql(d) => d.problems(),
         }
+    }
+
+    /// [`ObjectDraft::problems`] in English.
+    pub fn validate(&self) -> Vec<String> {
+        self.problems().iter().map(ObjectProblem::message).collect()
     }
 
     /// Everything that has to happen to turn `current` into this draft, or the

@@ -8655,7 +8655,7 @@ existing prose was left alone.
     restart and applies with one at 600, and a sequence restarted on one side compares the same).
     `ObjectDraft::Tsql` wires
     it into the editor: `from_item` answers it for `ObjectItem::Tsql`, and `kind`, `name`,
-    `validate` and `change_set` route to it. **`ObjectDraft::blank` takes the dialect now, because
+    `problems` (and so `validate`, its English) and `change_set` route to it. **`ObjectDraft::blank` takes the dialect now, because
     a sequence's draft depends on it** — PostgreSQL's `SequenceDraft` on PostgreSQL, MySQL and
     SQLite, a `TsqlObjectDraft` on SQL Server. The form and the plan follow the draft, so the wrong
     one would offer PostgreSQL's clauses and emit its grammar. A synonym, alias type or collection
@@ -29088,7 +29088,7 @@ existing prose was left alone.
     `tsql_toggle` and `with_sequence`. **Numbers are text here, as the model holds them**: a
     `decimal(38,0)` sequence's bounds pass any integer type the form could parse into, so nothing
     goes through `object_errors`, as the PostgreSQL sequence form's `i64` fields do, and
-    `TsqlObjectDraft::validate` judges them. A sequence
+    `TsqlObjectDraft::problems` judges them. A sequence
     has Name, *Stores* (its type, free text), Increment, Minimum, Maximum, a Cycle toggle, and a
     Cache toggle beside a *Cache size* field whose empty value means the server's size — the
     three states `None`, `Some(None)`, `Some(Some(n))` in two controls, **both written from one
@@ -29124,8 +29124,14 @@ existing prose was left alone.
     `[(String, fn() -> String); 4]` table; `bound_toggle`/`tsql_toggle` and `num_col` take owned
     `String`s. The NOT NULL toggle's label is the SQL clause and stays, as do the SQL samples and
     identifier placeholders (`domain_name`, `sequence_name`, `bigint`, `nvarchar(50)`,
-    `<xsd:schema …>`) and the storage-type dropdown's `smallint`/`integer`/`bigint`; the drafts'
-    `validate` sentences are core's prose, phase 4.
+    `<xsd:schema …>`) and the storage-type dropdown's `smallint`/`integer`/`bigint`.
+    The footer's refusals and Preview's readiness read `ObjectDraft::problems`, not its English
+    wrapper `validate`: the footer still shows the editor's own `object_errors` first and, failing
+    those, the draft's *last* problem (`pop()`), which `object_problem_text` words from
+    `object-problem-*` — `NotWhole` a whole message per `SequenceField` rather than the field's
+    name spliced in, and the figures as `i64::to_string` prints them, since formatting a number
+    for the locale is phase 7 (the editors' refusals, under `i18n.rs`). Held by
+    `english_says_every_object_problem_as_core_does`.
   - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's or SQL
     Server's namespaces inside one, over `core::ddl`'s `DatabaseDraft` — and PostgreSQL's
     **Create extension** picker, the same form (below). The smallest of the schema
@@ -40745,9 +40751,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below) — though
     `read_only_reason`'s own sentence inside one still is — nor the filter field's two refusals
     (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is, nor the
-    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor the database, view
-    and event editors' refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`, below) —
-    the other drafts' `validate` sentences still are.
+    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor the database, view,
+    event and object editors' refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`/
+    `ObjectProblem`, below) — the other drafts' `validate` sentences still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40978,26 +40984,34 @@ Re-introducing the anti-patterns these guard against is a regression:
     `users-note-*`, joining sentences with a space in code as core does, held by
     `english_says_every_users_note_as_core_does`; the live tests read `message()`.
     The object editors' refusals are the case where core's English has more readers than the
-    interface does, and the database, view and event editors are the first three; the shape below
-    is the one the remaining drafts are to take. A draft's `validate` stays core's English — still
+    interface does, and the database, view, event and object editors are the first four; the shape
+    below is the one the remaining drafts are to take. A draft's `validate` stays core's English — still
     a `Vec<String>`, because core's many tests (and the live ones) read it — and becomes a thin
     wrapper over a typed
-    `problems()`, one enum per draft whose `message()` is that English byte for byte and which has
+    `problems()`, one enum per draft — or per editor, where one editor holds several drafts —
+    whose `message()` is that English byte for byte and which has
     no `Display`. The editor words `problems()` from the catalogue and asks
-    `problems().is_empty()` for Preview's readiness, so these three editors no longer read
+    `problems().is_empty()` for Preview's readiness, so these four editors no longer read
     `validate` at all. `DatabaseDraft::problems` answers `DatabaseProblem` (`NoName`, `BadCollation`),
     `ViewDraft::problems(dialect)` answers `ViewProblem` (`NoName`, `NoSelect`, `NotAQuery`,
     `Materialized`, `Hidden`, `Verbatim`) — `view_not_editable_reason` now answering
     `Option<ViewProblem>` (`Hidden`/`Verbatim`) where it answered a `&'static str`, while
     `view_is_editable` still asks only `is_none()` — and `EventDraft::problems` answers
-    `EventProblem` (`NoName`, `NoTime`, `NoInterval`, `NoUnit`, `NoBody`). The event's name clash
+    `EventProblem` (`NoName`, `NoTime`, `NoInterval`, `NoUnit`, `NoBody`). The object editor's
+    four drafts share one flat `ObjectProblem`, answered by `EnumDraft`, `DomainDraft`,
+    `SequenceDraft` and `TsqlObjectDraft::problems` and dispatched by `ObjectDraft::problems`;
+    its figures are carried as each draft holds them — a PostgreSQL sequence's as `i64`, SQL
+    Server's `StartedOutside` start as the text typed — and SQL Server's not-a-whole-number
+    refusal is one `NotWhole { field: SequenceField }`, which the interface words as a whole
+    message per field. The event's name clash
     is not a problem but a decision of its own: `EventDraft::clashes` is it, `name_clash` the
     English `Option<String>` wrapped round it, and the editor words a clash from
     `event-name-clash` with `$name` the draft's trimmed name. Each editor's renderer sits beside it
-    (`database_problem_text`, `view_problem_text`, `event_problem_text`/`event_clash_text`), held
-    by `english_says_every_database_problem_as_core_does`,
-    `english_says_every_view_problem_as_core_does` and
-    `english_says_every_event_problem_as_core_does`. Those tests walk a hand-written list of
+    (`database_problem_text`, `view_problem_text`, `event_problem_text`/`event_clash_text`,
+    `object_problem_text`), held by `english_says_every_database_problem_as_core_does`,
+    `english_says_every_view_problem_as_core_does`,
+    `english_says_every_event_problem_as_core_does` and
+    `english_says_every_object_problem_as_core_does`. Those tests walk a hand-written list of
     variants rather than an `ALL`, so a new variant fails the renderer's exhaustive `match` at
     compile time but is not held to its English until someone adds it to the list.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
