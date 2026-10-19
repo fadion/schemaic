@@ -129,6 +129,19 @@ settings-format-join-on-hint = Das ON eines Joins und das AND und OR seiner Bedi
 settings-query-row-limit = Standard-Zeilenlimit
 settings-query-timeout = Zeitlimit für Anweisungen
 settings-query-timeout-hint = Eine Anweisung abbrechen, die länger als diese Zeit läuft. Standardmäßig aus – ein Import oder ein Bericht darf durchaus länger dauern.
+timeout-off = Kein Timeout
+timeout-hours = { $n ->
+    [one] { $n } Stunde
+   *[other] { $n } Stunden
+}
+timeout-minutes = { $n ->
+    [one] { $n } Minute
+   *[other] { $n } Minuten
+}
+timeout-seconds = { $n ->
+    [one] { $n } Sekunde
+   *[other] { $n } Sekunden
+}
 settings-query-confirm-writes = Vor schreibenden Anweisungen nachfragen
 settings-query-confirm-writes-hint = Vor jeder Anweisung nachfragen, die Daten oder das Schema ändert.
 settings-query-validate = Live-Prüfung gegen die Datenbank
@@ -1178,6 +1191,7 @@ connections-cli-access-hint = Der Kommandozeile schemaic und KI-Agenten über sc
 connections-ai-data-access = KI-Datenzugriff
 connections-statement-timeout = Zeitlimit für Anweisungen
 connections-statement-timeout-hint = Bricht eine Anweisung auf dieser Verbindung ab, die länger läuft.
+connections-statement-timeout-same = Wie in der App
 connections-environment = Umgebung
 connections-type = Typ
 connections-init-sql = Init-SQL

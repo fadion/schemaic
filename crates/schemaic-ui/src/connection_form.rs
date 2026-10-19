@@ -1655,8 +1655,12 @@ const CONN_STATEMENT_TIMEOUTS: [Option<u64>; crate::settings::STATEMENT_TIMEOUTS
 };
 
 /// [`CONN_STATEMENT_TIMEOUTS`]' labels, as the dropdown needs a `fn`.
+/// `connection::statement_timeout_choice_label` in the interface's language.
 fn conn_statement_timeout_label(v: Option<u64>) -> String {
-    schemaic_core::connection::statement_timeout_choice_label(v)
+    match v {
+        None => tr!("connections-statement-timeout-same"),
+        Some(secs) => crate::i18n::statement_timeout(secs),
+    }
 }
 
 /// What Windows sign-in presents, named: the account this process runs as,
@@ -2341,9 +2345,23 @@ fn conn_form(
 #[cfg(test)]
 mod tests {
     use super::{
-        MaskRun, mask_of_len, preset_cursor, runs_of_delta, splice_real, windows_sign_in_hint_for,
+        CONN_STATEMENT_TIMEOUTS, MaskRun, conn_statement_timeout_label, mask_of_len, preset_cursor,
+        runs_of_delta, splice_real, windows_sign_in_hint_for,
     };
     use floem::views::editor::core::xi_rope::{Interval, Rope, RopeDelta};
+
+    /// **Every timeout choice reads in English exactly as core's
+    /// `statement_timeout_choice_label`**, "Same as the app" included.
+    #[test]
+    fn english_names_every_timeout_choice_as_core_does() {
+        for v in CONN_STATEMENT_TIMEOUTS {
+            assert_eq!(
+                conn_statement_timeout_label(v),
+                schemaic_core::connection::statement_timeout_choice_label(v),
+                "{v:?}"
+            );
+        }
+    }
 
     /// The one sentence this file composes, read as it did in English before
     /// the catalogue: with the account in brackets, and without it when either

@@ -221,6 +221,19 @@ pub(crate) fn outcome_line(entry: &schemaic_core::history::HistoryEntry) -> Opti
 // (`alias_rename::refusal_message`, the app's `install_cli`); here only what
 // another crate calls.
 
+/// A statement timeout in words — `persist::statement_timeout_label` in the
+/// interface's language. Public for the app, whose timed-out message quotes
+/// it in the same words as the Settings and connection dropdowns.
+pub fn statement_timeout(secs: u64) -> String {
+    use schemaic_core::persist::{TimeoutSpan, statement_timeout_span};
+    match statement_timeout_span(secs) {
+        TimeoutSpan::Off => tr!("timeout-off"),
+        TimeoutSpan::Hours(n) => tr!("timeout-hours", n = n),
+        TimeoutSpan::Minutes(n) => tr!("timeout-minutes", n = n),
+        TimeoutSpan::Seconds(n) => tr!("timeout-seconds", n = n),
+    }
+}
+
 /// Why a run holds for its bind parameters — `ParamError`'s `Display` in the
 /// interface's language. Public for the app, which raises the hold.
 pub fn param_error(e: &schemaic_core::params::ParamError) -> String {
@@ -395,6 +408,19 @@ mod tests {
         }
         assert_eq!(LanguageChoice::System.label(), "System (English)");
         assert_eq!(LanguageChoice::Fixed(UiLanguage::EnGb).label(), "English");
+    }
+
+    /// **A statement timeout reads in English exactly as core's label**, in
+    /// every unit and both numbers of each.
+    #[test]
+    fn english_says_every_statement_timeout_as_core_does() {
+        for secs in [0, 1, 2, 45, 60, 90, 120, 900, 3_600, 7_200, 5_400] {
+            assert_eq!(
+                statement_timeout(secs),
+                schemaic_core::persist::statement_timeout_label(secs),
+                "{secs}"
+            );
+        }
     }
 
     /// A name quoted inside a message takes the language's own quotation

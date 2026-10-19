@@ -136,6 +136,22 @@ settings-format-join-on-hint = Put a join's ON, and the AND and OR of its condit
 settings-query-row-limit = Default row limit
 settings-query-timeout = Statement timeout
 settings-query-timeout-hint = Cancel a statement that runs longer than this. Off by default — an import or a report can legitimately take a while.
+# A statement timeout's value, in its largest whole unit (core's TimeoutSpan;
+# English must read exactly as its Display). Also quoted by the message a
+# timed-out statement leaves (timeout-cancelled-*), so the two agree.
+timeout-off = No timeout
+timeout-hours = { $n ->
+    [one] { $n } hour
+   *[other] { $n } hours
+}
+timeout-minutes = { $n ->
+    [one] { $n } minute
+   *[other] { $n } minutes
+}
+timeout-seconds = { $n ->
+    [one] { $n } second
+   *[other] { $n } seconds
+}
 settings-query-confirm-writes = Confirm before running writes
 settings-query-confirm-writes-hint = Ask before executing any statement that modifies data or schema.
 settings-query-validate = Live database validation
@@ -1303,6 +1319,9 @@ connections-cli-access-hint = Let the schemaic command line, and AI agents throu
 connections-ai-data-access = AI data access
 connections-statement-timeout = Statement timeout
 connections-statement-timeout-hint = Cancels a statement on this connection that runs longer.
+# The connection's timeout choice that follows the app's (core's
+# statement_timeout_choice_label); the other choices are timeout-*.
+connections-statement-timeout-same = Same as the app
 connections-environment = Environment
 connections-type = Type
 connections-init-sql = Init SQL
@@ -2556,7 +2575,8 @@ copy-stopped = The copy stopped on an error: { $error }
 compare-reading-failed = Reading { $database }: { $error }
 monitor-no-row-key = No row key for this table — changes can't be tracked.
 monitor-restarted = The table's columns changed, so change tracking restarted from here.
-# $timeout is the setting's value as its dropdown shows it, lower-cased (15 minutes).
+# $timeout is the setting's value as its dropdown shows it (15 minutes) — one
+# of timeout-hours/-minutes/-seconds, never timeout-off.
 timeout-cancelled-app = Cancelled: the statement ran longer than the { $timeout } statement timeout. Change or turn it off in Settings → Query.
 timeout-cancelled-connection = Cancelled: the statement ran longer than the { $timeout } statement timeout. Change or turn it off in this connection's settings.
 ai-chat-no-database = Can't reach the database, so the assistant can't be started for this connection. Check the connection and try again.

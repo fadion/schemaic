@@ -12485,9 +12485,11 @@ existing prose was left alone.
     accessor, and an unknown id follows the app for `read_only_of`'s reason — the run that asked
     fails on the missing connection, not on this
     (`a_timeout_is_looked_up_by_id_and_an_unknown_one_follows_the_app`).
-    `statement_timeout_choice_label` is the form's wording: *Same as the app* for `None`, otherwise
+    `statement_timeout_choice_label` is the form's English: *Same as the app* for `None`, otherwise
     `persist::statement_timeout_label`, so a message quoting the value matches either dropdown
-    (`the_forms_timeout_labels_follow_the_app_or_say_its_words`). It is listed in the redacting
+    (`the_forms_timeout_labels_follow_the_app_or_say_its_words`). The form itself words the choice
+    through `ui::i18n::statement_timeout` and is held to this (`connection_form.rs`'s entry), so the
+    function now stands as the English the interface is pinned to. It is listed in the redacting
     `Debug`, and `duplicate`'s struct update carries it.
     **`init_sql` is the session settings every connection opened for this one runs first** —
     `SET search_path …`, `SET time_zone …`, `SET ROLE …` — and what may be in it is
@@ -25535,9 +25537,10 @@ existing prose was left alone.
     Shortcuts modal's headings and rows are `shortcuts.rs`'s, converted after it (below), which is
     why `shortcut_group` takes a `shortcuts::Group` and renders `group.label()` and `shortcut_row`
     takes an owned description. `TermCursor::label` is `lib.rs`'s and came with that file; the
-    Agent CLI dropdown's *Disabled* is `agent_label`'s (above); and the options a dropdown takes
-    from core stay English: `KeywordCase::label` and `statement_timeout_label`, which wait for
-    phase 4.
+    Agent CLI dropdown's *Disabled* is `agent_label`'s (above); the *Statement timeout* dropdown's
+    `statement_timeout_label` is `i18n::statement_timeout`'s, the renderer the app's timed-out
+    message quotes too (*The string catalogue*); and the one option list a dropdown takes from core
+    still in English is `KeywordCase::label`, which waits for phase 4.
     That is why its builders take owned text: `focusable_toggle_row`, `focusable_toggle_row_when`,
     `toggle_row_layout` and `settings_group_label` take `impl Into<String>`, so a literal caller
     still compiles and a `tr!` result passes as well; `SettingsSection::label()` answers a
@@ -25732,8 +25735,11 @@ existing prose was left alone.
     Environment's 40, for the CLI toggle's reason. Its choices are `CONN_STATEMENT_TIMEOUTS`:
     *Same as the app* (`None`) first, because it is what every connection saved before the field
     does, then the app's own list from *Settings → Query* — none, 1, 5, 15 and 30 minutes, an hour —
-    labelled by `connection::statement_timeout_choice_label`, so the words match the app's dropdown
-    and the timed-out message. **The list is built from `settings::STATEMENT_TIMEOUTS`** — a
+    labelled by `conn_statement_timeout_label` — `connections-statement-timeout-same` for `None`,
+    otherwise `i18n::statement_timeout`, the one renderer the app's dropdown and the timed-out
+    message use too — so the words match both in every language.
+    `connection::statement_timeout_choice_label` is the English it is held to, *Same as the app* included
+    (`english_names_every_timeout_choice_as_core_does`). **The list is built from `settings::STATEMENT_TIMEOUTS`** — a
     `const` block prepends `None` and wraps each value — rather than copied, so a value added to
     Settings appears in both dropdowns. Its hint is *"Cancels a statement on this
     connection that runs longer."*, and `DraftSignals::statement_timeout` (`Option<u64>`) is
@@ -25982,7 +25988,7 @@ existing prose was left alone.
     as `Connection::db_type` and read by `default_port`/`is_networked`; the samples
     `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules' words —
     `SslMode`, `SshAuth`, `AuthMode`, `AiData` and `Environment`'s labels and notes,
-    `statement_timeout_choice_label`, `read_only_caveat`, `named_instance_port_note`,
+    `read_only_caveat`, `named_instance_port_note`,
     `ssh_config::describe_route`, `SshTunnel::route`'s error, `init_sql::check`'s refusal (core's
     prose, phase 4) and `lib.rs`'s `TestLine::text`.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
@@ -33712,11 +33718,15 @@ existing prose was left alone.
   expire still stops the batch, because the token it fires is the batch's. A timeout and the
   Cancel button arrive as the identical `DbError::Cancelled`, so the watchdog's `fired` flag is the
   only thing that can tell the user which stopped their query — hence `timeout_message`, which
-  quotes the timeout in the very words the settings dropdown uses (`persist::statement_timeout_label`
-  is shared for exactly that reason) and says where to change it: *Settings → Query*, or *this
+  quotes the timeout in the very words the settings dropdown uses (`ui::i18n::statement_timeout`
+  renders both, over `persist::statement_timeout_span`, for exactly that reason) and says where to
+  change it: *Settings → Query*, or *this
   connection's settings* when the value that fired was the connection's own, since the app's may
   then be off or different and the message would send the user to a setting that did not fire
-  (`a_connections_own_timeout_names_the_connection_as_where_to_change_it`). `EXPLAIN` is bounded
+  (`a_connections_own_timeout_names_the_connection_as_where_to_change_it`). **It quotes the label
+  as the dropdown shows it, case and all** — it used to lower-case it, which a statement never
+  needed (it only times out under a non-zero timeout, whose English units are lower case already)
+  and which would break a German noun. `EXPLAIN` is bounded
   too: `EXPLAIN ANALYZE` *executes* the statement, so it is as runaway-capable as the query itself,
   and there the timeout must produce a `PlanState::Failed` rather than the plain-cancel `return`,
   which would leave the modal spinning on `Running` for ever.
@@ -40380,9 +40390,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals,
-    `statement_timeout_label` (which the timeout message quotes as the
-    dropdown shows it), `format_bytes`, the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
+    translation* — among it `launch::*`'s refusals, `format_bytes`, the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
     whose state words the search box also matches) and `dump.rs`'s "Export failed: …" lines,
     which the headless CLI shares. A label a dropdown takes from another crate stays that crate's
     English too: `KeywordCase::label` (core).
@@ -40469,9 +40477,19 @@ Re-introducing the anti-patterns these guard against is a regression:
     `", "` in code, and words the sentence from `restore-refused`/`-more`, held by
     `english_refuses_every_restore_as_core_does` (`app_tests`). The separator is the code's, not
     the catalogue's, so a language that joins a list otherwise cannot say so.
+    The statement timeout is a span rather than a sentence: `persist::statement_timeout_span`
+    answers a `TimeoutSpan` — `Off`, or `Hours`/`Minutes`/`Seconds` in the largest whole unit — whose
+    `Display` is the English, `statement_timeout_label` its wrapper, and `i18n::statement_timeout`
+    words it from `timeout-off`/`-hours`/`-minutes`/`-seconds`. It has three readers that must say
+    the value alike — Settings' dropdown (`settings::statement_timeout_label`), the connection
+    form's choice (`conn_statement_timeout_label`, with `connections-statement-timeout-same` for
+    `None`) and the app's `timeout_message`, which quotes it back — two spellings of *15 minutes*
+    being how the setting and the error come to disagree. `english_says_every_statement_timeout_as_core_does` and
+    `english_names_every_timeout_choice_as_core_does` hold the English.
     **A typed message's renderer lives beside the code that shows it** — `alias_rename.rs`,
     `install_cli.rs`, `settings.rs`, `grid.rs`, the app's `main.rs` — and `ui/i18n.rs` holds only the ones another file or crate
-    calls.
+    calls: `param_error` for the app, and `statement_timeout`, which `settings.rs`,
+    `connection_form.rs` and the app all call.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.

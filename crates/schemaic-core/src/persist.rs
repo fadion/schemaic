@@ -474,13 +474,43 @@ pub fn statement_timeout(secs: u64) -> Option<std::time::Duration> {
 /// the error come to disagree about what was configured. **Computed from the
 /// value**, never looked up in the option list — a label with a list to fall off
 /// the end of is the trap `row_limit_label` documents.
+///
+/// The English of [`statement_timeout_span`]: the interface words that value
+/// itself.
 pub fn statement_timeout_label(secs: u64) -> String {
-    let plural = |n: u64, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    statement_timeout_span(secs).to_string()
+}
+
+/// A statement timeout in its largest whole unit, as
+/// [`statement_timeout_label`] words it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutSpan {
+    /// No timeout at all.
+    Off,
+    Hours(u64),
+    Minutes(u64),
+    Seconds(u64),
+}
+
+impl std::fmt::Display for TimeoutSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let plural = |n: u64, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+        match *self {
+            TimeoutSpan::Off => f.write_str("No timeout"),
+            TimeoutSpan::Hours(n) => f.write_str(&plural(n, "hour")),
+            TimeoutSpan::Minutes(n) => f.write_str(&plural(n, "minute")),
+            TimeoutSpan::Seconds(n) => f.write_str(&plural(n, "second")),
+        }
+    }
+}
+
+/// `secs` in the largest unit that divides it — see [`statement_timeout_label`].
+pub fn statement_timeout_span(secs: u64) -> TimeoutSpan {
     match secs {
-        0 => "No timeout".to_string(),
-        s if s.is_multiple_of(3600) => plural(s / 3600, "hour"),
-        s if s.is_multiple_of(60) => plural(s / 60, "minute"),
-        s => plural(s, "second"),
+        0 => TimeoutSpan::Off,
+        s if s.is_multiple_of(3600) => TimeoutSpan::Hours(s / 3600),
+        s if s.is_multiple_of(60) => TimeoutSpan::Minutes(s / 60),
+        s => TimeoutSpan::Seconds(s),
     }
 }
 

@@ -81,7 +81,8 @@ assertions pin English wording — stays the regression net throughout.
    equal; a list is joined UI-side before it is handed in. The renderer lives beside the code
    that shows it, `ui/i18n.rs` holding only the ones used across files. Done for
    `AliasRenameRefusal`, `ParamError`, `cli_install` (`Refusal`, `Report`, `RowHint`),
-   `stats::RowsRead`, `model::AttachScope` and `script::RestoreRefusal`.
+   `stats::RowsRead`, `model::AttachScope`, `script::RestoreRefusal` and
+   `persist::TimeoutSpan`.
    **`launch::*`'s refusals take a session of their own**: the largest group, and propagated
    through `?` inside the command builders, so the typed refusal reaches into them. Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
@@ -103,9 +104,8 @@ assertions pin English wording — stays the regression net throughout.
    `ExportFormat::label`, `activity::interval_label`, `KeywordCase::label` and the
    like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
-   unchanged today is this phase's list to work from: `launch::*`'s refusals,
-   `statement_timeout_label` (quoted by the
-   timeout message as its dropdown shows it), the grid's export notes, the activity panel's counts line — and
+   unchanged today is this phase's list to work from: `launch::*`'s refusals, the grid's export
+   notes, the activity panel's counts line — and
    one that is not core's but needs the same split: `schemaic-cli`'s `dump.rs` "Export failed: …"
    lines, which the dump modal shows and the headless CLI shares.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

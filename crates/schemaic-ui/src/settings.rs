@@ -1407,11 +1407,12 @@ pub(crate) const STATEMENT_TIMEOUTS: [u64; 6] = [0, 60, 300, 900, 1_800, 3_600];
 /// — the trap `row_limit_label`'s doc comment describes, and the reason none of
 /// these labels has a list to fall off the end of.
 ///
-/// The wording itself lives in `core::persist` because the app's
-/// timed-out-statement message quotes the same value back, and two spellings of
-/// "15 minutes" is how the dropdown and the error come to disagree.
+/// The wording itself is `i18n::statement_timeout`'s, over `core::persist`'s
+/// unit, because the app's timed-out-statement message quotes the same value
+/// back, and two spellings of "15 minutes" is how the dropdown and the error
+/// come to disagree.
 fn statement_timeout_label(secs: u64) -> String {
-    schemaic_core::persist::statement_timeout_label(secs)
+    crate::i18n::statement_timeout(secs)
 }
 
 /// The Agent CLI dropdown's text — `Agent::label` in the interface's language.
@@ -2632,9 +2633,10 @@ mod tests {
         assert_eq!(statement_timeout_label(0), "No timeout");
     }
 
-    /// The dropdown's label is `core::persist`'s, deliberately: the message a
-    /// timed-out statement leaves in the results pane quotes the same words, so
-    /// a local reimplementation here is how the two come to disagree.
+    /// The dropdown's label is `i18n::statement_timeout`'s, deliberately — the
+    /// renderer the message a timed-out statement leaves in the results pane
+    /// quotes too, so a local reimplementation here is how the two come to
+    /// disagree — and reads in English as `core::persist`'s.
     #[test]
     fn the_timeout_label_is_the_shared_one() {
         for &s in &STATEMENT_TIMEOUTS {

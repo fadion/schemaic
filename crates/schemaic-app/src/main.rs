@@ -15728,7 +15728,10 @@ impl Drop for RunTimeout {
 /// dropdown uses*, and where to change it — the connection's own setting when
 /// it was that one, since the app's may be off or different.
 fn timeout_message(t: schemaic_core::connection::StatementTimeout) -> String {
-    let timeout = persist::statement_timeout_label(t.secs).to_lowercase();
+    // As the dropdown words it, case and all: a statement only times out under
+    // a non-zero timeout, whose English units are lower case already, and
+    // lower-casing a German one would break its noun.
+    let timeout = schemaic_ui::i18n::statement_timeout(t.secs);
     if t.per_connection {
         tr!("timeout-cancelled-connection", timeout = timeout)
     } else {
@@ -17446,9 +17449,9 @@ mod app_tests {
     #[test]
     fn the_message_quotes_the_same_words_the_setting_shows() {
         for secs in [60u64, 300, 900, 1_800, 3_600] {
-            let label = schemaic_core::persist::statement_timeout_label(secs);
+            let label = schemaic_ui::i18n::statement_timeout(secs);
             assert!(
-                timeout_message(app_timeout(secs)).contains(&label.to_lowercase()),
+                timeout_message(app_timeout(secs)).contains(&label),
                 "{secs}s: {label}"
             );
         }
