@@ -120,7 +120,11 @@ assertions pin English wording — stays the regression net throughout.
    `restore-*`; a file dialog's type filter, which floem takes only as `&'static str`, goes
    through `tr_static!`, a per-site `OnceLock`), and closing tabs with the SQL file's open,
    save and reload (`tab-close-*`, `file-*`; core's `SQL_FILTER_NAME` went, its word now
-   `file-sql-filter`). A large file goes **a
+   `file-sql-filter`), and the export and dump runners' failures with a binary cell's load
+   and save (`export-*`, `dump-failed`, `blob-load-*`, `blob-save-failed`). The dump modal
+   still shows `schemaic-cli`'s own "Export failed: …" lines from `dump.rs`, which the
+   headless CLI shares — phase 4's, like core's prose; so is the write log's "file …, n
+   statements ran", a persisted record. A large file goes **a
    section at a time** — a function or a cluster of them — committed per section as
    `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded here as
    it lands, so the next session knows where to pick up without re-sweeping what is done. The

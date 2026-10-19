@@ -4909,9 +4909,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let token = if req.stoppable {
                             if export_token.borrow().is_some() {
                                 (done)(ExportOutcome::Failed {
-                                    message: "An export is already running. Cancel it or wait for \
-                                              it to finish."
-                                        .to_string(),
+                                    message: tr!("export-already-running"),
                                     // Nothing was opened.
                                     partial: false,
                                 });
@@ -5123,7 +5121,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                         let _ = std::fs::remove_file(&sweep_part);
                                     }
                                     ExportOutcome::Failed {
-                                        message: format!("Export failed: {e}"),
+                                        message: tr!("export-failed", error = e.to_string()),
                                         partial: incremental,
                                     }
                                 }
@@ -5132,7 +5130,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         handle.spawn(async move {
                             if let Err(e) = job.await {
                                 died(ExportOutcome::Failed {
-                                    message: format!("Export failed: worker died: {e}"),
+                                    message: tr!("export-worker-died", error = e.to_string()),
                                     partial: false,
                                 });
                             }
@@ -5177,10 +5175,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // the Download menu is on every result tab.
                         if export_token.borrow().is_some() {
                             (done)(ExportOutcome::Failed {
-                                message:
-                                    "An export is already running. Cancel it or wait for it to \
-                                     finish."
-                                        .to_string(),
+                                message: tr!("export-already-running"),
                                 // Nothing was opened — see the arm above.
                                 partial: false,
                             });
@@ -5366,9 +5361,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     sweep_on_cancel();
                                     ExportOutcome::Cancelled
                                 }
-                                (_, Ok(Err(e))) => failed(format!("Export failed: {e}")),
-                                (_, Err(e)) => failed(format!("Export failed: worker died: {e}")),
-                                (Err(e), _) => failed(format!("Export failed: {e}")),
+                                (_, Ok(Err(e))) => failed(tr!("export-failed", error = e)),
+                                (_, Err(e)) => {
+                                    failed(tr!("export-worker-died", error = e.to_string()))
+                                }
+                                (Err(e), _) => failed(tr!("export-failed", error = e.to_string())),
                                 (Ok(_), Ok(Ok(tally))) => ExportOutcome::Done(tally),
                             });
                         });
@@ -5460,7 +5457,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // Refused before the write, so it must not claim a file
                         // it never touched.
                         return (done)(DumpOutcome::Failed {
-                            message: format!("Dump failed: {e}"),
+                            message: tr!("dump-failed", error = e.to_string()),
                             partial: false,
                         });
                     }
@@ -5517,7 +5514,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // message must not send the user to a folder nothing was
                         // written to.
                         return (done)(FilesOutcome::Failed {
-                            message: format!("Export failed: {e}"),
+                            message: tr!("export-failed", error = e.to_string()),
                             files: 0,
                             // Refused before a plan existed, so nothing is known
                             // to be missing — `missing` is the plan's answer —
@@ -5744,7 +5741,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     report(
                         match req.doc.into_bytes().and_then(|b| {
                             schemaic_core::persist::write_file_atomic(&req.path, &b)
-                                .map_err(|e| format!("Export failed: {e}"))
+                                .map_err(|e| tr!("export-failed", error = e.to_string()))
                         }) {
                             Ok(()) => schemaic_ui::ExportOutcome::Done(Default::default()),
                             Err(e) => schemaic_ui::ExportOutcome::Failed {
@@ -5908,7 +5905,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // is 64.0 MB."
                 let too_big = |n: u64| {
                     let (got, most) = schemaic_core::format::contrasting_bytes(n, cap);
-                    format!("That file is {got} — the most that can be loaded is {most}.")
+                    tr!("blob-load-too-large", size = got, most = most)
                 };
                 match std::fs::metadata(&req.path) {
                     Ok(m) if schemaic_core::blob::load_too_large(m.len()) => {
@@ -5942,7 +5939,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 .max(cap + 1),
                         )),
                         Ok(Some(bytes)) => Ok(bytes),
-                        Err(e) => Err(format!("Load failed: {e}")),
+                        Err(e) => Err(tr!("blob-load-failed", error = e.to_string())),
                     },
                 );
             });
@@ -5963,7 +5960,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 report(
                     schemaic_core::persist::write_file_atomic(&req.path, &req.bytes.bytes)
                         .map(|()| shown)
-                        .map_err(|e| format!("Save failed: {e}")),
+                        .map_err(|e| tr!("blob-save-failed", error = e.to_string())),
                 );
             });
         })

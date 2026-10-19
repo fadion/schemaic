@@ -2373,3 +2373,17 @@ file-replace-title = Replace file?
 file-replace-question = “{ $name }” already exists — “{ $typed }” was saved with the .sql extension added. Replace it?
 file-reload-title = Reload from disk
 file-reload-unsaved = “{ $name }” has unsaved changes. Reloading discards them. Reload anyway?
+
+## The export and dump runners' failures, and a binary cell's load and save
+## (main.rs). The dump's own failures from schemaic-cli stay English for now.
+## $error is the operating system's, the engine's or the writer's own text.
+
+export-already-running = An export is already running. Cancel it or wait for it to finish.
+export-failed = Export failed: { $error }
+# The background task writing the file stopped without an answer.
+export-worker-died = Export failed: worker died: { $error }
+dump-failed = Dump failed: { $error }
+# $size is the file's size, $most the cap, both as the app writes a size (64 MB).
+blob-load-too-large = That file is { $size } — the most that can be loaded is { $most }.
+blob-load-failed = Load failed: { $error }
+blob-save-failed = Save failed: { $error }
