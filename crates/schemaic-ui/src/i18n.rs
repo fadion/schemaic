@@ -358,6 +358,51 @@ pub fn param_error(e: &schemaic_core::params::ParamError) -> String {
     }
 }
 
+/// Why a pasted string is not a connection URL — core's
+/// [`UrlError`](schemaic_core::conn_import::UrlError) in the interface's
+/// language. **Unredacted**, so reached only through [`skip_reason_shown`],
+/// which redacts the sentence it sits in.
+fn url_error_text(e: &schemaic_core::conn_import::UrlError) -> String {
+    use schemaic_core::conn_import::UrlError;
+    match e {
+        UrlError::Empty => tr!("conn-import-url-empty"),
+        UrlError::NoScheme => tr!("conn-import-url-no-scheme"),
+        UrlError::UnknownScheme(s) => tr!("conn-import-url-unknown-scheme", scheme = s.as_str()),
+        UrlError::NoHost => tr!("conn-import-url-no-host"),
+        UrlError::BadPort(p) => tr!("conn-import-url-bad-port", port = p.as_str()),
+        UrlError::NoPath => tr!("conn-import-url-no-path"),
+        UrlError::Transport(s) => tr!("conn-import-url-transport", server = s.as_str()),
+        UrlError::UserinfoInHost => tr!("conn-import-url-userinfo"),
+        UrlError::NotSqlServer => tr!("conn-import-url-not-sql-server"),
+    }
+}
+
+/// Why a connection-import entry was not imported, in the interface's
+/// language and **redacted** as core's
+/// [`SkipReason::message`](schemaic_core::conn_import::SkipReason::message)
+/// is: the reason carries text a parser chose out of the entry, which may be
+/// a password (`conn_import::redact_shown`). Public for the app's paste field,
+/// and said by the import modal's skipped sentence.
+pub fn skip_reason_shown(reason: &schemaic_core::conn_import::SkipReason) -> String {
+    use schemaic_core::conn_import::{SkipReason, redact_shown};
+    let words = match reason {
+        SkipReason::UnsupportedEngine(d) => {
+            tr!("conn-import-reason-unsupported-engine", driver = d.as_str())
+        }
+        SkipReason::NoServer => tr!("conn-import-reason-no-server"),
+        SkipReason::NotPublished => tr!("conn-import-reason-not-published"),
+        SkipReason::BadUrl(e) => tr!("conn-import-reason-unreadable", error = url_error_text(e)),
+        SkipReason::NotAnExport(e) => {
+            tr!("conn-import-reason-not-an-export", error = e.as_str())
+        }
+        &SkipReason::NewerExport(version) => {
+            tr!("conn-import-reason-newer-export", version = version)
+        }
+        SkipReason::Unreadable(e) => tr!("conn-import-reason-unreadable", error = e.as_str()),
+    };
+    redact_shown(&words)
+}
+
 /// Load `lang`'s catalogue (with `en-GB` behind it, message by message) into
 /// `loader` and set it up. Split from [`init`] so a test can do it to a loader
 /// of its own rather than to the one every other test reads.
@@ -395,6 +440,42 @@ fn pseudo(s: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// **Every URL error and skip reason reads in English exactly as core's
+    /// `message` says it** — redaction included, so a password a parser
+    /// carried into a reason stays hidden in the interface's wording.
+    #[test]
+    fn english_says_every_import_refusal_as_core_does() {
+        use schemaic_core::conn_import::{SkipReason, UrlError};
+        let errors = [
+            UrlError::Empty,
+            UrlError::NoScheme,
+            UrlError::UnknownScheme("postgersql".into()),
+            UrlError::NoHost,
+            UrlError::BadPort("54x2".into()),
+            UrlError::NoPath,
+            UrlError::Transport("np:\\\\.\\pipe\\sql".into()),
+            UrlError::UserinfoInHost,
+            UrlError::NotSqlServer,
+        ];
+        for e in &errors {
+            assert_eq!(url_error_text(e), e.message(), "{e:?}");
+        }
+        let mut reasons: Vec<SkipReason> = errors.into_iter().map(SkipReason::BadUrl).collect();
+        reasons.extend([
+            SkipReason::UnsupportedEngine("oracle.jdbc.OracleDriver".into()),
+            SkipReason::NoServer,
+            SkipReason::NotPublished,
+            SkipReason::NotAnExport("expected value at line 1 column 1".into()),
+            SkipReason::NewerExport(2),
+            SkipReason::Unreadable("could not parse postgres://admin:hunter2@h/d".into()),
+        ]);
+        for r in &reasons {
+            assert_eq!(skip_reason_shown(r), r.message(), "{r:?}");
+        }
+        let hidden = SkipReason::Unreadable("could not parse postgres://admin:hunter2@h/d".into());
+        assert!(!skip_reason_shown(&hidden).contains("hunter2"));
+    }
 
     fn loader(lang: UiLanguage) -> FluentLanguageLoader {
         let l = fluent_language_loader!();

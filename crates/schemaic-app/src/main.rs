@@ -11721,7 +11721,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         if text.trim().is_empty() {
             import_ui
                 .paste_error
-                .set(Some(conn_import::UrlError::Empty.message()));
+                .set(Some(tr!("conn-import-url-empty")));
             return;
         }
         let existing = connections.get_untracked();
@@ -11739,8 +11739,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             import_ui.paste_error.set(Some(
                 scan.skipped
                     .first()
-                    .map(|s| s.reason.message())
-                    .unwrap_or_else(|| conn_import::UrlError::Empty.message()),
+                    .map(|s| schemaic_ui::i18n::skip_reason_shown(&s.reason))
+                    .unwrap_or_else(|| tr!("conn-import-url-empty")),
             ));
             return;
         }

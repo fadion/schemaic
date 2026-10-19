@@ -11999,7 +11999,8 @@ existing prose was left alone.
     Removing `skip`'s own cap fails that first assertion and nowhere else. `merge_skipped`
     also dedupes through a `HashSet` rather than `contains`, which was O(n²) in the number of skipped
     entries: measured on this exact shape at 10,000 → 74 ms, 20,000 → 184 ms, 40,000 → 989 ms, on the
-    UI thread with no cancel and no progress. `Skipped`/`SkipReason` gained `Hash` for it. The cap
+    UI thread with no cancel and no progress. `Skipped`/`SkipReason` gained `Hash` for it, and
+    `UrlError` with them once `SkipReason::BadUrl` came to carry one. The cap
     makes that belt and braces, which is the point — a cap is a policy that could be raised, and the
     shape underneath it should still be right. `ROW_VIEW_CAP` (500) and `row_overflow_sentence` are
     the same rule for the rows the modal *offers*; `connection_import.rs`'s entry has what they
@@ -12254,7 +12255,20 @@ existing prose was left alone.
     redacts the name** — it is the render-facing accessor, and every variant carrying text carries
     text a *parser* chose out of the entry, so doing it at the one place both are rendered is what
     stops a fourth variant reopening it (`raw_message` is the unredacted form, and this module's own
-    tests are its only caller). The parameter half of `redacted` — `redact_params`, now only for
+    tests are its only caller). **The variants carry values, not finished English** — phase 4 of
+    *Interface translation* split what `Unreadable(String)` used to hold as sentences: a URL
+    `parse_url` refused is `BadUrl(UrlError)` (`parse_url_scan`'s pasted lines and a DataGrip
+    project's URLs, the two sites that built `Unreadable(e.message())`), a file that is not an
+    export is `NotAnExport` with the JSON reader's text, a newer export is `NewerExport` with its
+    format version, and `Unreadable(String)` is left for what is a library's or parser's own text —
+    DBeaver's and `docker inspect`'s JSON errors — which stays as written. `message` says all of
+    them byte for byte as before. **The interface's wording is redacted by the same function**:
+    the interface's `i18n::skip_reason_shown` words a reason from the catalogue and passes the whole
+    sentence through `redact_shown`, the public wrapper over the private `redacted`, because wording
+    a parser's text in another language does not make it any less a password — and redacting the
+    sentence rather than each argument is what keeps it the same question the English answers.
+    `english_says_every_import_refusal_as_core_does` fails without that call (on its `hunter2`
+    case). The parameter half of `redacted` — `redact_params`, now only for
     what no grammar claims: a skip reason's prose, a URL's path and query, the text inside a
     keyword string's value — also spans separators: ` ` is
     one of them, so an ODBC-shaped `Pwd = hunter2` — which the paste field invites — put its key, its
@@ -12378,9 +12392,10 @@ existing prose was left alone.
     hand-edited file can slip in neither a grant nor a password the next save would hand to the
     keyring, and the export and the import cannot come to disagree about what a shared file may
     carry (`a_hand_edited_export_is_stripped_and_a_newer_one_refused`). A version past
-    `EXPORT_VERSION` is refused as *exported by a newer Schemaic* rather than half-read. A file
+    `EXPORT_VERSION` is refused as *exported by a newer Schemaic* (`SkipReason::NewerExport`, which
+    carries the version) rather than half-read. A file
     that does not parse as the envelope — bad JSON, no `schemaic_connections` key — is one
-    `SkipReason::Unreadable` saying it is *not a Schemaic connections export*, not an empty scan
+    `SkipReason::NotAnExport` saying it is *not a Schemaic connections export*, not an empty scan
     (`a_file_that_is_not_an_export_is_unreadable`). Unlike every other source, the row arrives as
     written rather than through `blank`, so read-only, the environment and the folder come across —
     Schemaic's own guard rails, which the reason other sources blank them (guessing another tool's
@@ -26207,8 +26222,9 @@ existing prose was left alone.
     is *constructed*: the list is a plain `v_stack_from_iter` of one `h_stack` with a check box,
     three texts and two capsules per row, inside a `scroll` showing about five, rebuilt whole on
     every change to `rows`. A `.env` that really is a list of 140,000 URLs would build close to a
-    million views to show five. `conn_import::row_overflow_sentence` is the disclosure and is
-    separate from the cap so the *disclosure* is the tested half: a list that silently stops at 500
+    million views to show five. `conn_import::row_overflow_sentence` is the disclosure — the view
+    says it through `row_overflow_note` (`conn-import-row-overflow`), held equal to it in English —
+    and is separate from the cap so the *disclosure* is the tested half: a list that silently stops at 500
     of 140,000 is the failure this would otherwise introduce. A cap rather than a `virtual_stack`,
     because an import row is two lines or three depending on whether it carries notes, so
     virtualizing means a `VirtualItemSize::Fn` restating the layout — and there is no screenshot
@@ -26238,10 +26254,21 @@ existing prose was left alone.
     notes are core's word drawn UI-side: `import_note_label(ImportNote)` replaces
     `ImportNote::label` (`conn-import-note-*`), and
     `english_words_every_import_note_as_core_does` holds its English equal to core's. The
-    `import_label`, `empty_message` and `skipped_sentence` tests pass unchanged. English stays: the
-    URL placeholder, a sample; `SkipReason::message` inside the skipped names and
-    `UrlError::message` (core's prose, phase 4); and the "Added N connections." line, which the
-    app's import action writes, not this file.
+    `import_label`, `empty_message` and `skipped_sentence` tests pass unchanged. Why an entry was
+    left out is worded in `i18n.rs`, phase 4's shape, since the app's paste field says it too:
+    `i18n::url_error_text(&UrlError)` from `conn-import-url-*`, and
+    `i18n::skip_reason_shown(&SkipReason)` from `conn-import-reason-*` (a `BadUrl` puts
+    `url_error_text` inside `conn-import-reason-unreadable`) — the *name (why)* of the skipped
+    sentence here, and the app's paste-field error in `add_pasted_url`, which is
+    `conn-import-url-empty` or the first skip's `skip_reason_shown`.
+    **`skip_reason_shown` ends in `conn_import::redact_shown`, over the whole sentence**, for the
+    reason `SkipReason::message` is redacted (`conn_import.rs`'s entry). `url_error_text` is not
+    redacted, so it is private and reached only through it.
+    `i18n::tests::english_says_every_import_refusal_as_core_does` holds every `UrlError` and every
+    `SkipReason` — a `BadUrl` of each error among them, and the `hunter2` case — equal to core's
+    English, and `english_says_the_row_overflow_as_core_does` the overflow line. English stays: the URL placeholder, a
+    sample; the library text an `Unreadable` or `NotAnExport` carries; and the "Added N connections." line,
+    which the app's import action writes, not this file.
   - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
     panel's edges) and `v_resize_handle` (the editor/results split), plus the `DelayedHover` they
     share. Not `window_chrome::resize_zones`, which resizes the *window* and is mounted outside the
@@ -40715,6 +40742,15 @@ Re-introducing the anti-patterns these guard against is a regression:
     `Display`, since no headless surface says these, so the `why.to_string()` that would stay
     English in every language does not compile. `english_says_every_launcher_refusal_as_core_does`
     (`app_tests`) holds `refusal_text` equal to `message` for every variant of `Refusal::ALL`.
+    The connection import's refusals are the case where the words carry a secret. `conn_import`'s
+    `SkipReason` held finished English in `Unreadable(String)` and now carries values — `BadUrl`
+    with the `UrlError`, `NotAnExport`, `NewerExport` with the version — and
+    `i18n::skip_reason_shown` and `url_error_text` word them from
+    `conn-import-reason-*`/`conn-import-url-*` (in `i18n.rs`, since the import modal and the
+    app's paste field both say one). Since a parser's text inside a reason may be a
+    password, the worded sentence goes through `conn_import::redact_shown` whole, as core's
+    `message` does its English; `english_says_every_import_refusal_as_core_does` holds the two
+    equal and fails without the redaction (under `connection_import.rs`).
     A message core *chooses* by engine capability takes the same shape with the choice as the
     value: the Export modal's replay-toggle hints were whole `&'static str`s picked per dialect, and
     are now `dump::DropHint` (`drop_hint`) and `FkHint` (`fk_guard_says_drops`), each with a

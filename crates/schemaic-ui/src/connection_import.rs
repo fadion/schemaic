@@ -333,7 +333,7 @@ fn row_list(imp: ConnImportUi, ring: FocusRing) -> impl IntoView {
             // `conn_import::ROW_VIEW_CAP`. The cap is on the views, not on the
             // import: `rows` still holds every connection and Import still
             // creates all of them.
-            let overflow = schemaic_core::conn_import::row_overflow_sentence(rows.len());
+            let overflow = row_overflow_note(rows.len());
             let list = v_stack_from_iter(
                 rows.into_iter()
                     .enumerate()
@@ -570,7 +570,7 @@ fn skipped_sentence(skipped: &[Skipped], hidden: usize) -> Option<String> {
     let head = skipped
         .iter()
         .take(NAMED)
-        .map(|s| format!("{} ({})", s.name, s.reason.message()))
+        .map(|s| format!("{} ({})", s.name, crate::i18n::skip_reason_shown(&s.reason)))
         .collect::<Vec<_>>()
         .join(", ");
     let rest = total.saturating_sub(NAMED);
@@ -714,10 +714,38 @@ fn outcome_note(idle: bool, done: Option<String>) -> Option<String> {
     done.filter(|_| idle)
 }
 
+/// The line under a review list too long to show whole — core's
+/// `conn_import::row_overflow_sentence`, in the interface's language.
+fn row_overflow_note(total: usize) -> Option<String> {
+    use schemaic_core::conn_import::ROW_VIEW_CAP;
+    let hidden = total.checked_sub(ROW_VIEW_CAP).filter(|n| *n > 0)?;
+    Some(tr!(
+        "conn-import-row-overflow",
+        shown = ROW_VIEW_CAP,
+        total = total,
+        hidden = hidden
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use schemaic_core::conn_import::{SkipReason, parse_url};
+
+    /// **The overflow line reads in English exactly as core says it** — the
+    /// reasons in the skipped sentence have theirs in `i18n.rs`
+    /// (`english_says_every_import_refusal_as_core_does`).
+    #[test]
+    fn english_says_the_row_overflow_as_core_does() {
+        let cap = schemaic_core::conn_import::ROW_VIEW_CAP;
+        for total in [0, cap, cap + 1, cap + 1_234] {
+            assert_eq!(
+                row_overflow_note(total),
+                schemaic_core::conn_import::row_overflow_sentence(total),
+                "{total}"
+            );
+        }
+    }
     use schemaic_core::connection::Connection;
 
     /// The interface's words for a row's note are core's in English, for

@@ -1837,6 +1837,33 @@ conn-import-skipped-more = { $count ->
     [one] { $count } entry was not imported: { $names }, and { $rest } more.
    *[other] { $count } entries were not imported: { $names }, and { $rest } more.
 }
+# Why an entry was not imported: the "why" in "name (why)" above, so lower
+# case with no full stop (core's conn_import::SkipReason). $driver is a
+# driver or provider name as the source wrote it; $error a parser's text,
+# or one of the conn-import-url-* sentences below.
+conn-import-reason-unsupported-engine = unsupported engine ({ $driver })
+conn-import-reason-no-server = no server to connect to
+conn-import-reason-not-published = its port is not published to this machine
+conn-import-reason-unreadable = could not be read ({ $error })
+conn-import-reason-not-an-export = could not be read (not a Schemaic connections export: { $error })
+# $version is the export's format version, a whole number.
+conn-import-reason-newer-export = could not be read (exported by a newer Schemaic (version { $version }) — update to import it)
+# Under the paste field when a pasted line is not a connection URL (core's
+# conn_import::UrlError). The schemes (mysql://, sqlite:…), Server= and
+# tcp:host are syntax, never translated.
+conn-import-url-empty = Paste a connection URL.
+conn-import-url-no-scheme = No scheme — a URL starts with mysql://, postgresql://, sqlserver:// or sqlite:, a SQL Server connection string with Server=.
+# $scheme is the scheme as pasted, often a misspelling.
+conn-import-url-unknown-scheme = Unknown scheme "{ $scheme }" — expected mysql, mariadb, postgresql, sqlserver or sqlite.
+conn-import-url-no-host = No host in the URL.
+conn-import-url-bad-port = "{ $port }" is not a port number.
+conn-import-url-no-path = No database file after sqlite:.
+# $server is the server as written; named pipes and LocalDB are SQL Server's transports.
+conn-import-url-transport = "{ $server }" is reached over named pipes or LocalDB — Schemaic connects over TCP only.
+conn-import-url-userinfo = The server name holds an @ — a user name or password goes in its own field, not in the server.
+conn-import-url-not-sql-server = This connection string doesn't say it is SQL Server's — MySQL's and PostgreSQL's .NET drivers write the same keywords. Paste the server's URL instead (mysql://, postgresql://, sqlserver://), or, for SQL Server, write the server as tcp:host.
+# Under a review list longer than it shows (core's conn_import::row_overflow_sentence).
+conn-import-row-overflow = Showing the first { $shown } of { $total }. The other { $hidden } are still imported if they are ticked — this list stops here so the window stays responsive.
 conn-import-import = Import
 # The Import button with how many connections it will add.
 conn-import-import-count = Import { $count }

@@ -93,7 +93,10 @@ assertions pin English wording — stays the regression net throughout.
    modal's toggle hints (`dump::DropHint`, `FkHint`), and the finished-run notification
    (`notify::finished_note`, plain arguments), and the terminal launchers' refusals
    (`launch::Refusal`, `AuthMode::external_client_refusal` among them, worded by the app's
-   `refusal_text` — with no `Display`, so a `to_string()` cannot keep one English). Of the other existing enums, `ImportError`
+   `refusal_text` — with no `Display`, so a `to_string()` cannot keep one English), and
+   connection import's `conn_import::UrlError` and `SkipReason` (`i18n::url_error_text`,
+   `skip_reason_shown`, which passes its sentence through core's `redact_shown` as `message`
+   is redacted). Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
    so its prose lives at its construction sites and it is the weakest to convert.
@@ -132,8 +135,7 @@ assertions pin English wording — stays the regression net throughout.
      in `schemaic-db`; the hardest, since the sentence is built below core.
    - **The plan view's warnings** (`plan.rs`) and **the editor's offline diagnostics**
      (`intel::Diagnostic::message`).
-   - **Import** — `ImportError`'s `Display` and `import::xlsx_size_refusal`; **connection import**
-     — `conn_import::UrlError::message`, `SkipReason::message`, `row_overflow_sentence`.
+   - **Import** — `ImportError`'s `Display` and `import::xlsx_size_refusal`.
    - **Startup notices** — `persist`'s recovery notices, `secrets`' `notice`/`cli_notice`, and
      `secrets::save_connections`' answer; **the SSH tunnel's** `TunnelFailures::refusal`.
    - **The drop and truncate confirms** — `stats::truncate_prompt`, `drop_preview`.

@@ -1576,6 +1576,22 @@ conn-import-skipped-more = { $count ->
     [one] { $count } Eintrag wurde nicht importiert: { $names } und { $rest } weitere.
    *[other] { $count } Einträge wurden nicht importiert: { $names } und { $rest } weitere.
 }
+conn-import-reason-unsupported-engine = nicht unterstützte Engine ({ $driver })
+conn-import-reason-no-server = kein Server, mit dem verbunden werden kann
+conn-import-reason-not-published = sein Port ist für diesen Rechner nicht veröffentlicht
+conn-import-reason-unreadable = konnte nicht gelesen werden ({ $error })
+conn-import-reason-not-an-export = konnte nicht gelesen werden (kein Verbindungsexport von Schemaic: { $error })
+conn-import-reason-newer-export = konnte nicht gelesen werden (von einem neueren Schemaic exportiert (Version { $version }) – aktualisiere, um es zu importieren)
+conn-import-url-empty = Füge eine Verbindungs-URL ein.
+conn-import-url-no-scheme = Kein Schema – eine URL beginnt mit mysql://, postgresql://, sqlserver:// oder sqlite:, eine SQL-Server-Verbindungszeichenfolge mit Server=.
+conn-import-url-unknown-scheme = Unbekanntes Schema „{ $scheme }“ – erwartet wird mysql, mariadb, postgresql, sqlserver oder sqlite.
+conn-import-url-no-host = Kein Host in der URL.
+conn-import-url-bad-port = „{ $port }“ ist keine Portnummer.
+conn-import-url-no-path = Keine Datenbankdatei nach sqlite:.
+conn-import-url-transport = „{ $server }“ wird über Named Pipes oder LocalDB erreicht – Schemaic verbindet sich nur über TCP.
+conn-import-url-userinfo = Der Servername enthält ein @ – ein Benutzername oder Passwort gehört in sein eigenes Feld, nicht in den Server.
+conn-import-url-not-sql-server = Diese Verbindungszeichenfolge sagt nicht, dass sie zu SQL Server gehört – die .NET-Treiber von MySQL und PostgreSQL schreiben dieselben Schlüsselwörter. Füge stattdessen die URL des Servers ein (mysql://, postgresql://, sqlserver://), oder schreib für SQL Server den Server als tcp:host.
+conn-import-row-overflow = Die ersten { $shown } von { $total } werden angezeigt. Die übrigen { $hidden } werden trotzdem importiert, wenn sie angehakt sind – die Liste endet hier, damit das Fenster reaktionsschnell bleibt.
 conn-import-import = Importieren
 conn-import-import-count = { $count } importieren
 blob-kind-png = PNG-Bild

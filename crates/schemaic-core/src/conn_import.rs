@@ -217,7 +217,15 @@ pub enum SkipReason {
     /// A database container whose engine port is not published to this machine
     /// — reachable only on Docker's own network, so not by the app.
     NotPublished,
-    /// The file itself did not parse. Carries the parser's complaint.
+    /// A connection URL that did not parse ([`parse_url`]'s refusal).
+    BadUrl(UrlError),
+    /// A file that is not a Schemaic connections export. Carries the JSON
+    /// reader's complaint.
+    NotAnExport(String),
+    /// A Schemaic export of a newer format version than this build reads.
+    NewerExport(u32),
+    /// The file itself did not parse. Carries the parser's complaint — a
+    /// library's text, which stays as it was written.
     Unreadable(String),
 }
 
@@ -226,10 +234,12 @@ impl SkipReason {
     ///
     /// **Redacted here, for the reason [`ImportScan::skip`] redacts the name:**
     /// this is the render-facing accessor, and every variant that carries text
-    /// carries text a *parser* chose out of the entry. `Unreadable` is the one
+    /// carries text a *parser* chose out of the entry. `BadUrl` is the one
     /// that has already put a password on screen — `UrlError::BadPort` filled it
     /// from a `postgres://admin:sec/ret@…` whose authority the parser mis-split
-    /// — and `UnsupportedEngine` carries a driver string a DSN wrote. Doing it
+    /// (it was an `Unreadable` then) — and `UnsupportedEngine` carries a driver
+    /// string a DSN wrote. The interface's wording is redacted the same way,
+    /// through [`redact_shown`]. Doing it
     /// at the one place both are rendered is what stops a fourth variant
     /// reopening it, which redacting at the constructor would not: the reason is
     /// built by the caller and the name is not.
@@ -244,9 +254,30 @@ impl SkipReason {
             SkipReason::UnsupportedEngine(d) => format!("unsupported engine ({d})"),
             SkipReason::NoServer => "no server to connect to".to_string(),
             SkipReason::NotPublished => "its port is not published to this machine".to_string(),
+            SkipReason::BadUrl(e) => format!("could not be read ({})", e.message()),
+            SkipReason::NotAnExport(e) => {
+                format!("could not be read (not a Schemaic connections export: {e})")
+            }
+            SkipReason::NewerExport(version) => format!(
+                "could not be read (exported by a newer Schemaic (version {version}) — update to \
+                 import it)"
+            ),
             SkipReason::Unreadable(e) => format!("could not be read ({e})"),
         }
     }
+}
+
+/// `shown` — a [`SkipReason`] or [`UrlError`] as the interface words it —
+/// with anything that could be a password hidden, as [`SkipReason::message`]
+/// hides it in the English.
+///
+/// **The interface's renderer must pass its sentence through this**: the
+/// reason carries text a parser chose out of the entry (see
+/// [`SkipReason::message`]), and wording it in another language does not make
+/// that text any less a password. Redacting the whole sentence rather than
+/// each argument is what keeps it the same question the English answers.
+pub fn redact_shown(shown: &str) -> String {
+    redacted(shown)
 }
 
 /// An entry that was found and is **not** being offered, so the count in the
@@ -938,7 +969,7 @@ fn needs_password(c: &Connection) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Why a pasted string is not a connection URL.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum UrlError {
     /// Nothing (or only whitespace) was pasted.
     Empty,
@@ -1713,7 +1744,7 @@ fn parse_url_scan(text: &str) -> ImportScan {
                 origin: String::new(),
                 notes,
             }),
-            Err(e) => out.skip(line.trim(), SkipReason::Unreadable(e.message())),
+            Err(e) => out.skip(line.trim(), SkipReason::BadUrl(e)),
         }
     }
     out
@@ -2119,21 +2150,12 @@ pub fn parse_schemaic(json: &str) -> ImportScan {
     let file: ExportFile = match serde_json::from_str(strip_bom(json)) {
         Ok(f) => f,
         Err(e) => {
-            out.skip(
-                "",
-                SkipReason::Unreadable(format!("not a Schemaic connections export: {e}")),
-            );
+            out.skip("", SkipReason::NotAnExport(e.to_string()));
             return out;
         }
     };
     if file.schemaic_connections > EXPORT_VERSION {
-        out.skip(
-            "",
-            SkipReason::Unreadable(format!(
-                "exported by a newer Schemaic (version {}) — update to import it",
-                file.schemaic_connections
-            )),
-        );
+        out.skip("", SkipReason::NewerExport(file.schemaic_connections));
         return out;
     }
     for c in file.connections {
@@ -2461,7 +2483,7 @@ fn parse_datagrip_project(xml: &str, local: Option<&str>, project: Option<&str>)
                 continue;
             }
             Err(e) => {
-                out.skip(pick_name(&name, &url), SkipReason::Unreadable(e.message()));
+                out.skip(pick_name(&name, &url), SkipReason::BadUrl(e));
                 continue;
             }
         };
@@ -7077,7 +7099,13 @@ mod tests {
         let s = parse_schemaic(&file.to_string());
         assert!(s.found.is_empty());
         assert!(
-            matches!(s.skipped.as_slice(), [Skipped { reason: SkipReason::Unreadable(m), .. }] if m.contains("newer")),
+            matches!(
+                s.skipped.as_slice(),
+                [Skipped {
+                    reason: SkipReason::NewerExport(2),
+                    ..
+                }]
+            ),
             "{:?}",
             s.skipped
         );
@@ -7093,7 +7121,7 @@ mod tests {
                 matches!(
                     s.skipped.as_slice(),
                     [Skipped {
-                        reason: SkipReason::Unreadable(_),
+                        reason: SkipReason::NotAnExport(_),
                         ..
                     }]
                 ),
