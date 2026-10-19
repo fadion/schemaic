@@ -2230,3 +2230,24 @@ editor-run-anyway = Run anyway
 # A squiggle's tooltip, under its message: the fix a key would make. $keys is
 # the key (Alt+Enter); $fix is what it does.
 editor-diag-fix = { $keys }: { $fix }
+
+## The editor's context menu (editor_pane.rs). AI fix is the error modal's
+## message, Format code the shortcut's, and Rename alias / Rename CTE the
+## rename dialog's titles.
+
+editor-menu-ask-ai = Ask AI
+# Explains the statement under the caret in the AI panel.
+editor-menu-explain = Explain
+editor-menu-optimise = Optimise
+# Opens the statement's query plan.
+editor-menu-plan = Plan
+editor-menu-copy-single-line = Copy as single line
+editor-menu-make-single-line = Make single line
+editor-menu-format-statement = Format statement
+editor-menu-find-usages = Find usages
+editor-menu-create-view = Create view
+# What the inline AI box shows while Optimise runs (the request it sends the
+# model stays English).
+cmdk-optimise-label = Optimise this query
+# Refused at Ctrl+Enter with several carets and no selection.
+editor-several-carets = Several carets and nothing selected: select what to run, or leave one caret

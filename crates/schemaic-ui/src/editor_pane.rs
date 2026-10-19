@@ -4359,9 +4359,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             }
                         }
                         None => guard.set(Some(crate::RunGuard {
-                            message: "Several carets and nothing selected: select what to run, \
-                                      or leave one caret"
-                                .to_string(),
+                            message: tr!("editor-several-carets"),
                             pending: None,
                         })),
                     }
@@ -5215,7 +5213,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let has_problems = ai_on && !statement_problems().1.is_empty();
                 has_problems.then(|| {
                     MenuEntry::action_icon(
-                        "AI fix",
+                        tr!("error-modal-ai-fix"),
                         (icons::SPARKLES, theme::key_foreign),
                         move || {
                             let (range, problems) = statement_problems();
@@ -5229,7 +5227,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // below the separator as plain actions.
             let ai_entries = vec![
                 MenuEntry::action_icon(
-                    "Ask AI",
+                    tr!("editor-menu-ask-ai"),
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         let off = menu_offset.get_untracked();
@@ -5252,7 +5250,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     },
                 ),
                 MenuEntry::action_icon(
-                    "Explain",
+                    tr!("editor-menu-explain"),
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         let sql = query.get_untracked();
@@ -5269,7 +5267,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     },
                 ),
                 MenuEntry::action_icon(
-                    "Optimise",
+                    tr!("editor-menu-optimise"),
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         let sql = query.get_untracked();
@@ -5297,11 +5295,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 .cursor
                                 .update(|cc| cc.set_insert(Selection::region(lo, hi)));
                             anchor_cmdk(&ed_opt, cmdk, hi, area_h);
-                            cmdk.input.set("Optimise this query".to_string());
+                            cmdk.input.set(tr!("cmdk-optimise-label"));
                             // The box shows a label; the instruction below is
                             // what the model is actually sent, retry included.
                             cmdk.intent.set(Some((
-                                "Optimise this query".to_string(),
+                                tr!("cmdk-optimise-label"),
                                 OPTIMIZE_INTENT.to_string(),
                             )));
                             inline_ai.set(InlineAiState::Busy);
@@ -5336,7 +5334,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // then found again by its label and removed, which a translated
             // label would have quietly stopped doing.
             if schemaic_core::plan::supports_plan(dialect.get_untracked()) {
-                entries.push(MenuEntry::action("Plan", move || {
+                entries.push(MenuEntry::action(tr!("editor-menu-plan"), move || {
                     let sql = query.get_untracked();
                     let dia = dialect.get_untracked();
                     let (lo, hi) = statement_range(&sql, menu_offset.get_untracked(), dia);
@@ -5380,11 +5378,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 })
             };
             if one_line().is_some() {
-                entries.push(MenuEntry::action("Copy as single line", move || {
-                    if let Some(text) = one_line() {
-                        let _ = floem::Clipboard::set_contents(text);
-                    }
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("editor-menu-copy-single-line"),
+                    move || {
+                        if let Some(text) = one_line() {
+                            let _ = floem::Clipboard::set_contents(text);
+                        }
+                    },
+                ));
             }
             // "Make single line": the same text, written over what it was
             // taken from (`sqlfmt::single_line_in_place`). Absent when that
@@ -5408,11 +5409,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             };
             if one_line_edit().is_some() {
                 let ed = ed_one_line_edit.clone();
-                entries.push(MenuEntry::action("Make single line", move || {
-                    if let Some(edit) = one_line_edit() {
-                        rewrite_range(&ed, comp, edit);
-                    }
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("editor-menu-make-single-line"),
+                    move || {
+                        if let Some(edit) = one_line_edit() {
+                            rewrite_range(&ed, comp, edit);
+                        }
+                    },
+                ));
             }
             // "Format statement": the statement under the click alone, where
             // "Format code" with no selection takes the whole document. Only
@@ -5445,7 +5449,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     .map_or(entries.len(), |i| i + 1);
                 entries.insert(
                     at,
-                    MenuEntry::action("Format statement", move || {
+                    MenuEntry::action(tr!("editor-menu-format-statement"), move || {
                         if let Some(edit) = stmt_format() {
                             rewrite_range(&ed, comp, edit);
                         }
@@ -5479,36 +5483,39 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             };
             if usages_here().is_some() {
                 let ed = ed_rename.clone();
-                entries.push(MenuEntry::action("Find usages", move || {
-                    let Some((name, rows)) = usages_here() else {
-                        return;
-                    };
-                    let back = ed
-                        .editor_view_id
-                        .get_untracked()
-                        .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
-                    let target = ed.clone();
-                    // The rows' offsets are the text's at the click: changed
-                    // under the open list (an agent's edit, say), they may name
-                    // something else, or lie past the end — so the jump is
-                    // skipped, as *Rename alias* refuses with `Changed`.
-                    let opened_on = query.get_untracked();
-                    let jump = move |a: usize, b: usize| {
-                        if query.with_untracked(|now| *now != opened_on) {
+                entries.push(MenuEntry::action(
+                    tr!("editor-menu-find-usages"),
+                    move || {
+                        let Some((name, rows)) = usages_here() else {
                             return;
-                        }
-                        target
-                            .cursor
-                            .update(|c| c.set_insert(Selection::region(a, b)));
-                        target.center_window();
-                    };
-                    usages.set(Some(crate::UsagesRequest {
-                        name,
-                        rows,
-                        jump: Rc::new(jump),
-                        back,
-                    }));
-                }));
+                        };
+                        let back = ed
+                            .editor_view_id
+                            .get_untracked()
+                            .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
+                        let target = ed.clone();
+                        // The rows' offsets are the text's at the click: changed
+                        // under the open list (an agent's edit, say), they may name
+                        // something else, or lie past the end — so the jump is
+                        // skipped, as *Rename alias* refuses with `Changed`.
+                        let opened_on = query.get_untracked();
+                        let jump = move |a: usize, b: usize| {
+                            if query.with_untracked(|now| *now != opened_on) {
+                                return;
+                            }
+                            target
+                                .cursor
+                                .update(|c| c.set_insert(Selection::region(a, b)));
+                            target.center_window();
+                        };
+                        usages.set(Some(crate::UsagesRequest {
+                            name,
+                            rows,
+                            jump: Rc::new(jump),
+                            back,
+                        }));
+                    },
+                ));
             }
             let alias_name = move || {
                 query.with_untracked(|sql| {
@@ -5522,52 +5529,55 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             };
             if alias_name().is_some() {
                 let ed = ed_rename.clone();
-                entries.push(MenuEntry::action("Rename alias", move || {
-                    let Some((name, output)) = alias_name() else {
-                        return;
-                    };
-                    let at = menu_offset.get_untracked();
-                    // The text the offset was taken in: changed under the
-                    // dialog (an agent's edit, say), `at` may be on another
-                    // alias than the one the field names, so it refuses.
-                    let opened_on = query.get_untracked();
-                    // The keyboard comes back here however the dialog closes:
-                    // its root's own hand-back finds no other root to give it.
-                    let back = ed
-                        .editor_view_id
-                        .get_untracked()
-                        .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
-                    let ed = ed.clone();
-                    let apply = move |new: &str| {
-                        let m = query.with_untracked(|sql| {
-                            if *sql != opened_on {
-                                return Err(intel::AliasRenameRefusal::Changed);
+                entries.push(MenuEntry::action(
+                    tr!("alias-rename-title-alias"),
+                    move || {
+                        let Some((name, output)) = alias_name() else {
+                            return;
+                        };
+                        let at = menu_offset.get_untracked();
+                        // The text the offset was taken in: changed under the
+                        // dialog (an agent's edit, say), `at` may be on another
+                        // alias than the one the field names, so it refuses.
+                        let opened_on = query.get_untracked();
+                        // The keyboard comes back here however the dialog closes:
+                        // its root's own hand-back finds no other root to give it.
+                        let back = ed
+                            .editor_view_id
+                            .get_untracked()
+                            .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
+                        let ed = ed.clone();
+                        let apply = move |new: &str| {
+                            let m = query.with_untracked(|sql| {
+                                if *sql != opened_on {
+                                    return Err(intel::AliasRenameRefusal::Changed);
+                                }
+                                if output {
+                                    intel::output_alias_rename(
+                                        sql,
+                                        at,
+                                        new,
+                                        dialect.get_untracked(),
+                                        &catalog(),
+                                    )
+                                } else {
+                                    intel::alias_rename(sql, at, new, dialect.get_untracked())
+                                }
+                            })?;
+                            if !edit_untyped_multi(&ed, comp, &m, EditType::Other) {
+                                return Err(intel::AliasRenameRefusal::ReadOnly);
                             }
-                            if output {
-                                intel::output_alias_rename(
-                                    sql,
-                                    at,
-                                    new,
-                                    dialect.get_untracked(),
-                                    &catalog(),
-                                )
-                            } else {
-                                intel::alias_rename(sql, at, new, dialect.get_untracked())
-                            }
-                        })?;
-                        if !edit_untyped_multi(&ed, comp, &m, EditType::Other) {
-                            return Err(intel::AliasRenameRefusal::ReadOnly);
-                        }
-                        Ok(())
-                    };
-                    alias_rename.set(Some(crate::AliasRenameRequest {
-                        title: crate::i18n::tr!("alias-rename-title-alias"),
-                        placeholder: crate::i18n::tr!("alias-rename-placeholder-alias"),
-                        name,
-                        apply: Rc::new(apply),
-                        back,
-                    }));
-                }));
+                            Ok(())
+                        };
+                        alias_rename.set(Some(crate::AliasRenameRequest {
+                            title: crate::i18n::tr!("alias-rename-title-alias"),
+                            placeholder: crate::i18n::tr!("alias-rename-placeholder-alias"),
+                            name,
+                            apply: Rc::new(apply),
+                            back,
+                        }));
+                    },
+                ));
             }
             // "Rename CTE": the same dialog over a CTE's declaration or a
             // reference bound to it, renamed by scope through
@@ -5579,37 +5589,40 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             };
             if cte_name().is_some() {
                 let ed = ed_rename.clone();
-                entries.push(MenuEntry::action("Rename CTE", move || {
-                    let Some(name) = cte_name() else {
-                        return;
-                    };
-                    let at = menu_offset.get_untracked();
-                    let opened_on = query.get_untracked();
-                    let back = ed
-                        .editor_view_id
-                        .get_untracked()
-                        .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
-                    let ed = ed.clone();
-                    let apply = move |new: &str| {
-                        let m = query.with_untracked(|sql| {
-                            if *sql != opened_on {
-                                return Err(intel::AliasRenameRefusal::Changed);
+                entries.push(MenuEntry::action(
+                    tr!("alias-rename-title-cte"),
+                    move || {
+                        let Some(name) = cte_name() else {
+                            return;
+                        };
+                        let at = menu_offset.get_untracked();
+                        let opened_on = query.get_untracked();
+                        let back = ed
+                            .editor_view_id
+                            .get_untracked()
+                            .map(|vid| crate::widgets::menu_return(move || vid.request_focus()));
+                        let ed = ed.clone();
+                        let apply = move |new: &str| {
+                            let m = query.with_untracked(|sql| {
+                                if *sql != opened_on {
+                                    return Err(intel::AliasRenameRefusal::Changed);
+                                }
+                                intel::cte_rename(sql, at, new, dialect.get_untracked())
+                            })?;
+                            if !edit_untyped_multi(&ed, comp, &m, EditType::Other) {
+                                return Err(intel::AliasRenameRefusal::ReadOnly);
                             }
-                            intel::cte_rename(sql, at, new, dialect.get_untracked())
-                        })?;
-                        if !edit_untyped_multi(&ed, comp, &m, EditType::Other) {
-                            return Err(intel::AliasRenameRefusal::ReadOnly);
-                        }
-                        Ok(())
-                    };
-                    alias_rename.set(Some(crate::AliasRenameRequest {
-                        title: crate::i18n::tr!("alias-rename-title-cte"),
-                        placeholder: crate::i18n::tr!("alias-rename-placeholder-cte"),
-                        name,
-                        apply: Rc::new(apply),
-                        back,
-                    }));
-                }));
+                            Ok(())
+                        };
+                        alias_rename.set(Some(crate::AliasRenameRequest {
+                            title: crate::i18n::tr!("alias-rename-title-cte"),
+                            placeholder: crate::i18n::tr!("alias-rename-placeholder-cte"),
+                            name,
+                            apply: Rc::new(apply),
+                            back,
+                        }));
+                    },
+                ));
             }
             // First when it's there: over a squiggle it is the most specific
             // thing this menu can offer, and the one the user came for.
@@ -5637,9 +5650,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Its own group, as in the schema tree: it's the one entry here
                 // that ends at a statement against the database.
                 entries.push(MenuEntry::Separator);
-                entries.push(MenuEntry::action("Create view", move || {
-                    (make_view)(stmt.clone());
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("editor-menu-create-view"),
+                    move || {
+                        (make_view)(stmt.clone());
+                    },
+                ));
             }
             entries
         })
