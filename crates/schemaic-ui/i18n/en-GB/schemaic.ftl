@@ -1924,3 +1924,52 @@ grid-menu-copy-name = Copy name
 grid-menu-copy-qualified-name = Copy qualified name
 grid-menu-copy-values = Copy values
 grid-menu-sql-in-list = SQL IN list
+
+## The results grid's toolbar (grid.rs) — the status line, the commit and row
+## controls, and the copy, save, AI and chart icons.
+
+# The status line. $rows is core's phrase for what was read (1,000 of ~4.2m
+# rows (capped)), which stays English for now; $ms is the run time.
+grid-stats = { $rows } · { $cols ->
+    [one] { $cols } col
+   *[other] { $cols } cols
+} · { $ms } ms
+# The same, led by the database the result came from.
+grid-stats-in-database = { $database } · { $rows } · { $cols ->
+    [one] { $cols } col
+   *[other] { $cols } cols
+} · { $ms } ms
+# Beside the status line for a result kept (pinned) on its panel.
+grid-kept-note = · kept — read-only
+# $columns lists the columns whose values ran past what the grid holds.
+grid-arena-note = · { $columns } too large to hold in full — later rows show blank
+grid-sorted-subset = · sorted subset (capped) — not the full order
+# Replaces the "read all rows" offer while that re-read runs.
+grid-reading = reading…
+grid-committing = Committing…
+# $keys is the shortcut (Ctrl+Enter), in the keyboard's own legends.
+grid-commit-tip = { $count ->
+    [one] Commit { $count } change ({ $keys })
+   *[other] Commit { $count } changes ({ $keys })
+}
+grid-discard-tip = Discard all pending changes
+grid-copy-sql-tip = Copy the changes as SQL
+grid-add-row-tip = Add a row
+# $key is the Delete key's legend.
+grid-delete-row-tip = Mark the selected row for deletion ({ $key })
+grid-clone-row-tip = Clone the selected row
+grid-copy-results-tip = Copy the results…
+grid-copy-results-empty = Nothing to copy — no rows
+grid-save-results-tip = Save the results to a file…
+grid-save-results-empty = Nothing to save — no rows
+grid-ai-tip = Generate rows with AI…
+grid-ai-generating = Generating…
+# The AI menu's one entry on a connection whose data access is schema-only.
+grid-ai-off = AI actions send data — off for this connection
+grid-ai-fill-value = AI fill value
+grid-ai-insert-row = AI insert row
+grid-ai-seed-table = AI seed table
+grid-chart-tip = Chart the results
+grid-chart-empty = Nothing to chart — no rows
+# What the chart's title (Chart — …) calls a result charted from the grid.
+grid-chart-this-result = this result

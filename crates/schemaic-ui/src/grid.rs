@@ -48,7 +48,6 @@ use schemaic_core::model::{
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
 use schemaic_core::summary;
-use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
@@ -9009,7 +9008,6 @@ fn grid_toolbar(
     // selection moves on, and a result that outlived it must not claim the new one
     // (`ResultSet::database`). A connection with no default database says nothing
     // rather than inventing a name.
-    let scope = database.map(|d| format!("{d} · ")).unwrap_or_default();
     // A `label` rather than `text`, for the one part of this line that isn't
     // settled at build time: a capped result's total arrives from a catalogue
     // query, and the line reads `1,000 of ~4.2m rows` once it does. The row
@@ -9023,11 +9021,18 @@ fn grid_toolbar(
     // narrow panel eats the database name and the timing before it touches an
     // action or a warning.
     let stats = label(move || {
-        format!(
-            "{scope}{} · {ncols} {} · {elapsed_ms} ms",
-            schemaic_core::stats::rows_read_clause(nrows, row_total.get(), truncated),
-            plural(ncols, "col", "cols"),
-        )
+        let rows = schemaic_core::stats::rows_read_clause(nrows, row_total.get(), truncated);
+        let ms = elapsed_ms.to_string();
+        match &database {
+            None => tr!("grid-stats", rows = rows, cols = ncols, ms = ms),
+            Some(d) => tr!(
+                "grid-stats-in-database",
+                database = d.clone(),
+                rows = rows,
+                cols = ncols,
+                ms = ms
+            ),
+        }
     })
     .style(|s| {
         s.color(theme::text_dim())
@@ -9045,7 +9050,7 @@ fn grid_toolbar(
     // reactive show-hide, and here it is also the safe construction: this line
     // reacts to a pin, and a `dyn_container` that rebuilds while the grid around
     // it is being torn down is how the strip crashed once already.
-    let kept_note = text("· kept — read-only").style(move |s| {
+    let kept_note = text(tr!("grid-kept-note")).style(move |s| {
         let s = s
             .color(theme::text_muted())
             .font_size(theme::font_label())
@@ -9063,24 +9068,21 @@ fn grid_toolbar(
         // list can be long enough to push the whole strip on its own, and a
         // warning nobody can read because it shoved the buttons off the edge is
         // worse than one that ends in `…`.
-        text(format!(
-            "· {} too large to hold in full — later rows show blank",
-            capped_columns.join(", ")
-        ))
-        .style(|s| {
-            s.color(theme::error())
-                .font_size(theme::font_label())
-                .min_width(0.0)
-                .text_ellipsis()
-        })
-        .into_any()
+        text(tr!("grid-arena-note", columns = capped_columns.join(", ")))
+            .style(|s| {
+                s.color(theme::error())
+                    .font_size(theme::font_label())
+                    .min_width(0.0)
+                    .text_ellipsis()
+            })
+            .into_any()
     };
     // Sorting a capped result reorders only the fetched subset — flag it.
     let caveat = dyn_container(
         move || truncated && sort.get().is_some(),
         move |show| {
             if show {
-                text("· sorted subset (capped) — not the full order")
+                text(tr!("grid-sorted-subset"))
                     .style(|s| {
                         s.color(theme::error())
                             .font_size(theme::font_label())
@@ -9164,7 +9166,7 @@ fn grid_toolbar(
                         // The present participle the rest of the app answers with
                         // while it works ("Committing…" two controls to the
                         // right), and the same verb the offer itself used.
-                        "reading…".to_string()
+                        tr!("grid-reading")
                     } else {
                         schemaic_core::stats::read_more_offer(nrows, row_total.get()).1
                     }
@@ -9351,7 +9353,7 @@ fn grid_toolbar(
                 return empty().into_any();
             }
             let label = if busy {
-                "Committing…".to_string()
+                tr!("grid-committing")
             } else {
                 format!("{n}")
             };
@@ -9395,11 +9397,9 @@ fn grid_toolbar(
                 // two said Ctrl.
                 let keys = crate::shortcuts::keys_label("Ctrl+Enter");
                 let t = if busy {
-                    "Committing…".to_string()
-                } else if n == 1 {
-                    format!("Commit 1 change ({keys})")
+                    tr!("grid-committing")
                 } else {
-                    format!("Commit {n} changes ({keys})")
+                    tr!("grid-commit-tip", count = n, keys = keys.into_owned())
                 };
                 text(t).style(crate::widgets::tooltip_style)
             });
@@ -9426,7 +9426,7 @@ fn grid_toolbar(
             // "all", because it throws away the pending deletes and new rows too,
             // not just the edited cells — the ✗ sits next to a count that reads
             // like it belongs to the ✓ alone.
-            .tooltip(|| text("Discard all pending changes").style(crate::widgets::tooltip_style));
+            .tooltip(|| text(tr!("grid-discard-tip")).style(crate::widgets::tooltip_style));
             // After the commit/discard pair it is about, so the two stay
             // side by side: what the tick would send, as text.
             let sql_hov = RwSignal::new(false);
@@ -9449,7 +9449,7 @@ fn grid_toolbar(
                     .padding_horiz(theme::scaled(5.0))
                     .cursor(CursorStyle::Default)
             })
-            .tooltip(|| text("Copy the changes as SQL").style(crate::widgets::tooltip_style));
+            .tooltip(|| text(tr!("grid-copy-sql-tip")).style(crate::widgets::tooltip_style));
             let (r1, r2, r3) = (
                 strip_commit.clone(),
                 strip_commit.clone(),
@@ -9547,7 +9547,9 @@ fn grid_toolbar(
             h_stack((
                 in_strip_button(
                     toolbar_icon(icons::PLUS, 0.0, 0.0, || true, move || add_pending_row(gs))
-                        .tooltip(|| text("Add a row").style(crate::widgets::tooltip_style)),
+                        .tooltip(|| {
+                            text(tr!("grid-add-row-tip")).style(crate::widgets::tooltip_style)
+                        }),
                     r1,
                     TB_ADD,
                     true,
@@ -9557,8 +9559,11 @@ fn grid_toolbar(
                 ),
                 in_strip_button(
                     toolbar_icon(icons::MINUS, 0.0, 0.0, row_selected, del).tooltip(|| {
-                        text("Mark the selected row for deletion (Del)")
-                            .style(crate::widgets::tooltip_style)
+                        text(tr!(
+                            "grid-delete-row-tip",
+                            key = crate::shortcuts::keys_label("Del").into_owned()
+                        ))
+                        .style(crate::widgets::tooltip_style)
                     }),
                     r2,
                     TB_DELETE,
@@ -9569,7 +9574,7 @@ fn grid_toolbar(
                 ),
                 in_strip_button(
                     toolbar_icon(icons::COPY_PLUS, 0.0, 0.0, row_selected, clone).tooltip(|| {
-                        text("Clone the selected row").style(crate::widgets::tooltip_style)
+                        text(tr!("grid-clone-row-tip")).style(crate::widgets::tooltip_style)
                     }),
                     r3,
                     TB_CLONE,
@@ -9688,9 +9693,9 @@ fn grid_toolbar(
     // line says `0 rows` a few pixels away, but nothing joins the two.
     .tooltip(move || {
         text(if has_rows() {
-            "Copy the results…"
+            tr!("grid-copy-results-tip")
         } else {
-            "Nothing to copy — no rows"
+            tr!("grid-copy-results-empty")
         })
         .style(crate::widgets::tooltip_style)
     });
@@ -9751,9 +9756,9 @@ fn grid_toolbar(
     // Its empty-result tip is its twin's too — see `copy_menu`.
     .tooltip(move || {
         text(if has_rows() {
-            "Save the results to a file…"
+            tr!("grid-save-results-tip")
         } else {
-            "Nothing to save — no rows"
+            tr!("grid-save-results-empty")
         })
         .style(crate::widgets::tooltip_style)
     });
@@ -9821,25 +9826,22 @@ fn grid_toolbar(
                 let entries = if !ai_data_of(gs).may_attach() {
                     // One `popup.set` per opener (see the `popup_anchor_gate`
                     // test): the refusal is an entry, not an early return.
-                    vec![
-                        MenuEntry::action("AI actions send data — off for this connection", || {})
-                            .disabled(true),
-                    ]
+                    vec![MenuEntry::action(tr!("grid-ai-off"), || {}).disabled(true)]
                 } else {
                     vec![
                         MenuEntry::action_icon(
-                            "AI fill value",
+                            tr!("grid-ai-fill-value"),
                             (icons::SPARKLES, theme::key_foreign),
                             move || ai_fill_value(gs),
                         )
                         .disabled(!fill_enabled),
                         MenuEntry::action_icon(
-                            "AI insert row",
+                            tr!("grid-ai-insert-row"),
                             (icons::SPARKLES, theme::key_foreign),
                             move || ai_insert_row(gs),
                         ),
                         MenuEntry::action_icon(
-                            "AI seed table",
+                            tr!("grid-ai-seed-table"),
                             (icons::SPARKLES, theme::key_foreign),
                             move || open_seed_popover(gs),
                         ),
@@ -9897,9 +9899,9 @@ fn grid_toolbar(
             // only thing on screen disagreeing with the greyed glyph.
             .tooltip(move || {
                 let t = if gs.ai_busy.get() {
-                    "Generating…"
+                    tr!("grid-ai-generating")
                 } else {
-                    "Generate rows with AI…"
+                    tr!("grid-ai-tip")
                 };
                 text(t).style(crate::widgets::tooltip_style)
             });
@@ -9926,7 +9928,7 @@ fn grid_toolbar(
     let open_chart: Rc<dyn Fn()> = gated_action(has_rows, move || {
         gs.chart.set(Some(crate::ChartTarget {
             rs: gs.rs.get_untracked(),
-            title: "this result".to_string(),
+            title: tr!("grid-chart-this-result"),
         }));
     });
     let chart_hov = RwSignal::new(false);
@@ -9952,9 +9954,9 @@ fn grid_toolbar(
     })
     .tooltip(move || {
         text(if has_rows() {
-            "Chart the results"
+            tr!("grid-chart-tip")
         } else {
-            "Nothing to chart — no rows"
+            tr!("grid-chart-empty")
         })
         .style(crate::widgets::tooltip_style)
     });
@@ -16016,7 +16018,7 @@ mod find_hits_tests {
 }
 
 #[cfg(test)]
-mod menu_words_tests {
+mod catalogue_tests {
     use super::*;
     use schemaic_core::edit::CopyScope;
 
@@ -16047,6 +16049,42 @@ mod menu_words_tests {
         assert_eq!(
             tr!("grid-attach-to-chat", scope = "2 rows × 3 columns"),
             "Attach 2 rows × 3 columns to chat"
+        );
+    }
+
+    /// The toolbar's status line and tooltips read as they did when they were
+    /// assembled in place.
+    #[test]
+    fn the_toolbar_lines_read_as_they_did_in_english() {
+        assert_eq!(
+            tr!("grid-stats", rows = "1 row", cols = 1, ms = "4"),
+            "1 row · 1 col · 4 ms"
+        );
+        assert_eq!(
+            tr!(
+                "grid-stats-in-database",
+                database = "shop",
+                rows = "1,000 of ~4.2m rows",
+                cols = 12,
+                ms = "1234"
+            ),
+            "shop · 1,000 of ~4.2m rows · 12 cols · 1234 ms"
+        );
+        assert_eq!(
+            tr!("grid-commit-tip", count = 1, keys = "Ctrl+Enter"),
+            "Commit 1 change (Ctrl+Enter)"
+        );
+        assert_eq!(
+            tr!("grid-commit-tip", count = 5, keys = "Ctrl+Enter"),
+            "Commit 5 changes (Ctrl+Enter)"
+        );
+        assert_eq!(
+            tr!("grid-delete-row-tip", key = "Del"),
+            "Mark the selected row for deletion (Del)"
+        );
+        assert_eq!(
+            tr!("grid-arena-note", columns = "body, blob"),
+            "· body, blob too large to hold in full — later rows show blank"
         );
     }
 }

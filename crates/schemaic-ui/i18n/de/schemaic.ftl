@@ -1633,3 +1633,38 @@ grid-menu-copy-name = Namen kopieren
 grid-menu-copy-qualified-name = Qualifizierten Namen kopieren
 grid-menu-copy-values = Werte kopieren
 grid-menu-sql-in-list = SQL-IN-Liste
+grid-stats = { $rows } · { $cols ->
+    [one] { $cols } Spalte
+   *[other] { $cols } Spalten
+} · { $ms } ms
+grid-stats-in-database = { $database } · { $rows } · { $cols ->
+    [one] { $cols } Spalte
+   *[other] { $cols } Spalten
+} · { $ms } ms
+grid-kept-note = · behalten — schreibgeschützt
+grid-arena-note = · { $columns } zu groß, um vollständig gehalten zu werden — spätere Zeilen bleiben leer
+grid-sorted-subset = · sortierte Teilmenge (begrenzt) — nicht die vollständige Reihenfolge
+grid-reading = wird gelesen…
+grid-committing = Wird committet…
+grid-commit-tip = { $count ->
+    [one] { $count } Änderung committen ({ $keys })
+   *[other] { $count } Änderungen committen ({ $keys })
+}
+grid-discard-tip = Alle ausstehenden Änderungen verwerfen
+grid-copy-sql-tip = Die Änderungen als SQL kopieren
+grid-add-row-tip = Zeile hinzufügen
+grid-delete-row-tip = Die ausgewählte Zeile zum Löschen markieren ({ $key })
+grid-clone-row-tip = Die ausgewählte Zeile klonen
+grid-copy-results-tip = Die Ergebnisse kopieren…
+grid-copy-results-empty = Nichts zu kopieren — keine Zeilen
+grid-save-results-tip = Die Ergebnisse in eine Datei speichern…
+grid-save-results-empty = Nichts zu speichern — keine Zeilen
+grid-ai-tip = Zeilen mit KI erzeugen…
+grid-ai-generating = Wird erzeugt…
+grid-ai-off = KI-Aktionen senden Daten — für diese Verbindung ausgeschaltet
+grid-ai-fill-value = Wert mit KI ausfüllen
+grid-ai-insert-row = Zeile mit KI einfügen
+grid-ai-seed-table = Tabelle mit KI befüllen
+grid-chart-tip = Die Ergebnisse als Diagramm darstellen
+grid-chart-empty = Nichts darzustellen — keine Zeilen
+grid-chart-this-result = dieses Ergebnis
