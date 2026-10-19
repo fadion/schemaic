@@ -2194,3 +2194,8 @@ results-menu-close-all = Close all results
 ## Find Anywhere's search field (lib.rs's search_box).
 
 search-everywhere-placeholder = Search everywhere
+
+## Shared widgets (widgets.rs).
+
+# The one entry of a picker whose list is empty.
+widgets-nothing-to-choose = Nothing to choose from

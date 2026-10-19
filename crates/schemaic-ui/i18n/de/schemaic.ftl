@@ -1798,3 +1798,4 @@ results-menu-compare-with = Vergleichen mit { $result }
 results-menu-close-others = Andere Ergebnisse schließen
 results-menu-close-all = Alle Ergebnisse schließen
 search-everywhere-placeholder = Überall suchen
+widgets-nothing-to-choose = Nichts zur Auswahl

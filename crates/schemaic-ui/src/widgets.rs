@@ -4939,7 +4939,9 @@ pub(crate) fn open_picker(
 /// does and why its own wording still wins.
 fn noted_if_empty(entries: Vec<MenuEntry>) -> Vec<MenuEntry> {
     if entries.is_empty() {
-        return vec![MenuEntry::action("Nothing to choose from", || {}).disabled(true)];
+        return vec![
+            MenuEntry::action(crate::i18n::tr!("widgets-nothing-to-choose"), || {}).disabled(true),
+        ];
     }
     entries
 }
