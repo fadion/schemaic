@@ -2947,8 +2947,18 @@ editor-run-anyway = Run anyway
 # What the run guard says (core's sql::GuardReason), on the guard bar and in
 # the script panel's error line. SQL keywords stay as the statement spelt them.
 guard-read-only = Read-only connection.
-# $reason is the read-only gate's own reason, which stays English for now.
+# $reason is one of the read-only-* messages below.
 guard-read-only-refused = Read-only connection: { $reason }
+# Why the read-only gate refused a statement (core's sql::ReadOnlyReason),
+# after "Read-only connection:", so each starts in lower case. $heads is the
+# statements the engine reads with, joined by "/" (SELECT/SHOW/…); $word,
+# $name and $clause are SQL as the statement spelt it, in backticks.
+read-only-several = only a single statement is allowed
+read-only-not-a-read = only read-only queries ({ $heads }) are allowed
+read-only-denied = `{ $word }` is not permitted in a read-only query
+read-only-advances-sequence = `NEXT VALUE FOR` advances a sequence, which a read-only query does not
+read-only-unlisted-call = `{ $name }` is not a function known to be read-only, so it is not permitted in a read-only query; functions from extensions or defined in the database are refused too
+read-only-locks = `{ $clause }` locks the rows it reads, which a read-only query does not; drop the locking clause
 guard-no-database = No database selected.
 guard-writes-one = This statement modifies data.
 guard-writes-several = These statements modify data.

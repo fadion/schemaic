@@ -1204,17 +1204,23 @@ existing prose was left alone.
     TRUNCATE PARTITION ALL`, a `TRUNCATE` by another name.
     **What the guard says is a value, not a sentence** — phase 4 of *Interface translation*.
     `RunVerdict::Block`/`Confirm` carry a `GuardReason` — `ReadOnly`, `ReadOnlyRefused` with
-    `read_only_reason`'s text, `NoDatabase`, `Unsafe`, `Writes { several }`, `Script { file }`
-    (`script_verdict`'s confirmation) and `Staged { after, changes }` (`filter::with_staged_question`)
+    `read_only_refusal`'s `ReadOnlyReason`, `NoDatabase`, `Unsafe`, `Writes { several }`,
+    `Script { file }` (`script_verdict`'s confirmation) and `Staged { after, changes }` (`filter::with_staged_question`)
     — and `unsafe_reason`, `every_row_reason`, `drop_reason` and `first_unsafe` answer
     `Option<Unsafe>`: what the statement destroys, with the SQL keyword it spelt as a
     `&'static str` where there is a choice (`NoWhere { kind }`, `DropContainer { obj }`,
     `DropCascade { obj }`, `ReplaceContainer { obj }`). Each has `message()`, byte for byte the
     `String` it replaced, and no `Display`; the CLI says it, the editor words the value
     (`ui::i18n::guard_reason_text`, under *The string catalogue*). `NO_DATABASE_SELECTED` stays as
-    `NoDatabase`'s English. `ReadOnlyRefused` still holds an English sentence, because the MCP
-    server and `schemaic query` say `read_only_reason`'s text too. No decision moved with the
-    type: every arm, its order and the statements it fires on are as described above.
+    `NoDatabase`'s English. The read-only gate's own refusal is a value too: `read_only_refusal`
+    answers a `ReadRefusal` whose `reason` is a `ReadOnlyReason` — `Several`, `NotARead { heads }`,
+    `Denied { word }`, `AdvancesSequence`, `UnlistedCall { name }`, `Locks { clause }`, each field
+    SQL the statement spelt — and `ReadOnlyReason::message` is the English, byte for byte the
+    sentences it used to return. `read_only_reason` still answers `Result<(), String>` with that
+    English, for the callers that say or test it as text (`filter.rs`, `write_log.rs`, `mssql.rs`'s
+    `DbError::Refused`); `cli::query::gate` says `message()`, the CLI and the MCP server staying
+    English. No decision moved with the type: every arm, its order and the statements it fires on
+    are as described above.
     **Both halves judge the statement an executing prefix runs, not the prefix.** `EXPLAIN ANALYZE`
     (with `VERBOSE`/`FORMAT=…`), PostgreSQL's `EXPLAIN (… ANALYZE …)` option list and MariaDB's bare
     `ANALYZE [FORMAT=JSON]` execute what they explain, and every arm reads a head, so `EXPLAIN
@@ -40764,8 +40770,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below), nor the
     startup and keyring notices (`persist::Notice`, below), nor the file import's refusals, memory
     warnings and problem-list tail (`import::ReadRefusal`, below), nor the plan modal's warnings
-    (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below) — though
-    `read_only_reason`'s own sentence inside one still is — nor the filter field's two refusals
+    (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below), the
+    read-only gate's `ReadOnlyReason` inside one included, nor the filter field's two refusals
     (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is, nor the
     account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor any object editor's
     refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`/`ObjectProblem`/
@@ -40979,8 +40985,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     a plural on `$n`, and after another reason the two are joined with a space in code, as core's
     English joins them. The app's `guarded_run`/`guarded_run_all` set `RunGuard.message` from it,
     and `ScriptRequest::approved`'s `Err` is it — only ever a `Block` there, since the script panel
-    answers the `Confirm`. `ReadOnlyRefused`'s `$reason` is `read_only_reason`'s sentence and stays
-    English, the MCP server and `schemaic query` saying it too. The CLI keeps core's `message`, and
+    answers the `Confirm`. `ReadOnlyRefused`'s `$reason` is a `sql::ReadOnlyReason`, which the
+    private `read_only_reason_text` words from `read-only-*` — `$heads` joined with `/` as core joins
+    them, `$word`, `$name` and `$clause` SQL and spelt as the statement had them — so the guard bar
+    on a read-only SQL Server connection, the one place the editor asks that gate
+    (`read_only_is_a_rollback`), reads wholly in the interface's language; it used to splice
+    `read_only_reason`'s English into a translated sentence.
+    `english_says_every_read_only_reason_as_core_does` holds each reason equal to `message`, bare
+    and inside `ReadOnlyRefused`, over every engine's heads. The CLI keeps core's `message`, and
     its `refused_for_no_database` now matches the `NoDatabase` variant (`cli/run.rs`).
     `english_says_every_guard_reason_as_core_does` holds every reason equal to `message`, each
     keyword an `Unsafe` carries, and the staged question alone and after another over one change

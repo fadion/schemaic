@@ -684,8 +684,8 @@ pub fn guard_reason_text(r: &schemaic_core::sql::GuardReason) -> String {
     use schemaic_core::sql::GuardReason;
     match r {
         GuardReason::ReadOnly => tr!("guard-read-only"),
-        GuardReason::ReadOnlyRefused(reason) => {
-            tr!("guard-read-only-refused", reason = reason.as_str())
+        GuardReason::ReadOnlyRefused(r) => {
+            tr!("guard-read-only-refused", reason = read_only_reason_text(r))
         }
         GuardReason::NoDatabase => tr!("guard-no-database"),
         GuardReason::Unsafe(u) => unsafe_text(u),
@@ -701,6 +701,26 @@ pub fn guard_reason_text(r: &schemaic_core::sql::GuardReason) -> String {
                 None => note,
             }
         }
+    }
+}
+
+/// What the read-only gate refused a statement for — core's
+/// `sql::ReadOnlyReason::message` in the interface's language, said inside the
+/// guard's read-only refusal. The keywords and names inside stay as SQL; the
+/// heads are joined with `/` as core joins them.
+fn read_only_reason_text(r: &schemaic_core::sql::ReadOnlyReason) -> String {
+    use schemaic_core::sql::ReadOnlyReason;
+    match r {
+        ReadOnlyReason::Several => tr!("read-only-several"),
+        ReadOnlyReason::NotARead { heads } => {
+            tr!("read-only-not-a-read", heads = heads.join("/"))
+        }
+        ReadOnlyReason::Denied { word } => tr!("read-only-denied", word = word.as_str()),
+        ReadOnlyReason::AdvancesSequence => tr!("read-only-advances-sequence"),
+        ReadOnlyReason::UnlistedCall { name } => {
+            tr!("read-only-unlisted-call", name = name.as_str())
+        }
+        &ReadOnlyReason::Locks { clause } => tr!("read-only-locks", clause = clause),
     }
 }
 
@@ -774,7 +794,7 @@ mod tests {
         use schemaic_core::sql::{GuardReason, Unsafe};
         let mut reasons = vec![
             GuardReason::ReadOnly,
-            GuardReason::ReadOnlyRefused("only a single statement is allowed".into()),
+            GuardReason::ReadOnlyRefused(schemaic_core::sql::ReadOnlyReason::Several),
             GuardReason::NoDatabase,
             GuardReason::Writes { several: false },
             GuardReason::Writes { several: true },
@@ -817,6 +837,43 @@ mod tests {
         }
         for r in reasons {
             assert_eq!(guard_reason_text(&r), r.message(), "{r:?}");
+        }
+    }
+
+    /// **Every reason the read-only gate refuses with reads in English
+    /// exactly as core's `ReadOnlyReason::message`**, on its own and inside
+    /// the guard's read-only refusal — over each engine's list of heads.
+    #[test]
+    fn english_says_every_read_only_reason_as_core_does() {
+        use schemaic_core::intel::SqlDialect;
+        use schemaic_core::sql::{GuardReason, ReadOnlyReason, read_only_heads};
+        let mut reasons = vec![
+            ReadOnlyReason::Several,
+            ReadOnlyReason::Denied {
+                word: "SLEEP".into(),
+            },
+            ReadOnlyReason::AdvancesSequence,
+            ReadOnlyReason::UnlistedCall {
+                name: "my_func".into(),
+            },
+            ReadOnlyReason::Locks {
+                clause: "FOR UPDATE",
+            },
+        ];
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            reasons.push(ReadOnlyReason::NotARead {
+                heads: read_only_heads(d),
+            });
+        }
+        for r in reasons {
+            assert_eq!(read_only_reason_text(&r), r.message(), "{r:?}");
+            let g = GuardReason::ReadOnlyRefused(r);
+            assert_eq!(guard_reason_text(&g), g.message(), "{g:?}");
         }
     }
 

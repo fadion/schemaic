@@ -117,9 +117,9 @@ pub fn gate(sql: &str, dialect: schemaic_core::intel::SqlDialect) -> Result<&str
     let stmt = normalize_stmt(sql).ok_or(NoRows::Empty)?;
     schemaic_core::sql::read_only_refusal(stmt, dialect).map_err(|r| {
         if r.writes {
-            NoRows::NotARead(r.reason)
+            NoRows::NotARead(r.reason.message())
         } else {
-            NoRows::NotPermitted(r.reason)
+            NoRows::NotPermitted(r.reason.message())
         }
     })?;
     Ok(stmt)

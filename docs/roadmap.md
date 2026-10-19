@@ -103,7 +103,9 @@ assertions pin English wording — stays the regression net throughout.
    carries beside `Read`'s library text, `MemoryWarning`, `IssueTail`;
    `i18n::import_error_text`, `read_refusal_text`), and the plan modal's warnings
    (`plan::PlanNote`, `ServerWarning`; `plan_view::plan_note_text`), and the run guard
-   (`sql::GuardReason`, `Unsafe`, which `RunVerdict` carries; `i18n::guard_reason_text`), and
+   (`sql::GuardReason`, `Unsafe`, which `RunVerdict` carries; `i18n::guard_reason_text`) with
+   the read-only gate's reasons inside it (`sql::ReadOnlyReason`, which `ReadRefusal` carries
+   and the MCP server and `schemaic query` still say in English), and
    the filter field's refusals (`FilterError::BracketInName`, `TrailingInput` beside
    `BadCondition`'s parser text; `grid::filter_error_text`), and the users browser's notes
    (`users::PrincipalsNote`, `GrantsNote`, `PgImplicit`, which `schemaic-db` now fills as
@@ -135,9 +137,6 @@ assertions pin English wording — stays the regression net throughout.
      `unsupported`, `used_by::change_warnings`/`drop_warning`, the compare plan's `omitted`
      (`compare::omission_note`) and the AI proposal errors (`propose::resolve_target`/`apply`).
      The largest group; a test in `ddl_preview.rs` matches `"gone — "` on the English.
-   - **The read-only gate's reasons** — `sql::read_only_refusal`'s sentences, shared by the MCP
-     server and `schemaic query`, which the editor's guard shows inside
-     `GuardReason::ReadOnlyRefused` on SQL Server.
    - **Write-back** — `Rollback::note` and `one_row_verdict`'s text, fused into a `DbError::Query`
      in `schemaic-db`; the hardest, since the sentence is built below core.
    - **SQL Server's plan table** — the headings `showplan` writes as the table's columns and

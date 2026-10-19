@@ -3733,9 +3733,9 @@ pub enum GuardReason {
     /// A write on a read-only connection.
     ReadOnly,
     /// A statement a read-only connection's rollback cannot hold, where the
-    /// read-only session is only a rollback ([`read_only_reason`]'s text, which
-    /// the headless gates say too).
-    ReadOnlyRefused(String),
+    /// read-only session is only a rollback ([`read_only_refusal`]'s reason,
+    /// which the headless gates say too).
+    ReadOnlyRefused(ReadOnlyReason),
     /// A statement that [`needs_database`] with none selected
     /// ([`NO_DATABASE_SELECTED`]).
     NoDatabase,
@@ -3759,7 +3759,9 @@ impl GuardReason {
     pub fn message(&self) -> String {
         match self {
             GuardReason::ReadOnly => "Read-only connection.".to_string(),
-            GuardReason::ReadOnlyRefused(reason) => format!("Read-only connection: {reason}"),
+            GuardReason::ReadOnlyRefused(reason) => {
+                format!("Read-only connection: {}", reason.message())
+            }
             GuardReason::NoDatabase => NO_DATABASE_SELECTED.to_string(),
             GuardReason::Unsafe(u) => u.message(),
             GuardReason::Writes { several: false } => "This statement modifies data.".to_string(),
@@ -4277,8 +4279,8 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
     // second gate.
     if policy.read_only && policy.dialect.read_only_is_a_rollback() {
         for s in stmts {
-            if let Err(reason) = read_only_reason(s, policy.dialect) {
-                return RunVerdict::Block(GuardReason::ReadOnlyRefused(reason));
+            if let Err(r) = read_only_refusal(s, policy.dialect) {
+                return RunVerdict::Block(GuardReason::ReadOnlyRefused(r.reason));
             }
         }
     }
@@ -6066,14 +6068,63 @@ pub fn read_only_heads(dialect: SqlDialect) -> &'static [&'static str] {
 /// typing a `SLEEP()` at a prompt being told it "is not permitted in an AI
 /// query" is being answered about somebody else's session.
 pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
-    read_only_refusal(sql, dialect).map_err(|r| r.reason)
+    read_only_refusal(sql, dialect).map_err(|r| r.reason.message())
+}
+
+/// What [`read_only_refusal`] refused a statement for — a value, so the
+/// editor's guard can say it in the interface's language;
+/// [`ReadOnlyReason::message`] is the English, which the MCP server and
+/// `schemaic query` say. The `&'static str`s and `String`s are SQL — keywords
+/// and the names the statement spelt — which every language keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOnlyReason {
+    /// More than one statement.
+    Several,
+    /// A head outside this engine's `heads` ([`read_only_heads`]).
+    NotARead { heads: &'static [&'static str] },
+    /// A deny-listed `word`, upper-cased as the scan reads it.
+    Denied { word: String },
+    /// `NEXT VALUE FOR`.
+    AdvancesSequence,
+    /// A call to `name`, which is not on the engine's read-only allowlist.
+    UnlistedCall { name: String },
+    /// A row-locking `clause`.
+    Locks { clause: &'static str },
+}
+
+impl ReadOnlyReason {
+    /// The reason in English.
+    pub fn message(&self) -> String {
+        match self {
+            ReadOnlyReason::Several => "only a single statement is allowed".to_string(),
+            ReadOnlyReason::NotARead { heads } => {
+                format!("only read-only queries ({}) are allowed", heads.join("/"))
+            }
+            ReadOnlyReason::Denied { word } => {
+                format!("`{word}` is not permitted in a read-only query")
+            }
+            ReadOnlyReason::AdvancesSequence => {
+                "`NEXT VALUE FOR` advances a sequence, which a read-only query does not".to_string()
+            }
+            ReadOnlyReason::UnlistedCall { name } => format!(
+                "`{name}` is not a function known to be read-only, so it is not permitted \
+                 in a read-only query; functions from extensions or defined in the database \
+                 are refused too"
+            ),
+            ReadOnlyReason::Locks { clause } => format!(
+                "`{clause}` locks the rows it reads, which a read-only query does not; \
+                 drop the locking clause"
+            ),
+        }
+    }
 }
 
 /// Why [`read_only_refusal`] refused a statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadRefusal {
-    /// The words [`read_only_reason`] answers with.
-    pub reason: String,
+    /// What it was refused for; its [`message`](ReadOnlyReason::message) is
+    /// the words [`read_only_reason`] answers with.
+    pub reason: ReadOnlyReason,
     /// Whether the refusal is about a **write** — a statement that is not a
     /// read, or a write keyword inside one — so a front end with a write path
     /// may point at it. A lock, a sleep or a second statement is not one:
@@ -6089,21 +6140,18 @@ pub struct ReadRefusal {
 /// deletes, that retry is refused again as the `DELETE` — so a lock is named
 /// only when nothing else in the statement is refused.
 pub fn read_only_refusal(sql: &str, dialect: SqlDialect) -> Result<(), ReadRefusal> {
-    let refuse = |reason: String, writes: bool| Err(ReadRefusal { reason, writes });
+    let refuse = |reason: ReadOnlyReason, writes: bool| Err(ReadRefusal { reason, writes });
     let (marked, multi) = called_word_tokens(sql, dialect);
     let (words, called): (Vec<String>, Vec<bool>) = marked.into_iter().unzip();
     if multi {
-        return refuse("only a single statement is allowed".to_string(), false);
+        return refuse(ReadOnlyReason::Several, false);
     }
     let heads = read_only_heads(dialect);
     let head = words.first().map(|s| s.as_str()).unwrap_or("");
     if !heads.contains(&head) {
         // Naming this engine's heads, not a union of all three: a model told it
         // may `SHOW` on SQLite will keep trying.
-        return refuse(
-            format!("only read-only queries ({}) are allowed", heads.join("/")),
-            true,
-        );
+        return refuse(ReadOnlyReason::NotARead { heads }, true);
     }
     let denied: Vec<usize> = (0..words.len())
         .filter(|&k| is_denied(&words[k], dialect))
@@ -6114,29 +6162,21 @@ pub fn read_only_refusal(sql: &str, dialect: SqlDialect) -> Result<(), ReadRefus
         .find(|&&k| locking_clause(&words, k).is_none())
     {
         return refuse(
-            format!("`{}` is not permitted in a read-only query", words[k]),
+            ReadOnlyReason::Denied {
+                word: words[k].clone(),
+            },
             WRITE_KEYWORDS.contains(&words[k].as_str()),
         );
     }
     if advances_a_sequence(&words) {
-        return refuse(
-            "`NEXT VALUE FOR` advances a sequence, which a read-only query does not".to_string(),
-            true,
-        );
+        return refuse(ReadOnlyReason::AdvancesSequence, true);
     }
     // After a write, so a deleting CTE is still named as the `DELETE`; before a
     // lock, whose "drop the clause" retry this would refuse again.
     if let Some(policy) = read_call_policy(dialect)
         && let Some(name) = unlisted_call(sql, dialect, &policy)
     {
-        return refuse(
-            format!(
-                "`{name}` is not a function known to be read-only, so it is not permitted \
-                 in a read-only query; functions from extensions or defined in the database \
-                 are refused too"
-            ),
-            false,
-        );
+        return refuse(ReadOnlyReason::UnlistedCall { name }, false);
     }
     let lock = denied
         .iter()
@@ -6144,13 +6184,7 @@ pub fn read_only_refusal(sql: &str, dialect: SqlDialect) -> Result<(), ReadRefus
         .chain(shared_locks(&words))
         .min_by_key(|&(k, _)| k);
     if let Some((_, clause)) = lock {
-        return refuse(
-            format!(
-                "`{clause}` locks the rows it reads, which a read-only query does not; \
-                 drop the locking clause"
-            ),
-            false,
-        );
+        return refuse(ReadOnlyReason::Locks { clause }, false);
     }
     Ok(())
 }
@@ -9938,12 +9972,17 @@ mod tests {
             ),
         ] {
             let refusal = super::read_only_refusal(sql, d).expect_err(sql);
-            let why = &refusal.reason;
+            assert_eq!(
+                refusal.reason,
+                super::ReadOnlyReason::Locks { clause },
+                "{sql}"
+            );
+            let why = refusal.reason.message();
             assert!(why.contains(clause), "{sql}: {why}");
             assert!(why.contains("lock"), "{sql}: {why}");
             assert!(!why.contains("not permitted"), "{sql}: {why}");
             assert!(!refusal.writes, "{sql}: a lock is no write");
-            assert_eq!(super::read_only_reason(sql, d), Err(refusal.reason));
+            assert_eq!(super::read_only_reason(sql, d), Err(why));
         }
         // A column that happens to be called `share` is still a read.
         assert!(super::read_only_reason("SELECT share, key FROM t", SqlDialect::MySql).is_ok());
@@ -9963,7 +10002,8 @@ mod tests {
         ] {
             let refusal = super::read_only_refusal(sql, SqlDialect::Postgres).unwrap_err();
             assert_eq!(
-                refusal.reason, "`UPDATE` is not permitted in a read-only query",
+                refusal.reason.message(),
+                "`UPDATE` is not permitted in a read-only query",
                 "{sql}"
             );
             assert!(refusal.writes, "{sql}");
@@ -10122,7 +10162,13 @@ mod tests {
         let refusal = super::read_only_refusal("SELECT my_func(1)", SqlDialect::Postgres)
             .expect_err("unlisted");
         assert!(!refusal.writes, "{refusal:?}");
-        assert!(refusal.reason.contains("my_func"), "{}", refusal.reason);
+        assert_eq!(
+            refusal.reason,
+            super::ReadOnlyReason::UnlistedCall {
+                name: "my_func".into()
+            }
+        );
+        assert!(refusal.reason.message().contains("my_func"), "{refusal:?}");
         // The other two engines keep their deny lists; this is PostgreSQL's alone.
         assert!(gate("SELECT my_func(1)", SqlDialect::MySql).is_ok());
         assert!(gate("SELECT my_func(1)", SqlDialect::Sqlite).is_ok());
