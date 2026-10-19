@@ -20,7 +20,10 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
-use schemaic_core::plan::{PlanNote, PlanWarningKind, QueryPlan, ServerWarning};
+use schemaic_core::plan::{
+    PlanModule, PlanNote, PlanWarningKind, PlanWording, QueryPlan, ServerWarning, StatementHeading,
+    UnreadPlan,
+};
 
 use crate::i18n::tr;
 use crate::settings::focusable_toggle;
@@ -368,9 +371,109 @@ fn plan_warnings(plan: &QueryPlan) -> AnyView {
     .into_any()
 }
 
+/// The plan's headers and cells as the table shows them: the server's as they
+/// were read, and the ones Schemaic wrote — a SQL Server plan's headers, its
+/// statement headings and its notices ([`PlanWording`]) — in the interface's
+/// language. The plan's own cells stay core's English, which the AI reads.
+fn shown_table(plan: &QueryPlan) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut columns = plan.columns.clone();
+    let mut rows = plan.rows.clone();
+    match &plan.wording {
+        PlanWording::AsRead => {}
+        PlanWording::Showplan { measured, headings } => {
+            let mut words = vec![
+                tr!("plan-ms-operation"),
+                tr!("plan-ms-object"),
+                tr!("plan-ms-estimated-rows"),
+                tr!("plan-ms-estimated-cost"),
+            ];
+            if *measured {
+                words.push(tr!("plan-ms-actual-rows"));
+                words.push(tr!("plan-ms-executions"));
+            }
+            columns = words;
+            for (r, h) in headings {
+                if let Some(cell) = rows.get_mut(*r).and_then(|row| row.first_mut()) {
+                    *cell = statement_heading_text(h);
+                }
+            }
+        }
+        PlanWording::Unread(why) => {
+            columns = vec![tr!("plan-ms-plan")];
+            if let Some(cell) = rows.first_mut().and_then(|row| row.first_mut()) {
+                *cell = unread_plan_text(why);
+            }
+        }
+        PlanWording::NoPlan => {
+            columns = vec![tr!("plan-ms-plan")];
+            if let Some(cell) = rows.first_mut().and_then(|row| row.first_mut()) {
+                *cell = tr!("plan-ms-no-plan");
+            }
+        }
+    }
+    (columns, rows)
+}
+
+/// A planned statement's heading — core's `StatementHeading::text` in the
+/// interface's language. The statement's kind and its module's name stay as
+/// SQL Server wrote them.
+fn statement_heading_text(h: &StatementHeading) -> String {
+    let n = h.n;
+    let kind = h.kind.as_str();
+    match &h.module {
+        None => tr!("plan-ms-statement", n = n, kind = kind),
+        Some(PlanModule {
+            procedure,
+            name: Some(name),
+        }) => {
+            let name = name.as_str();
+            if *procedure {
+                tr!(
+                    "plan-ms-statement-in-procedure",
+                    n = n,
+                    kind = kind,
+                    name = name
+                )
+            } else {
+                tr!(
+                    "plan-ms-statement-in-function",
+                    n = n,
+                    kind = kind,
+                    name = name
+                )
+            }
+        }
+        Some(PlanModule {
+            procedure,
+            name: None,
+        }) => {
+            if *procedure {
+                tr!("plan-ms-statement-in-a-procedure", n = n, kind = kind)
+            } else {
+                tr!("plan-ms-statement-in-a-function", n = n, kind = kind)
+            }
+        }
+    }
+}
+
+/// Why a SQL Server plan could not be read — core's `UnreadPlan::text` in the
+/// interface's language. The XML reader's own error stays English.
+fn unread_plan_text(why: &UnreadPlan) -> String {
+    let reason = match why {
+        UnreadPlan::NotXml => tr!("plan-ms-unread-not-xml"),
+        UnreadPlan::NotShowplan { found } => {
+            tr!("plan-ms-unread-not-showplan", found = found.as_str())
+        }
+        UnreadPlan::Empty => tr!("plan-ms-unread-empty"),
+        UnreadPlan::Xml(e) => e.clone(),
+    };
+    tr!("plan-ms-unread", reason = reason)
+}
+
 /// Render the plan as a table. Column widths are measured from content (capped)
 /// so cells align across rows; flagged rows get an amber tint.
 fn plan_table(plan: &QueryPlan) -> AnyView {
+    let (columns, rows) = shown_table(plan);
     // `PAD` covers the horizontal padding each side; `GUARD` adds a few px of
     // slack over the pixel-exact text measurement so the last character never wraps
     // on a sub-pixel rounding (the columns "wrapping by one character" bug).
@@ -384,9 +487,9 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
     let cap = theme::scaled(360.0);
     let min = theme::scaled(34.0);
 
-    let ncols = plan.columns.len();
+    let ncols = columns.len();
     let mut widths = vec![0.0f64; ncols];
-    for (i, h) in plan.columns.iter().enumerate() {
+    for (i, h) in columns.iter().enumerate() {
         // Measured the way it is *drawn*: bold, at `font_label()`. It used to be
         // measured regular at `font_body()` — two mismatches, one of them silent
         // only because the two sizes happen to be equal today. Bold glyphs are
@@ -394,7 +497,7 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
         // own title, which is the bug the ER-diagram cards had.
         widths[i] = measure_text_px_bold_at(h, font_label());
     }
-    for row in &plan.rows {
+    for row in &rows {
         for (i, cell) in row.iter().enumerate() {
             if i < ncols {
                 widths[i] = widths[i].max(measure_text_px_at(cell, font_body()));
@@ -406,11 +509,10 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
     }
 
     let flagged: HashSet<usize> = plan.warnings.iter().map(|w| w.row).collect();
-    let last_row = plan.rows.len().saturating_sub(1);
+    let last_row = rows.len().saturating_sub(1);
 
     // Header row.
-    let header_cells: Vec<_> = plan
-        .columns
+    let header_cells: Vec<_> = columns
         .iter()
         .enumerate()
         .map(|(i, h)| {
@@ -441,8 +543,7 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
     });
 
     // Data rows.
-    let body_rows: Vec<_> = plan
-        .rows
+    let body_rows: Vec<_> = rows
         .iter()
         .enumerate()
         .map(|(ri, row)| {
@@ -587,6 +688,116 @@ fn ask_ai(
 mod tests {
     use super::plan_note_text;
     use schemaic_core::plan::{PlanNote, ServerWarning};
+
+    /// **A SQL Server plan's own words read in English exactly as core wrote
+    /// them into the cells** — the headers estimated and measured, a heading
+    /// with no module and in each kind of module, named and not, every reason
+    /// a document is unreadable and the batch with no plan — and every other
+    /// engine's table is shown as read.
+    #[test]
+    fn english_shows_a_plans_table_as_core_wrote_it() {
+        use schemaic_core::plan::{
+            NO_PLAN, PLAN_COLUMN, PlanModule, PlanWording, QueryPlan, StatementHeading, UnreadPlan,
+            showplan_columns,
+        };
+        let heading = |n, module| StatementHeading {
+            n,
+            kind: "SELECT".into(),
+            module,
+        };
+        let headings = [
+            heading(1, None),
+            heading(
+                2,
+                Some(PlanModule {
+                    procedure: true,
+                    name: Some("dbo.p".into()),
+                }),
+            ),
+            heading(
+                3,
+                Some(PlanModule {
+                    procedure: false,
+                    name: Some("db.dbo.f".into()),
+                }),
+            ),
+            heading(
+                4,
+                Some(PlanModule {
+                    procedure: true,
+                    name: None,
+                }),
+            ),
+            heading(
+                5,
+                Some(PlanModule {
+                    procedure: false,
+                    name: None,
+                }),
+            ),
+        ];
+        let mut plans = Vec::new();
+        for measured in [false, true] {
+            let columns = showplan_columns(measured);
+            let rows: Vec<Vec<String>> = headings
+                .iter()
+                .flat_map(|h| {
+                    let mut head = vec![h.text()];
+                    head.resize(columns.len(), String::new());
+                    let mut op = vec!["  Table Scan".to_string(), "dbo.t".into()];
+                    op.resize(columns.len(), "1".into());
+                    [head, op]
+                })
+                .collect();
+            plans.push(QueryPlan {
+                wording: PlanWording::Showplan {
+                    measured,
+                    headings: headings
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| (i * 2, h.clone()))
+                        .collect(),
+                },
+                columns,
+                rows,
+                ..Default::default()
+            });
+        }
+        for why in [
+            UnreadPlan::NotXml,
+            UnreadPlan::NotShowplan {
+                found: "Other".into(),
+            },
+            UnreadPlan::Empty,
+            UnreadPlan::Xml("unexpected end of file".into()),
+        ] {
+            plans.push(QueryPlan {
+                columns: vec![PLAN_COLUMN.into()],
+                rows: vec![vec![why.text()], vec!["<Other/>".into()]],
+                wording: PlanWording::Unread(why),
+                ..Default::default()
+            });
+        }
+        plans.push(QueryPlan {
+            columns: vec![PLAN_COLUMN.into()],
+            rows: vec![vec![NO_PLAN.into()]],
+            wording: PlanWording::NoPlan,
+            ..Default::default()
+        });
+        plans.push(QueryPlan {
+            columns: vec!["id".into(), "select_type".into()],
+            rows: vec![vec!["1".into(), "SIMPLE".into()]],
+            ..Default::default()
+        });
+        for plan in plans {
+            assert_eq!(
+                super::shown_table(&plan),
+                (plan.columns.clone(), plan.rows.clone()),
+                "{:?}",
+                plan.wording
+            );
+        }
+    }
 
     /// **Every plan warning reads in English exactly as core's
     /// `PlanNote::message`** — each engine's notes with a table named and

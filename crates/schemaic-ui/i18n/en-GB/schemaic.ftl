@@ -2352,6 +2352,31 @@ plan-missing-index-include = Missing index on `{ $table }` ({ $keys }; include {
 plan-missing-index-impact = Missing index on `{ $table }` ({ $keys }) — the server expected a { $impact }% improvement
 plan-missing-index-include-impact = Missing index on `{ $table }` ({ $keys }; include { $include }) — the server expected a { $impact }% improvement
 plan-ask-ai = Ask AI
+# A SQL Server plan's table, which Schemaic lays out from the plan's XML (core's
+# plan::PlanWording): its headers, then a heading row per planned statement
+# where a batch plans more than one. $kind is SQL Server's statement type
+# (SELECT, COND WITH QUERY); $name the function's or procedure's name.
+plan-ms-operation = Operation
+plan-ms-object = Object
+plan-ms-estimated-rows = Estimated rows
+plan-ms-estimated-cost = Estimated cost
+plan-ms-actual-rows = Actual rows
+plan-ms-executions = Executions
+plan-ms-statement = Statement { $n }: { $kind }
+plan-ms-statement-in-procedure = Statement { $n }: { $kind } in procedure { $name }
+plan-ms-statement-in-function = Statement { $n }: { $kind } in function { $name }
+plan-ms-statement-in-a-procedure = Statement { $n }: { $kind } in a procedure
+plan-ms-statement-in-a-function = Statement { $n }: { $kind } in a function
+# The one header of a table that holds no plan.
+plan-ms-plan = Plan
+plan-ms-no-plan = No statement in this batch has a plan.
+# A plan document that could not be read; $reason is one of the
+# plan-ms-unread-* messages, or the XML reader's own error in English.
+plan-ms-unread = Could not read the plan: { $reason }
+plan-ms-unread-not-xml = not an XML document
+# $found is the document's root element.
+plan-ms-unread-not-showplan = expected ShowPlanXML, found { $found }
+plan-ms-unread-empty = an empty document
 
 ## Used by modal (used_by_view.rs)
 ## A dependent's detail ("on lines") is core's and stays as it is for now.

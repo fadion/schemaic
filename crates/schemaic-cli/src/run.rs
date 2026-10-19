@@ -2043,6 +2043,7 @@ mod tests {
     fn plan(rows: usize, truncated: bool) -> schemaic_core::plan::QueryPlan {
         use schemaic_core::plan::{PlanNote, PlanWarning, PlanWarningKind, QueryPlan};
         QueryPlan {
+            wording: Default::default(),
             columns: vec!["id".into(), "detail".into(), "key".into()],
             rows: (0..rows)
                 .map(|i| vec![i.to_string(), format!("SCAN t{i}"), "NULL".into()])

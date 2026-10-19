@@ -114,7 +114,8 @@ assertions pin English wording — stays the regression net throughout.
    `TriggerProblem`, `RoutineProblem`, `ObjectProblem`, `ViewProblem`, `EventProblem`,
    `DatabaseProblem`), and the editor's squiggles (`intel::DiagMessage`, `FlowError`, which
    `Diagnostic::what` carries; `editor_pane::diag_message_text`, the AI fix prompt keeping
-   `Diagnostic::message`'s English).
+   `Diagnostic::message`'s English), and SQL Server's plan table (`plan::PlanWording`, beside
+   the English cells the AI and the CLI read; `plan_view::shown_table`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -141,9 +142,6 @@ assertions pin English wording — stays the regression net throughout.
      The largest group; a test in `ddl_preview.rs` matches `"gone — "` on the English.
    - **Write-back** — `Rollback::note` and `one_row_verdict`'s text, fused into a `DbError::Query`
      in `schemaic-db`; the hardest, since the sentence is built below core.
-   - **SQL Server's plan table** — the headings `showplan` writes as the table's columns and
-     its *Statement N: …*, *Could not read the plan* and *No statement … has a plan* rows,
-     which are cells, so the AI prompt and the CLI read the same English.
    - **Import's load backstop** — `RowCtx::row`'s `line N, column M: …` for a file that
      changed under the check, an `Err(String)` the row iterator hands the database layer
      mid-load; the write-back's problem, smaller.

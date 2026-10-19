@@ -14875,8 +14875,22 @@ existing prose was left alone.
     `a_cursors_plan_is_read_as_its_own_statement` checks the live server still writes them so.
     **A document
     that does not read as a plan is shown verbatim under the reason** rather than as an empty table
-    that would claim there was no plan (`an_unreadable_showplan_is_shown_verbatim`). The heuristics
-    are the other engines' in T-SQL's names — `Table Scan` and `Clustered Index Scan` are
+    that would claim there was no plan (`an_unreadable_showplan_is_shown_verbatim`).
+    **What of the table Schemaic wrote is said by `QueryPlan::wording`**, a `PlanWording`, so the
+    plan modal can put those words in the interface's language without the cells changing: `AsRead`
+    for every other engine's `EXPLAIN`, the server's throughout; `Showplan { measured, headings }`,
+    whose headers are `showplan_columns(measured)` and whose `headings` pair each heading row's
+    index with its `StatementHeading` — the number, the `StatementType` as SQL Server spells it, and
+    the `PlanModule` it runs in, a procedure or a function, named or not; `Unread(UnreadPlan)`, the
+    reason in row 0 under the one header `PLAN_COLUMN`, the documents verbatim after it; and
+    `NoPlan`, `NO_PLAN` under the same header. The cells stay the English they were —
+    `StatementHeading::text` and `UnreadPlan::text` write them — because `to_prompt_text`, the MCP
+    server's `explain` and `schemaic explain` read them, and all three are English. That is why the
+    module is a value: `MsStatement` used to splice *in function x* into its `kind`, a sentence no
+    translation could take apart again; and `parse_showplan` answers an `UnreadPlan` for a document
+    it cannot read. `a_plans_wording_says_what_its_cells_hold` holds each heading's row to its
+    `text`, every row beginning *Statement* to a heading, and each unread reason to row 0.
+    The heuristics are the other engines' in T-SQL's names — `Table Scan` and `Clustered Index Scan` are
     `FullScan`, `Sort` is `Filesort`, any `…Spool` is `TempTable` — and two kinds exist for
     this engine alone, since no other plan carries them: `MissingIndex`, from the plan's
     `<MissingIndexes>` with the impact the server expected (`MissingIndex::note`, the impact
@@ -27111,11 +27125,20 @@ existing prose was left alone.
     a write (`plan-analyze-unavailable`, which keeps the word *Analyze*), *Explaining* under the
     loading dots, *Potential issues* and *Ask AI*. The toggle's own **Analyze** label stays a
     literal — it is `EXPLAIN ANALYZE`'s keyword, which AGENTS.md's spelling rule and the roadmap's
-    never-translated list both name — as do the plan's columns and rows (the server's) and the
-    prompt `ask_ai` sends the AI panel, English as all AI text is. **On SQL Server the table is
-    still core's English, left rather than done**: `showplan` builds its column headings, its
-    *Statement N: …* heading rows, *Could not read the plan* and *No statement in this batch has a
-    plan.* as table cells, and the modal draws cells as they come.
+    never-translated list both name — as do the server's plan columns and rows and the prompt
+    `ask_ai` sends the AI panel, English as all AI text is. **SQL Server's table is the
+    catalogue's as far as Schemaic wrote it**: `plan_table` measures and draws what the private
+    `shown_table` hands it — the plan's headers and cells as read where `QueryPlan::wording` is
+    `AsRead`, and otherwise the headers from `plan-ms-operation` … `plan-ms-executions` or
+    `plan-ms-plan`, each heading row's first cell from `statement_heading_text` (`plan-ms-statement`,
+    and a whole message each for a named and an unnamed procedure or function rather than a module
+    spliced in), and row 0's notice from `unread_plan_text` (`plan-ms-unread`, its reason a
+    `plan-ms-unread-*`) or `plan-ms-no-plan`. What stays as written is SQL Server's: the statement's
+    kind, the module's name, the operators and objects, and the XML reader's own error as an unread
+    reason. The plan's cells are not rewritten, since `ask_ai` sends them — the translation is a
+    copy made for drawing. `english_shows_a_plans_table_as_core_wrote_it` holds the English equal to
+    core's cells for every heading shape, estimated and measured, every unread reason, the batch
+    with no plan, and an `AsRead` table left untouched.
     **Each warning is worded here**, from its `PlanNote` by `plan_note_text` and a server warning
     inside one by `server_warning_text` — `plan-detail-*`, `plan-my-*`, `plan-pg-*`, `plan-ms-*`,
     `plan-server-*` and `plan-missing-index` — with a message of its own for a table the plan does
@@ -40803,7 +40826,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below), nor the
     startup and keyring notices (`persist::Notice`, below), nor the file import's refusals, memory
     warnings and problem-list tail (`import::ReadRefusal`, below), nor the plan modal's warnings
-    (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below), the
+    (`plan::PlanNote`, below) and SQL Server's plan table (`plan::PlanWording`, below), nor the
+    run guard's reasons (`sql::GuardReason`, below), the
     read-only gate's `ReadOnlyReason` inside one included, nor the filter field's two refusals
     (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is, nor the
     account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor any object editor's
@@ -41008,7 +41032,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     and its sentence a message of its own — `-result`, since MySQL's English says *the result*,
     and `-unnamed` where PostgreSQL's and SQL Server's say *a table* — not a word handed in as
     `$table`. `english_says_every_plan_note_as_core_does` holds the English. SQL Server's plan table
-    itself — its headings, *Statement N* rows and could-not-read row — is still core's English.
+    itself — its headings, *Statement N* rows and could-not-read row — went the same way without
+    leaving its cells: core still writes them in English for the AI and the CLI, and says which
+    they are in `QueryPlan::wording`, a `PlanWording`; `plan_view`'s `shown_table` words exactly
+    those from `plan-ms-*` (`english_shows_a_plans_table_as_core_wrote_it`).
     The run guard's reasons are the case where a front end used to match the text. `RunVerdict`
     held finished English and now holds a `sql::GuardReason`, the destructive statements' warnings
     an `Unsafe` inside it (under `core::sql`), and `i18n::guard_reason_text` words it from

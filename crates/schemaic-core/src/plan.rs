@@ -41,6 +41,113 @@ pub struct QueryPlan {
     /// is its head — and the warnings cover only that head. A partitioned
     /// table's plan runs two rows a partition and can reach the cap.
     pub truncated: bool,
+    /// Which of `columns` and `rows` are Schemaic's words rather than the
+    /// server's, as values the plan modal says in the interface's language.
+    /// The cells keep the English, which the AI and the CLI read.
+    pub wording: PlanWording,
+}
+
+/// What of a [`QueryPlan`]'s table Schemaic wrote — SQL Server's alone, whose
+/// plan arrives as XML and is laid out here, where every other engine's
+/// `EXPLAIN` is shown as the server returned it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PlanWording {
+    /// Every header and cell is the server's.
+    #[default]
+    AsRead,
+    /// A SQL Server plan laid out as a table: its headers are
+    /// [`showplan_columns`] of `measured`, and each of `headings` is the first
+    /// cell of its row.
+    Showplan {
+        measured: bool,
+        headings: Vec<(usize, StatementHeading)>,
+    },
+    /// A document that does not read as a plan, said in row 0 under the one
+    /// header [`PLAN_COLUMN`]; the documents follow verbatim.
+    Unread(UnreadPlan),
+    /// No statement in the batch has a plan, said in row 0 under
+    /// [`PLAN_COLUMN`].
+    NoPlan,
+}
+
+/// The one header of a SQL Server plan table that holds no plan.
+pub const PLAN_COLUMN: &str = "Plan";
+
+/// [`PlanWording::NoPlan`]'s cell.
+pub const NO_PLAN: &str = "No statement in this batch has a plan.";
+
+/// The headers of a SQL Server plan table, in English; the measured ones
+/// add the actual rows and executions.
+pub fn showplan_columns(measured: bool) -> Vec<String> {
+    let mut columns = vec!["Operation", "Object", "Estimated rows", "Estimated cost"];
+    if measured {
+        columns.extend(["Actual rows", "Executions"]);
+    }
+    columns.into_iter().map(str::to_string).collect()
+}
+
+/// The heading row of the `n`th planned statement (1-based), where a batch
+/// plans more than one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatementHeading {
+    pub n: usize,
+    /// The plan's `StatementType` (`SELECT`, `COND WITH QUERY`), as SQL Server
+    /// spells it.
+    pub kind: String,
+    /// The function or procedure the statement runs in, if any.
+    pub module: Option<PlanModule>,
+}
+
+/// A function or procedure a planned statement runs inside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanModule {
+    /// A procedure rather than a function.
+    pub procedure: bool,
+    /// Its qualified name, unbracketed, when the plan gave one.
+    pub name: Option<String>,
+}
+
+impl StatementHeading {
+    /// The heading in English.
+    pub fn text(&self) -> String {
+        let within = match &self.module {
+            None => String::new(),
+            Some(m) => {
+                let what = if m.procedure { "procedure" } else { "function" };
+                match &m.name {
+                    Some(p) => format!(" in {what} {p}"),
+                    None => format!(" in a {what}"),
+                }
+            }
+        };
+        format!("Statement {}: {}{within}", self.n, self.kind)
+    }
+}
+
+/// Why a SQL Server plan document could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnreadPlan {
+    /// It does not start with `<`.
+    NotXml,
+    /// Its root element is `found`, not `ShowPlanXML`.
+    NotShowplan { found: String },
+    /// It holds no element.
+    Empty,
+    /// The XML reader's own error.
+    Xml(String),
+}
+
+impl UnreadPlan {
+    /// The reason in English, as the table's first cell says it.
+    pub fn text(&self) -> String {
+        let reason = match self {
+            UnreadPlan::NotXml => "not an XML document".to_string(),
+            UnreadPlan::NotShowplan { found } => format!("expected ShowPlanXML, found {found}"),
+            UnreadPlan::Empty => "an empty document".to_string(),
+            UnreadPlan::Xml(e) => e.clone(),
+        };
+        format!("Could not read the plan: {reason}")
+    }
 }
 
 /// The kind of a heuristic plan warning (drives the icon/colour in the UI).
@@ -269,6 +376,7 @@ impl QueryPlan {
             rows,
             warnings,
             truncated: rs.truncated,
+            wording: PlanWording::AsRead,
         }
     }
 
@@ -425,6 +533,8 @@ struct MsOp {
 #[derive(Default)]
 struct MsStatement {
     kind: String,
+    /// The function or procedure it runs in.
+    module: Option<PlanModule>,
     ops: Vec<MsOp>,
     /// Statement-level advice: missing indexes and the plan's own warnings.
     advice: Vec<(PlanWarningKind, PlanNote)>,
@@ -451,11 +561,12 @@ fn showplan(docs: &[String]) -> QueryPlan {
         match parse_showplan(doc) {
             Ok(mut s) => statements.append(&mut s),
             Err(reason) => {
-                let mut rows = vec![vec![format!("Could not read the plan: {reason}")]];
+                let mut rows = vec![vec![reason.text()]];
                 rows.extend(docs.iter().map(|d| vec![d.clone()]));
                 return QueryPlan {
-                    columns: vec!["Plan".to_string()],
+                    columns: vec![PLAN_COLUMN.to_string()],
                     rows,
+                    wording: PlanWording::Unread(reason),
                     ..Default::default()
                 };
             }
@@ -464,8 +575,9 @@ fn showplan(docs: &[String]) -> QueryPlan {
     statements.retain(|s| !s.ops.is_empty());
     if statements.is_empty() {
         return QueryPlan {
-            columns: vec!["Plan".to_string()],
-            rows: vec![vec!["No statement in this batch has a plan.".to_string()]],
+            columns: vec![PLAN_COLUMN.to_string()],
+            rows: vec![vec![NO_PLAN.to_string()]],
+            wording: PlanWording::NoPlan,
             ..Default::default()
         };
     }
@@ -473,21 +585,21 @@ fn showplan(docs: &[String]) -> QueryPlan {
         .iter()
         .flat_map(|s| &s.ops)
         .any(|o| o.actual_rows.is_some());
-    let mut columns: Vec<String> = ["Operation", "Object", "Estimated rows", "Estimated cost"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    if measured {
-        columns.push("Actual rows".to_string());
-        columns.push("Executions".to_string());
-    }
+    let columns = showplan_columns(measured);
     let headed = statements.len() > 1;
     let mut rows = Vec::new();
     let mut warnings = Vec::new();
+    let mut headings = Vec::new();
     for (n, stmt) in statements.iter().enumerate() {
         let indent = if headed {
-            let mut head = vec![format!("Statement {}: {}", n + 1, stmt.kind)];
+            let heading = StatementHeading {
+                n: n + 1,
+                kind: stmt.kind.clone(),
+                module: stmt.module.clone(),
+            };
+            let mut head = vec![heading.text()];
             head.resize(columns.len(), String::new());
+            headings.push((rows.len(), heading));
             rows.push(head);
             1
         } else {
@@ -557,6 +669,7 @@ fn showplan(docs: &[String]) -> QueryPlan {
         rows,
         warnings,
         truncated: false,
+        wording: PlanWording::Showplan { measured, headings },
     }
 }
 
@@ -671,12 +784,12 @@ fn showplan_warning(
 /// "no plan". And an operator joins a statement only inside one of that
 /// statement's own `<QueryPlan>`s, so a plan this reader does not place is
 /// dropped rather than added to the plan of the statement around it.
-fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
+fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, UnreadPlan> {
     use quick_xml::XmlVersion;
     use quick_xml::events::{BytesStart, Event};
 
     if !doc.trim_start().starts_with('<') {
-        return Err("not an XML document".to_string());
+        return Err(UnreadPlan::NotXml);
     }
     let attrs = |e: &BytesStart| -> Vec<(String, String)> {
         e.attributes()
@@ -696,7 +809,7 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
     // The statements open around the reader, innermost last.
     let mut stack: Vec<OpenStatement> = Vec::new();
     // The functions and procedures open around it, as a heading names them.
-    let mut modules: Vec<String> = Vec::new();
+    let mut modules: Vec<PlanModule> = Vec::new();
     // The elements open around it, outermost first.
     let mut path: Vec<Vec<u8>> = Vec::new();
     // Element depth inside a `<Warnings>`: 0 outside one, 1 at its children.
@@ -704,7 +817,9 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
     let mut missing: Option<MissingIndex> = None;
     let mut seen_root = false;
     loop {
-        let event = reader.read_event().map_err(|e| e.to_string())?;
+        let event = reader
+            .read_event()
+            .map_err(|e| UnreadPlan::Xml(e.to_string()))?;
         let (e, empty) = match &event {
             Event::Start(e) => (e, false),
             Event::Empty(e) => (e, true),
@@ -752,7 +867,9 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
         let attr = |k: &str| a.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         if !seen_root {
             if name != "ShowPlanXML" {
-                return Err(format!("expected ShowPlanXML, found {name}"));
+                return Err(UnreadPlan::NotShowplan {
+                    found: name.to_string(),
+                });
             }
             seen_root = true;
         }
@@ -779,12 +896,9 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
         }
         match name {
             _ if statement => {
-                let mut kind = attr("StatementType").unwrap_or_default();
-                if let Some(module) = modules.last() {
-                    kind.push_str(&format!(" in {module}"));
-                }
                 out.push(MsStatement {
-                    kind,
+                    kind: attr("StatementType").unwrap_or_default(),
+                    module: modules.last().cloned(),
                     ..MsStatement::default()
                 });
                 if !empty {
@@ -801,15 +915,9 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
                 }
             }
             "UDF" | "StoredProc" if !empty => {
-                let what = if name == "UDF" {
-                    "function"
-                } else {
-                    "procedure"
-                };
-                let proc = attr("ProcName").map(|p| unbracket_parts(&p));
-                modules.push(match proc {
-                    Some(p) => format!("{what} {p}"),
-                    None => format!("a {what}"),
+                modules.push(PlanModule {
+                    procedure: name != "UDF",
+                    name: attr("ProcName").map(|p| unbracket_parts(&p)),
                 });
             }
             "RelOp" => {
@@ -892,7 +1000,7 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
         }
     }
     if !seen_root {
-        return Err("an empty document".to_string());
+        return Err(UnreadPlan::Empty);
     }
     Ok(out)
 }
@@ -1383,6 +1491,78 @@ mod tests {
         );
         assert_eq!(plan.rows[1][1].split(' ').next(), Some("dbo.big"));
         assert_eq!(plan.rows[4][1].split(' ').next(), Some("dbo.t"));
+    }
+
+    /// **The wording names exactly the cells Schemaic wrote** — the headers, each
+    /// heading row's first cell, the notice under `Plan` — so the plan modal
+    /// can say them in its language while the cells stay the English the AI
+    /// and the CLI read. Every other engine's plan is the server's, as read.
+    #[test]
+    fn a_plans_wording_says_what_its_cells_hold() {
+        let plain = r#"<ShowPlanXML xmlns="x"><BatchSequence><Batch><Statements><StmtSimple StatementType="SET ON/OFF"></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"#;
+        for docs in [
+            vec![SHOWPLAN],
+            vec![plain, SHOWPLAN, SHOWPLAN],
+            vec![SHOWPLAN_NESTED_PROCEDURES],
+        ] {
+            let plan = QueryPlan::from_result(&showplan_rs(&docs));
+            let PlanWording::Showplan { measured, headings } = &plan.wording else {
+                panic!("{:?}", plan.wording);
+            };
+            assert_eq!(plan.columns, showplan_columns(*measured));
+            for (row, h) in headings {
+                assert_eq!(plan.rows[*row][0], h.text());
+            }
+            let headed: Vec<usize> = headings.iter().map(|(r, _)| *r).collect();
+            for (r, row) in plan.rows.iter().enumerate() {
+                assert_eq!(
+                    row[0].starts_with("Statement "),
+                    headed.contains(&r),
+                    "{row:?}"
+                );
+            }
+        }
+        let nested = QueryPlan::from_result(&showplan_rs(&[SHOWPLAN_NESTED_PROCEDURES]));
+        let PlanWording::Showplan { headings, .. } = nested.wording else {
+            unreachable!()
+        };
+        assert_eq!(
+            headings[0].1.module,
+            Some(PlanModule {
+                procedure: true,
+                name: Some("dbo.p2".into())
+            })
+        );
+        assert_eq!(headings.len(), 3);
+
+        let none = QueryPlan::from_result(&showplan_rs(&[plain]));
+        assert_eq!(none.wording, PlanWording::NoPlan);
+        assert_eq!(
+            (none.columns, none.rows),
+            (
+                vec![PLAN_COLUMN.to_string()],
+                vec![vec![NO_PLAN.to_string()]]
+            )
+        );
+
+        for (bad, why) in [
+            ("not xml", UnreadPlan::NotXml),
+            (
+                "<Other/>",
+                UnreadPlan::NotShowplan {
+                    found: "Other".into(),
+                },
+            ),
+            ("", UnreadPlan::NotXml),
+        ] {
+            let plan = QueryPlan::from_result(&showplan_rs(&[bad]));
+            assert_eq!(plan.wording, PlanWording::Unread(why.clone()), "{bad:?}");
+            assert_eq!(plan.rows[0][0], why.text());
+            assert_eq!(plan.columns, [PLAN_COLUMN]);
+        }
+
+        let mysql = QueryPlan::from_result(&rs(HEADERS, &[]));
+        assert_eq!(mysql.wording, PlanWording::AsRead);
     }
 
     /// A document that is not a plan is shown as the server sent it, with the
