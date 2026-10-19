@@ -2586,6 +2586,30 @@ cli-no-either-tool = No { $first } or { $second } found on PATH.
 cli-no-either-client = No { $first } or { $second } client found on PATH.
 cli-sqlcmd-windows-in-wsl = Windows sign-in needs a Windows sqlcmd, and the one found is inside WSL. Install sqlcmd on Windows, or open the connection in a query tab.
 
+## Why a client or tool is not handed what it was about to be (core's
+## launch::Refusal). Program names (psql, sqlcmd, sqlite3, mysql, docker ps,
+## cmd.exe), the quoted characters and 127.0.0.1 are never translated.
+
+# The connection import's Docker search and the database CLI both say it.
+cli-refused-shim = The client found on your PATH is a .cmd/.bat shim, which Windows runs through cmd.exe — where a database name carrying '&' or '|' would be a second command. Point Settings at the real executable, or open a query tab instead.
+cli-refused-name-equals = This database's name contains '=', which psql would read as a connection string and follow to another server. Open it in a query tab instead.
+cli-refused-name-uri = This database's name begins like a connection URI, which psql would follow to another server. Open it in a query tab instead.
+# ./name.db is an example path.
+cli-refused-file-dash = This database file's name begins with '-', which the sqlite3 client would read as an option rather than as the file. Rename it, or give it a path (./name.db), and open it again.
+cli-refused-sqlcmd-entra = sqlcmd cannot be handed the Azure CLI's sign-in token, so this connection cannot open in it. Open it in a query tab instead.
+cli-refused-sqlcmd-host = This connection's host contains a character sqlcmd reads as part of the address (',', ';', a second '\' or a ':' prefix). Set the port in its own field, and open it again.
+cli-refused-sqlcmd-ca = sqlcmd cannot verify against a CA file. Add the CA to the system's trust store and clear the connection's CA field, or open the connection in a query tab.
+cli-refused-sqlcmd-client-cert = SQL Server does not sign in with a client certificate, so sqlcmd has nowhere to send this connection's. Clear the client certificate and key, and open it again.
+cli-refused-wsl-paths = This connection's TLS certificate paths are Windows paths, which the WSL client cannot open. Install a native client, or move the certificates inside WSL.
+cli-refused-tunnelled-verify = This connection verifies the server's certificate and reaches it through an SSH tunnel, so the client would be told to dial 127.0.0.1 and check the certificate against that — which the server's own certificate cannot satisfy. Open a query tab instead, or lower the TLS mode for the CLI session.
+# The connection import's Docker search.
+cli-refused-not-container-id = docker ps printed something that is not a container id.
+# Back up and Restore from file.
+cli-refused-file-line-break = That file name contains a line break, which the client would read as two arguments. Choose another name.
+cli-refused-role = The role in this connection's init SQL cannot be handed to the tool as it is.
+cli-refused-mysql-source-path = The mysql client would read that file's path as commands of its own (a ';' or a '\' in it, or a space at an end). Move or rename it, then restore it.
+cli-refused-cloud-token = This connection signs in through a cloud CLI's token, which an external client is not handed. Open it in a query tab instead.
+
 ## Settings › Install's failures (install_cli.rs). $error is the operating
 ## system's own text; $path a file path.
 

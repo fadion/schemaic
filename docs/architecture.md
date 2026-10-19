@@ -12530,10 +12530,11 @@ existing prose was left alone.
     `Environment::badge_label` is asked by the top bar only for *whether* there is a badge. So,
     now, are the notes this module writes under the form's fields — `SslMode::caveat`,
     `AuthMode::tls_note`, `read_only_caveat`, `named_instance_port_note`: the form keeps the
-    decision here and words the answer itself (under `connection_form.rs`). The two refusals still
-    reach the user as they are, English: `AuthMode::transport_refusal` arrives as a database error
-    from `schemaic-db`, and `external_client_refusal` through the app's terminal launchers'
-    `Result<_, &'static str>`, beside `launch::*`'s own.
+    decision here and words the answer itself (under `connection_form.rs`). One refusal still
+    reaches the user as it is, English: `AuthMode::transport_refusal`, which arrives as a database
+    error from `schemaic-db`. `external_client_refusal` says nothing itself any more — it answers
+    `launch::Refusal::CloudToken`, one of `launch::*`'s own refusals, which the app words (under
+    `launch.rs`).
     **`statement_timeout_secs` is this connection's statement timeout over the app's** (*Settings →
     Query*, `persist::statement_timeout`) — the field's own example is a reporting replica that
     legitimately runs for an hour beside a production primary that never should. It is
@@ -12718,7 +12719,7 @@ existing prose was left alone.
     `db/cloud_iam.rs`). **`external_client_refusal` is what that costs**: `psql`, `mysql`,
     `pg_dump` and `mysqldump` are handed the connection's password in their environment, and an
     IAM connection has none — the token is fetched by the driver, inside the app — so *Open in CLI*,
-    *Back up* and *Restore* refuse one with its sentence (under `app/main.rs`) and `sqlcmd_args`
+    *Back up* and *Restore* refuse one with its `launch::Refusal` (under `app/main.rs`) and `sqlcmd_args`
     has an arm for the two that refuses with it too. `offered(db_type)`
     is the one list, in picker order with the default first, and it is where the OS enters:
     Windows sign-in is offered in a Windows build alone, a process anywhere else having no Windows
@@ -16767,7 +16768,7 @@ existing prose was left alone.
     clients — for Windows sign-in with no user sent, and a refusal for Entra, since `sqlcmd` cannot
     be handed the Azure CLI's token and falling back to a SQL login would be a different sign-in from
     the one saved (`sqlcmd_signs_in_the_way_the_connection_does`). The two cloud IAM modes have an
-    arm of their own, refused with `AuthMode::external_client_refusal`'s sentence — never in force
+    arm of their own, refused with `AuthMode::external_client_refusal`'s answer — never in force
     on SQL Server (`AuthMode::offered`), so it is there for a hand-made one. `mssql_shell_config` adds the one
     refusal the argv cannot see: Windows sign-in through a WSL `sqlcmd`, a Linux process having no
     Windows identity to present. The password travels as `SQLCMDPASSWORD`, which both clients read,
@@ -16875,6 +16876,19 @@ existing prose was left alone.
     `Source::Restore`, no `sql`, the detail `restore <file> into <db>, run in the terminal`, its
     outcome `Unknown`, because the client in the terminal and not Schemaic sees how it ends
     (`a_restore_is_logged_as_launched_with_its_outcome_unknown`).
+    **Nothing here that refuses answers with a sentence**: every refusal is a `Refusal`, fifteen
+    `Copy` variants — one per *reason* rather than per function, `psql_target` having two and
+    `sqlcmd_args` four of its own — and `AuthMode::external_client_refusal`'s `CloudToken` is the
+    fifteenth, so a launcher and the sign-in check it asks answer through one type.
+    `Refusal::message` is the English, the text each function used to return as a `&'static str`,
+    and what the app's `refusal_text` is held to (*The string catalogue*, under *UI conventions*);
+    `Refusal::ALL` is the list both sides' tests walk. **It has no `Display`, on purpose**: no
+    headless surface says one, and with it a caller's `why.to_string()` would compile and stay
+    English in every language — the missing impl is the guard, so don't add one for convenience.
+    `each_launcher_refuses_with_its_own_reason` has every function answer the variant it should
+    and asserts the answers, in order, are `ALL`, so a renderer keyed on the variant says the right
+    sentence and no variant goes unreached. `cli_flag_value` is the one refusal left a `String`:
+    it is `cloud_iam`'s sign-in, met as a connect error rather than a launcher's refusal.
   - `core/entra.rs` — **signing in to SQL Server with a Microsoft Entra token from the Azure CLI**:
     the pure half of `AuthMode::AzureCli`, `db/entra.rs` being the half that runs it. The token is
     the CLI's to mint and refresh — `az account get-access-token --resource
@@ -26079,8 +26093,9 @@ existing prose was left alone.
     English: the Type picker's engine names (`DbKind::label`), which are product names and are also
     what is persisted as `Connection::db_type` and read by `default_port`/`is_networked`; the
     samples `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules'
-    sentences — `connection`'s two sign-in refusals (`AuthMode::transport_refusal`,
-    `external_client_refusal`), which never reach this form, `ssh_config::describe_route`, `SshTunnel::route`'s error,
+    sentences — `connection`'s `AuthMode::transport_refusal`, which never reaches this form
+    (`external_client_refusal`, which never did either, is a `launch::Refusal` the app words now),
+    `ssh_config::describe_route`, `SshTunnel::route`'s error,
     `init_sql::check`'s refusal (core's prose, phase 4) and `lib.rs`'s `TestLine::text`.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import connections" — it was
@@ -38501,7 +38516,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   the generic one. `resolve_cli_with(progs, resolve)` takes the resolver, so the search is testable
   without a `PATH`.
   **What the search reaches is a value, not a sentence.** `resolve_cli`, `resolve_cli_with` and
-  `resolve_native_cli` answer `Err(Unreached::Absent)` or `Err(Unreached::Refused(why))`, and each
+  `resolve_native_cli` answer `Err(Unreached::Absent)` or `Err(Unreached::Refused(why))` — `why`
+  a `launch::Refusal`, which `said` words through `refusal_text` — and each
   caller makes the panel's line with `Unreached::said`, naming its own client from the catalogue
   (`cli-no-client` and its siblings); `native_tool` takes that line as its `none` closure. The
   generic case was a `const NO_CLIENT` sentence the callers compared the error against, by text, to
@@ -39656,9 +39672,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   is_an_interpreter)` for each of the three, and `a_launcher_that_is_an_interpreter_is_declared`
   fails if a second interpreter is added without amending that paragraph. **A refusal is a `Result`, not a caller's
   `if`** — `mysql_shell`/`psql_shell` and their `_config` halves return a `Result` where they
-  returned an `Option` or a bare config (`&'static str` from a `_config` half; `String` from the
-  `*_shell`s and `mssql_shell_config`, whose no-client and WSL-sign-in lines come from the
-  catalogue), so every
+  returned an `Option` or a bare config (a `launch::Refusal` from a `_config` half, which the
+  `*_shell` calling it words through `refusal_text`; `String` from the `*_shell`s and
+  `mssql_shell_config`, whose no-client and WSL-sign-in lines come from the catalogue), so every
   refusal lands on the one arm `open_db_cli` already had for "no client found" (a message spawned in
   the terminal panel, and no engine badge) and none of them can be forgotten at a call site. Don't
   add a second gate in a caller, and don't spell one of these decisions inline: `open_url` spawns
@@ -40541,12 +40557,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals, `format_bytes`, and `connection`'s two sign-in
-    refusals: `AuthMode::transport_refusal`, which reaches the user as a database error from
-    `schemaic-db` and goes with the error messages, and `external_client_refusal`, which the app's
-    terminal launchers return through the same `Result<_, &'static str>` as `launch::*`'s and goes
-    with them. The notes under the connection form's fields are no longer among it
-    (`connection_form.rs`).
+    translation* — among it `format_bytes` and `AuthMode::transport_refusal`, which reaches the
+    user as a database error from `schemaic-db` and goes with the error messages. The notes under
+    the connection form's fields are no longer among it (`connection_form.rs`), nor are
+    `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40690,6 +40704,17 @@ Re-introducing the anti-patterns these guard against is a regression:
     app's two before a run, when the connection cannot be had — rides the same field as
     `ExportFailure::Worded` and passes through untouched. `english_says_every_export_failure_as_core_does`
     holds every variant equal to the `Display` the CLI prints.
+    The launchers' refusals are the case where the missing `Display` is the guard.
+    `launch::Refusal` is the `Err` of every refusing function in `core::launch` and the answer of
+    `AuthMode::external_client_refusal`, and the app's `refusal_text` (beside `Unreached`, in
+    `main.rs`) words each variant from `cli-refused-*`. `mysql_shell_config`, `psql_shell_config`
+    and `sqlite_shell_config` hand the `Refusal` up; what returns a `String` — the `*_shell`s,
+    `mssql_shell_config`, `tool_tunnel_check`, the backup and restore builders, `reach_for_cli`,
+    `open_db_cli`'s tunnel TLS message shell, and `conn_sources`' Docker import for its two (a
+    refused `PATH` `docker`, `docker_inspect_args`) — maps through it. Core gives `message` and no
+    `Display`, since no headless surface says these, so the `why.to_string()` that would stay
+    English in every language does not compile. `english_says_every_launcher_refusal_as_core_does`
+    (`app_tests`) holds `refusal_text` equal to `message` for every variant of `Refusal::ALL`.
     A message core *chooses* by engine capability takes the same shape with the choice as the
     value: the Export modal's replay-toggle hints were whole `&'static str`s picked per dialect, and
     are now `dump::DropHint` (`drop_hint`) and `FkHint` (`fk_guard_says_drops`), each with a

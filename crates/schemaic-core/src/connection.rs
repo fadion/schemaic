@@ -1009,12 +1009,9 @@ impl AuthMode {
     /// cannot be opened on this sign-in, or `None`. They are handed the
     /// connection's password in their environment, and an IAM connection has
     /// none: the token is fetched by the driver, inside the app.
-    pub fn external_client_refusal(self) -> Option<&'static str> {
+    pub fn external_client_refusal(self) -> Option<crate::launch::Refusal> {
         match self {
-            AuthMode::AwsIam | AuthMode::GcpIam => Some(
-                "This connection signs in through a cloud CLI's token, which an external client \
-                 is not handed. Open it in a query tab instead.",
-            ),
+            AuthMode::AwsIam | AuthMode::GcpIam => Some(crate::launch::Refusal::CloudToken),
             AuthMode::Password | AuthMode::Windows | AuthMode::AzureCli => None,
         }
     }

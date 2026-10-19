@@ -40,6 +40,147 @@
 //!    permissive (the terminal's link tagger admits `&` because a query string
 //!    needs it); the launcher does not inherit those reasons.
 
+/// Why a client or tool cannot be handed what it was about to be — every
+/// refusal this module returns, and [`AuthMode::external_client_refusal`]'s.
+///
+/// **A value, not a sentence**, so the terminal panel can word it in the
+/// interface's language; [`Refusal::message`] is the English, which the
+/// interface's renderer is held equal to. **No `Display`, on purpose**: no
+/// headless surface says one, and with it a caller's `why.to_string()` would
+/// compile and stay English in every language.
+///
+/// [`AuthMode::external_client_refusal`]: crate::connection::AuthMode::external_client_refusal
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The client resolved is a `.cmd`/`.bat` shim ([`direct_spawn_verdict`]).
+    ClientIsShim,
+    /// The database name holds an `=` `psql` would read as conninfo
+    /// ([`psql_target`]).
+    NameHasEquals,
+    /// The database name begins like a connection URI ([`psql_target`]).
+    NameIsUri,
+    /// The SQLite file's name begins with `-` ([`sqlite_target`]).
+    FileStartsWithDash,
+    /// `sqlcmd` cannot be handed an Entra token ([`sqlcmd_args`]).
+    SqlcmdEntra,
+    /// The host holds address syntax `sqlcmd` would read ([`sqlcmd_args`]).
+    SqlcmdHost,
+    /// `sqlcmd` cannot verify against a CA file ([`sqlcmd_args`]).
+    SqlcmdCaFile,
+    /// SQL Server signs no one in by a client certificate ([`sqlcmd_args`]).
+    SqlcmdClientCert,
+    /// A certificate path is a Windows path the WSL client cannot open
+    /// ([`wsl_tls_blocker`]).
+    WslCertificatePaths,
+    /// A verifying rung through an SSH tunnel ([`tunnelled_verify_blocker`]).
+    TunnelledVerify,
+    /// `docker ps` printed something other than an id
+    /// ([`docker_inspect_args`]).
+    NotAContainerId,
+    /// The backup or restore file's name holds a line break
+    /// ([`backup_file_target`]).
+    FileNameLineBreak,
+    /// The init SQL's role cannot be passed as `--role` (`role_arg`).
+    RoleUnpassable,
+    /// The `mysql` client would read the path as commands
+    /// ([`mysql_source_path`]).
+    MysqlSourcePath,
+    /// The connection signs in by a cloud CLI's token, which an external
+    /// client is not handed.
+    CloudToken,
+}
+
+impl Refusal {
+    /// The refusal in English — the wording the interface's `en-GB`
+    /// catalogue is held to.
+    pub fn message(self) -> &'static str {
+        match self {
+            Refusal::ClientIsShim => {
+                "The client found on your PATH is a .cmd/.bat shim, which Windows runs \
+                 through cmd.exe — where a database name carrying '&' or '|' would be a second \
+                 command. Point Settings at the real executable, or open a query tab instead."
+            }
+            Refusal::NameHasEquals => {
+                "This database's name contains '=', which psql would read as a connection \
+                 string and follow to another server. Open it in a query tab instead."
+            }
+            Refusal::NameIsUri => {
+                "This database's name begins like a connection URI, which psql would follow to \
+                 another server. Open it in a query tab instead."
+            }
+            Refusal::FileStartsWithDash => {
+                "This database file's name begins with '-', which the sqlite3 client would read \
+                 as an option rather than as the file. Rename it, or give it a path (./name.db), \
+                 and open it again."
+            }
+            Refusal::SqlcmdEntra => {
+                "sqlcmd cannot be handed the Azure CLI's sign-in token, so this connection \
+                 cannot open in it. Open it in a query tab instead."
+            }
+            Refusal::SqlcmdHost => {
+                "This connection's host contains a character sqlcmd reads as part of the \
+                 address (',', ';', a second '\\' or a ':' prefix). Set the port in its own \
+                 field, and open it again."
+            }
+            Refusal::SqlcmdCaFile => {
+                "sqlcmd cannot verify against a CA file. Add the CA to the system's trust store \
+                 and clear the connection's CA field, or open the connection in a query tab."
+            }
+            Refusal::SqlcmdClientCert => {
+                "SQL Server does not sign in with a client certificate, so sqlcmd has nowhere \
+                 to send this connection's. Clear the client certificate and key, and open it \
+                 again."
+            }
+            Refusal::WslCertificatePaths => {
+                "This connection's TLS certificate paths are Windows paths, which the WSL \
+                 client cannot open. Install a native client, or move the certificates inside \
+                 WSL."
+            }
+            Refusal::TunnelledVerify => {
+                "This connection verifies the server's certificate and reaches it through an \
+                 SSH tunnel, so the client would be told to dial 127.0.0.1 and check the \
+                 certificate against that — which the server's own certificate cannot satisfy. \
+                 Open a query tab instead, or lower the TLS mode for the CLI session."
+            }
+            Refusal::NotAContainerId => "docker ps printed something that is not a container id.",
+            Refusal::FileNameLineBreak => {
+                "That file name contains a line break, which the client would read as two \
+                 arguments. Choose another name."
+            }
+            Refusal::RoleUnpassable => {
+                "The role in this connection's init SQL cannot be handed to the tool as it is."
+            }
+            Refusal::MysqlSourcePath => {
+                "The mysql client would read that file's path as commands of its own (a ';' or \
+                 a '\\' in it, or a space at an end). Move or rename it, then restore it."
+            }
+            Refusal::CloudToken => {
+                "This connection signs in through a cloud CLI's token, which an external client \
+                 is not handed. Open it in a query tab instead."
+            }
+        }
+    }
+
+    /// Every refusal, for the tests that hold a rendering to [`Self::message`].
+    pub const ALL: [Refusal; 15] = [
+        Refusal::ClientIsShim,
+        Refusal::NameHasEquals,
+        Refusal::NameIsUri,
+        Refusal::FileStartsWithDash,
+        Refusal::SqlcmdEntra,
+        Refusal::SqlcmdHost,
+        Refusal::SqlcmdCaFile,
+        Refusal::SqlcmdClientCert,
+        Refusal::WslCertificatePaths,
+        Refusal::TunnelledVerify,
+        Refusal::NotAContainerId,
+        Refusal::FileNameLineBreak,
+        Refusal::RoleUnpassable,
+        Refusal::MysqlSourcePath,
+        Refusal::CloudToken,
+    ];
+}
+
 /// The bytes a URL may contain, as an allowlist.
 ///
 /// The unreserved and reserved sets of RFC 3986 — nothing else. That excludes
@@ -105,15 +246,16 @@ pub fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
 ///
 /// Only the DB-CLI launchers ask. The user's own terminal shell is a shell by
 /// definition and is not this question.
-pub fn direct_spawn_verdict(resolved: &std::path::Path) -> Result<(), &'static str> {
-    const SHIM: &str = "The client found on your PATH is a .cmd/.bat shim, which Windows runs \
-        through cmd.exe — where a database name carrying '&' or '|' would be a second command. \
-        Point Settings at the real executable, or open a query tab instead.";
+pub fn direct_spawn_verdict(resolved: &std::path::Path) -> Result<(), Refusal> {
     let is_shim = resolved
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
-    if is_shim { Err(SHIM) } else { Ok(()) }
+    if is_shim {
+        Err(Refusal::ClientIsShim)
+    } else {
+        Ok(())
+    }
 }
 
 /// A URL the app may hand to the OS default browser, or `None`.
@@ -204,14 +346,10 @@ pub fn url_open_argv(raw: &str) -> Option<Vec<String>> {
 /// detection is on the *value*, not the position — so the answer is a refusal
 /// with a message, which is a shape the caller already has for "no client
 /// found".
-pub fn psql_target(db: &str) -> Result<&str, &'static str> {
+pub fn psql_target(db: &str) -> Result<&str, Refusal> {
     const URI_PREFIXES: [&str; 2] = ["postgresql://", "postgres://"];
-    const EQUALS: &str = "This database's name contains '=', which psql would read as a \
-        connection string and follow to another server. Open it in a query tab instead.";
-    const URI: &str = "This database's name begins like a connection URI, which psql would \
-        follow to another server. Open it in a query tab instead.";
     if db.contains('=') {
-        return Err(EQUALS);
+        return Err(Refusal::NameHasEquals);
     }
     // `get`, not `[..n]` — see `strip_scheme`. The name is read verbatim out of
     // `pg_database.datname`, is not the user's to vouch for, and this runs on
@@ -221,7 +359,7 @@ pub fn psql_target(db: &str) -> Result<&str, &'static str> {
         .iter()
         .any(|p| db.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)))
     {
-        return Err(URI);
+        return Err(Refusal::NameIsUri);
     }
     Ok(db)
 }
@@ -242,12 +380,9 @@ pub fn psql_target(db: &str) -> Result<&str, &'static str> {
 /// connection-string syntax to be re-read into, which is what makes
 /// [`psql_target`] the longer of the two. The refusal is a `Result` rather than
 /// a caller's `if`, so it lands on the one arm `open_db_cli` already had.
-pub fn sqlite_target(file: &str) -> Result<&str, &'static str> {
-    const DASH: &str = "This database file's name begins with '-', which the sqlite3 client \
-        would read as an option rather than as the file. Rename it, or give it a path \
-        (./name.db), and open it again.";
+pub fn sqlite_target(file: &str) -> Result<&str, Refusal> {
     if file.starts_with('-') {
-        return Err(DASH);
+        return Err(Refusal::FileStartsWithDash);
     }
     Ok(file)
 }
@@ -474,20 +609,10 @@ pub fn sqlcmd_args(
     user: &str,
     database: Option<&str>,
     tls: &crate::connection::Tls,
-) -> Result<Vec<String>, &'static str> {
+) -> Result<Vec<String>, Refusal> {
     use crate::connection::{AuthMode, SslMode};
-    const ENTRA: &str = "sqlcmd cannot be handed the Azure CLI's sign-in token, so this \
-        connection cannot open in it. Open it in a query tab instead.";
-    const HOST: &str = "This connection's host contains a character sqlcmd reads as part of the \
-        address (',', ';', a second '\\' or a ':' prefix). Set the port in its own field, and open \
-        it again.";
-    const CA: &str = "sqlcmd cannot verify against a CA file. Add the CA to the system's trust \
-        store and clear the connection's CA field, or open the connection in a query tab.";
-    const CLIENT_CERT: &str = "SQL Server does not sign in with a client certificate, so sqlcmd \
-        has nowhere to send this connection's. Clear the client certificate and key, and open \
-        it again.";
     if tls.uses_client_cert() {
-        return Err(CLIENT_CERT);
+        return Err(Refusal::SqlcmdClientCert);
     }
     // A named instance is `sqlcmd`'s own spelling too — `tcp:server\INSTANCE`,
     // which it resolves through SQL Server Browser as the connect does — so it
@@ -510,7 +635,7 @@ pub fn sqlcmd_args(
         || host.contains([',', '\\', ';'])
         || instance.is_some_and(|i| i.contains([',', ';', ':']))
     {
-        return Err(HOST);
+        return Err(Refusal::SqlcmdHost);
     }
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -524,11 +649,13 @@ pub fn sqlcmd_args(
     let sign_in = match auth {
         AuthMode::Password => format!("-U{user}"),
         AuthMode::Windows => "-E".to_string(),
-        AuthMode::AzureCli => return Err(ENTRA),
+        AuthMode::AzureCli => return Err(Refusal::SqlcmdEntra),
         // Never in force on SQL Server (`AuthMode::offered`), and refused the
         // same way should a hand-made one arrive.
         AuthMode::AwsIam | AuthMode::GcpIam => {
-            return Err(auth.external_client_refusal().unwrap_or(ENTRA));
+            return Err(auth
+                .external_client_refusal()
+                .unwrap_or(Refusal::SqlcmdEntra));
         }
     };
     let mut args = vec![address, sign_in];
@@ -544,7 +671,7 @@ pub fn sqlcmd_args(
         }
         SslMode::VerifyCa | SslMode::VerifyFull => {
             if tls.ca_file().is_some() {
-                return Err(CA);
+                return Err(Refusal::SqlcmdCaFile);
             }
             args.push("-Nm".to_string());
         }
@@ -564,11 +691,12 @@ pub fn sqlcmd_args(
 /// A path that is already POSIX-shaped (`/etc/ca.crt`, or a `/mnt/c/…` the user
 /// typed themselves) is left alone — this is not a ban on WSL plus TLS, only on
 /// handing a Linux process a drive letter.
-pub fn wsl_tls_blocker(tls: &crate::connection::Tls) -> Option<&'static str> {
-    const WHY: &str = "This connection's TLS certificate paths are Windows paths, which the WSL \
-        client cannot open. Install a native client, or move the certificates inside WSL.";
+pub fn wsl_tls_blocker(tls: &crate::connection::Tls) -> Option<Refusal> {
     let paths = [&tls.ca_path, &tls.client_cert_path, &tls.client_key_path];
-    paths.iter().any(|p| is_windows_path(p)).then_some(WHY)
+    paths
+        .iter()
+        .any(|p| is_windows_path(p))
+        .then_some(Refusal::WslCertificatePaths)
 }
 
 /// Why a **tunnelled** connection cannot open a CLI session at this TLS rung,
@@ -591,13 +719,9 @@ pub fn wsl_tls_blocker(tls: &crate::connection::Tls) -> Option<&'static str> {
 /// is that it checks. Only the two verifying rungs ask — `require` and below
 /// name no certificate, so the loopback address is the address and nothing is
 /// compared.
-pub fn tunnelled_verify_blocker(tls: &crate::connection::Tls) -> Option<&'static str> {
+pub fn tunnelled_verify_blocker(tls: &crate::connection::Tls) -> Option<Refusal> {
     use crate::connection::SslMode;
-    const WHY: &str = "This connection verifies the server's certificate and reaches it \
-        through an SSH tunnel, so the client would be told to dial 127.0.0.1 and check the \
-        certificate against that — which the server's own certificate cannot satisfy. Open a \
-        query tab instead, or lower the TLS mode for the CLI session.";
-    matches!(tls.mode, SslMode::VerifyCa | SslMode::VerifyFull).then_some(WHY)
+    matches!(tls.mode, SslMode::VerifyCa | SslMode::VerifyFull).then_some(Refusal::TunnelledVerify)
 }
 
 /// Is `p` a path only the Windows side can open?
@@ -676,8 +800,7 @@ pub const DOCKER_PS_ARGS: [&str; 3] = ["ps", "--quiet", "--no-trunc"];
 /// than being dropped, since a `docker` that printed something else is not the
 /// program this was written against. `--type=container` keeps an image that
 /// happens to share an id prefix out of the answer.
-pub fn docker_inspect_args(ps_output: &str) -> Result<Vec<String>, &'static str> {
-    const NOT_AN_ID: &str = "docker ps printed something that is not a container id.";
+pub fn docker_inspect_args(ps_output: &str) -> Result<Vec<String>, Refusal> {
     let mut args = vec!["inspect".to_string(), "--type=container".to_string()];
     for line in ps_output.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let is_id = matches!(line.len(), 12 | 64)
@@ -685,7 +808,7 @@ pub fn docker_inspect_args(ps_output: &str) -> Result<Vec<String>, &'static str>
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         if !is_id {
-            return Err(NOT_AN_ID);
+            return Err(Refusal::NotAContainerId);
         }
         args.push(line.to_string());
     }
@@ -706,11 +829,9 @@ pub fn docker_inspect_args(ps_output: &str) -> Result<Vec<String>, &'static str>
 /// `source` would read as the end of its argument and the start of a second
 /// command. Not the only such character for that client — its own rule is
 /// [`mysql_source_path`]'s.
-pub fn backup_file_target(file: &str) -> Result<&str, &'static str> {
-    const LINE_BREAK: &str = "That file name contains a line break, which the client would read \
-        as two arguments. Choose another name.";
+pub fn backup_file_target(file: &str) -> Result<&str, Refusal> {
     if file.trim().is_empty() || file.contains(['\n', '\r', '\0']) {
-        return Err(LINE_BREAK);
+        return Err(Refusal::FileNameLineBreak);
     }
     Ok(file)
 }
@@ -724,7 +845,7 @@ pub fn pg_dump_args(
     db: &str,
     file: &str,
     role: Option<&str>,
-) -> Result<Vec<String>, &'static str> {
+) -> Result<Vec<String>, Refusal> {
     let db = psql_target(db)?;
     let file = backup_file_target(file)?;
     let mut args: Vec<String> = vec![
@@ -746,11 +867,11 @@ pub fn pg_dump_args(
 
 /// `--role=<role>` for `pg_dump` and `pg_restore` — the role init SQL takes
 /// ([`init_role`]) — or nothing.
-fn role_arg(role: Option<&str>) -> Result<Option<String>, &'static str> {
+fn role_arg(role: Option<&str>) -> Result<Option<String>, Refusal> {
     match role {
         None => Ok(None),
         Some(r) if r.is_empty() || r.starts_with('-') || r.contains(['\n', '\r', '\0']) => {
-            Err("The role in this connection's init SQL cannot be handed to the tool as it is.")
+            Err(Refusal::RoleUnpassable)
         }
         Some(r) => Ok(Some(format!("--role={r}"))),
     }
@@ -768,7 +889,7 @@ pub fn pg_restore_args(
     db: &str,
     file: &str,
     role: Option<&str>,
-) -> Result<(&'static str, Vec<String>), &'static str> {
+) -> Result<(&'static str, Vec<String>), Refusal> {
     let db = psql_target(db)?;
     let file = backup_file_target(file)?;
     let role_flag = role_arg(role)?;
@@ -817,7 +938,7 @@ pub fn mysqldump_args(
     tls: Vec<String>,
     db: &str,
     file: &str,
-) -> Result<Vec<String>, &'static str> {
+) -> Result<Vec<String>, Refusal> {
     let file = backup_file_target(file)?;
     let mut args: Vec<String> = vec![
         "-h".into(),
@@ -850,7 +971,7 @@ pub fn mysql_restore_args(
     tls: Vec<String>,
     db: &str,
     file: &str,
-) -> Result<Vec<String>, &'static str> {
+) -> Result<Vec<String>, Refusal> {
     let file = mysql_source_path(file, cfg!(windows))?;
     let mut args: Vec<String> = vec![
         "-h".into(),
@@ -978,7 +1099,7 @@ pub fn init_role(init_sql: &str, dialect: crate::intel::SqlDialect) -> Option<St
 /// one with space at an end, which the client trims. On `windows` every path
 /// is backslashed (and `C:\Users\me\git\` holds a `\g`); the client takes `/`
 /// there, so the separators are turned round first.
-pub fn mysql_source_path(file: &str, windows: bool) -> Result<String, &'static str> {
+pub fn mysql_source_path(file: &str, windows: bool) -> Result<String, Refusal> {
     let file = backup_file_target(file)?;
     let path = if windows {
         file.replace('\\', "/")
@@ -986,10 +1107,7 @@ pub fn mysql_source_path(file: &str, windows: bool) -> Result<String, &'static s
         file.to_string()
     };
     if path.contains([';', '\\']) || path.trim() != path {
-        return Err(
-            "The mysql client would read that file's path as commands of its own \
-            (a ';' or a '\\' in it, or a space at an end). Move or rename it, then restore it.",
-        );
+        return Err(Refusal::MysqlSourcePath);
     }
     Ok(path)
 }
@@ -1897,7 +2015,7 @@ mod tests {
         );
     }
 
-    fn sqlcmd(host: &str, db: Option<&str>, mode: SslMode) -> Result<Vec<String>, &'static str> {
+    fn sqlcmd(host: &str, db: Option<&str>, mode: SslMode) -> Result<Vec<String>, Refusal> {
         sqlcmd_args(
             host,
             1433,
@@ -1977,7 +2095,8 @@ mod tests {
             ("tcp:h\\SQLEXPRESS", "-Stcp:h\\SQLEXPRESS"),
             ("(local)\\SQLEXPRESS", "-Stcp:localhost\\SQLEXPRESS"),
         ] {
-            let a = sqlcmd(host, None, SslMode::Require).unwrap_or_else(|e| panic!("{host}: {e}"));
+            let a =
+                sqlcmd(host, None, SslMode::Require).unwrap_or_else(|e| panic!("{host}: {e:?}"));
             assert_eq!(a[0], address, "{host:?}");
         }
     }
@@ -2039,5 +2158,59 @@ mod tests {
             },
         );
         assert!(client.is_err());
+    }
+
+    /// **Each refusal is the one its function answers**, so the interface,
+    /// which words a [`Refusal`] by its variant, says the right sentence —
+    /// and every variant is reached by something.
+    #[test]
+    fn each_launcher_refuses_with_its_own_reason() {
+        use crate::connection::{AuthMode, SslMode, Tls};
+        let sqlcmd = |host: &str, auth, tls: &Tls| {
+            sqlcmd_args(host, 1433, auth, "sa", None, tls).unwrap_err()
+        };
+        let mode = |mode| Tls {
+            mode,
+            ..Tls::default()
+        };
+        let reached = [
+            direct_spawn_verdict(std::path::Path::new("mysql.cmd")).unwrap_err(),
+            psql_target("a=b").unwrap_err(),
+            psql_target("postgres://x").unwrap_err(),
+            sqlite_target("-x.db").unwrap_err(),
+            sqlcmd("h", AuthMode::AzureCli, &mode(SslMode::Require)),
+            sqlcmd("a,b", AuthMode::Password, &mode(SslMode::Require)),
+            sqlcmd(
+                "h",
+                AuthMode::Password,
+                &Tls {
+                    mode: SslMode::VerifyFull,
+                    ca_path: "/ca.pem".into(),
+                    ..Tls::default()
+                },
+            ),
+            sqlcmd(
+                "h",
+                AuthMode::Password,
+                &Tls {
+                    mode: SslMode::Require,
+                    client_cert_path: "/c.pem".into(),
+                    client_key_path: "/k.pem".into(),
+                    ..Tls::default()
+                },
+            ),
+            wsl_tls_blocker(&Tls {
+                ca_path: "C:/ca.pem".into(),
+                ..Tls::default()
+            })
+            .unwrap(),
+            tunnelled_verify_blocker(&mode(SslMode::VerifyFull)).unwrap(),
+            docker_inspect_args("not an id").unwrap_err(),
+            backup_file_target("a\nb").unwrap_err(),
+            role_arg(Some("-x")).unwrap_err(),
+            mysql_source_path("a;b.sql", false).unwrap_err(),
+            AuthMode::AwsIam.external_client_refusal().unwrap(),
+        ];
+        assert_eq!(reached, Refusal::ALL);
     }
 }

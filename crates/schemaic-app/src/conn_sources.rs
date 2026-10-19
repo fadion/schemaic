@@ -275,7 +275,7 @@ pub fn docker_source() -> Result<Option<SourceFile>, String> {
         .map(|s| s.to_string())
         .collect();
     let ids = run(&ps_args)?;
-    let inspect = launch::docker_inspect_args(&ids).map_err(str::to_string)?;
+    let inspect = launch::docker_inspect_args(&ids).map_err(crate::refusal_text)?;
     if inspect.is_empty() {
         return Ok(None);
     }
@@ -304,7 +304,7 @@ fn docker_launcher() -> Result<(PathBuf, &'static [&'static str], &'static str),
     {
         return Ok((wsl, &["-e", "docker"], "docker (WSL)"));
     }
-    Err(refused.map_or_else(|| tr!("docker-not-found"), str::to_string))
+    Err(refused.map_or_else(|| tr!("docker-not-found"), crate::refusal_text))
 }
 
 /// Run `program` with `args`, no shell and no console window, and answer its

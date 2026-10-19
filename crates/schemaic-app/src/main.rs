@@ -429,7 +429,7 @@ enum Unreached {
     /// No candidate exists, on `PATH` or (where offered) inside WSL.
     Absent,
     /// A candidate was found and refused — `core::launch`'s reason.
-    Refused(&'static str),
+    Refused(launch::Refusal),
 }
 
 impl Unreached {
@@ -437,8 +437,32 @@ impl Unreached {
     fn said(self, absent: impl FnOnce() -> String) -> String {
         match self {
             Unreached::Absent => absent(),
-            Unreached::Refused(why) => why.to_string(),
+            Unreached::Refused(why) => refusal_text(why),
         }
+    }
+}
+
+/// A [`launch::Refusal`] in the interface's language — core decides what is
+/// refused, this only how it is said. [`launch::Refusal::message`] is the
+/// English it is held to.
+fn refusal_text(why: launch::Refusal) -> String {
+    use launch::Refusal;
+    match why {
+        Refusal::ClientIsShim => tr!("cli-refused-shim"),
+        Refusal::NameHasEquals => tr!("cli-refused-name-equals"),
+        Refusal::NameIsUri => tr!("cli-refused-name-uri"),
+        Refusal::FileStartsWithDash => tr!("cli-refused-file-dash"),
+        Refusal::SqlcmdEntra => tr!("cli-refused-sqlcmd-entra"),
+        Refusal::SqlcmdHost => tr!("cli-refused-sqlcmd-host"),
+        Refusal::SqlcmdCaFile => tr!("cli-refused-sqlcmd-ca"),
+        Refusal::SqlcmdClientCert => tr!("cli-refused-sqlcmd-client-cert"),
+        Refusal::WslCertificatePaths => tr!("cli-refused-wsl-paths"),
+        Refusal::TunnelledVerify => tr!("cli-refused-tunnelled-verify"),
+        Refusal::NotAContainerId => tr!("cli-refused-not-container-id"),
+        Refusal::FileNameLineBreak => tr!("cli-refused-file-line-break"),
+        Refusal::RoleUnpassable => tr!("cli-refused-role"),
+        Refusal::MysqlSourcePath => tr!("cli-refused-mysql-source-path"),
+        Refusal::CloudToken => tr!("cli-refused-cloud-token"),
     }
 }
 
@@ -471,7 +495,7 @@ fn resolve_cli_with<'a>(
     progs: &[&'a str],
     resolve: impl Fn(&str) -> Option<String>,
 ) -> Result<CliLauncher<'a>, Unreached> {
-    let mut refused: Option<&'static str> = None;
+    let mut refused: Option<launch::Refusal> = None;
     for prog in progs {
         // **Asked of what `which` resolved, not of the name.** A `.cmd`/`.bat`
         // image is run by `cmd.exe`, which does not know what the `--`
@@ -521,7 +545,7 @@ fn mysql_shell(
 ) -> Result<schemaic_term::ShellConfig, String> {
     let launcher = resolve_cli(&["mysql", "mariadb"])
         .map_err(|e| e.said(|| tr!("cli-no-client", client = "mysql/mariadb")))?;
-    Ok(mysql_shell_config(launcher, conn, db)?)
+    mysql_shell_config(launcher, conn, db).map_err(refusal_text)
 }
 
 /// The PostgreSQL half of [`mysql_shell`]. `db` is required — see
@@ -532,7 +556,7 @@ fn psql_shell(
 ) -> Result<schemaic_term::ShellConfig, String> {
     let launcher =
         resolve_cli(&["psql"]).map_err(|e| e.said(|| tr!("cli-no-client", client = "psql")))?;
-    Ok(psql_shell_config(launcher, conn, db)?)
+    psql_shell_config(launcher, conn, db).map_err(refusal_text)
 }
 
 /// The SQL Server fourth: `sqlcmd`, the ODBC one or the Go rewrite — they
@@ -559,7 +583,7 @@ fn mssql_shell_config(
     if conn.uses_tunnel()
         && let Some(why) = launch::tunnelled_verify_blocker(&conn.tls)
     {
-        return Err(why.to_string());
+        return Err(refusal_text(why));
     }
     use schemaic_core::connection::AuthMode;
     let auth = conn.effective_auth();
@@ -568,7 +592,8 @@ fn mssql_shell_config(
     if auth == AuthMode::Windows && matches!(launcher, CliLauncher::Wsl(_)) {
         return Err(tr!("cli-sqlcmd-windows-in-wsl"));
     }
-    let cli_args = launch::sqlcmd_args(&conn.host, conn.port, auth, &conn.user, db, &conn.tls)?;
+    let cli_args = launch::sqlcmd_args(&conn.host, conn.port, auth, &conn.user, db, &conn.tls)
+        .map_err(refusal_text)?;
     // A password only for a sign-in that sends one.
     let env = if auth.uses_credentials() {
         vec![("SQLCMDPASSWORD".to_string(), conn.password.clone())]
@@ -591,7 +616,7 @@ fn sqlite_shell(
 ) -> Result<schemaic_term::ShellConfig, String> {
     let launcher = resolve_native_cli("sqlite3")
         .map_err(|e| e.said(|| tr!("cli-no-client-on-path", client = "sqlite3")))?;
-    Ok(sqlite_shell_config(launcher, conn)?)
+    sqlite_shell_config(launcher, conn).map_err(refusal_text)
 }
 
 /// Which database `psql` should open.
@@ -627,7 +652,7 @@ fn mysql_shell_config(
     launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
-) -> Result<schemaic_term::ShellConfig, &'static str> {
+) -> Result<schemaic_term::ShellConfig, launch::Refusal> {
     // An IAM connection has no password to hand the client.
     if let Some(why) = conn.effective_auth().external_client_refusal() {
         return Err(why);
@@ -696,7 +721,7 @@ fn mysql_shell_config(
 fn sqlite_shell_config(
     launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
-) -> Result<schemaic_term::ShellConfig, &'static str> {
+) -> Result<schemaic_term::ShellConfig, launch::Refusal> {
     let file = launch::sqlite_target(&conn.file)?;
     let mut cfg = wrap_launcher(launcher, vec![file.to_string()], Vec::new());
     cfg.cwd = std::path::Path::new(file)
@@ -721,7 +746,7 @@ fn psql_shell_config(
     launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
     db: &str,
-) -> Result<schemaic_term::ShellConfig, &'static str> {
+) -> Result<schemaic_term::ShellConfig, launch::Refusal> {
     let db = launch::psql_target(db)?;
     // An IAM connection has no password to hand the client.
     if let Some(why) = conn.effective_auth().external_client_refusal() {
@@ -763,14 +788,14 @@ fn psql_shell_config(
 /// and an IAM connection has none.
 fn tool_tunnel_check(conn: &Connection) -> Result<(), String> {
     if let Some(why) = conn.effective_auth().external_client_refusal() {
-        return Err(why.to_string());
+        return Err(refusal_text(why));
     }
     match conn
         .uses_tunnel()
         .then(|| launch::tunnelled_verify_blocker(&conn.tls))
         .flatten()
     {
-        Some(why) => Err(why.to_string()),
+        Some(why) => Err(refusal_text(why)),
         None => Ok(()),
     }
 }
@@ -803,7 +828,8 @@ fn pg_dump_shell(
     tool_tunnel_check(conn)?;
     let prog = native_tool(&["pg_dump"], || tr!("cli-no-tool", tool = "pg_dump"))?;
     let role = launch::init_role(&conn.init_sql, SqlDialect::from_db_type(&conn.db_type));
-    let args = launch::pg_dump_args(&conn.host, conn.port, &conn.user, db, file, role.as_deref())?;
+    let args = launch::pg_dump_args(&conn.host, conn.port, &conn.user, db, file, role.as_deref())
+        .map_err(refusal_text)?;
     let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
     env.extend(launch::psql_cli_tls_env(&conn.tls));
     Ok(wrap_launcher(CliLauncher::Native(prog), args, env))
@@ -819,7 +845,8 @@ fn pg_restore_shell(
     tool_tunnel_check(conn)?;
     let role = launch::init_role(&conn.init_sql, SqlDialect::from_db_type(&conn.db_type));
     let (tool, args) =
-        launch::pg_restore_args(&conn.host, conn.port, &conn.user, db, file, role.as_deref())?;
+        launch::pg_restore_args(&conn.host, conn.port, &conn.user, db, file, role.as_deref())
+            .map_err(refusal_text)?;
     let prog = native_tool(&[tool], || tr!("cli-no-tool", tool = tool))?;
     let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
     env.extend(launch::psql_cli_tls_env(&conn.tls));
@@ -842,7 +869,8 @@ fn mysqldump_shell(
         )
     })?;
     let tls = launch::mysql_cli_tls_args(&conn.tls, launch::MysqlClient::of(prog));
-    let args = launch::mysqldump_args(&conn.host, conn.port, &conn.user, tls, db, file)?;
+    let args = launch::mysqldump_args(&conn.host, conn.port, &conn.user, tls, db, file)
+        .map_err(refusal_text)?;
     Ok(wrap_launcher(
         CliLauncher::Native(prog),
         args,
@@ -861,7 +889,8 @@ fn mysql_restore_shell(
         tr!("cli-no-either-client", first = "mariadb", second = "mysql")
     })?;
     let tls = launch::mysql_cli_tls_args(&conn.tls, launch::MysqlClient::of(prog));
-    let args = launch::mysql_restore_args(&conn.host, conn.port, &conn.user, tls, db, file)?;
+    let args = launch::mysql_restore_args(&conn.host, conn.port, &conn.user, tls, db, file)
+        .map_err(refusal_text)?;
     Ok(wrap_launcher(
         CliLauncher::Native(prog),
         args,
@@ -14193,7 +14222,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // certificate against it. Said here, where the rewrite happens,
                 // rather than met as the client's own handshake failure.
                 if let Some(why) = launch::tunnelled_verify_blocker(&conn.tls) {
-                    let cfg = message_shell(why);
+                    let cfg = message_shell(&refusal_text(why));
                     (install_terminal)(&cfg, None, "tunnel TLS message shell");
                     return;
                 }
@@ -14270,7 +14299,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return Ok(conn);
             }
             if let Some(why) = launch::tunnelled_verify_blocker(&conn.tls) {
-                return Err(why.to_string());
+                return Err(refusal_text(why));
             }
             match tunnels.borrow().get(&conn.id).map(|h| h.port()) {
                 Some(port) => Ok(Connection {
@@ -15882,6 +15911,15 @@ mod app_tests {
                 more,
             };
             assert_eq!(super::restore_refusal_text(&why), why.to_string(), "{more}");
+        }
+    }
+
+    /// **Every launcher refusal reads in English exactly as core's
+    /// `launch::Refusal::message` says it.**
+    #[test]
+    fn english_says_every_launcher_refusal_as_core_does() {
+        for why in schemaic_core::launch::Refusal::ALL {
+            assert_eq!(super::refusal_text(why), why.message(), "{why:?}");
         }
     }
 
@@ -17503,6 +17541,7 @@ mod app_tests {
     /// real one reads the machine's `PATH`.
     #[test]
     fn a_shim_for_one_candidate_does_not_hide_the_next_one() {
+        use schemaic_core::launch;
         let found = |table: &'static [(&'static str, &'static str)]| {
             move |p: &str| {
                 table
@@ -17538,20 +17577,24 @@ mod app_tests {
         // A shim and nothing else: the specific refusal, not the generic line —
         // this is the case the message was written for.
         let r = resolve_cli_with(&["mysql"], found(&[("mysql", "C:\\npm\\mysql.cmd")]));
-        let Some(super::Unreached::Refused(why)) = r.err() else {
-            panic!("a shim with no alternative is refused");
-        };
-        assert!(why.contains("shim"), "{why}");
+        assert_eq!(
+            r.err(),
+            Some(super::Unreached::Refused(launch::Refusal::ClientIsShim)),
+            "a shim with no alternative is refused"
+        );
         // Nothing at all is the generic line.
         let r = resolve_cli_with(&["mysql"], found(&[]));
         assert_eq!(r.err(), Some(super::Unreached::Absent));
-        // Which the caller names, from the catalogue — and a refusal it passes
-        // through untouched.
+        // Which the caller names, from the catalogue — and a refusal it words
+        // as core's.
         assert_eq!(
             super::Unreached::Absent.said(|| tr!("cli-no-client", client = "psql")),
             "No psql client found (PATH or WSL)."
         );
-        assert_eq!(super::Unreached::Refused("shim").said(String::new), "shim");
+        assert_eq!(
+            super::Unreached::Refused(launch::Refusal::ClientIsShim).said(String::new),
+            launch::Refusal::ClientIsShim.message()
+        );
         // And an ordinary first candidate still short-circuits.
         let r = resolve_cli_with(
             &["mysql", "mariadb"],
