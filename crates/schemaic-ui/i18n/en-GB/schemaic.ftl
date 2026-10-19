@@ -2096,6 +2096,43 @@ plan-analyze-hint = Executes the statement to measure real timings
 # Animated with trailing dots while it lasts.
 plan-explaining = Explaining
 plan-potential-issues = Potential issues
+# One warning per line under it (core's plan::PlanNote), by the engine whose
+# plan raised it. $table, $op and $wait are names from the plan itself; the
+# Extra: and type = parts quote MySQL's plan columns and stay as written. A
+# message ending -result or -unnamed is for a row the plan named no table on.
+plan-detail-no-index = no index used
+plan-detail-key-unused = index not used for lookup
+plan-my-full-scan = Full table scan on `{ $table }` ({ $detail }, type = ALL)
+plan-my-full-scan-result = Full table scan on the result ({ $detail }, type = ALL)
+plan-my-filesort = Filesort on `{ $table }` (Extra: Using filesort)
+plan-my-filesort-result = Filesort on the result (Extra: Using filesort)
+plan-my-temporary = Temporary table for `{ $table }` (Extra: Using temporary)
+plan-my-temporary-result = Temporary table for the result (Extra: Using temporary)
+plan-pg-seq-scan = Sequential scan on `{ $table }` (no index used)
+plan-pg-seq-scan-unnamed = Sequential scan on a table (no index used)
+plan-pg-sort = Sort node — the query sorts rows on the fly
+plan-ms-full-scan = Full scan of `{ $table }` ({ $op })
+plan-ms-full-scan-unnamed = Full scan of a table ({ $op })
+plan-ms-sort = Sort — the query sorts rows on the fly
+plan-ms-spool = { $op } — an intermediate worktable in tempdb
+# A warning SQL Server wrote on one operator; $warning is a plan-server-* line.
+plan-ms-operator = { $op }: { $warning }
+plan-server-no-join-predicate = no join predicate — every row pairs with every row
+plan-server-no-statistics = a column it reads has no statistics
+plan-server-spill = spilled to tempdb — its memory grant was too small
+# $issue and $expression are the server's own text.
+plan-server-convert = a type conversion affects the plan ({ $issue }): { $expression }
+plan-server-unmatched-indexes = a filtered index could not be used
+plan-server-memory-grant = its memory grant was misjudged
+plan-server-wait = waited on { $wait }
+# One this does not know, $name as SQL Server named it.
+plan-server-other = the server warns: { $name }
+# An index SQL Server says it would have used. $keys and $include are column
+# lists joined with ", "; $impact is a whole percentage.
+plan-missing-index = Missing index on `{ $table }` ({ $keys })
+plan-missing-index-include = Missing index on `{ $table }` ({ $keys }; include { $include })
+plan-missing-index-impact = Missing index on `{ $table }` ({ $keys }) — the server expected a { $impact }% improvement
+plan-missing-index-include-impact = Missing index on `{ $table }` ({ $keys }; include { $include }) — the server expected a { $impact }% improvement
 plan-ask-ai = Ask AI
 
 ## Used by modal (used_by_view.rs)

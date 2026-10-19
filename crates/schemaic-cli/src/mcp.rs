@@ -1092,7 +1092,7 @@ fn format_plan(plan: &schemaic_core::plan::QueryPlan) -> String {
         out.push_str("\n\nPotential issues:");
         for w in &listed {
             out.push_str("\n- ");
-            out.push_str(&w.message);
+            out.push_str(&w.message());
         }
         if !unlisted.is_empty() {
             out.push_str(&format!(

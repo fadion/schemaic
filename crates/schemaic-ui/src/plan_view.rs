@@ -20,7 +20,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
-use schemaic_core::plan::{PlanWarningKind, QueryPlan};
+use schemaic_core::plan::{PlanNote, PlanWarningKind, QueryPlan, ServerWarning};
 
 use crate::i18n::tr;
 use crate::settings::focusable_toggle;
@@ -232,6 +232,96 @@ fn loaded_body(plan: &QueryPlan) -> AnyView {
         .into_any()
 }
 
+/// A plan warning's line — core's `PlanNote::message` in the interface's
+/// language. Operator, wait-type and table names are the plan's own, and the
+/// `Extra`/`type` notes quote MySQL's plan columns as they read.
+fn plan_note_text(note: &PlanNote) -> String {
+    match note {
+        PlanNote::MyFullScan { table, keyed } => {
+            let detail = if *keyed {
+                tr!("plan-detail-key-unused")
+            } else {
+                tr!("plan-detail-no-index")
+            };
+            match table {
+                Some(t) => tr!("plan-my-full-scan", table = t.as_str(), detail = detail),
+                None => tr!("plan-my-full-scan-result", detail = detail),
+            }
+        }
+        PlanNote::MyFilesort { table: Some(t) } => tr!("plan-my-filesort", table = t.as_str()),
+        PlanNote::MyFilesort { table: None } => tr!("plan-my-filesort-result"),
+        PlanNote::MyTemporary { table: Some(t) } => tr!("plan-my-temporary", table = t.as_str()),
+        PlanNote::MyTemporary { table: None } => tr!("plan-my-temporary-result"),
+        PlanNote::PgSeqScan { table: Some(t) } => tr!("plan-pg-seq-scan", table = t.as_str()),
+        PlanNote::PgSeqScan { table: None } => tr!("plan-pg-seq-scan-unnamed"),
+        PlanNote::PgSort => tr!("plan-pg-sort"),
+        PlanNote::MsFullScan { table: Some(t), op } => {
+            tr!("plan-ms-full-scan", table = t.as_str(), op = op.as_str())
+        }
+        PlanNote::MsFullScan { table: None, op } => {
+            tr!("plan-ms-full-scan-unnamed", op = op.as_str())
+        }
+        PlanNote::MsSort => tr!("plan-ms-sort"),
+        PlanNote::MsSpool { op } => tr!("plan-ms-spool", op = op.as_str()),
+        PlanNote::MsOperator { op, warning } => tr!(
+            "plan-ms-operator",
+            op = op.as_str(),
+            warning = server_warning_text(warning)
+        ),
+        PlanNote::MsStatement(warning) => server_warning_text(warning),
+        PlanNote::MissingIndex {
+            table,
+            keys,
+            include,
+            impact,
+        } => {
+            let (table, keys) = (table.as_str(), keys.join(", "));
+            let include = include.join(", ");
+            match (include.is_empty(), impact) {
+                (true, None) => tr!("plan-missing-index", table = table, keys = keys),
+                (false, None) => tr!(
+                    "plan-missing-index-include",
+                    table = table,
+                    keys = keys,
+                    include = include
+                ),
+                (true, Some(v)) => tr!(
+                    "plan-missing-index-impact",
+                    table = table,
+                    keys = keys,
+                    impact = v.as_str()
+                ),
+                (false, Some(v)) => tr!(
+                    "plan-missing-index-include-impact",
+                    table = table,
+                    keys = keys,
+                    include = include,
+                    impact = v.as_str()
+                ),
+            }
+        }
+    }
+}
+
+/// A warning SQL Server wrote into its plan — core's `ServerWarning::message`
+/// in the interface's language.
+fn server_warning_text(w: &ServerWarning) -> String {
+    match w {
+        ServerWarning::NoJoinPredicate => tr!("plan-server-no-join-predicate"),
+        ServerWarning::NoStatistics => tr!("plan-server-no-statistics"),
+        ServerWarning::Spill => tr!("plan-server-spill"),
+        ServerWarning::Convert { issue, expression } => tr!(
+            "plan-server-convert",
+            issue = issue.as_str(),
+            expression = expression.as_str()
+        ),
+        ServerWarning::UnmatchedIndexes => tr!("plan-server-unmatched-indexes"),
+        ServerWarning::MemoryGrant => tr!("plan-server-memory-grant"),
+        ServerWarning::Wait { wait_type } => tr!("plan-server-wait", wait = wait_type.as_str()),
+        ServerWarning::Other(name) => tr!("plan-server-other", name = name.as_str()),
+    }
+}
+
 /// The heuristic-warning list (empty view when the plan is clean).
 fn plan_warnings(plan: &QueryPlan) -> AnyView {
     if plan.warnings.is_empty() {
@@ -248,7 +338,8 @@ fn plan_warnings(plan: &QueryPlan) -> AnyView {
             h_stack((
                 icons::icon(icons::TRIANGLE_ALERT, 15.0)
                     .style(move |s| s.color(kind_color()).flex_shrink(0.0_f32)),
-                text(w.message.clone()).style(|s| s.font_size(font_body()).color(theme::text())),
+                text(plan_note_text(&w.note))
+                    .style(|s| s.font_size(font_body()).color(theme::text())),
             ))
             .style(|s| s.items_center().gap(theme::scaled(8.0)))
             .into_any()
@@ -490,4 +581,83 @@ fn ask_ai(
     crate::reveal_ai_panel(right_panel);
     (ai_send)(msg);
     (close)();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_note_text;
+    use schemaic_core::plan::{PlanNote, ServerWarning};
+
+    /// **Every plan warning reads in English exactly as core's
+    /// `PlanNote::message`** — each engine's notes with a table named and
+    /// none, each server warning on an operator and on the statement, and a
+    /// missing index with and without included columns and an impact.
+    #[test]
+    fn english_says_every_plan_note_as_core_does() {
+        let t = || Some("film".to_string());
+        let server = [
+            ServerWarning::NoJoinPredicate,
+            ServerWarning::NoStatistics,
+            ServerWarning::Spill,
+            ServerWarning::Convert {
+                issue: "Seek Plan".into(),
+                expression: "CONVERT_IMPLICIT(int,[a])".into(),
+            },
+            ServerWarning::UnmatchedIndexes,
+            ServerWarning::MemoryGrant,
+            ServerWarning::Wait {
+                wait_type: "PAGEIOLATCH_SH".into(),
+            },
+            ServerWarning::Other("SomethingNew".into()),
+        ];
+        let mut notes = vec![PlanNote::PgSort, PlanNote::MsSort];
+        for table in [t(), None] {
+            for keyed in [false, true] {
+                notes.push(PlanNote::MyFullScan {
+                    table: table.clone(),
+                    keyed,
+                });
+            }
+            notes.push(PlanNote::MyFilesort {
+                table: table.clone(),
+            });
+            notes.push(PlanNote::MyTemporary {
+                table: table.clone(),
+            });
+            notes.push(PlanNote::PgSeqScan {
+                table: table.clone(),
+            });
+            notes.push(PlanNote::MsFullScan {
+                table,
+                op: "Clustered Index Scan".into(),
+            });
+        }
+        notes.push(PlanNote::MsSpool {
+            op: "Table Spool".into(),
+        });
+        for w in server {
+            notes.push(PlanNote::MsOperator {
+                op: "Hash Match (Inner Join)".into(),
+                warning: w.clone(),
+            });
+            notes.push(PlanNote::MsStatement(w));
+        }
+        let email = || vec!["EmailAddress".to_string()];
+        for (include, impact) in [
+            (vec![], None),
+            (email(), None),
+            (vec![], Some("92".to_string())),
+            (email(), Some("92".to_string())),
+        ] {
+            notes.push(PlanNote::MissingIndex {
+                table: "SalesLT.Customer".into(),
+                keys: vec!["CompanyName".into(), "Phone".into()],
+                include,
+                impact,
+            });
+        }
+        for n in notes {
+            assert_eq!(plan_note_text(&n), n.message(), "{n:?}");
+        }
+    }
 }

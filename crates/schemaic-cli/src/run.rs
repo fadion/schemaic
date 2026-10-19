@@ -1509,7 +1509,7 @@ fn plan_notes(plan: &schemaic_core::plan::QueryPlan) -> Vec<String> {
     let mut notes: Vec<String> = plan
         .warnings
         .iter()
-        .map(|w| format!("possible issue: {}", w.message))
+        .map(|w| format!("possible issue: {}", w.message()))
         .collect();
     if plan.truncated {
         notes.push(format!(
@@ -2038,7 +2038,7 @@ mod tests {
     }
 
     fn plan(rows: usize, truncated: bool) -> schemaic_core::plan::QueryPlan {
-        use schemaic_core::plan::{PlanWarning, PlanWarningKind, QueryPlan};
+        use schemaic_core::plan::{PlanNote, PlanWarning, PlanWarningKind, QueryPlan};
         QueryPlan {
             columns: vec!["id".into(), "detail".into(), "key".into()],
             rows: (0..rows)
@@ -2047,7 +2047,10 @@ mod tests {
             warnings: vec![PlanWarning {
                 row: 0,
                 kind: PlanWarningKind::FullScan,
-                message: "Full table scan on t0".into(),
+                note: PlanNote::MyFullScan {
+                    table: Some("t0".into()),
+                    keyed: false,
+                },
             }],
             truncated,
         }
@@ -2076,7 +2079,10 @@ mod tests {
     #[test]
     fn a_plans_findings_and_its_cut_go_to_stderr() {
         let notes = plan_notes(&plan(2, false));
-        assert_eq!(notes, ["possible issue: Full table scan on t0"]);
+        assert_eq!(
+            notes,
+            ["possible issue: Full table scan on `t0` (no index used, type = ALL)"]
+        );
         let notes = plan_notes(&plan(3, true));
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[1].contains("first 3 rows"), "{notes:?}");

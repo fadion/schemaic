@@ -74,8 +74,159 @@ pub struct PlanWarning {
     /// Index into [`QueryPlan::rows`] this warning refers to.
     pub row: usize,
     pub kind: PlanWarningKind,
-    /// Human-readable, one-line explanation shown in the modal.
-    pub message: String,
+    /// What the warning says — a value, so the plan modal can say it in the
+    /// interface's language; [`PlanWarning::message`] is the English, which
+    /// the AI prompt, the MCP server and the CLI read.
+    pub note: PlanNote,
+}
+
+impl PlanWarning {
+    /// The one-line explanation, in English.
+    pub fn message(&self) -> String {
+        self.note.message()
+    }
+}
+
+/// What a plan warning says, by the engine whose plan raised it. A `table` is
+/// the name the plan gave, `None` where it gave none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanNote {
+    /// MySQL's `type = ALL`; `keyed` when a key was listed but not used for
+    /// the lookup.
+    MyFullScan { table: Option<String>, keyed: bool },
+    /// MySQL's `Using filesort`.
+    MyFilesort { table: Option<String> },
+    /// MySQL's `Using temporary`.
+    MyTemporary { table: Option<String> },
+    /// PostgreSQL's `Seq Scan`.
+    PgSeqScan { table: Option<String> },
+    /// PostgreSQL's `Sort` node.
+    PgSort,
+    /// SQL Server's `Table Scan` or `Clustered Index Scan`, `op` being which.
+    MsFullScan { table: Option<String>, op: String },
+    /// SQL Server's `Sort`.
+    MsSort,
+    /// A SQL Server spool, `op` its operator's name.
+    MsSpool { op: String },
+    /// A warning SQL Server wrote on an operator, `op` the operator as the
+    /// plan table names it.
+    MsOperator { op: String, warning: ServerWarning },
+    /// A warning SQL Server wrote on the statement as a whole.
+    MsStatement(ServerWarning),
+    /// An index SQL Server's optimiser says it would have used: its key and
+    /// included columns, and the improvement it expected, as a whole
+    /// percentage printed (`92`).
+    MissingIndex {
+        table: String,
+        keys: Vec<String>,
+        include: Vec<String>,
+        impact: Option<String>,
+    },
+}
+
+/// An element under SQL Server's `<Warnings>`, in the words the table shows
+/// ([`showplan_warning`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerWarning {
+    NoJoinPredicate,
+    NoStatistics,
+    /// Any of the spills to `tempdb`.
+    Spill,
+    /// `PlanAffectingConvert`, with the server's issue and expression.
+    Convert {
+        issue: String,
+        expression: String,
+    },
+    UnmatchedIndexes,
+    MemoryGrant,
+    Wait {
+        wait_type: String,
+    },
+    /// One this does not know, named as the server named it.
+    Other(String),
+}
+
+impl ServerWarning {
+    /// The warning in English.
+    pub fn message(&self) -> String {
+        match self {
+            ServerWarning::NoJoinPredicate => {
+                "no join predicate — every row pairs with every row".to_string()
+            }
+            ServerWarning::NoStatistics => "a column it reads has no statistics".to_string(),
+            ServerWarning::Spill => {
+                "spilled to tempdb — its memory grant was too small".to_string()
+            }
+            ServerWarning::Convert { issue, expression } => {
+                format!("a type conversion affects the plan ({issue}): {expression}")
+            }
+            ServerWarning::UnmatchedIndexes => "a filtered index could not be used".to_string(),
+            ServerWarning::MemoryGrant => "its memory grant was misjudged".to_string(),
+            ServerWarning::Wait { wait_type } => format!("waited on {wait_type}"),
+            ServerWarning::Other(name) => format!("the server warns: {name}"),
+        }
+    }
+}
+
+impl PlanNote {
+    /// The note in English.
+    pub fn message(&self) -> String {
+        // A table as the sentence names it, or the engine's word for none.
+        let named = |t: &Option<String>, none: &str| match t {
+            Some(t) => format!("`{t}`"),
+            None => none.to_string(),
+        };
+        match self {
+            PlanNote::MyFullScan { table, keyed } => {
+                let detail = if *keyed {
+                    "index not used for lookup"
+                } else {
+                    "no index used"
+                };
+                format!(
+                    "Full table scan on {} ({detail}, type = ALL)",
+                    named(table, "the result")
+                )
+            }
+            PlanNote::MyFilesort { table } => format!(
+                "Filesort on {} (Extra: Using filesort)",
+                named(table, "the result")
+            ),
+            PlanNote::MyTemporary { table } => format!(
+                "Temporary table for {} (Extra: Using temporary)",
+                named(table, "the result")
+            ),
+            PlanNote::PgSeqScan { table } => format!(
+                "Sequential scan on {} (no index used)",
+                named(table, "a table")
+            ),
+            PlanNote::PgSort => "Sort node — the query sorts rows on the fly".to_string(),
+            PlanNote::MsFullScan { table, op } => {
+                format!("Full scan of {} ({op})", named(table, "a table"))
+            }
+            PlanNote::MsSort => "Sort — the query sorts rows on the fly".to_string(),
+            PlanNote::MsSpool { op } => format!("{op} — an intermediate worktable in tempdb"),
+            PlanNote::MsOperator { op, warning } => format!("{op}: {}", warning.message()),
+            PlanNote::MsStatement(warning) => warning.message(),
+            PlanNote::MissingIndex {
+                table,
+                keys,
+                include,
+                impact,
+            } => {
+                let mut cols = keys.join(", ");
+                if !include.is_empty() {
+                    cols.push_str("; include ");
+                    cols.push_str(&include.join(", "));
+                }
+                let impact = impact
+                    .as_ref()
+                    .map(|v| format!(" — the server expected a {v}% improvement"))
+                    .unwrap_or_default();
+                format!("Missing index on `{table}` ({cols}){impact}")
+            }
+        }
+    }
 }
 
 impl QueryPlan {
@@ -135,7 +286,7 @@ impl QueryPlan {
             out.push_str("\nPotential issues:\n");
             for w in &self.warnings {
                 out.push_str("- ");
-                out.push_str(&w.message);
+                out.push_str(&w.message());
                 out.push('\n');
             }
         }
@@ -168,14 +319,10 @@ fn analyze(columns: &[String], rows: &[Vec<String>]) -> Vec<PlanWarning> {
     let cell = |row: &[String], i: Option<usize>| -> String {
         i.and_then(|i| row.get(i)).cloned().unwrap_or_default()
     };
-    // A readable table label for the message (`<derived2>` etc. pass through).
-    let label = |row: &[String]| -> String {
+    // The row's table for the note (`<derived2>` etc. pass through).
+    let table = |row: &[String]| -> Option<String> {
         let t = cell(row, table_i);
-        if t.is_empty() {
-            "the result".to_string()
-        } else {
-            format!("`{t}`")
-        }
+        (!t.is_empty()).then_some(t)
     };
 
     let mut out = Vec::new();
@@ -185,16 +332,13 @@ fn analyze(columns: &[String], rows: &[Vec<String>]) -> Vec<PlanWarning> {
 
         // Full table scan: access type ALL with no index chosen.
         if access.eq_ignore_ascii_case("ALL") {
-            let no_key = is_blank(&cell(row, key_i));
-            let detail = if no_key {
-                "no index used"
-            } else {
-                "index not used for lookup"
-            };
             out.push(PlanWarning {
                 row: r,
                 kind: PlanWarningKind::FullScan,
-                message: format!("Full table scan on {} ({detail}, type = ALL)", label(row)),
+                note: PlanNote::MyFullScan {
+                    table: table(row),
+                    keyed: !is_blank(&cell(row, key_i)),
+                },
             });
         }
         // Extra-column smells (case-insensitive substring — MySQL packs several
@@ -204,17 +348,14 @@ fn analyze(columns: &[String], rows: &[Vec<String>]) -> Vec<PlanWarning> {
             out.push(PlanWarning {
                 row: r,
                 kind: PlanWarningKind::Filesort,
-                message: format!("Filesort on {} (Extra: Using filesort)", label(row)),
+                note: PlanNote::MyFilesort { table: table(row) },
             });
         }
         if extra_l.contains("using temporary") {
             out.push(PlanWarning {
                 row: r,
                 kind: PlanWarningKind::TempTable,
-                message: format!(
-                    "Temporary table for {} (Extra: Using temporary)",
-                    label(row)
-                ),
+                note: PlanNote::MyTemporary { table: table(row) },
             });
         }
     }
@@ -238,15 +379,12 @@ fn analyze_pg(rows: &[Vec<String>]) -> Vec<PlanWarning> {
                 .nth(1)
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("");
-            let label = if tbl.is_empty() {
-                "a table".to_string()
-            } else {
-                format!("`{tbl}`")
-            };
             out.push(PlanWarning {
                 row: r,
                 kind: PlanWarningKind::FullScan,
-                message: format!("Sequential scan on {label} (no index used)"),
+                note: PlanNote::PgSeqScan {
+                    table: (!tbl.is_empty()).then(|| tbl.to_string()),
+                },
             });
         } else if lower.starts_with("sort")
             && !lower.starts_with("sort key")
@@ -255,7 +393,7 @@ fn analyze_pg(rows: &[Vec<String>]) -> Vec<PlanWarning> {
             out.push(PlanWarning {
                 row: r,
                 kind: PlanWarningKind::Filesort,
-                message: "Sort node — the query sorts rows on the fly".to_string(),
+                note: PlanNote::PgSort,
             });
         }
     }
@@ -279,8 +417,8 @@ struct MsOp {
     /// Summed over `RunTimeCountersPerThread` — `None` when not measured.
     actual_rows: Option<u64>,
     executions: Option<u64>,
-    /// The operator's own `<Warnings>`, as (kind, text).
-    warnings: Vec<(PlanWarningKind, String)>,
+    /// The operator's own `<Warnings>`.
+    warnings: Vec<(PlanWarningKind, ServerWarning)>,
 }
 
 /// One planned statement (`<StmtSimple>` with a `<QueryPlan>`).
@@ -289,7 +427,7 @@ struct MsStatement {
     kind: String,
     ops: Vec<MsOp>,
     /// Statement-level advice: missing indexes and the plan's own warnings.
-    advice: Vec<(PlanWarningKind, String)>,
+    advice: Vec<(PlanWarningKind, PlanNote)>,
 }
 
 /// SQL Server's plan documents — one per statement, from `SET SHOWPLAN_XML ON`
@@ -374,41 +512,43 @@ fn showplan(docs: &[String]) -> QueryPlan {
                 row.push(op.executions.map(|v| v.to_string()).unwrap_or_default());
             }
             rows.push(row);
-            let label = match &op.table {
-                Some(t) => format!("`{t}`"),
-                None => "a table".to_string(),
-            };
             match op.physical.as_str() {
                 "Table Scan" | "Clustered Index Scan" => warnings.push(PlanWarning {
                     row: r,
                     kind: PlanWarningKind::FullScan,
-                    message: format!("Full scan of {label} ({})", op.physical),
+                    note: PlanNote::MsFullScan {
+                        table: op.table.clone(),
+                        op: op.physical.clone(),
+                    },
                 }),
                 "Sort" => warnings.push(PlanWarning {
                     row: r,
                     kind: PlanWarningKind::Filesort,
-                    message: "Sort — the query sorts rows on the fly".to_string(),
+                    note: PlanNote::MsSort,
                 }),
                 p if p.ends_with("Spool") => warnings.push(PlanWarning {
                     row: r,
                     kind: PlanWarningKind::TempTable,
-                    message: format!("{p} — an intermediate worktable in tempdb"),
+                    note: PlanNote::MsSpool { op: p.to_string() },
                 }),
                 _ => {}
             }
-            for (kind, text) in &op.warnings {
+            for (kind, warning) in &op.warnings {
                 warnings.push(PlanWarning {
                     row: r,
                     kind: *kind,
-                    message: format!("{name}: {text}"),
+                    note: PlanNote::MsOperator {
+                        op: name.clone(),
+                        warning: warning.clone(),
+                    },
                 });
             }
         }
-        for (kind, text) in &stmt.advice {
+        for (kind, note) in &stmt.advice {
             warnings.push(PlanWarning {
                 row: first,
                 kind: *kind,
-                message: text.clone(),
+                note: note.clone(),
             });
         }
     }
@@ -431,18 +571,14 @@ struct MissingIndex {
 }
 
 impl MissingIndex {
-    fn message(&self) -> String {
-        let mut cols = self.keys.join(", ");
-        if !self.include.is_empty() {
-            cols.push_str("; include ");
-            cols.push_str(&self.include.join(", "));
+    /// The index as a plan note, its impact printed as a whole percentage.
+    fn note(&self) -> PlanNote {
+        PlanNote::MissingIndex {
+            table: self.table.clone(),
+            keys: self.keys.clone(),
+            include: self.include.clone(),
+            impact: self.impact.parse::<f64>().ok().map(|v| format!("{v:.0}")),
         }
-        let impact = self
-            .impact
-            .parse::<f64>()
-            .map(|v| format!(" — the server expected a {v:.0}% improvement"))
-            .unwrap_or_default();
-        format!("Missing index on `{}` ({cols}){impact}", self.table)
     }
 }
 
@@ -489,30 +625,25 @@ struct OpenStatement {
 fn showplan_warning(
     name: &str,
     attr: &dyn Fn(&str) -> Option<String>,
-) -> (PlanWarningKind, String) {
-    let text = match name {
-        "NoJoinPredicate" => "no join predicate — every row pairs with every row".to_string(),
-        "ColumnsWithNoStatistics" => "a column it reads has no statistics".to_string(),
+) -> (PlanWarningKind, ServerWarning) {
+    let warning = match name {
+        "NoJoinPredicate" => ServerWarning::NoJoinPredicate,
+        "ColumnsWithNoStatistics" => ServerWarning::NoStatistics,
         "SpillToTempDb" | "HashSpillDetails" | "SortSpillDetails" | "ExchangeSpillDetails" => {
-            return (
-                PlanWarningKind::TempTable,
-                "spilled to tempdb — its memory grant was too small".to_string(),
-            );
+            return (PlanWarningKind::TempTable, ServerWarning::Spill);
         }
-        "PlanAffectingConvert" => {
-            let issue = attr("ConvertIssue").unwrap_or_default();
-            let expr = attr("Expression").unwrap_or_default();
-            format!("a type conversion affects the plan ({issue}): {expr}")
-        }
-        "UnmatchedIndexes" => "a filtered index could not be used".to_string(),
-        "MemoryGrantWarning" => "its memory grant was misjudged".to_string(),
-        "Wait" => {
-            let t = attr("WaitType").unwrap_or_default();
-            format!("waited on {t}")
-        }
-        other => format!("the server warns: {other}"),
+        "PlanAffectingConvert" => ServerWarning::Convert {
+            issue: attr("ConvertIssue").unwrap_or_default(),
+            expression: attr("Expression").unwrap_or_default(),
+        },
+        "UnmatchedIndexes" => ServerWarning::UnmatchedIndexes,
+        "MemoryGrantWarning" => ServerWarning::MemoryGrant,
+        "Wait" => ServerWarning::Wait {
+            wait_type: attr("WaitType").unwrap_or_default(),
+        },
+        other => ServerWarning::Other(other.to_string()),
     };
-    (PlanWarningKind::ServerWarning, text)
+    (PlanWarningKind::ServerWarning, warning)
 }
 
 /// Every planned statement one document holds, in document order, or why it
@@ -601,7 +732,7 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
                         if let (Some(m), Some(top)) = (missing.as_mut(), top) {
                             out[top.at]
                                 .advice
-                                .push((PlanWarningKind::MissingIndex, m.message()));
+                                .push((PlanWarningKind::MissingIndex, m.note()));
                             m.keys.clear();
                             m.include.clear();
                         }
@@ -637,12 +768,12 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, String> {
             .filter(|t| t.plans > 0)
             .map(|t| (t.at, t.ops.last().copied()));
         if in_warnings == 1 {
-            let warning = showplan_warning(name, &attr);
+            let (kind, warning) = showplan_warning(name, &attr);
             if let Some((at, op)) = top {
                 let s = &mut out[at];
                 match op {
-                    Some(i) => s.ops[i].warnings.push(warning),
-                    None => s.advice.push(warning),
+                    Some(i) => s.ops[i].warnings.push((kind, warning)),
+                    None => s.advice.push((kind, PlanNote::MsStatement(warning))),
                 }
             }
         }
@@ -835,7 +966,7 @@ mod tests {
         assert_eq!(plan.warnings.len(), 3);
         // Every warning points at the single row and names the table.
         assert!(plan.warnings.iter().all(|w| w.row == 0));
-        assert!(plan.warnings[0].message.contains("`film`"));
+        assert!(plan.warnings[0].message().contains("`film`"));
     }
 
     #[test]
@@ -861,7 +992,7 @@ mod tests {
         let plan = QueryPlan::from_result(&rs);
         assert_eq!(plan.warnings.len(), 1);
         assert_eq!(plan.warnings[0].kind, PlanWarningKind::FullScan);
-        assert!(plan.warnings[0].message.contains("index not used"));
+        assert!(plan.warnings[0].message().contains("index not used"));
     }
 
     #[test]
@@ -910,7 +1041,7 @@ mod tests {
         assert!(
             plan.warnings
                 .iter()
-                .any(|w| w.message.contains("`country`"))
+                .any(|w| w.message().contains("`country`"))
         );
     }
 
@@ -984,7 +1115,7 @@ mod tests {
             plan.warnings
                 .iter()
                 .filter(|w| w.kind == kind)
-                .map(|w| (w.row, w.message.as_str()))
+                .map(|w| (w.row, w.message()))
                 .collect::<Vec<_>>()
         };
         assert_eq!(at(PlanWarningKind::FullScan).len(), 1);

@@ -103,7 +103,8 @@ assertions pin English wording — stays the regression net throughout.
    `save_connections`' answer return too; `i18n::notice_text`), and the import modal's
    refusals, memory warnings and issue tail (`import::ReadRefusal`, which `ImportError::Refused`
    carries beside `Read`'s library text, `MemoryWarning`, `IssueTail`;
-   `i18n::import_error_text`, `read_refusal_text`). Of the other existing enums,
+   `i18n::import_error_text`, `read_refusal_text`), and the plan modal's warnings
+   (`plan::PlanNote`, `ServerWarning`; `plan_view::plan_note_text`). Of the other existing enums,
    `FilterError::BadCondition` renders not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
    so its prose lives at its construction sites and it is the weakest to convert.
@@ -138,8 +139,10 @@ assertions pin English wording — stays the regression net throughout.
      `i18n::staged_requery_note`, `staged_landing_note`, `reread_without_filter_note`.)
    - **Write-back** — `Rollback::note` and `one_row_verdict`'s text, fused into a `DbError::Query`
      in `schemaic-db`; the hardest, since the sentence is built below core.
-   - **The plan view's warnings** (`plan.rs`) and **the editor's offline diagnostics**
-     (`intel::Diagnostic::message`).
+   - **SQL Server's plan table** — the headings `showplan` writes as the table's columns and
+     its *Statement N: …*, *Could not read the plan* and *No statement … has a plan* rows,
+     which are cells, so the AI prompt and the CLI read the same English.
+   - **The editor's offline diagnostics** (`intel::Diagnostic::message`).
    - **Import's load backstop** — `RowCtx::row`'s `line N, column M: …` for a file that
      changed under the check, an `Err(String)` the row iterator hands the database layer
      mid-load; the write-back's problem, smaller.

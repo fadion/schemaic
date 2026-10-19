@@ -14782,6 +14782,14 @@ existing prose was left alone.
     one cut there must not read as whole (`a_capped_plan_carries_its_cut`); `to_prompt_text` for
     the AI — the plan modal's hand-off. The MCP server's `explain` reply is its own, capped
     `format_plan` (`schemaic-cli`'s `mcp.rs`).
+    **A warning carries what it found, not a sentence**: `PlanWarning::note` is a `PlanNote`, a
+    variant per engine's finding with its table, operator, server warning or index columns as
+    fields, so the plan modal can word it in the interface's language (under `plan_view.rs`).
+    `PlanWarning::message` — `PlanNote::message`, and `ServerWarning::message` inside it — is the
+    English, and stays the English for `to_prompt_text`, the MCP server's `explain` and
+    `schemaic explain`'s notes. Neither enum has a `Display`; the English is asked for by name. A
+    table the plan names none for is `None` rather than a stand-in word, because the stand-in is
+    not one word: MySQL's English says *the result*, PostgreSQL's and SQL Server's *a table*.
     **SQL Server's plan is not a table but an XML document per statement**, and it is read into
     the same tabular `QueryPlan` rather than a second shape the modal would have to learn: a result
     whose one column is `SHOWPLAN_COLUMN` (`Microsoft SQL Server 2005 XML Showplan`, the name
@@ -14822,9 +14830,14 @@ existing prose was left alone.
     are the other engines' in T-SQL's names — `Table Scan` and `Clustered Index Scan` are
     `FullScan`, `Sort` is `Filesort`, any `…Spool` is `TempTable` — and two kinds exist for
     this engine alone, since no other plan carries them: `MissingIndex`, from the plan's
-    `<MissingIndexes>` with the impact the server expected, and `ServerWarning`, the plan's own
-    `<Warnings>` (no join predicate, a column with no statistics, a plan-affecting conversion…),
-    except that a spill to `tempdb` maps to `TempTable`. `supports_plan` answers yes for every
+    `<MissingIndexes>` with the impact the server expected (`MissingIndex::note`, the impact
+    printed as a whole percentage), and `ServerWarning`, the plan's own `<Warnings>` (no join
+    predicate, a column with no statistics, a plan-affecting conversion…), except that a spill to
+    `tempdb` maps to `TempTable`. `showplan_warning` answers each element as a
+    `(PlanWarningKind, ServerWarning)` — an element it does not know is `ServerWarning::Other`
+    under the server's name — kept on its operator's `MsOp::warnings`, or, written on the statement
+    as a whole, as a `PlanNote::MsStatement` in `MsStatement::advice` beside the missing indexes.
+    `supports_plan` answers yes for every
     engine now and is kept an exhaustive `match`, so an engine added later has to answer it rather
     than inherit the yes (`a_sql_server_showplan_becomes_one_row_per_operator`,
     `a_sql_server_plan_warns_from_its_operators_and_its_own_advice`,
@@ -27046,9 +27059,22 @@ existing prose was left alone.
     a write (`plan-analyze-unavailable`, which keeps the word *Analyze*), *Explaining* under the
     loading dots, *Potential issues* and *Ask AI*. The toggle's own **Analyze** label stays a
     literal — it is `EXPLAIN ANALYZE`'s keyword, which AGENTS.md's spelling rule and the roadmap's
-    never-translated list both name — as do the plan's columns and rows (the server's), each
-    warning's message (core's prose, phase 4) and the prompt `ask_ai` sends the AI panel, English
-    as all AI text is. No test: no line here is composed from parts.
+    never-translated list both name — as do the plan's columns and rows (the server's) and the
+    prompt `ask_ai` sends the AI panel, English as all AI text is. **On SQL Server the table is
+    still core's English, left rather than done**: `showplan` builds its column headings, its
+    *Statement N: …* heading rows, *Could not read the plan* and *No statement in this batch has a
+    plan.* as table cells, and the modal draws cells as they come.
+    **Each warning is worded here**, from its `PlanNote` by `plan_note_text` and a server warning
+    inside one by `server_warning_text` — `plan-detail-*`, `plan-my-*`, `plan-pg-*`, `plan-ms-*`,
+    `plan-server-*` and `plan-missing-index` — with a message of its own for a table the plan does
+    not name (`-result` for MySQL's three, `-unnamed` for the PostgreSQL and SQL Server scans)
+    rather than a word spliced in, and the missing index's four shapes, with and without included
+    columns and an impact, four whole messages; the key and included columns are joined with
+    `", "` in code. What stays as written inside them is the plan's: operator, wait-type and table
+    names, the server's conversion issue and expression, and the quoted `Extra:`/`type =` text,
+    which names MySQL's plan columns. `english_says_every_plan_note_as_core_does` holds each line
+    equal to `PlanNote::message` — every engine's note with a table and without, every server
+    warning on an operator and on the statement, and the missing index in all four shapes.
   - `properties.rs` — the **table properties** modal (`properties_overlay`), opened by setting
     `overlay.properties` — from a Table or View row's context menu, or from the RESULTS title bar's
     Properties icon for a result that names one table; an effect in the modal calls
@@ -40665,7 +40691,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     the connection form's fields are no longer among it (`connection_form.rs`), nor are
     `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below), nor the
     startup and keyring notices (`persist::Notice`, below), nor the file import's refusals, memory
-    warnings and problem-list tail (`import::ReadRefusal`, below).
+    warnings and problem-list tail (`import::ReadRefusal`, below), nor the plan modal's warnings
+    (`plan::PlanNote`, below).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40856,6 +40883,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     `MemoryWarning` and `IssueTail`, it words beside their one caller (`import_view.rs`).
     `english_refuses_every_unreadable_file_as_core_does` holds every refusal equal to `message`
     bare and to `ImportError`'s `Display` inside one.
+    The plan modal's warnings are the case where the word for nothing differs by engine.
+    `PlanWarning` held its sentence as a `String` and now holds a `PlanNote`, with SQL Server's
+    own warnings a `ServerWarning` inside it (under `core/plan.rs`); `plan_view`'s `plan_note_text`
+    and `server_warning_text` word them from `plan-*`. A table the plan does not name is `None`,
+    and its sentence a message of its own — `-result`, since MySQL's English says *the result*,
+    and `-unnamed` where PostgreSQL's and SQL Server's say *a table* — not a word handed in as
+    `$table`. `english_says_every_plan_note_as_core_does` holds the English. SQL Server's plan table
+    itself — its headings, *Statement N* rows and could-not-read row — is still core's English.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and
