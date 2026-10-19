@@ -7921,7 +7921,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // empty/no-environment case leaves no gap after the switcher.
     let badge = dyn_container(
         move || active_conn_env(connections, active_conn),
-        move |env| match env.badge_label() {
+        move |env| match env.badge_label().map(|_| i18n::environment_label(env)) {
             // **The label's colour is read from the fill it lands on**, inside
             // the style closure like the fill itself — so a colour switch moves
             // both together and neither is frozen at build time. It used to be a

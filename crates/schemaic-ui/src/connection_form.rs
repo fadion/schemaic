@@ -1223,12 +1223,12 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         container(focusable_dropdown(
             draft.tls_mode,
             SslMode::ALL,
-            SslMode::label,
+            ssl_mode_label,
             ring.clone(),
             150,
         ))
         .style(|s| s.width(theme::scaled(200.0))),
-        label(move || mode.get().description().to_string()).style(|s| {
+        label(move || ssl_mode_description(mode.get())).style(|s| {
             s.width_full()
                 .font_size(theme::font_hint())
                 .color(theme::text_muted())
@@ -1409,7 +1409,7 @@ fn network_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 focusable_dropdown(
                     draft.ssh_auth,
                     SshAuth::ALL,
-                    SshAuth::label,
+                    ssh_auth_label,
                     ring.clone(),
                     130,
                 )
@@ -1556,7 +1556,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     let auth_picker = if modes.len() > 1 {
         v_stack((
             text(tr!("connections-authentication")).style(form_label_style),
-            focusable_dropdown(draft.auth, modes.clone(), AuthMode::label, ring.clone(), 68)
+            focusable_dropdown(draft.auth, modes.clone(), auth_mode_label, ring.clone(), 68)
                 .style(|s| s.width(theme::scaled(240.0))),
             sign_in_hint,
         ))
@@ -1654,7 +1654,50 @@ const CONN_STATEMENT_TIMEOUTS: [Option<u64>; crate::settings::STATEMENT_TIMEOUTS
     out
 };
 
-/// [`CONN_STATEMENT_TIMEOUTS`]' labels, as the dropdown needs a `fn`.
+/// The TLS picker's choices — `connection::SslMode::label`.
+fn ssl_mode_label(mode: SslMode) -> String {
+    match mode {
+        SslMode::Disable => tr!("tls-disable"),
+        SslMode::Prefer => tr!("tls-prefer"),
+        SslMode::Require => tr!("tls-require"),
+        SslMode::VerifyCa => tr!("tls-verify-ca"),
+        SslMode::VerifyFull => tr!("tls-verify-full"),
+    }
+}
+
+/// What a TLS mode protects, under the picker — `SslMode::description`.
+fn ssl_mode_description(mode: SslMode) -> String {
+    match mode {
+        SslMode::Disable => tr!("tls-disable-description"),
+        SslMode::Prefer => tr!("tls-prefer-description"),
+        SslMode::Require => tr!("tls-require-description"),
+        SslMode::VerifyCa => tr!("tls-verify-ca-description"),
+        SslMode::VerifyFull => tr!("tls-verify-full-description"),
+    }
+}
+
+/// The SSH tunnel's authentication choices — `connection::SshAuth::label`.
+fn ssh_auth_label(auth: SshAuth) -> String {
+    match auth {
+        SshAuth::Password => tr!("ssh-auth-password"),
+        SshAuth::KeyPair => tr!("ssh-auth-key-pair"),
+        SshAuth::Agent => tr!("ssh-auth-agent"),
+    }
+}
+
+/// The sign-in method's choices — `connection::AuthMode::label`. Microsoft
+/// Entra, AWS IAM and Google Cloud IAM, and the CLIs named, are product names.
+fn auth_mode_label(mode: AuthMode) -> String {
+    match mode {
+        AuthMode::Password => tr!("auth-password"),
+        AuthMode::Windows => tr!("auth-windows"),
+        AuthMode::AzureCli => tr!("auth-azure-cli"),
+        AuthMode::AwsIam => tr!("auth-aws-iam"),
+        AuthMode::GcpIam => tr!("auth-gcp-iam"),
+    }
+}
+
+/// [`CONN_STATEMENT_TIMEOUTS`]' labels, as the dropdown needs a `fn` —
 /// `connection::statement_timeout_choice_label` in the interface's language.
 fn conn_statement_timeout_label(v: Option<u64>) -> String {
     match v {
@@ -1922,7 +1965,7 @@ fn conn_form(
         container(focusable_dropdown(
             draft.ai_data,
             AiData::ALL,
-            AiData::label,
+            crate::i18n::ai_data_label,
             ring.clone(),
             // 35: between Read-only (30) and Environment (40), matching where
             // the field sits on screen. Tab order that disagrees with the eye
@@ -1930,7 +1973,7 @@ fn conn_form(
             35,
         ))
         .style(|s| s.width(theme::scaled(200.0))),
-        label(move || draft.ai_data.get().hint().to_string()).style(|s| {
+        label(move || crate::i18n::ai_data_hint(draft.ai_data.get())).style(|s| {
             s.width_full()
                 .font_size(theme::font_hint())
                 .color(theme::text_muted())
@@ -2021,7 +2064,7 @@ fn conn_form(
         container(focusable_dropdown(
             draft.environment,
             Environment::ALL,
-            Environment::label,
+            crate::i18n::environment_label,
             ring.clone(),
             40,
         ))
@@ -2349,6 +2392,33 @@ mod tests {
         runs_of_delta, splice_real, windows_sign_in_hint_for,
     };
     use floem::views::editor::core::xi_rope::{Interval, Rope, RopeDelta};
+
+    /// **The form's pickers read in English exactly as core's labels** — TLS
+    /// with its descriptions, SSH authentication and the sign-in method.
+    #[test]
+    fn english_names_every_picker_choice_as_core_does() {
+        use schemaic_core::connection::{AuthMode, SshAuth, SslMode};
+        for mode in SslMode::ALL {
+            assert_eq!(super::ssl_mode_label(mode), mode.label(), "{mode:?}");
+            assert_eq!(
+                super::ssl_mode_description(mode),
+                mode.description(),
+                "{mode:?}"
+            );
+        }
+        for auth in SshAuth::ALL {
+            assert_eq!(super::ssh_auth_label(auth), auth.label(), "{auth:?}");
+        }
+        for mode in [
+            AuthMode::Password,
+            AuthMode::Windows,
+            AuthMode::AzureCli,
+            AuthMode::AwsIam,
+            AuthMode::GcpIam,
+        ] {
+            assert_eq!(super::auth_mode_label(mode), mode.label(), "{mode:?}");
+        }
+    }
 
     /// **Every timeout choice reads in English exactly as core's
     /// `statement_timeout_choice_label`**, "Same as the app" included.

@@ -47,6 +47,18 @@ settings-ai-schema-context = Schema context
 settings-ai-schema-context-hint = How much database structure rides in every message. None also withholds the schema tools, so the assistant asks you for names instead of reading the catalogue itself.
 settings-ai-data-access = Data access
 settings-ai-data-access-where = Set per connection, in the connection's settings.
+# The active connection's level and what it lets leave (ai-data-* below);
+# $name is the connection's name.
+settings-ai-data-line = { $level } — { $hint }
+settings-ai-data-line-named = { $name }: { $level } — { $hint }
+# A connection's AI data access level and its consequence (core's
+# connection::AiData; English must read exactly as its label and hint).
+ai-data-schema-only = Schema only
+ai-data-on-request = Only what I attach
+ai-data-full = Let it read data
+ai-data-schema-only-hint = Structure only — names, types and definitions. No row ever leaves this machine, and attaching is refused.
+ai-data-on-request-hint = The assistant reads no data on its own. Rows you attach from a result leave this machine with that question.
+ai-data-full-hint = The assistant may run read-only queries and read sample rows by itself. Whatever it reads leaves this machine.
 settings-ai-gutter = Accent rule on replies
 settings-ai-gutter-hint = Mark the assistant's replies with a coloured rule down their right edge. Off gives them the same margin on both sides.
 
@@ -1383,6 +1395,13 @@ connections-statement-timeout-hint = Cancels a statement on this connection that
 # statement_timeout_choice_label); the other choices are timeout-*.
 connections-statement-timeout-same = Same as the app
 connections-environment = Environment
+# Its choices, also the top bar's badge (core's connection::Environment).
+env-none = None
+env-local = Local
+env-development = Development
+env-testing = Testing
+env-staging = Staging
+env-production = Production
 connections-type = Type
 connections-init-sql = Init SQL
 # PRAGMA and SET are SQL keywords.
@@ -1393,6 +1412,17 @@ connections-port = Port
 connections-database = Database
 connections-database-hint = Optional, and the database the connection opens in. Some hosted providers allow only their own and refuse a connection that does not name it.
 connections-authentication = Authentication
+# The SSH tunnel's authentication choices (core's connection::SshAuth).
+ssh-auth-password = Password
+ssh-auth-key-pair = Key pair
+ssh-auth-agent = SSH agent
+# The sign-in method's choices (core's connection::AuthMode). Microsoft Entra,
+# AWS IAM, Google Cloud IAM and the CLIs in brackets are product names.
+auth-password = User and password
+auth-windows = Windows (this account)
+auth-azure-cli = Microsoft Entra (Azure CLI)
+auth-aws-iam = AWS IAM (AWS CLI)
+auth-gcp-iam = Google Cloud IAM (gcloud)
 connections-user = User
 connections-password = Password
 # The commands in backticks are typed as written: never translated.
@@ -1419,6 +1449,18 @@ connections-private-key = Private key
 connections-private-key-dialog = Select private key
 connections-passphrase = Passphrase
 connections-tls = SSL / TLS
+# Its modes and what each protects (core's connection::SslMode). CA is a
+# certificate authority.
+tls-disable = Disable
+tls-prefer = Prefer
+tls-require = Require
+tls-verify-ca = Verify CA
+tls-verify-full = Verify full
+tls-disable-description = Connect in plain text.
+tls-prefer-description = Encrypt if the server offers it. No verification.
+tls-require-description = Refuse to connect without encryption. No verification.
+tls-verify-ca-description = Encrypt, and check the certificate against the CA.
+tls-verify-full-description = Encrypt, check the certificate, and check the host name.
 connections-ca-certificate = CA certificate
 connections-ca-certificate-dialog = Select CA certificate
 connections-ca-certificate-hint = Leave empty to trust the certificate authorities your operating system trusts, including any your organisation installed. Name a file to trust that one instead.

@@ -12523,6 +12523,13 @@ existing prose was left alone.
     (`cli/mcp.rs`'s entry). There is deliberately **no masking option** — a
     model cannot tell a masked value from a real one, so it reasons confidently about fiction, and
     the questions where values matter are exactly the ones masking ruins.
+    **The words on these types are not what the interface shows.** `Environment::label`, `AiData`'s
+    `label`/`hint`, `SslMode`'s `label`/`description`, `SshAuth::label` and `AuthMode::label` stay
+    English and are the wording the interface's own is held to — `ui/i18n.rs` and
+    `connection_form.rs` draw each from the catalogue (*The string catalogue*) — and
+    `Environment::badge_label` is asked by the top bar only for *whether* there is a badge. The
+    sentences this module writes — `SslMode::caveat`, `AuthMode`'s notes and refusals,
+    `read_only_caveat`, `named_instance_port_note` — still reach the form as they are, English.
     **`statement_timeout_secs` is this connection's statement timeout over the app's** (*Settings →
     Query*, `persist::statement_timeout`) — the field's own example is a reporting replica that
     legitimately runs for an hour beside a production primary that never should. It is
@@ -25139,7 +25146,11 @@ existing prose was left alone.
     byte-identical in English and fails on a new kind with no message. Not every use of core's word
     moves: the schema tree's `objgrp:`/`obj:` expansion keys (`object_group_key`, `object_key`) are
     persisted and must not change with the language, and the tree's *AI explain* prompts are
-    English by rule — both keep `ObjectKind::label`/`group_label`.
+    English by rule — both keep `ObjectKind::label`/`group_label`. `environment_label` (`env-*`)
+    and `ai_data_label`/`ai_data_hint` (`ai-data-*`, `ai-data-*-hint`) are the same for
+    `connection::Environment` and `AiData`, here because more than one file calls them: the
+    connection form's pickers, the top bar's environment badge and Settings' data-access line.
+    `english_names_every_environment_and_data_level_as_core_does` holds them to core's.
   - `settings.rs` — the Settings modal (its sections are General / Editor / Code formatting /
     Query / **Terminal** / **AI assistant** / **Appearance**, the last holding the two theme pickers,
     the **interface scale** and the **Language** dropdown — `language_section`, tabindex 330, with
@@ -25599,7 +25610,11 @@ existing prose was left alone.
     `settings-format-commas-trailing`/`-leading`, and `statement_gap_label` from
     `settings-format-gap-one`/`-none`, its *As typed* reusing `settings-format-case-keep`.
     `english_names_every_formatting_choice_as_core_does` holds all three equal to core's `label` in
-    English. No dropdown here shows another crate's text any more.
+    English. No dropdown here shows another crate's text any more. Nor does the AI page's
+    data-access line: `ai_data_line(name, lvl)` is `settings-ai-data-line`, or
+    `settings-ai-data-line-named` led by the connection's name, over `i18n::ai_data_label` and
+    `ai_data_hint` — where a `format!` of core's `AiData::label` and `hint` stood —
+    and `the_data_access_line_reads_as_it_did` holds it to that `format!`'s English.
     That is why its builders take owned text: `focusable_toggle_row`, `focusable_toggle_row_when`,
     `toggle_row_layout` and `settings_group_label` take `impl Into<String>`, so a literal caller
     still compiles and a `tr!` result passes as well; `SettingsSection::label()` answers a
@@ -25972,8 +25987,8 @@ existing prose was left alone.
     **`tls_fields` is always visible on a networked engine, not behind a toggle like the SSH
     block**: a database that enforces TLS is the ordinary case rather than the advanced one, and a
     checkbox marked "use SSL" is the control that leaves people believing a connection is verified
-    when it is only encrypted — so it is a named level with `SslMode::description` printed
-    underneath. What it shows below the picker comes from the mode's **capabilities**, never the
+    when it is only encrypted — so it is a named level with its description
+    (`ssl_mode_description`, `SslMode::description`'s words) printed underneath. What it shows below the picker comes from the mode's **capabilities**, never the
     variant: the CA path appears when `verifies_certificate`, the client identity when
     `negotiates_tls`, so a sixth level would not need this view found and edited. An *empty* CA
     path under a verifying mode means **whatever the operating system trusts** (`db/tls.rs`), and
@@ -26042,14 +26057,21 @@ existing prose was left alone.
     Windows sign-in hint is two whole messages, `connections-windows-hint-named` with `$account`
     (`DOMAIN\user`) and `connections-windows-hint` without: `windows_sign_in_hint` reads the
     environment and `windows_sign_in_hint_for(domain, user)` composes, which is what
-    `the_windows_sign_in_hint_reads_as_it_did_in_english` pins. What stays English: the Type
-    picker's engine names (`DbKind::label`), which are product names and are also what is persisted
-    as `Connection::db_type` and read by `default_port`/`is_networked`; the samples
-    `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules' words —
-    `SslMode`, `SshAuth`, `AuthMode`, `AiData` and `Environment`'s labels and notes,
-    `read_only_caveat`, `named_instance_port_note`,
-    `ssh_config::describe_route`, `SshTunnel::route`'s error, `init_sql::check`'s refusal (core's
-    prose, phase 4) and `lib.rs`'s `TestLine::text`.
+    `the_windows_sign_in_hint_reads_as_it_did_in_english` pins. The pickers' choices are drawn
+    here as properties of a typed value (*The string catalogue*) rather than passed through from
+    `connection`: `ssl_mode_label`/`ssl_mode_description` (`tls-*`, `tls-*-description`),
+    `ssh_auth_label` (`ssh-auth-*`) and `auth_mode_label` (`auth-*`, where Microsoft Entra, AWS
+    IAM, Google Cloud IAM and the CLIs named are product names), held to core's `label` and
+    `description` by `english_names_every_picker_choice_as_core_does`; the Environment and AI data
+    access pickers and the latter's hint take `i18n::environment_label`/`ai_data_label`/
+    `ai_data_hint`, which live there because the top bar and Settings call them too. What stays
+    English: the Type picker's engine names (`DbKind::label`), which are product names and are also
+    what is persisted as `Connection::db_type` and read by `default_port`/`is_networked`; the
+    samples `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules'
+    sentences — the caveats, refusals and notes `connection` writes (`SslMode::caveat`,
+    `AuthMode::tls_note`/`transport_refusal`/`external_client_refusal`, `read_only_caveat`,
+    `named_instance_port_note`), `ssh_config::describe_route`, `SshTunnel::route`'s error,
+    `init_sql::check`'s refusal (core's prose, phase 4) and `lib.rs`'s `TestLine::text`.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import connections" — it was
     "Import from another client", which misled once the modal read Schemaic's own exports and
@@ -33612,6 +33634,9 @@ existing prose was left alone.
     outer edges still land where the switcher's do, which is the part that keeps the header still.
     The switcher is the *only* thing that sets `conn_menu_open`, so the button leaves no menu
     behind it that nothing can raise.
+    The **environment badge** beside the switcher still asks core's `Environment::badge_label`
+    *whether* to show — `None` for no environment — but its word is `i18n::environment_label`'s
+    (`env-*`), not the `&'static str` that answer carries, which is core's English.
     The header's **update chip** (`update_state` + `apply_update` on `Ui`, alongside `resources`) is
     built in `header()` and goes in first in the right-hand cluster —
     `h_stack((update_chip, search, help, settings, chrome.controls()))` — because a muted text
@@ -40499,13 +40524,17 @@ Re-introducing the anti-patterns these guard against is a regression:
     and its sentinels (`WHERE`, `<null>`, `<default>`, `SQL VALUES`/`UPDATE`/`WHERE IN`, the
     parameter chip's `abc`/`123`/`NULL`/`SQL`); the export formats' names; persisted keys and file
     names; font names; the terminal's escape sequences; the find options' glyphs `Aa`, `W` and
-    `.*`; product names (the agents', *Microsoft Entra*); **everything sent to an AI model** — the
+    `.*`; product names (the agents', *Microsoft Entra*, *AWS IAM*, *Google Cloud IAM* and the CLIs
+    the sign-in picker names); **everything sent to an AI model** — the
     Explain prompt, the Optimise intent (whose box label `cmdk-optimise-label` *is* translated and
     compared against the box, so the English intent still goes out), the AI fill and seed system
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `launch::*`'s refusals and `format_bytes`.
+    translation* — among it `launch::*`'s refusals, `format_bytes`, and the caveats, refusals and
+    notes `connection` writes under the connection form's fields (`SslMode::caveat`,
+    `AuthMode::tls_note`/`transport_refusal`/`external_client_refusal`, `read_only_caveat`,
+    `named_instance_port_note`).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40547,7 +40576,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     `GrantLevelKind::label`, and `table_designer::identity_wording`/`storage_label` for
     `ddl::identity_wording` and `ddl::IndexStorage::label`, and `settings::keyword_case_label`/
     `comma_style_label`/`statement_gap_label` for `sqlfmt::KeywordCase::label`/`CommaStyle::label`/
-    `StatementGap::label`, and — the one from `schemaic-ai` rather
+    `StatementGap::label`, and `i18n::environment_label` and `ai_data_label`/`ai_data_hint` for
+    `connection::Environment::label` and `AiData::label`/`hint` (in `i18n.rs` because the form, the
+    top bar's badge and Settings' `ai_data_line` all call them), and `connection_form`'s
+    `ssl_mode_label`/`ssl_mode_description`, `ssh_auth_label` and `auth_mode_label` for
+    `SslMode::label`/`description`, `SshAuth::label` and `AuthMode::label`, and — the one from
+    `schemaic-ai` rather
     than core — `settings::agent_label` for `harness::Agent::label`, whose harnesses keep their
     product names and only *Disabled* is drawn —
     with a test holding its English equal to core's for every variant
@@ -40559,6 +40593,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_words_the_identity_toggle_as_core_does_on_every_engine`,
     `english_names_every_index_kind_as_core_does_and_each_apart`,
     `english_names_every_formatting_choice_as_core_does`,
+    `english_names_every_environment_and_data_level_as_core_does`,
+    `english_names_every_picker_choice_as_core_does`,
     `english_names_every_agent_as_the_ai_crate_does`).
     Where the word is a phrase core composes rather than a label, core answers with a value or
     keeps the composition and lets the caller word the part that is language: `history::ago` hands

@@ -221,6 +221,40 @@ pub(crate) fn outcome_line(entry: &schemaic_core::history::HistoryEntry) -> Opti
 // (`alias_rename::refusal_message`, the app's `install_cli`); here only what
 // another file or crate calls.
 
+/// A connection's environment as the form's picker and the top bar's badge
+/// name it — `connection::Environment::label` in the interface's language.
+pub(crate) fn environment_label(env: schemaic_core::connection::Environment) -> String {
+    use schemaic_core::connection::Environment;
+    match env {
+        Environment::None => tr!("env-none"),
+        Environment::Local => tr!("env-local"),
+        Environment::Development => tr!("env-development"),
+        Environment::Testing => tr!("env-testing"),
+        Environment::Staging => tr!("env-staging"),
+        Environment::Production => tr!("env-production"),
+    }
+}
+
+/// A connection's AI data access level — `connection::AiData::label`.
+pub(crate) fn ai_data_label(level: schemaic_core::connection::AiData) -> String {
+    use schemaic_core::connection::AiData;
+    match level {
+        AiData::SchemaOnly => tr!("ai-data-schema-only"),
+        AiData::OnRequest => tr!("ai-data-on-request"),
+        AiData::Full => tr!("ai-data-full"),
+    }
+}
+
+/// What a level lets leave the machine — `connection::AiData::hint`.
+pub(crate) fn ai_data_hint(level: schemaic_core::connection::AiData) -> String {
+    use schemaic_core::connection::AiData;
+    match level {
+        AiData::SchemaOnly => tr!("ai-data-schema-only-hint"),
+        AiData::OnRequest => tr!("ai-data-on-request-hint"),
+        AiData::Full => tr!("ai-data-full-hint"),
+    }
+}
+
 /// The sentence a finished export says — `export::export_note` in the
 /// interface's language: the rows and where they went, then each loss joined
 /// as core joins them (` — ` before the first, `; ` between).
@@ -475,6 +509,20 @@ mod tests {
         }
         assert_eq!(LanguageChoice::System.label(), "System (English)");
         assert_eq!(LanguageChoice::Fixed(UiLanguage::EnGb).label(), "English");
+    }
+
+    /// **A connection's environment and AI data access read in English
+    /// exactly as core's labels and hints**, every value.
+    #[test]
+    fn english_names_every_environment_and_data_level_as_core_does() {
+        use schemaic_core::connection::{AiData, Environment};
+        for env in Environment::ALL {
+            assert_eq!(environment_label(env), env.label(), "{env:?}");
+        }
+        for level in AiData::ALL {
+            assert_eq!(ai_data_label(level), level.label(), "{level:?}");
+            assert_eq!(ai_data_hint(level), level.hint(), "{level:?}");
+        }
     }
 
     /// **An export's note reads in English exactly as core's** — the head's

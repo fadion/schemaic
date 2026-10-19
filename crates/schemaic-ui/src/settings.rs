@@ -1230,11 +1230,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
             settings_group_label(tr!("settings-ai-data-access")),
             label(move || {
                 let (name, lvl) = active_ai_data.get();
-                if name.is_empty() {
-                    format!("{} — {}", lvl.label(), lvl.hint())
-                } else {
-                    format!("{name}: {} — {}", lvl.label(), lvl.hint())
-                }
+                ai_data_line(&name, lvl)
             })
             .style(|s| {
                 s.width_full()
@@ -1413,6 +1409,25 @@ pub(crate) const STATEMENT_TIMEOUTS: [u64; 6] = [0, 60, 300, 900, 1_800, 3_600];
 /// come to disagree.
 fn statement_timeout_label(secs: u64) -> String {
     crate::i18n::statement_timeout(secs)
+}
+
+/// The AI section's data-access line: the active connection's level and what
+/// it lets leave, led by the connection's name when there is one.
+fn ai_data_line(name: &str, lvl: schemaic_core::connection::AiData) -> String {
+    let (level, hint) = (
+        crate::i18n::ai_data_label(lvl),
+        crate::i18n::ai_data_hint(lvl),
+    );
+    if name.is_empty() {
+        tr!("settings-ai-data-line", level = level, hint = hint)
+    } else {
+        tr!(
+            "settings-ai-data-line-named",
+            name = name,
+            level = level,
+            hint = hint
+        )
+    }
 }
 
 /// The keyword, function and type case dropdowns' text — `KeywordCase::label`
@@ -2525,6 +2540,23 @@ mod tests {
         statement_timeout_label, term_font_label, thousands, wrap_width_label,
     };
     use crate::consts::TERM_FONT_SIZES;
+
+    /// **The AI section's data-access line reads as it did** — core's label
+    /// and hint around a dash, after the connection's name when there is one.
+    #[test]
+    fn the_data_access_line_reads_as_it_did() {
+        use schemaic_core::connection::AiData;
+        for lvl in AiData::ALL {
+            assert_eq!(
+                super::ai_data_line("", lvl),
+                format!("{} — {}", lvl.label(), lvl.hint())
+            );
+            assert_eq!(
+                super::ai_data_line("prod", lvl),
+                format!("prod: {} — {}", lvl.label(), lvl.hint())
+            );
+        }
+    }
 
     /// **The formatting dropdowns read in English exactly as core's labels** —
     /// the three case lists, *Commas* and *Between statements*.
