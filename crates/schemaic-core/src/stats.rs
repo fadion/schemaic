@@ -180,23 +180,56 @@ pub struct IndexStats {
 ///   difference between "drop this index" and "nobody was counting";
 /// - any other count prints, because the *size* of the number is the point.
 pub fn index_facts(ix: &IndexStats) -> Vec<String> {
-    let mut facts: Vec<String> = Vec::new();
+    index_fact_list(ix)
+        .into_iter()
+        .map(IndexFact::message)
+        .collect()
+}
+
+/// [`index_facts`]' decision as values, for the interface to word.
+pub fn index_fact_list(ix: &IndexStats) -> Vec<IndexFact> {
+    let mut facts = Vec::new();
     if let Some(b) = ix.bytes {
-        facts.push(format_bytes(b));
+        facts.push(IndexFact::Size(b));
     }
     if let Some(c) = ix.cardinality_label() {
-        facts.push(format!("cardinality {c}"));
+        facts.push(IndexFact::Cardinality(c));
     }
     match ix.scans {
         Some(0) => {}
-        Some(n) => facts.push(format!(
-            "{} {}",
-            RowCount::Exact(n).label(),
-            crate::text::plural(n as usize, "scan", "scans")
-        )),
-        None => facts.push("usage not counted".to_string()),
+        Some(n) => facts.push(IndexFact::Scans(n)),
+        None => facts.push(IndexFact::NotCounted),
     }
     facts
+}
+
+/// One of [`index_fact_list`]'s facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexFact {
+    /// The index's size on disk, in bytes.
+    Size(u64),
+    /// Its sampled cardinality, as [`IndexStats::cardinality_label`] prints it.
+    Cardinality(String),
+    /// How many times it was used — never zero, which [`unused_note`] says.
+    Scans(u64),
+    /// The engine did not count its use.
+    NotCounted,
+}
+
+impl IndexFact {
+    /// The fact in English.
+    pub fn message(self) -> String {
+        match self {
+            IndexFact::Size(b) => format_bytes(b),
+            IndexFact::Cardinality(c) => format!("cardinality {c}"),
+            IndexFact::Scans(n) => format!(
+                "{} {}",
+                RowCount::Exact(n).label(),
+                crate::text::plural(n as usize, "scan", "scans")
+            ),
+            IndexFact::NotCounted => "usage not counted".to_string(),
+        }
+    }
 }
 
 /// What [`IndexStats::is_unused`] is worth saying out loud.
@@ -998,10 +1031,17 @@ fn worth_naming(rows: RowCount) -> bool {
     }
 }
 
+/// The row figure a destructive confirmation names, or `None` when `rows`
+/// is none worth naming ([`CONFIRM_ROW_FLOOR`]) — [`truncate_prompt`]'s
+/// choice, for the interface to word.
+pub fn confirm_figure(rows: Option<RowCount>) -> Option<RowCount> {
+    rows.filter(|&r| worth_naming(r))
+}
+
 /// What the `TRUNCATE` confirmation asks about `label`, naming the scale of what
 /// goes when a row figure worth naming is already in hand.
 pub fn truncate_prompt(label: &str, rows: Option<RowCount>) -> String {
-    match rows.filter(|&r| worth_naming(r)) {
+    match confirm_figure(rows) {
         Some(r) => format!(
             "Delete all {} rows in {label}? This can't be undone.",
             r.label()

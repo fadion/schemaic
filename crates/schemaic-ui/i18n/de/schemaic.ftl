@@ -396,6 +396,8 @@ tree-triggers-count = Trigger ({ $n })
 tree-refresh-view = Sicht aktualisieren
 tree-truncate = Leeren
 tree-truncate-title = Tabelle leeren
+tree-truncate-rows = Alle { $rows } Zeilen in { $table } löschen? Das lässt sich nicht rückgängig machen.
+tree-truncate-every-row = Jede Zeile in { $table } löschen? Das lässt sich nicht rückgängig machen.
 tree-drop = Löschen
 tree-drop-index = Index löschen
 tree-drop-foreign-key = Fremdschlüssel löschen
@@ -715,6 +717,17 @@ props-updated = Aktualisiert
 props-comment = Kommentar
 props-section-partitioning = Partitionierung
 props-section-indexes = Indizes
+props-index-cardinality = Kardinalität { $cardinality }
+props-index-scans = { $n ->
+        [one] { $shown } Scan
+       *[other] { $shown } Scans
+    }
+props-index-not-counted = Nutzung nicht gezählt
+props-index-unused = seit dem Zurücksetzen der Serverzähler nie verwendet
+props-never-analysed = Diese Tabelle wurde nie analysiert, daher hat der Server keine Zeilenschätzung für sie. Führe ANALYZE aus, oder zähle die Zeilen.
+props-analysed-at = Geschätzt zum Stand des letzten ANALYZE, { $when }.
+props-read-live = Live gelesen — dieser Server hat information_schema_stats_expiry = 0.
+props-cached-up-to = Vom Server zwischengespeichert: diese Werte können bis zu { $age } alt sein (information_schema_stats_expiry = { $secs }).
 props-vacuum-note = { $pct } % der Zeilenversionen dieser Tabelle sind tot und noch nicht freigegeben. Ein VACUUM würde diesen Platz zurückgeben.
 props-copy = Kopieren
 

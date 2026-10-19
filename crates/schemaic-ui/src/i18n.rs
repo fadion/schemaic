@@ -432,6 +432,16 @@ pub fn not_sent_message(timed_out: bool) -> String {
     }
 }
 
+/// What the `TRUNCATE` confirmation asks about `label` — core's
+/// `stats::truncate_prompt` in the interface's language; the figure is
+/// core's `RowCount::label`, as the properties panel prints it.
+pub(crate) fn truncate_prompt(label: &str, rows: Option<schemaic_core::stats::RowCount>) -> String {
+    match schemaic_core::stats::confirm_figure(rows) {
+        Some(r) => tr!("tree-truncate-rows", rows = r.label(), table = label),
+        None => tr!("tree-truncate-every-row", table = label),
+    }
+}
+
 /// What an operation that finds no SSH tunnel says — core's
 /// `TunnelFailures::refusal` in the interface's language, the failure's own
 /// text inside it as written. Public for the app, whose connection lookup and
@@ -637,6 +647,27 @@ mod tests {
             assert_eq!(not_sent_message(timed_out), tx::not_sent_message(timed_out));
         }
         assert_eq!(tr!("tx-cancelled"), tx::CANCELLED);
+    }
+
+    /// **The truncate confirmation reads in English exactly as core's** —
+    /// with a figure worth naming, exact or estimated, and without one.
+    #[test]
+    fn english_asks_the_truncate_question_as_core_does() {
+        use schemaic_core::stats::{self, RowCount};
+        for rows in [
+            None,
+            Some(RowCount::Exact(0)),
+            Some(RowCount::Exact(1)),
+            Some(RowCount::Exact(4_213_551)),
+            Some(RowCount::Estimate(12)),
+            Some(RowCount::Estimate(4_200_000)),
+        ] {
+            assert_eq!(
+                truncate_prompt("shop.orders", rows),
+                stats::truncate_prompt("shop.orders", rows),
+                "{rows:?}"
+            );
+        }
     }
 
     /// **The tunnel refusal reads in English exactly as core's** — still

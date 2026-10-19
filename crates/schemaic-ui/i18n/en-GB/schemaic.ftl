@@ -437,6 +437,10 @@ tree-triggers-count = Triggers ({ $n })
 tree-refresh-view = Refresh view
 tree-truncate = Truncate
 tree-truncate-title = Truncate table
+# The Truncate confirmation (core's stats::truncate_prompt). $table is the
+# table's shown name; $rows a figure worth naming, formatted (4,213,551 or ~4.2m).
+tree-truncate-rows = Delete all { $rows } rows in { $table }? This can't be undone.
+tree-truncate-every-row = Delete every row in { $table }? This can't be undone.
 tree-drop = Drop
 tree-drop-index = Drop index
 tree-drop-foreign-key = Drop foreign key
@@ -796,6 +800,24 @@ props-updated = Updated
 props-comment = Comment
 props-section-partitioning = Partitioning
 props-section-indexes = Indexes
+# An index's facts after its name, joined by " · " (core's stats::IndexFact).
+# $cardinality and $shown arrive formatted (~1.2k, 12,345).
+props-index-cardinality = cardinality { $cardinality }
+props-index-scans = { $n ->
+        [one] { $shown } scan
+       *[other] { $shown } scans
+    }
+props-index-not-counted = usage not counted
+# Under an index the server has counted no use of (core's stats::unused_note).
+props-index-unused = never used since the server's counters were reset
+# Why the figures may be out of date (core's stats::Freshness). ANALYZE and
+# information_schema_stats_expiry are a statement and a server setting, never
+# translated. $when is the server's own timestamp; $age arrives formatted
+# (30s, 24h, 2d) and $secs is the setting's value.
+props-never-analysed = This table has never been analysed, so the server has no row estimate for it. Run ANALYZE, or count the rows.
+props-analysed-at = Estimated as of the last ANALYZE, { $when }.
+props-read-live = Read live — this server has information_schema_stats_expiry = 0.
+props-cached-up-to = Server-cached: these figures may be up to { $age } old (information_schema_stats_expiry = { $secs }).
 # $pct is a whole-number percentage. VACUUM is a SQL keyword.
 props-vacuum-note = { $pct }% of this table's row versions are dead and not yet reclaimed. A VACUUM would return that space.
 props-copy = Copy

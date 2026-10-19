@@ -2848,9 +2848,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             (ui.clone(), db.clone(), ns.clone(), tbl.clone());
                                         confirm.set(Some(crate::Confirm {
                                             title: tr!("tree-truncate-title"),
-                                            message: schemaic_core::stats::truncate_prompt(
-                                                &label, rows,
-                                            ),
+                                            message: crate::i18n::truncate_prompt(&label, rows),
                                             resolve: Rc::new(move |yes| {
                                                 if yes {
                                                     crate::ddl_preview::preview_change(

@@ -17929,8 +17929,9 @@ existing prose was left alone.
         matched 42 of 1,000: a claim that 958 rows were withheld, with no `(capped)` to hint a cap
         was ever involved. The noun follows the last figure named, which is
         the total when there is one: `1 of ~4.2m row` and `0 of 1 rows` are both wrong.
-        `truncate_prompt` is the Truncate confirmation's wording and `drop_scale` a table drop's
-        row figure, and both name a figure only above `CONFIRM_ROW_FLOOR` (1,000) when it is an
+        `truncate_prompt` is the Truncate confirmation's wording (its figure `confirm_figure`'s,
+        which the interface words around) and `drop_scale` a table drop's row figure, and both
+        name a figure only above `CONFIRM_ROW_FLOOR` (1,000) when it is an
         *estimate*: the point of naming one is scale, and InnoDB's sampled `TABLE_ROWS` is at its
         least reliable exactly below that — it reports 0 for a table holding a handful of rows, so
         *"Delete all ~0 rows in orders?"* would answer a question the user didn't ask, wrongly. A
@@ -17983,7 +17984,8 @@ existing prose was left alone.
         is one function: `RowCount::qualifier` (the word a figure is qualified with — the two had
         drifted to "(estimated)" against "(estimate)", with only the Markdown half tested),
         `TableStats::row_caption`, `TableStats::shows_free` (MySQL's `DATA_FREE`, and only when there
-        is some), `index_facts` + `unused_note` (an index's own line), and `count_row_state` — whose
+        is some), `index_facts` + `unused_note` (an index's own line; `index_fact_list` is the
+        same decision as `IndexFact` values for the interface to word), and `count_row_state` — whose
         `None` is the state that removes the **Count rows** row rather than leaving a blank band
         where the control was. `IndexStats::cardinality_label` is the one reader of
         `IndexStats::cardinality`: it is an InnoDB sample of ~20 index pages, and printed through the
@@ -27086,8 +27088,12 @@ existing prose was left alone.
       `section_with_gap`, `detail` and `swatch` take a `String`. The structure counts are Fluent
       plurals and the vacuum note a message, its percentage rounded with `{pct:.0}` before it
       reaches Fluent, which would otherwise print the fraction (`the_shared_counts_read_as_they_did`
-      holds both to the old English). What core words stays English until phase 4: `row_caption`,
-      `stats::index_facts`, the freshness notes and the copied Markdown.
+      holds both to the old English). Core's index facts and freshness caveat are worded here:
+      `index_fact_text` over `stats::index_fact_list`'s `IndexFact`s, `freshness_text` over
+      `Freshness`, and `props-index-unused` for `unused_note`, their figures (`format_bytes`,
+      `RowCount::label`, `format_age`) still core's until phase 7
+      (`english_says_every_stats_note_as_core_does`). What core words stays English until phase
+      4: `row_caption` and the copied Markdown.
   - `used_by_view.rs` — the **Used by** modal (`used_by_overlay`), over `core::used_by`, opened by
     setting `overlay.used_by` to a `UsedByTarget { database, schema, name, column, routine }`
     (re-exported as `schemaic_ui::UsedByTarget`; the app creates the signal beside `properties`)
@@ -29579,8 +29585,9 @@ existing prose was left alone.
     (`the_transaction_prompt_is_one_sentence_with_its_count` pins the English). The `{kind}` inside
     *Create {kind}* and *Edit {kind}* — and `CreateKind::label`'s fallback for an object kind — is
     `i18n::object_kind`, the catalogue's `kind-*` rather than `ObjectKind::label()`. Some words
-    reaching these popups are still another module's English: `ExportFormat::label`,
-    `activity::interval_label` and `stats::truncate_prompt`. The colour presets' names
+    reaching these popups are still another module's English: `ExportFormat::label` and
+    `activity::interval_label`; `stats::truncate_prompt`'s question is `i18n::truncate_prompt`'s
+    now (`tree-truncate-rows`, `-every-row`, over core's `confirm_figure`). The colour presets' names
     (`lib.rs`'s `CONN_COLOR_PRESETS`) were the fourth until `lib.rs` drew them from `colour-*`.
     **A PostgreSQL foreign table is offered what its server takes** (`object_entries` over
     `TableShape::ForeignTable`): its Drop, which `object_drop_change` makes `DROP FOREIGN TABLE`;

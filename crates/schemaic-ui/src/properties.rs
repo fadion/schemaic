@@ -720,7 +720,10 @@ fn index_row(idx: &IndexStats) -> AnyView {
     // decision (`stats::index_facts`) — the counted zero that prints nothing and
     // the absent count that says so out loud are the difference between "drop this
     // index" and "nobody was counting", and they were rules held in this view.
-    let facts = stats::index_facts(idx);
+    let facts: Vec<String> = stats::index_fact_list(idx)
+        .into_iter()
+        .map(index_fact_text)
+        .collect();
 
     let name = h_stack((
         icons::icon(
@@ -761,7 +764,7 @@ fn index_row(idx: &IndexStats) -> AnyView {
             // all the counter can support: it resets when the server does, and a
             // nightly job's index looks identical to a dead one. The sentence is
             // the model's, so the exported Markdown says it too.
-            text(stats::unused_note())
+            text(tr!("props-index-unused"))
                 .style(|s| s.font_size(font_body()).color(theme::plan_warn())),
         ))
         .style(|s| s.items_center().gap(theme::scaled(5.0)))
@@ -776,13 +779,48 @@ fn index_row(idx: &IndexStats) -> AnyView {
         .into_any()
 }
 
-/// The staleness caveat, verbatim from
-/// [`Freshness::note`](schemaic_core::stats::Freshness::note).
+/// The staleness caveat — [`stats::Freshness::note`] in the interface's
+/// language.
 fn freshness_note(stats: &TableStats) -> Option<AnyView> {
-    stats
-        .freshness
-        .note()
+    freshness_text(&stats.freshness)
         .map(|n| note_line(icons::CIRCLE_QUESTION, theme::text_faint, n))
+}
+
+/// [`Freshness::note`]'s words. The timestamp is the server's own text and
+/// the age `stats::format_age`'s, both as core prints them.
+///
+/// [`Freshness::note`]: schemaic_core::stats::Freshness::note
+fn freshness_text(f: &stats::Freshness) -> Option<String> {
+    use stats::Freshness;
+    match f {
+        Freshness::Unknown => None,
+        Freshness::Analyzed(None) => Some(tr!("props-never-analysed")),
+        Freshness::Analyzed(Some(when)) => Some(tr!("props-analysed-at", when = when.as_str())),
+        Freshness::CachedUpTo(0) => Some(tr!("props-read-live")),
+        &Freshness::CachedUpTo(secs) => Some(tr!(
+            "props-cached-up-to",
+            age = stats::format_age(secs),
+            secs = secs.to_string()
+        )),
+    }
+}
+
+/// One of an index's facts — [`IndexFact::message`] in the interface's
+/// language; the size and the counts are core's figures as it prints them.
+///
+/// [`IndexFact::message`]: schemaic_core::stats::IndexFact::message
+fn index_fact_text(fact: stats::IndexFact) -> String {
+    use stats::IndexFact;
+    match fact {
+        IndexFact::Size(b) => stats::format_bytes(b),
+        IndexFact::Cardinality(c) => tr!("props-index-cardinality", cardinality = c),
+        IndexFact::Scans(n) => tr!(
+            "props-index-scans",
+            n = n,
+            shown = RowCount::Exact(n).label()
+        ),
+        IndexFact::NotCounted => tr!("props-index-not-counted"),
+    }
 }
 
 /// A titled group of `label: value` rows. The heading is the app's form-section
@@ -921,3 +959,40 @@ fn footer(
 /// The Count-rows button's place in the focus ring — before the footer's
 /// actions, which is where it sits on screen.
 const COUNT_TAB: u32 = 10;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The staleness caveat, an index's facts and its unused flag read in
+    /// English exactly as core says them.**
+    #[test]
+    fn english_says_every_stats_note_as_core_does() {
+        use stats::Freshness;
+        for f in [
+            Freshness::Unknown,
+            Freshness::Analyzed(None),
+            Freshness::Analyzed(Some("2026-10-19 14:02:11+02".into())),
+            Freshness::CachedUpTo(0),
+            Freshness::CachedUpTo(45),
+            Freshness::CachedUpTo(86_400),
+        ] {
+            assert_eq!(freshness_text(&f), f.note(), "{f:?}");
+        }
+        for scans in [None, Some(0), Some(1), Some(12_345)] {
+            let ix = IndexStats {
+                name: "ix".into(),
+                bytes: Some(16_384),
+                cardinality: Some(1_200),
+                scans,
+                ..IndexStats::default()
+            };
+            let ours: Vec<String> = stats::index_fact_list(&ix)
+                .into_iter()
+                .map(index_fact_text)
+                .collect();
+            assert_eq!(ours, stats::index_facts(&ix), "{scans:?}");
+        }
+        assert_eq!(tr!("props-index-unused"), stats::unused_note());
+    }
+}
