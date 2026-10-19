@@ -28,6 +28,7 @@
 //! Everything here is pure; the registry, the symlink and the broadcast live at
 //! the app boundary (`schemaic-app`'s `install_cli`).
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The name a terminal types.
@@ -96,29 +97,212 @@ pub enum Plan {
     Link { link: PathBuf, target: PathBuf },
 }
 
+/// Why Install or Remove will not do it. The interface words each variant
+/// itself (phase 4 of interface translation); [`fmt::Display`] is the English,
+/// which the tests here read and the interface's English is held to. Paths are
+/// carried as they are shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The running executable's path has no folder in it.
+    NoFolder { exe: String },
+    /// Windows: no [`WINDOWS_SHIM`] beside the executable — a development build.
+    NoShim { dir: String },
+    /// Windows: the folder's name holds a `;`, which `PATH` would split.
+    SemicolonInFolder { dir: String },
+    /// A package upgrade replaced the running binary, so a link to it would
+    /// dangle.
+    ExeReplaced { exe: String },
+    /// No home directory to hold `~/.local/bin`.
+    NoHome,
+    /// The user `PATH` is not a text value in the registry.
+    PathNotText,
+    /// The user `PATH` is not lossless UTF-16.
+    PathNotUnicode,
+    /// Windows: a portable copy, whose folder Remove cannot claim.
+    PortableCopy { dir: String },
+    /// Install: something that is not a link sits where the link goes.
+    LinkSpotTaken { link: String },
+    /// Install: a live link there points at something else.
+    LinkPointsElsewhere { link: String, to: String },
+    /// Remove: the link points at another copy.
+    UnlinkPointsElsewhere { link: String, to: String },
+    /// Remove: what is there is not a link Schemaic made.
+    UnlinkNotALink { link: String },
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::NoFolder { exe } => write!(f, "Can't tell which folder {exe} is in."),
+            Refusal::NoShim { dir } => write!(
+                f,
+                "There is no {WINDOWS_SHIM} beside this copy of Schemaic, in {dir}, so there is \
+                 no console command to put on PATH. The installed app has one; a development \
+                 build doesn't."
+            ),
+            Refusal::SemicolonInFolder { dir } => write!(
+                f,
+                "This copy of Schemaic is in {dir}, whose name holds a ';' — PATH would read it \
+                 as two different folders. Move it somewhere without one and try again."
+            ),
+            Refusal::ExeReplaced { exe } => write!(
+                f,
+                "{exe} was replaced while Schemaic was running, so a link to it would point at \
+                 nothing. Restart Schemaic, then Install again."
+            ),
+            Refusal::NoHome => f.write_str(
+                "There is no home directory to hold the link, so there is nowhere to look.",
+            ),
+            Refusal::PathNotText => f.write_str(
+                "Your user PATH isn't stored as text in the registry, so it was left alone.",
+            ),
+            Refusal::PathNotUnicode => f.write_str(
+                "Your user PATH contains characters that can't be read back safely, so it was \
+                 left alone.",
+            ),
+            Refusal::PortableCopy { dir } => write!(
+                f,
+                "This is a portable copy, so Remove can't tell whether Install put {dir} on your \
+                 PATH or it was there already with other programs in it. Take it out under \
+                 Environment Variables if Install added it."
+            ),
+            Refusal::LinkSpotTaken { link } => write!(
+                f,
+                "{link} already exists and isn't a link, so Install left it alone. Move it aside \
+                 and try again."
+            ),
+            Refusal::LinkPointsElsewhere { link, to } => write!(
+                f,
+                "{link} already points at {to}. Remove it if that's an old copy of Schemaic, \
+                 then try again."
+            ),
+            Refusal::UnlinkPointsElsewhere { link, to } => write!(
+                f,
+                "{link} points at {to}, not at this copy of Schemaic, so Remove left it alone."
+            ),
+            Refusal::UnlinkNotALink { link } => write!(
+                f,
+                "{link} isn't a link Schemaic made, so Remove left it alone."
+            ),
+        }
+    }
+}
+
+/// What a finished Install or Remove says, naming the path it resolved.
+/// Worded by the interface; [`fmt::Display`] is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Report {
+    /// [`Plan::Already`].
+    Already { dir: String },
+    /// `dir` is on the user `PATH` — whether Install wrote it or found it
+    /// already there in the registry but not yet in this process.
+    Added { dir: String },
+    /// `link` points at `target`, with a word on `PATH` where it may lack the
+    /// link's folder ([`report_linked`]).
+    Linked {
+        link: String,
+        target: String,
+        then: LinkedHint,
+    },
+    /// `dir` has left the user `PATH`.
+    Removed { dir: String },
+    /// `dir` was not on the user `PATH` to begin with.
+    PathAbsent { dir: String },
+    /// `link` is gone.
+    Unlinked { link: String },
+    /// There was no link to remove.
+    LinkAbsent { link: String },
+    /// [`Removal::Package`].
+    Package { dir: String },
+}
+
+/// What [`Report::Linked`] adds about the link's folder `dir`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkedHint {
+    /// It is on this process's `PATH`: nothing to add.
+    None,
+    /// macOS, which cannot tell: add it in the shell profile if a new terminal
+    /// can't find the command.
+    IfNotFound { dir: String },
+    /// Linux, whose `PATH` lacks it.
+    NotOnPath { dir: String },
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Report::Already { dir } => {
+                write!(f, "The schemaic command is already on your PATH, in {dir}.")
+            }
+            Report::Added { dir } => write!(
+                f,
+                "Added {dir} to your user PATH. Open a new terminal to use schemaic — one that \
+                 is already open keeps the old PATH."
+            ),
+            Report::Linked { link, target, then } => {
+                write!(f, "Linked {link} to {target}.")?;
+                match then {
+                    LinkedHint::None => Ok(()),
+                    LinkedHint::IfNotFound { dir } => write!(
+                        f,
+                        " If a new terminal can't find schemaic, add {dir} to your PATH in your \
+                         shell profile."
+                    ),
+                    LinkedHint::NotOnPath { dir } => write!(
+                        f,
+                        " {dir} isn't on your PATH yet — add it in your shell profile, then open \
+                         a new terminal."
+                    ),
+                }
+            }
+            Report::Removed { dir } => write!(
+                f,
+                "Removed {dir} from your user PATH. A terminal that is already open keeps the \
+                 old PATH."
+            ),
+            Report::PathAbsent { dir } => write!(
+                f,
+                "{dir} isn't on your user PATH, so there was nothing to remove."
+            ),
+            Report::Unlinked { link } => write!(f, "Removed {link}."),
+            Report::LinkAbsent { link } => {
+                write!(f, "There is no {link}, so there was nothing to remove.")
+            }
+            Report::Package { dir } => write!(
+                f,
+                "The schemaic command in {dir} came with the installed package, not from \
+                 Install — remove the package to remove it."
+            ),
+        }
+    }
+}
+
+/// A path as a report or refusal shows it.
+fn shown(p: &Path) -> String {
+    p.display().to_string()
+}
+
 /// Decide what Install does on this machine, or why it can't.
-pub fn plan(p: &Probe) -> Result<Plan, String> {
+pub fn plan(p: &Probe) -> Result<Plan, Refusal> {
     match p.os {
         Os::Windows => {
             let exe = p.exe.to_string_lossy();
-            let dir = parent_of(&exe, Os::Windows)
-                .ok_or_else(|| format!("Can't tell which folder {exe} is in."))?;
+            let dir = parent_of(&exe, Os::Windows).ok_or_else(|| Refusal::NoFolder {
+                exe: exe.to_string(),
+            })?;
             if !p.console_shim {
-                return Err(format!(
-                    "There is no {WINDOWS_SHIM} beside this copy of Schemaic, in {dir}, so there \
-                     is no console command to put on PATH. The installed app has one; a \
-                     development build doesn't."
-                ));
+                return Err(Refusal::NoShim {
+                    dir: dir.to_string(),
+                });
             }
             // A `;` inside the folder's name would be read back as two entries —
             // `D:\Downloads;old\Schemaic` puts `D:\Downloads` and a cwd-relative
             // `old\Schemaic` on PATH, neither of them this folder, and neither
             // one that Remove could ever match.
             if dir.contains(';') {
-                return Err(format!(
-                    "This copy of Schemaic is in {dir}, whose name holds a ';' — PATH would read \
-                     it as two different folders. Move it somewhere without one and try again."
-                ));
+                return Err(Refusal::SemicolonInFolder {
+                    dir: dir.to_string(),
+                });
             }
             let dir = PathBuf::from(dir);
             // The registry's user PATH when it can be read, because that is
@@ -138,11 +322,7 @@ pub fn plan(p: &Probe) -> Result<Plan, String> {
             // The AppImage's target is the image file, not `exe`, so only a
             // plain binary is asked whether it is still there.
             if p.appimage.is_none() && !p.exe_exists {
-                return Err(format!(
-                    "{} was replaced while Schemaic was running, so a link to it would point at \
-                     nothing. Restart Schemaic, then Install again.",
-                    p.exe.display()
-                ));
+                return Err(Refusal::ExeReplaced { exe: shown(&p.exe) });
             }
             if let Some(dir) = on_path_as_command(p, &target) {
                 return Ok(Plan::Already { dir });
@@ -175,10 +355,8 @@ fn on_path_as_command(p: &Probe, target: &Path) -> Option<PathBuf> {
 }
 
 /// `~/.local/bin/schemaic` — the one link Install writes and Remove removes.
-fn link_path(p: &Probe) -> Result<PathBuf, String> {
-    let home = p.home.as_ref().ok_or_else(|| {
-        "There is no home directory to hold the link, so there is nowhere to look.".to_string()
-    })?;
+fn link_path(p: &Probe) -> Result<PathBuf, Refusal> {
+    let home = p.home.as_ref().ok_or(Refusal::NoHome)?;
     let home = home.to_string_lossy();
     Ok(PathBuf::from(format!(
         "{}/.local/bin/{COMMAND}",
@@ -264,14 +442,11 @@ pub const REG_EXPAND_SZ: u32 = 2;
 /// Text only. Anything else — a `REG_MULTI_SZ` a tool wrote, a binary blob — is
 /// refused rather than reinterpreted, because the write goes back in the type it
 /// was read in and a guess about bytes would be written over the user's PATH.
-pub fn user_path_type(ty: u32) -> Result<(), String> {
+pub fn user_path_type(ty: u32) -> Result<(), Refusal> {
     if ty == REG_SZ || ty == REG_EXPAND_SZ {
         Ok(())
     } else {
-        Err(
-            "Your user PATH isn't stored as text in the registry, so it was left alone."
-                .to_string(),
-        )
+        Err(Refusal::PathNotText)
     }
 }
 
@@ -282,16 +457,12 @@ pub fn user_path_type(ty: u32) -> Result<(), String> {
 /// surrogate cannot survive the round trip through a `String`, and writing back
 /// a replacement character would corrupt the entry holding it, so the value is
 /// refused and left as it is.
-pub fn decode_user_path(units: &[u16]) -> Result<String, String> {
+pub fn decode_user_path(units: &[u16]) -> Result<String, Refusal> {
     let mut end = units.len();
     while end > 0 && units[end - 1] == 0 {
         end -= 1;
     }
-    String::from_utf16(&units[..end]).map_err(|_| {
-        "Your user PATH contains characters that can't be read back safely, so it was left \
-         alone."
-            .to_string()
-    })
+    String::from_utf16(&units[..end]).map_err(|_| Refusal::PathNotUnicode)
 }
 
 /// Is `dir` one of the entries of a `PATH`-style value?
@@ -383,7 +554,7 @@ pub enum LinkStep {
     /// A dangling link — an AppImage that was moved or deleted — is replaced.
     Replace,
     /// Something that isn't ours is left alone, and this says what.
-    Refuse(String),
+    Refuse(Refusal),
 }
 
 /// Whether to create, keep, replace or refuse `link` → `target`, given what is
@@ -392,21 +563,19 @@ pub fn link_step(existing: &Existing, link: &Path, target: &Path) -> LinkStep {
     let link_s = link.to_string_lossy();
     match existing {
         Existing::Nothing => LinkStep::Create,
-        Existing::Other => LinkStep::Refuse(format!(
-            "{link_s} already exists and isn't a link, so Install left it alone. Move it \
-             aside and try again."
-        )),
+        Existing::Other => LinkStep::Refuse(Refusal::LinkSpotTaken {
+            link: link_s.to_string(),
+        }),
         Existing::Link { to, live } => {
             if link_points_at(link, to, target) {
                 LinkStep::Keep
             } else if !live {
                 LinkStep::Replace
             } else {
-                LinkStep::Refuse(format!(
-                    "{link_s} already points at {}. Remove it if that's an old copy of \
-                     Schemaic, then try again.",
-                    to.display()
-                ))
+                LinkStep::Refuse(Refusal::LinkPointsElsewhere {
+                    link: link_s.to_string(),
+                    to: shown(to),
+                })
             }
         }
     }
@@ -458,18 +627,17 @@ pub enum Removal {
 /// on `PATH` for years, which Install found there and did not write — and
 /// taking it out would take every other program in it with it. The entry
 /// itself cannot say who wrote it.
-pub fn removal(p: &Probe) -> Result<Removal, String> {
+pub fn removal(p: &Probe) -> Result<Removal, Refusal> {
     match p.os {
         Os::Windows => {
             let exe = p.exe.to_string_lossy();
-            let dir = parent_of(&exe, Os::Windows)
-                .ok_or_else(|| format!("Can't tell which folder {exe} is in."))?;
+            let dir = parent_of(&exe, Os::Windows).ok_or_else(|| Refusal::NoFolder {
+                exe: exe.to_string(),
+            })?;
             if !p.velopack {
-                return Err(format!(
-                    "This is a portable copy, so Remove can't tell whether Install put {dir} on \
-                     your PATH or it was there already with other programs in it. Take it out \
-                     under Environment Variables if Install added it."
-                ));
+                return Err(Refusal::PortableCopy {
+                    dir: dir.to_string(),
+                });
             }
             Ok(Removal::UserPath {
                 dir: PathBuf::from(dir),
@@ -526,7 +694,7 @@ pub enum UnlinkStep {
     /// Nothing there — nothing to do.
     Absent,
     /// Something that isn't ours is left alone, and this says what.
-    Refuse(String),
+    Refuse(Refusal),
 }
 
 /// Whether Remove may delete `link`, given what is there. A dangling link goes
@@ -538,15 +706,11 @@ pub fn unlink_step(existing: &Existing, link: &Path, target: &Path) -> UnlinkSte
         Existing::Link { to, live } if !live || link_points_at(link, to, target) => {
             UnlinkStep::Remove
         }
-        Existing::Link { to, .. } => UnlinkStep::Refuse(format!(
-            "{} points at {}, not at this copy of Schemaic, so Remove left it alone.",
-            link.display(),
-            to.display()
-        )),
-        Existing::Other => UnlinkStep::Refuse(format!(
-            "{} isn't a link Schemaic made, so Remove left it alone.",
-            link.display()
-        )),
+        Existing::Link { to, .. } => UnlinkStep::Refuse(Refusal::UnlinkPointsElsewhere {
+            link: shown(link),
+            to: shown(to),
+        }),
+        Existing::Other => UnlinkStep::Refuse(Refusal::UnlinkNotALink { link: shown(link) }),
     }
 }
 
@@ -582,89 +746,96 @@ pub fn removable(
 }
 
 /// The report once `dir` has left the user `PATH`.
-pub fn report_removed(dir: &Path) -> String {
-    format!(
-        "Removed {} from your user PATH. A terminal that is already open keeps the old PATH.",
-        dir.display()
-    )
+pub fn report_removed(dir: &Path) -> Report {
+    Report::Removed { dir: shown(dir) }
 }
 
 /// The report when `dir` was not on the user `PATH` to begin with.
-pub fn report_path_absent(dir: &Path) -> String {
-    format!(
-        "{} isn't on your user PATH, so there was nothing to remove.",
-        dir.display()
-    )
+pub fn report_path_absent(dir: &Path) -> Report {
+    Report::PathAbsent { dir: shown(dir) }
 }
 
 /// The report once `link` is gone.
-pub fn report_unlinked(link: &Path) -> String {
-    format!("Removed {}.", link.display())
+pub fn report_unlinked(link: &Path) -> Report {
+    Report::Unlinked { link: shown(link) }
 }
 
 /// The report when there was no link to remove.
-pub fn report_link_absent(link: &Path) -> String {
-    format!(
-        "There is no {}, so there was nothing to remove.",
-        link.display()
-    )
+pub fn report_link_absent(link: &Path) -> Report {
+    Report::LinkAbsent { link: shown(link) }
 }
 
 /// The report for [`Removal::Package`].
-pub fn report_package(dir: &Path) -> String {
-    format!(
-        "The schemaic command in {} came with the installed package, not from Install — \
-         remove the package to remove it.",
-        dir.display()
-    )
+pub fn report_package(dir: &Path) -> Report {
+    Report::Package { dir: shown(dir) }
 }
 
 /// The report for [`Plan::Already`].
-pub fn report_already(dir: &Path) -> String {
-    format!(
-        "The schemaic command is already on your PATH, in {}.",
-        dir.display()
-    )
+pub fn report_already(dir: &Path) -> Report {
+    Report::Already { dir: shown(dir) }
 }
 
 /// The report once `dir` is on the user `PATH` — whether Install wrote it or
 /// found it already there in the registry but not yet in this process.
-pub fn report_added(dir: &Path) -> String {
-    format!(
-        "Added {} to your user PATH. Open a new terminal to use schemaic — one that is \
-         already open keeps the old PATH.",
-        dir.display()
-    )
+pub fn report_added(dir: &Path) -> Report {
+    Report::Added { dir: shown(dir) }
 }
 
 /// The report once `link` points at `target`. Adds a hint when the link's
 /// directory may not be on `PATH`: on macOS always, because an app started from
 /// Finder gets launchd's minimal `PATH` and cannot tell; on Linux only when the
 /// process's own `PATH` lacks it.
-pub fn report_linked(link: &Path, target: &Path, os: Os, path_var: &str) -> String {
+pub fn report_linked(link: &Path, target: &Path, os: Os, path_var: &str) -> Report {
     let link_s = link.to_string_lossy();
-    let done = format!("Linked {link_s} to {}.", target.display());
-    let dir = parent_of(&link_s, os).unwrap_or("");
-    match os {
-        Os::MacOs => format!(
-            "{done} If a new terminal can't find schemaic, add {dir} to your PATH in your \
-             shell profile."
-        ),
-        _ if !path_has_dir(path_var, Path::new(dir), os) => format!(
-            "{done} {dir} isn't on your PATH yet — add it in your shell profile, then open a \
-             new terminal."
-        ),
-        _ => done,
+    let dir = parent_of(&link_s, os).unwrap_or("").to_string();
+    let then = match os {
+        Os::MacOs => LinkedHint::IfNotFound { dir },
+        _ if !path_has_dir(path_var, Path::new(&dir), os) => LinkedHint::NotOnPath { dir },
+        _ => LinkedHint::None,
+    };
+    Report::Linked {
+        link: link_s.to_string(),
+        target: shown(target),
+        then,
     }
 }
 
-/// The Settings row's hint for this platform.
-pub fn hint(os: Os) -> &'static str {
-    match os {
-        Os::Windows => "Run Schemaic from a terminal by name. Adds its folder to your user PATH.",
-        Os::MacOs | Os::Linux => {
-            "Run Schemaic from a terminal by name. Links it into ~/.local/bin."
+/// The Settings row's hint: what Install would do here, or where the command
+/// already is ([`row_status`]). Worded by the interface; [`fmt::Display`] is
+/// the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowHint {
+    /// Windows, before Install: it adds the folder to the user `PATH`.
+    AddsFolder,
+    /// macOS and Linux, before Install: it links into `~/.local/bin`.
+    Links,
+    /// Windows: the folder `dir` is on the user `PATH` already.
+    FolderOnPath { dir: String },
+    /// macOS and Linux: the running binary is the command, at `path`.
+    ComesWithApp { path: String },
+}
+
+impl fmt::Display for RowHint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Run Schemaic from a terminal by name. ")?;
+        match self {
+            RowHint::AddsFolder => f.write_str("Adds its folder to your user PATH."),
+            RowHint::Links => f.write_str("Links it into ~/.local/bin."),
+            RowHint::FolderOnPath { dir } => {
+                write!(f, "Its folder, {dir}, is already on your user PATH.")
+            }
+            RowHint::ComesWithApp { path } => {
+                write!(f, "The {COMMAND} command comes with the app, at {path}.")
+            }
         }
+    }
+}
+
+/// The Settings row's hint for this platform, before Install.
+pub fn hint(os: Os) -> RowHint {
+    match os {
+        Os::Windows => RowHint::AddsFolder,
+        Os::MacOs | Os::Linux => RowHint::Links,
     }
 }
 
@@ -672,7 +843,7 @@ pub fn hint(os: Os) -> &'static str {
 /// has anything left to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowStatus {
-    pub hint: String,
+    pub hint: RowHint,
     pub can_install: bool,
 }
 
@@ -688,26 +859,20 @@ pub struct RowStatus {
 ///
 /// Anything else keeps the plain hint and the button — including a plan that
 /// failed, whose reason the click reports; a disabled button would give none.
-pub fn row_status(os: Os, plan: Option<&Result<Plan, String>>) -> RowStatus {
+pub fn row_status(os: Os, plan: Option<&Result<Plan, Refusal>>) -> RowStatus {
     let Some(Ok(Plan::Already { dir })) = plan else {
         return RowStatus {
-            hint: hint(os).to_string(),
+            hint: hint(os),
             can_install: true,
         };
     };
     let hint = match os {
-        Os::Windows => format!(
-            "Run Schemaic from a terminal by name. Its folder, {}, is already on your user \
-             PATH.",
-            dir.display()
-        ),
+        Os::Windows => RowHint::FolderOnPath { dir: shown(dir) },
         // Joined by hand: `dir` is a Unix path here, and `Path::join` would use
         // the separator of whatever platform is asking.
-        Os::MacOs | Os::Linux => format!(
-            "Run Schemaic from a terminal by name. The {COMMAND} command comes with the app, \
-             at {}/{COMMAND}.",
-            dir.display().to_string().trim_end_matches('/')
-        ),
+        Os::MacOs | Os::Linux => RowHint::ComesWithApp {
+            path: format!("{}/{COMMAND}", shown(dir).trim_end_matches('/')),
+        },
     };
     RowStatus {
         hint,
@@ -835,7 +1000,7 @@ mod tests {
     #[test]
     fn a_folder_whose_name_holds_a_semicolon_is_refused() {
         let got = plan(&win(r"D:\Downloads;old\Schemaic\schemaic.exe", "", true));
-        let why = got.expect_err("a folder PATH cannot hold");
+        let why = got.expect_err("a folder PATH cannot hold").to_string();
         assert!(why.contains(';'), "{why}");
     }
 
@@ -968,7 +1133,9 @@ mod tests {
     fn windows_without_the_shim_is_refused_and_says_why() {
         // A dev build: `schemaic-cli.exe` sits beside the exe, not `schemaic.com`,
         // so the directory on PATH would give a terminal the GUI.
-        let err = plan(&win(r"C:\src\target\debug\schemaic.exe", "", false)).unwrap_err();
+        let err = plan(&win(r"C:\src\target\debug\schemaic.exe", "", false))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(WINDOWS_SHIM), "{err}");
         assert!(err.contains(r"C:\src\target\debug"), "{err}");
     }
@@ -1067,7 +1234,7 @@ mod tests {
     fn no_home_directory_is_refused() {
         let mut p = unix(Os::Linux, "/opt/schemaic/schemaic", "/usr/bin");
         p.home = None;
-        assert!(plan(&p).unwrap_err().contains("home"));
+        assert_eq!(plan(&p), Err(Refusal::NoHome));
     }
 
     // ---- path_has_dir ----
@@ -1248,6 +1415,7 @@ mod tests {
         let LinkStep::Refuse(why) = step(Existing::Link { to, live: true }) else {
             panic!("expected a refusal");
         };
+        let why = why.to_string();
         assert!(
             why.contains(LINK) && why.contains("/usr/local/bin/other"),
             "{why}"
@@ -1259,6 +1427,7 @@ mod tests {
         let LinkStep::Refuse(why) = step(Existing::Other) else {
             panic!("expected a refusal");
         };
+        let why = why.to_string();
         assert!(why.contains(LINK), "{why}");
     }
 
@@ -1266,20 +1435,31 @@ mod tests {
 
     #[test]
     fn reports_name_the_path_they_resolved() {
-        assert!(report_already(Path::new("/usr/bin")).contains("/usr/bin"));
-        assert!(report_added(Path::new(VELOPACK_DIR)).contains(VELOPACK_DIR));
-        let r = report_linked(Path::new(LINK), Path::new(TARGET), Os::Linux, "");
+        let said = |r: Report| r.to_string();
+        assert!(said(report_already(Path::new("/usr/bin"))).contains("/usr/bin"));
+        assert!(said(report_added(Path::new(VELOPACK_DIR))).contains(VELOPACK_DIR));
+        let r = said(report_linked(
+            Path::new(LINK),
+            Path::new(TARGET),
+            Os::Linux,
+            "",
+        ));
         assert!(r.contains(LINK) && r.contains(TARGET), "{r}");
     }
 
     #[test]
     fn report_added_says_a_new_terminal_is_needed() {
-        assert!(report_added(Path::new(VELOPACK_DIR)).contains("new terminal"));
+        assert!(
+            report_added(Path::new(VELOPACK_DIR))
+                .to_string()
+                .contains("new terminal")
+        );
     }
 
     #[test]
     fn report_linked_hints_when_linux_path_lacks_the_directory() {
         let r = report_linked(Path::new(LINK), Path::new(TARGET), Os::Linux, "/usr/bin");
+        let r = r.to_string();
         assert!(r.contains("isn't on your PATH"), "{r}");
     }
 
@@ -1287,6 +1467,7 @@ mod tests {
     fn report_linked_is_quiet_when_linux_path_has_the_directory() {
         let path = "/home/me/.local/bin:/usr/bin";
         let r = report_linked(Path::new(LINK), Path::new(TARGET), Os::Linux, path);
+        let r = r.to_string();
         assert!(!r.contains("PATH"), "{r}");
     }
 
@@ -1295,6 +1476,7 @@ mod tests {
         // Finder hands the app launchd's PATH, so the process can't tell.
         let path = "/home/me/.local/bin:/usr/bin";
         let r = report_linked(Path::new(LINK), Path::new(TARGET), Os::MacOs, path);
+        let r = r.to_string();
         assert!(r.contains("PATH"), "{r}");
     }
 
@@ -1366,7 +1548,7 @@ mod tests {
     fn unix_removal_without_home_is_refused() {
         let mut p = unix(Os::MacOs, "/Applications/S.app/Contents/MacOS/schemaic", "");
         p.home = None;
-        assert!(removal(&p).unwrap_err().contains("home"));
+        assert_eq!(removal(&p), Err(Refusal::NoHome));
     }
 
     // ---- user_path_remove ----
@@ -1462,6 +1644,7 @@ mod tests {
         let UnlinkStep::Refuse(why) = unstep(Existing::Link { to, live: true }) else {
             panic!("expected a refusal");
         };
+        let why = why.to_string();
         assert!(
             why.contains(LINK) && why.contains("/opt/other/schemaic"),
             "{why}"
@@ -1473,6 +1656,7 @@ mod tests {
         let UnlinkStep::Refuse(why) = unstep(Existing::Other) else {
             panic!("expected a refusal");
         };
+        let why = why.to_string();
         assert!(why.contains(LINK), "{why}");
     }
 
@@ -1564,20 +1748,19 @@ mod tests {
 
     #[test]
     fn removal_reports_name_the_path() {
-        assert!(report_removed(Path::new(VELOPACK_DIR)).contains(VELOPACK_DIR));
-        assert!(report_path_absent(Path::new(VELOPACK_DIR)).contains(VELOPACK_DIR));
-        assert!(report_unlinked(Path::new(LINK)).contains(LINK));
-        assert!(report_link_absent(Path::new(LINK)).contains(LINK));
-        assert!(report_package(Path::new("/usr/bin")).contains("/usr/bin"));
+        let said = |r: Report| r.to_string();
+        assert!(said(report_removed(Path::new(VELOPACK_DIR))).contains(VELOPACK_DIR));
+        assert!(said(report_path_absent(Path::new(VELOPACK_DIR))).contains(VELOPACK_DIR));
+        assert!(said(report_unlinked(Path::new(LINK))).contains(LINK));
+        assert!(said(report_link_absent(Path::new(LINK))).contains(LINK));
+        assert!(said(report_package(Path::new("/usr/bin"))).contains("/usr/bin"));
     }
 
     #[test]
     fn every_platform_has_a_hint() {
-        for os in [Os::Windows, Os::MacOs, Os::Linux] {
-            assert!(!hint(os).is_empty());
-        }
-        assert!(hint(Os::Windows).contains("PATH"));
-        assert!(hint(Os::MacOs).contains(".local/bin"));
+        assert!(hint(Os::Windows).to_string().contains("PATH"));
+        assert!(hint(Os::MacOs).to_string().contains(".local/bin"));
+        assert!(hint(Os::Linux).to_string().contains(".local/bin"));
     }
 
     // ---- row_status: what the row says before a click ----
@@ -1595,9 +1778,16 @@ mod tests {
         );
         let s = row_status(Os::Linux, Some(&plan(&p)));
         assert!(!s.can_install, "{s:?}");
-        assert!(s.hint.contains("/usr/bin/schemaic"), "{s:?}");
-        assert!(s.hint.contains("comes with"), "{s:?}");
-        assert!(!s.hint.contains(".local/bin"), "{s:?}");
+        assert_eq!(
+            s.hint,
+            RowHint::ComesWithApp {
+                path: "/usr/bin/schemaic".into()
+            }
+        );
+        let hint = s.hint.to_string();
+        assert!(hint.contains("/usr/bin/schemaic"), "{hint}");
+        assert!(hint.contains("comes with"), "{hint}");
+        assert!(!hint.contains(".local/bin"), "{hint}");
     }
 
     /// Windows' `Already` is a folder Install (or the user) put on the user
@@ -1608,8 +1798,9 @@ mod tests {
         p.user_path = Some(format!(r"C:\Windows;{VELOPACK_DIR}"));
         let s = row_status(Os::Windows, Some(&plan(&p)));
         assert!(!s.can_install, "{s:?}");
-        assert!(s.hint.contains(VELOPACK_DIR), "{s:?}");
-        assert!(s.hint.contains("user PATH"), "{s:?}");
+        let hint = s.hint.to_string();
+        assert!(hint.contains(VELOPACK_DIR), "{hint}");
+        assert!(hint.contains("user PATH"), "{hint}");
     }
 
     /// **Where Install has work, the row is unchanged**: an AppImage links, so
@@ -1622,7 +1813,7 @@ mod tests {
         assert_eq!(
             s,
             RowStatus {
-                hint: hint(Os::Linux).to_string(),
+                hint: hint(Os::Linux),
                 can_install: true
             }
         );
@@ -1636,11 +1827,11 @@ mod tests {
             assert_eq!(
                 row_status(os, None),
                 RowStatus {
-                    hint: hint(os).to_string(),
+                    hint: hint(os),
                     can_install: true
                 }
             );
-            let failed: Result<Plan, String> = Err("no home".to_string());
+            let failed: Result<Plan, Refusal> = Err(Refusal::NoHome);
             assert!(row_status(os, Some(&failed)).can_install);
         }
     }

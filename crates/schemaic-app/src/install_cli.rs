@@ -2,7 +2,9 @@
 //! uninstall hook: the side-effect half of [`schemaic_core::cli_install`],
 //! which owns every decision — the registry value's decode included
 //! (`user_path_type`, `decode_user_path`): `win::UserPath::open` only reads the
-//! bytes and hands them over. The one test here pins core's registry type
+//! bytes and hands them over. Core says *why* and *what was done* as typed
+//! values (`Refusal`, `Report`), worded here in the interface's language; the
+//! tests hold that English to core's `Display`, and pin core's registry type
 //! numbers to the Windows API's.
 //!
 //! This module gathers the [`Probe`] and performs the [`Plan`] or the
@@ -11,15 +13,15 @@
 //! thread: the broadcast waits on every top-level window, and a slow one should
 //! stall a thread nobody is looking at rather than the UI.
 
-use schemaic_core::cli_install::{self, Os, Plan, Probe, Removal};
+use schemaic_core::cli_install::{self, LinkedHint, Os, Plan, Probe, Refusal, Removal, Report};
 use std::path::Path;
 
 /// Install the `schemaic` command, or say why not. The `Ok` text names the path
 /// that was resolved, for the Settings row to show.
 pub(crate) fn install() -> Result<String, String> {
     let probe = probe()?;
-    match cli_install::plan(&probe)? {
-        Plan::Already { dir } => Ok(cli_install::report_already(&dir)),
+    match cli_install::plan(&probe).map_err(refusal)? {
+        Plan::Already { dir } => Ok(report(cli_install::report_already(&dir))),
         Plan::AddUserPath { dir } => add_user_path(&dir),
         Plan::Link { link, target } => link_command(&link, &target, &probe),
     }
@@ -28,8 +30,8 @@ pub(crate) fn install() -> Result<String, String> {
 /// Undo [`install`] — only ever what Install could have written.
 pub(crate) fn remove() -> Result<String, String> {
     let probe = probe()?;
-    match cli_install::removal(&probe)? {
-        Removal::Package { dir } => Ok(cli_install::report_package(&dir)),
+    match cli_install::removal(&probe).map_err(refusal)? {
+        Removal::Package { dir } => Ok(report(cli_install::report_package(&dir))),
         Removal::UserPath { dir } => remove_user_path(&dir),
         Removal::Unlink { link, target } => unlink_command(&link, &target),
     }
@@ -103,6 +105,58 @@ pub(crate) fn on_uninstall() {
     }
 }
 
+/// Why Install or Remove would not — core's [`Refusal`] in the interface's
+/// language; its `Display` is the English this agrees with.
+fn refusal(why: Refusal) -> String {
+    match why {
+        Refusal::NoFolder { exe } => tr!("install-refuse-no-folder", exe = exe),
+        Refusal::NoShim { dir } => tr!("install-refuse-no-shim", dir = dir),
+        Refusal::SemicolonInFolder { dir } => tr!("install-refuse-semicolon", dir = dir),
+        Refusal::ExeReplaced { exe } => tr!("install-refuse-exe-replaced", exe = exe),
+        Refusal::NoHome => tr!("install-refuse-no-home"),
+        Refusal::PathNotText => tr!("install-refuse-path-not-text"),
+        Refusal::PathNotUnicode => tr!("install-refuse-path-not-unicode"),
+        Refusal::PortableCopy { dir } => tr!("install-refuse-portable", dir = dir),
+        Refusal::LinkSpotTaken { link } => tr!("install-refuse-spot-taken", link = link),
+        Refusal::LinkPointsElsewhere { link, to } => {
+            tr!("install-refuse-points-elsewhere", link = link, to = to)
+        }
+        Refusal::UnlinkPointsElsewhere { link, to } => {
+            tr!("install-refuse-unlink-elsewhere", link = link, to = to)
+        }
+        Refusal::UnlinkNotALink { link } => tr!("install-refuse-unlink-not-ours", link = link),
+    }
+}
+
+/// What a finished Install or Remove says — core's [`Report`] in the
+/// interface's language.
+fn report(done: Report) -> String {
+    match done {
+        Report::Already { dir } => tr!("install-report-already", dir = dir),
+        Report::Added { dir } => tr!("install-report-added", dir = dir),
+        Report::Linked { link, target, then } => match then {
+            LinkedHint::None => tr!("install-report-linked", link = link, target = target),
+            LinkedHint::IfNotFound { dir } => tr!(
+                "install-report-linked-if-not-found",
+                link = link,
+                target = target,
+                dir = dir
+            ),
+            LinkedHint::NotOnPath { dir } => tr!(
+                "install-report-linked-not-on-path",
+                link = link,
+                target = target,
+                dir = dir
+            ),
+        },
+        Report::Removed { dir } => tr!("install-report-removed", dir = dir),
+        Report::PathAbsent { dir } => tr!("install-report-path-absent", dir = dir),
+        Report::Unlinked { link } => tr!("install-report-unlinked", link = link),
+        Report::LinkAbsent { link } => tr!("install-report-link-absent", link = link),
+        Report::Package { dir } => tr!("install-report-package", dir = dir),
+    }
+}
+
 fn probe() -> Result<Probe, String> {
     let exe =
         std::env::current_exe().map_err(|e| tr!("install-no-exe-path", error = e.to_string()))?;
@@ -173,12 +227,12 @@ fn add_user_path(dir: &Path) -> Result<String, String> {
         // Already in the registry — written between the planner's read and
         // this one, or the planner could not read it and fell back to our own
         // PATH.
-        return Ok(cli_install::report_added(dir));
+        return Ok(report(cli_install::report_added(dir)));
     };
     path.write(&updated)?;
     win::broadcast_environment_change();
     tracing::info!(dir = %dir.display(), "added the CLI's folder to the user PATH");
-    Ok(cli_install::report_added(dir))
+    Ok(report(cli_install::report_added(dir)))
 }
 
 /// Take every entry naming `dir` out of `HKCU\Environment\Path`, then tell
@@ -187,12 +241,12 @@ fn add_user_path(dir: &Path) -> Result<String, String> {
 fn remove_user_path(dir: &Path) -> Result<String, String> {
     let path = win::UserPath::open(win::Access::Write)?;
     let Some(updated) = cli_install::user_path_remove(&path.raw, dir, env_lookup) else {
-        return Ok(cli_install::report_path_absent(dir));
+        return Ok(report(cli_install::report_path_absent(dir)));
     };
     path.write(&updated)?;
     win::broadcast_environment_change();
     tracing::info!(dir = %dir.display(), "removed the CLI's folder from the user PATH");
-    Ok(cli_install::report_removed(dir))
+    Ok(report(cli_install::report_removed(dir)))
 }
 
 #[cfg(windows)]
@@ -311,7 +365,7 @@ mod win {
             if rc != 0 {
                 return Err(tr!("install-path-read", error = os_error(rc).to_string()));
             }
-            schemaic_core::cli_install::user_path_type(ty)?;
+            schemaic_core::cli_install::user_path_type(ty).map_err(super::refusal)?;
             // Rounded up to whole u16s, plus room for a terminator the stored
             // value may lack.
             let mut buf = vec![0u16; (bytes as usize).div_ceil(2) + 1];
@@ -334,8 +388,9 @@ mod win {
             // Asked again of the type this read returned: the value could have
             // been rewritten as another type between the two calls, and `ty` is
             // what the write goes back in.
-            schemaic_core::cli_install::user_path_type(ty)?;
-            path.raw = schemaic_core::cli_install::decode_user_path(&buf)?;
+            schemaic_core::cli_install::user_path_type(ty).map_err(super::refusal)?;
+            path.raw =
+                schemaic_core::cli_install::decode_user_path(&buf).map_err(super::refusal)?;
             path.ty = ty;
             Ok(path)
         }
@@ -428,7 +483,7 @@ fn link_command(link: &Path, target: &Path, probe: &Probe) -> Result<String, Str
     use cli_install::LinkStep;
     match cli_install::link_step(&existing_at(link)?, link, target) {
         LinkStep::Keep => {}
-        LinkStep::Refuse(why) => return Err(why),
+        LinkStep::Refuse(why) => return Err(refusal(why)),
         step => {
             if let Some(dir) = link.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| {
@@ -458,12 +513,12 @@ fn link_command(link: &Path, target: &Path, probe: &Probe) -> Result<String, Str
             tracing::info!(link = %link.display(), target = %target.display(), "linked the CLI");
         }
     }
-    Ok(cli_install::report_linked(
+    Ok(report(cli_install::report_linked(
         link,
         target,
         probe.os,
         &probe.path_var,
-    ))
+    )))
 }
 
 /// Remove `link` if it is ours. `remove_file` on a symlink removes the link,
@@ -472,8 +527,8 @@ fn link_command(link: &Path, target: &Path, probe: &Probe) -> Result<String, Str
 fn unlink_command(link: &Path, target: &Path) -> Result<String, String> {
     use cli_install::UnlinkStep;
     match cli_install::unlink_step(&existing_at(link)?, link, target) {
-        UnlinkStep::Absent => Ok(cli_install::report_link_absent(link)),
-        UnlinkStep::Refuse(why) => Err(why),
+        UnlinkStep::Absent => Ok(report(cli_install::report_link_absent(link))),
+        UnlinkStep::Refuse(why) => Err(refusal(why)),
         UnlinkStep::Remove => {
             std::fs::remove_file(link).map_err(|e| {
                 tr!(
@@ -483,13 +538,73 @@ fn unlink_command(link: &Path, target: &Path) -> Result<String, String> {
                 )
             })?;
             tracing::info!(link = %link.display(), "unlinked the CLI");
-            Ok(cli_install::report_unlinked(link))
+            Ok(report(cli_install::report_unlinked(link)))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// **Every refusal reads in English exactly as core's `Display`**, which
+    /// core's own tests read.
+    #[test]
+    fn english_refuses_every_install_as_core_does() {
+        let s = |v: &str| v.to_string();
+        for why in [
+            Refusal::NoFolder {
+                exe: s("schemaic.exe"),
+            },
+            Refusal::NoShim { dir: s(r"C:\src") },
+            Refusal::SemicolonInFolder { dir: s(r"D:\a;b") },
+            Refusal::ExeReplaced { exe: s("/opt/s") },
+            Refusal::NoHome,
+            Refusal::PathNotText,
+            Refusal::PathNotUnicode,
+            Refusal::PortableCopy {
+                dir: s(r"C:\tools"),
+            },
+            Refusal::LinkSpotTaken { link: s("/l") },
+            Refusal::LinkPointsElsewhere {
+                link: s("/l"),
+                to: s("/t"),
+            },
+            Refusal::UnlinkPointsElsewhere {
+                link: s("/l"),
+                to: s("/t"),
+            },
+            Refusal::UnlinkNotALink { link: s("/l") },
+        ] {
+            assert_eq!(refusal(why.clone()), why.to_string(), "{why:?}");
+        }
+    }
+
+    /// The same for every report, each of a link's three endings included.
+    #[test]
+    fn english_reports_every_install_as_core_does() {
+        let s = |v: &str| v.to_string();
+        let linked = |then| Report::Linked {
+            link: s("/home/me/.local/bin/schemaic"),
+            target: s("/opt/s"),
+            then,
+        };
+        for done in [
+            Report::Already { dir: s("/usr/bin") },
+            Report::Added { dir: s(r"C:\S") },
+            linked(LinkedHint::None),
+            linked(LinkedHint::IfNotFound { dir: s("/d") }),
+            linked(LinkedHint::NotOnPath { dir: s("/d") }),
+            Report::Removed { dir: s(r"C:\S") },
+            Report::PathAbsent { dir: s(r"C:\S") },
+            Report::Unlinked { link: s("/l") },
+            Report::LinkAbsent { link: s("/l") },
+            Report::Package { dir: s("/usr/bin") },
+        ] {
+            assert_eq!(report(done.clone()), done.to_string(), "{done:?}");
+        }
+    }
+
     /// Core decides by the registry's type numbers without linking the Windows
     /// API; these are the numbers the API means by them.
     #[cfg(windows)]

@@ -1416,6 +1416,20 @@ fn statement_timeout_label(secs: u64) -> String {
     schemaic_core::persist::statement_timeout_label(secs)
 }
 
+/// The Command line row's hint — core's `cli_install::RowHint` in the
+/// interface's language.
+fn cli_hint(hint: &schemaic_core::cli_install::RowHint) -> String {
+    use schemaic_core::cli_install::RowHint;
+    match hint {
+        RowHint::AddsFolder => tr!("install-hint-adds-folder"),
+        RowHint::Links => tr!("install-hint-links"),
+        RowHint::FolderOnPath { dir } => tr!("install-hint-folder-on-path", dir = dir.as_str()),
+        RowHint::ComesWithApp { path } => {
+            tr!("install-hint-comes-with-app", path = path.as_str())
+        }
+    }
+}
+
 /// `1234567` → `"1,234,567"`. The row-limit dropdown's only formatting need, and
 /// the reason its label no longer has a list to fall off the end of.
 fn thousands(n: usize) -> String {
@@ -1678,7 +1692,8 @@ fn cli_row(
             v_stack((
                 text(tr!("settings-cli"))
                     .style(|s| s.color(theme::text()).font_size(theme::font_label())),
-                floem::views::label(move || status.with(|s| s.hint.clone())).style(form_hint_style),
+                floem::views::label(move || status.with(|s| cli_hint(&s.hint)))
+                    .style(form_hint_style),
             ))
             .style(|s| {
                 s.flex_col()
@@ -2466,11 +2481,30 @@ pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, WRAP_WIDTHS, editor_font_label,
-        log_hint, row_limit_label, should_ask_for_a_notice, statement_timeout_label,
-        term_font_label, thousands, wrap_width_label,
+        EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, WRAP_WIDTHS, cli_hint,
+        editor_font_label, log_hint, row_limit_label, should_ask_for_a_notice,
+        statement_timeout_label, term_font_label, thousands, wrap_width_label,
     };
     use crate::consts::TERM_FONT_SIZES;
+
+    /// **The Command line row's hint reads in English exactly as core's
+    /// `RowHint` says it**, every variant.
+    #[test]
+    fn english_hints_every_cli_row_as_core_does() {
+        use schemaic_core::cli_install::RowHint;
+        for hint in [
+            RowHint::AddsFolder,
+            RowHint::Links,
+            RowHint::FolderOnPath {
+                dir: r"C:\Users\me\AppData\Local\Schemaic\current".into(),
+            },
+            RowHint::ComesWithApp {
+                path: "/usr/bin/schemaic".into(),
+            },
+        ] {
+            assert_eq!(cli_hint(&hint), hint.to_string(), "{hint:?}");
+        }
+    }
 
     /// **A blocking `--help` spawn per keystroke.** The notice memo tracks the
     /// live field and the probe cache is keyed by the resolved path, so every

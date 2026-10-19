@@ -26,7 +26,7 @@ layout for longer text and locale formatting.
   descriptions and results, and everything sent to an AI harness stay English. Their output is
   parsed by scripts or read by a model, and a translated `schemaic exec` report would break the
   first and gain nothing with the second. Text shared between the GUI and one of those surfaces
-  (`cli_install::report_*`, the export and compare notes) has to be split at that seam, not
+  (the export and compare notes) has to be split at that seam, not
   translated through it.
 - **Server and driver errors stay in the server's language.** A translated sentence wrapping an
   English (or German, or whatever the server is set to) error is expected, not a defect.
@@ -75,11 +75,14 @@ assertions pin English wording — stays the regression net throughout.
    catalogue. `run_verdict`'s `Block(NO_DATABASE_SELECTED)` is the one the CLI already
    recognises by its text (`cli::run::refused_for_no_database`) — harmless while the CLI is
    English, and the first thing a typed refusal replaces. Each becomes a typed message (an id plus arguments, or an enum per area) the UI
-   renders; core keeps an English rendering for the CLI and MCP. The type is proposed on two
-   areas and awaits review before the rest follow: `AliasRenameRefusal` (no arguments) and
-   `ParamError` (arguments) are drawn by `i18n::alias_rename_refusal` and `i18n::param_error`, one
-   `tr!` arm per variant, its fields the message's arguments, with core's `message()`/`Display`
-   kept as the English and pinned equal by a test. Of the other existing enums, `ImportError`
+   renders; core keeps an English rendering for the CLI and MCP. **The shape is settled**
+   (reviewed 2026-10-19): an enum per area, its fields the message's arguments, one `tr!` arm
+   per variant, core's `message()`/`Display` kept as the English and a test holding the two
+   equal; a list is joined UI-side before it is handed in. The renderer lives beside the code
+   that shows it, `ui/i18n.rs` holding only the ones used across files. Done for
+   `AliasRenameRefusal`, `ParamError` and `cli_install` (`Refusal`, `Report`, `RowHint`).
+   **`launch::*`'s refusals take a session of their own**: the largest group, and propagated
+   through `?` inside the command builders, so the typed refusal reaches into them. Of the other existing enums, `ImportError`
    renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
    so its prose lives at its construction sites and it is the weakest to convert.
@@ -99,7 +102,7 @@ assertions pin English wording — stays the regression net throughout.
    like are the same case. Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
    unchanged today is this phase's list to work from: `launch::*`'s refusals,
-   `script::restore_refusal`, `cli_install::report_*`, `statement_timeout_label` (quoted by the
+   `script::restore_refusal`, `statement_timeout_label` (quoted by the
    timeout message as its dropdown shows it), `stats::rows_read_clause`,
    `model::attach_scope_label`, the grid's export notes, the activity panel's counts line — and
    two that are not core's but need the same split: `schemaic-cli`'s `dump.rs` "Export failed: …"

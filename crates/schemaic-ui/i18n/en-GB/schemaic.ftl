@@ -2304,9 +2304,8 @@ cli-no-either-tool = No { $first } or { $second } found on PATH.
 cli-no-either-client = No { $first } or { $second } client found on PATH.
 cli-sqlcmd-windows-in-wsl = Windows sign-in needs a Windows sqlcmd, and the one found is inside WSL. Install sqlcmd on Windows, or open the connection in a query tab.
 
-## Settings › Install's failures (install_cli.rs). What it reports on success
-## is core's and stays English for now. $error is the operating system's own
-## text; $path a file path.
+## Settings › Install's failures (install_cli.rs). $error is the operating
+## system's own text; $path a file path.
 
 install-no-exe-path = Can't tell where Schemaic is running from: { $error }
 install-registry-open = Couldn't open your user environment in the registry: { $error }
@@ -2320,6 +2319,41 @@ install-remove = Couldn't remove { $path }: { $error }
 # Asked of the wrong platform's install, which the Settings row never offers.
 install-path-is-windows = A user PATH entry is a Windows install; this platform links instead.
 install-link-is-unix = Linking the command is a macOS and Linux install.
+
+## Settings › Install and Remove: why not, what was done, and the row's hint
+## (core's cli_install Refusal, Report and RowHint; English must read exactly
+## as their Display, which a test holds). schemaic is the command typed, PATH
+## the variable's name, schemaic.com a file name: none is translated. $dir is a
+## folder, $exe the running program, $link the link's path, $to and $target
+## what a link points at, $path the command's own path.
+
+install-refuse-no-folder = Can't tell which folder { $exe } is in.
+install-refuse-no-shim = There is no schemaic.com beside this copy of Schemaic, in { $dir }, so there is no console command to put on PATH. The installed app has one; a development build doesn't.
+install-refuse-semicolon = This copy of Schemaic is in { $dir }, whose name holds a ';' — PATH would read it as two different folders. Move it somewhere without one and try again.
+install-refuse-exe-replaced = { $exe } was replaced while Schemaic was running, so a link to it would point at nothing. Restart Schemaic, then Install again.
+install-refuse-no-home = There is no home directory to hold the link, so there is nowhere to look.
+install-refuse-path-not-text = Your user PATH isn't stored as text in the registry, so it was left alone.
+install-refuse-path-not-unicode = Your user PATH contains characters that can't be read back safely, so it was left alone.
+install-refuse-portable = This is a portable copy, so Remove can't tell whether Install put { $dir } on your PATH or it was there already with other programs in it. Take it out under Environment Variables if Install added it.
+install-refuse-spot-taken = { $link } already exists and isn't a link, so Install left it alone. Move it aside and try again.
+install-refuse-points-elsewhere = { $link } already points at { $to }. Remove it if that's an old copy of Schemaic, then try again.
+install-refuse-unlink-elsewhere = { $link } points at { $to }, not at this copy of Schemaic, so Remove left it alone.
+install-refuse-unlink-not-ours = { $link } isn't a link Schemaic made, so Remove left it alone.
+install-report-already = The schemaic command is already on your PATH, in { $dir }.
+install-report-added = Added { $dir } to your user PATH. Open a new terminal to use schemaic — one that is already open keeps the old PATH.
+install-report-linked = Linked { $link } to { $target }.
+# macOS, where the app cannot tell whether the folder is on a terminal's PATH.
+install-report-linked-if-not-found = Linked { $link } to { $target }. If a new terminal can't find schemaic, add { $dir } to your PATH in your shell profile.
+install-report-linked-not-on-path = Linked { $link } to { $target }. { $dir } isn't on your PATH yet — add it in your shell profile, then open a new terminal.
+install-report-removed = Removed { $dir } from your user PATH. A terminal that is already open keeps the old PATH.
+install-report-path-absent = { $dir } isn't on your user PATH, so there was nothing to remove.
+install-report-unlinked = Removed { $link }.
+install-report-link-absent = There is no { $link }, so there was nothing to remove.
+install-report-package = The schemaic command in { $dir } came with the installed package, not from Install — remove the package to remove it.
+install-hint-adds-folder = Run Schemaic from a terminal by name. Adds its folder to your user PATH.
+install-hint-links = Run Schemaic from a terminal by name. Links it into ~/.local/bin.
+install-hint-folder-on-path = Run Schemaic from a terminal by name. Its folder, { $dir }, is already on your user PATH.
+install-hint-comes-with-app = Run Schemaic from a terminal by name. The schemaic command comes with the app, at { $path }.
 
 ## The connection gate's refusals (main.rs) — what a run, a query plan or a
 ## grid commit says when the check that the server is reachable stops it.

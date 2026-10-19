@@ -16890,7 +16890,7 @@ existing prose was left alone.
     argv branch, plus `schemaic.com` on Windows — but it shipped reachable only by its full path on
     Windows and macOS, and getting it onto `PATH` is a write to the user's own environment, so it
     happens only on a click, never at install time, and every outcome names the path it resolved.
-    `plan(&Probe) -> Result<Plan, String>` is the whole decision: `Plan::Already { dir }`,
+    `plan(&Probe) -> Result<Plan, Refusal>` is the whole decision: `Plan::Already { dir }`,
     `AddUserPath { dir }` (Windows) or `Link { link, target }` (macOS and Linux). On Windows the
     directory is the one holding `schemaic.com`, and **a copy with no shim beside it is refused**
     rather than planned — a development build has `schemaic-cli.exe` there instead, so putting that
@@ -16947,13 +16947,20 @@ existing prose was left alone.
     is, `Keep` a link already resolving to the target (a relative one resolved lexically against its
     own directory), `Replace` a *dangling* one — an AppImage that was moved or deleted — and
     `Refuse`, naming it, anything live pointing elsewhere or any regular file, because something
-    that isn't Install's is left alone. The report strings (`report_already`, `report_added`,
-    `report_linked`) live here so the "names the path it resolved" promise is tested
+    that isn't Install's is left alone. The reports (`report_already`, `report_added`,
+    `report_linked`) are built here so the "names the path it resolved" promise is tested
     (`reports_name_the_path_they_resolved`); `report_linked` **always** adds a "put it on your
     `PATH`" hint on macOS, since an app started from Finder gets launchd's minimal `PATH` and cannot
     tell whether the user's shell has `~/.local/bin` (`report_linked_always_hints_on_macos`), and on
     Linux only when the process's own `PATH` lacks it.
-    **`row_status(os, Option<&Result<Plan, String>>) -> RowStatus { hint, can_install }` is `plan`'s
+    **Nothing here returns finished English**: every refusal is a `Refusal` — the `Err` of `plan`,
+    `removal`, `user_path_type` and `decode_user_path`, and the payload of `LinkStep::Refuse` and
+    `UnlinkStep::Refuse` — every outcome a `Report`, which the `report_*` functions construct
+    (`Linked` carrying a `LinkedHint` for the macOS and Linux `PATH` word), and the row's hint a
+    `RowHint`, which `hint(os)` returns. Each type's `Display` is the English these used to return
+    as `String`s, byte for byte, and the tests here read it; the app words every variant itself
+    (`install_cli.rs`, `settings::cli_hint` — under *The string catalogue*).
+    **`row_status(os, Option<&Result<Plan, Refusal>>) -> RowStatus { hint, can_install }` is `plan`'s
     answer asked ahead of the click.** The row's hint used to be `hint(os)` alone — a description of
     what Install *would* do — beside an Install that was always enabled, with `plan` run only behind
     the button: on a `.deb` install the row read "Links it into ~/.local/bin", and the click
@@ -16980,7 +16987,7 @@ existing prose was left alone.
     buttons**: a Remove racing an Install over the same registry value or link would leave
     whichever finished second as the answer while the row showed the other
     (`busy_covers_install_and_remove_and_nothing_else`).
-    **`removal(&Probe) -> Result<Removal, String>` is the inverse, and deliberately narrower: it only
+    **`removal(&Probe) -> Result<Removal, Refusal>` is the inverse, and deliberately narrower: it only
     ever undoes what Install could have written.** `Removal::UserPath { dir }` (Windows) is this
     copy's folder, and unlike `plan` it neither asks for `schemaic.com` nor reads the process
     `PATH` — the uninstall hook must clean up whether or not the shim survived
@@ -25210,7 +25217,8 @@ existing prose was left alone.
     not a `Command` in a view; a machine with no config directory gets the path-less hint and a
     disabled button rather than a control that silently does nothing.
     `cli_row` sits under it and is General's other trip outside the app: **Command line**, a
-    hint read from `CliCommand::status` (`core::cli_install::row_status`), **Install** and
+    hint read from `CliCommand::status` (`core::cli_install::row_status`, its `RowHint` worded by
+    `cli_hint` from `install-hint-*`), **Install** and
     **Remove** side by side at `action_gap()` (tabindex 30 and 35), reading **Installing** / **Removing** while one runs, and
     the outcome on a line of its own under the whole row — `theme::text_dim` on success,
     `theme::error` on failure — which stays there for the rest of the session, naming the path the
@@ -36114,6 +36122,12 @@ existing prose was left alone.
     the `Removal`
     (`remove`); `on_uninstall`, Windows-only, is `remove` for the Velopack hook with the outcome
     logged rather than shown — a copy that never ran Install finds nothing and changes nothing.
+    What `install` and `remove` hand back is the interface's wording: core answers with a `Refusal`
+    or a `Report`, and the private `refusal` and `report` word each variant from
+    `install-refuse-*` / `install-report-*`, `english_refuses_every_install_as_core_does` and
+    `english_reports_every_install_as_core_does` holding the English equal to core's `Display`. So
+    the hook logs that wording, not `Display` — English all the same, since it runs before
+    `i18n::init` and the loader starts on `en-GB`.
     **On Windows it is a read-modify-write of `HKCU\Environment\Path` in the value's own registry
     type**, through `RegCreateKeyExW`/`RegQueryValueExW`/`RegSetValueExW`: a `REG_EXPAND_SZ` must
     stay one or every `%USERPROFILE%\…` entry in it stops resolving, and a missing value is created
@@ -40358,7 +40372,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
     translation* — among it `launch::*`'s refusals, `script::restore_refusal`,
-    `cli_install::report_*`, `statement_timeout_label` (which the timeout message quotes as the
+    `statement_timeout_label` (which the timeout message quotes as the
     dropdown shows it), `format_bytes`, `stats::rows_read_clause`, `model::attach_scope_label`,
     the grid's export notes, `ActivitySummary::total_label` (the activity panel's counts line,
     whose state words the search box also matches) and `dump.rs`'s "Export failed: …" lines,
@@ -40422,6 +40436,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     `params-not-a-number` with `$name` and `$text` — for the app's run guard (`guarded_run`,
     `guarded_run_all`), in place of `e.to_string()`. `english_refuses_every_alias_rename_as_core_does`
     and `english_says_every_parameter_error_as_core_does` hold the English equal byte for byte.
+    The third is `cli_install`, whose `Refusal`, `Report` and `RowHint` the app's
+    `install_cli::refusal`/`report` word from `install-refuse-*`/`install-report-*` and
+    `settings::cli_hint` from `install-hint-*`, held by `english_refuses_every_install_as_core_does`,
+    `english_reports_every_install_as_core_does` and `english_hints_every_cli_row_as_core_does`.
+    **A typed message's renderer lives beside the code that shows it** — `install_cli.rs`,
+    `settings.rs` — and `ui/i18n.rs` holds only the ones used across files.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.
