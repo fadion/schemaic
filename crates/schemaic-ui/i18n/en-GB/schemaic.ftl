@@ -2343,3 +2343,33 @@ restore-confirm = Run { $path } into { $database } on { $connection }? What it c
 restore-read-only = This connection is read-only in Schemaic, so nothing is restored into it.
 restore-engine-not-here = This engine's backups are not restored from here.
 restore-unreadable = { $path } could not be read before restoring it, so nothing was run: { $error }
+
+## Closing tabs and a tab's SQL file — open, save, reload (main.rs). $name is
+## a tab's or a file's name; $path a file path; $size a size as the app
+## writes one (1.2 MB); $error the operating system's own text.
+
+tab-close-title = Close “{ $name }”
+tab-close-unsaved = “{ $name }” has unsaved changes. Closing discards them; the file on disk is left as it is. Close anyway?
+tab-close-all-title = Close all tabs
+tab-close-all-question = Are you sure you want to close all the tabs?
+tab-close-others-title = Close other tabs
+tab-close-others-question = Are you sure you want to close all the other tabs?
+file-open-title = Open SQL file
+file-save-title = Save SQL file
+# The open and save dialogs' file-type filter.
+file-sql-filter = SQL script
+file-read-failed = Couldn't read { $path }: { $error }
+file-save-failed = Couldn't save { $path }: { $error }
+file-too-large = { $path } is { $size } — too large to open in an editor tab. Schemaic would spend most of its time re-analysing it. Run it from a query tab, or use Import for a data file.
+file-too-large-short = The file is too large to open.
+file-large-title = Open a large file?
+file-large-question = “{ $name }” is { $size }. Schemaic re-analyses the whole document shortly after every pause in typing, so a file this size makes the editor slow to respond for as long as the tab is open. Open it anyway?
+file-changed-on-disk = { $path } has changed on disk since it was opened. Saving now would discard those changes — reload the file (or Save As to a different name) instead.
+file-lossy-title = Replace unreadable bytes?
+# � is the replacement character the editor shows in place of each byte.
+file-lossy-question = Schemaic couldn't read every byte of “{ $name }” as text and showed those bytes as “�”. Saving writes what you see, so each of them is replaced permanently — in the whole file, not just the lines you edited. Save anyway?
+file-replace-title = Replace file?
+# $typed is the name typed in the dialog; $name that name with .sql added.
+file-replace-question = “{ $name }” already exists — “{ $typed }” was saved with the .sql extension added. Replace it?
+file-reload-title = Reload from disk
+file-reload-unsaved = “{ $name }” has unsaved changes. Reloading discards them. Reload anyway?

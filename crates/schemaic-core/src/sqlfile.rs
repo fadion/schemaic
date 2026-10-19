@@ -36,11 +36,9 @@ use std::path::{Path, PathBuf};
 /// The extension a SQL script gets when the user doesn't type one.
 pub const SQL_EXT: &str = "sql";
 
-/// Extensions the Open/Save dialogs filter on.
+/// Extensions the Open/Save dialogs filter on. The name shown beside them in
+/// the type dropdown is the interface's word (`file-sql-filter`), not core's.
 pub const SQL_EXTENSIONS: &[&str] = &["sql"];
-
-/// The name shown beside those extensions in the dialog's type dropdown.
-pub const SQL_FILTER_NAME: &str = "SQL script";
 
 /// The suggested file name for a tab that has never been saved.
 const FALLBACK_NAME: &str = "query";

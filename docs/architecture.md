@@ -16459,7 +16459,8 @@ existing prose was left alone.
     (`encode`), what the tab is called once it has a file (`tab_title` — the file name *with* its
     extension, or `orders.sql` and `orders.txt` would give two tabs one title), and what the Save
     dialog should suggest for a tab that hasn't got one (`suggested_name`), plus the
-    `SQL_EXT`/`SQL_EXTENSIONS`/`SQL_FILTER_NAME` both dialogs filter on.
+    `SQL_EXT`/`SQL_EXTENSIONS` both dialogs filter on — the filter's name beside them is the
+    interface's word (`file-sql-filter`, through the app's `tr_static!`), not core's.
     **Line endings are remembered, not normalised away.** The editor works in `\n` and a `.sql` file
     checked into a repository on Windows very often does not, so a save that rewrote every line
     ending would turn a one-line edit into a whole-file diff — the kind of change that survives

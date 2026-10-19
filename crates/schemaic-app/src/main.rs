@@ -7543,11 +7543,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .map(|p| schemaic_core::sqlfile::tab_title(&p))
                     .unwrap_or_else(|| tab.title());
                 confirm.set(Some(Confirm {
-                    title: format!("Close “{name}”"),
-                    message: format!(
-                        "“{name}” has unsaved changes. Closing discards them; the file on \
-                         disk is left as it is. Close anyway?"
-                    ),
+                    title: tr!("tab-close-title", name = name.clone()),
+                    message: tr!("tab-close-unsaved", name = name.clone()),
                     resolve: Rc::new(move |yes| {
                         if yes {
                             (tx_then)();
@@ -7622,8 +7619,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let guard_close = guard_close.clone();
             let close_tab_now = close_tab_now.clone();
             confirm.set(Some(Confirm {
-                title: "Close all tabs".to_string(),
-                message: "Are you sure you want to close all the tabs?".to_string(),
+                title: tr!("tab-close-all-title"),
+                message: tr!("tab-close-all-question"),
                 resolve: Rc::new(move |yes| {
                     if yes {
                         close_tabs_seq(ids.clone(), guard_close.clone(), close_tab_now.clone());
@@ -7660,8 +7657,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let guard_close = guard_close.clone();
             let close_tab_now = close_tab_now.clone();
             confirm.set(Some(Confirm {
-                title: "Close other tabs".to_string(),
-                message: "Are you sure you want to close all the other tabs?".to_string(),
+                title: tr!("tab-close-others-title"),
+                message: tr!("tab-close-others-question"),
                 resolve: Rc::new(move |yes| {
                     if yes {
                         schemaic_ui::activate(active, keep);
@@ -8004,13 +8001,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                         OpenVerdict::Confirm(_) => {}
                         OpenVerdict::Refuse(n) => {
-                            report(Err(FileReadError::Message(format!(
-                                "{} is {} — too large to open in an editor tab. \
-                                 Schemaic would spend most of its time re-analysing \
-                                 it. Run it from a query tab, or use Import for a \
-                                 data file.",
-                                path.display(),
-                                schemaic_core::stats::format_bytes(n)
+                            report(Err(FileReadError::Message(tr!(
+                                "file-too-large",
+                                path = path.display().to_string(),
+                                size = schemaic_core::stats::format_bytes(n)
                             ))));
                             return;
                         }
@@ -8018,7 +8012,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let res = std::fs::read(&path)
                         .map(|bytes| schemaic_core::sqlfile::decode(&bytes))
                         .map_err(|e| {
-                            FileReadError::Message(format!("Couldn't read {}: {e}", path.display()))
+                            FileReadError::Message(tr!(
+                                "file-read-failed",
+                                path = path.display().to_string(),
+                                error = e.to_string()
+                            ))
                         });
                     report(res);
                 });
@@ -8042,14 +8040,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(FileReadError::TooBig(n)) => {
                         let (retry, again, done) = (retry.clone(), again.clone(), done.clone());
                         confirm.set(Some(Confirm {
-                            title: "Open a large file?".to_string(),
-                            message: format!(
-                                "“{}” is {}. Schemaic re-analyses the whole document \
-                                 shortly after every pause in typing, so a file this \
-                                 size makes the editor slow to respond for as long as \
-                                 the tab is open. Open it anyway?",
-                                schemaic_core::sqlfile::tab_title(&again),
-                                schemaic_core::stats::format_bytes(n),
+                            title: tr!("file-large-title"),
+                            message: tr!(
+                                "file-large-question",
+                                name = schemaic_core::sqlfile::tab_title(&again),
+                                size = schemaic_core::stats::format_bytes(n)
                             ),
                             resolve: Rc::new(move |yes| {
                                 if !yes {
@@ -8064,7 +8059,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                             FileReadError::Message(m) => m,
                                             // Unreachable: the retry allows it.
                                             FileReadError::TooBig(_) => {
-                                                "The file is too large to open.".to_string()
+                                                tr!("file-too-large-short")
                                             }
                                         }))
                                     }),
@@ -8101,18 +8096,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         && let Ok(now) = std::fs::read(&path)
                         && schemaic_core::sqlfile::changed_on_disk(&now, &expected)
                     {
-                        report(Err(format!(
-                            "{} has changed on disk since it was opened. \
-                             Saving now would discard those changes — reload the \
-                             file (or Save As to a different name) instead.",
-                            path.display()
+                        report(Err(tr!(
+                            "file-changed-on-disk",
+                            path = path.display().to_string()
                         )));
                         return;
                     }
                     // Atomic: `fs::write` truncates first, and this file is the
                     // one thing Schemaic can't regenerate.
-                    let res = schemaic_core::persist::write_file_atomic(&path, &contents)
-                        .map_err(|e| format!("Couldn't save {}: {e}", path.display()));
+                    let res =
+                        schemaic_core::persist::write_file_atomic(&path, &contents).map_err(|e| {
+                            tr!(
+                                "file-save-failed",
+                                path = path.display().to_string(),
+                                error = e.to_string()
+                            )
+                        });
                     report(res);
                 });
             },
@@ -8214,13 +8213,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             confirm.set(Some(Confirm {
                 // Not "Save as UTF-8?": a damaged UTF-16 file is lossy too, and
                 // it is saved as UTF-16.
-                title: "Replace unreadable bytes?".to_string(),
-                message: format!(
-                    "Schemaic couldn't read every byte of “{}” as text and showed \
-                     those bytes as “�”. Saving writes what you see, so each of \
-                     them is replaced permanently — in the whole file, not just \
-                     the lines you edited. Save anyway?",
-                    schemaic_core::sqlfile::tab_title(&path)
+                title: tr!("file-lossy-title"),
+                message: tr!(
+                    "file-lossy-question",
+                    name = schemaic_core::sqlfile::tab_title(&path)
                 ),
                 resolve: Rc::new(move |yes| {
                     if yes {
@@ -8248,10 +8244,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 None => schemaic_core::sqlfile::suggested_name(&tab.title()),
             };
             let opts = floem::file::FileDialogOptions::new()
-                .title("Save SQL file")
+                .title(tr!("file-save-title"))
                 .default_name(default_name)
                 .allowed_types(vec![floem::file::FileSpec {
-                    name: schemaic_core::sqlfile::SQL_FILTER_NAME,
+                    name: tr_static!("file-sql-filter"),
                     extensions: schemaic_core::sqlfile::SQL_EXTENSIONS,
                 }]);
             let write_tab_to = write_tab_to.clone();
@@ -8272,12 +8268,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // step invented is confirmed here, where the dialog can't.
                 if path != picked && path.exists() {
                     confirm.set(Some(Confirm {
-                        title: "Replace file?".to_string(),
-                        message: format!(
-                            "“{}” already exists — “{}” was saved with the .sql \
-                             extension added. Replace it?",
-                            schemaic_core::sqlfile::tab_title(&path),
-                            schemaic_core::sqlfile::tab_title(&picked),
+                        title: tr!("file-replace-title"),
+                        message: tr!(
+                            "file-replace-question",
+                            name = schemaic_core::sqlfile::tab_title(&path),
+                            typed = schemaic_core::sqlfile::tab_title(&picked)
                         ),
                         resolve: Rc::new(move |yes| {
                             if yes {
@@ -8328,9 +8323,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let file_error = file_error.clone();
         Rc::new(move || {
             let opts = floem::file::FileDialogOptions::new()
-                .title("Open SQL file")
+                .title(tr!("file-open-title"))
                 .allowed_types(vec![floem::file::FileSpec {
-                    name: schemaic_core::sqlfile::SQL_FILTER_NAME,
+                    name: tr_static!("file-sql-filter"),
                     extensions: schemaic_core::sqlfile::SQL_EXTENSIONS,
                 }]);
             let next_id = next_id.clone();
@@ -8458,10 +8453,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             }
             confirm.set(Some(schemaic_ui::Confirm {
-                title: "Reload from disk".to_string(),
-                message: format!(
-                    "“{}” has unsaved changes. Reloading discards them. Reload anyway?",
-                    schemaic_core::sqlfile::tab_title(&path)
+                title: tr!("file-reload-title"),
+                message: tr!(
+                    "file-reload-unsaved",
+                    name = schemaic_core::sqlfile::tab_title(&path)
                 ),
                 resolve: Rc::new(move |yes| {
                     if yes {
