@@ -640,7 +640,7 @@ pub fn from_pg_rows(rows: &[PgRoleRow]) -> Vec<Principal> {
 /// `pg_proc.proacl` and `pg_attribute.attacl` are two of the ones it does not,
 /// so a role holding nothing but an `EXECUTE` grant and a column grant was shown
 /// "This account holds no privileges." under a note enumerating five caveats
-/// that covered neither. [`pg_scope_note`] names both now.
+/// that covered neither. [`GrantsNote::PgScope`] names both now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PgObjectKind {
     Database,

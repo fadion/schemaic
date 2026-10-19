@@ -3450,7 +3450,7 @@ fn pg_bool(row: &[Option<String>], i: usize) -> bool {
 /// **Three of the four see one database only.** `pg_database` is cluster-wide,
 /// but `pg_namespace` and `pg_class` are per-database catalogues, so a
 /// connection answers for the database it is attached to and knows nothing about
-/// the others. That is what [`users::pg_scope_note`] says on the screen, rather
+/// the others. That is what [`users::GrantsNote::PgScope`] says on the screen, rather
 /// than a list that looks complete and isn't.
 pub(crate) async fn fetch_grants(
     db: &Db,
@@ -3506,7 +3506,8 @@ pub(crate) async fn fetch_grants(
     // selected the client above stands on PostgreSQL's *maintenance* database,
     // and these two queries would answer for it — a database the user did not
     // choose and is not looking at — while the note said nothing at all. See
-    // `users::pg_no_database_note`, which is what is said instead.
+    // `users::GrantsNote::PgScope` with no database, which is what is said
+    // instead.
     if scope.is_some() {
         let schemas = query_all(
             &client,

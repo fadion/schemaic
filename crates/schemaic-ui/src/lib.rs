@@ -5591,7 +5591,7 @@ pub enum PropertiesState {
 /// not to a database. `database` is carried anyway because PostgreSQL's schema,
 /// table and sequence privileges live in the catalogue of the database holding
 /// the object, so the grant list is only ever as wide as one database and has to
-/// say which (see `users::pg_scope_note`). `None` is a connection with nothing
+/// say which (see `users::GrantsNote::PgScope`). `None` is a connection with nothing
 /// selected: the cluster-wide half still answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsersTarget {

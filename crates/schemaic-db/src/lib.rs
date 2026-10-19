@@ -2196,7 +2196,7 @@ impl Db {
     /// What one account is allowed to do, as `GRANT` statements.
     ///
     /// `database` is the database PostgreSQL's per-database privileges are read
-    /// from — see [`users::pg_scope_note`] for why one connection can only ever
+    /// from — see [`users::GrantsNote::PgScope`] for why one connection can only ever
     /// answer for one — and is ignored on MySQL, whose grant tables are
     /// server-wide and answer for every database at once.
     pub async fn fetch_grants(
