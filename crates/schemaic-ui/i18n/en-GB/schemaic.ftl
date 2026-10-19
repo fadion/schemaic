@@ -1875,3 +1875,52 @@ raster-invalid-svg = Invalid SVG: { $error }
 # "Image", not "Diagram": the chart's PNG comes through here too.
 raster-too-large = Image is too large to rasterise ({ $width }×{ $height })
 raster-png-failed = PNG encoding failed: { $error }
+
+## The results grid's context menus (grid.rs) — a cell's, a row gutter's and a
+## column header's. SQL keywords (NULL, DEFAULT, IN) stay as they are, and
+## the export formats' names (CSV, JSON, SQL VALUES…) are not here.
+
+grid-menu-copy = Copy
+# A cell's Copy when it copies the one raw value rather than the selection.
+grid-menu-copy-value = Copy value
+grid-menu-copy-formatted = Copy formatted
+grid-menu-copy-as = Copy as
+grid-menu-paste = Paste
+grid-menu-fill-down = Fill down
+grid-menu-fill-up = Fill up
+grid-menu-edit-field = Edit field
+# Opens the whole-row panel: Edit row where something in it is writable.
+grid-menu-edit-row = Edit row
+grid-menu-view-row = View row
+grid-menu-edit-binary = Edit binary
+grid-menu-view-binary = View binary
+grid-menu-filter-by-value = Filter by this value
+grid-menu-exclude-value = Exclude this value
+grid-menu-follow-relation = Follow relation
+# A submenu of the tables whose keys point at this row.
+grid-menu-referenced-by = Referenced by
+grid-menu-set-null = Set to NULL
+grid-menu-set-default = Set to DEFAULT
+grid-menu-duplicate-rows = { $count ->
+    [one] Duplicate row
+   *[other] Duplicate { $count } rows
+}
+grid-menu-delete-rows = { $count ->
+    [one] Delete row
+   *[other] Delete { $count } rows
+}
+grid-menu-undo-delete = Undo delete
+grid-menu-ai-summary = AI summary
+# $scope is what would be sent, as core phrases it (3 rows × 2 columns from
+# shop.orders); it stays English for now.
+grid-attach-to-chat = Attach { $scope } to chat
+grid-menu-freeze = Freeze
+grid-menu-unfreeze = Unfreeze
+grid-menu-hide-column = Hide column
+grid-menu-show-hidden-columns = Show hidden columns ({ $count })
+grid-menu-show-all = Show all
+grid-menu-format-as = Format as
+grid-menu-copy-name = Copy name
+grid-menu-copy-qualified-name = Copy qualified name
+grid-menu-copy-values = Copy values
+grid-menu-sql-in-list = SQL IN list

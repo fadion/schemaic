@@ -53,6 +53,7 @@ use schemaic_core::text_ops::contains_ignore_ascii_case;
 use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
 use crate::consts::*;
+use crate::i18n::tr;
 use crate::shortcuts::MenuKey;
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
@@ -2201,7 +2202,7 @@ fn show_columns_submenu(gs: GridState, layout: &ColLayout) -> Vec<MenuEntry> {
         })
         .collect();
     entries.push(MenuEntry::Separator);
-    entries.push(MenuEntry::action("Show all", move || {
+    entries.push(MenuEntry::action(tr!("grid-menu-show-all"), move || {
         gs.hidden.set(Default::default())
     }));
     entries
@@ -2877,9 +2878,9 @@ fn attach_label(gs: GridState) -> String {
     let ncols = gs.rs.get_untracked().col_count();
     let n = gs.order.get_untracked().len();
     let cols = (0, ncols.saturating_sub(1));
-    format!(
-        "Attach {} to chat",
-        attach_scope(n, cols, &gs.layout_untracked(), ncols)
+    tr!(
+        "grid-attach-to-chat",
+        scope = attach_scope(n, cols, &gs.layout_untracked(), ncols)
     )
 }
 
@@ -3199,7 +3200,7 @@ fn copy_as_menu(gs: GridState, pos: usize, sel: Block) -> MenuEntry {
         }
     };
     MenuEntry::sub(
-        "Copy as",
+        tr!("grid-menu-copy-as"),
         ExportFormat::clipboard_formats()
             .map(|f| MenuEntry::action(f.label(), move || copy(render_rows_at(gs, pos, sel, f))))
             // The rows without the `INSERT` around them, for a `VALUES` the
@@ -10247,10 +10248,10 @@ impl BlobLaunch {
     /// different offers and the panel behind them differs by a button: a
     /// read-only cell can only be looked at, and a writable one is where its
     /// value is replaced.
-    fn label(&self) -> &'static str {
+    fn label(&self) -> String {
         match self.stage.is_some() {
-            true => "Edit binary",
-            false => "View binary",
+            true => tr!("grid-menu-edit-binary"),
+            false => tr!("grid-menu-view-binary"),
         }
     }
 }
@@ -10377,7 +10378,8 @@ fn blob_launch(
 /// about a column.
 fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEntry> {
     let mut entries = vec![
-        MenuEntry::action("Copy", move || copy_selection(gs)).shortcut(MenuKey::GridCopy),
+        MenuEntry::action(tr!("grid-menu-copy"), move || copy_selection(gs))
+            .shortcut(MenuKey::GridCopy),
         // The rows as the toolbar's Copy renders the whole result — an
         // `INSERT`, a JSON array, a Markdown table — for just these rows, plus
         // the SQL fragments only a row gesture can mean (`copy_as_menu`).
@@ -10396,24 +10398,20 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
         let all_deleted = gs
             .del_rows
             .with_untracked(|d| idxs.iter().all(|i| d.contains(i)));
-        let plural = |verb: &str| {
-            if n == 1 {
-                format!("{verb} row")
-            } else {
-                format!("{verb} {n} rows")
-            }
-        };
         entries.push(MenuEntry::Separator);
         let dup = idxs.clone();
-        entries.push(MenuEntry::action(plural("Duplicate"), move || {
-            clone_rows(gs, &dup);
-        }));
+        entries.push(MenuEntry::action(
+            tr!("grid-menu-duplicate-rows", count = n),
+            move || {
+                clone_rows(gs, &dup);
+            },
+        ));
         let del = idxs;
         let delete = MenuEntry::action(
             if all_deleted {
-                "Undo delete".to_string()
+                tr!("grid-menu-undo-delete")
             } else {
-                plural("Delete")
+                tr!("grid-menu-delete-rows", count = n)
             },
             move || set_rows_deleted(gs, &del, !all_deleted),
         );
@@ -10434,12 +10432,22 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
     if ai_offered(gs) {
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::action_icon(
-            format!("Attach {} to chat", selection_scope_label(gs)),
+            tr!("grid-attach-to-chat", scope = selection_scope_label(gs)),
             (icons::SPARKLES, theme::key_foreign),
             move || attach_to_chat(gs, false),
         ));
     }
     entries
+}
+
+/// The cell menu's Copy entry, named for what it copies — the interface's own
+/// word for core's [`CopyScope::label`](schemaic_core::edit::CopyScope::label),
+/// which stays English for the CLI's sake.
+fn copy_scope_label(scope: schemaic_core::edit::CopyScope) -> String {
+    match scope {
+        schemaic_core::edit::CopyScope::Selection => tr!("grid-menu-copy"),
+        schemaic_core::edit::CopyScope::Cell => tr!("grid-menu-copy-value"),
+    }
 }
 
 /// Zebra-stripe an odd display row (shared by the frozen and data panes so both
@@ -10778,13 +10786,13 @@ fn header_cell(
             // Each column freezes on its own and joins the ones already
             // frozen; they are drawn first, in index order (`ColLayout`).
             let freeze_item = if gs.frozen.with_untracked(|f| f.contains(&ci)) {
-                MenuEntry::action("Unfreeze", move || {
+                MenuEntry::action(tr!("grid-menu-unfreeze"), move || {
                     gs.frozen.update(|f| {
                         f.remove(&ci);
                     })
                 })
             } else {
-                MenuEntry::action("Freeze", move || {
+                MenuEntry::action(tr!("grid-menu-freeze"), move || {
                     gs.frozen.update(|f| {
                         f.insert(ci);
                     })
@@ -10827,32 +10835,35 @@ fn header_cell(
             // Hide this column; bring back the ones already hidden. The last drawn
             // column cannot go — see `ColLayout::may_hide`.
             entries.push(
-                MenuEntry::action("Hide column", move || hide_column(gs, ci))
+                MenuEntry::action(tr!("grid-menu-hide-column"), move || hide_column(gs, ci))
                     .disabled(!layout.may_hide(ci, rs.col_count())),
             );
             let n_hidden = layout.hidden_in(rs.col_count());
             if n_hidden > 0 {
                 entries.push(MenuEntry::sub(
-                    format!("Show hidden columns ({n_hidden})"),
+                    tr!("grid-menu-show-hidden-columns", count = n_hidden),
                     show_columns_submenu(gs, &layout),
                 ));
             }
             entries.extend([
-                MenuEntry::sub("Format as", format_submenu(gs, ci)),
+                MenuEntry::sub(tr!("grid-menu-format-as"), format_submenu(gs, ci)),
                 MenuEntry::Separator,
                 // The name as the header shows it — an alias where the query
                 // gave one, since that is what the next query will refer to.
-                MenuEntry::action("Copy name", move || {
+                MenuEntry::action(tr!("grid-menu-copy-name"), move || {
                     let _ = floem::Clipboard::set_contents(name.clone());
                 }),
             ]);
             if let Some(q) = qualified {
-                entries.push(MenuEntry::action("Copy qualified name", move || {
-                    let _ = floem::Clipboard::set_contents(q.clone());
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("grid-menu-copy-qualified-name"),
+                    move || {
+                        let _ = floem::Clipboard::set_contents(q.clone());
+                    },
+                ));
             }
             entries.push(MenuEntry::sub(
-                "Copy values",
+                tr!("grid-menu-copy-values"),
                 vec![
                     MenuEntry::action("CSV", move || {
                         let _ = floem::Clipboard::set_contents(export_column_csv(gs, ci));
@@ -10861,7 +10872,7 @@ fn header_cell(
                         let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
                     }),
                     // Empty when every value is NULL — `IN ()` is no list.
-                    MenuEntry::action("SQL IN list", move || {
+                    MenuEntry::action(tr!("grid-menu-sql-in-list"), move || {
                         let text = export_column_in_list(gs, ci);
                         if !text.is_empty() {
                             let _ = floem::Clipboard::set_contents(text);
@@ -10875,7 +10886,7 @@ fn header_cell(
             if ai_offered(gs) {
                 entries.push(MenuEntry::Separator);
                 entries.push(MenuEntry::action_icon(
-                    "AI summary",
+                    tr!("grid-menu-ai-summary"),
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         // Asked again at the launch, not only at the build.
@@ -11827,7 +11838,7 @@ fn data_cell(
             // committed row to open in the panel (it's filled via inline cell edits).
             let mut entries: Vec<MenuEntry> = Vec::new();
             if text_editable && !deleted {
-                entries.push(MenuEntry::action("Edit field", move || {
+                entries.push(MenuEntry::action(tr!("grid-menu-edit-field"), move || {
                     start_edit(gs, i, ci)
                 }));
             }
@@ -11837,9 +11848,9 @@ fn data_cell(
             // *Edit row* and opened a view.
             if pending.is_none() {
                 let label = if model.any_editable() {
-                    "Edit row"
+                    tr!("grid-menu-edit-row")
                 } else {
-                    "View row"
+                    tr!("grid-menu-view-row")
                 };
                 entries.push(MenuEntry::action(label, move || {
                     open_edit_row(gs, data_idx)
@@ -11868,7 +11879,7 @@ fn data_cell(
             // about the block — and says which of the two it is, since Ctrl+C
             // and the gutter menu's Copy both mean the whole selection.
             let scope = schemaic_core::edit::copy_scope(gs.bounds_untracked(), i, ci);
-            let copy = MenuEntry::action(scope.label(), move || match scope {
+            let copy = MenuEntry::action(copy_scope_label(scope), move || match scope {
                 schemaic_core::edit::CopyScope::Selection => copy_selection(gs),
                 schemaic_core::edit::CopyScope::Cell => {
                     let _ = floem::Clipboard::set_contents(v_copy.clone());
@@ -11882,9 +11893,12 @@ fn data_cell(
             });
             // Only when this column shows a formatted (non-raw) value.
             if fmt != ColumnFormat::None {
-                entries.push(MenuEntry::action("Copy formatted", move || {
-                    let _ = floem::Clipboard::set_contents(formatted_val.clone());
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("grid-menu-copy-formatted"),
+                    move || {
+                        let _ = floem::Clipboard::set_contents(formatted_val.clone());
+                    },
+                ));
             }
             // The gutter's *Copy as*, over the same gesture: the selected block
             // when this cell is inside one of more than one cell, else this
@@ -11902,7 +11916,7 @@ fn data_cell(
             // not on this cell — Ctrl+V and this entry do the same thing.
             if text_editable && !deleted {
                 entries.push(
-                    MenuEntry::action("Paste", move || paste_selection(gs))
+                    MenuEntry::action(tr!("grid-menu-paste"), move || paste_selection(gs))
                         .shortcut(MenuKey::GridPaste),
                 );
                 // Over a block of two rows or more that this cell is part of —
@@ -11912,10 +11926,10 @@ fn data_cell(
                     .is_some_and(|(r0, _, r1, _)| r1 > r0 && (r0..=r1).contains(&i));
                 if in_block {
                     use schemaic_core::edit::Fill;
-                    entries.push(MenuEntry::action("Fill down", move || {
+                    entries.push(MenuEntry::action(tr!("grid-menu-fill-down"), move || {
                         fill_selection(gs, Fill::Down)
                     }));
-                    entries.push(MenuEntry::action("Fill up", move || {
+                    entries.push(MenuEntry::action(tr!("grid-menu-fill-up"), move || {
                         fill_selection(gs, Fill::Up)
                     }));
                 }
@@ -11925,13 +11939,19 @@ fn data_cell(
             if can_filter {
                 entries.push(MenuEntry::Separator);
                 let v1 = filter_val.clone();
-                entries.push(MenuEntry::action("Filter by this value", move || {
-                    gs.add_filter_condition(ci, v1.as_deref(), false);
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("grid-menu-filter-by-value"),
+                    move || {
+                        gs.add_filter_condition(ci, v1.as_deref(), false);
+                    },
+                ));
                 let v2 = filter_val.clone();
-                entries.push(MenuEntry::action("Exclude this value", move || {
-                    gs.add_filter_condition(ci, v2.as_deref(), true);
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("grid-menu-exclude-value"),
+                    move || {
+                        gs.add_filter_condition(ci, v2.as_deref(), true);
+                    },
+                ));
             }
             // "Follow relation" — this cell's column is a foreign key with a known
             // target. Real rows only (a pending new row has no committed key to
@@ -11939,9 +11959,12 @@ fn data_cell(
             // (Static label — table names can get long; Ctrl-click is the shortcut.)
             if let Some(spec) = &fs_menu {
                 let spec = spec.clone();
-                entries.push(MenuEntry::action("Follow relation", move || {
-                    follow_relation(gs, data_idx, &spec);
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("grid-menu-follow-relation"),
+                    move || {
+                        follow_relation(gs, data_idx, &spec);
+                    },
+                ));
             }
             // "Referenced by" — the other way: the tables whose keys point at
             // this row's table, each opened filtered to the rows that point at
@@ -11969,13 +11992,16 @@ fn data_cell(
                 Vec::new()
             };
             if !referencing.is_empty() {
-                entries.push(MenuEntry::sub("Referenced by", referencing));
+                entries.push(MenuEntry::sub(tr!("grid-menu-referenced-by"), referencing));
             }
             if nullable && !deleted {
-                entries.push(MenuEntry::action("Set to NULL", move || match pending {
-                    Some(p) => gs.stage_new(p, ci, None),
-                    None => gs.stage(data_idx, ci, None),
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("grid-menu-set-null"),
+                    move || match pending {
+                        Some(p) => gs.stage_new(p, ci, None),
+                        None => gs.stage(data_idx, ci, None),
+                    },
+                ));
             }
             // Beside NULL, and not gated on nullable: a NOT NULL column with a
             // default is the common case. On a pending row it is offered only
@@ -11988,18 +12014,28 @@ fn data_cell(
                         .with_untracked(|r| r.get(p).is_some_and(|row| row.contains_key(&ci)))
                 });
             if takes_default {
-                entries.push(MenuEntry::action("Set to DEFAULT", move || match pending {
-                    Some(p) => gs.unset_new(p, ci),
-                    None => gs.stage_default(data_idx, ci),
-                }));
+                entries.push(MenuEntry::action(
+                    tr!("grid-menu-set-default"),
+                    move || match pending {
+                        Some(p) => gs.unset_new(p, ci),
+                        None => gs.stage_default(data_idx, ci),
+                    },
+                ));
             }
             // Row actions (single writable table, real rows): duplicate + delete.
             if can_rows {
                 entries.push(MenuEntry::Separator);
-                entries.push(MenuEntry::action("Duplicate row", move || {
-                    clone_row(gs, data_idx);
-                }));
-                let del_label = if deleted { "Undo delete" } else { "Delete row" };
+                entries.push(MenuEntry::action(
+                    tr!("grid-menu-duplicate-rows", count = 1),
+                    move || {
+                        clone_row(gs, data_idx);
+                    },
+                ));
+                let del_label = if deleted {
+                    tr!("grid-menu-undo-delete")
+                } else {
+                    tr!("grid-menu-delete-rows", count = 1)
+                };
                 entries.push(MenuEntry::action(del_label, move || {
                     gs.toggle_delete(data_idx);
                 }));
@@ -12015,7 +12051,7 @@ fn data_cell(
                 // different kind of act from editing or deleting one.
                 entries.push(MenuEntry::Separator);
                 entries.push(MenuEntry::action_icon(
-                    "AI summary",
+                    tr!("grid-menu-ai-summary"),
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         // Asked again at the launch, not only at the build.
@@ -12036,7 +12072,7 @@ fn data_cell(
                 // consent notice, and it names exactly what is about to travel —
                 // a lone cell is one *column*, a gutter selection is whole rows.
                 entries.push(MenuEntry::action_icon(
-                    format!("Attach {} to chat", selection_scope_label(gs)),
+                    tr!("grid-attach-to-chat", scope = selection_scope_label(gs)),
                     (icons::SPARKLES, theme::key_foreign),
                     move || attach_to_chat(gs, false),
                 ));
@@ -15976,6 +16012,42 @@ mod find_hits_tests {
         // Its unset column is empty, not a stale read of the committed row
         // above it — searching the value that *is* there must not hit it.
         assert_eq!(find_hits(&cells, "alpha").0, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod menu_words_tests {
+    use super::*;
+    use schemaic_core::edit::CopyScope;
+
+    /// The cell menu's Copy says in English what core's `CopyScope::label`
+    /// says, which the CLI still reads.
+    #[test]
+    fn the_copy_scope_reads_as_core_says_it_in_english() {
+        for scope in [CopyScope::Selection, CopyScope::Cell] {
+            assert_eq!(copy_scope_label(scope), scope.label(), "{scope:?}");
+        }
+    }
+
+    /// The menu entries built around a count or a phrase read as they did when
+    /// they were assembled in place.
+    #[test]
+    fn the_counted_entries_read_as_they_did_in_english() {
+        assert_eq!(tr!("grid-menu-duplicate-rows", count = 1), "Duplicate row");
+        assert_eq!(
+            tr!("grid-menu-duplicate-rows", count = 3),
+            "Duplicate 3 rows"
+        );
+        assert_eq!(tr!("grid-menu-delete-rows", count = 1), "Delete row");
+        assert_eq!(tr!("grid-menu-delete-rows", count = 12), "Delete 12 rows");
+        assert_eq!(
+            tr!("grid-menu-show-hidden-columns", count = 2),
+            "Show hidden columns (2)"
+        );
+        assert_eq!(
+            tr!("grid-attach-to-chat", scope = "2 rows × 3 columns"),
+            "Attach 2 rows × 3 columns to chat"
+        );
     }
 }
 

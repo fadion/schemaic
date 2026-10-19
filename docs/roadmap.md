@@ -109,7 +109,9 @@ assertions pin English wording — stays the regression net throughout.
    recorded on the *Within the large files* line below, so the next session knows where to pick
    up without re-sweeping what is done. The file leaves *Left* only when a whole-file sweep
    finds nothing.
-   **Within the large files:** nothing yet beyond the headers and openers named above.
+   **Within the large files:** beyond the headers and openers named above, `grid.rs`'s context
+   menus — a cell's, a row gutter's, a column header's, *Copy as* and *Show hidden columns*
+   (`grid-menu-*`, and `grid-attach-to-chat`, which the toolbar's attach label shares).
    **Left, in order** — delete a name as its file lands: the four large files' remainders,
    `grid.rs`, `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,

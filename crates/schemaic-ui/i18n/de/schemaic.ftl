@@ -1594,3 +1594,42 @@ usages-title = { $count ->
 raster-invalid-svg = Ungültiges SVG: { $error }
 raster-too-large = Das Bild ist zu groß zum Rastern ({ $width }×{ $height })
 raster-png-failed = PNG-Kodierung fehlgeschlagen: { $error }
+grid-menu-copy = Kopieren
+grid-menu-copy-value = Wert kopieren
+grid-menu-copy-formatted = Formatiert kopieren
+grid-menu-copy-as = Kopieren als
+grid-menu-paste = Einfügen
+grid-menu-fill-down = Nach unten ausfüllen
+grid-menu-fill-up = Nach oben ausfüllen
+grid-menu-edit-field = Feld bearbeiten
+grid-menu-edit-row = Zeile bearbeiten
+grid-menu-view-row = Zeile anzeigen
+grid-menu-edit-binary = Binärwert bearbeiten
+grid-menu-view-binary = Binärwert anzeigen
+grid-menu-filter-by-value = Nach diesem Wert filtern
+grid-menu-exclude-value = Diesen Wert ausschließen
+grid-menu-follow-relation = Beziehung folgen
+grid-menu-referenced-by = Referenziert von
+grid-menu-set-null = Auf NULL setzen
+grid-menu-set-default = Auf DEFAULT setzen
+grid-menu-duplicate-rows = { $count ->
+    [one] Zeile duplizieren
+   *[other] { $count } Zeilen duplizieren
+}
+grid-menu-delete-rows = { $count ->
+    [one] Zeile löschen
+   *[other] { $count } Zeilen löschen
+}
+grid-menu-undo-delete = Löschen rückgängig machen
+grid-menu-ai-summary = KI-Zusammenfassung
+grid-attach-to-chat = { $scope } an den Chat anhängen
+grid-menu-freeze = Fixieren
+grid-menu-unfreeze = Fixierung aufheben
+grid-menu-hide-column = Spalte ausblenden
+grid-menu-show-hidden-columns = Ausgeblendete Spalten anzeigen ({ $count })
+grid-menu-show-all = Alle anzeigen
+grid-menu-format-as = Formatieren als
+grid-menu-copy-name = Namen kopieren
+grid-menu-copy-qualified-name = Qualifizierten Namen kopieren
+grid-menu-copy-values = Werte kopieren
+grid-menu-sql-in-list = SQL-IN-Liste
