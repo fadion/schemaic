@@ -1860,6 +1860,17 @@ alias-rename-placeholder-cte = CTE name
 alias-rename-new-name = New name
 alias-rename-rename = Rename
 
+## Why it will not rename (core's AliasRenameRefusal). Said of an alias and a
+## CTE alike. English must read exactly as core's message (a test holds it).
+
+alias-rename-no-alias = There is nothing here to rename any more.
+alias-rename-empty = Give it a name.
+# $name is the name typed, blanks trimmed.
+alias-rename-conflict = “{ $name }” is already a name in this query: renaming to it would change which table a reference reads.
+alias-rename-unsure = A reference here may read another column of this name, or read this one where the rename cannot follow, and the loaded schema cannot tell — so no edit is made. Load the tables' schema, or rename by hand.
+alias-rename-changed = The query changed while this was open. Close it and rename again.
+alias-rename-read-only = The editor is read-only until the AI suggestion is accepted or rejected.
+
 ## The editor's usages list (usages_view.rs)
 
 # $name is what was looked up (an alias, a CTE, a column).
@@ -2219,6 +2230,11 @@ cmdk-reject = Reject
 params-value-placeholder = value
 # On the kind chip; NULL and SQL are the chip's own words.
 params-kind-tip = Text, number, NULL, or raw SQL — click to change
+# Why the run holds (core's ParamError; English must read as its Display).
+# $names is the list as written, e.g. ":id, :from".
+params-missing = No value for { $names }
+# $name is the parameter's name without its colon; $text what was typed.
+params-not-a-number = :{ $name } is a number, but reads "{ $text }"
 
 ## The editor's error and guard bars (editor_pane.rs). Explain and AI fix are
 ## the error modal's own (error-modal-explain, error-modal-ai-fix).

@@ -1587,6 +1587,12 @@ alias-rename-placeholder-alias = Alias
 alias-rename-placeholder-cte = Name der CTE
 alias-rename-new-name = Neuer Name
 alias-rename-rename = Umbenennen
+alias-rename-no-alias = Hier gibt es nichts mehr umzubenennen.
+alias-rename-empty = Gib einen Namen ein.
+alias-rename-conflict = „{ $name }“ ist in dieser Abfrage schon ein Name: Eine Umbenennung darauf würde ändern, welche Tabelle eine Referenz liest.
+alias-rename-unsure = Eine Referenz hier liest vielleicht eine andere Spalte dieses Namens oder liest diese dort, wo die Umbenennung nicht folgen kann, und das geladene Schema kann es nicht entscheiden — daher wird nichts geändert. Lade das Schema der Tabellen oder benenne von Hand um.
+alias-rename-changed = Die Abfrage hat sich geändert, während dies offen war. Schließe es und benenne erneut um.
+alias-rename-read-only = Der Editor ist schreibgeschützt, bis der KI-Vorschlag angenommen oder abgelehnt ist.
 usages-title = { $count ->
     [one] { $count } Verwendung von { $name }
    *[other] { $count } Verwendungen von { $name }
@@ -1805,6 +1811,8 @@ cmdk-accept = Übernehmen
 cmdk-reject = Verwerfen
 params-value-placeholder = Wert
 params-kind-tip = Text, Zahl, NULL oder rohes SQL — zum Ändern klicken
+params-missing = Kein Wert für { $names }
+params-not-a-number = :{ $name } ist eine Zahl, lautet aber „{ $text }“
 editor-error-view = Anzeigen
 editor-run-anyway = Trotzdem ausführen
 editor-diag-fix = { $keys }: { $fix }

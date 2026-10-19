@@ -75,12 +75,14 @@ assertions pin English wording — stays the regression net throughout.
    catalogue. `run_verdict`'s `Block(NO_DATABASE_SELECTED)` is the one the CLI already
    recognises by its text (`cli::run::refused_for_no_database`) — harmless while the CLI is
    English, and the first thing a typed refusal replaces. Each becomes a typed message (an id plus arguments, or an enum per area) the UI
-   renders; core keeps an English rendering for the CLI and MCP. Settle the message type on one
-   area first and review it before the rest follow. The existing enums are the nearest starting
-   points, though they render in three different ways: `AliasRenameRefusal` through `message()`,
-   `ImportError` and `ParamError` through `Display`, and `FilterError::BadCondition` not at all
+   renders; core keeps an English rendering for the CLI and MCP. The type is proposed on two
+   areas and awaits review before the rest follow: `AliasRenameRefusal` (no arguments) and
+   `ParamError` (arguments) are drawn by `i18n::alias_rename_refusal` and `i18n::param_error`, one
+   `tr!` arm per variant, its fields the message's arguments, with core's `message()`/`Display`
+   kept as the English and pinned equal by a test. Of the other existing enums, `ImportError`
+   renders through `Display` (its `Read` wraps a library's text), and `FilterError::BadCondition` not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
-   so its prose lives at its construction sites and it is the weakest of the four to start from.
+   so its prose lives at its construction sites and it is the weakest to convert.
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for

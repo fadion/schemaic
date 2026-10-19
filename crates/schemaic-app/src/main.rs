@@ -9287,7 +9287,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // run yet, so the bar offers no "Run anyway".
                 Err(e) => {
                     run_guard.set(Some(RunGuard {
-                        message: e.to_string(),
+                        message: schemaic_ui::i18n::param_error(&e),
                         pending: None,
                     }));
                     return;
@@ -9333,7 +9333,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Ok(pair) => pair,
                     Err(e) => {
                         run_guard.set(Some(RunGuard {
-                            message: e.to_string(),
+                            message: schemaic_ui::i18n::param_error(&e),
                             pending: None,
                         }));
                         return;

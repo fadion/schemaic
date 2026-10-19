@@ -74,7 +74,7 @@ pub(crate) fn alias_rename_overlay(open: RwSignal<Option<AliasRenameRequest>>) -
                 let typed = name.get_untracked();
                 match (req.apply)(&typed) {
                     Ok(()) => done(),
-                    Err(why) => refusal.set(Some(why.message(&typed))),
+                    Err(why) => refusal.set(Some(crate::i18n::alias_rename_refusal(why, &typed))),
                 }
             });
             // A refusal answers the name it was given; editing the name

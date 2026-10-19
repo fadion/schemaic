@@ -40336,8 +40336,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `&'static str`** — floem's `FileSpec::name`, a file dialog's type filter — gets the app's
     `tr_static!` (top of `main.rs`): a `OnceLock` per use site, filled once, which is sound only
     because the language is fixed at launch, and leaks nothing per dialog opened. A word core gives
-    as a property of a typed value is drawn UI-side (below); core's *prose* is not the view's to
-    translate and stays as it comes.
+    as a property of a typed value is drawn UI-side (below), and so is a message core gives as a
+    typed *why*; prose core hands over as a finished `String` is not the view's to translate and
+    stays as it comes.
   - **Shared words have shared ids**, so one action cannot be worded two ways: `dialog-*` for
     the words no one dialog owns (`dialog-cancel`, `dialog-yes`, `dialog-no`, `dialog-close`,
     `dialog-stop`, and `dialog-read-only`, the sentence beside a disabled write button that the
@@ -40411,6 +40412,16 @@ Re-introducing the anti-patterns these guard against is a regression:
     palette's history rows, a result chip's tooltip), and `history::outcome_line_with` keeps which
     facts and where the separators go while `i18n::outcome_line` supplies `outcome-rows`/
     `outcome-rows-capped` — `english_says_ago_and_rows_as_core_does` holding both to core's English.
+    **A whole message takes the same shape** — phase 4 of *Interface translation*, begun under
+    *Core's typed messages* in `ui/i18n.rs`: where core says *why* as a typed value, an enum whose
+    fields are the arguments, the interface words it there, one `tr!` arm per variant, and core's
+    `message`/`Display` stays the English. `i18n::alias_rename_refusal` words
+    `intel::AliasRenameRefusal` from `alias-rename-*` (`Conflict` takes the trimmed `$name`) for
+    `alias_rename.rs`, and `i18n::param_error` words `params::ParamError` — `params-missing` with
+    `$names`, the `:a, :b` list joined UI-side as core's `Display` joins it, and
+    `params-not-a-number` with `$name` and `$text` — for the app's run guard (`guarded_run`,
+    `guarded_run_all`), in place of `e.to_string()`. `english_refuses_every_alias_rename_as_core_does`
+    and `english_says_every_parameter_error_as_core_does` hold the English equal byte for byte.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.
