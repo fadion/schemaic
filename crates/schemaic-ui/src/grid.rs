@@ -7189,7 +7189,12 @@ fn field_label(name: String, type_name: String) -> impl IntoView {
 ///
 /// Navigable regardless of `autofocus`, because Tab walking past a button as
 /// though it were a label is the other half of the same complaint.
-fn field_mini_btn(label: &'static str, autofocus: bool, action: impl Fn() + 'static) -> AnyView {
+fn field_mini_btn(
+    label: impl Into<String>,
+    autofocus: bool,
+    action: impl Fn() + 'static,
+) -> AnyView {
+    let label: String = label.into();
     let id = floem::reactive::create_rw_signal(None);
     let btn = crate::widgets::key_pressable(
         text(label).style(|s| s.font_size(theme::scaled_font(13.0))),
@@ -7251,7 +7256,9 @@ fn nullable_field(
                     // keys went on moving the grid's selection behind the open
                     // panel. Pressing this turns the field into its control, and the
                     // control's own autofocus then takes the caret.
-                    field_mini_btn("Set value", autofocus, move || f.is_null.set(false)),
+                    field_mini_btn(tr!("grid-row-set-value"), autofocus, move || {
+                        f.is_null.set(false)
+                    }),
                 ))
                 .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
                 .on_double_click_stop(move |_| f.is_null.set(false))
@@ -7262,7 +7269,7 @@ fn nullable_field(
                     // Never autofocused: the control beside it has the panel's
                     // autofocus, and two views asking for the caret on the same
                     // mount is a race with no right answer.
-                    field_mini_btn("Set NULL", false, move || f.is_null.set(true)),
+                    field_mini_btn(tr!("grid-row-set-null"), false, move || f.is_null.set(true)),
                 ))
                 .style(|s| s.items_center().width_full().gap(theme::scaled(6.0)))
                 .into_any()
@@ -7725,7 +7732,7 @@ fn json_editor(f: FieldSig, sink: RwSignal<Option<ModalError>>) -> AnyView {
                 editing.set(None);
                 err.set(None);
             }
-            Err(e) => err.set(Some(format!("Invalid JSON: {e}"))),
+            Err(e) => err.set(Some(tr!("grid-row-invalid-json", error = e.to_string()))),
         }
     });
     // Start editing a leaf, committing any in-progress edit first (so switching
@@ -7833,7 +7840,7 @@ fn json_field(
                 h_stack((
                     null_sentinel(),
                     empty().style(|s| s.flex_grow(1.0_f32)),
-                    field_mini_btn("Set value", autofocus, enable),
+                    field_mini_btn(tr!("grid-row-set-value"), autofocus, enable),
                 ))
                 .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
                 .on_double_click_stop(move |_| enable())
@@ -7904,7 +7911,7 @@ fn readonly_value(f: FieldSig) -> AnyView {
 /// Two labels for one button, the same pair the cell menu's entry carries and
 /// for the same reason — *Edit* on a cell that takes a write, *View* on one that
 /// does not, because they open a panel with a different set of buttons.
-type BlobField = (&'static str, Rc<dyn Fn()>);
+type BlobField = (String, Rc<dyn Fn()>);
 
 /// One field row: the column label + its value editor (editable) or read-only cell.
 ///
@@ -8065,8 +8072,8 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     // Short labels here: the row is already headed by the
                     // column's name, so "Edit binary" would say it twice.
                     let word = match launch.stage.is_some() {
-                        true => "Edit",
-                        false => "View",
+                        true => tr!("grid-row-edit-binary"),
+                        false => tr!("grid-row-view-binary"),
                     };
                     let launch = Rc::new(launch);
                     let open: Rc<dyn Fn()> = Rc::new(move || {
@@ -8120,9 +8127,13 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             let title = match gs.source.get_untracked() {
                 // Qualified outside `public`, so two same-named tables read apart.
                 Some(src) if !src.table.is_empty() => {
-                    format!("Row {row_no}  ·  {}", src.display())
+                    tr!(
+                        "grid-row-title-in-table",
+                        row = row_no,
+                        table = src.display()
+                    )
                 }
-                _ => format!("Row {row_no}"),
+                _ => tr!("grid-row-title", row = row_no),
             };
 
             // Header icons — Save (✓, when editable) then Close (✕). Save commits
@@ -8227,7 +8238,8 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 move || gs.edit_row_saving.get(),
                 move |saving| {
                     if saving {
-                        loading_dots("Saving", theme::text_dim, theme::font_label).into_any()
+                        loading_dots(tr!("grid-row-saving"), theme::text_dim, theme::font_label)
+                            .into_any()
                     } else {
                         empty().into_any()
                     }
@@ -16131,6 +16143,20 @@ mod catalogue_tests {
         assert_eq!(
             tr!("grid-export-fetched-rows", count = "200k"),
             "Fetched rows (200k)"
+        );
+    }
+
+    /// The row panel's title reads as it did, its wide separator included.
+    #[test]
+    fn the_row_panel_title_reads_as_it_did_in_english() {
+        assert_eq!(tr!("grid-row-title", row = 7), "Row 7");
+        assert_eq!(
+            tr!("grid-row-title-in-table", row = 12, table = "shop.orders"),
+            "Row 12  ·  shop.orders"
+        );
+        assert_eq!(
+            tr!("grid-row-invalid-json", error = "expected value at line 1"),
+            "Invalid JSON: expected value at line 1"
         );
     }
 

@@ -118,7 +118,7 @@ assertions pin English wording — stays the regression net throughout.
    sentences are core's); the clipboard, fill, attach and export paths — fill's notes, the
    attachment's summary (`attach_summary`), *Copy as* SQL's refusals, the export menu's
    *Fetched rows* and the Save dialog (the export notes, and the "the clipboard" / "the file"
-   they name, are core's).
+   they name, are core's); the row panel (`grid-row-*`; its `<null>` is SQL).
    **Left, in order** — delete a name as its file lands: the four large files' remainders,
    `grid.rs`, `lib.rs`, `widgets.rs` and `editor_pane.rs`, each more than one session; then
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,

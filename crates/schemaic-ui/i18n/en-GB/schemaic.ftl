@@ -2023,3 +2023,20 @@ grid-export-fetched-rows = Fetched rows ({ $count })
 # The Save dialog's title.
 grid-export-dialog-title = Export results
 grid-export-already-running = An export is already running — nothing was written.
+
+## The results grid's row panel (grid.rs) — Edit row / View row. The <null>
+## sentinel is SQL and stays as it is.
+
+# $row is the row's number on screen.
+grid-row-title = Row { $row }
+# The same, for a row read from one table; $table is its name.
+grid-row-title-in-table = Row { $row }  ·  { $table }
+grid-row-set-value = Set value
+grid-row-set-null = Set NULL
+# A binary field's button; the row already names the column, so one word.
+grid-row-edit-binary = Edit
+grid-row-view-binary = View
+# $error is the JSON parser's own message.
+grid-row-invalid-json = Invalid JSON: { $error }
+# Animated with trailing dots while the row is written.
+grid-row-saving = Saving
