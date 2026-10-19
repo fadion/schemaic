@@ -40737,8 +40737,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     says *why* as a typed value, an enum whose fields are the arguments, the interface words it,
     one `tr!` arm per variant, and core's `message`/`Display` stays the English.
     `alias_rename::refusal_message` words `intel::AliasRenameRefusal` from `alias-rename-*`
-    (`Conflict` takes the trimmed `$name`), and `i18n::param_error` (under *Core's typed
-    messages*, since the app calls it) words `params::ParamError` — `params-missing` with
+    (`Conflict` takes the trimmed `$name`), and `i18n::param_error` (in `i18n.rs` rather than
+    beside a view, since the app calls it) words `params::ParamError` — `params-missing` with
     `$names`, the `:a, :b` list joined UI-side as core's `Display` joins it, and
     `params-not-a-number` with `$name` and `$text` — for the app's run guard (`guarded_run`,
     `guarded_run_all`), in place of `e.to_string()`. `english_refuses_every_alias_rename_as_core_does`
