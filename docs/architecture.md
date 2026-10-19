@@ -25011,8 +25011,12 @@ existing prose was left alone.
     are `crates/schemaic-ui/i18n/<tag>/schemaic.ftl` — `en-GB` the source, `de` machine-drafted and
     unreviewed — embedded in the binary by `rust-embed`, and `crates/schemaic-ui/i18n.toml` names
     `en-GB` the fallback and the Fluent domain `schemaic`, after the app rather than the crate, so
-    that every crate drawing the interface can share the one catalogue. Only this crate reads it
-    today: `LOADER` and `tr!` are `pub(crate)`. **`tr!` is `fl!` against `LOADER`**, so a message
+    that every crate drawing the interface can share the one catalogue. `schemaic-app` is the
+    second to read it: `LOADER` is `pub`, but `tr!` stays this crate's, because `fl!` checks a
+    message id against the *calling* crate's `i18n.toml` and a macro exported from here would carry
+    no check into the app — so the app has a `tr!` and an `i18n.toml` of its own, pointed at these
+    catalogues (the `schemaic-app` entry). One catalogue, one loader, checked from both crates.
+    **`tr!` is `fl!` against `LOADER`**, so a message
     id and its argument names are checked against the `en-GB` file at compile time and a missing key
     is a build error rather than a blank label — but *only* against `en-GB`, which is why the tests
     below read the other files. `LOADER` is a `LazyLock<FluentLanguageLoader>` holding `en-GB` until
@@ -33524,6 +33528,14 @@ existing prose was left alone.
   answer with one. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
   switch.
+  **The app draws its words from `schemaic-ui`'s catalogue, not a second one.** `main.rs` defines
+  its own `tr!` — `fl!(schemaic_ui::i18n::LOADER, …)` — above the `mod` lines, so every module of
+  the crate sees it, and `crates/schemaic-app/i18n.toml` points `assets_dir` at
+  `../schemaic-ui/i18n` with the domain `schemaic`. That file is the whole point: `fl!` checks an
+  id and its argument names against the *calling* crate's `i18n.toml`, so `schemaic-ui`'s own
+  `tr!` exported here would have compiled with no check at all. `build.rs` prints
+  `cargo:rerun-if-changed=../schemaic-ui/i18n` for the same reason — nothing else tells cargo that
+  an id added to another crate's `.ftl` means recompiling this one.
   **Getting past the row cap is a per-tab override, not a fetch mode.** The cap is read once per
   run, so `Tab::row_cap_override` — set by the results toolbar's "read N rows", cleared by the next
   manual run — is all it takes; there is no second path through the DB layer. The label names a
@@ -38301,6 +38313,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   of last resort so a box whose **only** client is a shim still gets that specific line rather than
   the generic one. `resolve_cli_with(progs, resolve)` takes the resolver, so the search is testable
   without a `PATH`.
+  **What the search reaches is a value, not a sentence.** `resolve_cli`, `resolve_cli_with` and
+  `resolve_native_cli` answer `Err(Unreached::Absent)` or `Err(Unreached::Refused(why))`, and each
+  caller makes the panel's line with `Unreached::said`, naming its own client from the catalogue
+  (`cli-no-client` and its siblings); `native_tool` takes that line as its `none` closure. The
+  generic case was a `const NO_CLIENT` sentence the callers compared the error against, by text, to
+  swap in their own client's name — a comparison that stops matching the moment the sentence is
+  translated, with nothing to say so: *Nothing decides behaviour by an English label* (under *UI
+  conventions*), met on an error rather than a label.
   **A *constant* standing in for a capability is the same failure with no comparison left to grep
   for**, and three of that shape fell together. `ddl::normalize_type`'s `dialect == Postgres` became
   the private, exhaustive `TypeAliasing` (see `ddl.rs`), which is what stopped SQLite being
@@ -39448,8 +39468,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   gate now also asserts the launcher is in a `LAUNCHERS` allowlist declaring `(program,
   is_an_interpreter)` for each of the three, and `a_launcher_that_is_an_interpreter_is_declared`
   fails if a second interpreter is added without amending that paragraph. **A refusal is a `Result`, not a caller's
-  `if`** — `mysql_shell`/`psql_shell` and their `_config` halves return
-  `Result<ShellConfig, &'static str>` where they returned an `Option` or a bare config, so every
+  `if`** — `mysql_shell`/`psql_shell` and their `_config` halves return a `Result` where they
+  returned an `Option` or a bare config (`&'static str` from a `_config` half; `String` from the
+  `*_shell`s and `mssql_shell_config`, whose no-client and WSL-sign-in lines come from the
+  catalogue), so every
   refusal lands on the one arm `open_db_cli` already had for "no client found" (a message spawned in
   the terminal panel, and no engine badge) and none of them can be forgotten at a call site. Don't
   add a second gate in a caller, and don't spell one of these decisions inline: `open_url` spawns
@@ -40306,7 +40328,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`used_by_view.rs`), the interface themes' names (`themes.rs`), the AI panel's reply
   renderer's own controls (`markdown.rs`), the grid's cell pickers and calendar
   (`cell_editors.rs`), the Rename alias / Rename CTE dialog (`alias_rename.rs`), the Find
-  usages list (`usages_view.rs`) and the PNG rasteriser's refusals (`erd_raster.rs`) are converted;
+  usages list (`usages_view.rs`), the PNG rasteriser's refusals (`erd_raster.rs`) and the terminal
+  panel's DB-client lines (`schemaic-app`'s `main.rs`, `cli-*`) are converted;
   every other label is still an English literal until phase 3 of the
   roadmap's *Interface translation* converts its file — that entry keeps the list of what is
   converted and the recipe a file follows, so neither is repeated here. Only the GUI is

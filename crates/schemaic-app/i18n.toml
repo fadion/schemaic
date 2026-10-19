@@ -1,0 +1,10 @@
+# The app crate's view of the interface's string catalogue. `fl!` reads the
+# *calling* crate's `i18n.toml` to check a message id at compile time, so this
+# one points at `schemaic-ui`'s catalogues rather than keeping a second set:
+# one catalogue, one loader (`schemaic_ui::i18n::LOADER`), checked from both
+# crates.
+fallback_language = "en-GB"
+
+[fluent]
+assets_dir = "../schemaic-ui/i18n"
+domain = "schemaic"

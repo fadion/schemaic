@@ -2274,3 +2274,16 @@ find-replace = Replace
 # Replaces every match.
 find-replace-all = All
 goto-line-label = Go to:
+
+## The database CLI and the backup tools, when none is found (main.rs). The
+## names ($client, $tool, $first, $second) are program names, never translated.
+## The terminal panel prints these through a shell's echo, which turns quotes
+## and most symbols into spaces — keep to letters and plain punctuation.
+
+# $client is a client's program name (psql, sqlcmd, mysql/mariadb).
+cli-no-client = No { $client } client found (PATH or WSL).
+cli-no-client-on-path = No { $client } client found on PATH.
+cli-no-tool = No { $tool } found on PATH.
+cli-no-either-tool = No { $first } or { $second } found on PATH.
+cli-no-either-client = No { $first } or { $second } client found on PATH.
+cli-sqlcmd-windows-in-wsl = Windows sign-in needs a Windows sqlcmd, and the one found is inside WSL. Install sqlcmd on Windows, or open the connection in a query tab.

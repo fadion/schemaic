@@ -73,9 +73,11 @@ assertions pin English wording — stays the regression net throughout.
    `source_gate::no_menu_label_ends_in_an_ellipsis` already reads a `tr!` label's text in every
    catalogue, and `overlays.rs`'s `menu_order_gate` keys its skeleton on message ids — the one
    table `schema_tree.rs`'s blank-space menu is placed by too.
-   `schemaic-app` has no `i18n.toml` yet and `tr!` is
-   `pub(crate)` to `schemaic-ui`; the app's first converted file decides how it reaches the
-   loader.
+   `schemaic-app` reaches the loader through its own `tr!` (top of `main.rs`, visible to every
+   module), `fl!` against the now-public `schemaic_ui::i18n::LOADER`; its `i18n.toml` points
+   at `schemaic-ui`'s catalogues, because `fl!` checks ids against the *calling* crate's
+   config, and its `build.rs` reruns on a catalogue change for the same reason. The app's
+   messages go in the same two `.ftl` files.
 
    **Converted:** `settings.rs`, `shortcuts.rs`, `overlays.rs`, `schema_tree.rs`,
    `history_panel.rs`, `snippet_panel.rs`, `tabs.rs`, `activity_panel.rs`, `ai_panel.rs`,
@@ -110,7 +112,9 @@ assertions pin English wording — stays the regression net throughout.
    comma-separated list each language writes for itself, as many verbs as it likes, which the
    loader-width test measures in every catalogue) and `editor_pane.rs` (six: `cmdk-*`,
    `params-*`, the error and guard bars, `editor-menu-*`, the run menu, `find-*` and
-   `goto-line-label`). The next session starts on `schemaic-app`. A large file goes **a
+   `goto-line-label`). `schemaic-app` has begun: `main.rs`'s database-CLI and backup-tool
+   launchers (`cli-*`; the "no client" case is `Unreached::Absent`, a value the caller names,
+   where it was a `const` line the callers compared against). A large file goes **a
    section at a time** — a function or a cluster of them — committed per section as
    `feat(i18n): draw <section> of <the file's area> from the catalogue`, and recorded here as
    it lands, so the next session knows where to pick up without re-sweeping what is done. The
@@ -132,8 +136,7 @@ assertions pin English wording — stays the regression net throughout.
    measures, and its Rename alias / Rename CTE entries the rename dialog's titles.
    **Left, in order** — delete a name as its file lands:
    `schemaic-app` (`main.rs`, `install_cli.rs`, `ai.rs`, `conn_sources.rs`, `notify.rs`,
-   `agent_cli.rs`, `antigravity.rs`), whose first file settles how it reaches the loader
-   (above). A file with
+   `agent_cli.rs`, `antigravity.rs`). A file with
    no literal a user reads drops off without a commit. The list came from a sweep for
    capitalised string literals, so sweep a file whole before calling it done; a sentence that
    starts lower-case, or spans a `\` continuation, slips past a quick one.

@@ -38,6 +38,10 @@ notify-rust = "4.18"
 # launch (`schemaic_ui::i18n::init`). Already in the tree through cosmic-text,
 # same version.
 sys-locale = "0.3"
+# `tr!` (`main.rs`): `fl!` against `schemaic_ui::i18n::LOADER`, its ids checked
+# at compile time against the catalogue `i18n.toml` points at — the same
+# catalogue and the same version `schemaic-ui` uses.
+i18n-embed-fl = "0.10"
 
 # The OS keyring moved to `schemaic-conn` with `secrets.rs`, so the headless CLI
 # can reach a saved connection without linking floem. The backend notes that used

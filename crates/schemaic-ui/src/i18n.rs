@@ -33,7 +33,12 @@ use schemaic_core::locale::{self, UiLanguage};
 struct Catalogues;
 
 /// The loader every [`tr!`] reads. `en-GB` until [`init`] chooses otherwise.
-pub(crate) static LOADER: LazyLock<FluentLanguageLoader> = LazyLock::new(|| {
+///
+/// Public for the app crate's own `tr!`, which is `fl!` against this same
+/// loader, its ids checked through an `i18n.toml` pointing at these catalogues
+/// — `fl!` reads the calling crate's, so a macro exported from here would not
+/// carry the check across.
+pub static LOADER: LazyLock<FluentLanguageLoader> = LazyLock::new(|| {
     let loader = fluent_language_loader!();
     configure(&loader, UiLanguage::EnGb);
     loader

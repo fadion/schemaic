@@ -11,6 +11,17 @@
 //! active connection's databases. DB IO runs on the tokio runtime and results
 //! are marshalled back through Floem's async→UI seam.
 
+/// A catalogue message, by id — `schemaic-ui`'s `tr!`, for this crate: `fl!`
+/// against the one loader ([`schemaic_ui::i18n::LOADER`]), the id and its
+/// argument names checked at compile time through this crate's `i18n.toml`,
+/// which points at `schemaic-ui`'s catalogues. Defined before the `mod` lines
+/// so every module of the crate sees it.
+macro_rules! tr {
+    ($($args:tt)*) => {
+        i18n_embed_fl::fl!(schemaic_ui::i18n::LOADER, $($args)*)
+    };
+}
+
 mod agent_cli;
 mod ai;
 mod antigravity;
@@ -396,10 +407,34 @@ enum CliLauncher<'a> {
     Wsl(&'a str),
 }
 
+/// Why a client search reached no client.
+///
+/// **A value, not a sentence.** The "nothing found" case was a `const` line the
+/// callers compared the error against to swap in their own client's name — a
+/// comparison that stops matching the moment the line is translated, so each
+/// caller now names its client from the catalogue ([`Unreached::said`]).
+#[derive(Debug, PartialEq)]
+enum Unreached {
+    /// No candidate exists, on `PATH` or (where offered) inside WSL.
+    Absent,
+    /// A candidate was found and refused — `core::launch`'s reason.
+    Refused(&'static str),
+}
+
+impl Unreached {
+    /// The line the panel shows: the refusal, or `absent` for none found.
+    fn said(self, absent: impl FnOnce() -> String) -> String {
+        match self {
+            Unreached::Absent => absent(),
+            Unreached::Refused(why) => why.to_string(),
+        }
+    }
+}
+
 /// Find a client: the first of `progs` on `PATH`, else the first one inside WSL.
-/// `None` when neither exists, which is the caller's cue to say so in the
-/// terminal rather than spawn something that dies immediately.
-fn resolve_cli<'a>(progs: &[&'a str]) -> Result<CliLauncher<'a>, &'static str> {
+/// [`Unreached::Absent`] when neither exists, which is the caller's cue to say
+/// so in the terminal rather than spawn something that dies immediately.
+fn resolve_cli<'a>(progs: &[&'a str]) -> Result<CliLauncher<'a>, Unreached> {
     resolve_cli_with(progs, |p| {
         schemaic_term::shell::which(p).map(|path| path.display().to_string())
     })
@@ -424,7 +459,7 @@ fn resolve_cli<'a>(progs: &[&'a str]) -> Result<CliLauncher<'a>, &'static str> {
 fn resolve_cli_with<'a>(
     progs: &[&'a str],
     resolve: impl Fn(&str) -> Option<String>,
-) -> Result<CliLauncher<'a>, &'static str> {
+) -> Result<CliLauncher<'a>, Unreached> {
     let mut refused: Option<&'static str> = None;
     for prog in progs {
         // **Asked of what `which` resolved, not of the name.** A `.cmd`/`.bat`
@@ -445,23 +480,19 @@ fn resolve_cli_with<'a>(
         // The WSL launcher is `wsl.exe` itself; the client name rides in its
         // argv and is never a Windows image.
         Some(_) => Ok(CliLauncher::Wsl(progs[0])),
-        None => Err(refused.unwrap_or(NO_CLIENT)),
+        None => Err(refused.map_or(Unreached::Absent, Unreached::Refused)),
     }
 }
 
-/// The line the panel shows when no client was found at all — as opposed to one
-/// found and refused, which says why.
-const NO_CLIENT: &str = "No client found (PATH or WSL).";
-
 /// Find a client on `PATH` only, with **no WSL fallback** — see [`sqlite_shell`]
 /// for the one client that must not have one.
-fn resolve_native_cli(prog: &str) -> Result<CliLauncher<'_>, &'static str> {
+fn resolve_native_cli(prog: &str) -> Result<CliLauncher<'_>, Unreached> {
     match schemaic_term::shell::which(prog) {
         Some(path) => {
-            launch::direct_spawn_verdict(&path)?;
+            launch::direct_spawn_verdict(&path).map_err(Unreached::Refused)?;
             Ok(CliLauncher::Native(prog))
         }
-        None => Err(NO_CLIENT),
+        None => Err(Unreached::Absent),
     }
 }
 
@@ -476,15 +507,10 @@ fn resolve_native_cli(prog: &str) -> Result<CliLauncher<'_>, &'static str> {
 fn mysql_shell(
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
-) -> Result<schemaic_term::ShellConfig, &'static str> {
-    let launcher = resolve_cli(&["mysql", "mariadb"]).map_err(|e| {
-        if e == NO_CLIENT {
-            "No mysql/mariadb client found (PATH or WSL)."
-        } else {
-            e
-        }
-    })?;
-    mysql_shell_config(launcher, conn, db)
+) -> Result<schemaic_term::ShellConfig, String> {
+    let launcher = resolve_cli(&["mysql", "mariadb"])
+        .map_err(|e| e.said(|| tr!("cli-no-client", client = "mysql/mariadb")))?;
+    Ok(mysql_shell_config(launcher, conn, db)?)
 }
 
 /// The PostgreSQL half of [`mysql_shell`]. `db` is required — see
@@ -492,15 +518,10 @@ fn mysql_shell(
 fn psql_shell(
     conn: &schemaic_core::connection::Connection,
     db: &str,
-) -> Result<schemaic_term::ShellConfig, &'static str> {
-    let launcher = resolve_cli(&["psql"]).map_err(|e| {
-        if e == NO_CLIENT {
-            "No psql client found (PATH or WSL)."
-        } else {
-            e
-        }
-    })?;
-    psql_shell_config(launcher, conn, db)
+) -> Result<schemaic_term::ShellConfig, String> {
+    let launcher =
+        resolve_cli(&["psql"]).map_err(|e| e.said(|| tr!("cli-no-client", client = "psql")))?;
+    Ok(psql_shell_config(launcher, conn, db)?)
 }
 
 /// The SQL Server fourth: `sqlcmd`, the ODBC one or the Go rewrite — they
@@ -509,14 +530,9 @@ fn psql_shell(
 fn mssql_shell(
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
-) -> Result<schemaic_term::ShellConfig, &'static str> {
-    let launcher = resolve_cli(&["sqlcmd"]).map_err(|e| {
-        if e == NO_CLIENT {
-            "No sqlcmd client found (PATH or WSL)."
-        } else {
-            e
-        }
-    })?;
+) -> Result<schemaic_term::ShellConfig, String> {
+    let launcher =
+        resolve_cli(&["sqlcmd"]).map_err(|e| e.said(|| tr!("cli-no-client", client = "sqlcmd")))?;
     mssql_shell_config(launcher, conn, db)
 }
 
@@ -527,22 +543,19 @@ fn mssql_shell_config(
     launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
-) -> Result<schemaic_term::ShellConfig, &'static str> {
+) -> Result<schemaic_term::ShellConfig, String> {
     // See `mysql_shell_config`'s copy: the refusal belongs to the builder.
     if conn.uses_tunnel()
         && let Some(why) = launch::tunnelled_verify_blocker(&conn.tls)
     {
-        return Err(why);
+        return Err(why.to_string());
     }
     use schemaic_core::connection::AuthMode;
     let auth = conn.effective_auth();
     // Windows sign-in is the Windows process's identity; `sqlcmd` inside WSL is
     // a Linux process, which has none to present.
     if auth == AuthMode::Windows && matches!(launcher, CliLauncher::Wsl(_)) {
-        return Err(
-            "Windows sign-in needs a Windows sqlcmd, and the one found is inside WSL. \
-             Install sqlcmd on Windows, or open the connection in a query tab.",
-        );
+        return Err(tr!("cli-sqlcmd-windows-in-wsl"));
     }
     let cli_args = launch::sqlcmd_args(&conn.host, conn.port, auth, &conn.user, db, &conn.tls)?;
     // A password only for a sign-in that sends one.
@@ -564,15 +577,10 @@ fn mssql_shell_config(
 /// the path to `/mnt/c/…`, which nothing here does yet.
 fn sqlite_shell(
     conn: &schemaic_core::connection::Connection,
-) -> Result<schemaic_term::ShellConfig, &'static str> {
-    let launcher = resolve_native_cli("sqlite3").map_err(|e| {
-        if e == NO_CLIENT {
-            "No sqlite3 client found on PATH."
-        } else {
-            e
-        }
-    })?;
-    sqlite_shell_config(launcher, conn)
+) -> Result<schemaic_term::ShellConfig, String> {
+    let launcher = resolve_native_cli("sqlite3")
+        .map_err(|e| e.said(|| tr!("cli-no-client-on-path", client = "sqlite3")))?;
+    Ok(sqlite_shell_config(launcher, conn)?)
 }
 
 /// Which database `psql` should open.
@@ -759,18 +767,20 @@ fn tool_tunnel_check(conn: &Connection) -> Result<(), String> {
 /// The first of `progs` on `PATH`, native only — a backup tool is handed a
 /// path from this machine's file dialog, which inside WSL would name somewhere
 /// else (`sqlite_shell`'s reason) — or the panel's line for none.
-fn native_tool<'a>(progs: &[&'a str], none: &str) -> Result<&'a str, String> {
+fn native_tool<'a>(progs: &[&'a str], none: impl FnOnce() -> String) -> Result<&'a str, String> {
     let mut refused = None;
     for p in progs {
         match resolve_native_cli(p) {
             Ok(CliLauncher::Native(p)) | Ok(CliLauncher::Wsl(p)) => return Ok(p),
-            Err(e) if e != NO_CLIENT => {
-                refused.get_or_insert(e);
+            Err(Unreached::Refused(why)) => {
+                refused.get_or_insert(why);
             }
-            Err(_) => {}
+            Err(Unreached::Absent) => {}
         }
     }
-    Err(refused.unwrap_or(none).to_string())
+    Err(refused
+        .map_or(Unreached::Absent, Unreached::Refused)
+        .said(none))
 }
 
 /// `pg_dump` of `db` to `file`, in the terminal (`launch::pg_dump_args`).
@@ -780,7 +790,7 @@ fn pg_dump_shell(
     file: &str,
 ) -> Result<schemaic_term::ShellConfig, String> {
     tool_tunnel_check(conn)?;
-    let prog = native_tool(&["pg_dump"], "No pg_dump found on PATH.")?;
+    let prog = native_tool(&["pg_dump"], || tr!("cli-no-tool", tool = "pg_dump"))?;
     let role = launch::init_role(&conn.init_sql, SqlDialect::from_db_type(&conn.db_type));
     let args = launch::pg_dump_args(&conn.host, conn.port, &conn.user, db, file, role.as_deref())?;
     let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
@@ -799,7 +809,7 @@ fn pg_restore_shell(
     let role = launch::init_role(&conn.init_sql, SqlDialect::from_db_type(&conn.db_type));
     let (tool, args) =
         launch::pg_restore_args(&conn.host, conn.port, &conn.user, db, file, role.as_deref())?;
-    let prog = native_tool(&[tool], &format!("No {tool} found on PATH."))?;
+    let prog = native_tool(&[tool], || tr!("cli-no-tool", tool = tool))?;
     let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
     env.extend(launch::psql_cli_tls_env(&conn.tls));
     Ok(wrap_launcher(CliLauncher::Native(prog), args, env))
@@ -813,10 +823,13 @@ fn mysqldump_shell(
     file: &str,
 ) -> Result<schemaic_term::ShellConfig, String> {
     tool_tunnel_check(conn)?;
-    let prog = native_tool(
-        &launch::MYSQL_DUMP_TOOLS,
-        "No mariadb-dump or mysqldump found on PATH.",
-    )?;
+    let prog = native_tool(&launch::MYSQL_DUMP_TOOLS, || {
+        tr!(
+            "cli-no-either-tool",
+            first = "mariadb-dump",
+            second = "mysqldump"
+        )
+    })?;
     let tls = launch::mysql_cli_tls_args(&conn.tls, launch::MysqlClient::of(prog));
     let args = launch::mysqldump_args(&conn.host, conn.port, &conn.user, tls, db, file)?;
     Ok(wrap_launcher(
@@ -833,10 +846,9 @@ fn mysql_restore_shell(
     file: &str,
 ) -> Result<schemaic_term::ShellConfig, String> {
     tool_tunnel_check(conn)?;
-    let prog = native_tool(
-        &launch::MYSQL_RESTORE_TOOLS,
-        "No mariadb or mysql client found on PATH.",
-    )?;
+    let prog = native_tool(&launch::MYSQL_RESTORE_TOOLS, || {
+        tr!("cli-no-either-client", first = "mariadb", second = "mysql")
+    })?;
     let tls = launch::mysql_cli_tls_args(&conn.tls, launch::MysqlClient::of(prog));
     let args = launch::mysql_restore_args(&conn.host, conn.port, &conn.user, tls, db, file)?;
     Ok(wrap_launcher(
@@ -14240,7 +14252,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let label = built
                 .is_ok()
                 .then(|| schemaic_core::connection::engine_label(&conn.db_type));
-            let cfg = built.unwrap_or_else(message_shell);
+            let cfg = built.unwrap_or_else(|e| message_shell(&e));
             (install_terminal)(&cfg, label, "db cli spawn");
         })
     };
@@ -17440,11 +17452,20 @@ mod app_tests {
         // A shim and nothing else: the specific refusal, not the generic line —
         // this is the case the message was written for.
         let r = resolve_cli_with(&["mysql"], found(&[("mysql", "C:\\npm\\mysql.cmd")]));
-        let why = r.err().expect("a shim with no alternative is refused");
+        let Some(super::Unreached::Refused(why)) = r.err() else {
+            panic!("a shim with no alternative is refused");
+        };
         assert!(why.contains("shim"), "{why}");
         // Nothing at all is the generic line.
         let r = resolve_cli_with(&["mysql"], found(&[]));
-        assert_eq!(r.err(), Some(super::NO_CLIENT));
+        assert_eq!(r.err(), Some(super::Unreached::Absent));
+        // Which the caller names, from the catalogue — and a refusal it passes
+        // through untouched.
+        assert_eq!(
+            super::Unreached::Absent.said(|| tr!("cli-no-client", client = "psql")),
+            "No psql client found (PATH or WSL)."
+        );
+        assert_eq!(super::Unreached::Refused("shim").said(String::new), "shim");
         // And an ordinary first candidate still short-circuits.
         let r = resolve_cli_with(
             &["mysql", "mariadb"],

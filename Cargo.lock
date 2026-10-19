@@ -5376,6 +5376,7 @@ version = "0.35.0"
 dependencies = [
  "crossbeam-channel",
  "floem",
+ "i18n-embed-fl",
  "image",
  "notify-rust",
  "schemaic-ai",
