@@ -6886,8 +6886,8 @@ mod destructive_launch_gate {
                 "script_view.rs",
                 "accept_launch(s.running.get_untracked(),false)",
                 "`run_script` mints a `ScriptRequest::approved(policy(..))` two \
-                 lines down, and `sql::script_verdict` answers `Block(\"Read-only \
-                 connection.\")` — a refusal strictly stronger than this one, and \
+                 lines down, and `sql::script_verdict` answers \
+                 `Block(GuardReason::ReadOnly)` — a refusal strictly stronger than this one, and \
                  the invariant's own named exception.",
             ),
             (

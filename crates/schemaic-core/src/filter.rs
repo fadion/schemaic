@@ -585,13 +585,17 @@ pub fn with_staged_question(
     verdict: crate::sql::RunVerdict,
     staged: usize,
 ) -> crate::sql::RunVerdict {
-    use crate::sql::RunVerdict;
-    let Some(note) = staged_run_note(staged) else {
+    use crate::sql::{GuardReason, RunVerdict};
+    if staged == 0 {
         return verdict;
+    }
+    let staged = |after: Option<GuardReason>| GuardReason::Staged {
+        after: after.map(Box::new),
+        changes: staged,
     };
     match verdict {
-        RunVerdict::Allow => RunVerdict::Confirm(note),
-        RunVerdict::Confirm(m) => RunVerdict::Confirm(format!("{m} {note}")),
+        RunVerdict::Allow => RunVerdict::Confirm(staged(None)),
+        RunVerdict::Confirm(m) => RunVerdict::Confirm(staged(Some(m))),
         RunVerdict::Block(m) => RunVerdict::Block(m),
     }
 }
@@ -1625,22 +1629,37 @@ mod tests {
         );
         let three = staged_run_note(3).expect("a note");
         assert!(three.contains("3 staged changes"), "{three}");
-        use crate::sql::RunVerdict;
+        use crate::sql::{GuardReason, RunVerdict};
         assert_eq!(
             with_staged_question(RunVerdict::Allow, 0),
             RunVerdict::Allow
         );
+        let alone = with_staged_question(RunVerdict::Allow, 1);
         assert_eq!(
-            with_staged_question(RunVerdict::Allow, 1),
-            RunVerdict::Confirm(one.clone())
+            alone,
+            RunVerdict::Confirm(GuardReason::Staged {
+                after: None,
+                changes: 1
+            })
         );
-        assert!(matches!(
-            with_staged_question(RunVerdict::Confirm("Writes.".into()), 1),
-            RunVerdict::Confirm(m) if m.starts_with("Writes. ") && m.ends_with(&one)
-        ));
+        let RunVerdict::Confirm(alone) = alone else {
+            unreachable!()
+        };
+        assert_eq!(alone.message(), one);
+        let writes = GuardReason::Writes { several: false };
+        let RunVerdict::Confirm(both) =
+            with_staged_question(RunVerdict::Confirm(writes.clone()), 1)
+        else {
+            panic!("a question stays a question");
+        };
+        let m = both.message();
+        assert!(
+            m.starts_with(&format!("{} ", writes.message())) && m.ends_with(&one),
+            "{m}"
+        );
         assert_eq!(
-            with_staged_question(RunVerdict::Block("No.".into()), 2),
-            RunVerdict::Block("No.".into())
+            with_staged_question(RunVerdict::Block(GuardReason::ReadOnly), 2),
+            RunVerdict::Block(GuardReason::ReadOnly)
         );
     }
 

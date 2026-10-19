@@ -72,9 +72,7 @@ assertions pin English wording — stays the regression net throughout.
 4. **Messages built in `schemaic-core`.** The hard part. Around 130 functions return finished
    English prose (`run_verdict`, the DDL preview notes, `Rollback::note`, `tx`, `dump`, `compare`,
    `stats`, `import`, `conn_import`, `users`), and core cannot — and should not — reach a UI
-   catalogue. `run_verdict`'s `Block(NO_DATABASE_SELECTED)` is the one the CLI already
-   recognises by its text (`cli::run::refused_for_no_database`) — harmless while the CLI is
-   English, and the first thing a typed refusal replaces. Each becomes a typed message (an id plus arguments, or an enum per area) the UI
+   catalogue. Each becomes a typed message (an id plus arguments, or an enum per area) the UI
    renders; core keeps an English rendering for the CLI and MCP. **The shape is settled**
    (reviewed 2026-10-19): an enum per area, its fields the message's arguments, one `tr!` arm
    per variant, core's `message()`/`Display` kept as the English and a test holding the two
@@ -104,7 +102,9 @@ assertions pin English wording — stays the regression net throughout.
    refusals, memory warnings and issue tail (`import::ReadRefusal`, which `ImportError::Refused`
    carries beside `Read`'s library text, `MemoryWarning`, `IssueTail`;
    `i18n::import_error_text`, `read_refusal_text`), and the plan modal's warnings
-   (`plan::PlanNote`, `ServerWarning`; `plan_view::plan_note_text`). Of the other existing enums,
+   (`plan::PlanNote`, `ServerWarning`; `plan_view::plan_note_text`), and the run guard
+   (`sql::GuardReason`, `Unsafe`, which `RunVerdict` carries; `i18n::guard_reason_text`). Of the
+   other existing enums,
    `FilterError::BadCondition` renders not at all
    — it carries a finished `String` (the parser's text, or a sentence built where it is raised),
    so its prose lives at its construction sites and it is the weakest to convert.
@@ -132,9 +132,9 @@ assertions pin English wording — stays the regression net throughout.
      `unsupported`, `used_by::change_warnings`/`drop_warning`, the compare plan's `omitted`
      (`compare::omission_note`) and the AI proposal errors (`propose::resolve_target`/`apply`).
      The largest group; a test in `ddl_preview.rs` matches `"gone — "` on the English.
-   - **The run guard** — `RunVerdict::Block`/`Confirm`'s `String`s (read-only, `NO_DATABASE_SELECTED`,
-     "modifies data", `filter::with_staged_question`'s suffix), which `ScriptRequest::approved`
-     passes on too.
+   - **The read-only gate's reasons** — `sql::read_only_refusal`'s sentences, shared by the MCP
+     server and `schemaic query`, which the editor's guard shows inside
+     `GuardReason::ReadOnlyRefused` on SQL Server.
    - **Filters** — `FilterError::BadCondition` (below). (The three fixed notices are done:
      `i18n::staged_requery_note`, `staged_landing_note`, `reread_without_filter_note`.)
    - **Write-back** — `Rollback::note` and `one_row_verdict`'s text, fused into a `DbError::Query`

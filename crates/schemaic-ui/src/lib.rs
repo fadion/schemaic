@@ -408,7 +408,7 @@ impl ScriptRequest {
         match schemaic_core::sql::script_verdict(policy, file_name) {
             // Refused with no override, by design: the read-only block has
             // none, and here it applies to a file nobody has read.
-            schemaic_core::sql::RunVerdict::Block(why) => Err(why),
+            schemaic_core::sql::RunVerdict::Block(why) => Err(i18n::guard_reason_text(&why)),
             schemaic_core::sql::RunVerdict::Confirm(_) => Ok(()),
             // `script_verdict` never returns this; matched rather than caught
             // by a wildcard so that if it ever does, the change is made here on

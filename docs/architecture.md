@@ -1202,6 +1202,19 @@ existing prose was left alone.
     (`a_dumps_drop_before_create_is_destructive_and_not_unqualified`, watched fail at 2). Beside the
     missing-`WHERE` `DELETE`/`UPDATE` and the `TRUNCATE` it asks about MySQL's `ALTER TABLE …
     TRUNCATE PARTITION ALL`, a `TRUNCATE` by another name.
+    **What the guard says is a value, not a sentence** — phase 4 of *Interface translation*.
+    `RunVerdict::Block`/`Confirm` carry a `GuardReason` — `ReadOnly`, `ReadOnlyRefused` with
+    `read_only_reason`'s text, `NoDatabase`, `Unsafe`, `Writes { several }`, `Script { file }`
+    (`script_verdict`'s confirmation) and `Staged { after, changes }` (`filter::with_staged_question`)
+    — and `unsafe_reason`, `every_row_reason`, `drop_reason` and `first_unsafe` answer
+    `Option<Unsafe>`: what the statement destroys, with the SQL keyword it spelt as a
+    `&'static str` where there is a choice (`NoWhere { kind }`, `DropContainer { obj }`,
+    `DropCascade { obj }`, `ReplaceContainer { obj }`). Each has `message()`, byte for byte the
+    `String` it replaced, and no `Display`; the CLI says it, the editor words the value
+    (`ui::i18n::guard_reason_text`, under *The string catalogue*). `NO_DATABASE_SELECTED` stays as
+    `NoDatabase`'s English. `ReadOnlyRefused` still holds an English sentence, because the MCP
+    server and `schemaic query` say `read_only_reason`'s text too. No decision moved with the
+    type: every arm, its order and the statements it fires on are as described above.
     **Both halves judge the statement an executing prefix runs, not the prefix.** `EXPLAIN ANALYZE`
     (with `VERBOSE`/`FORMAT=…`), PostgreSQL's `EXPLAIN (… ANALYZE …)` option list and MariaDB's bare
     `ANALYZE [FORMAT=JSON]` execute what they explain, and every arm reads a head, so `EXPLAIN
@@ -36906,7 +36919,9 @@ existing prose was left alone.
     flag, the unsafe-statement warning (`sql::unsafe_reason` — a missing `WHERE`, a `TRUNCATE`, or
     a statement that destroys stored rows with their object, listed under `core::sql`) and the
     user's own say-so. `ExecRequest::approved` is the
-    guard and the only constructor; the fields are private and `run` takes one by value. **The
+    guard and the only constructor; the fields are private and `run` takes one by value. Its
+    refusals `NotRun::Blocked`/`NeedsConsent` carry the verdict's `sql::GuardReason` as it came,
+    and `NotRun::message` says the reason's English `message()`. **The
     request carries the target its verdict judged** — a clone of the `Connection` and the
     database, read back through `connection()` and `database()` — and `run(db, request, timeout)`
     takes no database of its own, running in `request.database()`, while `run.rs`'s `run_exec`
@@ -37561,10 +37576,13 @@ existing prose was left alone.
     "does not exist" reads as a typo in the table name — and `Refused` does not. The first cut keyed
     that wording on the dialect, and so told `exec`'s refused PostgreSQL write it had run
     (`only_a_statement_that_ran_is_told_where_it_ran`). That refusal is the guard's own
-    `Block(NO_DATABASE_SELECTED)`, reached through `needs_database`, and it gets the `Refused` hint:
-    `core::sql::NO_DATABASE_SELECTED` is now the one spelling `run_verdict` and `script_verdict`
-    both block with, so `refused_for_no_database` recognises it by identity rather than by
-    re-typing it (`the_no_database_refusal_is_the_named_constant`).
+    `Block(GuardReason::NoDatabase)`, reached through `needs_database`, and it gets the `Refused`
+    hint: `GuardReason::NoDatabase` is the one value `run_verdict` and `script_verdict` both block
+    with, and `refused_for_no_database` matches `NotRun::Blocked(GuardReason::NoDatabase)` by
+    variant. It used to keep that identity by comparing the text with
+    `core::sql::NO_DATABASE_SELECTED`, which is now only that variant's English
+    (`the_no_database_refusal_is_one_reason_on_both_paths`,
+    `the_guards_no_database_refusal_is_recognised_and_nothing_else_is`).
     **An up-front refusal of an unscoped `query` was considered and rejected.** The CLI cannot tell
     from the text whether a statement needs a database — `SELECT 1`, `SELECT … FROM app.t` and `SHOW
     DATABASES` all run fine without one — and PostgreSQL never reports "no database" at all. So the
@@ -38049,7 +38067,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   done nothing — and a `DELETE` confirmed against a tab bound to `staging` then executed against a
   tab bound to `production`, reported into its panel and recorded in history under its name. The
   `no_database` term is per-tab too, so a `CREATE TABLE` judged `Allow` for a database-bound tab
-  could run on a database-less one, past the `Block("No database selected.")` arm and, on
+  could run on a database-less one, past the `Block(GuardReason::NoDatabase)` arm and, on
   PostgreSQL, into the maintenance database `needs_database` says nothing in Schemaic can reach
   again. `gate1_on_tab` pins the wrapped action to the tab it was started from and **refuses** when
   they differ, with a message rather than silently — running anyway is the defect, and running
@@ -38105,7 +38123,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   "Run anyway". **Don't add a run path that takes the raw action, and don't re-implement the
   verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
   un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
-  `EXPLAIN ANALYZE` may run a statement for its timings.)
+  `EXPLAIN ANALYZE` may run a statement for its timings.) **What the verdict carries is a reason,
+  not a sentence** — `sql::GuardReason`, which the editor words from the catalogue and the CLI
+  says in core's English (under `core::sql`). Making it a value changed no decision: which arm,
+  in which order, for which statements, is as stated here; only how the reason travels moved.
   **On a read-only connection the verdict's `Block` is a text answer, so the session backs it.**
   `run_verdict` refuses a write by `contains_write`, a whitelist of heads, and `SELECT setval('s',
   1000)`, `SELECT lo_unlink(…)` and a `SELECT` of a function whose body deletes all open with one —
@@ -40692,7 +40713,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below), nor the
     startup and keyring notices (`persist::Notice`, below), nor the file import's refusals, memory
     warnings and problem-list tail (`import::ReadRefusal`, below), nor the plan modal's warnings
-    (`plan::PlanNote`, below).
+    (`plan::PlanNote`, below), nor the run guard's reasons (`sql::GuardReason`, below) — though
+    `read_only_reason`'s own sentence inside one still is.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -40891,6 +40913,22 @@ Re-introducing the anti-patterns these guard against is a regression:
     and `-unnamed` where PostgreSQL's and SQL Server's say *a table* — not a word handed in as
     `$table`. `english_says_every_plan_note_as_core_does` holds the English. SQL Server's plan table
     itself — its headings, *Statement N* rows and could-not-read row — is still core's English.
+    The run guard's reasons are the case where a front end used to match the text. `RunVerdict`
+    held finished English and now holds a `sql::GuardReason`, the destructive statements' warnings
+    an `Unsafe` inside it (under `core::sql`), and `i18n::guard_reason_text` words it from
+    `guard-*`, its private `unsafe_text` each `Unsafe`. `DATABASE` and `SCHEMA` get a message each
+    (`guard-drop-database`/`-schema`, `guard-replace-database`/`-schema`) rather than core's
+    lowercased keyword spliced into one sentence; `$kind` (`DELETE`/`UPDATE`) and `$obj` (`TYPE`,
+    `DOMAIN`, `EXTENSION`) are SQL and go in as spelt. The staged-edits question is `guard-staged`,
+    a plural on `$n`, and after another reason the two are joined with a space in code, as core's
+    English joins them. The app's `guarded_run`/`guarded_run_all` set `RunGuard.message` from it,
+    and `ScriptRequest::approved`'s `Err` is it — only ever a `Block` there, since the script panel
+    answers the `Confirm`. `ReadOnlyRefused`'s `$reason` is `read_only_reason`'s sentence and stays
+    English, the MCP server and `schemaic query` saying it too. The CLI keeps core's `message`, and
+    its `refused_for_no_database` now matches the `NoDatabase` variant (`cli/run.rs`).
+    `english_says_every_guard_reason_as_core_does` holds every reason equal to `message`, each
+    keyword an `Unsafe` carries, and the staged question alone and after another over one change
+    and three. What the guard decides did not move — only how its reason is carried.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and
@@ -40923,7 +40961,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     do.
     **A typed message's renderer lives beside the code that shows it** — `alias_rename.rs`,
     `install_cli.rs`, `settings.rs`, `grid.rs`, the app's `main.rs` — and `ui/i18n.rs` holds only the ones another file or crate
-    calls: `param_error` for the app, `statement_timeout`, which `settings.rs`,
+    calls: `param_error` for the app, `guard_reason_text` for the app's run guard and `lib.rs`'s
+    `ScriptRequest::approved`, `statement_timeout`, which `settings.rs`,
     `connection_form.rs` and the app all call, the three export notes, which `grid.rs`,
     `result_diff_view.rs` and `dump_view.rs` share, `skip_reason_shown`, which the import modal
     and the app's paste field share, `read_refusal_text` and `import_error_text` for the app's
@@ -44819,7 +44858,9 @@ this bundle's.
   (`a_view_landing_keeps_the_shown_query_unless_it_shows_the_rows`). **And a run from the editor
   asks**: Run and Run All replaced the result holding staged edits, and they went with it, so the
   run guard folds `Tab::staged_on_replaced_panels` into its verdict
-  (`filter::with_staged_question`, `staged_run_note`) — an allowed run asks first, *Run anyway*
+  (`filter::with_staged_question`, which folds the question in as `GuardReason::Staged { after,
+  changes }`, `after` being the reason the run was already asked about, and `staged_run_note`, the
+  English its `message` says) — an allowed run asks first, *Run anyway*
   discarding them (`a_run_over_staged_edits_names_what_it_discards`). The chevrons carry *Previous page*/*Next page* tooltips
   otherwise, and they are plain clickable containers rather than `in_strip_button`s, so F6's ring does not
   reach them.

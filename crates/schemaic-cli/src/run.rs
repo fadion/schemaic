@@ -1638,7 +1638,10 @@ fn no_database_failure(
 /// Did the write guard refuse for want of a database? It says so on PostgreSQL,
 /// where the server would not — see `sql::needs_database`.
 fn refused_for_no_database(e: &exec::NotRun) -> bool {
-    matches!(e, exec::NotRun::Blocked(why) if why == schemaic_core::sql::NO_DATABASE_SELECTED)
+    matches!(
+        e,
+        exec::NotRun::Blocked(schemaic_core::sql::GuardReason::NoDatabase)
+    )
 }
 
 /// `schemaic exec`. Select, approve, then connect — [`run_query`]'s order, for
@@ -2451,8 +2454,8 @@ mod tests {
         for other in [
             NotRun::Empty,
             NotRun::Several,
-            NotRun::Blocked("Read-only connection.".into()),
-            NotRun::NeedsConsent(schemaic_core::sql::NO_DATABASE_SELECTED.into()),
+            NotRun::Blocked(schemaic_core::sql::GuardReason::ReadOnly),
+            NotRun::NeedsConsent(schemaic_core::sql::GuardReason::NoDatabase),
         ] {
             assert!(!refused_for_no_database(&other), "{other:?}");
         }

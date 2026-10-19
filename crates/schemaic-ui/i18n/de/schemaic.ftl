@@ -2144,6 +2144,29 @@ params-missing = Kein Wert für { $names }
 params-not-a-number = :{ $name } ist eine Zahl, lautet aber „{ $text }“
 editor-error-view = Anzeigen
 editor-run-anyway = Trotzdem ausführen
+guard-read-only = Schreibgeschützte Verbindung.
+guard-read-only-refused = Schreibgeschützte Verbindung: { $reason }
+guard-no-database = Keine Datenbank ausgewählt.
+guard-writes-one = Diese Anweisung ändert Daten.
+guard-writes-several = Diese Anweisungen ändern Daten.
+guard-script = Jede Anweisung in { $file } ausführen? Ein Skript kann Objekte anlegen, ändern und löschen, und was es ändert, lässt sich von hier aus nicht rückgängig machen.
+guard-staged = { $n ->
+    [one] Diese Ausführung ersetzt das Ergebnis mit { $n } vorgemerkten Änderung — die Ausführung würde sie verwerfen. Übernimm oder verwirf sie zuerst, oder führe trotzdem aus.
+   *[other] Diese Ausführung ersetzt das Ergebnis mit { $n } vorgemerkten Änderungen — die Ausführung würde sie verwerfen. Übernimm oder verwirf sie zuerst, oder führe trotzdem aus.
+}
+guard-truncate-partition-all = TRUNCATE PARTITION ALL entfernt jede Zeile der Tabelle.
+guard-truncate = TRUNCATE entfernt jede Zeile der Tabelle.
+guard-no-where = { $kind }-Anweisung ohne WHERE-Klausel erkannt.
+guard-drop-table = DROP TABLE löscht die Tabelle und jede Zeile darin.
+guard-drop-database = DROP DATABASE löscht die Datenbank und jede Tabelle darin.
+guard-drop-schema = DROP SCHEMA löscht das Schema und jede Tabelle darin.
+guard-drop-owned = DROP OWNED löscht alles, was der Rolle gehört, jede Tabelle samt ihren Zeilen.
+guard-drop-cascade = DROP { $obj } … CASCADE löscht jede davon abhängige Spalte samt ihren Werten.
+guard-replace-table = CREATE OR REPLACE TABLE löscht die vorhandene Tabelle und jede Zeile darin.
+guard-replace-database = CREATE OR REPLACE DATABASE löscht die vorhandene Datenbank und jede Tabelle darin.
+guard-replace-schema = CREATE OR REPLACE SCHEMA löscht das vorhandene Schema und jede Tabelle darin.
+guard-truncate-partition = TRUNCATE PARTITION entfernt jede Zeile in den genannten Partitionen.
+guard-drop-partition = DROP PARTITION löscht die Partition und jede Zeile darin.
 editor-diag-fix = { $keys }: { $fix }
 editor-menu-ask-ai = KI fragen
 editor-menu-explain = Erklären

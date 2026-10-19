@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use schemaic_core::connection::Connection;
 use schemaic_core::model::ResultSet;
-use schemaic_core::sql::{GuardPolicy, RunVerdict};
+use schemaic_core::sql::{GuardPolicy, GuardReason, RunVerdict};
 use schemaic_db::{Db, Enforce};
 use tokio_util::sync::CancellationToken;
 
@@ -37,9 +37,9 @@ pub enum NotRun {
     Several,
     /// The guard said no outright — a read-only connection, or no database
     /// selected. There is no override for this and `--yes` does not reach it.
-    Blocked(String),
+    Blocked(GuardReason),
     /// The guard wants the user to look first, and `--yes` was not given.
-    NeedsConsent(String),
+    NeedsConsent(GuardReason),
 }
 
 impl NotRun {
@@ -52,9 +52,9 @@ impl NotRun {
                  so a failure half-way is not something you have to reconstruct"
                     .to_string()
             }
-            NotRun::Blocked(why) => format!("refused: {why}"),
+            NotRun::Blocked(why) => format!("refused: {}", why.message()),
             NotRun::NeedsConsent(why) => {
-                format!("{why} Pass --yes to run it anyway.")
+                format!("{} Pass --yes to run it anyway.", why.message())
             }
         }
     }

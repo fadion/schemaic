@@ -2721,6 +2721,37 @@ params-not-a-number = :{ $name } is a number, but reads "{ $text }"
 editor-error-view = View
 # The guard bar's button that runs a statement it warned about.
 editor-run-anyway = Run anyway
+# What the run guard says (core's sql::GuardReason), on the guard bar and in
+# the script panel's error line. SQL keywords stay as the statement spelt them.
+guard-read-only = Read-only connection.
+# $reason is the read-only gate's own reason, which stays English for now.
+guard-read-only-refused = Read-only connection: { $reason }
+guard-no-database = No database selected.
+guard-writes-one = This statement modifies data.
+guard-writes-several = These statements modify data.
+# $file is the script's file name.
+guard-script = Run every statement in { $file }? A script can create, alter and drop objects, and what it changes cannot be undone from here.
+# Before a run that would replace a result holding $n staged edits; it follows
+# the guard's other question when there is one.
+guard-staged = { $n ->
+    [one] This run replaces the result holding { $n } staged change — running would discard it. Commit or discard it first, or run anyway.
+   *[other] This run replaces the result holding { $n } staged changes — running would discard them. Commit or discard them first, or run anyway.
+}
+# A statement that destroys stored rows (core's sql::Unsafe). $kind is DELETE
+# or UPDATE; $obj is TYPE, DOMAIN or EXTENSION.
+guard-truncate-partition-all = TRUNCATE PARTITION ALL removes every row in the table.
+guard-truncate = TRUNCATE removes every row in the table.
+guard-no-where = { $kind } statement without WHERE clause detected.
+guard-drop-table = DROP TABLE deletes the table and every row in it.
+guard-drop-database = DROP DATABASE deletes the database and every table in it.
+guard-drop-schema = DROP SCHEMA deletes the schema and every table in it.
+guard-drop-owned = DROP OWNED deletes everything the role owns, every table and its rows with it.
+guard-drop-cascade = DROP { $obj } … CASCADE deletes every column that depends on it, with its values.
+guard-replace-table = CREATE OR REPLACE TABLE deletes the existing table and every row in it.
+guard-replace-database = CREATE OR REPLACE DATABASE deletes the existing database and every table in it.
+guard-replace-schema = CREATE OR REPLACE SCHEMA deletes the existing schema and every table in it.
+guard-truncate-partition = TRUNCATE PARTITION removes every row in the partitions it names.
+guard-drop-partition = DROP PARTITION deletes the partition and every row in it.
 # A squiggle's tooltip, under its message: the fix a key would make. $keys is
 # the key (Alt+Enter); $fix is what it does.
 editor-diag-fix = { $keys }: { $fix }

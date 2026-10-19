@@ -676,6 +676,56 @@ pub fn import_error_text(e: &schemaic_core::import::ImportError) -> String {
     }
 }
 
+/// Why the run guard refused a run or asks first — core's
+/// [`GuardReason::message`](schemaic_core::sql::GuardReason::message) in the
+/// interface's language. Public for the app's run guard bar; the script
+/// modal's error bar says it too.
+pub fn guard_reason_text(r: &schemaic_core::sql::GuardReason) -> String {
+    use schemaic_core::sql::GuardReason;
+    match r {
+        GuardReason::ReadOnly => tr!("guard-read-only"),
+        GuardReason::ReadOnlyRefused(reason) => {
+            tr!("guard-read-only-refused", reason = reason.as_str())
+        }
+        GuardReason::NoDatabase => tr!("guard-no-database"),
+        GuardReason::Unsafe(u) => unsafe_text(u),
+        GuardReason::Writes { several: false } => tr!("guard-writes-one"),
+        GuardReason::Writes { several: true } => tr!("guard-writes-several"),
+        GuardReason::Script { file } => tr!("guard-script", file = file.as_str()),
+        GuardReason::Staged { after, changes } => {
+            // Bound first: `tr!` pastes `.into()` after an argument.
+            let n = *changes;
+            let note = tr!("guard-staged", n = n);
+            match after {
+                Some(m) => format!("{} {note}", guard_reason_text(m)),
+                None => note,
+            }
+        }
+    }
+}
+
+/// A destructive statement's warning — core's `sql::Unsafe::message` in the
+/// interface's language. The SQL keywords inside stay as the statement spelt
+/// them.
+fn unsafe_text(u: &schemaic_core::sql::Unsafe) -> String {
+    use schemaic_core::sql::Unsafe;
+    match *u {
+        Unsafe::TruncatePartitionAll => tr!("guard-truncate-partition-all"),
+        Unsafe::Truncate => tr!("guard-truncate"),
+        Unsafe::NoWhere { kind } => tr!("guard-no-where", kind = kind),
+        Unsafe::DropTable => tr!("guard-drop-table"),
+        Unsafe::DropContainer { obj: "DATABASE" } => tr!("guard-drop-database"),
+        Unsafe::DropContainer { .. } => tr!("guard-drop-schema"),
+        Unsafe::DropOwned => tr!("guard-drop-owned"),
+        Unsafe::DropCascade { obj } => tr!("guard-drop-cascade", obj = obj),
+        Unsafe::ReplaceTable => tr!("guard-replace-table"),
+        Unsafe::ReplaceContainer { obj: "DATABASE" } => tr!("guard-replace-database"),
+        Unsafe::ReplaceContainer { .. } => tr!("guard-replace-schema"),
+        Unsafe::TruncatePartition => tr!("guard-truncate-partition"),
+        Unsafe::DropPartition => tr!("guard-drop-partition"),
+    }
+}
+
 /// Load `lang`'s catalogue (with `en-GB` behind it, message by message) into
 /// `loader` and set it up. Split from [`init`] so a test can do it to a loader
 /// of its own rather than to the one every other test reads.
@@ -713,6 +763,62 @@ fn pseudo(s: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// **Every run guard reason reads in English exactly as core's
+    /// `GuardReason::message`** — the refusals, every destructive statement's
+    /// warning with each keyword it carries, the write confirmation over one
+    /// statement and several, a script, and the staged-edits question alone
+    /// and after another, over one change and several.
+    #[test]
+    fn english_says_every_guard_reason_as_core_does() {
+        use schemaic_core::sql::{GuardReason, Unsafe};
+        let mut reasons = vec![
+            GuardReason::ReadOnly,
+            GuardReason::ReadOnlyRefused("only a single statement is allowed".into()),
+            GuardReason::NoDatabase,
+            GuardReason::Writes { several: false },
+            GuardReason::Writes { several: true },
+            GuardReason::Script {
+                file: "seed.sql".into(),
+            },
+        ];
+        let unsafe_ones = [
+            Unsafe::TruncatePartitionAll,
+            Unsafe::Truncate,
+            Unsafe::NoWhere { kind: "DELETE" },
+            Unsafe::NoWhere { kind: "UPDATE" },
+            Unsafe::DropTable,
+            Unsafe::DropContainer { obj: "DATABASE" },
+            Unsafe::DropContainer { obj: "SCHEMA" },
+            Unsafe::DropOwned,
+            Unsafe::DropCascade { obj: "TYPE" },
+            Unsafe::DropCascade { obj: "EXTENSION" },
+            Unsafe::ReplaceTable,
+            Unsafe::ReplaceContainer { obj: "DATABASE" },
+            Unsafe::ReplaceContainer { obj: "SCHEMA" },
+            Unsafe::TruncatePartition,
+            Unsafe::DropPartition,
+        ];
+        reasons.extend(unsafe_ones.into_iter().map(GuardReason::Unsafe));
+        for changes in [1, 3] {
+            reasons.push(GuardReason::Staged {
+                after: None,
+                changes,
+            });
+            for after in [
+                GuardReason::Writes { several: false },
+                GuardReason::Unsafe(Unsafe::NoWhere { kind: "DELETE" }),
+            ] {
+                reasons.push(GuardReason::Staged {
+                    after: Some(Box::new(after)),
+                    changes,
+                });
+            }
+        }
+        for r in reasons {
+            assert_eq!(guard_reason_text(&r), r.message(), "{r:?}");
+        }
+    }
 
     /// **A file the import cannot read is refused in English exactly as core
     /// says it** — every `ReadRefusal` on its own (as `xlsx_size_refusal`

@@ -1262,7 +1262,7 @@ fn gate1<A: Clone + 'static>(gate: &ConnGate, action: &Rc<dyn Fn(A)>) -> Rc<dyn 
 /// `production`, reported into its panel and was recorded in history under its
 /// name. And the `no_database` term is per-tab, so a `CREATE TABLE` judged
 /// `Allow` for a database-bound tab could run on a database-less one, past the
-/// `Block("No database selected.")` arm — on PostgreSQL, into the hidden
+/// `Block(GuardReason::NoDatabase)` arm — on PostgreSQL, into the hidden
 /// maintenance database `needs_database`'s own doc says *"nothing in Schemaic
 /// can reach again"*.
 ///
@@ -9361,12 +9361,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     (gated_run)(sql)
                 }
-                RunVerdict::Block(message) => run_guard.set(Some(RunGuard {
-                    message,
+                RunVerdict::Block(why) => run_guard.set(Some(RunGuard {
+                    message: schemaic_ui::i18n::guard_reason_text(&why),
                     pending: None,
                 })),
-                RunVerdict::Confirm(message) => run_guard.set(Some(RunGuard {
-                    message,
+                RunVerdict::Confirm(why) => run_guard.set(Some(RunGuard {
+                    message: schemaic_ui::i18n::guard_reason_text(&why),
                     // The *substituted* statement is parked, so "Run anyway"
                     // replays what was judged rather than re-deriving it.
                     pending: Some(PendingRun::Single(sql)),
@@ -9398,12 +9398,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     (gated_run_all)(stmts)
                 }
-                RunVerdict::Block(message) => run_guard.set(Some(RunGuard {
-                    message,
+                RunVerdict::Block(why) => run_guard.set(Some(RunGuard {
+                    message: schemaic_ui::i18n::guard_reason_text(&why),
                     pending: None,
                 })),
-                RunVerdict::Confirm(message) => run_guard.set(Some(RunGuard {
-                    message,
+                RunVerdict::Confirm(why) => run_guard.set(Some(RunGuard {
+                    message: schemaic_ui::i18n::guard_reason_text(&why),
                     pending: Some(PendingRun::Batch(stmts)),
                 })),
             }

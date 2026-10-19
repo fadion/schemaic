@@ -3336,8 +3336,77 @@ pub fn has_top_level_where(sql: &str, dialect: SqlDialect) -> bool {
 /// holds no rows, so those run as before: a guard that fires on every DDL
 /// statement is one people learn to click through. The schema tree's own Drop
 /// goes through the DDL preview instead, so it is not asked twice.
-pub fn unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+pub fn unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<Unsafe> {
     every_row_reason(stmt, dialect).or_else(|| drop_reason(stmt, dialect))
+}
+
+/// Why a statement asks before it runs ([`unsafe_reason`]) — what it destroys,
+/// as a value, so the editor can say it in the interface's language;
+/// [`Unsafe::message`] is the English, which the CLI says. The `&'static str`s
+/// are the SQL keywords the statement spelled, which every language keeps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unsafe {
+    /// `ALTER TABLE … TRUNCATE PARTITION ALL`.
+    TruncatePartitionAll,
+    /// `TRUNCATE`, or a data-modifying CTE holding one.
+    Truncate,
+    /// A `DELETE` or `UPDATE` (`kind`) with no `WHERE`.
+    NoWhere { kind: &'static str },
+    /// `DROP TABLE`/`TABLES`.
+    DropTable,
+    /// `DROP DATABASE` or `DROP SCHEMA` (`obj`).
+    DropContainer { obj: &'static str },
+    /// PostgreSQL's `DROP OWNED`.
+    DropOwned,
+    /// `DROP TYPE`/`DOMAIN`/`EXTENSION` (`obj`) `… CASCADE`.
+    DropCascade { obj: &'static str },
+    /// MariaDB's `CREATE OR REPLACE TABLE`.
+    ReplaceTable,
+    /// MariaDB's `CREATE OR REPLACE DATABASE`/`SCHEMA` (`obj`).
+    ReplaceContainer { obj: &'static str },
+    /// `ALTER TABLE … TRUNCATE PARTITION`.
+    TruncatePartition,
+    /// `ALTER TABLE … DROP PARTITION`.
+    DropPartition,
+}
+
+impl Unsafe {
+    /// The warning in English.
+    pub fn message(&self) -> String {
+        match *self {
+            Unsafe::TruncatePartitionAll => {
+                "TRUNCATE PARTITION ALL removes every row in the table.".to_string()
+            }
+            Unsafe::Truncate => "TRUNCATE removes every row in the table.".to_string(),
+            Unsafe::NoWhere { kind } => format!("{kind} statement without WHERE clause detected."),
+            Unsafe::DropTable => "DROP TABLE deletes the table and every row in it.".to_string(),
+            Unsafe::DropContainer { obj } => format!(
+                "DROP {obj} deletes the {} and every table in it.",
+                obj.to_ascii_lowercase()
+            ),
+            Unsafe::DropOwned => {
+                "DROP OWNED deletes everything the role owns, every table and its rows with it."
+                    .to_string()
+            }
+            Unsafe::DropCascade { obj } => format!(
+                "DROP {obj} … CASCADE deletes every column that depends on it, with its values."
+            ),
+            Unsafe::ReplaceTable => {
+                "CREATE OR REPLACE TABLE deletes the existing table and every row in it."
+                    .to_string()
+            }
+            Unsafe::ReplaceContainer { obj } => format!(
+                "CREATE OR REPLACE {obj} deletes the existing {} and every table in it.",
+                obj.to_ascii_lowercase()
+            ),
+            Unsafe::TruncatePartition => {
+                "TRUNCATE PARTITION removes every row in the partitions it names.".to_string()
+            }
+            Unsafe::DropPartition => {
+                "DROP PARTITION deletes the partition and every row in it.".to_string()
+            }
+        }
+    }
 }
 
 /// The warning for a statement that deletes stored rows **with the object that
@@ -3359,56 +3428,57 @@ pub fn unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
 ///
 /// Each T-SQL statement in `stmt` is judged, not its first alone — see
 /// [`tsql_statements`].
-pub(crate) fn drop_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+pub(crate) fn drop_reason(stmt: &str, dialect: SqlDialect) -> Option<Unsafe> {
     tsql_statements(stmt, dialect)
         .into_iter()
         .find_map(|s| one_drop_reason(s, dialect))
 }
 
 /// [`drop_reason`] for one statement.
-fn one_drop_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+fn one_drop_reason(stmt: &str, dialect: SqlDialect) -> Option<Unsafe> {
     let stmt = analyzed_statement(stmt, dialect).unwrap_or(stmt);
     let words = leading_words(stmt, PARTITION_WORDS, dialect);
     let word = |i: usize| words.get(i).map(String::as_str);
-    match (word(0)?, word(1)) {
-        ("DROP", Some("TABLE" | "TABLES")) => {
-            Some("DROP TABLE deletes the table and every row in it.".to_string())
+    // The container keyword as the static the note carries.
+    let container = |obj: &str| {
+        if obj == "DATABASE" {
+            "DATABASE"
+        } else {
+            "SCHEMA"
         }
-        ("DROP", Some(obj @ ("DATABASE" | "SCHEMA"))) => Some(format!(
-            "DROP {obj} deletes the {} and every table in it.",
-            obj.to_ascii_lowercase()
-        )),
-        ("DROP", Some("OWNED")) => Some(
-            "DROP OWNED deletes everything the role owns, every table and its rows with it."
-                .to_string(),
-        ),
+    };
+    match (word(0)?, word(1)) {
+        ("DROP", Some("TABLE" | "TABLES")) => Some(Unsafe::DropTable),
+        ("DROP", Some(obj @ ("DATABASE" | "SCHEMA"))) => Some(Unsafe::DropContainer {
+            obj: container(obj),
+        }),
+        ("DROP", Some("OWNED")) => Some(Unsafe::DropOwned),
         ("DROP", Some(obj @ ("TYPE" | "DOMAIN" | "EXTENSION")))
             if word_tokens(stmt, dialect).0.iter().any(|w| w == "CASCADE") =>
         {
-            Some(format!(
-                "DROP {obj} … CASCADE deletes every column that depends on it, with its values."
-            ))
+            Some(Unsafe::DropCascade {
+                obj: match obj {
+                    "TYPE" => "TYPE",
+                    "DOMAIN" => "DOMAIN",
+                    _ => "EXTENSION",
+                },
+            })
         }
         ("CREATE", Some("OR")) if word(2) == Some("REPLACE") => match word(3)? {
-            "TABLE" => Some(
-                "CREATE OR REPLACE TABLE deletes the existing table and every row in it."
-                    .to_string(),
-            ),
-            obj @ ("DATABASE" | "SCHEMA") => Some(format!(
-                "CREATE OR REPLACE {obj} deletes the existing {} and every table in it.",
-                obj.to_ascii_lowercase()
-            )),
+            "TABLE" => Some(Unsafe::ReplaceTable),
+            obj @ ("DATABASE" | "SCHEMA") => Some(Unsafe::ReplaceContainer {
+                obj: container(obj),
+            }),
             _ => None,
         },
         ("ALTER", _) => {
             let at = words.windows(2).position(|w| {
                 matches!(w[0].as_str(), "TRUNCATE" | "DROP") && w[1] == "PARTITION"
             })?;
-            let why = match words[at].as_str() {
-                "TRUNCATE" => "TRUNCATE PARTITION removes every row in the partitions it names.",
-                _ => "DROP PARTITION deletes the partition and every row in it.",
-            };
-            Some(why.to_string())
+            Some(match words[at].as_str() {
+                "TRUNCATE" => Unsafe::TruncatePartition,
+                _ => Unsafe::DropPartition,
+            })
         }
         _ => None,
     }
@@ -3521,14 +3591,14 @@ fn matching_paren(b: &[u8], open: usize, dialect: SqlDialect) -> Option<usize> {
 /// **Each T-SQL statement in `stmt` is judged**, not its first alone: with no
 /// `;` between them, a bare `DELETE` on the line below a scoped one borrowed
 /// that one's `WHERE` — see [`tsql_statements`].
-pub fn every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+pub fn every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<Unsafe> {
     tsql_statements(stmt, dialect)
         .into_iter()
         .find_map(|s| one_every_row_reason(s, dialect))
 }
 
 /// [`every_row_reason`] for one statement.
-fn one_every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+fn one_every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<Unsafe> {
     let stmt = analyzed_statement(stmt, dialect).unwrap_or(stmt);
     match leading_keyword(stmt, dialect)?.as_str() {
         "ALTER" => {
@@ -3536,14 +3606,16 @@ fn one_every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
             words
                 .windows(3)
                 .any(|w| w[0] == "TRUNCATE" && w[1] == "PARTITION" && w[2] == "ALL")
-                .then(|| "TRUNCATE PARTITION ALL removes every row in the table.".to_string())
+                .then_some(Unsafe::TruncatePartitionAll)
         }
-        "TRUNCATE" => Some("TRUNCATE removes every row in the table.".to_string()),
+        "TRUNCATE" => Some(Unsafe::Truncate),
         kind @ ("DELETE" | "UPDATE") => {
             if has_top_level_where(stmt, dialect) {
                 None
             } else {
-                Some(format!("{kind} statement without WHERE clause detected."))
+                Some(Unsafe::NoWhere {
+                    kind: write_kind(kind),
+                })
             }
         }
         // A data-modifying CTE hides the write inside the statement, where
@@ -3560,21 +3632,28 @@ fn one_every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
 /// That errs toward silence on an unusual scoped write and toward warning on the
 /// all-rows case, which is the right way round: a false warning costs a click, a
 /// missed one costs the table.
-fn cte_unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+fn cte_unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<Unsafe> {
     let (words, _) = word_tokens(stmt, dialect);
     if words.iter().any(|w| w == "TRUNCATE") {
-        return Some("TRUNCATE removes every row in the table.".to_string());
+        return Some(Unsafe::Truncate);
     }
     let kind = words.iter().find(|w| *w == "DELETE" || *w == "UPDATE")?;
     if words.iter().any(|w| w == "WHERE") {
         None
     } else {
-        Some(format!("{kind} statement without WHERE clause detected."))
+        Some(Unsafe::NoWhere {
+            kind: write_kind(kind),
+        })
     }
 }
 
+/// `DELETE` or `UPDATE`, as the static an [`Unsafe::NoWhere`] carries.
+fn write_kind(kind: &str) -> &'static str {
+    if kind == "DELETE" { "DELETE" } else { "UPDATE" }
+}
+
 /// The first unsafe statement's warning across all statements in `sql`.
-pub fn first_unsafe(sql: &str, dialect: SqlDialect) -> Option<String> {
+pub fn first_unsafe(sql: &str, dialect: SqlDialect) -> Option<Unsafe> {
     statement_ranges(sql, dialect)
         .into_iter()
         .find_map(|(lo, hi)| sql.get(lo..hi).and_then(|s| unsafe_reason(s, dialect)))
@@ -3639,10 +3718,65 @@ pub enum RunVerdict {
     /// Refused, with **no override**. The read-only connection block: the user
     /// marked this connection read-only, and the product deliberately offers no
     /// "Run anyway" for it.
-    Block(String),
+    Block(GuardReason),
     /// Held back with an override available ("Run anyway") — the missing-`WHERE`
     /// warning, or `confirm_writes`.
-    Confirm(String),
+    Confirm(GuardReason),
+}
+
+/// Why the guard said [`RunVerdict::Block`] or [`RunVerdict::Confirm`] — a
+/// value, so the editor can say it in the interface's language, and so a front
+/// end that adds a hint to one refusal recognises it by variant rather than by
+/// its text. [`GuardReason::message`] is the English, which the CLI says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuardReason {
+    /// A write on a read-only connection.
+    ReadOnly,
+    /// A statement a read-only connection's rollback cannot hold, where the
+    /// read-only session is only a rollback ([`read_only_reason`]'s text, which
+    /// the headless gates say too).
+    ReadOnlyRefused(String),
+    /// A statement that [`needs_database`] with none selected
+    /// ([`NO_DATABASE_SELECTED`]).
+    NoDatabase,
+    /// A statement that destroys stored rows ([`first_unsafe`]).
+    Unsafe(Unsafe),
+    /// "Confirm before running writes", over one statement or `several`.
+    Writes { several: bool },
+    /// A script file, named by `file` ([`script_verdict`]).
+    Script { file: String },
+    /// A run that would replace a result holding `changes` staged edits —
+    /// `filter::with_staged_question` — after the reason the run was already
+    /// asked about, if any.
+    Staged {
+        after: Option<Box<GuardReason>>,
+        changes: usize,
+    },
+}
+
+impl GuardReason {
+    /// The reason in English.
+    pub fn message(&self) -> String {
+        match self {
+            GuardReason::ReadOnly => "Read-only connection.".to_string(),
+            GuardReason::ReadOnlyRefused(reason) => format!("Read-only connection: {reason}"),
+            GuardReason::NoDatabase => NO_DATABASE_SELECTED.to_string(),
+            GuardReason::Unsafe(u) => u.message(),
+            GuardReason::Writes { several: false } => "This statement modifies data.".to_string(),
+            GuardReason::Writes { several: true } => "These statements modify data.".to_string(),
+            GuardReason::Script { file } => format!(
+                "Run every statement in {file}? A script can create, alter and drop \
+                 objects, and what it changes cannot be undone from here."
+            ),
+            GuardReason::Staged { after, changes } => {
+                let note = crate::filter::staged_run_note(*changes).unwrap_or_default();
+                match after {
+                    Some(m) => format!("{} {note}", m.message()),
+                    None => note,
+                }
+            }
+        }
+    }
 }
 
 /// Does `sql` need a database to run *in*, as opposed to being a server-level or
@@ -4107,9 +4241,9 @@ pub fn no_database_failure(message: &str, dialect: SqlDialect) -> Option<NoDatab
 }
 
 /// What the write guard says when a statement [`needs_database`] and none is
-/// selected — the words MySQL's own ERROR 1046 uses. Named, so a front end that
-/// adds a hint to this refusal recognises it by identity rather than by
-/// re-typing it.
+/// selected — the words MySQL's own ERROR 1046 uses, as
+/// [`GuardReason::NoDatabase`]'s English. A front end that adds a hint to this
+/// refusal recognises it by that variant, never by this text.
 pub const NO_DATABASE_SELECTED: &str = "No database selected.";
 
 /// The write guard, as one decision over the statements about to run.
@@ -4131,7 +4265,7 @@ pub const NO_DATABASE_SELECTED: &str = "No database selected.";
 pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
     let writes = || stmts.iter().any(|s| contains_write(s, policy.dialect));
     if policy.read_only && writes() {
-        return RunVerdict::Block("Read-only connection.".to_string());
+        return RunVerdict::Block(GuardReason::ReadOnly);
     }
     // **Where the read-only session is only a rollback, the rollback is not the
     // whole guard.** A `RAISERROR … WITH LOG`, or a function that calls an
@@ -4144,7 +4278,7 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
     if policy.read_only && policy.dialect.read_only_is_a_rollback() {
         for s in stmts {
             if let Err(reason) = read_only_reason(s, policy.dialect) {
-                return RunVerdict::Block(format!("Read-only connection: {reason}"));
+                return RunVerdict::Block(GuardReason::ReadOnlyRefused(reason));
             }
         }
     }
@@ -4153,16 +4287,14 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
         // refuses (ERROR 1046), because the connection simply carries no
         // database. PostgreSQL's carries a hidden one instead, so the refusal has
         // to come from here — and it should read the same either way.
-        return RunVerdict::Block(NO_DATABASE_SELECTED.to_string());
+        return RunVerdict::Block(GuardReason::NoDatabase);
     }
-    if let Some(message) = stmts.iter().find_map(|s| first_unsafe(s, policy.dialect)) {
-        return RunVerdict::Confirm(message);
+    if let Some(why) = stmts.iter().find_map(|s| first_unsafe(s, policy.dialect)) {
+        return RunVerdict::Confirm(GuardReason::Unsafe(why));
     }
     if policy.confirm_writes && writes() {
-        return RunVerdict::Confirm(if stmts.len() == 1 {
-            "This statement modifies data.".to_string()
-        } else {
-            "These statements modify data.".to_string()
+        return RunVerdict::Confirm(GuardReason::Writes {
+            several: stmts.len() != 1,
         });
     }
     RunVerdict::Allow
@@ -4229,15 +4361,14 @@ pub fn rerunnable_for_export(sql: &str, dialect: SqlDialect) -> bool {
 /// user can still recognise at this point — they have read no statements either.
 pub fn script_verdict(policy: GuardPolicy, file: &str) -> RunVerdict {
     if policy.read_only {
-        return RunVerdict::Block("Read-only connection.".to_string());
+        return RunVerdict::Block(GuardReason::ReadOnly);
     }
     if policy.no_database {
-        return RunVerdict::Block(NO_DATABASE_SELECTED.to_string());
+        return RunVerdict::Block(GuardReason::NoDatabase);
     }
-    RunVerdict::Confirm(format!(
-        "Run every statement in {file}? A script can create, alter and drop \
-         objects, and what it changes cannot be undone from here."
-    ))
+    RunVerdict::Confirm(GuardReason::Script {
+        file: file.to_string(),
+    })
 }
 
 /// Bounded Levenshtein edit distance between two ASCII strings.
@@ -7164,10 +7295,10 @@ mod tests {
         }
     }
 
-    /// The guard's refusal and the constant a front end compares against are
-    /// the same words, on both paths that refuse for it.
+    /// The guard refuses for no database with the one reason a front end
+    /// matches, `GuardReason::NoDatabase`, on both paths that refuse for it.
     #[test]
-    fn the_no_database_refusal_is_the_named_constant() {
+    fn the_no_database_refusal_is_one_reason_on_both_paths() {
         let policy = GuardPolicy {
             read_only: false,
             confirm_writes: false,
@@ -7176,11 +7307,11 @@ mod tests {
         };
         assert_eq!(
             run_verdict(&["CREATE TABLE t (id int)".to_string()], policy),
-            RunVerdict::Block(NO_DATABASE_SELECTED.to_string())
+            RunVerdict::Block(GuardReason::NoDatabase)
         );
         assert_eq!(
             script_verdict(policy, "dump.sql"),
-            RunVerdict::Block(NO_DATABASE_SELECTED.to_string())
+            RunVerdict::Block(GuardReason::NoDatabase)
         );
     }
 
@@ -8773,10 +8904,10 @@ mod tests {
         super::has_top_level_where(s, SqlDialect::MySql)
     }
     fn unsafe_reason(s: &str) -> Option<String> {
-        super::unsafe_reason(s, SqlDialect::MySql)
+        super::unsafe_reason(s, SqlDialect::MySql).map(|u| u.message())
     }
     fn first_unsafe(s: &str) -> Option<String> {
-        super::first_unsafe(s, SqlDialect::MySql)
+        super::first_unsafe(s, SqlDialect::MySql).map(|u| u.message())
     }
     fn contains_write(s: &str) -> bool {
         super::contains_write(s, SqlDialect::MySql)
@@ -9492,8 +9623,9 @@ mod tests {
                 ("/* tidy */ DROP TABLE t", "table"),
                 ("DROP TABLE \"t\" CASCADE", "table"),
             ] {
-                let why =
-                    super::unsafe_reason(sql, d).unwrap_or_else(|| panic!("{d:?}: {sql} must ask"));
+                let why = super::unsafe_reason(sql, d)
+                    .unwrap_or_else(|| panic!("{d:?}: {sql} must ask"))
+                    .message();
                 assert!(why.contains(noun), "{d:?}: {sql}: {why}");
             }
         }
@@ -9522,8 +9654,9 @@ mod tests {
                 ("ALTER TABLE t DROP PARTITION p0", "partition"),
                 ("ALTER TABLE t TRUNCATE PARTITION ALL", "every row"),
             ] {
-                let why =
-                    super::unsafe_reason(sql, d).unwrap_or_else(|| panic!("{d:?}: {sql} must ask"));
+                let why = super::unsafe_reason(sql, d)
+                    .unwrap_or_else(|| panic!("{d:?}: {sql} must ask"))
+                    .message();
                 assert!(why.contains(noun), "{d:?}: {sql}: {why}");
             }
         }
@@ -11250,15 +11383,16 @@ line */",
         };
         assert_eq!(
             v(&["DELETE FROM orders WHERE id = 1"], p),
-            RunVerdict::Block("Read-only connection.".to_string())
+            RunVerdict::Block(GuardReason::ReadOnly)
         );
+        assert_eq!(GuardReason::ReadOnly.message(), "Read-only connection.");
         // Even one write among reads blocks the batch.
         assert_eq!(
             v(
                 &["SELECT 1", "UPDATE t SET a = 1 WHERE id = 2", "SELECT 2"],
                 p
             ),
-            RunVerdict::Block("Read-only connection.".to_string())
+            RunVerdict::Block(GuardReason::ReadOnly)
         );
     }
 
@@ -11280,7 +11414,10 @@ line */",
             "SELECT dbo.note()",
         ] {
             assert!(
-                matches!(v(&[sql], ms), RunVerdict::Block(ref m) if m.starts_with("Read-only connection")),
+                matches!(
+                    v(&[sql], ms),
+                    RunVerdict::Block(GuardReason::ReadOnlyRefused(_))
+                ),
                 "{sql}: {:?}",
                 v(&[sql], ms)
             );
@@ -11631,7 +11768,11 @@ line */",
         };
         assert_eq!(
             v(&["CREATE TABLE users (id int)"], p),
-            RunVerdict::Block("No database selected.".to_string()),
+            RunVerdict::Block(GuardReason::NoDatabase),
+        );
+        assert_eq!(
+            GuardReason::NoDatabase.message(),
+            "No database selected.",
             "the same message MySQL's server gives"
         );
         // The statement that fixes the situation still runs.
@@ -11664,7 +11805,7 @@ line */",
         };
         assert_eq!(
             v(&["CREATE TABLE users (id int)"], p),
-            RunVerdict::Block("Read-only connection.".to_string())
+            RunVerdict::Block(GuardReason::ReadOnly)
         );
     }
 
@@ -11690,18 +11831,20 @@ line */",
             confirm_writes: true,
             ..open_policy()
         };
-        let RunVerdict::Confirm(msg) = v(&["DELETE FROM orders"], p) else {
+        let RunVerdict::Confirm(why) = v(&["DELETE FROM orders"], p) else {
             panic!("expected a confirm");
         };
+        let msg = why.message();
         assert!(msg.contains("without WHERE"), "{msg}");
     }
 
     #[test]
     fn the_missing_where_net_fires_even_with_confirm_writes_off() {
         // It is not a setting — it is the net that catches the mistake.
-        let RunVerdict::Confirm(msg) = v(&["UPDATE t SET a = 1"], open_policy()) else {
+        let RunVerdict::Confirm(why) = v(&["UPDATE t SET a = 1"], open_policy()) else {
             panic!("expected a confirm");
         };
+        let msg = why.message();
         assert!(msg.contains("without WHERE"), "{msg}");
         assert!(matches!(
             v(&["TRUNCATE TABLE t"], open_policy()),
@@ -11717,12 +11860,12 @@ line */",
         };
         assert_eq!(
             v(&["INSERT INTO t VALUES (1)"], p),
-            RunVerdict::Confirm("This statement modifies data.".to_string())
+            RunVerdict::Confirm(GuardReason::Writes { several: false })
         );
         // …and says so in the plural for a batch.
         assert_eq!(
             v(&["SELECT 1", "INSERT INTO t VALUES (1)"], p),
-            RunVerdict::Confirm("These statements modify data.".to_string())
+            RunVerdict::Confirm(GuardReason::Writes { several: true })
         );
         // With the setting off, the same write is allowed straight through.
         assert_eq!(
