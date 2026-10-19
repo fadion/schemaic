@@ -630,12 +630,18 @@ fn is_windows_path(p: &str) -> bool {
 /// `terminal.json` or an OS error string back to the user.
 ///
 /// An **allowlist**, for the reason [`is_url_byte`]'s doc gives: filtering every
-/// metacharacter of every shell is how one of them comes to be missed. Letters,
-/// digits, space and a short punctuation set that neither shell treats as
-/// syntax; everything else — including every non-ASCII byte and every control
-/// character, newline among them — becomes a space, and runs of spaces collapse
+/// metacharacter of every shell is how one of them comes to be missed. Letters
+/// and digits in any script, space and a short punctuation set that neither
+/// shell treats as syntax; everything else — every other non-ASCII character
+/// (typographic quotes and dashes, fullwidth symbols, direction marks) and every
+/// control character, newline among them — becomes a space, and runs of spaces collapse
 /// so a stripped run does not leave a gap. The result can be pasted into either
 /// command with no quoting beyond what is already there.
+///
+/// **A letter in any script is kept** because a translated message is made of
+/// them — German's `für` printed `f r` — and no shell gives one a meaning. It
+/// was once dropped for the console's codepage, but the panel's console is a
+/// pseudo-console, which takes `cmd`'s UTF-16 and hands back UTF-8.
 ///
 /// **The backslash is on the list**, so a Windows path in a message stays a
 /// path: `cmd` gives it no meaning, `sh` none inside single quotes, and the
@@ -645,7 +651,7 @@ fn is_windows_path(p: &str) -> bool {
 pub fn shell_message_text(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     for ch in msg.chars() {
-        let keep = ch.is_ascii_alphanumeric() || " .,:;!?-_/()[]+=@#\\".contains(ch);
+        let keep = ch.is_alphanumeric() || " .,:;!?-_/()[]+=@#\\".contains(ch);
         let ch = if keep { ch } else { ' ' };
         if ch == ' ' && out.ends_with(' ') {
             continue;
@@ -1354,9 +1360,16 @@ mod tests {
             ),
             "Couldn t start /usr/bin/zsh (No such file or directory). Pick another shell in terminal settings."
         );
-        // Non-ASCII goes, deliberately: a console codepage is not something this
-        // can answer for.
-        assert_eq!(shell_message_text("naïve 東京"), "na ve");
+        // **A letter in any script stays** — no shell reads one as syntax, and a
+        // translated message is made of them: German's `für` printed `f r`.
+        // Every other non-ASCII character still goes, the typographic quotes
+        // and dashes among them, along with the marks no allowlist vouches for.
+        assert_eq!(shell_message_text("naïve 東京"), "naïve 東京");
+        assert_eq!(
+            shell_message_text("Kein Client für „mysql“ — öffne"),
+            "Kein Client für mysql öffne"
+        );
+        assert_eq!(shell_message_text("a\u{202E}b \u{FF06} c"), "a b c");
         assert_eq!(shell_message_text("   "), "");
         assert_eq!(shell_message_text(""), "");
         // **A Windows path stays legible**: a backslash is no syntax to `cmd`,
