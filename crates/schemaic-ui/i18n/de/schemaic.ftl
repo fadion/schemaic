@@ -1805,3 +1805,6 @@ cmdk-accept = Übernehmen
 cmdk-reject = Verwerfen
 params-value-placeholder = Wert
 params-kind-tip = Text, Zahl, NULL oder rohes SQL — zum Ändern klicken
+editor-error-view = Anzeigen
+editor-run-anyway = Trotzdem ausführen
+editor-diag-fix = { $keys }: { $fix }

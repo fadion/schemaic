@@ -2077,11 +2077,12 @@ fn error_bar_fits_explain(bar_w: f64) -> bool {
             + crate::widgets::measure_text_px_at(label, fs)
     };
     // Every gap and label to the right of the message, in bar order.
+    // The labels the bar draws, so a longer language is measured as it is.
     let buttons = theme::scaled(10.0)
-        + crate::widgets::measure_text_px_at("View", fs)
+        + crate::widgets::measure_text_px_at(&tr!("editor-error-view"), fs)
         + theme::scaled(20.0)
-        + sparkle("Explain")
-        + sparkle("AI fix");
+        + sparkle(&tr!("error-modal-explain"))
+        + sparkle(&tr!("error-modal-ai-fix"));
     // `bar_w` is the border box; the share is of what the children actually get,
     // which is what `max_width_pct` resolves against too.
     let content = (bar_w - 2.0 * theme::scaled(ERROR_BAR_PAD)).max(0.0);
@@ -2671,9 +2672,13 @@ fn tip_message(
 ) -> String {
     match schemaic_core::intel::fix_at(offline, d.range.0).map(|(_, _, fix)| fix) {
         Some(fix) => format!(
-            "{}\n{}: {fix}",
+            "{}\n{}",
             d.message,
-            crate::shortcuts::keys_label("Alt+Enter")
+            tr!(
+                "editor-diag-fix",
+                keys = crate::shortcuts::keys_label("Alt+Enter").into_owned(),
+                fix = fix.to_string()
+            )
         ),
         None => d.message.clone(),
     }
@@ -6665,7 +6670,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // reach a model. `flex_shrink(0)` because a button that
                     // shrinks is never what the layout wants — the message is the
                     // part that yields.
-                    text("View")
+                    text(tr!("editor-error-view"))
                         .on_click_stop(move |_| error_modal_open.set(true))
                         .style(|s| {
                             s.color(theme::err_fix_btn())
@@ -6695,7 +6700,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 }
                                 let explain_error = explain_error.clone();
                                 crate::widgets::sparkle_action(
-                                    "Explain",
+                                    tr!("error-modal-explain"),
                                     theme::err_fix_btn,
                                     theme::err_fix_btn_hover,
                                     // The bar is workspace furniture, not a
@@ -6720,7 +6725,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             }
                             let ai_fix = ai_fix.clone();
                             crate::widgets::sparkle_action(
-                                "AI fix",
+                                tr!("error-modal-ai-fix"),
                                 theme::err_fix_btn,
                                 theme::err_fix_btn_hover,
                                 None,
@@ -6784,7 +6789,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // A soft guard (unsafe WHERE) offers "Run anyway"; a hard block
                 // (read-only, `pending: None`) shows only the message.
                 let action: floem::AnyView = if g.pending.is_some() {
-                    text("Run anyway")
+                    text(tr!("editor-run-anyway"))
                         .on_click_stop(move |_| (run_anyway)())
                         .style(|s| {
                             s.color(theme::err_fix_btn())
@@ -9754,6 +9759,15 @@ mod geometry_tests {
         let tip = tip_message(&server, &offline);
         assert!(tip.starts_with("Unknown column 'salery'\n"), "{tip}");
         assert!(tip.ends_with(": salary"), "{tip}");
+    }
+
+    /// The fix line reads as it was formatted before the catalogue.
+    #[test]
+    fn the_fix_line_reads_as_it_did_in_english() {
+        assert_eq!(
+            crate::i18n::tr!("editor-diag-fix", keys = "Alt+Enter", fix = "salary"),
+            "Alt+Enter: salary"
+        );
     }
 
     /// The hovered diagnostic's own fix gives way to the one the key would

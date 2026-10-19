@@ -2219,3 +2219,14 @@ cmdk-reject = Reject
 params-value-placeholder = value
 # On the kind chip; NULL and SQL are the chip's own words.
 params-kind-tip = Text, number, NULL, or raw SQL — click to change
+
+## The editor's error and guard bars (editor_pane.rs). Explain and AI fix are
+## the error modal's own (error-modal-explain, error-modal-ai-fix).
+
+# Opens the full error in the error modal.
+editor-error-view = View
+# The guard bar's button that runs a statement it warned about.
+editor-run-anyway = Run anyway
+# A squiggle's tooltip, under its message: the fix a key would make. $keys is
+# the key (Alt+Enter); $fix is what it does.
+editor-diag-fix = { $keys }: { $fix }
