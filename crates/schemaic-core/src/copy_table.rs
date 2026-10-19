@@ -357,12 +357,11 @@ pub fn select_sql_with(
 /// a value the copy does not have, and so is every cell of a column whose text
 /// outgrew the chunk's arena (`ResultSet::capped_columns`), which reads blank
 /// past that point. Written, either is a wrong value under a success report.
-pub fn chunk_refusal(rs: &crate::model::ResultSet) -> Option<String> {
+pub fn chunk_refusal(rs: &crate::model::ResultSet) -> Option<CopyStop> {
     if let Some(&c) = rs.capped_columns.first() {
-        let name = rs.columns.get(c).map_or("a column", |c| c.name.as_str());
-        return Some(format!(
-            "{name} holds more text than one read can carry, so the copy stopped before writing it"
-        ));
+        return Some(CopyStop::TooLong {
+            column: rs.columns.get(c).map(|c| c.name.clone()),
+        });
     }
     for (c, col) in rs.columns.iter().enumerate() {
         if !(rs.binary_columns.contains(&c) || col.is_binary()) {
@@ -373,13 +372,46 @@ pub fn chunk_refusal(rs: &crate::model::ResultSet) -> Option<String> {
                 .is_some_and(|v| !v.is_null() && crate::model::is_binary_display(v.text()))
         });
         if placeholder {
-            return Some(format!(
-                "{} holds bytes the copy cannot read as they are, so it stopped before writing them",
-                col.name
-            ));
+            return Some(CopyStop::Bytes {
+                column: col.name.clone(),
+            });
         }
     }
     None
+}
+
+/// A value a copy read but must not write — [`chunk_refusal`]'s answer, and
+/// `import::build_insert_as`'s — so the copy stops rather than writing a wrong
+/// value under a success report. [`CopyStop::message`] is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyStop {
+    /// The `column`'s text outgrew one read's arena — `None` when the read
+    /// did not name it.
+    TooLong { column: Option<String> },
+    /// The `column` arrived as bytes the copy cannot read as they are.
+    Bytes { column: String },
+    /// The `column`'s value is not the shape its read's form promised.
+    NotItsForm { column: Option<String> },
+}
+
+impl CopyStop {
+    /// The refusal in English.
+    pub fn message(&self) -> String {
+        let named = |c: &Option<String>| c.clone().unwrap_or_else(|| "a column".to_string());
+        match self {
+            CopyStop::TooLong { column } => format!(
+                "{} holds more text than one read can carry, so the copy stopped before writing it",
+                named(column)
+            ),
+            CopyStop::Bytes { column } => format!(
+                "{column} holds bytes the copy cannot read as they are, so it stopped before writing them"
+            ),
+            CopyStop::NotItsForm { column } => format!(
+                "the value read for {} is not the form the copy asked for, so nothing was written",
+                named(column)
+            ),
+        }
+    }
 }
 
 /// Does an explicit value written into an auto-numbered column move the
@@ -808,7 +840,7 @@ mod tests {
     fn a_chunk_holding_a_bytes_placeholder_is_refused() {
         use crate::model::Value;
         let blob = chunk("varbinary", vec![Value::Str("<3 bytes>".into())]);
-        assert!(chunk_refusal(&blob).is_some_and(|w| w.contains("body")));
+        assert!(chunk_refusal(&blob).is_some_and(|w| w.message().contains("body")));
         let text = chunk("text", vec![Value::Str("<3 bytes>".into())]);
         assert_eq!(chunk_refusal(&text), None);
         let hex = chunk("varbinary", vec![Value::Str("00ff".into()), Value::Null]);
@@ -816,6 +848,33 @@ mod tests {
         let mut capped = chunk("text", vec![Value::Str("x".into())]);
         capped.capped_columns = vec![0];
         assert!(chunk_refusal(&capped).is_some());
+    }
+
+    /// **A copy's refusals read as the sentences they were** — each with its
+    /// column named and, where a read may not name it, without.
+    #[test]
+    fn a_copy_refusal_says_what_it_used_to() {
+        let s = |c: &str| Some(c.to_string());
+        assert_eq!(
+            CopyStop::TooLong { column: s("body") }.message(),
+            "body holds more text than one read can carry, so the copy stopped before writing it"
+        );
+        assert!(
+            CopyStop::TooLong { column: None }
+                .message()
+                .starts_with("a column holds")
+        );
+        assert_eq!(
+            CopyStop::Bytes {
+                column: "img".into()
+            }
+            .message(),
+            "img holds bytes the copy cannot read as they are, so it stopped before writing them"
+        );
+        assert_eq!(
+            CopyStop::NotItsForm { column: s("img") }.message(),
+            "the value read for img is not the form the copy asked for, so nothing was written"
+        );
     }
 
     #[test]

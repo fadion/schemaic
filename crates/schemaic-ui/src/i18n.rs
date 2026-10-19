@@ -704,6 +704,72 @@ pub fn guard_reason_text(r: &schemaic_core::sql::GuardReason) -> String {
     }
 }
 
+/// What is wrong with a field — `import::IssueKind::message`'s words in the
+/// interface's language; core keeps its English for the CLI. Here because the
+/// import modal's problem list and a load's backstop ([`row_error_text`]) both
+/// say it.
+pub(crate) fn issue_kind_message(kind: schemaic_core::import::IssueKind) -> String {
+    use schemaic_core::import::IssueKind;
+    match kind {
+        IssueKind::NotAnInteger => tr!("import-issue-not-an-integer"),
+        IssueKind::NotANumber => tr!("import-issue-not-a-number"),
+        IssueKind::NotABoolean => tr!("import-issue-not-a-boolean"),
+        IssueKind::CellError => tr!("import-issue-cell-error"),
+        IssueKind::NullInNotNull => tr!("import-issue-null-in-not-null"),
+        IssueKind::FieldCount { expected, found } => {
+            tr!(
+                "import-issue-field-count",
+                expected = expected,
+                found = found
+            )
+        }
+    }
+}
+
+/// Why the rows being written could not be read on — core's
+/// `import::RowError::message` in the interface's language. The CSV reader's
+/// and a copy's read's own words pass through as they came.
+fn row_error_text(e: &schemaic_core::import::RowError) -> String {
+    use schemaic_core::copy_table::CopyStop;
+    use schemaic_core::import::RowError;
+    match e {
+        RowError::Issue(i) => {
+            let (line, column) = (i.line, i.column.as_str());
+            let problem = issue_kind_message(i.kind);
+            if i.text.is_empty() {
+                tr!(
+                    "write-row-issue-empty",
+                    line = line,
+                    column = column,
+                    problem = problem
+                )
+            } else {
+                tr!(
+                    "write-row-issue",
+                    line = line,
+                    column = column,
+                    problem = problem,
+                    text = i.text.as_str()
+                )
+            }
+        }
+        RowError::Read(m) => m.clone(),
+        RowError::Copy(CopyStop::TooLong { column: Some(c) }) => {
+            tr!("write-copy-too-long", column = c.as_str())
+        }
+        RowError::Copy(CopyStop::TooLong { column: None }) => tr!("write-copy-too-long-unnamed"),
+        RowError::Copy(CopyStop::Bytes { column }) => {
+            tr!("write-copy-bytes", column = column.as_str())
+        }
+        RowError::Copy(CopyStop::NotItsForm { column: Some(c) }) => {
+            tr!("write-copy-not-its-form", column = c.as_str())
+        }
+        RowError::Copy(CopyStop::NotItsForm { column: None }) => {
+            tr!("write-copy-not-its-form-unnamed")
+        }
+    }
+}
+
 /// A write path's failure — core's
 /// [`WriteFailure::message`](schemaic_core::model::WriteFailure::message), what
 /// `DbError::Write` displays, in the interface's language. Public for the
@@ -713,6 +779,7 @@ pub fn write_failure_text(f: &schemaic_core::model::WriteFailure) -> String {
     use schemaic_core::model::{Rollback, WriteAction, WriteCause};
     let cause = match &f.cause {
         WriteCause::Server(m) | WriteCause::Refused(m) => m.clone(),
+        WriteCause::Row(e) => row_error_text(e),
         WriteCause::OneRow(miss) => {
             let (table, affected) = (miss.table.as_str(), miss.affected);
             match miss.action {
@@ -912,6 +979,48 @@ mod tests {
                     table: table.into(),
                     affected,
                 }));
+            }
+        }
+        {
+            use schemaic_core::copy_table::CopyStop;
+            use schemaic_core::import::{Issue, IssueKind, RowError};
+            for kind in [
+                IssueKind::NotAnInteger,
+                IssueKind::NotANumber,
+                IssueKind::NotABoolean,
+                IssueKind::CellError,
+                IssueKind::NullInNotNull,
+                IssueKind::FieldCount {
+                    expected: 3,
+                    found: 2,
+                },
+            ] {
+                for text in ["", "nope"] {
+                    causes.push(WriteCause::Row(RowError::Issue(Issue {
+                        line: 12,
+                        column: "qty".into(),
+                        text: text.into(),
+                        kind,
+                    })));
+                }
+            }
+            causes.push(WriteCause::Row(RowError::Read(
+                "CSV error: record 3 (line 4, byte 30): found record with 2 fields".into(),
+            )));
+            for stop in [
+                CopyStop::TooLong {
+                    column: Some("body".into()),
+                },
+                CopyStop::TooLong { column: None },
+                CopyStop::Bytes {
+                    column: "img".into(),
+                },
+                CopyStop::NotItsForm {
+                    column: Some("img".into()),
+                },
+                CopyStop::NotItsForm { column: None },
+            ] {
+                causes.push(WriteCause::Row(RowError::Copy(stop)));
             }
         }
         for (rows, wrote) in [(500, 499), (1, 0), (2, 1)] {

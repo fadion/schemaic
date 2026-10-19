@@ -2635,7 +2635,7 @@ impl RowCtx {
         fields: &[Field],
         sheet_errors: &[usize],
         line: u64,
-    ) -> Result<Vec<Value>, String> {
+    ) -> Result<Vec<Value>, RowError> {
         let fields = &fields[..trim_to_mapping(fields, self.format, &self.mapping)];
         let (values, issues) = coerce_record(
             fields,
@@ -2646,22 +2646,47 @@ impl RowCtx {
             self.dialect,
             line,
         );
-        match issues.first() {
+        match issues.into_iter().next() {
             // Only the first issue is reported here: the import is all-or-nothing,
             // and `validate` has already shown the user the whole list. This is
             // the backstop for a file that changed underneath them.
-            Some(i) => Err(format!(
+            Some(i) => Err(RowError::Issue(i)),
+            None => Ok(values),
+        }
+    }
+}
+
+/// Why a row source could not hand over its next row — [`RowIter`]'s error,
+/// and a copy's read's. The import stops on it, whole; the interface says it
+/// in its own language, and [`RowError::message`] is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowError {
+    /// A record the check passed that no longer coerces — the file changed
+    /// underneath the import. Its first problem.
+    Issue(Issue),
+    /// The reader's own words (the CSV parser's), or a copy's read's error.
+    Read(String),
+    /// A copied value the write must not write.
+    Copy(crate::copy_table::CopyStop),
+}
+
+impl RowError {
+    /// The error in English.
+    pub fn message(&self) -> String {
+        match self {
+            RowError::Issue(i) => format!(
                 "line {}, column {}: {} ({})",
                 i.line,
                 i.column,
                 i.kind.message(),
                 if i.text.is_empty() {
-                    "empty".to_string()
+                    "empty"
                 } else {
-                    i.text.clone()
+                    i.text.as_str()
                 }
-            )),
-            None => Ok(values),
+            ),
+            RowError::Read(m) => m.clone(),
+            RowError::Copy(r) => r.message(),
         }
     }
 }
@@ -2776,7 +2801,7 @@ pub fn row_iter<R: std::io::Read>(
 }
 
 impl<R: std::io::Read> Iterator for RowIter<R> {
-    type Item = Result<Vec<Value>, String>;
+    type Item = Result<Vec<Value>, RowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.source {
@@ -2788,7 +2813,7 @@ impl<R: std::io::Read> Iterator for RowIter<R> {
                         let fields: Vec<Field> = rec.iter().map(|f| Some(f.to_string())).collect();
                         self.ctx.row(&fields, &[], line)
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(RowError::Read(e.to_string())),
                 })
             }
             RowSourceIter::Buffered(rows) => {
@@ -2944,7 +2969,7 @@ pub fn build_insert_as(
     dialect: SqlDialect,
     forms: &[CellForm],
     overriding: bool,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, crate::copy_table::CopyStop> {
     if rows.is_empty() || columns.is_empty() {
         return Ok(None);
     }
@@ -2960,10 +2985,9 @@ pub fn build_insert_as(
         for (i, v) in r.iter().enumerate() {
             let form = forms.get(i).copied().unwrap_or_default();
             cells.push(cell_literal(v, form, dialect).ok_or_else(|| {
-                format!(
-                    "the value read for {} is not the form the copy asked for, so nothing was written",
-                    columns.get(i).copied().unwrap_or("a column")
-                )
+                crate::copy_table::CopyStop::NotItsForm {
+                    column: columns.get(i).map(|c| c.to_string()),
+                }
             })?);
         }
         values.push(format!("({})", cells.join(", ")));
@@ -3909,8 +3933,40 @@ mod tests {
             row_iter(csv.as_bytes(), ImportFormat::Csv, &cfg(true), &t, &m, MySql).unwrap();
         assert!(it.next().unwrap().is_ok());
         let err = it.next().unwrap().unwrap_err();
-        assert!(err.contains("line 3"), "{err}");
-        assert!(err.contains("id"), "{err}");
+        assert!(matches!(&err, RowError::Issue(i) if i.line == 3), "{err:?}");
+        let err = err.message();
+        assert_eq!(err, "line 3, column id: not a whole number (nope)");
+    }
+
+    /// **The backstop reads as it did** — an empty field named as empty, and
+    /// the reader's own words and a copy's refusal passed through as they are.
+    #[test]
+    fn a_row_error_says_what_it_used_to() {
+        let issue = |text: &str| {
+            RowError::Issue(Issue {
+                line: 7,
+                column: "qty".into(),
+                text: text.into(),
+                kind: IssueKind::NullInNotNull,
+            })
+            .message()
+        };
+        assert_eq!(
+            issue(""),
+            "line 7, column qty: empty, but the column can't be NULL (empty)"
+        );
+        assert_eq!(
+            issue("x"),
+            "line 7, column qty: empty, but the column can't be NULL (x)"
+        );
+        assert_eq!(
+            RowError::Read("CSV error: record 2".into()).message(),
+            "CSV error: record 2"
+        );
+        let stop = crate::copy_table::CopyStop::Bytes {
+            column: "img".into(),
+        };
+        assert_eq!(RowError::Copy(stop.clone()).message(), stop.message());
     }
 
     #[test]

@@ -6472,11 +6472,14 @@ fn cancelled_write(undone: Rollback) -> DbError {
 /// An import's reader or statement-building error `e`, with what the rollback
 /// after it achieved — **only worth saying when it isn't what the message
 /// implies**, so a complete rollback leaves `e` as it was, and only a
-/// [`DbError::Query`] has a sentence to carry the note.
+/// [`DbError::Query`] or a write failure without a rollback yet (a row
+/// source's) has a sentence to carry the note.
 fn with_partial_rollback(e: DbError, undone: Rollback) -> DbError {
     match (e, undone) {
         (e, Rollback::Complete) => e,
         (DbError::Query(msg), undone) => DbError::write(WriteCause::Server(msg), Some(undone)),
+        // A row source's failure, which lacks only this.
+        (DbError::Write(f), undone) if f.undone.is_none() => DbError::write(f.cause, Some(undone)),
         (e, _) => e,
     }
 }

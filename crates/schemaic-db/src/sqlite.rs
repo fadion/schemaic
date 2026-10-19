@@ -1628,7 +1628,7 @@ pub(crate) async fn import_rows(
                 if cancel.is_cancelled() {
                     return Err(DbError::Cancelled);
                 }
-                batch.push(row.map_err(DbError::Query)?);
+                batch.push(row.map_err(crate::row_failure)?);
                 if batch.len() >= INSERT_BATCH_ROWS {
                     total += flush(&mut batch)?;
                 }
@@ -7779,7 +7779,9 @@ mod tests {
         let n = schemaic_core::import::INSERT_BATCH_ROWS + 3;
         let mut rows = (1..=n).map(|i| {
             if i == n {
-                Err("row 503 is malformed".to_string())
+                Err(schemaic_core::import::RowError::Read(
+                    "row 503 is malformed".to_string(),
+                ))
             } else {
                 Ok(vec![Value::Int(i as i64), Value::Str(format!("v{i}"))])
             }

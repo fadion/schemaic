@@ -16,6 +16,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use schemaic_core::import::RowError;
 use schemaic_core::model::Value;
 use schemaic_core::script::{ExecEnd, Statement};
 use schemaic_db::{DbError, ImportTarget, session::Session};
@@ -534,7 +535,9 @@ pub async fn a_reader_error_rolls_the_whole_import_back(target: &'static Target)
     let mut rows = (1..=5000)
         .map(|i| {
             if i == 4000 {
-                Err("the file ends in the middle of a record".to_string())
+                Err(RowError::Read(
+                    "the file ends in the middle of a record".to_string(),
+                ))
             } else {
                 Ok(vec![Value::Int(i), Value::Str(format!("row {i}"))])
             }
@@ -1308,14 +1311,14 @@ async fn seed_import_table_as(scratch: &Scratch, engine_clause: Option<&str>) {
 
 async fn import(
     scratch: &Scratch,
-    rows: &mut (dyn Iterator<Item = Result<Vec<Value>, String>> + Send),
+    rows: &mut (dyn Iterator<Item = Result<Vec<Value>, RowError>> + Send),
 ) -> Result<u64, schemaic_db::DbError> {
     import_with(scratch, rows, CancellationToken::new()).await
 }
 
 async fn import_with(
     scratch: &Scratch,
-    rows: &mut (dyn Iterator<Item = Result<Vec<Value>, String>> + Send),
+    rows: &mut (dyn Iterator<Item = Result<Vec<Value>, RowError>> + Send),
     cancel: CancellationToken,
 ) -> Result<u64, schemaic_db::DbError> {
     let columns = ["id".to_string(), "name".to_string()];
@@ -1342,7 +1345,7 @@ async fn import_with(
 /// `next()` is what the real reader's disk IO looks like from here. `batches`
 /// full batches means at least one is already on the server when the token
 /// fires, which is the whole point on a non-transactional table.
-fn slow_rows(batches: usize) -> impl Iterator<Item = Result<Vec<Value>, String>> + Send {
+fn slow_rows(batches: usize) -> impl Iterator<Item = Result<Vec<Value>, RowError>> + Send {
     let n = schemaic_core::import::INSERT_BATCH_ROWS * batches;
     (1..=n).map(move |i| {
         // Paced so the run outlives the 400 ms cancel without being slow: one

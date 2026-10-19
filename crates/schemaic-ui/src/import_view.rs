@@ -18,7 +18,7 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::import::{
-    self, CsvDialect, ImportFormat, Issue, IssueKind, Mapping, NullRule, ReadConfig, Target,
+    self, CsvDialect, ImportFormat, Issue, Mapping, NullRule, ReadConfig, Target,
 };
 use schemaic_core::model::engine_is_transactional;
 
@@ -973,30 +973,11 @@ fn memory_warning_text(w: &import::MemoryWarning) -> String {
     }
 }
 
-/// What is wrong with a field — `IssueKind::message`'s words, drawn here so
-/// they can be translated; core keeps its English for the CLI.
-fn issue_kind_message(kind: IssueKind) -> String {
-    match kind {
-        IssueKind::NotAnInteger => tr!("import-issue-not-an-integer"),
-        IssueKind::NotANumber => tr!("import-issue-not-a-number"),
-        IssueKind::NotABoolean => tr!("import-issue-not-a-boolean"),
-        IssueKind::CellError => tr!("import-issue-cell-error"),
-        IssueKind::NullInNotNull => tr!("import-issue-null-in-not-null"),
-        IssueKind::FieldCount { expected, found } => {
-            tr!(
-                "import-issue-field-count",
-                expected = expected,
-                found = found
-            )
-        }
-    }
-}
-
 /// One problem's line: where it is — the line, and the column when the
-/// problem has one — then what is wrong ([`issue_kind_message`]). A whole
+/// problem has one — then what is wrong ([`crate::i18n::issue_kind_message`]). A whole
 /// message per shape rather than a place spliced in.
 fn issue_line(is: &Issue) -> String {
-    let message = issue_kind_message(is.kind);
+    let message = crate::i18n::issue_kind_message(is.kind);
     if is.column.is_empty() {
         tr!("import-problem-at-line", line = is.line, message = message)
     } else {
@@ -1624,7 +1605,8 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{issue_kind_message, issue_line, issue_tail_text, memory_warning_text};
+    use super::{issue_line, issue_tail_text, memory_warning_text};
+    use crate::i18n::issue_kind_message;
     use crate::i18n::tr;
     use schemaic_core::import::{Issue, IssueKind};
 

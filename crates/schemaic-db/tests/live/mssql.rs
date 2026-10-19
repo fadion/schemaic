@@ -7119,7 +7119,7 @@ async fn the_routine_controls_reach_the_server() {
 async fn import_into(
     s: &Scratch,
     columns: &[&str],
-    rows: &mut (dyn Iterator<Item = Result<Vec<Value>, String>> + Send),
+    rows: &mut (dyn Iterator<Item = Result<Vec<Value>, schemaic_core::import::RowError>> + Send),
     cancel: CancellationToken,
 ) -> Result<u64, DbError> {
     let columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();

@@ -4019,7 +4019,7 @@ pub(crate) async fn import_rows(
         let batch = match crate::next_batch_off_executor(rows, &mut held) {
             Ok(Some(b)) => b,
             Ok(None) => break,
-            Err(e) => return Err(failed(&mut client, err_text(e)).await),
+            Err(e) => return Err(failed_on(&mut client, e).await),
         };
         // **Asked again once the batch is in hand**: reading it is where an
         // import spends its time, so it is where Stop lands. Left to the race
@@ -4049,13 +4049,7 @@ pub(crate) async fn import_rows(
         let sql = match target.insert_sql(&batch, MS) {
             Ok(Some(sql)) => sql,
             Ok(None) => continue,
-            Err(e) => {
-                let msg = match e {
-                    DbError::Query(msg) => msg,
-                    e => e.to_string(),
-                };
-                return Err(failed(&mut client, msg).await);
-            }
+            Err(e) => return Err(failed_on(&mut client, e).await),
         };
         let bound = Bound {
             sql,
@@ -5295,6 +5289,16 @@ fn err_text(e: DbError) -> String {
 /// achieved.
 async fn failed(client: &mut MsClient, msg: String) -> DbError {
     failed_as(client, WriteCause::Server(msg)).await
+}
+
+/// [`failed`] for an error `e` the import was handed — a row source's, which
+/// already says what failed and lacks only the rollback, or anything else, by
+/// its own sentence.
+async fn failed_on(client: &mut MsClient, e: DbError) -> DbError {
+    match e {
+        DbError::Write(f) if f.undone.is_none() => failed_as(client, f.cause).await,
+        e => failed(client, err_text(e)).await,
+    }
 }
 
 /// [`failed`] for any cause.

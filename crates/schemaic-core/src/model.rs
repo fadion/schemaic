@@ -1456,8 +1456,11 @@ pub struct WriteFailure {
 /// What made a write path fail ([`WriteFailure`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteCause {
-    /// The server's, the driver's or the file reader's own words.
+    /// The server's or the driver's own words.
     Server(String),
+    /// The rows being written could not be read on: an import's file, or a
+    /// copy's read ([`crate::import::RowError`]).
+    Row(crate::import::RowError),
     /// The 1-row safety net ([`one_row_verdict`]).
     OneRow(OneRowMiss),
     /// A batch of `rows` rows that wrote `wrote`; `affected` where the engine
@@ -1494,6 +1497,7 @@ impl WriteFailure {
     pub fn message(&self) -> String {
         let cause = match &self.cause {
             WriteCause::Server(m) | WriteCause::Refused(m) => m.clone(),
+            WriteCause::Row(e) => e.message(),
             WriteCause::OneRow(miss) => miss.message(),
             &WriteCause::Batch {
                 rows,

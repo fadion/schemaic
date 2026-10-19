@@ -496,6 +496,17 @@ write-one-row-insert = insert into { $table } affected { $affected } rows (expec
 # A batch of $rows rows that wrote $wrote.
 write-batch-inserted = a batch of { $rows } rows inserted { $wrote }
 write-batch-affected = a batch of { $rows } rows affected { $wrote }
+# A record the check passed that no longer reads — the file changed under the
+# import. $problem is one of the import-issue-* messages; $column the target
+# column; $text the field as the file has it.
+write-row-issue = line { $line }, column { $column }: { $problem } ({ $text })
+write-row-issue-empty = line { $line }, column { $column }: { $problem } (empty)
+# A copied value the copy must not write; $column is the column's name.
+write-copy-too-long = { $column } holds more text than one read can carry, so the copy stopped before writing it
+write-copy-too-long-unnamed = a column holds more text than one read can carry, so the copy stopped before writing it
+write-copy-bytes = { $column } holds bytes the copy cannot read as they are, so it stopped before writing them
+write-copy-not-its-form = the value read for { $column } is not the form the copy asked for, so nothing was written
+write-copy-not-its-form-unnamed = the value read for a column is not the form the copy asked for, so nothing was written
 write-commit-cancelled = Commit cancelled
 write-import-cancelled = Import cancelled
 # What the rollback achieved, appended to the failure, so each starts with its

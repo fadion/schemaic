@@ -88,6 +88,7 @@ use std::collections::HashMap;
 use mysql_async::{Conn, OptsBuilder};
 use schemaic_core::activity::{self, KillKind, SessionInfo};
 use schemaic_core::blob::{BlobRef, BlobValue};
+use schemaic_core::import::RowError;
 use schemaic_core::model::{
     ErrorSource, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder, ResultSet, Value,
 };
@@ -2994,7 +2995,7 @@ impl ImportTarget<'_> {
             self.forms,
             self.overriding,
         )
-        .map_err(DbError::Query)
+        .map_err(|stop| row_failure(RowError::Copy(stop)))
     }
 }
 
@@ -3003,7 +3004,14 @@ impl ImportTarget<'_> {
 ///
 /// `Send` because the import runs on the tokio runtime: the reader is pulled
 /// between `await`s, so it crosses whatever thread the task resumes on.
-pub type RowSource<'a> = &'a mut (dyn Iterator<Item = Result<Vec<Value>, String>> + Send);
+pub type RowSource<'a> = &'a mut (dyn Iterator<Item = Result<Vec<Value>, RowError>> + Send);
+
+/// A row source's error as the write path's failure — a statement's, so
+/// "query failed:" as the `DbError::Query` it used to be — with no rollback
+/// yet: the engine adds what its rollback achieved.
+pub(crate) fn row_failure(e: RowError) -> DbError {
+    DbError::write(schemaic_core::model::WriteCause::Row(e), None)
+}
 
 impl Db {
     /// Bulk-load rows into one table in a single transaction, as batched
@@ -3145,7 +3153,7 @@ struct ChunkRows<'a> {
 }
 
 impl Iterator for ChunkRows<'_> {
-    type Item = Result<Vec<Value>, String>;
+    type Item = Result<Vec<Value>, RowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -3161,7 +3169,7 @@ impl Iterator for ChunkRows<'_> {
                 if r == 0
                     && let Some(why) = schemaic_core::copy_table::chunk_refusal(rs)
                 {
-                    return Some(Err(why));
+                    return Some(Err(RowError::Copy(why)));
                 }
                 let row = (0..rs.columns.len())
                     .map(|c| rs.cell(r, c).map_or(Value::Null, |v| v.to_value()))
@@ -3174,7 +3182,7 @@ impl Iterator for ChunkRows<'_> {
                     self.chunk = Some(rs);
                     self.at = 0;
                 }
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Some(Err(RowError::Read(e))),
             }
         }
     }
@@ -3245,7 +3253,7 @@ fn next_batch(
         let row = match held.take() {
             Some(row) => row,
             None => match rows.next() {
-                Some(row) => row.map_err(DbError::Query)?,
+                Some(row) => row.map_err(row_failure)?,
                 None => break,
             },
         };

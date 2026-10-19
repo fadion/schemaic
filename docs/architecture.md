@@ -216,8 +216,9 @@ existing prose was left alone.
     a commit un-stages).
     **`WriteFailure { cause, undone }` is a write path's failure as a value rather than a
     sentence** — the grid's Commit, an import, a copy — so the interface can say it in its own
-    language. `WriteCause` is what went wrong: `Server` (the server's, the driver's or the file
-    reader's own words), `OneRow` (the net's `OneRowMiss` — its `action`, a `WriteAction` where
+    language. `WriteCause` is what went wrong: `Server` (the server's or the driver's own words),
+    `Row` (the rows being written could not be read on — an `import::RowError`, the file's or the
+    copy's read's, which travelled as text — a bare `Query`, or `Server` where MySQL and SQL Server added the rollback — until it became a value of its own), `OneRow` (the net's `OneRowMiss` — its `action`, a `WriteAction` where
     `WriteStep::action` used to answer the English *delete on*/*update on*/*insert into*, the
     unquoted `table` and the count), `Batch { rows, wrote, affected }` (an import batch that wrote
     another number, `affected` where the engine counts what a statement affected rather than what
@@ -226,7 +227,7 @@ existing prose was left alone.
     reports the cause alone. `message()` is the English the errors displayed before it existed,
     byte for byte: the cause, then `Rollback::note` — unchanged, still the English clause with
     its own leading separator — and `query failed: ` in front exactly when
-    `WriteCause::is_statements` (`Server`, `OneRow`, `Batch`), never over a Stop or Schemaic's own
+    `WriteCause::is_statements` (`Server`, `Row`, `OneRow`, `Batch`), never over a Stop or Schemaic's own
     refusal. That one predicate also decides the error modal's source for `DbError::Write` (under
     `schemaic-db`'s `lib.rs`), so the prefix and the offer of *Explain* cannot disagree.
     `a_write_failure_says_what_its_error_used_to` and
@@ -5283,7 +5284,17 @@ existing prose was left alone.
     && generated.is_none()` rather than on "integer primary key", which was silent on a natural
     `INT` key and noisy about every defaulted column. `validate` reads the whole file and returns
     *every* `Issue` with its line before anything is written, then `row_iter` streams coerced rows
-    for the load.
+    for the load. **A row the stream cannot hand over is a `RowError`, not a sentence** —
+    `RowIter`'s item is `Result<Vec<Value>, RowError>`, and so is `db::RowSource`'s, which a copy's
+    read feeds too: `Issue` is `RowCtx::row`'s backstop for a file that changed underneath the
+    import since `validate` passed it, carrying only the record's first problem since the load is
+    all-or-nothing and the list has already been shown; `Read` is the CSV parser's own words, or a
+    copy's read's error; `Copy` is a `copy_table::CopyStop`. It was an `Err(String)` the db layer
+    carried as text, so why a load stopped on its own rows could only ever be said in English.
+    `message()` is that string byte for byte — *line N, column C: `IssueKind::message` (text)*, the
+    text `empty` for a blank field, and `Read`'s and `Copy`'s words as they are
+    (`a_row_error_says_what_it_used_to`; `row_iter_reports_the_first_bad_row_and_says_where` asserts
+    the exact English).
     **A shape check still has to refuse a number with no SQL literal.** `ColKind::Exact` parses for
     shape only — the text is what gets inserted, so nothing is rounded on the way through, which is
     the whole reason it is not `Float` — and `NaN`, `inf`, `Infinity` and `1e400` all parse as
@@ -5329,8 +5340,8 @@ existing prose was left alone.
     differently under `standard_conforming_strings` — `Server` through `export::server_literal`, and
     `Quoted` as-is. **Each is checked to be its form's shape first** — even-length hex digits,
     the dump's own checks, one of the shapes SQLite's `quote()` writes — and a cell that is not
-    makes the whole call an `Err`, so the batch is never written and the load's transaction rolls
-    back: these texts go into the statement as SQL, nothing else may, and a wrong shape written
+    makes the whole call an `Err` (`copy_table::CopyStop::NotItsForm`, naming the column), so the
+    batch is never written and the load's transaction rolls back: these texts go into the statement as SQL, nothing else may, and a wrong shape written
     would be a wrong value rather than a refusal
     (`a_carried_cell_is_written_as_its_form_and_checked_first`,
     `overriding_puts_the_clause_before_values_where_the_engine_has_one`). **A `Value` cell goes
@@ -9881,6 +9892,13 @@ existing prose was left alone.
     loudly instead of writing the placeholder
     (`a_chunk_holding_a_bytes_placeholder_is_refused`, which also holds that prose reading
     `<3 bytes>` in a text column passes; SQLite's `a_copy_never_writes_a_bytes_placeholder`).
+    It answers a **`CopyStop`** rather than a sentence — `TooLong { column }` (`None` when the read
+    did not name it) or `Bytes { column }`, with `NotItsForm { column }` the third arm,
+    `import::build_insert_as`'s refusal of a cell not in its form's shape — so the interface can
+    word why a copy stopped; `message()` is the English the `String` said before, byte for byte
+    (`a_copy_refusal_says_what_it_used_to`). It is a *stop* because `CopyRefusal` was taken: that
+    is `refusal`'s answer, the modal's own refusals before anything runs (*Name the copy.*), this a
+    value met mid-write, which reaches the interface inside `import::RowError::Copy`.
     `rows_change(src)` is the preview's change-list line for the rows — *"Then copy every row of
     `<source>` into it (not shown as SQL)"*, the source through `schema::display_name`, so bare
     where it has no schema. The rows are no statement in the plan: `Db::copy_rows` streams them once
@@ -18891,7 +18909,10 @@ existing prose was left alone.
   Its `modal_source` follows the same predicate as the English prefix —
   `WriteCause::is_statements`, `Statement` where the message says "query failed:", `App` over a
   Stop or a refusal — so it lands where the variant it replaced did. **Only the exits that carry
-  a rollback became `Write`**: a server error PostgreSQL's write paths return bare, through
+  a rollback became `Write`** — and one producer that never does: `row_failure`, a row source's
+  `WriteCause::Row` built with `undone: None` for the engine to complete (under `Db::import_rows`
+  below), which reaches the interface as a `Write` even where PostgreSQL and SQLite return it
+  bare. A server error PostgreSQL's write paths return bare, through
   `db_err`, is still a `Query`, as is one under SQL Server's savepoint, which carries no note
   (`WriteScope::failure`, under `mssql.rs`), and both still read "query failed:" in English in
   every language. `modal_source_tests` has no `Write` case; the SQL Server import's live tests
@@ -20878,7 +20899,10 @@ existing prose was left alone.
   **`import_rows` is that discipline scaled to a file**, in the shape every engine's load takes
   (`Db::import_rows`, under `lib.rs` below): one `BEGIN TRANSACTION`, batches pulled through the
   shared `next_batch_off_executor`, each required to insert exactly its own rows or the whole
-  import rolls back. **The batches are literal SQL, not bound parameters** — the shared
+  import rolls back. An error the import is *handed* — the batch read's, or
+  `ImportTarget::insert_sql`'s — leaves through `failed_on`: a row source's `DbError::Write`, which
+  arrives with no `undone`, keeps its cause and gains the rollback, and anything else is `failed`
+  over its own sentence (`err_text`), as before. **The batches are literal SQL, not bound parameters** — the shared
   `import::build_insert_as` through `ImportTarget::insert_sql`, `N'…'` for text — where
   `commit_writes` binds: a bound batch spends a
   parameter per cell, SQL Server takes at most 2,100 per request, and 500 rows of five columns is
@@ -21860,8 +21884,17 @@ existing prose was left alone.
   Its other exits each roll back and say what that achieved, as a `DbError::Write`: a statement's
   error and a short batch count build one directly, and a reader's or statement builder's error
   goes through `with_partial_rollback`, which leaves it untouched after a complete rollback — the
-  message already implies one — and otherwise makes a `Query`'s text a `WriteCause::Server` with
-  the `Rollback`. `every_import_exit_says_what_the_rollback_achieved` reads `import_on`'s source
+  message already implies one — and otherwise gives it the `Rollback`: a `Query`'s text becomes a
+  `WriteCause::Server`, and a row source's failure, which arrives as a `Write` with `undone:
+  None`, keeps its cause and gains the `undone`.
+  **A row source's error reaches the engine as a value, not text.** `RowSource`'s item is
+  `Result<Vec<Value>, import::RowError>`, and the crate-private `row_failure` makes one a
+  `DbError::write(WriteCause::Row(e), None)` — a statement's failure, so "query failed:" in front
+  exactly as the `DbError::Query` it used to be — at the three places a row surfaces:
+  `next_batch`, `ImportTarget::insert_sql` (a `CopyStop` from `build_insert_as`) and SQLite's
+  import loop, which pulls the source directly. The rollback is left to the engine because only
+  the engine knows it: MySQL's `with_partial_rollback` above, SQL Server's `failed_on` (under
+  `mssql.rs`); PostgreSQL and SQLite return it bare, as they returned the `Query`. `every_import_exit_says_what_the_rollback_achieved` reads `import_on`'s source
   and fails on a `return Err(` whose next ten lines name none of `Some(undone)`,
   `cancelled_import(` and `with_partial_rollback(`, with a floor of three `Some(undone)`. The
   `COMMIT` exit's `Server` holds the driver's own sentence, as every other exit's does: it held
@@ -21937,13 +21970,14 @@ existing prose was left alone.
   is cancelled and the task awaited; the write's error wins over the read's. `progress` is called
   with the rows handed to the writer so far, once per chunk. **`ChunkRows` vets each chunk before
   handing over its first row**: when `copy_table::chunk_refusal` answers — a `<n bytes>`
-  placeholder in a bytes column, or a column past the chunk's arena cap — that is the reader's
-  error, and the write rolls back as it does on a bad record in a file, rather than writing a
-  value the read never had (`a_copy_never_writes_a_bytes_placeholder`). `ImportTarget` carries
+  placeholder in a bytes column, or a column past the chunk's arena cap — its `CopyStop` is the
+  reader's error, a `RowError::Copy` (the read's own failure a `RowError::Read`), and the write
+  rolls back as it does on a bad record in a file, rather than writing a value the read never had
+  (`a_copy_never_writes_a_bytes_placeholder`). `ImportTarget` carries
   the copy's `forms` and `overriding` (`copy_table::rows_read`) and derives `Default`, a file
   import passing neither; its `insert_sql` is how all four engines' writers build a batch,
   through `import::build_insert_as`, whose refusal of a cell not in its form's shape comes back
-  as a `DbError::Query`.
+  as `CopyStop::NotItsForm` and leaves as `row_failure`'s `DbError::Write`.
   `a_copy_moves_every_row_from_one_database_to_another` is the SQLite happy path; the live tier's
   `a_copied_table_has_every_row_and_numbers_on_past_them` runs it end to end — plan, rows, settle —
   in `runtime.rs` on MariaDB, MySQL 8 and PostgreSQL and under the same name in `mssql.rs`.
@@ -27975,9 +28009,11 @@ existing prose was left alone.
     plurals `import-problems` and `import-done`, and each problem's line through `issue_line` —
     `import-problem-at-line` or `import-problem-at-column`, a message per shape rather than a place
     spliced in. What is wrong with a field is core's word drawn here, early, as the roadmap's rule
-    for a property of a typed value has it: `issue_kind_message` stands in for `IssueKind::message`
-    (`import-issue-*`), core keeping its English for the CLI, and
-    `english_words_every_issue_kind_as_core_does` holds the two equal for every kind;
+    for a property of a typed value has it: `i18n::issue_kind_message` stands in for
+    `IssueKind::message` (`import-issue-*`), core keeping its English for the CLI — in `i18n.rs`
+    rather than here, `pub(crate)`, because the load's backstop says it too (*The string
+    catalogue*) — and `english_words_every_issue_kind_as_core_does`, still in this file, holds the
+    two equal for every kind;
     `the_composed_lines_read_as_they_did_in_english` pins the rest. Core's composed prose is the
     catalogue's too, from the value core decides: `issue_tail_text` words `import::issue_tail_of`'s
     `IssueTail` from `import-tail-*`, and `memory_warning_text` the `MemoryWarning`
@@ -27989,11 +28025,12 @@ existing prose was left alone.
     `xlsx_size_refusal` and `i18n::import_error_text` for every `ImportError` the three return, in
     place of `e.to_string()`. How the load *failed* is the app's too: `ImportOutcome::Failed` takes
     `db_error_shown`, so a `DbError::Write` — the cancelled sentence, the batch count, the rollback
-    clause — is `i18n::write_failure_text`'s (*The string catalogue*). What stays English: the format names (`ImportFormat::label`); a
-    library's own text inside `ImportError::Read` and an io error's OS text; the load's per-row
-    backstop, `RowCtx::row`'s *line N, column M: …* `Err(String)`, which travels through the db layer
-    as text; the preview's `NULL` cell, a SQL keyword; the `—` for a missing column; and a target's
-    `name  (type)`.
+    clause — is `i18n::write_failure_text`'s (*The string catalogue*), and so, now that it is a
+    value (`import::RowError`), is the load's per-row backstop, `RowCtx::row`'s *line N, column
+    M: …*, which used to travel through the db layer as English text. What stays English: the
+    format names (`ImportFormat::label`); a library's own text inside `ImportError::Read`, the CSV
+    parser's inside `RowError::Read`, and an io error's OS text; the preview's `NULL` cell, a SQL
+    keyword; the `—` for a missing column; and a target's `name  (type)`.
   - `script_view.rs` — the **script-load** modal, **Import** to the user, over `core::script`; the
     inverse of `dump_view.rs` below, and the entry directly *above* it in the two menus that carry
     both (a database's and a PostgreSQL namespace's), where the group reads
@@ -41220,20 +41257,26 @@ Re-introducing the anti-patterns these guard against is a regression:
     `i18n::write_failure_text` words it from `write-*`: the 1-row miss a message per `WriteAction`
     (`write-one-row-delete`/`-update`/`-insert`), the batch count `write-batch-inserted`/`-affected`,
     the two Stops, each `Rollback` its own `write-rollback-*`, and `write-query-failed` wrapping
-    the lot exactly when `WriteCause::is_statements` says core's English would. **The three
+    the lot exactly when `WriteCause::is_statements` says core's English would. A `Row` is the
+    private `row_error_text`'s: a record's `Issue` is `write-row-issue`, or `write-row-issue-empty`
+    for a blank field, with what is wrong from `issue_kind_message` — the import modal's own words
+    for the problem list, moved here from `import_view.rs` so the two cannot drift — and each
+    `CopyStop` its `write-copy-*`, a message apiece for a column named and unnamed. **The three
     rollback messages open with `{" "}`**, because Fluent drops a value's leading blank and the
     clause is appended straight after the cause; written as plain text they lose the space.
     The app's `db_error_shown` asks it for a `Write` and `to_string()` for anything else, and
     `modal_error_shown` is `modal_about_another_statement` over that text; the Commit's
     `CommitDone::Failed`, the import's `ImportOutcome::Failed` and the copy's failure take them,
-    while the log keeps `to_string()`, English. What stays English: the server's, driver's or
-    reader's words inside `Server`, and a database-layer refusal's own text inside `Refused` (SQL
+    while the log keeps `to_string()`, English. What stays English: the server's or driver's
+    words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and a
+    database-layer refusal's own text inside `Refused` (SQL
     Server's blank-string and code-page refusals — the note after it is worded); and every write
     failure that is not a `Write` — PostgreSQL's server errors on these paths, a SQL Server batch
     under a Manual tab's savepoint — whose "query failed:" stays English in every language.
     `english_says_every_write_failure_as_core_does` holds it equal to `message` over every cause,
-    every 1-row miss with and without a schema, each batch count both ways, and each with every
-    rollback outcome and none.
+    every 1-row miss with and without a schema, each batch count both ways, every `IssueKind`
+    with and without text, a `Read` and each `CopyStop`, and each with every rollback outcome and
+    none.
     A Manual tab's run disclosures are the case where the choice is the hard part and the words
     the easy one: `tx::TxNote` is what a failed or cancelled run cost its transaction, chosen by
     `tx::run_failure_note`/`run_cancelled_note` (under `core::tx`, with every reason), and
