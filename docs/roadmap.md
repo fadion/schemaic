@@ -124,7 +124,9 @@ assertions pin English wording — stays the regression net throughout.
    the DDL modal's failure (`schemaic_db::DdlCause`, which `DdlError` carries in place of
    its flattened text; the app's `ddl_error_shown`, the write log keeping the English),
    and the run paths' own notices (each an English `ModalError::app` with its wording as
-   `shown`, `StatementTimeout::cancelled_message` the timed-out one's English).
+   `shown`, `StatementTimeout::cancelled_message` the timed-out one's English), and the
+   DDL preview's change list (`ddl::ChangeLine`, which `Change::line` builds and
+   `SchemaPlan::lines` and `stats::drop_preview` carry; `ddl_preview::change_line_text`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -145,11 +147,14 @@ assertions pin English wording — stays the regression net throughout.
    keys) and AI prompts keep core's English. What the converted views and the app pass through
    unchanged today is this phase's list to work from (surveyed 2026-10-19; it once claimed only
    the number formatting was left, which was never true):
-   - **The DDL preview modal's body** — `ddl::Change::summary`, `risk_heading`, `destructive`,
-     `unsupported`, `used_by::change_warnings`/`drop_warning`, the compare plan's `omitted`
-     (`compare::omission_note`) and the AI proposal errors (`propose::resolve_target`/`apply`).
-     The largest group; a test in `ddl_preview.rs` matches `"gone — "` on the English.
-   - **The drop's preview lines** — `stats::drop_preview`, which goes with the DDL preview's body.
+   - **The rest of the DDL preview modal's body** — `risk_heading`, `destructive` (each
+     change's `risks`), `unsupported`, `used_by::change_warnings`/`drop_warning`, the
+     compare plan's `omitted` (`compare::omission_note`), `ddl::elsewhere_report` and the
+     AI proposal errors (`propose::resolve_target`/`apply`). The change list is done
+     (`ddl::ChangeLine`, `ddl_preview::change_line_text`). A test in `ddl_preview.rs`
+     matches `"gone — "` on the English.
+   - **The drop's warning** — `stats::drop_warning`, which goes with the risks; its line is
+     a `ChangeLine` now (`stats::drop_summary`).
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

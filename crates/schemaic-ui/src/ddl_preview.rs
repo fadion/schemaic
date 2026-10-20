@@ -257,7 +257,11 @@ pub(crate) fn preview_of(
         // in-database runner, so the two answers differ for exactly this case.
         qualified: !cs.changes.iter().any(schemaic_core::ddl::is_server_level)
             && !cs.changes.iter().all(schemaic_core::ddl::is_account_change),
-        changes: cs.changes.iter().map(|c| c.summary()).collect(),
+        changes: cs
+            .changes
+            .iter()
+            .map(|c| change_line_text(&c.line()))
+            .collect(),
         destructive: cs.destructive(),
         risk_heading: cs.risk_heading(),
         used_by: Vec::new(),
@@ -342,7 +346,11 @@ pub(crate) fn preview_of_plan(
         // Each *statement* is still qualified, and `summaries` names the object
         // per line.
         qualified: false,
-        changes: plan.summaries(),
+        changes: plan
+            .lines()
+            .iter()
+            .map(|(subject, line)| plan_line_text(subject, line))
+            .collect(),
         destructive: plan.destructive(),
         risk_heading: plan.risk_heading(),
         used_by: Vec::new(),
@@ -544,7 +552,10 @@ pub(crate) fn preview_change_warning(
     table: &str,
     schema: Option<&str>,
     change: schemaic_core::ddl::Change,
-    reword: impl FnOnce(Vec<String>, Vec<String>) -> (Vec<String>, Vec<String>),
+    reword: impl FnOnce(
+        Vec<schemaic_core::ddl::ChangeLine>,
+        Vec<String>,
+    ) -> (Vec<schemaic_core::ddl::ChangeLine>, Vec<String>),
 ) {
     let ctx = crate::table_designer::edit_ctx(conn);
     let cs = schemaic_core::ddl::single(table, schema, ctx.dialect, change);
@@ -555,10 +566,12 @@ pub(crate) fn preview_change_warning(
         &cs,
         ctx.read_only,
     );
-    (p.changes, p.destructive) = reword(
-        std::mem::take(&mut p.changes),
+    let (lines, destructive) = reword(
+        cs.changes.iter().map(|c| c.line()).collect(),
         std::mem::take(&mut p.destructive),
     );
+    p.changes = lines.iter().map(change_line_text).collect();
+    p.destructive = destructive;
     open_preview(ddl, p);
 }
 
@@ -1427,6 +1440,537 @@ pub(crate) fn ddl_preview_overlay(
     })
 }
 
+/// A change's line in the preview's list — core's
+/// [`ChangeLine::message`](schemaic_core::ddl::ChangeLine::message) in the
+/// interface's language. Names, types, SQL and clause keywords stay as they
+/// came.
+pub(crate) fn change_line_text(line: &schemaic_core::ddl::ChangeLine) -> String {
+    use schemaic_core::ddl::{
+        AddedClause, ChangeLine as L, ClauseChange, EventEdit, IndexStorage, MoveTo,
+        PrivilegeWords, SequenceEdit, TableOptionEdit,
+    };
+    use schemaic_core::schema::EventStatus;
+    use schemaic_core::users::PrincipalKind;
+    let list = |v: &[String]| v.join(", ");
+    let what = |k| crate::i18n::object_kind(k);
+    // A selector's answer for an optional part: whether it is there.
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    let added = |clauses: &[AddedClause]| -> String {
+        let words: Vec<String> = clauses
+            .iter()
+            .map(|c| {
+                tr!(
+                    "ddl-clause-added",
+                    clause = c.kind.label(),
+                    value = c.value.as_str()
+                )
+            })
+            .collect();
+        words.join(", ")
+    };
+    let changed = |clauses: &[ClauseChange]| -> String {
+        let side = |v: &Option<String>| v.clone().unwrap_or_else(|| tr!("ddl-clause-none"));
+        let words: Vec<String> = clauses
+            .iter()
+            .map(|c| {
+                tr!(
+                    "ddl-clause-changed",
+                    clause = c.kind.label(),
+                    from = side(&c.from),
+                    to = side(&c.to)
+                )
+            })
+            .collect();
+        words.join(", ")
+    };
+    let privileges = |p: &PrivilegeWords| match p {
+        PrivilegeWords::None => tr!("ddl-privileges-none"),
+        PrivilegeWords::Named(names) => list(names),
+        &PrivilegeWords::Count(count) => tr!("ddl-privileges-count", count = count),
+    };
+    match line {
+        &L::CreateTable { ref name, columns } => {
+            tr!(
+                "ddl-line-create-table",
+                name = name.as_str(),
+                columns = columns
+            )
+        }
+        L::RebuildTable { name } => tr!("ddl-line-rebuild-table", name = name.as_str()),
+        L::DropTable => tr!("ddl-line-drop-table"),
+        L::DropForeignTable => tr!("ddl-line-drop-foreign-table"),
+        L::TruncateTable => tr!("ddl-line-truncate-table"),
+        L::RenameTable { to } => tr!("ddl-line-rename-table", to = to.as_str()),
+        L::AddColumn {
+            name,
+            type_name,
+            clauses,
+        } => tr!(
+            "ddl-line-add-column",
+            name = name.as_str(),
+            datatype = type_name.as_str(),
+            has_clauses = yes(!clauses.is_empty()),
+            clauses = added(clauses)
+        ),
+        L::DropColumn { name } => tr!("ddl-line-drop-column", name = name.as_str()),
+        L::RebuildComputedColumn { name, expression } => tr!(
+            "ddl-line-rebuild-computed-column",
+            name = name.as_str(),
+            expression = expression.as_str()
+        ),
+        L::RenameColumn {
+            from,
+            to,
+            retype,
+            clauses,
+        } => {
+            let (old_type, new_type) = retype.clone().unwrap_or_default();
+            tr!(
+                "ddl-line-rename-column",
+                from = from.as_str(),
+                to = to.as_str(),
+                retyped = yes(retype.is_some()),
+                old_type = old_type,
+                new_type = new_type,
+                has_clauses = yes(!clauses.is_empty()),
+                clauses = changed(clauses)
+            )
+        }
+        L::MoveColumn { name, to } => match to {
+            MoveTo::First => tr!("ddl-line-move-column-first", name = name.as_str()),
+            MoveTo::After(a) => {
+                tr!(
+                    "ddl-line-move-column-after",
+                    name = name.as_str(),
+                    after = a.as_str()
+                )
+            }
+            MoveTo::Unplaced => tr!("ddl-line-move-column", name = name.as_str()),
+        },
+        L::RetypeColumn {
+            name,
+            from,
+            to,
+            clauses,
+        } => tr!(
+            "ddl-line-retype-column",
+            name = name.as_str(),
+            from = from.as_str(),
+            to = to.as_str(),
+            has_clauses = yes(!clauses.is_empty()),
+            clauses = changed(clauses)
+        ),
+        L::ChangeColumn { name, clauses } => tr!(
+            "ddl-line-change-column",
+            name = name.as_str(),
+            has_clauses = yes(!clauses.is_empty()),
+            clauses = changed(clauses)
+        ),
+        L::AddPrimaryKey { columns } => {
+            tr!("ddl-line-add-primary-key", columns = list(columns))
+        }
+        L::DropPrimaryKey { columns } => {
+            tr!("ddl-line-drop-primary-key", columns = list(columns))
+        }
+        L::RebuildPrimaryKey { columns } => {
+            tr!("ddl-line-rebuild-primary-key", columns = list(columns))
+        }
+        L::ChangePrimaryKey { from, to } => tr!(
+            "ddl-line-change-primary-key",
+            from = list(from),
+            to = list(to)
+        ),
+        L::AddIndex(ix) => {
+            // The words before *index*, as core's `IndexStorage::summary_noun`;
+            // a rowstore index has none.
+            let kind = ix.storage.and_then(|kind| match kind {
+                IndexStorage::Rowstore => None,
+                IndexStorage::Columnstore => Some(tr!("ddl-index-kind-columnstore")),
+                IndexStorage::ClusteredColumnstore => {
+                    Some(tr!("ddl-index-kind-clustered-columnstore"))
+                }
+                IndexStorage::PrimaryXml => Some(tr!("ddl-index-kind-primary-xml")),
+                IndexStorage::SelectiveXml => Some(tr!("ddl-index-kind-selective-xml")),
+                IndexStorage::SecondaryXml => Some(tr!("ddl-index-kind-secondary-xml")),
+                IndexStorage::Spatial => Some(tr!("ddl-index-kind-spatial")),
+            });
+            // Each optional part answers a selector beside its value, rather
+            // than its value standing in for "absent": a column named `none`
+            // must not read as no key.
+            tr!(
+                "ddl-line-add-index",
+                unique = yes(ix.unique),
+                has_kind = yes(kind.is_some()),
+                kind = kind.unwrap_or_default(),
+                name = ix.name.as_str(),
+                has_method = yes(ix.method.is_some()),
+                method = ix.method.clone().unwrap_or_default(),
+                has_columns = yes(!ix.keys.is_empty()),
+                columns = list(&ix.keys),
+                has_include = yes(!ix.include.is_empty()),
+                include = list(&ix.include),
+                has_order = yes(!ix.order.is_empty()),
+                order = list(&ix.order),
+                has_predicate = yes(ix.predicate.is_some()),
+                predicate = ix.predicate.clone().unwrap_or_default()
+            )
+        }
+        L::DropIndex { name } => tr!("ddl-line-drop-index", name = name.as_str()),
+        L::RenameIndex { from, to } => {
+            tr!(
+                "ddl-line-rename-index",
+                from = from.as_str(),
+                to = to.as_str()
+            )
+        }
+        L::KeepLossyIndex { name } => tr!("ddl-line-keep-lossy-index", name = name.as_str()),
+        L::AddForeignKey {
+            name,
+            ref_table,
+            ref_columns,
+        } => tr!(
+            "ddl-line-add-foreign-key",
+            name = name.as_str(),
+            table = ref_table.as_str(),
+            columns = list(ref_columns)
+        ),
+        L::DropForeignKey { name } => tr!("ddl-line-drop-foreign-key", name = name.as_str()),
+        L::AddCheck { name, expression } => tr!(
+            "ddl-line-add-check",
+            name = name.as_str(),
+            expression = expression.as_str()
+        ),
+        L::DropCheck { name } => tr!("ddl-line-drop-check", name = name.as_str()),
+        L::TableOptions(parts) => {
+            let parts: Vec<String> = parts
+                .iter()
+                .map(|p| match p {
+                    TableOptionEdit::Engine(e) => {
+                        tr!("ddl-table-option-engine", engine = e.as_str())
+                    }
+                    TableOptionEdit::Collation(c) => {
+                        tr!("ddl-table-option-collation", collation = c.as_str())
+                    }
+                    TableOptionEdit::Comment => tr!("ddl-table-option-comment"),
+                    TableOptionEdit::CommentCleared => tr!("ddl-table-option-comment-cleared"),
+                })
+                .collect();
+            tr!("ddl-line-table-options", parts = parts.join(", "))
+        }
+        L::CreateView { name, indexes } => match indexes.as_slice() {
+            [] => tr!("ddl-line-create-view", name = name.as_str()),
+            [one] => tr!(
+                "ddl-line-create-view-index",
+                name = name.as_str(),
+                index = one.as_str()
+            ),
+            _ => tr!(
+                "ddl-line-create-view-indexes",
+                name = name.as_str(),
+                indexes = list(indexes)
+            ),
+        },
+        L::RedefineView { name } => tr!("ddl-line-redefine-view", name = name.as_str()),
+        L::RecreateView { name } => tr!("ddl-line-recreate-view", name = name.as_str()),
+        L::RenameView { to } => tr!("ddl-line-rename-view", to = to.as_str()),
+        L::DropView {
+            materialized: false,
+        } => tr!("ddl-line-drop-view"),
+        L::DropView { materialized: true } => tr!("ddl-line-drop-materialized-view"),
+        L::RefreshView {
+            concurrently: false,
+        } => tr!("ddl-line-refresh-view"),
+        L::RefreshView { concurrently: true } => tr!("ddl-line-refresh-view-concurrently"),
+        L::CreateTrigger { name } => tr!("ddl-line-create-trigger", name = name.as_str()),
+        L::RedefineTrigger { name } => tr!("ddl-line-redefine-trigger", name = name.as_str()),
+        L::RecreateTrigger { from: None, name } => {
+            tr!("ddl-line-recreate-trigger", name = name.as_str())
+        }
+        L::RecreateTrigger {
+            from: Some(from),
+            name,
+        } => tr!(
+            "ddl-line-recreate-trigger-as",
+            from = from.as_str(),
+            name = name.as_str()
+        ),
+        L::DropTrigger { name } => tr!("ddl-line-drop-trigger", name = name.as_str()),
+        L::CreateRoutine { kind, name } => {
+            tr!(
+                "ddl-line-create-routine",
+                what = what(*kind),
+                name = name.as_str()
+            )
+        }
+        L::ReplaceRoutine {
+            kind,
+            recreate,
+            from,
+            name,
+        } => {
+            let (what, name) = (what(*kind), name.as_str());
+            match (recreate, from) {
+                (false, None) => tr!("ddl-line-redefine-routine", what = what, name = name),
+                (false, Some(from)) => tr!(
+                    "ddl-line-redefine-routine-as",
+                    what = what,
+                    from = from.as_str(),
+                    name = name
+                ),
+                (true, None) => tr!("ddl-line-recreate-routine", what = what, name = name),
+                (true, Some(from)) => tr!(
+                    "ddl-line-recreate-routine-as",
+                    what = what,
+                    from = from.as_str(),
+                    name = name
+                ),
+            }
+        }
+        L::RenameRoutine { kind, from, to } => tr!(
+            "ddl-line-rename-routine",
+            what = what(*kind),
+            from = from.as_str(),
+            to = to.as_str()
+        ),
+        L::DropRoutine { kind, name } => {
+            tr!(
+                "ddl-line-drop-routine",
+                what = what(*kind),
+                name = name.as_str()
+            )
+        }
+        L::CreateEvent { name } => tr!("ddl-line-create-event", name = name.as_str()),
+        L::AlterEvent { name, edits } if edits.is_empty() => {
+            tr!("ddl-line-alter-event", name = name.as_str())
+        }
+        L::AlterEvent { name, edits } => {
+            let edits: Vec<String> = edits
+                .iter()
+                .map(|e| match e {
+                    EventEdit::Rename(to) => tr!("ddl-event-edit-rename", to = to.as_str()),
+                    EventEdit::Schedule(s) => {
+                        tr!("ddl-event-edit-schedule", schedule = s.as_str())
+                    }
+                    EventEdit::Status(EventStatus::Enabled) => {
+                        tr!("ddl-event-edit-status-enabled")
+                    }
+                    EventEdit::Status(EventStatus::Disabled) => {
+                        tr!("ddl-event-edit-status-disabled")
+                    }
+                    EventEdit::Status(
+                        EventStatus::SlavesideDisabled | EventStatus::ReplicaDisabled,
+                    ) => tr!("ddl-event-edit-status-replica"),
+                    EventEdit::Preserve(true) => tr!("ddl-event-edit-preserve"),
+                    EventEdit::Preserve(false) => tr!("ddl-event-edit-no-preserve"),
+                    EventEdit::Definer(d) => tr!("ddl-event-edit-definer", definer = d.as_str()),
+                    EventEdit::Comment => tr!("ddl-event-edit-comment"),
+                    EventEdit::Body => tr!("ddl-event-edit-body"),
+                })
+                .collect();
+            tr!(
+                "ddl-line-alter-event-edits",
+                name = name.as_str(),
+                edits = edits.join(", ")
+            )
+        }
+        L::DropEvent { name } => tr!("ddl-line-drop-event", name = name.as_str()),
+        &L::CreateEnum { ref name, values } => {
+            tr!(
+                "ddl-line-create-enum",
+                name = name.as_str(),
+                values = values
+            )
+        }
+        L::AddEnumValue {
+            value,
+            after,
+            before,
+        } => match (after, before) {
+            (Some(a), _) => tr!(
+                "ddl-line-add-enum-value-after",
+                value = value.as_str(),
+                after = a.as_str()
+            ),
+            (_, Some(b)) => tr!(
+                "ddl-line-add-enum-value-before",
+                value = value.as_str(),
+                before = b.as_str()
+            ),
+            _ => tr!("ddl-line-add-enum-value", value = value.as_str()),
+        },
+        L::RenameEnumValue { from, to } => {
+            tr!(
+                "ddl-line-rename-enum-value",
+                from = from.as_str(),
+                to = to.as_str()
+            )
+        }
+        &L::RecreateEnum {
+            ref name,
+            values,
+            columns,
+        } => tr!(
+            "ddl-line-recreate-enum",
+            name = name.as_str(),
+            values = values,
+            columns = columns
+        ),
+        L::CreateDomain { name, base_type } => tr!(
+            "ddl-line-create-domain",
+            name = name.as_str(),
+            datatype = base_type.as_str()
+        ),
+        L::SetDomainDefault { to: Some(d) } => {
+            tr!("ddl-line-set-domain-default", default = d.as_str())
+        }
+        L::SetDomainDefault { to: None } => tr!("ddl-line-drop-domain-default"),
+        L::SetDomainNotNull { to: true } => tr!("ddl-line-domain-not-null"),
+        L::SetDomainNotNull { to: false } => tr!("ddl-line-domain-nullable"),
+        &L::RecreateDomain {
+            ref name,
+            ref base_type,
+            ref was,
+            columns,
+        } => tr!(
+            "ddl-line-recreate-domain",
+            name = name.as_str(),
+            datatype = base_type.as_str(),
+            was = was.as_str(),
+            columns = columns
+        ),
+        L::CreateSequence { name } => tr!("ddl-line-create-sequence", name = name.as_str()),
+        L::AlterSequence(edits) => {
+            let edits: Vec<String> = edits
+                .iter()
+                .map(|e| match e {
+                    SequenceEdit::Type(t) => tr!("ddl-sequence-edit-type", datatype = t.as_str()),
+                    SequenceEdit::Increment(n) => {
+                        tr!("ddl-sequence-edit-increment", value = n.to_string())
+                    }
+                    SequenceEdit::Minimum(n) => {
+                        tr!("ddl-sequence-edit-minimum", value = n.to_string())
+                    }
+                    SequenceEdit::Maximum(n) => {
+                        tr!("ddl-sequence-edit-maximum", value = n.to_string())
+                    }
+                    SequenceEdit::Start(n) => {
+                        tr!("ddl-sequence-edit-start", value = n.to_string())
+                    }
+                    SequenceEdit::Cache(n) => {
+                        tr!("ddl-sequence-edit-cache", value = n.to_string())
+                    }
+                    SequenceEdit::Cycling(true) => tr!("ddl-sequence-edit-cycling-on"),
+                    SequenceEdit::Cycling(false) => tr!("ddl-sequence-edit-cycling-off"),
+                    SequenceEdit::Owner(Some(o)) => {
+                        tr!("ddl-sequence-edit-owner", owner = o.as_str())
+                    }
+                    SequenceEdit::Owner(None) => tr!("ddl-sequence-edit-no-owner"),
+                })
+                .collect();
+            tr!("ddl-line-alter-sequence", edits = edits.join(", "))
+        }
+        L::RestartSequence { to } => tr!("ddl-line-restart-sequence", value = to.as_str()),
+        L::CreateObject { kind, name } => {
+            tr!(
+                "ddl-line-create-object",
+                what = what(*kind),
+                name = name.as_str()
+            )
+        }
+        L::ReplaceObject {
+            kind,
+            name,
+            renamed: None,
+        } => tr!(
+            "ddl-line-replace-object",
+            what = what(*kind),
+            name = name.as_str()
+        ),
+        L::ReplaceObject {
+            kind,
+            name,
+            renamed: Some(to),
+        } => tr!(
+            "ddl-line-replace-object-as",
+            what = what(*kind),
+            name = name.as_str(),
+            to = to.as_str()
+        ),
+        L::AlterTsqlSequence { clauses } => {
+            tr!("ddl-line-alter-tsql-sequence", clauses = list(clauses))
+        }
+        L::RenameObject { kind, to } => {
+            tr!(
+                "ddl-line-rename-object",
+                what = what(*kind),
+                to = to.as_str()
+            )
+        }
+        L::DropObject { kind } => tr!("ddl-line-drop-object", what = what(*kind)),
+        L::SetObjectComment { kind, set: true } => {
+            tr!("ddl-line-set-object-comment", what = what(*kind))
+        }
+        L::SetObjectComment { kind, set: false } => {
+            tr!("ddl-line-clear-object-comment", what = what(*kind))
+        }
+        L::CreateDatabase { name } => tr!("ddl-line-create-database", name = name.as_str()),
+        L::DropDatabase { name } => tr!("ddl-line-drop-database", name = name.as_str()),
+        L::CreateSchema { name } => tr!("ddl-line-create-schema", name = name.as_str()),
+        L::DropSchema { name } => tr!("ddl-line-drop-schema", name = name.as_str()),
+        L::CreateExtension { name } => tr!("ddl-line-create-extension", name = name.as_str()),
+        L::CreateAccount { kind, who } => {
+            let who = who.as_str();
+            match kind {
+                PrincipalKind::User => tr!("ddl-line-create-user", who = who),
+                PrincipalKind::Role => tr!("ddl-line-create-role", who = who),
+                PrincipalKind::Login => tr!("ddl-line-create-login", who = who),
+            }
+        }
+        L::DropAccount { kind, who } => {
+            let who = who.as_str();
+            match kind {
+                PrincipalKind::User => tr!("ddl-line-drop-user", who = who),
+                PrincipalKind::Role => tr!("ddl-line-drop-role", who = who),
+                PrincipalKind::Login => tr!("ddl-line-drop-login", who = who),
+            }
+        }
+        L::SetPassword { who } => tr!("ddl-line-set-password", who = who.as_str()),
+        L::GrantPrivileges { privileges: p, to } => tr!(
+            "ddl-line-grant-privileges",
+            privileges = privileges(p),
+            who = to.as_str()
+        ),
+        L::RevokePrivileges {
+            privileges: p,
+            from,
+        } => tr!(
+            "ddl-line-revoke-privileges",
+            privileges = privileges(p),
+            who = from.as_str()
+        ),
+        L::GrantRole { role, member } => tr!(
+            "ddl-line-grant-role",
+            role = role.as_str(),
+            member = member.as_str()
+        ),
+        L::RevokeRole { role, member } => tr!(
+            "ddl-line-revoke-role",
+            role = role.as_str(),
+            member = member.as_str()
+        ),
+    }
+}
+
+/// A comparison's line: `line` worded, about `subject` — core's
+/// `SchemaPlan::summaries` in the interface's language.
+pub(crate) fn plan_line_text(subject: &str, line: &schemaic_core::ddl::ChangeLine) -> String {
+    tr!(
+        "ddl-line-of",
+        subject = subject,
+        line = change_line_text(line)
+    )
+}
+
 /// A `DdlUi` with every signal freshly made, for the tests in this crate that
 /// need one.
 ///
@@ -1487,6 +2031,380 @@ mod tests {
     use super::*;
     use floem::reactive::Scope;
     use schemaic_core::intel::SqlDialect;
+
+    /// **Every change line reads in English exactly as core's** — each
+    /// variant, with its optional parts present and absent, its counts at one
+    /// and many and its lists empty, single and several.
+    #[test]
+    fn english_says_every_change_line_as_core_does() {
+        use schemaic_core::ddl::{
+            AddedClause, ChangeLine as L, ClauseChange, ClauseKind, EventEdit, IndexLine,
+            IndexStorage, MoveTo, ObjectKind, PrivilegeWords, SequenceEdit, TableOptionEdit,
+        };
+        use schemaic_core::schema::EventStatus;
+        use schemaic_core::users::PrincipalKind;
+        let s = |v: &str| v.to_string();
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let added: Vec<AddedClause> = ClauseKind::ALL
+            .iter()
+            .map(|&kind| AddedClause {
+                kind,
+                value: s("0"),
+            })
+            .collect();
+        let changed = vec![
+            ClauseChange {
+                kind: ClauseKind::Default,
+                from: Some(s("0")),
+                to: None,
+            },
+            ClauseChange {
+                kind: ClauseKind::Collate,
+                from: None,
+                to: Some(s("utf8mb4_bin")),
+            },
+        ];
+        let index = |unique, storage, method: Option<&str>, keys: &[&str], rest: bool| {
+            L::AddIndex(IndexLine {
+                unique,
+                storage,
+                name: s("ix"),
+                method: method.map(s),
+                keys: v(keys),
+                include: if rest { v(&["a", "b"]) } else { vec![] },
+                order: if rest { v(&["c"]) } else { vec![] },
+                predicate: rest.then(|| s("qty > 0")),
+            })
+        };
+        let kinds = [
+            ObjectKind::Enum,
+            ObjectKind::Sequence,
+            ObjectKind::Function,
+            ObjectKind::Procedure,
+            ObjectKind::Synonym,
+            ObjectKind::XmlSchemaCollection,
+        ];
+        let mut lines = vec![
+            L::CreateTable {
+                name: s("t"),
+                columns: 1,
+            },
+            L::CreateTable {
+                name: s("t"),
+                columns: 3,
+            },
+            L::RebuildTable { name: s("t") },
+            L::DropTable,
+            L::DropForeignTable,
+            L::TruncateTable,
+            L::RenameTable { to: s("u") },
+            L::AddColumn {
+                name: s("qty"),
+                type_name: s("int"),
+                clauses: vec![],
+            },
+            L::AddColumn {
+                name: s("qty"),
+                type_name: s("int"),
+                clauses: added,
+            },
+            L::DropColumn { name: s("qty") },
+            L::RebuildComputedColumn {
+                name: s("total"),
+                expression: s("qty * price"),
+            },
+            L::RenameColumn {
+                from: s("qty"),
+                to: s("n"),
+                retype: None,
+                clauses: vec![],
+            },
+            L::RenameColumn {
+                from: s("qty"),
+                to: s("n"),
+                retype: Some((s("int"), s("bigint"))),
+                clauses: changed.clone(),
+            },
+            L::MoveColumn {
+                name: s("qty"),
+                to: MoveTo::First,
+            },
+            L::MoveColumn {
+                name: s("qty"),
+                to: MoveTo::After(s("id")),
+            },
+            L::MoveColumn {
+                name: s("qty"),
+                to: MoveTo::Unplaced,
+            },
+            L::RetypeColumn {
+                name: s("qty"),
+                from: s("int"),
+                to: s("bigint"),
+                clauses: changed.clone(),
+            },
+            L::ChangeColumn {
+                name: s("qty"),
+                clauses: vec![],
+            },
+            L::ChangeColumn {
+                name: s("qty"),
+                clauses: changed,
+            },
+            L::AddPrimaryKey {
+                columns: v(&["id"]),
+            },
+            L::DropPrimaryKey {
+                columns: v(&["a", "b"]),
+            },
+            L::RebuildPrimaryKey {
+                columns: v(&["id"]),
+            },
+            L::ChangePrimaryKey {
+                from: v(&["id"]),
+                to: v(&["a", "b"]),
+            },
+            index(false, None, None, &["a"], false),
+            index(true, None, Some("gist"), &["a desc", "b"], true),
+            index(
+                false,
+                Some(IndexStorage::ClusteredColumnstore),
+                None,
+                &[],
+                false,
+            ),
+            // A part whose value is the selector's own word is still that part.
+            index(true, None, Some("no"), &["none"], true),
+            L::DropIndex { name: s("ix") },
+            L::RenameIndex {
+                from: s("ix"),
+                to: s("iy"),
+            },
+            L::KeepLossyIndex { name: s("ix") },
+            L::AddForeignKey {
+                name: s("fk"),
+                ref_table: s("customers"),
+                ref_columns: v(&["id", "region"]),
+            },
+            L::DropForeignKey { name: s("fk") },
+            L::AddCheck {
+                name: s("ck"),
+                expression: s("qty > 0"),
+            },
+            L::DropCheck { name: s("ck") },
+            L::TableOptions(vec![
+                TableOptionEdit::Engine(s("InnoDB")),
+                TableOptionEdit::Collation(s("utf8mb4_bin")),
+                TableOptionEdit::Comment,
+            ]),
+            L::TableOptions(vec![TableOptionEdit::CommentCleared]),
+            L::RedefineView { name: s("v") },
+            L::RecreateView { name: s("v") },
+            L::RenameView { to: s("w") },
+            L::DropView {
+                materialized: false,
+            },
+            L::DropView { materialized: true },
+            L::RefreshView {
+                concurrently: false,
+            },
+            L::RefreshView { concurrently: true },
+            L::CreateTrigger { name: s("tr") },
+            L::RedefineTrigger { name: s("tr") },
+            L::RecreateTrigger {
+                from: None,
+                name: s("tr"),
+            },
+            L::RecreateTrigger {
+                from: Some(s("old")),
+                name: s("tr"),
+            },
+            L::DropTrigger { name: s("tr") },
+            L::CreateEvent { name: s("ev") },
+            L::AlterEvent {
+                name: s("ev"),
+                edits: vec![],
+            },
+            L::AlterEvent {
+                name: s("ev"),
+                edits: vec![
+                    EventEdit::Rename(s("ev2")),
+                    EventEdit::Schedule(s("EVERY 1 HOUR")),
+                    EventEdit::Status(EventStatus::Enabled),
+                    EventEdit::Status(EventStatus::Disabled),
+                    EventEdit::Status(EventStatus::SlavesideDisabled),
+                    EventEdit::Status(EventStatus::ReplicaDisabled),
+                    EventEdit::Preserve(true),
+                    EventEdit::Preserve(false),
+                    EventEdit::Definer(s("root@localhost")),
+                    EventEdit::Comment,
+                    EventEdit::Body,
+                ],
+            },
+            L::DropEvent { name: s("ev") },
+            L::AddEnumValue {
+                value: s("x"),
+                after: None,
+                before: None,
+            },
+            L::AddEnumValue {
+                value: s("x"),
+                after: Some(s("a")),
+                before: None,
+            },
+            L::AddEnumValue {
+                value: s("x"),
+                after: None,
+                before: Some(s("b")),
+            },
+            L::RenameEnumValue {
+                from: s("a"),
+                to: s("b"),
+            },
+            L::CreateDomain {
+                name: s("d"),
+                base_type: s("int"),
+            },
+            L::SetDomainDefault { to: Some(s("0")) },
+            L::SetDomainDefault { to: None },
+            L::SetDomainNotNull { to: true },
+            L::SetDomainNotNull { to: false },
+            L::CreateSequence { name: s("sq") },
+            L::AlterSequence(vec![
+                SequenceEdit::Type(s("bigint")),
+                SequenceEdit::Increment(2),
+                SequenceEdit::Minimum(-5),
+                SequenceEdit::Maximum(1_000_000),
+                SequenceEdit::Start(10),
+                SequenceEdit::Cache(20),
+                SequenceEdit::Cycling(true),
+                SequenceEdit::Cycling(false),
+                SequenceEdit::Owner(Some(s("orders.id"))),
+                SequenceEdit::Owner(None),
+            ]),
+            L::RestartSequence { to: s("100") },
+            L::AlterTsqlSequence {
+                clauses: v(&["INCREMENT BY 2", "RESTART WITH 1"]),
+            },
+            L::CreateDatabase { name: s("shop") },
+            L::DropDatabase { name: s("shop") },
+            L::CreateSchema {
+                name: s("reporting"),
+            },
+            L::DropSchema {
+                name: s("reporting"),
+            },
+            L::CreateExtension {
+                name: s("pgcrypto"),
+            },
+            L::SetPassword { who: s("app@%") },
+            L::GrantRole {
+                role: s("reader"),
+                member: s("app@%"),
+            },
+            L::RevokeRole {
+                role: s("reader"),
+                member: s("app@%"),
+            },
+        ];
+        for n in [0, 1, 2] {
+            let indexes = v(&["ix1", "ix2"][..n]);
+            lines.push(L::CreateView {
+                name: s("v"),
+                indexes,
+            });
+        }
+        for (values, columns) in [(1, 1), (3, 2), (2, 0)] {
+            lines.push(L::CreateEnum {
+                name: s("e"),
+                values,
+            });
+            lines.push(L::RecreateEnum {
+                name: s("e"),
+                values,
+                columns,
+            });
+            lines.push(L::RecreateDomain {
+                name: s("d"),
+                base_type: s("bigint"),
+                was: s("int"),
+                columns,
+            });
+        }
+        for kind in kinds {
+            for from in [None, Some(s("old"))] {
+                for recreate in [false, true] {
+                    lines.push(L::ReplaceRoutine {
+                        kind,
+                        recreate,
+                        from: from.clone(),
+                        name: s("f"),
+                    });
+                }
+                lines.push(L::ReplaceObject {
+                    kind,
+                    name: s("o"),
+                    renamed: from.clone(),
+                });
+            }
+            lines.extend([
+                L::CreateRoutine { kind, name: s("f") },
+                L::RenameRoutine {
+                    kind,
+                    from: s("f"),
+                    to: s("g"),
+                },
+                L::DropRoutine { kind, name: s("f") },
+                L::CreateObject { kind, name: s("o") },
+                L::RenameObject { kind, to: s("p") },
+                L::DropObject { kind },
+                L::SetObjectComment { kind, set: true },
+                L::SetObjectComment { kind, set: false },
+            ]);
+        }
+        for kind in [
+            PrincipalKind::User,
+            PrincipalKind::Role,
+            PrincipalKind::Login,
+        ] {
+            lines.push(L::CreateAccount {
+                kind,
+                who: s("app@%"),
+            });
+            lines.push(L::DropAccount {
+                kind,
+                who: s("app@%"),
+            });
+        }
+        for privileges in [
+            PrivilegeWords::None,
+            PrivilegeWords::Named(v(&["SELECT"])),
+            PrivilegeWords::Named(v(&["SELECT", "INSERT", "UPDATE"])),
+            PrivilegeWords::Count(18),
+        ] {
+            lines.push(L::GrantPrivileges {
+                privileges: privileges.clone(),
+                to: s("app@%"),
+            });
+            lines.push(L::RevokePrivileges {
+                privileges,
+                from: s("app@%"),
+            });
+        }
+        for line in &lines {
+            assert_eq!(change_line_text(line), line.message(), "{line:?}");
+            assert_eq!(
+                plan_line_text("shop.orders", line),
+                format!("shop.orders — {}", line.message()),
+                "{line:?}"
+            );
+        }
+        // Every storage kind but the plain one names itself before *index*.
+        for storage in IndexStorage::ALL {
+            let line = index(false, Some(storage), None, &["a"], false);
+            assert_eq!(change_line_text(&line), line.message(), "{storage:?}");
+        }
+    }
 
     /// The change count heading and the applied line read as they did in
     /// English before the catalogue — the title has tests of its own below.

@@ -4862,10 +4862,10 @@ fn view_drop_cost(dialect: SqlDialect, restored: bool) -> &'static str {
 /// `Add column note text` with no warning and a `Primary`-coloured Apply. The
 /// SQL box did hold the truth, but it is a `no_wrap` field whose tail is off the
 /// right edge; the list is what the modal is built to be read as.
-fn column_clauses(c: &ColumnInfo) -> String {
+fn column_clauses(c: &ColumnInfo) -> Vec<AddedClause> {
     clause_pairs(c)
         .into_iter()
-        .filter_map(|(label, value)| value.map(|v| format!(", {label} {v}")))
+        .filter_map(|(kind, value)| value.map(|value| AddedClause { kind, value }))
         .collect()
 }
 
@@ -4881,15 +4881,15 @@ fn column_clauses(c: &ColumnInfo) -> String {
 /// exact: an added or edited clause was named, a cleared one was silent, and all
 /// three `AlterColumn` arms shared the same value so a rename or a retype hid it
 /// too.
-fn clause_pairs(c: &ColumnInfo) -> [(&'static str, Option<String>); 4] {
+fn clause_pairs(c: &ColumnInfo) -> [(ClauseKind, Option<String>); 4] {
     [
-        ("default", c.default.clone()),
+        (ClauseKind::Default, c.default.clone()),
         (
-            "generated as",
+            ClauseKind::GeneratedAs,
             c.generated.as_ref().map(|g| format!("({g})")),
         ),
-        ("on update", c.on_update.clone()),
-        ("collate", c.collation.clone()),
+        (ClauseKind::OnUpdate, c.on_update.clone()),
+        (ClauseKind::Collate, c.collation.clone()),
     ]
 }
 
@@ -4898,49 +4898,794 @@ fn clause_pairs(c: &ColumnInfo) -> [(&'static str, Option<String>); 4] {
 ///
 /// Empty when none differs, which is the "nothing to restate" case the
 /// `AlterColumn` arms already had.
-fn clause_changes(from: &ColumnInfo, to: &ColumnInfo) -> String {
-    let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "(none)".to_string());
+fn clause_changes(from: &ColumnInfo, to: &ColumnInfo) -> Vec<ClauseChange> {
     clause_pairs(from)
         .into_iter()
         .zip(clause_pairs(to))
         .filter(|((_, a), (_, b))| a != b)
-        .map(|((label, a), (_, b))| format!(", {label} {} → {}", show(&a), show(&b)))
+        .map(|((kind, from), (_, to))| ClauseChange { kind, from, to })
         .collect()
 }
 
-impl Change {
-    /// One line of plain language for the preview's change list.
-    pub fn summary(&self) -> String {
+/// Which of a column's free-SQL clauses a [`ChangeLine`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClauseKind {
+    Default,
+    GeneratedAs,
+    OnUpdate,
+    Collate,
+}
+
+impl ClauseKind {
+    /// Every kind, in the order a line names them.
+    pub const ALL: [ClauseKind; 4] = [
+        ClauseKind::Default,
+        ClauseKind::GeneratedAs,
+        ClauseKind::OnUpdate,
+        ClauseKind::Collate,
+    ];
+
+    /// The words a line names it by, in English.
+    pub fn label(self) -> &'static str {
         match self {
-            Change::CreateTable(d) => format!(
-                "Create table {} with {} column{}",
-                d.name,
-                d.columns.len(),
-                plural(d.columns.len())
-            ),
-            Change::RebuildTable(r) => format!(
-                "Rebuild {} — this can't be altered in place, so the rows are copied \
-                 into a new table and it takes the old one's place",
-                r.current.name
-            ),
-            Change::DropTable => "Drop the table".to_string(),
-            Change::DropForeignTable => "Drop the foreign table".to_string(),
-            Change::TruncateTable => "Delete every row".to_string(),
-            Change::RenameTable { to } => format!("Rename the table to {to}"),
-            Change::AddColumn { column, .. } => {
+            ClauseKind::Default => "default",
+            ClauseKind::GeneratedAs => "generated as",
+            ClauseKind::OnUpdate => "on update",
+            ClauseKind::Collate => "collate",
+        }
+    }
+}
+
+/// A clause a new column carries — `, default 0` — its `value` the SQL as
+/// written (a generated column's in parentheses).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddedClause {
+    pub kind: ClauseKind,
+    pub value: String,
+}
+
+/// A clause a column change moves from one value to another — `, default 0 →
+/// (none)` — `None` being no clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClauseChange {
+    pub kind: ClauseKind,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// Where a column move puts the column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MoveTo {
+    First,
+    After(String),
+    /// A move with no position, which no edit produces.
+    Unplaced,
+}
+
+/// An index being added, as its line names it — every list the statement
+/// carries, so a line cannot read the same before and after an edit of one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexLine {
+    pub unique: bool,
+    /// The kind, where it is not a plain rowstore index.
+    pub storage: Option<IndexStorage>,
+    pub name: String,
+    /// The access method, where `storage` does not already name it.
+    pub method: Option<String>,
+    /// The key columns, each with ` desc` where it descends.
+    pub keys: Vec<String>,
+    pub include: Vec<String>,
+    pub order: Vec<String>,
+    pub predicate: Option<String>,
+}
+
+/// One of a table's options a line names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableOptionEdit {
+    Engine(String),
+    Collation(String),
+    Comment,
+    CommentCleared,
+}
+
+/// One of a sequence's clauses that differ, as its line names it
+/// ([`sequence_edits`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SequenceEdit {
+    Type(String),
+    Increment(i64),
+    Minimum(i64),
+    Maximum(i64),
+    Start(i64),
+    Cache(i64),
+    Cycling(bool),
+    /// `table.column`, or `None` for no owner.
+    Owner(Option<String>),
+}
+
+/// One of an event's parts that differ, as its line names it
+/// ([`event_edits`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventEdit {
+    Rename(String),
+    /// The schedule's SQL, on one line.
+    Schedule(String),
+    Status(crate::schema::EventStatus),
+    /// Keep it after it completes, or delete it.
+    Preserve(bool),
+    Definer(String),
+    Comment,
+    Body,
+}
+
+/// A privilege list as a line says it — the names while they fit, a count
+/// once they don't ([`Change::privilege_words`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrivilegeWords {
+    None,
+    Named(Vec<String>),
+    Count(usize),
+}
+
+impl PrivilegeWords {
+    pub fn of(privileges: &[String]) -> PrivilegeWords {
+        match privileges.len() {
+            // **Not "nothing".** An empty selection emits no statement at all
+            // (`users::privilege_sql` answers `None`), so a summary reading
+            // "Grant nothing to app@%" describes a plan the preview then shows
+            // with an empty SQL box and a dimmed Apply — a change listed with no
+            // statement and no reason. Saying the list is empty is the sentence
+            // that matches what is on screen. Unreachable through the form,
+            // whose Apply asks `GrantDraft::is_ready` first; reachable by any
+            // caller that builds the change directly.
+            0 => PrivilegeWords::None,
+            1..=3 => PrivilegeWords::Named(privileges.to_vec()),
+            n => PrivilegeWords::Count(n),
+        }
+    }
+
+    /// The English.
+    pub fn message(&self) -> String {
+        match self {
+            PrivilegeWords::None => "no privileges".to_string(),
+            PrivilegeWords::Named(p) => p.join(", "),
+            PrivilegeWords::Count(n) => format!("{n} privileges"),
+        }
+    }
+}
+
+/// [`Change::summary`] as a value: one variant per sentence the preview's
+/// change list says, its fields the sentence's arguments, so the interface
+/// can say it in its own language. [`ChangeLine::message`] is the English,
+/// which the CLI, the MCP server and every test read.
+///
+/// Lists are carried whole and joined by whoever words them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChangeLine {
+    CreateTable {
+        name: String,
+        columns: usize,
+    },
+    RebuildTable {
+        name: String,
+    },
+    DropTable,
+    DropForeignTable,
+    TruncateTable,
+    RenameTable {
+        to: String,
+    },
+    AddColumn {
+        name: String,
+        type_name: String,
+        clauses: Vec<AddedClause>,
+    },
+    DropColumn {
+        name: String,
+    },
+    RebuildComputedColumn {
+        name: String,
+        expression: String,
+    },
+    /// A rename, with the retype it carries (`from`, `to`) where there is one.
+    RenameColumn {
+        from: String,
+        to: String,
+        retype: Option<(String, String)>,
+        clauses: Vec<ClauseChange>,
+    },
+    MoveColumn {
+        name: String,
+        to: MoveTo,
+    },
+    RetypeColumn {
+        name: String,
+        from: String,
+        to: String,
+        clauses: Vec<ClauseChange>,
+    },
+    ChangeColumn {
+        name: String,
+        clauses: Vec<ClauseChange>,
+    },
+    AddPrimaryKey {
+        columns: Vec<String>,
+    },
+    DropPrimaryKey {
+        columns: Vec<String>,
+    },
+    RebuildPrimaryKey {
+        columns: Vec<String>,
+    },
+    ChangePrimaryKey {
+        from: Vec<String>,
+        to: Vec<String>,
+    },
+    AddIndex(IndexLine),
+    DropIndex {
+        name: String,
+    },
+    RenameIndex {
+        from: String,
+        to: String,
+    },
+    KeepLossyIndex {
+        name: String,
+    },
+    AddForeignKey {
+        name: String,
+        ref_table: String,
+        ref_columns: Vec<String>,
+    },
+    DropForeignKey {
+        name: String,
+    },
+    /// A table's check or a domain's.
+    AddCheck {
+        name: String,
+        expression: String,
+    },
+    DropCheck {
+        name: String,
+    },
+    TableOptions(Vec<TableOptionEdit>),
+    /// With the indexes created alongside it (SQL Server's indexed view).
+    CreateView {
+        name: String,
+        indexes: Vec<String>,
+    },
+    RedefineView {
+        name: String,
+    },
+    RecreateView {
+        name: String,
+    },
+    RenameView {
+        to: String,
+    },
+    DropView {
+        materialized: bool,
+    },
+    RefreshView {
+        concurrently: bool,
+    },
+    CreateTrigger {
+        name: String,
+    },
+    RedefineTrigger {
+        name: String,
+    },
+    /// `from` where the server's name differs from the draft's.
+    RecreateTrigger {
+        from: Option<String>,
+        name: String,
+    },
+    DropTrigger {
+        name: String,
+    },
+    /// `kind` is the routine's, `Function` or `Procedure`.
+    CreateRoutine {
+        kind: ObjectKind,
+        name: String,
+    },
+    /// `from` where the server's name differs from the draft's; `recreate`
+    /// where the engine drops it first.
+    ReplaceRoutine {
+        kind: ObjectKind,
+        recreate: bool,
+        from: Option<String>,
+        name: String,
+    },
+    RenameRoutine {
+        kind: ObjectKind,
+        from: String,
+        to: String,
+    },
+    DropRoutine {
+        kind: ObjectKind,
+        name: String,
+    },
+    CreateEvent {
+        name: String,
+    },
+    AlterEvent {
+        name: String,
+        edits: Vec<EventEdit>,
+    },
+    DropEvent {
+        name: String,
+    },
+    CreateEnum {
+        name: String,
+        values: usize,
+    },
+    AddEnumValue {
+        value: String,
+        after: Option<String>,
+        before: Option<String>,
+    },
+    RenameEnumValue {
+        from: String,
+        to: String,
+    },
+    RecreateEnum {
+        name: String,
+        values: usize,
+        columns: usize,
+    },
+    CreateDomain {
+        name: String,
+        base_type: String,
+    },
+    SetDomainDefault {
+        to: Option<String>,
+    },
+    SetDomainNotNull {
+        to: bool,
+    },
+    RecreateDomain {
+        name: String,
+        base_type: String,
+        was: String,
+        columns: usize,
+    },
+    CreateSequence {
+        name: String,
+    },
+    AlterSequence(Vec<SequenceEdit>),
+    RestartSequence {
+        to: String,
+    },
+    /// A SQL Server standalone object's create.
+    CreateObject {
+        kind: ObjectKind,
+        name: String,
+    },
+    /// `renamed` where it comes back under another name.
+    ReplaceObject {
+        kind: ObjectKind,
+        name: String,
+        renamed: Option<String>,
+    },
+    /// SQL Server's `ALTER SEQUENCE`, its clauses the SQL itself.
+    AlterTsqlSequence {
+        clauses: Vec<String>,
+    },
+    RenameObject {
+        kind: ObjectKind,
+        to: String,
+    },
+    DropObject {
+        kind: ObjectKind,
+    },
+    SetObjectComment {
+        kind: ObjectKind,
+        set: bool,
+    },
+    CreateDatabase {
+        name: String,
+    },
+    DropDatabase {
+        name: String,
+    },
+    CreateSchema {
+        name: String,
+    },
+    DropSchema {
+        name: String,
+    },
+    CreateExtension {
+        name: String,
+    },
+    /// `who` is the name, with its host where a user's draft carries one.
+    CreateAccount {
+        kind: crate::users::PrincipalKind,
+        who: String,
+    },
+    DropAccount {
+        kind: crate::users::PrincipalKind,
+        who: String,
+    },
+    SetPassword {
+        who: String,
+    },
+    GrantPrivileges {
+        privileges: PrivilegeWords,
+        to: String,
+    },
+    RevokePrivileges {
+        privileges: PrivilegeWords,
+        from: String,
+    },
+    GrantRole {
+        role: String,
+        member: String,
+    },
+    RevokeRole {
+        role: String,
+        member: String,
+    },
+}
+
+impl ChangeLine {
+    /// The English — what [`Change::summary`] returns.
+    pub fn message(&self) -> String {
+        let list = |v: &[String]| v.join(", ");
+        let added = |clauses: &[AddedClause]| -> String {
+            clauses
+                .iter()
+                .map(|c| format!(", {} {}", c.kind.label(), c.value))
+                .collect()
+        };
+        let changed = |clauses: &[ClauseChange]| -> String {
+            let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "(none)".to_string());
+            clauses
+                .iter()
+                .map(|c| format!(", {} {} → {}", c.kind.label(), show(&c.from), show(&c.to)))
+                .collect()
+        };
+        match self {
+            ChangeLine::CreateTable { name, columns } => {
                 format!(
-                    "Add column {} {}{}",
-                    column.name,
-                    column.type_name,
-                    column_clauses(column)
+                    "Create table {name} with {columns} column{}",
+                    plural(*columns)
                 )
             }
-            Change::DropColumn { name, .. } => format!("Drop column {name}"),
-            Change::RebuildComputedColumn { column } => format!(
-                "Rebuild computed column {} as ({}) around the column change",
-                column.name,
-                column.generated.as_deref().unwrap_or_default()
+            ChangeLine::RebuildTable { name } => format!(
+                "Rebuild {name} — this can't be altered in place, so the rows are copied \
+                 into a new table and it takes the old one's place"
             ),
+            ChangeLine::DropTable => "Drop the table".to_string(),
+            ChangeLine::DropForeignTable => "Drop the foreign table".to_string(),
+            ChangeLine::TruncateTable => "Delete every row".to_string(),
+            ChangeLine::RenameTable { to } => format!("Rename the table to {to}"),
+            ChangeLine::AddColumn {
+                name,
+                type_name,
+                clauses,
+            } => format!("Add column {name} {type_name}{}", added(clauses)),
+            ChangeLine::DropColumn { name } => format!("Drop column {name}"),
+            ChangeLine::RebuildComputedColumn { name, expression } => {
+                format!("Rebuild computed column {name} as ({expression}) around the column change")
+            }
+            ChangeLine::RenameColumn {
+                from,
+                to,
+                retype,
+                clauses,
+            } => {
+                let retype = match retype {
+                    Some((a, b)) => format!(", and its type from {a} to {b}"),
+                    None => String::new(),
+                };
+                format!("Rename column {from} to {to}{retype}{}", changed(clauses))
+            }
+            ChangeLine::MoveColumn { name, to } => match to {
+                MoveTo::First => format!("Move column {name} first"),
+                MoveTo::After(a) => format!("Move column {name} after {a}"),
+                MoveTo::Unplaced => format!("Move column {name}"),
+            },
+            ChangeLine::RetypeColumn {
+                name,
+                from,
+                to,
+                clauses,
+            } => format!(
+                "Change column {name} from {from} to {to}{}",
+                changed(clauses)
+            ),
+            ChangeLine::ChangeColumn { name, clauses } => {
+                format!("Change column {name}{}", changed(clauses))
+            }
+            ChangeLine::AddPrimaryKey { columns } => {
+                format!("Add primary key ({})", list(columns))
+            }
+            ChangeLine::DropPrimaryKey { columns } => {
+                format!("Drop the primary key ({})", list(columns))
+            }
+            ChangeLine::RebuildPrimaryKey { columns } => format!(
+                "Rebuild the primary key ({}) around the column change",
+                list(columns)
+            ),
+            ChangeLine::ChangePrimaryKey { from, to } => format!(
+                "Change the primary key from ({}) to ({})",
+                list(from),
+                list(to)
+            ),
+            ChangeLine::AddIndex(ix) => {
+                let mut s = format!("Add {}", if ix.unique { "unique " } else { "" });
+                if let Some(kind) = ix.storage.and_then(IndexStorage::summary_noun) {
+                    s.push_str(kind);
+                    s.push(' ');
+                }
+                s.push_str(&format!("index {}", ix.name));
+                if let Some(m) = &ix.method {
+                    s.push_str(&format!(" using {m}"));
+                }
+                if !ix.keys.is_empty() {
+                    s.push_str(&format!(" on ({})", list(&ix.keys)));
+                }
+                if !ix.include.is_empty() {
+                    s.push_str(&format!(" including ({})", list(&ix.include)));
+                }
+                if !ix.order.is_empty() {
+                    s.push_str(&format!(" ordered by ({})", list(&ix.order)));
+                }
+                if let Some(p) = &ix.predicate {
+                    s.push_str(&format!(" where {p}"));
+                }
+                s
+            }
+            ChangeLine::DropIndex { name } => format!("Drop index {name}"),
+            ChangeLine::RenameIndex { from, to } => format!("Rename index {from} to {to}"),
+            ChangeLine::KeepLossyIndex { name } => {
+                format!("Leave index {name} unchanged — Schemaic can't read all of it")
+            }
+            ChangeLine::AddForeignKey {
+                name,
+                ref_table,
+                ref_columns,
+            } => format!(
+                "Add foreign key {name} → {ref_table}({})",
+                list(ref_columns)
+            ),
+            ChangeLine::DropForeignKey { name } => format!("Drop foreign key {name}"),
+            ChangeLine::AddCheck { name, expression } => {
+                format!("Add check {name} ({expression})")
+            }
+            ChangeLine::DropCheck { name } => format!("Drop check {name}"),
+            ChangeLine::TableOptions(parts) => {
+                let parts: Vec<String> = parts
+                    .iter()
+                    .map(|p| match p {
+                        TableOptionEdit::Engine(e) => format!("engine to {e}"),
+                        TableOptionEdit::Collation(c) => format!("collation to {c}"),
+                        TableOptionEdit::Comment => "comment".to_string(),
+                        TableOptionEdit::CommentCleared => "comment (cleared)".to_string(),
+                    })
+                    .collect();
+                format!("Set the table's {}", parts.join(", "))
+            }
+            ChangeLine::CreateView { name, indexes } => match indexes.len() {
+                0 => format!("Create view {name}"),
+                1 => format!("Create view {name} and its index {}", indexes[0]),
+                _ => format!("Create view {name} and its indexes {}", list(indexes)),
+            },
+            ChangeLine::RedefineView { name } => format!("Redefine view {name}"),
+            ChangeLine::RecreateView { name } => format!("Drop and re-create view {name}"),
+            ChangeLine::RenameView { to } => format!("Rename the view to {to}"),
+            ChangeLine::DropView { materialized } => format!(
+                "Drop the {}view",
+                if *materialized { "materialized " } else { "" }
+            ),
+            ChangeLine::RefreshView { concurrently } => format!(
+                "Rebuild the materialized view's rows{}",
+                if *concurrently {
+                    " without blocking readers"
+                } else {
+                    " — readers are blocked until it finishes"
+                }
+            ),
+            ChangeLine::CreateTrigger { name } => format!("Create trigger {name}"),
+            ChangeLine::RedefineTrigger { name } => format!("Redefine trigger {name}"),
+            ChangeLine::RecreateTrigger { from, name } => match from {
+                Some(from) => format!("Re-create trigger {from} as {name}"),
+                None => format!("Re-create trigger {name}"),
+            },
+            ChangeLine::DropTrigger { name } => format!("Drop trigger {name}"),
+            ChangeLine::CreateRoutine { kind, name } => {
+                format!("Create {} {name}", kind.label())
+            }
+            ChangeLine::ReplaceRoutine {
+                kind,
+                recreate,
+                from,
+                name,
+            } => {
+                let verb = if *recreate { "Re-create" } else { "Redefine" };
+                match from {
+                    Some(from) => format!("{verb} {} {from} as {name}", kind.label()),
+                    None => format!("{verb} {} {name}", kind.label()),
+                }
+            }
+            ChangeLine::RenameRoutine { kind, from, to } => {
+                format!("Rename {} {from} to {to}", kind.label())
+            }
+            ChangeLine::DropRoutine { kind, name } => format!("Drop {} {name}", kind.label()),
+            ChangeLine::CreateEvent { name } => format!("Create event {name}"),
+            ChangeLine::AlterEvent { name, edits } => {
+                if edits.is_empty() {
+                    format!("Alter event {name}")
+                } else {
+                    let edits: Vec<String> = edits.iter().map(EventEdit::message).collect();
+                    format!("Alter event {name}: {}", edits.join(", "))
+                }
+            }
+            ChangeLine::DropEvent { name } => format!("Drop event {name}"),
+            ChangeLine::CreateEnum { name, values } => {
+                format!("Create type {name} with {values} value{}", plural(*values))
+            }
+            ChangeLine::AddEnumValue {
+                value,
+                after,
+                before,
+            } => match (after, before) {
+                (Some(a), _) => format!("Add value {value} after {a}"),
+                (_, Some(b)) => format!("Add value {value} before {b}"),
+                _ => format!("Add value {value}"),
+            },
+            ChangeLine::RenameEnumValue { from, to } => format!("Rename value {from} to {to}"),
+            ChangeLine::RecreateEnum {
+                name,
+                values,
+                columns,
+            } => format!(
+                "Re-create type {name} ({values} value{}, re-casting {columns} column{})",
+                plural(*values),
+                plural(*columns)
+            ),
+            ChangeLine::CreateDomain { name, base_type } => {
+                format!("Create domain {name} as {base_type}")
+            }
+            ChangeLine::SetDomainDefault { to } => match to {
+                Some(d) => format!("Set the domain's default to {d}"),
+                None => "Drop the domain's default".to_string(),
+            },
+            ChangeLine::SetDomainNotNull { to } => {
+                format!(
+                    "Make the domain {}",
+                    if *to { "NOT NULL" } else { "nullable" }
+                )
+            }
+            ChangeLine::RecreateDomain {
+                name,
+                base_type,
+                was,
+                columns,
+            } => format!(
+                "Re-create domain {name} as {base_type} (was {was}; re-casting {columns} column{})",
+                plural(*columns)
+            ),
+            ChangeLine::CreateSequence { name } => format!("Create sequence {name}"),
+            ChangeLine::AlterSequence(edits) => {
+                let edits: Vec<String> = edits.iter().map(SequenceEdit::message).collect();
+                format!("Set the sequence's {}", edits.join(", "))
+            }
+            ChangeLine::RestartSequence { to } => format!("Restart the sequence at {to}"),
+            ChangeLine::CreateObject { kind, name } => format!("Create {} {name}", kind.label()),
+            ChangeLine::ReplaceObject {
+                kind,
+                name,
+                renamed,
+            } => format!(
+                "Drop the {} {name} and create it again{}",
+                kind.label(),
+                match renamed {
+                    Some(to) => format!(" as {to}"),
+                    None => String::new(),
+                }
+            ),
+            ChangeLine::AlterTsqlSequence { clauses } => {
+                format!("Alter the sequence: {}", list(clauses))
+            }
+            ChangeLine::RenameObject { kind, to } => format!("Rename the {} to {to}", kind.label()),
+            ChangeLine::DropObject { kind } => format!("Drop the {}", kind.label()),
+            ChangeLine::SetObjectComment { kind, set: true } => {
+                format!("Set the {}'s comment", kind.label())
+            }
+            ChangeLine::SetObjectComment { kind, set: false } => {
+                format!("Clear the {}'s comment", kind.label())
+            }
+            ChangeLine::CreateDatabase { name } => format!("Create database {name}"),
+            ChangeLine::DropDatabase { name } => format!("Drop database {name}"),
+            ChangeLine::CreateSchema { name } => format!("Create schema {name}"),
+            ChangeLine::DropSchema { name } => format!("Drop schema {name}"),
+            ChangeLine::CreateExtension { name } => format!("Create extension {name}"),
+            ChangeLine::CreateAccount { kind, who } => {
+                format!("Create {} {who}", kind.label().to_lowercase())
+            }
+            ChangeLine::DropAccount { kind, who } => {
+                format!("Drop {} {who}", kind.label().to_lowercase())
+            }
+            ChangeLine::SetPassword { who } => format!("Set password for {who}"),
+            ChangeLine::GrantPrivileges { privileges, to } => {
+                format!("Grant {} to {to}", privileges.message())
+            }
+            ChangeLine::RevokePrivileges { privileges, from } => {
+                format!("Revoke {} from {from}", privileges.message())
+            }
+            ChangeLine::GrantRole { role, member } => format!("Grant {role} to {member}"),
+            ChangeLine::RevokeRole { role, member } => format!("Revoke {role} from {member}"),
+        }
+    }
+}
+
+impl SequenceEdit {
+    /// The English.
+    pub fn message(&self) -> String {
+        match self {
+            SequenceEdit::Type(t) => format!("type to {t}"),
+            SequenceEdit::Increment(n) => format!("increment to {n}"),
+            SequenceEdit::Minimum(n) => format!("minimum to {n}"),
+            SequenceEdit::Maximum(n) => format!("maximum to {n}"),
+            SequenceEdit::Start(n) => format!("start to {n}"),
+            SequenceEdit::Cache(n) => format!("cache to {n}"),
+            SequenceEdit::Cycling(true) => "cycling on".to_string(),
+            SequenceEdit::Cycling(false) => "cycling off".to_string(),
+            SequenceEdit::Owner(Some(o)) => format!("owner to {o}"),
+            SequenceEdit::Owner(None) => "owner to none".to_string(),
+        }
+    }
+}
+
+impl EventEdit {
+    /// The English.
+    pub fn message(&self) -> String {
+        match self {
+            EventEdit::Rename(to) => format!("rename to {to}"),
+            EventEdit::Schedule(s) => format!("schedule to {s}"),
+            EventEdit::Status(s) => format!("status to {}", s.label().to_lowercase()),
+            EventEdit::Preserve(true) => "keep it after it completes".to_string(),
+            EventEdit::Preserve(false) => "delete it after it completes".to_string(),
+            EventEdit::Definer(d) => format!("definer to {d}"),
+            EventEdit::Comment => "comment".to_string(),
+            EventEdit::Body => "body".to_string(),
+        }
+    }
+}
+
+impl Change {
+    /// One line of plain language for the preview's change list — the
+    /// English of [`Change::line`].
+    pub fn summary(&self) -> String {
+        self.line().message()
+    }
+
+    /// The preview's line for this change, as a value the interface words
+    /// ([`ChangeLine`]).
+    pub fn line(&self) -> ChangeLine {
+        match self {
+            Change::CreateTable(d) => ChangeLine::CreateTable {
+                name: d.name.clone(),
+                columns: d.columns.len(),
+            },
+            Change::RebuildTable(r) => ChangeLine::RebuildTable {
+                name: r.current.name.clone(),
+            },
+            Change::DropTable => ChangeLine::DropTable,
+            Change::DropForeignTable => ChangeLine::DropForeignTable,
+            Change::TruncateTable => ChangeLine::TruncateTable,
+            Change::RenameTable { to } => ChangeLine::RenameTable { to: to.clone() },
+            Change::AddColumn { column, .. } => ChangeLine::AddColumn {
+                name: column.name.clone(),
+                type_name: column.type_name.clone(),
+                clauses: column_clauses(column),
+            },
+            Change::DropColumn { name, .. } => ChangeLine::DropColumn { name: name.clone() },
+            Change::RebuildComputedColumn { column } => ChangeLine::RebuildComputedColumn {
+                name: column.name.clone(),
+                expression: column.generated.clone().unwrap_or_default(),
+            },
             Change::AlterColumn {
                 from, to, position, ..
             } => {
@@ -4964,45 +5709,54 @@ impl Change {
                 // the user was shown. `check_free_sql` is what refuses that
                 // payload now; this is what stops the *next* free-SQL field
                 // being invisible for the same reason.
-                let retype = if from.type_name == to.type_name {
-                    String::new()
-                } else {
-                    format!(", and its type from {} to {}", from.type_name, to.type_name)
-                };
+                let retype = (from.type_name != to.type_name)
+                    .then(|| (from.type_name.clone(), to.type_name.clone()));
                 if from.name != to.name {
-                    format!(
-                        "Rename column {} to {}{retype}{clauses}",
-                        from.name, to.name
-                    )
-                } else if from.as_ref() == to.as_ref() && position.is_some() {
-                    match position {
-                        Some(Position::First) => format!("Move column {} first", to.name),
-                        Some(Position::After(a)) => format!("Move column {} after {a}", to.name),
-                        None => format!("Move column {}", to.name),
+                    ChangeLine::RenameColumn {
+                        from: from.name.clone(),
+                        to: to.name.clone(),
+                        retype,
+                        clauses,
                     }
-                } else if from.type_name != to.type_name {
-                    format!(
-                        "Change column {} from {} to {}{clauses}",
-                        to.name, from.type_name, to.type_name
-                    )
+                } else if from.as_ref() == to.as_ref() && position.is_some() {
+                    ChangeLine::MoveColumn {
+                        name: to.name.clone(),
+                        to: match position {
+                            Some(Position::First) => MoveTo::First,
+                            Some(Position::After(a)) => MoveTo::After(a.clone()),
+                            None => MoveTo::Unplaced,
+                        },
+                    }
+                } else if let Some((from, to_type)) = retype {
+                    ChangeLine::RetypeColumn {
+                        name: to.name.clone(),
+                        from,
+                        to: to_type,
+                        clauses,
+                    }
                 } else {
-                    format!("Change column {}{clauses}", to.name)
+                    ChangeLine::ChangeColumn {
+                        name: to.name.clone(),
+                        clauses,
+                    }
                 }
             }
             Change::PrimaryKey { from, to, .. } => match (from.is_empty(), to.is_empty()) {
-                (true, _) => format!("Add primary key ({})", to.join(", ")),
-                (_, true) => format!("Drop the primary key ({})", from.join(", ")),
+                (true, _) => ChangeLine::AddPrimaryKey {
+                    columns: to.clone(),
+                },
+                (_, true) => ChangeLine::DropPrimaryKey {
+                    columns: from.clone(),
+                },
                 // The same key, off and back on around a column change the
                 // engine refuses under it (`repair_tsql_dependents`).
-                _ if from == to => format!(
-                    "Rebuild the primary key ({}) around the column change",
-                    to.join(", ")
-                ),
-                _ => format!(
-                    "Change the primary key from ({}) to ({})",
-                    from.join(", "),
-                    to.join(", ")
-                ),
+                _ if from == to => ChangeLine::RebuildPrimaryKey {
+                    columns: to.clone(),
+                },
+                _ => ChangeLine::ChangePrimaryKey {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
             },
             // Every list the statement carries, and its kind: a line that
             // left one out read the same before and after an edit of it. A
@@ -5010,24 +5764,19 @@ impl Change {
             // none, so it has no `on (…)` at all; an expression key is shown
             // as its SQL, which is what `name` holds for one.
             Change::AddIndex(ix) => {
-                let mut s = format!("Add {}", if ix.unique { "unique " } else { "" });
-                if let Some(kind) = IndexStorage::of(ix).summary_noun() {
-                    s.push_str(kind);
-                    s.push(' ');
-                }
-                s.push_str(&format!("index {}", ix.name));
-                // A method that is not one of SQL Server's kinds (named above)
-                // is the access method itself — PostgreSQL's `gist`, `gin` —
-                // and a key's direction and a filter are the statement's too:
-                // each read the same before and after an edit (S3.1-L1-04).
-                if IndexStorage::of(ix).summary_noun().is_none()
-                    && let Some(m) = ix.method.as_deref().filter(|m| !m.is_empty())
-                {
-                    s.push_str(&format!(" using {m}"));
-                }
-                let list = |names: Vec<&str>| names.join(", ");
-                if !ix.columns.is_empty() {
-                    let keys: Vec<String> = ix
+                let storage = IndexStorage::of(ix);
+                let named = storage.summary_noun().is_some();
+                ChangeLine::AddIndex(IndexLine {
+                    unique: ix.unique,
+                    storage: named.then_some(storage),
+                    name: ix.name.clone(),
+                    // A method that is not one of SQL Server's kinds (named
+                    // above) is the access method itself — PostgreSQL's
+                    // `gist`, `gin` — and a key's direction and a filter are
+                    // the statement's too: each read the same before and
+                    // after an edit (S3.1-L1-04).
+                    method: ix.method.clone().filter(|m| !named && !m.is_empty()),
+                    keys: ix
                         .columns
                         .iter()
                         .map(|c| {
@@ -5037,36 +5786,36 @@ impl Change {
                                 c.name.clone()
                             }
                         })
-                        .collect();
-                    s.push_str(&format!(" on ({})", keys.join(", ")));
-                }
-                if !ix.include.is_empty() {
-                    let cols = ix.include.iter().map(String::as_str).collect();
-                    s.push_str(&format!(" including ({})", list(cols)));
-                }
-                if !ix.order.is_empty() {
-                    let cols = ix.order.iter().map(String::as_str).collect();
-                    s.push_str(&format!(" ordered by ({})", list(cols)));
-                }
-                if let Some(p) = ix.predicate.as_deref().filter(|p| !p.trim().is_empty()) {
-                    s.push_str(&format!(" where {}", p.trim()));
-                }
-                s
+                        .collect(),
+                    include: ix.include.clone(),
+                    order: ix.order.clone(),
+                    predicate: ix
+                        .predicate
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string),
+                })
             }
-            Change::DropIndex { name, .. } => format!("Drop index {name}"),
-            Change::RenameIndex { from, to, .. } => format!("Rename index {from} to {to}"),
-            Change::KeepLossyIndex { name } => {
-                format!("Leave index {name} unchanged — Schemaic can't read all of it")
+            Change::DropIndex { name, .. } => ChangeLine::DropIndex { name: name.clone() },
+            Change::RenameIndex { from, to, .. } => ChangeLine::RenameIndex {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            Change::KeepLossyIndex { name } => ChangeLine::KeepLossyIndex { name: name.clone() },
+            Change::AddForeignKey(fk) => ChangeLine::AddForeignKey {
+                name: fk.name.clone(),
+                ref_table: fk.ref_table.clone(),
+                ref_columns: fk.ref_columns.clone(),
+            },
+            Change::DropForeignKey { name } => ChangeLine::DropForeignKey { name: name.clone() },
+            Change::AddCheck(ck) | Change::AddDomainCheck(ck) => ChangeLine::AddCheck {
+                name: ck.name.clone(),
+                expression: ck.expression.clone(),
+            },
+            Change::DropCheck { name } | Change::DropDomainCheck { name } => {
+                ChangeLine::DropCheck { name: name.clone() }
             }
-            Change::AddForeignKey(fk) => format!(
-                "Add foreign key {} → {}({})",
-                fk.name,
-                fk.ref_table,
-                fk.ref_columns.join(", ")
-            ),
-            Change::DropForeignKey { name } => format!("Drop foreign key {name}"),
-            Change::AddCheck(ck) => format!("Add check {} ({})", ck.name, ck.expression),
-            Change::DropCheck { name } => format!("Drop check {name}"),
             // Name the options this change actually carries — "change the
             // table's options" couldn't say which, and used to be shown for an
             // edit the statement didn't make.
@@ -5077,87 +5826,76 @@ impl Change {
             } => {
                 let mut parts = Vec::new();
                 if let Some(e) = engine {
-                    parts.push(format!("engine to {e}"));
+                    parts.push(TableOptionEdit::Engine(e.clone()));
                 }
                 if let Some(c) = collation {
-                    parts.push(format!("collation to {c}"));
+                    parts.push(TableOptionEdit::Collation(c.clone()));
                 }
                 if let Some(cm) = comment {
                     parts.push(if cm.is_empty() {
-                        "comment (cleared)".to_string()
+                        TableOptionEdit::CommentCleared
                     } else {
-                        "comment".to_string()
+                        TableOptionEdit::Comment
                     });
                 }
-                format!("Set the table's {}", parts.join(", "))
+                ChangeLine::TableOptions(parts)
             }
-            Change::CreateView(d) => {
-                let indexes: Vec<&str> = d
+            Change::CreateView(d) => ChangeLine::CreateView {
+                name: d.name.clone(),
+                indexes: d
                     .options
                     .tsql
                     .indexes
                     .iter()
                     .filter(|ix| !ix.lossy)
-                    .map(|ix| ix.name.as_str())
-                    .collect();
-                match indexes.len() {
-                    0 => format!("Create view {}", d.name),
-                    1 => format!("Create view {} and its index {}", d.name, indexes[0]),
-                    _ => format!(
-                        "Create view {} and its indexes {}",
-                        d.name,
-                        indexes.join(", ")
-                    ),
-                }
-            }
+                    .map(|ix| ix.name.clone())
+                    .collect(),
+            },
             Change::ReplaceView {
                 draft, recreate, ..
             } => {
+                let name = draft.name.clone();
                 if *recreate {
-                    format!("Drop and re-create view {}", draft.name)
+                    ChangeLine::RecreateView { name }
                 } else {
-                    format!("Redefine view {}", draft.name)
+                    ChangeLine::RedefineView { name }
                 }
             }
-            Change::RenameView { to } => format!("Rename the view to {to}"),
-            Change::DropView { materialized } => {
-                format!(
-                    "Drop the {}view",
-                    if *materialized { "materialized " } else { "" }
-                )
-            }
+            Change::RenameView { to } => ChangeLine::RenameView { to: to.clone() },
+            Change::DropView { materialized } => ChangeLine::DropView {
+                materialized: *materialized,
+            },
             // The lock is the half a reader can't see in the SQL, and it is the
             // one that decides whether this is safe to run now: a plain refresh
             // blocks every reader of the view for as long as its query takes.
             // Said here rather than in `risks`, which is what `is_destructive`
             // reads — a refresh destroys nothing, and dressing it in the drop
             // colours would spend the warning that Drop needs.
-            Change::RefreshView { concurrently } => format!(
-                "Rebuild the materialized view's rows{}",
-                if *concurrently {
-                    " without blocking readers"
-                } else {
-                    " — readers are blocked until it finishes"
-                }
-            ),
-            Change::CreateTrigger(d) => format!("Create trigger {}", d.info.name),
+            Change::RefreshView { concurrently } => ChangeLine::RefreshView {
+                concurrently: *concurrently,
+            },
+            Change::CreateTrigger(d) => ChangeLine::CreateTrigger {
+                name: d.info.name.clone(),
+            },
             Change::ReplaceTrigger {
                 draft,
                 in_place: true,
                 ..
-            } => format!("Redefine trigger {}", draft.info.name),
+            } => ChangeLine::RedefineTrigger {
+                name: draft.info.name.clone(),
+            },
             Change::ReplaceTrigger { draft, .. } => {
                 let server = draft.original.as_deref().unwrap_or(&draft.info.name);
-                if server != draft.info.name {
-                    format!("Re-create trigger {server} as {}", draft.info.name)
-                } else {
-                    format!("Re-create trigger {}", draft.info.name)
+                ChangeLine::RecreateTrigger {
+                    from: (server != draft.info.name).then(|| server.to_string()),
+                    name: draft.info.name.clone(),
                 }
             }
-            Change::DropTrigger { name, .. } => format!("Drop trigger {name}"),
-            Change::CreateRoutine(d) => {
-                format!("Create {} {}", d.info.kind.label(), d.info.name)
-            }
+            Change::DropTrigger { name, .. } => ChangeLine::DropTrigger { name: name.clone() },
+            Change::CreateRoutine(d) => ChangeLine::CreateRoutine {
+                kind: routine_object_kind(d.info.kind),
+                name: d.info.name.clone(),
+            },
             // "Re-create" where the engine has to drop first, "Redefine" where it
             // replaces in place — the same distinction the trigger and view
             // summaries draw, and the one thing that tells a reader whether the
@@ -5167,130 +5905,127 @@ impl Change {
                 server,
                 recreate,
             } => {
-                let what = draft.info.kind.label();
                 let held = if server.name.is_empty() {
                     draft.original.as_deref().unwrap_or(&draft.info.name)
                 } else {
                     &server.name
                 };
-                let verb = if *recreate { "Re-create" } else { "Redefine" };
-                if held != draft.info.name {
-                    format!("{verb} {what} {held} as {}", draft.info.name)
-                } else {
-                    format!("{verb} {what} {}", draft.info.name)
+                ChangeLine::ReplaceRoutine {
+                    kind: routine_object_kind(draft.info.kind),
+                    recreate: *recreate,
+                    from: (held != draft.info.name).then(|| held.to_string()),
+                    name: draft.info.name.clone(),
                 }
             }
-            Change::RenameRoutine { from, to } => {
-                format!("Rename {} {} to {to}", from.kind.label(), from.name)
-            }
-            Change::DropRoutine(f) => format!("Drop {} {}", f.kind.label(), f.name),
-            Change::CreateEvent(d) => format!("Create event {}", d.info.name),
+            Change::RenameRoutine { from, to } => ChangeLine::RenameRoutine {
+                kind: routine_object_kind(from.kind),
+                from: from.name.clone(),
+                to: to.clone(),
+            },
+            Change::DropRoutine(f) => ChangeLine::DropRoutine {
+                kind: routine_object_kind(f.kind),
+                name: f.name.clone(),
+            },
+            Change::CreateEvent(d) => ChangeLine::CreateEvent {
+                name: d.info.name.clone(),
+            },
             // Names what the `ALTER` will actually restate, from the **same**
             // comparison the emitter builds its clauses from
             // ([`event_alter_clauses`]) — the `TableOptions` rule, which exists
             // because the sentence and the statement once disagreed.
-            Change::AlterEvent { from, to } => {
-                let edits = event_edits(from, to);
-                if edits.is_empty() {
-                    format!("Alter event {}", from.name)
-                } else {
-                    format!("Alter event {}: {}", from.name, edits.join(", "))
-                }
-            }
-            Change::DropEvent(e) => format!("Drop event {}", e.name),
-            Change::CreateEnum(e) => format!(
-                "Create type {} with {} value{}",
-                e.name,
-                e.values.len(),
-                plural(e.values.len())
-            ),
+            Change::AlterEvent { from, to } => ChangeLine::AlterEvent {
+                name: from.name.clone(),
+                edits: event_edits(from, to),
+            },
+            Change::DropEvent(e) => ChangeLine::DropEvent {
+                name: e.name.clone(),
+            },
+            Change::CreateEnum(e) => ChangeLine::CreateEnum {
+                name: e.name.clone(),
+                values: e.values.len(),
+            },
             Change::AddEnumValue {
                 value,
                 after,
                 before,
-            } => match (after, before) {
-                (Some(a), _) => format!("Add value {value} after {a}"),
-                (_, Some(b)) => format!("Add value {value} before {b}"),
-                _ => format!("Add value {value}"),
+            } => ChangeLine::AddEnumValue {
+                value: value.clone(),
+                after: after.clone(),
+                before: before.clone(),
             },
-            Change::RenameEnumValue { from, to } => format!("Rename value {from} to {to}"),
-            Change::RecreateEnum { info, dependents } => format!(
-                "Re-create type {} ({} value{}, re-casting {} column{})",
-                info.name,
-                info.values.len(),
-                plural(info.values.len()),
-                dependents.len(),
-                plural(dependents.len())
-            ),
-            Change::CreateDomain(d) => format!("Create domain {} as {}", d.name, d.base_type),
-            Change::SetDomainDefault { to } => match to {
-                Some(d) => format!("Set the domain's default to {d}"),
-                None => "Drop the domain's default".to_string(),
+            Change::RenameEnumValue { from, to } => ChangeLine::RenameEnumValue {
+                from: from.clone(),
+                to: to.clone(),
             },
-            Change::SetDomainNotNull { to } => {
-                format!(
-                    "Make the domain {}",
-                    if *to { "NOT NULL" } else { "nullable" }
-                )
-            }
-            Change::AddDomainCheck(ck) => format!("Add check {} ({})", ck.name, ck.expression),
-            Change::DropDomainCheck { name } => format!("Drop check {name}"),
+            Change::RecreateEnum { info, dependents } => ChangeLine::RecreateEnum {
+                name: info.name.clone(),
+                values: info.values.len(),
+                columns: dependents.len(),
+            },
+            Change::CreateDomain(d) => ChangeLine::CreateDomain {
+                name: d.name.clone(),
+                base_type: d.base_type.clone(),
+            },
+            Change::SetDomainDefault { to } => ChangeLine::SetDomainDefault { to: to.clone() },
+            Change::SetDomainNotNull { to } => ChangeLine::SetDomainNotNull { to: *to },
             Change::RecreateDomain {
                 info,
                 from_type,
                 dependents,
-            } => format!(
-                "Re-create domain {} as {} (was {from_type}; re-casting {} column{})",
-                info.name,
-                info.base_type,
-                dependents.len(),
-                plural(dependents.len())
-            ),
-            Change::CreateSequence(s) => format!("Create sequence {}", s.name),
+            } => ChangeLine::RecreateDomain {
+                name: info.name.clone(),
+                base_type: info.base_type.clone(),
+                was: from_type.clone(),
+                columns: dependents.len(),
+            },
+            Change::CreateSequence(s) => ChangeLine::CreateSequence {
+                name: s.name.clone(),
+            },
             // Name what changed, as `TableOptions` does — "alter the sequence"
             // couldn't say which of six clauses the statement carries.
             Change::AlterSequence { from, to } => {
-                format!("Set the sequence's {}", sequence_edits(from, to).join(", "))
+                ChangeLine::AlterSequence(sequence_edits(from, to))
             }
-            Change::RestartSequence { to } => format!("Restart the sequence at {to}"),
-            Change::CreateTsqlObject(t) => {
-                format!("Create {} {}", t.object_kind().label(), t.name)
-            }
-            Change::ReplaceTsqlObject { from, to } => format!(
-                "Drop the {} {} and create it again{}",
-                from.object_kind().label(),
-                from.name,
-                if from.name == to.name {
-                    String::new()
-                } else {
-                    format!(" as {}", to.name)
-                }
-            ),
+            Change::RestartSequence { to } => ChangeLine::RestartSequence { to: to.to_string() },
+            Change::CreateTsqlObject(t) => ChangeLine::CreateObject {
+                kind: t.object_kind(),
+                name: t.name.clone(),
+            },
+            Change::ReplaceTsqlObject { from, to } => ChangeLine::ReplaceObject {
+                kind: from.object_kind(),
+                name: from.name.clone(),
+                renamed: (from.name != to.name).then(|| to.name.clone()),
+            },
             Change::AlterTsqlSequence { from, to, restart } => {
-                let mut what = tsql_sequence_clauses(from, to);
+                let mut clauses = tsql_sequence_clauses(from, to);
                 if let Some(r) = restart {
-                    what.push(format!("RESTART WITH {}", r.trim()));
+                    clauses.push(format!("RESTART WITH {}", r.trim()));
                 }
-                format!("Alter the sequence: {}", what.join(", "))
+                ChangeLine::AlterTsqlSequence { clauses }
             }
-            Change::RenameObject { kind, to } => format!("Rename the {} to {to}", kind.label()),
-            Change::DropObject { kind } => format!("Drop the {}", kind.label()),
-            Change::SetObjectComment { kind, comment } => match comment {
-                Some(_) => format!("Set the {}'s comment", kind.label()),
-                None => format!("Clear the {}'s comment", kind.label()),
+            Change::RenameObject { kind, to } => ChangeLine::RenameObject {
+                kind: *kind,
+                to: to.clone(),
+            },
+            Change::DropObject { kind } => ChangeLine::DropObject { kind: *kind },
+            Change::SetObjectComment { kind, comment } => ChangeLine::SetObjectComment {
+                kind: *kind,
+                set: comment.is_some(),
             },
             // The database and namespace lines name the object rather than
             // saying "the database", because unlike every arm above them the
             // preview's subject is not something the user right-clicked: a
             // create was typed into a form, and a drop is the one plan here
             // whose target it is worth reading twice.
-            Change::CreateDatabase(d) => format!("Create database {}", d.name),
-            Change::DropDatabase { name } => format!("Drop database {name}"),
-            Change::CreateSchema { name, .. } => format!("Create schema {name}"),
-            Change::DropSchema { name } => format!("Drop schema {name}"),
+            Change::CreateDatabase(d) => ChangeLine::CreateDatabase {
+                name: d.name.clone(),
+            },
+            Change::DropDatabase { name } => ChangeLine::DropDatabase { name: name.clone() },
+            Change::CreateSchema { name, .. } => ChangeLine::CreateSchema { name: name.clone() },
+            Change::DropSchema { name } => ChangeLine::DropSchema { name: name.clone() },
             // Named for the reason a schema's create is: it was picked from a
             // list, not right-clicked.
-            Change::CreateExtension { name } => format!("Create extension {name}"),
+            Change::CreateExtension { name } => ChangeLine::CreateExtension { name: name.clone() },
             // The account lines name the account for the same reason the
             // database ones name the database: the preview's subject was typed
             // into a form or picked out of a list, not right-clicked.
@@ -5301,66 +6036,53 @@ impl Change {
             // written when the draft carries one and left off when it does not,
             // which is exactly the distinction that was missing; the risk block
             // below is what says what a blank one means.
-            Change::CreateAccount(d) => {
-                let who = match d.host.trim() {
-                    "" => d.name.clone(),
-                    h => format!("{}@{h}", d.name),
-                };
-                match d.kind {
-                    crate::users::PrincipalKind::User => format!("Create user {who}"),
-                    crate::users::PrincipalKind::Role => format!("Create role {}", d.name),
-                    crate::users::PrincipalKind::Login => format!("Create login {}", d.name),
-                }
-            }
-            Change::DropAccount(p) => {
-                format!("Drop {} {}", p.kind.label().to_lowercase(), p.display())
-            }
+            Change::CreateAccount(d) => ChangeLine::CreateAccount {
+                kind: d.kind,
+                who: match (d.kind, d.host.trim()) {
+                    (crate::users::PrincipalKind::User, h) if !h.is_empty() => {
+                        format!("{}@{h}", d.name)
+                    }
+                    _ => d.name.clone(),
+                },
+            },
+            Change::DropAccount(p) => ChangeLine::DropAccount {
+                kind: p.kind,
+                who: p.display(),
+            },
             // The account's own `display()`, host included, because on MySQL
             // `app@%` and `app@10.0.0.%` are two accounts with two passwords and
             // a summary naming only `app` would not say which one is moving.
-            Change::SetAccountPassword(r) => {
-                format!("Set password for {}", r.account.display())
-            }
-            Change::GrantPrivileges(c) => format!(
-                "Grant {} to {}",
-                Self::privilege_words(&c.privileges),
-                c.account.display()
-            ),
-            Change::RevokePrivileges(c) => format!(
-                "Revoke {} from {}",
-                Self::privilege_words(&c.privileges),
-                c.account.display()
-            ),
-            Change::GrantRole(c) => {
-                format!("Grant {} to {}", c.role.display(), c.member.display())
-            }
-            Change::RevokeRole(c) => {
-                format!("Revoke {} from {}", c.role.display(), c.member.display())
-            }
+            Change::SetAccountPassword(r) => ChangeLine::SetPassword {
+                who: r.account.display(),
+            },
+            Change::GrantPrivileges(c) => ChangeLine::GrantPrivileges {
+                privileges: PrivilegeWords::of(&c.privileges),
+                to: c.account.display(),
+            },
+            Change::RevokePrivileges(c) => ChangeLine::RevokePrivileges {
+                privileges: PrivilegeWords::of(&c.privileges),
+                from: c.account.display(),
+            },
+            Change::GrantRole(c) => ChangeLine::GrantRole {
+                role: c.role.display(),
+                member: c.member.display(),
+            },
+            Change::RevokeRole(c) => ChangeLine::RevokeRole {
+                role: c.role.display(),
+                member: c.member.display(),
+            },
         }
     }
 
     /// The privilege list as a summary line says it: the names themselves while
-    /// they fit, and a count once they don't.
+    /// they fit, and a count once they don't — [`PrivilegeWords`]'s English.
     ///
     /// Eighteen privileges is a legal selection at MySQL's database level, and
     /// the summary is one line above the Apply button — spelled out it wraps to
     /// four and pushes the statements off the panel. Three is where a list still
     /// reads as a list.
     fn privilege_words(privileges: &[String]) -> String {
-        match privileges.len() {
-            // **Not "nothing".** An empty selection emits no statement at all
-            // (`users::privilege_sql` answers `None`), so a summary reading
-            // "Grant nothing to app@%" describes a plan the preview then shows
-            // with an empty SQL box and a dimmed Apply — a change listed with no
-            // statement and no reason. Saying the list is empty is the sentence
-            // that matches what is on screen. Unreachable through the form,
-            // whose Apply asks `GrantDraft::is_ready` first; reachable by any
-            // caller that builds the change directly.
-            0 => "no privileges".to_string(),
-            1..=3 => privileges.join(", "),
-            n => format!("{n} privileges"),
-        }
+        PrivilegeWords::of(privileges).message()
     }
 
     /// What this change destroys, in plain language — empty when nothing is at
@@ -6257,46 +6979,49 @@ fn recreate_risk(name: &str, kind: &str, dependents: &[TypeDependent]) -> String
 
 /// Which of a sequence's clauses differ, named for the preview.
 ///
-/// Shared by the summary and the emitter, so the line the user reads and the
-/// statement that runs are built from the same comparison — the `TableOptions`
-/// rule, which exists because the two once disagreed.
-fn sequence_edits(from: &SequenceInfo, to: &SequenceInfo) -> Vec<String> {
+/// Shared by the summary and the differ (`diff_sequence`, which raises the
+/// change only where this names something), so the line the user reads and
+/// the statement that runs are built from the same comparison — the
+/// `TableOptions` rule, which exists because the two once disagreed.
+fn sequence_edits(from: &SequenceInfo, to: &SequenceInfo) -> Vec<SequenceEdit> {
     let mut out = Vec::new();
     if !from.data_type.eq_ignore_ascii_case(&to.data_type) {
-        out.push(format!("type to {}", to.data_type));
+        out.push(SequenceEdit::Type(to.data_type.clone()));
     }
     if from.increment != to.increment {
-        out.push(format!("increment to {}", to.increment));
+        out.push(SequenceEdit::Increment(to.increment));
     }
     if from.min_value != to.min_value {
-        out.push(format!("minimum to {}", to.min_value));
+        out.push(SequenceEdit::Minimum(to.min_value));
     }
     if from.max_value != to.max_value {
-        out.push(format!("maximum to {}", to.max_value));
+        out.push(SequenceEdit::Maximum(to.max_value));
     }
     if from.start != to.start {
-        out.push(format!("start to {}", to.start));
+        out.push(SequenceEdit::Start(to.start));
     }
     if from.cache != to.cache {
-        out.push(format!("cache to {}", to.cache));
+        out.push(SequenceEdit::Cache(to.cache));
     }
     if from.cycle != to.cycle {
-        out.push(
-            if to.cycle {
-                "cycling on"
-            } else {
-                "cycling off"
-            }
-            .to_string(),
-        );
+        out.push(SequenceEdit::Cycling(to.cycle));
     }
     if from.owned_by != to.owned_by {
-        out.push(match &to.owned_by {
-            Some(o) => format!("owner to {}.{}", o.table, o.column),
-            None => "owner to none".to_string(),
-        });
+        out.push(SequenceEdit::Owner(
+            to.owned_by
+                .as_ref()
+                .map(|o| format!("{}.{}", o.table, o.column)),
+        ));
     }
     out
+}
+
+/// The object kind a routine of `kind` is named as.
+fn routine_object_kind(kind: crate::schema::RoutineKind) -> ObjectKind {
+    match kind {
+        crate::schema::RoutineKind::Function => ObjectKind::Function,
+        crate::schema::RoutineKind::Procedure => ObjectKind::Procedure,
+    }
 }
 
 /// Everything an in-place column change puts at risk. Narrowing is the one that
@@ -8854,45 +9579,34 @@ fn event_alter_clauses(from: &EventInfo, to: &EventInfo, d: SqlDialect) -> Vec<S
 /// Shared by the summary and — through the same field comparisons —
 /// [`event_alter_clauses`], so the line the user reads and the statement that
 /// runs are answering one question. The [`sequence_edits`] rule.
-fn event_edits(from: &EventInfo, to: &EventInfo) -> Vec<String> {
+fn event_edits(from: &EventInfo, to: &EventInfo) -> Vec<EventEdit> {
     let mut out = Vec::new();
     if from.name != to.name {
-        out.push(format!("rename to {}", to.name));
+        out.push(EventEdit::Rename(to.name.clone()));
     }
     if from.schedule != to.schedule {
-        out.push(format!(
-            "schedule to {}",
+        out.push(EventEdit::Schedule(
             to.schedule
                 .sql()
                 .split_whitespace()
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join(" "),
         ));
     }
     if from.status != to.status {
-        out.push(format!("status to {}", to.status.label().to_lowercase()));
+        out.push(EventEdit::Status(to.status));
     }
     if from.preserve != to.preserve {
-        out.push(
-            if to.preserve {
-                "keep it after it completes"
-            } else {
-                "delete it after it completes"
-            }
-            .to_string(),
-        );
+        out.push(EventEdit::Preserve(to.preserve));
     }
     if event_definer_clause(from, to).is_some() {
-        out.push(format!(
-            "definer to {}",
-            to.definer.as_deref().unwrap_or_default()
-        ));
+        out.push(EventEdit::Definer(to.definer.clone().unwrap_or_default()));
     }
     if from.comment.clone().unwrap_or_default() != to.comment.clone().unwrap_or_default() {
-        out.push("comment".to_string());
+        out.push(EventEdit::Comment);
     }
     if event_restates_body(from, to) {
-        out.push("body".to_string());
+        out.push(EventEdit::Body);
     }
     out
 }

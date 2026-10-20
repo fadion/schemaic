@@ -450,6 +450,186 @@ ddl-dangling-foreign-key = der Plan hinterlässt einen Fremdschlüssel, der ins 
 ddl-breaks-view = der Plan würde die Sicht { $view } beschädigen, die eine Spalte liest, die er umbenennt oder entfernt ({ $why }). Es wurde nichts geändert. Bearbeite oder entferne zuerst die Sicht.
 ddl-no-databases = SQLite hat keine Datenbanken, die sich anlegen oder löschen ließen — eine Datenbank ist dort eine Datei, und Schemaic legt sie nicht für dich an und löscht sie nicht.
 ddl-rollback-failed = { $error } — und auch das Zurückrollen ist fehlgeschlagen: { $rollback }
+ddl-line-create-table = { $columns ->
+    [one] Tabelle { $name } mit { $columns } Spalte erstellen
+   *[other] Tabelle { $name } mit { $columns } Spalten erstellen
+}
+ddl-line-rebuild-table = { $name } neu aufbauen — das lässt sich nicht an Ort und Stelle ändern, daher werden die Zeilen in eine neue Tabelle kopiert, die den Platz der alten einnimmt
+ddl-line-drop-table = Tabelle löschen
+ddl-line-drop-foreign-table = Fremdtabelle löschen
+ddl-line-truncate-table = Alle Zeilen löschen
+ddl-line-rename-table = Tabelle in { $to } umbenennen
+ddl-line-add-column = Spalte { $name } { $datatype } hinzufügen{ $has_clauses ->
+        [yes] {" "}({ $clauses })
+       *[no] {""}
+    }
+ddl-line-drop-column = Spalte { $name } löschen
+ddl-line-rebuild-computed-column = Berechnete Spalte { $name } als ({ $expression }) um die Spaltenänderung herum neu aufbauen
+ddl-line-rename-column = Spalte { $from } in { $to } umbenennen{ $retyped ->
+        [yes] , und ihren Typ von { $old_type } in { $new_type } ändern
+       *[no] {""}
+    }{ $has_clauses ->
+        [yes] {" "}({ $clauses })
+       *[no] {""}
+    }
+ddl-line-move-column-first = Spalte { $name } an den Anfang verschieben
+ddl-line-move-column-after = Spalte { $name } hinter { $after } verschieben
+ddl-line-move-column = Spalte { $name } verschieben
+ddl-line-retype-column = Spalte { $name } von { $from } in { $to } ändern{ $has_clauses ->
+        [yes] {" "}({ $clauses })
+       *[no] {""}
+    }
+ddl-line-change-column = Spalte { $name } ändern{ $has_clauses ->
+        [yes] {" "}({ $clauses })
+       *[no] {""}
+    }
+ddl-clause-added = { $clause } { $value }
+ddl-clause-changed = { $clause } { $from } → { $to }
+ddl-clause-none = (keine)
+ddl-line-add-primary-key = Primärschlüssel ({ $columns }) hinzufügen
+ddl-line-drop-primary-key = Primärschlüssel ({ $columns }) löschen
+ddl-line-rebuild-primary-key = Primärschlüssel ({ $columns }) um die Spaltenänderung herum neu aufbauen
+ddl-line-change-primary-key = Primärschlüssel von ({ $from }) in ({ $to }) ändern
+ddl-line-add-index = { $unique ->
+        [yes] Eindeutigen Index
+       *[no] Index
+    } { $name }{ $has_kind ->
+        [yes] {" "}({ $kind })
+       *[no] {""}
+    } hinzufügen{ $has_method ->
+        [yes] , mit { $method }
+       *[no] {""}
+    }{ $has_columns ->
+        [yes] , auf ({ $columns })
+       *[no] {""}
+    }{ $has_include ->
+        [yes] , einschließlich ({ $include })
+       *[no] {""}
+    }{ $has_order ->
+        [yes] , sortiert nach ({ $order })
+       *[no] {""}
+    }{ $has_predicate ->
+        [yes] , wobei { $predicate }
+       *[no] {""}
+    }
+ddl-index-kind-columnstore = Columnstore
+ddl-index-kind-clustered-columnstore = gruppierter Columnstore
+ddl-index-kind-primary-xml = primärer XML-Index
+ddl-index-kind-selective-xml = selektiver XML-Index
+ddl-index-kind-secondary-xml = sekundärer XML-Index
+ddl-index-kind-spatial = räumlich
+ddl-line-drop-index = Index { $name } löschen
+ddl-line-rename-index = Index { $from } in { $to } umbenennen
+ddl-line-keep-lossy-index = Index { $name } unverändert lassen — Schemaic kann ihn nicht vollständig lesen
+ddl-line-add-foreign-key = Fremdschlüssel { $name } → { $table }({ $columns }) hinzufügen
+ddl-line-drop-foreign-key = Fremdschlüssel { $name } löschen
+ddl-line-add-check = Check { $name } ({ $expression }) hinzufügen
+ddl-line-drop-check = Check { $name } löschen
+ddl-line-table-options = Für die Tabelle setzen: { $parts }
+ddl-table-option-engine = Engine auf { $engine }
+ddl-table-option-collation = Sortierung auf { $collation }
+ddl-table-option-comment = Kommentar
+ddl-table-option-comment-cleared = Kommentar (geleert)
+ddl-line-create-view = Sicht { $name } erstellen
+ddl-line-create-view-index = Sicht { $name } und ihren Index { $index } erstellen
+ddl-line-create-view-indexes = Sicht { $name } und ihre Indizes { $indexes } erstellen
+ddl-line-redefine-view = Sicht { $name } neu definieren
+ddl-line-recreate-view = Sicht { $name } löschen und neu erstellen
+ddl-line-rename-view = Sicht in { $to } umbenennen
+ddl-line-drop-view = Sicht löschen
+ddl-line-drop-materialized-view = Materialisierte Sicht löschen
+ddl-line-refresh-view = Die Zeilen der materialisierten Sicht neu aufbauen — Lesende sind blockiert, bis es fertig ist
+ddl-line-refresh-view-concurrently = Die Zeilen der materialisierten Sicht neu aufbauen, ohne Lesende zu blockieren
+ddl-line-create-trigger = Trigger { $name } erstellen
+ddl-line-redefine-trigger = Trigger { $name } neu definieren
+ddl-line-recreate-trigger = Trigger { $name } neu erstellen
+ddl-line-recreate-trigger-as = Trigger { $from } als { $name } neu erstellen
+ddl-line-drop-trigger = Trigger { $name } löschen
+ddl-line-create-routine = { $what } { $name } erstellen
+ddl-line-redefine-routine = { $what } { $name } neu definieren
+ddl-line-redefine-routine-as = { $what } { $from } als { $name } neu definieren
+ddl-line-recreate-routine = { $what } { $name } neu erstellen
+ddl-line-recreate-routine-as = { $what } { $from } als { $name } neu erstellen
+ddl-line-rename-routine = { $what } { $from } in { $to } umbenennen
+ddl-line-drop-routine = { $what } { $name } löschen
+ddl-line-create-event = Ereignis { $name } erstellen
+ddl-line-alter-event = Ereignis { $name } ändern
+ddl-line-alter-event-edits = Ereignis { $name } ändern: { $edits }
+ddl-line-drop-event = Ereignis { $name } löschen
+ddl-event-edit-rename = umbenennen in { $to }
+ddl-event-edit-schedule = Zeitplan auf { $schedule }
+ddl-event-edit-status-enabled = Status auf aktiviert
+ddl-event-edit-status-disabled = Status auf deaktiviert
+ddl-event-edit-status-replica = Status auf deaktiviert (Replikat)
+ddl-event-edit-preserve = nach Abschluss behalten
+ddl-event-edit-no-preserve = nach Abschluss löschen
+ddl-event-edit-definer = Definer auf { $definer }
+ddl-event-edit-comment = Kommentar
+ddl-event-edit-body = Rumpf
+ddl-line-create-enum = { $values ->
+    [one] Typ { $name } mit { $values } Wert erstellen
+   *[other] Typ { $name } mit { $values } Werten erstellen
+}
+ddl-line-add-enum-value = Wert { $value } hinzufügen
+ddl-line-add-enum-value-after = Wert { $value } hinter { $after } hinzufügen
+ddl-line-add-enum-value-before = Wert { $value } vor { $before } hinzufügen
+ddl-line-rename-enum-value = Wert { $from } in { $to } umbenennen
+ddl-line-recreate-enum = Typ { $name } neu erstellen ({ $values ->
+    [one] { $values } Wert
+   *[other] { $values } Werte
+}, { $columns ->
+    [one] { $columns } Spalte wird neu umgewandelt
+   *[other] { $columns } Spalten werden neu umgewandelt
+})
+ddl-line-create-domain = Domäne { $name } als { $datatype } erstellen
+ddl-line-set-domain-default = Standardwert der Domäne auf { $default } setzen
+ddl-line-drop-domain-default = Standardwert der Domäne löschen
+ddl-line-domain-not-null = Domäne NOT NULL machen
+ddl-line-domain-nullable = Domäne nullbar machen
+ddl-line-recreate-domain = Domäne { $name } als { $datatype } neu erstellen (war { $was }; { $columns ->
+    [one] { $columns } Spalte wird neu umgewandelt
+   *[other] { $columns } Spalten werden neu umgewandelt
+})
+ddl-line-create-sequence = Sequenz { $name } erstellen
+ddl-line-alter-sequence = Für die Sequenz setzen: { $edits }
+ddl-sequence-edit-type = Typ auf { $datatype }
+ddl-sequence-edit-increment = Schrittweite auf { $value }
+ddl-sequence-edit-minimum = Minimum auf { $value }
+ddl-sequence-edit-maximum = Maximum auf { $value }
+ddl-sequence-edit-start = Start auf { $value }
+ddl-sequence-edit-cache = Cache auf { $value }
+ddl-sequence-edit-cycling-on = Zyklus an
+ddl-sequence-edit-cycling-off = Zyklus aus
+ddl-sequence-edit-owner = Besitzer auf { $owner }
+ddl-sequence-edit-no-owner = kein Besitzer
+ddl-line-restart-sequence = Sequenz bei { $value } neu starten
+ddl-line-create-object = { $what } { $name } erstellen
+ddl-line-replace-object = { $what } { $name } löschen und neu erstellen
+ddl-line-replace-object-as = { $what } { $name } löschen und als { $to } neu erstellen
+ddl-line-alter-tsql-sequence = Sequenz ändern: { $clauses }
+ddl-line-rename-object = { $what } in { $to } umbenennen
+ddl-line-drop-object = { $what } löschen
+ddl-line-set-object-comment = Kommentar setzen: { $what }
+ddl-line-clear-object-comment = Kommentar leeren: { $what }
+ddl-line-create-database = Datenbank { $name } erstellen
+ddl-line-drop-database = Datenbank { $name } löschen
+ddl-line-create-schema = Schema { $name } erstellen
+ddl-line-drop-schema = Schema { $name } löschen
+ddl-line-create-extension = Erweiterung { $name } erstellen
+ddl-line-create-user = Benutzer { $who } erstellen
+ddl-line-create-role = Rolle { $who } erstellen
+ddl-line-create-login = Anmeldung { $who } erstellen
+ddl-line-drop-user = Benutzer { $who } löschen
+ddl-line-drop-role = Rolle { $who } löschen
+ddl-line-drop-login = Anmeldung { $who } löschen
+ddl-line-set-password = Passwort für { $who } setzen
+ddl-line-grant-privileges = { $who } { $privileges } gewähren
+ddl-line-revoke-privileges = { $who } { $privileges } entziehen
+ddl-privileges-none = keine Berechtigungen
+ddl-privileges-count = { $count } Berechtigungen
+ddl-line-grant-role = { $member } { $role } gewähren
+ddl-line-revoke-role = { $member } { $role } entziehen
+ddl-line-of = { $subject } — { $line }
 write-one-row-delete = Löschen in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
 write-one-row-update = Aktualisieren in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
 write-one-row-insert = Einfügen in { $table } betraf { $affected } Zeilen (erwartet: genau 1)

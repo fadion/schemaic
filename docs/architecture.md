@@ -6890,7 +6890,8 @@ existing prose was left alone.
     found and changed by hand, and that is the sentence `risks` writes. Its `summary` names the
     account through `Principal::display`, host included, because on MySQL `app@%` and `app@10.0.0.%`
     are two accounts with two passwords and a line naming only `app` would not say which one moved.
-    `summary`'s arms run their privilege list through `privilege_words`, which names them while
+    `line`'s arms carry their privilege list as `PrivilegeWords::of` (`privilege_words`, which the
+    risks still use, is its English), which names them while
     there are three or fewer and counts them beyond: eighteen is a legal selection at MySQL's
     database level, and the summary is one line above Apply. An empty list reads **"no privileges",
     not "nothing"** — `users::privilege_sql` emits no statement for one, so the preview headed a plan
@@ -7533,10 +7534,12 @@ existing prose was left alone.
     `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
-    Every `Change` answers `summary()` and `risks()`, which is what the preview
+    Every `Change` answers `line()` and `risks()`, which is what the preview
     modal renders — `risks()` returns *every* consequence, not the first, because one edit can
     narrow a column **and** make it NOT NULL and the NOT-NULL sentence ("the statement fails")
-    otherwise reads as a promise that nothing is lost.
+    otherwise reads as a promise that nothing is lost. `line()` is a `ChangeLine`, the change's
+    sentence as a value the interface words, and `summary()` is its English, `line().message()`,
+    for the CLI, the MCP server, the withheld list and the tests (under *The string catalogue*).
     **The change list is a *diff*, and `summary()` used to print only the new side.** A column's
     four free-SQL fields — default, generated expression, `ON UPDATE`, `COLLATE` — are free SQL by
     design, a default having to be able to say `nextval('s')`, and `column_clauses` renders only
@@ -7545,7 +7548,7 @@ existing prose was left alone.
     byte-identical to the "nothing interesting changed" case, `Change column qty`, while `emit()`
     wrote `MODIFY COLUMN qty INT NOT NULL`. That is against `column_clauses`' own stated contract —
     the change list is the consent gesture, so nothing may reach `emit()` without reaching it.
-    `clause_pairs` gives the four as `(label, Option<value>)` and `clause_changes` names each pair
+    `clause_pairs` gives the four as `(ClauseKind, Option<value>)` and `clause_changes` names each pair
     that differs **in both directions**, `, default 0 → (none)`, on all three `AlterColumn` arms;
     they shared the one value, so a rename or a retype hid it too. The asymmetry was exact — an
     added or edited clause was named, a cleared one was silent — and clearing a `COLLATE` changes
@@ -18139,6 +18142,8 @@ existing prose was left alone.
         listed `DropTable`'s summary, *"Drop the table"*, over *"Drops the sequence"* until
         `stats::drop_preview` reworded both halves together — `drop_summary` over the lines,
         `drop_warning` over the risks — handed to `preview_change_warning` as one closure. The
+        lines are `ddl::ChangeLine`s, worded by the preview after the closure has run, so a
+        sequence's is `ChangeLine::DropObject { kind: Sequence }` rather than English text. The
         property is pinned rather than the strings: for every shape on every engine that takes its
         drop, the line's noun is the warning's (`a_drops_line_and_warning_name_the_same_object`,
         R2-L6-02). And **every drop a Drop entry routes carries a warning** — every table-shaped
@@ -28589,7 +28594,9 @@ existing prose was left alone.
     edit has dependents — dropping a column takes its index and FK with it) and
     `ddl_preview::preview_change` (a lone `Change`). `preview_change_warning` is `preview_change`
     with the plan's change lines and `destructive` list reworded by the caller, one closure over
-    both, for facts it holds and the change set does not: the schema tree's Drop passes
+    both, for facts it holds and the change set does not — the lines as `ChangeLine`s, which
+    `change_line_text` words only after the closure returns, so a caller rewords a value rather
+    than an English sentence: the schema tree's Drop passes
     `stats::drop_preview` — a table's row figure, a MariaDB sequence's `DROP TABLE` worded as a
     sequence's in its line and its warning alike — which is what the confirm it replaced had said
     before the preview said everything else again. The same closure then appends
@@ -28684,8 +28691,9 @@ existing prose was left alone.
     derive. Deriving it the way `preview_of` does answered `true`, and `preview_title` then wrote
     `Apply changes to My MariaDB · shop.12 objects` — every input to it true and the result nonsense,
     because a plan's subject is a **count**, not an object that lives in a database. Nothing is lost
-    by the title declining to qualify it: each statement is still qualified and `summaries()` names
-    the object per line. `preview_of_plan` has four unit tests of its own, two of which fail against
+    by the title declining to qualify it: each statement is still qualified and each change line
+    names its object — `SchemaPlan::lines()` pairs each `ChangeLine` with its subject, which
+    `plan_line_text` words, and `summaries()` is that list's English. `preview_of_plan` has four unit tests of its own, two of which fail against
     the old derivation — `a_plan_is_never_qualified_by_the_database_it_runs_in`, and
     `an_empty_plan_previews_as_empty_and_unqualified`, where `all()` over no changes was vacuously
     true and flipped the answer for a reason that had nothing to do with accounts. It had none while
@@ -28732,8 +28740,9 @@ existing prose was left alone.
     footers share is now one message rather than two literals that modal's source gate held equal.
     `the_counted_lines_read_as_they_did_in_english` pins both plurals. English stays: the SQL box
     (`sql_box_text`, its `-- After the plan commits…` comment included, being generated SQL) and the
-    *SQL* heading; `ChangeSet::risk_heading` and the change, risk, used-by, withheld and omitted
-    lines, core's prose, phase 4; and `preview_proposal`'s two `Err` sentences, which go back
+    *SQL* heading; `ChangeSet::risk_heading` and the risk, used-by, withheld and omitted lines,
+    core's prose, phase 4 — the change lines have left that list, worded from `ChangeLine` (under
+    *The string catalogue*); and `preview_proposal`'s two `Err` sentences, which go back
     through the AI panel's propose path, whose sibling error in `ai_panel.rs` is English too.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
@@ -41008,7 +41017,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     write path's failure (`model::WriteFailure`, below), though the server's words inside it
     still are, nor `DbError`'s own *query failed:*, *connection failed:* and *query cancelled*
     wherever the app shows an error through `db_error_shown` (below) — the sites still on
-    `to_string()` are listed there.
+    `to_string()` are listed there — nor the DDL preview's change lines (`ddl::ChangeLine`,
+    below), though its risk heading and risk lines, withheld, *Used by* and omitted lines still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41309,6 +41319,42 @@ Re-introducing the anti-patterns these guard against is a regression:
     over one index and two). Those tests walk a hand-written list of
     variants rather than an `ALL`, so a new variant fails the renderer's exhaustive `match` at
     compile time but is not held to its English until someone adds it to the list.
+    The DDL preview's change list is the case of one value with many small parts. `Change::summary`
+    built finished English and is now `self.line().message()`: `Change::line` answers a
+    `ddl::ChangeLine`, one variant per sentence the list says, its fields the sentence's arguments
+    and its lists carried whole, joined by whoever words them; `message()` is the English byte for
+    byte, which the CLI, the MCP server and every core test still read
+    (under `ddl.rs`). The parts are typed alongside it — `ClauseKind` with `AddedClause` and
+    `ClauseChange` for a column's free-SQL clauses, `MoveTo`, `IndexLine`, `TableOptionEdit`,
+    `SequenceEdit`, `EventEdit` and `PrivilegeWords` — and a routine's kind is an `ObjectKind`
+    (`routine_object_kind`), so the interface names it through `i18n::object_kind`. `ClauseKind::label`
+    (*default*, *generated as*, *on update*, *collate*) is SQL, and both languages print it
+    untranslated. `ddl_preview.rs`'s `change_line_text` words a line from `ddl-line-*`,
+    `ddl-clause-*`, `ddl-index-*`, `ddl-table-option-*`, `ddl-event-edit-*`,
+    `ddl-sequence-edit-*` and `ddl-privileges-*`, and `plan_line_text` puts a comparison's line
+    after its object with `ddl-line-of`; `preview_of` and `preview_of_plan` fill
+    `DdlPreview::changes` from them, and `preview_change_warning`'s `reword` now takes and returns
+    `ChangeLine`s, worded after it (under `ddl_preview.rs`). **The added-index line is one
+    message**, `ddl-line-add-index`, with the selector rule below applied to every optional part —
+    `$unique`, then `$has_kind`/`$kind` (a `ddl-index-kind-*` word), `$has_method`/`$method`,
+    `$has_columns`/`$columns`, `$has_include`/`$include`, `$has_order`/`$order` and
+    `$has_predicate`/`$predicate`, each leading space a `{" "}`. **A part's presence is a yes/no
+    flag beside its value, not the lock-wait sentence's `none` sentinel**, because these values
+    are the user's names: a key column or method literally called `none` would select the empty
+    variant and vanish from the line, so the test words an index whose method is `no` and whose
+    key is `none`. A column line's clauses are a list like any other: each `ddl-clause-added` or
+    `ddl-clause-changed` is worded on its own, joined with `", "` in code and handed to
+    `ddl-line-add-column`, `-rename-column`, `-retype-column` or `-change-column` as `$clauses`
+    beside `$has_clauses`; a rename's type change is a selector in its message (`$retyped`,
+    `$old_type`, `$new_type`). The joins left in code — clauses, table options, sequence and event
+    edits, column lists — are lists, joined before they are handed in, as *Restore from file*'s
+    are. `english_says_every_change_line_as_core_does` holds `change_line_text` equal to
+    `message()` over every variant — optional parts present and absent, counts one and many, lists
+    empty, single and several, every `IndexStorage`, every object and principal kind — and
+    `plan_line_text` equal to `SchemaPlan::summaries`' line. What stays core's English in the
+    modal: the risk heading and risk lines (`ChangeSet::risk_heading`, `Change::risks`,
+    `destructive`), the withheld lines (`unsupported`, which still reads `Change::summary` for a
+    refused change), the *Used by* warnings and the omitted notes.
     The editor's diagnostics are the case where one value has two readers in two languages.
     `intel::Diagnostic` held a finished `message: String` and now holds `what`, an
     `intel::DiagMessage` (under `core::intel`), with `Diagnostic::message()` the English byte for

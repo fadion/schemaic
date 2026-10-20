@@ -2155,8 +2155,217 @@ diff-no-added = No added rows.
 diff-no-removed = No removed rows.
 
 ## The DDL preview — the plan a schema editor or a comparison applies (ddl_preview.rs)
-## The change list, the risk heading and its lines, and the Used by,
-## withheld and omitted lines are core's words and stay as they are for now.
+## The risk heading and its lines, and the Used by, withheld and omitted lines
+## are core's words and stay as they are for now.
+
+## The change list: one line per change (core's ddl::ChangeLine). English must
+## read exactly as core's Change::summary (a test holds it). Names, types, SQL
+## expressions and clause keywords (default, generated as, on update, collate,
+## NOT NULL, RESTART WITH …) are never translated. $what is an object kind as
+## kind-* words it; $columns, $indexes and similar are lists already joined.
+
+ddl-line-create-table = { $columns ->
+    [one] Create table { $name } with { $columns } column
+   *[other] Create table { $name } with { $columns } columns
+}
+ddl-line-rebuild-table = Rebuild { $name } — this can't be altered in place, so the rows are copied into a new table and it takes the old one's place
+ddl-line-drop-table = Drop the table
+ddl-line-drop-foreign-table = Drop the foreign table
+ddl-line-truncate-table = Delete every row
+ddl-line-rename-table = Rename the table to { $to }
+# $clauses is the column's clauses, each a ddl-clause-added, joined by commas;
+# $has_clauses is yes or no.
+ddl-line-add-column = Add column { $name } { $datatype }{ $has_clauses ->
+        [yes] , { $clauses }
+       *[no] {""}
+    }
+ddl-line-drop-column = Drop column { $name }
+ddl-line-rebuild-computed-column = Rebuild computed column { $name } as ({ $expression }) around the column change
+# $retyped is yes when the rename also changes the type from $old_type to
+# $new_type; $clauses is each ddl-clause-changed, joined by commas.
+ddl-line-rename-column = Rename column { $from } to { $to }{ $retyped ->
+        [yes] , and its type from { $old_type } to { $new_type }
+       *[no] {""}
+    }{ $has_clauses ->
+        [yes] , { $clauses }
+       *[no] {""}
+    }
+ddl-line-move-column-first = Move column { $name } first
+ddl-line-move-column-after = Move column { $name } after { $after }
+ddl-line-move-column = Move column { $name }
+ddl-line-retype-column = Change column { $name } from { $from } to { $to }{ $has_clauses ->
+        [yes] , { $clauses }
+       *[no] {""}
+    }
+ddl-line-change-column = Change column { $name }{ $has_clauses ->
+        [yes] , { $clauses }
+       *[no] {""}
+    }
+# $clause is the clause's keyword (default, collate…), $value its SQL.
+ddl-clause-added = { $clause } { $value }
+ddl-clause-changed = { $clause } { $from } → { $to }
+# A clause the column does not have, on one side of ddl-clause-changed.
+ddl-clause-none = (none)
+ddl-line-add-primary-key = Add primary key ({ $columns })
+ddl-line-drop-primary-key = Drop the primary key ({ $columns })
+ddl-line-rebuild-primary-key = Rebuild the primary key ({ $columns }) around the column change
+ddl-line-change-primary-key = Change the primary key from ({ $from }) to ({ $to })
+# Each optional part has a yes/no selector beside its value: $kind (one of
+# ddl-index-kind-*), $method (an access method: gist, gin…), $columns (the
+# key), $include, $order (lists) and $predicate (the filter's SQL).
+ddl-line-add-index = Add { $unique ->
+        [yes] unique{" "}
+       *[no] {""}
+    }{ $has_kind ->
+        [yes] { $kind }{" "}
+       *[no] {""}
+    }index { $name }{ $has_method ->
+        [yes] {" "}using { $method }
+       *[no] {""}
+    }{ $has_columns ->
+        [yes] {" "}on ({ $columns })
+       *[no] {""}
+    }{ $has_include ->
+        [yes] {" "}including ({ $include })
+       *[no] {""}
+    }{ $has_order ->
+        [yes] {" "}ordered by ({ $order })
+       *[no] {""}
+    }{ $has_predicate ->
+        [yes] {" "}where { $predicate }
+       *[no] {""}
+    }
+ddl-index-kind-columnstore = columnstore
+ddl-index-kind-clustered-columnstore = clustered columnstore
+ddl-index-kind-primary-xml = primary XML
+ddl-index-kind-selective-xml = selective XML
+ddl-index-kind-secondary-xml = secondary XML
+ddl-index-kind-spatial = spatial
+ddl-line-drop-index = Drop index { $name }
+ddl-line-rename-index = Rename index { $from } to { $to }
+ddl-line-keep-lossy-index = Leave index { $name } unchanged — Schemaic can't read all of it
+ddl-line-add-foreign-key = Add foreign key { $name } → { $table }({ $columns })
+ddl-line-drop-foreign-key = Drop foreign key { $name }
+ddl-line-add-check = Add check { $name } ({ $expression })
+ddl-line-drop-check = Drop check { $name }
+# $parts is ddl-table-option-* joined by commas.
+ddl-line-table-options = Set the table's { $parts }
+ddl-table-option-engine = engine to { $engine }
+ddl-table-option-collation = collation to { $collation }
+ddl-table-option-comment = comment
+ddl-table-option-comment-cleared = comment (cleared)
+ddl-line-create-view = Create view { $name }
+ddl-line-create-view-index = Create view { $name } and its index { $index }
+ddl-line-create-view-indexes = Create view { $name } and its indexes { $indexes }
+ddl-line-redefine-view = Redefine view { $name }
+ddl-line-recreate-view = Drop and re-create view { $name }
+ddl-line-rename-view = Rename the view to { $to }
+ddl-line-drop-view = Drop the view
+ddl-line-drop-materialized-view = Drop the materialized view
+ddl-line-refresh-view = Rebuild the materialized view's rows — readers are blocked until it finishes
+ddl-line-refresh-view-concurrently = Rebuild the materialized view's rows without blocking readers
+ddl-line-create-trigger = Create trigger { $name }
+ddl-line-redefine-trigger = Redefine trigger { $name }
+ddl-line-recreate-trigger = Re-create trigger { $name }
+# $from is the trigger's name on the server, $name the one it takes.
+ddl-line-recreate-trigger-as = Re-create trigger { $from } as { $name }
+ddl-line-drop-trigger = Drop trigger { $name }
+# $what is a function or a procedure.
+ddl-line-create-routine = Create { $what } { $name }
+ddl-line-redefine-routine = Redefine { $what } { $name }
+ddl-line-redefine-routine-as = Redefine { $what } { $from } as { $name }
+ddl-line-recreate-routine = Re-create { $what } { $name }
+ddl-line-recreate-routine-as = Re-create { $what } { $from } as { $name }
+ddl-line-rename-routine = Rename { $what } { $from } to { $to }
+ddl-line-drop-routine = Drop { $what } { $name }
+ddl-line-create-event = Create event { $name }
+ddl-line-alter-event = Alter event { $name }
+# $edits is ddl-event-edit-* joined by commas.
+ddl-line-alter-event-edits = Alter event { $name }: { $edits }
+ddl-line-drop-event = Drop event { $name }
+ddl-event-edit-rename = rename to { $to }
+# $schedule is the schedule's SQL.
+ddl-event-edit-schedule = schedule to { $schedule }
+ddl-event-edit-status-enabled = status to enabled
+ddl-event-edit-status-disabled = status to disabled
+ddl-event-edit-status-replica = status to disabled on replica
+ddl-event-edit-preserve = keep it after it completes
+ddl-event-edit-no-preserve = delete it after it completes
+ddl-event-edit-definer = definer to { $definer }
+ddl-event-edit-comment = comment
+ddl-event-edit-body = body
+ddl-line-create-enum = { $values ->
+    [one] Create type { $name } with { $values } value
+   *[other] Create type { $name } with { $values } values
+}
+ddl-line-add-enum-value = Add value { $value }
+ddl-line-add-enum-value-after = Add value { $value } after { $after }
+ddl-line-add-enum-value-before = Add value { $value } before { $before }
+ddl-line-rename-enum-value = Rename value { $from } to { $to }
+# $values and $columns are counts.
+ddl-line-recreate-enum = Re-create type { $name } ({ $values ->
+    [one] { $values } value
+   *[other] { $values } values
+}, re-casting { $columns ->
+    [one] { $columns } column
+   *[other] { $columns } columns
+})
+ddl-line-create-domain = Create domain { $name } as { $datatype }
+ddl-line-set-domain-default = Set the domain's default to { $default }
+ddl-line-drop-domain-default = Drop the domain's default
+ddl-line-domain-not-null = Make the domain NOT NULL
+ddl-line-domain-nullable = Make the domain nullable
+# $was is the type it had.
+ddl-line-recreate-domain = Re-create domain { $name } as { $datatype } (was { $was }; re-casting { $columns ->
+    [one] { $columns } column
+   *[other] { $columns } columns
+})
+ddl-line-create-sequence = Create sequence { $name }
+# $edits is ddl-sequence-edit-* joined by commas.
+ddl-line-alter-sequence = Set the sequence's { $edits }
+ddl-sequence-edit-type = type to { $datatype }
+ddl-sequence-edit-increment = increment to { $value }
+ddl-sequence-edit-minimum = minimum to { $value }
+ddl-sequence-edit-maximum = maximum to { $value }
+ddl-sequence-edit-start = start to { $value }
+ddl-sequence-edit-cache = cache to { $value }
+ddl-sequence-edit-cycling-on = cycling on
+ddl-sequence-edit-cycling-off = cycling off
+# $owner is table.column.
+ddl-sequence-edit-owner = owner to { $owner }
+ddl-sequence-edit-no-owner = owner to none
+ddl-line-restart-sequence = Restart the sequence at { $value }
+ddl-line-create-object = Create { $what } { $name }
+ddl-line-replace-object = Drop the { $what } { $name } and create it again
+ddl-line-replace-object-as = Drop the { $what } { $name } and create it again as { $to }
+# $clauses is SQL Server's ALTER SEQUENCE clauses, as SQL.
+ddl-line-alter-tsql-sequence = Alter the sequence: { $clauses }
+ddl-line-rename-object = Rename the { $what } to { $to }
+ddl-line-drop-object = Drop the { $what }
+ddl-line-set-object-comment = Set the { $what }'s comment
+ddl-line-clear-object-comment = Clear the { $what }'s comment
+ddl-line-create-database = Create database { $name }
+ddl-line-drop-database = Drop database { $name }
+ddl-line-create-schema = Create schema { $name }
+ddl-line-drop-schema = Drop schema { $name }
+ddl-line-create-extension = Create extension { $name }
+# $who is the account (app, app@%).
+ddl-line-create-user = Create user { $who }
+ddl-line-create-role = Create role { $who }
+ddl-line-create-login = Create login { $who }
+ddl-line-drop-user = Drop user { $who }
+ddl-line-drop-role = Drop role { $who }
+ddl-line-drop-login = Drop login { $who }
+ddl-line-set-password = Set password for { $who }
+# $privileges is up to three privilege names (SELECT, INSERT), or ddl-privileges-*.
+ddl-line-grant-privileges = Grant { $privileges } to { $who }
+ddl-line-revoke-privileges = Revoke { $privileges } from { $who }
+ddl-privileges-none = no privileges
+ddl-privileges-count = { $count } privileges
+ddl-line-grant-role = Grant { $role } to { $member }
+ddl-line-revoke-role = Revoke { $role } from { $member }
+# A comparison's line: $subject is the object the change is about.
+ddl-line-of = { $subject } — { $line }
 
 # $connection is the connection's name; $subject what the plan changes
 # (shop.orders, app@%).

@@ -1073,9 +1073,11 @@ pub fn drop_change(shape: TableShape, materialized: bool) -> crate::ddl::Change 
 /// table"* over [`drop_warning`]'s *"Drops the sequence"* — the two halves of
 /// one modal disagreeing about what the object is (R2-L6-02). A table's and
 /// a view's are already their own.
-pub fn drop_summary(summary: String, shape: TableShape) -> String {
+pub fn drop_summary(summary: crate::ddl::ChangeLine, shape: TableShape) -> crate::ddl::ChangeLine {
     match shape {
-        TableShape::Sequence => "Drop the sequence".to_string(),
+        TableShape::Sequence => crate::ddl::ChangeLine::DropObject {
+            kind: crate::ddl::ObjectKind::Sequence,
+        },
         TableShape::Table | TableShape::View | TableShape::ForeignTable => summary,
     }
 }
@@ -1085,11 +1087,11 @@ pub fn drop_summary(summary: String, shape: TableShape) -> String {
 /// [`drop_warning`] over the risks. One call, so the two halves of the modal
 /// are worded together.
 pub fn drop_preview(
-    lines: Vec<String>,
+    lines: Vec<crate::ddl::ChangeLine>,
     risks: Vec<String>,
     rows: Option<RowCount>,
     shape: TableShape,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<crate::ddl::ChangeLine>, Vec<String>) {
     (
         lines.into_iter().map(|l| drop_summary(l, shape)).collect(),
         drop_warning(risks, rows, shape),
@@ -2371,8 +2373,8 @@ mod tests {
                         continue;
                     }
                     let (lines, warning) =
-                        drop_preview(vec![change.summary()], change.risks(d), None, shape);
-                    let line = &lines[0];
+                        drop_preview(vec![change.line()], change.risks(d), None, shape);
+                    let line = &lines[0].message();
                     assert_eq!(
                         noun(line, "Drop the "),
                         noun(&warning[0], "Drops the "),

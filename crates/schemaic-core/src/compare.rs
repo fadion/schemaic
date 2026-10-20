@@ -1687,14 +1687,20 @@ impl SchemaPlan {
     /// One line per change, for the preview modal's summary list, each named
     /// for its object — see [`SchemaPlan::destructive`] for why.
     pub fn summaries(&self) -> Vec<String> {
+        self.lines()
+            .into_iter()
+            .map(|(subject, line)| format!("{subject} — {}", line.message()))
+            .collect()
+    }
+
+    /// [`SchemaPlan::summaries`] as values: each change's line with the
+    /// object it is about, for the interface to word.
+    pub fn lines(&self) -> Vec<(String, ddl::ChangeLine)> {
         self.sets
             .iter()
             .flat_map(|s| {
                 let subject = Self::subject_of(s);
-                s.changes
-                    .iter()
-                    .map(Change::summary)
-                    .map(move |c| format!("{subject} — {c}"))
+                s.changes.iter().map(move |c| (subject.clone(), c.line()))
             })
             .collect()
     }
