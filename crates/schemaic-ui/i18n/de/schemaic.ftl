@@ -773,6 +773,42 @@ ddl-risk-star-refresh = Aktualisiert jede Sicht und Inline-Funktion in dieser Da
 ddl-risk-piecewise = SQL Server erstellt, ändert oder löscht ein nativ kompiliertes Modul nicht innerhalb einer Transaktion; dieser Plan läuft daher Anweisung für Anweisung und lässt sich nicht anhalten: Schlägt eine Anweisung fehl, bleiben die vorherigen angewendet.
 ddl-risk-drop-sequence-table = Löscht die Sequenz: Der erreichte Wert geht verloren, und alles, was noch aus ihr zieht, schlägt fehl.
 ddl-risk-drop-scale = Laut den Statistiken des Schemabaums sind das { $rows } Zeilen.
+ddl-used-by-count-view = { $count ->
+    [one] { $count } Sicht
+   *[other] { $count } Sichten
+}
+ddl-used-by-count-routine = { $count ->
+    [one] { $count } Routine
+   *[other] { $count } Routinen
+}
+ddl-used-by-count-trigger = { $count ->
+    [one] { $count } Trigger
+   *[other] { $count } Triggern
+}
+ddl-used-by-count-event = { $count ->
+    [one] { $count } Ereignis
+   *[other] { $count } Ereignissen
+}
+ddl-used-by-count-foreign-key = { $count ->
+    [one] { $count } Fremdschlüssel
+   *[other] { $count } Fremdschlüsseln
+}
+ddl-used-by-count-expression = { $count ->
+    [one] { $count } Tabellenausdruck
+   *[other] { $count } Tabellenausdrücken
+}
+ddl-used-by-counts = { $first } und { $last }
+ddl-used-by-listing = { $counts }: { $names }{ $more ->
+        [0] {""}
+       *[other] {" "}und { $more } weiteren
+    }
+ddl-used-by-drop = Verwendet von { $listing }.
+ddl-used-by-change = { $subject } wird verwendet von { $listing }. { $then ->
+        [renamed] Sie nennen nach der Umbenennung weiterhin { $name }.
+        [dropped] Sie brechen, wenn es gelöscht wird.
+       *[retyped] Prüfe sie gegen den neuen Typ.
+    }
+ddl-used-by-column = Spalte { $name }
 ddl-risk-of = { $subject } — { $risk }
 ddl-risk-cycle = Die Fremdschlüssel zwischen diesen Tabellen bilden einen Zyklus, keine Erstellreihenfolge erfüllt sie also alle. Eine Anweisung wird abgelehnt, weil sie auf eine noch nicht existierende Tabelle verweist, und weder MySQL noch MariaDB rollen DDL zurück.
 ddl-risk-clash = { $holder } hält noch { $names }, was das Erstellen von { $claimer } braucht — { $why ->

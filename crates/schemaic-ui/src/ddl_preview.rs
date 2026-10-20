@@ -214,7 +214,8 @@ pub(crate) fn open_preview(d: crate::DdlUi, preview: DdlPreview) {
 
 /// `preview` with its *Used by* lines — what in the loaded schema of its
 /// database still names something `cs` renames, drops or retypes
-/// (`used_by::change_warnings`). Left empty while that schema is not loaded:
+/// (`used_by::change_notes`, worded by [`used_by_note_text`]). Left empty
+/// while that schema is not loaded:
 /// the preview opens either way, and the tree's *Used by* says why it cannot
 /// answer. Called by the editors that hold a `SchemaUi`, which `preview_of`
 /// does not.
@@ -224,7 +225,10 @@ pub(crate) fn with_used_by(
     cs: &schemaic_core::ddl::ChangeSet,
 ) -> DdlPreview {
     if let Some(db) = crate::table_designer::loaded_schema(schema, &preview.database) {
-        preview.used_by = schemaic_core::used_by::change_warnings(&db, cs, &preview.database);
+        preview.used_by = schemaic_core::used_by::change_notes(&db, cs, &preview.database)
+            .iter()
+            .map(used_by_note_text)
+            .collect();
     }
     preview
 }
@@ -2297,6 +2301,66 @@ pub(crate) fn plan_risk_text(risk: &schemaic_core::compare::PlanRisk) -> String 
     }
 }
 
+/// The dependents a *Used by* line names — core's `used_by::Listing` in the
+/// interface's language.
+fn listing_text(l: &schemaic_core::used_by::Listing) -> String {
+    use schemaic_core::used_by::DependentKind as K;
+    let counts: Vec<String> = l
+        .kinds
+        .iter()
+        .map(|&(kind, count)| match kind {
+            K::View => tr!("ddl-used-by-count-view", count = count),
+            K::Routine => tr!("ddl-used-by-count-routine", count = count),
+            K::Trigger => tr!("ddl-used-by-count-trigger", count = count),
+            K::Event => tr!("ddl-used-by-count-event", count = count),
+            K::ForeignKey => tr!("ddl-used-by-count-foreign-key", count = count),
+            K::Expression => tr!("ddl-used-by-count-expression", count = count),
+        })
+        .collect();
+    let counts = match counts.split_last() {
+        Some((last, rest)) if !rest.is_empty() => tr!(
+            "ddl-used-by-counts",
+            first = rest.join(", "),
+            last = last.as_str()
+        ),
+        _ => counts.concat(),
+    };
+    tr!(
+        "ddl-used-by-listing",
+        counts = counts,
+        names = l.names.join(", "),
+        more = l.more
+    )
+}
+
+/// A drop's *Used by* line — core's `used_by::drop_warning` in the
+/// interface's language.
+pub(crate) fn used_by_drop_text(l: &schemaic_core::used_by::Listing) -> String {
+    tr!("ddl-used-by-drop", listing = listing_text(l))
+}
+
+/// A change's *Used by* line — core's `used_by::UsedByNote::message` in the
+/// interface's language.
+pub(crate) fn used_by_note_text(n: &schemaic_core::used_by::UsedByNote) -> String {
+    use schemaic_core::used_by::{UsedBySubject, UsedByThen};
+    let subject = match &n.subject {
+        UsedBySubject::Column(c) => tr!("ddl-used-by-column", name = c.as_str()),
+        UsedBySubject::Object(o) => o.clone(),
+    };
+    let (then, name) = match &n.then {
+        UsedByThen::StillNames(name) => ("renamed", name.as_str()),
+        UsedByThen::BreaksOnDrop => ("dropped", ""),
+        UsedByThen::CheckNewType => ("retyped", ""),
+    };
+    tr!(
+        "ddl-used-by-change",
+        subject = subject,
+        listing = listing_text(&n.listing),
+        then = then,
+        name = name
+    )
+}
+
 /// A comparison's line: `line` worded, about `subject` — core's
 /// `SchemaPlan::summaries` in the interface's language.
 pub(crate) fn plan_line_text(subject: &str, line: &schemaic_core::ddl::ChangeLine) -> String {
@@ -2995,6 +3059,66 @@ mod tests {
         }
         for risk in &plan {
             assert_eq!(plan_risk_text(risk), risk.message(), "{risk:?}");
+        }
+    }
+
+    /// **Every *Used by* line reads in English exactly as core's** — a drop's
+    /// and a change's, every kind counted at one and many, one kind and
+    /// several, with and without more beyond the names, each subject and
+    /// each consequence.
+    #[test]
+    fn english_says_every_used_by_line_as_core_does() {
+        use schemaic_core::used_by::{
+            DependentKind as K, Listing, UsedByNote, UsedBySubject, UsedByThen,
+        };
+        let kinds = [
+            K::View,
+            K::Routine,
+            K::Trigger,
+            K::Event,
+            K::ForeignKey,
+            K::Expression,
+        ];
+        let names = |n: usize| (0..n).map(|i| format!("o{i}")).collect::<Vec<_>>();
+        let mut listings = Vec::new();
+        for kind in kinds {
+            for count in [1, 3] {
+                listings.push(Listing {
+                    kinds: vec![(kind, count)],
+                    names: names(count),
+                    more: 0,
+                });
+            }
+        }
+        listings.push(Listing {
+            kinds: vec![(K::View, 2), (K::Routine, 1)],
+            names: names(3),
+            more: 0,
+        });
+        listings.push(Listing {
+            kinds: vec![(K::View, 2), (K::Trigger, 1), (K::ForeignKey, 4)],
+            names: names(4),
+            more: 3,
+        });
+        for l in &listings {
+            assert_eq!(used_by_drop_text(l), l.drop_message(), "{l:?}");
+            for subject in [
+                UsedBySubject::Column("qty".into()),
+                UsedBySubject::Object("shop.orders".into()),
+            ] {
+                for then in [
+                    UsedByThen::StillNames("qty".into()),
+                    UsedByThen::BreaksOnDrop,
+                    UsedByThen::CheckNewType,
+                ] {
+                    let n = UsedByNote {
+                        subject: subject.clone(),
+                        listing: l.clone(),
+                        then,
+                    };
+                    assert_eq!(used_by_note_text(&n), n.message(), "{n:?}");
+                }
+            }
         }
     }
 

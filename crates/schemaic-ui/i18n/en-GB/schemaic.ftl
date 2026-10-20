@@ -2543,6 +2543,54 @@ ddl-risk-piecewise = SQL Server will not create, alter or drop a natively compil
 ddl-risk-drop-sequence-table = Drops the sequence: the value it has reached is lost, and anything that still draws from it fails.
 # $rows is the figure as the properties panel prints it (~4.2m, 12).
 ddl-risk-drop-scale = By the schema tree's statistics, that is { $rows } rows.
+## The Used by lines: what in the loaded schema still names something the plan
+## renames, drops or retypes (core's used_by::UsedByNote and Listing). English
+## must read exactly as core's change_warning and drop_warning (a test holds it).
+
+# A count of one kind of dependent, in a list ("2 views and 1 routine").
+ddl-used-by-count-view = { $count ->
+    [one] { $count } view
+   *[other] { $count } views
+}
+ddl-used-by-count-routine = { $count ->
+    [one] { $count } routine
+   *[other] { $count } routines
+}
+ddl-used-by-count-trigger = { $count ->
+    [one] { $count } trigger
+   *[other] { $count } triggers
+}
+ddl-used-by-count-event = { $count ->
+    [one] { $count } event
+   *[other] { $count } events
+}
+ddl-used-by-count-foreign-key = { $count ->
+    [one] { $count } foreign key
+   *[other] { $count } foreign keys
+}
+ddl-used-by-count-expression = { $count ->
+    [one] { $count } table expression
+   *[other] { $count } table expressions
+}
+# $first is every count but the last, joined by commas; $last the last.
+ddl-used-by-counts = { $first } and { $last }
+# $counts is the counts above; $names the first few dependents, joined; $more
+# how many more there are.
+ddl-used-by-listing = { $counts }: { $names }{ $more ->
+        [0] {""}
+       *[other] {" "}and { $more } more
+    }
+# A drop's line: $listing is ddl-used-by-listing.
+ddl-used-by-drop = Used by { $listing }.
+# A change's line: $subject is ddl-used-by-column or the object's name; $then
+# is renamed (with $name the old name), dropped or retyped.
+ddl-used-by-change = { $subject } is used by { $listing }. { $then ->
+        [renamed] They still name { $name } after the rename.
+        [dropped] They break when it is dropped.
+       *[retyped] Check them against its new type.
+    }
+ddl-used-by-column = Column { $name }
+
 # A comparison's risk: $subject is the object it happens to.
 ddl-risk-of = { $subject } — { $risk }
 ddl-risk-cycle = The foreign keys between these tables form a cycle, so no creation order satisfies all of them. One statement will be refused for referencing a table that does not exist yet, and neither MySQL nor MariaDB rolls DDL back.

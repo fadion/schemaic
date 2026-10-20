@@ -15794,7 +15794,12 @@ existing prose was left alone.
     out every `goes_with_it` dependent**, returning `None` when nothing else is left: a trigger on
     the dropped table goes with it and is no breakage, so the sentence is about what the drop
     breaks (`a_trigger_on_the_table_is_listed_and_one_elsewhere_that_writes_it`,
-    `the_drop_warning_counts_by_kind_and_names_the_first_few`).
+    `the_drop_warning_counts_by_kind_and_names_the_first_few`). It is `drop_listing(deps)`'s
+    English: that returns the sentence as a value, a `Listing { kinds, names, more }` — the count
+    per `DependentKind` in the order met, the first four names, how many are left — whose
+    `message()` is the *"2 views and 1 routine: a, b and 3 more"* part and `drop_message()` the
+    *"Used by …."* around it, so the preview words the same value in the interface's language
+    (`used_by_drop_text`, under `ddl_preview.rs`) while core's tests still read the English.
     **A rename or a column edit asks the same question**, since it breaks a dependent as surely as
     a drop does. `touched(&[Change], table) -> Vec<Touch>` reads off a plan the names it takes away
     or alters — a `Touch { column, kind }`, `column: None` for the object itself, `TouchKind` one of
@@ -15819,9 +15824,13 @@ existing prose was left alone.
     `change_warning(touch, object, deps, dialect)` words one —
     *"orders is used by 2 views and 1 routine: a, b, c. They still name orders after the
     rename."*, *"Column note is used by …. They break when it is dropped."*, *"… Check them against
-    its new type."* — over the private `listing`, which `drop_warning` was factored onto with its
-    text unchanged, so the `goes_with_it` rows drop out here too: a trigger on a table follows the
-    table's rename on every engine (`the_change_warning_leaves_out_what_goes_with_the_object`).
+    its new type."* — and is `change_note`'s English, a `UsedByNote { subject, listing, then }`:
+    `subject` a `UsedBySubject` (`Column(name)` or `Object(name)`), `then` a `UsedByThen`
+    (`StillNames(old)`, `BreaksOnDrop`, `CheckNewType`), `message()` the sentence. Its `listing` is
+    the private `listing`'s `Listing`, the one `drop_listing` hands out, which `drop_warning` was
+    factored onto with its text unchanged, so the `goes_with_it` rows drop out here too: a trigger
+    on a table follows the table's rename on every engine
+    (`the_change_warning_leaves_out_what_goes_with_the_object`).
     **A rename's sentence leaves foreign keys out too**, and a drop's or a retype's keeps them: a
     key is held against the object, not its name, and was checked live to follow both a renamed
     referenced table and a renamed referenced column on MariaDB, MySQL 8, PostgreSQL, SQL Server and
@@ -15841,8 +15850,9 @@ existing prose was left alone.
     not ask it**: building anew carries nothing across but a key, which names a table rather than a
     view or routine and is put back against the new table, so only keys drop out and the sentence
     is the same *"They still name X after the rename."*
-    `change_warnings(&DbSchema, &ChangeSet, database)` is the composition the preview calls, and it
-    asks **under the name before the plan** — the set's `table`, which is the server's name, a
+    `change_notes(&DbSchema, &ChangeSet, database)` is the composition the preview calls —
+    `change_warnings`, its English, is what core's tests read — and it asks **under the name before
+    the plan** — the set's `table`, which is the server's name, a
     renamed routine's `from`, or a routine re-created under a new name's `server` — because the
     loaded schema still holds the old one and a dependent still names it
     (`a_plan_is_warned_about_by_what_uses_the_names_it_changes`,
@@ -28613,8 +28623,9 @@ existing prose was left alone.
     sequence's in its line and its warning alike — which is what the confirm it replaced had said
     before the preview said everything else again. **The closure takes the risks as `Risk`s and
     hands back finished strings**, the one half it words itself, with `risk_text`: the same
-    closure then appends `used_by::drop_warning`, which is still core's English, so the list it
-    returns is mixed and only the caller knows where the worded part ends. The appended line is
+    closure then appends `used_by_drop_text` over `used_by::drop_listing`, so every line of the
+    list it returns is worded — it was mixed while that line was `used_by::drop_warning`'s English,
+    and only the caller knew where the worded part ended. The appended line is
     over the object's dependents (`used_by_view::dependents_of`, read when
     the entry is clicked), so what the drop breaks — *"Used by 2 views …"* — is named before Apply
     rather than by the next error; nothing is appended when the database's schema is not loaded, or
@@ -28626,7 +28637,8 @@ existing prose was left alone.
     heads itself a neutral *"Used by"* beside an accent-coloured triangle, has no error box, hides
     when empty, and **Apply stays live**. A drop's dependents stay where they were, in
     `destructive`, since `used_by::touched` leaves whole-object drops out. It is filled by
-    `ddl_preview::with_used_by(preview, SchemaUi, &cs)` over `used_by::change_warnings`, reading the
+    `ddl_preview::with_used_by(preview, SchemaUi, &cs)` over `used_by::change_notes`, each worded by
+    `used_by_note_text` (under *The string catalogue*), reading the
     schema through `table_designer::loaded_schema` and leaving the list empty while that is not
     loaded — the preview opens either way. `preview_of` cannot fill it, holding no `SchemaUi`, so
     every editor that previews a rename or a column edit calls `with_used_by` itself: the table
@@ -28758,10 +28770,12 @@ existing prose was left alone.
     footers share is now one message rather than two literals that modal's source gate held equal.
     `the_counted_lines_read_as_they_did_in_english` pins both plurals. English stays: the SQL box
     (`sql_box_text`, its `-- After the plan commits…` comment included, being generated SQL) and the
-    *SQL* heading; the used-by, withheld and omitted lines and the after-commit refresh note
-    (`ddl::elsewhere_report`), core's prose, phase 4 — the change lines, the risk lines and the
-    risk heading have left that list, worded from `ChangeLine` and `Risk`/`PlanRisk` (`risk_text`,
-    `plan_risk_text`, both under *The string catalogue*) and from the bool above; and `preview_proposal`'s two `Err` sentences, which go back
+    *SQL* heading; the withheld and omitted lines and the after-commit refresh note
+    (`ddl::elsewhere_report`), core's prose, phase 4 — the change lines, the risk lines, the
+    risk heading and the *Used by* lines have left that list, worded from `ChangeLine`,
+    `Risk`/`PlanRisk` and `used_by::Listing`/`UsedByNote` (`risk_text`, `plan_risk_text`,
+    `used_by_drop_text`, `used_by_note_text`, all under *The string catalogue*) and from the bool
+    above; and `preview_proposal`'s two `Err` sentences, which go back
     through the AI panel's propose path, whose sibling error in `ai_panel.rs` is English too.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
@@ -41038,7 +41052,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     still are, nor `DbError`'s own *query failed:*, *connection failed:* and *query cancelled*
     wherever the app shows an error through `db_error_shown` (below) — the sites still on
     `to_string()` are listed there — nor the DDL preview's change lines (`ddl::ChangeLine`,
-    below) and risk heading, though its risk lines, withheld, *Used by* and omitted lines still are.
+    below), risk lines (`ddl::Risk`, below), risk heading and *Used by* lines (`used_by::Listing`,
+    below), though its withheld and omitted lines still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41388,10 +41403,24 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_says_every_risk_as_core_does` holds both equal to `message()` over a hand-written list
     — every variant, each engine's view cost restored and not, optional parts both ways, the cycle
     and every `ClashWhy` under every `ClashCost` — so, as above, a new variant fails the `match` at compile time but is held to
-    its English only once someone adds it. What stays core's English in the
-    modal: the withheld lines (`unsupported`, which still reads `Change::summary` for a
-    refused change), the *Used by* warnings (`used_by::change_warnings` and `drop_warning`), the
-    omitted notes and the after-commit refresh note (`ddl::elsewhere_report`).
+    its English only once someone adds it.
+    The *Used by* lines went the same way, as two values sharing one part. A drop's line is
+    `used_by::drop_listing`'s `Listing { kinds, names, more }`, `drop_warning` its English; a
+    rename's or column edit's is a `UsedByNote { subject, listing, then }` from `change_note` and
+    `change_notes`, `change_warning` and `change_warnings` their English (under `used_by.rs`).
+    `listing_text` words a `Listing` from `ddl-used-by-*`: each kind counted by its own plural
+    message (`ddl-used-by-count-view` … `-expression`), all but the last joined with `", "` in code
+    and `ddl-used-by-counts` putting *and* before the last, then `ddl-used-by-listing` with the
+    names and a `$more` selector whose `0` variant says nothing. `used_by_drop_text` sets it in
+    `ddl-used-by-drop`; `used_by_note_text` sets it in `ddl-used-by-change` beside the subject —
+    the object's name, or `ddl-used-by-column` — and a `$then` selector (`renamed`, with `$name`
+    the old name, `dropped`, `retyped`). `with_used_by` fills `DdlPreview::used_by` with the
+    latter and the schema tree's Drop appends the former (under `ddl_preview.rs`).
+    `english_says_every_used_by_line_as_core_does` holds both equal to core's English over every
+    kind at one and many, one kind and several, with and without more, and each subject under each
+    consequence. What stays core's English in the modal: the withheld lines (`unsupported`, which
+    still reads `Change::summary` for a refused change), the omitted notes and the after-commit
+    refresh note (`ddl::elsewhere_report`).
     The editor's diagnostics are the case where one value has two readers in two languages.
     `intel::Diagnostic` held a finished `message: String` and now holds `what`, an
     `intel::DiagMessage` (under `core::intel`), with `Diagnostic::message()` the English byte for

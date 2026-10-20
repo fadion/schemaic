@@ -2916,9 +2916,17 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                                 // What it breaks, named before Apply
                                                 // rather than by the next error
                                                 // (`core::used_by`).
-                                                w.extend(used.as_deref().and_then(
-                                                    schemaic_core::used_by::drop_warning,
-                                                ));
+                                                w.extend(
+                                                    used.as_deref()
+                                                        .and_then(
+                                                            schemaic_core::used_by::drop_listing,
+                                                        )
+                                                        .map(|l| {
+                                                            crate::ddl_preview::used_by_drop_text(
+                                                                &l,
+                                                            )
+                                                        }),
+                                                );
                                                 (lines, w)
                                             },
                                         );

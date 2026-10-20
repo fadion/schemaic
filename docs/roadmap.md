@@ -129,7 +129,9 @@ assertions pin English wording — stays the regression net throughout.
    `SchemaPlan::lines` and `stats::drop_preview` carry; `ddl_preview::change_line_text`), its
    risk heading (`ddl::risk_heading_for`; `risk_heading_text`) and its risk lines (`ddl::Risk`
    from `Change::risk_lines` and `ChangeSet::risk_lines`, `compare::PlanRisk` and `ClashNote`
-   from `SchemaPlan::risk_lines`, `stats::drop_warning`'s too; `risk_text`, `plan_risk_text`).
+   from `SchemaPlan::risk_lines`, `stats::drop_warning`'s too; `risk_text`, `plan_risk_text`)
+   and its *Used by* lines (`used_by::Listing` from `drop_listing`, `UsedByNote` from
+   `change_notes`; `used_by_drop_text`, `used_by_note_text`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -150,8 +152,7 @@ assertions pin English wording — stays the regression net throughout.
    keys) and AI prompts keep core's English. What the converted views and the app pass through
    unchanged today is this phase's list to work from (surveyed 2026-10-19; it once claimed only
    the number formatting was left, which was never true):
-   - **The rest of the DDL preview modal's body** — `unsupported`,
-     `used_by::change_warnings`/`drop_warning`, the compare plan's `omitted`
+   - **The rest of the DDL preview modal's body** — `unsupported`, the compare plan's `omitted`
      (`compare::omission_note`), `ddl::elsewhere_report` and the AI proposal errors
      (`propose::resolve_target`/`apply`). A test in `ddl_preview.rs` matches `"gone — "` on
      the English.

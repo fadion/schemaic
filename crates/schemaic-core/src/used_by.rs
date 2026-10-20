@@ -344,7 +344,12 @@ fn function_is(name: &str, ns: Option<&str>, routine: &str) -> bool {
 /// nothing outside the object uses it (a trigger on the dropped table goes
 /// with it, and is no breakage). Names the first few, then counts the rest.
 pub fn drop_warning(deps: &[Dependent]) -> Option<String> {
-    Some(format!("Used by {}.", listing(deps)?))
+    drop_listing(deps).map(|l| l.drop_message())
+}
+
+/// [`drop_warning`] as a value the interface words: what the drop breaks.
+pub fn drop_listing(deps: &[Dependent]) -> Option<Listing> {
+    listing(deps)
 }
 
 /// What a change does to a name something else may use: the object's own
@@ -444,25 +449,117 @@ pub fn change_warning(
     deps: &[Dependent],
     dialect: SqlDialect,
 ) -> Option<String> {
+    change_note(touch, object, deps, dialect).map(|n| n.message())
+}
+
+/// [`change_warning`] as a value the interface words ([`UsedByNote`]).
+pub fn change_note(
+    touch: &Touch,
+    object: &str,
+    deps: &[Dependent],
+    dialect: SqlDialect,
+) -> Option<UsedByNote> {
     let follows = |kind: DependentKind| match touch.kind {
         TouchKind::Rename => crate::ddl::rename_follows(dialect, kind),
         TouchKind::Recreate => kind == DependentKind::ForeignKey,
         TouchKind::Drop | TouchKind::Retype => false,
     };
     let deps: Vec<Dependent> = deps.iter().filter(|d| !follows(d.kind)).cloned().collect();
-    let listed = listing(&deps)?;
+    let listing = listing(&deps)?;
     let (subject, name) = match &touch.column {
-        Some(c) => (format!("Column {c}"), c.as_str()),
-        None => (object.to_string(), object),
+        Some(c) => (UsedBySubject::Column(c.clone()), c.clone()),
+        None => (
+            UsedBySubject::Object(object.to_string()),
+            object.to_string(),
+        ),
     };
     let then = match touch.kind {
-        TouchKind::Rename | TouchKind::Recreate => {
-            format!("They still name {name} after the rename.")
-        }
-        TouchKind::Drop => "They break when it is dropped.".to_string(),
-        TouchKind::Retype => "Check them against its new type.".to_string(),
+        TouchKind::Rename | TouchKind::Recreate => UsedByThen::StillNames(name),
+        TouchKind::Drop => UsedByThen::BreaksOnDrop,
+        TouchKind::Retype => UsedByThen::CheckNewType,
     };
-    Some(format!("{subject} is used by {listed}. {then}"))
+    Some(UsedByNote {
+        subject,
+        listing,
+        then,
+    })
+}
+
+/// What a change's *Used by* sentence is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UsedBySubject {
+    Column(String),
+    /// The object itself, by its display name.
+    Object(String),
+}
+
+/// What a change's *Used by* sentence says follows for the dependents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UsedByThen {
+    /// Renamed: they still name it by this, the old name.
+    StillNames(String),
+    BreaksOnDrop,
+    CheckNewType,
+}
+
+/// One *Used by* sentence of a change's preview ([`change_warning`]) as a
+/// value: `subject` is used by `listing`, and `then`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsedByNote {
+    pub subject: UsedBySubject,
+    pub listing: Listing,
+    pub then: UsedByThen,
+}
+
+impl UsedByNote {
+    /// The English.
+    pub fn message(&self) -> String {
+        let subject = match &self.subject {
+            UsedBySubject::Column(c) => format!("Column {c}"),
+            UsedBySubject::Object(o) => o.clone(),
+        };
+        let then = match &self.then {
+            UsedByThen::StillNames(name) => format!("They still name {name} after the rename."),
+            UsedByThen::BreaksOnDrop => "They break when it is dropped.".to_string(),
+            UsedByThen::CheckNewType => "Check them against its new type.".to_string(),
+        };
+        format!("{subject} is used by {}. {then}", self.listing.message())
+    }
+}
+
+/// The dependents a sentence names, as a value: how many of each kind, in
+/// order, the first few names and how many more there are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listing {
+    pub kinds: Vec<(DependentKind, usize)>,
+    pub names: Vec<String>,
+    pub more: usize,
+}
+
+impl Listing {
+    /// The English: `2 views and 1 routine: a, b, c`.
+    pub fn message(&self) -> String {
+        let counted: Vec<String> = self
+            .kinds
+            .iter()
+            .map(|(k, n)| format!("{n} {}", k.noun(*n)))
+            .collect();
+        let counted = match counted.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => counted.join(""),
+        };
+        let more = if self.more > 0 {
+            format!(" and {} more", self.more)
+        } else {
+            String::new()
+        };
+        format!("{counted}: {}{more}", self.names.join(", "))
+    }
+
+    /// The drop's sentence around it ([`drop_warning`]).
+    pub fn drop_message(&self) -> String {
+        format!("Used by {}.", self.message())
+    }
 }
 
 /// The *Used by* sentences a preview of `plan` shows: one per name it
@@ -476,6 +573,18 @@ pub fn change_warnings(
     plan: &crate::ddl::ChangeSet,
     database: &str,
 ) -> Vec<String> {
+    change_notes(schema, plan, database)
+        .iter()
+        .map(UsedByNote::message)
+        .collect()
+}
+
+/// [`change_warnings`] as values the interface words.
+pub fn change_notes(
+    schema: &DbSchema,
+    plan: &crate::ddl::ChangeSet,
+    database: &str,
+) -> Vec<UsedByNote> {
     use crate::ddl::Change;
     let routine = plan.changes.iter().find_map(|c| match c {
         Change::RenameRoutine { from, .. } => Some(from),
@@ -503,7 +612,7 @@ pub fn change_warnings(
                 },
             };
             let deps = used_by(schema, target, plan.dialect, database);
-            change_warning(t, &shown, &deps, plan.dialect)
+            change_note(t, &shown, &deps, plan.dialect)
         })
         .collect()
 }
@@ -511,7 +620,7 @@ pub fn change_warnings(
 /// `2 views and 1 routine: a, b, c` — the dependents that would break, by
 /// kind and then by name, the first few named and the rest counted. `None`
 /// when only what goes with the object uses it.
-fn listing(deps: &[Dependent]) -> Option<String> {
+fn listing(deps: &[Dependent]) -> Option<Listing> {
     const NAMED: usize = 4;
     let deps: Vec<&Dependent> = deps.iter().filter(|d| !d.goes_with_it).collect();
     if deps.is_empty() {
@@ -524,23 +633,13 @@ fn listing(deps: &[Dependent]) -> Option<String> {
             None => kinds.push((d.kind, 1)),
         }
     }
-    let counted: Vec<String> = kinds
-        .iter()
-        .map(|(k, n)| format!("{n} {}", k.noun(*n)))
-        .collect();
-    let mut names: Vec<&str> = deps.iter().take(NAMED).map(|d| d.name.as_str()).collect();
-    let more = deps.len().saturating_sub(NAMED);
-    let more = (more > 0).then(|| format!(" and {more} more"));
+    let mut names: Vec<String> = deps.iter().take(NAMED).map(|d| d.name.clone()).collect();
     names.dedup();
-    let counted = match counted.split_last() {
-        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
-        _ => counted.join(""),
-    };
-    Some(format!(
-        "{counted}: {}{}",
-        names.join(", "),
-        more.unwrap_or_default()
-    ))
+    Some(Listing {
+        kinds,
+        names,
+        more: deps.len().saturating_sub(NAMED),
+    })
 }
 
 #[cfg(test)]
