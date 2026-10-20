@@ -1350,12 +1350,12 @@ impl SchemaComparison {
         // later"), and the refused `CREATE` comes back with nothing above Apply:
         // the constraint name is still held by a table this plan no longer
         // touches.
-        let clashes: Vec<String> = self
+        let clashes: Vec<ClashNote> = self
             .name_clashes
             .iter()
             .filter(|c| !(c.resolved && chosen_keys.contains(&c.freed_by)))
             .filter(|c| chosen_keys.contains(&c.claimed_by))
-            .map(|c| c.note(self.dialect))
+            .map(|c| c.clash_note(self.dialect))
             .collect();
         SchemaPlan {
             sets,
@@ -1451,7 +1451,96 @@ pub struct SchemaPlan {
     /// One line per name a table this plan drops still holds and a table it
     /// creates needs, where no order resolves it — see [`NameClash`]. Reported
     /// through [`SchemaPlan::destructive`] for [`SchemaPlan::cycles`]' reason.
-    pub clashes: Vec<String>,
+    pub clashes: Vec<ClashNote>,
+}
+
+/// One line of a plan's risk block ([`SchemaPlan::risk_lines`]): a set's
+/// risk named for its object, the foreign-key cycle, or a name clash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanRisk {
+    Of { subject: String, risk: ddl::Risk },
+    Cycle,
+    Clash(ClashNote),
+}
+
+impl PlanRisk {
+    /// The English.
+    pub fn message(&self) -> String {
+        match self {
+            PlanRisk::Of { subject, risk } => format!("{subject} — {}", risk.message()),
+            PlanRisk::Cycle => {
+                "The foreign keys between these tables form a cycle, so no creation \
+                 order satisfies all of them. One statement will be refused for \
+                 referencing a table that does not exist yet, and neither MySQL nor \
+                 MariaDB rolls DDL back."
+                    .to_string()
+            }
+            PlanRisk::Clash(c) => c.message(),
+        }
+    }
+}
+
+/// Why a name clash's drop cannot come first ([`NameClash::note`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClashWhy {
+    /// The plan does not include the drop.
+    NotDropped,
+    /// A column default draws from the sequence holding the name.
+    DefaultDrawsFromIt,
+    /// Another table references the table holding the name.
+    Referenced,
+}
+
+/// What a name clash costs on the engine ([`NameClash::note`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClashCost {
+    /// MySQL: one statement refused, and nothing rolls DDL back.
+    NoRollback,
+    /// One statement refused, which rolls the whole migration back.
+    RollsBack,
+    /// SQLite: one statement refused.
+    Refused,
+}
+
+/// A name clash as the risk block says it — [`NameClash::note`]'s sentence as
+/// a value. `holder` still holds `names`, which creating `claimer` needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClashNote {
+    pub holder: String,
+    pub names: Vec<String>,
+    pub claimer: String,
+    pub why: ClashWhy,
+    pub cost: ClashCost,
+}
+
+impl ClashNote {
+    /// The English.
+    pub fn message(&self) -> String {
+        let why = match self.why {
+            ClashWhy::NotDropped => "and this plan does not drop it",
+            ClashWhy::DefaultDrawsFromIt => {
+                "and it cannot be dropped first because a column default draws from it"
+            }
+            ClashWhy::Referenced => {
+                "and it cannot be dropped first because another table references it"
+            }
+        };
+        let cost = match self.cost {
+            ClashCost::NoRollback => {
+                "One statement will be refused, and neither MySQL nor MariaDB rolls DDL back."
+            }
+            ClashCost::RollsBack => {
+                "One statement will be refused, which rolls the whole migration back."
+            }
+            ClashCost::Refused => "One statement will be refused.",
+        };
+        format!(
+            "{} still holds {}, which creating {} needs — {why}. {cost}",
+            self.holder,
+            self.names.join(", "),
+            self.claimer
+        )
+    }
 }
 
 impl SchemaPlan {
@@ -1647,26 +1736,26 @@ impl SchemaPlan {
     ///
     /// A foreign-key cycle is reported here too — see [`SchemaPlan::cycles`].
     pub fn destructive(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
+        self.risk_lines().iter().map(PlanRisk::message).collect()
+    }
+
+    /// [`SchemaPlan::destructive`] as values the interface words.
+    pub fn risk_lines(&self) -> Vec<PlanRisk> {
+        let mut out: Vec<PlanRisk> = self
             .sets
             .iter()
             .flat_map(|s| {
                 let subject = Self::subject_of(s);
-                s.destructive()
-                    .into_iter()
-                    .map(move |r| format!("{subject} — {r}"))
+                s.risk_lines().into_iter().map(move |risk| PlanRisk::Of {
+                    subject: subject.clone(),
+                    risk,
+                })
             })
             .collect();
         if self.cycles {
-            out.push(
-                "The foreign keys between these tables form a cycle, so no creation \
-                 order satisfies all of them. One statement will be refused for \
-                 referencing a table that does not exist yet, and neither MySQL nor \
-                 MariaDB rolls DDL back."
-                    .to_string(),
-            );
+            out.push(PlanRisk::Cycle);
         }
-        out.extend(self.clashes.iter().cloned());
+        out.extend(self.clashes.iter().cloned().map(PlanRisk::Clash));
         out
     }
 
@@ -1977,38 +2066,38 @@ impl NameClash {
     /// reference on the left when `resolved` is false, and "this plan does not
     /// include the drop" when the user unticked it.
     pub fn note(&self, dialect: SqlDialect) -> String {
+        self.clash_note(dialect).message()
+    }
+
+    /// [`NameClash::note`] as a value the interface words ([`ClashNote`]).
+    pub fn clash_note(&self, dialect: SqlDialect) -> ClashNote {
         let strip = |k: &str| k.split_once(':').map_or(k, |(_, n)| n).to_string();
-        let names = self.names.join(", ");
         let why = if self.resolved {
-            "and this plan does not drop it"
+            ClashWhy::NotDropped
         } else if self.freed_by.starts_with("sequence:") {
             // `free_names_across_kinds`' one other reason.
-            "and it cannot be dropped first because a column default draws from it"
+            ClashWhy::DefaultDrawsFromIt
         } else {
-            "and it cannot be dropped first because another table references it"
+            ClashWhy::Referenced
         };
         let cost = match dialect {
-            SqlDialect::MySql => {
-                "One statement will be refused, and neither MySQL nor MariaDB rolls DDL back."
-            }
+            SqlDialect::MySql => ClashCost::NoRollback,
             // The whole migration is one transaction here, so nothing is left
             // half-applied — but the migration does not happen.
-            SqlDialect::Postgres => {
-                "One statement will be refused, which rolls the whole migration back."
-            }
-            SqlDialect::Sqlite => "One statement will be refused.",
+            SqlDialect::Postgres => ClashCost::RollsBack,
+            SqlDialect::Sqlite => ClashCost::Refused,
             // T-SQL DDL is transactional too, and `mssql::run_ddl` keeps the
             // promise: one `BEGIN TRANSACTION` around the plan, rolled back
             // whole on a refusal.
-            SqlDialect::MsSql => {
-                "One statement will be refused, which rolls the whole migration back."
-            }
+            SqlDialect::MsSql => ClashCost::RollsBack,
         };
-        format!(
-            "{} still holds {names}, which creating {} needs — {why}. {cost}",
-            strip(&self.freed_by),
-            strip(&self.claimed_by),
-        )
+        ClashNote {
+            holder: strip(&self.freed_by),
+            names: self.names.clone(),
+            claimer: strip(&self.claimed_by),
+            why,
+            cost,
+        }
     }
 }
 
@@ -4177,12 +4266,14 @@ mod tests {
         assert!(
             plan.clashes
                 .iter()
-                .any(|n| n.contains("fk_orders_customer")),
+                .any(|n| n.message().contains("fk_orders_customer")),
             "the refused CREATE is back with nothing said: {:?}",
             plan.clashes
         );
         assert!(
-            plan.clashes.iter().any(|n| n.contains("does not drop it")),
+            plan.clashes
+                .iter()
+                .any(|n| n.message().contains("does not drop it")),
             "the sentence gives the wrong reason: {:?}",
             plan.clashes
         );
@@ -4221,7 +4312,7 @@ mod tests {
             schema_of(vec![table("customers", &[("id", "int")]), three("orders")]),
         );
         let plan = c.plan(|_| true);
-        let note = plan.clashes.join(" ");
+        let note = plan.destructive().join(" ");
         for n in ["fk_a", "fk_b", "fk_c"] {
             assert!(note.contains(n), "{n} is not named: {note}");
         }
@@ -4270,7 +4361,7 @@ mod tests {
         let c = mysql(blocked, right());
         let plan = c.plan(|_| true);
         assert!(
-            plan.clashes.iter().any(|n| n.contains("fk_cust")),
+            plan.clashes.iter().any(|n| n.message().contains("fk_cust")),
             "nothing disclosed: {:?}",
             plan.clashes
         );

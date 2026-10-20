@@ -4741,28 +4741,6 @@ fn unreplayable_rename(c: &Change) -> Option<String> {
     ))
 }
 
-/// The risk sentence for editing a **signed** SQL Server module
-/// ([`crate::schema::TsqlModule::signed`]): any `CREATE OR ALTER` or drop
-/// removes the signature, and it cannot be put back without the
-/// certificate's private key — so the rights the certificate granted the
-/// module stop applying, and callers who relied on them start failing.
-fn signature_lost(what: &str, name: &str) -> String {
-    format!(
-        "{} {name} is signed (ADD SIGNATURE), and any change to it removes the signature — \
-         Schemaic can't sign it again without the certificate's key. Whatever the certificate \
-         let it do stops working until you run ADD SIGNATURE again.",
-        capitalised(what)
-    )
-}
-
-/// `what` with its first letter upper-cased, for a sentence that starts with it.
-fn capitalised(what: &str) -> String {
-    let mut c = what.chars();
-    c.next()
-        .map(|f| f.to_uppercase().chain(c).collect())
-        .unwrap_or_default()
-}
-
 /// The refusal for a routine **recreate that would drop a numbered procedure
 /// group**, or `None` when the change is fine.
 ///
@@ -4817,39 +4795,19 @@ fn numbered_group_refusal(c: &Change) -> Option<String> {
 /// re-create arm then appended its own reassurance two lines later, so one risk
 /// block said the triggers are not restored *and* that they are put back, on the
 /// last surface before an irreversible Apply.
-fn view_drop_cost(dialect: SqlDialect, restored: bool) -> &'static str {
-    match (dialect, restored) {
-        (SqlDialect::Sqlite, false) => {
-            "Views that select from it stop resolving until it is back, and its \
-             INSTEAD OF triggers are dropped with it and aren't restored."
-        }
-        (SqlDialect::Sqlite, true) => {
-            "Views that select from it stop resolving until it is back, and its \
-             INSTEAD OF triggers are dropped with it."
-        }
+fn view_drop_cost(dialect: SqlDialect, restored: bool) -> ViewCost {
+    let engine = match dialect {
+        SqlDialect::Sqlite => ViewCostEngine::Sqlite,
         // No rules, and a view that selects from it is not dropped with it —
         // it fails until the view is back, unless it is schema-bound, which
         // blocks the drop and so the plan.
         // Its description (`MS_Description`) is an extended property of the
         // view, and goes with it; its indexes, if it is an indexed view, are
         // the plan's to put back (`view_indexes_rebuilt`).
-        (SqlDialect::MsSql, true) => {
-            "Grants on it and its description are dropped with it and aren't restored; \
-             its INSTEAD OF triggers are dropped too."
-        }
-        (SqlDialect::MsSql, false) => {
-            "Grants on it, its description and its INSTEAD OF triggers are dropped with it \
-             and aren't restored."
-        }
-        (_, true) => {
-            "Dependent views, rules and grants are dropped with it and aren't \
-             restored; its INSTEAD OF triggers are dropped too."
-        }
-        (_, false) => {
-            "Dependent views, rules, grants and its INSTEAD OF triggers are dropped \
-             with it and aren't restored."
-        }
-    }
+        SqlDialect::MsSql => ViewCostEngine::MsSql,
+        SqlDialect::MySql | SqlDialect::Postgres => ViewCostEngine::Other,
+    };
+    ViewCost { engine, restored }
 }
 
 /// The clauses of a column definition the emitter writes **verbatim**, rendered
@@ -5019,7 +4977,12 @@ pub enum EventEdit {
 }
 
 /// A privilege list as a line says it — the names while they fit, a count
-/// once they don't ([`Change::privilege_words`]).
+/// once they don't.
+///
+/// Eighteen privileges is a legal selection at MySQL's database level, and
+/// the summary is one line above the Apply button — spelled out it wraps to
+/// four and pushes the statements off the panel. Three is where a list still
+/// reads as a list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrivilegeWords {
     None,
@@ -5654,6 +5617,837 @@ impl EventEdit {
     }
 }
 
+/// Which engine's account of dropping a view a risk gives — what goes with
+/// it, and whether its `INSTEAD OF` triggers come back ([`view_drop_cost`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewCost {
+    pub engine: ViewCostEngine,
+    /// The plan puts the view's triggers back.
+    pub restored: bool,
+}
+
+/// The engines [`ViewCost`] tells apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewCostEngine {
+    Sqlite,
+    MsSql,
+    /// PostgreSQL and MySQL: dependent views, rules and grants.
+    Other,
+}
+
+impl ViewCost {
+    /// The English.
+    pub fn message(self) -> &'static str {
+        match (self.engine, self.restored) {
+            (ViewCostEngine::Sqlite, false) => {
+                "Views that select from it stop resolving until it is back, and its \
+                 INSTEAD OF triggers are dropped with it and aren't restored."
+            }
+            (ViewCostEngine::Sqlite, true) => {
+                "Views that select from it stop resolving until it is back, and its \
+                 INSTEAD OF triggers are dropped with it."
+            }
+            (ViewCostEngine::MsSql, true) => {
+                "Grants on it and its description are dropped with it and aren't restored; \
+                 its INSTEAD OF triggers are dropped too."
+            }
+            (ViewCostEngine::MsSql, false) => {
+                "Grants on it, its description and its INSTEAD OF triggers are dropped with it \
+                 and aren't restored."
+            }
+            (ViewCostEngine::Other, true) => {
+                "Dependent views, rules and grants are dropped with it and aren't \
+                 restored; its INSTEAD OF triggers are dropped too."
+            }
+            (ViewCostEngine::Other, false) => {
+                "Dependent views, rules, grants and its INSTEAD OF triggers are dropped \
+                 with it and aren't restored."
+            }
+        }
+    }
+}
+
+/// Why a view edit has to drop the view first — the engine's own reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecreateViewWhy {
+    Sqlite,
+    MsSql,
+    Postgres,
+}
+
+/// What a type change is about: a column, or a domain's base type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeSubject {
+    Column(String),
+    Domain(String),
+}
+
+/// What a signed module is, for the sentence that says its signature goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignedKind {
+    Trigger,
+    Function,
+    Procedure,
+}
+
+/// What a rename-create-recast-drop rebuild re-creates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecreateKind {
+    Type,
+    Domain,
+}
+
+/// What a dropped standalone object's server refuses over — its risk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectDrop {
+    Sequence,
+    Synonym,
+    Extension,
+    /// A type, domain or XML schema collection a column may still use.
+    UsedByColumns(ObjectKind),
+}
+
+/// One consequence a plan has, as a value the interface words —
+/// [`Change::risks`]'s and [`ChangeSet::destructive`]'s sentences, one variant
+/// per sentence, its fields the sentence's arguments. [`Risk::message`] is the
+/// English, which the CLI, the MCP server and every test read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Risk {
+    /// `tsql` where SQL Server's rebuild, with its own guard, runs it.
+    RebuildTable {
+        name: String,
+        tsql: bool,
+    },
+    DropTable,
+    DropForeignTable,
+    TruncateTable,
+    DropColumn {
+        name: String,
+    },
+    RebuildComputedColumn {
+        name: String,
+    },
+    ColumnNotNull {
+        name: String,
+    },
+    ColumnStopsGenerated {
+        name: String,
+    },
+    ColumnBecomesGenerated {
+        name: String,
+        expression: String,
+    },
+    ColumnExpressionChanges {
+        name: String,
+        from: String,
+        to: String,
+    },
+    /// A smaller precision (`truncates`) or scale (`rounds`), or both.
+    TypeNarrows {
+        subject: TypeSubject,
+        from: String,
+        to: String,
+        truncates: bool,
+        rounds: bool,
+    },
+    TypeRewrites {
+        subject: TypeSubject,
+        from: String,
+        to: String,
+    },
+    PrimaryKeyDropped,
+    PrimaryKeyRebuilt,
+    PrimaryKeyReplaced {
+        columns: Vec<String>,
+    },
+    DropForeignKey {
+        name: String,
+    },
+    DropUniqueIndex {
+        name: String,
+    },
+    DropView {
+        materialized: bool,
+        cost: ViewCost,
+    },
+    RecreateView {
+        name: String,
+        cost: ViewCost,
+        why: RecreateViewWhy,
+    },
+    /// How many statements dropped with a re-created view are put back.
+    ViewStatementsReplayed {
+        count: usize,
+    },
+    /// An indexed view's alter: `dropped` its indexes, `again` those built
+    /// again, `gone` those that are not.
+    ViewIndexesDropped {
+        view: String,
+        dropped: Vec<String>,
+        again: Vec<String>,
+        gone: Vec<String>,
+    },
+    AddNotNullColumn {
+        name: String,
+    },
+    DropCheck {
+        name: String,
+    },
+    KeepLossyIndex {
+        name: String,
+    },
+    DropTrigger {
+        name: String,
+    },
+    RedefineTriggerInPlace {
+        name: String,
+    },
+    RecreateTrigger {
+        name: String,
+    },
+    /// Editing a **signed** SQL Server module
+    /// ([`crate::schema::TsqlModule::signed`]): any `CREATE OR ALTER` or drop
+    /// removes the signature, and it cannot be put back without the
+    /// certificate's private key — so the rights the certificate granted the
+    /// module stop applying, and callers who relied on them start failing.
+    SignatureLost {
+        kind: SignedKind,
+        name: String,
+    },
+    RedefinesRoutine {
+        name: String,
+    },
+    RoutineParametersChange {
+        name: String,
+    },
+    RecreateRoutine {
+        held: String,
+        kind: ObjectKind,
+    },
+    /// `comment` where the plan does not put the comment back either.
+    RoutineGrantsLost {
+        held: String,
+        comment: bool,
+    },
+    /// `members` is the group's members' names, already joined.
+    DropNumberedGroup {
+        kind: ObjectKind,
+        name: String,
+        members: String,
+    },
+    DropRoutine {
+        kind: ObjectKind,
+        name: String,
+    },
+    DropEvent {
+        name: String,
+    },
+    OneShotEvent,
+    OneShotEventAltered {
+        name: String,
+    },
+    AddEnumValue {
+        value: String,
+    },
+    RenameEnumValue {
+        from: String,
+        to: String,
+    },
+    /// `columns` are the first named, `more` how many beyond them.
+    Recreate {
+        kind: RecreateKind,
+        name: String,
+        columns: Vec<String>,
+        more: usize,
+    },
+    DropDomainCheck {
+        name: String,
+    },
+    DomainNullable,
+    DomainNotNull,
+    DropObject(ObjectDrop),
+    RestartSequence {
+        to: String,
+    },
+    ReplaceSynonym,
+    /// `start` is where it starts over, where the draft says.
+    ReplaceSequence {
+        start: Option<String>,
+    },
+    ReplaceObject {
+        kind: ObjectKind,
+    },
+    /// `alias_type` where a bound rule or default is among what it refuses
+    /// over.
+    ReplaceRefused {
+        alias_type: bool,
+    },
+    DropDatabase {
+        name: String,
+    },
+    /// `cascade` where the engine has a `CASCADE` Schemaic withholds.
+    DropSchema {
+        name: String,
+        cascade: bool,
+    },
+    DropLogin {
+        who: String,
+    },
+    /// `cuts_off` where the engine ends the account's sessions.
+    DropAccount {
+        who: String,
+        cuts_off: bool,
+    },
+    SetPassword {
+        who: String,
+    },
+    /// The revoke, with what the engine adds to it: `cascades`, a lifted
+    /// `deny`, and the column permissions it `cleared`.
+    RevokePrivileges {
+        privileges: PrivilegeWords,
+        who: String,
+        cascades: bool,
+        deny: bool,
+        cleared: Option<PrivilegeWords>,
+    },
+    RevokeRole {
+        role: String,
+        member: String,
+    },
+    BlankPassword {
+        who: String,
+    },
+    HostIsEverywhere,
+    GrantServerWide {
+        privileges: PrivilegeWords,
+        who: String,
+    },
+    GrantEveryDatabase {
+        privileges: PrivilegeWords,
+        who: String,
+    },
+    GrantKeepsColumnDenies {
+        privileges: PrivilegeWords,
+        who: String,
+    },
+    /// The plan's own refresh of what selects `*` from `table`.
+    StarRefresh {
+        table: String,
+    },
+    /// A plan that cannot run in one transaction.
+    Piecewise,
+    /// The schema tree's Drop of a MariaDB sequence (`stats::drop_warning`).
+    DropSequenceTable,
+    /// How many rows a table's drop takes, `rows` as `RowCount::label` says it.
+    DropScale {
+        rows: String,
+    },
+}
+
+impl Risk {
+    /// The English.
+    pub fn message(&self) -> String {
+        let list = |v: &[String]| v.join(", ");
+        match self {
+            Risk::RebuildTable { name, tsql: true } => format!(
+                "Drops {name} and recreates it, copying every row across, and puts back its \
+                 keys, indexes, checks, defaults and triggers, its own and its columns' \
+                 comments, and the foreign keys other tables have on it. It stops before \
+                 it starts if the table has anything else Schemaic doesn't restate — \
+                 permissions, an owner of its own, a schema-bound dependent, system \
+                 versioning, a ledger, replication, compression, index options, a disabled \
+                 index, a bound rule or default, a sensitivity classification, a \
+                 description on a key, index, default, check or trigger. Statistics \
+                 created by hand are not carried over."
+            ),
+            Risk::RebuildTable { name, tsql: false } => format!(
+                "Drops {name} and recreates it, copying every row across. \
+                 Anything about the table Schemaic didn't read is not carried over."
+            ),
+            Risk::DropTable => "Drops the table and every row in it.".to_string(),
+            Risk::DropForeignTable => {
+                "Drops the foreign table: its definition goes, and the rows it reads stay where they are, \
+                 on the foreign server or in the file; a view or routine that names it fails \
+                 from then on."
+                    .to_string()
+            }
+            Risk::TruncateTable => "Deletes every row in the table. This can't be undone.".to_string(),
+            Risk::DropColumn { name } => format!("Drops column {name} and all the data in it."),
+            Risk::RebuildComputedColumn { name } => format!(
+                "Drops computed column {name} and adds it back, so it moves to the end \
+                 of the table."
+            ),
+            Risk::ColumnNotNull { name } => format!(
+                "Column {name} becomes NOT NULL — the statement fails if any row holds NULL."
+            ),
+            Risk::ColumnStopsGenerated { name } => format!(
+                "Column {name} stops being generated. Its current values are kept, but \
+                 nothing recomputes them from now on."
+            ),
+            Risk::ColumnBecomesGenerated { name, expression } => format!(
+                "Column {name} becomes generated from {expression}. Every value in it is \
+                 replaced by what the expression computes."
+            ),
+            Risk::ColumnExpressionChanges { name, from, to } => format!(
+                "Column {name}'s expression changes from {from} to {to}. On PostgreSQL this \
+                 drops and re-adds the column, so every value is recomputed and the \
+                 column moves to the end of the table."
+            ),
+            Risk::TypeNarrows {
+                subject,
+                from,
+                to,
+                truncates,
+                rounds,
+            } => {
+                let mut lost = Vec::new();
+                if *truncates {
+                    lost.push("truncates values that no longer fit");
+                }
+                if *rounds {
+                    lost.push("rounds every value in the column");
+                }
+                format!(
+                    "Narrowing {} from {from} to {to} {}.",
+                    subject.message(),
+                    lost.join(" and ")
+                )
+            }
+            Risk::TypeRewrites { subject, from, to } => format!(
+                "Changing {} from {from} to {to} rewrites every value; \
+                 it can fail or lose precision.",
+                subject.message()
+            ),
+            Risk::PrimaryKeyDropped => {
+                "Leaves the table without a primary key — rows can no longer be edited from the grid."
+                    .to_string()
+            }
+            Risk::PrimaryKeyRebuilt => "Drops and re-adds the primary key around the column change. When \
+                 it is the clustered index this rewrites the whole table, and a \
+                 foreign key in another table that references it stops the plan."
+                .to_string(),
+            Risk::PrimaryKeyReplaced { columns } => format!(
+                "Replaces the primary key: {} {} no longer unique, and duplicates \
+                 are accepted from now on. On MySQL this rebuilds the clustered \
+                 index, which rewrites the whole table.",
+                list(columns),
+                if columns.len() == 1 { "is" } else { "are" },
+            ),
+            Risk::DropForeignKey { name } => format!(
+                "Drops foreign key {name}. Rows that no longer have a matching \
+                 parent are accepted from now on, and existing data is not \
+                 re-examined if it's added back."
+            ),
+            Risk::DropUniqueIndex { name } => format!(
+                "Drops unique index {name}. Duplicate values are accepted from now \
+                 on, and the grid may lose the key it was editing rows by."
+            ),
+            Risk::DropView { materialized, cost } => format!(
+                "Drops the {}view. {}",
+                if *materialized { "materialized " } else { "" },
+                cost.message()
+            ),
+            Risk::RecreateView { name, cost, why } => {
+                let why = match why {
+                    RecreateViewWhy::Sqlite => {
+                        "SQLite has no way to replace a view in place, so every edit \
+                         to one — a rename included — takes this route."
+                    }
+                    RecreateViewWhy::MsSql => {
+                        "SQL Server's sp_rename would leave the view's stored definition \
+                         naming the old one, so a rename takes this route."
+                    }
+                    RecreateViewWhy::Postgres => {
+                        "PostgreSQL can't replace a view whose columns changed name, \
+                         type or order, so this is the only way to apply the edit."
+                    }
+                };
+                format!("Re-creating {name} drops it first. {} {why}", cost.message())
+            }
+            Risk::ViewStatementsReplayed { count } => format!(
+                "{count} statement{} dropped with it {} put back afterwards, in the \
+                 same transaction.",
+                if *count == 1 { "" } else { "s" },
+                if *count == 1 { "is" } else { "are" },
+            ),
+            Risk::ViewIndexesDropped {
+                view,
+                dropped,
+                again,
+                gone,
+            } => {
+                let it = |n: &[String]| if n.len() == 1 { "it" } else { "them" };
+                let guarded = if again.is_empty() {
+                    ""
+                } else {
+                    " An index with a fill factor, compression, padding, lock options, a filegroup or a \
+                     description stops the plan before anything changes — Schemaic can't build those again."
+                };
+                let stats = " Statistics created by hand on the view are not carried over.";
+                let tail = if gone.is_empty() {
+                    format!(
+                        "and this plan builds {} again after it, in the same transaction. On a large view \
+                         that takes as long as building {} did.{guarded}{stats}",
+                        it(again),
+                        it(again)
+                    )
+                } else if again.is_empty() {
+                    format!(
+                        "and this plan does not build {} again: the view it is made to match has no such \
+                         index.{stats}",
+                        it(gone)
+                    )
+                } else {
+                    format!(
+                        "and this plan builds {} again after it, in the same transaction, but not {}, which \
+                         the view it is made to match does not have.{guarded}{stats}",
+                        list(again),
+                        list(gone)
+                    )
+                };
+                format!(
+                    "Redefining view {view} drops its index{} ({}) — SQL Server's ALTER VIEW always does — {tail}",
+                    if dropped.len() == 1 { "" } else { "es" },
+                    list(dropped),
+                )
+            }
+            Risk::AddNotNullColumn { name } => format!(
+                "Column {name} is NOT NULL with no default. If the table already \
+                 has rows there is no value to give them, and the engine will \
+                 refuse the whole plan."
+            ),
+            Risk::DropCheck { name } => format!(
+                "Drops check {name}. Rows the constraint refused are accepted from \
+                 now on, and existing data is not re-examined if it's added back."
+            ),
+            Risk::KeepLossyIndex { name } => format!(
+                "Your edit to index {name} is not included. It uses something \
+                 Schemaic can't read back — an expression key column, an operator \
+                 class, or a NULLS ordering — and applying the edit would mean \
+                 re-creating the index without it. Edit this index in SQL instead."
+            ),
+            Risk::DropTrigger { name } => format!(
+                "Drops trigger {name}. Whatever it did on each write stops \
+                 happening, and rows written from now on won't have it applied."
+            ),
+            Risk::RedefineTriggerInPlace { name } => format!(
+                "Redefines trigger {name} in place — it is not dropped, so its \
+                 permissions stay — and what it does on each write changes \
+                 from now on."
+            ),
+            Risk::RecreateTrigger { name } => format!(
+                "Re-creating trigger {name} drops it first. Where DDL isn't \
+                 transactional (MySQL), a new definition the server rejects \
+                 leaves the table with no trigger."
+            ),
+            Risk::SignatureLost { kind, name } => format!(
+                "{} {name} is signed (ADD SIGNATURE), and any change to it removes the signature — \
+                 Schemaic can't sign it again without the certificate's key. Whatever the certificate \
+                 let it do stops working until you run ADD SIGNATURE again.",
+                match kind {
+                    SignedKind::Trigger => "Trigger",
+                    SignedKind::Function => "Function",
+                    SignedKind::Procedure => "Procedure",
+                }
+            ),
+            Risk::RedefinesRoutine { name } => format!(
+                "Redefines {name}. Everything that calls it runs the new body from \
+                 now on, including triggers on other tables this edit never \
+                 mentioned."
+            ),
+            Risk::RoutineParametersChange { name } => format!(
+                "Changes {name}'s parameter list. Callers that pass the old \
+                 arguments no longer resolve to it."
+            ),
+            Risk::RecreateRoutine { held, kind } => format!(
+                "Re-creating {held} drops it first. Where DDL isn't transactional \
+                 (MySQL), a new definition the server rejects leaves no \
+                 {} at all.",
+                kind.label()
+            ),
+            Risk::RoutineGrantsLost {
+                held,
+                comment: false,
+            } => format!(
+                "Privileges granted on {held} do not survive being dropped, and \
+                 this plan does not restore them — re-apply any GRANT afterwards."
+            ),
+            Risk::RoutineGrantsLost {
+                held,
+                comment: true,
+            } => format!(
+                "Privileges granted on {held} and its comment do not survive \
+                 being dropped, and this plan does not restore them — \
+                 re-apply any GRANT and COMMENT afterwards."
+            ),
+            Risk::DropNumberedGroup {
+                kind,
+                name,
+                members,
+            } => format!(
+                "Drops {} {name} and every member of its numbered group with it: {members}.",
+                kind.label()
+            ),
+            Risk::DropRoutine { kind, name } => format!(
+                "Drops {} {name}. PostgreSQL refuses while a trigger still uses it, so \
+                 any that do have to be dropped first.",
+                kind.label()
+            ),
+            Risk::DropEvent { name } => format!(
+                "Drops event {name}. Its schedule and its body are gone with it — \
+                 nothing else in the database holds a copy."
+            ),
+            Risk::OneShotEvent => "This event runs once and the server then deletes it — that's \
+                 ON COMPLETION NOT PRESERVE. Turn Preserve on to keep it."
+                .to_string(),
+            Risk::OneShotEventAltered { name } => format!(
+                "Event {name} will run once and the server will then delete it — \
+                 that's ON COMPLETION NOT PRESERVE. Turn Preserve on to keep it."
+            ),
+            Risk::AddEnumValue { value } => format!(
+                "Adding {value} can't be undone in place — PostgreSQL can't remove \
+                 an enum value, so taking it back means re-creating the type. The \
+                 value also can't be used until this plan is applied."
+            ),
+            Risk::RenameEnumValue { from, to } => format!(
+                "Every row holding {from} reads {to} from now on. If you meant to \
+                 remove {from} rather than rename it, delete it and apply that on \
+                 its own."
+            ),
+            Risk::Recreate {
+                kind,
+                name,
+                columns,
+                more,
+            } => {
+                let kind = match kind {
+                    RecreateKind::Type => "type",
+                    RecreateKind::Domain => "domain",
+                };
+                let mut out = format!(
+                    "Re-creating {kind} {name} drops and rebuilds it. Every column below is \
+                     re-cast through text; a value the new definition doesn't accept fails the \
+                     whole plan, and nothing is applied"
+                );
+                if columns.is_empty() {
+                    out.push_str(
+                        ". Nothing uses it today, but a view or function built on it \
+                                  can't be listed here and would make the server refuse.",
+                    );
+                    return out;
+                }
+                out.push_str(&format!(": {}", list(columns)));
+                if *more > 0 {
+                    out.push_str(&format!(" and {more} more"));
+                }
+                out.push_str(
+                    ". A view or function built on it can't be listed here and would make the \
+                     server refuse.",
+                );
+                out
+            }
+            Risk::DropDomainCheck { name } => format!(
+                "Drops check {name}. Every column of this domain stops being \
+                 checked, and existing data is not re-examined if it's added back."
+            ),
+            Risk::DomainNullable => "Every column of this domain starts accepting NULL, including ones \
+                 in tables this edit never mentioned."
+                .to_string(),
+            Risk::DomainNotNull => {
+                "The statement fails if any column of this domain already holds NULL.".to_string()
+            }
+            Risk::DropObject(ObjectDrop::Sequence) => "Drops the sequence and the position it had \
+                 reached. The server refuses while a column's default still draws \
+                 from it, so those defaults have to go first."
+                .to_string(),
+            Risk::DropObject(ObjectDrop::Synonym) => "Drops the synonym. Nothing refuses it: a view, \
+                 routine or query that names it fails from then on, when it next \
+                 runs."
+                .to_string(),
+            Risk::DropObject(ObjectDrop::Extension) => "Drops the extension and the functions, types and \
+                 operators it installed. The server refuses while anything of yours \
+                 still depends on them — a column of its type, an index or a server \
+                 on its wrapper — and names what does."
+                .to_string(),
+            Risk::DropObject(ObjectDrop::UsedByColumns(k)) => format!(
+                "Drops the {}. The server refuses while a column still uses it, \
+                 so those columns have to change type first.",
+                k.label()
+            ),
+            Risk::RestartSequence { to } => format!(
+                "Restarts the counter at {to}. Values already handed out are not \
+                 changed, so a key it reaches again collides."
+            ),
+            Risk::ReplaceSynonym => "Drops the synonym and creates it again. Nothing refuses the \
+                 drop: the two statements run in one transaction."
+                .to_string(),
+            Risk::ReplaceSequence { start } => format!(
+                "Drops the sequence and creates it again: the position it had \
+                 reached is lost, and it starts over at {}. The server refuses \
+                 the drop while a column's default still draws from it.",
+                start.as_deref().unwrap_or("its start value")
+            ),
+            Risk::ReplaceObject { kind } => format!(
+                "Drops the {} and creates it again. The server refuses the drop \
+                 while a column still uses it, so those columns have to change \
+                 type first.",
+                kind.label()
+            ),
+            Risk::ReplaceRefused { alias_type } => {
+                let kept = if *alias_type {
+                    "permissions on it, an owner of its own, extended properties or \
+                     a bound rule or default"
+                } else {
+                    "permissions on it, an owner of its own or extended properties"
+                };
+                format!(
+                    "Refused while it has {kept}: the re-create would not restore \
+                     them."
+                )
+            }
+            Risk::DropDatabase { name } => format!(
+                "Drops the database {name} and everything in it — every table and \
+                 all its rows, every view, index, routine and trigger. Nothing is \
+                 kept and there is no undo: the only way back is a backup taken \
+                 before this runs."
+            ),
+            Risk::DropSchema { name, cascade } => {
+                let cascade = if *cascade {
+                    " — Schemaic never sends CASCADE"
+                } else {
+                    ""
+                };
+                format!(
+                    "Drops the schema {name}. The server refuses while it still holds \
+                     tables, views or routines, so this either takes an empty schema \
+                     or fails{cascade}."
+                )
+            }
+            Risk::DropLogin { who } => format!(
+                "Drops the login {who}, and with it every server permission and server-role \
+                 membership it holds — recorded nowhere else, so a login made again under \
+                 this name starts without them. The server refuses while anything is \
+                 connected as it, so its sessions have to end first. Its users in each \
+                 database are not dropped: they stay, keeping their permissions, mapped to \
+                 no login, and a new login of this name does not re-attach to them without \
+                 ALTER USER … WITH LOGIN."
+            ),
+            Risk::DropAccount { who, cuts_off } => format!(
+                "Drops {who} and every privilege it holds. The grants are not recorded \
+                 anywhere else, so putting the account back means granting them all \
+                 again from memory. {}",
+                if *cuts_off {
+                    "Anything connected as it fails at its next statement in this database."
+                } else {
+                    "Anything still connected as it keeps running until it disconnects."
+                }
+            ),
+            Risk::SetPassword { who } => format!(
+                "Changes {who}'s password. The old one cannot be recovered, so \
+                 anything still configured with it — an application, a job, \
+                 another developer's client — fails to connect until it is \
+                 updated by hand. Sessions already open keep running."
+            ),
+            Risk::RevokePrivileges {
+                privileges,
+                who,
+                cascades,
+                deny,
+                cleared,
+            } => {
+                let what = privileges.message();
+                let mut s = format!(
+                    "Takes {what} away from {who}. Anything relying on it — an \
+                     application, a job, a view someone else owns — starts failing at \
+                     its next statement."
+                );
+                if *cascades {
+                    s.push_str(&format!(
+                        " The revoke carries CASCADE, so it is also taken from every \
+                         account {who} granted it on to, and what runs as those accounts \
+                         fails the same way."
+                    ));
+                }
+                if *deny {
+                    s.push_str(&format!(
+                        " Where {who} is denied it instead (DENY), the revoke lifts the \
+                         denial — which gives access back if a role it belongs to grants it."
+                    ));
+                }
+                if let Some(cleared) = cleared {
+                    s.push_str(&format!(
+                        " On a table it also deletes every column-level grant and DENY of {} \
+                         {who} has on the table's columns: a column {who} was denied is no \
+                         longer denied, and one granted on its own is no longer granted.",
+                        cleared.message()
+                    ));
+                }
+                s
+            }
+            Risk::RevokeRole { role, member } => format!(
+                "Takes the role {role} away from {member}, and with it every privilege the \
+                 role carries."
+            ),
+            Risk::BlankPassword { who } => format!(
+                "{who} will have no password: anyone who can reach the server can log \
+                 in as it. Set one here, or with ALTER USER afterwards."
+            ),
+            Risk::HostIsEverywhere => {
+                "Its host is % — every machine on the network, not just this one.".to_string()
+            }
+            Risk::GrantServerWide { privileges, who } => format!(
+                "Grants {} to {who} on the whole server — the instance \
+                 itself, not the database being browsed.",
+                privileges.message()
+            ),
+            Risk::GrantEveryDatabase { privileges, who } => format!(
+                "Grants {} to {who} on every database on this server — including \
+                 databases that do not exist yet, not just the one being browsed.",
+                privileges.message()
+            ),
+            Risk::GrantKeepsColumnDenies { privileges, who } => format!(
+                "A table-level grant of {} deletes any DENY of it {who} has on one of \
+                 the table's columns, so the statement denies those columns to {who} again \
+                 straight after granting: a column {who} was denied stays denied. Where \
+                 {who} also holds the grant option on the table, the server refuses to \
+                 deny it again without CASCADE, and nothing is applied.",
+                privileges.message()
+            ),
+            Risk::StarRefresh { table } => format!(
+                "Refreshes every view and inline function in this database that selects * \
+                 from {0}, directly or through a synonym: SQL Server binds those to the \
+                 table's columns by position, and would otherwise read and write the wrong \
+                 columns. The plan fails if one of them no longer compiles against the new \
+                 columns. One in another database that selects * from {0} is refreshed after \
+                 the plan commits, outside its transaction: until then it reads the old \
+                 positions, and if its refresh fails the plan stays applied and the view is \
+                 named here.",
+                table
+            ),
+            Risk::Piecewise => "SQL Server will not create, alter or drop a natively compiled module inside a \
+                 transaction, so this plan runs one statement at a time and cannot be stopped: if \
+                 a statement fails, the ones before it stay applied."
+                .to_string(),
+            Risk::DropSequenceTable => "Drops the sequence: the value it has reached is lost, and anything that still \
+                 draws from it fails."
+                .to_string(),
+            Risk::DropScale { rows } => {
+                format!("By the schema tree's statistics, that is {rows} rows.")
+            }
+        }
+    }
+}
+
+impl TypeSubject {
+    /// The English: the column's name, or *domain d*.
+    pub fn message(&self) -> String {
+        match self {
+            TypeSubject::Column(name) => name.clone(),
+            TypeSubject::Domain(name) => format!("domain {name}"),
+        }
+    }
+}
+
 impl Change {
     /// One line of plain language for the preview's change list — the
     /// English of [`Change::line`].
@@ -6074,17 +6868,6 @@ impl Change {
         }
     }
 
-    /// The privilege list as a summary line says it: the names themselves while
-    /// they fit, and a count once they don't — [`PrivilegeWords`]'s English.
-    ///
-    /// Eighteen privileges is a legal selection at MySQL's database level, and
-    /// the summary is one line above the Apply button — spelled out it wraps to
-    /// four and pushes the statements off the panel. Three is where a list still
-    /// reads as a list.
-    fn privilege_words(privileges: &[String]) -> String {
-        PrivilegeWords::of(privileges).message()
-    }
-
     /// What this change destroys, in plain language — empty when nothing is at
     /// risk. These are the sentences the preview lists above the Apply button, so
     /// they name the consequence rather than the operation.
@@ -6099,67 +6882,44 @@ impl Change {
     /// and a SQLite user their `INSTEAD OF` triggers, and stating one list to
     /// both told half the users the warning wasn't about them.
     pub fn risks(&self, dialect: SqlDialect) -> Vec<String> {
+        self.risk_lines(dialect).iter().map(Risk::message).collect()
+    }
+
+    /// [`Change::risks`] as values the interface words ([`Risk`]).
+    pub fn risk_lines(&self, dialect: SqlDialect) -> Vec<Risk> {
         match self {
             // The table really is dropped in the middle of this, so it belongs
             // in the destructive block even though the plan puts it back. What
             // protects the rows is that the whole procedure is one transaction.
-            Change::RebuildTable(r) => vec![match dialect {
-                // Its guard refuses what it knows it would drop; what it
-                // cannot see is the statistics made by hand.
-                SqlDialect::MsSql => format!(
-                    "Drops {} and recreates it, copying every row across, and puts back its \
-                     keys, indexes, checks, defaults and triggers, its own and its columns' \
-                     comments, and the foreign keys other tables have on it. It stops before \
-                     it starts if the table has anything else Schemaic doesn't restate — \
-                     permissions, an owner of its own, a schema-bound dependent, system \
-                     versioning, a ledger, replication, compression, index options, a disabled \
-                     index, a bound rule or default, a sensitivity classification, a \
-                     description on a key, index, default, check or trigger. Statistics \
-                     created by hand are not carried over.",
-                    r.current.name
-                ),
-                SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => format!(
-                    "Drops {} and recreates it, copying every row across. \
-                     Anything about the table Schemaic didn't read is not carried over.",
-                    r.current.name
-                ),
+            // On SQL Server its guard refuses what it knows it would drop;
+            // what it cannot see is the statistics made by hand.
+            Change::RebuildTable(r) => vec![Risk::RebuildTable {
+                name: r.current.name.clone(),
+                tsql: match dialect {
+                    SqlDialect::MsSql => true,
+                    SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => false,
+                },
             }],
-            Change::DropTable => vec!["Drops the table and every row in it.".to_string()],
+            Change::DropTable => vec![Risk::DropTable],
             // Destructive all the same: the definition — its server, options
             // and columns — is what goes, and nothing here can restate it.
-            Change::DropForeignTable => vec![
-                "Drops the foreign table: its definition goes, and the rows it reads stay where they are, \
-                 on the foreign server or in the file; a view or routine that names it fails \
-                 from then on."
-                    .to_string(),
-            ],
-            Change::TruncateTable => {
-                vec!["Deletes every row in the table. This can't be undone.".to_string()]
-            }
-            Change::DropColumn { name, .. } => {
-                vec![format!("Drops column {name} and all the data in it.")]
-            }
+            Change::DropForeignTable => vec![Risk::DropForeignTable],
+            Change::TruncateTable => vec![Risk::TruncateTable],
+            Change::DropColumn { name, .. } => vec![Risk::DropColumn { name: name.clone() }],
             // No data: the value is the expression's. What does change is
             // where the column sits, and T-SQL has no way to put it back.
-            Change::RebuildComputedColumn { column } => vec![format!(
-                "Drops computed column {} and adds it back, so it moves to the end \
-                 of the table.",
-                column.name
-            )],
+            Change::RebuildComputedColumn { column } => vec![Risk::RebuildComputedColumn {
+                name: column.name.clone(),
+            }],
             Change::AlterColumn { from, to, .. } => alter_risks(from, to, dialect),
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && to.is_empty() => {
-                vec!["Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string()]
+                vec![Risk::PrimaryKeyDropped]
             }
             // The same key rebuilt (`repair_tsql_dependents`): nothing stops
             // being unique, but on SQL Server a key is the table's clustered
             // index as a rule, and dropping it rewrites the table twice.
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && from == to => {
-                vec![
-                    "Drops and re-adds the primary key around the column change. When \
-                     it is the clustered index this rewrites the whole table, and a \
-                     foreign key in another table that references it stops the plan."
-                        .to_string(),
-                ]
+                vec![Risk::PrimaryKeyRebuilt]
             }
             // **The swap case, which fell through this match to `Vec::new()`.**
             // A drop-to-nothing was the only guarded arm, so replacing the key
@@ -6167,36 +6927,24 @@ impl Change {
             // unique from that moment, and on MySQL the statement rebuilds the
             // clustered index (a table rewrite, not a metadata change).
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && !to.is_empty() => {
-                vec![format!(
-                    "Replaces the primary key: {} {} no longer unique, and duplicates \
-                     are accepted from now on. On MySQL this rebuilds the clustered \
-                     index, which rewrites the whole table.",
-                    from.join(", "),
-                    if from.len() == 1 { "is" } else { "are" },
-                )]
+                vec![Risk::PrimaryKeyReplaced {
+                    columns: from.clone(),
+                }]
             }
             // Like `DropCheck`, and filed with it: no data is lost, the table
             // stops guaranteeing something it guaranteed a moment ago, and
             // nothing on any surface afterwards shows it. From here orphan rows
             // in the referencing table are simply accepted.
-            Change::DropForeignKey { name } => vec![format!(
-                "Drops foreign key {name}. Rows that no longer have a matching \
-                 parent are accepted from now on, and existing data is not \
-                 re-examined if it's added back."
-            )],
+            Change::DropForeignKey { name } => vec![Risk::DropForeignKey { name: name.clone() }],
             // Gated on `unique`: a plain index costs query speed, which is not
             // this block's business. A unique one was refusing duplicate rows.
             Change::DropIndex {
                 name, unique: true, ..
-            } => vec![format!(
-                "Drops unique index {name}. Duplicate values are accepted from now \
-                 on, and the grid may lose the key it was editing rows by."
-            )],
-            Change::DropView { materialized } => vec![format!(
-                "Drops the {}view. {}",
-                if *materialized { "materialized " } else { "" },
-                view_drop_cost(dialect, false)
-            )],
+            } => vec![Risk::DropUniqueIndex { name: name.clone() }],
+            Change::DropView { materialized } => vec![Risk::DropView {
+                materialized: *materialized,
+                cost: view_drop_cost(dialect, false),
+            }],
             // The one place a *redefinition* is destructive: neither SQLite nor
             // PostgreSQL can always replace a view in place, so the edit costs a
             // drop. Saying that here is the whole reason the recreate isn't done
@@ -6209,37 +6957,24 @@ impl Change {
                 server_indexes,
             } => {
                 let why = match dialect {
-                    SqlDialect::Sqlite => {
-                        "SQLite has no way to replace a view in place, so every edit \
-                         to one — a rename included — takes this route."
-                    }
-                    SqlDialect::MsSql => {
-                        "SQL Server's sp_rename would leave the view's stored definition \
-                         naming the old one, so a rename takes this route."
-                    }
-                    _ => {
-                        "PostgreSQL can't replace a view whose columns changed name, \
-                         type or order, so this is the only way to apply the edit."
-                    }
+                    SqlDialect::Sqlite => RecreateViewWhy::Sqlite,
+                    SqlDialect::MsSql => RecreateViewWhy::MsSql,
+                    SqlDialect::MySql | SqlDialect::Postgres => RecreateViewWhy::Postgres,
                 };
-                let mut out = vec![format!(
-                    "Re-creating {} drops it first. {} {why}",
-                    draft.name,
+                let mut out = vec![Risk::RecreateView {
+                    name: draft.name.clone(),
                     // The replay is what makes the triggers half of that
                     // sentence untrue — see `view_drop_cost`.
-                    view_drop_cost(dialect, !replay.is_empty())
-                )];
+                    cost: view_drop_cost(dialect, !replay.is_empty()),
+                    why,
+                }];
                 // The reassurance is worth as much as the warning: the triggers
                 // are named as coming back, so the sentence above doesn't read
                 // as an unqualified loss.
                 if !replay.is_empty() {
-                    out.push(format!(
-                        "{} statement{} dropped with it {} put back afterwards, in the \
-                         same transaction.",
-                        replay.len(),
-                        if replay.len() == 1 { "" } else { "s" },
-                        if replay.len() == 1 { "is" } else { "are" },
-                    ));
+                    out.push(Risk::ViewStatementsReplayed {
+                        count: replay.len(),
+                    });
                 }
                 out.extend(view_indexes_rebuilt(draft, server_indexes));
                 out
@@ -6269,37 +7004,23 @@ impl Change {
                     && column.generated.is_none()
                     && !column.auto_increment =>
             {
-                vec![format!(
-                    "Column {} is NOT NULL with no default. If the table already \
-                     has rows there is no value to give them, and the engine will \
-                     refuse the whole plan.",
-                    column.name
-                )]
+                vec![Risk::AddNotNullColumn {
+                    name: column.name.clone(),
+                }]
             }
             // No data is lost, which is exactly why it's worth a sentence: the
             // table stops guaranteeing something it guaranteed a moment ago, and
             // nothing about the statement or the grid afterwards shows it.
-            Change::DropCheck { name } => vec![format!(
-                "Drops check {name}. Rows the constraint refused are accepted from \
-                 now on, and existing data is not re-examined if it's added back."
-            )],
+            Change::DropCheck { name } => vec![Risk::DropCheck { name: name.clone() }],
             // Not destructive — the *opposite* — but it belongs in the same
             // block, because the block is where the preview says what the plan
             // won't do for you. Silently omitting the user's edit would be the
             // dishonesty this change exists to avoid.
-            Change::KeepLossyIndex { name } => vec![format!(
-                "Your edit to index {name} is not included. It uses something \
-                 Schemaic can't read back — an expression key column, an operator \
-                 class, or a NULLS ordering — and applying the edit would mean \
-                 re-creating the index without it. Edit this index in SQL instead."
-            )],
+            Change::KeepLossyIndex { name } => vec![Risk::KeepLossyIndex { name: name.clone() }],
             // Like `DropCheck`, this destroys no data and still has to be said:
             // whatever the trigger maintained — an audit row, a denormalized
             // total, a guard — silently stops happening on the next write.
-            Change::DropTrigger { name, .. } => vec![format!(
-                "Drops trigger {name}. Whatever it did on each write stops \
-                 happening, and rows written from now on won't have it applied."
-            )],
+            Change::DropTrigger { name, .. } => vec![Risk::DropTrigger { name: name.clone() }],
             // Neither engine can alter a trigger, so a redefinition is a drop and
             // a create. That is safe where DDL is transactional and *isn't* on
             // MySQL, which commits each statement as it runs — so a rejected new
@@ -6312,27 +7033,23 @@ impl Change {
                 in_place,
                 server_signed,
             } => {
+                let held = draft
+                    .original
+                    .clone()
+                    .unwrap_or_else(|| draft.info.name.clone());
                 let mut out = vec![if *in_place {
-                    format!(
-                        "Redefines trigger {} in place — it is not dropped, so its \
-                         permissions stay — and what it does on each write changes \
-                         from now on.",
-                        draft.info.name
-                    )
+                    Risk::RedefineTriggerInPlace {
+                        name: draft.info.name.clone(),
+                    }
                 } else {
-                    format!(
-                        "Re-creating trigger {} drops it first. Where DDL isn't \
-                         transactional (MySQL), a new definition the server rejects \
-                         leaves the table with no trigger.",
-                        draft.original.as_deref().unwrap_or(&draft.info.name)
-                    )
+                    Risk::RecreateTrigger { name: held.clone() }
                 }];
                 // The server's trigger, the one the alter or the drop strips.
                 if *server_signed {
-                    out.push(signature_lost(
-                        "trigger",
-                        draft.original.as_deref().unwrap_or(&draft.info.name),
-                    ));
+                    out.push(Risk::SignatureLost {
+                        kind: SignedKind::Trigger,
+                        name: held,
+                    });
                 }
                 out
             }
@@ -6346,12 +7063,9 @@ impl Change {
                 recreate,
             } => {
                 let f = &draft.info;
-                let mut out = vec![format!(
-                    "Redefines {}. Everything that calls it runs the new body from \
-                     now on, including triggers on other tables this edit never \
-                     mentioned.",
-                    f.name
-                )];
+                let mut out = vec![Risk::RedefinesRoutine {
+                    name: f.name.clone(),
+                }];
                 // The parameter list is the routine's *identity* where the
                 // engine overloads, so this is not a redefinition at all — the
                 // old signature is dropped and a differently-shaped routine
@@ -6367,11 +7081,9 @@ impl Change {
                     && routine_identity_args(&server.arguments, dialect)
                         != routine_identity_args(&f.arguments, dialect)
                 {
-                    out.push(format!(
-                        "Changes {}'s parameter list. Callers that pass the old \
-                         arguments no longer resolve to it.",
-                        f.name
-                    ));
+                    out.push(Risk::RoutineParametersChange {
+                        name: f.name.clone(),
+                    });
                 }
                 // The same sentence `ReplaceTrigger` earns, and for the same
                 // reason: MySQL has no `CREATE OR REPLACE` for a routine and no
@@ -6385,12 +7097,10 @@ impl Change {
                     } else {
                         &server.name
                     };
-                    out.push(format!(
-                        "Re-creating {held} drops it first. Where DDL isn't transactional \
-                         (MySQL), a new definition the server rejects leaves no \
-                         {} at all.",
-                        f.kind.label()
-                    ));
+                    out.push(Risk::RecreateRoutine {
+                        held: held.to_string(),
+                        kind: routine_object_kind(f.kind),
+                    });
                     // **What is lost here is invisible in the SQL box by
                     // construction**: the plan is a `DROP` and a `CREATE`, and
                     // privileges and the comment are not in either statement
@@ -6406,44 +7116,39 @@ impl Change {
                     // back** (`recreate_restates_routine_comment`): SQL Server's
                     // sets it again after the create, and telling the user to
                     // re-apply it asked for work already done.
-                    out.push(if recreate_restates_routine_comment(dialect) {
-                        format!(
-                            "Privileges granted on {held} do not survive being dropped, and \
-                             this plan does not restore them — re-apply any GRANT afterwards."
-                        )
-                    } else {
-                        format!(
-                            "Privileges granted on {held} and its comment do not survive \
-                             being dropped, and this plan does not restore them — \
-                             re-apply any GRANT and COMMENT afterwards."
-                        )
+                    out.push(Risk::RoutineGrantsLost {
+                        held: held.to_string(),
+                        comment: !recreate_restates_routine_comment(dialect),
                     });
                 }
                 // An alter drops a signature as surely as a drop does.
                 if server.tsql.module.signed {
-                    out.push(signature_lost(f.kind.label(), &server.name));
+                    out.push(Risk::SignatureLost {
+                        kind: match f.kind {
+                            crate::schema::RoutineKind::Function => SignedKind::Function,
+                            crate::schema::RoutineKind::Procedure => SignedKind::Procedure,
+                        },
+                        name: server.name.clone(),
+                    });
                 }
                 out
             }
             // A numbered group's head goes with every member — the one drop
             // here that takes more than the routine it names.
-            Change::DropRoutine(f) if !f.tsql.numbered.is_empty() => vec![format!(
-                "Drops {} {} and every member of its numbered group with it: {}.",
-                f.kind.label(),
-                f.name,
-                f.tsql.numbered_names(&f.name)
-            )],
-            Change::DropRoutine(f) => vec![format!(
-                "Drops {} {}. PostgreSQL refuses while a trigger still uses it, so \
-                 any that do have to be dropped first.",
-                f.kind.label(),
-                f.name
-            )],
-            Change::DropEvent(e) => vec![format!(
-                "Drops event {}. Its schedule and its body are gone with it — \
-                 nothing else in the database holds a copy.",
-                e.name
-            )],
+            Change::DropRoutine(f) if !f.tsql.numbered.is_empty() => {
+                vec![Risk::DropNumberedGroup {
+                    kind: routine_object_kind(f.kind),
+                    name: f.name.clone(),
+                    members: f.tsql.numbered_names(&f.name),
+                }]
+            }
+            Change::DropRoutine(f) => vec![Risk::DropRoutine {
+                kind: routine_object_kind(f.kind),
+                name: f.name.clone(),
+            }],
+            Change::DropEvent(e) => vec![Risk::DropEvent {
+                name: e.name.clone(),
+            }],
             // **The one-shot that deletes itself.** `ON COMPLETION NOT PRESERVE`
             // is MySQL's default and says nothing on a recurring schedule, which
             // never completes; on an `AT` schedule it means the server drops the
@@ -6452,11 +7157,7 @@ impl Change {
             // combination, because it is the one property of an event that is
             // destructive without any statement here saying `DROP`.
             Change::CreateEvent(d) if d.info.schedule.is_one_shot() && !d.info.preserve => {
-                vec![
-                    "This event runs once and the server then deletes it — that's \
-                     ON COMPLETION NOT PRESERVE. Turn Preserve on to keep it."
-                        .to_string(),
-                ]
+                vec![Risk::OneShotEvent]
             }
             // **The alter arm compares both sides**, because it warns about an
             // edit rather than about a state. An event that was already a
@@ -6470,33 +7171,28 @@ impl Change {
                     && !to.preserve
                     && !(from.schedule.is_one_shot() && !from.preserve) =>
             {
-                vec![format!(
-                    "Event {} will run once and the server will then delete it — \
-                     that's ON COMPLETION NOT PRESERVE. Turn Preserve on to keep it.",
-                    to.name
-                )]
+                vec![Risk::OneShotEventAltered {
+                    name: to.name.clone(),
+                }]
             }
             // Nothing is destroyed and it still has to be said, because it is the
             // one edit here that **can't be undone in place**: PostgreSQL has no
             // way to remove an enum value, so taking this one back means
             // re-creating the type and re-casting every column that uses it.
-            Change::AddEnumValue { value, .. } => vec![format!(
-                "Adding {value} can't be undone in place — PostgreSQL can't remove \
-                 an enum value, so taking it back means re-creating the type. The \
-                 value also can't be used until this plan is applied."
-            )],
+            Change::AddEnumValue { value, .. } => vec![Risk::AddEnumValue {
+                value: value.clone(),
+            }],
             // No row is rewritten and every row means something new, which is
             // exactly why it has to be said. A value list can't tell "I renamed
             // this one" from "I deleted it and typed another", so the plan takes
             // the reading that keeps the data — and this sentence is what makes
             // that reading visible before it runs.
-            Change::RenameEnumValue { from, to } => vec![format!(
-                "Every row holding {from} reads {to} from now on. If you meant to \
-                 remove {from} rather than rename it, delete it and apply that on \
-                 its own."
-            )],
+            Change::RenameEnumValue { from, to } => vec![Risk::RenameEnumValue {
+                from: from.clone(),
+                to: to.clone(),
+            }],
             Change::RecreateEnum { info, dependents } => {
-                vec![recreate_risk(&info.name, "type", dependents)]
+                vec![recreate_risk(&info.name, RecreateKind::Type, dependents)]
             }
             Change::RecreateDomain {
                 info,
@@ -6518,30 +7214,21 @@ impl Change {
                 out.extend(type_change_risk(
                     from_type,
                     &info.base_type,
-                    &format!("domain {}", info.name),
+                    TypeSubject::Domain(info.name.clone()),
                     // A domain exists on no other engine, so the dialect is not
                     // in question here — and `type_change_risk` normalises for
                     // itself now, which is where the call site's own comment
                     // said the fix belonged.
                     SqlDialect::Postgres,
                 ));
-                out.push(recreate_risk(&info.name, "domain", dependents));
+                out.push(recreate_risk(&info.name, RecreateKind::Domain, dependents));
                 out
             }
             // The same shape as `DropCheck` on a table: no data goes, but the
             // guarantee does, and every column of this type loses it at once.
-            Change::DropDomainCheck { name } => vec![format!(
-                "Drops check {name}. Every column of this domain stops being \
-                 checked, and existing data is not re-examined if it's added back."
-            )],
-            Change::SetDomainNotNull { to: false } => vec![
-                "Every column of this domain starts accepting NULL, including ones \
-                 in tables this edit never mentioned."
-                    .to_string(),
-            ],
-            Change::SetDomainNotNull { to: true } => vec![
-                "The statement fails if any column of this domain already holds NULL.".to_string(),
-            ],
+            Change::DropDomainCheck { name } => vec![Risk::DropDomainCheck { name: name.clone() }],
+            Change::SetDomainNotNull { to: false } => vec![Risk::DomainNullable],
+            Change::SetDomainNotNull { to: true } => vec![Risk::DomainNotNull],
             // Per kind, as both engines with these objects answer (measured,
             // PostgreSQL 16 and SQL Server 2022): a sequence a default draws
             // from is refused by name — this said PostgreSQL's `nextval`
@@ -6549,42 +7236,23 @@ impl Change {
             // drop — and so is a type or an XML schema collection a column
             // uses; a synonym is refused by nothing, and what names it fails
             // when next run.
-            Change::DropObject { kind } => vec![match kind {
-                ObjectKind::Sequence => "Drops the sequence and the position it had \
-                     reached. The server refuses while a column's default still draws \
-                     from it, so those defaults have to go first."
-                    .to_string(),
-                ObjectKind::Synonym => "Drops the synonym. Nothing refuses it: a view, \
-                     routine or query that names it fails from then on, when it next \
-                     runs."
-                    .to_string(),
+            Change::DropObject { kind } => vec![Risk::DropObject(match kind {
+                ObjectKind::Sequence => ObjectDrop::Sequence,
+                ObjectKind::Synonym => ObjectDrop::Synonym,
                 // Measured on PostgreSQL 16: `file_fdw` with a server on it is
                 // refused, naming the server and the foreign table behind it.
                 // No `CASCADE` is sent, so that refusal is the answer.
-                ObjectKind::Extension => "Drops the extension and the functions, types and \
-                     operators it installed. The server refuses while anything of yours \
-                     still depends on them — a column of its type, an index or a server \
-                     on its wrapper — and names what does."
-                    .to_string(),
-                k => format!(
-                    "Drops the {}. The server refuses while a column still uses it, \
-                     so those columns have to change type first.",
-                    k.label()
-                ),
-            }],
+                ObjectKind::Extension => ObjectDrop::Extension,
+                k => ObjectDrop::UsedByColumns(*k),
+            })],
             // Every row keeps its value, and the counter forgets where it was: the
             // next `nextval` can hand back a key that already exists.
-            Change::RestartSequence { to } => vec![format!(
-                "Restarts the counter at {to}. Values already handed out are not \
-                 changed, so a key it reaches again collides."
-            )],
+            Change::RestartSequence { to } => vec![Risk::RestartSequence { to: to.to_string() }],
             Change::AlterTsqlSequence {
                 restart: Some(to), ..
-            } => vec![format!(
-                "Restarts the counter at {}. Values already handed out are not \
-                 changed, so a key it reaches again collides.",
-                to.trim()
-            )],
+            } => vec![Risk::RestartSequence {
+                to: to.trim().to_string(),
+            }],
             // A replace is the drop's consequence plus the create's: what the
             // drop refuses over still stops it (measured, 2022), and a
             // sequence created again starts over. And what stands on the object
@@ -6593,44 +7261,24 @@ impl Change {
             // them (`tsql_replace_guard`); said for every kind, the synonym's
             // included, whose Apply wore Primary over a lifted DENY.
             Change::ReplaceTsqlObject { from, to } => {
-                let kept = match from.object_kind() {
-                    ObjectKind::AliasType => {
-                        "permissions on it, an owner of its own, extended properties or \
-                         a bound rule or default"
-                    }
-                    _ => "permissions on it, an owner of its own or extended properties",
-                };
                 let first = match from.object_kind() {
-                    ObjectKind::Synonym => {
-                        "Drops the synonym and creates it again. Nothing refuses the \
-                         drop: the two statements run in one transaction."
-                            .to_string()
-                    }
+                    ObjectKind::Synonym => Risk::ReplaceSynonym,
                     // The start it is created at, a restart asked for included.
-                    ObjectKind::Sequence => format!(
-                        "Drops the sequence and creates it again: the position it had \
-                         reached is lost, and it starts over at {}. The server refuses \
-                         the drop while a column's default still draws from it.",
-                        match &to.kind {
+                    ObjectKind::Sequence => Risk::ReplaceSequence {
+                        start: match &to.kind {
                             crate::schema::TsqlObjectKind::Sequence { start, .. } => {
-                                start.trim()
+                                Some(start.trim().to_string())
                             }
-                            _ => "its start value",
-                        }
-                    ),
-                    k => format!(
-                        "Drops the {} and creates it again. The server refuses the drop \
-                         while a column still uses it, so those columns have to change \
-                         type first.",
-                        k.label()
-                    ),
+                            _ => None,
+                        },
+                    },
+                    kind => Risk::ReplaceObject { kind },
                 };
                 vec![
                     first,
-                    format!(
-                        "Refused while it has {kept}: the re-create would not restore \
-                         them."
-                    ),
+                    Risk::ReplaceRefused {
+                        alias_type: from.object_kind() == ObjectKind::AliasType,
+                    },
                 ]
             }
             // **The largest single act in this module, and the sentence says so
@@ -6644,12 +7292,7 @@ impl Change {
             // added to the preview's warning, but a whole database's is the sum of a
             // schema fetch this change has never made, and a figure that arrived
             // as `~0` on a stale tree would be worse than none.
-            Change::DropDatabase { name } => vec![format!(
-                "Drops the database {name} and everything in it — every table and \
-                 all its rows, every view, index, routine and trigger. Nothing is \
-                 kept and there is no undo: the only way back is a backup taken \
-                 before this runs."
-            )],
+            Change::DropDatabase { name } => vec![Risk::DropDatabase { name: name.clone() }],
             // A namespace's drop is never `CASCADE`, so the server refuses while
             // anything is in it — which makes this the rare drop whose worst case
             // is a *refusal*. The sentence says that, rather than borrowing the
@@ -6666,18 +7309,10 @@ impl Change {
             // withholds `CASCADE` is said only where the engine has one to
             // withhold (`supports_drop_schema_cascade`): T-SQL's `DROP SCHEMA`
             // has no such clause.
-            Change::DropSchema { name } => {
-                let cascade = if supports_drop_schema_cascade(dialect) {
-                    " — Schemaic never sends CASCADE"
-                } else {
-                    ""
-                };
-                vec![format!(
-                    "Drops the schema {name}. The server refuses while it still holds \
-                     tables, views or routines, so this either takes an empty schema \
-                     or fails{cascade}."
-                )]
-            }
+            Change::DropSchema { name } => vec![Risk::DropSchema {
+                name: name.clone(),
+                cascade: supports_drop_schema_cascade(dialect),
+            }],
             // **An account drop destroys its privileges, not its data**, and the
             // sentence says which — because "drops the user" reads as reversible
             // to anyone who has just been told a `DROP DATABASE` is not, and the
@@ -6701,28 +7336,12 @@ impl Change {
             // else records. Asked of the account, not the engine: a login is
             // SQL Server's alone.
             Change::DropAccount(p) if p.kind == crate::users::PrincipalKind::Login => {
-                vec![format!(
-                    "Drops the login {}, and with it every server permission and server-role \
-                     membership it holds — recorded nowhere else, so a login made again under \
-                     this name starts without them. The server refuses while anything is \
-                     connected as it, so its sessions have to end first. Its users in each \
-                     database are not dropped: they stay, keeping their permissions, mapped to \
-                     no login, and a new login of this name does not re-attach to them without \
-                     ALTER USER … WITH LOGIN.",
-                    p.display()
-                )]
+                vec![Risk::DropLogin { who: p.display() }]
             }
-            Change::DropAccount(p) => vec![format!(
-                "Drops {} and every privilege it holds. The grants are not recorded \
-                 anywhere else, so putting the account back means granting them all \
-                 again from memory. {}",
-                p.display(),
-                if crate::users::drop_user_cuts_off_sessions(dialect) {
-                    "Anything connected as it fails at its next statement in this database."
-                } else {
-                    "Anything still connected as it keeps running until it disconnects."
-                }
-            )],
+            Change::DropAccount(p) => vec![Risk::DropAccount {
+                who: p.display(),
+                cuts_off: crate::users::drop_user_cuts_off_sessions(dialect),
+            }],
             // **A reset is not undoable, which is the part that surprises.**
             // Nothing is destroyed and the account keeps every privilege it
             // holds, so this reads as the mildest thing in the list — but the
@@ -6730,13 +7349,9 @@ impl Change {
             // the server, so every client still configured with it is broken
             // until each one is found and changed. That is the sentence, and it
             // is why this change is not in `risk_is_reversible`.
-            Change::SetAccountPassword(r) => vec![format!(
-                "Changes {}'s password. The old one cannot be recovered, so \
-                 anything still configured with it — an application, a job, \
-                 another developer's client — fails to connect until it is \
-                 updated by hand. Sessions already open keep running.",
-                r.account.display()
-            )],
+            Change::SetAccountPassword(r) => vec![Risk::SetPassword {
+                who: r.account.display(),
+            }],
             // Taking a privilege away is destructive in the sense this list
             // means — something that worked stops working — but it destroys no
             // data and is undone by granting it back, which is what separates
@@ -6752,47 +7367,23 @@ impl Change {
             // means granting it back does not undo the revoke, so there it
             // takes the strong heading (`risk_is_reversible`).
             Change::RevokePrivileges(c) => {
-                let what = Self::privilege_words(&c.privileges);
-                let who = c.account.display();
-                let mut s = format!(
-                    "Takes {what} away from {who}. Anything relying on it — an \
-                     application, a job, a view someone else owns — starts failing at \
-                     its next statement."
-                );
-                if crate::users::revoke_cascades(dialect) {
-                    s.push_str(&format!(
-                        " The revoke carries CASCADE, so it is also taken from every \
-                         account {who} granted it on to, and what runs as those accounts \
-                         fails the same way."
-                    ));
-                }
-                if crate::users::supports_deny(dialect) {
-                    s.push_str(&format!(
-                        " Where {who} is denied it instead (DENY), the revoke lifts the \
-                         denial — which gives access back if a role it belongs to grants it."
-                    ));
-                }
                 // On a table, the revoke takes the columns' permissions too
                 // (`users::table_revoke_clears_columns`, measured on 2022 and
                 // 2025): a column denied stops being denied, and one granted on
                 // its own stops being granted — neither of which "a DENY" said.
                 let cleared = crate::users::column_permissions_cleared(c, dialect);
-                if !cleared.is_empty() {
-                    s.push_str(&format!(
-                        " On a table it also deletes every column-level grant and DENY of {} \
-                         {who} has on the table's columns: a column {who} was denied is no \
-                         longer denied, and one granted on its own is no longer granted.",
-                        Self::privilege_words(&cleared)
-                    ));
-                }
-                vec![s]
+                vec![Risk::RevokePrivileges {
+                    privileges: PrivilegeWords::of(&c.privileges),
+                    who: c.account.display(),
+                    cascades: crate::users::revoke_cascades(dialect),
+                    deny: crate::users::supports_deny(dialect),
+                    cleared: (!cleared.is_empty()).then(|| PrivilegeWords::of(&cleared)),
+                }]
             }
-            Change::RevokeRole(c) => vec![format!(
-                "Takes the role {} away from {}, and with it every privilege the \
-                 role carries.",
-                c.role.display(),
-                c.member.display()
-            )],
+            Change::RevokeRole(c) => vec![Risk::RevokeRole {
+                role: c.role.display(),
+                member: c.member.display(),
+            }],
             // **Creating an account destroys nothing and is still the highest-
             // consequence thing this module emits.** `risks` is where the
             // preview says what the plan will *do for you* — `DropCheck`'s
@@ -6809,11 +7400,9 @@ impl Change {
             Change::CreateAccount(d) if d.kind == crate::users::PrincipalKind::User => {
                 let mut out = Vec::new();
                 if d.password.is_empty() && crate::users::blank_password_signs_in(dialect) {
-                    out.push(format!(
-                        "{} will have no password: anyone who can reach the server can log \
-                         in as it. Set one here, or with ALTER USER afterwards.",
-                        d.principal(dialect).display()
-                    ));
+                    out.push(Risk::BlankPassword {
+                        who: d.principal(dialect).display(),
+                    });
                 }
                 // The host is MySQL's alone (`users::accounts_have_hosts`), and
                 // blank means `%` — the form's own placeholder says so, but only
@@ -6822,10 +7411,7 @@ impl Change {
                     && matches!(d.host.trim(), "" | "%")
                     && d.password.is_empty()
                 {
-                    out.push(
-                        "Its host is % — every machine on the network, not just this one."
-                            .to_string(),
-                    );
+                    out.push(Risk::HostIsEverywhere);
                 }
                 out
             }
@@ -6848,17 +7434,13 @@ impl Change {
             Change::GrantPrivileges(c)
                 if c.level.kind() == crate::users::GrantLevelKind::Global =>
             {
-                let privs = Self::privilege_words(&c.privileges);
+                let privileges = PrivilegeWords::of(&c.privileges);
                 let who = c.account.display();
                 vec![match dialect {
-                    SqlDialect::MsSql => format!(
-                        "Grants {privs} to {who} on the whole server — the instance \
-                         itself, not the database being browsed."
-                    ),
-                    SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => format!(
-                        "Grants {privs} to {who} on every database on this server — including \
-                         databases that do not exist yet, not just the one being browsed."
-                    ),
+                    SqlDialect::MsSql => Risk::GrantServerWide { privileges, who },
+                    SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+                        Risk::GrantEveryDatabase { privileges, who }
+                    }
                 }]
             }
             // **A table grant that would lift a column's `DENY`**, where the
@@ -6871,16 +7453,12 @@ impl Change {
             Change::GrantPrivileges(c)
                 if !crate::users::column_permissions_kept(c, dialect).is_empty() =>
             {
-                let kept =
-                    Self::privilege_words(&crate::users::column_permissions_kept(c, dialect));
-                let who = c.account.display();
-                vec![format!(
-                    "A table-level grant of {kept} deletes any DENY of it {who} has on one of \
-                     the table's columns, so the statement denies those columns to {who} again \
-                     straight after granting: a column {who} was denied stays denied. Where \
-                     {who} also holds the grant option on the table, the server refuses to \
-                     deny it again without CASCADE, and nothing is applied."
-                )]
+                vec![Risk::GrantKeepsColumnDenies {
+                    privileges: PrivilegeWords::of(&crate::users::column_permissions_kept(
+                        c, dialect,
+                    )),
+                    who: c.account.display(),
+                }]
             }
             _ => Vec::new(),
         }
@@ -6888,7 +7466,7 @@ impl Change {
 
     /// Whether this change destroys anything at all.
     pub fn is_destructive(&self, dialect: SqlDialect) -> bool {
-        !self.risks(dialect).is_empty()
+        !self.risk_lines(dialect).is_empty()
     }
 
     /// Is what this change takes away put back by doing the opposite?
@@ -6941,40 +7519,24 @@ impl Change {
 /// on this one can't be enumerated from the introspected schema at all, so the
 /// honest claim is "these columns, and the server may still refuse" — never
 /// "these columns, and that's all of them".
-fn recreate_risk(name: &str, kind: &str, dependents: &[TypeDependent]) -> String {
+fn recreate_risk(name: &str, kind: RecreateKind, dependents: &[TypeDependent]) -> Risk {
     const NAMED: usize = 6;
-    let mut out = format!(
-        "Re-creating {kind} {name} drops and rebuilds it. Every column below is \
-         re-cast through text; a value the new definition doesn't accept fails the \
-         whole plan, and nothing is applied"
-    );
-    if dependents.is_empty() {
-        out.push_str(
-            ". Nothing uses it today, but a view or function built on it \
-                      can't be listed here and would make the server refuse.",
-        );
-        return out;
+    Risk::Recreate {
+        kind,
+        name: name.to_string(),
+        columns: dependents
+            .iter()
+            .take(NAMED)
+            .map(|d| {
+                format!(
+                    "{}.{}",
+                    crate::schema::display_name(d.schema.as_deref(), &d.table),
+                    d.column
+                )
+            })
+            .collect(),
+        more: dependents.len().saturating_sub(NAMED),
     }
-    let named: Vec<String> = dependents
-        .iter()
-        .take(NAMED)
-        .map(|d| {
-            format!(
-                "{}.{}",
-                crate::schema::display_name(d.schema.as_deref(), &d.table),
-                d.column
-            )
-        })
-        .collect();
-    out.push_str(&format!(": {}", named.join(", ")));
-    if dependents.len() > NAMED {
-        out.push_str(&format!(" and {} more", dependents.len() - NAMED));
-    }
-    out.push_str(
-        ". A view or function built on it can't be listed here and would make the \
-         server refuse.",
-    );
-    out
 }
 
 /// Which of a sequence's clauses differ, named for the preview.
@@ -7031,13 +7593,11 @@ fn routine_object_kind(kind: crate::schema::RoutineKind) -> ObjectKind {
 /// **All of them, not the first.** Nullability and type are independent halves of
 /// one edit and a designer changes both at once routinely; returning early on the
 /// nullability half hid the narrowing — the more dangerous of the two.
-fn alter_risks(from: &ColumnInfo, to: &ColumnInfo, dialect: SqlDialect) -> Vec<String> {
+fn alter_risks(from: &ColumnInfo, to: &ColumnInfo, dialect: SqlDialect) -> Vec<Risk> {
     let mut out = Vec::new();
+    let name = || to.name.clone();
     if from.nullable && !to.nullable {
-        out.push(format!(
-            "Column {} becomes NOT NULL — the statement fails if any row holds NULL.",
-            to.name
-        ));
+        out.push(Risk::ColumnNotNull { name: name() });
     }
     // **A generated expression, in either direction.** This function covered a
     // nullability flip and a type change, and a generated-expression edit is
@@ -7046,28 +7606,22 @@ fn alter_risks(from: &ColumnInfo, to: &ColumnInfo, dialect: SqlDialect) -> Vec<S
     // `DROP COLUMN, ADD COLUMN` and nulled every row. Which statement PG gets
     // is `pg_column_clauses`' business; that the user is told is this one's.
     match (from.generated.as_deref(), to.generated.as_deref()) {
-        (Some(_), None) => out.push(format!(
-            "Column {} stops being generated. Its current values are kept, but \
-             nothing recomputes them from now on.",
-            to.name
-        )),
-        (None, Some(expr)) => out.push(format!(
-            "Column {} becomes generated from {expr}. Every value in it is \
-             replaced by what the expression computes.",
-            to.name
-        )),
-        (Some(a), Some(b)) if a != b => out.push(format!(
-            "Column {}'s expression changes from {a} to {b}. On PostgreSQL this \
-             drops and re-adds the column, so every value is recomputed and the \
-             column moves to the end of the table.",
-            to.name
-        )),
+        (Some(_), None) => out.push(Risk::ColumnStopsGenerated { name: name() }),
+        (None, Some(expr)) => out.push(Risk::ColumnBecomesGenerated {
+            name: name(),
+            expression: expr.to_string(),
+        }),
+        (Some(a), Some(b)) if a != b => out.push(Risk::ColumnExpressionChanges {
+            name: name(),
+            from: a.to_string(),
+            to: b.to_string(),
+        }),
         _ => {}
     }
     out.extend(type_change_risk(
         &from.type_name,
         &to.type_name,
-        &to.name,
+        TypeSubject::Column(name()),
         dialect,
     ));
     out
@@ -7099,7 +7653,12 @@ fn alter_risks(from: &ColumnInfo, to: &ColumnInfo, dialect: SqlDialect) -> Vec<S
 ///
 /// The *message* still quotes `from` and `to` as the user typed them: the
 /// comparison is the machine's question, the sentence is theirs.
-fn type_change_risk(from: &str, to: &str, subject: &str, dialect: SqlDialect) -> Option<String> {
+fn type_change_risk(
+    from: &str,
+    to: &str,
+    subject: TypeSubject,
+    dialect: SqlDialect,
+) -> Option<Risk> {
     let normalized_from = normalize_type(from, dialect);
     let normalized_to = normalize_type(to, dialect);
     let (fb, fa) = {
@@ -7125,25 +7684,23 @@ fn type_change_risk(from: &str, to: &str, subject: &str, dialect: SqlDialect) ->
         // Looking only at the first parameter missed the rounding case, which is
         // the one that loses data without the statement complaining.
         let narrowed = |i: usize| matches!((fa.get(i), ta.get(i)), (Some(a), Some(b)) if b < a);
-        let mut lost = Vec::new();
-        if narrowed(0) {
-            lost.push("truncates values that no longer fit");
-        }
-        if narrowed(1) {
-            lost.push("rounds every value in the column");
-        }
-        if lost.is_empty() {
+        let (truncates, rounds) = (narrowed(0), narrowed(1));
+        if !truncates && !rounds {
             return None;
         }
-        return Some(format!(
-            "Narrowing {subject} from {from} to {to} {}.",
-            lost.join(" and ")
-        ));
+        return Some(Risk::TypeNarrows {
+            subject,
+            from: from.to_string(),
+            to: to.to_string(),
+            truncates,
+            rounds,
+        });
     }
-    Some(format!(
-        "Changing {subject} from {from} to {to} rewrites every value; \
-         it can fail or lose precision."
-    ))
+    Some(Risk::TypeRewrites {
+        subject,
+        from: from.to_string(),
+        to: to.to_string(),
+    })
 }
 
 /// Where a plan is going: the dialect it must be spelled in, and — within the
@@ -7210,6 +7767,11 @@ impl ChangeSet {
     /// Every destructive consequence in this set, in change order — a change can
     /// contribute more than one.
     pub fn destructive(&self) -> Vec<String> {
+        self.risk_lines().iter().map(Risk::message).collect()
+    }
+
+    /// [`ChangeSet::destructive`] as values the interface words ([`Risk`]).
+    pub fn risk_lines(&self) -> Vec<Risk> {
         // A check that comes off and goes back on in the same plan is not a
         // dropped check, and saying "rows the constraint refused are accepted
         // from now on" about one is simply false. Neither engine can alter a
@@ -7236,7 +7798,7 @@ impl ChangeSet {
                 _ => None,
             })
             .collect();
-        let mut out: Vec<String> = self
+        let mut out: Vec<Risk> = self
             .changes
             .iter()
             .filter(|c| match c {
@@ -7246,22 +7808,14 @@ impl ChangeSet {
                 Change::DropIndex { remade, .. } => !remade,
                 _ => true,
             })
-            .flat_map(|c| c.risks(self.dialect))
+            .flat_map(|c| c.risk_lines(self.dialect))
             .collect();
         // The plan's own step rather than any one change's: said once, however
         // many of its changes move a column.
         if self.refreshes_star_dependents() {
-            out.push(format!(
-                "Refreshes every view and inline function in this database that selects * \
-                 from {0}, directly or through a synonym: SQL Server binds those to the \
-                 table's columns by position, and would otherwise read and write the wrong \
-                 columns. The plan fails if one of them no longer compiles against the new \
-                 columns. One in another database that selects * from {0} is refreshed after \
-                 the plan commits, outside its transaction: until then it reads the old \
-                 positions, and if its refresh fails the plan stays applied and the view is \
-                 named here.",
-                self.table
-            ));
+            out.push(Risk::StarRefresh {
+                table: self.table.clone(),
+            });
         }
         out.extend(self.piecewise_risk());
         out
@@ -7924,13 +8478,8 @@ impl ChangeSet {
     /// never run whole, and say what failed and what stuck when one stops; a
     /// natively compiled module is the case where an engine that does promise
     /// it has to be told it cannot.
-    fn piecewise_risk(&self) -> Option<String> {
-        (ddl_is_transactional(self.dialect) && !self.runs_whole()).then(|| {
-            "SQL Server will not create, alter or drop a natively compiled module inside a \
-             transaction, so this plan runs one statement at a time and cannot be stopped: if \
-             a statement fails, the ones before it stay applied."
-                .to_string()
-        })
+    fn piecewise_risk(&self) -> Option<Risk> {
+        (ddl_is_transactional(self.dialect) && !self.runs_whole()).then_some(Risk::Piecewise)
     }
 
     /// The script as it may **leave** the preview — for the clipboard, and for
@@ -9762,53 +10311,29 @@ pub(crate) fn view_index_statements(v: &ViewDraft, name: &str, d: SqlDialect) ->
 /// is the other side's view, and an index only the target has is dropped and
 /// not built: the sentence says so, rather than reading the draft's set and
 /// saying nothing.
-fn view_indexes_rebuilt(v: &ViewDraft, server: &[IndexInfo]) -> Option<String> {
-    let dropped: Vec<&str> = server.iter().map(|ix| ix.name.as_str()).collect();
+///
+/// Where any is built again the sentence says what the rebuild cannot carry —
+/// the guard refuses an index that has any of it (`tsql_view_index_guard`) —
+/// and every form says the view's hand-made statistics go: `ALTER VIEW` takes
+/// them as well, and nothing here reads them (measured on SQL Server 2022:
+/// `CREATE STATISTICS` on an indexed view, gone after its alter) — the table
+/// rebuild's disclosure.
+fn view_indexes_rebuilt(v: &ViewDraft, server: &[IndexInfo]) -> Option<Risk> {
+    let dropped: Vec<String> = server.iter().map(|ix| ix.name.clone()).collect();
     if dropped.is_empty() {
         return None;
     }
     let built = view_indexes_built_again(v, server);
-    let (again, gone): (Vec<&str>, Vec<&str>) = dropped.iter().partition(|n| built.contains(n));
-    let it = |n: &[&str]| if n.len() == 1 { "it" } else { "them" };
-    // What the rebuild cannot carry, said where it is built again: the guard
-    // refuses an index that has any of it (`tsql_view_index_guard`).
-    let guarded = if again.is_empty() {
-        ""
-    } else {
-        " An index with a fill factor, compression, padding, lock options, a filegroup or a \
-         description stops the plan before anything changes — Schemaic can't build those again."
-    };
-    // `ALTER VIEW` takes the view's own statistics as well, and nothing here
-    // reads them (measured on SQL Server 2022: `CREATE STATISTICS` on an
-    // indexed view, gone after its alter) — the table rebuild's disclosure.
-    let stats = " Statistics created by hand on the view are not carried over.";
-    let tail = if gone.is_empty() {
-        format!(
-            "and this plan builds {} again after it, in the same transaction. On a large view \
-             that takes as long as building {} did.{guarded}{stats}",
-            it(&again),
-            it(&again)
-        )
-    } else if again.is_empty() {
-        format!(
-            "and this plan does not build {} again: the view it is made to match has no such \
-             index.{stats}",
-            it(&gone)
-        )
-    } else {
-        format!(
-            "and this plan builds {} again after it, in the same transaction, but not {}, which \
-             the view it is made to match does not have.{guarded}{stats}",
-            again.join(", "),
-            gone.join(", ")
-        )
-    };
-    Some(format!(
-        "Redefining view {} drops its index{} ({}) — SQL Server's ALTER VIEW always does — {tail}",
-        v.original.as_deref().unwrap_or(&v.name),
-        if dropped.len() == 1 { "" } else { "es" },
-        dropped.join(", "),
-    ))
+    let (again, gone): (Vec<String>, Vec<String>) = dropped
+        .iter()
+        .cloned()
+        .partition(|n| built.contains(&n.as_str()));
+    Some(Risk::ViewIndexesDropped {
+        view: v.original.clone().unwrap_or_else(|| v.name.clone()),
+        dropped,
+        again,
+        gone,
+    })
 }
 
 /// What `CREATE INDEX` from the model does not state, for the index `which`

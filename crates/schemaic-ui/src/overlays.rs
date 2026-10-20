@@ -2906,10 +2906,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             // warning are worded as a sequence's.
                                             object_drop_change(shape, materialized),
                                             |lines, w| {
-                                                let (lines, mut w) =
-                                                    schemaic_core::stats::drop_preview(
-                                                        lines, w, rows, shape,
-                                                    );
+                                                let (lines, w) = schemaic_core::stats::drop_preview(
+                                                    lines, w, rows, shape,
+                                                );
+                                                let mut w: Vec<String> = w
+                                                    .iter()
+                                                    .map(crate::ddl_preview::risk_text)
+                                                    .collect();
                                                 // What it breaks, named before Apply
                                                 // rather than by the next error
                                                 // (`core::used_by`).

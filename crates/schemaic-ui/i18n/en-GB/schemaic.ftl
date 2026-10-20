@@ -2372,6 +2372,192 @@ ddl-line-revoke-role = Revoke { $role } from { $member }
 # A comparison's line: $subject is the object the change is about.
 ddl-line-of = { $subject } — { $line }
 
+## The risk block: what the plan destroys or changes for good (core's
+## ddl::Risk). English must read exactly as core's Change::risks (a test holds
+## it). Names, types, SQL keywords (NOT NULL, DENY, CASCADE, ALTER USER …) are
+## never translated. $what is an object kind as kind-* words it.
+
+# $engine is sqlserver where SQL Server's own guarded rebuild runs it.
+ddl-risk-rebuild-table = { $engine ->
+        [sqlserver] Drops { $name } and recreates it, copying every row across, and puts back its keys, indexes, checks, defaults and triggers, its own and its columns' comments, and the foreign keys other tables have on it. It stops before it starts if the table has anything else Schemaic doesn't restate — permissions, an owner of its own, a schema-bound dependent, system versioning, a ledger, replication, compression, index options, a disabled index, a bound rule or default, a sensitivity classification, a description on a key, index, default, check or trigger. Statistics created by hand are not carried over.
+       *[other] Drops { $name } and recreates it, copying every row across. Anything about the table Schemaic didn't read is not carried over.
+    }
+ddl-risk-drop-table = Drops the table and every row in it.
+ddl-risk-drop-foreign-table = Drops the foreign table: its definition goes, and the rows it reads stay where they are, on the foreign server or in the file; a view or routine that names it fails from then on.
+ddl-risk-truncate-table = Deletes every row in the table. This can't be undone.
+ddl-risk-drop-column = Drops column { $name } and all the data in it.
+ddl-risk-rebuild-computed-column = Drops computed column { $name } and adds it back, so it moves to the end of the table.
+ddl-risk-column-not-null = Column { $name } becomes NOT NULL — the statement fails if any row holds NULL.
+ddl-risk-column-stops-generated = Column { $name } stops being generated. Its current values are kept, but nothing recomputes them from now on.
+# $expression is SQL.
+ddl-risk-column-becomes-generated = Column { $name } becomes generated from { $expression }. Every value in it is replaced by what the expression computes.
+ddl-risk-column-expression-changes = Column { $name }'s expression changes from { $from } to { $to }. On PostgreSQL this drops and re-adds the column, so every value is recomputed and the column moves to the end of the table.
+# $subject is a column's name, or ddl-risk-domain-subject; $loss is truncates,
+# rounds or both.
+ddl-risk-type-narrows = Narrowing { $subject } from { $from } to { $to } { $loss ->
+        [truncates] truncates values that no longer fit
+        [rounds] rounds every value in the column
+       *[both] truncates values that no longer fit and rounds every value in the column
+    }.
+ddl-risk-type-rewrites = Changing { $subject } from { $from } to { $to } rewrites every value; it can fail or lose precision.
+ddl-risk-domain-subject = domain { $name }
+ddl-risk-primary-key-dropped = Leaves the table without a primary key — rows can no longer be edited from the grid.
+ddl-risk-primary-key-rebuilt = Drops and re-adds the primary key around the column change. When it is the clustered index this rewrites the whole table, and a foreign key in another table that references it stops the plan.
+# $columns is the old key's columns, joined; $count how many.
+ddl-risk-primary-key-replaced = Replaces the primary key: { $count ->
+        [one] { $columns } is
+       *[other] { $columns } are
+    } no longer unique, and duplicates are accepted from now on. On MySQL this rebuilds the clustered index, which rewrites the whole table.
+ddl-risk-drop-foreign-key = Drops foreign key { $name }. Rows that no longer have a matching parent are accepted from now on, and existing data is not re-examined if it's added back.
+ddl-risk-drop-unique-index = Drops unique index { $name }. Duplicate values are accepted from now on, and the grid may lose the key it was editing rows by.
+# $cost is one of ddl-risk-view-cost-*.
+ddl-risk-drop-view = { $materialized ->
+        [yes] Drops the materialized view. { $cost }
+       *[no] Drops the view. { $cost }
+    }
+# What goes with a dropped view, per engine; -restored where the plan puts its
+# INSTEAD OF triggers back.
+ddl-risk-view-cost-sqlite = Views that select from it stop resolving until it is back, and its INSTEAD OF triggers are dropped with it and aren't restored.
+ddl-risk-view-cost-sqlite-restored = Views that select from it stop resolving until it is back, and its INSTEAD OF triggers are dropped with it.
+ddl-risk-view-cost-sqlserver = Grants on it, its description and its INSTEAD OF triggers are dropped with it and aren't restored.
+ddl-risk-view-cost-sqlserver-restored = Grants on it and its description are dropped with it and aren't restored; its INSTEAD OF triggers are dropped too.
+ddl-risk-view-cost-other = Dependent views, rules, grants and its INSTEAD OF triggers are dropped with it and aren't restored.
+ddl-risk-view-cost-other-restored = Dependent views, rules and grants are dropped with it and aren't restored; its INSTEAD OF triggers are dropped too.
+# $why is sqlite, sqlserver or postgres: the engine's reason it can't replace in place.
+ddl-risk-recreate-view = Re-creating { $name } drops it first. { $cost } { $why ->
+        [sqlite] SQLite has no way to replace a view in place, so every edit to one — a rename included — takes this route.
+        [sqlserver] SQL Server's sp_rename would leave the view's stored definition naming the old one, so a rename takes this route.
+       *[postgres] PostgreSQL can't replace a view whose columns changed name, type or order, so this is the only way to apply the edit.
+    }
+ddl-risk-view-statements-replayed = { $count ->
+        [one] { $count } statement dropped with it is put back afterwards, in the same transaction.
+       *[other] { $count } statements dropped with it are put back afterwards, in the same transaction.
+    }
+# An indexed view's edit. $dropped is its indexes, joined, and $dropped_count
+# how many; $case says which are built again: all, none, or some ($again those
+# that are, $gone those that are not, with $again_count and $gone_count).
+ddl-risk-view-indexes-dropped = Redefining view { $view } drops its { $dropped_count ->
+        [one] index
+       *[other] indexes
+    } ({ $dropped }) — SQL Server's ALTER VIEW always does — { $case ->
+        [all] and this plan builds { $again_count ->
+            [one] it
+           *[other] them
+        } again after it, in the same transaction. On a large view that takes as long as building { $again_count ->
+            [one] it
+           *[other] them
+        } did. An index with a fill factor, compression, padding, lock options, a filegroup or a description stops the plan before anything changes — Schemaic can't build those again. Statistics created by hand on the view are not carried over.
+        [none] and this plan does not build { $gone_count ->
+            [one] it
+           *[other] them
+        } again: the view it is made to match has no such index. Statistics created by hand on the view are not carried over.
+       *[some] and this plan builds { $again } again after it, in the same transaction, but not { $gone }, which the view it is made to match does not have. An index with a fill factor, compression, padding, lock options, a filegroup or a description stops the plan before anything changes — Schemaic can't build those again. Statistics created by hand on the view are not carried over.
+    }
+ddl-risk-add-not-null-column = Column { $name } is NOT NULL with no default. If the table already has rows there is no value to give them, and the engine will refuse the whole plan.
+ddl-risk-drop-check = Drops check { $name }. Rows the constraint refused are accepted from now on, and existing data is not re-examined if it's added back.
+ddl-risk-keep-lossy-index = Your edit to index { $name } is not included. It uses something Schemaic can't read back — an expression key column, an operator class, or a NULLS ordering — and applying the edit would mean re-creating the index without it. Edit this index in SQL instead.
+ddl-risk-drop-trigger = Drops trigger { $name }. Whatever it did on each write stops happening, and rows written from now on won't have it applied.
+ddl-risk-redefine-trigger-in-place = Redefines trigger { $name } in place — it is not dropped, so its permissions stay — and what it does on each write changes from now on.
+ddl-risk-recreate-trigger = Re-creating trigger { $name } drops it first. Where DDL isn't transactional (MySQL), a new definition the server rejects leaves the table with no trigger.
+# $kind is trigger, function or procedure.
+ddl-risk-signature-lost = { $kind ->
+        [trigger] Trigger
+        [function] Function
+       *[procedure] Procedure
+    } { $name } is signed (ADD SIGNATURE), and any change to it removes the signature — Schemaic can't sign it again without the certificate's key. Whatever the certificate let it do stops working until you run ADD SIGNATURE again.
+ddl-risk-redefines-routine = Redefines { $name }. Everything that calls it runs the new body from now on, including triggers on other tables this edit never mentioned.
+ddl-risk-routine-parameters-change = Changes { $name }'s parameter list. Callers that pass the old arguments no longer resolve to it.
+ddl-risk-recreate-routine = Re-creating { $held } drops it first. Where DDL isn't transactional (MySQL), a new definition the server rejects leaves no { $what } at all.
+ddl-risk-routine-grants-lost = { $comment ->
+        [yes] Privileges granted on { $held } and its comment do not survive being dropped, and this plan does not restore them — re-apply any GRANT and COMMENT afterwards.
+       *[no] Privileges granted on { $held } do not survive being dropped, and this plan does not restore them — re-apply any GRANT afterwards.
+    }
+# $members is the group's members (grp;2, grp;3), joined.
+ddl-risk-drop-numbered-group = Drops { $what } { $name } and every member of its numbered group with it: { $members }.
+ddl-risk-drop-routine = Drops { $what } { $name }. PostgreSQL refuses while a trigger still uses it, so any that do have to be dropped first.
+ddl-risk-drop-event = Drops event { $name }. Its schedule and its body are gone with it — nothing else in the database holds a copy.
+ddl-risk-one-shot-event = This event runs once and the server then deletes it — that's ON COMPLETION NOT PRESERVE. Turn Preserve on to keep it.
+ddl-risk-one-shot-event-altered = Event { $name } will run once and the server will then delete it — that's ON COMPLETION NOT PRESERVE. Turn Preserve on to keep it.
+ddl-risk-add-enum-value = Adding { $value } can't be undone in place — PostgreSQL can't remove an enum value, so taking it back means re-creating the type. The value also can't be used until this plan is applied.
+ddl-risk-rename-enum-value = Every row holding { $from } reads { $to } from now on. If you meant to remove { $from } rather than rename it, delete it and apply that on its own.
+# $kind is type or domain; $columns the columns re-cast, joined, $has_columns
+# yes or no, and $more how many beyond those named.
+ddl-risk-recreate = Re-creating { $kind ->
+        [domain] domain
+       *[type] type
+    } { $name } drops and rebuilds it. Every column below is re-cast through text; a value the new definition doesn't accept fails the whole plan, and nothing is applied{ $has_columns ->
+        [yes] : { $columns }{ $more ->
+            [0] {""}
+           *[other] {" "}and { $more } more
+        }. A view or function built on it can't be listed here and would make the server refuse.
+       *[no] . Nothing uses it today, but a view or function built on it can't be listed here and would make the server refuse.
+    }
+ddl-risk-drop-domain-check = Drops check { $name }. Every column of this domain stops being checked, and existing data is not re-examined if it's added back.
+ddl-risk-domain-nullable = Every column of this domain starts accepting NULL, including ones in tables this edit never mentioned.
+ddl-risk-domain-not-null = The statement fails if any column of this domain already holds NULL.
+ddl-risk-drop-sequence = Drops the sequence and the position it had reached. The server refuses while a column's default still draws from it, so those defaults have to go first.
+ddl-risk-drop-synonym = Drops the synonym. Nothing refuses it: a view, routine or query that names it fails from then on, when it next runs.
+ddl-risk-drop-extension = Drops the extension and the functions, types and operators it installed. The server refuses while anything of yours still depends on them — a column of its type, an index or a server on its wrapper — and names what does.
+ddl-risk-drop-used-object = Drops the { $what }. The server refuses while a column still uses it, so those columns have to change type first.
+ddl-risk-restart-sequence = Restarts the counter at { $value }. Values already handed out are not changed, so a key it reaches again collides.
+ddl-risk-replace-synonym = Drops the synonym and creates it again. Nothing refuses the drop: the two statements run in one transaction.
+# $start is the value it starts over at; ddl-risk-start-value where the draft names none.
+ddl-risk-replace-sequence = Drops the sequence and creates it again: the position it had reached is lost, and it starts over at { $start }. The server refuses the drop while a column's default still draws from it.
+ddl-risk-start-value = its start value
+ddl-risk-replace-object = Drops the { $what } and creates it again. The server refuses the drop while a column still uses it, so those columns have to change type first.
+ddl-risk-replace-refused = { $alias_type ->
+        [yes] Refused while it has permissions on it, an owner of its own, extended properties or a bound rule or default: the re-create would not restore them.
+       *[no] Refused while it has permissions on it, an owner of its own or extended properties: the re-create would not restore them.
+    }
+ddl-risk-drop-database = Drops the database { $name } and everything in it — every table and all its rows, every view, index, routine and trigger. Nothing is kept and there is no undo: the only way back is a backup taken before this runs.
+ddl-risk-drop-schema = Drops the schema { $name }. The server refuses while it still holds tables, views or routines, so this either takes an empty schema or fails{ $cascade ->
+        [yes] {" "}— Schemaic never sends CASCADE.
+       *[no] .
+    }
+ddl-risk-drop-login = Drops the login { $who }, and with it every server permission and server-role membership it holds — recorded nowhere else, so a login made again under this name starts without them. The server refuses while anything is connected as it, so its sessions have to end first. Its users in each database are not dropped: they stay, keeping their permissions, mapped to no login, and a new login of this name does not re-attach to them without ALTER USER … WITH LOGIN.
+ddl-risk-drop-account = Drops { $who } and every privilege it holds. The grants are not recorded anywhere else, so putting the account back means granting them all again from memory. { $cuts_off ->
+        [yes] Anything connected as it fails at its next statement in this database.
+       *[no] Anything still connected as it keeps running until it disconnects.
+    }
+ddl-risk-set-password = Changes { $who }'s password. The old one cannot be recovered, so anything still configured with it — an application, a job, another developer's client — fails to connect until it is updated by hand. Sessions already open keep running.
+# $privileges is up to three names or ddl-privileges-*; $cleared likewise, the
+# column permissions a table revoke deletes, where $has_cleared is yes.
+ddl-risk-revoke-privileges = Takes { $privileges } away from { $who }. Anything relying on it — an application, a job, a view someone else owns — starts failing at its next statement.{ $cascades ->
+        [yes] {" "}The revoke carries CASCADE, so it is also taken from every account { $who } granted it on to, and what runs as those accounts fails the same way.
+       *[no] {""}
+    }{ $deny ->
+        [yes] {" "}Where { $who } is denied it instead (DENY), the revoke lifts the denial — which gives access back if a role it belongs to grants it.
+       *[no] {""}
+    }{ $has_cleared ->
+        [yes] {" "}On a table it also deletes every column-level grant and DENY of { $cleared } { $who } has on the table's columns: a column { $who } was denied is no longer denied, and one granted on its own is no longer granted.
+       *[no] {""}
+    }
+ddl-risk-revoke-role = Takes the role { $role } away from { $member }, and with it every privilege the role carries.
+ddl-risk-blank-password = { $who } will have no password: anyone who can reach the server can log in as it. Set one here, or with ALTER USER afterwards.
+ddl-risk-host-is-everywhere = Its host is % — every machine on the network, not just this one.
+ddl-risk-grant-server-wide = Grants { $privileges } to { $who } on the whole server — the instance itself, not the database being browsed.
+ddl-risk-grant-every-database = Grants { $privileges } to { $who } on every database on this server — including databases that do not exist yet, not just the one being browsed.
+ddl-risk-grant-keeps-column-denies = A table-level grant of { $privileges } deletes any DENY of it { $who } has on one of the table's columns, so the statement denies those columns to { $who } again straight after granting: a column { $who } was denied stays denied. Where { $who } also holds the grant option on the table, the server refuses to deny it again without CASCADE, and nothing is applied.
+ddl-risk-star-refresh = Refreshes every view and inline function in this database that selects * from { $table }, directly or through a synonym: SQL Server binds those to the table's columns by position, and would otherwise read and write the wrong columns. The plan fails if one of them no longer compiles against the new columns. One in another database that selects * from { $table } is refreshed after the plan commits, outside its transaction: until then it reads the old positions, and if its refresh fails the plan stays applied and the view is named here.
+ddl-risk-piecewise = SQL Server will not create, alter or drop a natively compiled module inside a transaction, so this plan runs one statement at a time and cannot be stopped: if a statement fails, the ones before it stay applied.
+ddl-risk-drop-sequence-table = Drops the sequence: the value it has reached is lost, and anything that still draws from it fails.
+# $rows is the figure as the properties panel prints it (~4.2m, 12).
+ddl-risk-drop-scale = By the schema tree's statistics, that is { $rows } rows.
+# A comparison's risk: $subject is the object it happens to.
+ddl-risk-of = { $subject } — { $risk }
+ddl-risk-cycle = The foreign keys between these tables form a cycle, so no creation order satisfies all of them. One statement will be refused for referencing a table that does not exist yet, and neither MySQL nor MariaDB rolls DDL back.
+# A name a table being dropped still holds and one being created needs: $names
+# joined; $why says why the drop can't come first, $cost what the engine does.
+ddl-risk-clash = { $holder } still holds { $names }, which creating { $claimer } needs — { $why ->
+        [not-dropped] and this plan does not drop it
+        [default] and it cannot be dropped first because a column default draws from it
+       *[referenced] and it cannot be dropped first because another table references it
+    }. { $cost ->
+        [no-rollback] One statement will be refused, and neither MySQL nor MariaDB rolls DDL back.
+        [rolls-back] One statement will be refused, which rolls the whole migration back.
+       *[refused] One statement will be refused.
+    }
+
 # $connection is the connection's name; $subject what the plan changes
 # (shop.orders, app@%).
 preview-title = Apply changes to { $connection } · { $subject }

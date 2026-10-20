@@ -262,7 +262,7 @@ pub(crate) fn preview_of(
             .iter()
             .map(|c| change_line_text(&c.line()))
             .collect(),
-        destructive: cs.destructive(),
+        destructive: cs.risk_lines().iter().map(risk_text).collect(),
         risk_heading: risk_heading_text(cs.risk_reversible()),
         used_by: Vec::new(),
         then: None,
@@ -351,7 +351,7 @@ pub(crate) fn preview_of_plan(
             .iter()
             .map(|(subject, line)| plan_line_text(subject, line))
             .collect(),
-        destructive: plan.destructive(),
+        destructive: plan.risk_lines().iter().map(plan_risk_text).collect(),
         risk_heading: risk_heading_text(plan.risk_reversible()),
         used_by: Vec::new(),
         then: None,
@@ -535,7 +535,9 @@ pub(crate) fn preview_change(
     schema: Option<&str>,
     change: schemaic_core::ddl::Change,
 ) {
-    preview_change_warning(conn, ddl, database, table, schema, change, |l, w| (l, w));
+    preview_change_warning(conn, ddl, database, table, schema, change, |l, w| {
+        (l, w.iter().map(risk_text).collect())
+    });
 }
 
 /// [`preview_change`], with the change's lines and warning reworded by
@@ -554,7 +556,7 @@ pub(crate) fn preview_change_warning(
     change: schemaic_core::ddl::Change,
     reword: impl FnOnce(
         Vec<schemaic_core::ddl::ChangeLine>,
-        Vec<String>,
+        Vec<schemaic_core::ddl::Risk>,
     ) -> (Vec<schemaic_core::ddl::ChangeLine>, Vec<String>),
 ) {
     let ctx = crate::table_designer::edit_ctx(conn);
@@ -568,7 +570,7 @@ pub(crate) fn preview_change_warning(
     );
     let (lines, destructive) = reword(
         cs.changes.iter().map(|c| c.line()).collect(),
-        std::mem::take(&mut p.destructive),
+        cs.risk_lines(),
     );
     p.changes = lines.iter().map(change_line_text).collect();
     p.destructive = destructive;
@@ -1446,8 +1448,8 @@ pub(crate) fn ddl_preview_overlay(
 /// came.
 pub(crate) fn change_line_text(line: &schemaic_core::ddl::ChangeLine) -> String {
     use schemaic_core::ddl::{
-        AddedClause, ChangeLine as L, ClauseChange, EventEdit, IndexStorage, MoveTo,
-        PrivilegeWords, SequenceEdit, TableOptionEdit,
+        AddedClause, ChangeLine as L, ClauseChange, EventEdit, IndexStorage, MoveTo, SequenceEdit,
+        TableOptionEdit,
     };
     use schemaic_core::schema::EventStatus;
     use schemaic_core::users::PrincipalKind;
@@ -1483,11 +1485,7 @@ pub(crate) fn change_line_text(line: &schemaic_core::ddl::ChangeLine) -> String 
             .collect();
         words.join(", ")
     };
-    let privileges = |p: &PrivilegeWords| match p {
-        PrivilegeWords::None => tr!("ddl-privileges-none"),
-        PrivilegeWords::Named(names) => list(names),
-        &PrivilegeWords::Count(count) => tr!("ddl-privileges-count", count = count),
-    };
+    let privileges = privilege_words_text;
     match line {
         &L::CreateTable { ref name, columns } => {
             tr!(
@@ -1971,6 +1969,334 @@ pub(crate) fn risk_heading_text(reversible: bool) -> String {
     }
 }
 
+/// A privilege list as a line says it — core's `ddl::PrivilegeWords` in the
+/// interface's language; the names themselves stay as they came.
+fn privilege_words_text(p: &schemaic_core::ddl::PrivilegeWords) -> String {
+    use schemaic_core::ddl::PrivilegeWords;
+    match p {
+        PrivilegeWords::None => tr!("ddl-privileges-none"),
+        PrivilegeWords::Named(names) => names.join(", "),
+        &PrivilegeWords::Count(count) => tr!("ddl-privileges-count", count = count),
+    }
+}
+
+/// One consequence in the risk block — core's
+/// [`Risk::message`](schemaic_core::ddl::Risk::message) in the interface's
+/// language. Names, types and SQL stay as they came.
+pub(crate) fn risk_text(risk: &schemaic_core::ddl::Risk) -> String {
+    use schemaic_core::ddl::{
+        ObjectDrop, RecreateKind, RecreateViewWhy, Risk as R, SignedKind, TypeSubject, ViewCost,
+        ViewCostEngine,
+    };
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    let list = |v: &[String]| v.join(", ");
+    let what = |k| crate::i18n::object_kind(k);
+    let subject = |s: &TypeSubject| match s {
+        TypeSubject::Column(name) => name.clone(),
+        TypeSubject::Domain(name) => tr!("ddl-risk-domain-subject", name = name.as_str()),
+    };
+    let cost = |c: &ViewCost| match (c.engine, c.restored) {
+        (ViewCostEngine::Sqlite, false) => tr!("ddl-risk-view-cost-sqlite"),
+        (ViewCostEngine::Sqlite, true) => tr!("ddl-risk-view-cost-sqlite-restored"),
+        (ViewCostEngine::MsSql, false) => tr!("ddl-risk-view-cost-sqlserver"),
+        (ViewCostEngine::MsSql, true) => tr!("ddl-risk-view-cost-sqlserver-restored"),
+        (ViewCostEngine::Other, false) => tr!("ddl-risk-view-cost-other"),
+        (ViewCostEngine::Other, true) => tr!("ddl-risk-view-cost-other-restored"),
+    };
+    match risk {
+        R::RebuildTable { name, tsql } => tr!(
+            "ddl-risk-rebuild-table",
+            engine = if *tsql { "sqlserver" } else { "other" },
+            name = name.as_str()
+        ),
+        R::DropTable => tr!("ddl-risk-drop-table"),
+        R::DropForeignTable => tr!("ddl-risk-drop-foreign-table"),
+        R::TruncateTable => tr!("ddl-risk-truncate-table"),
+        R::DropColumn { name } => tr!("ddl-risk-drop-column", name = name.as_str()),
+        R::RebuildComputedColumn { name } => {
+            tr!("ddl-risk-rebuild-computed-column", name = name.as_str())
+        }
+        R::ColumnNotNull { name } => tr!("ddl-risk-column-not-null", name = name.as_str()),
+        R::ColumnStopsGenerated { name } => {
+            tr!("ddl-risk-column-stops-generated", name = name.as_str())
+        }
+        R::ColumnBecomesGenerated { name, expression } => tr!(
+            "ddl-risk-column-becomes-generated",
+            name = name.as_str(),
+            expression = expression.as_str()
+        ),
+        R::ColumnExpressionChanges { name, from, to } => tr!(
+            "ddl-risk-column-expression-changes",
+            name = name.as_str(),
+            from = from.as_str(),
+            to = to.as_str()
+        ),
+        R::TypeNarrows {
+            subject: s,
+            from,
+            to,
+            truncates,
+            rounds,
+        } => tr!(
+            "ddl-risk-type-narrows",
+            subject = subject(s),
+            from = from.as_str(),
+            to = to.as_str(),
+            loss = match (truncates, rounds) {
+                (true, true) => "both",
+                (true, false) => "truncates",
+                (false, _) => "rounds",
+            }
+        ),
+        R::TypeRewrites {
+            subject: s,
+            from,
+            to,
+        } => tr!(
+            "ddl-risk-type-rewrites",
+            subject = subject(s),
+            from = from.as_str(),
+            to = to.as_str()
+        ),
+        R::PrimaryKeyDropped => tr!("ddl-risk-primary-key-dropped"),
+        R::PrimaryKeyRebuilt => tr!("ddl-risk-primary-key-rebuilt"),
+        R::PrimaryKeyReplaced { columns } => tr!(
+            "ddl-risk-primary-key-replaced",
+            count = columns.len(),
+            columns = list(columns)
+        ),
+        R::DropForeignKey { name } => tr!("ddl-risk-drop-foreign-key", name = name.as_str()),
+        R::DropUniqueIndex { name } => tr!("ddl-risk-drop-unique-index", name = name.as_str()),
+        R::DropView {
+            materialized,
+            cost: c,
+        } => tr!(
+            "ddl-risk-drop-view",
+            materialized = yes(*materialized),
+            cost = cost(c)
+        ),
+        R::RecreateView { name, cost: c, why } => tr!(
+            "ddl-risk-recreate-view",
+            name = name.as_str(),
+            cost = cost(c),
+            why = match why {
+                RecreateViewWhy::Sqlite => "sqlite",
+                RecreateViewWhy::MsSql => "sqlserver",
+                RecreateViewWhy::Postgres => "postgres",
+            }
+        ),
+        &R::ViewStatementsReplayed { count } => {
+            tr!("ddl-risk-view-statements-replayed", count = count)
+        }
+        R::ViewIndexesDropped {
+            view,
+            dropped,
+            again,
+            gone,
+        } => tr!(
+            "ddl-risk-view-indexes-dropped",
+            view = view.as_str(),
+            dropped_count = dropped.len(),
+            dropped = list(dropped),
+            case = if gone.is_empty() {
+                "all"
+            } else if again.is_empty() {
+                "none"
+            } else {
+                "some"
+            },
+            again_count = again.len(),
+            again = list(again),
+            gone_count = gone.len(),
+            gone = list(gone)
+        ),
+        R::AddNotNullColumn { name } => {
+            tr!("ddl-risk-add-not-null-column", name = name.as_str())
+        }
+        R::DropCheck { name } => tr!("ddl-risk-drop-check", name = name.as_str()),
+        R::KeepLossyIndex { name } => tr!("ddl-risk-keep-lossy-index", name = name.as_str()),
+        R::DropTrigger { name } => tr!("ddl-risk-drop-trigger", name = name.as_str()),
+        R::RedefineTriggerInPlace { name } => {
+            tr!("ddl-risk-redefine-trigger-in-place", name = name.as_str())
+        }
+        R::RecreateTrigger { name } => tr!("ddl-risk-recreate-trigger", name = name.as_str()),
+        R::SignatureLost { kind, name } => tr!(
+            "ddl-risk-signature-lost",
+            kind = match kind {
+                SignedKind::Trigger => "trigger",
+                SignedKind::Function => "function",
+                SignedKind::Procedure => "procedure",
+            },
+            name = name.as_str()
+        ),
+        R::RedefinesRoutine { name } => tr!("ddl-risk-redefines-routine", name = name.as_str()),
+        R::RoutineParametersChange { name } => {
+            tr!("ddl-risk-routine-parameters-change", name = name.as_str())
+        }
+        R::RecreateRoutine { held, kind } => tr!(
+            "ddl-risk-recreate-routine",
+            held = held.as_str(),
+            what = what(*kind)
+        ),
+        R::RoutineGrantsLost { held, comment } => tr!(
+            "ddl-risk-routine-grants-lost",
+            comment = yes(*comment),
+            held = held.as_str()
+        ),
+        R::DropNumberedGroup {
+            kind,
+            name,
+            members,
+        } => tr!(
+            "ddl-risk-drop-numbered-group",
+            what = what(*kind),
+            name = name.as_str(),
+            members = members.as_str()
+        ),
+        R::DropRoutine { kind, name } => tr!(
+            "ddl-risk-drop-routine",
+            what = what(*kind),
+            name = name.as_str()
+        ),
+        R::DropEvent { name } => tr!("ddl-risk-drop-event", name = name.as_str()),
+        R::OneShotEvent => tr!("ddl-risk-one-shot-event"),
+        R::OneShotEventAltered { name } => {
+            tr!("ddl-risk-one-shot-event-altered", name = name.as_str())
+        }
+        R::AddEnumValue { value } => tr!("ddl-risk-add-enum-value", value = value.as_str()),
+        R::RenameEnumValue { from, to } => tr!(
+            "ddl-risk-rename-enum-value",
+            from = from.as_str(),
+            to = to.as_str()
+        ),
+        R::Recreate {
+            kind,
+            name,
+            columns,
+            more,
+        } => {
+            let more = *more;
+            tr!(
+                "ddl-risk-recreate",
+                kind = match kind {
+                    RecreateKind::Type => "type",
+                    RecreateKind::Domain => "domain",
+                },
+                name = name.as_str(),
+                has_columns = yes(!columns.is_empty()),
+                columns = list(columns),
+                more = more
+            )
+        }
+        R::DropDomainCheck { name } => tr!("ddl-risk-drop-domain-check", name = name.as_str()),
+        R::DomainNullable => tr!("ddl-risk-domain-nullable"),
+        R::DomainNotNull => tr!("ddl-risk-domain-not-null"),
+        R::DropObject(ObjectDrop::Sequence) => tr!("ddl-risk-drop-sequence"),
+        R::DropObject(ObjectDrop::Synonym) => tr!("ddl-risk-drop-synonym"),
+        R::DropObject(ObjectDrop::Extension) => tr!("ddl-risk-drop-extension"),
+        R::DropObject(ObjectDrop::UsedByColumns(kind)) => {
+            tr!("ddl-risk-drop-used-object", what = what(*kind))
+        }
+        R::RestartSequence { to } => tr!("ddl-risk-restart-sequence", value = to.as_str()),
+        R::ReplaceSynonym => tr!("ddl-risk-replace-synonym"),
+        R::ReplaceSequence { start } => tr!(
+            "ddl-risk-replace-sequence",
+            start = start.clone().unwrap_or_else(|| tr!("ddl-risk-start-value"))
+        ),
+        R::ReplaceObject { kind } => tr!("ddl-risk-replace-object", what = what(*kind)),
+        R::ReplaceRefused { alias_type } => {
+            tr!("ddl-risk-replace-refused", alias_type = yes(*alias_type))
+        }
+        R::DropDatabase { name } => tr!("ddl-risk-drop-database", name = name.as_str()),
+        R::DropSchema { name, cascade } => tr!(
+            "ddl-risk-drop-schema",
+            name = name.as_str(),
+            cascade = yes(*cascade)
+        ),
+        R::DropLogin { who } => tr!("ddl-risk-drop-login", who = who.as_str()),
+        R::DropAccount { who, cuts_off } => tr!(
+            "ddl-risk-drop-account",
+            who = who.as_str(),
+            cuts_off = yes(*cuts_off)
+        ),
+        R::SetPassword { who } => tr!("ddl-risk-set-password", who = who.as_str()),
+        R::RevokePrivileges {
+            privileges,
+            who,
+            cascades,
+            deny,
+            cleared,
+        } => tr!(
+            "ddl-risk-revoke-privileges",
+            privileges = privilege_words_text(privileges),
+            who = who.as_str(),
+            cascades = yes(*cascades),
+            deny = yes(*deny),
+            has_cleared = yes(cleared.is_some()),
+            cleared = cleared
+                .as_ref()
+                .map(privilege_words_text)
+                .unwrap_or_default()
+        ),
+        R::RevokeRole { role, member } => tr!(
+            "ddl-risk-revoke-role",
+            role = role.as_str(),
+            member = member.as_str()
+        ),
+        R::BlankPassword { who } => tr!("ddl-risk-blank-password", who = who.as_str()),
+        R::HostIsEverywhere => tr!("ddl-risk-host-is-everywhere"),
+        R::GrantServerWide { privileges, who } => tr!(
+            "ddl-risk-grant-server-wide",
+            privileges = privilege_words_text(privileges),
+            who = who.as_str()
+        ),
+        R::GrantEveryDatabase { privileges, who } => tr!(
+            "ddl-risk-grant-every-database",
+            privileges = privilege_words_text(privileges),
+            who = who.as_str()
+        ),
+        R::GrantKeepsColumnDenies { privileges, who } => tr!(
+            "ddl-risk-grant-keeps-column-denies",
+            privileges = privilege_words_text(privileges),
+            who = who.as_str()
+        ),
+        R::StarRefresh { table } => tr!("ddl-risk-star-refresh", table = table.as_str()),
+        R::Piecewise => tr!("ddl-risk-piecewise"),
+        R::DropSequenceTable => tr!("ddl-risk-drop-sequence-table"),
+        R::DropScale { rows } => tr!("ddl-risk-drop-scale", rows = rows.as_str()),
+    }
+}
+
+/// A comparison's risk line — core's `compare::PlanRisk::message` in the
+/// interface's language.
+pub(crate) fn plan_risk_text(risk: &schemaic_core::compare::PlanRisk) -> String {
+    use schemaic_core::compare::{ClashCost, ClashWhy, PlanRisk};
+    match risk {
+        PlanRisk::Of { subject, risk } => tr!(
+            "ddl-risk-of",
+            subject = subject.as_str(),
+            risk = risk_text(risk)
+        ),
+        PlanRisk::Cycle => tr!("ddl-risk-cycle"),
+        PlanRisk::Clash(c) => tr!(
+            "ddl-risk-clash",
+            holder = c.holder.as_str(),
+            names = c.names.join(", "),
+            claimer = c.claimer.as_str(),
+            why = match c.why {
+                ClashWhy::NotDropped => "not-dropped",
+                ClashWhy::DefaultDrawsFromIt => "default",
+                ClashWhy::Referenced => "referenced",
+            },
+            cost = match c.cost {
+                ClashCost::NoRollback => "no-rollback",
+                ClashCost::RollsBack => "rolls-back",
+                ClashCost::Refused => "refused",
+            }
+        ),
+    }
+}
+
 /// A comparison's line: `line` worded, about `subject` — core's
 /// `SchemaPlan::summaries` in the interface's language.
 pub(crate) fn plan_line_text(subject: &str, line: &schemaic_core::ddl::ChangeLine) -> String {
@@ -2413,6 +2739,262 @@ mod tests {
         for storage in IndexStorage::ALL {
             let line = index(false, Some(storage), None, &["a"], false);
             assert_eq!(change_line_text(&line), line.message(), "{storage:?}");
+        }
+    }
+
+    /// **Every risk reads in English exactly as core's** — each variant, its
+    /// engine and optional parts both ways, its counts at one and many and
+    /// its lists empty, single and several; and a comparison's, its cycle
+    /// and every clash.
+    #[test]
+    fn english_says_every_risk_as_core_does() {
+        use schemaic_core::compare::{ClashCost, ClashNote, ClashWhy, PlanRisk};
+        use schemaic_core::ddl::{
+            ObjectDrop, ObjectKind, PrivilegeWords, RecreateKind, RecreateViewWhy, Risk as R,
+            SignedKind, TypeSubject, ViewCost, ViewCostEngine,
+        };
+        let s = |v: &str| v.to_string();
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut risks = vec![
+            R::DropTable,
+            R::DropForeignTable,
+            R::TruncateTable,
+            R::DropColumn { name: s("qty") },
+            R::RebuildComputedColumn { name: s("total") },
+            R::ColumnNotNull { name: s("qty") },
+            R::ColumnStopsGenerated { name: s("total") },
+            R::ColumnBecomesGenerated {
+                name: s("total"),
+                expression: s("qty * price"),
+            },
+            R::ColumnExpressionChanges {
+                name: s("total"),
+                from: s("a + b"),
+                to: s("a * b"),
+            },
+            R::PrimaryKeyDropped,
+            R::PrimaryKeyRebuilt,
+            R::PrimaryKeyReplaced {
+                columns: v(&["id"]),
+            },
+            R::PrimaryKeyReplaced {
+                columns: v(&["a", "b"]),
+            },
+            R::DropForeignKey { name: s("fk") },
+            R::DropUniqueIndex { name: s("ux") },
+            R::ViewStatementsReplayed { count: 1 },
+            R::ViewStatementsReplayed { count: 3 },
+            R::AddNotNullColumn { name: s("qty") },
+            R::DropCheck { name: s("ck") },
+            R::KeepLossyIndex { name: s("ix") },
+            R::DropTrigger { name: s("tr") },
+            R::RedefineTriggerInPlace { name: s("tr") },
+            R::RecreateTrigger { name: s("tr") },
+            R::RedefinesRoutine { name: s("f") },
+            R::RoutineParametersChange { name: s("f") },
+            R::DropEvent { name: s("ev") },
+            R::OneShotEvent,
+            R::OneShotEventAltered { name: s("ev") },
+            R::AddEnumValue { value: s("x") },
+            R::RenameEnumValue {
+                from: s("a"),
+                to: s("b"),
+            },
+            R::DropDomainCheck { name: s("ck") },
+            R::DomainNullable,
+            R::DomainNotNull,
+            R::DropObject(ObjectDrop::Sequence),
+            R::DropObject(ObjectDrop::Synonym),
+            R::DropObject(ObjectDrop::Extension),
+            R::RestartSequence { to: s("100") },
+            R::ReplaceSynonym,
+            R::ReplaceSequence {
+                start: Some(s("1")),
+            },
+            R::ReplaceSequence { start: None },
+            R::DropDatabase { name: s("shop") },
+            R::DropLogin { who: s("app") },
+            R::SetPassword { who: s("app@%") },
+            R::RevokeRole {
+                role: s("reader"),
+                member: s("app@%"),
+            },
+            R::BlankPassword { who: s("app@%") },
+            R::HostIsEverywhere,
+            R::StarRefresh {
+                table: s("dbo.orders"),
+            },
+            R::Piecewise,
+            R::DropSequenceTable,
+            R::DropScale { rows: s("~4.2m") },
+        ];
+        for b in [false, true] {
+            risks.push(R::RebuildTable {
+                name: s("t"),
+                tsql: b,
+            });
+            risks.push(R::RoutineGrantsLost {
+                held: s("f"),
+                comment: b,
+            });
+            risks.push(R::ReplaceRefused { alias_type: b });
+            risks.push(R::DropSchema {
+                name: s("reporting"),
+                cascade: b,
+            });
+            risks.push(R::DropAccount {
+                who: s("app@%"),
+                cuts_off: b,
+            });
+            for engine in [
+                ViewCostEngine::Sqlite,
+                ViewCostEngine::MsSql,
+                ViewCostEngine::Other,
+            ] {
+                let cost = ViewCost {
+                    engine,
+                    restored: b,
+                };
+                risks.push(R::DropView {
+                    materialized: b,
+                    cost,
+                });
+                for why in [
+                    RecreateViewWhy::Sqlite,
+                    RecreateViewWhy::MsSql,
+                    RecreateViewWhy::Postgres,
+                ] {
+                    risks.push(R::RecreateView {
+                        name: s("v"),
+                        cost,
+                        why,
+                    });
+                }
+            }
+        }
+        for subject in [
+            TypeSubject::Column(s("qty")),
+            TypeSubject::Domain(s("money")),
+        ] {
+            for (truncates, rounds) in [(true, false), (false, true), (true, true)] {
+                risks.push(R::TypeNarrows {
+                    subject: subject.clone(),
+                    from: s("decimal(10,2)"),
+                    to: s("decimal(8,0)"),
+                    truncates,
+                    rounds,
+                });
+            }
+            risks.push(R::TypeRewrites {
+                subject,
+                from: s("int"),
+                to: s("text"),
+            });
+        }
+        for (again, gone) in [
+            (vec![s("ix1")], vec![]),
+            (v(&["ix1", "ix2"]), vec![]),
+            (vec![], vec![s("ix1")]),
+            (vec![], v(&["ix1", "ix2"])),
+            (vec![s("ix1")], vec![s("ix2")]),
+        ] {
+            let dropped = again.iter().chain(&gone).cloned().collect();
+            risks.push(R::ViewIndexesDropped {
+                view: s("v"),
+                dropped,
+                again,
+                gone,
+            });
+        }
+        for kind in [
+            SignedKind::Trigger,
+            SignedKind::Function,
+            SignedKind::Procedure,
+        ] {
+            risks.push(R::SignatureLost { kind, name: s("m") });
+        }
+        for kind in [ObjectKind::Function, ObjectKind::Procedure] {
+            risks.push(R::RecreateRoutine { held: s("f"), kind });
+            risks.push(R::DropRoutine { kind, name: s("f") });
+            risks.push(R::DropNumberedGroup {
+                kind,
+                name: s("grp"),
+                members: s("grp;2, grp;3"),
+            });
+        }
+        for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::AliasType] {
+            risks.push(R::DropObject(ObjectDrop::UsedByColumns(kind)));
+            risks.push(R::ReplaceObject { kind });
+        }
+        for kind in [RecreateKind::Type, RecreateKind::Domain] {
+            for (columns, more) in [(vec![], 0), (v(&["t.a"]), 0), (v(&["t.a", "u.b"]), 4)] {
+                risks.push(R::Recreate {
+                    kind,
+                    name: s("mood"),
+                    columns,
+                    more,
+                });
+            }
+        }
+        let words = [
+            PrivilegeWords::None,
+            PrivilegeWords::Named(v(&["SELECT"])),
+            PrivilegeWords::Count(18),
+        ];
+        for p in &words {
+            for (cascades, deny) in [(false, false), (true, false), (false, true), (true, true)] {
+                for cleared in [None, Some(PrivilegeWords::Named(v(&["SELECT", "UPDATE"])))] {
+                    risks.push(R::RevokePrivileges {
+                        privileges: p.clone(),
+                        who: s("app"),
+                        cascades,
+                        deny,
+                        cleared,
+                    });
+                }
+            }
+            risks.push(R::GrantServerWide {
+                privileges: p.clone(),
+                who: s("app"),
+            });
+            risks.push(R::GrantEveryDatabase {
+                privileges: p.clone(),
+                who: s("app@%"),
+            });
+            risks.push(R::GrantKeepsColumnDenies {
+                privileges: p.clone(),
+                who: s("app"),
+            });
+        }
+        for risk in &risks {
+            assert_eq!(risk_text(risk), risk.message(), "{risk:?}");
+        }
+        let mut plan = vec![PlanRisk::Cycle];
+        plan.extend(risks.into_iter().take(5).map(|risk| PlanRisk::Of {
+            subject: s("shop.orders"),
+            risk,
+        }));
+        for why in [
+            ClashWhy::NotDropped,
+            ClashWhy::DefaultDrawsFromIt,
+            ClashWhy::Referenced,
+        ] {
+            for cost in [
+                ClashCost::NoRollback,
+                ClashCost::RollsBack,
+                ClashCost::Refused,
+            ] {
+                plan.push(PlanRisk::Clash(ClashNote {
+                    holder: s("orders_old"),
+                    names: v(&["fk_a", "fk_b"]),
+                    claimer: s("orders"),
+                    why,
+                    cost,
+                }));
+            }
+        }
+        for risk in &plan {
+            assert_eq!(plan_risk_text(risk), risk.message(), "{risk:?}");
         }
     }
 

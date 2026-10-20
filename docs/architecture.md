@@ -6890,8 +6890,8 @@ existing prose was left alone.
     found and changed by hand, and that is the sentence `risks` writes. Its `summary` names the
     account through `Principal::display`, host included, because on MySQL `app@%` and `app@10.0.0.%`
     are two accounts with two passwords and a line naming only `app` would not say which one moved.
-    `line`'s arms carry their privilege list as `PrivilegeWords::of` (`privilege_words`, which the
-    risks still use, is its English), which names them while
+    `line`'s arms and the grant and revoke `Risk`s carry their privilege list as
+    `PrivilegeWords::of` (`PrivilegeWords::message` is its English), which names them while
     there are three or fewer and counts them beyond: eighteen is a legal selection at MySQL's
     database level, and the summary is one line above Apply. An empty list reads **"no privileges",
     not "nothing"** — `users::privilege_sql` emits no statement for one, so the preview headed a plan
@@ -7540,6 +7540,10 @@ existing prose was left alone.
     otherwise reads as a promise that nothing is lost. `line()` is a `ChangeLine`, the change's
     sentence as a value the interface words, and `summary()` is its English, `line().message()`,
     for the CLI, the MCP server, the withheld list and the tests (under *The string catalogue*).
+    `risks()` is the same move made for the risk block: `risk_lines()` answers one `Risk` per
+    sentence, `risks()` is its English, and `is_destructive` asks `risk_lines()`; a set's
+    `ChangeSet::risk_lines()` adds the plan's own `Risk::StarRefresh` and `Risk::Piecewise`
+    (`piecewise_risk`), and `destructive()` is its English.
     **The change list is a *diff*, and `summary()` used to print only the new side.** A column's
     four free-SQL fields — default, generated expression, `ON UPDATE`, `COLLATE` — are free SQL by
     design, a default having to be able to say `nextval('s')`, and `column_clauses` renders only
@@ -9344,8 +9348,10 @@ existing prose was left alone.
     come off. It is a `retain` + `splice` and not a second sort, because the order everything else is
     in was just computed and is not up for revision. `SchemaComparison::name_clashes` keeps the whole
     list, `resolved` ones included, so a reader can see the plan is deliberately not in phase order;
-    `plan()` turns the ones this plan cannot settle into `SchemaPlan::clashes`, one
-    `NameClash::note` line each, and `destructive()` appends them.
+    `plan()` turns the ones this plan cannot settle into `SchemaPlan::clashes`, one `ClashNote`
+    each (`NameClash::clash_note`: the holder, the names, the claimer, a `ClashWhy` and the
+    engine's `ClashCost`, with `note()` its English), and `risk_lines()` appends them as
+    `PlanRisk::Clash` — `destructive()` being that list's English.
     **`resolved` is resolved only if the drop is in *this* plan**, and the filter had no way to say
     so: the flag is computed once, in `SchemaComparison::of`, from the whole schema — `include` is
     not known until `plan()` — so a clash the reordering settled stayed settled however the ticks
@@ -13337,7 +13343,7 @@ existing prose was left alone.
     certificate's private key. Module signing is how a module is granted rights its callers lack, so
     the edit silently broke every call that relied on it, and the preview said only "Redefines p".
     `db::mssql`'s trigger and routine listings read it (`EXISTS` over `sys.crypt_properties`,
-    `class = 1`), and `ddl::signature_lost` puts a risk sentence under the `ReplaceRoutine` and
+    `class = 1`), and `ddl::Risk::SignatureLost` puts a risk sentence under the `ReplaceRoutine` and
     `ReplaceTrigger` arms, in place or recreated
     (`editing_a_signed_routine_says_it_strips_the_signature` and its trigger sibling; live,
     `a_signed_modules_edit_says_it_strips_the_signature` on 2022 and 2025, which also finds the
@@ -18144,14 +18150,17 @@ existing prose was left alone.
         (`a_drop_warning_speaks_of_the_shape_it_drops`). **So is its change line**: the preview
         listed `DropTable`'s summary, *"Drop the table"*, over *"Drops the sequence"* until
         `stats::drop_preview` reworded both halves together — `drop_summary` over the lines,
-        `drop_warning` over the risks — handed to `preview_change_warning` as one closure. The
-        lines are `ddl::ChangeLine`s, worded by the preview after the closure has run, so a
-        sequence's is `ChangeLine::DropObject { kind: Sequence }` rather than English text. The
+        `drop_warning` over the risks — handed to `preview_change_warning` as one closure. Both
+        halves are values: the lines are `ddl::ChangeLine`s, worded by the preview after the
+        closure has run, so a sequence's is `ChangeLine::DropObject { kind: Sequence }` rather
+        than English text, and the risks are `ddl::Risk`s — a sequence's warning
+        `Risk::DropSequenceTable`, the figure `Risk::DropScale { rows }` — which the tree's Drop
+        words with `ddl_preview::risk_text` inside the closure (under `ddl_preview.rs`). The
         property is pinned rather than the strings: for every shape on every engine that takes its
         drop, the line's noun is the warning's (`a_drops_line_and_warning_name_the_same_object`,
         R2-L6-02). And **every drop a Drop entry routes carries a warning** — every table-shaped
         row, each object kind's row drop, a numbered and a plain routine, an event, a database,
-        a schema and each account kind — since `Change::risks` ends in a catch-all `Vec::new()`
+        a schema and each account kind — since `Change::risk_lines` ends in a catch-all `Vec::new()`
         and the confirm with the non-blank fallback that once caught an emptied arm is gone
         (`every_drop_a_drop_entry_routes_carries_a_warning`, R2-L6-01). **A PostgreSQL foreign
         table is the fourth shape** (`TableShape::ForeignTable`, under `schema.rs`): `drop_change`
@@ -28602,8 +28611,11 @@ existing prose was left alone.
     than an English sentence: the schema tree's Drop passes
     `stats::drop_preview` — a table's row figure, a MariaDB sequence's `DROP TABLE` worded as a
     sequence's in its line and its warning alike — which is what the confirm it replaced had said
-    before the preview said everything else again. The same closure then appends
-    `used_by::drop_warning` over the object's dependents (`used_by_view::dependents_of`, read when
+    before the preview said everything else again. **The closure takes the risks as `Risk`s and
+    hands back finished strings**, the one half it words itself, with `risk_text`: the same
+    closure then appends `used_by::drop_warning`, which is still core's English, so the list it
+    returns is mixed and only the caller knows where the worded part ends. The appended line is
+    over the object's dependents (`used_by_view::dependents_of`, read when
     the entry is clicked), so what the drop breaks — *"Used by 2 views …"* — is named before Apply
     rather than by the next error; nothing is appended when the database's schema is not loaded, or
     when everything that uses the object goes with it.
@@ -28746,9 +28758,10 @@ existing prose was left alone.
     footers share is now one message rather than two literals that modal's source gate held equal.
     `the_counted_lines_read_as_they_did_in_english` pins both plurals. English stays: the SQL box
     (`sql_box_text`, its `-- After the plan commits…` comment included, being generated SQL) and the
-    *SQL* heading; the risk, used-by, withheld and omitted lines, core's prose, phase 4 — the
-    change lines and the risk heading have left that list, worded from `ChangeLine` (under
-    *The string catalogue*) and from the bool above; and `preview_proposal`'s two `Err` sentences, which go back
+    *SQL* heading; the used-by, withheld and omitted lines and the after-commit refresh note
+    (`ddl::elsewhere_report`), core's prose, phase 4 — the change lines, the risk lines and the
+    risk heading have left that list, worded from `ChangeLine` and `Risk`/`PlanRisk` (`risk_text`,
+    `plan_risk_text`, both under *The string catalogue*) and from the bool above; and `preview_proposal`'s two `Err` sentences, which go back
     through the AI panel's propose path, whose sibling error in `ai_panel.rs` is English too.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
@@ -29921,7 +29934,8 @@ existing prose was left alone.
     had its body from `risk_prompt(change, dialect)` — born `container_drop_prompt`, renamed when
     `users_view`'s account drop became its third caller — which rendered `Change::risks` so the
     confirm and the preview could not say different things about one act; with the confirm gone
-    the preview's risk block *is* `Change::risks`, there is no second rendering to keep in step,
+    the preview's risk block *is* the change's risks (`Change::risk_lines`, worded by
+    `ddl_preview::risk_text`), there is no second rendering to keep in step,
     and the function went with its last caller. The table drop's confirm had said two things the
     preview did not — the row figure, and a MariaDB sequence named as a sequence rather than as the
     table `DROP TABLE` treats it as — and both now ride into the preview's warning through
@@ -41357,9 +41371,27 @@ Re-introducing the anti-patterns these guard against is a regression:
     are. `english_says_every_change_line_as_core_does` holds `change_line_text` equal to
     `message()` over every variant — optional parts present and absent, counts one and many, lists
     empty, single and several, every `IndexStorage`, every object and principal kind — and
-    `plan_line_text` equal to `SchemaPlan::summaries`' line. What stays core's English in the
-    modal: the risk lines (`Change::risks`, `destructive`), the withheld lines (`unsupported`, which still reads `Change::summary` for a
-    refused change), the *Used by* warnings and the omitted notes.
+    `plan_line_text` equal to `SchemaPlan::summaries`' line.
+    The risk block followed by the same route. `Change::risks` is `risk_lines(dialect)`'s English
+    and `ChangeSet::destructive` `risk_lines()`'s: a `ddl::Risk` per sentence, its fields the
+    arguments, `Risk::message()` the English byte for byte (under `ddl.rs`). The parts are typed
+    beside it — `ViewCost` (a `ViewCostEngine` and `restored`, what goes with a dropped view and
+    whether its `INSTEAD OF` triggers come back, which `view_drop_cost` now returns rather than a
+    sentence), `RecreateViewWhy`, `TypeSubject` (a column or a domain), `SignedKind`,
+    `RecreateKind` and `ObjectDrop` — and the privilege lists are the change lines' own
+    `PrivilegeWords`, which `privilege_words_text` words for both renderers. A comparison's risk is
+    a `compare::PlanRisk` — `Of { subject, risk }`, `Cycle`, or `Clash(ClashNote)` — with
+    `SchemaPlan::destructive()` its English. `risk_text` and `plan_risk_text` word them from
+    `ddl-risk-*`, each optional clause a selector inside one message rather than a sentence glued
+    on in code: `ddl-risk-revoke-privileges` carries `$cascades`, `$deny` and
+    `$has_cleared`/`$cleared`, and `ddl-risk-recreate` `$has_columns`/`$columns` and `$more`.
+    `english_says_every_risk_as_core_does` holds both equal to `message()` over a hand-written list
+    — every variant, each engine's view cost restored and not, optional parts both ways, the cycle
+    and every `ClashWhy` under every `ClashCost` — so, as above, a new variant fails the `match` at compile time but is held to
+    its English only once someone adds it. What stays core's English in the
+    modal: the withheld lines (`unsupported`, which still reads `Change::summary` for a
+    refused change), the *Used by* warnings (`used_by::change_warnings` and `drop_warning`), the
+    omitted notes and the after-commit refresh note (`ddl::elsewhere_report`).
     The editor's diagnostics are the case where one value has two readers in two languages.
     `intel::Diagnostic` held a finished `message: String` and now holds `what`, an
     `intel::DiagMessage` (under `core::intel`), with `Diagnostic::message()` the English byte for

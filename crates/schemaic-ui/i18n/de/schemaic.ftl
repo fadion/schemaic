@@ -630,6 +630,160 @@ ddl-privileges-count = { $count } Berechtigungen
 ddl-line-grant-role = { $member } { $role } gewähren
 ddl-line-revoke-role = { $member } { $role } entziehen
 ddl-line-of = { $subject } — { $line }
+ddl-risk-rebuild-table = { $engine ->
+        [sqlserver] Löscht { $name } und legt die Tabelle neu an, kopiert dabei jede Zeile und stellt ihre Schlüssel, Indizes, Checks, Standardwerte und Trigger, ihre eigenen Kommentare und die ihrer Spalten sowie die Fremdschlüssel anderer Tabellen auf sie wieder her. Es bricht ab, bevor es beginnt, wenn die Tabelle noch etwas hat, das Schemaic nicht wiederherstellt — Berechtigungen, einen eigenen Besitzer, ein schemagebundenes abhängiges Objekt, Systemversionierung, ein Ledger, Replikation, Komprimierung, Indexoptionen, einen deaktivierten Index, eine gebundene Regel oder einen gebundenen Standardwert, eine Vertraulichkeitsklassifizierung, eine Beschreibung an einem Schlüssel, Index, Standardwert, Check oder Trigger. Von Hand erstellte Statistiken werden nicht übernommen.
+       *[other] Löscht { $name } und legt die Tabelle neu an, wobei jede Zeile kopiert wird. Was Schemaic an der Tabelle nicht gelesen hat, wird nicht übernommen.
+    }
+ddl-risk-drop-table = Löscht die Tabelle und jede Zeile darin.
+ddl-risk-drop-foreign-table = Löscht die Fremdtabelle: Ihre Definition geht verloren, die gelesenen Zeilen bleiben, wo sie sind, auf dem Fremdserver oder in der Datei; eine Sicht oder Routine, die sie nennt, schlägt von da an fehl.
+ddl-risk-truncate-table = Löscht jede Zeile der Tabelle. Das lässt sich nicht rückgängig machen.
+ddl-risk-drop-column = Löscht die Spalte { $name } und alle Daten darin.
+ddl-risk-rebuild-computed-column = Löscht die berechnete Spalte { $name } und fügt sie wieder hinzu, sodass sie ans Ende der Tabelle rückt.
+ddl-risk-column-not-null = Die Spalte { $name } wird NOT NULL — die Anweisung schlägt fehl, wenn eine Zeile NULL enthält.
+ddl-risk-column-stops-generated = Die Spalte { $name } wird nicht mehr generiert. Ihre aktuellen Werte bleiben erhalten, aber nichts berechnet sie mehr neu.
+ddl-risk-column-becomes-generated = Die Spalte { $name } wird aus { $expression } generiert. Jeder Wert darin wird durch das ersetzt, was der Ausdruck berechnet.
+ddl-risk-column-expression-changes = Der Ausdruck der Spalte { $name } ändert sich von { $from } in { $to }. Unter PostgreSQL wird die Spalte dafür gelöscht und neu hinzugefügt, sodass jeder Wert neu berechnet wird und die Spalte ans Ende der Tabelle rückt.
+ddl-risk-type-narrows = Das Verkleinern von { $subject } von { $from } auf { $to } { $loss ->
+        [truncates] schneidet Werte ab, die nicht mehr passen
+        [rounds] rundet jeden Wert der Spalte
+       *[both] schneidet Werte ab, die nicht mehr passen, und rundet jeden Wert der Spalte
+    }.
+ddl-risk-type-rewrites = Das Ändern von { $subject } von { $from } in { $to } schreibt jeden Wert neu; das kann fehlschlagen oder Genauigkeit kosten.
+ddl-risk-domain-subject = Domäne { $name }
+ddl-risk-primary-key-dropped = Lässt die Tabelle ohne Primärschlüssel zurück — Zeilen lassen sich nicht mehr im Raster bearbeiten.
+ddl-risk-primary-key-rebuilt = Löscht den Primärschlüssel um die Spaltenänderung herum und fügt ihn wieder hinzu. Ist er der gruppierte Index, wird dabei die ganze Tabelle neu geschrieben, und ein Fremdschlüssel einer anderen Tabelle, der auf ihn verweist, hält den Plan an.
+ddl-risk-primary-key-replaced = Ersetzt den Primärschlüssel: { $count ->
+        [one] { $columns } ist
+       *[other] { $columns } sind
+    } nicht mehr eindeutig, und Duplikate werden von nun an angenommen. Unter MySQL wird dabei der gruppierte Index neu aufgebaut, was die ganze Tabelle neu schreibt.
+ddl-risk-drop-foreign-key = Löscht den Fremdschlüssel { $name }. Zeilen ohne passende übergeordnete Zeile werden von nun an angenommen, und vorhandene Daten werden beim erneuten Hinzufügen nicht neu geprüft.
+ddl-risk-drop-unique-index = Löscht den eindeutigen Index { $name }. Doppelte Werte werden von nun an angenommen, und das Raster verliert womöglich den Schlüssel, über den es Zeilen bearbeitet hat.
+ddl-risk-drop-view = { $materialized ->
+        [yes] Löscht die materialisierte Sicht. { $cost }
+       *[no] Löscht die Sicht. { $cost }
+    }
+ddl-risk-view-cost-sqlite = Sichten, die aus ihr lesen, lösen sich nicht mehr auf, bis sie zurück ist, und ihre INSTEAD-OF-Trigger werden mit ihr gelöscht und nicht wiederhergestellt.
+ddl-risk-view-cost-sqlite-restored = Sichten, die aus ihr lesen, lösen sich nicht mehr auf, bis sie zurück ist, und ihre INSTEAD-OF-Trigger werden mit ihr gelöscht.
+ddl-risk-view-cost-sqlserver = Berechtigungen auf ihr, ihre Beschreibung und ihre INSTEAD-OF-Trigger werden mit ihr gelöscht und nicht wiederhergestellt.
+ddl-risk-view-cost-sqlserver-restored = Berechtigungen auf ihr und ihre Beschreibung werden mit ihr gelöscht und nicht wiederhergestellt; ihre INSTEAD-OF-Trigger werden ebenfalls gelöscht.
+ddl-risk-view-cost-other = Abhängige Sichten, Regeln, Berechtigungen und ihre INSTEAD-OF-Trigger werden mit ihr gelöscht und nicht wiederhergestellt.
+ddl-risk-view-cost-other-restored = Abhängige Sichten, Regeln und Berechtigungen werden mit ihr gelöscht und nicht wiederhergestellt; ihre INSTEAD-OF-Trigger werden ebenfalls gelöscht.
+ddl-risk-recreate-view = Das Neuerstellen von { $name } löscht die Sicht zuerst. { $cost } { $why ->
+        [sqlite] SQLite kann eine Sicht nicht an Ort und Stelle ersetzen, daher nimmt jede Änderung daran — auch eine Umbenennung — diesen Weg.
+        [sqlserver] sp_rename von SQL Server würde die gespeicherte Definition der Sicht beim alten Namen belassen, daher nimmt eine Umbenennung diesen Weg.
+       *[postgres] PostgreSQL kann eine Sicht, deren Spalten Name, Typ oder Reihenfolge geändert haben, nicht ersetzen, daher ist dies der einzige Weg, die Änderung anzuwenden.
+    }
+ddl-risk-view-statements-replayed = { $count ->
+        [one] { $count } mit ihr gelöschte Anweisung wird danach in derselben Transaktion wiederhergestellt.
+       *[other] { $count } mit ihr gelöschte Anweisungen werden danach in derselben Transaktion wiederhergestellt.
+    }
+ddl-risk-view-indexes-dropped = Das Neudefinieren der Sicht { $view } löscht { $dropped_count ->
+        [one] ihren Index
+       *[other] ihre Indizes
+    } ({ $dropped }) — ALTER VIEW von SQL Server tut das immer — { $case ->
+        [all] und dieser Plan baut { $again_count ->
+            [one] ihn
+           *[other] sie
+        } danach in derselben Transaktion wieder auf. Bei einer großen Sicht dauert das so lange wie der ursprüngliche Aufbau. Ein Index mit Füllfaktor, Komprimierung, Auffüllung, Sperroptionen, einer Dateigruppe oder einer Beschreibung hält den Plan an, bevor sich etwas ändert — Schemaic kann solche nicht wieder aufbauen. Von Hand erstellte Statistiken auf der Sicht werden nicht übernommen.
+        [none] und dieser Plan baut { $gone_count ->
+            [one] ihn
+           *[other] sie
+        } nicht wieder auf: Die Sicht, an die sie angeglichen wird, hat keinen solchen Index. Von Hand erstellte Statistiken auf der Sicht werden nicht übernommen.
+       *[some] und dieser Plan baut { $again } danach in derselben Transaktion wieder auf, aber nicht { $gone }, die die Sicht, an die sie angeglichen wird, nicht hat. Ein Index mit Füllfaktor, Komprimierung, Auffüllung, Sperroptionen, einer Dateigruppe oder einer Beschreibung hält den Plan an, bevor sich etwas ändert — Schemaic kann solche nicht wieder aufbauen. Von Hand erstellte Statistiken auf der Sicht werden nicht übernommen.
+    }
+ddl-risk-add-not-null-column = Die Spalte { $name } ist NOT NULL ohne Standardwert. Hat die Tabelle bereits Zeilen, gibt es keinen Wert für sie, und die Engine lehnt den ganzen Plan ab.
+ddl-risk-drop-check = Löscht den Check { $name }. Zeilen, die die Bedingung abgelehnt hat, werden von nun an angenommen, und vorhandene Daten werden beim erneuten Hinzufügen nicht neu geprüft.
+ddl-risk-keep-lossy-index = Deine Änderung am Index { $name } ist nicht enthalten. Er verwendet etwas, das Schemaic nicht zurücklesen kann — eine Ausdrucksspalte als Schlüssel, eine Operatorklasse oder eine NULLS-Sortierung —, und die Änderung anzuwenden hieße, den Index ohne das neu zu erstellen. Bearbeite diesen Index stattdessen in SQL.
+ddl-risk-drop-trigger = Löscht den Trigger { $name }. Was er bei jedem Schreiben getan hat, geschieht nicht mehr, und ab jetzt geschriebene Zeilen bekommen es nicht mehr.
+ddl-risk-redefine-trigger-in-place = Definiert den Trigger { $name } an Ort und Stelle neu — er wird nicht gelöscht, seine Berechtigungen bleiben also —, und was er bei jedem Schreiben tut, ändert sich von nun an.
+ddl-risk-recreate-trigger = Das Neuerstellen des Triggers { $name } löscht ihn zuerst. Wo DDL nicht transaktional ist (MySQL), lässt eine vom Server abgelehnte neue Definition die Tabelle ohne Trigger zurück.
+ddl-risk-signature-lost = { $kind ->
+        [trigger] Trigger
+        [function] Funktion
+       *[procedure] Prozedur
+    } { $name } ist signiert (ADD SIGNATURE), und jede Änderung daran entfernt die Signatur — Schemaic kann ohne den Schlüssel des Zertifikats nicht neu signieren. Was das Zertifikat erlaubt hat, funktioniert nicht mehr, bis du ADD SIGNATURE erneut ausführst.
+ddl-risk-redefines-routine = Definiert { $name } neu. Alles, was es aufruft, führt von nun an den neuen Rumpf aus, auch Trigger auf anderen Tabellen, die diese Änderung nie erwähnt hat.
+ddl-risk-routine-parameters-change = Ändert die Parameterliste von { $name }. Aufrufe mit den alten Argumenten lösen sich nicht mehr dorthin auf.
+ddl-risk-recreate-routine = Das Neuerstellen von { $held } löscht es zuerst. Wo DDL nicht transaktional ist (MySQL), bleibt bei einer vom Server abgelehnten neuen Definition keine { $what } übrig.
+ddl-risk-routine-grants-lost = { $comment ->
+        [yes] Auf { $held } gewährte Berechtigungen und sein Kommentar überstehen das Löschen nicht, und dieser Plan stellt sie nicht wieder her — wende GRANT und COMMENT danach erneut an.
+       *[no] Auf { $held } gewährte Berechtigungen überstehen das Löschen nicht, und dieser Plan stellt sie nicht wieder her — wende GRANT danach erneut an.
+    }
+ddl-risk-drop-numbered-group = Löscht { $what } { $name } und mit ihr jedes Mitglied ihrer nummerierten Gruppe: { $members }.
+ddl-risk-drop-routine = Löscht { $what } { $name }. PostgreSQL lehnt ab, solange ein Trigger sie noch verwendet; solche müssen zuerst gelöscht werden.
+ddl-risk-drop-event = Löscht das Ereignis { $name }. Sein Zeitplan und sein Rumpf gehen mit ihm verloren — nichts sonst in der Datenbank hält eine Kopie.
+ddl-risk-one-shot-event = Dieses Ereignis läuft einmal, und der Server löscht es danach — das ist ON COMPLETION NOT PRESERVE. Schalte „Nach Abschluss behalten“ ein, um es zu behalten.
+ddl-risk-one-shot-event-altered = Das Ereignis { $name } läuft einmal, und der Server löscht es danach — das ist ON COMPLETION NOT PRESERVE. Schalte „Nach Abschluss behalten“ ein, um es zu behalten.
+ddl-risk-add-enum-value = Das Hinzufügen von { $value } lässt sich nicht an Ort und Stelle rückgängig machen — PostgreSQL kann keinen Enum-Wert entfernen, das Zurücknehmen heißt also, den Typ neu zu erstellen. Der Wert ist außerdem erst nutzbar, wenn dieser Plan angewendet ist.
+ddl-risk-rename-enum-value = Jede Zeile mit { $from } liest von nun an { $to }. Wolltest du { $from } entfernen statt umbenennen, lösche es und wende das für sich an.
+ddl-risk-recreate = Das Neuerstellen { $kind ->
+        [domain] der Domäne
+       *[type] des Typs
+    } { $name } löscht und baut sie neu auf. Jede Spalte unten wird über Text neu umgewandelt; ein Wert, den die neue Definition nicht annimmt, lässt den ganzen Plan scheitern, und nichts wird angewendet{ $has_columns ->
+        [yes] : { $columns }{ $more ->
+            [0] {""}
+           *[other] {" "}und { $more } weitere
+        }. Eine darauf aufbauende Sicht oder Funktion kann hier nicht aufgeführt werden und würde den Server ablehnen lassen.
+       *[no] . Nichts verwendet sie heute, aber eine darauf aufbauende Sicht oder Funktion kann hier nicht aufgeführt werden und würde den Server ablehnen lassen.
+    }
+ddl-risk-drop-domain-check = Löscht den Check { $name }. Keine Spalte dieser Domäne wird mehr geprüft, und vorhandene Daten werden beim erneuten Hinzufügen nicht neu geprüft.
+ddl-risk-domain-nullable = Jede Spalte dieser Domäne nimmt ab jetzt NULL an, auch in Tabellen, die diese Änderung nie erwähnt hat.
+ddl-risk-domain-not-null = Die Anweisung schlägt fehl, wenn eine Spalte dieser Domäne bereits NULL enthält.
+ddl-risk-drop-sequence = Löscht die Sequenz und die erreichte Position. Der Server lehnt ab, solange der Standardwert einer Spalte noch aus ihr zieht; diese Standardwerte müssen zuerst weg.
+ddl-risk-drop-synonym = Löscht das Synonym. Nichts lehnt das ab: Eine Sicht, Routine oder Abfrage, die es nennt, schlägt von da an beim nächsten Ausführen fehl.
+ddl-risk-drop-extension = Löscht die Erweiterung und die von ihr installierten Funktionen, Typen und Operatoren. Der Server lehnt ab, solange noch etwas von dir davon abhängt — eine Spalte ihres Typs, ein Index oder ein Server auf ihrem Wrapper — und nennt, was.
+ddl-risk-drop-used-object = Löscht { $what }. Der Server lehnt ab, solange eine Spalte sie noch verwendet; diese Spalten müssen zuerst ihren Typ ändern.
+ddl-risk-restart-sequence = Startet den Zähler bei { $value } neu. Bereits vergebene Werte bleiben unverändert, ein erneut erreichter Schlüssel kollidiert also.
+ddl-risk-replace-synonym = Löscht das Synonym und legt es neu an. Nichts lehnt das Löschen ab: Die beiden Anweisungen laufen in einer Transaktion.
+ddl-risk-replace-sequence = Löscht die Sequenz und legt sie neu an: Die erreichte Position geht verloren, und sie beginnt wieder bei { $start }. Der Server lehnt das Löschen ab, solange der Standardwert einer Spalte noch aus ihr zieht.
+ddl-risk-start-value = ihrem Startwert
+ddl-risk-replace-object = Löscht { $what } und legt es neu an. Der Server lehnt das Löschen ab, solange eine Spalte es noch verwendet; diese Spalten müssen zuerst ihren Typ ändern.
+ddl-risk-replace-refused = { $alias_type ->
+        [yes] Abgelehnt, solange es Berechtigungen, einen eigenen Besitzer, erweiterte Eigenschaften oder eine gebundene Regel bzw. einen gebundenen Standardwert hat: Das Neuerstellen würde sie nicht wiederherstellen.
+       *[no] Abgelehnt, solange es Berechtigungen, einen eigenen Besitzer oder erweiterte Eigenschaften hat: Das Neuerstellen würde sie nicht wiederherstellen.
+    }
+ddl-risk-drop-database = Löscht die Datenbank { $name } und alles darin — jede Tabelle samt allen Zeilen, jede Sicht, jeden Index, jede Routine und jeden Trigger. Nichts bleibt, und es gibt kein Rückgängig: Der einzige Weg zurück ist eine vorher erstellte Sicherung.
+ddl-risk-drop-schema = Löscht das Schema { $name }. Der Server lehnt ab, solange es noch Tabellen, Sichten oder Routinen enthält; dies trifft also entweder ein leeres Schema oder schlägt fehl{ $cascade ->
+        [yes] {" "}— Schemaic sendet nie CASCADE.
+       *[no] .
+    }
+ddl-risk-drop-login = Löscht die Anmeldung { $who } und mit ihr jede Serverberechtigung und Serverrollen-Mitgliedschaft — nirgends sonst festgehalten, eine neu angelegte Anmeldung dieses Namens beginnt also ohne sie. Der Server lehnt ab, solange etwas unter ihr verbunden ist; ihre Sitzungen müssen also zuerst enden. Ihre Benutzer in jeder Datenbank werden nicht gelöscht: Sie bleiben samt ihren Berechtigungen, keiner Anmeldung zugeordnet, und eine neue Anmeldung dieses Namens wird ohne ALTER USER … WITH LOGIN nicht wieder mit ihnen verbunden.
+ddl-risk-drop-account = Löscht { $who } und jede Berechtigung. Die Berechtigungen sind nirgends sonst festgehalten; das Konto wiederherzustellen heißt also, sie alle aus dem Gedächtnis neu zu gewähren. { $cuts_off ->
+        [yes] Alles, was darunter verbunden ist, schlägt bei seiner nächsten Anweisung in dieser Datenbank fehl.
+       *[no] Alles, was noch darunter verbunden ist, läuft weiter, bis es die Verbindung trennt.
+    }
+ddl-risk-set-password = Ändert das Passwort von { $who }. Das alte lässt sich nicht wiederherstellen; alles, was noch damit eingerichtet ist — eine Anwendung, ein Job, der Client eines anderen Entwicklers —, kann sich nicht verbinden, bis es von Hand aktualisiert ist. Bereits offene Sitzungen laufen weiter.
+ddl-risk-revoke-privileges = Entzieht { $who } { $privileges }. Alles, was darauf angewiesen ist — eine Anwendung, ein Job, eine Sicht, die jemand anderem gehört —, schlägt bei seiner nächsten Anweisung fehl.{ $cascades ->
+        [yes] {" "}Der Entzug trägt CASCADE, wird also auch jedem Konto entzogen, dem { $who } es gewährt hat, und was unter diesen Konten läuft, schlägt genauso fehl.
+       *[no] {""}
+    }{ $deny ->
+        [yes] {" "}Ist es { $who } stattdessen verweigert (DENY), hebt der Entzug die Verweigerung auf — was den Zugriff zurückgibt, wenn eine Rolle, der es angehört, ihn gewährt.
+       *[no] {""}
+    }{ $has_cleared ->
+        [yes] {" "}Auf einer Tabelle löscht er außerdem jedes GRANT und DENY von { $cleared } auf Spaltenebene, das { $who } auf den Spalten der Tabelle hat: Eine { $who } verweigerte Spalte ist nicht mehr verweigert, und eine einzeln gewährte nicht mehr gewährt.
+       *[no] {""}
+    }
+ddl-risk-revoke-role = Entzieht { $member } die Rolle { $role } und mit ihr jede Berechtigung, die die Rolle trägt.
+ddl-risk-blank-password = { $who } hat kein Passwort: Jeder, der den Server erreicht, kann sich damit anmelden. Setze hier eines oder später mit ALTER USER.
+ddl-risk-host-is-everywhere = Sein Host ist % — jeder Rechner im Netzwerk, nicht nur dieser.
+ddl-risk-grant-server-wide = Gewährt { $who } { $privileges } auf dem ganzen Server — der Instanz selbst, nicht nur der durchsuchten Datenbank.
+ddl-risk-grant-every-database = Gewährt { $who } { $privileges } auf jeder Datenbank dieses Servers — auch auf noch nicht existierenden, nicht nur der durchsuchten.
+ddl-risk-grant-keeps-column-denies = Ein GRANT von { $privileges } auf Tabellenebene löscht jedes DENY, das { $who } auf einer Spalte der Tabelle hat; die Anweisung verweigert diese Spalten { $who } daher direkt nach dem Gewähren erneut: Eine { $who } verweigerte Spalte bleibt verweigert. Hat { $who } auf der Tabelle auch die Grant-Option, lehnt der Server das erneute Verweigern ohne CASCADE ab, und nichts wird angewendet.
+ddl-risk-star-refresh = Aktualisiert jede Sicht und Inline-Funktion in dieser Datenbank, die * aus { $table } liest, direkt oder über ein Synonym: SQL Server bindet diese über die Position an die Spalten der Tabelle und würde sonst die falschen Spalten lesen und schreiben. Der Plan schlägt fehl, wenn sich eine davon nicht mehr gegen die neuen Spalten kompilieren lässt. Eine in einer anderen Datenbank, die * aus { $table } liest, wird nach dem Commit des Plans außerhalb seiner Transaktion aktualisiert: Bis dahin liest sie die alten Positionen, und schlägt ihre Aktualisierung fehl, bleibt der Plan angewendet und die Sicht wird hier genannt.
+ddl-risk-piecewise = SQL Server erstellt, ändert oder löscht ein nativ kompiliertes Modul nicht innerhalb einer Transaktion; dieser Plan läuft daher Anweisung für Anweisung und lässt sich nicht anhalten: Schlägt eine Anweisung fehl, bleiben die vorherigen angewendet.
+ddl-risk-drop-sequence-table = Löscht die Sequenz: Der erreichte Wert geht verloren, und alles, was noch aus ihr zieht, schlägt fehl.
+ddl-risk-drop-scale = Laut den Statistiken des Schemabaums sind das { $rows } Zeilen.
+ddl-risk-of = { $subject } — { $risk }
+ddl-risk-cycle = Die Fremdschlüssel zwischen diesen Tabellen bilden einen Zyklus, keine Erstellreihenfolge erfüllt sie also alle. Eine Anweisung wird abgelehnt, weil sie auf eine noch nicht existierende Tabelle verweist, und weder MySQL noch MariaDB rollen DDL zurück.
+ddl-risk-clash = { $holder } hält noch { $names }, was das Erstellen von { $claimer } braucht — { $why ->
+        [not-dropped] und dieser Plan löscht es nicht
+        [default] und es lässt sich nicht zuerst löschen, weil der Standardwert einer Spalte aus ihm zieht
+       *[referenced] und es lässt sich nicht zuerst löschen, weil eine andere Tabelle darauf verweist
+    }. { $cost ->
+        [no-rollback] Eine Anweisung wird abgelehnt, und weder MySQL noch MariaDB rollen DDL zurück.
+        [rolls-back] Eine Anweisung wird abgelehnt, was die ganze Migration zurückrollt.
+       *[refused] Eine Anweisung wird abgelehnt.
+    }
 write-one-row-delete = Löschen in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
 write-one-row-update = Aktualisieren in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
 write-one-row-insert = Einfügen in { $table } betraf { $affected } Zeilen (erwartet: genau 1)

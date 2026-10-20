@@ -1088,10 +1088,10 @@ pub fn drop_summary(summary: crate::ddl::ChangeLine, shape: TableShape) -> crate
 /// are worded together.
 pub fn drop_preview(
     lines: Vec<crate::ddl::ChangeLine>,
-    risks: Vec<String>,
+    risks: Vec<crate::ddl::Risk>,
     rows: Option<RowCount>,
     shape: TableShape,
-) -> (Vec<crate::ddl::ChangeLine>, Vec<String>) {
+) -> (Vec<crate::ddl::ChangeLine>, Vec<crate::ddl::Risk>) {
     (
         lines.into_iter().map(|l| drop_summary(l, shape)).collect(),
         drop_warning(risks, rows, shape),
@@ -1107,14 +1107,14 @@ pub fn drop_preview(
 /// so its risks are the table's — *"every row in it"*, about a counter — and
 /// are replaced with its own; the confirm had been the one place that drop
 /// was worded as a sequence's. A view's are already its own.
-pub fn drop_warning(risks: Vec<String>, rows: Option<RowCount>, shape: TableShape) -> Vec<String> {
+pub fn drop_warning(
+    risks: Vec<crate::ddl::Risk>,
+    rows: Option<RowCount>,
+    shape: TableShape,
+) -> Vec<crate::ddl::Risk> {
     match shape {
         TableShape::Table => risks.into_iter().chain(drop_scale(rows, shape)).collect(),
-        TableShape::Sequence => vec![
-            "Drops the sequence: the value it has reached is lost, and anything that still \
-             draws from it fails."
-                .to_string(),
-        ],
+        TableShape::Sequence => vec![crate::ddl::Risk::DropSequenceTable],
         // Its own change's risk, and no row figure: the rows are not here.
         TableShape::View | TableShape::ForeignTable => risks,
     }
@@ -1133,15 +1133,12 @@ pub fn drop_warning(risks: Vec<String>, rows: Option<RowCount>, shape: TableShap
 /// MariaDB sequence is a counter: neither is ever given a figure. The boolean
 /// had two answers for the three, and a sequence took the table's sentence,
 /// the user being told about "all N rows in it" about a counter.
-fn drop_scale(rows: Option<RowCount>, shape: TableShape) -> Option<String> {
+fn drop_scale(rows: Option<RowCount>, shape: TableShape) -> Option<crate::ddl::Risk> {
     match shape {
         TableShape::View | TableShape::Sequence | TableShape::ForeignTable => None,
-        TableShape::Table => rows.filter(|&r| worth_naming(r)).map(|r| {
-            format!(
-                "By the schema tree's statistics, that is {} rows.",
-                r.label()
-            )
-        }),
+        TableShape::Table => rows
+            .filter(|&r| worth_naming(r))
+            .map(|r| crate::ddl::Risk::DropScale { rows: r.label() }),
     }
 }
 
@@ -2314,24 +2311,29 @@ mod tests {
     /// A table's keeps its sentence and gains the figure; a view's is its own.
     #[test]
     fn a_drop_warning_speaks_of_the_shape_it_drops() {
-        let table = vec!["Drops the table and every row in it.".to_string()];
+        use crate::ddl::Risk;
+        let said = |risks: Vec<Risk>| -> Vec<String> { risks.iter().map(Risk::message).collect() };
+        let table = vec![Risk::DropTable];
         let big = Some(RowCount::Estimate(4_200_000));
         assert_eq!(
-            drop_warning(table.clone(), big, TableShape::Table),
+            said(drop_warning(table.clone(), big, TableShape::Table)),
             vec![
                 "Drops the table and every row in it.".to_string(),
                 "By the schema tree's statistics, that is ~4.2m rows.".to_string(),
             ]
         );
         assert_eq!(drop_warning(table.clone(), None, TableShape::Table), table);
-        let seq = drop_warning(table.clone(), big, TableShape::Sequence);
+        let seq = said(drop_warning(table.clone(), big, TableShape::Sequence));
         assert_eq!(seq.len(), 1, "{seq:?}");
         assert!(seq[0].contains("sequence"), "{seq:?}");
         assert!(
             !seq[0].contains("table") && !seq[0].contains("row"),
             "{seq:?}"
         );
-        let view = vec!["Drops the view.".to_string()];
+        let view = crate::ddl::Change::DropView {
+            materialized: false,
+        }
+        .risk_lines(SqlDialect::Postgres);
         assert_eq!(drop_warning(view.clone(), big, TableShape::View), view);
     }
 
@@ -2373,11 +2375,11 @@ mod tests {
                         continue;
                     }
                     let (lines, warning) =
-                        drop_preview(vec![change.line()], change.risks(d), None, shape);
+                        drop_preview(vec![change.line()], change.risk_lines(d), None, shape);
                     let line = &lines[0].message();
                     assert_eq!(
                         noun(line, "Drop the "),
-                        noun(&warning[0], "Drops the "),
+                        noun(&warning[0].message(), "Drops the "),
                         "{shape:?} on {d:?}: {line:?} over {warning:?}"
                     );
                 }
@@ -2394,11 +2396,15 @@ mod tests {
     fn a_drop_names_its_scale_only_for_a_table_with_a_figure_worth_naming() {
         let big = Some(RowCount::Estimate(4_200_000));
         assert_eq!(
-            drop_scale(big, TableShape::Table).as_deref(),
+            drop_scale(big, TableShape::Table)
+                .map(|r| r.message())
+                .as_deref(),
             Some("By the schema tree's statistics, that is ~4.2m rows.")
         );
         assert_eq!(
-            drop_scale(Some(RowCount::Exact(12)), TableShape::Table).as_deref(),
+            drop_scale(Some(RowCount::Exact(12)), TableShape::Table)
+                .map(|r| r.message())
+                .as_deref(),
             Some("By the schema tree's statistics, that is 12 rows.")
         );
         for quiet in [
