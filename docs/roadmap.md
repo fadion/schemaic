@@ -134,7 +134,10 @@ assertions pin English wording — stays the regression net throughout.
    `change_notes`; `used_by_drop_text`, `used_by_note_text`), and the AI proposal card's
    refusals (`propose::ProposeError`, its `Invalid` a `TableProblem` and `NotAnExpression`'s
    field an `ExpressionField`; `ddl_preview::propose_error_text`), and the note under an
-   applied plan (`ddl::ElsewhereNote` from `elsewhere_notes`; `i18n::elsewhere_note_text`).
+   applied plan (`ddl::ElsewhereNote` from `elsewhere_notes`; `i18n::elsewhere_note_text`), and
+   what a comparison leaves out of every plan (`compare::PlanOmission` — `Omission` with its
+   `HeldBack`, and `CompareNote` — in `SchemaPlan::omissions` and `SchemaComparison::standing`;
+   `compare_view::omission_text`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -155,9 +158,8 @@ assertions pin English wording — stays the regression net throughout.
    keys) and AI prompts keep core's English. What the converted views and the app pass through
    unchanged today is this phase's list to work from (surveyed 2026-10-19; it once claimed only
    the number formatting was left, which was never true):
-   - **The rest of the DDL preview modal's body** — `unsupported`, the compare plan's `omitted`
-     (`compare::omission_note`). A test in `ddl_preview.rs` matches `"gone — "` on the
-     English.
+   - **The rest of the DDL preview modal's body** — `unsupported`. A test in `ddl_preview.rs`
+     matches `"gone — "` on the English.
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
      `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

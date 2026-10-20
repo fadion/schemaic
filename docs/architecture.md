@@ -9408,8 +9408,9 @@ existing prose was left alone.
     warning, because `dump::order_tables` reports *that* there is a cycle and not which edge, so
     whether the selected tables are the ones in it cannot be answered from a `ChangeSet`;
     over-reporting costs one line in a risk block, and the flag is a warning and never a refusal.
-    **`SchemaPlan::omitted` is what no plan built from this comparison can carry**, one line per
-    object naming it and why — and `plan()` applies that exclusion **itself** rather than trusting
+    **`SchemaPlan::omissions` is what no plan built from this comparison can carry**, one
+    `PlanOmission` per object naming it and why, `omitted()` their English lines — and `plan()`
+    applies that exclusion **itself** rather than trusting
     the caller's `include` predicate. On MySQL every routine, trigger and event difference is kept
     out of a plan, `information_schema` handing their bodies back with the escapes already resolved,
     and past the tree nothing said so: `unsupported()` was empty so the withheld block stayed hidden,
@@ -9426,15 +9427,18 @@ existing prose was left alone.
     change for a PostgreSQL identity kind (`GENERATED ALWAYS` vs `BY DEFAULT`) that
     `pg_column_clauses` has no arm for, so the set is non-empty and emits nothing, and
     `unsupported()` cannot see it either, `supports_change` being `true` for a PostgreSQL
-    `AlterColumn` whatever the clause builder can express. So `omission_note` has three arms rather
-    than two, and the third says "this comparison has no statement for the difference it found"
-    instead of the read-failure sentence, which would send the reader to check a privilege that is
-    fine. **The third is a set that emits and must not run.** `CompareEntry::held_back` is the
-    sentence saying why no plan may carry an entry's changes, set where the server would refuse the
+    `AlterColumn` whatever the clause builder can express. So `CompareEntry::omission` has three
+    arms rather than two (`OmissionWhy::NeedsSource`, `Unread`, `NoStatement`), and the third says
+    "this comparison has no statement for the difference it found" instead of the read-failure
+    sentence, which would send the reader to check a privilege that is fine. **The third is a set
+    that emits and must not run.** `CompareEntry::held_back` is the reason no plan may carry an
+    entry's changes — a `HeldBack`, one variant per reason (`PartitionOfHeld { parent, sub }`,
+    `PartitioningDiffers`, `SequenceUnwritten`, `PartitionedUnrestated`, `SequenceRangeLeft { at,
+    min, max }`), whose `message()` is the sentence — set where the server would refuse the
     statements and the only change it would take does damage the comparison may not choose for the
     user, or where the difference needs a statement the comparison does not write at all;
-    `unplannable` is true whenever it is set, and `omission_note` reads it ahead of its other
-    three arms, so the omitted line is that sentence. Three producers set it — `tsql_entry`, through
+    `unplannable` is true whenever it is set, and `omission` reads it ahead of its other three
+    arms, as `OmissionWhy::HeldBack`, so the omitted line is that sentence. Three producers set it — `tsql_entry`, through
     `held_back_sequence`, for a SQL Server sequence's range, `table_entry` for a table whose
     partitioning differs or a partitioned one no `CREATE TABLE` can restate, and
     `hold_partitions_of_held_tables` for a partition of a table so held (all below) — and every other entry is built with `None`. `is_planned` carries the same term, so counting and building cannot answer
@@ -9447,8 +9451,12 @@ existing prose was left alone.
     not refuse** (`a_mysql_body_is_kept_out_of_the_plan_and_disclosed_by_it`,
     `a_blocked_body_cannot_be_planned_however_the_predicate_answers`).
     **`CompareEntry::omission_note` is `pub` for `schemaic compare --table`**, which discloses only
-    the named objects' omissions and so cannot take the plan's whole list: `omitted` is built over
+    the named objects' omissions and so cannot take the plan's whole list: `omissions` is built over
     every difference in the comparison, whatever `include` answered (`cli/compare.rs`).
+    `omission_note` is `omission()`'s English — an `Omission { what, why }`, `what` a `Described {
+    kind, label }` whose `message()` is *table dbo.orders* — and the value is what the interface
+    words, `compare_view::omission_text` saying it from the catalogue (under `compare_view.rs`); the
+    CLI keeps the English, as it keeps `notes()`.
     **`SchemaComparison::new_namespaces` is the prerequisite a migration had no way to state.** A
     namespace is not an object this comparison pairs — there is nothing in it to diff — so a
     right-only PostgreSQL namespace meant `CREATE TABLE reporting.sales`
@@ -9581,17 +9589,17 @@ existing prose was left alone.
     sequence is ERROR 1050. Now that `create_ddl` restates a read sequence (under `schema.rs`), the
     panes show its real `CREATE SEQUENCE`; the comparison still plans nothing for one, but no longer
     hides what it read. Its disclosure would otherwise contradict that pane with *"its definition
-    could not be read"*: a read sequence carries `held_back` saying the comparison writes no
-    statement for one and to copy it from `SHOW CREATE SEQUENCE`
+    could not be read"*: a read sequence carries `held_back` (`HeldBack::SequenceUnwritten`) saying
+    the comparison writes no statement for one and to copy it from `SHOW CREATE SEQUENCE`
     (`a_read_sequence_is_disclosed_as_unplanned_not_unread`). And two sequences pair by their
     definitions — `SequenceDef::options`, never `next`, the counter two copies of one sequence need
-    not share — so a pair whose options differ is `Differing` and lands in `omitted` instead of
+    not share — so a pair whose options differ is `Differing` and lands in `omissions` instead of
     reading `Same` off the empty set, while a pair with either side's definition unread is
     `uncertain` (`two_sequences_are_compared_by_their_definitions`).
     **A PostgreSQL foreign table takes the same road one step removed.** It keys `f:`, so it never
     pairs with a same-named table and is never planned as that table's alter; it is filed under
     `CompareKind::Table`, which is where the tree shows it; and its change set is empty, so it is
-    disclosed in `omitted` as a sequence is. The model holds its columns and not its server or
+    disclosed in `omissions` as a sequence is. The model holds its columns and not its server or
     options, so the only statements the table arms could write are a `CREATE TABLE` making an empty
     local table where the wrapper's rows were, and an `ALTER` or `DROP TABLE` the server refuses on
     one (`a_foreign_table_is_disclosed_not_planned`).
@@ -9601,7 +9609,8 @@ existing prose was left alone.
     (`partitions_are_tables`) and the key (`TableInfo::partitioning`'s) or the whole `partition_of`
     differs — or elsewhere (MySQL, SQL Server) the whole `Partitioning` does, the partitions being the table's
     own, so a partition added or a bound moved is the same difference — `table_entry` makes the
-    entry `Differing` whatever its change set says, and sets `held_back` to *"its partitioning
+    entry `Differing` whatever its change set says, and sets `held_back` to
+    `HeldBack::PartitioningDiffers`, *"its partitioning
     differs, and this comparison writes no statement that repartitions a table — recreate it by
     hand"* — worded for the differ rather than the server, since MySQL does have `ALTER TABLE …
     PARTITION BY` and `ADD`/`REORGANIZE PARTITION` and `ddl::diff` writes none of them, so the
@@ -9619,7 +9628,8 @@ existing prose was left alone.
     existing tables. **A partitioned table the target lacks is held back where no `CREATE TABLE` restates the
     partitioning** (`schema::restates_partitioning`, false on SQL Server, whose partitioning is a
     partition scheme over a partition function, objects the model does not hold): `table_entry`
-    sets `held_back` to *"it is partitioned, and no CREATE TABLE here restates its partition scheme
+    sets `held_back` to `HeldBack::PartitionedUnrestated`, *"it is partitioned, and no CREATE TABLE
+    here restates its partition scheme
     — create the partition function and scheme, then the table, by hand"*, because created plain
     it would have read as done
     (`a_missing_partitioned_sql_server_table_is_held_back_not_created_plain`, which asserts the
@@ -9629,8 +9639,9 @@ existing prose was left alone.
     source's created `PARTITION OF` a table the target holds plain, which the server refuses, or a
     target's dropped — every row of the table the omission note said was left alone.
     `hold_partitions_of_held_tables`, run in `SchemaComparison::of` right after the table entries,
-    sets `held_back` to *"it is a partition of <parent>, which is held back — recreate them
-    together, by hand"* (*sub-partition* where the held table is further up) on every table entry
+    sets `held_back` to `HeldBack::PartitionOfHeld`, *"it is a partition of <parent>, which is
+    held back — recreate them together, by hand"* (*sub-partition*, `sub: true`, where the held
+    table is further up) on every table entry
     that is a difference, is not already held and has, on either side, a held table up its
     `partition_of` chain — **whatever the tables between compare as**: the hold used to pass only
     through held entries, so a sub-partition under a `Same` `a_2024` of a held `events` was dropped
@@ -9714,7 +9725,9 @@ existing prose was left alone.
     case-sensitive source's `dbo.Orders` and `dbo.orders` are two tables a case-insensitive target
     cannot hold together, and the second overwrote the first in `pair`'s map, so one was never
     planned or named. The one compared is the one the other side spells exactly, or else the first
-    read, and the other gets a line in `SchemaComparison::notes`
+    read, and the other gets a `CompareNote::SetAside { aside, side, kept }` in
+    `SchemaComparison::remarks` — `pair` names both through the `what: Fn(&T) -> Described` its
+    caller passes, and `notes()` is the remarks' English
     (`two_source_objects_differing_only_in_case_are_named_not_collapsed`). Live, all three from a
     `Latin1_General_CS_AS` source into a `CI` target: `a_comparison_matches_every_name_as_the_target_does`.
     A built-in namespace is matched the same way: `ddl::namespace_comes_with_every_database` takes the
@@ -9774,13 +9787,15 @@ existing prose was left alone.
     2022) and the migration rolls back at it, as it always did. The server would take a `RESTART
     WITH` a value inside the range, or a re-create, and either hands out again numbers the tables
     may already hold — a choice about the user's data the comparison has no business making for
-    them. So `held_back_sequence` sets `CompareEntry::held_back` (above) and the entry stays out of
+    them. So `held_back_sequence` sets `CompareEntry::held_back` (above) to
+    `HeldBack::SequenceRangeLeft { at, min, max }` and the entry stays out of
     every plan, its sentence naming the counter and the range and telling the user to restart the
     sequence on the target by hand, at a value no table holds, and compare again. That sentence is
     the one instruction for a difference no plan carries, and a comparison whose only difference it
     is plans nothing and never enables Preview, so the omitted list alone would never be read:
-    `SchemaComparison::standing_notes` puts each held-back entry's line ahead of `notes`, and that
-    is what the view's banner reads (CMP-03's banner, under `compare_view.rs`). A re-create — a new
+    `SchemaComparison::standing` puts each held-back entry's `PlanOmission::Entry` ahead of the
+    remarks, each as a `PlanOmission::Note`, and that is what the view's banner reads (CMP-03's
+    banner, under `compare_view.rs`); `standing_notes` is its English. A re-create — a new
     type or start — begins a fresh counter and is not asked about; a counter never used is the
     start, which `tsql_entry` already keeps only inside the range. **A target restarted past the
     source's range is not this case**: `RESTART WITH` moves `start_value` too, so its start no
@@ -9791,10 +9806,11 @@ existing prose was left alone.
     `a_sequence_restart_is_honoured_and_not_compared`). **An alias type's bound rule or default is
     not compared or carried** — the rule or default is an object of its own, and the comparison
     creates none — so it made the type bare and then called the two databases the same, a loss the
-    dump names in its header (S4.2-L1-07). It is said instead: `SchemaComparison::notes` holds a
-    line for each binding the source's `DbSchema::tsql_type_bindings` has and the target's lacks
-    (`binding_notes`), matched as the target's names compare; the comparison view shows them above
-    the tree, where they stand after Apply too, and every plan's `omitted` carries them
+    dump names in its header (S4.2-L1-07). It is said instead: `SchemaComparison::remarks` holds a
+    `CompareNote::BindingNotCarried { alias, rule, default }` for each binding the source's
+    `DbSchema::tsql_type_bindings` has and the target's lacks (`binding_notes`), matched as the
+    target's names compare; the comparison view shows them above the tree, where they stand after
+    Apply too, and every plan's `omissions` carries them
     (`an_alias_types_binding_the_target_lacks_is_disclosed`; live,
     `a_comparison_names_an_alias_types_binding_it_leaves_behind`, before and after Apply). The trade runs the other way too — a sequence the
     comparison creates is `create_sql` alone and starts at its own `START WITH`, where the dump moves
@@ -28732,8 +28748,8 @@ existing prose was left alone.
     true and flipped the answer for a reason that had nothing to do with accounts. It had none while
     `preview_of` had them, which is how the nonsense title shipped.
     `withheld` is `SchemaPlan::unsupported()`, so the "not applied in part" refusal fires on the
-    button *and* inside `apply()` on this path too. **`omitted` is `SchemaPlan::omitted` and is a
-    second block beside it, drawn by `omitted_block`, which discloses and does not refuse** — the
+    button *and* inside `apply()` on this path too. **`omitted` is `SchemaPlan::omissions`, each
+    worded by `compare_view::omission_text`, and is a second block beside it, drawn by `omitted_block`, which discloses and does not refuse** — the
     difference between the two is what makes them two blocks. Withheld means half an edit, and half
     an edit is not a smaller edit, so Apply waits for the tick to be cleared; omitted means whole
     objects sat out, what is below is complete, and the user has no tick to clear because those rows
@@ -28775,11 +28791,12 @@ existing prose was left alone.
     footers share is now one message rather than two literals that modal's source gate held equal.
     `the_counted_lines_read_as_they_did_in_english` pins both plurals. English stays: the SQL box
     (`sql_box_text`, its `-- After the plan commits…` comment included, being generated SQL) and the
-    *SQL* heading; the withheld and omitted lines, core's prose, phase 4 — the change lines, the
-    risk lines, the risk heading, the *Used by* lines and the after-commit refresh note have left
-    that list, worded from `ChangeLine`, `Risk`/`PlanRisk`, `used_by::Listing`/`UsedByNote` and
-    `ddl::ElsewhereNote` (`risk_text`, `plan_risk_text`, `used_by_drop_text`, `used_by_note_text`,
-    `elsewhere_note_text`, all under *The string catalogue*) and from the bool
+    *SQL* heading; the withheld lines, core's prose, phase 4 — the change lines, the
+    risk lines, the risk heading, the *Used by* lines, the after-commit refresh note and the omitted
+    lines have left that list, worded from `ChangeLine`, `Risk`/`PlanRisk`,
+    `used_by::Listing`/`UsedByNote`, `ddl::ElsewhereNote` and `compare::PlanOmission` (`risk_text`,
+    `plan_risk_text`, `used_by_drop_text`, `used_by_note_text`, `elsewhere_note_text`, all under
+    *The string catalogue*, and `omission_text`, under `compare_view.rs`) and from the bool
     above, and so has every `Err` `preview_proposal` hands the card — its own two refusals
     (`propose-not-loaded`, `propose-nothing-to-change`) and each `ProposeError` that
     `resolve_target` or `apply` returns, through `propose_error_text`.
@@ -32780,21 +32797,32 @@ existing prose was left alone.
     `compare-*` messages; the tally is one message with all four counts, which
     `the_summary_reads_as_it_did` holds to the `format!` it replaced.
     **What the comparison noted is shown above the tree**, one line each, under the banner a
-    foreign-key cycle takes: `SchemaComparison::notes` — an alias type's bound rule or default the
+    foreign-key cycle takes: `SchemaComparison::remarks` — an alias type's bound rule or default the
     target lacks, a source object a case-insensitive target cannot hold beside another — reached the
     reader only through a plan's omitted list, and once every object agreed no plan was built, so a
     second comparison after Apply read "These two schemas match" with Preview disabled and the note
     nowhere (CMP-03). The empty tree says `EmptyRows::AgreesExceptNoted` then, not
-    `EverythingAgrees` (under `compare.rs`). The banner reads `SchemaComparison::standing_notes()`
-    rather than `notes`, which puts each **held-back** entry's omission line first
+    `EverythingAgrees` (under `compare.rs`). The banner reads `SchemaComparison::standing()`
+    rather than the remarks alone, which puts each **held-back** entry's omission first
     (`CompareEntry::held_back` — a SQL Server sequence range the target's counter has left, a
-    table whose partitioning differs, a partitioned SQL Server table the target lacks, or a
-    partition of a held table): that
+    table whose partitioning differs, a partitioned SQL Server table the target lacks, a
+    partition of a held table, or a MariaDB sequence the comparison writes no statement for): that
     line is the instruction for the one difference no plan carries, and a comparison holding only
     that difference plans nothing, so Preview is never enabled and the omitted list it would have
     been read in is never shown.
-    Those notes are core's prose and stay English in every language until phase 4 of the roadmap's
-    *Interface translation* reaches core's sentences.
+    **Those lines are worded here, and so is the preview's omitted list.** `omission_text`
+    (`pub(crate)`, for `ddl_preview::preview_of_plan`) words a `compare::PlanOmission` from the
+    catalogue: an entry's `compare-omitted` (`$what`, `$why`), its object `compare-described` with
+    the kind through `compare_kind_word`, its reason one of `compare-omitted-needs-source`,
+    `-unread`, `-no-statement` or a `compare-held-*` message per `HeldBack` — `$sub` selecting
+    *partition* or *sub-partition*, the range's `$at`, `$min` and `$max` as the server gave them,
+    `SHOW CREATE SEQUENCE` never translated; and a note's `compare-note-set-aside` (a `$side`
+    selector) or `compare-note-binding`, whose `$bound` selector says the rule, the default or
+    both. `english_says_every_omission_as_core_does` holds it equal to `PlanOmission::message()`
+    over every `OmissionWhy` and `HeldBack` (both values of `sub`) under three kinds, a set-aside
+    each way round, and each binding — a hand-written list, so a new variant fails the `match` at
+    compile time but is held to its English only once someone adds it. The CLI keeps the English
+    (`omission_note`, `notes()`).
     **The module names no `Ui` — it is off `whole_ui_gate`'s list, 8 to zero — and the split is
     `import_view.rs`'s.** The renderers take `OverlayUi`, being the eight `compare_*` signals and
     nothing else: `open_compare`, `reset`, `body_for`, `ready_body` and `filter_bar`. The four that
@@ -32900,7 +32928,7 @@ existing prose was left alone.
     selection, a future "invert") cannot reach `emit` however the caller's predicate answers.
     Counting over a laxer predicate than the one that builds the plan is how a confident "1 object"
     comes to sit over a button that builds an empty plan and returns. **And the preview now says so
-    out loud**: what is kept out travels as `SchemaPlan::omitted` into the modal's own block, where
+    out loud**: what is kept out travels as `SchemaPlan::omissions` into the modal's own block, where
     it discloses without refusing — before that, the last surface ahead of Apply counted only what
     was included and reported "Applied N statements to 1 object" over a three-difference comparison.
     Lifting the block means re-reading each body through `Db::{trigger,routine,event}_source` first —
@@ -37502,14 +37530,14 @@ existing prose was left alone.
     `needs_source` keeps out printed "no differences: … already matches …" over a `left out:` line
     naming that trigger (`differences_only_left_out_are_not_called_no_differences`). Then
     `destructive: …` for each of `plan.destructive()` and `not in the script: …` for each of
-    `plan.unsupported()`. **The `left out: …` lines are not `plan.omitted`**, which they were:
+    `plan.unsupported()`. **The `left out: …` lines are not `plan.omitted()`**, which they were:
     that list is built over the whole comparison, so `-t a` listed a trigger left out on another
     table under "no differences in a" (`named_tables_narrow_the_left_out_lines_too`). `report`
     builds them from `cmp.differences()` through `plan`'s own two exclusions, `needs_source() ||
     unplannable()`, and an `in_scope` predicate — everything with no `--table`, else the named
     objects matched as `selectable_keys_of` matches them (the same namespace, and the object
     itself or a trigger whose `table` is it) — each line being `CompareEntry::omission_note`, made
-    `pub` for this (under `core/compare.rs`). The comparison's own `notes`, which are about the reading
+    `pub` for this (under `core/compare.rs`). The comparison's own `notes()`, which are about the reading
     rather than any one object, follow as `note: …` lines whatever the scope. Both tests were
     watched fail against the old `report`. Nothing here runs anything; the script is printed for a
     person to read.
@@ -41059,8 +41087,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     still are, nor `DbError`'s own *query failed:*, *connection failed:* and *query cancelled*
     wherever the app shows an error through `db_error_shown` (below) — the sites still on
     `to_string()` are listed there — nor the DDL preview's change lines (`ddl::ChangeLine`,
-    below), risk lines (`ddl::Risk`, below), risk heading and *Used by* lines (`used_by::Listing`,
-    below), though its withheld and omitted lines still are.
+    below), risk lines (`ddl::Risk`, below), risk heading, *Used by* lines (`used_by::Listing`,
+    below) and omitted lines (`compare::PlanOmission`, under `compare_view.rs`), nor the compare
+    tab's standing notes above its tree, though the preview's withheld lines still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41440,9 +41469,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     `to_string()` — which it may be, since the note is `DdlOutcome::Applied(Some(note))`, for the
     eye, and no log keeps it. `english_says_every_refresh_note_as_core_does` holds the worded lines,
     joined, equal to `elsewhere_report` over the batch's failure, one, three and eleven views and
-    databases (with and without an error), and one of each. What stays core's English in the
-    modal: the withheld lines (`unsupported`, which still reads `Change::summary` for a refused
-    change) and the omitted notes.
+    databases (with and without an error), and one of each. The omitted notes went too, worded by
+    `compare_view::omission_text` from `compare::PlanOmission` (under `compare_view.rs`), and with
+    them the compare tab's standing notes, which are the same values. What stays core's English in
+    the modal is the last of it: the withheld lines (`unsupported`, which still reads
+    `Change::summary` for a refused change).
     An AI proposal's refusal is the same two-reader case, its readers on either side of the chat.
     `ProposeError` held two pieces it had already worded in English: `Invalid` carried
     `validate`'s first sentence, and `NotAnExpression`'s `what` the field's name as a `String`.

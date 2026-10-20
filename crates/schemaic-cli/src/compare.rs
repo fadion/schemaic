@@ -99,7 +99,7 @@ pub fn report(
             .map(|u| format!("not in the script: {u}")),
     );
     notes.extend(left_out.iter().map(|o| format!("left out: {o}")));
-    notes.extend(cmp.notes.iter().map(|n| format!("note: {n}")));
+    notes.extend(cmp.notes().iter().map(|n| format!("note: {n}")));
     let script = (!plan.is_empty()).then(|| plan.export_script());
     Ok(Report { script, notes })
 }

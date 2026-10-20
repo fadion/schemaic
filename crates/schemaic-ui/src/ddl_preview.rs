@@ -369,7 +369,11 @@ pub(crate) fn preview_of_plan(
         // so nothing the user does adds them. Before this, the last surface
         // before an irreversible Apply said "1 object" over a three-difference
         // comparison and reported "Applied N statements to 1 object".
-        omitted: plan.omitted.clone(),
+        omitted: plan
+            .omissions
+            .iter()
+            .map(crate::compare_view::omission_text)
+            .collect(),
         statements: plan.emit(),
         // **`export_script`, the same field `preview_of` fills that way**, and
         // for the same reason: this is what Copy and Open in editor hand over,
@@ -4107,7 +4111,7 @@ mod tests {
         let plan = compare_plan(left, right);
 
         let p = preview_of_plan(1, "shop", "1 object", &plan, false);
-        assert_eq!(p.omitted, plan.omitted);
+        assert_eq!(p.omitted, plan.omitted());
         assert!(
             p.omitted.iter().any(|o| o.contains("t_ins")),
             "{:?}",

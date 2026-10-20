@@ -6092,11 +6092,11 @@ async fn a_comparison_matches_every_name_as_the_target_does() {
     let c = SchemaComparison::of(&read(&target).await, &src, MS);
     assert!(c.new_namespaces.is_empty(), "{:?}", c.new_namespaces);
     let said = |c: &SchemaComparison| {
-        c.notes
+        c.notes()
             .iter()
             .any(|n| n.contains("dbo.Items") && n.contains("dbo.items"))
     };
-    assert!(said(&c), "{:?}", c.notes);
+    assert!(said(&c), "{:?}", c.notes());
     let plan = c.plan(|_| true);
     assert!(plan.clashes.is_empty(), "{:?}", plan.clashes);
     let stmts = plan.emit();
@@ -6108,7 +6108,7 @@ async fn a_comparison_matches_every_name_as_the_target_does() {
     let again = SchemaComparison::of(&read(&target).await, &src, MS);
     let left: Vec<String> = again.differences().map(|e| e.key()).collect();
     assert!(left.is_empty(), "{left:?}");
-    assert!(said(&again), "{:?}", again.notes);
+    assert!(said(&again), "{:?}", again.notes());
 }
 
 /// **A Storage switch leaves nothing the new kind refuses** (S3.1-L1-02): a
@@ -6172,7 +6172,7 @@ async fn a_comparison_names_an_alias_types_binding_it_leaves_behind() {
         }
     };
     let plan = SchemaComparison::of(&read(&target).await, &read(&source).await, MS).plan(|_| true);
-    let note = plan.omitted.join(" ");
+    let note = plan.omitted().join(" ");
     assert!(note.contains("qty") && note.contains("rl_pos"), "{note}");
     let stmts = plan.emit();
     target
@@ -6186,9 +6186,9 @@ async fn a_comparison_names_an_alias_types_binding_it_leaves_behind() {
     let again = SchemaComparison::of(&read(&target).await, &read(&source).await, MS);
     assert_eq!(again.differences().count(), 0);
     assert!(
-        again.notes.join(" ").contains("rl_pos"),
+        again.notes().join(" ").contains("rl_pos"),
         "{:?}",
-        again.notes
+        again.notes()
     );
     assert_eq!(
         again.empty_reason(RowFilter {
@@ -6242,9 +6242,9 @@ async fn a_comparison_discloses_the_modules_the_source_would_not_show() {
         );
         for name in ["v_enc", "p_enc"] {
             assert!(
-                plan.omitted.iter().any(|o| o.contains(name)),
+                plan.omitted().iter().any(|o| o.contains(name)),
                 "{round}: {:?}",
-                plan.omitted
+                plan.omitted()
             );
         }
         if round == "absent" {
@@ -6340,9 +6340,9 @@ async fn a_comparison_discloses_a_group_whose_member_the_source_encrypts() {
     let plan = SchemaComparison::of(&read(&target).await, &src, MS).plan(|_| true);
     assert!(plan.emit().is_empty(), "{:#?}", plan.emit());
     assert!(
-        plan.omitted.iter().any(|o| o.contains("ge")),
+        plan.omitted().iter().any(|o| o.contains("ge")),
         "{:?}",
-        plan.omitted
+        plan.omitted()
     );
 }
 

@@ -253,7 +253,7 @@ pub struct CompareEntry {
     /// the comparison writes no statement for the difference at all: a table
     /// partitioned differently on the two sides, or a partitioned one no
     /// `CREATE TABLE` here restates.
-    pub held_back: Option<String>,
+    pub held_back: Option<HeldBack>,
     /// The object's `CREATE` as the **left** side has it, and empty when only
     /// the right side does.
     ///
@@ -414,20 +414,217 @@ impl CompareEntry {
     /// discloses only the named objects' and so cannot take the plan's whole
     /// list.
     pub fn omission_note(&self) -> String {
+        self.omission().message()
+    }
+
+    /// [`CompareEntry::omission_note`] as a value the interface words.
+    pub fn omission(&self) -> Omission {
         let why = if let Some(why) = &self.held_back {
-            why.as_str()
+            OmissionWhy::HeldBack(why.clone())
         } else if self.needs_source() {
-            "its body must be re-read from the server before it can be applied"
+            OmissionWhy::NeedsSource
         } else if self.changes.is_empty() {
-            "this comparison has no statement for it — its definition could not be read"
+            OmissionWhy::Unread
         } else {
             // The third case, and it is not about reading: the difference was
             // seen and this engine's emitter has no clause for it. Saying "its
             // definition could not be read" there sends the reader to check a
             // privilege that is fine.
-            "this comparison has no statement for the difference it found"
+            OmissionWhy::NoStatement
         };
-        format!("{} {} — {why}", self.kind.label(), self.label())
+        Omission {
+            what: Described {
+                kind: self.kind,
+                label: self.label(),
+            },
+            why,
+        }
+    }
+}
+
+/// An object as a note names it: its kind and its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Described {
+    pub kind: CompareKind,
+    pub label: String,
+}
+
+impl Described {
+    /// The English: *table dbo.orders*.
+    pub fn message(&self) -> String {
+        format!("{} {}", self.kind.label(), self.label)
+    }
+}
+
+/// Why a difference is held out of every plan ([`CompareEntry::held_back`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeldBack {
+    /// A partition (`sub` for a deeper one) of `parent`, which is held back.
+    PartitionOfHeld { parent: String, sub: bool },
+    /// Partitioned differently on the two sides.
+    PartitioningDiffers,
+    /// A MariaDB sequence, for which the comparison writes no statement.
+    SequenceUnwritten,
+    /// Missing on the target, and partitioned where no `CREATE TABLE` here
+    /// restates the scheme.
+    PartitionedUnrestated,
+    /// The target's counter (`at`) has left the new range.
+    SequenceRangeLeft {
+        at: String,
+        min: String,
+        max: String,
+    },
+}
+
+impl HeldBack {
+    /// The English.
+    pub fn message(&self) -> String {
+        match self {
+            HeldBack::PartitionOfHeld { parent, sub } => format!(
+                "it is a {} of {parent}, which is held back — recreate them together, by hand",
+                if *sub { "sub-partition" } else { "partition" },
+            ),
+            HeldBack::PartitioningDiffers => {
+                "its partitioning differs, and this comparison writes no \
+                 statement that repartitions a table — recreate it by hand"
+                    .to_string()
+            }
+            HeldBack::SequenceUnwritten => "this comparison writes no statement for a sequence — \
+                 copy it from `SHOW CREATE SEQUENCE`, which its pane shows"
+                .to_string(),
+            HeldBack::PartitionedUnrestated => {
+                "it is partitioned, and no CREATE TABLE here restates \
+                 its partition scheme — create the partition function and scheme, then the \
+                 table, by hand"
+                    .to_string()
+            }
+            HeldBack::SequenceRangeLeft { at, min, max } => format!(
+                "the target's counter has reached {at}, outside the new range {min} to {max}, and the \
+                 server refuses to narrow a sequence past a value it has handed out. Restart it \
+                 on the target (ALTER SEQUENCE … RESTART WITH) at a value no table holds, then \
+                 compare again"
+            ),
+        }
+    }
+}
+
+/// Why an entry is in no plan ([`CompareEntry::omission`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OmissionWhy {
+    HeldBack(HeldBack),
+    /// Its body must be re-read before it can be applied.
+    NeedsSource,
+    /// No statement, its definition unread.
+    Unread,
+    /// No statement for the difference found.
+    NoStatement,
+}
+
+/// An entry no plan can carry, as its note says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Omission {
+    pub what: Described,
+    pub why: OmissionWhy,
+}
+
+impl Omission {
+    /// The English.
+    pub fn message(&self) -> String {
+        let why = match &self.why {
+            OmissionWhy::HeldBack(h) => h.message(),
+            OmissionWhy::NeedsSource => {
+                "its body must be re-read from the server before it can be applied".to_string()
+            }
+            OmissionWhy::Unread => {
+                "this comparison has no statement for it — its definition could not be read"
+                    .to_string()
+            }
+            OmissionWhy::NoStatement => {
+                "this comparison has no statement for the difference it found".to_string()
+            }
+        };
+        format!("{} — {why}", self.what.message())
+    }
+}
+
+/// Which side of a comparison holds the object a note sets aside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteSide {
+    Target,
+    Source,
+}
+
+/// A note about the comparison as a whole ([`SchemaComparison::remarks`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompareNote {
+    /// Two objects on `side` fold to one name on a case-insensitive target:
+    /// `aside` is not compared, `kept` is.
+    SetAside {
+        aside: Described,
+        side: NoteSide,
+        kept: Described,
+    },
+    /// An alias type's bound rule or default, which the comparison does not
+    /// carry.
+    BindingNotCarried {
+        alias: String,
+        rule: Option<String>,
+        default: Option<String>,
+    },
+}
+
+impl CompareNote {
+    /// The English.
+    pub fn message(&self) -> String {
+        match self {
+            CompareNote::SetAside { aside, side, kept } => {
+                let kept = kept.message();
+                format!(
+                    "{} — the {} also holds {kept}, and the target's names ignore case, so \
+                     it can hold only one of the two; {kept} is the one compared",
+                    aside.message(),
+                    match side {
+                        NoteSide::Target => "target",
+                        NoteSide::Source => "source",
+                    },
+                )
+            }
+            CompareNote::BindingNotCarried {
+                alias,
+                rule,
+                default,
+            } => {
+                let what: Vec<String> = [
+                    rule.as_ref().map(|r| format!("the rule {r}")),
+                    default.as_ref().map(|d| format!("the default {d}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                format!(
+                    "Alias type {alias}: {} bound to it on the source is not compared or carried — \
+                     bind it by hand (sp_bindrule / sp_bindefault).",
+                    what.join(" and ")
+                )
+            }
+        }
+    }
+}
+
+/// One line of a plan's *Not included* list ([`SchemaPlan::omissions`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanOmission {
+    Entry(Omission),
+    Note(CompareNote),
+}
+
+impl PlanOmission {
+    /// The English.
+    pub fn message(&self) -> String {
+        match self {
+            PlanOmission::Entry(o) => o.message(),
+            PlanOmission::Note(n) => n.message(),
+        }
     }
 }
 
@@ -630,8 +827,11 @@ pub struct SchemaComparison {
     ///   made the type without it and then called the two the same, a loss
     ///   the dump names in its header (S4.2-L1-07).
     ///
-    /// Every plan's [`SchemaPlan::omitted`] carries these.
-    pub notes: Vec<String>,
+    /// Every plan's [`SchemaPlan::omissions`] carries these. [`notes`] is
+    /// their English.
+    ///
+    /// [`notes`]: SchemaComparison::notes
+    pub remarks: Vec<CompareNote>,
 }
 
 /// Why a comparison's tree is empty — see [`SchemaComparison::empty_reason`].
@@ -697,8 +897,8 @@ impl SchemaComparison {
         };
         // What this comparison saw and cannot compare or carry, whatever is
         // ticked — see `SchemaComparison::notes`.
-        let mut notes: Vec<String> = Vec::new();
-        let described = |kind: CompareKind, label: String| format!("{} {label}", kind.label());
+        let mut notes: Vec<CompareNote> = Vec::new();
+        let described = |kind: CompareKind, label: String| Described { kind, label };
         // The right side read as if it had come from the left side's database.
         // Two identical databases are identical here and not one object earlier;
         // see [`as_read_from`] for what rides on the difference. Every read below
@@ -1053,8 +1253,13 @@ impl SchemaComparison {
             cycles_drop: c2,
             new_namespaces,
             name_clashes: clashes,
-            notes,
+            remarks: notes,
         }
+    }
+
+    /// [`SchemaComparison::remarks`] in English.
+    pub fn notes(&self) -> Vec<String> {
+        self.remarks.iter().map(CompareNote::message).collect()
     }
 
     /// Just the entries that would contribute statements, in plan order.
@@ -1104,7 +1309,7 @@ impl SchemaComparison {
             // No filter, and no rows: everything either side holds agrees, and
             // agreement is hidden by default — unless a note says what was not
             // compared, which "the schemas match" would contradict.
-            return if self.notes.is_empty() {
+            return if self.remarks.is_empty() {
                 EmptyRows::EverythingAgrees
             } else {
                 EmptyRows::AgreesExceptNoted
@@ -1134,10 +1339,15 @@ impl SchemaComparison {
     ///
     /// [`notes`]: SchemaComparison::notes
     pub fn standing_notes(&self) -> Vec<String> {
+        self.standing().iter().map(PlanOmission::message).collect()
+    }
+
+    /// [`SchemaComparison::standing_notes`] as values the interface words.
+    pub fn standing(&self) -> Vec<PlanOmission> {
         self.differences()
             .filter(|e| e.held_back.is_some())
-            .map(CompareEntry::omission_note)
-            .chain(self.notes.iter().cloned())
+            .map(|e| PlanOmission::Entry(e.omission()))
+            .chain(self.remarks.iter().cloned().map(PlanOmission::Note))
             .collect()
     }
 
@@ -1304,11 +1514,11 @@ impl SchemaComparison {
         // and Apply reported "Applied N statements to 1 object" over a
         // three-difference comparison. `SchemaComparison::needs_source`, written
         // to disclose exactly this, had no production caller at all.
-        let omitted: Vec<String> = self
+        let omissions: Vec<PlanOmission> = self
             .differences()
             .filter(|e| e.needs_source() || e.unplannable())
-            .map(CompareEntry::omission_note)
-            .chain(self.notes.iter().cloned())
+            .map(|e| PlanOmission::Entry(e.omission()))
+            .chain(self.remarks.iter().cloned().map(PlanOmission::Note))
             .collect();
         // **A cycle breaks a plan that creates a table and one that drops
         // one, and they are not the same cycle.** A `CREATE` carries an inline
@@ -1361,7 +1571,7 @@ impl SchemaComparison {
             sets,
             dialect: self.dialect,
             cycles: (self.cycles_create && creates_a_table) || (self.cycles_drop && drops_a_table),
-            omitted,
+            omissions,
             clashes,
         }
     }
@@ -1447,7 +1657,8 @@ pub struct SchemaPlan {
     /// until the offending tick is cleared. This means a difference is not in
     /// the plan at all: what is here is complete, and there is no tick to clear
     /// — the objects have no tick-box. So it discloses and does not refuse.
-    pub omitted: Vec<String>,
+    /// [`SchemaPlan::omitted`] is its English.
+    pub omissions: Vec<PlanOmission>,
     /// One line per name a table this plan drops still holds and a table it
     /// creates needs, where no order resolves it — see [`NameClash`]. Reported
     /// through [`SchemaPlan::destructive`] for [`SchemaPlan::cycles`]' reason.
@@ -1546,6 +1757,11 @@ impl ClashNote {
 impl SchemaPlan {
     pub fn is_empty(&self) -> bool {
         self.sets.iter().all(ChangeSet::is_empty)
+    }
+
+    /// [`SchemaPlan::omissions`] in English, one line each.
+    pub fn omitted(&self) -> Vec<String> {
+        self.omissions.iter().map(PlanOmission::message).collect()
     }
 
     /// `schema.object` for one of this plan's sets — what puts the object's
@@ -1821,23 +2037,22 @@ fn pair<'a, T>(
     names: Names,
     left: impl Iterator<Item = (String, &'a T)>,
     right: impl Iterator<Item = (String, &'a T)>,
-    what: impl Fn(&T) -> String,
-    notes: &mut Vec<String>,
+    what: impl Fn(&T) -> Described,
+    notes: &mut Vec<CompareNote>,
 ) -> Vec<(Option<&'a T>, Option<&'a T>)> {
     type Slot<'a, T> = Option<(String, &'a T)>;
     let mut by_key: BTreeMap<String, (Slot<'a, T>, Slot<'a, T>)> = BTreeMap::new();
-    let mut set_aside = |side: &str, kept: &T, aside: &T| {
-        let kept = what(kept);
-        notes.push(format!(
-            "{} — the {side} also holds {kept}, and the target's names ignore case, so \
-             it can hold only one of the two; {kept} is the one compared",
-            what(aside),
-        ));
+    let mut set_aside = |side: NoteSide, kept: &T, aside: &T| {
+        notes.push(CompareNote::SetAside {
+            aside: what(aside),
+            side,
+            kept: what(kept),
+        });
     };
     for (k, v) in left {
         let slot = &mut by_key.entry(names.key(&k)).or_default().0;
         match slot {
-            Some((had, kept)) if *had != k => set_aside("target", kept, v),
+            Some((had, kept)) if *had != k => set_aside(NoteSide::Target, kept, v),
             _ => *slot = Some((k, v)),
         }
     }
@@ -1847,10 +2062,10 @@ fn pair<'a, T>(
             Some((had, kept)) if *had != k => {
                 let spelt_as_target = l.as_ref().is_some_and(|(lk, _)| *lk == k);
                 if spelt_as_target {
-                    set_aside("source", v, kept);
+                    set_aside(NoteSide::Source, v, kept);
                     *slot = Some((k, v));
                 } else {
-                    set_aside("source", kept, v);
+                    set_aside(NoteSide::Source, kept, v);
                 }
             }
             _ => *slot = Some((k, v)),
@@ -2314,7 +2529,7 @@ fn free_names_across_kinds(
 /// lacks, one line each — see [`SchemaComparison::notes`]. Matched by
 /// schema and type name as the target compares names ([`Names`]), and a
 /// binding by the rule's or default's name as the catalogue printed it.
-fn binding_notes(left: &DbSchema, right: &DbSchema, names: Names) -> Vec<String> {
+fn binding_notes(left: &DbSchema, right: &DbSchema, names: Names) -> Vec<CompareNote> {
     let same = |a: &str, b: &str| names.same(a, b);
     let key = |b: &crate::schema::TsqlTypeBinding| {
         (
@@ -2337,20 +2552,14 @@ fn binding_notes(left: &DbSchema, right: &DbSchema, names: Names) -> Vec<String>
                 .filter(|t| !ours.and_then(|o| o.as_deref()).is_some_and(|o| same(o, t)))
                 .map(str::to_string)
         };
-        let what: Vec<String> = [
-            missing(&b.rule, had.map(|h| &h.rule)).map(|r| format!("the rule {r}")),
-            missing(&b.default, had.map(|h| &h.default)).map(|d| format!("the default {d}")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if !what.is_empty() {
-            out.push(format!(
-                "Alias type {}: {} bound to it on the source is not compared or carried — \
-                 bind it by hand (sp_bindrule / sp_bindefault).",
-                display_name(Some(&schema), &name),
-                what.join(" and ")
-            ));
+        let rule = missing(&b.rule, had.map(|h| &h.rule));
+        let default = missing(&b.default, had.map(|h| &h.default));
+        if rule.is_some() || default.is_some() {
+            out.push(CompareNote::BindingNotCarried {
+                alias: display_name(Some(&schema), &name),
+                rule,
+                default,
+            });
         }
     }
     out
@@ -2818,11 +3027,10 @@ fn hold_partitions_of_held_tables(entries: &mut [CompareEntry], left: &DbSchema,
         let key = (e.schema.clone(), e.name.clone());
         if let Some((schema, parent)) = held_above(&key) {
             let direct = parent_of(&key.0, &key.1) == Some((schema.clone(), parent.clone()));
-            e.held_back = Some(format!(
-                "it is a {} of {}, which is held back — recreate them together, by hand",
-                if direct { "partition" } else { "sub-partition" },
-                display_name(schema.as_deref(), &parent)
-            ));
+            e.held_back = Some(HeldBack::PartitionOfHeld {
+                parent: display_name(schema.as_deref(), &parent),
+                sub: !direct,
+            });
         }
     }
 }
@@ -2962,29 +3170,17 @@ fn table_entry(
         changes,
         uncertain,
         held_back: if repartitioned {
-            Some(
-                "its partitioning differs, and this comparison writes no statement that \
-                 repartitions a table — recreate it by hand"
-                    .to_string(),
-            )
+            Some(HeldBack::PartitioningDiffers)
         } else if shape == TableShape::Sequence && any.sequence.is_some() {
             // Its definition *was* read — the pane shows it — so the default
             // note's "could not be read" would contradict the screen.
-            Some(
-                "this comparison writes no statement for a sequence — copy it from \
-                 `SHOW CREATE SEQUENCE`, which its pane shows"
-                    .to_string(),
-            )
+            Some(HeldBack::SequenceUnwritten)
         } else if l.is_none()
             && r.is_some_and(|r| r.partitioning.is_some())
             && !crate::schema::restates_partitioning(dialect)
         {
             // Created plain, it would read as done.
-            Some(
-                "it is partitioned, and no CREATE TABLE here restates its partition scheme — \
-                 create the partition function and scheme, then the table, by hand"
-                    .to_string(),
-            )
+            Some(HeldBack::PartitionedUnrestated)
         } else {
             None
         },
@@ -3323,7 +3519,7 @@ fn tsql_entry(
 /// back with the sentence that says what to do. A re-create (a new type or
 /// start) starts a fresh counter and is not asked about here; a counter never
 /// used is the start, which `tsql_entry` keeps only inside the range.
-fn held_back_sequence(changes: &ChangeSet) -> Option<String> {
+fn held_back_sequence(changes: &ChangeSet) -> Option<HeldBack> {
     changes.changes.iter().find_map(|c| match c {
         Change::AlterTsqlSequence {
             from,
@@ -3336,15 +3532,11 @@ fn held_back_sequence(changes: &ChangeSet) -> Option<String> {
                     ..
                 },
                 TsqlObjectKind::Sequence { min, max, .. },
-            ) if !within(at, min, max) => Some(format!(
-                "the target's counter has reached {}, outside the new range {} to {}, and the \
-                 server refuses to narrow a sequence past a value it has handed out. Restart it \
-                 on the target (ALTER SEQUENCE … RESTART WITH) at a value no table holds, then \
-                 compare again",
-                at.trim(),
-                min.trim(),
-                max.trim()
-            )),
+            ) if !within(at, min, max) => Some(HeldBack::SequenceRangeLeft {
+                at: at.trim().to_string(),
+                min: min.trim().to_string(),
+                max: max.trim().to_string(),
+            }),
             _ => None,
         },
         _ => None,
@@ -3541,11 +3733,11 @@ mod tests {
         let plan = c.plan(|_| true);
         assert!(plan.emit().is_empty(), "{:?}", plan.emit());
         assert!(
-            plan.omitted
+            plan.omitted()
                 .iter()
                 .any(|o| o.contains("sq1") && o.contains("SHOW CREATE SEQUENCE")),
             "{:?}",
-            plan.omitted
+            plan.omitted()
         );
 
         // Only the counter differs: the same sequence.
@@ -3585,9 +3777,9 @@ mod tests {
             "a sequence was offered as a table:\n{sql}"
         );
         assert!(
-            plan.omitted.iter().any(|o| o.contains("sq1")),
+            plan.omitted().iter().any(|o| o.contains("sq1")),
             "the object was dropped from the plan silently: {:?}",
-            plan.omitted
+            plan.omitted()
         );
         assert_eq!(find(&c, "sequence:sq1").kind, CompareKind::Sequence);
 
@@ -3596,7 +3788,7 @@ mod tests {
         let plan = c.plan(|_| true);
         let sql = plan.emit().join("\n");
         assert!(!sql.contains("DROP TABLE"), "{sql}");
-        assert!(plan.omitted.iter().any(|o| o.contains("sq1")));
+        assert!(plan.omitted().iter().any(|o| o.contains("sq1")));
 
         // A sequence and a table of the same name are two objects, not one
         // that changed kind — the reason the shape is part of the key.
@@ -3634,9 +3826,9 @@ mod tests {
             let sql = plan.emit().join("\n");
             assert!(!sql.contains("TABLE"), "{sql}");
             assert!(
-                plan.omitted.iter().any(|o| o.contains("ft")),
+                plan.omitted().iter().any(|o| o.contains("ft")),
                 "{:?}",
-                plan.omitted
+                plan.omitted()
             );
         }
     }
@@ -3739,11 +3931,11 @@ mod tests {
             .push(part("pmax", "VALUES LESS THAN MAXVALUE"));
         let plan = my(vec![t], vec![more]).plan(|_| true);
         assert!(
-            plan.omitted
+            plan.omitted()
                 .iter()
                 .any(|o| o.contains("partitioning differs")),
             "{:?}",
-            plan.omitted
+            plan.omitted()
         );
     }
 
@@ -3768,9 +3960,11 @@ mod tests {
         assert!(!sql.contains("CREATE TABLE"), "{sql}");
         assert!(!sql.contains("PARTITION"), "{sql}");
         assert!(
-            plan.omitted.iter().any(|o| o.contains("partition scheme")),
+            plan.omitted()
+                .iter()
+                .any(|o| o.contains("partition scheme")),
             "{:?}",
-            plan.omitted
+            plan.omitted()
         );
     }
 
@@ -3791,11 +3985,11 @@ mod tests {
         let plan = cmp.plan(|_| true);
         for name in ["events", "a_2024"] {
             assert!(
-                plan.omitted
+                plan.omitted()
                     .iter()
                     .any(|o| o.contains(name) && o.contains("partitioning differs")),
                 "{name}: {:?}",
-                plan.omitted
+                plan.omitted()
             );
         }
         assert!(!plan.emit().join("\n").contains("ALTER"));
@@ -3925,9 +4119,9 @@ mod tests {
         assert!(!sql.contains("PARTITION OF"), "{sql}");
         assert!(!sql.contains("a_2024"), "{sql}");
         assert!(
-            plan.omitted.iter().any(|o| o.contains("a_2024")),
+            plan.omitted().iter().any(|o| o.contains("a_2024")),
             "{:?}",
-            plan.omitted
+            plan.omitted()
         );
         // The target partitioned, the source plain: nothing dropped.
         let plan = SchemaComparison::of(
@@ -3939,9 +4133,9 @@ mod tests {
         let sql = plan.emit().join("\n");
         assert!(!sql.contains("DROP"), "{sql}");
         assert!(
-            plan.omitted.iter().any(|o| o.contains("a_2024")),
+            plan.omitted().iter().any(|o| o.contains("a_2024")),
             "{:?}",
-            plan.omitted
+            plan.omitted()
         );
     }
 
@@ -4065,9 +4259,9 @@ mod tests {
         let sql = plan.emit().join("\n");
         assert!(!sql.contains("DROP TABLE"), "{sql}");
         assert!(
-            plan.omitted.iter().any(|o| o.contains("a_2024_h1")),
+            plan.omitted().iter().any(|o| o.contains("a_2024_h1")),
             "{:?}",
-            plan.omitted
+            plan.omitted()
         );
         // And the other way round: nothing created under the held table.
         let plan = SchemaComparison::of(&source, &target, SqlDialect::Postgres).plan(|_| true);
@@ -4663,13 +4857,17 @@ mod tests {
             cycles_drop: false,
             new_namespaces: Vec::new(),
             name_clashes: Vec::new(),
-            notes: Vec::new(),
+            remarks: Vec::new(),
         };
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 0, "nothing to apply");
         assert!(plan.emit().is_empty());
-        assert_eq!(plan.omitted.len(), 1, "{:?}", plan.omitted);
-        assert!(plan.omitted[0].contains("secret_v"), "{:?}", plan.omitted);
+        assert_eq!(plan.omitted().len(), 1, "{:?}", plan.omitted());
+        assert!(
+            plan.omitted()[0].contains("secret_v"),
+            "{:?}",
+            plan.omitted()
+        );
         // No tick-box either, for `needs_source`'s reason.
         assert!(
             c.selectable_keys(RowFilter {
@@ -4749,16 +4947,16 @@ mod tests {
             cycles_drop: false,
             new_namespaces: Vec::new(),
             name_clashes: Vec::new(),
-            notes: Vec::new(),
+            remarks: Vec::new(),
         };
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 0, "not an object the plan applies");
-        assert_eq!(plan.omitted.len(), 1, "{:?}", plan.omitted);
-        assert!(plan.omitted[0].contains("city"), "{:?}", plan.omitted);
+        assert_eq!(plan.omitted().len(), 1, "{:?}", plan.omitted());
+        assert!(plan.omitted()[0].contains("city"), "{:?}", plan.omitted());
         assert!(
-            plan.omitted[0].contains("no statement for the difference"),
+            plan.omitted()[0].contains("no statement for the difference"),
             "and it says which of the two reasons: {:?}",
-            plan.omitted
+            plan.omitted()
         );
     }
 
@@ -5760,7 +5958,7 @@ mod tests {
         };
         let c = SchemaComparison::of(&ci(vec![]), &source, SqlDialect::MsSql);
         assert_eq!(c.entries.len(), 1, "{:?}", keys(&c));
-        let omitted = c.plan(|_| true).omitted.join("\n");
+        let omitted = c.plan(|_| true).omitted().join("\n");
         assert!(
             omitted.contains("dbo.Orders") && omitted.contains("dbo.orders"),
             "{omitted}"
@@ -5773,9 +5971,9 @@ mod tests {
         );
         assert_eq!(find(&c, "table:dbo.orders").status, ObjectStatus::Same);
         assert!(
-            c.notes.iter().any(|n| n.starts_with("table dbo.Orders")),
+            c.notes().iter().any(|n| n.starts_with("table dbo.Orders")),
             "{:?}",
-            c.notes
+            c.notes()
         );
     }
 
@@ -5866,7 +6064,7 @@ mod tests {
             &bound(Some("[dbo].[rl_pos]")),
             SqlDialect::MsSql,
         );
-        let omitted = c.plan(|_| true).omitted.join(" ");
+        let omitted = c.plan(|_| true).omitted().join(" ");
         assert!(
             omitted.contains("qty") && omitted.contains("rl_pos"),
             "{omitted}"
@@ -5878,9 +6076,9 @@ mod tests {
             SqlDialect::MsSql,
         );
         assert!(
-            c.plan(|_| true).omitted.is_empty(),
+            c.plan(|_| true).omitted().is_empty(),
             "{:?}",
-            c.plan(|_| true).omitted
+            c.plan(|_| true).omitted()
         );
     }
 
@@ -5911,7 +6109,7 @@ mod tests {
         };
         let c = SchemaComparison::of(&target, &source, SqlDialect::MsSql);
         assert_eq!(c.differences().count(), 0);
-        assert_eq!(c.notes.len(), 1, "{:?}", c.notes);
+        assert_eq!(c.remarks.len(), 1, "{:?}", c.remarks);
         let unfiltered = RowFilter {
             query: "",
             show_same: false,
@@ -6068,15 +6266,15 @@ mod tests {
         assert!(e.unplannable(), "{:?}", e.changes.emit());
         let plan = c.plan(|_| true);
         assert!(plan.emit().is_empty(), "{:?}", plan.emit());
-        assert_eq!(plan.omitted.len(), 1, "{:?}", plan.omitted);
+        assert_eq!(plan.omitted().len(), 1, "{:?}", plan.omitted());
         assert!(
-            plan.omitted[0].contains("5000") && plan.omitted[0].contains("RESTART"),
+            plan.omitted()[0].contains("5000") && plan.omitted()[0].contains("RESTART"),
             "{:?}",
-            plan.omitted
+            plan.omitted()
         );
         // And said where it can be read with nothing to plan: the omitted
         // list belongs to a preview that a lone held-back entry never opens.
-        assert_eq!(c.standing_notes(), plan.omitted);
+        assert_eq!(c.standing_notes(), plan.omitted());
         // Below a raised minimum, the same.
         let c = compare(seq("1", big, Some("5")), seq("100", big, None));
         assert!(find(&c, "sequence:dbo.order_no").unplannable());
@@ -7572,7 +7770,7 @@ mod tests {
             )],
             dialect: SqlDialect::MySql,
             cycles: false,
-            omitted: Vec::new(),
+            omissions: Vec::new(),
             clashes: Vec::new(),
         };
         assert!(
@@ -7709,8 +7907,8 @@ mod tests {
         // … and Apply is not refused, because what *is* in the plan is complete.
         assert!(plan.unsupported().is_empty());
         // But the plan says what it left behind, naming the object.
-        assert_eq!(plan.omitted.len(), 1);
-        assert!(plan.omitted[0].contains("t_ins"), "{:?}", plan.omitted);
+        assert_eq!(plan.omitted().len(), 1);
+        assert!(plan.omitted()[0].contains("t_ins"), "{:?}", plan.omitted());
     }
 
     /// The exclusion is `plan`'s own, not only the caller's. A key that reached
@@ -7734,7 +7932,7 @@ mod tests {
         assert!(!is_planned(blocked, &selected), "no tick-box, no plan");
         // And even a predicate that says yes to everything cannot.
         assert!(c.plan(|_| true).emit().is_empty());
-        assert_eq!(c.plan(|_| true).omitted.len(), 1);
+        assert_eq!(c.plan(|_| true).omitted().len(), 1);
     }
 
     #[test]
@@ -8727,7 +8925,7 @@ mod tsql_module_tests {
             }
             let plan = c.plan(|_| true);
             assert!(plan.emit().is_empty(), "{:?}", plan.emit());
-            assert_eq!(plan.omitted.len(), 3, "{:?}", plan.omitted);
+            assert_eq!(plan.omitted().len(), 3, "{:?}", plan.omitted());
         }
     }
 
@@ -8790,11 +8988,11 @@ mod tsql_module_tests {
         let plan = c.plan(|_| true);
         assert!(plan.emit().is_empty(), "{:#?}", plan.emit());
         assert!(
-            plan.omitted
+            plan.omitted()
                 .iter()
                 .any(|o| o.contains("grp") && o.contains("could not be read")),
             "{:?}",
-            plan.omitted
+            plan.omitted()
         );
 
         // Both sides hold it: the head is drafted with the target's members.

@@ -677,17 +677,17 @@ fn ready_body(c: Rc<SchemaComparison>, o: OverlayUi, ring: FocusRing) -> impl In
     };
 
     // **What the comparison noted and cannot compare or carry, said here and
-    // not only in a plan** (CMP-03). `SchemaComparison::notes` reached the
+    // not only in a plan** (CMP-03). `SchemaComparison::remarks` reached the
     // reader through a plan's omitted list alone, and with every object the
     // same no plan is built — Preview is disabled — so a second comparison
     // after Apply read "These two schemas match" over an alias type whose
     // bound rule it had left behind. One line each, under the same banner
     // the cycle takes, since both are facts about the two schemas rather
     // than about the ticks. A held-back entry's reason leads them
-    // (`standing_notes`): it is the instruction for the one difference no plan
+    // (`standing`, worded by `omission_text`): it is the instruction for the one difference no plan
     // will carry, and a comparison holding only that difference has no
     // preview to read it in either.
-    let standing = c.standing_notes();
+    let standing: Vec<String> = c.standing().iter().map(omission_text).collect();
     let notes_note: AnyView = if standing.is_empty() {
         empty().into_any()
     } else {
@@ -931,6 +931,76 @@ fn compare_kind_word(kind: CompareKind) -> String {
         CompareKind::Trigger => tr!("compare-kind-trigger"),
         CompareKind::Event => tr!("compare-kind-event"),
         CompareKind::Synonym => tr!("compare-kind-synonym"),
+    }
+}
+
+/// One line of what a comparison leaves out of every plan — core's
+/// `compare::PlanOmission::message` in the interface's language. Read by the
+/// standing notes above the tree and the preview's *Not included* list.
+pub(crate) fn omission_text(o: &schemaic_core::compare::PlanOmission) -> String {
+    use schemaic_core::compare::{
+        CompareNote, Described, HeldBack, NoteSide, OmissionWhy, PlanOmission,
+    };
+    let described = |d: &Described| {
+        tr!(
+            "compare-described",
+            kind = compare_kind_word(d.kind),
+            name = d.label.as_str()
+        )
+    };
+    match o {
+        PlanOmission::Entry(e) => {
+            let why = match &e.why {
+                OmissionWhy::HeldBack(HeldBack::PartitionOfHeld { parent, sub }) => tr!(
+                    "compare-held-partition",
+                    sub = if *sub { "yes" } else { "no" },
+                    parent = parent.as_str()
+                ),
+                OmissionWhy::HeldBack(HeldBack::PartitioningDiffers) => {
+                    tr!("compare-held-partitioning-differs")
+                }
+                OmissionWhy::HeldBack(HeldBack::SequenceUnwritten) => {
+                    tr!("compare-held-sequence-unwritten")
+                }
+                OmissionWhy::HeldBack(HeldBack::PartitionedUnrestated) => {
+                    tr!("compare-held-partitioned-unrestated")
+                }
+                OmissionWhy::HeldBack(HeldBack::SequenceRangeLeft { at, min, max }) => tr!(
+                    "compare-held-sequence-range",
+                    at = at.as_str(),
+                    min = min.as_str(),
+                    max = max.as_str()
+                ),
+                OmissionWhy::NeedsSource => tr!("compare-omitted-needs-source"),
+                OmissionWhy::Unread => tr!("compare-omitted-unread"),
+                OmissionWhy::NoStatement => tr!("compare-omitted-no-statement"),
+            };
+            tr!("compare-omitted", what = described(&e.what), why = why)
+        }
+        PlanOmission::Note(CompareNote::SetAside { aside, side, kept }) => tr!(
+            "compare-note-set-aside",
+            aside = described(aside),
+            side = match side {
+                NoteSide::Target => "target",
+                NoteSide::Source => "source",
+            },
+            kept = described(kept)
+        ),
+        PlanOmission::Note(CompareNote::BindingNotCarried {
+            alias,
+            rule,
+            default,
+        }) => tr!(
+            "compare-note-binding",
+            alias = alias.as_str(),
+            bound = match (rule, default) {
+                (Some(_), Some(_)) => "both",
+                (Some(_), None) => "rule",
+                (None, _) => "default",
+            },
+            rule = rule.clone().unwrap_or_default(),
+            default = default.clone().unwrap_or_default()
+        ),
     }
 }
 
@@ -1398,6 +1468,75 @@ mod tests {
     use crate::i18n::tr;
     use schemaic_core::compare::CompareKind;
     use schemaic_core::text::plural;
+
+    /// **What no plan carries reads in English exactly as core's** — every
+    /// reason an entry is left out, held back or not, and both notes about
+    /// the comparison, each way round.
+    #[test]
+    fn english_says_every_omission_as_core_does() {
+        use super::omission_text;
+        use schemaic_core::compare::{
+            CompareNote, Described, HeldBack, NoteSide, Omission, OmissionWhy, PlanOmission,
+        };
+        let d = |kind, label: &str| Described {
+            kind,
+            label: label.into(),
+        };
+        let mut lines = Vec::new();
+        for why in [
+            OmissionWhy::NeedsSource,
+            OmissionWhy::Unread,
+            OmissionWhy::NoStatement,
+            OmissionWhy::HeldBack(HeldBack::PartitionOfHeld {
+                parent: "dbo.sales".into(),
+                sub: false,
+            }),
+            OmissionWhy::HeldBack(HeldBack::PartitionOfHeld {
+                parent: "dbo.sales".into(),
+                sub: true,
+            }),
+            OmissionWhy::HeldBack(HeldBack::PartitioningDiffers),
+            OmissionWhy::HeldBack(HeldBack::SequenceUnwritten),
+            OmissionWhy::HeldBack(HeldBack::PartitionedUnrestated),
+            OmissionWhy::HeldBack(HeldBack::SequenceRangeLeft {
+                at: "5000".into(),
+                min: "1".into(),
+                max: "1000".into(),
+            }),
+        ] {
+            for kind in [
+                CompareKind::Table,
+                CompareKind::Sequence,
+                CompareKind::Procedure,
+            ] {
+                lines.push(PlanOmission::Entry(Omission {
+                    what: d(kind, "dbo.orders"),
+                    why: why.clone(),
+                }));
+            }
+        }
+        for side in [NoteSide::Target, NoteSide::Source] {
+            lines.push(PlanOmission::Note(CompareNote::SetAside {
+                aside: d(CompareKind::Table, "dbo.Items"),
+                side,
+                kept: d(CompareKind::Table, "dbo.items"),
+            }));
+        }
+        for (rule, default) in [
+            (Some("rl_pos"), None),
+            (None, Some("df_zero")),
+            (Some("rl_pos"), Some("df_zero")),
+        ] {
+            lines.push(PlanOmission::Note(CompareNote::BindingNotCarried {
+                alias: "dbo.money".into(),
+                rule: rule.map(str::to_string),
+                default: default.map(str::to_string),
+            }));
+        }
+        for line in &lines {
+            assert_eq!(omission_text(line), line.message(), "{line:?}");
+        }
+    }
 
     /// English names every kind as core's `CompareKind` does, group and
     /// singular alike. Listed by hand — there is no `CompareKind::ALL` — so a

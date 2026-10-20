@@ -1109,6 +1109,38 @@ compare-include-identical = Include identical
 compare-select-all = Select all
 compare-select-none = None
 compare-hint-held-back = held back from the plan; the note above says why
+# What no plan from this comparison carries, above the tree and in the preview's
+# Not included list (core's compare::PlanOmission). English must read exactly as
+# core's omission_note and notes (a test holds it). $kind is compare-kind-*.
+compare-described = { $kind } { $name }
+# $what is compare-described; $why one of the reasons below.
+compare-omitted = { $what } — { $why }
+compare-omitted-needs-source = its body must be re-read from the server before it can be applied
+compare-omitted-unread = this comparison has no statement for it — its definition could not be read
+compare-omitted-no-statement = this comparison has no statement for the difference it found
+# $parent is the partitioned table held back; $sub yes for a deeper level.
+compare-held-partition = it is a { $sub ->
+        [yes] sub-partition
+       *[no] partition
+    } of { $parent }, which is held back — recreate them together, by hand
+compare-held-partitioning-differs = its partitioning differs, and this comparison writes no statement that repartitions a table — recreate it by hand
+# SHOW CREATE SEQUENCE is a statement: never translated.
+compare-held-sequence-unwritten = this comparison writes no statement for a sequence — copy it from `SHOW CREATE SEQUENCE`, which its pane shows
+compare-held-partitioned-unrestated = it is partitioned, and no CREATE TABLE here restates its partition scheme — create the partition function and scheme, then the table, by hand
+# $at is where the target's counter is; $min and $max the new range.
+compare-held-sequence-range = the target's counter has reached { $at }, outside the new range { $min } to { $max }, and the server refuses to narrow a sequence past a value it has handed out. Restart it on the target (ALTER SEQUENCE … RESTART WITH) at a value no table holds, then compare again
+# Two objects on one side whose names fold to one on a case-insensitive target;
+# $side is target or source.
+compare-note-set-aside = { $aside } — the { $side ->
+        [target] target
+       *[source] source
+    } also holds { $kept }, and the target's names ignore case, so it can hold only one of the two; { $kept } is the one compared
+# An alias type's bound rule or default; $bound is rule, default or both.
+compare-note-binding = Alias type { $alias }: { $bound ->
+        [rule] the rule { $rule }
+        [default] the default { $default }
+       *[both] the rule { $rule } and the default { $default }
+    } bound to it on the source is not compared or carried — bind it by hand (sp_bindrule / sp_bindefault).
 compare-hint-blocked = body must be re-read before this can be applied
 compare-hint-uncertain = an index this model reads only in part — a match here isn't certain
 compare-preview-migration = Preview migration

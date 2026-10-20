@@ -1353,6 +1353,28 @@ compare-include-identical = Identische einbeziehen
 compare-select-all = Alle auswählen
 compare-select-none = Keine
 compare-hint-held-back = aus dem Plan zurückgehalten; der Hinweis oben sagt, warum
+compare-described = { $kind } { $name }
+compare-omitted = { $what } — { $why }
+compare-omitted-needs-source = sein Rumpf muss erst vom Server neu gelesen werden, bevor er angewendet werden kann
+compare-omitted-unread = dieser Vergleich hat keine Anweisung dafür — seine Definition konnte nicht gelesen werden
+compare-omitted-no-statement = dieser Vergleich hat keine Anweisung für den gefundenen Unterschied
+compare-held-partition = es ist eine { $sub ->
+        [yes] Unterpartition
+       *[no] Partition
+    } von { $parent }, das zurückgehalten wird — erstelle sie gemeinsam neu, von Hand
+compare-held-partitioning-differs = seine Partitionierung unterscheidet sich, und dieser Vergleich schreibt keine Anweisung, die eine Tabelle neu partitioniert — erstelle sie von Hand neu
+compare-held-sequence-unwritten = dieser Vergleich schreibt keine Anweisung für eine Sequenz — kopiere sie aus `SHOW CREATE SEQUENCE`, das ihr Bereich zeigt
+compare-held-partitioned-unrestated = es ist partitioniert, und kein CREATE TABLE hier stellt sein Partitionsschema wieder her — erstelle Partitionsfunktion und -schema, dann die Tabelle, von Hand
+compare-held-sequence-range = der Zähler des Ziels hat { $at } erreicht, außerhalb des neuen Bereichs { $min } bis { $max }, und der Server lehnt es ab, eine Sequenz über einen bereits vergebenen Wert hinaus einzuschränken. Starte sie auf dem Ziel neu (ALTER SEQUENCE … RESTART WITH), bei einem Wert, den keine Tabelle enthält, und vergleiche dann erneut
+compare-note-set-aside = { $aside } — { $side ->
+        [target] das Ziel
+       *[source] die Quelle
+    } enthält auch { $kept }, und die Namen des Ziels ignorieren Groß- und Kleinschreibung, es kann also nur eines der beiden enthalten; verglichen wird { $kept }
+compare-note-binding = Aliastyp { $alias }: { $bound ->
+        [rule] die Regel { $rule }
+        [default] der Standardwert { $default }
+       *[both] die Regel { $rule } und der Standardwert { $default }
+    }, an der Quelle daran gebunden, wird weder verglichen noch übernommen — binde von Hand (sp_bindrule / sp_bindefault).
 compare-hint-blocked = der Rumpf muss neu gelesen werden, bevor dies angewendet werden kann
 compare-hint-uncertain = ein Index, den dieses Modell nur teilweise liest – eine Übereinstimmung hier ist nicht sicher
 compare-preview-migration = Migrationsvorschau
