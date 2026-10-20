@@ -1712,6 +1712,72 @@ pub enum ConnectFailure {
     SignIn(SignInFailure),
 }
 
+/// **A query's failure in Schemaic's words** — `schemaic-db`'s
+/// `DbError::QueryFailed`, a `Query` the database layer composed itself, some
+/// around the server's text (`error`, which passes through). The interface
+/// words it; [`QueryFailure::message`] is the English after *query failed:*.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryFailure {
+    /// The export's writer stopped taking rows.
+    ExportStopped,
+    /// A statement an export was asked to stream returns no rows.
+    NoRowsToExport,
+    /// The engine has no server settings to list.
+    NoServerSettings,
+    /// The engine publishes variables but no status list.
+    NoStatusList,
+    /// An import with no columns to write.
+    NoImportColumns,
+    /// A copy's read ended with the runtime's `error`.
+    ReadStopped(String),
+    /// SQL Server's error inside a batch of several statements, which runs on
+    /// past it.
+    BatchContinued(String),
+    /// SQLite's lock failure, with the advice that names the way out.
+    SqliteLocked(String),
+    /// A failure whose rollback failed too.
+    RollbackFailedToo { error: String, rollback: String },
+}
+
+impl QueryFailure {
+    /// The failure in English, after *query failed:*.
+    pub fn message(&self) -> String {
+        match self {
+            QueryFailure::ExportStopped => "the export stopped reading".to_string(),
+            QueryFailure::NoRowsToExport => "that statement returns no rows to export".to_string(),
+            QueryFailure::NoServerSettings => {
+                "This engine has no server settings to show.".to_string()
+            }
+            QueryFailure::NoStatusList => {
+                "This engine publishes no status list — only its variables.".to_string()
+            }
+            QueryFailure::NoImportColumns => "No columns to import into".to_string(),
+            QueryFailure::ReadStopped(e) => format!("The read stopped: {e}"),
+            QueryFailure::BatchContinued(m) => format!(
+                "{m}\nSQL Server runs a batch on past a statement's error unless the error ends \
+                 the batch, so the statements after the failing one may have run."
+            ),
+            QueryFailure::SqliteLocked(e) => format!(
+                "{e}\n\nOn SQLite a long read blocks a write: a whole-table export or import \
+                 holds a read lock on the file until it finishes, and no write can start until \
+                 it does (MySQL and PostgreSQL do not work this way). Wait for it or cancel it, \
+                 then try again. To let reads and writes overlap on this file for good, switch \
+                 it to WAL journal mode — `PRAGMA journal_mode = WAL` — which changes the file \
+                 itself, so Schemaic will not do it for you."
+            ),
+            QueryFailure::RollbackFailedToo { error, rollback } => {
+                format!("{error} — and the rollback failed too: {rollback}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for QueryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
 /// The CLI a sign-in asks for its token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenCli {

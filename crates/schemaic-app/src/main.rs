@@ -410,6 +410,7 @@ fn db_error_shown(e: &DbError) -> String {
     use schemaic_ui::i18n;
     match e {
         DbError::Query(m) | DbError::QueryAt { message: m, .. } => i18n::db_query_failed(m.clone()),
+        DbError::QueryFailed(f) => i18n::db_query_failed(i18n::query_failure_text(f)),
         DbError::Connect(m) => i18n::db_connection_failed(m.clone()),
         DbError::ConnectFailed(f) => i18n::db_connection_failed(i18n::connect_failure_text(f)),
         DbError::Cancelled => i18n::db_query_cancelled(),
@@ -453,6 +454,18 @@ fn db_error_pair(e: &DbError) -> (String, String) {
 fn modal_error_shown(e: &DbError) -> schemaic_core::model::ModalError {
     e.modal_about_another_statement()
         .shown_as(db_error_shown(e))
+}
+
+/// An export's failure as the writer reported it, for the eye. The writer is
+/// the nearer witness (a full disk fails it first), but a failure of the read
+/// reaches it as the reader's own `to_string()` on the channel — English — so
+/// where that is what it reports, the reader's error is said as the window
+/// says it ([`db_error_shown`]).
+fn export_writer_reason<T>(read: &Result<T, DbError>, written: String) -> String {
+    match read {
+        Err(e) if e.to_string() == written => db_error_shown(e),
+        _ => written,
+    }
 }
 
 /// How a copy ended short: the rows committed before what failed, when the
@@ -5517,17 +5530,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     partial: incremental,
                                 }
                             };
-                            report(match (read, written) {
+                            report(match (&read, written) {
                                 (Err(schemaic_db::DbError::Cancelled), _) => {
                                     sweep_on_cancel();
                                     ExportOutcome::Cancelled
                                 }
-                                (_, Ok(Err(e))) => failed(tr!("export-failed", error = e)),
+                                (_, Ok(Err(e))) => failed(tr!(
+                                    "export-failed",
+                                    error = export_writer_reason(&read, e)
+                                )),
                                 (_, Err(e)) => {
                                     failed(tr!("export-worker-died", error = e.to_string()))
                                 }
                                 (Err(e), _) => {
-                                    failed(tr!("export-failed", error = db_error_shown(&e)))
+                                    failed(tr!("export-failed", error = db_error_shown(e)))
                                 }
                                 (Ok(_), Ok(Ok(tally))) => ExportOutcome::Done(tally),
                             });

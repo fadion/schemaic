@@ -973,10 +973,9 @@ pub(crate) async fn run_statement(
 /// (measured on 2022). Only the server's own errors are annotated.
 fn batch_error(e: DbError, several: bool) -> DbError {
     match e {
-        DbError::Query(m) if several => DbError::Query(format!(
-            "{m}\nSQL Server runs a batch on past a statement's error unless the error ends \
-             the batch, so the statements after the failing one may have run."
-        )),
+        DbError::Query(m) if several => {
+            DbError::QueryFailed(crate::QueryFailure::BatchContinued(m))
+        }
         other => other,
     }
 }
@@ -5265,6 +5264,7 @@ fn err_text(e: DbError) -> String {
     match e {
         DbError::Query(m) | DbError::Connect(m) => m,
         DbError::ConnectFailed(f) => f.to_string(),
+        DbError::QueryFailed(f) => f.to_string(),
         other => other.to_string(),
     }
 }

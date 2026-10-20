@@ -267,6 +267,15 @@ existing prose was left alone.
     CLI, the MCP server and the logs read what they read before; the driver's error inside, the
     hosts, paths and fingerprints pass through as they came. The interface's wording is held to it
     by `english_says_every_connect_failure_as_core_does` (*The string catalogue*).
+    **`QueryFailure` is the same move for the `Query` sentences `schemaic-db` writes itself** —
+    what `DbError::QueryFailed` carries: `ExportStopped`, `NoRowsToExport`, `NoServerSettings`,
+    `NoStatusList`, `NoImportColumns`, `ReadStopped(error)`, `BatchContinued` (SQL Server's text,
+    with the note that the batch ran on past it), `SqliteLocked(error)` (SQLite's text, with the
+    advice that names the way out) and `RollbackFailedToo { error, rollback }`. `message()` is each
+    producer's old English **byte for byte**, after the *query failed:* the variant puts in front,
+    and `Display` is it; the server's, SQLite's or the runtime's text inside passes through. The
+    interface's wording is held to it by `english_says_every_query_failure_as_core_does` (*The
+    string catalogue*).
     **`CellEdit` is what one staged cell holds** — `Null | Text | Bytes | Default` — and it replaced
     the `Option<String>` that had room for exactly two of the first three. `Text` is what was typed
     or pasted, bound as a string parameter and coerced by the server to whatever the column is;
@@ -19100,7 +19109,8 @@ existing prose was left alone.
   recording which engines carry a separate detail field at all.
   **`DbError::modal_source` answers whose words an error is** (`core::model::ErrorSource`), read off
   the variant, for the editor's error bar and the error modal behind it: `Query` is a statement's
-  failure, with SQL for *AI fix* to rewrite; `Connect` — and `ConnectFailed`, below — is the
+  failure, with SQL for *AI fix* to rewrite — and so is `QueryFailed`, below; `Connect` — and
+  `ConnectFailed`, below — is the
   server's words about no statement, explained and never fixed; `Cancelled` is the user's Stop or Schemaic's own watchdog and has
   nothing to explain; `Refused` is **Schemaic's own sentence** and has nothing to explain either.
   `Refused` exists because the variant is the provenance and this crate had been writing its own
@@ -19164,6 +19174,18 @@ existing prose was left alone.
   driver's own connect error moved to `ConnectFailed` would stop being recognised. SQL Server's
   `err_text` passes `ConnectFailed`'s `Display`, without the prefix, as it passes a `Connect`'s
   string.
+  **`QueryFailed(QueryFailure)` is the same for the `Query` sentences this crate writes itself**
+  (`core::model::QueryFailure`, re-exported as `schemaic_db::QueryFailure`). It shares `Query`'s
+  `#[error("query failed: {0}")]`, its `modal_source` (`Statement`) and its `position` (`None`),
+  so again nothing a reader of `to_string()` or the modal could see changed. Its producers are
+  `writer_gone` (`ExportStopped`), `stream_query`'s no-rows refusal, `fetch_server_vars`' two
+  refusals, `import_rows`' no-columns refusal, `copy_rows`' read that stopped, SQL Server's
+  `batch_error` (`BatchContinued`, under `mssql.rs`), SQLite `query_err`'s lock arm
+  (`SqliteLocked`) and the SQLite import's rollback that failed too (both under `sqlite.rs`); SQL
+  Server's `err_text` passes its `Display` without the prefix. **Four sentences stay a plain
+  `Query` on purpose**: `COUNT(*) returned no row`, *the count came back as … not a number* and
+  *A copy needs the multi-threaded runtime* are internal invariants failing, and MySQL's
+  `Unknown database '{db}'` mimics the server's own text.
   **The server refusing a statement Schemaic sent for itself is a connect failure, not `Query`** — its words, but about SQL the user did not write, and theirs
   was never sent: `enforce_session`'s "could not prepare the session: …" (`PrepareSession`),
   `pg::read_only_setup_failed` ("could not make the session read-only: …", `ReadOnlySetup`, for
@@ -19413,7 +19435,8 @@ existing prose was left alone.
   that flush when the statement yields no columns at all (a DML/DDL/utility outcome reports
   `affected` instead), so nothing whatever reached the channel — and the writer, seeing no chunk,
   produced an empty file and reported it as `Done(0)`. `stream_query` answers
-  `DbError::Query("that statement returns no rows to export")` when the run comes back with no
+  `DbError::QueryFailed(QueryFailure::NoRowsToExport)` — *that statement returns no rows to
+  export* — when the run comes back with no
   columns and nothing sent, and puts it on the channel as well, like every other error here. The
   refusal lives in `stream_query` rather than in the caller that happens to be careful — the export
   menu never offers such a statement — because this is public API and the next caller may not be
@@ -20179,7 +20202,8 @@ existing prose was left alone.
   because the band between 5 and 15 is where a wait actually *resolves* (a chunk flush, a commit, an
   import's transaction), while past it the blocker is a read as long as the table is big and waiting
   minutes with no way to cancel is worse than a refusal that says why. That refusal is
-  `query_err` appending `LOCK_ADVICE` on `SQLITE_BUSY`/`SQLITE_LOCKED`, read off `ErrorCode` and
+  `query_err` answering `QueryFailed(QueryFailure::SqliteLocked)` — SQLite's own sentence with the
+  advice under it, its English in core — on `SQLITE_BUSY`/`SQLITE_LOCKED`, read off `ErrorCode` and
   never matched in the message text (`is_lock_failure`) so a reworded SQLite build cannot quietly
   drop it: the engine's own sentence is *database is locked*, which names neither the user's other
   operation nor the way out, and someone who has only met two MVCC engines has no reason to connect a
@@ -20900,7 +20924,8 @@ existing prose was left alone.
   `flush_stream` discarded the error at the next request (the write on 2022 and 2025, the
   procedure on 2022; `a_write_or_a_procedure_past_the_row_cap_is_read_to_its_end`). And a server error from a piece
   holding several statements
-  carries `batch_error`'s sentence: SQL Server runs a batch on past a statement's error unless the
+  carries `batch_error`'s sentence (`QueryFailure::BatchContinued`, the server's text above it,
+  under `schemaic-db`'s `lib.rs`): SQL Server runs a batch on past a statement's error unless the
   error ends the batch, so a duplicate key followed by an `UPDATE` reports the duplicate while the
   `UPDATE` commits (measured on 2022; `a_batch_reports_its_error_past_its_first_result`). **`prepare_check` is the same DMF, and not `SET NOEXEC ON`**, which was the
   first version: `NOEXEC` compiles without resolving names, so `SELECT * FROM nope` came back clean
@@ -41338,9 +41363,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     Explain prompt, the Optimise intent (whose box label `cmdk-optimise-label` *is* translated and
     compared against the box, so the English intent still goes out), the AI fill and seed system
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
-    stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
-    the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation*. A figure is not
+    stderr; what the app writes to the write log, a persisted record; log and `tracing` lines;
+    the prose core and `schemaic-cli` return wherever the CLI, the MCP server, a log or a model
+    reads it — where the window shows it, it is a typed value the window words (*A typed
+    message*, below); and four `Query`
+    sentences `schemaic-db` deliberately left plain, three of them internal invariants failing
+    (`COUNT(*) returned no row`, *the count came back as … not a number*, *A copy needs the
+    multi-threaded runtime*) and MySQL's `Unknown database '{db}'`, which mimics the server's own
+    text — only their *query failed:* is worded. A figure is not
     among it: core prints it in English and the view writes it in the language's marks (*Figures
     in the interface's marks*, below). The notes under
     the connection form's fields are no longer among it (`connection_form.rs`), nor are
@@ -41362,7 +41392,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `to_string()` are listed there — nor `schemaic-db`'s own refusals (`model::DbRefusal`, below),
     `AuthMode::transport_refusal`'s sentence among them, nor the sentences it composes around a
     driver's, the SSH library's or the system's text at connect (`model::ConnectFailure`, below),
-    though its cloud IAM and Entra sign-in sentences and a few `Query` ones of its own still are,
+    its cloud IAM and Entra sign-in sentences among them, nor the `Query` sentences it writes
+    itself (`model::QueryFailure`, below) but the four above,
     nor the DDL preview's change lines (`ddl::ChangeLine`,
     below), risk lines (`ddl::Risk`, below), risk heading, *Used by* lines (`used_by::Listing`,
     below), omitted lines (`compare::PlanOmission`, under `compare_view.rs`) and withheld lines
@@ -41505,9 +41536,23 @@ Re-introducing the anti-patterns these guard against is a regression:
     palette's history rows, a result chip's tooltip), and `history::outcome_line_with` keeps which
     facts and where the separators go while `i18n::outcome_line` supplies `outcome-rows`/
     `outcome-rows-capped` — `english_says_ago_and_rows_as_core_does` holding both to core's English.
-    **A whole message takes the same shape** — phase 4 of *Interface translation*: where core
-    says *why* as a typed value, an enum whose fields are the arguments, the interface words it,
-    one `tr!` arm per variant, and core's `message`/`Display` stays the English.
+    **A typed message** — phases 4 and 5 of *Interface translation*, landed, the shape settled on
+    review (2026-10-19). Prose composed below the views — in `schemaic-core`, `schemaic-db` and
+    `schemaic-ai` — becomes a typed value, an enum per area whose fields are the message's
+    arguments, and core's `message()`/`Display` stays the English the CLI, the MCP server, the logs
+    and the AI read. The interface words it through a renderer with one `tr!` arm per variant,
+    beside the code that shows it (`ui/i18n.rs` holding the ones used across files, below), and a
+    test holds the renderer equal to the English over every variant. A list is joined UI-side.
+    Where core's function takes only plain values there is no value to type: the renderer restates
+    it over the same arguments, held by the same kind of test. A word that is a property of a typed
+    value (`ObjectKind`, `ChartKind`, …) is drawn by the interface while core keeps its English
+    (above); a core function that composes a line around one counted word takes the word from the
+    caller; and a value with a server's or driver's text inside passes that text through as it
+    came. **Plurals are whole Fluent messages selected on the raw count, never `text::plural`** —
+    phase 5's rule, and done: no hand-rolled plural is left in what the view crates show (the
+    app's two remaining calls, `ai.rs`'s schema outline and the script run's write-log detail,
+    write English on purpose, as do the view crates' tests), and core's remaining `plural(` calls
+    are English renderings. What follows is each case as it landed.
     `alias_rename::refusal_message` words `intel::AliasRenameRefusal` from `alias-rename-*`
     (`Conflict` takes the trimmed `$name`), and `i18n::param_error` (in `i18n.rs` rather than
     beside a view, since the app calls it) words `params::ParamError` — `params-missing` with
@@ -41914,7 +41959,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     itself from the section *A database error's own words* — `Query` and `QueryAt` as
     `db-query-failed` (`i18n::db_query_failed`), `Connect` as `db-connection-failed`, `Cancelled`
     as `db-query-cancelled` — with the server's or driver's message inside as it came — a
-    `ConnectFailed` as `db-connection-failed` around `i18n::connect_failure_text`, which words its
+    `QueryFailed` as `db-query-failed` around `i18n::query_failure_text`, which words its
+    `QueryFailure` from `db-query-*`, SQL Server's batch note and SQLite's lock advice each a
+    message of its own joined under the server's or SQLite's text with line breaks in code (one
+    and two, as core's English breaks them), a `ConnectFailed` as `db-connection-failed` around `i18n::connect_failure_text`, which words its
     `ConnectFailure` from `db-connect-*`, `db-ssh-*`, `db-tls-*` and — through the private
     `sign_in_failure_text`, the CLI's product name passing through — `db-sign-in-*` (a route
     refusal through `connection_form.rs`'s `route_note_text`, now `pub(crate)` for it), and a
@@ -41934,7 +41982,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     key with a recorded key and without one, a route refusal, and every `SignInFailure` for every
     CLI, a host and a user each with all three `ValueProblem`s; it was taken red by removing the
     alignment space in en-GB's `Offered  { $key }` (under `ssh.rs`), and again for the sign-in
-    arm by shortening en-GB's `db-sign-in-no-token-from-azure-silent`. `modal_error_shown` is `modal_about_another_statement` *shown as* that text
+    arm by shortening en-GB's `db-sign-in-no-token-from-azure-silent`.
+    `english_says_every_query_failure_as_core_does` does the same for `query_failure_text` over
+    every variant; it was taken red by shortening en-GB's `db-query-no-import-columns`.
+    `modal_error_shown` is `modal_about_another_statement` *shown as* that text
     (`ModalError::shown_as`), and `db_error_pair` is `(to_string(), db_error_shown)` for a caller
     that raises its error as text. The Commit's `CommitDone::Failed`, a Manual tab's `end_tx`, a
     failed session open, the import's `ImportOutcome::Failed` and the copy's `CopyFailed` take
@@ -41943,7 +41994,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     error. The run paths set it as `shown` too: a failed lazy `BEGIN`, the fresh-connection batch's
     per-statement failure and, inside the transaction note, the editor run's and Run All's session
     failures (under `core::tx`). So does every surface that only displays a `DbError` — the plan
-    modal's `PlanState::Failed`, the export's read failure inside `export-failed`, the dump's table
+    modal's `PlanState::Failed`, the export's read failure inside `export-failed` — and, through
+    `export_writer_reason`, the writer's failure there too where it is only the read's: the writer
+    is the nearer witness (a full disk fails it first) and its message is preferred, but a failed
+    read reaches it as the reader's own `to_string()` on the `ExportChunk` channel, English, so
+    where the two are equal the reader's error is shown as `db_error_shown` words it (no test can
+    fail on this in English, the two being equal there) — the dump's table
     list, the blob panel, Server Activity's locks, sessions and kill, compare's database list and
     `compare-reading-failed`, the properties panel's table statistics, the account browser's
     principals and grants, the server variables viewer, the connection test's ping, the SQLite
@@ -41976,16 +42032,19 @@ Re-introducing the anti-patterns these guard against is a regression:
     statements already applied. What stays
     English: the server's or driver's
     words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and the
-    sentences `schemaic-db` still composes around a driver's text inside a `Query` — a few `Query`
-    sentences of its own: `lib.rs`'s export, settings and import ones, SQL Server's
-    batch-continues note and SQLite's lock advice — where only the prefix is worded. Its SSH, TLS,
+    four `Query` sentences `schemaic-db` left plain on purpose — `COUNT(*) returned no row`, *the
+    count came back as … not a number*, *A copy needs the multi-threaded runtime* and MySQL's
+    `Unknown database '{db}'` — where only the prefix is worded. Its own export, settings, import
+    and copy sentences, SQL Server's batch-continues note and SQLite's lock advice are no longer
+    among it: they are a `QueryFailure`, worded as above. Its SSH, TLS,
     timeout, init SQL and session set-up sentences are no longer among it, nor cloud IAM's and
     Microsoft Entra's sign-in messages: they are a `ConnectFailure`, worded as above. A database-layer refusal inside `Refused` (SQL Server's
     blank-string and code-page refusals) is no longer among it: it is a `DbRefusal`, worded as
-    above. And, until the
-    roadmap's next step, the one `DbError` still taken as `to_string()`, prefix and all: the
-    squiggle's diagnostic
-    (`intel::db_error_diagnostic`), whose text the AI fix prompt reads. The run paths' own `App`
+    above. The inner error of a SQLite import's `RollbackFailedToo` still is, prefix and all: its
+    `error` is the failure's whole `to_string()`, carried as text. The squiggle's
+    diagnostic (`intel::db_error_diagnostic`) still takes `to_string()`, prefix and all, as the
+    `text` the AI fix prompt reads, its hover showing `db_error_shown` (`Diagnostic::shown_as`,
+    above). The run paths' own `App`
     notes — not sent, timed out, a Stop's disclosure — used to be the other way round, the
     interface's wording in `text`, which *Explain* sent and the write log recorded; they now carry
     core's English as `text` and the wording as `shown` (under `core::tx`).
@@ -42032,7 +42091,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     and the app's paste field share, `read_refusal_text` and `import_error_text` for the app's
     import probe, check and load, `write_failure_text` for the app's Commit, import and copy
     failures, `db_query_failed`, `db_connection_failed`, `db_query_cancelled`,
-    `connect_failure_text` and `db_refusal_text` for the app's `db_error_shown`, the crate holding no `DbError`, the six
+    `connect_failure_text`, `query_failure_text` and `db_refusal_text` for the app's `db_error_shown`, the crate holding no `DbError`, the six
     `ddl_*` for its `ddl_error_shown`, for
     the same reason, and the grid's three filter notices — `staged_requery_note`
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded

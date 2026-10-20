@@ -548,6 +548,15 @@ db-sign-in-not-found = { $cli } wurde nicht gefunden. Installiere es und melde d
 db-sign-in-not-found-azure = Die Azure CLI (az) wurde nicht gefunden. Installiere sie und führe `az login` aus, oder melde dich mit einer SQL-Anmeldung an.
 db-sign-in-no-answer = { $cli } hat nicht innerhalb von { $secs } Sekunden geantwortet.
 db-sign-in-not-started = { $cli } konnte nicht gestartet werden: { $error }
+db-query-export-stopped = der Export hat aufgehört zu lesen
+db-query-no-rows-to-export = diese Anweisung liefert keine Zeilen zum Exportieren
+db-query-no-server-settings = Diese Engine hat keine Servereinstellungen zum Anzeigen.
+db-query-no-status-list = Diese Engine veröffentlicht keine Statusliste — nur ihre Variablen.
+db-query-no-import-columns = Keine Spalten, in die importiert werden kann
+db-query-read-stopped = Das Lesen wurde abgebrochen: { $error }
+db-query-batch-continued = SQL Server führt einen Batch nach dem Fehler einer Anweisung weiter aus, sofern der Fehler den Batch nicht beendet, daher sind die Anweisungen nach der fehlgeschlagenen womöglich gelaufen.
+db-query-sqlite-locked = Bei SQLite blockiert ein langes Lesen ein Schreiben: Ein Export oder Import einer ganzen Tabelle hält eine Lesesperre auf der Datei, bis er fertig ist, und solange kann kein Schreibvorgang beginnen (MySQL und PostgreSQL arbeiten nicht so). Warte darauf oder brich ihn ab und versuche es dann erneut. Damit sich Lesen und Schreiben auf dieser Datei dauerhaft überlappen können, stelle sie auf den WAL-Journalmodus um — `PRAGMA journal_mode = WAL` —, was die Datei selbst ändert, daher macht Schemaic das nicht für dich.
+db-query-rollback-failed-too = { $error } — und auch das Zurückrollen ist fehlgeschlagen: { $rollback }
 ddl-statement-failed = Anweisung { $n } fehlgeschlagen: { $error }
 ddl-already-applied = { $n ->
     [one] { $failed } — { $n } vorherige Anweisung ist bereits angewendet und lässt sich nicht zurückrollen

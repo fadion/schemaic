@@ -623,6 +623,22 @@ db-sign-in-not-found-azure = The Azure CLI (az) was not found. Install it and ru
 db-sign-in-no-answer = The { $cli } did not answer within { $secs } seconds.
 db-sign-in-not-started = The { $cli } could not be started: { $error }
 
+## A query's failure in the database layer's own words (core's
+## model::QueryFailure), after db-query-failed's prefix; a test holds the
+## English equal. $error is the server's or the runtime's text.
+
+db-query-export-stopped = the export stopped reading
+db-query-no-rows-to-export = that statement returns no rows to export
+db-query-no-server-settings = This engine has no server settings to show.
+db-query-no-status-list = This engine publishes no status list — only its variables.
+db-query-no-import-columns = No columns to import into
+db-query-read-stopped = The read stopped: { $error }
+# On its own line under SQL Server's error.
+db-query-batch-continued = SQL Server runs a batch on past a statement's error unless the error ends the batch, so the statements after the failing one may have run.
+# A paragraph under SQLite's "database is locked".
+db-query-sqlite-locked = On SQLite a long read blocks a write: a whole-table export or import holds a read lock on the file until it finishes, and no write can start until it does (MySQL and PostgreSQL do not work this way). Wait for it or cancel it, then try again. To let reads and writes overlap on this file for good, switch it to WAL journal mode — `PRAGMA journal_mode = WAL` — which changes the file itself, so Schemaic will not do it for you.
+db-query-rollback-failed-too = { $error } — and the rollback failed too: { $rollback }
+
 ## A DDL plan that failed, in the DDL preview (schemaic-db's DdlError). English
 ## must read exactly as DdlError displays (a test holds it).
 

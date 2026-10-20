@@ -103,6 +103,8 @@ use tokio_util::sync::CancellationToken;
 
 /// [`DbError::Refused`]'s value, where every producer in this crate names it.
 pub use schemaic_core::model::DbRefusal;
+/// [`DbError::QueryFailed`]'s value.
+pub use schemaic_core::model::QueryFailure;
 /// [`DbError::ConnectFailed`]'s values.
 pub use schemaic_core::model::{ConnectFailure, SshFailure, SshPhase, TlsFailure};
 
@@ -127,6 +129,11 @@ pub enum DbError {
     /// everything else is told as before.
     #[error("query failed: {message}")]
     QueryAt { message: String, at: usize },
+    /// A [`DbError::Query`] in this crate's own words, some around the
+    /// server's ([`schemaic_core::model::QueryFailure`]): displayed and sourced
+    /// the same way, and worded by the interface in its own language.
+    #[error("query failed: {0}")]
+    QueryFailed(schemaic_core::model::QueryFailure),
     #[error("query cancelled")]
     Cancelled,
     /// **Schemaic's own sentence**, not the server's — a refusal written before
@@ -168,7 +175,9 @@ impl DbError {
     /// name.
     pub fn modal_source(&self) -> ErrorSource {
         match self {
-            DbError::Query(_) | DbError::QueryAt { .. } => ErrorSource::Statement,
+            DbError::Query(_) | DbError::QueryAt { .. } | DbError::QueryFailed(_) => {
+                ErrorSource::Statement
+            }
             DbError::Connect(_) | DbError::ConnectFailed(_) => ErrorSource::Server,
             DbError::Cancelled | DbError::Refused(_) => ErrorSource::App,
             DbError::Write(f) if f.cause.is_statements() => ErrorSource::Statement,
@@ -190,6 +199,7 @@ impl DbError {
         match self {
             DbError::QueryAt { at, .. } => Some(*at),
             DbError::Query(_)
+            | DbError::QueryFailed(_)
             | DbError::Connect(_)
             | DbError::ConnectFailed(_)
             | DbError::Cancelled
@@ -419,7 +429,7 @@ impl RowDest {
 /// Reported as a query error so the row loop stops rather than reading a table
 /// nobody is writing down.
 fn writer_gone() -> DbError {
-    DbError::Query("the export stopped reading".to_string())
+    DbError::QueryFailed(QueryFailure::ExportStopped)
 }
 
 /// What an engine module has to answer, by name.
@@ -1272,7 +1282,7 @@ impl Db {
             // refusal lives here rather than in the caller that happens to be
             // careful.
             Ok(rs) if rs.columns.is_empty() && dest.sent() == 0 => {
-                let e = DbError::Query("that statement returns no rows to export".to_string());
+                let e = DbError::QueryFailed(QueryFailure::NoRowsToExport);
                 let _ = tx.send(Err(e.to_string())).await;
                 Err(e)
             }
@@ -2163,14 +2173,10 @@ impl Db {
     ) -> Result<Vec<server_vars::ServerVar>, DbError> {
         let dialect = self.engine.dialect();
         if !server_vars::supports_server_vars(dialect) {
-            return Err(DbError::Query(
-                "This engine has no server settings to show.".to_string(),
-            ));
+            return Err(DbError::QueryFailed(QueryFailure::NoServerSettings));
         }
         if kind == server_vars::VarKind::Status && !server_vars::supports_status(dialect) {
-            return Err(DbError::Query(
-                "This engine publishes no status list — only its variables.".to_string(),
-            ));
+            return Err(DbError::QueryFailed(QueryFailure::NoStatusList));
         }
         let fetch = async {
             match self.engine {
@@ -3132,7 +3138,7 @@ impl Db {
         cancel: CancellationToken,
     ) -> Result<u64, DbError> {
         if target.columns.is_empty() {
-            return Err(DbError::Query("No columns to import into".to_string()));
+            return Err(DbError::QueryFailed(QueryFailure::NoImportColumns));
         }
         match self.engine {
             Engine::Postgres => pg::import_rows(self, target, rows, cancel).await,
@@ -3215,7 +3221,7 @@ impl Db {
         drop(rows);
         let read = reader
             .await
-            .map_err(|e| DbError::Query(format!("The read stopped: {e}")))?;
+            .map_err(|e| DbError::QueryFailed(QueryFailure::ReadStopped(e.to_string())))?;
         match (written, read) {
             (Ok(n), Ok(_)) => Ok(n),
             (Err(e), _) => Err(e),

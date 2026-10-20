@@ -118,17 +118,10 @@ const TEMP: &str = "temp";
 /// the other two backends split them: the distinction the UI draws is "couldn't
 /// reach it" versus "it said no".
 ///
-/// A lock failure keeps SQLite's own sentence and gains [`LOCK_ADVICE`], because
-/// on this engine "database is locked" is a sentence about *another operation of
-/// the user's own* and names neither it nor the way out.
-fn query_err(e: rusqlite::Error) -> DbError {
-    if is_lock_failure(&e) {
-        return DbError::Query(format!("{e}\n\n{LOCK_ADVICE}"));
-    }
-    DbError::Query(e.to_string())
-}
-
-/// Why a write to a SQLite file was refused, and what to do about it.
+/// A lock failure keeps SQLite's own sentence and gains the advice
+/// (`QueryFailure::SqliteLocked`, its English in core), because on this engine
+/// "database is locked" is a sentence about *another operation of the user's
+/// own* and names neither it nor the way out.
 ///
 /// **The one engine where a long read blocks a write.** MySQL and PostgreSQL are
 /// MVCC and the same export blocks nothing, so a user who has only met those two
@@ -149,12 +142,12 @@ fn query_err(e: rusqlite::Error) -> DbError {
 /// the user's file, it adds `-wal`/`-shm` siblings, and it is not available on
 /// every filesystem. Changing someone's database as a side effect of a failed
 /// cell edit is not this layer's call.
-const LOCK_ADVICE: &str = "On SQLite a long read blocks a write: a whole-table export or import \
-     holds a read lock on the file until it finishes, and no write can start until it does \
-     (MySQL and PostgreSQL do not work this way). Wait for it or cancel it, then try again. To \
-     let reads and writes overlap on this file for good, switch it to WAL journal mode — \
-     `PRAGMA journal_mode = WAL` — which changes the file itself, so Schemaic will not do it \
-     for you.";
+fn query_err(e: rusqlite::Error) -> DbError {
+    if is_lock_failure(&e) {
+        return DbError::QueryFailed(crate::QueryFailure::SqliteLocked(e.to_string()));
+    }
+    DbError::Query(e.to_string())
+}
 
 /// Is this the file being locked by another connection, rather than the statement
 /// being wrong?
@@ -226,7 +219,7 @@ fn open(db: &Db) -> Result<SqliteConn, DbError> {
     // *resolves*: a chunk flush, a commit, an import's transaction. Past that the
     // blocker is a whole-table read whose length is the size of the table, and
     // waiting minutes with no way to cancel is worse than a refusal that says why
-    // — which is what [`LOCK_ADVICE`] is for.
+    // — which is what `query_err`'s lock advice is for.
     conn.busy_timeout(std::time::Duration::from_secs(15))
         .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))?;
     // The connection's init SQL — PRAGMAs only (`init_sql::check`) — before
@@ -1639,9 +1632,12 @@ pub(crate) async fn import_rows(
                 let undo = conn.execute_batch("ROLLBACK");
                 match undo {
                     Ok(()) => Err(e),
-                    Err(u) => Err(DbError::Query(format!(
-                        "{e} — and the rollback failed too: {u}"
-                    ))),
+                    Err(u) => Err(DbError::QueryFailed(
+                        crate::QueryFailure::RollbackFailedToo {
+                            error: e.to_string(),
+                            rollback: u.to_string(),
+                        },
+                    )),
                 }
             }
         }
@@ -5467,7 +5463,7 @@ mod tests {
     /// no file: the keeper holds a read transaction open, exactly as the export's
     /// stepping loop does, and the write arrives on the fresh connection that this
     /// module's one-connection-per-operation rule mandates. The file case was
-    /// measured separately against a real 53 MB database — see [`LOCK_ADVICE`] —
+    /// measured separately against a real 53 MB database — see [`query_err`] —
     /// and cannot be a test here, because the suite touches no filesystem.
     #[tokio::test]
     async fn a_write_blocked_by_a_long_read_says_what_is_holding_the_file() {

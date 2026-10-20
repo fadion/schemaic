@@ -14,8 +14,9 @@ file rather than ticked off.
 Translate the GUI into languages other than English. The catalogue, the loader and every view's
 own words are in place (`docs/architecture.md`, *The string catalogue*), with a German catalogue
 reached through `SCHEMAIC_LOCALE=de`, and figures follow the language's marks (*Figures in the
-interface's marks* there); what is left is the prose built outside the views and the layout for
-longer text.
+interface's marks* there). The prose built below the views — in `schemaic-core`, `schemaic-db`
+and `schemaic-ai` — is a typed value the window words, and its plurals are whole messages (the
+same section, *A typed message*). What is left is the layout for longer text.
 
 ### Decided
 
@@ -70,127 +71,6 @@ everywhere (letters, arrows, `Tab`, `Esc`, `F6`) and macOS's `Cmd` have no messa
 Each phase leaves English output byte-identical, so the existing suite — several hundred
 assertions pin English wording — stays the regression net throughout.
 
-4. **Messages built in `schemaic-core`.** The hard part. Around 130 functions return finished
-   English prose (`run_verdict`, the DDL preview notes, `Rollback::note`, `tx`, `dump`, `compare`,
-   `stats`, `import`, `conn_import`, `users`), and core cannot — and should not — reach a UI
-   catalogue. Each becomes a typed message (an id plus arguments, or an enum per area) the UI
-   renders; core keeps an English rendering for the CLI and MCP. **The shape is settled**
-   (reviewed 2026-10-19): an enum per area, its fields the message's arguments, one `tr!` arm
-   per variant, core's `message()`/`Display` kept as the English and a test holding the two
-   equal; a list is joined UI-side before it is handed in. Where core's function already takes
-   only plain values (a name, a count, a flag, a list), no type is needed: the renderer takes
-   the same arguments and the test holds the two equal. The renderer lives beside the code
-   that shows it, `ui/i18n.rs` holding only the ones used across files. Done for
-   `AliasRenameRefusal`, `ParamError`, `cli_install` (`Refusal`, `Report`, `RowHint`),
-   `stats::RowsRead`, `model::AttachScope`, `script::RestoreRefusal` and
-   `persist::TimeoutSpan`, and the activity panel's state words and counts line (core handed
-   the words through `activity::matches_query_with`, since the search box matches them) and its
-   lock-wait card (`activity::LockWait`, one message with a selector per optional part), and
-   every export outcome: the single-file notes (`export::ExportNote`, `SqlCopyNote`), the dump
-   and folder notes (plain arguments, `dump_view`) and the writers' failures
-   (`dump::ExportFailure`, carried through the writer threads to the modal), and the dump
-   modal's toggle hints (`dump::DropHint`, `FkHint`), and the finished-run notification
-   (`notify::finished_note`, plain arguments), and the terminal launchers' refusals
-   (`launch::Refusal`, `AuthMode::external_client_refusal` among them, worded by the app's
-   `refusal_text` — with no `Display`, so a `to_string()` cannot keep one English), and
-   connection import's `conn_import::UrlError` and `SkipReason` (`i18n::url_error_text`,
-   `skip_reason_shown`, which passes its sentence through core's `redact_shown` as `message`
-   is redacted), and the run paths' transaction disclosures (`tx::TxNote`, chosen by
-   `run_failure_note`/`run_cancelled_note`, worded by `i18n::run_failed_message`,
-   `run_cancelled_message` and `not_sent_message`), and the startup notices
-   (`persist::Notice`, the queue's value now, which `secrets`' `notice`s and
-   `save_connections`' answer return too; `i18n::notice_text`), and the import modal's
-   refusals, memory warnings and issue tail (`import::ReadRefusal`, which `ImportError::Refused`
-   carries beside `Read`'s library text, `MemoryWarning`, `IssueTail`;
-   `i18n::import_error_text`, `read_refusal_text`), and the plan modal's warnings
-   (`plan::PlanNote`, `ServerWarning`; `plan_view::plan_note_text`), and the run guard
-   (`sql::GuardReason`, `Unsafe`, which `RunVerdict` carries; `i18n::guard_reason_text`) with
-   the read-only gate's reasons inside it (`sql::ReadOnlyReason`, which `ReadRefusal` carries
-   and the MCP server and `schemaic query` still say in English), and
-   the filter field's refusals (`FilterError::BracketInName`, `TrailingInput` beside
-   `BadCondition`'s parser text; `grid::filter_error_text`), and the users browser's notes
-   (`users::PrincipalsNote`, `GrantsNote`, `PgImplicit`, which `schemaic-db` now fills as
-   values; `users_view::principals_note_text`, `grants_note_text`), and every object editor's
-   refusals (each draft's `validate` the English over a typed `problems()`: `TableProblem`,
-   `TriggerProblem`, `RoutineProblem`, `ObjectProblem`, `ViewProblem`, `EventProblem`,
-   `DatabaseProblem`), and the editor's squiggles (`intel::DiagMessage`, `FlowError`, which
-   `Diagnostic::what` carries; `editor_pane::diag_message_text`, the AI fix prompt keeping
-   `Diagnostic::message`'s English), and SQL Server's plan table (`plan::PlanWording`, beside
-   the English cells the AI and the CLI read; `plan_view::shown_table`), and the write paths'
-   failures (`model::WriteFailure` — a `WriteCause` with the `Rollback` it achieved, which
-   `DbError::Write` carries; `i18n::write_failure_text`, the app's `db_error_shown`) with the
-   rows' own failure inside them (`import::RowError`, the row source's error, and
-   `copy_table::CopyStop`), and `DbError`'s own prefixes (`i18n::db_query_failed`,
-   `db_connection_failed`, `db_query_cancelled`, through the app's `db_error_shown`), and
-   the DDL modal's failure (`schemaic_db::DdlCause`, which `DdlError` carries in place of
-   its flattened text; the app's `ddl_error_shown`, the write log keeping the English),
-   and the run paths' own notices (each an English `ModalError::app` with its wording as
-   `shown`, `StatementTimeout::cancelled_message` the timed-out one's English), and the
-   DDL preview's change list (`ddl::ChangeLine`, which `Change::line` builds and
-   `SchemaPlan::lines` and `stats::drop_preview` carry; `ddl_preview::change_line_text`), its
-   risk heading (`ddl::risk_heading_for`; `risk_heading_text`) and its risk lines (`ddl::Risk`
-   from `Change::risk_lines` and `ChangeSet::risk_lines`, `compare::PlanRisk` and `ClashNote`
-   from `SchemaPlan::risk_lines`, `stats::drop_warning`'s too; `risk_text`, `plan_risk_text`)
-   and its *Used by* lines (`used_by::Listing` from `drop_listing`, `UsedByNote` from
-   `change_notes`; `used_by_drop_text`, `used_by_note_text`), and the AI proposal card's
-   refusals (`propose::ProposeError`, its `Invalid` a `TableProblem` and `NotAnExpression`'s
-   field an `ExpressionField`; `ddl_preview::propose_error_text`), and the note under an
-   applied plan (`ddl::ElsewhereNote` from `elsewhere_notes`; `i18n::elsewhere_note_text`), and
-   what a comparison leaves out of every plan (`compare::PlanOmission` — `Omission` with its
-   `HeldBack`, and `CompareNote` — in `SchemaPlan::omissions` and `SchemaComparison::standing`;
-   `compare_view::omission_text`), and the withheld lines (`ddl::Withheld` from
-   `ChangeSet::withheld_lines` and `SchemaPlan::withheld_lines`; `ddl_preview::withheld_text`,
-   `plan_withheld_text`) — the last of the DDL preview's body — and the grid's selection
-   readout (`aggregate::FigureWhat` and `Stat` on each `Figure`; `grid::figure_text`), its
-   read-more link (`stats::ReadMore` from `read_more`; `grid::read_more_text`) and the chart's
-   caption and undrawable note (`chart_view::caption_text`, `chart-too-large`), none of which
-   the 2026-10-19 survey had listed, and the editor squiggle's database diagnostic
-   (`intel::DiagMessage::Server`'s `shown`, set by `Diagnostic::shown_as` from the run's
-   `ModalError::displayed` and the live check's `db_error_shown`), and `schemaic-ai`'s refusals
-   (`SpawnRefusal`, `CliFailure`, and `Constraint::notice`'s plain arguments;
-   `i18n::spawn_refusal_text`, `cli_failure_text`, `constraint_notice_text`) with Seed rows'
-   `seed::SeedError` (`seed_error_text`), and the grid's own refusals (`edit::paste_report`'s
-   plain arguments, `CopySqlRefusal`, `rowjson::FieldRefusal`; `grid::paste_report_shown`,
-   `copy_sql_refusal_text`, `field_refusal_text`), the result diff's `result_diff::DiffError`
-   (`diff_error_text`) and the find bar's `text_ops::PatternError` (`pattern_error_text`), and
-   Ctrl+K's diff summary (`diff::inline_plan_summary`'s plain arguments;
-   `editor_pane::inline_plan_summary_text`) and the hover's quick info (`quickinfo::QuickInfo`
-   from `info`; `quick_info_text`), and the completion popup's own words (`rank::RowWords` on
-   `Suggestion::words`; `completion::shown_words`), *CTE* staying the SQL term it is, and the
-   init SQL's refusal (`init_sql::InitRefusal`; `connection_form::init_refusal_text`), and the
-   SSH host's note (`ssh_config::RouteNote`, `RouteRefusal` and `connection::JumpHostError`;
-   `route_note_text`), and the database layer's own refusals (`model::DbRefusal`, which
-   `DbError::Refused` and `WriteCause::Refused` carry; `i18n::db_refusal_text`), and the frames
-   it puts around a driver's text at connect — SSH, TLS, timeouts, the session set-up
-   (`model::ConnectFailure` in `DbError::ConnectFailed`; `i18n::connect_failure_text`, and
-   `LoadFailure::Tunnel`'s `shown`), cloud IAM and Entra sign-in among them
-   (`model::SignInFailure`, which core `cloud_iam` and `entra` answer).
-   **A word that is a property of a typed value needs none of that and goes early**: the
-   interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
-   keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
-   `ObjectKind`, `history::Bucket` (`history_panel::bucket_title`), `activity::KillKind`
-   (`activity_panel::kill_label`), `chart::ChartKind` (`chart_view::chart_kind_label`) and
-   `compare::CompareKind` and `EmptyRows` (`compare_view::compare_kind_group`,
-   `compare_kind_word`, `empty_rows_message`), `users::PrincipalKind`
-   (`users_view::principal_kind_label`), and `GrantSubject` and `GrantLevelKind`
-   (`account_editor::grant_subject_label`, `grant_level_label`), `ddl::IndexStorage` and
-   `ddl::identity_wording` (`table_designer::storage_label`, `identity_wording`), and
-   `schemaic-ai`'s `Agent::label` (`settings::agent_label`). Where a
-   core function composes a line around one counted word, it takes the word from the caller
-   instead (`history::outcome_line_with`, which `i18n::outcome_line` calls);
-   `ExportFormat::label`, `activity::interval_label` and the like are the same case, and
-   `sqlfmt`'s `KeywordCase`, `CommaStyle` and `StatementGap` labels are done
-   (`settings::keyword_case_label`, `comma_style_label`, `statement_gap_label`), and so are
-   `connection`'s pickers (`Environment`, `AiData`, `SslMode`, `SshAuth`, `AuthMode`). Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
-   keys) and AI prompts keep core's English. What the converted views and the app pass through
-   unchanged today is this phase's list to work from (resurveyed 2026-10-20; no English literal
-   or hand-rolled plural is left in the two view crates' own code, so all of it is prose handed
-   up from below):
-   - **`schemaic-db`'s own `Query` sentences** — `lib.rs`'s export, server-settings and
-     import ones, SQL Server's note that a batch runs on past an error, SQLite's lock advice.
-5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
-   folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
-   their own (the views' own were folded as they were converted).
 6. **Layout for longer text.** German, Finnish and Russian run 30–100% longer than English.
    Roughly sixty fixed-width boxes sit beside text — the connection form, the import and compare
    panes, the find bar, `widgets::fact_row`'s fixed label column — and each either measures its

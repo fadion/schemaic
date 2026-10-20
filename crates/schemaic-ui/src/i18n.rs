@@ -1315,6 +1315,30 @@ pub fn connect_failure_text(f: &schemaic_core::model::ConnectFailure) -> String 
     }
 }
 
+/// A query's failure in the database layer's own words — core's
+/// `model::QueryFailure`, what `DbError::QueryFailed` carries, in the
+/// interface's language and without *query failed:* (`db_query_failed` puts it
+/// in front). The server's and the runtime's words inside pass through.
+pub fn query_failure_text(f: &schemaic_core::model::QueryFailure) -> String {
+    use schemaic_core::model::QueryFailure;
+    match f {
+        QueryFailure::ExportStopped => tr!("db-query-export-stopped"),
+        QueryFailure::NoRowsToExport => tr!("db-query-no-rows-to-export"),
+        QueryFailure::NoServerSettings => tr!("db-query-no-server-settings"),
+        QueryFailure::NoStatusList => tr!("db-query-no-status-list"),
+        QueryFailure::NoImportColumns => tr!("db-query-no-import-columns"),
+        QueryFailure::ReadStopped(e) => tr!("db-query-read-stopped", error = e.as_str()),
+        // A real line break is two messages joined here.
+        QueryFailure::BatchContinued(m) => format!("{m}\n{}", tr!("db-query-batch-continued")),
+        QueryFailure::SqliteLocked(e) => format!("{e}\n\n{}", tr!("db-query-sqlite-locked")),
+        QueryFailure::RollbackFailedToo { error, rollback } => tr!(
+            "db-query-rollback-failed-too",
+            error = error.as_str(),
+            rollback = rollback.as_str()
+        ),
+    }
+}
+
 /// Why a cloud IAM or Entra sign-in got no token — core's
 /// `model::SignInFailure` in the interface's language. The CLIs' names are
 /// products and their own words pass through.
@@ -1473,6 +1497,30 @@ mod tests {
         }
         for r in reasons {
             assert_eq!(guard_reason_text(&r), r.message(), "{r:?}");
+        }
+    }
+
+    /// **Every query failure in the database layer's words reads in English
+    /// exactly as core's `QueryFailure::message`.**
+    #[test]
+    fn english_says_every_query_failure_as_core_does() {
+        use schemaic_core::model::QueryFailure;
+        let e = || "database is locked".to_string();
+        for f in [
+            QueryFailure::ExportStopped,
+            QueryFailure::NoRowsToExport,
+            QueryFailure::NoServerSettings,
+            QueryFailure::NoStatusList,
+            QueryFailure::NoImportColumns,
+            QueryFailure::ReadStopped(e()),
+            QueryFailure::BatchContinued("Violation of PRIMARY KEY constraint".into()),
+            QueryFailure::SqliteLocked(e()),
+            QueryFailure::RollbackFailedToo {
+                error: "query failed: disk I/O error".into(),
+                rollback: e(),
+            },
+        ] {
+            assert_eq!(query_failure_text(&f), f.message(), "{f:?}");
         }
     }
 
