@@ -376,12 +376,12 @@ impl SshTunnel {
     /// `Err` with the sentence the form shows when a jump entry cannot be
     /// read — never a silently dropped hop, which would connect by a route the
     /// user did not write.
-    pub fn route(&self) -> Result<Vec<SshHop>, String> {
+    pub fn route(&self) -> Result<Vec<SshHop>, JumpHostError> {
         let mut hops = Vec::new();
         if !self.jump.trim().is_empty() {
             for (i, entry) in self.jump.split(',').enumerate() {
                 let hop = parse_jump_host(entry.trim(), &self.user)
-                    .map_err(|why| format!("Jump host {}: {why}", i + 1))?;
+                    .map_err(|why| JumpHostError { number: i + 1, why })?;
                 hops.push(hop);
             }
         }
@@ -394,15 +394,62 @@ impl SshTunnel {
     }
 }
 
+/// Why [`SshTunnel::route`] could not read a jump host: its 1-based `number`
+/// in the list, and why. The connection form words it in the interface's
+/// language; `Display` is the English the connect's error says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JumpHostError {
+    pub number: usize,
+    pub why: JumpEntryError,
+}
+
+/// Why one jump-host entry is not `[ssh://][user@]host[:port]`, quoting the
+/// part of it that is wrong as it was typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JumpEntryError {
+    /// Nothing between two commas.
+    Empty,
+    /// The entry holds whitespace.
+    HoldsSpace(String),
+    /// `[` with no `]`.
+    UnclosedBracket(String),
+    /// Something other than `:port` after `]`.
+    TextAfterBracket(String),
+    /// No host before the port.
+    NoHost(String),
+    /// A port that is not 1–65535.
+    NotAPort(String),
+}
+
+impl JumpEntryError {
+    /// The reason in English.
+    pub fn message(&self) -> String {
+        match self {
+            JumpEntryError::Empty => "empty — remove the extra comma".to_string(),
+            JumpEntryError::HoldsSpace(s) => format!("\"{s}\" holds a space"),
+            JumpEntryError::UnclosedBracket(s) => format!("\"{s}\" opens a [ it does not close"),
+            JumpEntryError::TextAfterBracket(s) => format!("\"{s}\" has text after its ]"),
+            JumpEntryError::NoHost(s) => format!("\"{s}\" names no host"),
+            JumpEntryError::NotAPort(s) => format!("\"{s}\" is not a port"),
+        }
+    }
+}
+
+impl std::fmt::Display for JumpHostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Jump host {}: {}", self.number, self.why.message())
+    }
+}
+
 /// One `ProxyJump` entry — `[ssh://][user@]host[:port]`, the host bracketed
 /// when it is an IPv6 address — or why it is not one.
-fn parse_jump_host(entry: &str, default_user: &str) -> Result<SshHop, String> {
+fn parse_jump_host(entry: &str, default_user: &str) -> Result<SshHop, JumpEntryError> {
     let rest = entry.strip_prefix("ssh://").unwrap_or(entry);
     if rest.is_empty() {
-        return Err("empty — remove the extra comma".to_string());
+        return Err(JumpEntryError::Empty);
     }
     if rest.chars().any(char::is_whitespace) {
-        return Err(format!("\"{rest}\" holds a space"));
+        return Err(JumpEntryError::HoldsSpace(rest.to_string()));
     }
     // The last `@`: a user may be an email address.
     let (user, host_port) = match rest.rfind('@') {
@@ -411,13 +458,13 @@ fn parse_jump_host(entry: &str, default_user: &str) -> Result<SshHop, String> {
     };
     let (host, port) = if let Some(inner) = host_port.strip_prefix('[') {
         let Some(close) = inner.find(']') else {
-            return Err(format!("\"{host_port}\" opens a [ it does not close"));
+            return Err(JumpEntryError::UnclosedBracket(host_port.to_string()));
         };
         let after = &inner[close + 1..];
         let port = match after.strip_prefix(':') {
             Some(p) => Some(p),
             None if after.is_empty() => None,
-            None => return Err(format!("\"{host_port}\" has text after its ]")),
+            None => return Err(JumpEntryError::TextAfterBracket(host_port.to_string())),
         };
         (&inner[..close], port)
     } else {
@@ -427,13 +474,13 @@ fn parse_jump_host(entry: &str, default_user: &str) -> Result<SshHop, String> {
         }
     };
     if host.is_empty() {
-        return Err(format!("\"{entry}\" names no host"));
+        return Err(JumpEntryError::NoHost(entry.to_string()));
     }
     let port = match port {
         None => 22,
         Some(p) => match p.parse::<u16>() {
             Ok(n) if n > 0 => n,
-            _ => return Err(format!("\"{p}\" is not a port")),
+            _ => return Err(JumpEntryError::NotAPort(p.to_string())),
         },
     };
     Ok(SshHop {
@@ -3805,7 +3852,7 @@ mod tests {
             "[::1",
             "a b",
         ] {
-            let err = tunnel_via(bad).route().unwrap_err();
+            let err = tunnel_via(bad).route().unwrap_err().to_string();
             assert!(err.starts_with("Jump host"), "{bad:?}: {err}");
         }
     }

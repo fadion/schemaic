@@ -2033,6 +2033,27 @@ connections-ssh-password = SSH-Passwort
 connections-ssh-agent-hint = Das Signieren übernimmt dein laufender SSH-Agent (OpenSSH-Agent / Pageant unter Windows). Schemaic speichert keinen Schlüssel.
 connections-jump-hosts = Jump-Hosts
 connections-jump-hosts-hint = Optional. Hosts, die vor dem SSH-Host durchlaufen werden, der nächste zuerst – jeder meldet sich wie unten eingestellt an.
+connections-route-config = ~/.ssh/config: { $address }{ $key ->
+        [some] , Schlüssel { $keypath }
+       *[none] {""}
+    }{ $through ->
+        [some] , über { $jump }
+       *[none] {""}
+    }
+connections-route-jump-host = Jump-Host { $host }
+connections-route-proxy-command = ~/.ssh/config erreicht { $host } über ein ProxyCommand, das Schemaic nicht ausführen kann. Gib die Route stattdessen unter Jump-Hosts an.
+connections-route-match = ~/.ssh/config leitet { $host } womöglich über einen Match-Block, den Schemaic nicht liest. Gib die Route stattdessen unter Jump-Hosts an.
+connections-route-match-destination = ~/.ssh/config lenkt { $host } womöglich über einen Match-Block auf einen anderen Host oder Port, den Schemaic nicht liest. Gib stattdessen die Adresse selbst als SSH-Host an.
+connections-route-include = ~/.ssh/config bindet eine Datei ein, die Schemaic nicht lesen konnte, wo sie für { $host } gilt. Gib die Adresse selbst als SSH-Host an und die Route unter Jump-Hosts.
+connections-route-config-jump-password = ~/.ssh/config erreicht { $host } über { $jump }, und ein Passwort wird nur an die Hosts gesendet, die diese Verbindung nennt. Trag den Jump-Host unter Jump-Hosts ein, falls er dasselbe Passwort nimmt, oder melde dich mit einem Schlüssel oder dem SSH-Agenten an.
+connections-route-jump-own-proxy-jump = ~/.ssh/config erreicht den Jump-Host { $host } über { $jump }, und Schemaic folgt nicht dem eigenen ProxyJump eines Jump-Hosts. Gib die Route stattdessen unter Jump-Hosts an, { $jump } zuerst.
+connections-jump-host-error = Jump-Host { $number }: { $why }
+connections-jump-empty = leer — entferne das überzählige Komma
+connections-jump-space = „{ $entry }“ enthält ein Leerzeichen
+connections-jump-unclosed = „{ $entry }“ öffnet eine [, die nicht geschlossen wird
+connections-jump-after-bracket = „{ $entry }“ hat Text nach seiner ]
+connections-jump-no-host = „{ $entry }“ nennt keinen Host
+connections-jump-not-a-port = „{ $entry }“ ist kein Port
 connections-private-key = Privater Schlüssel
 connections-private-key-dialog = Privaten Schlüssel auswählen
 connections-passphrase = Passphrase

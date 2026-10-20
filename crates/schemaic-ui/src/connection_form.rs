@@ -287,7 +287,7 @@ fn jump_hosts_field(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl
             .err()
         },
         |err| match err {
-            Some(why) => text(why)
+            Some(why) => text(jump_host_error_text(&why))
                 .style(|s| {
                     s.font_size(theme::font_label())
                         .color(theme::error())
@@ -315,6 +315,83 @@ fn jump_hosts_field(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
+/// A jump host that cannot be read — core's `connection::JumpHostError` in
+/// the interface's language, under the Jump hosts field and in the SSH host's
+/// note alike.
+fn jump_host_error_text(e: &schemaic_core::connection::JumpHostError) -> String {
+    use schemaic_core::connection::JumpEntryError;
+    let reason = match &e.why {
+        JumpEntryError::Empty => tr!("connections-jump-empty"),
+        JumpEntryError::HoldsSpace(s) => tr!("connections-jump-space", entry = s.as_str()),
+        JumpEntryError::UnclosedBracket(s) => tr!("connections-jump-unclosed", entry = s.as_str()),
+        JumpEntryError::TextAfterBracket(s) => {
+            tr!("connections-jump-after-bracket", entry = s.as_str())
+        }
+        JumpEntryError::NoHost(s) => tr!("connections-jump-no-host", entry = s.as_str()),
+        JumpEntryError::NotAPort(s) => tr!("connections-jump-not-a-port", entry = s.as_str()),
+    };
+    let number = e.number.to_string();
+    tr!("connections-jump-host-error", number = number, why = reason)
+}
+
+/// The SSH host's note — core's `ssh_config::RouteNote` in the interface's
+/// language. Hosts, users, ports, key paths and jump lists pass through as
+/// the connection and the config spell them.
+fn route_note_text(note: &schemaic_core::ssh_config::RouteNote) -> String {
+    use schemaic_core::ssh_config::{RouteHost, RouteNote, RouteRefusal, UnreadRoute};
+    let has = |o: &Option<String>| if o.is_some() { "some" } else { "none" };
+    let why = match note {
+        RouteNote::Resolved {
+            user,
+            host,
+            port,
+            key,
+            through,
+        } => {
+            let address = match user {
+                Some(user) => format!("{user}@{host}:{port}"),
+                None => format!("{host}:{port}"),
+            };
+            return tr!(
+                "connections-route-config",
+                address = address,
+                key = has(key),
+                keypath = key.clone().unwrap_or_default(),
+                through = has(through),
+                jump = through.clone().unwrap_or_default()
+            );
+        }
+        RouteNote::Refused(why) => why,
+    };
+    match why {
+        RouteRefusal::JumpHost(e) => jump_host_error_text(e),
+        RouteRefusal::Unread { host, unread } => {
+            let host = match host {
+                RouteHost::Ssh(h) => h.clone(),
+                RouteHost::FirstJump(h) => tr!("connections-route-jump-host", host = h.as_str()),
+            };
+            match unread {
+                UnreadRoute::ProxyCommand => tr!("connections-route-proxy-command", host = host),
+                UnreadRoute::Match => tr!("connections-route-match", host = host),
+                UnreadRoute::MatchDestination => {
+                    tr!("connections-route-match-destination", host = host)
+                }
+                UnreadRoute::Include => tr!("connections-route-include", host = host),
+            }
+        }
+        RouteRefusal::ConfigJumpPassword { host, jump } => tr!(
+            "connections-route-config-jump-password",
+            host = host.as_str(),
+            jump = jump.as_str()
+        ),
+        RouteRefusal::JumpOwnProxyJump { host, jump } => tr!(
+            "connections-route-jump-own-proxy-jump",
+            host = host.as_str(),
+            jump = jump.as_str()
+        ),
+    }
+}
+
 /// What `~/.ssh/config` makes of the tunnel as typed — the host an alias names,
 /// and the port, user, key and jump hosts the file fills in, or the connect's
 /// refusal (`core::ssh_config::describe_route`) — or nothing when it changes nothing. The
@@ -340,6 +417,7 @@ fn ssh_config_hint(draft: DraftSignals) -> impl IntoView {
         // The route the connect builds, so the note says what it will —
         // its refusal included (`describe_route`).
         schemaic_core::ssh_config::describe_route(&tunnel, Some((text, home.as_deref())))
+            .map(|note| route_note_text(&note))
     });
     // The box collapses with the line, so an alias-free host claims no gap
     // (`widgets::collapse_unless`).
@@ -2437,6 +2515,68 @@ mod tests {
         runs_of_delta, splice_real, windows_sign_in_hint_for,
     };
     use floem::views::editor::core::xi_rope::{Interval, Rope, RopeDelta};
+
+    /// **The SSH host's note reads in English exactly as core's `RouteNote`**
+    /// — what the config makes of the tunnel with and without each optional
+    /// part, every way the route is refused, for the SSH host and the first
+    /// jump host, and every unreadable jump entry.
+    #[test]
+    fn english_says_every_route_note_as_core_does() {
+        use schemaic_core::connection::{JumpEntryError, JumpHostError};
+        use schemaic_core::ssh_config::{RouteHost, RouteNote, RouteRefusal, UnreadRoute};
+        let n = |s: &str| s.to_string();
+        let mut notes = Vec::new();
+        for user in [None, Some(n("me"))] {
+            for key in [None, Some(n("~/.ssh/id_ed25519"))] {
+                for through in [None, Some(n("edge,inner"))] {
+                    notes.push(RouteNote::Resolved {
+                        user: user.clone(),
+                        host: n("db.prod.internal"),
+                        port: 2222,
+                        key: key.clone(),
+                        through,
+                    });
+                }
+            }
+        }
+        for host in [RouteHost::Ssh(n("db")), RouteHost::FirstJump(n("edge"))] {
+            for unread in [
+                UnreadRoute::ProxyCommand,
+                UnreadRoute::Match,
+                UnreadRoute::MatchDestination,
+                UnreadRoute::Include,
+            ] {
+                notes.push(RouteNote::Refused(RouteRefusal::Unread {
+                    host: host.clone(),
+                    unread,
+                }));
+            }
+        }
+        notes.push(RouteNote::Refused(RouteRefusal::ConfigJumpPassword {
+            host: n("prod"),
+            jump: n("jump.corp"),
+        }));
+        notes.push(RouteNote::Refused(RouteRefusal::JumpOwnProxyJump {
+            host: n("edge"),
+            jump: n("outer"),
+        }));
+        for why in [
+            JumpEntryError::Empty,
+            JumpEntryError::HoldsSpace(n("a b")),
+            JumpEntryError::UnclosedBracket(n("[::1")),
+            JumpEntryError::TextAfterBracket(n("[::1]x")),
+            JumpEntryError::NoHost(n("ops@")),
+            JumpEntryError::NotAPort(n("0")),
+        ] {
+            notes.push(RouteNote::Refused(RouteRefusal::JumpHost(JumpHostError {
+                number: 2,
+                why,
+            })));
+        }
+        for note in notes {
+            assert_eq!(super::route_note_text(&note), note.to_string(), "{note:?}");
+        }
+    }
 
     /// **Every init SQL refusal reads in English exactly as core's
     /// `InitRefusal`** — each reason, a named one with its name.

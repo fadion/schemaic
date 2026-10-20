@@ -12821,7 +12821,11 @@ existing prose was left alone.
     host, a bad or zero port, an unclosed `[` — with *Jump host N: …*, because a hop dropped
     silently would connect by a route the user did not write
     (`a_jump_entry_that_cannot_be_read_refuses_the_route`); the form prints that same sentence
-    under the field as it is typed. Every hop signs in with the tunnel's own method and
+    under the field as it is typed. The refusal is a value, `JumpHostError` — the entry's 1-based
+    `number` and a `JumpEntryError` (`Empty`, `HoldsSpace`, `UnclosedBracket`, `TextAfterBracket`,
+    `NoHost`, `NotAPort`, each but the first carrying the wrong part as typed), which
+    `parse_jump_host` answers — so the SSH host's note can word it; its `Display` is the English,
+    `JumpEntryError::message` the reason after the colon. Every hop signs in with the tunnel's own method and
     credentials — one password, one key or one agent for the whole route — so a jump host needing
     a different sign-in from the SSH host cannot be described. Under password sign-in that holds
     only for hops the connection names: a jump host only `~/.ssh/config`'s `ProxyJump` supplies is
@@ -13121,7 +13125,8 @@ existing prose was left alone.
     **first** jump host's own route is not ignored, though — `resolve_route` refuses it, below,
     rather than following it or dialling around it.
     **`resolve_route(tunnel, config)` is the composition `open_tunnel` connects by** — moved out of
-    it verbatim, so that it could be tested, answering a `Route { tunnel, hops }`. With no config
+    it verbatim, so that it could be tested, answering a `Route { tunnel, hops }` or the
+    `RouteRefusal` below. With no config
     it is `route()` as typed (`a_route_without_a_config_is_the_route_as_typed`); otherwise the SSH
     host is `resolve`d and `apply`'d **before** `route()`, so a config `ProxyJump` is read by the
     same reader as typed jump hosts, then every hop but the last goes through `apply_to_hop` — the
@@ -13143,7 +13148,7 @@ existing prose was left alone.
     agent sign-in send no secret and are unaffected
     (`a_password_is_offered_only_to_hosts_the_connection_names`). And **the first jump host's own
     route** — an `unread_route`, or a non-empty `ProxyJump` of its own — refuses the whole route
-    (`first_hop_route_sentence`), with the unread-route sentence about *jump host <alias>* or
+    (`first_hop_refusal`), with the unread-route sentence about *jump host <alias>* or
     *~/.ssh/config reaches jump host <alias> through <jump>, and Schemaic does not follow a jump
     host's own ProxyJump. Give the route as Jump hosts instead, <jump> first.* It is the first hop
     alone because of how `ssh` builds the chain: `ssh -J a,b host` reaches `b` as `ssh -J a -W … b`,
@@ -13174,10 +13179,19 @@ existing prose was left alone.
     `describe_route(tunnel, config)`**, which answers `resolve_route`'s refusal where the connect
     refuses and `describe`'s line otherwise: `describe` sees only the host's own block, so the
     connect's refusal of the first jump host's own route read as *through inner* in the form
-    (`the_form_names_the_first_jump_hosts_refusal`). It reaches them through
-    the same sentence functions and `may_offer_password`, not by calling `resolve_route`. It speaks
-    only of the SSH host, so the first jump host's refusal is not among them: that one shows at
-    connect, not under the field.
+    (`the_form_names_the_first_jump_hosts_refusal`). `describe` itself reaches its refusals
+    through the same `RouteRefusal`s and `may_offer_password`, not by calling `resolve_route`, and
+    speaks only of the SSH host — which is why the first jump host's refusal comes to the form
+    through `describe_route` alone. **Both answer a value, `RouteNote`, not a sentence** —
+    `Refused(RouteRefusal)`, or `Resolved { user, host, port, key, through }` with the optional
+    parts `None` where the line leaves them off — and `RouteRefusal` is one too: `JumpHost`
+    (a `JumpHostError`, with a `From` so `route()?` reads as it did), `Unread { host, unread }`,
+    `ConfigJumpPassword { host, jump }` and `JumpOwnProxyJump { host, jump }`, where `RouteHost`
+    tells the SSH host (`Ssh`) from the first jump host (`FirstJump`, which the English calls
+    *jump host <alias>*). The connection form words them in the interface's language; each
+    `Display` is the English the connect's error still says, byte for byte the `String` it
+    replaced, and `unread_route_sentence` and `config_jump_password_sentence` survive as that
+    English. The tests here read the `Display`.
   - `init_sql.rs` — **a connection's init SQL**: the session settings `Connection::init_sql` runs on
     every connection Schemaic opens for it — a `search_path`, a time zone, a role — and `check(sql,
     dialect)`, the gate they pass first. **It is user SQL that runs with nobody confirming it, on
@@ -21821,8 +21835,9 @@ existing prose was left alone.
   last, through `apply_to_hop`; the last is the SSH host, already resolved. It also refuses,
   before any I/O, a route the file hides in a `ProxyCommand` or a `Match` block for the SSH host
   or its first jump host (whose own `ProxyJump` refuses too), and a password bound for a jump host
-  only the file names — all under that entry; the first jump host's refusal shows at connect
-  only, since the form's hint speaks of the SSH host alone. Known-hosts entries
+  only the file names — all under that entry, and the form's hint says each of them first
+  (`describe_route`). The `RouteRefusal` reaches `DbError::Connect` as its English `Display`:
+  the form words it, the connect's error does not yet. Known-hosts entries
   are therefore keyed by the **resolved** `host:port`, not the alias. The connection form keeps the
   alias in its field and says what it became on a line under it (`ssh_config_hint`, under
   `connection_form.rs`) — from its own read of the file, taken when the tunnel's fields are built,
@@ -26408,20 +26423,20 @@ existing prose was left alone.
     **The SSH box's *Jump hosts* field (`jump_hosts_field`) checks itself with the tunnel's own
     parser.** It sits after SSH user at tabindex 125, in the gap before the Authentication
     dropdown's 130, a mono field with the placeholder *user@bastion:22, inner*. Under it is
-    `SshTunnel::route`'s error as typed, in `theme::error()`, or else the hint *"Optional. Hosts to
+    `SshTunnel::route`'s error as typed (`jump_host_error_text`), in `theme::error()`, or else the hint *"Optional. Hosts to
     pass through before the SSH host, nearest first — each signs in the way set below."* — the same
     function `open_tunnel` connects by, so the form cannot pass a route the connect then refuses,
     or the reverse. `DraftSignals::ssh_jump` is threaded through create, load and `to_connection`,
     and the effect that resets a prior Test result tracks it, as it does every other SSH field.
     **Under the SSH host/port row, `ssh_config_hint` says what `~/.ssh/config` makes of the tunnel**
-    — `core::ssh_config::describe`'s line, so a host typed as an alias shows the `HostName`, port,
-    user, key and jump hosts the connect will actually use — or, where the connect would refuse
-    the route the file gives it, that refusal's sentence. Only the SSH host's, though: a route the
-    file gives the first jump host is refused at connect, not under the field. The row and the hint share an inner
+    — `core::ssh_config::describe_route`'s `RouteNote`, worded by `route_note_text`, so a host typed
+    as an alias shows the `HostName`, port, user, key and jump hosts the connect will actually use
+    — or, where the connect would refuse the route, that refusal, the first jump host's own route
+    included. The row and the hint share an inner
     `v_stack` at 6px, as the Database field's hint sits under its field, rather than standing in the
     SSH box's 20px gap. **The file is read once, when the tunnel's fields are built** — the `on`
     arm of `network_fields`' `dyn_container`, so reopening the form or toggling the tunnel off and on
-    — and `describe` is memoised over the draft's trimmed host, port, user, auth, key path and jump,
+    — and `describe_route` is memoised over the draft's trimmed host, port, user, auth, key path and jump,
     so typing re-resolves against that text without touching the disk. The trade is that an edit to
     the file shows here only on that rebuild, while the tunnel itself re-reads per connect. The
     label is `widgets::collapse_unless`'d on the line being `Some`, not merely emptied: a host the
@@ -26519,13 +26534,24 @@ existing prose was left alone.
     `connections-init-*` message inside `connections-init-refused`'s `$statement`/`$why` framing,
     held to `InitRefusal`'s `Display` for every reason by
     `english_says_every_init_refusal_as_core_does`. The statement's preview and the lower-cased
-    setting names it carries are SQL, and are not translated. What stays
+    setting names it carries are SQL, and are not translated. The SSH host's note is the same move
+    again: `ssh_config_hint` used to show `ssh_config::describe_route`'s finished English, and
+    `route_note_text` now maps the `RouteNote` — `connections-route-config`, whose `$key` and
+    `$through` selectors take `some`/`none`, for the resolved line;
+    `connections-route-proxy-command`, `-match`, `-match-destination` and `-include` for an
+    unread route, about `connections-route-jump-host`'s phrase where the first jump host is the
+    one refused; `-config-jump-password` and `-jump-own-proxy-jump`; and
+    `connections-jump-host-error` around a `connections-jump-*` reason — held to the `Display`s for
+    every resolved combination, every unread route for both hosts, both other refusals and every
+    `JumpEntryError` by `english_says_every_route_note_as_core_does`. Hosts, users, ports, key
+    paths and jump lists pass through as the connection and the config spell them. What stays
     English: the Type picker's engine names (`DbKind::label`), which are product names and are also
     what is persisted as `Connection::db_type` and read by `default_port`/`is_networked`; the
     samples `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules'
     sentences — `connection`'s `AuthMode::transport_refusal`, which never reaches this form
     (`external_client_refusal`, which never did either, is a `launch::Refusal` the app words now),
-    `ssh_config::describe_route`, `SshTunnel::route`'s error and `lib.rs`'s `TestLine::text`.
+    and `lib.rs`'s `TestLine::text`. `SshTunnel::route`'s `JumpHostError` is worded by
+    `jump_host_error_text`, under the Jump hosts field and inside the SSH host's note alike.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import connections" — it was
     "Import from another client", which misled once the modal read Schemaic's own exports and

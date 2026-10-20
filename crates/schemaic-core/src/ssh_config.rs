@@ -367,11 +367,14 @@ pub fn apply(
 /// changes nothing ([`apply`] answers the tunnel as it was). A route the
 /// config hides where the connection names no jump hosts is said instead, in
 /// the sentence the connect refuses with ([`resolve_route`]).
-pub fn describe(tunnel: &crate::connection::SshTunnel, cfg: &SshConfigHost) -> Option<String> {
+pub fn describe(tunnel: &crate::connection::SshTunnel, cfg: &SshConfigHost) -> Option<RouteNote> {
     if let Some(unread) = cfg.unread_route
         && !(!tunnel.jump.trim().is_empty() && unread.settled_by_typed_jumps())
     {
-        return Some(unread_route_sentence(&tunnel.host, unread));
+        return Some(RouteNote::Refused(RouteRefusal::Unread {
+            host: RouteHost::Ssh(tunnel.host.clone()),
+            unread,
+        }));
     }
     let t = apply(tunnel, cfg);
     if t == *tunnel {
@@ -382,21 +385,19 @@ pub fn describe(tunnel: &crate::connection::SshTunnel, cfg: &SshConfigHost) -> O
         && t.auth == crate::connection::SshAuth::Password
         && !may_offer_password(HopOrigin::Config)
     {
-        return Some(config_jump_password_sentence(&tunnel.host, &t.jump));
+        return Some(RouteNote::Refused(RouteRefusal::ConfigJumpPassword {
+            host: tunnel.host.clone(),
+            jump: t.jump.clone(),
+        }));
     }
     let user = t.user.trim();
-    let mut out = if user.is_empty() {
-        format!("~/.ssh/config: {}:{}", t.host, t.port)
-    } else {
-        format!("~/.ssh/config: {user}@{}:{}", t.host, t.port)
-    };
-    if t.key_path != tunnel.key_path {
-        out.push_str(&format!(", key {}", t.key_path));
-    }
-    if t.jump != tunnel.jump && !t.jump.is_empty() {
-        out.push_str(&format!(", through {}", t.jump));
-    }
-    Some(out)
+    Some(RouteNote::Resolved {
+        user: (!user.is_empty()).then(|| user.to_string()),
+        host: t.host.clone(),
+        port: t.port,
+        key: (t.key_path != tunnel.key_path).then(|| t.key_path.clone()),
+        through: (t.jump != tunnel.jump && !t.jump.is_empty()).then(|| t.jump.clone()),
+    })
 }
 
 /// The connection form's note under the SSH host, from the **route the
@@ -408,12 +409,119 @@ pub fn describe(tunnel: &crate::connection::SshTunnel, cfg: &SshConfigHost) -> O
 pub fn describe_route(
     tunnel: &crate::connection::SshTunnel,
     config: Option<(&str, Option<&str>)>,
-) -> Option<String> {
+) -> Option<RouteNote> {
     let (text, home) = config?;
     if let Err(why) = resolve_route(tunnel, Some((text, home))) {
-        return Some(why);
+        return Some(RouteNote::Refused(why));
     }
     describe(tunnel, &resolve(text, &tunnel.host, home))
+}
+
+/// The connection form's note under the SSH host ([`describe_route`]), as a
+/// value: the form words it in the interface's language, and `Display` is the
+/// English. Hosts, users, ports, key paths and jump lists pass through as the
+/// connection and the config spell them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteNote {
+    /// The connect would refuse the route.
+    Refused(RouteRefusal),
+    /// What the config makes of the tunnel: `user@host:port`, then the key
+    /// and the jump hosts where the config supplied them.
+    Resolved {
+        user: Option<String>,
+        host: String,
+        port: u16,
+        key: Option<String>,
+        through: Option<String>,
+    },
+}
+
+impl std::fmt::Display for RouteNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouteNote::Refused(why) => write!(f, "{why}"),
+            RouteNote::Resolved {
+                user,
+                host,
+                port,
+                key,
+                through,
+            } => {
+                match user {
+                    Some(user) => write!(f, "~/.ssh/config: {user}@{host}:{port}")?,
+                    None => write!(f, "~/.ssh/config: {host}:{port}")?,
+                }
+                if let Some(key) = key {
+                    write!(f, ", key {key}")?;
+                }
+                if let Some(through) = through {
+                    write!(f, ", through {through}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Why a tunnel's route cannot be built ([`resolve_route`]) — the connect's
+/// refusal and the form's note alike. `Display` is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteRefusal {
+    /// A jump host the connection names cannot be read.
+    JumpHost(crate::connection::JumpHostError),
+    /// The config hides `host`'s route or destination where Schemaic cannot
+    /// follow it.
+    Unread {
+        host: RouteHost,
+        unread: UnreadRoute,
+    },
+    /// Password sign-in, and the config alone supplies the jump hosts.
+    ConfigJumpPassword { host: String, jump: String },
+    /// The first jump host's own `ProxyJump`, which is not followed.
+    JumpOwnProxyJump { host: String, jump: String },
+}
+
+/// Which host a refusal is about: the SSH host, or the first jump host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteHost {
+    Ssh(String),
+    FirstJump(String),
+}
+
+impl RouteHost {
+    /// The host as the English names it.
+    fn english(&self) -> String {
+        match self {
+            RouteHost::Ssh(h) => h.clone(),
+            RouteHost::FirstJump(h) => format!("jump host {h}"),
+        }
+    }
+}
+
+impl From<crate::connection::JumpHostError> for RouteRefusal {
+    fn from(e: crate::connection::JumpHostError) -> Self {
+        RouteRefusal::JumpHost(e)
+    }
+}
+
+impl std::fmt::Display for RouteRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouteRefusal::JumpHost(e) => write!(f, "{e}"),
+            RouteRefusal::Unread { host, unread } => {
+                f.write_str(&unread_route_sentence(&host.english(), *unread))
+            }
+            RouteRefusal::ConfigJumpPassword { host, jump } => {
+                f.write_str(&config_jump_password_sentence(host, jump))
+            }
+            RouteRefusal::JumpOwnProxyJump { host, jump } => write!(
+                f,
+                "~/.ssh/config reaches jump host {host} through {jump}, and Schemaic does not \
+                 follow a jump host's own ProxyJump. Give the route as Jump hosts instead, \
+                 {jump} first."
+            ),
+        }
+    }
 }
 
 /// A jump host as `~/.ssh/config` completes it: its `HostName`, and the
@@ -451,11 +559,11 @@ pub struct Route {
 /// again — takes its own `HostName` and port. A hop's user is the resolved
 /// tunnel's where the entry names none.
 ///
-/// `Err` with the sentence the connect shows when the route cannot be built.
+/// `Err` with why, when the route cannot be built — the connect's refusal.
 pub fn resolve_route(
     tunnel: &crate::connection::SshTunnel,
     config: Option<(&str, Option<&str>)>,
-) -> Result<Route, String> {
+) -> Result<Route, RouteRefusal> {
     let Some((text, home)) = config else {
         return Ok(Route {
             hops: tunnel.route()?,
@@ -467,7 +575,10 @@ pub fn resolve_route(
     if let Some(unread) = found.unread_route
         && !(typed_jumps && unread.settled_by_typed_jumps())
     {
-        return Err(unread_route_sentence(&tunnel.host, unread));
+        return Err(RouteRefusal::Unread {
+            host: RouteHost::Ssh(tunnel.host.clone()),
+            unread,
+        });
     }
     let resolved = apply(tunnel, &found);
     let mut hops = resolved.route()?;
@@ -481,12 +592,15 @@ pub fn resolve_route(
         && resolved.auth == crate::connection::SshAuth::Password
         && !may_offer_password(jump_origin)
     {
-        return Err(config_jump_password_sentence(&tunnel.host, &resolved.jump));
+        return Err(RouteRefusal::ConfigJumpPassword {
+            host: tunnel.host.clone(),
+            jump: resolved.jump.clone(),
+        });
     }
     for (i, hop) in hops.iter_mut().take(jumps).enumerate() {
         let found = resolve(text, &hop.host, home);
         if i == 0
-            && let Some(why) = first_hop_route_sentence(&hop.host, &found)
+            && let Some(why) = first_hop_refusal(&hop.host, &found)
         {
             return Err(why);
         }
@@ -533,17 +647,17 @@ fn config_jump_password_sentence(alias: &str, jump: &str) -> String {
 /// taken; but it dials `a` as `ssh a` would, by `a`'s own route. That route is
 /// not followed here — so one the config gives (an explicit `none` aside) is
 /// refused rather than dialled around.
-fn first_hop_route_sentence(alias: &str, cfg: &SshConfigHost) -> Option<String> {
-    let alias = format!("jump host {alias}");
+fn first_hop_refusal(alias: &str, cfg: &SshConfigHost) -> Option<RouteRefusal> {
     if let Some(unread) = cfg.unread_route {
-        return Some(unread_route_sentence(&alias, unread));
+        return Some(RouteRefusal::Unread {
+            host: RouteHost::FirstJump(alias.to_string()),
+            unread,
+        });
     }
     let jump = cfg.proxy_jump.as_deref().map(str::trim).unwrap_or("");
-    (!jump.is_empty()).then(|| {
-        format!(
-            "~/.ssh/config reaches {alias} through {jump}, and Schemaic does not follow a jump \
-             host's own ProxyJump. Give the route as Jump hosts instead, {jump} first."
-        )
+    (!jump.is_empty()).then(|| RouteRefusal::JumpOwnProxyJump {
+        host: alias.to_string(),
+        jump: jump.to_string(),
     })
 }
 
@@ -964,7 +1078,7 @@ Host *
             ..SshTunnel::default()
         };
         assert_eq!(
-            describe(&open, &cfg()).as_deref(),
+            describe(&open, &cfg()).map(|n| n.to_string()).as_deref(),
             Some(
                 "~/.ssh/config: deploy@db.prod.internal:2222, key /home/me/.ssh/prod, through bastion"
             )
@@ -977,7 +1091,7 @@ Host *
             ..open.clone()
         };
         assert_eq!(
-            describe(&stated, &cfg()).as_deref(),
+            describe(&stated, &cfg()).map(|n| n.to_string()).as_deref(),
             Some("~/.ssh/config: me@db.prod.internal:2222")
         );
     }
@@ -1000,7 +1114,9 @@ Host *
             ..SshConfigHost::default()
         };
         assert_eq!(
-            describe(&open_tunnel(), &c).as_deref(),
+            describe(&open_tunnel(), &c)
+                .map(|n| n.to_string())
+                .as_deref(),
             Some("~/.ssh/config: real.example:22")
         );
     }
@@ -1117,7 +1233,9 @@ Host *
             );
             let mut t = tunnel("db", crate::connection::SshAuth::KeyPair);
             t.jump = "edge".into();
-            let why = resolve_route(&t, Some((text, None))).expect_err(text);
+            let why = resolve_route(&t, Some((text, None)))
+                .expect_err(text)
+                .to_string();
             assert!(why.contains("Match"), "{why}");
         }
         // Set first by a Host block, it is settled: a later Match cannot move it.
@@ -1197,7 +1315,9 @@ Host *
         let text =
             "Host db\n  ProxyJump inner\nHost inner\n  HostName 10.0.0.2\n  ProxyJump outer\n";
         let t = tunnel("db", crate::connection::SshAuth::KeyPair);
-        let note = describe_route(&t, Some((text, None))).expect("a note");
+        let note = describe_route(&t, Some((text, None)))
+            .expect("a note")
+            .to_string();
         assert!(
             note.contains("does not follow a jump host's own ProxyJump"),
             "{note}"
@@ -1205,7 +1325,9 @@ Host *
         // A route that builds keeps the ordinary line.
         let fine = "Host db\n  HostName 10.0.0.9\n";
         assert_eq!(
-            describe_route(&t, Some((fine, None))).as_deref(),
+            describe_route(&t, Some((fine, None)))
+                .map(|n| n.to_string())
+                .as_deref(),
             Some("~/.ssh/config: me@10.0.0.9:22")
         );
         assert_eq!(describe_route(&t, None), None);
@@ -1275,10 +1397,14 @@ Host *
         use crate::connection::SshAuth;
         let text = "Host db\n  HostName 10.1.2.3\n  ProxyCommand ssh -W %h:%p bastion\n";
         let t = tunnel("db", SshAuth::KeyPair);
-        let why = resolve_route(&t, Some((text, None))).unwrap_err();
+        let why = resolve_route(&t, Some((text, None)))
+            .unwrap_err()
+            .to_string();
         assert!(why.contains("ProxyCommand"), "{why}");
         assert!(why.contains("Jump hosts"), "{why}");
-        let m = resolve_route(&t, Some(("Match all\n  ProxyJump edge\n", None))).unwrap_err();
+        let m = resolve_route(&t, Some(("Match all\n  ProxyJump edge\n", None)))
+            .unwrap_err()
+            .to_string();
         assert!(m.contains("Match"), "{m}");
         // Jump hosts the connection names are its route, whatever the config
         // would have done.
@@ -1312,7 +1438,9 @@ Host *
                     (typed, text.to_string()),
                     (tunnel("db", SshAuth::KeyPair), config),
                 ] {
-                    let why = resolve_route(&t, Some((&text, None))).unwrap_err();
+                    let why = resolve_route(&t, Some((&text, None)))
+                        .unwrap_err()
+                        .to_string();
                     assert!(why.contains("jump host edge"), "{text}: {why}");
                     assert!(why.contains(says), "{text}: {why}");
                     assert!(why.contains("Jump hosts"), "{text}: {why}");
@@ -1363,8 +1491,9 @@ Host *
         let text = "Host prod\n  ProxyJump jump.corp\n";
         // Password sign-in through a jump host only the config names: refused
         // before anything is dialled, rather than sending prod's password there.
-        let why =
-            resolve_route(&tunnel("prod", SshAuth::Password), Some((text, None))).unwrap_err();
+        let why = resolve_route(&tunnel("prod", SshAuth::Password), Some((text, None)))
+            .unwrap_err()
+            .to_string();
         assert!(why.contains("jump.corp"), "{why}");
         assert!(why.contains("Jump hosts"), "{why}");
         // A key or the agent sends no secret, so the config's jump stands.
@@ -1389,9 +1518,13 @@ Host *
         );
         // The form says so before the connect does.
         let found = resolve(text, "prod", None);
-        let note = describe(&tunnel("prod", SshAuth::Password), &found).unwrap();
+        let note = describe(&tunnel("prod", SshAuth::Password), &found)
+            .unwrap()
+            .to_string();
         assert!(note.contains("password is sent only"), "{note}");
-        let keyed = describe(&tunnel("prod", SshAuth::KeyPair), &found).unwrap();
+        let keyed = describe(&tunnel("prod", SshAuth::KeyPair), &found)
+            .unwrap()
+            .to_string();
         assert!(keyed.ends_with("through jump.corp"), "{keyed}");
     }
 
@@ -1402,14 +1535,19 @@ Host *
             unread_route: Some(UnreadRoute::ProxyCommand),
             ..SshConfigHost::default()
         };
-        let d = describe(&open_tunnel(), &c).unwrap();
+        let d = describe(&open_tunnel(), &c).unwrap().to_string();
         assert!(d.contains("ProxyCommand"), "{d}");
         // Said even when the config changes nothing else.
         let only = SshConfigHost {
             unread_route: Some(UnreadRoute::Match),
             ..SshConfigHost::default()
         };
-        assert!(describe(&open_tunnel(), &only).unwrap().contains("Match"));
+        assert!(
+            describe(&open_tunnel(), &only)
+                .unwrap()
+                .to_string()
+                .contains("Match")
+        );
         // Not when the connection names its own jump hosts.
         let mut typed = open_tunnel();
         typed.jump = "edge".into();

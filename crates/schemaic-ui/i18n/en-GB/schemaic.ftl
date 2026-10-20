@@ -1874,6 +1874,36 @@ connections-ssh-password = SSH password
 connections-ssh-agent-hint = Signing is delegated to your running SSH agent (OpenSSH agent / Pageant on Windows). No key is stored by Schemaic.
 connections-jump-hosts = Jump hosts
 connections-jump-hosts-hint = Optional. Hosts to pass through before the SSH host, nearest first — each signs in the way set below.
+# The note under the SSH host (core's ssh_config::RouteNote; a test holds the
+# English equal). Hosts, users, ports, key paths and jump lists are as the
+# connection and ~/.ssh/config spell them. $address is user@host:port;
+# $key and $through are "some" or "none" for the optional key path ($keypath)
+# and jump hosts ($jump) the config supplied.
+connections-route-config = ~/.ssh/config: { $address }{ $key ->
+        [some] , key { $keypath }
+       *[none] {""}
+    }{ $through ->
+        [some] , through { $jump }
+       *[none] {""}
+    }
+# Why the connect would refuse the route. $host is the SSH host, or
+# connections-route-jump-host for the first jump host; $jump a jump list.
+connections-route-jump-host = jump host { $host }
+connections-route-proxy-command = ~/.ssh/config reaches { $host } through a ProxyCommand, which Schemaic cannot run. Give the route as Jump hosts instead.
+connections-route-match = ~/.ssh/config may route { $host } through a Match block, which Schemaic does not read. Give the route as Jump hosts instead.
+connections-route-match-destination = ~/.ssh/config may point { $host } at another host or port through a Match block, which Schemaic does not read. Give the address itself as the SSH host instead.
+connections-route-include = ~/.ssh/config includes a file Schemaic could not read where it applies to { $host }. Give the address itself as the SSH host, and the route as Jump hosts.
+connections-route-config-jump-password = ~/.ssh/config reaches { $host } through { $jump }, and a password is sent only to the hosts this connection names. Add the jump host to Jump hosts if it takes the same password, or sign in with a key or the SSH agent.
+connections-route-jump-own-proxy-jump = ~/.ssh/config reaches jump host { $host } through { $jump }, and Schemaic does not follow a jump host's own ProxyJump. Give the route as Jump hosts instead, { $jump } first.
+# A jump host that cannot be read: $number its place in the list, $why one of
+# the reasons below, $entry the part of it that is wrong as it was typed.
+connections-jump-host-error = Jump host { $number }: { $why }
+connections-jump-empty = empty — remove the extra comma
+connections-jump-space = "{ $entry }" holds a space
+connections-jump-unclosed = "{ $entry }" opens a [ it does not close
+connections-jump-after-bracket = "{ $entry }" has text after its ]
+connections-jump-no-host = "{ $entry }" names no host
+connections-jump-not-a-port = "{ $entry }" is not a port
 connections-private-key = Private key
 connections-private-key-dialog = Select private key
 connections-passphrase = Passphrase

@@ -436,7 +436,7 @@ pub async fn open_tunnel(
             .as_ref()
             .map(|(text, home)| (text.as_str(), home.as_deref())),
     )
-    .map_err(DbError::Connect)?;
+    .map_err(|why| DbError::Connect(why.to_string()))?;
     let ssh = &resolved;
     let mut sessions: Vec<client::Handle<TunnelClient>> = Vec::with_capacity(route.len());
     for hop in &route {
