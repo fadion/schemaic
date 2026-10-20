@@ -1256,6 +1256,25 @@ pub struct StatementTimeout {
     pub per_connection: bool,
 }
 
+impl StatementTimeout {
+    /// What a run this timeout cancelled says, in English — the setting in
+    /// the dropdown's own words (`persist::statement_timeout_label`) and
+    /// where to change it. The error's `text`, which *Explain* sends and the
+    /// write log keeps; the window says it in its own language.
+    pub fn cancelled_message(self) -> String {
+        let timeout = crate::persist::statement_timeout_label(self.secs);
+        let place = if self.per_connection {
+            "this connection's settings"
+        } else {
+            "Settings → Query"
+        };
+        format!(
+            "Cancelled: the statement ran longer than the {timeout} statement timeout. \
+             Change or turn it off in {place}."
+        )
+    }
+}
+
 /// Redacting, for [`SshTunnel`]'s reasons — the DB password here, and the two
 /// the `ssh` field carries, which reach this output through its own impl.
 impl std::fmt::Debug for Connection {

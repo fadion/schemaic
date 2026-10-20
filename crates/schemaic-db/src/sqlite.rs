@@ -1767,15 +1767,28 @@ pub(crate) async fn run_ddl(
     // that exists between two statements of a script they may not have read. The
     // engine's message is otherwise the most useful thing there is, so only the
     // name is changed (`ddl::unshadow`).
-    let fail = |at: usize, message: String| crate::DdlError {
-        message: schemaic_core::ddl::unshadow(&message),
+    use crate::DdlCause;
+    let unshadow = schemaic_core::ddl::unshadow;
+    let fail = |at: usize, cause: DdlCause| crate::DdlError {
+        cause: match cause {
+            DdlCause::Server(m) => DdlCause::Server(unshadow(&m)),
+            DdlCause::DanglingForeignKey { row } => DdlCause::DanglingForeignKey {
+                row: unshadow(&row),
+            },
+            DdlCause::BreaksView { view, why } => DdlCause::BreaksView {
+                view: unshadow(&view),
+                why: unshadow(&why),
+            },
+            other => other,
+        },
         at,
         applied: 0,
     };
+    let server = |e: &dyn std::fmt::Display| DdlCause::Server(e.to_string());
     if stmts.is_empty() {
         return Ok(());
     }
-    let conn = tokio::task::block_in_place(|| open(db)).map_err(|e| fail(0, format!("{e}")))?;
+    let conn = tokio::task::block_in_place(|| open(db)).map_err(|e| fail(0, server(&e)))?;
 
     // **Stop reaches a statement already running.** The preview offers Stop for
     // SQLite — `ddl_rolls_back_as_a_whole(Sqlite)` is true, so the footer's only
@@ -1803,7 +1816,7 @@ pub(crate) async fn run_ddl(
 
     let out = tokio::task::block_in_place(|| {
         if cancel.is_cancelled() {
-            return Err(fail(0, "the plan was cancelled".into()));
+            return Err(fail(0, DdlCause::Cancelled));
         }
         // **Enforcement off for the duration, and verified before the commit.**
         // Outside the transaction, because SQLite ignores this pragma inside
@@ -1858,14 +1871,14 @@ pub(crate) async fn run_ddl(
         let broken_before = broken_views(&conn);
 
         conn.execute_batch("BEGIN")
-            .map_err(|e| fail(0, format!("{e}")))?;
+            .map_err(|e| fail(0, server(&e)))?;
 
         // Any early return past this point must undo the transaction, so the
         // body runs to a result first and the rollback is applied to it once.
         let result = (|| -> Result<(), crate::DdlError> {
             for (i, sql) in stmts.iter().enumerate() {
                 if cancel.is_cancelled() {
-                    return Err(fail(i, "the plan was cancelled".into()));
+                    return Err(fail(i, DdlCause::Cancelled));
                 }
                 conn.execute_batch(sql).map_err(|e| {
                     // An interrupt surfaces as an ordinary error, so the token
@@ -1873,16 +1886,16 @@ pub(crate) async fn run_ddl(
                     // as a failure would name the user's own Stop as a fault in
                     // the plan. `run_script`'s arm models the same thing.
                     if cancel.is_cancelled() {
-                        fail(i, "the plan was cancelled".into())
+                        fail(i, DdlCause::Cancelled)
                     } else {
-                        fail(i, format!("{e}"))
+                        fail(i, server(&e))
                     }
                 })?;
             }
             // The last statement's index, so a violation is reported against the
             // plan rather than against nothing.
             let last = stmts.len() - 1;
-            let now = fk_violations(&conn).map_err(|e| fail(last, format!("{e}")))?;
+            let now = fk_violations(&conn).map_err(|e| fail(last, server(&e)))?;
             // Only what the plan *added*. A row that was already dangling before
             // `BEGIN` came with the file, and refusing for it would take the whole
             // DDL feature away from a database whose bad row has nothing to do
@@ -1890,17 +1903,18 @@ pub(crate) async fn run_ddl(
             if let Some(row) = now.added_since(&inherited) {
                 return Err(fail(
                     last,
-                    format!("the plan leaves a foreign key pointing at nothing: {row}"),
+                    DdlCause::DanglingForeignKey {
+                        row: row.to_string(),
+                    },
                 ));
             }
             if let Some((view, why)) = first_newly_broken_view(&conn, &broken_before) {
                 return Err(fail(
                     last,
-                    format!(
-                        "the plan would break the view {view}, which reads a column it \
-                         renames or drops ({why}). Nothing was changed. Edit or drop the \
-                         view first."
-                    ),
+                    DdlCause::BreaksView {
+                        view: view.to_string(),
+                        why: why.to_string(),
+                    },
                 ));
             }
             Ok(())
@@ -1909,14 +1923,17 @@ pub(crate) async fn run_ddl(
         match result {
             Ok(()) => conn
                 .execute_batch("COMMIT")
-                .map_err(|e| fail(stmts.len() - 1, format!("{e}"))),
+                .map_err(|e| fail(stmts.len() - 1, server(&e))),
             Err(e) => {
                 // Reported only if the rollback itself fails — the original
                 // error is the one worth surfacing.
                 match conn.execute_batch("ROLLBACK") {
                     Ok(()) => Err(e),
                     Err(u) => Err(crate::DdlError {
-                        message: format!("{} — and the rollback failed too: {u}", e.message),
+                        cause: DdlCause::RollbackFailed {
+                            cause: Box::new(e.cause),
+                            rollback: u.to_string(),
+                        },
                         at: e.at,
                         applied: 0,
                     }),
@@ -10955,9 +10972,8 @@ mod rebuild_fk_tests {
         // in the plan: `SQLITE_INTERRUPT` arrives as an ordinary error, so the
         // token is the only thing that tells the two apart.
         assert!(
-            err.message.contains("cancelled"),
-            "the interrupt was reported as a failure: {}",
-            err.message
+            err.message().contains("cancelled"),
+            "the interrupt was reported as a failure: {err}"
         );
         // Rolled back whole, which is what this engine's arm promises.
         let rows: i64 = keeper

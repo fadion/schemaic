@@ -5830,28 +5830,6 @@ fn unpinnable_mode(back: &str) -> DbError {
     ))
 }
 
-/// `DbError` isn't `Clone`; this reproduces one for the "connect failed"
-/// fan-out below.
-///
-/// **Here rather than in the dispatcher**, where it sat until its only caller
-/// moved: `lib.rs`'s own rule is that what stays there is what more than one
-/// engine reads, and this is read by one. It was widened to `pub(crate)` to
-/// survive the extraction instead, which is the shape that rule exists to
-/// refuse. Private again, and the compiler proves that is complete.
-fn err_clone(e: &DbError) -> DbError {
-    match e {
-        DbError::Connect(s) => DbError::Connect(s.clone()),
-        DbError::Query(s) => DbError::Query(s.clone()),
-        DbError::QueryAt { message, at } => DbError::QueryAt {
-            message: message.clone(),
-            at: *at,
-        },
-        DbError::Cancelled => DbError::Cancelled,
-        DbError::Refused(s) => DbError::Refused(s.clone()),
-        DbError::Write(f) => DbError::Write(f.clone()),
-    }
-}
-
 /// Run `stmts` in order on **one** connection, reporting each result as it lands.
 ///
 /// **It takes `scope` where [`crate::pg::run_batch`] does not**, and the extra
@@ -5895,7 +5873,7 @@ pub(crate) async fn run_batch(
                 on_result(
                     i,
                     if i == 0 {
-                        Err(err_clone(&e))
+                        Err(e.clone())
                     } else {
                         Err(DbError::Cancelled)
                     },

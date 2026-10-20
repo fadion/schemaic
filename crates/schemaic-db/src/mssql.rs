@@ -3941,14 +3941,14 @@ pub(crate) async fn run_server_ddl(
     stmts: &[String],
     cancel: CancellationToken,
 ) -> Result<(), crate::DdlError> {
-    let fail = |at: usize, message: String| crate::DdlError {
-        message,
+    let fail = |at: usize, cause: crate::DdlCause| crate::DdlError {
+        cause,
         at,
         applied: at,
     };
     let mut client = connect(db, Some("master"))
         .await
-        .map_err(|e| fail(0, err_text(e)))?;
+        .map_err(|e| fail(0, ddl_cause(e)))?;
     for (i, sql) in stmts.iter().enumerate() {
         let step = {
             let run = drain(&mut client, sql);
@@ -3959,10 +3959,10 @@ pub(crate) async fn run_server_ddl(
         };
         match step {
             Some(Ok(())) => {}
-            Some(Err(e)) => return Err(fail(i, err_text(e))),
+            Some(Err(e)) => return Err(fail(i, ddl_cause(e))),
             None => {
                 attention(&mut client).await;
-                return Err(fail(i, "cancelled".to_string()));
+                return Err(fail(i, crate::DdlCause::Cancelled));
             }
         }
     }
@@ -4112,8 +4112,8 @@ pub(crate) async fn run_ddl(
     whole: bool,
     cancel: CancellationToken,
 ) -> Result<(), crate::DdlError> {
-    let fail = |at: usize, message: String| crate::DdlError {
-        message,
+    let fail = |at: usize, cause: crate::DdlCause| crate::DdlError {
+        cause,
         at,
         applied: if whole {
             0
@@ -4123,11 +4123,11 @@ pub(crate) async fn run_ddl(
     };
     let mut client = connect(db, Some(database))
         .await
-        .map_err(|e| fail(0, err_text(e)))?;
+        .map_err(|e| fail(0, ddl_cause(e)))?;
     if whole {
         drain(&mut client, "BEGIN TRANSACTION")
             .await
-            .map_err(|e| fail(0, err_text(e)))?;
+            .map_err(|e| fail(0, ddl_cause(e)))?;
     }
     // Best-effort, as on the other engines: a plan that waits behind another
     // session's lock gives up rather than hanging the modal.
@@ -4146,13 +4146,13 @@ pub(crate) async fn run_ddl(
                 if whole {
                     let _ = rollback(&mut client).await;
                 }
-                return Err(fail(i, err_text(e)));
+                return Err(fail(i, ddl_cause(e)));
             }
             None => {
                 if attention(&mut client).await && whole {
                     let _ = rollback(&mut client).await;
                 }
-                return Err(fail(i, "cancelled".to_string()));
+                return Err(fail(i, crate::DdlCause::Cancelled));
             }
         }
     }
@@ -4161,7 +4161,7 @@ pub(crate) async fn run_ddl(
     }
     if let Err(e) = drain(&mut client, "COMMIT TRANSACTION").await {
         let _ = rollback(&mut client).await;
-        return Err(fail(stmts.len().saturating_sub(1), err_text(e)));
+        return Err(fail(stmts.len().saturating_sub(1), ddl_cause(e)));
     }
     Ok(())
 }
@@ -5283,6 +5283,12 @@ fn err_text(e: DbError) -> String {
         DbError::Query(m) | DbError::Connect(m) | DbError::Refused(m) => m,
         other => other.to_string(),
     }
+}
+
+/// A DDL step's failure: the server's words, as [`err_text`] takes them off
+/// the error.
+fn ddl_cause(e: DbError) -> crate::DdlCause {
+    crate::DdlCause::Server(err_text(e))
 }
 
 /// A failed step's error, the server's words `msg`, with what the rollback

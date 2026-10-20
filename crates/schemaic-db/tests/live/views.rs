@@ -70,7 +70,9 @@ pub async fn an_introspected_view_diffs_to_nothing_against_its_own_draft(target:
         .unwrap_or_else(|e| {
             panic!(
                 "{}: re-applying the server's own view failed at statement {} of {stmts:?}: {}",
-                target.name, e.at, e.message
+                target.name,
+                e.at,
+                e.message()
             )
         });
 
@@ -526,7 +528,9 @@ async fn assert_writes_back_unchanged(scratch: &Scratch, target: &Target, what: 
             panic!(
                 "{}: re-applying the server's own view after {what} failed at \
                  statement {} of {stmts:?}: {}",
-                target.name, e.at, e.message
+                target.name,
+                e.at,
+                e.message()
             )
         });
 

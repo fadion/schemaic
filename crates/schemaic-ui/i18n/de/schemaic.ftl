@@ -440,6 +440,16 @@ error-modal-explain = Erklären
 db-query-failed = Abfrage fehlgeschlagen: { $error }
 db-connection-failed = Verbindung fehlgeschlagen: { $error }
 db-query-cancelled = Abfrage abgebrochen
+ddl-statement-failed = Anweisung { $n } fehlgeschlagen: { $error }
+ddl-already-applied = { $n ->
+    [one] { $failed } — { $n } vorherige Anweisung ist bereits angewendet und lässt sich nicht zurückrollen
+   *[other] { $failed } — { $n } vorherige Anweisungen sind bereits angewendet und lassen sich nicht zurückrollen
+}
+ddl-cancelled = der Plan wurde abgebrochen
+ddl-dangling-foreign-key = der Plan hinterlässt einen Fremdschlüssel, der ins Leere zeigt: { $row }
+ddl-breaks-view = der Plan würde die Sicht { $view } beschädigen, die eine Spalte liest, die er umbenennt oder entfernt ({ $why }). Es wurde nichts geändert. Bearbeite oder entferne zuerst die Sicht.
+ddl-no-databases = SQLite hat keine Datenbanken, die sich anlegen oder löschen ließen — eine Datenbank ist dort eine Datei, und Schemaic legt sie nicht für dich an und löscht sie nicht.
+ddl-rollback-failed = { $error } — und auch das Zurückrollen ist fehlgeschlagen: { $rollback }
 write-one-row-delete = Löschen in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
 write-one-row-update = Aktualisieren in { $table } betraf { $affected } Zeilen (erwartet: genau 1)
 write-one-row-insert = Einfügen in { $table } betraf { $affected } Zeilen (erwartet: genau 1)

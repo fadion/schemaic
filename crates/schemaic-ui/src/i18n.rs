@@ -788,6 +788,47 @@ pub fn db_query_cancelled() -> String {
     tr!("db-query-cancelled")
 }
 
+/// A DDL plan that stopped at its `at`th statement (0-based) with `applied`
+/// earlier ones in effect — `schemaic-db`'s `DdlError`, *statement N
+/// failed:* in English, `cause` already worded by the app.
+pub fn ddl_failed(at: usize, applied: usize, cause: String) -> String {
+    let n = at + 1;
+    let failed = tr!("ddl-statement-failed", n = n, error = cause);
+    if applied == 0 {
+        failed
+    } else {
+        tr!("ddl-already-applied", failed = failed, n = applied)
+    }
+}
+
+/// The user's Stop of a DDL plan — `DdlCause::Cancelled`.
+pub fn ddl_cancelled() -> String {
+    tr!("ddl-cancelled")
+}
+
+/// SQLite's refusal of a plan that leaves `row` pointing at nothing —
+/// `DdlCause::DanglingForeignKey`.
+pub fn ddl_dangling_foreign_key(row: String) -> String {
+    tr!("ddl-dangling-foreign-key", row = row)
+}
+
+/// SQLite's refusal of a plan that breaks `view` — `DdlCause::BreaksView`,
+/// `why` the engine's words.
+pub fn ddl_breaks_view(view: String, why: String) -> String {
+    tr!("ddl-breaks-view", view = view, why = why)
+}
+
+/// A server-level plan on SQLite — `DdlCause::NoDatabases`.
+pub fn ddl_no_databases() -> String {
+    tr!("ddl-no-databases")
+}
+
+/// A plan's failure `cause`, already worded, whose rollback then failed with
+/// the engine's words `rollback` — `DdlCause::RollbackFailed`.
+pub fn ddl_rollback_failed(cause: String, rollback: String) -> String {
+    tr!("ddl-rollback-failed", error = cause, rollback = rollback)
+}
+
 /// A write path's failure — core's
 /// [`WriteFailure::message`](schemaic_core::model::WriteFailure::message), what
 /// `DbError::Write` displays, in the interface's language. Public for the

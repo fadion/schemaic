@@ -682,7 +682,7 @@ async fn an_extension_is_created_and_dropped_through_its_plans() {
     assert_eq!(create, vec![r#"CREATE EXTENSION "pg_trgm";"#.to_string()]);
     s.db.run_ddl(&s.database, &create, CancellationToken::new())
         .await
-        .unwrap_or_else(|e| panic!("{}\n{create:?}", e.message));
+        .unwrap_or_else(|e| panic!("{}\n{create:?}", e.message()));
     let schema = read().await;
     let trgm = schema
         .extensions
@@ -703,7 +703,7 @@ async fn an_extension_is_created_and_dropped_through_its_plans() {
     assert_eq!(drop, vec![r#"DROP EXTENSION "pg_trgm";"#.to_string()]);
     s.db.run_ddl(&s.database, &drop, CancellationToken::new())
         .await
-        .unwrap_or_else(|e| panic!("{}\n{drop:?}", e.message));
+        .unwrap_or_else(|e| panic!("{}\n{drop:?}", e.message()));
     assert!(!read().await.extensions.iter().any(|x| x.name == "pg_trgm"));
 
     // A column of its type: the server refuses, and nothing cascades.
@@ -720,7 +720,7 @@ async fn an_extension_is_created_and_dropped_through_its_plans() {
         s.db.run_ddl(&s.database, &drop, CancellationToken::new())
             .await
             .expect_err("a column still uses its type");
-    assert!(refused.message.contains("depend"), "{}", refused.message);
+    assert!(refused.message().contains("depend"), "{refused}");
     let after = read().await;
     assert!(after.extensions.iter().any(|x| x.name == "citext"));
     assert!(after.tables.iter().any(|t| t.name == "t"));
@@ -788,11 +788,7 @@ async fn a_foreign_table_is_read_and_dropped_as_one() {
         s.db.run_ddl(&s.database, &as_table, CancellationToken::new())
             .await
             .expect_err("DROP TABLE on a foreign table");
-    assert!(
-        refused.message.contains("not a table"),
-        "{}",
-        refused.message
-    );
+    assert!(refused.message().contains("not a table"), "{refused}");
 
     let drop = single(
         "ft",
@@ -803,7 +799,7 @@ async fn a_foreign_table_is_read_and_dropped_as_one() {
     .emit();
     s.db.run_ddl(&s.database, &drop, CancellationToken::new())
         .await
-        .unwrap_or_else(|e| panic!("{}\n{drop:?}", e.message));
+        .unwrap_or_else(|e| panic!("{}\n{drop:?}", e.message()));
     let after =
         s.db.fetch_schema(&s.database, CancellationToken::new())
             .await

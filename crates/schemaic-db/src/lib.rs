@@ -101,7 +101,7 @@ use schemaic_core::stats::{SchemaStats, count_rows_sql};
 use schemaic_core::users::{self, Grants, Principal};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum DbError {
     #[error("connection failed: {0}")]
     Connect(String),
@@ -2531,7 +2531,9 @@ pub(crate) fn assemble_schema(
 /// table is untouched.
 #[derive(Debug, Clone)]
 pub struct DdlError {
-    pub message: String,
+    /// Why the statement at `at` failed, as a value the interface can say in
+    /// its own language; [`DdlCause::message`] is the English.
+    pub cause: DdlCause,
     /// 0-based index of the statement that failed, **counted over the whole
     /// emitted plan** — including its session scaffolding, because the script the
     /// user is reading in the preview panel includes it too, and an ordinal that
@@ -2545,9 +2547,78 @@ pub struct DdlError {
     pub applied: usize,
 }
 
+impl DdlError {
+    /// Why it failed, in English — the server's words with whatever this
+    /// crate said around them.
+    pub fn message(&self) -> String {
+        self.cause.message()
+    }
+}
+
+/// Why a DDL statement failed — [`DdlError::cause`].
+///
+/// A value rather than the sentence because the DDL modal says it in the
+/// interface's language while the write log, the CLI and the tests keep
+/// [`DdlCause::message`]'s English: a `DbError` flattened to text in this
+/// crate could only ever say *query failed:* in English.
+#[derive(Debug, Clone)]
+pub enum DdlCause {
+    /// The server's or the driver's own words, as they came (on SQLite with
+    /// the rebuild's shadow table named back, `ddl::unshadow`).
+    Server(String),
+    /// A [`DbError`], its own prefix and all — MySQL's every failure, and
+    /// PostgreSQL's connect.
+    Db(DbError),
+    /// The user's Stop, on an engine whose runner says so itself.
+    Cancelled,
+    /// SQLite's foreign-key check after the plan found a row the plan left
+    /// pointing at nothing; `row` is the check's own description of it.
+    DanglingForeignKey { row: String },
+    /// SQLite's check after the plan found `view` no longer reads, `why`
+    /// being the engine's words.
+    BreaksView { view: String, why: String },
+    /// A server-level plan on SQLite, where a database is a file.
+    NoDatabases,
+    /// The plan failed with `cause`, and the rollback then failed with the
+    /// engine's words `rollback`.
+    RollbackFailed {
+        cause: Box<DdlCause>,
+        rollback: String,
+    },
+}
+
+impl DdlCause {
+    /// The English.
+    pub fn message(&self) -> String {
+        match self {
+            DdlCause::Server(m) => m.clone(),
+            DdlCause::Db(e) => e.to_string(),
+            DdlCause::Cancelled => "the plan was cancelled".to_string(),
+            DdlCause::DanglingForeignKey { row } => {
+                format!("the plan leaves a foreign key pointing at nothing: {row}")
+            }
+            DdlCause::BreaksView { view, why } => format!(
+                "the plan would break the view {view}, which reads a column it \
+                 renames or drops ({why}). Nothing was changed. Edit or drop the \
+                 view first."
+            ),
+            DdlCause::NoDatabases => "SQLite has no databases to create or drop — a database \
+                                      there is a file, which Schemaic does not create or \
+                                      delete for you."
+                .to_string(),
+            DdlCause::RollbackFailed { cause, rollback } => {
+                format!(
+                    "{} — and the rollback failed too: {rollback}",
+                    cause.message()
+                )
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for DdlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "statement {} failed: {}", self.at + 1, self.message)?;
+        write!(f, "statement {} failed: {}", self.at + 1, self.message())?;
         if self.applied > 0 {
             write!(
                 f,
@@ -2651,7 +2722,7 @@ impl Db {
         cancel: CancellationToken,
     ) -> Result<(), DdlError> {
         let fail = |at: usize, applied: usize, e: DbError| DdlError {
-            message: e.to_string(),
+            cause: DdlCause::Db(e),
             at,
             applied,
         };
@@ -2756,7 +2827,7 @@ impl Db {
         cancel: CancellationToken,
     ) -> Result<(), DdlError> {
         let fail = |at: usize, applied: usize, e: DbError| DdlError {
-            message: e.to_string(),
+            cause: DdlCause::Db(e),
             at,
             applied,
         };
@@ -2765,15 +2836,11 @@ impl Db {
         }
         match self.engine {
             Engine::Postgres => pg::run_server_ddl(self, avoid, stmts, cancel).await,
-            Engine::Sqlite => Err(fail(
-                0,
-                0,
-                DbError::Query(
-                    "SQLite has no databases to create or drop — a database there is a \
-                     file, which Schemaic does not create or delete for you."
-                        .to_string(),
-                ),
-            )),
+            Engine::Sqlite => Err(DdlError {
+                cause: DdlCause::NoDatabases,
+                at: 0,
+                applied: 0,
+            }),
             Engine::MySql => mysql::run_server_ddl(self, stmts, cancel, fail).await,
             Engine::MsSql => mssql::run_server_ddl(self, avoid, stmts, cancel).await,
         }
@@ -3741,7 +3808,7 @@ mod tests {
             )
             .await
             .expect_err("SQLite has no databases to create");
-        assert!(err.message.contains("file"), "{}", err.message);
+        assert!(err.message().contains("file"), "{err}");
         assert_eq!(err.applied, 0, "nothing ran");
     }
 
@@ -4489,7 +4556,7 @@ mod tests {
         // in effect and cannot be rolled back, so the introspected model is now
         // wrong and the caller must re-read it.
         let err = DdlError {
-            message: "Duplicate key name 'ix'".to_string(),
+            cause: DdlCause::Server("Duplicate key name 'ix'".to_string()),
             at: 1,
             applied: 1,
         };
@@ -4501,7 +4568,7 @@ mod tests {
         // Also PostgreSQL's every failure — the transaction rolled the plan back,
         // so `applied` is 0 whichever statement failed.
         let err = DdlError {
-            message: "syntax error".to_string(),
+            cause: DdlCause::Server("syntax error".to_string()),
             at: 3,
             applied: 0,
         };

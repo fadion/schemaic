@@ -492,6 +492,25 @@ db-query-failed = query failed: { $error }
 db-connection-failed = connection failed: { $error }
 db-query-cancelled = query cancelled
 
+## A DDL plan that failed, in the DDL preview (schemaic-db's DdlError). English
+## must read exactly as DdlError displays (a test holds it).
+
+# $n is the failed statement's place in the plan, from 1; $error why.
+ddl-statement-failed = statement { $n } failed: { $error }
+# $failed is ddl-statement-failed; $n how many earlier statements stay in effect.
+ddl-already-applied = { $n ->
+    [one] { $failed } — { $n } earlier statement already applied and cannot be rolled back
+   *[other] { $failed } — { $n } earlier statements already applied and cannot be rolled back
+}
+ddl-cancelled = the plan was cancelled
+# SQLite's own check after the plan; $row is the check's description of the row.
+ddl-dangling-foreign-key = the plan leaves a foreign key pointing at nothing: { $row }
+# $why is SQLite's own words.
+ddl-breaks-view = the plan would break the view { $view }, which reads a column it renames or drops ({ $why }). Nothing was changed. Edit or drop the view first.
+ddl-no-databases = SQLite has no databases to create or drop — a database there is a file, which Schemaic does not create or delete for you.
+# $error is why the plan failed; $rollback SQLite's words.
+ddl-rollback-failed = { $error } — and the rollback failed too: { $rollback }
+
 ## A write path's failure — the grid's Commit, an import, a copy (core's
 ## model::WriteFailure). The server's words in $error stay the server's.
 

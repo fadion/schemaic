@@ -699,7 +699,9 @@ async fn run_ddl(scratch: &Scratch, stmts: &[String], target: &Target) {
         .unwrap_or_else(|e| {
             panic!(
                 "{}: the trigger plan failed at statement {} of {stmts:?}: {}",
-                target.name, e.at, e.message
+                target.name,
+                e.at,
+                e.message()
             )
         });
 }

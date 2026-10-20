@@ -397,7 +397,10 @@ impl ScratchAccount {
             .run_ddl(&self.database, &stmts, CancellationToken::new())
             .await
             .unwrap_or_else(|e| {
-                panic!("{summary:?} refused: {}\nstatements: {stmts:?}", e.message)
+                panic!(
+                    "{summary:?} refused: {}\nstatements: {stmts:?}",
+                    e.message()
+                )
             });
     }
 
@@ -470,7 +473,7 @@ impl Drop for ScratchAccount {
             rt.block_on(async {
                 db.run_ddl(&database, &stmts, CancellationToken::new())
                     .await
-                    .map_err(|e| e.message)
+                    .map_err(|e| e.message())
             })
         })
         .join();

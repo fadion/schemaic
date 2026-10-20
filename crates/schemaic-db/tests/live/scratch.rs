@@ -229,7 +229,9 @@ impl Scratch {
             .unwrap_or_else(|e| {
                 panic!(
                     "{}: the {what} plan failed at statement {} of {stmts:?}: {}",
-                    self.target.name, e.at, e.message
+                    self.target.name,
+                    e.at,
+                    e.message()
                 )
             });
     }

@@ -798,20 +798,21 @@ pub(crate) async fn run_ddl(
     stmts: &[String],
     cancel: CancellationToken,
 ) -> Result<(), crate::DdlError> {
-    let fail = |at: usize, e: String| crate::DdlError {
-        message: e,
+    use crate::DdlCause;
+    let fail = |at: usize, cause: DdlCause| crate::DdlError {
+        cause,
         at,
         applied: 0,
     };
     let client = connect_to(db, database)
         .await
-        .map_err(|e| fail(0, e.to_string()))?;
+        .map_err(|e| fail(0, DdlCause::Db(e)))?;
     // Control statements go through `batch_execute` — `BEGIN` isn't a preparable
     // statement, and neither are several DDL forms.
     client
         .batch_execute("BEGIN")
         .await
-        .map_err(|e| fail(0, db_text(&e)))?;
+        .map_err(|e| fail(0, DdlCause::Server(db_text(&e))))?;
     // Inside the transaction, so it reverts with it — and the connection is
     // this plan's alone either way. Best-effort, as on MySQL.
     let _ = client
@@ -834,8 +835,8 @@ pub(crate) async fn run_ddl(
     // as `on`.
     for (i, sql) in stmts.iter().enumerate() {
         let step = tokio::select! {
-            r = client.batch_execute(sql) => r.map_err(|e| db_text(&e)),
-            _ = cancel.cancelled() => Err("cancelled".to_string()),
+            r = client.batch_execute(sql) => r.map_err(|e| DdlCause::Server(db_text(&e))),
+            _ = cancel.cancelled() => Err(DdlCause::Cancelled),
         };
         if let Err(e) = step {
             let _ = client.batch_execute("ROLLBACK").await;
@@ -844,7 +845,10 @@ pub(crate) async fn run_ddl(
     }
     if let Err(e) = client.batch_execute("COMMIT").await {
         let _ = client.batch_execute("ROLLBACK").await;
-        return Err(fail(stmts.len().saturating_sub(1), db_text(&e)));
+        return Err(fail(
+            stmts.len().saturating_sub(1),
+            DdlCause::Server(db_text(&e)),
+        ));
     }
     Ok(())
 }
@@ -878,18 +882,18 @@ pub(crate) async fn run_server_ddl(
     let client = connect_maintenance_avoiding(db, avoid)
         .await
         .map_err(|e| crate::DdlError {
-            message: e.to_string(),
+            cause: crate::DdlCause::Db(e),
             at: 0,
             applied: 0,
         })?;
     for (i, sql) in stmts.iter().enumerate() {
         let step = tokio::select! {
-            r = client.batch_execute(sql) => r.map_err(|e| db_text(&e)),
-            _ = cancel.cancelled() => Err("cancelled".to_string()),
+            r = client.batch_execute(sql) => r.map_err(|e| crate::DdlCause::Server(db_text(&e))),
+            _ = cancel.cancelled() => Err(crate::DdlCause::Cancelled),
         };
         if let Err(e) = step {
             return Err(crate::DdlError {
-                message: e,
+                cause: e,
                 at: i,
                 applied: i,
             });

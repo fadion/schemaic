@@ -320,8 +320,9 @@ existing prose was left alone.
     re-offered a fix for "the statement was not sent" with every other test green — so
     `app_tests::a_runs_own_notes_reach_the_bar_as_schemaics` reads `main.rs` for it: every
     `QueryState::Failed(` built from `not_sent_message(`/`timeout_message(` opens with
-    `ModalError::app(`, and every `i18n::run_cancelled_message(` lands as `Failed(ModalError::app(m))`,
-    with floors on both counts. `ModalError::new(text, source)` is the
+    `ModalError::app(`, and every `i18n::run_cancelled_message(` is followed within 900 bytes by
+    `QueryState::Failed(ModalError::app(en).shown_as(m))` — core's English the text, the wording
+    shown — with floors on both counts. `ModalError::new(text, source)` is the
     constructor for a producer already holding a source. The editor's error bar asks the same
     `resolve_kept(None, Some(err), kept)` for its own *Explain* and *AI fix* as the modal's
     fallback does, so bar and modal cannot offer different ones — including on a **kept** (pinned)
@@ -372,7 +373,8 @@ existing prose was left alone.
     translation. A producer with a wording sets it with `shown_as`, which leaves `text` alone;
     `about_another_statement` changes the source and keeps `shown`
     (`the_actions_act_on_the_english_whatever_is_shown`). The editor's run paths had the same fault
-    over their transaction notes, and keep the two apart the same way now (under `core::tx`).
+    over their transaction notes and their own not-sent, timeout and Stop notices, and keep the
+    two apart the same way now (under `core::tx`).
   - `access.rs` — **what a dump's replay drops besides the objects, and the statements that put it
     back**: `ReplayAccess { tables, routines }`, on `DbSchema::replay_access`, each half `None`
     where it was not read. It is read by the dump runner alone, for a file that drops
@@ -11886,8 +11888,14 @@ existing prose was left alone.
     `to_string()`, and only `shown_as` from `i18n::run_failed_message` over the app's
     `db_error_shown`. They used to put the interface's wording in `text`, so under a German
     interface *Explain* sent the model the note in German and the write log (`ran_of`) recorded it
-    so. The not-sent, timeout and cancel notes have not been split yet: each is still worded
-    straight into a `ModalError::app`'s `text`, which the write log keeps. Core's English otherwise
+    so. The not-sent, timeout and cancel notes were the last to be split, and had the same fault:
+    each was a `ModalError::app` of the wording, so its `text` — what *Explain* sends and the write
+    log keeps — was the translation. Each is now `ModalError::app(<English>).shown_as(<wording>)`:
+    not-sent is this module's `not_sent_message` beside `i18n::not_sent_message`; the timeout is
+    `connection::StatementTimeout::cancelled_message` beside the app's `timeout_message` — inside
+    `run_failed_message` from here and from `ui::i18n` respectively where a session's note follows
+    it, bare on Run All's own connection; and a Stop's disclosure is `run_cancelled_message` from
+    here as `text`, `i18n`'s as `shown`. Core's English otherwise
     stays for core's own tests and the live tier, whose `tests/live/mssql.rs` reads
     `failed_message`.
     **And `Lost` has no way back on the tab itself.** `can_commit` and `can_rollback` are both false
@@ -12698,8 +12706,10 @@ existing prose was left alone.
     its timeout off would be held to the app's again
     (`a_connections_own_timeout_wins_and_zero_means_none_here`). `Connection::statement_timeout(app_secs)`
     resolves it to a `StatementTimeout { secs, per_connection }`, the flag being what lets the
-    timed-out message name the setting that fired (the app's `timeout_message`; the statement
-    timeout's passage under `ui/lib.rs`); `statement_timeout_of(list, id, app_secs)` is the registry's
+    timed-out message name the setting that fired (`StatementTimeout::cancelled_message`, the
+    English an error's `text` carries, and the app's `timeout_message`, its wording, held equal by
+    `english_says_the_timed_out_notice_as_core_does`; the statement timeout's passage under
+    `ui/lib.rs`); `statement_timeout_of(list, id, app_secs)` is the registry's
     accessor, and an unknown id follows the app for `read_only_of`'s reason — the run that asked
     fails on the missing connection, not on this
     (`a_timeout_is_looked_up_by_id_and_an_unknown_one_follows_the_app`).
@@ -18343,11 +18353,12 @@ existing prose was left alone.
   the half that was got wrong: the `assemble_schema_*` tests travelled to `mysql.rs` with one step
   and had to come back, a test for a function two engines share not belonging in one engine's
   module. **The other direction is the one the rule is easiest to lose in**: `err_clone` — which
-  rebuilds a `DbError` for the "connect failed" fan-out, `DbError` not being `Clone` — stayed in
-  `lib.rs` when its only caller moved to `mysql.rs`, and was *widened* to `pub(crate)` so the call
-  would still reach it. Widening to survive an extraction is exactly the shape the rule refuses: it
-  is read by one engine, so it lives beside that engine and is private again, which the compiler
-  then proves is the whole of its audience.
+  rebuilt a `DbError` for the "connect failed" fan-out, `DbError` not being `Clone` then — stayed
+  in `lib.rs` when its only caller moved to `mysql.rs`, and was *widened* to `pub(crate)` so the
+  call would still reach it. Widening to survive an extraction is exactly the shape the rule
+  refuses: it was read by one engine, so it went to live beside that engine, private again, which
+  the compiler then proved was the whole of its audience. (It is gone now: `DbError` became
+  `Clone` for `DdlCause::Db`.)
   **`mysql::run_batch` takes two arguments `pg::run_batch` does not** — the `USE` scope and the
   dialect — because `USE` is MySQL's alone, so only that arm can move the batch's current database
   mid-run and only it has to make a later statement's result label follow. That is the concrete
@@ -19565,6 +19576,20 @@ existing prose was left alone.
   **`DdlError::at` deliberately did not change**: it stays an ordinal over the whole emitted plan,
   scaffolding included, because that is the script the preview panel shows and a "statement 3" that
   disagreed with what is on screen would be a second wrong number rather than a fix for the first.
+  **`DdlError::cause` is a value, not the sentence** (`DdlCause`). It was a `message: String`
+  flattened here, which made the DDL modal's failure the last `DbError` the window could show only
+  as `to_string()`: the error was finished inside this crate, *query failed:* and all, before
+  anything could word it, and one English string then served both the modal and the write log.
+  `Server` is the server's or driver's words as they came (on SQLite with the rebuild's shadow
+  table named back, `ddl::unshadow`); `Db` a `DbError`, prefix and all — MySQL's every failure and
+  PostgreSQL's connect, which is why `DbError` is `Clone` now; `Cancelled`; `DanglingForeignKey`
+  and `BreaksView`, SQLite's two checks after the plan; `NoDatabases`, SQLite's server-level
+  refusal; and `RollbackFailed`, any of them with the rollback's own failure beside it.
+  `DdlCause::message` (and `DdlError::message`) is the English, and `Display` is still *statement N
+  failed: …* plus the *already applied* clause, with two deliberate changes: PostgreSQL's and SQL
+  Server's Stop said a bare *cancelled* and now say *the plan was cancelled*, and SQLite's
+  server-level refusal, a `DbError::Query` until then, has lost the *query failed:* in front of a
+  sentence that was never a query's. The app words it (`ddl_error_shown`, under `app/main.rs`).
   **SQLite's DDL is transactional too**, so `sqlite::run_ddl` wraps the whole
   plan in one and rolls it back whole, which is why every `DdlError` from that backend carries
   `applied: 0` — a half-applied plan is a state this engine never leaves behind, so there is no
@@ -32989,9 +33014,10 @@ existing prose was left alone.
     so a `DbError::Write` — the rollback clause included — is worded too. That is the modal's
     copy only: the write log's entry takes the same error's `to_string()`, carried beside it as the
     app's `CopyFailed` `(logged, shown)`, because one string for both wrote a German interface's
-    wording into the persisted log. What stays English: any
-    other error inside them, the settle's `run_ddl` failure among them, which arrive whole; and the
-    `<table>_copy` default, which is an identifier.
+    wording into the persisted log. The settle's `run_ddl` failure, a `DdlError`, is
+    `ddl_error_shown`'s beside its `to_string()` the same way — it used to pass `to_string()` as
+    both. What stays English: the server's words inside either error, and the `<table>_copy`
+    default, which is an identifier.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
     surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
@@ -34248,8 +34274,9 @@ existing prose was left alone.
   batch path means re-arming inside `run_batch`'s per-statement callback; a statement that does
   expire still stops the batch, because the token it fires is the batch's. A timeout and the
   Cancel button arrive as the identical `DbError::Cancelled`, so the watchdog's `fired` flag is the
-  only thing that can tell the user which stopped their query — hence `timeout_message`, which
-  quotes the timeout in the very words the settings dropdown uses (`ui::i18n::statement_timeout`
+  only thing that can tell the user which stopped their query — hence `timeout_message` (the
+  wording; core's `StatementTimeout::cancelled_message` is the English the error's `text`
+  keeps), which quotes the timeout in the very words the settings dropdown uses (`ui::i18n::statement_timeout`
   renders both, over `persist::statement_timeout_span`, for exactly that reason) and says where to
   change it: *Settings → Query*, or *this
   connection's settings* when the value that fired was the connection's own, since the app's may
@@ -41336,16 +41363,32 @@ Re-introducing the anti-patterns these guard against is a regression:
     *Explain* and *AI fix* send, so a German interface sent the model German; and the copy's failure
     was one `db_error_shown` string for both the modal and `write_log::Entry::ended`, so it wrote
     German into the persisted write log. The copy now carries both, `(logged, shown)` in the app's
-    `CopyFailed`, and a `ModalError`'s `text` is English by rule (under `core::model`). What stays
+    `CopyFailed`, and a `ModalError`'s `text` is English by rule (under `core::model`).
+    A failed DDL plan was the same lesson a third time, and the last `DbError` the window still
+    showed as `to_string()`: one English string served the DDL modal and its write-log entry, and
+    `schemaic-db` had already flattened it (`DdlError`'s `message: String`) before anything could
+    word it. `DdlError` now carries a `DdlCause` (under `schemaic-db`'s `lib.rs`), and the app's
+    `ddl_error_shown` words it through `i18n::ddl_failed` — `ddl-statement-failed`, inside
+    `ddl-already-applied` when earlier statements are in effect — around `ddl_cause_shown`, which
+    hands a `Db` to `db_error_shown`, passes a `Server` through as it came, and words the rest from
+    `ddl-*` (`ddl_cancelled`, `ddl_dangling_foreign_key`, `ddl_breaks_view`, `ddl_no_databases`,
+    and `ddl_rollback_failed` around its inner cause, worded by the same function). The DDL run's
+    report carries `(logged, shown)` as the copy's does: the write log takes `to_string()`,
+    `DdlOutcome::Failed` the wording; and the copy's settle failure, a `run_ddl` of its own, passes
+    `ddl_error_shown` as its `shown` where it passed `to_string()` twice.
+    `english_shows_every_ddl_failure_as_it_displays` (`app_tests`) holds the English equal to
+    `Display` for every cause, bare and inside a `RollbackFailed`, with none, one and several
+    statements already applied. What stays
     English: the server's or driver's
     words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and a
     database-layer refusal's own text inside `Refused` (SQL
     Server's blank-string and code-page refusals — the note after it is worded). And, until the
-    roadmap's next step, every `DbError` still taken as `to_string()`, prefix and all: the DDL modal's failure, one string shared with its write-log entry; the
-    copy's settle failure, a `DdlError`; the squiggle's diagnostic
-    (`intel::db_error_diagnostic`), whose text the AI fix prompt reads; and the run paths' own
-    `App` notes, whose `text` is the interface's wording and is what the write log records (under
-    `core::tx`).
+    roadmap's next step, the one `DbError` still taken as `to_string()`, prefix and all: the
+    squiggle's diagnostic
+    (`intel::db_error_diagnostic`), whose text the AI fix prompt reads. The run paths' own `App`
+    notes — not sent, timed out, a Stop's disclosure — used to be the other way round, the
+    interface's wording in `text`, which *Explain* sent and the write log recorded; they now carry
+    core's English as `text` and the wording as `shown` (under `core::tx`).
     `english_says_every_write_failure_as_core_does` holds it equal to `message` over every cause,
     every 1-row miss with and without a schema, each batch count both ways, every `IssueKind`
     with and without text, a `Read` and each `CopyStop`, and each with every rollback outcome and
@@ -41389,7 +41432,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     and the app's paste field share, `read_refusal_text` and `import_error_text` for the app's
     import probe, check and load, `write_failure_text` for the app's Commit, import and copy
     failures, `db_query_failed`, `db_connection_failed` and `db_query_cancelled` for the app's
-    `db_error_shown`, the crate holding no `DbError`, and the grid's three filter notices — `staged_requery_note`
+    `db_error_shown`, the crate holding no `DbError`, the six `ddl_*` for its `ddl_error_shown`, for
+    the same reason, and the grid's three filter notices — `staged_requery_note`
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded
     from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork` — and,
     public for the app's run paths, `run_failed_message`, `run_cancelled_message` and

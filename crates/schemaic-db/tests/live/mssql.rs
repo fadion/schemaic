@@ -2909,7 +2909,7 @@ async fn a_failing_plan_is_rolled_back_whole() {
             .await
             .expect_err("the index is refused");
     assert_eq!((err.at, err.applied), (1, 0), "{err}");
-    assert!(err.message.contains("nope"), "{err}");
+    assert!(err.message().contains("nope"), "{err}");
     assert_eq!(
         s.scalar("SELECT COUNT(*) FROM sys.tables WHERE name = 't'")
             .await,

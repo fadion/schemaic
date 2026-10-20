@@ -417,6 +417,29 @@ fn db_error_shown(e: &DbError) -> String {
     }
 }
 
+/// `e`, a failed DDL plan, as the DDL modal shows it — [`db_error_shown`]'s
+/// rule, for the eye only: the write log keeps `to_string()`, the English.
+fn ddl_error_shown(e: &schemaic_db::DdlError) -> String {
+    schemaic_ui::i18n::ddl_failed(e.at, e.applied, ddl_cause_shown(&e.cause))
+}
+
+/// Why a DDL statement failed, as [`ddl_error_shown`] says it.
+fn ddl_cause_shown(cause: &schemaic_db::DdlCause) -> String {
+    use schemaic_db::DdlCause;
+    use schemaic_ui::i18n;
+    match cause {
+        DdlCause::Server(m) => m.clone(),
+        DdlCause::Db(e) => db_error_shown(e),
+        DdlCause::Cancelled => i18n::ddl_cancelled(),
+        DdlCause::DanglingForeignKey { row } => i18n::ddl_dangling_foreign_key(row.clone()),
+        DdlCause::BreaksView { view, why } => i18n::ddl_breaks_view(view.clone(), why.clone()),
+        DdlCause::NoDatabases => i18n::ddl_no_databases(),
+        DdlCause::RollbackFailed { cause, rollback } => {
+            i18n::ddl_rollback_failed(ddl_cause_shown(cause), rollback.clone())
+        }
+    }
+}
+
 /// An error raised as `Result<_, String>` by a caller that has already turned
 /// its `DbError` into text: the window's wording beside the English.
 fn db_error_pair(e: &DbError) -> (String, String) {
@@ -3843,16 +3866,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // first for that reason.
                     Err(DbError::Cancelled) if stmt == Some(StmtOutcome::NotSent) => {
                         tracing::info!("run cancelled before the statement was sent");
-                        QueryState::Failed(ModalError::app(schemaic_ui::i18n::not_sent_message(
-                            timed_out,
-                        )))
+                        QueryState::Failed(
+                            ModalError::app(tx::not_sent_message(timed_out))
+                                .shown_as(schemaic_ui::i18n::not_sent_message(timed_out)),
+                        )
                     }
                     // A timeout and the Cancel button arrive as the same error,
                     // so the watchdog's flag is the only thing that can tell the
                     // user which of the two stopped their query. Schemaic's own
                     // watchdog, so its own words — like the two cancels here.
                     Err(DbError::Cancelled) if tx::timeout_reached(stmt, timed_out) => {
-                        QueryState::Failed(ModalError::app(note(timeout_message(timeout))))
+                        QueryState::Failed(
+                            ModalError::app(note_en(timeout.cancelled_message()))
+                                .shown_as(note(timeout_message(timeout))),
+                        )
                     }
                     // **A Stop is not a smaller timeout.** MySQL commits the
                     // open transaction before it runs a DDL statement, so
@@ -3866,7 +3893,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         ) {
                             Some(m) => {
                                 tracing::info!("query cancelled after an implicit commit");
-                                QueryState::Failed(ModalError::app(m))
+                                let en = tx::run_cancelled_message(stmt, tx_before, engine, &sql)
+                                    .unwrap_or_else(|| m.clone());
+                                QueryState::Failed(ModalError::app(en).shown_as(m))
                             }
                             None => {
                                 tracing::info!("query cancelled");
@@ -4464,9 +4493,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
                                 Err(DbError::Cancelled) if out.stmt == StmtOutcome::NotSent => {
                                     stopped = true;
-                                    QueryState::Failed(ModalError::app(
-                                        schemaic_ui::i18n::not_sent_message(timed_out),
-                                    ))
+                                    QueryState::Failed(
+                                        ModalError::app(tx::not_sent_message(timed_out)).shown_as(
+                                            schemaic_ui::i18n::not_sent_message(timed_out),
+                                        ),
+                                    )
                                 }
                                 // The sources are `run_query_core`'s: a timeout
                                 // and a cancel are Schemaic's own words, a
@@ -4475,15 +4506,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     if tx::timeout_reached(Some(out.stmt), timed_out) =>
                                 {
                                     stopped = true;
-                                    QueryState::Failed(ModalError::app(
-                                        schemaic_ui::i18n::run_failed_message(
-                                            &timeout_message(timeout),
+                                    QueryState::Failed(
+                                        ModalError::app(tx::run_failed_message(
+                                            &timeout.cancelled_message(),
                                             out.stmt,
                                             before,
                                             engine,
                                             sql,
+                                        ))
+                                        .shown_as(
+                                            schemaic_ui::i18n::run_failed_message(
+                                                &timeout_message(timeout),
+                                                out.stmt,
+                                                before,
+                                                engine,
+                                                sql,
+                                            ),
                                         ),
-                                    ))
+                                    )
                                 }
                                 // The same pair as `run_query_core`'s, and the
                                 // same hole: see `tx::cancelled_message`.
@@ -4495,7 +4535,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                         engine,
                                         sql,
                                     ) {
-                                        Some(m) => QueryState::Failed(ModalError::app(m)),
+                                        Some(m) => {
+                                            let en = tx::run_cancelled_message(
+                                                Some(out.stmt),
+                                                before,
+                                                engine,
+                                                sql,
+                                            )
+                                            .unwrap_or_else(|| m.clone());
+                                            QueryState::Failed(ModalError::app(en).shown_as(m))
+                                        }
                                         None => QueryState::Cancelled,
                                     }
                                 }
@@ -4549,7 +4598,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 states[i] = match res {
                                     Ok(rs) => QueryState::Loaded(Arc::new(rs)),
                                     Err(DbError::Cancelled) if timed_out => QueryState::Failed(
-                                        ModalError::app(timeout_message(timeout)),
+                                        ModalError::app(timeout.cancelled_message())
+                                            .shown_as(timeout_message(timeout)),
                                     ),
                                     Err(DbError::Cancelled) => QueryState::Cancelled,
                                     Err(e) => QueryState::Failed(
@@ -10320,7 +10370,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         Ok(n) => {
                             match dst.run_ddl(&req.target.database, &req.settle, token).await {
                                 Ok(()) => Ok(n),
-                                Err(e) => Err((Some(n), Some((e.to_string(), e.to_string())))),
+                                Err(e) => {
+                                    Err((Some(n), Some((e.to_string(), ddl_error_shown(&e)))))
+                                }
                             }
                         }
                         Err(DbError::Cancelled) => Err((None, None)),
@@ -11117,11 +11169,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let (log_write, dialect) = (log_write.clone(), dialect_of(&db));
                         let report = create_ext_action(
                             cx,
-                            move |(changed, res): (bool, Result<Option<String>, String>)| {
+                            // A failure is `(logged, shown)`: the write log's
+                            // English and the modal's wording.
+                            move |(changed, res): (
+                                bool,
+                                Result<Option<String>, (String, String)>,
+                            )| {
                                 (log_write)(
                                     conn_id,
                                     dialect,
-                                    log_entry.ended(res.clone().map(|_| None)),
+                                    log_entry.ended(
+                                        res.as_ref().map(|_| None).map_err(|(l, _)| l.clone()),
+                                    ),
                                 );
                                 // Refresh before reporting, so the modal's success
                                 // state and the tree can't be seen disagreeing for
@@ -11166,7 +11225,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                                 (done)(match res {
                                     Ok(note) => DdlOutcome::Applied(note),
-                                    Err(e) => DdlOutcome::Failed(e),
+                                    Err((_, shown)) => DdlOutcome::Failed(shown),
                                 });
                             },
                         );
@@ -11221,7 +11280,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     }
                                     Ok((!notes.is_empty()).then(|| notes.join("\n")))
                                 }
-                                Err(e) => Err(e.to_string()),
+                                Err(e) => Err((e.to_string(), ddl_error_shown(&e))),
                             };
                             report((changed, out));
                         });
@@ -16010,6 +16069,46 @@ mod app_tests {
         }
     }
 
+    /// **A DDL plan's failure reads in English exactly as it displays** —
+    /// every cause, wrapped in a rollback's failure or not, with none, one
+    /// and several earlier statements in effect.
+    #[test]
+    fn english_shows_every_ddl_failure_as_it_displays() {
+        use super::{DbError, ddl_error_shown};
+        use schemaic_db::{DdlCause, DdlError};
+        let causes = [
+            DdlCause::Server("Duplicate key name 'ix'".into()),
+            DdlCause::Db(DbError::Query("Table 'shop.t' doesn't exist".into())),
+            DdlCause::Db(DbError::Connect("Access denied".into())),
+            DdlCause::Db(DbError::Cancelled),
+            DdlCause::Cancelled,
+            DdlCause::DanglingForeignKey {
+                row: "orders row 3 → customers".into(),
+            },
+            DdlCause::BreaksView {
+                view: "v_orders".into(),
+                why: "no such column: qty".into(),
+            },
+            DdlCause::NoDatabases,
+        ];
+        for cause in causes {
+            let wrapped = DdlCause::RollbackFailed {
+                cause: Box::new(cause.clone()),
+                rollback: "database is locked".into(),
+            };
+            for cause in [cause, wrapped] {
+                for (at, applied) in [(0, 0), (2, 1), (4, 3)] {
+                    let e = DdlError {
+                        cause: cause.clone(),
+                        at,
+                        applied,
+                    };
+                    assert_eq!(ddl_error_shown(&e), e.to_string(), "{e:?}");
+                }
+            }
+        }
+    }
+
     /// **A restore refusal reads in English exactly as core's
     /// `RestoreRefusal` says it** — named and unnamed switches, with and
     /// without a remainder.
@@ -16486,13 +16585,14 @@ mod app_tests {
             "the needle stopped matching: {notes} notes found — a gate that scans \
              nothing reports success"
         );
-        // A Stop's disclosure is matched, then wrapped, one line on.
+        // A Stop's disclosure is matched, then wrapped — its English the
+        // text, the wording `m` shown — a few lines on.
         let mut stops = 0usize;
         for (at, _) in body.match_indices("i18n::run_cancelled_message(") {
             stops += 1;
-            let after = &body[at..(at + 400).min(body.len())];
+            let after = &body[at..(at + 900).min(body.len())];
             assert!(
-                after.contains("QueryState::Failed(ModalError::app(m))"),
+                after.contains("QueryState::Failed(ModalError::app(en).shown_as(m))"),
                 "a Stop's disclosure reaches the bar as something other than \
                  Schemaic's words:\n{after}"
             );
@@ -17601,6 +17701,22 @@ mod app_tests {
         assert!(msg.contains("1 hour"), "{msg}");
         assert!(msg.contains("this connection"), "{msg}");
         assert!(!msg.contains("Settings"), "{msg}");
+    }
+
+    /// **The timed-out notice reads in English exactly as core's** — the
+    /// English is the error's `text`, which *Explain* and the write log read,
+    /// and the window's wording is its `shown`.
+    #[test]
+    fn english_says_the_timed_out_notice_as_core_does() {
+        for per_connection in [false, true] {
+            for secs in [1, 45, 60, 900, 3_600, 5_400] {
+                let t = schemaic_core::connection::StatementTimeout {
+                    secs,
+                    per_connection,
+                };
+                assert_eq!(timeout_message(t), t.cancelled_message(), "{t:?}");
+            }
+        }
     }
 
     fn app_timeout(secs: u64) -> schemaic_core::connection::StatementTimeout {
