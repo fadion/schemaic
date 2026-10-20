@@ -1980,13 +1980,22 @@ impl SchemaPlan {
     /// plan asks for — and Apply is refused while it does, which for a plan
     /// over many objects is why the line has to say *which* tick to clear.
     pub fn unsupported(&self) -> Vec<String> {
+        self.withheld_lines()
+            .into_iter()
+            .map(|(subject, w)| format!("{subject} — {}", w.message()))
+            .collect()
+    }
+
+    /// [`SchemaPlan::unsupported`] as values: each refusal with the object
+    /// it is about, for the interface to word.
+    pub fn withheld_lines(&self) -> Vec<(String, ddl::Withheld)> {
         self.sets
             .iter()
             .flat_map(|s| {
                 let subject = Self::subject_of(s);
-                s.unsupported()
+                s.withheld_lines()
                     .into_iter()
-                    .map(move |w| format!("{subject} — {w}"))
+                    .map(move |w| (subject.clone(), w))
             })
             .collect()
     }

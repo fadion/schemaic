@@ -4717,7 +4717,7 @@ pub fn touches_natively_compiled_module(change: &Change) -> bool {
 /// unfaithfulness [`IndexReplay::Refuse`] exists to refuse elsewhere. So the
 /// plan says what it can't do and the preview blocks Apply, rather than the
 /// engine saying `no such table` after the drop has already run.
-fn unreplayable_rename(c: &Change) -> Option<String> {
+fn unreplayable_rename(c: &Change) -> Option<Withheld> {
     let Change::ReplaceView {
         draft,
         recreate: true,
@@ -4731,14 +4731,11 @@ fn unreplayable_rename(c: &Change) -> Option<String> {
     if replay.is_empty() || was == draft.name {
         return None;
     }
-    Some(format!(
-        "Renaming {was} to {} can't carry its {} trigger{} across: their SQL names \
-         {was}, and re-writing it here would change what you wrote. Rename the view \
-         on its own after re-creating the triggers against the new name.",
-        draft.name,
-        replay.len(),
-        if replay.len() == 1 { "" } else { "s" },
-    ))
+    Some(Withheld::UnreplayableRename {
+        was: was.to_string(),
+        to: draft.name.clone(),
+        triggers: replay.len(),
+    })
 }
 
 /// The refusal for a routine **recreate that would drop a numbered procedure
@@ -4750,7 +4747,7 @@ fn unreplayable_rename(c: &Change) -> Option<String> {
 /// ALTER` of the head keeps them (measured on SQL Server 2022), so only the
 /// plans that drop first — a rename, a change of kind — are refused, and the
 /// preview withholds Apply rather than let the drop run.
-fn numbered_group_refusal(c: &Change) -> Option<String> {
+fn numbered_group_refusal(c: &Change) -> Option<Withheld> {
     let Change::ReplaceRoutine {
         server,
         recreate: true,
@@ -4762,13 +4759,10 @@ fn numbered_group_refusal(c: &Change) -> Option<String> {
     if server.tsql.numbered.is_empty() {
         return None;
     }
-    Some(format!(
-        "{} heads a numbered procedure group ({}), and this plan drops it first, which \
-         drops every member of the group with it. Edit it under its own name and kind, \
-         which alters it in place and keeps them.",
-        server.name,
-        server.tsql.numbered_names(&server.name)
-    ))
+    Some(Withheld::NumberedGroup {
+        name: server.name.clone(),
+        members: server.tsql.numbered_names(&server.name),
+    })
 }
 
 /// What a view loses when it's dropped, on `dialect` — the sentence behind both
@@ -6438,6 +6432,248 @@ impl Risk {
     }
 }
 
+/// A column a plan renames or drops, as a refusal names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Moved {
+    Renamed { from: String, to: String },
+    Dropped { name: String },
+}
+
+impl Moved {
+    /// The English: *qty, which this plan renames to n*.
+    pub fn message(&self) -> String {
+        match self {
+            Moved::Renamed { from, to } => format!("{from}, which this plan renames to {to}"),
+            Moved::Dropped { name } => format!("{name}, which this plan drops"),
+        }
+    }
+}
+
+/// A clause of a SQLite declaration the model has no field for
+/// ([`unrestatable_sqlite_clauses`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteClause {
+    Deferrable,
+    OnConflict,
+    DescKey,
+    CollateKey,
+}
+
+impl SqliteClause {
+    /// The English.
+    pub fn label(self) -> &'static str {
+        match self {
+            SqliteClause::Deferrable => "a foreign key's DEFERRABLE clause",
+            SqliteClause::OnConflict => "an ON CONFLICT clause",
+            SqliteClause::DescKey => "a DESC primary-key column",
+            SqliteClause::CollateKey => "a COLLATE on a primary-key column",
+        }
+    }
+}
+
+/// Why an index SQLite's pragmas only partly read cannot survive a rebuild
+/// ([`sqlite_index_replay`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartlyReadWhy {
+    /// Its unread text may name a column the plan moves.
+    MayName(Moved),
+    /// There is no index to read it back from.
+    NotFound,
+    /// The edit to it can't be written from what was read.
+    Edited,
+    /// The engine kept no `CREATE` text for it.
+    NoText,
+}
+
+/// One thing a plan asks for that this engine can't express — a line of the
+/// preview's withheld list ([`ChangeSet::unsupported`]) as a value.
+/// [`Withheld::message`] is the English, which the script's `-- INCOMPLETE`
+/// header, the CLI and the tests read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Withheld {
+    /// A change the engine has no statement for, as its line says it.
+    Change(ChangeLine),
+    /// A view re-created under a new name whose triggers name the old one.
+    UnreplayableRename {
+        was: String,
+        to: String,
+        triggers: usize,
+    },
+    /// A numbered procedure group's head the plan drops first.
+    NumberedGroup { name: String, members: String },
+    /// A view whose index Schemaic can't restate; `created` where the plan
+    /// creates the view rather than edits it.
+    LossyViewIndexes {
+        view: String,
+        indexes: Vec<String>,
+        created: bool,
+    },
+    /// SQL Server's rebuild of `table`: an index not read whole.
+    TsqlLossyIndex { table: String, index: String },
+    /// … a trigger whose text is encrypted.
+    TsqlEncryptedTrigger { table: String, trigger: String },
+    /// … a signed trigger.
+    TsqlSignedTrigger { table: String, trigger: String },
+    /// … a trigger kept verbatim, under a table renamed.
+    TsqlRenamedTrigger { table: String, trigger: String },
+    /// SQLite's rebuild: an index only partly read.
+    PartlyRead { index: String, why: PartlyReadWhy },
+    /// … a partial index whose condition names a dropped column.
+    ConditionNamesDropped { index: String, column: String },
+    /// … triggers on the table whose replayed SQL names a moved column.
+    StrandsTriggers { count: usize, moved: Moved },
+    /// … a trigger on another table that names a moved column; `trigger`
+    /// is `(name, table)` where its text could be read.
+    StrandsOtherTrigger {
+        trigger: Option<(String, String)>,
+        moved: Moved,
+    },
+    /// … a generated column computing from a moved column.
+    StrandsGeneratedColumn { column: String, moved: Moved },
+    /// … clauses of the declaration the model has no field for.
+    CannotRestate { clauses: Vec<SqliteClause> },
+    /// … a virtual table.
+    VirtualTable { name: String },
+}
+
+impl Withheld {
+    /// The English.
+    pub fn message(&self) -> String {
+        let s = |n: usize, one: &'static str, many: &'static str| if n == 1 { one } else { many };
+        match self {
+            Withheld::Change(line) => line.message(),
+            Withheld::UnreplayableRename { was, to, triggers } => format!(
+                "Renaming {was} to {to} can't carry its {triggers} trigger{} across: their SQL names \
+                 {was}, and re-writing it here would change what you wrote. Rename the view \
+                 on its own after re-creating the triggers against the new name.",
+                s(*triggers, "", "s"),
+            ),
+            Withheld::NumberedGroup { name, members } => format!(
+                "{name} heads a numbered procedure group ({members}), and this plan drops it first, which \
+                 drops every member of the group with it. Edit it under its own name and kind, \
+                 which alters it in place and keeps them."
+            ),
+            Withheld::LossyViewIndexes {
+                view,
+                indexes,
+                created: true,
+            } => format!(
+                "Creating view {view} can't create its index{} {} — of a kind Schemaic can't \
+                 restate. Create this view in SQL instead.",
+                s(indexes.len(), "", "es"),
+                indexes.join(", ")
+            ),
+            Withheld::LossyViewIndexes {
+                view,
+                indexes,
+                created: false,
+            } => format!(
+                "Editing view {view} drops its index{} {}, which Schemaic can't create again — of \
+                 a kind Schemaic can't restate. Edit this view in SQL instead.",
+                s(indexes.len(), "", "es"),
+                indexes.join(", ")
+            ),
+            Withheld::TsqlLossyIndex { table, index } => format!(
+                "Rebuilding {table} would drop the index {index}: it is of a kind Schemaic doesn't \
+                 read whole"
+            ),
+            Withheld::TsqlEncryptedTrigger { table, trigger } => format!(
+                "Rebuilding {table} would drop the trigger {trigger}: its text is encrypted"
+            ),
+            Withheld::TsqlSignedTrigger { table, trigger } => format!(
+                "Rebuilding {table} would drop the signature on the trigger {trigger}, which can't be put \
+                 back without the certificate's private key"
+            ),
+            Withheld::TsqlRenamedTrigger { table, trigger } => format!(
+                "Rebuilding {table} under a new name would leave the trigger {trigger} naming the old one"
+            ),
+            Withheld::PartlyRead { index, why } => {
+                let partly_read = format!(
+                    "Index {index} was only partly read — SQLite keeps a partial index's \
+                     predicate, and an expression key, only in the index's own CREATE text"
+                );
+                match why {
+                    PartlyReadWhy::MayName(moved) => format!(
+                        "{partly_read}, and that text may name {}. Drop the index to go \
+                         on without it.",
+                        moved.message()
+                    ),
+                    PartlyReadWhy::NotFound => format!(
+                        "{partly_read}, so it can't be created from what was read. Drop the \
+                         index to go on without it."
+                    ),
+                    PartlyReadWhy::Edited => format!(
+                        "{partly_read}, so this edit to it can't be written — what was read \
+                         is not the whole index. Undo the change to keep the index as it is, \
+                         or drop it."
+                    ),
+                    PartlyReadWhy::NoText => format!(
+                        "{partly_read} — and there is no such text for this one, so \
+                         recreating it would change what it indexes. Drop the index to go on \
+                         without it."
+                    ),
+                }
+            }
+            Withheld::ConditionNamesDropped { index, column } => format!(
+                "Index {index}'s condition names {column}, which this plan drops. Edit the condition \
+                 or drop the index first."
+            ),
+            Withheld::StrandsTriggers { count, moved } => format!(
+                "This table has {count} trigger{} on it, and their SQL is replayed exactly as \
+                 SQLite stored it — which would still name {}. SQLite accepts such a \
+                 trigger and then refuses every write to the table. Drop or edit the \
+                 trigger first, or rename the column with no other change so SQLite's own \
+                 ALTER TABLE can rewrite it.",
+                s(*count, "", "s"),
+                moved.message(),
+            ),
+            Withheld::StrandsOtherTrigger { trigger, moved } => format!(
+                "{} names {}. A rebuild renames this table underneath that trigger \
+                 and leaves its SQL exactly as it was, so the trigger would go on naming a \
+                 column that is gone — SQLite accepts such a trigger and then refuses every \
+                 write to *that* table. Drop or edit the trigger first, or rename the \
+                 column with no other change so SQLite's own ALTER TABLE can rewrite it.",
+                match trigger {
+                    Some((name, table)) => format!("Trigger {name} on {table}"),
+                    None => "A trigger on another table".to_string(),
+                },
+                moved.message(),
+            ),
+            Withheld::StrandsGeneratedColumn { column, moved } => format!(
+                "Generated column {column} computes from {}. A rebuild writes the table \
+                 from the model, and nothing rewrites that expression — SQLite \
+                 refuses the new table with \"no such column\" and the whole plan \
+                 rolls back. Edit or remove {column} first.",
+                moved.message(),
+            ),
+            Withheld::CannotRestate { clauses } => {
+                let labels: Vec<&str> = clauses.iter().map(|c| c.label()).collect();
+                let named = match labels.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => {
+                        format!("{} and {last}", rest.join(", "))
+                    }
+                    _ => labels.concat(),
+                };
+                format!(
+                    "This table's declaration carries {named}, which Schemaic's model has no \
+                     field for. A rebuild writes the table back from that model, so the clause \
+                     would be gone from a table that still looked right — and every write \
+                     depending on it would behave differently from then on. Change this table \
+                     with a script instead (Copy DDL is the start of one), or take the clause \
+                     off first."
+                )
+            }
+            Withheld::VirtualTable { name } => format!(
+                "`{name}` is a virtual table. Its columns are a module's interface rather than \
+                 a storage declaration, and its real data lives in shadow tables a rebuild \
+                 would drop — an FTS5 index would be gone from a table that still held the \
+                 text. Change it with a script instead (DROP and CREATE VIRTUAL TABLE), or \
+                 edit the tables it indexes."
+            ),
+        }
+    }
+}
+
 impl TypeSubject {
     /// The English: the column's name, or *domain d*.
     pub fn message(&self) -> String {
@@ -7870,6 +8106,14 @@ impl ChangeSet {
     /// Server an identity switched on or off, or a computed column changed, is
     /// the ordinary case.
     pub fn unsupported(&self) -> Vec<String> {
+        self.withheld_lines()
+            .iter()
+            .map(Withheld::message)
+            .collect()
+    }
+
+    /// [`ChangeSet::unsupported`] as values the interface words ([`Withheld`]).
+    pub fn withheld_lines(&self) -> Vec<Withheld> {
         // A rebuild performs the whole set — it writes the table the draft
         // describes — so nothing beside it is withheld, however little of it has
         // a statement of its own.
@@ -7907,11 +8151,11 @@ impl ChangeSet {
                     .collect(),
             };
         }
-        let mut out: Vec<String> = self
+        let mut out: Vec<Withheld> = self
             .changes
             .iter()
             .filter(|c| !supports_change(self.dialect, c))
-            .map(Change::summary)
+            .map(|c| Withheld::Change(c.line()))
             .collect();
         out.extend(self.changes.iter().filter_map(unreplayable_rename));
         out.extend(self.changes.iter().filter_map(numbered_group_refusal));
@@ -10503,7 +10747,7 @@ fn tsql_view_index_guard(qname: &str, v: &ViewDraft, server: &[IndexInfo]) -> Op
 ///
 /// **And a view created from a reading** (the comparison's create) with such
 /// an index: the view would arrive without it, the plan saying nothing.
-fn lossy_view_index_refusal(c: &Change) -> Option<String> {
+fn lossy_view_index_refusal(c: &Change) -> Option<Withheld> {
     // What the alter drops is the server's; what it builds, the draft's —
     // one reading in the editor, two in a comparison, and a lossy one on
     // either side is refused.
@@ -10530,21 +10774,14 @@ fn lossy_view_index_refusal(c: &Change) -> Option<String> {
     if lost.is_empty() {
         return None;
     }
-    let plural = if lost.len() == 1 { "" } else { "es" };
-    Some(if created {
-        format!(
-            "Creating view {} can't create its index{plural} {} — of a kind Schemaic can't \
-             restate. Create this view in SQL instead.",
-            draft.name,
-            lost.join(", ")
-        )
-    } else {
-        format!(
-            "Editing view {} drops its index{plural} {}, which Schemaic can't create again — of \
-             a kind Schemaic can't restate. Edit this view in SQL instead.",
-            draft.original.as_deref().unwrap_or(&draft.name),
-            lost.join(", ")
-        )
+    Some(Withheld::LossyViewIndexes {
+        view: if created {
+            draft.name.clone()
+        } else {
+            draft.original.clone().unwrap_or_else(|| draft.name.clone())
+        },
+        indexes: lost.into_iter().map(str::to_string).collect(),
+        created,
     })
 }
 
@@ -15814,8 +16051,8 @@ enum IndexReplay<'a> {
     /// re-declares as a `UNIQUE (…)` line. Distinct from [`IndexReplay::Refuse`]
     /// — nothing is lost and nothing is withheld.
     Skip,
-    /// Neither is faithful, so the plan is refused — the string says why.
-    Refuse(String),
+    /// Neither is faithful, so the plan is refused — the value says why.
+    Refuse(Withheld),
 }
 
 /// Is this index the one SQLite makes for a `UNIQUE` (or `PRIMARY KEY`)
@@ -15861,45 +16098,32 @@ fn sqlite_index_replay<'a>(
     if !ix.info.lossy {
         return partial_index_replay(current, draft, ix);
     }
-    let name = &ix.info.name;
-    let partly_read = format!(
-        "Index {name} was only partly read — SQLite keeps a partial index's \
-         predicate, and an expression key, only in the index's own CREATE text"
-    );
+    let refuse = |why| {
+        IndexReplay::Refuse(Withheld::PartlyRead {
+            index: ix.info.name.clone(),
+            why,
+        })
+    };
     // A column this plan renames or removes may be one the unread part names,
     // and replaying the text would then create an index over a column that is
     // gone. Asked first, so the reason the user is given is the edit they made
     // rather than the rewrite the designer did to the index on their behalf.
     if let Some(moved) = column_moved(current, draft) {
-        return IndexReplay::Refuse(format!(
-            "{partly_read}, and that text may name {moved}. Drop the index to go \
-             on without it."
-        ));
+        return refuse(PartlyReadWhy::MayName(moved));
     }
     let Some(cur) = ix
         .original
         .as_deref()
         .and_then(|o| current.indexes.iter().find(|c| c.name == o))
     else {
-        return IndexReplay::Refuse(format!(
-            "{partly_read}, so it can't be created from what was read. Drop the \
-             index to go on without it."
-        ));
+        return refuse(PartlyReadWhy::NotFound);
     };
     if !indexes_equal(cur, &ix.info) {
-        return IndexReplay::Refuse(format!(
-            "{partly_read}, so this edit to it can't be written — what was read \
-             is not the whole index. Undo the change to keep the index as it is, \
-             or drop it."
-        ));
+        return refuse(PartlyReadWhy::Edited);
     }
     match cur.create_sql.as_deref() {
         Some(sql) => IndexReplay::Verbatim(sql),
-        None => IndexReplay::Refuse(format!(
-            "{partly_read} — and there is no such text for this one, so \
-             recreating it would change what it indexes. Drop the index to go on \
-             without it."
-        )),
+        None => refuse(PartlyReadWhy::NoText),
     }
 }
 
@@ -15932,11 +16156,10 @@ fn partial_index_replay<'a>(
         !kept.contains(c.name.as_str())
             && repoint_check_column(pred, &c.name, &c.name, SqlDialect::Sqlite).is_some()
     }) {
-        return IndexReplay::Refuse(format!(
-            "Index {}'s condition names {}, which this plan drops. Edit the condition \
-             or drop the index first.",
-            ix.info.name, gone.name
-        ));
+        return IndexReplay::Refuse(Withheld::ConditionNamesDropped {
+            index: ix.info.name.clone(),
+            column: gone.name.clone(),
+        });
     }
     let untouched = ix
         .original
@@ -16352,27 +16575,17 @@ fn is_rename_only(from: &ColumnInfo, to: &ColumnInfo) -> bool {
 /// faithfully for triggers — the same argument [`TableInfo::dependent_ddl`]
 /// makes for keeping the text verbatim in the first place — so the honest answer
 /// is to say what can't be done, in the preview, before anything runs.
-fn rebuild_strands_a_trigger(current: &TableInfo, draft: &TableDraft) -> Option<String> {
+fn rebuild_strands_a_trigger(current: &TableInfo, draft: &TableDraft) -> Option<Withheld> {
     if current.dependent_ddl.is_empty() && current.referring_ddl.is_empty() {
         return None;
     }
     let moved = moved_columns(current, draft);
     let first = moved.first()?;
     if !current.dependent_ddl.is_empty() {
-        return Some(format!(
-            "This table has {} trigger{} on it, and their SQL is replayed exactly as \
-             SQLite stored it — which would still name {}. SQLite accepts such a \
-             trigger and then refuses every write to the table. Drop or edit the \
-             trigger first, or rename the column with no other change so SQLite's own \
-             ALTER TABLE can rewrite it.",
-            current.dependent_ddl.len(),
-            if current.dependent_ddl.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
-            first.phrase,
-        ));
+        return Some(Withheld::StrandsTriggers {
+            count: current.dependent_ddl.len(),
+            moved: first.moved.clone(),
+        });
     }
     // **A trigger on another table.** Not replayed by the rebuild and not
     // dropped by it — and not rewritten either, which is the whole problem.
@@ -16383,19 +16596,13 @@ fn rebuild_strands_a_trigger(current: &TableInfo, draft: &TableDraft) -> Option<
         let m = moved
             .iter()
             .find(|m| crate::intel::code_names(sql, &m.name, SqlDialect::Sqlite))?;
-        let owner = sqlite_trigger_info(sql)
-            .map(|t| format!("Trigger {} on {}", t.name, t.table))
-            .unwrap_or_else(|| "A trigger on another table".to_string());
+        let owner = sqlite_trigger_info(sql).map(|t| (t.name, t.table));
         Some((owner, m))
     })?;
-    Some(format!(
-        "{owner} names {}. A rebuild renames this table underneath that trigger \
-         and leaves its SQL exactly as it was, so the trigger would go on naming a \
-         column that is gone — SQLite accepts such a trigger and then refuses every \
-         write to *that* table. Drop or edit the trigger first, or rename the \
-         column with no other change so SQLite's own ALTER TABLE can rewrite it.",
-        hit.phrase,
-    ))
+    Some(Withheld::StrandsOtherTrigger {
+        trigger: owner,
+        moved: hit.moved.clone(),
+    })
 }
 
 /// Is this SQLite declaration a **virtual** table — `CREATE VIRTUAL TABLE …
@@ -16463,19 +16670,14 @@ pub fn is_sqlite_virtual_table(create_sql: &str) -> bool {
 /// for a rebuild to write at all. The shadow tables are separately dropped from
 /// the schema listing (`db::sqlite::master_entries`), which is the other end of
 /// the same hole — a designer edit on `docs_data` did the identical damage.
-fn rebuild_refuses_a_virtual_table(current: &TableInfo) -> Option<String> {
+fn rebuild_refuses_a_virtual_table(current: &TableInfo) -> Option<Withheld> {
     let sql = current.create_sql.as_deref()?;
     if !is_sqlite_virtual_table(sql) {
         return None;
     }
-    Some(format!(
-        "`{}` is a virtual table. Its columns are a module's interface rather than \
-         a storage declaration, and its real data lives in shadow tables a rebuild \
-         would drop — an FTS5 index would be gone from a table that still held the \
-         text. Change it with a script instead (DROP and CREATE VIRTUAL TABLE), or \
-         edit the tables it indexes.",
-        current.name
-    ))
+    Some(Withheld::VirtualTable {
+        name: current.name.clone(),
+    })
 }
 
 /// The refusal for a rebuild of a table whose declaration says more than this
@@ -16499,22 +16701,9 @@ fn rebuild_refuses_a_virtual_table(current: &TableInfo) -> Option<String> {
 /// Refusing is the honest half of the pair: the alternative is four model
 /// additions, and until they exist the preview says which clause it cannot write
 /// rather than writing a table that merely looks like the one that was there.
-fn rebuild_cannot_restate(current: &TableInfo) -> Option<String> {
-    let missing = unrestatable_sqlite_clauses(current.create_sql.as_deref()?);
-    let (last, rest) = missing.split_last()?;
-    let named = if rest.is_empty() {
-        (*last).to_string()
-    } else {
-        format!("{} and {last}", rest.join(", "))
-    };
-    Some(format!(
-        "This table's declaration carries {named}, which Schemaic's model has no \
-         field for. A rebuild writes the table back from that model, so the clause \
-         would be gone from a table that still looked right — and every write \
-         depending on it would behave differently from then on. Change this table \
-         with a script instead (Copy DDL is the start of one), or take the clause \
-         off first."
-    ))
+fn rebuild_cannot_restate(current: &TableInfo) -> Option<Withheld> {
+    let clauses = unrestatable_sqlite_clauses(current.create_sql.as_deref()?);
+    (!clauses.is_empty()).then_some(Withheld::CannotRestate { clauses })
 }
 
 /// Every clause in a SQLite table's own `CREATE` text that the model has no field
@@ -16552,12 +16741,12 @@ fn rebuild_cannot_restate(current: &TableInfo) -> Option<String> {
 /// - `DEFERRABLE` needs no position, and not by luck of the scan: SQLite refuses
 ///   it as a bare column name (*near "deferrable": syntax error*), so the only
 ///   way it reaches code is as the clause.
-fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
+fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<SqliteClause> {
     use crate::sql::{is_word_byte, is_word_start, skip_noncode};
     let d = SqlDialect::Sqlite;
     let b = create_sql.as_bytes();
-    let mut out: Vec<&'static str> = Vec::new();
-    let mut add = |what: &'static str| {
+    let mut out: Vec<SqliteClause> = Vec::new();
+    let mut add = |what: SqliteClause| {
         if !out.contains(&what) {
             out.push(what);
         }
@@ -16646,13 +16835,13 @@ fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
         if word.eq_ignore_ascii_case("PRIMARY") {
             item_is_key = true;
         } else if word.eq_ignore_ascii_case("DEFERRABLE") {
-            add("a foreign key's DEFERRABLE clause");
+            add(SqliteClause::Deferrable);
         } else if word.eq_ignore_ascii_case("CONFLICT") && prev_word.eq_ignore_ascii_case("ON") {
-            add("an ON CONFLICT clause");
+            add(SqliteClause::OnConflict);
         } else if word.eq_ignore_ascii_case("DESC") && item_is_key && !first_in_group {
-            add("a DESC primary-key column");
+            add(SqliteClause::DescKey);
         } else if word.eq_ignore_ascii_case("COLLATE") && item_is_key && depth > 1 {
-            add("a COLLATE on a primary-key column");
+            add(SqliteClause::CollateKey);
         }
         prev_word.clear();
         prev_word.push_str(word);
@@ -16663,11 +16852,11 @@ fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
 }
 
 /// A column this plan renames or drops: the name it is known by in SQL written
-/// before the plan, and the phrase a refusal wants for it.
+/// before the plan, and what a refusal says happens to it.
 struct MovedColumn {
     /// The **old** name, which is the one another statement still spells.
     name: String,
-    phrase: String,
+    moved: Moved,
 }
 
 /// A generated column whose expression names a column this plan moves, or
@@ -16691,7 +16880,7 @@ struct MovedColumn {
 /// Through [`repoint_check_column`] like the check arm, so the engine's own
 /// quoting and case rules decide what "names it" means rather than a
 /// substring test.
-fn rebuild_strands_a_generated_column(current: &TableInfo, draft: &TableDraft) -> Option<String> {
+fn rebuild_strands_a_generated_column(current: &TableInfo, draft: &TableDraft) -> Option<Withheld> {
     let moved = moved_columns(current, draft);
     if moved.is_empty() {
         return None;
@@ -16710,13 +16899,10 @@ fn rebuild_strands_a_generated_column(current: &TableInfo, draft: &TableDraft) -
         }) else {
             continue;
         };
-        return Some(format!(
-            "Generated column {} computes from {}. A rebuild writes the table \
-             from the model, and nothing rewrites that expression — SQLite \
-             refuses the new table with \"no such column\" and the whole plan \
-             rolls back. Edit or remove {} first.",
-            c.info.name, m.phrase, c.info.name,
-        ));
+        return Some(Withheld::StrandsGeneratedColumn {
+            column: c.info.name.clone(),
+            moved: m.moved.clone(),
+        });
     }
     None
 }
@@ -16737,7 +16923,10 @@ fn moved_columns(current: &TableInfo, draft: &TableDraft) -> Vec<MovedColumn> {
         match &c.original {
             Some(o) if *o != c.info.name => out.push(MovedColumn {
                 name: o.clone(),
-                phrase: format!("{o}, which this plan renames to {}", c.info.name),
+                moved: Moved::Renamed {
+                    from: o.clone(),
+                    to: c.info.name.clone(),
+                },
             }),
             _ => {}
         }
@@ -16754,7 +16943,9 @@ fn moved_columns(current: &TableInfo, draft: &TableDraft) -> Vec<MovedColumn> {
     {
         out.push(MovedColumn {
             name: c.name.clone(),
-            phrase: format!("{}, which this plan drops", c.name),
+            moved: Moved::Dropped {
+                name: c.name.clone(),
+            },
         });
     }
     out
@@ -16762,11 +16953,11 @@ fn moved_columns(current: &TableInfo, draft: &TableDraft) -> Vec<MovedColumn> {
 
 /// The first entry of [`moved_columns`]' phrase, for a caller that only needs
 /// something to say.
-fn column_moved(current: &TableInfo, draft: &TableDraft) -> Option<String> {
+fn column_moved(current: &TableInfo, draft: &TableDraft) -> Option<Moved> {
     moved_columns(current, draft)
         .into_iter()
         .next()
-        .map(|m| m.phrase)
+        .map(|m| m.moved)
 }
 
 /// Step 1 of SQLite's twelve-step procedure, as a statement rather than as a
@@ -17995,40 +18186,37 @@ fn tsql_late_arm(probe: &str, cond: &str, why: &str) -> String {
 /// did not read; a trigger whose text is encrypted has none to put back; a signed one
 /// would come back unsigned (S2-L5-05); one kept verbatim names the table as
 /// it was, which a rename leaves behind.
-fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
-    let t = &current.name;
-    let mut out: Vec<String> = current
+fn tsql_rebuild_refusals(current: &TableInfo, draft: &TableDraft) -> Vec<Withheld> {
+    let table = || current.name.clone();
+    let mut out: Vec<Withheld> = current
         .indexes
         .iter()
         .filter(|ix| ix.lossy && !ix.is_primary())
-        .map(|ix| {
-            format!(
-                "Rebuilding {t} would drop the index {}: it is of a kind Schemaic doesn't \
-                 read whole",
-                ix.name
-            )
+        .map(|ix| Withheld::TsqlLossyIndex {
+            table: table(),
+            index: ix.name.clone(),
         })
         .collect();
     let renamed = !draft.name.trim().is_empty() && draft.name != current.name;
     for tr in &current.triggers {
+        let trigger = tr.name.clone();
         if tr.tsql.hidden {
-            out.push(format!(
-                "Rebuilding {t} would drop the trigger {}: its text is encrypted",
-                tr.name
-            ));
+            out.push(Withheld::TsqlEncryptedTrigger {
+                table: table(),
+                trigger,
+            });
         } else if tr.tsql.module.signed {
             // Re-created from its text, it comes back unsigned, and only the
             // certificate's private key could sign it again.
-            out.push(format!(
-                "Rebuilding {t} would drop the signature on the trigger {}, which can't be put \
-                 back without the certificate's private key",
-                tr.name
-            ));
+            out.push(Withheld::TsqlSignedTrigger {
+                table: table(),
+                trigger,
+            });
         } else if renamed && tr.tsql.verbatim.is_some() {
-            out.push(format!(
-                "Rebuilding {t} under a new name would leave the trigger {} naming the old one",
-                tr.name
-            ));
+            out.push(Withheld::TsqlRenamedTrigger {
+                table: table(),
+                trigger,
+            });
         }
     }
     out

@@ -810,6 +810,48 @@ propose-not-loaded = { $table } ist in { $database } gerade nicht geladen — ö
 propose-nothing-to-change = { $subject } sieht bereits so aus — es gibt nichts zu ändern.
 propose-no-database = Für diesen Tab ist keine Datenbank ausgewählt, eine von hier angewendete Schemaänderung hätte also kein Ziel. Wähle zuerst eine für diese Verbindung — sind alle Datenbanken ausgeblendet, holt das SCHEMA-Auge eine zurück.
 propose-other-connection = Diese Änderung betrifft einen Tab einer anderen Verbindung — wechsle zu ihm oder wähle seine Verbindung im Baum, bevor du eine Schemaänderung anwendest.
+ddl-moved-renamed = { $from }, die dieser Plan in { $to } umbenennt
+ddl-moved-dropped = { $name }, die dieser Plan löscht
+ddl-withheld-unreplayable-rename = { $count ->
+        [one] Das Umbenennen von { $was } in { $to } kann seinen { $count } Trigger nicht mitnehmen: Sein SQL nennt { $was }, und es hier umzuschreiben würde ändern, was du geschrieben hast. Benenne die Sicht für sich um, nachdem du die Trigger gegen den neuen Namen neu erstellt hast.
+       *[other] Das Umbenennen von { $was } in { $to } kann seine { $count } Trigger nicht mitnehmen: Ihr SQL nennt { $was }, und es hier umzuschreiben würde ändern, was du geschrieben hast. Benenne die Sicht für sich um, nachdem du die Trigger gegen den neuen Namen neu erstellt hast.
+    }
+ddl-withheld-numbered-group = { $name } führt eine nummerierte Prozedurgruppe ({ $members }) an, und dieser Plan löscht es zuerst, womit jedes Mitglied der Gruppe mitgelöscht wird. Bearbeite es unter seinem eigenen Namen und Typ, was es an Ort und Stelle ändert und sie behält.
+ddl-withheld-view-index-create = { $count ->
+        [one] Das Erstellen der Sicht { $view } kann ihren Index { $indexes } nicht erstellen — von einer Art, die Schemaic nicht wiederherstellen kann. Erstelle diese Sicht stattdessen in SQL.
+       *[other] Das Erstellen der Sicht { $view } kann ihre Indizes { $indexes } nicht erstellen — von einer Art, die Schemaic nicht wiederherstellen kann. Erstelle diese Sicht stattdessen in SQL.
+    }
+ddl-withheld-view-index-edit = { $count ->
+        [one] Das Bearbeiten der Sicht { $view } löscht ihren Index { $indexes }, den Schemaic nicht wieder erstellen kann — von einer Art, die Schemaic nicht wiederherstellen kann. Bearbeite diese Sicht stattdessen in SQL.
+       *[other] Das Bearbeiten der Sicht { $view } löscht ihre Indizes { $indexes }, die Schemaic nicht wieder erstellen kann — von einer Art, die Schemaic nicht wiederherstellen kann. Bearbeite diese Sicht stattdessen in SQL.
+    }
+ddl-withheld-tsql-lossy-index = Das Neuaufbauen von { $table } würde den Index { $index } löschen: Er ist von einer Art, die Schemaic nicht vollständig liest
+ddl-withheld-tsql-encrypted-trigger = Das Neuaufbauen von { $table } würde den Trigger { $trigger } löschen: Sein Text ist verschlüsselt
+ddl-withheld-tsql-signed-trigger = Das Neuaufbauen von { $table } würde die Signatur des Triggers { $trigger } entfernen, die sich ohne den privaten Schlüssel des Zertifikats nicht wiederherstellen lässt
+ddl-withheld-tsql-renamed-trigger = Das Neuaufbauen von { $table } unter neuem Namen würde den Trigger { $trigger } beim alten Namen belassen
+ddl-withheld-partly-read = Der Index { $index } wurde nur teilweise gelesen — SQLite hält das Prädikat eines partiellen Index und einen Ausdrucksschlüssel nur im eigenen CREATE-Text des Index{ $why ->
+        [may-name] , und dieser Text nennt womöglich { $moved }. Lösche den Index, um ohne ihn fortzufahren.
+        [not-found] , daher lässt er sich aus dem Gelesenen nicht erstellen. Lösche den Index, um ohne ihn fortzufahren.
+        [edited] , daher lässt sich diese Änderung daran nicht schreiben — das Gelesene ist nicht der ganze Index. Mache die Änderung rückgängig, um den Index zu behalten, oder lösche ihn.
+       *[no-text] {" "}— und für diesen gibt es keinen solchen Text, ein Neuerstellen würde also ändern, was er indiziert. Lösche den Index, um ohne ihn fortzufahren.
+    }
+ddl-withheld-condition-names-dropped = Die Bedingung des Index { $index } nennt { $column }, die dieser Plan löscht. Bearbeite zuerst die Bedingung oder lösche den Index.
+ddl-withheld-strands-triggers = Diese Tabelle hat { $count ->
+        [one] { $count } Trigger
+       *[other] { $count } Trigger
+    }, und deren SQL wird genau so wiederholt, wie SQLite es gespeichert hat — was weiterhin { $moved } nennen würde. SQLite nimmt einen solchen Trigger an und lehnt dann jedes Schreiben in die Tabelle ab. Lösche oder bearbeite zuerst den Trigger, oder benenne die Spalte ohne weitere Änderung um, damit SQLites eigenes ALTER TABLE ihn umschreiben kann.
+ddl-withheld-strands-other-trigger = { $owner } nennt { $moved }. Ein Neuaufbau benennt diese Tabelle unter diesem Trigger um und lässt sein SQL unverändert, sodass der Trigger weiter eine Spalte nennt, die es nicht mehr gibt — SQLite nimmt einen solchen Trigger an und lehnt dann jedes Schreiben in *jene* Tabelle ab. Lösche oder bearbeite zuerst den Trigger, oder benenne die Spalte ohne weitere Änderung um, damit SQLites eigenes ALTER TABLE ihn umschreiben kann.
+ddl-withheld-trigger-on = Der Trigger { $name } auf { $table }
+ddl-withheld-some-trigger = Ein Trigger auf einer anderen Tabelle
+ddl-withheld-strands-generated-column = Die generierte Spalte { $column } berechnet sich aus { $moved }. Ein Neuaufbau schreibt die Tabelle aus dem Modell, und nichts schreibt diesen Ausdruck um — SQLite lehnt die neue Tabelle mit "no such column" ab, und der ganze Plan wird zurückgerollt. Bearbeite oder entferne zuerst { $column }.
+ddl-withheld-cannot-restate = Die Deklaration dieser Tabelle enthält { $clauses }, wofür Schemaics Modell kein Feld hat. Ein Neuaufbau schreibt die Tabelle aus diesem Modell zurück, die Klausel wäre also aus einer Tabelle verschwunden, die noch richtig aussieht — und jedes Schreiben, das davon abhängt, würde sich von da an anders verhalten. Ändere diese Tabelle stattdessen mit einem Skript („DDL kopieren“ ist der Anfang eines solchen), oder entferne die Klausel zuerst.
+ddl-sqlite-clauses = { $first } und { $last }
+ddl-sqlite-clause-deferrable = die DEFERRABLE-Klausel eines Fremdschlüssels
+ddl-sqlite-clause-on-conflict = eine ON-CONFLICT-Klausel
+ddl-sqlite-clause-desc-key = eine DESC-Primärschlüsselspalte
+ddl-sqlite-clause-collate-key = ein COLLATE auf einer Primärschlüsselspalte
+ddl-withheld-virtual-table = `{ $name }` ist eine virtuelle Tabelle. Ihre Spalten sind die Schnittstelle eines Moduls statt einer Speicherdeklaration, und ihre eigentlichen Daten liegen in Schattentabellen, die ein Neuaufbau löschen würde — ein FTS5-Index wäre aus einer Tabelle verschwunden, die den Text noch enthält. Ändere sie stattdessen mit einem Skript (DROP und CREATE VIRTUAL TABLE), oder bearbeite die Tabellen, die sie indiziert.
+ddl-withheld-of = { $subject } — { $line }
 ddl-used-by-count-view = { $count ->
     [one] { $count } Sicht
    *[other] { $count } Sichten

@@ -270,7 +270,7 @@ pub(crate) fn preview_of(
         risk_heading: risk_heading_text(cs.risk_reversible()),
         used_by: Vec::new(),
         then: None,
-        withheld: cs.unsupported(),
+        withheld: cs.withheld_lines().iter().map(withheld_text).collect(),
         // A single object's edit is about that object: it is either in the plan
         // or there is no plan. Nothing can be left out of it.
         omitted: Vec::new(),
@@ -362,7 +362,11 @@ pub(crate) fn preview_of_plan(
         // The same refusal a single set gets: non-empty disables Apply and is
         // re-checked inside `apply`, so a plan that can't be expressed in full
         // is not applied in part.
-        withheld: plan.unsupported(),
+        withheld: plan
+            .withheld_lines()
+            .iter()
+            .map(|(subject, w)| plan_withheld_text(subject, w))
+            .collect(),
         // **The disclosure this modal was missing.** A comparison can hold
         // differences no plan can carry — on MySQL, every routine, trigger and
         // event, whose bodies arrive escape-mangled — and they have no tick-box,
@@ -2303,6 +2307,156 @@ pub(crate) fn plan_risk_text(risk: &schemaic_core::compare::PlanRisk) -> String 
     }
 }
 
+/// A column a refusal names as renamed or dropped — core's `ddl::Moved`.
+fn moved_text(m: &schemaic_core::ddl::Moved) -> String {
+    use schemaic_core::ddl::Moved;
+    match m {
+        Moved::Renamed { from, to } => {
+            tr!("ddl-moved-renamed", from = from.as_str(), to = to.as_str())
+        }
+        Moved::Dropped { name } => tr!("ddl-moved-dropped", name = name.as_str()),
+    }
+}
+
+/// One line of the withheld list — core's
+/// [`Withheld::message`](schemaic_core::ddl::Withheld::message) in the
+/// interface's language.
+pub(crate) fn withheld_text(w: &schemaic_core::ddl::Withheld) -> String {
+    use schemaic_core::ddl::{PartlyReadWhy, SqliteClause, Withheld as W};
+    match w {
+        W::Change(line) => change_line_text(line),
+        &W::UnreplayableRename {
+            ref was,
+            ref to,
+            triggers,
+        } => tr!(
+            "ddl-withheld-unreplayable-rename",
+            count = triggers,
+            was = was.as_str(),
+            to = to.as_str()
+        ),
+        W::NumberedGroup { name, members } => tr!(
+            "ddl-withheld-numbered-group",
+            name = name.as_str(),
+            members = members.as_str()
+        ),
+        W::LossyViewIndexes {
+            view,
+            indexes,
+            created,
+        } => {
+            let (view, count, indexes) = (view.as_str(), indexes.len(), indexes.join(", "));
+            if *created {
+                tr!(
+                    "ddl-withheld-view-index-create",
+                    count = count,
+                    view = view,
+                    indexes = indexes
+                )
+            } else {
+                tr!(
+                    "ddl-withheld-view-index-edit",
+                    count = count,
+                    view = view,
+                    indexes = indexes
+                )
+            }
+        }
+        W::TsqlLossyIndex { table, index } => tr!(
+            "ddl-withheld-tsql-lossy-index",
+            table = table.as_str(),
+            index = index.as_str()
+        ),
+        W::TsqlEncryptedTrigger { table, trigger } => tr!(
+            "ddl-withheld-tsql-encrypted-trigger",
+            table = table.as_str(),
+            trigger = trigger.as_str()
+        ),
+        W::TsqlSignedTrigger { table, trigger } => tr!(
+            "ddl-withheld-tsql-signed-trigger",
+            table = table.as_str(),
+            trigger = trigger.as_str()
+        ),
+        W::TsqlRenamedTrigger { table, trigger } => tr!(
+            "ddl-withheld-tsql-renamed-trigger",
+            table = table.as_str(),
+            trigger = trigger.as_str()
+        ),
+        W::PartlyRead { index, why } => {
+            let (why, moved) = match why {
+                PartlyReadWhy::MayName(m) => ("may-name", moved_text(m)),
+                PartlyReadWhy::NotFound => ("not-found", String::new()),
+                PartlyReadWhy::Edited => ("edited", String::new()),
+                PartlyReadWhy::NoText => ("no-text", String::new()),
+            };
+            tr!(
+                "ddl-withheld-partly-read",
+                index = index.as_str(),
+                why = why,
+                moved = moved
+            )
+        }
+        W::ConditionNamesDropped { index, column } => tr!(
+            "ddl-withheld-condition-names-dropped",
+            index = index.as_str(),
+            column = column.as_str()
+        ),
+        &W::StrandsTriggers { count, ref moved } => tr!(
+            "ddl-withheld-strands-triggers",
+            count = count,
+            moved = moved_text(moved)
+        ),
+        W::StrandsOtherTrigger { trigger, moved } => tr!(
+            "ddl-withheld-strands-other-trigger",
+            owner = match trigger {
+                Some((name, table)) => tr!(
+                    "ddl-withheld-trigger-on",
+                    name = name.as_str(),
+                    table = table.as_str()
+                ),
+                None => tr!("ddl-withheld-some-trigger"),
+            },
+            moved = moved_text(moved)
+        ),
+        W::StrandsGeneratedColumn { column, moved } => tr!(
+            "ddl-withheld-strands-generated-column",
+            column = column.as_str(),
+            moved = moved_text(moved)
+        ),
+        W::CannotRestate { clauses } => {
+            let words: Vec<String> = clauses
+                .iter()
+                .map(|c| match c {
+                    SqliteClause::Deferrable => tr!("ddl-sqlite-clause-deferrable"),
+                    SqliteClause::OnConflict => tr!("ddl-sqlite-clause-on-conflict"),
+                    SqliteClause::DescKey => tr!("ddl-sqlite-clause-desc-key"),
+                    SqliteClause::CollateKey => tr!("ddl-sqlite-clause-collate-key"),
+                })
+                .collect();
+            let clauses = match words.split_last() {
+                Some((last, rest)) if !rest.is_empty() => tr!(
+                    "ddl-sqlite-clauses",
+                    first = rest.join(", "),
+                    last = last.as_str()
+                ),
+                _ => words.concat(),
+            };
+            tr!("ddl-withheld-cannot-restate", clauses = clauses)
+        }
+        W::VirtualTable { name } => tr!("ddl-withheld-virtual-table", name = name.as_str()),
+    }
+}
+
+/// A comparison's withheld line — core's `SchemaPlan::unsupported` in the
+/// interface's language.
+pub(crate) fn plan_withheld_text(subject: &str, w: &schemaic_core::ddl::Withheld) -> String {
+    tr!(
+        "ddl-withheld-of",
+        subject = subject,
+        line = withheld_text(w)
+    )
+}
+
 /// Why an AI proposal cannot be previewed, on its card — core's
 /// `ProposeError` `Display` in the interface's language; the names and the
 /// model's own SQL stay as they came.
@@ -3125,6 +3279,120 @@ mod tests {
         }
         for risk in &plan {
             assert_eq!(plan_risk_text(risk), risk.message(), "{risk:?}");
+        }
+    }
+
+    /// **Every withheld line reads in English exactly as core's** — each
+    /// refusal, its counts at one and many, each way a column moves, every
+    /// reason a partly-read index is refused and the SQLite clauses one,
+    /// two and several; and a comparison's, named for its object.
+    #[test]
+    fn english_says_every_withheld_line_as_core_does() {
+        use schemaic_core::ddl::{ChangeLine, Moved, PartlyReadWhy, SqliteClause, Withheld as W};
+        let s = |v: &str| v.to_string();
+        let moves = [
+            Moved::Renamed {
+                from: s("qty"),
+                to: s("n"),
+            },
+            Moved::Dropped { name: s("qty") },
+        ];
+        let mut lines = vec![
+            W::Change(ChangeLine::DropTable),
+            W::Change(ChangeLine::RenameIndex {
+                from: s("ix"),
+                to: s("iy"),
+            }),
+            W::NumberedGroup {
+                name: s("grp"),
+                members: s("grp;2, grp;3"),
+            },
+            W::TsqlLossyIndex {
+                table: s("t"),
+                index: s("ix"),
+            },
+            W::TsqlEncryptedTrigger {
+                table: s("t"),
+                trigger: s("tr"),
+            },
+            W::TsqlSignedTrigger {
+                table: s("t"),
+                trigger: s("tr"),
+            },
+            W::TsqlRenamedTrigger {
+                table: s("t"),
+                trigger: s("tr"),
+            },
+            W::ConditionNamesDropped {
+                index: s("ix"),
+                column: s("qty"),
+            },
+            W::VirtualTable { name: s("docs") },
+        ];
+        for n in [1, 3] {
+            lines.push(W::UnreplayableRename {
+                was: s("v"),
+                to: s("w"),
+                triggers: n,
+            });
+            for created in [false, true] {
+                lines.push(W::LossyViewIndexes {
+                    view: s("v"),
+                    indexes: (0..n).map(|i| format!("ix{i}")).collect(),
+                    created,
+                });
+            }
+        }
+        for moved in &moves {
+            for count in [1, 2] {
+                lines.push(W::StrandsTriggers {
+                    count,
+                    moved: moved.clone(),
+                });
+            }
+            for trigger in [None, Some((s("tr"), s("orders")))] {
+                lines.push(W::StrandsOtherTrigger {
+                    trigger,
+                    moved: moved.clone(),
+                });
+            }
+            lines.push(W::StrandsGeneratedColumn {
+                column: s("total"),
+                moved: moved.clone(),
+            });
+            lines.push(W::PartlyRead {
+                index: s("ix"),
+                why: PartlyReadWhy::MayName(moved.clone()),
+            });
+        }
+        for why in [
+            PartlyReadWhy::NotFound,
+            PartlyReadWhy::Edited,
+            PartlyReadWhy::NoText,
+        ] {
+            lines.push(W::PartlyRead {
+                index: s("ix"),
+                why,
+            });
+        }
+        let all = [
+            SqliteClause::Deferrable,
+            SqliteClause::OnConflict,
+            SqliteClause::DescKey,
+            SqliteClause::CollateKey,
+        ];
+        for n in 1..=all.len() {
+            lines.push(W::CannotRestate {
+                clauses: all[..n].to_vec(),
+            });
+        }
+        for w in &lines {
+            assert_eq!(withheld_text(w), w.message(), "{w:?}");
+            assert_eq!(
+                plan_withheld_text("city", w),
+                format!("city — {}", w.message()),
+                "{w:?}"
+            );
         }
     }
 

@@ -7147,8 +7147,9 @@ existing prose was left alone.
     of them rather than the first, since the first moved column is not necessarily the one a given
     trigger spells, and refusing on any trigger that merely names the *table* would withhold edits
     that are fine — and each match goes through `intel::code_names`, so a mention in a comment or a
-    string literal is not one. `column_moved` stays as the thin first-phrase wrapper for the callers
-    that only need something to say.
+    string literal is not one. `column_moved` stays as the thin first-column wrapper for the callers
+    that only need something to say, and what it returns is a `Moved` — `Renamed { from, to }` or
+    `Dropped { name }` — which the refusal carries and the interface words, not a phrase.
     It also withholds a rebuild of a table whose *declaration* says more than the model can restate
     (`rebuild_cannot_restate`, over `unrestatable_sqlite_clauses`): a foreign key's `DEFERRABLE`, a
     column's `ON CONFLICT`, a `DESC` primary-key column, and a `COLLATE` **inside** a
@@ -7542,7 +7543,12 @@ existing prose was left alone.
     narrow a column **and** make it NOT NULL and the NOT-NULL sentence ("the statement fails")
     otherwise reads as a promise that nothing is lost. `line()` is a `ChangeLine`, the change's
     sentence as a value the interface words, and `summary()` is its English, `line().message()`,
-    for the CLI, the MCP server, the withheld list and the tests (under *The string catalogue*).
+    for the CLI, the MCP server and the tests (under *The string catalogue*); a refused change
+    reaches the withheld list as that `ChangeLine` itself, `Withheld::Change`.
+    `ChangeSet::withheld_lines()` is the same move made for the withheld list: one `Withheld` per
+    sentence, every producer above and below — `sqlite_index_replay`'s `IndexReplay::Refuse`
+    included — returning one rather than a `String`, and `unsupported()` is its English, which is
+    still what `withheld_header`, the CLI and the tests read.
     `risks()` is the same move made for the risk block: `risk_lines()` answers one `Risk` per
     sentence, `risks()` is its English, and `is_destructive` asks `risk_lines()`; a set's
     `ChangeSet::risk_lines()` adds the plan's own `Risk::StarRefresh` and `Risk::Piecewise`
@@ -13291,7 +13297,8 @@ existing prose was left alone.
     a transaction insert children before parents and have the key checked at commit, so a copy
     restored without it refuses those inserts at statement time and the application fails against a
     database that "restored fine". That this matters was already settled here —
-    `ddl::unrestatable_sqlite_clauses` names *"a foreign key's DEFERRABLE clause"* and **withholds**
+    `ddl::unrestatable_sqlite_clauses` names `SqliteClause::Deferrable` (*"a foreign key's
+    DEFERRABLE clause"*) and **withholds**
     the SQLite rebuild rather than drop it — so until now the same attribute was a refusal on one
     engine and a silent drop on another, because the model had no field for either side to read.
     `pg.rs` reads both off `con.confmatchtype` / `con.condeferrable` + `con.condeferred` through
@@ -28614,7 +28621,8 @@ existing prose was left alone.
     **Every path ends at `ddl_preview`** — designer, Create table, and the context-menu
     shortcuts — so there's one place that shows the SQL, one that names what's destroyed, and
     one "Open in editor" escape hatch. Never run generated DDL without it.
-    `DdlPreview::withheld` (from `ChangeSet::unsupported()`) is the other half of that honesty:
+    `DdlPreview::withheld` (`ChangeSet::withheld_lines()`, worded by `withheld_text` — the values
+    `unsupported()` is the English of) is the other half of that honesty:
     when the dialect can't express part of the plan the modal shows a "This engine can't express
     part of this plan" block listing each one, and Apply refuses — **both on the button and inside
     `apply()`**, the same rule the write guard follows, since a disabled button is not a guard. It
@@ -28747,7 +28755,8 @@ existing prose was left alone.
     `an_empty_plan_previews_as_empty_and_unqualified`, where `all()` over no changes was vacuously
     true and flipped the answer for a reason that had nothing to do with accounts. It had none while
     `preview_of` had them, which is how the nonsense title shipped.
-    `withheld` is `SchemaPlan::unsupported()`, so the "not applied in part" refusal fires on the
+    `withheld` is `SchemaPlan::withheld_lines()` worded by `plan_withheld_text` — the values
+    `unsupported()` is the English of — so the "not applied in part" refusal fires on the
     button *and* inside `apply()` on this path too. **`omitted` is `SchemaPlan::omissions`, each
     worded by `compare_view::omission_text`, and is a second block beside it, drawn by `omitted_block`, which discloses and does not refuse** — the
     difference between the two is what makes them two blocks. Withheld means half an edit, and half
@@ -28791,11 +28800,12 @@ existing prose was left alone.
     footers share is now one message rather than two literals that modal's source gate held equal.
     `the_counted_lines_read_as_they_did_in_english` pins both plurals. English stays: the SQL box
     (`sql_box_text`, its `-- After the plan commits…` comment included, being generated SQL) and the
-    *SQL* heading; the withheld lines, core's prose, phase 4 — the change lines, the
-    risk lines, the risk heading, the *Used by* lines, the after-commit refresh note and the omitted
-    lines have left that list, worded from `ChangeLine`, `Risk`/`PlanRisk`,
-    `used_by::Listing`/`UsedByNote`, `ddl::ElsewhereNote` and `compare::PlanOmission` (`risk_text`,
-    `plan_risk_text`, `used_by_drop_text`, `used_by_note_text`, `elsewhere_note_text`, all under
+    *SQL* heading, and what the server says, and nothing else — the change lines, the
+    risk lines, the risk heading, the *Used by* lines, the after-commit refresh note, the omitted
+    lines and, last, the withheld lines have left that list, worded from `ChangeLine`,
+    `Risk`/`PlanRisk`, `used_by::Listing`/`UsedByNote`, `ddl::ElsewhereNote`,
+    `compare::PlanOmission` and `ddl::Withheld` (`risk_text`, `plan_risk_text`, `used_by_drop_text`,
+    `used_by_note_text`, `elsewhere_note_text`, `withheld_text`, `plan_withheld_text`, all under
     *The string catalogue*, and `omission_text`, under `compare_view.rs`) and from the bool
     above, and so has every `Err` `preview_proposal` hands the card — its own two refusals
     (`propose-not-loaded`, `propose-nothing-to-change`) and each `ProposeError` that
@@ -41088,8 +41098,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     wherever the app shows an error through `db_error_shown` (below) — the sites still on
     `to_string()` are listed there — nor the DDL preview's change lines (`ddl::ChangeLine`,
     below), risk lines (`ddl::Risk`, below), risk heading, *Used by* lines (`used_by::Listing`,
-    below) and omitted lines (`compare::PlanOmission`, under `compare_view.rs`), nor the compare
-    tab's standing notes above its tree, though the preview's withheld lines still are.
+    below), omitted lines (`compare::PlanOmission`, under `compare_view.rs`) and withheld lines
+    (`ddl::Withheld`, below) — the modal's whole body but the SQL and the server's words — nor the
+    compare tab's standing notes above its tree.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41471,9 +41482,33 @@ Re-introducing the anti-patterns these guard against is a regression:
     joined, equal to `elsewhere_report` over the batch's failure, one, three and eleven views and
     databases (with and without an error), and one of each. The omitted notes went too, worded by
     `compare_view::omission_text` from `compare::PlanOmission` (under `compare_view.rs`), and with
-    them the compare tab's standing notes, which are the same values. What stays core's English in
-    the modal is the last of it: the withheld lines (`unsupported`, which still reads
-    `Change::summary` for a refused change).
+    them the compare tab's standing notes, which are the same values. The withheld lines were the
+    last of it, and with them nothing in the modal's body is core's English but the SQL and what
+    the server says. `ChangeSet::withheld_lines()` returns a `ddl::Withheld` per sentence:
+    `Change(ChangeLine)` for a change the engine has no statement for, said as its change line
+    (where `unsupported` used to read `Change::summary`); `UnreplayableRename`, `NumberedGroup` and
+    `LossyViewIndexes { created }`; SQL Server's rebuild refusals `TsqlLossyIndex`,
+    `TsqlEncryptedTrigger`, `TsqlSignedTrigger` and `TsqlRenamedTrigger`; and SQLite's —
+    `PartlyRead { index, why }`, its `PartlyReadWhy` one of `MayName(Moved)`, `NotFound`, `Edited`
+    and `NoText`, then `ConditionNamesDropped`, `StrandsTriggers`, `StrandsOtherTrigger { trigger }`
+    (`Some((name, table))` where the trigger's text could be read), `StrandsGeneratedColumn`,
+    `CannotRestate { clauses }` and `VirtualTable`. A moved column is a `Moved`, which replaced
+    `MovedColumn::phrase`, and `unrestatable_sqlite_clauses` returns `SqliteClause`s
+    (`Deferrable`, `OnConflict`, `DescKey`, `CollateKey`) whose `label()` is the English; every
+    producer returns these values, `IndexReplay::Refuse` carrying one. `Withheld::message()` is the
+    English byte for byte and `unsupported()` that list's English, which stays what
+    `withheld_header` (the script's `-- INCOMPLETE` header, so Copy and Open in editor), the CLI
+    and the tests read. A comparison's is `SchemaPlan::withheld_lines()`, each paired with its
+    subject, `unsupported()` its English as *subject — line*. `withheld_text` words a `Withheld`
+    from `ddl-withheld-*` — `$count` plurals for the triggers and indexes, `-view-index-create` and
+    `-edit` for `created`, a `$why` selector for the partly-read reason — a `Moved` through
+    `moved_text` (`ddl-moved-renamed`/`-dropped`), each clause from `ddl-sqlite-clause-*` with the
+    last joined by `ddl-sqlite-clauses`, and a refused change through `change_line_text`;
+    `plan_withheld_text` sets that in `ddl-withheld-of` beside the subject. `preview_of` and
+    `preview_of_plan` fill `DdlPreview::withheld` from them, and its emptiness still gates Apply.
+    `english_says_every_withheld_line_as_core_does` holds both equal to core's English over every
+    variant, each `Moved` under every strand and the partly-read `MayName`, every other reason, one
+    and several triggers and indexes, a view created and edited, and one to four clauses.
     An AI proposal's refusal is the same two-reader case, its readers on either side of the chat.
     `ProposeError` held two pieces it had already worded in English: `Invalid` carried
     `validate`'s first sentence, and `NotAnExpression`'s `what` the field's name as a `String`.

@@ -2624,6 +2624,63 @@ propose-nothing-to-change = { $subject } already looks like that — there is no
 propose-no-database = This tab has no database selected, so a schema change applied from here would have nowhere to go. Pick one for this connection first — if every database is hidden, the SCHEMA eye is where to bring one back.
 propose-other-connection = This change is about a tab on a different connection — switch to it, or select its connection in the tree, before applying a schema change.
 
+## The withheld lines: what the plan asks for that this engine can't express,
+## which keeps Apply off (core's ddl::Withheld). English must read exactly as
+## core's ChangeSet::unsupported (a test holds it). A change it has no
+## statement for is said as its change line (ddl-line-*).
+
+# A column a plan renames or drops, inside a refusal.
+ddl-moved-renamed = { $from }, which this plan renames to { $to }
+ddl-moved-dropped = { $name }, which this plan drops
+ddl-withheld-unreplayable-rename = { $count ->
+        [one] Renaming { $was } to { $to } can't carry its { $count } trigger across: their SQL names { $was }, and re-writing it here would change what you wrote. Rename the view on its own after re-creating the triggers against the new name.
+       *[other] Renaming { $was } to { $to } can't carry its { $count } triggers across: their SQL names { $was }, and re-writing it here would change what you wrote. Rename the view on its own after re-creating the triggers against the new name.
+    }
+# $members is the group's members (grp;2, grp;3), joined.
+ddl-withheld-numbered-group = { $name } heads a numbered procedure group ({ $members }), and this plan drops it first, which drops every member of the group with it. Edit it under its own name and kind, which alters it in place and keeps them.
+# $indexes is the view's indexes, joined; $count how many.
+ddl-withheld-view-index-create = { $count ->
+        [one] Creating view { $view } can't create its index { $indexes } — of a kind Schemaic can't restate. Create this view in SQL instead.
+       *[other] Creating view { $view } can't create its indexes { $indexes } — of a kind Schemaic can't restate. Create this view in SQL instead.
+    }
+ddl-withheld-view-index-edit = { $count ->
+        [one] Editing view { $view } drops its index { $indexes }, which Schemaic can't create again — of a kind Schemaic can't restate. Edit this view in SQL instead.
+       *[other] Editing view { $view } drops its indexes { $indexes }, which Schemaic can't create again — of a kind Schemaic can't restate. Edit this view in SQL instead.
+    }
+ddl-withheld-tsql-lossy-index = Rebuilding { $table } would drop the index { $index }: it is of a kind Schemaic doesn't read whole
+ddl-withheld-tsql-encrypted-trigger = Rebuilding { $table } would drop the trigger { $trigger }: its text is encrypted
+ddl-withheld-tsql-signed-trigger = Rebuilding { $table } would drop the signature on the trigger { $trigger }, which can't be put back without the certificate's private key
+ddl-withheld-tsql-renamed-trigger = Rebuilding { $table } under a new name would leave the trigger { $trigger } naming the old one
+# An index SQLite's pragmas only partly read; $why is may-name (with $moved a
+# ddl-moved-*), not-found, edited or no-text.
+ddl-withheld-partly-read = Index { $index } was only partly read — SQLite keeps a partial index's predicate, and an expression key, only in the index's own CREATE text{ $why ->
+        [may-name] , and that text may name { $moved }. Drop the index to go on without it.
+        [not-found] , so it can't be created from what was read. Drop the index to go on without it.
+        [edited] , so this edit to it can't be written — what was read is not the whole index. Undo the change to keep the index as it is, or drop it.
+       *[no-text] {" "}— and there is no such text for this one, so recreating it would change what it indexes. Drop the index to go on without it.
+    }
+ddl-withheld-condition-names-dropped = Index { $index }'s condition names { $column }, which this plan drops. Edit the condition or drop the index first.
+ddl-withheld-strands-triggers = This table has { $count ->
+        [one] { $count } trigger
+       *[other] { $count } triggers
+    } on it, and their SQL is replayed exactly as SQLite stored it — which would still name { $moved }. SQLite accepts such a trigger and then refuses every write to the table. Drop or edit the trigger first, or rename the column with no other change so SQLite's own ALTER TABLE can rewrite it.
+# $owner is ddl-withheld-trigger-on or ddl-withheld-some-trigger.
+ddl-withheld-strands-other-trigger = { $owner } names { $moved }. A rebuild renames this table underneath that trigger and leaves its SQL exactly as it was, so the trigger would go on naming a column that is gone — SQLite accepts such a trigger and then refuses every write to *that* table. Drop or edit the trigger first, or rename the column with no other change so SQLite's own ALTER TABLE can rewrite it.
+ddl-withheld-trigger-on = Trigger { $name } on { $table }
+ddl-withheld-some-trigger = A trigger on another table
+ddl-withheld-strands-generated-column = Generated column { $column } computes from { $moved }. A rebuild writes the table from the model, and nothing rewrites that expression — SQLite refuses the new table with "no such column" and the whole plan rolls back. Edit or remove { $column } first.
+# $clauses is the ddl-sqlite-clause-* the declaration carries, the last joined by
+# ddl-sqlite-clauses.
+ddl-withheld-cannot-restate = This table's declaration carries { $clauses }, which Schemaic's model has no field for. A rebuild writes the table back from that model, so the clause would be gone from a table that still looked right — and every write depending on it would behave differently from then on. Change this table with a script instead (Copy DDL is the start of one), or take the clause off first.
+ddl-sqlite-clauses = { $first } and { $last }
+ddl-sqlite-clause-deferrable = a foreign key's DEFERRABLE clause
+ddl-sqlite-clause-on-conflict = an ON CONFLICT clause
+ddl-sqlite-clause-desc-key = a DESC primary-key column
+ddl-sqlite-clause-collate-key = a COLLATE on a primary-key column
+ddl-withheld-virtual-table = `{ $name }` is a virtual table. Its columns are a module's interface rather than a storage declaration, and its real data lives in shadow tables a rebuild would drop — an FTS5 index would be gone from a table that still held the text. Change it with a script instead (DROP and CREATE VIRTUAL TABLE), or edit the tables it indexes.
+# A comparison's withheld line: $subject is the object it is about.
+ddl-withheld-of = { $subject } — { $line }
+
 ## The Used by lines: what in the loaded schema still names something the plan
 ## renames, drops or retypes (core's used_by::UsedByNote and Listing). English
 ## must read exactly as core's change_warning and drop_warning (a test holds it).
