@@ -4087,13 +4087,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let stmt = sql.get(lo..hi).unwrap_or("").to_string();
                     let diags = match db.prepare_check(database.as_deref(), &stmt).await {
                         Ok(()) => Vec::new(),
-                        Err(e) => vec![schemaic_core::intel::db_error_diagnostic(
-                            &sql,
-                            lo,
-                            hi,
-                            &e.to_string(),
-                            dialect,
-                        )],
+                        Err(e) => vec![
+                            schemaic_core::intel::db_error_diagnostic(
+                                &sql,
+                                lo,
+                                hi,
+                                &e.to_string(),
+                                dialect,
+                            )
+                            .shown_as(&db_error_shown(&e)),
+                        ],
                     };
                     send(diags);
                 });

@@ -144,7 +144,9 @@ assertions pin English wording — stays the regression net throughout.
    readout (`aggregate::FigureWhat` and `Stat` on each `Figure`; `grid::figure_text`), its
    read-more link (`stats::ReadMore` from `read_more`; `grid::read_more_text`) and the chart's
    caption and undrawable note (`chart_view::caption_text`, `chart-too-large`), none of which
-   the 2026-10-19 survey had listed.
+   the 2026-10-19 survey had listed, and the editor squiggle's database diagnostic
+   (`intel::DiagMessage::Server`'s `shown`, set by `Diagnostic::shown_as` from the run's
+   `ModalError::displayed` and the live check's `db_error_shown`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -163,15 +165,23 @@ assertions pin English wording — stays the regression net throughout.
    (`settings::keyword_case_label`, `comma_style_label`, `statement_gap_label`), and so are
    `connection`'s pickers (`Environment`, `AiData`, `SslMode`, `SshAuth`, `AuthMode`). Keys built from core's word (the tree's `objgrp:`/`obj:` expansion
    keys) and AI prompts keep core's English. What the converted views and the app pass through
-   unchanged today is this phase's list to work from (surveyed 2026-10-19; it once claimed only
-   the number formatting was left, which was never true):
-   - **The editor squiggle's database diagnostic** — `intel::db_error_diagnostic` and
-     `run_error_diagnostic` take a `DbError`'s `to_string()` (or a `ModalError`'s English
-     `text`), *query failed:* and all, and the hover shows it as it came; the AI fix prompt
-     reads the same string, so it needs the wording carried beside it.
-   - **The AI panel's own refusals outside a proposal** — e.g. `ai_panel.rs`'s "This tab has
-     no database selected, so a statement run from here …", still English literals in the UI
-     crate (found 2026-10-20, not surveyed further).
+   unchanged today is this phase's list to work from (resurveyed 2026-10-20; no English literal
+   or hand-rolled plural is left in the two view crates' own code, so all of it is prose handed
+   up from below):
+   - **The AI panel's own refusals outside a proposal** — `ai_panel.rs`'s two
+     `ModalError::app` literals over `tabsel::TabScope`.
+   - **`schemaic-ai`'s refusals** — `Constraint::notice`, `oversize_reason`/`spawn_refusal`,
+     `cli_failure_message`'s own fallbacks, and `seed::parse_seed_response`'s error, through
+     the AI panel, Ctrl+K and the grid's Fill and Seed.
+   - **The grid's own refusals** — `edit::paste_report`, `rowjson::update_changes`,
+     `withheld_model_reason` and Copy as SQL's `&'static str` errors, `result_diff::DiffError`,
+     and the find bar's `text_ops::find_regex`.
+   - **Ctrl+K's diff summary and the hover's quick info** — `diff::inline_plan_summary`,
+     `quickinfo::describe`.
+   - **The connection form's notes** — `ssh_config::describe_route`, `init_sql::check`'s
+     refusal.
+   - **The completion popup's detail words** — `rank`'s *foreign key*, *expand \**'s column
+     count, *CTE*.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).

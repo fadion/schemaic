@@ -6672,6 +6672,17 @@ impl Diagnostic {
     pub fn message(&self) -> String {
         self.what.message()
     }
+
+    /// A server error's diagnostic with `shown` — the same error as its
+    /// interface wording, the app's `db_error_shown` — for the hover, cut and
+    /// cleaned as the English is. [`Diagnostic::message`] keeps the English,
+    /// which the AI fix prompt reads; any other diagnostic is unchanged.
+    pub fn shown_as(mut self, shown: &str) -> Self {
+        if let DiagMessage::Server { shown: s, .. } = &mut self.what {
+            *s = Some(clean_db_message(shown));
+        }
+        self
+    }
 }
 
 /// What a [`Diagnostic`] says. The `String` fields are SQL — the names and
@@ -6682,8 +6693,11 @@ pub enum DiagMessage {
     /// A statement the parser refused, with its error's `detail` when it
     /// gave one — the parser's own English, after Schemaic's prefix.
     Syntax { detail: Option<String> },
-    /// The server's error, in the server's words.
-    Server(String),
+    /// The server's error, in the server's words: `text` as the client
+    /// reports it in English, `shown` the same error worded for the
+    /// interface ([`Diagnostic::shown_as`]) — the server's part is the same
+    /// in both, and only the client's frame around it is translated.
+    Server { text: String, shown: Option<String> },
     /// A reserved `word` used as an alias, to be quoted with `quote`.
     ReservedAlias { word: String, quote: AliasQuote },
     /// A `table` the catalogue does not hold, in the `database` the statement
@@ -6773,6 +6787,14 @@ pub enum FlowError {
 }
 
 impl DiagMessage {
+    /// The server's error `text`, with no interface wording beside it yet.
+    pub fn server(text: impl Into<String>) -> Self {
+        DiagMessage::Server {
+            text: text.into(),
+            shown: None,
+        }
+    }
+
     /// The message in English.
     pub fn message(&self) -> String {
         use crate::text::plural;
@@ -6786,7 +6808,7 @@ impl DiagMessage {
         match self {
             DiagMessage::Syntax { detail: None } => "Syntax error".to_string(),
             DiagMessage::Syntax { detail: Some(d) } => format!("Syntax error: {d}"),
-            DiagMessage::Server(m) => m.clone(),
+            DiagMessage::Server { text, .. } => text.clone(),
             DiagMessage::ReservedAlias { word, quote } => {
                 let quote = match quote {
                     AliasQuote::Backticks => "backticks",
@@ -18827,7 +18849,7 @@ pub fn run_error_diagnostic(
         return Some(Diagnostic {
             range,
             severity: Severity::Error,
-            what: DiagMessage::Server(clean_db_message(message)),
+            what: DiagMessage::server(clean_db_message(message)),
             fix: None,
         });
     }
@@ -18872,7 +18894,7 @@ pub fn db_error_diagnostic(
     Diagnostic {
         range,
         severity: Severity::Error,
-        what: DiagMessage::Server(clean_db_message(message)),
+        what: DiagMessage::server(clean_db_message(message)),
         fix: None,
     }
 }
@@ -35360,7 +35382,7 @@ mod tests {
         let d = |lo: usize, hi: usize, severity, msg: &str| Diagnostic {
             range: (lo, hi),
             severity,
-            what: DiagMessage::Server(msg.to_string()),
+            what: DiagMessage::server(msg),
             fix: None,
         };
         let outer_warn = d(0, 100, Severity::Warning, "outer warning");
@@ -35550,7 +35572,7 @@ mod tests {
                 .map(|i| Diagnostic {
                     range: (i * 10, i * 10 + 5),
                     severity: Severity::Error,
-                    what: DiagMessage::Server(String::new()),
+                    what: DiagMessage::server(""),
                     fix: None,
                 })
                 .collect::<Vec<_>>()
@@ -36656,7 +36678,7 @@ mod tests {
         let d = |lo: usize, hi: usize, m: &str| Diagnostic {
             range: (lo, hi),
             severity: Severity::Warning,
-            what: DiagMessage::Server(m.to_string()),
+            what: DiagMessage::server(m),
             fix: None,
         };
         let diags = vec![
@@ -36675,6 +36697,43 @@ mod tests {
     }
 
     #[test]
+    fn a_server_error_shows_its_wording_and_still_says_english() {
+        // The hover reads `shown`, cut and cleaned as the English is; the AI
+        // fix prompt reads `message()`, which stays the client's English.
+        let sql = "SELECT * FROM t WHERE";
+        let english = "query failed: You have an error in your SQL syntax; check the manual \
+            that corresponds to your MySQL server version for the right syntax to use near '' \
+            at line 1\nsecond line";
+        let shown = "Abfrage fehlgeschlagen: You have an error in your SQL syntax; check the \
+            manual that corresponds to your MySQL server version for the right syntax to use \
+            near '' at line 1\nsecond line";
+        let d = db_error_diagnostic(sql, 0, sql.len(), english).shown_as(shown);
+        assert_eq!(
+            d.what,
+            DiagMessage::Server {
+                text: "query failed: You have an error in your SQL syntax; near '' at line 1"
+                    .to_string(),
+                shown: Some(
+                    "Abfrage fehlgeschlagen: You have an error in your SQL syntax; near '' at line 1"
+                        .to_string()
+                ),
+            }
+        );
+        assert_eq!(
+            d.message(),
+            "query failed: You have an error in your SQL syntax; near '' at line 1"
+        );
+        // Any other diagnostic has no server text to word, and is unchanged.
+        let syntax = Diagnostic {
+            range: (0, 6),
+            severity: Severity::Error,
+            what: DiagMessage::Syntax { detail: None },
+            fix: None,
+        };
+        assert_eq!(syntax.clone().shown_as(shown), syntax);
+    }
+
+    #[test]
     fn problems_in_range_is_ordered_and_deduplicated() {
         // A message said twice is said once — "Fix these 2 problems" for one
         // problem is a lie the prompt would repeat. (The two sources' overlap,
@@ -36682,7 +36741,7 @@ mod tests {
         let d = |lo: usize, hi: usize, m: &str| Diagnostic {
             range: (lo, hi),
             severity: Severity::Error,
-            what: DiagMessage::Server(m.to_string()),
+            what: DiagMessage::server(m),
             fix: None,
         };
         let diags = vec![
@@ -37454,7 +37513,7 @@ mod tests {
         let d = |sev: Severity, m: &str| Diagnostic {
             range: (7, 13),
             severity: sev,
-            what: DiagMessage::Server(m.to_string()),
+            what: DiagMessage::server(m),
             fix: None,
         };
         let diags = vec![
@@ -37469,7 +37528,7 @@ mod tests {
         let diags = vec![Diagnostic {
             range: (12, 12),
             severity: Severity::Warning,
-            what: DiagMessage::Server("missing something".to_string()),
+            what: DiagMessage::server("missing something"),
             fix: None,
         }];
         assert_eq!(problems_in_range(&diags, 10, 20).len(), 1);
@@ -37485,7 +37544,7 @@ mod tests {
         let diags = vec![Diagnostic {
             range: (40, 40),
             severity: Severity::Warning,
-            what: DiagMessage::Server("missing something".to_string()),
+            what: DiagMessage::server("missing something"),
             fix: None,
         }];
         assert!(problems_in_range(&diags, 10, 40).is_empty());

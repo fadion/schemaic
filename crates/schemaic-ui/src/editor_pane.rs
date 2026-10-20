@@ -2699,7 +2699,7 @@ fn diag_message_text(m: &schemaic_core::intel::DiagMessage) -> String {
         DiagMessage::Syntax { detail: Some(d) } => {
             tr!("diag-syntax-detail", detail = d.as_str())
         }
-        DiagMessage::Server(text) => text.clone(),
+        DiagMessage::Server { text, shown } => shown.clone().unwrap_or_else(|| text.clone()),
         DiagMessage::ReservedAlias { word, quote } => {
             let word = word.as_str();
             match quote {
@@ -3493,6 +3493,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .map(|at| (sent, at))
                     });
                     intel::run_error_diagnostic(sql, spans, at, &err.text, dialect.get_untracked())
+                        .map(|d| d.shown_as(err.displayed()))
                 })
             }
             _ => None,
@@ -9884,7 +9885,7 @@ mod geometry_tests {
         Diagnostic {
             range,
             severity,
-            what: schemaic_core::intel::DiagMessage::Server(msg.to_string()),
+            what: schemaic_core::intel::DiagMessage::server(msg),
             fix: fix.map(str::to_string),
         }
     }
@@ -9902,7 +9903,7 @@ mod geometry_tests {
             DiagMessage::Syntax {
                 detail: Some(s("Expected: an expression, found: EOF")),
             },
-            DiagMessage::Server(s("Unknown column 'x' in 'field list'")),
+            DiagMessage::server("Unknown column 'x' in 'field list'"),
             DiagMessage::AliasedAs {
                 name: s("orders"),
                 alias: s("o"),
@@ -9984,6 +9985,22 @@ mod geometry_tests {
         for m in all {
             assert_eq!(diag_message_text(&m), m.message(), "{m:?}");
         }
+    }
+
+    /// **A server error's hover is its interface wording** where the run or
+    /// the live check handed one in, and its English where none was.
+    #[test]
+    fn a_server_error_hovers_in_its_wording() {
+        use schemaic_core::intel::DiagMessage;
+        let worded = DiagMessage::Server {
+            text: "query failed: Unknown column 'x'".to_string(),
+            shown: Some("Abfrage fehlgeschlagen: Unknown column 'x'".to_string()),
+        };
+        assert_eq!(
+            diag_message_text(&worded),
+            "Abfrage fehlgeschlagen: Unknown column 'x'"
+        );
+        assert_eq!(worded.message(), "query failed: Unknown column 'x'");
     }
 
     /// **The tip names what the key does.** The server's error outranks the

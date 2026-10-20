@@ -2586,9 +2586,16 @@ existing prose was left alone.
     are one variant, `Flow(FlowError)`, whose fifteen variants are what `TsqlFlow` reports through
     `flow_error`, which takes one. Two variants carry text that is not Schemaic's to translate and
     pass through as they came: `Syntax { detail }`, the parser's own English after the prefix
-    `friendly_syntax_message` strips (`None` when nothing is left), and `Server`, the server's
-    error as `clean_db_message` tidies it, built by `db_error_diagnostic` and
-    `run_error_diagnostic`. `Diagnostic::message()` — `DiagMessage::message`, and
+    `friendly_syntax_message` strips (`None` when nothing is left), and `Server { text, shown }`,
+    the server's error as `clean_db_message` tidies it, built by `db_error_diagnostic` and
+    `run_error_diagnostic` through `DiagMessage::server` with `shown` empty. **`Server` carries the
+    error twice** because the server's words arrive inside the client's frame — `query failed: …`
+    — and the frame is Schemaic's: the hover showed it in English in every language. A caller
+    holding the interface wording (the app's `db_error_shown`, a `ModalError`'s `displayed()`)
+    sets it with `Diagnostic::shown_as`, which cuts it to its first line and strips MySQL/MariaDB's
+    *check the manual…* phrase exactly as the English is, and leaves any other variant unchanged;
+    `text` stays the English, which `locate_db_error` and `run_fix_range` still read
+    (`a_server_error_shows_its_wording_and_still_says_english`). `Diagnostic::message()` — `DiagMessage::message`, and
     `FlowError::message` under it — is the English, byte for byte the text the field held, and it
     is what the AI fix prompt reads (`problems_in_range`, above); the editor words `what` itself
     (under `editor_pane.rs`), held to `message` in English by
@@ -26750,7 +26757,7 @@ existing prose was left alone.
     none (R3-L5-03). The decision is `intel::alias_rename`'s — `output_alias_rename`'s for an output
     column's alias, which *Rename alias* also offers (under `intel.rs`); this file asks and
     shows the answer, and `AliasRenameRequest::apply` is the editor's own rename, so it knows no
-    buffer or offset. A refusal — `AliasRenameRefusal::message` — is written in the error colour
+    buffer or offset. A refusal — `AliasRenameRefusal`, worded by `refusal_message` — is written in the error colour
     under the field and **the dialog stays open on it**, the name still there to correct; editing
     the name retracts it, since it answered the name it was given. Enter submits, Escape and ✕
     close, and there is **no click-away**, as the snippet editor has none: the name is applied only
@@ -26777,8 +26784,9 @@ existing prose was left alone.
     `alias-rename-title-alias`/`-cte` and `alias-rename-placeholder-alias`/`-cte` ahead of that
     file's own conversion. The placeholder reaches the field through `FieldCfg::placeholder_of`, and
     the title goes to `widgets::modal_title`, which takes `impl Into<String>` — this was its last
-    caller with a `&'static str`. A refusal's text is `AliasRenameRefusal::message`, core's prose,
-    left for phase 4. No test: nothing here is composed.
+    caller with a `&'static str`. A refusal's text is the private `refusal_message`'s, a `tr!` arm
+    per `AliasRenameRefusal` variant (`Conflict` with the trimmed `$name`), held to core's
+    `message` in English by `english_refuses_every_alias_rename_as_core_does` (under `i18n.rs`).
   - `usages_view.rs` — the SQL editor's *Find usages* list (`usages_overlay`, raised by
     `OverlayUi::usages` with a `UsagesRequest`, which `lib.rs` re-exports for the app): a modal
     titled *N usages of name* (*usage* for one), whose rows are a line number and that line's text
@@ -31064,8 +31072,13 @@ existing prose was left alone.
     `flow_error_text`, from `diag-*` — a message per variant, `diag-table-not-found` and
     `diag-column-not-found` taking a `$within`/`$suggested` selector (`some`/`none`) for the
     optional *in …* and *did you mean* parts, the row-width messages a plural per count, a reserved
-    alias a message per `AliasQuote` — while the parser's detail and the server's error pass
-    through as they came. `english_says_every_diagnostic_as_core_does` holds it equal to core's
+    alias a message per `AliasQuote` — while the parser's detail passes through as it came, and a
+    server error shows its `shown` wording where it has one and its English `text` where it has
+    none (`a_server_error_hovers_in_its_wording`). Both producers set it: the run-error squiggle
+    maps `run_error_diagnostic`'s answer through `shown_as(err.displayed())`, and the app's live
+    check `db_error_diagnostic`'s through `shown_as(&db_error_shown(&e))`, so a German interface
+    hovers *Abfrage fehlgeschlagen: …* around the server's own text, which stays the server's.
+    `english_says_every_diagnostic_as_core_does` holds it equal to core's
     `DiagMessage::message` for every variant: the not-found pair with each optional part present
     and absent, alone and together, counts at one and several, every quote and every
     `FlowError`. The tip says what
@@ -41123,7 +41136,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`/`ObjectProblem`/
     `RoutineProblem`/`TriggerProblem`/`TableProblem`, below), though every draft's `validate`
     still answers core's English, nor the editor's diagnostics (`intel::DiagMessage`, below),
-    though the parser's detail in a syntax error and the server's own error still are, nor a
+    though the parser's detail in a syntax error and the server's words inside its error still are, nor a
     write path's failure (`model::WriteFailure`, below), though the server's words inside it
     still are, nor `DbError`'s own *query failed:*, *connection failed:* and *query cancelled*
     wherever the app shows an error through `db_error_shown` (below) — the sites still on
@@ -41620,8 +41633,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     byte and no `Display`. The squiggle's hover words it — `editor_pane.rs`'s `tip_message`
     through `diag_message_text` and `flow_error_text`, from `diag-*` and `diag-flow-*` — while
     `problems_in_range` hands the AI fix prompt `message()`, so the model reads English whatever
-    the interface's language. `Syntax`'s parser detail and `Server`'s text pass through as they
-    came. `english_says_every_diagnostic_as_core_does` holds the two equal, over a hand-written
+    the interface's language. `Syntax`'s parser detail passes through as it came; `Server` holds
+    its English `text` for the prompt and the interface's `shown` for the hover
+    (`Diagnostic::shown_as`, from `db_error_shown` or a `ModalError`'s `displayed()`), the client's
+    frame worded and the server's message inside it untouched.
+    `english_says_every_diagnostic_as_core_does` holds the two equal, over a hand-written
     list like the editors' above.
     A write path's failure is the case where the value had to be carried through a layer that only
     knew strings. The grid's Commit, an import and a copy failed with a `DbError::Query` or

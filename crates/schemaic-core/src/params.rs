@@ -1257,7 +1257,7 @@ mod tests {
         crate::intel::Diagnostic {
             range,
             severity: crate::intel::Severity::Error,
-            what: crate::intel::DiagMessage::Server("unknown column".to_string()),
+            what: crate::intel::DiagMessage::server("unknown column"),
             fix: None,
         }
     }
