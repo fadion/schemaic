@@ -74,7 +74,9 @@ assertions pin English wording — stays the regression net throughout.
 6. **Layout for longer text.** German, Finnish and Russian run 30–100% longer than English.
    Roughly sixty fixed-width boxes sit beside text — the connection form, the import and compare
    panes, the find bar, `widgets::fact_row`'s fixed label column — and each either measures its
-   text or ellipsises. The pseudo-locale (`SCHEMAIC_LOCALE=pseudo`) finds them.
+   text or ellipsises. The doubled pseudo-locale (`SCHEMAIC_LOCALE=pseudo-en`, every label's
+   words said twice) finds them and still reads as English; the accented one
+   (`SCHEMAIC_LOCALE=pseudo`) is only 30–40% longer.
 
 ### Data in any script — in scope regardless of locale
 

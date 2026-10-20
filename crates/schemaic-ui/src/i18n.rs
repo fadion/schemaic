@@ -1422,8 +1422,13 @@ fn configure(loader: &FluentLanguageLoader, lang: UiLanguage) {
     // After the load, not before: a load swaps in fresh bundles, and these are
     // settings of the bundles.
     loader.set_use_isolating(false);
-    if lang == UiLanguage::Pseudo {
-        loader.with_bundles_mut(|bundle| bundle.set_transform(Some(pseudo)));
+    let transform: Option<fn(&str) -> Cow<'_, str>> = match lang {
+        UiLanguage::Pseudo => Some(pseudo),
+        UiLanguage::PseudoEn => Some(doubled),
+        UiLanguage::EnGb | UiLanguage::De => None,
+    };
+    if let Some(transform) = transform {
+        loader.with_bundles_mut(|bundle| bundle.set_transform(Some(transform)));
     }
 }
 
@@ -1437,6 +1442,25 @@ fn pseudo(s: &str) -> Cow<'_, str> {
         return Cow::Borrowed(s);
     }
     Cow::Owned(format!("[{}]", fluent_pseudo::transform(s, false, true)))
+}
+
+/// The doubled pseudo-locale's transform: a text piece's words, from its first
+/// letter to its last, said twice — `System (` becomes `System System (`, so
+/// the parenthesis still opens on the value after it. A piece with no letter
+/// (`)`, ` — `) is left alone. Values are never doubled: Fluent hands this the
+/// text pieces only, and a message wrapped in another would otherwise double
+/// again at each level.
+fn doubled(s: &str) -> Cow<'_, str> {
+    let Some(start) = s.find(char::is_alphabetic) else {
+        return Cow::Borrowed(s);
+    };
+    let (end, last) = s
+        .char_indices()
+        .rfind(|(_, c)| c.is_alphabetic())
+        .expect("a piece with a first letter has a last one");
+    let end = end + last.len_utf8();
+    let words = &s[start..end];
+    Cow::Owned(format!("{}{words} {words}{}", &s[..start], &s[end..]))
 }
 
 #[cfg(test)]
@@ -2369,10 +2393,15 @@ mod tests {
         assert_eq!(options[0], LanguageChoice::System);
         assert!(options.contains(&LanguageChoice::Fixed(UiLanguage::EnGb)));
         assert!(!options.contains(&LanguageChoice::Fixed(UiLanguage::Pseudo)));
+        assert!(!options.contains(&LanguageChoice::Fixed(UiLanguage::PseudoEn)));
         for o in &options {
             assert_eq!(LanguageChoice::from_key(o.key()), *o);
         }
         assert_eq!(LanguageChoice::from_key("pseudo"), LanguageChoice::System);
+        assert_eq!(
+            LanguageChoice::from_key("pseudo-en"),
+            LanguageChoice::System
+        );
         assert_eq!(LanguageChoice::from_key("xx"), LanguageChoice::System);
         assert_eq!(
             LanguageChoice::from_key("de"),
@@ -2638,6 +2667,32 @@ mod tests {
     fn pseudo_leaves_whitespace_alone() {
         assert_eq!(pseudo(" "), " ");
         assert_eq!(pseudo(""), "");
+    }
+
+    /// The doubled locale is still English, twice: the words repeat, and the
+    /// punctuation and spacing around them stay where a placeable expects them.
+    #[test]
+    fn doubled_repeats_the_words_inside_their_punctuation() {
+        assert_eq!(
+            doubled("Manage connections"),
+            "Manage connections Manage connections"
+        );
+        assert_eq!(doubled("System ("), "System System (");
+        assert_eq!(doubled(" rows in "), " rows in rows in ");
+        assert_eq!(doubled("Saved. Restart?"), "Saved. Restart Saved. Restart?");
+        assert_eq!(doubled(")"), ")");
+        assert_eq!(doubled(" — "), " — ");
+        assert_eq!(doubled(""), "");
+    }
+
+    /// Through the loader: every message reads twice, and a value put into one
+    /// reads once — it is data, and doubling it would double again each time
+    /// one message is wrapped in another.
+    #[test]
+    fn the_doubled_locale_repeats_the_words_and_spares_the_values() {
+        let l = loader(UiLanguage::PseudoEn);
+        assert_eq!(l.get("settings-language"), "Language Language");
+        assert_eq!(system(&l, "English"), "System System (English)");
     }
 
     /// The catalogues, as embedded, parsed **strictly**. At run time a parse

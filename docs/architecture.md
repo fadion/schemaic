@@ -11414,15 +11414,19 @@ existing prose was left alone.
     a question only the GUI asks: the CLI, the MCP server and everything sent to an AI harness stay
     English, because scripts parse the first and a model reads the second, so nothing in core
     renders through it (`ui/i18n.rs` is the half that does; the conventions are under *UI
-    conventions*, *The string catalogue*). `UiLanguage` is `EnGb`, `De` and `Pseudo`, with `key()`
-    the persisted spelling and what `SCHEMAIC_LOCALE` takes, `catalogue()` the directory its `.ftl`
-    lives in — `Pseudo` answers `en-GB`'s, being the English catalogue transformed — and
+    conventions*, *The string catalogue*). `UiLanguage` is `EnGb`, `De`, `Pseudo` and `PseudoEn`
+    (the doubled pseudo-locale, key `pseudo-en`), with `key()` the persisted spelling and what
+    `SCHEMAIC_LOCALE` takes, `catalogue()` the directory its `.ftl` lives in — both pseudo-locales
+    answer `en-GB`'s, being the English catalogue transformed — and
     `endonym()` the language's name **in itself**, which is deliberately not in any catalogue: a
     picker lists each language the same way in every language, so a reader lost in the wrong one
     can still find their own. `from_key` reads the primary subtag case-insensitively, so `de-AT`,
     `de_AT` and POSIX's `de_AT.UTF-8` are all German and `en-US` is the one English there is
-    (`keys_round_trip_and_tolerate_case_and_region`). `number_marks()` is the language's decimal
-    and grouping marks, a table rather than CLDR, `Pseudo` keeping English's
+    (`keys_round_trip_and_tolerate_case_and_region`). **`pseudo-en` is matched whole before that
+    split** — `pseudo-en` and `pseudo_en`, case-insensitively — because the split would otherwise
+    read it as `pseudo` in a region and draw the accented locale instead (the same test).
+    `number_marks()` is the language's decimal and grouping marks, a table rather than CLDR, both
+    pseudo-locales keeping English's
     (`german_swaps_both_marks_and_the_pseudo_locale_keeps_english_s`; *Figures in the interface's
     marks*, under *UI conventions*).
     **`resolve(env, setting, os)` takes three sources in order, and only the first is
@@ -11436,7 +11440,7 @@ existing prose was left alone.
     joins it when its catalogue is complete, not when it is started — and
     `the_system_never_reaches_an_unshipped_catalogue` asserts German is *not* on it, with *update
     this test when German ships* as its message, so shipping German fails that test on purpose. The
-    pseudo-locale is never reached from the setting either, a hand-edited settings file not being a
+    pseudo-locales are never reached from the setting either, a hand-edited settings file not being a
     way into a developer tool (`the_pseudo_locale_is_the_environment_s_alone`). The private
     `resolve_in` takes the shipped list as a parameter so the ordering can be tested with German
     counted as shipped (`the_system_is_read_in_preference_order`,
@@ -25707,6 +25711,17 @@ existing prose was left alone.
     shows which end it cut. Fluent applies it to a message's text pieces and never to the values put
     into it, which are data rather than the interface's words, so a string still left as a literal is
     the one that reads plain (`the_pseudo_locale_marks_the_words_and_spares_the_values`).
+    **The doubled pseudo-locale (`PseudoEn`) is the same `en-GB` with a second transform**,
+    `doubled`, chosen beside `pseudo` in `configure`: each text piece's words, from its first letter
+    to its last, said twice, with the spacing and punctuation outside them kept where they were —
+    *Manage connections* reads *Manage connections Manage connections*, and *System (* reads
+    *System System (*, so the parenthesis still opens on the value after it — and a piece with no
+    letter (`)`, ` — `) left alone (`doubled_repeats_the_words_inside_their_punctuation`). It exists
+    because the accented one is the wrong tool for layout: roughly 30–40% longer, it reads as nearly
+    English and is too short to stress a box. Doubled is twice the length, past German, and still
+    readable, so a box too narrow shows *which* label it cut. Values are spared here too, and for a
+    second reason: a message wrapped in another would otherwise double again at each level
+    (`the_doubled_locale_repeats_the_words_and_spares_the_values`).
     **Two catalogue tests stand in for what `fl!` cannot see.** At run time a malformed `.ftl` is
     only logged and its broken messages fall back to English, unseen, so
     `every_catalogue_parses_cleanly` parses every embedded file strictly with `fluent-syntax` (a
@@ -25716,7 +25731,7 @@ existing prose was left alone.
     Nothing tests the other direction: a message missing from a translation falls back to English by
     design, and keeping an incomplete catalogue out of users' hands is `SHIPPED`'s job.
     **`LanguageChoice` is the setting as Settings offers it** — `System` or `Fixed(UiLanguage)`,
-    `options()` being `System` then `SHIPPED`, never the pseudo-locale. `from_key` reads a key it
+    `options()` being `System` then `SHIPPED`, never either pseudo-locale. `from_key` reads a key it
     does not offer (a newer build's, a hand edit, an unshipped catalogue) as `System`, which is also
     what `resolve` makes of it (`the_language_setting_offers_only_what_ships`). `label()` names a
     language by its endonym and the system entry as `System (English)` —
@@ -41446,7 +41461,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     copy (`Figure::copy`) and every pinned English test read the bytes they read before; the view
     marks what it shows. `text::NumberMarks { decimal, group }` is the pair, `NumberMarks::ENGLISH`
     core's own, and `locale::UiLanguage::number_marks` answers it per language — `Pseudo` keeping
-    English's, its catalogue being English's.
+    English's, its catalogue being English's, and `PseudoEn` likewise.
     **A table, not CLDR (decided 2026-10-20).** The need is two characters per shipped language,
     which a table answers and `german_swaps_both_marks_and_the_pseudo_locale_keeps_english_s` pins.
     CLDR data would move byte-pinned English under a `cargo update` — French's grouping space
@@ -42115,7 +42130,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **`SCHEMAIC_LOCALE` reaches what Settings cannot**: `SCHEMAIC_LOCALE=de` for a catalogue still
     being written, `SCHEMAIC_LOCALE=pseudo` for the pseudo-locale, whose accented, lengthened and
     bracketed text shows every box too narrow for a longer language and every string nobody moved
-    into the catalogue (the one left plain). The setting and the OS reach only `locale::SHIPPED`,
+    into the catalogue (the one left plain); `SCHEMAIC_LOCALE=pseudo-en` for the doubled one, every
+    label said twice, which is the stronger test of layout — twice as long and still readable, so a
+    clipped box shows which label it cut. The setting and the OS reach only `locale::SHIPPED`,
     which a language joins when its catalogue is complete.
   - **Two tests guard what the compiler cannot**: `every_catalogue_parses_cleanly`, because a
     malformed translation is only logged at run time and falls back to English unseen; and

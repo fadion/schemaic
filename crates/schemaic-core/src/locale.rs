@@ -31,6 +31,11 @@ pub enum UiLanguage {
     /// longer language and every string nobody moved into the catalogue (it is
     /// the one left plain). A development tool, never offered in Settings.
     Pseudo,
+    /// The doubled pseudo-locale: the English catalogue with every message's
+    /// words said twice — *Manage connections Manage connections*. Twice the
+    /// length, past even German's, and still readable, so a box too narrow
+    /// shows which label it cut. A development tool, never offered in Settings.
+    PseudoEn,
 }
 
 /// The catalogues a user may choose, or be given by their OS. A language joins
@@ -47,15 +52,16 @@ impl UiLanguage {
             UiLanguage::EnGb => "en-GB",
             UiLanguage::De => "de",
             UiLanguage::Pseudo => "pseudo",
+            UiLanguage::PseudoEn => "pseudo-en",
         }
     }
 
     /// The catalogue's language tag — the directory its `.ftl` lives in. The
-    /// pseudo-locale is the English catalogue transformed, so it has none of
-    /// its own.
+    /// pseudo-locales are the English catalogue transformed, so they have none
+    /// of their own.
     pub fn catalogue(self) -> &'static str {
         match self {
-            UiLanguage::EnGb | UiLanguage::Pseudo => "en-GB",
+            UiLanguage::EnGb | UiLanguage::Pseudo | UiLanguage::PseudoEn => "en-GB",
             UiLanguage::De => "de",
         }
     }
@@ -68,14 +74,17 @@ impl UiLanguage {
             UiLanguage::EnGb => "English",
             UiLanguage::De => "Deutsch",
             UiLanguage::Pseudo => "Pseudo",
+            UiLanguage::PseudoEn => "Pseudo English",
         }
     }
 
-    /// The marks the language writes a figure with. The pseudo-locale keeps
-    /// English's: it tests the words' length, and its catalogue is English's.
+    /// The marks the language writes a figure with. The pseudo-locales keep
+    /// English's: they test the words' length, and their catalogue is English's.
     pub fn number_marks(self) -> crate::text::NumberMarks {
         match self {
-            UiLanguage::EnGb | UiLanguage::Pseudo => crate::text::NumberMarks::ENGLISH,
+            UiLanguage::EnGb | UiLanguage::Pseudo | UiLanguage::PseudoEn => {
+                crate::text::NumberMarks::ENGLISH
+            }
             UiLanguage::De => crate::text::NumberMarks {
                 decimal: ',',
                 group: '.',
@@ -87,6 +96,10 @@ impl UiLanguage {
     /// region on a language the app has only one of is ignored (`de-AT` is
     /// German; `en-US` is the English there is).
     pub fn from_key(key: &str) -> Option<Self> {
+        // Before the region is dropped: `pseudo-en` is not `pseudo` in a region.
+        if key.replace('_', "-").eq_ignore_ascii_case("pseudo-en") {
+            return Some(UiLanguage::PseudoEn);
+        }
         // The primary subtag: `de-AT`, `de_AT` and POSIX's `de_AT.UTF-8` alike.
         let primary = key.split(['-', '_', '.', '@']).next().unwrap_or("");
         match primary.to_ascii_lowercase().as_str() {
@@ -141,6 +154,7 @@ mod tests {
         use crate::text::NumberMarks;
         assert_eq!(UiLanguage::EnGb.number_marks(), NumberMarks::ENGLISH);
         assert_eq!(UiLanguage::Pseudo.number_marks(), NumberMarks::ENGLISH);
+        assert_eq!(UiLanguage::PseudoEn.number_marks(), NumberMarks::ENGLISH);
         assert_eq!(
             UiLanguage::De.number_marks(),
             NumberMarks {
@@ -152,7 +166,12 @@ mod tests {
 
     #[test]
     fn keys_round_trip_and_tolerate_case_and_region() {
-        for lang in [UiLanguage::EnGb, UiLanguage::De, UiLanguage::Pseudo] {
+        for lang in [
+            UiLanguage::EnGb,
+            UiLanguage::De,
+            UiLanguage::Pseudo,
+            UiLanguage::PseudoEn,
+        ] {
             assert_eq!(UiLanguage::from_key(lang.key()), Some(lang));
         }
         assert_eq!(UiLanguage::from_key("EN-gb"), Some(UiLanguage::EnGb));
@@ -160,6 +179,16 @@ mod tests {
         assert_eq!(UiLanguage::from_key("en_US.UTF-8"), Some(UiLanguage::EnGb));
         assert_eq!(UiLanguage::from_key("de-AT"), Some(UiLanguage::De));
         assert_eq!(UiLanguage::from_key("Pseudo"), Some(UiLanguage::Pseudo));
+        // The region is not ignored here: `pseudo-en` is a locale of its own,
+        // not the accented one with a region on it.
+        assert_eq!(
+            UiLanguage::from_key("Pseudo-EN"),
+            Some(UiLanguage::PseudoEn)
+        );
+        assert_eq!(
+            UiLanguage::from_key("pseudo_en"),
+            Some(UiLanguage::PseudoEn)
+        );
         assert_eq!(UiLanguage::from_key("fr-FR"), None);
         assert_eq!(UiLanguage::from_key(""), None);
         assert_eq!(UiLanguage::from_key(SYSTEM_KEY), None);
@@ -213,6 +242,14 @@ mod tests {
     #[test]
     fn the_pseudo_locale_is_the_environment_s_alone() {
         assert_eq!(resolve(None, "pseudo", &os(&["en-GB"])), UiLanguage::EnGb);
+        assert_eq!(
+            resolve(None, "pseudo-en", &os(&["en-GB"])),
+            UiLanguage::EnGb
+        );
+        assert_eq!(
+            resolve(Some("pseudo-en"), "en-GB", &os(&["en-GB"])),
+            UiLanguage::PseudoEn
+        );
     }
 
     /// The first preferred language the app has wins; an unknown one is passed
