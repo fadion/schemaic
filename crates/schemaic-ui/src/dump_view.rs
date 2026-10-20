@@ -917,7 +917,7 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                                     table = p.table.clone(),
                                     index = p.index,
                                     total = p.total,
-                                    rows = schemaic_core::text::human_count(p.rows as usize),
+                                    rows = crate::i18n::count(p.rows as usize),
                                 ))
                                 .style(|s| {
                                     s.color(theme::text_muted())
@@ -1078,10 +1078,10 @@ fn dump_title(database: &str, schema: Option<&str>, format: ExportFormat) -> Str
 /// exactly what it holds, and dressing that up as an estimate would hedge a
 /// number that needs no hedging.
 fn export_count_line(rows: u64, total: Option<u64>, approx: bool) -> String {
-    let shown = schemaic_core::text::human_count(rows as usize);
+    let shown = crate::i18n::count(rows as usize);
     match total {
         Some(total) => {
-            let total = schemaic_core::text::human_count(total as usize);
+            let total = crate::i18n::count(total as usize);
             if approx {
                 tr!("export-progress-of-about", rows = shown, total = total)
             } else {

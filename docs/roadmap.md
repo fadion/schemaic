@@ -13,8 +13,9 @@ file rather than ticked off.
 
 Translate the GUI into languages other than English. The catalogue, the loader and every view's
 own words are in place (`docs/architecture.md`, *The string catalogue*), with a German catalogue
-reached through `SCHEMAIC_LOCALE=de`; what is left is the prose built outside the views, the
-layout for longer text and locale formatting.
+reached through `SCHEMAIC_LOCALE=de`, and figures follow the language's marks (*Figures in the
+interface's marks* there); what is left is the prose built outside the views and the layout for
+longer text.
 
 ### Decided
 
@@ -139,7 +140,11 @@ assertions pin English wording — stays the regression net throughout.
    `HeldBack`, and `CompareNote` — in `SchemaPlan::omissions` and `SchemaComparison::standing`;
    `compare_view::omission_text`), and the withheld lines (`ddl::Withheld` from
    `ChangeSet::withheld_lines` and `SchemaPlan::withheld_lines`; `ddl_preview::withheld_text`,
-   `plan_withheld_text`) — the last of the DDL preview's body.
+   `plan_withheld_text`) — the last of the DDL preview's body — and the grid's selection
+   readout (`aggregate::FigureWhat` and `Stat` on each `Figure`; `grid::figure_text`), its
+   read-more link (`stats::ReadMore` from `read_more`; `grid::read_more_text`) and the chart's
+   caption and undrawable note (`chart_view::caption_text`, `chart-too-large`), none of which
+   the 2026-10-19 survey had listed.
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -167,8 +172,6 @@ assertions pin English wording — stays the regression net throughout.
    - **The AI panel's own refusals outside a proposal** — e.g. `ai_panel.rs`'s "This tab has
      no database selected, so a statement run from here …", still English literals in the UI
      crate (found 2026-10-20, not surveyed further).
-   - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
-     `transcript::elapsed_text` and `TurnStats::summary`, which holds only figures.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).
@@ -176,10 +179,6 @@ assertions pin English wording — stays the regression net throughout.
    Roughly sixty fixed-width boxes sit beside text — the connection form, the import and compare
    panes, the find bar, `widgets::fact_row`'s fixed label column — and each either measures its
    text or ellipsises. The pseudo-locale (`SCHEMAIC_LOCALE=pseudo`) finds them.
-7. **Locale formatting** — thousands separators and decimals. (The "… ago" is done: core's
-   `history::ago` is the interval as a value, `i18n::relative_time` says it in the interface's
-   language, and `relative_time` stays core's English.)
-   Nothing is locale-aware today. Decide whether it is worth `icu4x` before starting.
 
 ### Data in any script — in scope regardless of locale
 

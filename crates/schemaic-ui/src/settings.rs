@@ -1374,8 +1374,11 @@ fn editor_font_label(px: f32) -> String {
     format!("{} px", px as i32)
 }
 
+/// `1234567` → `1,234,567`, grouped in the interface's marks — the row-limit
+/// dropdown's only formatting need, and the reason its label has no list to
+/// fall off the end of.
 fn row_limit_label(n: usize) -> String {
-    thousands(n)
+    schemaic_core::text::group_digits(&n.to_string(), crate::i18n::number_marks().group)
 }
 
 /// Format Code's wrap widths, in characters. **`0` leads and means off**,
@@ -1482,20 +1485,6 @@ fn cli_hint(hint: &schemaic_core::cli_install::RowHint) -> String {
             tr!("install-hint-comes-with-app", path = path.as_str())
         }
     }
-}
-
-/// `1234567` → `"1,234,567"`. The row-limit dropdown's only formatting need, and
-/// the reason its label no longer has a list to fall off the end of.
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Is this CLI-path field stable enough to be worth a `--help` probe?
@@ -2537,7 +2526,7 @@ mod tests {
     use super::{
         EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, WRAP_WIDTHS, agent_label, cli_hint,
         editor_font_label, log_hint, row_limit_label, should_ask_for_a_notice,
-        statement_timeout_label, term_font_label, thousands, wrap_width_label,
+        statement_timeout_label, term_font_label, wrap_width_label,
     };
     use crate::consts::TERM_FONT_SIZES;
 
@@ -2780,12 +2769,11 @@ mod tests {
     }
 
     #[test]
-    fn thousands_groups_from_the_right() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(999), "999");
-        assert_eq!(thousands(1_000), "1,000");
-        assert_eq!(thousands(12_345), "12,345");
-        assert_eq!(thousands(1_000_000), "1,000,000");
+    fn row_limits_group_from_the_right() {
+        assert_eq!(row_limit_label(999), "999");
+        assert_eq!(row_limit_label(1_000), "1,000");
+        assert_eq!(row_limit_label(12_345), "12,345");
+        assert_eq!(row_limit_label(1_000_000), "1,000,000");
     }
 }
 

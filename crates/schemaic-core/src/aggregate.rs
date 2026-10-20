@@ -15,6 +15,7 @@
 //! divides, and it says so by carrying more decimals than its inputs.
 
 use crate::model::{CellRef, Column};
+use crate::text::NumberMarks;
 
 /// A fixed-point decimal: `units` × 10⁻ˢᶜᵃˡᵉ.
 ///
@@ -533,27 +534,11 @@ fn mean(sum: i128, scale: u32, n: i128) -> Option<Fixed> {
 /// a total is a quantity you read off and compare, where a selection count is
 /// small and reads as a plain number. It groups the integer part and leaves the
 /// fraction alone, which is what separates `1,234.5678` from a phone number.
-fn grouped(s: &str) -> String {
-    let (sign, rest) = match s.strip_prefix('-') {
-        Some(r) => ("-", r),
-        None => ("", s),
-    };
-    let (int_part, frac) = match rest.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (rest, None),
-    };
-    let mut out = String::with_capacity(rest.len() + rest.len() / 3 + 1);
-    for (i, c) in int_part.chars().enumerate() {
-        // A separator every three digits, counted from the right.
-        if i > 0 && (int_part.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    match frac {
-        Some(f) => format!("{sign}{out}.{f}"),
-        None => format!("{sign}{out}"),
-    }
+///
+/// In `marks`, so the interface can show it in its language
+/// ([`FigureWhat::Stat`] carries the ungrouped value for that).
+pub fn grouped(s: &str, marks: NumberMarks) -> String {
+    crate::text::group_number(s, marks).unwrap_or_else(|| s.to_string())
 }
 
 impl Aggregates {
@@ -576,9 +561,15 @@ impl Aggregates {
     /// a `WHERE` would read as text — what clicking a figure puts on the
     /// clipboard.
     pub fn figures(&self) -> Vec<Figure> {
-        let fig = |shown: String, copy: String| Figure { shown, copy };
-        let exact =
-            |label: &str, v: &Fixed| fig(format!("{label} {}", grouped(&v.text())), v.text());
+        let fig = |shown: String, copy: String, what: FigureWhat| Figure { shown, copy, what };
+        let exact = |stat: Stat, v: &Fixed| {
+            let value = v.text();
+            fig(
+                format!("{} {}", stat.label(), grouped(&value, NumberMarks::ENGLISH)),
+                value.clone(),
+                FigureWhat::Stat { stat, value },
+            )
+        };
         // `N+` when the scan stopped at its budget — the same `+` the find
         // bar's count uses for the same reason, rather than a number that
         // reads exact and is not. Copied with it too: a bare `100000` on the
@@ -592,30 +583,45 @@ impl Aggregates {
                 crate::text::plural(self.rows, "row", "rows")
             ),
             format!("{}{more}", self.rows),
+            FigureWhat::Rows {
+                n: self.rows,
+                more: self.truncated,
+            },
         )];
         let nulls = self.rows - self.non_null - self.unset;
         if nulls > 0 {
-            parts.push(fig(format!("{nulls}{more} null"), format!("{nulls}{more}")));
+            parts.push(fig(
+                format!("{nulls}{more} null"),
+                format!("{nulls}{more}"),
+                FigureWhat::Nulls {
+                    n: nulls,
+                    more: self.truncated,
+                },
+            ));
         }
         // One value is its own distinct count and its own median, so neither
         // is printed until there are two.
         let several = self.non_null > 1;
         if let Some(d) = self.distinct.filter(|_| several) {
-            parts.push(fig(format!("{d} distinct"), d.to_string()));
+            parts.push(fig(
+                format!("{d} distinct"),
+                d.to_string(),
+                FigureWhat::Distinct(d),
+            ));
         }
         if let Some(n) = &self.numeric {
-            parts.push(exact("Sum", &n.sum));
+            parts.push(exact(Stat::Sum, &n.sum));
             // Omitted, not printed as a placeholder, when the mean can't be
             // represented: the other three are exact and saying so about them is
             // the whole job. An `Avg —` beside them would read as a value.
             if let Some(avg) = &n.avg {
-                parts.push(exact("Avg", avg));
+                parts.push(exact(Stat::Avg, avg));
             }
             if let Some(median) = n.median.as_ref().filter(|_| several) {
-                parts.push(exact("Median", median));
+                parts.push(exact(Stat::Median, median));
             }
-            parts.push(exact("Min", &n.min));
-            parts.push(exact("Max", &n.max));
+            parts.push(exact(Stat::Min, &n.min));
+            parts.push(exact(Stat::Max, &n.max));
         }
         // **In characters, and labelled so**: that is what MySQL and
         // PostgreSQL count a `VARCHAR(n)` in, but SQL Server's `nvarchar(n)`
@@ -625,10 +631,13 @@ impl Aggregates {
             Some((lo, hi)) if lo == hi => parts.push(fig(
                 format!("Length {lo} {}", crate::text::plural(lo, "char", "chars")),
                 lo.to_string(),
+                FigureWhat::Length { lo, hi },
             )),
-            Some((lo, hi)) => {
-                parts.push(fig(format!("Length {lo}–{hi} chars"), format!("{lo}–{hi}")))
-            }
+            Some((lo, hi)) => parts.push(fig(
+                format!("Length {lo}–{hi} chars"),
+                format!("{lo}–{hi}"),
+                FigureWhat::Length { lo, hi },
+            )),
             None => {}
         }
         parts
@@ -638,10 +647,54 @@ impl Aggregates {
 /// One figure of a selection's readout ([`Aggregates::figures`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Figure {
-    /// As the bar shows it: `Sum 1,234.50`.
+    /// As the bar shows it, in English: `Sum 1,234.50`. The interface words
+    /// [`Figure::what`] instead; this is the English a test holds it to.
     pub shown: String,
-    /// As clicking it copies it: `1234.50`.
+    /// As clicking it copies it: `1234.50`. Never localised — a spreadsheet or
+    /// a `WHERE` reads it.
     pub copy: String,
+    /// What the figure is, for the interface to word in its own language.
+    pub what: FigureWhat,
+}
+
+/// What one [`Figure`] says, as values: the words around them are the
+/// interface's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FigureWhat {
+    /// `10 rows`, `100000+ rows` when the scan stopped at its budget.
+    Rows { n: usize, more: bool },
+    /// `3 null`, with the same `+`.
+    Nulls { n: usize, more: bool },
+    /// `7 distinct`.
+    Distinct(usize),
+    /// `Sum 1,234.50`: `value` is the **ungrouped** English text (`1234.50`),
+    /// which [`grouped`] writes in a language's marks.
+    Stat { stat: Stat, value: String },
+    /// `Length 5 chars`, or `Length 2–9 chars` when `lo != hi`.
+    Length { lo: usize, hi: usize },
+}
+
+/// The arithmetic a numeric column's readout carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stat {
+    Sum,
+    Avg,
+    Median,
+    Min,
+    Max,
+}
+
+impl Stat {
+    /// Core's English word, for [`Figure::shown`].
+    pub fn label(self) -> &'static str {
+        match self {
+            Stat::Sum => "Sum",
+            Stat::Avg => "Avg",
+            Stat::Median => "Median",
+            Stat::Min => "Min",
+            Stat::Max => "Max",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1087,21 +1140,46 @@ mod tests {
 
     #[test]
     fn groups_the_integer_part_in_threes() {
-        assert_eq!(grouped("1234"), "1,234");
-        assert_eq!(grouped("10000"), "10,000");
-        assert_eq!(grouped("1000000"), "1,000,000");
-        assert_eq!(grouped("999"), "999", "nothing to group");
-        assert_eq!(grouped("-1234567"), "-1,234,567");
+        let en = NumberMarks::ENGLISH;
+        assert_eq!(grouped("1234", en), "1,234");
+        assert_eq!(grouped("10000", en), "10,000");
+        assert_eq!(grouped("1000000", en), "1,000,000");
+        assert_eq!(grouped("999", en), "999", "nothing to group");
+        assert_eq!(grouped("-1234567", en), "-1,234,567");
     }
 
     /// The fraction is left alone — grouping it too is what would turn a total
     /// into something that reads like a phone number.
     #[test]
     fn grouping_leaves_the_decimals_alone() {
-        assert_eq!(grouped("1234.5678"), "1,234.5678");
-        assert_eq!(grouped("0.50"), "0.50");
-        assert_eq!(grouped("-0.05"), "-0.05");
-        assert_eq!(grouped("12345.60"), "12,345.60");
+        let en = NumberMarks::ENGLISH;
+        assert_eq!(grouped("1234.5678", en), "1,234.5678");
+        assert_eq!(grouped("0.50", en), "0.50");
+        assert_eq!(grouped("-0.05", en), "-0.05");
+        assert_eq!(grouped("12345.60", en), "12,345.60");
+    }
+
+    /// The interface's language moves both marks; the copy never moves.
+    #[test]
+    fn a_stat_carries_its_value_ungrouped_for_the_interface_to_mark() {
+        let de = NumberMarks {
+            decimal: ',',
+            group: '.',
+        };
+        assert_eq!(grouped("-1234567.25", de), "-1.234.567,25");
+        let f = Figure {
+            shown: "Sum 1,234.50".into(),
+            copy: "1234.50".into(),
+            what: FigureWhat::Stat {
+                stat: Stat::Sum,
+                value: "1234.50".into(),
+            },
+        };
+        let FigureWhat::Stat { value, .. } = &f.what else {
+            unreachable!()
+        };
+        assert_eq!(grouped(value, de), "1.234,50");
+        assert_eq!(f.copy, "1234.50");
     }
 
     /// The counts stay plain: only the arithmetic is grouped.

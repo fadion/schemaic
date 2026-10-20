@@ -952,7 +952,7 @@ fn issue_tail_text(shown: usize, total: usize, capped: bool) -> Option<String> {
 /// interface's language, sizes as core prints them.
 fn memory_warning_text(w: &import::MemoryWarning) -> String {
     use import::MemoryWarning;
-    use schemaic_core::format::human_bytes;
+    let human_bytes = |n: i64| crate::i18n::figure(&schemaic_core::format::human_bytes(n));
     match *w {
         MemoryWarning::Json {
             file_bytes,

@@ -27,6 +27,7 @@ use i18n_embed::fluent::{FluentLanguageLoader, fluent_language_loader};
 use i18n_embed::unic_langid::LanguageIdentifier;
 use rust_embed::RustEmbed;
 use schemaic_core::locale::{self, UiLanguage};
+use schemaic_core::text::{self, NumberMarks};
 
 #[derive(RustEmbed)]
 #[folder = "i18n/"]
@@ -79,6 +80,45 @@ pub fn init(env: Option<String>, os: Vec<String>, setting: &str) -> UiLanguage {
 /// The language the interface is drawn in.
 pub(crate) fn active() -> UiLanguage {
     LAUNCH.get().map_or(UiLanguage::EnGb, |l| l.active)
+}
+
+/// The marks the interface writes a figure with — English's until [`init`],
+/// and in every test.
+pub fn number_marks() -> NumberMarks {
+    active().number_marks()
+}
+
+/// A figure core printed in English (`1,234.5`, `1.5 KiB`, `1.2s`, `~4.2m`),
+/// in the interface's marks. **Every figure a view shows goes through this or
+/// through a grouper given [`number_marks`]**; core's own printers stay English
+/// for the CLI, MCP and the clipboard. A figure handed to [`tr!`] as a string
+/// argument goes through it too — a plural selects on the raw number, never on
+/// this.
+pub fn figure(english: &str) -> String {
+    text::remark(english, number_marks())
+}
+
+/// `text::human_count` in the interface's marks: `1.25k`, German `1,25k` —
+/// the form the go-to-row box reads back in the same marks.
+pub fn count(n: usize) -> String {
+    figure(&text::human_count(n))
+}
+
+/// `stats::format_bytes` in the interface's marks: `1.5 KiB`, German `1,5 KiB`.
+pub fn bytes(n: u64) -> String {
+    figure(&schemaic_core::stats::format_bytes(n))
+}
+
+/// `transcript::elapsed_text` in the interface's marks: `1.2s`, German `1,2s`.
+pub fn elapsed(ms: u64) -> String {
+    figure(&schemaic_core::transcript::elapsed_text(ms))
+}
+
+/// `format::contrasting_bytes` in the interface's marks — two sizes told
+/// apart, for a refusal whose point is that they differ.
+pub fn contrasting_bytes(a: u64, b: u64) -> (String, String) {
+    let (a, b) = schemaic_core::format::contrasting_bytes(a, b);
+    (figure(&a), figure(&b))
 }
 
 /// The language a *Language* setting of `key` would draw, on this machine —
@@ -203,7 +243,7 @@ pub(crate) fn relative_time(ts: u64, now: u64) -> String {
 /// A history row's outcome line — `history::outcome_line`'s composition, with
 /// the row count worded here.
 pub(crate) fn outcome_line(entry: &schemaic_core::history::HistoryEntry) -> Option<String> {
-    schemaic_core::history::outcome_line_with(entry, |n, capped| {
+    schemaic_core::history::outcome_line_with(entry, number_marks(), |n, capped| {
         if capped {
             tr!("outcome-rows-capped", n = n)
         } else {
@@ -263,7 +303,7 @@ pub(crate) fn export_note(note: &schemaic_core::export::ExportNote) -> String {
     let n = note.rows as usize;
     let head = tr!(
         "export-note-rows",
-        rows = schemaic_core::text::human_count(n),
+        rows = count(n),
         n = n,
         name = note.name.as_str()
     );
@@ -437,7 +477,11 @@ pub fn not_sent_message(timed_out: bool) -> String {
 /// core's `RowCount::label`, as the properties panel prints it.
 pub(crate) fn truncate_prompt(label: &str, rows: Option<schemaic_core::stats::RowCount>) -> String {
     match schemaic_core::stats::confirm_figure(rows) {
-        Some(r) => tr!("tree-truncate-rows", rows = r.label(), table = label),
+        Some(r) => tr!(
+            "tree-truncate-rows",
+            rows = figure(&r.label()),
+            table = label
+        ),
         None => tr!("tree-truncate-every-row", table = label),
     }
 }
@@ -620,8 +664,8 @@ pub fn notice_text(notice: &schemaic_core::persist::Notice) -> String {
 /// interface's language, sizes as core prints them. Public for the app, whose
 /// probe refuses a workbook too big to open before reading it.
 pub fn read_refusal_text(r: &schemaic_core::import::ReadRefusal) -> String {
-    use schemaic_core::format::human_bytes;
     use schemaic_core::import::{ReadRefusal, XLSX_MAX_BYTES, XLSX_MAX_COLS};
+    let human_bytes = |n: i64| figure(&schemaic_core::format::human_bytes(n));
     let max = human_bytes(XLSX_MAX_BYTES as i64);
     match r {
         ReadRefusal::NotObjects => tr!("import-refuse-not-objects"),
@@ -1904,5 +1948,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **No view shows a figure core printed in English unmarked.** Core's
+    /// printers write English's marks for the CLI, MCP and the clipboard; a
+    /// view calling one directly showed `1.5 KiB` to a German reader. So
+    /// outside this file every call to one in the two view crates sits on a
+    /// line that hands it to [`figure`] or is given [`number_marks`] — or goes
+    /// through [`count`], [`bytes`], [`elapsed`] and [`contrasting_bytes`],
+    /// which do. A `figure(` ending the line above counts, as `cargo fmt`
+    /// splits one there; a call split further, or a printer imported under
+    /// another name, is not seen.
+    #[test]
+    fn every_core_figure_a_view_shows_takes_the_interface_s_marks() {
+        const PRINTERS: [&str; 7] = [
+            "human_count",
+            "format_bytes",
+            "human_bytes",
+            "contrasting_bytes",
+            "group_digits",
+            "format_duration",
+            "elapsed_text",
+        ];
+        // `::name` as a whole path segment — called, or passed as a function
+        // (`.map(stats::format_bytes)`), which is how one was missed.
+        let names = |line: &str, prefix: &str, p: &str| {
+            let needle = format!("{prefix}{p}");
+            line.match_indices(&needle).any(|(at, _)| {
+                let next = line[at + needle.len()..].chars().next();
+                !next.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+        };
+        let files = crate::source_gate::crate_sources();
+        let mut seen = 0usize;
+        let mut offenders = Vec::new();
+        for (name, code) in files.iter().filter(|(n, _)| n != "i18n.rs") {
+            let lines: Vec<&str> = code.lines().collect();
+            for (i, &line) in lines.iter().enumerate() {
+                // `cargo fmt` breaks `figure(` + the call over two lines.
+                let above = i.checked_sub(1).map_or("", |j| lines[j]);
+                let imports = line.trim_start().starts_with("use schemaic_core");
+                for p in PRINTERS {
+                    // Core's, by its path; a view's own wrapper is unqualified,
+                    // and this file's are `i18n::`.
+                    if imports || !names(line, "::", p) || names(line, "i18n::", p) {
+                        continue;
+                    }
+                    seen += 1;
+                    let marked = |l: &str| l.contains("figure(") || l.contains("number_marks()");
+                    if !(marked(line) || above.trim_end().ends_with("figure(")) {
+                        offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
+                    }
+                }
+                let imported = PRINTERS.iter().any(|p| names(line, "", p));
+                if imports && imported {
+                    offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            seen >= 5,
+            "only {seen} core printer calls found; this gate has gone blind"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a figure core printed in English, shown without the interface's \
+             marks (wrap it in `i18n::figure`, or use `i18n::count`/`bytes`):\n{}",
+            offenders.join("\n")
+        );
     }
 }

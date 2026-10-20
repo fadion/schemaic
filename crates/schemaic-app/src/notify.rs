@@ -36,7 +36,7 @@ pub(crate) fn finished_note(what: Finished, failed: bool, took_ms: u64) -> (Stri
         (Finished::Dump, false) => tr!("notify-dump-finished"),
         (Finished::Dump, true) => tr!("notify-dump-failed"),
     };
-    let took = schemaic_core::history::format_duration(took_ms);
+    let took = schemaic_ui::i18n::figure(&schemaic_core::history::format_duration(took_ms));
     (title, tr!("notify-took", duration = took))
 }
 

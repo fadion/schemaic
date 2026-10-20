@@ -135,11 +135,16 @@ pub struct Scene {
 /// **`measure` is called for each of [`Scene::ticks`] first, in order, then
 /// for each of [`Scene::under`]** — a contract, not an accident: the canvas
 /// keeps what it measured and draws the tick labels from it, by position.
+///
+/// The tick labels are written in `figures`, the interface's marks — the
+/// export is a picture of the chart on screen, not data, so it carries them
+/// too.
 pub fn layout(
     drawn: &Plot,
     width: f64,
     height: f64,
     m: &Metrics,
+    figures: crate::text::NumberMarks,
     measure: &mut dyn FnMut(&str) -> (f64, f64),
 ) -> Option<Scene> {
     // Every mark's width below divides by the count.
@@ -150,7 +155,10 @@ pub fn layout(
     let ticks = chart::ticks(lo, hi, 5);
     let (&t0, &t1) = (ticks.first()?, ticks.last()?);
     // As one axis, so their precision follows the step (`tick_labels`).
-    let texts = chart::tick_labels(&ticks);
+    let texts: Vec<String> = chart::tick_labels(&ticks)
+        .iter()
+        .map(|t| crate::text::remark(t, figures))
+        .collect();
     let sizes: Vec<(f64, f64)> = texts.iter().map(|t| measure(t)).collect();
     let gutter = sizes.iter().map(|s| s.0).fold(0.0, f64::max) + m.gutter_pad;
     let label_h = sizes.first().map_or(12.0, |s| s.1);
@@ -234,10 +242,18 @@ pub fn layout(
         }
     };
 
+    // A histogram's are bin edges, figures like the ticks; a series' are the
+    // label column's values — data, never re-marked.
+    let edges = matches!(drawn, Plot::Bins(_));
     let under = drawn
         .x_labels()
         .into_iter()
         .map(|(at, text)| {
+            let text = if edges {
+                crate::text::remark(&text, figures)
+            } else {
+                text
+            };
             let (w, h) = measure(&text);
             Label {
                 left: (plot.x0 + at * plot.width() - w / 2.0).clamp(0.0, (width - w).max(0.0)),
@@ -405,8 +421,94 @@ mod tests {
         (s.chars().count() as f64 * 7.0, 12.0)
     }
 
+    /// [`super::layout`] in English marks, which every test of the geometry is
+    /// written in; it shadows the glob import.
+    fn layout(
+        drawn: &Plot,
+        width: f64,
+        height: f64,
+        m: &Metrics,
+        measure: &mut dyn FnMut(&str) -> (f64, f64),
+    ) -> Option<Scene> {
+        super::layout(
+            drawn,
+            width,
+            height,
+            m,
+            crate::text::NumberMarks::ENGLISH,
+            measure,
+        )
+    }
+
     fn lay(drawn: &Plot) -> Scene {
         layout(drawn, 600.0, 300.0, &Metrics::BASE, &mut measure).expect("drawable")
+    }
+
+    /// The tick labels are written in the marks given — German's decimal
+    /// comma on a fractional axis — and measured as written.
+    #[test]
+    fn the_tick_labels_are_written_in_the_marks_given() {
+        let de = crate::text::NumberMarks {
+            decimal: ',',
+            group: '.',
+        };
+        let mut asked: Vec<String> = Vec::new();
+        let s = super::layout(
+            &series(ChartKind::Line, &[0.1, 0.35]),
+            600.0,
+            300.0,
+            &Metrics::BASE,
+            de,
+            &mut |t| {
+                asked.push(t.to_string());
+                measure(t)
+            },
+        )
+        .expect("drawable");
+        let ticks: Vec<&str> = s.ticks.iter().map(|l| l.text.as_str()).collect();
+        assert!(ticks.iter().any(|t| t.contains(',')), "{ticks:?}");
+        assert!(!ticks.iter().any(|t| t.contains('.')), "{ticks:?}");
+        assert_eq!(asked[..ticks.len()], ticks[..]);
+        // A series' labels are its label column's values, left as they came.
+        assert!(s.under.iter().all(|l| l.text.starts_with('r')));
+    }
+
+    /// A histogram's labels under the axis are bin edges, and take the marks;
+    /// a series' are data, and do not.
+    #[test]
+    fn only_a_histogram_s_edges_take_the_marks() {
+        let de = crate::text::NumberMarks {
+            decimal: ',',
+            group: '.',
+        };
+        let bins = Plot::Bins(vec![
+            Bin {
+                lo: 0.5,
+                hi: 1.5,
+                count: 2,
+            },
+            Bin {
+                lo: 1.5,
+                hi: 2.5,
+                count: 1,
+            },
+        ]);
+        let s =
+            super::layout(&bins, 600.0, 300.0, &Metrics::BASE, de, &mut measure).expect("drawable");
+        let under: Vec<&str> = s.under.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(under, ["0,5", "1,5", "2,5"]);
+        let labelled = Plot::Series(
+            ChartKind::Bar,
+            Series {
+                labels: vec!["1.5".into(), "2.5".into()],
+                values: vec![1.0, 2.0],
+                skipped: 0,
+            },
+        );
+        let s = super::layout(&labelled, 600.0, 300.0, &Metrics::BASE, de, &mut measure)
+            .expect("drawable");
+        let under: Vec<&str> = s.under.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(under, ["1.5", "2.5"]);
     }
 
     fn series(kind: ChartKind, values: &[f64]) -> Plot {

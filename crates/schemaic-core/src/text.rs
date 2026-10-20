@@ -266,6 +266,110 @@ pub fn human_count(n: usize) -> String {
     format!("{s}{suffix}")
 }
 
+/// The two marks a language writes a figure with: `1,234.5` in English,
+/// `1.234,5` in German. [`crate::locale::UiLanguage::number_marks`] says which
+/// a language uses.
+///
+/// **A table, not CLDR** (`docs/architecture.md`, *Figures in the interface's
+/// marks*): two characters
+/// per shipped language is the whole need, and pinned English must not move
+/// when a data crate does. Grouping is always in threes — a language grouped
+/// otherwise (Indian `1,23,456`) is what would reopen that decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NumberMarks {
+    pub decimal: char,
+    pub group: char,
+}
+
+impl NumberMarks {
+    /// Core's own: what the CLI, MCP, the AI and every pinned English figure
+    /// are written in, whatever the interface's language.
+    pub const ENGLISH: NumberMarks = NumberMarks {
+        decimal: '.',
+        group: ',',
+    };
+}
+
+/// Put `group` between every three of `digits`, counted from the right:
+/// `4213551` → `4,213,551`. `digits` is an integer's digits and nothing else —
+/// [`group_number`] is the one that takes a sign and a fraction.
+///
+/// **The one grouper.** Four copies of this loop once lived in `stats`,
+/// `format`, `aggregate` and the settings view, each with the comma written in;
+/// a language's mark had four places to be missed.
+pub fn group_digits(digits: &str, group: char) -> String {
+    let n = digits.chars().count();
+    let mut out = String::with_capacity(digits.len() + n / 3 * group.len_utf8());
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (n - i).is_multiple_of(3) {
+            out.push(group);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A plain rendered number — `[-]digits[.digits]`, as Rust prints one —
+/// grouped and written with `marks`: `1234567.891` → `1,234,567.891`, or
+/// `1.234.567,891` in German. The fraction is never grouped.
+///
+/// `None` for anything else (an exponent, a stray letter, a number already
+/// grouped), so a caller falls back to the text as it came rather than
+/// half-grouping it.
+pub fn group_number(s: &str, marks: NumberMarks) -> Option<String> {
+    let t = s.trim();
+    let (sign, rest) = match t.strip_prefix('-') {
+        Some(r) => ("-", r),
+        None => ("", t),
+    };
+    let (int_part, frac) = match rest.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (rest, None),
+    };
+    let digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int_part) || frac.is_some_and(|f| !digits(f)) {
+        return None;
+    }
+    let grouped = group_digits(int_part, marks.group);
+    Some(match frac {
+        Some(f) => format!("{sign}{grouped}{}{f}", marks.decimal),
+        None => format!("{sign}{grouped}"),
+    })
+}
+
+/// An **English-written** figure rewritten with `marks`: `1,234.5` →
+/// `1.234,5`, `1.5 KiB` → `1,5 KiB`, `1.2s` → `1,2s`.
+///
+/// This is how the interface localises a figure core has already printed:
+/// core's printers stay English for the CLI, MCP and the clipboard, and the
+/// view hands what it shows through here. Only a `.` or `,` **between two
+/// digits** is a mark — a full stop, a list's comma and an ellipsis around a
+/// figure are punctuation and pass untouched — so a short line holding several
+/// figures (`1.2s · ↑1.2k ↓340`) can go through whole. A prose sentence should
+/// not: its own words belong to the catalogue, with the figure as an argument.
+pub fn remark(figure: &str, marks: NumberMarks) -> String {
+    if marks == NumberMarks::ENGLISH {
+        return figure.to_string();
+    }
+    let chars: Vec<char> = figure.chars().collect();
+    let digit = |i: Option<usize>| {
+        i.and_then(|i| chars.get(i))
+            .is_some_and(char::is_ascii_digit)
+    };
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let between = digit(i.checked_sub(1)) && digit(Some(i + 1));
+            match c {
+                '.' if between => marks.decimal,
+                ',' if between => marks.group,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
 /// Would showing `msg` in a one-line bar `fits_chars` wide hide any of it?
 ///
 /// The decision behind the error bar's **View** action, which opens the full text
@@ -332,6 +436,78 @@ pub fn field_suggestion<'a>(typed: &str, options: &'a [String]) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GERMAN: NumberMarks = NumberMarks {
+        decimal: ',',
+        group: '.',
+    };
+
+    /// Threes from the right, whatever the length, with the mark it is given.
+    #[test]
+    fn digits_group_in_threes_from_the_right() {
+        assert_eq!(group_digits("", ','), "");
+        assert_eq!(group_digits("7", ','), "7");
+        assert_eq!(group_digits("999", ','), "999");
+        assert_eq!(group_digits("1000", ','), "1,000");
+        assert_eq!(group_digits("12345", ','), "12,345");
+        assert_eq!(group_digits("4213551", ','), "4,213,551");
+        assert_eq!(group_digits("4213551", '.'), "4.213.551");
+    }
+
+    /// A rendered number keeps its sign and its fraction, the fraction is never
+    /// grouped, and both marks come from the language.
+    #[test]
+    fn a_number_groups_its_integer_part_only() {
+        let en = NumberMarks::ENGLISH;
+        assert_eq!(
+            group_number("1234567.891", en).as_deref(),
+            Some("1,234,567.891")
+        );
+        assert_eq!(group_number("-1234", en).as_deref(), Some("-1,234"));
+        assert_eq!(group_number(" 42 ", en).as_deref(), Some("42"));
+        assert_eq!(
+            group_number("1234567.891", GERMAN).as_deref(),
+            Some("1.234.567,891")
+        );
+        assert_eq!(group_number("-0.5", GERMAN).as_deref(), Some("-0,5"));
+    }
+
+    /// Anything that is not a plain number is refused rather than half-grouped.
+    #[test]
+    fn a_number_that_is_not_plain_is_refused() {
+        let en = NumberMarks::ENGLISH;
+        for s in [
+            "", "-", ".5", "1.", "1e9", "12a", "1.2.3", "1,234", "NaN", "--1",
+        ] {
+            assert_eq!(group_number(s, en), None, "{s:?}");
+        }
+    }
+
+    /// English figures read the same through `remark`, and German swaps both
+    /// marks at once — a grouped decimal is the case a one-mark swap breaks.
+    #[test]
+    fn a_figure_is_remarked_for_the_language() {
+        for s in ["1,234,567.5", "1.5 KiB", "~4.2m", "1m 00s", "12"] {
+            assert_eq!(remark(s, NumberMarks::ENGLISH), s);
+        }
+        assert_eq!(remark("1,234,567.5", GERMAN), "1.234.567,5");
+        assert_eq!(remark("1.5 KiB", GERMAN), "1,5 KiB");
+        assert_eq!(remark("~4.25m", GERMAN), "~4,25m");
+        assert_eq!(remark("1.2s  ·  ↑1.2k ↓340", GERMAN), "1,2s  ·  ↑1,2k ↓340");
+    }
+
+    /// Only a mark *between two digits* is a mark: a sentence's full stop, a
+    /// list's comma and an ellipsis are punctuation and stay as they are.
+    #[test]
+    fn remark_leaves_punctuation_that_is_not_between_digits() {
+        assert_eq!(
+            remark("Read 1,250 rows, of 3.5k.", GERMAN),
+            "Read 1.250 rows, of 3,5k."
+        );
+        assert_eq!(remark("a.b, 1. 2,", GERMAN), "a.b, 1. 2,");
+        assert_eq!(remark("…", GERMAN), "…");
+        assert_eq!(remark("", GERMAN), "");
+    }
 
     /// One line whatever the value holds: NULL says so, every mandatory break
     /// is a space (a CRLF one), and a long value is cut to the limit.
@@ -698,7 +874,7 @@ mod tests {
         for n in [1usize, 999, 1_000, 1_250, 200_000, 1_000_000, 1_500_000] {
             let printed = human_count(n);
             assert_eq!(
-                crate::model::goto_row_index(&printed, n),
+                crate::model::goto_row_index(&printed, n, NumberMarks::ENGLISH),
                 Some(n - 1),
                 "{printed:?} came from {n}"
             );
@@ -725,7 +901,7 @@ mod tests {
             999_999_999,
         ] {
             let printed = human_count(n);
-            let parsed = crate::model::goto_row_index(&printed, usize::MAX)
+            let parsed = crate::model::goto_row_index(&printed, usize::MAX, NumberMarks::ENGLISH)
                 .unwrap_or_else(|| panic!("{printed:?} is unreadable"))
                 + 1;
             // Two decimals of the printed unit is the resolution the string has,

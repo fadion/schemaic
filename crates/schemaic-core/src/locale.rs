@@ -71,6 +71,18 @@ impl UiLanguage {
         }
     }
 
+    /// The marks the language writes a figure with. The pseudo-locale keeps
+    /// English's: it tests the words' length, and its catalogue is English's.
+    pub fn number_marks(self) -> crate::text::NumberMarks {
+        match self {
+            UiLanguage::EnGb | UiLanguage::Pseudo => crate::text::NumberMarks::ENGLISH,
+            UiLanguage::De => crate::text::NumberMarks {
+                decimal: ',',
+                group: '.',
+            },
+        }
+    }
+
     /// A key as the setting or the variable spells it. Case-insensitive, and a
     /// region on a language the app has only one of is ignored (`de-AT` is
     /// German; `en-US` is the English there is).
@@ -122,6 +134,20 @@ mod tests {
 
     fn os(tags: &[&str]) -> Vec<String> {
         tags.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn german_swaps_both_marks_and_the_pseudo_locale_keeps_english_s() {
+        use crate::text::NumberMarks;
+        assert_eq!(UiLanguage::EnGb.number_marks(), NumberMarks::ENGLISH);
+        assert_eq!(UiLanguage::Pseudo.number_marks(), NumberMarks::ENGLISH);
+        assert_eq!(
+            UiLanguage::De.number_marks(),
+            NumberMarks {
+                decimal: ',',
+                group: '.'
+            }
+        );
     }
 
     #[test]

@@ -37,10 +37,15 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector, virtual_stack};
 
+use crate::i18n::contrasting_bytes;
 use schemaic_core::blob::{
     BlobKind, BlobValue, HEX_COLS, PreviewVerdict, hex_line, hex_row_count, preview_verdict,
 };
-use schemaic_core::format::{contrasting_bytes, human_bytes};
+
+/// `format::human_bytes` in the interface's marks.
+fn human_bytes(n: i64) -> String {
+    crate::i18n::figure(&schemaic_core::format::human_bytes(n))
+}
 
 use crate::i18n::tr;
 use crate::theme;

@@ -2229,6 +2229,7 @@ fn grid_cells<'a>(
         formats,
         dirty,
         new_rows,
+        marks: crate::i18n::number_marks(),
     }
 }
 
@@ -2764,7 +2765,7 @@ fn fill_selection(gs: GridState, fill: schemaic_core::edit::Fill) {
         gs.stage_many(real) + gs.stage_new_many(pending, schemaic_core::edit::BlankCell::IsAValue);
     // After staging, because `stage` clears the bar.
     if skipped > 0 {
-        let n = schemaic_core::text::human_count;
+        let n = crate::i18n::count;
         gs.commit_note.set(Some(tr!(
             "grid-fill-skipped",
             count = staged,
@@ -2902,10 +2903,12 @@ fn rows_read_text(said: &schemaic_core::stats::RowsRead) -> String {
     use schemaic_core::stats::RowsRead;
     // `n` by value: `tr!` pastes an argument in front of `.into()`, so a
     // `*n` would parse as `*(n.into())`.
+    // The figures come printed in English; the marks are the interface's.
+    let figure = crate::i18n::figure;
     match *said {
-        RowsRead::All { ref read, n } => tr!("grid-rows-read", read = read.as_str(), n = n),
+        RowsRead::All { ref read, n } => tr!("grid-rows-read", read = figure(read), n = n),
         RowsRead::Capped { ref read, n } => {
-            tr!("grid-rows-read-capped", read = read.as_str(), n = n)
+            tr!("grid-rows-read-capped", read = figure(read), n = n)
         }
         RowsRead::OfTotal {
             ref read,
@@ -2913,10 +2916,43 @@ fn rows_read_text(said: &schemaic_core::stats::RowsRead) -> String {
             n,
         } => tr!(
             "grid-rows-read-of-total",
-            read = read.as_str(),
-            total = total.as_str(),
+            read = figure(read),
+            total = figure(total),
             n = n
         ),
+    }
+}
+
+/// One figure of the selection readout — core's `aggregate::Figure::shown` in
+/// the interface's language, the arithmetic grouped in its marks.
+fn figure_text(what: &schemaic_core::aggregate::FigureWhat) -> String {
+    use schemaic_core::aggregate::{FigureWhat, Stat, grouped};
+    let more = |m: bool| if m { "+" } else { "" };
+    match *what {
+        FigureWhat::Rows { n, more: m } => tr!("grid-figure-rows", n = n, more = more(m)),
+        FigureWhat::Nulls { n, more: m } => tr!("grid-figure-nulls", n = n, more = more(m)),
+        FigureWhat::Distinct(n) => tr!("grid-figure-distinct", n = n),
+        FigureWhat::Stat { stat, ref value } => {
+            let value = grouped(value, crate::i18n::number_marks());
+            match stat {
+                Stat::Sum => tr!("grid-figure-sum", value = value),
+                Stat::Avg => tr!("grid-figure-avg", value = value),
+                Stat::Median => tr!("grid-figure-median", value = value),
+                Stat::Min => tr!("grid-figure-min", value = value),
+                Stat::Max => tr!("grid-figure-max", value = value),
+            }
+        }
+        FigureWhat::Length { lo, hi } if lo == hi => tr!("grid-figure-length", n = lo),
+        FigureWhat::Length { lo, hi } => tr!("grid-figure-length-range", lo = lo, hi = hi),
+    }
+}
+
+/// The read-more link — core's `stats::ReadMore` in the interface's language.
+fn read_more_text(offer: schemaic_core::stats::ReadMore) -> String {
+    use schemaic_core::stats::ReadMore;
+    match offer {
+        ReadMore::All => tr!("grid-read-all"),
+        ReadMore::Rows(n) => tr!("grid-read-more", rows = crate::i18n::count(n)),
     }
 }
 
@@ -3370,7 +3406,7 @@ fn export_menu(
         MenuEntry::sub(
             tr!(
                 "grid-export-fetched-rows",
-                count = schemaic_core::text::human_count(fetched)
+                count = crate::i18n::count(fetched)
             ),
             per_format(false),
         ),
@@ -3381,7 +3417,7 @@ fn export_menu(
         MenuEntry::sub(
             {
                 let size = match row_total {
-                    Some(n) => format!("~{}", schemaic_core::text::human_count(n.value() as usize)),
+                    Some(n) => format!("~{}", crate::i18n::count(n.value() as usize)),
                     None => String::new(),
                 };
                 // **Every way the file will differ from the screen, said at the
@@ -4780,7 +4816,7 @@ fn selection_readout(
             }
             let n = r.figures.len();
             for (i, f) in r.figures.into_iter().enumerate() {
-                let shown = f.shown;
+                let shown = figure_text(&f.what);
                 let copy = f.copy;
                 parts.push(
                     label(move || match copied.get() {
@@ -5719,9 +5755,9 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         // row showing no number at all, and made a row of 9s stop one short of
         // the last row that does.
         let edges = gs.layout_untracked().edges(ncols);
-        let target = gs
-            .goto_query
-            .with_untracked(|q| schemaic_core::model::goto_target(q, nrows, edges));
+        let target = gs.goto_query.with_untracked(|q| {
+            schemaic_core::model::goto_target(q, nrows, edges, crate::i18n::number_marks())
+        });
         if let Some(t) = target {
             gs.anchor.set(Some(t.anchor));
             gs.active.set(Some(t.active));
@@ -6599,7 +6635,7 @@ fn clone_rows(gs: GridState, data_idxs: &[usize]) {
 /// The duplicate confirmation's question — core's `edit::duplicate_prompt`
 /// in the interface's language, the count grouped as core groups it.
 fn duplicate_question(n: usize) -> String {
-    let rows = schemaic_core::stats::group_digits(n as u64);
+    let rows = crate::i18n::figure(&schemaic_core::stats::group_digits(n as u64));
     tr!("grid-duplicate-question", rows = rows.as_str(), n = n)
 }
 
@@ -9269,7 +9305,7 @@ fn grid_toolbar(
                         // right), and the same verb the offer itself used.
                         tr!("grid-reading")
                     } else {
-                        schemaic_core::stats::read_more_offer(nrows, row_total.get()).1
+                        read_more_text(schemaic_core::stats::read_more(nrows, row_total.get()).1)
                     }
                 })
                 .style(move |s| {
@@ -9318,8 +9354,7 @@ fn grid_toolbar(
                 // Asked again at the click rather than captured: the total
                 // may have landed since the label was last drawn, and the
                 // cap has to match the words the user just read.
-                let (cap, _) =
-                    schemaic_core::stats::read_more_offer(nrows, row_total.get_untracked());
+                let (cap, _) = schemaic_core::stats::read_more(nrows, row_total.get_untracked());
                 // The override is per-tab and transient: the next manual run
                 // clears it, because getting past the cap once is not a
                 // decision about every query the user will ever run.
@@ -11870,7 +11905,7 @@ fn data_cell(
             };
             let formatted_val = if fmt != ColumnFormat::None && !staged_here && pending.is_none() {
                 rs.cell(data_idx, ci)
-                    .map(|c| format::apply(fmt, &c.to_value()))
+                    .map(|c| format::apply(fmt, &c.to_value(), crate::i18n::number_marks()))
                     .unwrap_or_else(|| val.clone())
             } else {
                 val.clone()
@@ -12339,7 +12374,11 @@ fn cell_orig_preview(
             (cell_preview(c.display()), false)
         }
         Some(c) => (
-            cell_preview(&format::apply(fmt, &c.to_value())),
+            cell_preview(&format::apply(
+                fmt,
+                &c.to_value(),
+                crate::i18n::number_marks(),
+            )),
             c.is_null(),
         ),
         None => (String::new(), true),
@@ -13195,7 +13234,11 @@ mod cell_preview_tests {
         ] {
             let rs = one(text);
             let c = rs.cell(0, 0).unwrap();
-            let long_way = cell_preview(&format::apply(ColumnFormat::None, &c.to_value()));
+            let long_way = cell_preview(&format::apply(
+                ColumnFormat::None,
+                &c.to_value(),
+                schemaic_core::text::NumberMarks::ENGLISH,
+            ));
             assert_eq!(
                 cell_orig_preview(&rs, 0, 0, ColumnFormat::None).0,
                 long_way,
@@ -15498,7 +15541,7 @@ mod row_selection_tests {
     /// as a row selection too.
     #[test]
     fn a_jump_reads_as_a_row_selection() {
-        let t = goto_target("5", 100, (0, 4)).unwrap();
+        let t = goto_target("5", 100, (0, 4), crate::i18n::number_marks()).unwrap();
         let bounds = Some((t.anchor.0, t.anchor.1, t.active.0, t.active.1));
         assert_eq!(
             selection_kind(bounds, Some(t.anchor), &[0, 1, 2, 3, 4]),
@@ -16709,7 +16752,8 @@ mod clear_tests {
 #[cfg(test)]
 mod core_words_tests {
     use super::{
-        attach_scope_text, duplicate_question, filter_error_text, rows_read_text, sql_copy_words,
+        attach_scope_text, duplicate_question, figure_text, filter_error_text, read_more_text,
+        rows_read_text, sql_copy_words,
     };
 
     /// **The filter field's refusal reads in English exactly as core's
@@ -16781,6 +16825,68 @@ mod core_words_tests {
         ] {
             let said = rows_read(loaded, total, truncated);
             assert_eq!(rows_read_text(&said), said.to_string(), "{said:?}");
+        }
+    }
+
+    /// **The selection readout reads in English exactly as core's
+    /// `Figure::shown`** — a number column (every stat, grouped, with NULLs and
+    /// distinct), one row, a text column of one length and of a range, and a
+    /// scan stopped at its budget.
+    #[test]
+    fn english_reads_every_selection_figure_as_core_does() {
+        use schemaic_core::aggregate::{aggregate_capped, aggregate_texts};
+        use schemaic_core::model::Column;
+        let col = |t: &str| Column {
+            name: "c".into(),
+            type_name: t.into(),
+            origin: None,
+        };
+        let numbers = [Some("1234.5"), Some("2000000"), None, Some("7"), Some("7")];
+        let aggs = [
+            aggregate_texts(&col("decimal"), numbers.into_iter()),
+            aggregate_texts(&col("int"), [Some("1")].into_iter()),
+            aggregate_texts(&col("varchar"), [Some("abc"), Some("xyz")].into_iter()),
+            aggregate_texts(&col("varchar"), [Some("a"), Some("abcdef")].into_iter()),
+            aggregate_capped(&col("int"), (0..10).map(|_| Some("5")), 3),
+        ];
+        let first: Vec<String> = aggs[0].figures().into_iter().map(|f| f.shown).collect();
+        assert_eq!(
+            first,
+            [
+                "5 rows",
+                "1 null",
+                "3 distinct",
+                "Sum 2,001,248.5",
+                "Avg 500,312.125",
+                "Median 620.75",
+                "Min 7.0",
+                "Max 2,000,000.0"
+            ],
+            "the number column reaches every stat and the grouping"
+        );
+        for agg in aggs {
+            for f in agg.figures() {
+                assert_eq!(figure_text(&f.what), f.shown, "{f:?}");
+            }
+        }
+    }
+
+    /// **The read-more link reads in English exactly as core's
+    /// `read_more_offer` says it** — the whole result, and the next step.
+    #[test]
+    fn english_offers_every_read_more_as_core_does() {
+        use schemaic_core::stats::{read_more, read_more_offer};
+        for (loaded, total) in [
+            (200_000, Some(RowCount::Estimate(292_020))),
+            (1_000, Some(RowCount::Exact(4_213))),
+            (1_000, None),
+            (200_000, Some(RowCount::Estimate(4_200_000))),
+        ] {
+            assert_eq!(
+                read_more_text(read_more(loaded, total).1),
+                read_more_offer(loaded, total).1,
+                "{loaded} {total:?}"
+            );
         }
     }
 

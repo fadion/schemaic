@@ -1132,6 +1132,14 @@ chart-file-stem = { $name } Diagramm
 chart-nothing-to-save = Nichts zu speichern.
 chart-no-numbers = In diesem Ergebnis gibt es keine Zahlenspalte für ein Diagramm.
 chart-all-null = Jeder Wert dieser Spalte ist NULL.
+chart-too-large = Diese Werte sind zu groß zum Zeichnen.
+chart-caption-rows = { $n ->
+    [one] { $n } Zeile
+   *[other] { $n } Zeilen
+}
+chart-caption-skipped-null = { $skipped } NULL, nicht gezeichnet
+chart-caption-skipped = { $skipped } nicht gezeichnet (NULL oder über { $max })
+chart-caption-truncated = die gelesenen Zeilen, nicht das ganze Ergebnis
 
 ## Schema editors — shared
 
@@ -2636,6 +2644,8 @@ grid-rows-read-of-total = { $n ->
 grid-kept-note = · behalten — schreibgeschützt
 grid-arena-note = · { $columns } zu groß, um vollständig gehalten zu werden — spätere Zeilen bleiben leer
 grid-sorted-subset = · sortierte Teilmenge (begrenzt) — nicht die vollständige Reihenfolge
+grid-read-all = alle Zeilen lesen
+grid-read-more = { $rows } Zeilen lesen
 grid-reading = wird gelesen…
 grid-committing = Wird committet…
 grid-commit-tip = { $count ->
@@ -2664,6 +2674,22 @@ grid-error-view = Anzeigen
 grid-rollback-tab = { $tab } zurückrollen
 grid-find-placeholder = In Ergebnissen suchen
 grid-figure-copied = Kopiert
+grid-figure-rows = { $n ->
+    [one] { $n }{ $more } Zeile
+   *[other] { $n }{ $more } Zeilen
+}
+grid-figure-nulls = { $n }{ $more } NULL
+grid-figure-distinct = { $n } eindeutig
+grid-figure-sum = Summe { $value }
+grid-figure-avg = Mittel { $value }
+grid-figure-median = Median { $value }
+grid-figure-min = Min { $value }
+grid-figure-max = Max { $value }
+grid-figure-length = { $n ->
+    [one] Länge { $n } Zeichen
+   *[other] Länge { $n } Zeichen
+}
+grid-figure-length-range = Länge { $lo }–{ $hi } Zeichen
 grid-goto-label = Gehe zu Zeile:
 export-dest-clipboard = die Zwischenablage
 export-dest-file = die Datei

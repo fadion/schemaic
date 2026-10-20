@@ -68,6 +68,26 @@ fn chart_kind_label(kind: ChartKind) -> String {
     }
 }
 
+/// The line under the canvas — core's `chart::caption` in the interface's
+/// language; `english_captions_every_chart_as_core_does` holds them equal.
+fn caption_text(rows: usize, kind: ChartKind, skipped: usize, truncated: bool) -> String {
+    let mut parts = vec![tr!("chart-caption-rows", n = rows)];
+    if skipped > 0 {
+        parts.push(match kind {
+            ChartKind::Histogram => tr!("chart-caption-skipped-null", skipped = skipped),
+            ChartKind::Bar | ChartKind::Line => tr!(
+                "chart-caption-skipped",
+                skipped = skipped,
+                max = chart::MAX_POINTS
+            ),
+        });
+    }
+    if truncated {
+        parts.push(tr!("chart-caption-truncated"));
+    }
+    parts.join(" · ")
+}
+
 /// The save icon's place in the Tab ring: after the three pickers (10, 20, 30).
 const EXPORT_TAB: u32 = 40;
 
@@ -95,6 +115,7 @@ fn export_doc(drawn: &Plot, fmt: ErdExportFormat) -> Option<crate::ErdDoc> {
         EXPORT_W,
         EXPORT_H,
         &chart_draw::Metrics::BASE,
+        crate::i18n::number_marks(),
         &mut |t| measure(t, EXPORT_FONT),
     )?;
     use crate::erd_view::hex;
@@ -486,10 +507,10 @@ fn chart_body(
         return note(tr!("chart-all-null"));
     }
     // Said, where the canvas would otherwise paint nothing.
-    if let Some(why) = drawn.undrawable() {
-        return note(why.to_string());
+    if drawn.undrawable().is_some() {
+        return note(tr!("chart-too-large"));
     }
-    let line = chart::caption(rs.row_count(), kind, skipped, rs.truncated);
+    let line = caption_text(rs.row_count(), kind, skipped, rs.truncated);
     v_stack((
         ChartCanvas {
             id: ViewId::new(),
@@ -540,6 +561,7 @@ impl View for ChartCanvas {
             size.width,
             size.height,
             &chart_draw::Metrics::BASE.map(theme::scaled),
+            crate::i18n::number_marks(),
             &mut |t| {
                 let l = layout(t, font, theme::text_faint);
                 let s = l.size();
@@ -622,6 +644,35 @@ mod tests {
         for kind in ChartKind::ALL {
             assert_eq!(chart_kind_label(kind), kind.label(), "{kind:?}");
         }
+    }
+
+    /// English captions every chart as core's `chart::caption` does — one
+    /// row and several, each kind's skipped note, and a capped read.
+    #[test]
+    fn english_captions_every_chart_as_core_does() {
+        for kind in ChartKind::ALL {
+            for (rows, skipped, truncated) in [(1, 0, false), (42, 3, false), (5000, 0, true)] {
+                assert_eq!(
+                    caption_text(rows, kind, skipped, truncated),
+                    chart::caption(rows, kind, skipped, truncated),
+                    "{kind:?} {rows} {skipped} {truncated}"
+                );
+            }
+        }
+    }
+
+    /// The undrawable note reads as core's English.
+    #[test]
+    fn english_refuses_an_undrawable_chart_as_core_does() {
+        let huge = Plot::Series(
+            ChartKind::Line,
+            Series {
+                labels: vec!["a".into(), "b".into()],
+                values: vec![-f64::MAX, f64::MAX],
+                skipped: 0,
+            },
+        );
+        assert_eq!(huge.undrawable(), Some(tr!("chart-too-large").as_str()));
     }
 
     fn bars() -> Plot {

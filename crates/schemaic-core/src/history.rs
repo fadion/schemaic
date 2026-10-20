@@ -767,7 +767,7 @@ pub fn matches_query(entry: &HistoryEntry, query: &str) -> bool {
 /// number the query never produced. The `+` that marks a capped count is the
 /// count's *wording*, so a caller of [`outcome_line_with`] supplies it.
 pub fn outcome_line(entry: &HistoryEntry) -> Option<String> {
-    outcome_line_with(entry, |n, capped| {
+    outcome_line_with(entry, crate::text::NumberMarks::ENGLISH, |n, capped| {
         // `200000+ rows` when the fetch stopped at the cap: that number is what
         // came back, not what the query returned, and only the `+` says so once
         // the grid is gone. Always plural there — the count means "at least this
@@ -782,9 +782,11 @@ pub fn outcome_line(entry: &HistoryEntry) -> Option<String> {
 
 /// [`outcome_line`] with the row count worded by `rows(count, capped)` — the
 /// composition (which facts, where the separator goes, nothing counted on a
-/// failure) stays here, and the interface supplies the words in its language.
+/// failure) stays here, and the interface supplies the words in its language
+/// and the `marks` the duration is written in.
 pub fn outcome_line_with(
     entry: &HistoryEntry,
+    marks: crate::text::NumberMarks,
     rows: impl Fn(u64, bool) -> String,
 ) -> Option<String> {
     if entry.outcome == Outcome::Unknown {
@@ -795,7 +797,7 @@ pub fn outcome_line_with(
     // exclusive: a run that failed produced nothing to count.
     let mut facts: Vec<String> = Vec::new();
     if let Some(ms) = entry.duration_ms {
-        facts.push(format_duration(ms));
+        facts.push(crate::text::remark(&format_duration(ms), marks));
     }
     if let Some(n) = entry.rows.filter(|_| !failed) {
         facts.push(rows(n, entry.rows_capped));
@@ -2021,18 +2023,36 @@ mod tests {
     #[test]
     fn outcome_line_takes_its_row_words_from_the_caller() {
         let words = |n: u64, capped: bool| format!("{n}{} Zeilen", if capped { "+" } else { "" });
+        let en = crate::text::NumberMarks::ENGLISH;
         assert_eq!(
-            outcome_line_with(&finished(Some(100), false, true), words).as_deref(),
+            outcome_line_with(&finished(Some(100), false, true), en, words).as_deref(),
             Some("5ms · 100 Zeilen")
         );
         assert_eq!(
-            outcome_line_with(&finished(Some(200_000), true, true), words).as_deref(),
+            outcome_line_with(&finished(Some(200_000), true, true), en, words).as_deref(),
             Some("5ms · 200000+ Zeilen")
         );
         // A failure keeps its trailing separator and counts nothing.
         assert_eq!(
-            outcome_line_with(&finished(Some(9), false, false), words),
+            outcome_line_with(&finished(Some(9), false, false), en, words),
             outcome_line(&finished(Some(9), false, false))
+        );
+    }
+
+    /// The duration is written in the caller's marks: `1.2s` is `1,2s` in
+    /// German, and the composition around it does not change.
+    #[test]
+    fn outcome_line_writes_its_duration_in_the_caller_s_marks() {
+        let de = crate::text::NumberMarks {
+            decimal: ',',
+            group: '.',
+        };
+        let mut e = finished(Some(3), false, true);
+        e.duration_ms = Some(1_234);
+        let words = |n: u64, _| format!("{n} Zeilen");
+        assert_eq!(
+            outcome_line_with(&e, de, words).as_deref(),
+            Some("1,2s · 3 Zeilen")
         );
     }
 

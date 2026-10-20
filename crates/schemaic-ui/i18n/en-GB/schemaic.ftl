@@ -808,6 +808,16 @@ chart-file-stem = { $name } chart
 chart-nothing-to-save = Nothing to save.
 chart-no-numbers = No column of numbers to chart in this result.
 chart-all-null = Every value in that column is NULL.
+chart-too-large = These values are too large to draw.
+# The line under the canvas, its parts joined with " · ". $n is the result's
+# row count; $skipped the values not drawn; $max the most a series draws.
+chart-caption-rows = { $n ->
+    [one] { $n } row
+   *[other] { $n } rows
+}
+chart-caption-skipped-null = { $skipped } NULL, not drawn
+chart-caption-skipped = { $skipped } not drawn (NULL, or past { $max })
+chart-caption-truncated = the rows read, not the whole result
 
 ## Schema editors — shared
 
@@ -3261,6 +3271,11 @@ grid-kept-note = · kept — read-only
 # $columns lists the columns whose values ran past what the grid holds.
 grid-arena-note = · { $columns } too large to hold in full — later rows show blank
 grid-sorted-subset = · sorted subset (capped) — not the full order
+# The link that re-reads a capped result: the whole of it when the total is
+# within one step, otherwise the next step. $rows is the step's figure,
+# formatted (1m, 200k).
+grid-read-all = read all rows
+grid-read-more = read { $rows } rows
 # Replaces the "read all rows" offer while that re-read runs.
 grid-reading = reading…
 grid-committing = Committing…
@@ -3302,6 +3317,25 @@ grid-rollback-tab = Roll back { $tab }
 grid-find-placeholder = Find in results
 # Stands in for a figure of the selection readout just after it is clicked.
 grid-figure-copied = Copied
+# The selection readout's figures. $n is the count, which selects the plural;
+# $more is "+" when the scan stopped at its budget, else empty. $value is a
+# figure, formatted (1,234.50). Length counts characters; $lo and $hi bound it.
+grid-figure-rows = { $n ->
+    [one] { $n }{ $more } row
+   *[other] { $n }{ $more } rows
+}
+grid-figure-nulls = { $n }{ $more } null
+grid-figure-distinct = { $n } distinct
+grid-figure-sum = Sum { $value }
+grid-figure-avg = Avg { $value }
+grid-figure-median = Median { $value }
+grid-figure-min = Min { $value }
+grid-figure-max = Max { $value }
+grid-figure-length = { $n ->
+    [one] Length { $n } char
+   *[other] Length { $n } chars
+}
+grid-figure-length-range = Length { $lo }–{ $hi } chars
 grid-goto-label = Go to row:
 
 ## The results grid's clipboard, fill, attach and export (grid.rs).

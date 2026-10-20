@@ -411,7 +411,7 @@ fn probe_body(p: &Probe) -> impl IntoView {
         ProbeSummary::NothingToRun => tr!("script-probe-nothing"),
         ProbeSummary::CutOffBeforeFirst => tr!(
             "script-probe-cut-off",
-            size = schemaic_core::stats::format_bytes(p.bytes_read)
+            size = crate::i18n::bytes(p.bytes_read)
         ),
         // `count` is the figure as shown (`412+` when the probe stopped short)
         // and `n` the number the plural is chosen by.
@@ -419,7 +419,7 @@ fn probe_body(p: &Probe) -> impl IntoView {
             "script-probe-counted",
             count = p.count_label(p.statements),
             n = p.statements,
-            size = schemaic_core::stats::format_bytes(p.bytes_read)
+            size = crate::i18n::bytes(p.bytes_read)
         ),
     };
 
@@ -464,7 +464,7 @@ fn probe_body(p: &Probe) -> impl IntoView {
                 Some(DestructionNotice::Unread) => rows.push(
                     text(tr!(
                         "script-unread",
-                        size = schemaic_core::stats::format_bytes(p.bytes_read)
+                        size = crate::i18n::bytes(p.bytes_read)
                     ))
                     .style(|s| {
                         s.font_size(theme::font_label())
@@ -662,8 +662,8 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                                 // denominator, rather than dividing by zero.
                                 Some(p) if p.bytes_total > 0 => text(tr!(
                                     "script-progress-of",
-                                    done = schemaic_core::stats::format_bytes(p.bytes_done),
-                                    total = schemaic_core::stats::format_bytes(p.bytes_total)
+                                    done = crate::i18n::bytes(p.bytes_done),
+                                    total = crate::i18n::bytes(p.bytes_total)
                                 ))
                                 .style(|st| {
                                     st.color(theme::text_muted())
@@ -673,7 +673,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                                 .into_any(),
                                 Some(p) => text(tr!(
                                     "script-progress-read",
-                                    done = schemaic_core::stats::format_bytes(p.bytes_done)
+                                    done = crate::i18n::bytes(p.bytes_done)
                                 ))
                                 .style(|st| {
                                     st.color(theme::text_muted())

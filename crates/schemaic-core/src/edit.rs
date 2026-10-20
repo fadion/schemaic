@@ -1410,6 +1410,9 @@ pub struct GridCells<'a> {
     pub dirty: &'a HashMap<(usize, usize), CellEdit>,
     /// Pending new rows, in the display order they are drawn past the real ones.
     pub new_rows: &'a [HashMap<usize, CellEdit>],
+    /// The marks a formatted column is written in — the interface's, as the
+    /// painter writes them ([`crate::format::apply`]).
+    pub marks: crate::text::NumberMarks,
 }
 
 impl GridCells<'_> {
@@ -1488,7 +1491,7 @@ impl GridCells<'_> {
                 match self.rs.cell(di, ci) {
                     None => f(""),
                     Some(c) if fmt == crate::format::ColumnFormat::None => f(c.display()),
-                    Some(c) => f(&crate::format::apply(fmt, &c.to_value())),
+                    Some(c) => f(&crate::format::apply(fmt, &c.to_value(), self.marks)),
                 }
             }
         }
@@ -2076,9 +2079,15 @@ impl GridCells<'_> {
             })
             .collect();
         let (send, total) = attach_span(r0, r1, cap);
+        // Formatted as painted, but in English's marks: what is sent to an AI
+        // stays English whatever language the interface is drawn in.
+        let english = GridCells {
+            marks: crate::text::NumberMarks::ENGLISH,
+            ..*self
+        };
         let rows: Vec<Vec<String>> = (r0..=r1)
             .take(send)
-            .map(|i| cols.iter().map(|&ci| self.text(i, ci, true)).collect())
+            .map(|i| cols.iter().map(|&ci| english.text(i, ci, true)).collect())
             .collect();
         (columns, rows, total)
     }
@@ -4915,6 +4924,7 @@ mod tests {
             formats,
             dirty,
             new_rows,
+            marks: crate::text::NumberMarks::ENGLISH,
         }
     }
 
@@ -6044,6 +6054,31 @@ mod tests {
                 vec!["2024-03-02 12:00:00".to_string(), "second".to_string()],
                 vec!["2024-03-01 12:00:00".to_string(), "first".to_string()],
             ]
+        );
+    }
+
+    /// **An attachment is for the model, and the model reads English** — so a
+    /// formatted column goes in English's marks whatever the interface's are,
+    /// while the grid it was taken from paints the language's.
+    #[test]
+    fn an_attachment_writes_its_figures_in_english_whatever_the_grid_shows() {
+        let rs = ResultSet::from_rows(
+            vec![col("n", "INT", "t", false, false)],
+            vec![vec![Value::Int(1_234_567)]],
+        );
+        let (order, formats) = (vec![0usize], vec![crate::format::ColumnFormat::Grouped]);
+        let (dirty, new_rows) = (HashMap::new(), Vec::new());
+        let g = GridCells {
+            marks: crate::text::NumberMarks {
+                decimal: ',',
+                group: '.',
+            },
+            ..cells(&rs, &order, &formats, &dirty, &new_rows)
+        };
+        assert_eq!(g.text(0, 0, true), "1.234.567", "the grid paints German's");
+        assert_eq!(
+            g.attached((0, 0, 0, 0), 200, None).1,
+            vec![vec!["1,234,567".to_string()]]
         );
     }
 

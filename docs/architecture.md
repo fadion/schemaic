@@ -560,7 +560,7 @@ existing prose was left alone.
     menu writes the same `Scene`, so the file is the chart on screen rather than a second drawing of it
     that drifts. The arithmetic was inline in `paint` until the export needed it; it moved here
     rather than being copied, the bargain `erd_export`'s `SvgScene` strikes with `EdgeCanvas`.
-    `layout(plot, width, height, &Metrics, measure) -> Option<Scene>` places the horizontal grid
+    `layout(plot, width, height, &Metrics, figures, measure) -> Option<Scene>` places the horizontal grid
     lines (one per `chart::ticks` step, labelled as one axis by `tick_labels`), the tick labels
     in a gutter as wide as the widest of them plus `gutter_pad`, the marks — `Marks::Line { points,
     dots }`, a point per value at its slot's centre and dots while there are at most `MAX_DOTS`
@@ -575,7 +575,12 @@ existing prose was left alone.
     (`the_tick_labels_are_measured_first_in_order_then_the_labels_under_the_axis`). A tick label is `Align::End`: placed by its measured box but
     anchored at its right edge, so an SVG renderer whose glyphs come out a hair wider than the
     canvas's still lines the column up against the plot
-    (`the_gutter_is_the_widest_tick_label_and_the_labels_end_at_it`). It answers `None` for no
+    (`the_gutter_is_the_widest_tick_label_and_the_labels_end_at_it`). The tick labels, and a
+    histogram's edge labels under the axis, are written in `figures` — the interface's
+    `NumberMarks`, which the export carries too, being a picture of the chart — while a series'
+    labels are the label column's values and are never re-marked
+    (`the_tick_labels_are_written_in_the_marks_given`, `only_a_histogram_s_edges_take_the_marks`;
+    *Figures in the interface's marks*). It answers `None` for no
     axis (`Plot::undrawable`'s range), for a box too small for the gutter, and **for an empty
     plot** — checked first, because every mark's width divides by the count
     (`nothing_to_lay_out_without_an_axis_or_a_box`).
@@ -4331,7 +4336,8 @@ existing prose was left alone.
     the rows that survived would tell a user who picked 900 that 200 went.
     **And the surfaces that *read* the grid resolve a cell here rather than in the view.**
     `GridCells` is a borrow struct over what the grid's signals hold — `rs`, the display→data
-    `order`, the per-column `formats`, `dirty` and `new_rows` — and `text(i, ci, formatted)`
+    `order`, the per-column `formats`, `dirty` and `new_rows`, plus the `marks` a formatted column
+    is written in (the interface's, as the painter writes them) — and `text(i, ci, formatted)`
     resolves one *display* cell in the painter's order: a pending new row's typed value, then a
     staged edit, then the stored cell through `format::apply`. `tsv_block(rect, layout)` is the
     clipboard's block **plus what the format could not carry** — `TsvBlock { text, split }`, `split`
@@ -11350,7 +11356,10 @@ existing prose was left alone.
     picker lists each language the same way in every language, so a reader lost in the wrong one
     can still find their own. `from_key` reads the primary subtag case-insensitively, so `de-AT`,
     `de_AT` and POSIX's `de_AT.UTF-8` are all German and `en-US` is the one English there is
-    (`keys_round_trip_and_tolerate_case_and_region`).
+    (`keys_round_trip_and_tolerate_case_and_region`). `number_marks()` is the language's decimal
+    and grouping marks, a table rather than CLDR, `Pseudo` keeping English's
+    (`german_swaps_both_marks_and_the_pseudo_locale_keeps_english_s`; *Figures in the interface's
+    marks*, under *UI conventions*).
     **`resolve(env, setting, os)` takes three sources in order, and only the first is
     unconditional.** `SCHEMAIC_LOCALE` is a developer's, so it reaches whatever it names — a
     catalogue still being written, and the pseudo-locale — and one it does not know falls through
@@ -11473,9 +11482,10 @@ existing prose was left alone.
     `failed` own the rows-vs-`affected` choice and the `rows_capped` rule, and `outcome_line` the
     facts line's composition, so both are in core rather than in a view builder: a wrong
     `rows_capped` writes a number into a log read long after the grid it came from. That
-    composition is `outcome_line_with(entry, rows)` — which facts, the separators, nothing counted
-    on a failure — with the row count worded by the caller's `rows(count, capped)`; `outcome_line`
-    is it with English words (`outcome_line_takes_its_row_words_from_the_caller`). `preview`
+    composition is `outcome_line_with(entry, marks, rows)` — which facts, the separators, nothing
+    counted on a failure — with the row count worded by the caller's `rows(count, capped)` and the
+    duration written in the caller's `marks` (`outcome_line_writes_its_duration_in_the_caller_s_marks`);
+    `outcome_line` is it with English words and marks (`outcome_line_takes_its_row_words_from_the_caller`). `preview`
     clamps at `PREVIEW_MAX` while `matches_query` searches the unclamped text, through
     `text_ops::contains_collapsed_ignore_ascii_case` so the collapse the panel draws happens during
     the comparison rather than into a `String` first — `max_height` and
@@ -12049,7 +12059,10 @@ existing prose was left alone.
     `celledit::value_list`, which goes through `sql::skip_noncode` because a member may contain a
     quote, a comma or a `)`.
   - `core/format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
-    bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
+    bool). Display-only; edit/copy stay raw. Persisted to `format.json`. `apply(fmt, v, marks)`
+    writes *Grouped* and *Bytes* in the marks it is handed — the interface's, from every view —
+    through `text::group_number` and `text::remark` (`a_format_writes_its_figure_in_the_marks_given`;
+    *Figures in the interface's marks*).
     **Named crate-qualified because the basename is no longer unique**: `schemaic-cli` has a
     `format.rs` of its own (the `--format` surface), and `doc_coverage`'s bare-basename match would
     let either entry answer for both files.
@@ -18067,7 +18080,12 @@ existing prose was left alone.
       ten), where each used to spell them itself — and they are **symbols, never translated**: the
       stats line prints a count through one and the go-to box parses what the user retypes from it,
       so translating the printing side alone would print counts the box refuses. The decimal point
-      between them is the same question for locale formatting, and has to move both sides at once.
+      between them is the same question for locale formatting, and it moved both sides at once:
+      the stats line shows `human_count` through `i18n::count`, in the interface's marks, and
+      `goto_row_index` takes the same `NumberMarks` — German's box reads `1,25k` as 1250 and
+      `1.250` as 1250 grouped (`goto_row_reads_the_interface_language_s_marks`,
+      `every_remarked_count_reads_back_in_german`). `NumberMarks`, `group_digits`, `group_number`
+      and `remark` live here too (*Figures in the interface's marks*, under *UI conventions*).
       The property was stated in `human_count`'s doc and tested by nothing until
       `model::tests::every_count_human_count_prints_reads_back`, which reads back every printed
       count — the promotion edges `999_995` and `999_995_000` and a count past a billion among them —
@@ -25465,7 +25483,10 @@ existing prose was left alone.
     `app_view` straight after `load_ui_state`, logging the answer, so this crate never touches the
     environment. `active()` is the language on screen and
     `would_draw(key)` what a *Language* setting of `key` would draw on this machine, from the `env`
-    and `os` `init` was handed rather than asking the OS again.
+    and `os` `init` was handed rather than asking the OS again. `number_marks()` is the active
+    language's `NumberMarks`, and `figure`, `count`, `bytes` and `contrasting_bytes` write core's
+    English figures in them — the view's half of *Figures in the interface's marks*, with
+    `every_core_figure_a_view_shows_takes_the_interface_s_marks` the gate that keeps a view on it.
     **`configure` loads a catalogue and *then* calls `set_use_isolating(false)`, and the order is
     load-bearing**: a load swaps in fresh bundles and the flag is a setting of the bundles, so set
     first it is silently undone. Fluent wraps every placeable in U+2068/U+2069 by default, so a
@@ -27424,8 +27445,10 @@ existing prose was left alone.
       holds both to the old English). Core's index facts and freshness caveat are worded here:
       `index_fact_text` over `stats::index_fact_list`'s `IndexFact`s, `freshness_text` over
       `Freshness`, `props-index-unused` for `unused_note` and `row_caption_text` for the row
-      tile's `row_caption`, their figures (`format_bytes`, `RowCount::label`, `format_age`)
-      still core's until phase 7 (`english_says_every_stats_note_as_core_does`). The copied
+      tile's `row_caption` (`english_says_every_stats_note_as_core_does`), their figures in the
+      interface's marks — sizes through `i18n::bytes` (imported here as `format_bytes`), counts
+      as `RowCount::label` prints them through `i18n::figure` — and `format_age`, whole units with
+      no mark to move, as core prints it. The copied
       Markdown stays core's English.
   - `used_by_view.rs` — the **Used by** modal (`used_by_overlay`), over `core::used_by`, opened by
     setting `overlay.used_by` to a `UsedByTarget { database, schema, name, column, routine }`
@@ -27564,8 +27587,11 @@ existing prose was left alone.
     number* is `row_number()`, a message where it was the constant `ROW_NUMBER`, and it is a
     **value as well as a label**: the picker hands back the text it shows, so a pick is compared
     with `row_number()`, and `picker_labels` reserves it, so the entry, the comparison and the name
-    a same-named column steps aside for are all one language. `chart::caption` and
-    `Plot::undrawable` are core's prose and stay English until phase 4. Its *"Saved {name}"* and
+    a same-named column steps aside for are all one language. The line under the canvas is
+    `caption_text`, `chart::caption`'s clauses as `chart-caption-*` messages
+    (`english_captions_every_chart_as_core_does`), and the note in place of an undrawable range
+    `chart-too-large`, held to `Plot::undrawable`'s English by a test — the view asks `undrawable`
+    only whether it is `Some`, and `chart::caption` is now read by tests alone. Its *"Saved {name}"* and
     that notice's *the file* fallback are not `chart-*`: they are `save_document`'s `erd-saved` and
     `erd-unnamed-file`, shared with the diagram, so they are translated with `erd_view.rs`.
     Mounted in the workspace group directly after `used_by_overlay`, counted by
@@ -28129,7 +28155,7 @@ existing prose was left alone.
     catalogue's too, from the value core decides: `issue_tail_text` words `import::issue_tail_of`'s
     `IssueTail` from `import-tail-*`, and `memory_warning_text` the `MemoryWarning`
     `memory_warning` answers from `import-memory-json`/`-xlsx`, its sizes going in as
-    `format::human_bytes` prints them, since a locale's number formatting is phase 7 —
+    `format::human_bytes` prints them through `i18n::figure`, in the interface's marks —
     `english_tells_every_issue_tail_as_core_does` and `english_warns_of_every_memory_cost_as_core_does`
     holding each to core's `message`. Why a file cannot be read is worded by the app, which owns the
     probe, the check and the load, through `i18n::read_refusal_text` for the probe's
@@ -29406,8 +29432,8 @@ existing prose was left alone.
     whole messages** (`object-editor-title-{edit,create}`) around `i18n::object_kind`'s word, built
     by `editor_title`, where it had been `format!("Edit {} …", kind.label())` — so a language can
     put the verb last (`the_title_reads_as_it_did_in_english`). `restart_label` is both engines'
-    *Restart at* label, and **the counter goes to Fluent as text, not a number**: as a number it
-    would be grouped for the locale, and it is the server's value to the digit
+    *Restart at* label, and **the counter goes to Fluent as text, not a number**: a Fluent number
+    is an `f64`, which loses digits past 2^53, and it is the server's value to the digit
     (`the_restart_label_prints_the_counter_as_the_server_has_it`). **A number field's message is
     also the key `object_errors` withdraws it by** — `object-editor-not-whole-number`, naming the
     field — so `num_field` builds it once per field: built afresh per report, a message that came
@@ -29422,8 +29448,8 @@ existing prose was left alone.
     wrapper `validate`: the footer still shows the editor's own `object_errors` first and, failing
     those, the draft's *last* problem (`pop()`), which `object_problem_text` words from
     `object-problem-*` — `NotWhole` a whole message per `SequenceField` rather than the field's
-    name spliced in, and the figures as `i64::to_string` prints them, since formatting a number
-    for the locale is phase 7 (the editors' refusals, under `i18n.rs`). Held by
+    name spliced in, and the figures as `i64::to_string` prints them — a plain integer, which
+    stays ungrouped in every language (*Figures in the interface's marks*). Held by
     `english_says_every_object_problem_as_core_does`.
   - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's or SQL
     Server's namespaces inside one, over `core::ddl`'s `DatabaseDraft` — and PostgreSQL's
@@ -32765,9 +32791,10 @@ existing prose was left alone.
     (`blob-kind-*`), and `english_words_every_blob_kind_as_core_does` holds its English equal to
     core's — but the save dialog's `FileSpec` still takes `kind.label()`, since it needs a
     `&'static str`. `the_composed_lines_read_as_they_did_in_english` pins the assembled lines; the
-    saved-to, `save_offer` and loaded-line tests pass unchanged. English stays: the sizes
-    (`human_bytes`/`contrasting_bytes`, core's formatting, phase 7), the save dialog's file type
-    name, the suggested file name, and a load failure's OS message.
+    saved-to, `save_offer` and loaded-line tests pass unchanged. The sizes are core's
+    `human_bytes` through `i18n::figure` and `i18n::contrasting_bytes`, so in the interface's
+    marks. English stays: the save dialog's file type name, the suggested file name, and a load
+    failure's OS message.
   - `compare_view.rs` — the **schema-compare** overlay (`compare_overlay`), over `core::compare`:
     two databases side by side, and the migration between them. Not a tab — there is no tab kind in
     this app, `Tab`/`SavedTab` being query tabs — so it is the sixth entry of the modal layer's
@@ -34221,7 +34248,9 @@ existing prose was left alone.
   pressing, and rounded up to two significant figures so the offer reads as a figure rather than as
   arithmetic. **The step alone is not the offer, because it can name rows that do not exist**:
   `stats::read_more_offer` takes the same `row_total` the stats line prints and, when the step
-  already covers it, says *"read all rows"* instead. That case shipped wrong — a 200k read of a
+  already covers it, says *"read all rows"* instead — its English `Display`, that is, over
+  `stats::read_more`'s `ReadMore::{All, Rows(n)}`, which the grid words by `read_more_text`, the
+  step through `i18n::count` (`english_offers_every_read_more_as_core_does`). That case shipped wrong — a 200k read of a
   ~292k table stepped to a million and the toolbar read "read 1m rows", on a line that had just
   described the table as ~292.02k. It then shipped wrong the other way: *"read all ~292.02k rows"*
   named the total a second time, three words from where `rows_read` had already printed it,
@@ -36460,7 +36489,7 @@ existing prose was left alone.
     `history::wants_attention` has said yes and only with *Notify when a run finishes in the
     background* on. The words are `finished_note`'s: `history::finished_note`'s arguments worded
     from `notify-{query,script,export,dump}-{finished,failed}` and `notify-took`, whose `$duration`
-    is still core's `format_duration` (formatting for the locale is phase 7), and
+    is core's `format_duration` through `i18n::figure`, in the interface's marks, and
     `english_says_every_finished_run_as_core_does` holds the English equal to core's for every kind,
     outcome and width of duration. Through `notify-rust` 4.18 — a
     WinRT toast on Windows (`tauri-winrt-notification`, over the `windows` 0.62 already in the
@@ -41078,8 +41107,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `format_bytes` and `AuthMode::transport_refusal`, which reaches the
-    user as a database error from `schemaic-db` and goes with the error messages. The notes under
+    translation* — among it `AuthMode::transport_refusal`, which reaches the
+    user as a database error from `schemaic-db` and goes with the error messages. A figure is not
+    among it: core prints it in English and the view writes it in the language's marks (*Figures
+    in the interface's marks*, below). The notes under
     the connection form's fields are no longer among it (`connection_form.rs`), nor are
     `launch::*`'s refusals and `external_client_refusal` (`launch::Refusal`, below), nor the
     startup and keyring notices (`persist::Notice`, below), nor the file import's refusals, memory
@@ -41130,6 +41161,65 @@ Re-introducing the anti-patterns these guard against is a regression:
     `{" "}`, and a variant that says nothing as `{""}`**: Fluent trims the whitespace a variant
     starts with, so `[other]  for { $held }` would glue *for* to the word before it, and an empty
     variant needs something to stand in it — `activity-lock-wait-sentence` has both.
+  - **Figures in the interface's marks** — phase 7 of *Interface translation*, landed: a
+    figure the GUI shows is written with the interface language's decimal and grouping marks
+    (`1,234.5` in `en-GB`, `1.234,5` in `de`), and **core's printers stay English**. The CLI, the
+    MCP server, the AI's prompts, the clipboard's Markdown (`to_markdown`), a selection figure's
+    copy (`Figure::copy`) and every pinned English test read the bytes they read before; the view
+    marks what it shows. `text::NumberMarks { decimal, group }` is the pair, `NumberMarks::ENGLISH`
+    core's own, and `locale::UiLanguage::number_marks` answers it per language — `Pseudo` keeping
+    English's, its catalogue being English's.
+    **A table, not CLDR (decided 2026-10-20).** The need is two characters per shipped language,
+    which a table answers and `german_swaps_both_marks_and_the_pseudo_locale_keeps_english_s` pins.
+    CLDR data would move byte-pinned English under a `cargo update` — French's grouping space
+    changed from U+00A0 to U+202F between CLDR releases — and the shortcut through the catalogue
+    does not exist: fluent-rs's `NUMBER()` ignores the locale, and a `FluentNumber` renders
+    `f64::to_string`, with no grouping and always `.`. icu4x would also add a second
+    locale-identifier stack beside `unic-langid`. What would reopen it: locale dates, collation, or
+    a grouping no table expresses (Indian `1,23,456` — the grouper works in threes, always).
+    **`text::group_digits(digits, group)` is the one grouper.** Four copies of its loop lived in
+    `stats::group_digits`, `format::group_number`, `aggregate::grouped` and the settings view's
+    `thousands`, each with the comma written in, so a language's mark had four places to be
+    missed. `stats::group_digits(u64)` survives as the English wrapper, `aggregate::grouped(s,
+    marks)` (now `pub`) delegates, `format::group_number` and `thousands` are gone, and Settings'
+    `row_limit_label` groups through the marks. `text::group_number(s, marks)` groups a plain
+    rendered number — sign and fraction, the fraction never grouped — and answers `None` for
+    anything else (an exponent, a letter, a number already grouped), so a caller shows the text as
+    it came rather than half-grouping it. `text::remark(english, marks)` rewrites a figure core has
+    already printed, and **only a `.` or `,` between two digits is a mark**: a full stop, a list's
+    comma and an ellipsis pass untouched, so a short line of figures (`1.2s · ↑1.2k ↓340`) can go
+    through whole (`remark_leaves_punctuation_that_is_not_between_digits`). A prose sentence
+    should not — its words are the catalogue's, with the figure an argument.
+    **The view's side is `ui::i18n`**: `number_marks()` (English's until `init`, and in every
+    test), `figure(&str)` over `remark`, and `count(n)`, `bytes(n)`, `elapsed(ms)` and
+    `contrasting_bytes(a, b)` — `human_count`, `stats::format_bytes`, `transcript::elapsed_text`
+    and `format::contrasting_bytes` through it. **A figure
+    handed to `tr!` goes as a pre-formatted string while the raw number selects the plural**, the
+    catalogue's existing `$n`/`$rows` split. A plain integer `{ $n }` in a message stays ungrouped,
+    as core's English has it — an ungrouped integer is valid German too.
+    **Where core composes the figure itself, it takes the marks** rather than having its output
+    re-marked: `model::goto_row_index(input, total, marks)` and `goto_target(…, marks)` (the go-to
+    box, which has to read back what the stats line prints — under `text.rs` and *Data grid*),
+    `history::outcome_line_with(entry, marks, rows)` for the duration, `chart_draw::layout(…,
+    figures, measure)` for the tick labels and a histogram's bin edges under the axis — never a
+    series' labels, which are the label column's data (`only_a_histogram_s_edges_take_the_marks`)
+    — and `format::apply(fmt, v, marks)`, *Grouped* and *Bytes* being how a value is shown. The
+    chart's SVG and PNG carry the marks, the file being a picture of the chart on screen.
+    `edit::GridCells` gained `marks`, so the find bar matches the digits painted. **Ctrl+C, the
+    export and *Copy as* read the raw value and never meet them; *Copy formatted* carries the
+    interface's, being the cell as painted; and an AI attachment, which takes the formatted text
+    on purpose, takes it in English's** — `GridCells::attached` reads through a copy of itself
+    with `NumberMarks::ENGLISH`, since what is sent to a model stays English
+    (`an_attachment_writes_its_figures_in_english_whatever_the_grid_shows`).
+    **The gate is `every_core_figure_a_view_shows_takes_the_interface_s_marks`** (`i18n.rs`): in
+    both view crates' production code outside `i18n.rs`, a `::human_count`, `format_bytes`,
+    `human_bytes`, `contrasting_bytes`, `group_digits`, `format_duration` or `elapsed_text` path
+    segment — called, or passed as a function — must share its line with `figure(` or
+    `number_marks()` unless it is `i18n::`'s, and none may be imported by a `use schemaic_core…`.
+    It first missed `.map(stats::format_bytes)`, a printer passed rather than called, and was seen
+    red on it once it matched whole path segments. A `figure(` ending the line above also counts,
+    as `cargo fmt` splits one there (it did, on the AI panel's timer, which now calls
+    `i18n::elapsed`); a call split further, or a printer under another name, is not seen.
   - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
     core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
     `history_panel::bucket_title` for `history::Bucket::label`, `activity_panel::kill_label`
@@ -41191,7 +41281,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_reads_every_row_segment_as_core_does`, `english_scopes_every_attachment_as_core_does`
     and `english_asks_the_duplicate_question_as_core_does` (`core_words_tests`). Their figures
     arrive as core prints them — `human_count`, `RowCount::label`, `stats::group_digits` (made
-    `pub` for this) — since formatting a number for the locale is phase 7; `rows_read_clause`,
+    `pub` for this) — and reach the message through `i18n::figure`, in the interface's marks
+    (*Figures in the interface's marks*, above); `rows_read_clause`,
     `attach_scope_label` and `duplicate_prompt` remain only as the English wrappers core's tests
     read.
     *Restore from file*'s refusal is the first that joins a list: `script::RestoreRefusal` keeps
@@ -45355,7 +45446,12 @@ this bundle's.
   copied as the bare value (`1234.50`: no label, no grouping commas, which a spreadsheet or a
   `WHERE` would read as text; `each_figure_copies_as_its_bare_value`) — rather than the one
   flattened line, and `Aggregates::summary` is now those figures joined, so the summary's tests
-  guard both. A clicked figure reads *Copied* for `FIGURE_COPIED_FOR`, behind a generation so a
+  guard both. **What the chip shows is worded from the figure's `what`, not its `shown`**:
+  `FigureWhat` is `Rows { n, more }`, `Nulls { n, more }`, `Distinct`, `Length { lo, hi }` or
+  `Stat { stat, value }` — the value **ungrouped**, so `grid::figure_text` groups it in the
+  interface's marks through `aggregate::grouped` and words `Stat`'s `Sum`/`Avg`/`Median`/`Min`/`Max`
+  from `grid-figure-*` (`a_stat_carries_its_value_ungrouped_for_the_interface_to_mark`,
+  `english_reads_every_selection_figure_as_core_does`); `shown` stays core's English. A clicked figure reads *Copied* for `FIGURE_COPIED_FOR`, behind a generation so a
   second click is not cut short by the first one's reset, and **it is withdrawn when the readout
   is rebuilt**: keyed by position and outliving the chip, it landed on whatever figure the next
   selection put in that place, a value nobody copied. The click then hands the keyboard back
@@ -45908,7 +46004,10 @@ this bundle's.
   on screen was a miss. `200k`/`1.25k`/`3m`/`1b` all read, in fixed point, the suffixes coming from
   `text::COUNT_UNITS`, the table `human_count` prints from (both under `text.rs`, with the test
   that pins the round trip); separators are accepted
-  for a count pasted from elsewhere (the app writes none). `None` is left for the only two cases
+  for a count pasted from elsewhere (the app writes none). **Both marks are the interface
+  language's** (`grid_view` passes `i18n::number_marks()`), since the stats line prints its counts
+  in them: in German `,` is the decimal point and `.` a group, so an English `1,250` pasted there
+  is a fraction without a suffix and a miss, as `1.250` is in English. `None` is left for the only two cases
   that can mean no row: an empty grid, and input that isn't a number.
   The three decisions around it are **`model::goto_target`** — which row, the landing gesture, and
   the scroll column — so `grid_view` is a wrapper rather than a place any of them can quietly

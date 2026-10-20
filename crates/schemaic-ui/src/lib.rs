@@ -9895,7 +9895,7 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
             Some((kept, total)) => text(tr!(
                 "results-pinned-total",
                 count = kept,
-                size = schemaic_core::stats::format_bytes(total)
+                size = crate::i18n::bytes(total)
             ))
             .tooltip(|| text(tr!("results-pinned-tip")).style(crate::widgets::tooltip_style))
             .style(|s| {
@@ -9990,9 +9990,7 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
             foot.push(ran_ago(panel.ran_at, now_secs()));
         }
         if let QueryState::Loaded(rs) = &panel.state {
-            foot.push(schemaic_core::stats::format_bytes(
-                rs.retained_bytes() as u64
-            ));
+            foot.push(crate::i18n::bytes(rs.retained_bytes() as u64));
         }
         if panel.pinned {
             foot.push(tr!("results-chip-kept"));

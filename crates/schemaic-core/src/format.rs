@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::Value;
+use crate::text::NumberMarks;
 
 /// A display transform for one column's cell values.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -158,7 +159,14 @@ pub fn upsert(
 /// Render a cell value under a format. NULLs always render as `NULL` (unformatted)
 /// and any value that doesn't fit the format falls back to its raw display, so a
 /// formatter can never hide or corrupt data.
-pub fn apply(format: ColumnFormat, v: &Value) -> String {
+///
+/// **A format is how a value is shown, so it writes the interface's `marks`**
+/// (`1.234.567` under *Grouped* in German). Ctrl+C and the export take the raw
+/// value and never meet it; *Copy formatted* takes it as painted; an AI
+/// attachment takes it formatted but in English's marks
+/// ([`crate::edit::GridCells::attached`]); and the find bar matches what is
+/// painted, so it is given the same marks.
+pub fn apply(format: ColumnFormat, v: &Value, marks: NumberMarks) -> String {
     if v.is_null() {
         return v.display();
     }
@@ -167,45 +175,14 @@ pub fn apply(format: ColumnFormat, v: &Value) -> String {
         ColumnFormat::Timestamp => as_i64(v)
             .map(|n| fmt_epoch_secs(epoch_to_seconds(n)))
             .unwrap_or_else(|| v.display()),
-        ColumnFormat::Grouped => group_number(&v.display()).unwrap_or_else(|| v.display()),
-        ColumnFormat::Bytes => as_i64(v).map(human_bytes).unwrap_or_else(|| v.display()),
+        ColumnFormat::Grouped => {
+            crate::text::group_number(&v.display(), marks).unwrap_or_else(|| v.display())
+        }
+        ColumnFormat::Bytes => as_i64(v)
+            .map(|n| crate::text::remark(&human_bytes(n), marks))
+            .unwrap_or_else(|| v.display()),
         ColumnFormat::Bool => bool_glyph(v),
     }
-}
-
-/// Add thousands separators to a numeric string's integer part, preserving an
-/// optional leading sign and decimal fraction. Returns `None` for anything that
-/// isn't a plain number (so it falls back to raw).
-fn group_number(s: &str) -> Option<String> {
-    let t = s.trim();
-    let (sign, rest) = match t.strip_prefix('-') {
-        Some(r) => ("-", r),
-        None => ("", t),
-    };
-    let (int_part, frac) = match rest.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (rest, None),
-    };
-    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if let Some(f) = frac
-        && !f.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let n = int_part.len();
-    let mut grouped = String::with_capacity(n + n / 3);
-    for (i, b) in int_part.bytes().enumerate() {
-        if i > 0 && (n - i) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(b as char);
-    }
-    Some(match frac {
-        Some(f) => format!("{sign}{grouped}.{f}"),
-        None => format!("{sign}{grouped}"),
-    })
 }
 
 /// A suggested default formatter for a column that has no explicit rule yet:
@@ -314,8 +291,7 @@ pub fn contrasting_bytes(a: u64, b: u64) -> (String, String) {
 /// `65536` → `65,536 bytes`. The unrounded form, for when a rounded one would
 /// be ambiguous — see [`contrasting_bytes`].
 fn exact_bytes(n: u64) -> String {
-    let grouped = group_number(&n.to_string()).unwrap_or_else(|| n.to_string());
-    format!("{grouped} bytes")
+    format!("{} bytes", crate::stats::group_digits(n))
 }
 
 /// `true` / `false` for a value's truthiness, or the raw display for text that
@@ -426,6 +402,41 @@ mod tests {
         );
     }
     use super::*;
+
+    /// [`super::apply`] in English marks, which every test of what a format
+    /// does is written in; it shadows the glob import.
+    fn apply(format: ColumnFormat, v: &Value) -> String {
+        super::apply(format, v, NumberMarks::ENGLISH)
+    }
+
+    /// The formats that write a figure write it in the marks given; the rest
+    /// have none to write.
+    #[test]
+    fn a_format_writes_its_figure_in_the_marks_given() {
+        let de = NumberMarks {
+            decimal: ',',
+            group: '.',
+        };
+        let at = |f, v: Value| super::apply(f, &v, de);
+        assert_eq!(
+            at(ColumnFormat::Grouped, Value::Int(1_234_567)),
+            "1.234.567"
+        );
+        assert_eq!(
+            at(ColumnFormat::Grouped, Value::Str("-1234.5".into())),
+            "-1.234,5"
+        );
+        assert_eq!(at(ColumnFormat::Bytes, Value::Int(1_572_864)), "1,5 MB");
+        assert_eq!(
+            at(ColumnFormat::Timestamp, Value::Int(0)),
+            "1970-01-01 00:00:00"
+        );
+        assert_eq!(at(ColumnFormat::None, Value::Str("1.5".into())), "1.5");
+        assert_eq!(
+            at(ColumnFormat::Grouped, Value::Str("12.3a".into())),
+            "12.3a"
+        );
+    }
 
     /// Build a one-column result whose column carries the given provenance.
     fn rs_of(origin: Option<(&str, Option<&str>, &str, &str)>) -> crate::model::ResultSet {

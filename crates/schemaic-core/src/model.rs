@@ -9,6 +9,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::text::NumberMarks;
+
 /// A single result cell.
 ///
 /// M2 parses the wire text into compact numeric variants (for tighter memory on
@@ -1635,14 +1637,20 @@ pub fn drop_committed(staged: &mut StagedEdits, committed: &HashSet<(usize, usiz
 ///
 /// Nothing else is stripped: a stray letter is still a miss rather than being
 /// quietly filtered into a number the user never asked for.
-pub fn goto_row_index(input: &str, total: usize) -> Option<usize> {
+///
+/// **Both marks are the interface language's** (`marks`), because the stats
+/// line prints `human_count` through them: German shows `1,25k`, so its box
+/// reads `,` as the decimal point and `.` as a group (`1.250` is 1250 rows).
+pub fn goto_row_index(input: &str, total: usize, marks: NumberMarks) -> Option<usize> {
     if total == 0 {
         return None;
     }
     let mut s = String::with_capacity(input.len());
     for c in input.trim().chars() {
         match c {
-            ',' | '_' | ' ' | '\u{202f}' | '\u{a0}' => continue,
+            c if c == marks.decimal => s.push('.'),
+            c if c == marks.group => continue,
+            '_' | ' ' | '\u{202f}' | '\u{a0}' => continue,
             _ => s.push(c.to_ascii_lowercase()),
         }
     }
@@ -1796,8 +1804,15 @@ pub struct GotoTarget {
 /// row, the landing gesture, and the scroll column — are here together so they
 /// can be tested as one and so `grid_view` is a wrapper rather than a place
 /// where any of them can quietly change.
-pub fn goto_target(input: &str, total: usize, edges: (usize, usize)) -> Option<GotoTarget> {
-    let row = goto_row_index(input, total)?;
+///
+/// `marks` are the interface language's — see [`goto_row_index`].
+pub fn goto_target(
+    input: &str,
+    total: usize,
+    edges: (usize, usize),
+    marks: NumberMarks,
+) -> Option<GotoTarget> {
+    let row = goto_row_index(input, total, marks)?;
     let (anchor, active) = row_selection(row, edges);
     Some(GotoTarget {
         anchor,
@@ -2143,6 +2158,55 @@ impl ErrorModalContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The go-to-row readers in English marks, which every test of their
+    /// other decisions is written in; these shadow the glob import, and the
+    /// tests of the marks themselves call `super::` with German's.
+    fn goto_row_index(input: &str, total: usize) -> Option<usize> {
+        super::goto_row_index(input, total, NumberMarks::ENGLISH)
+    }
+
+    fn goto_target(input: &str, total: usize, edges: (usize, usize)) -> Option<GotoTarget> {
+        super::goto_target(input, total, edges, NumberMarks::ENGLISH)
+    }
+
+    const GERMAN: NumberMarks = NumberMarks {
+        decimal: ',',
+        group: '.',
+    };
+
+    /// **German reads its own marks back**: `1,25k` is what its stats line
+    /// prints for 1250 rows, and `1.250` is 1250 grouped. English's comma is a
+    /// group there no longer, so `1,250` is a fraction without a suffix and a
+    /// miss — as `1.250` is in English.
+    #[test]
+    fn goto_row_reads_the_interface_language_s_marks() {
+        assert_eq!(super::goto_row_index("1,25k", 200_000, GERMAN), Some(1_249));
+        assert_eq!(super::goto_row_index("1.250", 200_000, GERMAN), Some(1_249));
+        assert_eq!(
+            super::goto_row_index("1.234.567", usize::MAX, GERMAN),
+            Some(1_234_566)
+        );
+        assert_eq!(super::goto_row_index("1,250", 200_000, GERMAN), None);
+        assert_eq!(goto_row_index("1.250", 200_000), None);
+        assert_eq!(
+            super::goto_target("1,5k", 2_000, (0, 2), GERMAN).map(|t| t.anchor.0),
+            Some(1_499)
+        );
+    }
+
+    /// Every count `human_count` prints, remarked for German as the stats line
+    /// shows it, reads back in German.
+    #[test]
+    fn every_remarked_count_reads_back_in_german() {
+        for n in [1usize, 1_253, 999_995, 12_345_678, 7_654_321_098] {
+            let shown = crate::text::remark(&crate::text::human_count(n), GERMAN);
+            let back = super::goto_row_index(&shown, usize::MAX, GERMAN)
+                .unwrap_or_else(|| panic!("{n} shows as {shown:?}, which the box refuses"))
+                + 1;
+            assert!(back.abs_diff(n) <= n / 200 + 1, "{n} → {shown:?} → {back}");
+        }
+    }
 
     // ── the error modal's actions ───────────────────────────────────────────
 

@@ -1385,17 +1385,16 @@ fn assistant_footer(
 
     // Left: summary (done) or the live timer (pending).
     let left: AnyView = if let Some(st) = stats.filter(|s| !s.is_empty()) {
-        text(st.summary()).style(style).into_any()
+        // Only figures, arrows and a middle dot: the marks are all it needs.
+        text(crate::i18n::figure(&st.summary()))
+            .style(style)
+            .into_any()
     } else if pending {
         dyn_container(
             move || elapsed_ms.get(),
             // The same formatter the finished turn's footer uses — the live
             // counter is replaced by it in place when the turn ends.
-            move |ms| {
-                text(schemaic_core::transcript::elapsed_text(ms))
-                    .style(style)
-                    .into_any()
-            },
+            move |ms| text(crate::i18n::elapsed(ms)).style(style).into_any(),
         )
         .into_any()
     } else {

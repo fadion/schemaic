@@ -2273,7 +2273,7 @@ pub(crate) fn risk_text(risk: &schemaic_core::ddl::Risk) -> String {
         R::StarRefresh { table } => tr!("ddl-risk-star-refresh", table = table.as_str()),
         R::Piecewise => tr!("ddl-risk-piecewise"),
         R::DropSequenceTable => tr!("ddl-risk-drop-sequence-table"),
-        R::DropScale { rows } => tr!("ddl-risk-drop-scale", rows = rows.as_str()),
+        R::DropScale { rows } => tr!("ddl-risk-drop-scale", rows = crate::i18n::figure(rows)),
     }
 }
 

@@ -82,17 +82,11 @@ impl RowCount {
 
 /// `4213551` → `4,213,551`. Thousands separators, for a figure precise enough to
 /// deserve them.
+///
+/// English's comma, for the CLI, the clipboard's Markdown and core's English;
+/// the interface marks what it shows through [`crate::text::remark`].
 pub fn group_digits(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    let lead = digits.len() % 3;
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && i % 3 == lead {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    crate::text::group_digits(&n.to_string(), crate::text::NumberMarks::ENGLISH.group)
 }
 
 /// Why a statistic might be out of date — the sentence the modal owes the user
@@ -966,6 +960,31 @@ fn round_up_2sf(n: usize) -> usize {
 /// A total at or below what was already read is stale and says nothing, exactly
 /// as it does for [`rows_read_clause`].
 pub fn read_more_offer(rows_read: usize, total: Option<RowCount>) -> (usize, String) {
+    let (cap, offer) = read_more(rows_read, total);
+    (cap, offer.to_string())
+}
+
+/// What the read-more link offers, as a value the interface words:
+/// [`read_more_offer`]'s English is its `Display`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadMore {
+    /// `read all rows` — the total is within one click.
+    All,
+    /// `read 1m rows` — the next step, its figure `text::human_count`'s.
+    Rows(usize),
+}
+
+impl fmt::Display for ReadMore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            ReadMore::All => f.write_str("read all rows"),
+            ReadMore::Rows(n) => write!(f, "read {} rows", crate::text::human_count(n)),
+        }
+    }
+}
+
+/// [`read_more_offer`] with the offer as a [`ReadMore`], for the interface.
+pub fn read_more(rows_read: usize, total: Option<RowCount>) -> (usize, ReadMore) {
     let step = next_row_cap(rows_read);
     match total {
         // Within one click, and worth more rows than are already on screen.
@@ -1001,12 +1020,9 @@ pub fn read_more_offer(rows_read: usize, total: Option<RowCount>) -> (usize, Str
                 rounded.min(step)
             }
             .max(rows_read + 1);
-            (cap, "read all rows".to_string())
+            (cap, ReadMore::All)
         }
-        _ => (
-            step,
-            format!("read {} rows", crate::text::human_count(step)),
-        ),
+        _ => (step, ReadMore::Rows(step)),
     }
 }
 

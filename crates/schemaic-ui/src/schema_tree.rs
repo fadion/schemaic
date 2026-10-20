@@ -2799,7 +2799,7 @@ fn size_badge(
                         Some(p) => t.partition(p).and_then(|p| p.total_bytes()),
                         None => t.total_bytes(),
                     })
-                    .map(schemaic_core::stats::format_bytes),
+                    .map(crate::i18n::bytes),
                 _ => None,
             })
         },

@@ -2029,7 +2029,8 @@ mod tests {
     }
 
     /// Both engines' counters go through one label, and a counter is printed to
-    /// the digit — a number handed to Fluent would be grouped for the locale.
+    /// the digit — a number handed to Fluent is an `f64`, which loses digits
+    /// past 2^53.
     #[test]
     fn the_restart_label_prints_the_counter_as_the_server_has_it() {
         assert_eq!(

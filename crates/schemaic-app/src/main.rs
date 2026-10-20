@@ -6069,7 +6069,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // cap read "That file is 64.0 MB — the most that can be loaded
                 // is 64.0 MB."
                 let too_big = |n: u64| {
-                    let (got, most) = schemaic_core::format::contrasting_bytes(n, cap);
+                    let (got, most) = schemaic_ui::i18n::contrasting_bytes(n, cap);
                     tr!("blob-load-too-large", size = got, most = most)
                 };
                 match std::fs::metadata(&req.path) {
@@ -8171,7 +8171,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             report(Err(FileReadError::Message(tr!(
                                 "file-too-large",
                                 path = path.display().to_string(),
-                                size = schemaic_core::stats::format_bytes(n)
+                                size = schemaic_ui::i18n::bytes(n)
                             ))));
                             return;
                         }
@@ -8211,7 +8211,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             message: tr!(
                                 "file-large-question",
                                 name = schemaic_core::sqlfile::tab_title(&again),
-                                size = schemaic_core::stats::format_bytes(n)
+                                size = schemaic_ui::i18n::bytes(n)
                             ),
                             resolve: Rc::new(move |yes| {
                                 if !yes {

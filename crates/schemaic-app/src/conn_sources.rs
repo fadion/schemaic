@@ -127,8 +127,8 @@ impl SourceError {
             SourceError::TooBig(bytes) => tr!(
                 "import-source-too-big",
                 path = p,
-                size = schemaic_core::stats::format_bytes(*bytes),
-                most = schemaic_core::stats::format_bytes(MAX_BYTES)
+                size = schemaic_ui::i18n::bytes(*bytes),
+                most = schemaic_ui::i18n::bytes(MAX_BYTES)
             ),
             SourceError::Unreadable(why) => {
                 tr!("import-source-unreadable", path = p, error = why.clone())

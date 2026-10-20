@@ -30,7 +30,9 @@ use floem::reactive::create_effect;
 
 use schemaic_core::schema::TableInfo;
 use schemaic_core::stats;
-use schemaic_core::stats::{IndexStats, RowCount, TableStats, format_bytes};
+use schemaic_core::stats::{IndexStats, RowCount, TableStats};
+
+use crate::i18n::{bytes as format_bytes, figure};
 
 use crate::i18n::tr;
 use crate::theme::{font_body, font_hint, font_label};
@@ -364,7 +366,8 @@ fn headline(stats: &TableStats) -> AnyView {
     // qualifies it — the same word the copied Markdown uses, which is the point of
     // asking rather than deciding here.
     let row_tile = tile(
-        rows.map(RowCount::label).unwrap_or_else(|| "—".to_string()),
+        rows.map(|r| figure(&r.label()))
+            .unwrap_or_else(|| "—".to_string()),
         row_caption_text(stats),
     );
     let size_tile = tile(
@@ -645,7 +648,7 @@ fn options_section(stats: &TableStats, info: Option<&TableInfo>) -> Option<AnyVi
     if let Some(a) = stats.auto_increment {
         rows.push(detail(
             tr!("props-next-auto-increment"),
-            RowCount::Exact(a).label(),
+            figure(&RowCount::Exact(a).label()),
         ));
     }
     if let Some(c) = &stats.created {
@@ -822,12 +825,12 @@ fn freshness_text(f: &stats::Freshness) -> Option<String> {
 fn index_fact_text(fact: stats::IndexFact) -> String {
     use stats::IndexFact;
     match fact {
-        IndexFact::Size(b) => stats::format_bytes(b),
+        IndexFact::Size(b) => format_bytes(b),
         IndexFact::Cardinality(c) => tr!("props-index-cardinality", cardinality = c),
         IndexFact::Scans(n) => tr!(
             "props-index-scans",
             n = n,
-            shown = RowCount::Exact(n).label()
+            shown = figure(&RowCount::Exact(n).label())
         ),
         IndexFact::NotCounted => tr!("props-index-not-counted"),
     }
