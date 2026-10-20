@@ -3749,6 +3749,15 @@ quickinfo-function = function { $name }({ $arguments })
 quickinfo-function-returns = function { $name }({ $arguments }) returns { $returns }
 quickinfo-procedure = procedure { $name }({ $arguments })
 quickinfo-procedure-returns = procedure { $name }({ $arguments }) returns { $returns }
+# The autocomplete popup's own words (core's rank::RowWords; a test holds the
+# English equal): a foreign-key join row's detail, and the row that expands
+# SELECT * into its columns. $count selects the plural; $n is it as a figure.
+completion-foreign-key = foreign key
+completion-expand-star = expand *
+completion-columns = { $count ->
+        [one] { $n } column
+       *[other] { $n } columns
+    }
 # A squiggle's tooltip, under its message: the fix a key would make. $keys is
 # the key (Alt+Enter); $fix is what it does.
 editor-diag-fix = { $keys }: { $fix }

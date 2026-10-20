@@ -17905,6 +17905,15 @@ existing prose was left alone.
       reads a signal. **A `Suggestion` carries a `SuggestGlyph` rather than an icon**: the *reason*
       for its leading glyph (a column's type family, an FK target, an in-scope alias), which
       `completion::glyph_icon` turns into an SVG, so no `&'static str` icon body reaches core.
+      **And it carries a `RowWords` where its words are Schemaic's own** rather than a name, a type
+      or a signature: `Suggestion::words` (and `Cand`'s) is `ForeignKey` on the FK join target and
+      `join_condition_row` (detail *foreign key*), `ExpandStar { columns }` on the star expansion
+      (text *expand \**, detail the column count), and `None` on every other row — the popup showed
+      those words in English whatever the interface's language. The producers still write the
+      English into `text` and `detail`, through `RowWords::text` and `detail`, so `text` is what
+      `fuzzy_score` matches as before and no English test moved; the popup says them in the
+      interface's language (`shown_words`, under `completion.rs`). A CTE row's *CTE* is not among
+      them: it is an SQL term.
       **The comparator is asserted by *calling* `rank`, which is what being callable was for.**
       `completion.rs` held a test named `the_callers_comparator_preselects_the_prefix_match` whose
       own doc claimed it covered the composition — and it built its rows from `fuzzy_score` and
@@ -30846,6 +30855,16 @@ existing prose was left alone.
     by the predicted height (under *Floem 0.2 gotchas*), so a footer counted in one call and not
     the other is a box taller than the space it was placed in. No test covers the footer; it is a
     view.
+    **A row's own words are said in the interface's language** — the FK join row's *foreign key*
+    and the star expansion's *expand \** and its column count, which reached the popup in English
+    whatever the language. `shown_words` answers a row's text and detail: core's, or for a row
+    carrying `rank::RowWords`, the catalogue's (`completion-foreign-key`,
+    `completion-expand-star`, and `completion-columns`, a plural whose `$n` is the count through
+    `i18n::figure`). **The row view and `natural_width` both read it**, so a longer translation is
+    the width the box is given; the row's exhaustive `Suggestion` destructure discards `text`,
+    `detail` and `words`, so core's English is not in scope where the row is drawn. `english_says_every_row_word_as_core_does` holds it to
+    core's English — `join_condition_row`, the expand row at 1, 3 and 1,200 columns, and a plain
+    row — and was red with *foreign-key* hyphenated in `en-GB`.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is five signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
@@ -41212,7 +41231,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     pattern (`text_ops::PatternError`, under `editor_pane.rs`), though the regex crate's reason
     inside it still is, nor the hover's quick info (`quickinfo::QuickInfo`, under `editor_pane.rs`),
     though the schema's own names, types, defaults and comments inside it still are, nor Ctrl+K's
-    diff-bar summary (`inline_plan_summary_text`, under `editor_pane.rs`).
+    diff-bar summary (`inline_plan_summary_text`, under `editor_pane.rs`), nor the autocomplete
+    popup's own row words (`rank::RowWords`, under `completion.rs`), though a CTE row's *CTE*,
+    an SQL term, still is.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every

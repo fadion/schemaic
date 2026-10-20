@@ -104,6 +104,40 @@ pub struct Suggestion {
     /// Absolute byte range to replace on accept, overriding the default word range —
     /// used by `SELECT *` expansion to swap the `*` (or `t.*`) for the column list.
     pub replace: Option<(usize, usize)>,
+    /// Where the row's text or detail are Schemaic's own words rather than a
+    /// name, a type or a signature from the catalogue: the popup says them in
+    /// the interface's language, and `text`/`detail` hold the English.
+    pub words: Option<RowWords>,
+}
+
+/// The rows whose words are Schemaic's ([`Suggestion::words`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowWords {
+    /// A foreign-key join target or join condition: detail *foreign key*.
+    ForeignKey,
+    /// `SELECT *` expansion: text *expand \**, detail its column count.
+    ExpandStar { columns: usize },
+}
+
+impl RowWords {
+    /// The row's text in English, where these words replace it.
+    pub fn text(self) -> Option<&'static str> {
+        match self {
+            RowWords::ForeignKey => None,
+            RowWords::ExpandStar { .. } => Some("expand *"),
+        }
+    }
+
+    /// The row's detail in English.
+    pub fn detail(self) -> String {
+        match self {
+            RowWords::ForeignKey => "foreign key".to_string(),
+            RowWords::ExpandStar { columns } => format!(
+                "{columns} {}",
+                crate::text::plural(columns, "column", "columns")
+            ),
+        }
+    }
 }
 
 /// One column, as ranking needs it.
@@ -251,6 +285,7 @@ struct Cand {
     tier: u8,
     insert: Option<String>,
     replace: Option<(usize, usize)>,
+    words: Option<RowWords>,
 }
 
 /// The names a statement declares itself, which the schema cannot know.
@@ -438,6 +473,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             tier,
             insert: None,
             replace: None,
+            words: None,
         });
     };
     // A table row just added (past `before`) that names a view wears the
@@ -589,6 +625,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             tier,
             insert: written.then(|| crate::intel::written_name_sql(&c.name, input.dialect)),
             replace: None,
+            words: None,
         });
     };
     // The statement's own CTE or derived table of this name, which shadows a
@@ -659,6 +696,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 tier: 0,
                 insert: Some(qualifier_sql(&r.name, r.alias.as_deref())),
                 replace: None,
+                words: None,
             });
         }
     };
@@ -698,6 +736,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             // The row shows the abbrev and inserts the query.
             insert: Some(row.body.clone()),
             replace: None,
+            words: None,
         });
     }
     // Expected clause-keyword continuations go in the *top* tier (above columns,
@@ -909,7 +948,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                 cands.push(Cand {
                     text: jt.table.clone(),
                     kind: SuggestKind::Table,
-                    detail: "foreign key".to_string(),
+                    detail: RowWords::ForeignKey.detail(),
                     table: String::new(),
                     alias: String::new(),
                     glyph: SuggestGlyph::ForeignKey,
@@ -920,6 +959,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
                         None => format!("{} ON {}", jt.table_sql, jt.predicate),
                     }),
                     replace: None,
+                    words: Some(RowWords::ForeignKey),
                 });
             }
             // With FK targets present, keep them strictly above the plain table list.
@@ -1177,18 +1217,18 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
     // `*`).
     if let Some(exp) = input.star {
         // `exp.columns`, not the commas in the SQL: a quoted identifier holding one
-        // (`` `a,b` ``, legal on MySQL) over-reported. And `plural`, which this
+        // (`` `a,b` ``, legal on MySQL) over-reported. And `plural` (in
+        // `RowWords::detail`), which this
         // workspace has 33 other call sites for — a one-column table is ordinary
         // (an id-only join table, a `settings(key)` lookup) and the row read
         // "1 columns".
-        let ncols = exp.columns;
+        let words = RowWords::ExpandStar {
+            columns: exp.columns,
+        };
         cands.push(Cand {
-            text: "expand *".to_string(),
+            text: words.text().unwrap_or_default().to_string(),
             kind: SuggestKind::Column,
-            detail: format!(
-                "{ncols} {}",
-                crate::text::plural(ncols, "column", "columns")
-            ),
+            detail: words.detail(),
             table: String::new(),
             alias: String::new(),
             glyph: SuggestGlyph::Table,
@@ -1196,6 +1236,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             tier: 0,
             insert: Some(exp.replacement.clone()),
             replace: Some(exp.range),
+            words: Some(words),
         });
     }
 
@@ -1231,6 +1272,7 @@ fn rank_rows(schema: &SchemaIndex, input: &RankInput<'_>) -> (Vec<Suggestion>, b
             key: c.key,
             insert: c.insert,
             replace: c.replace,
+            words: c.words,
         })
         .collect();
     (items, completes_a_word)
@@ -1281,13 +1323,14 @@ pub fn join_condition_row(predicate: String) -> Suggestion {
         insert: Some(predicate.clone()),
         text: predicate,
         kind: SuggestKind::Column,
-        detail: "foreign key".to_string(),
+        detail: RowWords::ForeignKey.detail(),
         table: String::new(),
         alias: String::new(),
         // A purple key-square marks the ready-to-insert FK join predicate.
         glyph: SuggestGlyph::ForeignKey,
         key: KeyKind::Foreign,
         replace: None,
+        words: Some(RowWords::ForeignKey),
     }
 }
 
@@ -1405,6 +1448,7 @@ pub fn enum_value_suggestions(
                 key: KeyKind::None,
                 insert: Some(insert),
                 replace: Some(slot.value),
+                words: None,
             }
         })
         .collect()
@@ -2240,6 +2284,7 @@ mod tests {
             key: KeyKind::None,
             insert: Some("sales.ledger".to_string()),
             replace: None,
+            words: None,
         };
         assert_eq!(
             accepted_insert(&row, SqlDialect::Postgres, false).as_deref(),

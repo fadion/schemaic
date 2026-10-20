@@ -37,6 +37,7 @@ use schemaic_core::rank;
 use floem::AnyView;
 
 use crate::consts::*;
+use crate::i18n::tr;
 use crate::widgets::{autohide, measure_text_px_at};
 use crate::{ConnNode, icons, theme};
 
@@ -764,6 +765,25 @@ fn row_width(name_w: f64, table_w: f64, detail_w: f64) -> f64 {
     .ceil()
 }
 
+/// A row's text and detail as the popup shows them: core's English, except
+/// where the words are Schemaic's own (`rank::RowWords`), which are said in
+/// the interface's language. The width and the row both read this, so a
+/// longer translation is the width the box is given.
+fn shown_words(it: &Suggestion) -> (String, String) {
+    use schemaic_core::rank::RowWords;
+    match it.words {
+        None => (it.text.clone(), it.detail.clone()),
+        Some(RowWords::ForeignKey) => (it.text.clone(), tr!("completion-foreign-key")),
+        Some(RowWords::ExpandStar { columns }) => {
+            let n = crate::i18n::figure(&columns.to_string());
+            (
+                tr!("completion-expand-star"),
+                tr!("completion-columns", count = columns, n = n),
+            )
+        }
+    }
+}
+
 /// The list's natural width: its widest row, measured through the same font system
 /// the rows paint with (`measure_text_px_at`), so the box is sized to what is
 /// actually in it. Before this the popup was a flat `min_width(320)`, which left a
@@ -782,13 +802,14 @@ fn natural_width(items: &[Suggestion]) -> f64 {
     items
         .iter()
         .map(|it| {
+            let (text, detail) = shown_words(it);
             row_width(
-                text_w(&it.text, completion_name_size()),
+                text_w(&text, completion_name_size()),
                 text_w(
                     &annotation_label(&it.table, &it.alias),
                     completion_annot_size(),
                 ),
-                text_w(&it.detail, completion_annot_size()),
+                text_w(&detail, completion_annot_size()),
             )
         })
         .fold(0.0_f64, f64::max)
@@ -1829,16 +1850,18 @@ pub(crate) fn completion_popup(
                 .into_iter()
                 .enumerate()
                 .map(move |(i, item)| {
+                    let (name, detail) = shown_words(&item);
                     let Suggestion {
-                        text: name,
+                        text: _,
                         kind,
-                        detail,
+                        detail: _,
                         table,
                         alias,
                         glyph,
                         key,
                         insert: _,
                         replace: _,
+                        words: _,
                     } = item;
                     // Schema-style leading glyph, coloured by kind/key (see
                     // `suggest_icon_color`): a column's type family tinted gold (PK) /
@@ -2951,6 +2974,7 @@ mod tests {
             key: KeyKind::None,
             insert: None,
             replace: None,
+            words: None,
         }
     }
 
@@ -2972,6 +2996,28 @@ mod tests {
             ..table.clone()
         };
         assert_eq!(at(&fk), None);
+    }
+
+    /// **The popup's own words read in English exactly as core writes them**
+    /// into `text` and `detail` — a foreign-key row, and the expand row at one
+    /// column and several — and a row without them shows core's text as it is.
+    #[test]
+    fn english_says_every_row_word_as_core_does() {
+        use super::shown_words;
+        use schemaic_core::rank::RowWords;
+        let fk = schemaic_core::rank::join_condition_row("o.id = orders.id".into());
+        assert_eq!(fk.words, Some(RowWords::ForeignKey));
+        assert_eq!(shown_words(&fk), (fk.text.clone(), fk.detail.clone()));
+        for columns in [1, 3, 1_200] {
+            let words = RowWords::ExpandStar { columns };
+            let row = Suggestion {
+                words: Some(words),
+                ..sugg(words.text().unwrap(), "", &words.detail())
+            };
+            assert_eq!(shown_words(&row), (row.text.clone(), row.detail.clone()));
+        }
+        let plain = sugg("id", "orders", "int");
+        assert_eq!(shown_words(&plain), ("id".to_string(), "int".to_string()));
     }
 
     #[test]

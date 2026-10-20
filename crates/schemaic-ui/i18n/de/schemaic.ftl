@@ -2943,6 +2943,12 @@ quickinfo-function = Funktion { $name }({ $arguments })
 quickinfo-function-returns = Funktion { $name }({ $arguments }) gibt { $returns } zurück
 quickinfo-procedure = Prozedur { $name }({ $arguments })
 quickinfo-procedure-returns = Prozedur { $name }({ $arguments }) gibt { $returns } zurück
+completion-foreign-key = Fremdschlüssel
+completion-expand-star = * ausschreiben
+completion-columns = { $count ->
+        [one] { $n } Spalte
+       *[other] { $n } Spalten
+    }
 diag-syntax-detail = Syntaxfehler: { $detail }
 diag-reserved-alias-backticks = `{ $word }` ist ein reserviertes Schlüsselwort und kann nicht als Alias verwendet werden (setze es in Backticks)
 diag-reserved-alias-double-quotes = `{ $word }` ist ein reserviertes Schlüsselwort und kann nicht als Alias verwendet werden (setze es in doppelte Anführungszeichen)

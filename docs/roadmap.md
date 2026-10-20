@@ -155,7 +155,8 @@ assertions pin English wording — stays the regression net throughout.
    (`diff_error_text`) and the find bar's `text_ops::PatternError` (`pattern_error_text`), and
    Ctrl+K's diff summary (`diff::inline_plan_summary`'s plain arguments;
    `editor_pane::inline_plan_summary_text`) and the hover's quick info (`quickinfo::QuickInfo`
-   from `info`; `quick_info_text`).
+   from `info`; `quick_info_text`), and the completion popup's own words (`rank::RowWords` on
+   `Suggestion::words`; `completion::shown_words`), *CTE* staying the SQL term it is.
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -179,8 +180,6 @@ assertions pin English wording — stays the regression net throughout.
    up from below):
    - **The connection form's notes** — `ssh_config::describe_route`, `init_sql::check`'s
      refusal.
-   - **The completion popup's detail words** — `rank`'s *foreign key*, *expand \**'s column
-     count, *CTE*.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).
