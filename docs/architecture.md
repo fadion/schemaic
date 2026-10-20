@@ -25466,7 +25466,9 @@ existing prose was left alone.
     (`$error`). The model's own text — the reply, the proposal's summary — is never translated;
     the unreadable line's `$error` is serde's, and the error `CodeActions::propose` hands back is
     shown as it comes — already worded, by `ddl_preview::propose_error_text` or the panel's own
-    `propose-no-database`/`propose-other-connection`. `the_proposal_card_reads_as_it_did_in_english` pins the card's lines.
+    `propose-no-database`/`propose-other-connection`; a code block's Run, refused for the same two
+    `TabScope`s, says `ai-run-no-database`/`ai-run-other-connection`.
+    `the_proposal_card_reads_as_it_did_in_english` pins the card's lines.
   - `i18n.rs` — **the interface's string catalogue**: Fluent, through `i18n-embed` (feature
     `fluent-system`) and `i18n-embed-fl`, over the language `core::locale` chose. The catalogues
     are `crates/schemaic-ui/i18n/<tag>/schemaic.ftl` — `en-GB` the source, `de` machine-drafted and

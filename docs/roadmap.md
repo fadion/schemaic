@@ -168,8 +168,6 @@ assertions pin English wording — stays the regression net throughout.
    unchanged today is this phase's list to work from (resurveyed 2026-10-20; no English literal
    or hand-rolled plural is left in the two view crates' own code, so all of it is prose handed
    up from below):
-   - **The AI panel's own refusals outside a proposal** — `ai_panel.rs`'s two
-     `ModalError::app` literals over `tabsel::TabScope`.
    - **`schemaic-ai`'s refusals** — `Constraint::notice`, `oversize_reason`/`spawn_refusal`,
      `cli_failure_message`'s own fallbacks, and `seed::parse_seed_response`'s error, through
      the AI panel, Ctrl+K and the grid's Fill and Seed.

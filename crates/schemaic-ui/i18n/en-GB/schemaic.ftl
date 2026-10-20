@@ -2633,6 +2633,9 @@ propose-not-loaded = { $table } isn't loaded in { $database } right now — open
 propose-nothing-to-change = { $subject } already looks like that — there is nothing to change.
 propose-no-database = This tab has no database selected, so a schema change applied from here would have nowhere to go. Pick one for this connection first — if every database is hidden, the SCHEMA eye is where to bring one back.
 propose-other-connection = This change is about a tab on a different connection — switch to it, or select its connection in the tree, before applying a schema change.
+# A code block's Run, refused for the same two reasons.
+ai-run-no-database = This tab has no database selected, so a statement run from here would have nowhere to go. Pick one for this connection first — if every database is hidden, the SCHEMA eye is where to bring one back.
+ai-run-other-connection = This chat is about a tab on a different connection. A new tab would open on the connection selected in the tree, so the statement would run somewhere else — switch to that tab, or select its connection in the tree, first.
 
 ## The withheld lines: what the plan asks for that this engine can't express,
 ## which keeps Apply off (core's ddl::Withheld). English must read exactly as
