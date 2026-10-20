@@ -22,6 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::model::{SignInFailure, SignInField, TokenCli};
+
 /// The cloud whose CLI a sign-in asks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cloud {
@@ -32,10 +34,7 @@ pub enum Cloud {
 impl Cloud {
     /// The CLI's own name, as a message says it.
     pub fn cli(self) -> &'static str {
-        match self {
-            Cloud::Aws => "AWS CLI (aws)",
-            Cloud::Gcloud => "Google Cloud CLI (gcloud)",
-        }
+        TokenCli::from(self).name()
     }
 
     /// How long a token is taken to be good for **after it was fetched** — the
@@ -190,11 +189,16 @@ pub fn rds_region(host: &str) -> Option<String> {
 /// The arguments that ask the CLI for a token for `user` at `host:port` — each
 /// connection-supplied value through `launch::cli_flag_value`, so none can be
 /// read as an option.
-pub fn token_args(cloud: Cloud, host: &str, port: u16, user: &str) -> Result<Vec<String>, String> {
+pub fn token_args(
+    cloud: Cloud,
+    host: &str,
+    port: u16,
+    user: &str,
+) -> Result<Vec<String>, SignInFailure> {
     match cloud {
         Cloud::Aws => {
-            let host = crate::launch::cli_flag_value("host", host)?;
-            let user = crate::launch::cli_flag_value("user", user)?;
+            let host = crate::launch::cli_flag_value(SignInField::Host, host)?;
+            let user = crate::launch::cli_flag_value(SignInField::User, user)?;
             let mut args: Vec<String> = [
                 "rds",
                 "generate-db-auth-token",
@@ -233,7 +237,7 @@ pub fn token_argv(
     cli: &Path,
     args: Vec<String>,
     exists: impl Fn(&Path) -> bool,
-) -> Result<(PathBuf, Vec<String>), &'static str> {
+) -> Result<(PathBuf, Vec<String>), SignInFailure> {
     let is_shim = cli
         .extension()
         .and_then(|e| e.to_str())
@@ -242,14 +246,9 @@ pub fn token_argv(
         return Ok((cli.to_path_buf(), args));
     }
     match cloud {
-        Cloud::Aws => Err(
-            "The AWS CLI found is a .cmd shim (the pip-installed version 1), and Schemaic does not \
-             run a shim through cmd.exe. Install the AWS CLI version 2, or sign in with a password.",
-        ),
+        Cloud::Aws => Err(SignInFailure::Shim(TokenCli::Aws)),
         Cloud::Gcloud => {
-            const SHIM: &str = "The gcloud found is a .cmd shim with no bundled Python beside it, \
-                and Schemaic does not run a shim through cmd.exe. Reinstall the Google Cloud CLI \
-                with its installer, or sign in with a password.";
+            const SHIM: SignInFailure = SignInFailure::Shim(TokenCli::Gcloud);
             let sdk = cli.parent().and_then(Path::parent).ok_or(SHIM)?;
             let python = sdk
                 .join("platform")
@@ -269,18 +268,18 @@ pub fn token_argv(
 /// The token in the CLI's output: its one non-empty line. More than one is
 /// not a token — a prompt, a warning on stdout — and is refused rather than
 /// sent to the server as a password.
-pub fn parse_token(stdout: &str) -> Result<String, &'static str> {
+pub fn parse_token(stdout: &str) -> Result<String, SignInFailure> {
     let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
     match (lines.next(), lines.next()) {
         (Some(token), None) if !token.chars().any(char::is_whitespace) => Ok(token.to_string()),
-        (None, _) => Err("The cloud CLI answered with no token."),
-        _ => Err("The cloud CLI answered with more than a token."),
+        (None, _) => Err(SignInFailure::NoToken),
+        _ => Err(SignInFailure::MoreThanToken),
     }
 }
 
-/// The sentence for a CLI that exited unsuccessfully: a sign-in to do when it
-/// says so, its own first line otherwise.
-pub fn failure_text(cloud: Cloud, stderr: &str) -> String {
+/// Why a CLI exited unsuccessfully: a sign-in to do when it says so, its own
+/// first line otherwise.
+pub fn failure(cloud: Cloud, stderr: &str) -> SignInFailure {
     let lower = stderr.to_ascii_lowercase();
     let signed_out = match cloud {
         Cloud::Aws => {
@@ -295,23 +294,21 @@ pub fn failure_text(cloud: Cloud, stderr: &str) -> String {
         }
     };
     if signed_out {
-        return match cloud {
-            Cloud::Aws => {
-                "The AWS CLI has no credentials. Run `aws configure` or `aws sso login`, \
-                           then connect again."
-                    .to_string()
-            }
-            Cloud::Gcloud => {
-                "The Google Cloud CLI is not signed in. Run `gcloud auth login`, then connect \
-                 again."
-                    .to_string()
-            }
-        };
+        return SignInFailure::SignedOut(cloud.into());
     }
     let first = stderr.lines().map(str::trim).find(|l| !l.is_empty());
-    match first {
-        Some(line) => format!("The {} could not get a token: {line}", cloud.cli()),
-        None => format!("The {} could not get a token.", cloud.cli()),
+    SignInFailure::NoTokenFrom {
+        cli: cloud.into(),
+        line: first.map(str::to_string),
+    }
+}
+
+impl From<Cloud> for TokenCli {
+    fn from(cloud: Cloud) -> Self {
+        match cloud {
+            Cloud::Aws => TokenCli::Aws,
+            Cloud::Gcloud => TokenCli::Gcloud,
+        }
     }
 }
 
@@ -520,6 +517,7 @@ mod tests {
 
     #[test]
     fn a_signed_out_cli_says_how_to_sign_in() {
+        let failure_text = |cloud, stderr: &str| failure(cloud, stderr).to_string();
         assert!(
             failure_text(
                 Cloud::Aws,

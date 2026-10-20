@@ -395,20 +395,20 @@ pub fn sqlite_target(file: &str) -> Result<&str, Refusal> {
 /// user named `--profile=prod` would sign in as somebody else's profile rather
 /// than fail; and a control character has no business in any of the three.
 /// Empty is refused too: a flag with no value takes the next flag as one.
-pub fn cli_flag_value<'a>(what: &str, value: &'a str) -> Result<&'a str, String> {
+pub fn cli_flag_value(
+    field: crate::model::SignInField,
+    value: &str,
+) -> Result<&str, crate::model::SignInFailure> {
+    use crate::model::{SignInFailure, ValueProblem};
+    let refuse = |problem| Err(SignInFailure::BadValue { field, problem });
     if value.is_empty() {
-        return Err(format!("The connection has no {what} to sign in with."));
+        return refuse(ValueProblem::Empty);
     }
     if value.starts_with('-') {
-        return Err(format!(
-            "The connection's {what} begins with '-', which the cloud CLI would read as an \
-             option rather than as the {what}."
-        ));
+        return refuse(ValueProblem::LeadingDash);
     }
     if value.chars().any(char::is_control) {
-        return Err(format!(
-            "The connection's {what} holds a control character."
-        ));
+        return refuse(ValueProblem::ControlCharacter);
     }
     Ok(value)
 }

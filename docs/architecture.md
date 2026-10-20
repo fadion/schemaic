@@ -251,10 +251,16 @@ existing prose was left alone.
     `DbError::ConnectFailed` carries: `TimedOut`, `InitFailed { statement, error }`,
     `SessionRetired`, `BeginFailed`, `PrepareSession`, `ReadOnlySetup`, `GuardSession`,
     `PlanSetup`, `NoMaintenanceDb`, and `Ssh(SshFailure)` and `Tls(TlsFailure)`, a variant for each
-    of `ssh.rs`'s and `tls.rs`'s failures (under `schemaic-db`). `SshFailure::NoAnswer` carries an
-    `SshPhase` — `Connect` or `Authentication` — where `ssh::within` used to splice the word into
-    its string, the two host-key refusals carry the host, the fingerprints and the store's file
-    name rather than the paragraphs, and `Route` holds the `ssh_config::RouteRefusal` itself. Each
+    of `ssh.rs`'s and `tls.rs`'s failures (under `schemaic-db`), and `SignIn(SignInFailure)` for a
+    cloud IAM or Entra sign-in that got no token (`cloud_iam.rs`, `entra.rs`, both halves).
+    `SshFailure::NoAnswer` carries an `SshPhase` — `Connect` or `Authentication` — where
+    `ssh::within` used to splice the word into its string, the two host-key refusals carry the host, the fingerprints and the store's file
+    name rather than the paragraphs, and `Route` holds the `ssh_config::RouteRefusal` itself.
+    `SignInFailure` names its CLI as a `TokenCli` — `Aws`, `Gcloud`, `Azure` — whose `name()` is
+    the product as a sentence says it ("AWS CLI (aws)"), passed through in every language, and a
+    host or user `launch::cli_flag_value` refuses as `BadValue { field, problem }` (`SignInField`,
+    `ValueProblem`) rather than a sentence with the word spliced in; the CLI's own first stderr
+    line, or the system's error where it could not be started, rides inside as it came. Each
     was a `DbError::Connect(String)` until now, so only the *connection failed:* in front reached
     the window in the interface's language and the rest of it in English. `message()` is each
     producer's old English **byte for byte**, without that prefix, and `Display` is it, so the
@@ -17143,7 +17149,7 @@ existing prose was left alone.
     include a `--format=` line that would otherwise have reached the argv as an option).
     `--type=container` keeps an image sharing an id prefix out of the answer, and empty output is an
     empty argv — no second call at all (`nothing_running_is_no_call_at_all`).
-    `cli_flag_value(what, value)` is the check for **a connection's own setting as the value of a
+    `cli_flag_value(field, value)` is the check for **a connection's own setting as the value of a
     cloud CLI's flag** — `core::cloud_iam`'s `aws rds generate-db-auth-token --hostname <host>
     --username <user>`, the first argv in which a sign-in CLI is handed anything but constants. The
     CLIs read any word beginning with `-` as an option, so a user named `--profile=prod` would sign
@@ -17246,8 +17252,10 @@ existing prose was left alone.
     English in every language — the missing impl is the guard, so don't add one for convenience.
     `each_launcher_refuses_with_its_own_reason` has every function answer the variant it should
     and asserts the answers, in order, are `ALL`, so a renderer keyed on the variant says the right
-    sentence and no variant goes unreached. `cli_flag_value` is the one refusal left a `String`:
-    it is `cloud_iam`'s sign-in, met as a connect error rather than a launcher's refusal.
+    sentence and no variant goes unreached. `cli_flag_value` is the one refusal here that is not a
+    `Refusal`: it is `cloud_iam`'s sign-in, met as a connect error rather than a launcher's
+    refusal, so it answers a `model::SignInFailure::BadValue` naming the field and the problem —
+    the type the rest of that sign-in's failures are (under `core::model`).
   - `core/entra.rs` — **signing in to SQL Server with a Microsoft Entra token from the Azure CLI**:
     the pure half of `AuthMode::AzureCli`, `db/entra.rs` being the half that runs it. The token is
     the CLI's to mint and refresh — `az account get-access-token --resource
@@ -17269,9 +17277,12 @@ existing prose was left alone.
     — `accessToken`, and `expires_on` as an epoch number or, on some versions, a string — and refuses
     anything else rather than guessing (`a_token_is_read_from_the_clis_answer`). **`AzureToken`'s
     `Debug` is hand-written and redacts the token**, a bearer credential, for `Db`'s reason (*Connection
-    identity*, under the invariants); the same test asserts it never prints. `failure_text` turns the
-    CLI's stderr into a sentence a user can act on: a signed-out CLI says to run `az login`, anything
-    else keeps the CLI's own first line without its `ERROR:` prefix (`a_failure_says_what_to_do`).
+    identity*, under the invariants); the same test asserts it never prints. `failure` turns the
+    CLI's stderr into something a user can act on: a signed-out CLI is `SignedOut`, which says to
+    run `az login`, anything else `NoTokenFrom` with the CLI's own first line without its `ERROR:`
+    prefix, or with none where it printed none (`a_failure_says_what_to_do`). That, the shim
+    refusal and `parse_token`'s two are a `model::SignInFailure`, not a sentence, so the interface
+    words them (under `core::model`); `to_string()` is the English they were.
     `azure_cli_profile` names the file whose change means the CLI's sign-in changed —
     `AZURE_CONFIG_DIR`'s `azureProfile.json`, or `.azure`'s under the home directory — which
     `db/entra.rs` keys its token cache on
@@ -17312,10 +17323,12 @@ existing prose was left alone.
     runs as found — a script there, as `az` is. `parse_token` takes exactly one non-empty line with
     no whitespace in it and refuses anything else: a warning or a prompt on stdout is not a token,
     and accepted it would go to the server as the password (`a_token_is_one_line_and_nothing_else`).
-    `failure_text` is `entra`'s: a signed-out CLI says to run `aws configure` or `aws sso login`, or
+    `failure` is `entra`'s: a signed-out CLI says to run `aws configure` or `aws sso login`, or
     `gcloud auth login`, and anything else keeps the CLI's own first stderr line
-    (`a_signed_out_cli_says_how_to_sign_in`). `identity_files` names what the token cache keys on,
-    as `azure_cli_profile` does for Entra: AWS's `~/.aws/credentials` and `~/.aws/config`, or the
+    (`a_signed_out_cli_says_how_to_sign_in`). Every refusal here — `token_args`', `token_argv`'s,
+    `parse_token`'s and `failure`'s — is a `model::SignInFailure` naming the CLI through
+    `From<Cloud> for TokenCli`, as `entra`'s are. `identity_files` names what the token cache keys
+    on, as `azure_cli_profile` does for Entra: AWS's `~/.aws/credentials` and `~/.aws/config`, or the
     files `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` name; gcloud's `active_config`,
     the **active** configuration's own `configurations/config_<name>` and `credentials.db` under
     `CLOUDSDK_CONFIG`, else `%APPDATA%\gcloud` on Windows and `~/.config/gcloud` elsewhere
@@ -19141,11 +19154,11 @@ existing prose was left alone.
   around another's text at connect: the thirteen "timed out" sites, `Db::init_failed`,
   `session::retired_error` and `begin_failed`, `enforce_session`'s prepare,
   `pg::read_only_setup_failed` and `connect_maintenance_avoiding`'s *no maintenance database
-  reachable*, SQL Server's session guard and plan set-up, and every `ssh.rs` and `tls.rs` failure
-  but one (their passages, below). **`Connect(String)` stays for a driver's or the system's text
-  alone** — SQLite's `{file}: {e}`, the tunnel listener's `local_addr` — where there is no frame
-  of Schemaic's to word; `cloud_iam.rs`'s and `entra.rs`'s sign-in sentences are the exception
-  still to move, English composed inside a `Connect`. Keeping the driver's text there is
+  reachable*, SQL Server's session guard and plan set-up, every `ssh.rs` and `tls.rs` failure
+  but one (their passages, below), and every failure `cloud_iam.rs` and `entra.rs` meet asking a
+  CLI for a token, through each one's private `sign_in_failed`. **`Connect(String)` stays for a
+  driver's or the system's text alone** — SQLite's `{file}: {e}`, the tunnel listener's
+  `local_addr` — where there is no frame of Schemaic's to word. Keeping the driver's text there is
   load-bearing: `unknown_database`, which decides whether an
   unopenable configured database is recoverable, reads only a `Connect`'s message, so the
   driver's own connect error moved to `ConnectFailed` would stop being recognised. SQL Server's
@@ -20828,9 +20841,11 @@ existing prose was left alone.
   by the server turning the token away. `fetch` is the Entra fetch again — `cli_candidates`,
   `token_argv`, `tokio::process` with stdin null and `kill_on_drop`, `CREATE_NO_WINDOW` on Windows,
   a 60 s `CLI_TIMEOUT` because gcloud's first run after an update can take tens of seconds — and
-  its failures are `DbError::Connect` sentences: *"The {cli} was not found. Install it and sign in
-  with it, or sign in with a password."*, a timeout, a CLI that could not be started, or
-  `failure_text`. **`Db::sign_in_secret` is its one caller**, and what MySQL's `dial` and
+  its failures are a `DbError::ConnectFailed(ConnectFailure::SignIn(..))` apiece, built by
+  `sign_in_failed` as `db/entra.rs`'s are: a CLI not found, `token_args`' or `token_argv`'s
+  refusal, a timeout, a CLI that could not be started, `failure` or `parse_token`'s refusal —
+  values the app words (under `core::model`), where they were English sentences inside a
+  `Connect`. **`Db::sign_in_secret` is its one caller**, and what MySQL's `dial` and
   PostgreSQL's `connect_probe` hand their driver where the password goes: the password, or under an
   IAM mode `AuthMode::transport_refusal` first — a `DbError::Refused`, with no CLI run, for a plan
   short of the floor, the case being a handle assembled from parts — and then the token
@@ -41900,8 +41915,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `db-query-failed` (`i18n::db_query_failed`), `Connect` as `db-connection-failed`, `Cancelled`
     as `db-query-cancelled` — with the server's or driver's message inside as it came — a
     `ConnectFailed` as `db-connection-failed` around `i18n::connect_failure_text`, which words its
-    `ConnectFailure` from `db-connect-*`, `db-ssh-*` and `db-tls-*` (a route refusal through
-    `connection_form.rs`'s `route_note_text`, now `pub(crate)` for it), and a
+    `ConnectFailure` from `db-connect-*`, `db-ssh-*`, `db-tls-*` and — through the private
+    `sign_in_failure_text`, the CLI's product name passing through — `db-sign-in-*` (a route
+    refusal through `connection_form.rs`'s `route_note_text`, now `pub(crate)` for it), and a
     `Refused` through `i18n::db_refusal_text`. That variant is already the whole sentence (under
     `schemaic-db`'s `lib.rs`), so it used to pass through as written, which was English whatever
     the interface's language; it carries a `DbRefusal` now (under `core::model`), and
@@ -41915,8 +41931,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     the code page's lost character with and without one; it was taken red by rewording en-GB's
     code-page *has no character for* clause. `english_says_every_connect_failure_as_core_does`
     does the same for `connect_failure_text` over every variant, both `SshPhase`s, a changed host
-    key with a recorded key and without one, and a route refusal; it was taken red by removing the
-    alignment space in en-GB's `Offered  { $key }` (under `ssh.rs`). `modal_error_shown` is `modal_about_another_statement` *shown as* that text
+    key with a recorded key and without one, a route refusal, and every `SignInFailure` for every
+    CLI, a host and a user each with all three `ValueProblem`s; it was taken red by removing the
+    alignment space in en-GB's `Offered  { $key }` (under `ssh.rs`), and again for the sign-in
+    arm by shortening en-GB's `db-sign-in-no-token-from-azure-silent`. `modal_error_shown` is `modal_about_another_statement` *shown as* that text
     (`ModalError::shown_as`), and `db_error_pair` is `(to_string(), db_error_shown)` for a caller
     that raises its error as text. The Commit's `CommitDone::Failed`, a Manual tab's `end_tx`, a
     failed session open, the import's `ImportOutcome::Failed` and the copy's `CopyFailed` take
@@ -41958,14 +41976,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     statements already applied. What stays
     English: the server's or driver's
     words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and the
-    sentences `schemaic-db` still composes around a driver's text inside a `Connect` or `Query` —
-    cloud IAM's and Microsoft Entra's sign-in messages (`cloud_iam.rs`/`entra.rs`, and core's
-    `cloud_iam::{failure_text, parse_token, token_args}` and `entra::{failure_text,
-    parse_token}`), and a few `Query`
+    sentences `schemaic-db` still composes around a driver's text inside a `Query` — a few `Query`
     sentences of its own: `lib.rs`'s export, settings and import ones, SQL Server's
     batch-continues note and SQLite's lock advice — where only the prefix is worded. Its SSH, TLS,
-    timeout, init SQL and session set-up sentences are no longer among it: they are a
-    `ConnectFailure`, worded as above. A database-layer refusal inside `Refused` (SQL Server's
+    timeout, init SQL and session set-up sentences are no longer among it, nor cloud IAM's and
+    Microsoft Entra's sign-in messages: they are a `ConnectFailure`, worded as above. A database-layer refusal inside `Refused` (SQL Server's
     blank-string and code-page refusals) is no longer among it: it is a `DbRefusal`, worded as
     above. And, until the
     roadmap's next step, the one `DbError` still taken as `to_string()`, prefix and all: the

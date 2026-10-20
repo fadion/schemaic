@@ -1708,6 +1708,165 @@ pub enum ConnectFailure {
     Ssh(SshFailure),
     /// A TLS set-up's failure.
     Tls(TlsFailure),
+    /// A cloud IAM or Entra sign-in's failure to get a token.
+    SignIn(SignInFailure),
+}
+
+/// The CLI a sign-in asks for its token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenCli {
+    Aws,
+    Gcloud,
+    Azure,
+}
+
+impl TokenCli {
+    /// The CLI as the English names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            TokenCli::Aws => "AWS CLI (aws)",
+            TokenCli::Gcloud => "Google Cloud CLI (gcloud)",
+            TokenCli::Azure => "Azure CLI",
+        }
+    }
+}
+
+/// Which of the connection's values a cloud sign-in passes to its CLI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignInField {
+    Host,
+    User,
+}
+
+/// What is wrong with a value a cloud CLI would be handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueProblem {
+    Empty,
+    LeadingDash,
+    ControlCharacter,
+}
+
+/// Why a sign-in could not get a token ([`ConnectFailure::SignIn`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignInFailure {
+    /// A value the CLI would read wrongly or not at all.
+    BadValue {
+        field: SignInField,
+        problem: ValueProblem,
+    },
+    /// The CLI found is a `.cmd` shim Schemaic will not run.
+    Shim(TokenCli),
+    /// A cloud CLI printed no token.
+    NoToken,
+    /// A cloud CLI printed more than a token.
+    MoreThanToken,
+    /// The Azure CLI's answer was not its token's JSON.
+    AzureBadAnswer,
+    /// The Azure CLI's answer held no access token.
+    AzureNoAccessToken,
+    /// The CLI is not signed in.
+    SignedOut(TokenCli),
+    /// The CLI could not get a token, with its first line where it gave one.
+    NoTokenFrom { cli: TokenCli, line: Option<String> },
+    /// The CLI was not found.
+    NotFound(TokenCli),
+    /// The CLI did not answer within `secs`.
+    NoAnswer { cli: TokenCli, secs: u64 },
+    /// The CLI could not be started.
+    NotStarted { cli: TokenCli, error: String },
+}
+
+impl SignInFailure {
+    /// The failure in English.
+    pub fn message(&self) -> String {
+        match self {
+            SignInFailure::BadValue { field, problem } => {
+                let what = match field {
+                    SignInField::Host => "host",
+                    SignInField::User => "user",
+                };
+                match problem {
+                    ValueProblem::Empty => format!("The connection has no {what} to sign in with."),
+                    ValueProblem::LeadingDash => format!(
+                        "The connection's {what} begins with '-', which the cloud CLI would read \
+                         as an option rather than as the {what}."
+                    ),
+                    ValueProblem::ControlCharacter => {
+                        format!("The connection's {what} holds a control character.")
+                    }
+                }
+            }
+            SignInFailure::Shim(TokenCli::Aws) => "The AWS CLI found is a .cmd shim (the \
+                                                   pip-installed version 1), and Schemaic does \
+                                                   not run a shim through cmd.exe. Install the \
+                                                   AWS CLI version 2, or sign in with a password."
+                .to_string(),
+            SignInFailure::Shim(TokenCli::Gcloud) => "The gcloud found is a .cmd shim with no \
+                                                      bundled Python beside it, and Schemaic does \
+                                                      not run a shim through cmd.exe. Reinstall \
+                                                      the Google Cloud CLI with its installer, or \
+                                                      sign in with a password."
+                .to_string(),
+            SignInFailure::Shim(TokenCli::Azure) => "The Azure CLI found is a .cmd/.bat shim with \
+                                                     no Python beside it, and Schemaic does not run \
+                                                     a shim through cmd.exe. Reinstall the Azure \
+                                                     CLI with Microsoft's installer, or sign in \
+                                                     with a SQL login."
+                .to_string(),
+            SignInFailure::NoToken => "The cloud CLI answered with no token.".to_string(),
+            SignInFailure::MoreThanToken => {
+                "The cloud CLI answered with more than a token.".to_string()
+            }
+            SignInFailure::AzureBadAnswer => {
+                "The Azure CLI's answer was not the token it should have printed.".to_string()
+            }
+            SignInFailure::AzureNoAccessToken => {
+                "The Azure CLI answered without an access token.".to_string()
+            }
+            SignInFailure::SignedOut(TokenCli::Aws) => "The AWS CLI has no credentials. Run `aws \
+                                                        configure` or `aws sso login`, then \
+                                                        connect again."
+                .to_string(),
+            SignInFailure::SignedOut(TokenCli::Gcloud) => "The Google Cloud CLI is not signed \
+                                                           in. Run `gcloud auth login`, then \
+                                                           connect again."
+                .to_string(),
+            SignInFailure::SignedOut(TokenCli::Azure) => {
+                "The Azure CLI is not signed in. Run `az login`, then connect again.".to_string()
+            }
+            SignInFailure::NoTokenFrom { cli, line: Some(line) } => {
+                format!("The {} could not get a token: {line}", cli.name())
+            }
+            SignInFailure::NoTokenFrom {
+                cli: TokenCli::Azure,
+                line: None,
+            } => "The Azure CLI could not get a token: it gave no reason".to_string(),
+            SignInFailure::NoTokenFrom { cli, line: None } => {
+                format!("The {} could not get a token.", cli.name())
+            }
+            SignInFailure::NotFound(TokenCli::Azure) => "The Azure CLI (az) was not found. \
+                                                         Install it and run `az login`, or sign \
+                                                         in with a SQL login."
+                .to_string(),
+            SignInFailure::NotFound(cli) => format!(
+                "The {} was not found. Install it and sign in with it, or sign in with a \
+                 password.",
+                cli.name()
+            ),
+            SignInFailure::NoAnswer { cli, secs } => {
+                format!("The {} did not answer within {secs} seconds.", cli.name())
+            }
+            SignInFailure::NotStarted { cli, error } => {
+                format!("The {} could not be started: {error}", cli.name())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SignInFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
 }
 
 /// Which SSH step did not answer in time.
@@ -1814,6 +1973,7 @@ impl ConnectFailure {
             ConnectFailure::NoMaintenanceDb => "no maintenance database reachable".to_string(),
             ConnectFailure::Ssh(f) => f.message(),
             ConnectFailure::Tls(f) => f.message(),
+            ConnectFailure::SignIn(f) => f.message(),
         }
     }
 }

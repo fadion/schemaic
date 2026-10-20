@@ -519,6 +519,35 @@ db-tls-cert-is-der = { $path } enthält kein PEM-Zertifikat — eine DER-Datei m
 db-tls-key-unreadable = Schlüsseldatei { $path } konnte nicht gelesen werden: { $error }
 db-tls-key-encrypted = { $path } ist ein passwortgeschützter privater Schlüssel, den Schemaic nicht öffnen kann. Entschlüssle ihn zuerst: openssl pkcs8 -in { $path } -out client-key.pem
 db-tls-key-not-pem = { $path } ist kein privater PEM-Schlüssel: { $error }
+db-sign-in-no-value = { $field ->
+        [host] Die Verbindung hat keinen Host für die Anmeldung.
+       *[user] Die Verbindung hat keinen Benutzer für die Anmeldung.
+    }
+db-sign-in-leading-dash = { $field ->
+        [host] Der Host der Verbindung beginnt mit „-“, was die Cloud-CLI als Option statt als Host lesen würde.
+       *[user] Der Benutzer der Verbindung beginnt mit „-“, was die Cloud-CLI als Option statt als Benutzer lesen würde.
+    }
+db-sign-in-control = { $field ->
+        [host] Der Host der Verbindung enthält ein Steuerzeichen.
+       *[user] Der Benutzer der Verbindung enthält ein Steuerzeichen.
+    }
+db-sign-in-shim-aws = Die gefundene AWS CLI ist ein .cmd-Skript (die per pip installierte Version 1), und Schemaic führt kein Skript über cmd.exe aus. Installiere die AWS CLI Version 2 oder melde dich mit einem Passwort an.
+db-sign-in-shim-gcloud = Das gefundene gcloud ist ein .cmd-Skript ohne mitgeliefertes Python daneben, und Schemaic führt kein Skript über cmd.exe aus. Installiere die Google Cloud CLI mit ihrem Installationsprogramm neu oder melde dich mit einem Passwort an.
+db-sign-in-shim-azure = Die gefundene Azure CLI ist ein .cmd/.bat-Skript ohne Python daneben, und Schemaic führt kein Skript über cmd.exe aus. Installiere die Azure CLI mit dem Installationsprogramm von Microsoft neu oder melde dich mit einer SQL-Anmeldung an.
+db-sign-in-no-token = Die Cloud-CLI hat kein Token geliefert.
+db-sign-in-more-than-token = Die Cloud-CLI hat mehr als ein Token geliefert.
+db-sign-in-azure-bad-answer = Die Antwort der Azure CLI war nicht das Token, das sie hätte ausgeben sollen.
+db-sign-in-azure-no-access-token = Die Azure CLI hat ohne Zugriffstoken geantwortet.
+db-sign-in-signed-out-aws = Die AWS CLI hat keine Anmeldedaten. Führe `aws configure` oder `aws sso login` aus und verbinde dich dann erneut.
+db-sign-in-signed-out-gcloud = Die Google Cloud CLI ist nicht angemeldet. Führe `gcloud auth login` aus und verbinde dich dann erneut.
+db-sign-in-signed-out-azure = Die Azure CLI ist nicht angemeldet. Führe `az login` aus und verbinde dich dann erneut.
+db-sign-in-no-token-from = { $cli } konnte kein Token beschaffen: { $line }
+db-sign-in-no-token-from-silent = { $cli } konnte kein Token beschaffen.
+db-sign-in-no-token-from-azure-silent = Die Azure CLI konnte kein Token beschaffen: Sie hat keinen Grund genannt
+db-sign-in-not-found = { $cli } wurde nicht gefunden. Installiere es und melde dich damit an, oder melde dich mit einem Passwort an.
+db-sign-in-not-found-azure = Die Azure CLI (az) wurde nicht gefunden. Installiere sie und führe `az login` aus, oder melde dich mit einer SQL-Anmeldung an.
+db-sign-in-no-answer = { $cli } hat nicht innerhalb von { $secs } Sekunden geantwortet.
+db-sign-in-not-started = { $cli } konnte nicht gestartet werden: { $error }
 ddl-statement-failed = Anweisung { $n } fehlgeschlagen: { $error }
 ddl-already-applied = { $n ->
     [one] { $failed } — { $n } vorherige Anweisung ist bereits angewendet und lässt sich nicht zurückrollen

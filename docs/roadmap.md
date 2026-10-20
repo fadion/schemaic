@@ -163,7 +163,8 @@ assertions pin English wording — stays the regression net throughout.
    `DbError::Refused` and `WriteCause::Refused` carry; `i18n::db_refusal_text`), and the frames
    it puts around a driver's text at connect — SSH, TLS, timeouts, the session set-up
    (`model::ConnectFailure` in `DbError::ConnectFailed`; `i18n::connect_failure_text`, and
-   `LoadFailure::Tunnel`'s `shown`).
+   `LoadFailure::Tunnel`'s `shown`), cloud IAM and Entra sign-in among them
+   (`model::SignInFailure`, which core `cloud_iam` and `entra` answer).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -185,9 +186,6 @@ assertions pin English wording — stays the regression net throughout.
    unchanged today is this phase's list to work from (resurveyed 2026-10-20; no English literal
    or hand-rolled plural is left in the two view crates' own code, so all of it is prose handed
    up from below):
-   - **Cloud IAM and Entra sign-in's messages** — `schemaic-db`'s `cloud_iam.rs` and
-     `entra.rs` frames around the CLI's text, and core `cloud_iam`'s and `entra`'s
-     `failure_text`, `parse_token` and argv refusals, still inside a plain `DbError::Connect`.
    - **`schemaic-db`'s own `Query` sentences** — `lib.rs`'s export, server-settings and
      import ones, SQL Server's note that a batch runs on past an error, SQLite's lock advice.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,

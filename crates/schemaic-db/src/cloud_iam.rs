@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use schemaic_core::cloud_iam::{self, Cloud};
+use schemaic_core::model::SignInFailure;
 
 use crate::DbError;
 
@@ -122,8 +123,13 @@ pub(crate) async fn token(
     Ok(token)
 }
 
+/// `failure` as the connect's error.
+fn sign_in_failed(failure: SignInFailure) -> DbError {
+    DbError::ConnectFailed(crate::ConnectFailure::SignIn(failure))
+}
+
 async fn fetch(cloud: Cloud, host: &str, port: u16, user: &str) -> Result<String, DbError> {
-    let args = cloud_iam::token_args(cloud, host, port, user).map_err(DbError::Connect)?;
+    let args = cloud_iam::token_args(cloud, host, port, user).map_err(sign_in_failed)?;
     let path = std::env::var_os("PATH");
     let program_files: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)"]
         .iter()
@@ -132,23 +138,13 @@ async fn fetch(cloud: Cloud, host: &str, port: u16, user: &str) -> Result<String
         .collect();
     let pf: Vec<&std::path::Path> = program_files.iter().map(|p| p.as_path()).collect();
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    let cli = cloud_iam::cli_candidates(
-        cloud,
-        path.as_deref(),
-        &pf,
-        local.as_deref(),
-        cfg!(windows),
-    )
-    .into_iter()
-    .find(|p| p.is_file())
-    .ok_or_else(|| {
-        DbError::Connect(format!(
-            "The {} was not found. Install it and sign in with it, or sign in with a password.",
-            cloud.cli()
-        ))
-    })?;
-    let (program, argv) = cloud_iam::token_argv(cloud, &cli, args, |p| p.is_file())
-        .map_err(|m| DbError::Connect(m.to_string()))?;
+    let cli =
+        cloud_iam::cli_candidates(cloud, path.as_deref(), &pf, local.as_deref(), cfg!(windows))
+            .into_iter()
+            .find(|p| p.is_file())
+            .ok_or_else(|| sign_in_failed(SignInFailure::NotFound(cloud.into())))?;
+    let (program, argv) =
+        cloud_iam::token_argv(cloud, &cli, args, |p| p.is_file()).map_err(sign_in_failed)?;
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(argv)
         .stdin(std::process::Stdio::null())
@@ -164,21 +160,24 @@ async fn fetch(cloud: Cloud, host: &str, port: u16, user: &str) -> Result<String
     let out = tokio::time::timeout(CLI_TIMEOUT, cmd.output())
         .await
         .map_err(|_| {
-            DbError::Connect(format!(
-                "The {} did not answer within {} seconds.",
-                cloud.cli(),
-                CLI_TIMEOUT.as_secs()
-            ))
+            sign_in_failed(SignInFailure::NoAnswer {
+                cli: cloud.into(),
+                secs: CLI_TIMEOUT.as_secs(),
+            })
         })?
-        .map_err(|e| DbError::Connect(format!("The {} could not be started: {e}", cloud.cli())))?;
+        .map_err(|e| {
+            sign_in_failed(SignInFailure::NotStarted {
+                cli: cloud.into(),
+                error: e.to_string(),
+            })
+        })?;
     if !out.status.success() {
-        return Err(DbError::Connect(cloud_iam::failure_text(
+        return Err(sign_in_failed(cloud_iam::failure(
             cloud,
             &String::from_utf8_lossy(&out.stderr),
         )));
     }
-    cloud_iam::parse_token(&String::from_utf8_lossy(&out.stdout))
-        .map_err(|m| DbError::Connect(m.to_string()))
+    cloud_iam::parse_token(&String::from_utf8_lossy(&out.stdout)).map_err(sign_in_failed)
 }
 
 #[cfg(test)]

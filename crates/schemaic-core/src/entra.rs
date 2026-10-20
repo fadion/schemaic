@@ -11,11 +11,13 @@
 //! What lives here is what can be tested without a CLI: where to look for
 //! `az` ([`azure_cli_candidates`]), the argv that runs it
 //! ([`azure_cli_token_argv`]), reading its answer ([`parse_token`]) and
-//! saying what went wrong in words a user can act on ([`failure_text`]), and
+//! saying what went wrong in words a user can act on ([`failure`]), and
 //! which file's change means the CLI's sign-in changed
 //! ([`azure_cli_profile`]).
 
 use std::path::{Path, PathBuf};
+
+use crate::model::{SignInFailure, TokenCli};
 
 /// The resource a token for Azure SQL is minted for — its audience.
 pub const AZURE_SQL_RESOURCE: &str = "https://database.windows.net/";
@@ -87,10 +89,8 @@ pub fn azure_cli_candidates(
 pub fn azure_cli_token_argv(
     az: &Path,
     exists: impl Fn(&Path) -> bool,
-) -> Result<(PathBuf, Vec<String>), &'static str> {
-    const SHIM: &str = "The Azure CLI found is a .cmd/.bat shim with no Python beside it, and \
-        Schemaic does not run a shim through cmd.exe. Reinstall the Azure CLI with Microsoft's \
-        installer, or sign in with a SQL login.";
+) -> Result<(PathBuf, Vec<String>), SignInFailure> {
+    const SHIM: SignInFailure = SignInFailure::Shim(TokenCli::Azure);
     let args = || TOKEN_ARGS.iter().map(|a| a.to_string());
     let is_shim = az
         .extension()
@@ -136,14 +136,14 @@ impl std::fmt::Debug for AzureToken {
 }
 
 /// Read `az account get-access-token --output json`'s answer.
-pub fn parse_token(stdout: &str) -> Result<AzureToken, String> {
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .map_err(|_| "The Azure CLI's answer was not the token it should have printed.")?;
+pub fn parse_token(stdout: &str) -> Result<AzureToken, SignInFailure> {
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|_| SignInFailure::AzureBadAnswer)?;
     let token = v
         .get("accessToken")
         .and_then(|t| t.as_str())
         .filter(|t| !t.trim().is_empty())
-        .ok_or("The Azure CLI answered without an access token.")?
+        .ok_or(SignInFailure::AzureNoAccessToken)?
         .trim()
         .to_string();
     // A number on current CLIs; a string on some, which parses the same.
@@ -154,21 +154,29 @@ pub fn parse_token(stdout: &str) -> Result<AzureToken, String> {
     Ok(AzureToken { token, expires_at })
 }
 
-/// What went wrong asking the Azure CLI, in a sentence that says what to do.
+/// What went wrong asking the Azure CLI, as a value that says what to do.
 /// `stderr` is the CLI's own; its `ERROR:` prefix is dropped and the first
 /// line kept, since the rest is its help text.
-pub fn failure_text(stderr: &str) -> String {
+pub fn failure(stderr: &str) -> SignInFailure {
     let lower = stderr.to_ascii_lowercase();
     if lower.contains("az login") {
-        return "The Azure CLI is not signed in. Run `az login`, then connect again.".to_string();
+        return SignInFailure::SignedOut(TokenCli::Azure);
     }
     let first = stderr
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("it gave no reason");
-    let first = first.strip_prefix("ERROR:").unwrap_or(first).trim();
-    format!("The Azure CLI could not get a token: {first}")
+        .map(|first| {
+            first
+                .strip_prefix("ERROR:")
+                .unwrap_or(first)
+                .trim()
+                .to_string()
+        });
+    SignInFailure::NoTokenFrom {
+        cli: TokenCli::Azure,
+        line: first,
+    }
 }
 
 /// Where the Azure CLI keeps its **profile** — which accounts are signed in
@@ -303,6 +311,7 @@ mod tests {
     /// CLI's own first line, without its `ERROR:` prefix.
     #[test]
     fn a_failure_says_what_to_do() {
+        let failure_text = |stderr: &str| failure(stderr).to_string();
         let signed_out = "ERROR: Please run 'az login' to setup account.\n";
         assert!(failure_text(signed_out).contains("Run `az login`"));
         let other = "ERROR: (AADSTS700082) The refresh token has expired.\nmore help";

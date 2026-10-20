@@ -589,6 +589,39 @@ db-tls-cert-is-der = { $path } holds no PEM certificate — a DER file has to be
 db-tls-key-unreadable = cannot read key file { $path }: { $error }
 db-tls-key-encrypted = { $path } is a passphrase-protected private key, which Schemaic cannot open. Decrypt it first: openssl pkcs8 -in { $path } -out client-key.pem
 db-tls-key-not-pem = { $path } is not a PEM private key: { $error }
+# A cloud IAM or Entra sign-in that got no token (core's model::SignInFailure).
+# $cli is the CLI's product name (AWS CLI (aws), Google Cloud CLI (gcloud),
+# Azure CLI); $field is "host" or "user", the connection's value the CLI is
+# given; $line the CLI's own first line of error.
+db-sign-in-no-value = { $field ->
+        [host] The connection has no host to sign in with.
+       *[user] The connection has no user to sign in with.
+    }
+db-sign-in-leading-dash = { $field ->
+        [host] The connection's host begins with '-', which the cloud CLI would read as an option rather than as the host.
+       *[user] The connection's user begins with '-', which the cloud CLI would read as an option rather than as the user.
+    }
+db-sign-in-control = { $field ->
+        [host] The connection's host holds a control character.
+       *[user] The connection's user holds a control character.
+    }
+db-sign-in-shim-aws = The AWS CLI found is a .cmd shim (the pip-installed version 1), and Schemaic does not run a shim through cmd.exe. Install the AWS CLI version 2, or sign in with a password.
+db-sign-in-shim-gcloud = The gcloud found is a .cmd shim with no bundled Python beside it, and Schemaic does not run a shim through cmd.exe. Reinstall the Google Cloud CLI with its installer, or sign in with a password.
+db-sign-in-shim-azure = The Azure CLI found is a .cmd/.bat shim with no Python beside it, and Schemaic does not run a shim through cmd.exe. Reinstall the Azure CLI with Microsoft's installer, or sign in with a SQL login.
+db-sign-in-no-token = The cloud CLI answered with no token.
+db-sign-in-more-than-token = The cloud CLI answered with more than a token.
+db-sign-in-azure-bad-answer = The Azure CLI's answer was not the token it should have printed.
+db-sign-in-azure-no-access-token = The Azure CLI answered without an access token.
+db-sign-in-signed-out-aws = The AWS CLI has no credentials. Run `aws configure` or `aws sso login`, then connect again.
+db-sign-in-signed-out-gcloud = The Google Cloud CLI is not signed in. Run `gcloud auth login`, then connect again.
+db-sign-in-signed-out-azure = The Azure CLI is not signed in. Run `az login`, then connect again.
+db-sign-in-no-token-from = The { $cli } could not get a token: { $line }
+db-sign-in-no-token-from-silent = The { $cli } could not get a token.
+db-sign-in-no-token-from-azure-silent = The Azure CLI could not get a token: it gave no reason
+db-sign-in-not-found = The { $cli } was not found. Install it and sign in with it, or sign in with a password.
+db-sign-in-not-found-azure = The Azure CLI (az) was not found. Install it and run `az login`, or sign in with a SQL login.
+db-sign-in-no-answer = The { $cli } did not answer within { $secs } seconds.
+db-sign-in-not-started = The { $cli } could not be started: { $error }
 
 ## A DDL plan that failed, in the DDL preview (schemaic-db's DdlError). English
 ## must read exactly as DdlError displays (a test holds it).

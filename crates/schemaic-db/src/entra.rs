@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use schemaic_core::entra::{self, AzureToken};
+use schemaic_core::model::{SignInFailure, TokenCli};
 
 use crate::DbError;
 
@@ -141,9 +142,12 @@ pub(crate) fn forget() {
     }
 }
 
+/// `failure` as the connect's error.
+fn sign_in_failed(failure: SignInFailure) -> DbError {
+    DbError::ConnectFailed(crate::ConnectFailure::SignIn(failure))
+}
+
 async fn fetch() -> Result<AzureToken, DbError> {
-    const NOT_FOUND: &str = "The Azure CLI (az) was not found. Install it and run `az login`, \
-        or sign in with a SQL login.";
     let path = std::env::var_os("PATH");
     let program_files: Vec<std::path::PathBuf> = ["ProgramFiles", "ProgramFiles(x86)"]
         .iter()
@@ -154,9 +158,9 @@ async fn fetch() -> Result<AzureToken, DbError> {
     let az = entra::azure_cli_candidates(path.as_deref(), &pf, cfg!(windows))
         .into_iter()
         .find(|p| p.is_file())
-        .ok_or_else(|| DbError::Connect(NOT_FOUND.to_string()))?;
-    let (program, args) = entra::azure_cli_token_argv(&az, |p| p.is_file())
-        .map_err(|m| DbError::Connect(m.to_string()))?;
+        .ok_or_else(|| sign_in_failed(SignInFailure::NotFound(TokenCli::Azure)))?;
+    let (program, args) =
+        entra::azure_cli_token_argv(&az, |p| p.is_file()).map_err(sign_in_failed)?;
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -173,18 +177,23 @@ async fn fetch() -> Result<AzureToken, DbError> {
     let out = tokio::time::timeout(CLI_TIMEOUT, cmd.output())
         .await
         .map_err(|_| {
-            DbError::Connect(format!(
-                "The Azure CLI did not answer within {} seconds.",
-                CLI_TIMEOUT.as_secs()
-            ))
+            sign_in_failed(SignInFailure::NoAnswer {
+                cli: TokenCli::Azure,
+                secs: CLI_TIMEOUT.as_secs(),
+            })
         })?
-        .map_err(|e| DbError::Connect(format!("The Azure CLI could not be started: {e}")))?;
+        .map_err(|e| {
+            sign_in_failed(SignInFailure::NotStarted {
+                cli: TokenCli::Azure,
+                error: e.to_string(),
+            })
+        })?;
     if !out.status.success() {
-        return Err(DbError::Connect(entra::failure_text(
-            &String::from_utf8_lossy(&out.stderr),
-        )));
+        return Err(sign_in_failed(entra::failure(&String::from_utf8_lossy(
+            &out.stderr,
+        ))));
     }
-    entra::parse_token(&String::from_utf8_lossy(&out.stdout)).map_err(DbError::Connect)
+    entra::parse_token(&String::from_utf8_lossy(&out.stdout)).map_err(sign_in_failed)
 }
 
 #[cfg(test)]

@@ -1311,6 +1311,63 @@ pub fn connect_failure_text(f: &schemaic_core::model::ConnectFailure) -> String 
         ConnectFailure::NoMaintenanceDb => tr!("db-connect-no-maintenance-db"),
         ConnectFailure::Ssh(f) => ssh(f),
         ConnectFailure::Tls(f) => tls(f),
+        ConnectFailure::SignIn(f) => sign_in_failure_text(f),
+    }
+}
+
+/// Why a cloud IAM or Entra sign-in got no token — core's
+/// `model::SignInFailure` in the interface's language. The CLIs' names are
+/// products and their own words pass through.
+fn sign_in_failure_text(f: &schemaic_core::model::SignInFailure) -> String {
+    use schemaic_core::model::{SignInFailure, SignInField, TokenCli, ValueProblem};
+    match f {
+        SignInFailure::BadValue { field, problem } => {
+            let field = match field {
+                SignInField::Host => "host",
+                SignInField::User => "user",
+            };
+            match problem {
+                ValueProblem::Empty => tr!("db-sign-in-no-value", field = field),
+                ValueProblem::LeadingDash => tr!("db-sign-in-leading-dash", field = field),
+                ValueProblem::ControlCharacter => tr!("db-sign-in-control", field = field),
+            }
+        }
+        SignInFailure::Shim(TokenCli::Aws) => tr!("db-sign-in-shim-aws"),
+        SignInFailure::Shim(TokenCli::Gcloud) => tr!("db-sign-in-shim-gcloud"),
+        SignInFailure::Shim(TokenCli::Azure) => tr!("db-sign-in-shim-azure"),
+        SignInFailure::NoToken => tr!("db-sign-in-no-token"),
+        SignInFailure::MoreThanToken => tr!("db-sign-in-more-than-token"),
+        SignInFailure::AzureBadAnswer => tr!("db-sign-in-azure-bad-answer"),
+        SignInFailure::AzureNoAccessToken => tr!("db-sign-in-azure-no-access-token"),
+        SignInFailure::SignedOut(TokenCli::Aws) => tr!("db-sign-in-signed-out-aws"),
+        SignInFailure::SignedOut(TokenCli::Gcloud) => tr!("db-sign-in-signed-out-gcloud"),
+        SignInFailure::SignedOut(TokenCli::Azure) => tr!("db-sign-in-signed-out-azure"),
+        SignInFailure::NoTokenFrom {
+            cli,
+            line: Some(line),
+        } => tr!(
+            "db-sign-in-no-token-from",
+            cli = cli.name(),
+            line = line.as_str()
+        ),
+        SignInFailure::NoTokenFrom {
+            cli: TokenCli::Azure,
+            line: None,
+        } => tr!("db-sign-in-no-token-from-azure-silent"),
+        SignInFailure::NoTokenFrom { cli, line: None } => {
+            tr!("db-sign-in-no-token-from-silent", cli = cli.name())
+        }
+        SignInFailure::NotFound(TokenCli::Azure) => tr!("db-sign-in-not-found-azure"),
+        SignInFailure::NotFound(cli) => tr!("db-sign-in-not-found", cli = cli.name()),
+        SignInFailure::NoAnswer { cli, secs } => {
+            let secs = secs.to_string();
+            tr!("db-sign-in-no-answer", cli = cli.name(), secs = secs)
+        }
+        SignInFailure::NotStarted { cli, error } => tr!(
+            "db-sign-in-not-started",
+            cli = cli.name(),
+            error = error.as_str()
+        ),
     }
 }
 
@@ -1533,6 +1590,37 @@ mod tests {
             },
         ];
         all.extend(tls.into_iter().map(ConnectFailure::Tls));
+        use schemaic_core::model::{SignInFailure, SignInField, TokenCli, ValueProblem};
+        let mut sign_in = vec![
+            SignInFailure::NoToken,
+            SignInFailure::MoreThanToken,
+            SignInFailure::AzureBadAnswer,
+            SignInFailure::AzureNoAccessToken,
+        ];
+        for field in [SignInField::Host, SignInField::User] {
+            for problem in [
+                ValueProblem::Empty,
+                ValueProblem::LeadingDash,
+                ValueProblem::ControlCharacter,
+            ] {
+                sign_in.push(SignInFailure::BadValue { field, problem });
+            }
+        }
+        for cli in [TokenCli::Aws, TokenCli::Gcloud, TokenCli::Azure] {
+            sign_in.extend([
+                SignInFailure::Shim(cli),
+                SignInFailure::SignedOut(cli),
+                SignInFailure::NoTokenFrom {
+                    cli,
+                    line: Some(s("ExpiredToken")),
+                },
+                SignInFailure::NoTokenFrom { cli, line: None },
+                SignInFailure::NotFound(cli),
+                SignInFailure::NoAnswer { cli, secs: 30 },
+                SignInFailure::NotStarted { cli, error: e() },
+            ]);
+        }
+        all.extend(sign_in.into_iter().map(ConnectFailure::SignIn));
         for f in all {
             assert_eq!(connect_failure_text(&f), f.message(), "{f:?}");
         }
