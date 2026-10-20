@@ -11265,18 +11265,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Ok(()) => {
                                     let mut notes: Vec<String> = Vec::new();
                                     for (table, sql) in &after_commit {
+                                        // For the eye only — the note is the
+                                        // modal's, and no log keeps it.
                                         let note = match db.refresh_elsewhere(&database, sql).await
                                         {
-                                            Ok(rows) => schemaic_core::ddl::elsewhere_report(
+                                            Ok(rows) => schemaic_core::ddl::elsewhere_notes(
                                                 table, &rows, None,
                                             ),
-                                            Err(e) => schemaic_core::ddl::elsewhere_report(
+                                            Err(e) => schemaic_core::ddl::elsewhere_notes(
                                                 table,
                                                 &[],
-                                                Some(&e.to_string()),
+                                                Some(&db_error_shown(&e)),
                                             ),
                                         };
-                                        notes.extend(note);
+                                        notes.extend(
+                                            note.iter().map(schemaic_ui::i18n::elsewhere_note_text),
+                                        );
                                     }
                                     Ok((!notes.is_empty()).then(|| notes.join("\n")))
                                 }

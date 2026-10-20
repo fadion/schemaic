@@ -1423,8 +1423,8 @@ pub struct DdlRunRequest {
 pub enum DdlOutcome {
     /// The whole plan is in effect. The note, where there is one, is what the
     /// work after its commit could not do ([`DdlRunRequest::after_commit`],
-    /// `ddl::elsewhere_report`): the plan stands, and the modal says so under
-    /// it in the error colour.
+    /// `ddl::elsewhere_notes`, worded by [`i18n::elsewhere_note_text`]): the
+    /// plan stands, and the modal says so under it in the error colour.
     Applied(Option<String>),
     /// Carries a message that already says which statement failed and how much
     /// of the plan stuck (see `schemaic_db::DdlError`).

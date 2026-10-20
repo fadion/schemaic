@@ -17291,21 +17291,111 @@ pub fn elsewhere_report(
     rows: &[ElsewhereRefresh],
     failed: Option<&str>,
 ) -> Option<String> {
+    let notes = elsewhere_notes(table, rows, failed);
+    (!notes.is_empty()).then(|| {
+        notes
+            .iter()
+            .map(ElsewhereNote::message)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// A list a note names: the first eight items and how many more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Capped {
+    pub shown: Vec<String>,
+    pub more: usize,
+}
+
+impl Capped {
     const SHOWN: usize = 8;
-    if let Some(e) = failed {
-        return Some(format!(
-            "The views in other databases that select * from {table} were not refreshed ({e}), \
-             and read and write the wrong columns until they are (sp_refreshview)."
-        ));
+
+    fn of(items: Vec<String>) -> Capped {
+        let more = items.len().saturating_sub(Self::SHOWN);
+        Capped {
+            shown: items.into_iter().take(Self::SHOWN).collect(),
+            more,
+        }
     }
-    let list = |items: Vec<String>| {
-        let n = items.len();
-        let mut out = items.into_iter().take(SHOWN).collect::<Vec<_>>().join(", ");
-        if n > SHOWN {
-            out.push_str(&format!(", and {} more", n - SHOWN));
+
+    /// How many items there are in all.
+    pub fn len(&self) -> usize {
+        self.shown.len() + self.more
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The English.
+    pub fn message(&self) -> String {
+        let mut out = self.shown.join(", ");
+        if self.more > 0 {
+            out.push_str(&format!(", and {} more", self.more));
         }
         out
-    };
+    }
+}
+
+/// One sentence of [`elsewhere_report`], as a value the interface words.
+/// Each item names a view (`db.module (error)`) or a database (`db`, with
+/// its error where there was one), the server's words as they came.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ElsewhereNote {
+    /// The batch itself failed; nothing was refreshed.
+    Failed { table: String, error: String },
+    /// These views could not be refreshed.
+    Unrefreshed { table: String, views: Capped },
+    /// These databases could not be searched.
+    Unsearched { table: String, databases: Capped },
+}
+
+impl ElsewhereNote {
+    /// The English.
+    pub fn message(&self) -> String {
+        use crate::text::plural;
+        match self {
+            ElsewhereNote::Failed { table, error } => format!(
+                "The views in other databases that select * from {table} were not refreshed \
+                 ({error}), and read and write the wrong columns until they are (sp_refreshview)."
+            ),
+            ElsewhereNote::Unrefreshed { table, views } => {
+                let n = views.len();
+                format!(
+                    "{n} {} in another database that {} * from {table} could not be refreshed, and \
+                     {} the wrong columns until {} (sp_refreshview): {}.",
+                    plural(n, "view", "views"),
+                    plural(n, "selects", "select"),
+                    plural(n, "reads and writes", "read and write"),
+                    plural(n, "it is", "they are"),
+                    views.message(),
+                )
+            }
+            ElsewhereNote::Unsearched { table, databases } => {
+                let n = databases.len();
+                format!(
+                    "{n} {} not searched for a view that selects * from {table}: {}.",
+                    plural(n, "database was", "databases were"),
+                    databases.message(),
+                )
+            }
+        }
+    }
+}
+
+/// [`elsewhere_report`] as values: empty where the refresh did everything.
+pub fn elsewhere_notes(
+    table: &str,
+    rows: &[ElsewhereRefresh],
+    failed: Option<&str>,
+) -> Vec<ElsewhereNote> {
+    if let Some(e) = failed {
+        return vec![ElsewhereNote::Failed {
+            table: table.to_string(),
+            error: e.to_string(),
+        }];
+    }
     let unrefreshed: Vec<String> = rows
         .iter()
         .filter_map(|r| match (&r.module, &r.error) {
@@ -17321,28 +17411,20 @@ pub fn elsewhere_report(
             None => r.database.clone(),
         })
         .collect();
-    let mut out: Vec<String> = Vec::new();
+    let mut out = Vec::new();
     if !unrefreshed.is_empty() {
-        let n = unrefreshed.len();
-        out.push(format!(
-            "{n} {} in another database that {} * from {table} could not be refreshed, and \
-             {} the wrong columns until {} (sp_refreshview): {}.",
-            crate::text::plural(n, "view", "views"),
-            crate::text::plural(n, "selects", "select"),
-            crate::text::plural(n, "reads and writes", "read and write"),
-            crate::text::plural(n, "it is", "they are"),
-            list(unrefreshed),
-        ));
+        out.push(ElsewhereNote::Unrefreshed {
+            table: table.to_string(),
+            views: Capped::of(unrefreshed),
+        });
     }
     if !unsearched.is_empty() {
-        let n = unsearched.len();
-        out.push(format!(
-            "{n} {} not searched for a view that selects * from {table}: {}.",
-            crate::text::plural(n, "database was", "databases were"),
-            list(unsearched),
-        ));
+        out.push(ElsewhereNote::Unsearched {
+            table: table.to_string(),
+            databases: Capped::of(unsearched),
+        });
     }
-    (!out.is_empty()).then(|| out.join("\n"))
+    out
 }
 
 /// A column whose values the server makes, so no `INSERT` names it: a

@@ -450,6 +450,19 @@ ddl-dangling-foreign-key = der Plan hinterlässt einen Fremdschlüssel, der ins 
 ddl-breaks-view = der Plan würde die Sicht { $view } beschädigen, die eine Spalte liest, die er umbenennt oder entfernt ({ $why }). Es wurde nichts geändert. Bearbeite oder entferne zuerst die Sicht.
 ddl-no-databases = SQLite hat keine Datenbanken, die sich anlegen oder löschen ließen — eine Datenbank ist dort eine Datei, und Schemaic legt sie nicht für dich an und löscht sie nicht.
 ddl-rollback-failed = { $error } — und auch das Zurückrollen ist fehlgeschlagen: { $rollback }
+ddl-elsewhere-failed = Die Sichten in anderen Datenbanken, die * aus { $table } lesen, wurden nicht aktualisiert ({ $error }) und lesen und schreiben die falschen Spalten, bis sie es sind (sp_refreshview).
+ddl-elsewhere-unrefreshed = { $count ->
+        [one] { $count } Sicht in einer anderen Datenbank, die * aus { $table } liest, konnte nicht aktualisiert werden und liest und schreibt die falschen Spalten, bis sie es ist (sp_refreshview): { $views }.
+       *[other] { $count } Sichten in einer anderen Datenbank, die * aus { $table } lesen, konnten nicht aktualisiert werden und lesen und schreiben die falschen Spalten, bis sie es sind (sp_refreshview): { $views }.
+    }
+ddl-elsewhere-unsearched = { $count ->
+        [one] { $count } Datenbank wurde nicht nach einer Sicht durchsucht, die * aus { $table } liest: { $databases }.
+       *[other] { $count } Datenbanken wurden nicht nach einer Sicht durchsucht, die * aus { $table } liest: { $databases }.
+    }
+ddl-elsewhere-list = { $items }{ $more ->
+        [0] {""}
+       *[other] , und { $more } weitere
+    }
 ddl-line-create-table = { $columns ->
     [one] Tabelle { $name } mit { $columns } Spalte erstellen
    *[other] Tabelle { $name } mit { $columns } Spalten erstellen

@@ -7459,10 +7459,13 @@ existing prose was left alone.
     or single-user is a row with no module, and Azure SQL Database, with no cross-database reference
     to find, is skipped. `Db::refresh_elsewhere` sets the plan's lock wait and runs the batch twice
     where the first fails whole, since a `WITH ROLLBACK IMMEDIATE` on a database the walk is inside
-    kills its session. `ddl::elsewhere_report` turns the rows into what the walk could not do — a
-    view whose refresh failed, named with the server's reason, and a database not searched, each
-    list cut at eight — and that is `DdlOutcome::Applied`'s note, shown under the success lines in
-    the error colour, the plan standing either way. A view the walk refreshed was promised, and is
+    kills its session. `ddl::elsewhere_notes` turns the rows into what the walk could not do — an
+    `ElsewhereNote` for a view whose refresh failed, named with the server's reason, and one for a
+    database not searched, each list a `Capped` cut at eight, or a single `Failed` where the batch
+    itself failed, its error `db_error_shown`'s — and those, worded by `i18n::elsewhere_note_text`
+    one line each, are `DdlOutcome::Applied`'s note, shown under the success lines in the error
+    colour, the plan standing either way (`ddl::elsewhere_report` is their English, under *The
+    string catalogue*). A view the walk refreshed was promised, and is
     not repeated (`a_plan_that_moves_columns_refreshes_other_databases_after_it_commits`,
     `the_refresh_elsewhere_reports_what_it_could_not_do`,
     `the_sql_box_shows_what_runs_after_the_commit`; live,
@@ -28772,11 +28775,11 @@ existing prose was left alone.
     footers share is now one message rather than two literals that modal's source gate held equal.
     `the_counted_lines_read_as_they_did_in_english` pins both plurals. English stays: the SQL box
     (`sql_box_text`, its `-- After the plan commits…` comment included, being generated SQL) and the
-    *SQL* heading; the withheld and omitted lines and the after-commit refresh note
-    (`ddl::elsewhere_report`), core's prose, phase 4 — the change lines, the risk lines, the
-    risk heading and the *Used by* lines have left that list, worded from `ChangeLine`,
-    `Risk`/`PlanRisk` and `used_by::Listing`/`UsedByNote` (`risk_text`, `plan_risk_text`,
-    `used_by_drop_text`, `used_by_note_text`, all under *The string catalogue*) and from the bool
+    *SQL* heading; the withheld and omitted lines, core's prose, phase 4 — the change lines, the
+    risk lines, the risk heading, the *Used by* lines and the after-commit refresh note have left
+    that list, worded from `ChangeLine`, `Risk`/`PlanRisk`, `used_by::Listing`/`UsedByNote` and
+    `ddl::ElsewhereNote` (`risk_text`, `plan_risk_text`, `used_by_drop_text`, `used_by_note_text`,
+    `elsewhere_note_text`, all under *The string catalogue*) and from the bool
     above, and so has every `Err` `preview_proposal` hands the card — its own two refusals
     (`propose-not-loaded`, `propose-nothing-to-change`) and each `ProposeError` that
     `resolve_target` or `apply` returns, through `propose_error_text`.
@@ -41422,9 +41425,24 @@ Re-introducing the anti-patterns these guard against is a regression:
     latter and the schema tree's Drop appends the former (under `ddl_preview.rs`).
     `english_says_every_used_by_line_as_core_does` holds both equal to core's English over every
     kind at one and many, one kind and several, with and without more, and each subject under each
-    consequence. What stays core's English in the modal: the withheld lines (`unsupported`, which
-    still reads `Change::summary` for a refused change), the omitted notes and the after-commit
-    refresh note (`ddl::elsewhere_report`).
+    consequence.
+    The after-commit refresh note — what SQL Server's walk of other databases' `SELECT *` views
+    could not do once a plan committed (under `ddl.rs`) — went the same way. `ddl::elsewhere_notes`
+    returns an `ElsewhereNote` per sentence: `Failed { table, error }` for a batch that failed
+    whole, `Unrefreshed { table, views }` and `Unsearched { table, databases }`, each list a
+    `Capped { shown, more }`, the first eight items and how many more, whose `message()` adds
+    *, and N more*. `ElsewhereNote::message()` is the English and `elsewhere_report` the notes'
+    English joined by newlines, unchanged byte for byte. `elsewhere_note_text` words them from
+    `ddl-elsewhere-*` — `$count` plurals, the list set in `ddl-elsewhere-list` with a `$more`
+    selector — the items inside, `db.module (error)` or a database, the server's words as they
+    came. The app's `run_ddl` words each note of each batch and joins them with `"\n"` as
+    `elsewhere_report` does, and a failed batch's error is now `db_error_shown`'s where it was
+    `to_string()` — which it may be, since the note is `DdlOutcome::Applied(Some(note))`, for the
+    eye, and no log keeps it. `english_says_every_refresh_note_as_core_does` holds the worded lines,
+    joined, equal to `elsewhere_report` over the batch's failure, one, three and eleven views and
+    databases (with and without an error), and one of each. What stays core's English in the
+    modal: the withheld lines (`unsupported`, which still reads `Change::summary` for a refused
+    change) and the omitted notes.
     An AI proposal's refusal is the same two-reader case, its readers on either side of the chat.
     `ProposeError` held two pieces it had already worded in English: `Invalid` carried
     `validate`'s first sentence, and `NotAnExpression`'s `what` the field's name as a `String`.

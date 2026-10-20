@@ -508,6 +508,23 @@ ddl-dangling-foreign-key = the plan leaves a foreign key pointing at nothing: { 
 # $why is SQLite's own words.
 ddl-breaks-view = the plan would break the view { $view }, which reads a column it renames or drops ({ $why }). Nothing was changed. Edit or drop the view first.
 ddl-no-databases = SQLite has no databases to create or drop — a database there is a file, which Schemaic does not create or delete for you.
+# What the refresh after a SQL Server plan's commit could not do, under the
+# applied plan (core's ddl::ElsewhereNote). sp_refreshview is a procedure name.
+ddl-elsewhere-failed = The views in other databases that select * from { $table } were not refreshed ({ $error }), and read and write the wrong columns until they are (sp_refreshview).
+# $views is ddl-elsewhere-list over "db.view (why)" items.
+ddl-elsewhere-unrefreshed = { $count ->
+        [one] { $count } view in another database that selects * from { $table } could not be refreshed, and reads and writes the wrong columns until it is (sp_refreshview): { $views }.
+       *[other] { $count } views in another database that select * from { $table } could not be refreshed, and read and write the wrong columns until they are (sp_refreshview): { $views }.
+    }
+ddl-elsewhere-unsearched = { $count ->
+        [one] { $count } database was not searched for a view that selects * from { $table }: { $databases }.
+       *[other] { $count } databases were not searched for a view that selects * from { $table }: { $databases }.
+    }
+# $items is the first eight, joined; $more how many beyond them.
+ddl-elsewhere-list = { $items }{ $more ->
+        [0] {""}
+       *[other] , and { $more } more
+    }
 # $error is why the plan failed; $rollback SQLite's words.
 ddl-rollback-failed = { $error } — and the rollback failed too: { $rollback }
 

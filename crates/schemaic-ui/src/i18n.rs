@@ -818,6 +818,39 @@ pub fn ddl_breaks_view(view: String, why: String) -> String {
     tr!("ddl-breaks-view", view = view, why = why)
 }
 
+/// What the refresh after a SQL Server plan's commit could not do — core's
+/// `ddl::ElsewhereNote` in the interface's language, the server's words in
+/// it as they came. Public for the app, which runs the refresh.
+pub fn elsewhere_note_text(note: &schemaic_core::ddl::ElsewhereNote) -> String {
+    use schemaic_core::ddl::{Capped, ElsewhereNote};
+    let list = |c: &Capped| {
+        tr!(
+            "ddl-elsewhere-list",
+            items = c.shown.join(", "),
+            more = c.more
+        )
+    };
+    match note {
+        ElsewhereNote::Failed { table, error } => tr!(
+            "ddl-elsewhere-failed",
+            table = table.as_str(),
+            error = error.as_str()
+        ),
+        ElsewhereNote::Unrefreshed { table, views } => tr!(
+            "ddl-elsewhere-unrefreshed",
+            count = views.len(),
+            table = table.as_str(),
+            views = list(views)
+        ),
+        ElsewhereNote::Unsearched { table, databases } => tr!(
+            "ddl-elsewhere-unsearched",
+            count = databases.len(),
+            table = table.as_str(),
+            databases = list(databases)
+        ),
+    }
+}
+
 /// A server-level plan on SQLite — `DdlCause::NoDatabases`.
 pub fn ddl_no_databases() -> String {
     tr!("ddl-no-databases")
@@ -1292,6 +1325,42 @@ mod tests {
             assert_eq!(not_sent_message(timed_out), tx::not_sent_message(timed_out));
         }
         assert_eq!(tr!("tx-cancelled"), tx::CANCELLED);
+    }
+
+    /// **The after-commit refresh note reads in English exactly as core's** —
+    /// the batch's failure, one view and several unrefreshed, one database
+    /// and several unsearched, with and without more beyond the eight shown.
+    #[test]
+    fn english_says_every_refresh_note_as_core_does() {
+        use schemaic_core::ddl::{ElsewhereRefresh, elsewhere_notes, elsewhere_report};
+        let view = |i: usize| ElsewhereRefresh {
+            database: format!("db{i}"),
+            module: Some(format!("dbo.v{i}")),
+            error: Some("Invalid column name 'qty'.".into()),
+        };
+        let database = |i: usize, error: bool| ElsewhereRefresh {
+            database: format!("other{i}"),
+            module: None,
+            error: error.then(|| "The server principal is not able to access it.".into()),
+        };
+        let mut cases: Vec<(Vec<ElsewhereRefresh>, Option<&str>)> =
+            vec![(vec![], Some("query failed: timeout"))];
+        for n in [1, 3, 11] {
+            cases.push(((0..n).map(view).collect(), None));
+            cases.push(((0..n).map(|i| database(i, i % 2 == 0)).collect(), None));
+        }
+        cases.push((vec![view(0), database(0, false)], None));
+        for (rows, failed) in cases {
+            let worded: Vec<String> = elsewhere_notes("dbo.orders", &rows, failed)
+                .iter()
+                .map(elsewhere_note_text)
+                .collect();
+            assert_eq!(
+                Some(worded.join("\n")),
+                elsewhere_report("dbo.orders", &rows, failed),
+                "{rows:?}"
+            );
+        }
     }
 
     /// **The truncate confirmation reads in English exactly as core's** —
