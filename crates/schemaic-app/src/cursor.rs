@@ -216,11 +216,13 @@ fn approve_verdict(
     match ended {
         None => Err(tr!("ai-cursor-enable-unfinished")),
         Some((true, _)) => Ok(()),
-        Some((false, code)) => Err(schemaic_ai::cli_failure_message(
-            schemaic_ai::harness::Harness::Cursor,
-            code,
-            stdout,
-            stderr,
+        Some((false, code)) => Err(schemaic_ui::i18n::cli_failure_text(
+            &schemaic_ai::cli_failure_message(
+                schemaic_ai::harness::Harness::Cursor,
+                code,
+                stdout,
+                stderr,
+            ),
         )),
     }
 }

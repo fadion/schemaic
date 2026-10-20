@@ -385,39 +385,140 @@ pub fn oversize_reason(
     harness: crate::harness::Harness,
     args: &[String],
     limit: usize,
-    levers: &str,
-) -> Option<String> {
+    levers: Levers,
+) -> Option<SpawnRefusal> {
     // Roughly what the OS sees: the arguments plus a separator each.
     let total: usize = args.iter().map(|a| arg_units(a) + 1).sum();
     let longest = args.iter().map(|a| arg_units(a)).max().unwrap_or(0);
     if total <= limit && longest <= limit {
         return None;
     }
-    let name = harness.label();
-    // **The unit, not "characters".** Windows counts UTF-16 code units and
-    // everything else counts bytes, and the number is only useful if the reader
-    // can compare it to something — a byte count labelled "characters" is the
-    // same kind of wrong the measurement itself used to be, one step further on.
-    let unit = arg_unit_name();
-    Some(format!(
-        "The context sent to {name} is too large for one command line \
-         ({total} {unit}; this platform allows about {limit}). {levers}"
-    ))
+    Some(SpawnRefusal::Oversize {
+        harness,
+        total,
+        unit: ArgUnit::PLATFORM,
+        limit,
+        levers,
+    })
 }
 
-/// The levers a chat turn or a Ctrl+K generation has: the schema outline in the
-/// system prompt, and the editor's own text.
-pub const SCHEMA_AND_QUERY_LEVERS: &str = "Narrow Settings → AI → Schema context to the active database (or None), or \
-     shorten the query in the editor.";
+/// What the user can change to make a refused context fit, by surface — the
+/// sentence an oversize refusal ends on ([`oversize_reason`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Levers {
+    /// A chat turn's or a Ctrl+K generation's: the schema outline in the
+    /// system prompt, and the editor's own text.
+    SchemaAndQuery,
+    /// AI Fill's and Seed rows'. Neither of the two above is one: the schema
+    /// section is a `CREATE TABLE` skeleton and there is no editor in a grid
+    /// context menu. What does work is the connection's data level, below
+    /// which the row sample is not sent at all.
+    Sample,
+}
 
-/// The levers AI Fill and Seed rows have. Neither of the two above is one: the
-/// schema section is a `CREATE TABLE` skeleton and there is no editor in a grid
-/// context menu. What does work is the connection's data level, below which the
-/// row sample is not sent at all.
-// The settings' own words — "Let it read data", "Schema context" — so the reader
-// can find what the sentence names.
-pub const SAMPLE_LEVERS: &str = "Lower this connection's AI data access below \"Let it read data\", which \
-     stops the row sample being sent, or narrow Settings → AI → Schema context.";
+impl Levers {
+    /// The sentence in English.
+    // The settings' own words — "Let it read data", "Schema context" — so the
+    // reader can find what the sentence names.
+    pub fn message(self) -> &'static str {
+        match self {
+            Levers::SchemaAndQuery => {
+                "Narrow Settings → AI → Schema context to the active database (or None), or \
+                 shorten the query in the editor."
+            }
+            Levers::Sample => {
+                "Lower this connection's AI data access below \"Let it read data\", which \
+                 stops the row sample being sent, or narrow Settings → AI → Schema context."
+            }
+        }
+    }
+}
+
+/// The levers a chat turn or a Ctrl+K generation has ([`Levers::SchemaAndQuery`]).
+pub const SCHEMA_AND_QUERY_LEVERS: Levers = Levers::SchemaAndQuery;
+
+/// The levers AI Fill and Seed rows have ([`Levers::Sample`]).
+pub const SAMPLE_LEVERS: Levers = Levers::Sample;
+
+/// The unit a platform's command-line limit is counted in ([`arg_units`]).
+///
+/// **The unit, not "characters".** Windows counts UTF-16 code units and
+/// everything else counts bytes, and the number is only useful if the reader
+/// can compare it to something — a byte count labelled "characters" is the
+/// same kind of wrong the measurement itself used to be, one step further on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgUnit {
+    Characters,
+    Bytes,
+}
+
+impl ArgUnit {
+    /// This platform's.
+    pub const PLATFORM: ArgUnit = match cfg!(windows) {
+        true => ArgUnit::Characters,
+        false => ArgUnit::Bytes,
+    };
+
+    /// The unit's name in English.
+    pub fn name(self) -> &'static str {
+        match self {
+            ArgUnit::Characters => "characters",
+            ArgUnit::Bytes => "bytes",
+        }
+    }
+}
+
+/// Why a spawn cannot happen ([`spawn_refusal`]), as a value: the app words it
+/// in the interface's language, and `Display` is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpawnRefusal {
+    /// The command line is longer than the platform takes ([`oversize_reason`]).
+    Oversize {
+        harness: crate::harness::Harness,
+        total: usize,
+        unit: ArgUnit,
+        limit: usize,
+        levers: Levers,
+    },
+    /// The harness resolved to a batch shim, which cannot be given a
+    /// multi-line prompt ([`batch_shim_reason`]).
+    BatchShim {
+        harness: crate::harness::Harness,
+        bin: String,
+    },
+}
+
+impl std::fmt::Display for SpawnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnRefusal::Oversize {
+                harness,
+                total,
+                unit,
+                limit,
+                levers,
+            } => write!(
+                f,
+                "The context sent to {} is too large for one command line \
+                 ({total} {}; this platform allows about {limit}). {}",
+                harness.label(),
+                unit.name(),
+                levers.message()
+            ),
+            SpawnRefusal::BatchShim { harness, bin } => {
+                let name = harness.label();
+                write!(
+                    f,
+                    "{name} resolved to a batch shim ({bin}), which cannot be given a \
+                     multi-line prompt — Windows runs a .cmd through cmd.exe, and it \
+                     refuses the argument before {name} is started. Set Settings → AI → \
+                     CLI path to the real executable (an npm install usually has one under \
+                     node_modules, beside the shim)."
+                )
+            }
+        }
+    }
+}
 
 /// **Why this spawn cannot happen, or `None`** — the one pre-spawn verdict, and
 /// what every call site asks.
@@ -438,8 +539,8 @@ pub fn spawn_refusal(
     bin: &str,
     args: &[String],
     limit: usize,
-    levers: &str,
-) -> Option<String> {
+    levers: Levers,
+) -> Option<SpawnRefusal> {
     oversize_reason(harness, args, limit, levers)
         .or_else(|| batch_shim_reason(cfg!(windows), harness, bin, args))
 }
@@ -505,26 +606,14 @@ pub fn batch_shim_reason(
     harness: crate::harness::Harness,
     bin: &str,
     args: &[String],
-) -> Option<String> {
+) -> Option<SpawnRefusal> {
     if !batch_argv_refused(windows, bin, args) {
         return None;
     }
-    let name = harness.label();
-    Some(format!(
-        "{name} resolved to a batch shim ({bin}), which cannot be given a \
-         multi-line prompt — Windows runs a .cmd through cmd.exe, and it \
-         refuses the argument before {name} is started. Set Settings → AI → \
-         CLI path to the real executable (an npm install usually has one under \
-         node_modules, beside the shim)."
-    ))
-}
-
-/// What [`arg_units`] counts, for the message that reports it.
-fn arg_unit_name() -> &'static str {
-    match cfg!(windows) {
-        true => "characters",
-        false => "bytes",
-    }
+    Some(SpawnRefusal::BatchShim {
+        harness,
+        bin: bin.to_string(),
+    })
 }
 
 /// One argument's length **in the units the platform's limit is counted in**.
@@ -564,19 +653,48 @@ pub fn cli_failure_message(
     code: Option<i32>,
     stdout: &str,
     stderr: &str,
-) -> String {
+) -> CliFailure {
     let err = stderr.trim();
     if !err.is_empty() {
-        return err.to_string();
+        return CliFailure::Said(err.to_string());
     }
     let out = stdout.trim();
     if !out.is_empty() {
-        return out.to_string();
+        return CliFailure::Said(out.to_string());
     }
-    let name = harness.label();
     match code {
-        Some(c) => format!("the {name} CLI exited with status {c}"),
-        None => format!("the {name} CLI was terminated by a signal"),
+        Some(code) => CliFailure::Exited { harness, code },
+        None => CliFailure::Signalled { harness },
+    }
+}
+
+/// A failed CLI invocation ([`cli_failure_message`]), as a value: what the CLI
+/// said is its own and passes through, and the two fallbacks are Schemaic's,
+/// which the app words in the interface's language. `Display` is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CliFailure {
+    /// The CLI's own words, stderr's or else stdout's, trimmed.
+    Said(String),
+    /// It said nothing and exited with `code`.
+    Exited {
+        harness: crate::harness::Harness,
+        code: i32,
+    },
+    /// It said nothing and was killed by a signal.
+    Signalled { harness: crate::harness::Harness },
+}
+
+impl std::fmt::Display for CliFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliFailure::Said(s) => f.write_str(s),
+            CliFailure::Exited { harness, code } => {
+                write!(f, "the {} CLI exited with status {code}", harness.label())
+            }
+            CliFailure::Signalled { harness } => {
+                write!(f, "the {} CLI was terminated by a signal", harness.label())
+            }
+        }
     }
 }
 
@@ -1457,15 +1575,14 @@ mod tests {
     #[test]
     fn cli_failure_prefers_stderr_then_stdout_then_status() {
         use crate::harness::Harness;
+        let said = |code, stdout: &str, stderr: &str| {
+            cli_failure_message(Harness::Claude, code, stdout, stderr).to_string()
+        };
         // stderr wins when present.
-        assert_eq!(
-            cli_failure_message(Harness::Claude, Some(1), "out", "boom"),
-            "boom"
-        );
+        assert_eq!(said(Some(1), "out", "boom"), "boom");
         // The real-world case: auth error on stdout, empty stderr → show stdout.
         assert_eq!(
-            cli_failure_message(
-                Harness::Claude,
+            said(
                 Some(1),
                 "Failed to authenticate: OAuth session expired and could not be refreshed\n",
                 "   "
@@ -1474,11 +1591,11 @@ mod tests {
         );
         // Both empty → fall back to the exit status (never a blank message).
         assert_eq!(
-            cli_failure_message(Harness::Claude, Some(2), "", ""),
+            said(Some(2), "", ""),
             "the Claude Code CLI exited with status 2"
         );
         assert_eq!(
-            cli_failure_message(Harness::Claude, None, "", ""),
+            said(None, "", ""),
             "the Claude Code CLI was terminated by a signal"
         );
     }
@@ -1492,7 +1609,7 @@ mod tests {
     fn a_failure_names_the_harness_that_actually_failed() {
         use crate::harness::Harness;
         for h in Harness::ALL {
-            let m = cli_failure_message(h, Some(3), "", "");
+            let m = cli_failure_message(h, Some(3), "", "").to_string();
             assert!(
                 m.contains(h.label()),
                 "{h:?} was reported as something else: {m}"
@@ -1501,7 +1618,7 @@ mod tests {
         // And a harness with something to say still says it, rather than being
         // replaced by its own name.
         assert_eq!(
-            cli_failure_message(Harness::Codex, Some(1), "", "no such model"),
+            cli_failure_message(Harness::Codex, Some(1), "", "no such model").to_string(),
             "no such model"
         );
     }
@@ -1685,7 +1802,8 @@ mod tests {
             30_000,
             SCHEMA_AND_QUERY_LEVERS,
         )
-        .expect("must refuse");
+        .expect("must refuse")
+        .to_string();
         // The setting by the name its group wears in Settings → AI, so the
         // reader can find it.
         assert!(why.contains("Schema context"), "{why}");
@@ -1706,11 +1824,13 @@ mod tests {
             150,
             SCHEMA_AND_QUERY_LEVERS,
         )
-        .expect("must refuse");
+        .expect("must refuse")
+        .to_string();
         assert!(chat.contains("query in the editor"), "{chat}");
 
-        let sample =
-            oversize_reason(crate::harness::Harness::Claude, &args, 150, SAMPLE_LEVERS).expect("x");
+        let sample = oversize_reason(crate::harness::Harness::Claude, &args, 150, SAMPLE_LEVERS)
+            .expect("x")
+            .to_string();
         assert!(sample.contains("AI data access"), "{sample}");
         assert!(
             !sample.contains("query in the editor"),
@@ -1731,7 +1851,9 @@ mod tests {
     fn an_oversize_refusal_names_the_harness_it_was_built_for() {
         let args = vec!["-p".to_string(), "y".repeat(200)];
         for h in crate::harness::Harness::ALL {
-            let why = oversize_reason(h, &args, 150, SCHEMA_AND_QUERY_LEVERS).expect("must refuse");
+            let why = oversize_reason(h, &args, 150, SCHEMA_AND_QUERY_LEVERS)
+                .expect("must refuse")
+                .to_string();
             assert!(
                 why.contains(h.label()),
                 "{h:?} was named as something else: {why}"
@@ -1844,7 +1966,8 @@ mod tests {
             "opencode.cmd",
             &args(&["run", "a\n\nb"]),
         )
-        .expect("a shim with a multi-line prompt is refused");
+        .expect("a shim with a multi-line prompt is refused")
+        .to_string();
         assert!(why.contains("opencode.cmd"), "{why}");
         assert!(why.contains("CLI path"), "{why}");
         assert!(

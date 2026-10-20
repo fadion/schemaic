@@ -4194,6 +4194,38 @@ ai-session-ended = The { $cli } session ended. Ask again to start a new one.
 ai-session-restart-failed = The { $cli } session could not be restarted after stopping ({ $error }), so it has ended. Ask again to start a new one.
 ai-session-not-accepting = The { $cli } session is no longer accepting questions. Ask again to start a new one.
 
+## Why an agent CLI was not started or failed (schemaic-ai's SpawnRefusal and
+## CliFailure), and what its own tools are kept to (Constraint::notice).
+## English must read exactly as schemaic-ai's (a test holds it). $total and
+## $limit are plain numbers; $unit is one of ai-unit-*; $levers one of
+## ai-levers-*; $code an exit status; $mcp is "isolated" when the CLI keeps
+## the user's own MCP servers out of the session, else "shared".
+
+ai-oversize = The context sent to { $cli } is too large for one command line ({ $total } { $unit }; this platform allows about { $limit }). { $levers }
+ai-unit-characters = characters
+ai-unit-bytes = bytes
+ai-levers-schema-and-query = Narrow Settings → AI → Schema context to the active database (or None), or shorten the query in the editor.
+ai-levers-sample = Lower this connection's AI data access below "Let it read data", which stops the row sample being sent, or narrow Settings → AI → Schema context.
+ai-batch-shim = { $cli } resolved to a batch shim ({ $bin }), which cannot be given a multi-line prompt — Windows runs a .cmd through cmd.exe, and it refuses the argument before { $cli } is started. Set Settings → AI → CLI path to the real executable (an npm install usually has one under node_modules, beside the shim).
+ai-cli-exited = the { $cli } CLI exited with status { $code }
+ai-cli-signalled = the { $cli } CLI was terminated by a signal
+ai-constraint-sandboxed = { $cli } runs sandboxed: its own built-in tools cannot write files or run commands, though they can still read this machine.{ $mcp ->
+        [isolated] {""}
+       *[shared] {" "}Any MCP servers you have registered with it are also available to this session, and Schemaic cannot restrict them.
+    }
+ai-constraint-workspace-rules = { $cli } is kept to answering by a permissions file Schemaic writes for this session, not by a sandbox: its own tools are refused writing files and running commands, but they can still read files on this machine.{ $mcp ->
+        [isolated] {""}
+       *[shared] {" "}MCP servers you have registered with it also start with this session; their tools are refused unless your own settings allow them.
+    }
+ai-constraint-denylist = This { $cli } build does not accept the flag that empties its built-in tools, so they are held back by a denylist instead — weaker, and not something Schemaic can guarantee. Updating the CLI restores the full seal.
+ai-constraint-unrestricted = Schemaic could not fully restrict { $cli }'s built-in tools for this session, so it may be able to do more than answer questions about this database.
+ai-constraint-unknown = Schemaic could not confirm that this { $cli } binary accepts the flags that restrict it, so the assistant is disabled. Check the path in Settings → AI.
+# Seed rows' reply it could not use (core's seed::SeedError); $error is the
+# JSON parser's own text.
+ai-seed-empty = the model returned no content
+ai-seed-not-json = the reply was not valid JSON: { $error }
+ai-seed-not-rows = the reply was not a JSON array of row objects
+
 ## Import Connections' sources (conn_sources.rs) — a picked file it cannot
 ## read, and Docker. $path is a file path; $size and $most sizes as the app
 ## writes one (1.2 MB); $error the operating system's or Docker's own text.

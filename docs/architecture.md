@@ -15169,6 +15169,9 @@ existing prose was left alone.
       of real rows, so enum/format/FK conventions come from data rather than guesswork;
       `parse_fill_response`/`parse_seed_response` read the reply back (fence stripping,
       case-insensitive bare `null`, JSON bool → `"1"`/`"0"` for MySQL `tinyint(1)`).
+      `parse_seed_response`'s `SeedError` (`Empty`, `NotJson`, `NotArrayOfObjects`) displays the
+      English; the app's Seed rows shows it through `ui::i18n::seed_error_text` rather than
+      `to_string()`, the JSON parser's own text inside `NotJson` passing through as it came.
       **Both consent questions are answered inside the builder, not at the call site.** `sample_section`
       takes the `AiData` and drops the rows below `may_query` even when a caller hands them over,
       because the sample was gated on `may_attach` — true at `OnRequest`, the *default*, whose consent
@@ -23159,7 +23162,9 @@ existing prose was left alone.
   `Constraint::notice` reaches the user in three places and no fourth: under the settings modal's
   *Agent CLI* dropdown, where it describes the grade the selected binary would run at before a
   session is started, in what `spawn_refusal` prints when the session is refused outright, and — since
-  the one-shot paths gained that same gate — in what `ai::inline_plan` hands back when it refuses. It
+  the one-shot paths gained that same gate — in what `ai::inline_plan` hands back when it refuses.
+  In all three it is drawn as `schemaic_ui::i18n::constraint_notice_text`, the same sentence in the
+  interface's language (*The string catalogue*); `notice` itself stays the English. It
   does not reach the AI panel itself, so a *runnable but weaker* session that was configured in an
   earlier sitting carries no reminder. **Inline generation (Ctrl+K, AI Fill, AI Seed) runs on the
   harness the picker names**, on that harness's own flags: `harness::inline_argv` is the closed
@@ -23457,12 +23462,13 @@ existing prose was left alone.
   once the count was right it was a byte count labelled "characters" everywhere but Windows — the
   same error one step further on, and the step that reaches the user. A number in a refusal is only
   useful if the reader can compare it to the limit printed beside it, and they cannot compare two
-  figures whose unit they have been told wrongly. `arg_unit_name()` sits beside `arg_units()` and
-  answers `"characters"` on Windows and `"bytes"` elsewhere — the count and the word that labels it
-  reading the same `cfg!(windows)` four lines apart, so a platform added to one has to be added to
-  the other in the same edit.
+  figures whose unit they have been told wrongly. `ArgUnit::PLATFORM` answers `Characters` on
+  Windows and `Bytes` elsewhere (`name()` the English word) — the count and the word that labels it
+  reading the same `cfg!(windows)`, `arg_units` below and the constant above, so a platform added
+  to one has to be added to the other in the same edit. It was `arg_unit_name()`, a `&str`, until
+  the refusal became a value the window words (below).
   **And the lever the refusal names is the caller's, because it is not the same everywhere.**
-  `oversize_reason` and `spawn_refusal` take `levers: &str`, of which there are two constants:
+  `oversize_reason` and `spawn_refusal` take `levers: Levers`, of which there are two constants:
   `SCHEMA_AND_QUERY_LEVERS` (narrow *Settings → AI → Schema context*, or shorten the query in the
   editor) for a chat turn or a Ctrl+K generation, and `SAMPLE_LEVERS` (lower this connection's AI
   data access below *"Let it read data"*, which stops the row sample being sent, or narrow the same
@@ -23472,6 +23478,16 @@ existing prose was left alone.
   the one thing that would have worked went unnamed. `ai::inline_plan` threads the argument through
   to the one-shot paths, and `an_oversize_refusal_names_the_levers_its_caller_has` asserts both
   messages still carry the measurement and still blame no installation.
+  **The refusal is a value, not a sentence.** `oversize_reason`, `batch_shim_reason` and
+  `spawn_refusal` answer `Option<SpawnRefusal>` — `Oversize { harness, total, unit, limit, levers }`
+  or `BatchShim { harness, bin }` — and `cli_failure_message` answers a `CliFailure`: `Said`, the
+  CLI's own stderr or else stdout passing through, or the two fallbacks that are Schemaic's,
+  `Exited { harness, code }` and `Signalled { harness }`. Each `Display` is the English byte for
+  byte, `Levers::message()` the two lever sentences; the constants `SCHEMA_AND_QUERY_LEVERS` and
+  `SAMPLE_LEVERS` are `Levers` now, so no caller changed. They used to be finished English
+  `String`s, which reached the AI panel, Ctrl+K and the grid's Fill and Seed in English whatever
+  the interface's language; the window words them through `schemaic_ui::i18n` (*The string
+  catalogue*).
   - `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
     `Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`/`Copilot`/`Cursor`) is **a dialect
     rather than a vendor**: the
@@ -24419,7 +24435,8 @@ existing prose was left alone.
     with an empty stderr, so surfacing stderr alone yields a blank. On Claude Code 2.1.289 a
     `stream-json` session's expired login does not reach this order at all: it arrives as JSON in a
     turn that ends cleanly, and is read out of that turn's `result` (`claude_error_text`, under
-    `stream.rs`).
+    `stream.rs`). What it answers is a `CliFailure` rather than a `String` (under `lib.rs`), so the
+    two fallbacks can be worded in the interface's language while what the CLI said stays its own.
     With the Gemini adapter deleted, `claude`, `codex`, `agy` and `opencode` were the four, and every
     argv here is for a binary somebody has run — and with the Antigravity resume measured above,
     nothing on any of those four is now carried on its help page alone. `copilot` is the fifth, and
@@ -34959,7 +34976,8 @@ existing prose was left alone.
   **A session may only start on a binary the probe established can be restricted, and that gate is
   the first thing `start_ai_session` does** — ahead of the MCP config being written and ahead of the
   oversize check. `ai::spawn_refusal` is the rule: a `Constraint` that is not runnable is refused
-  with `Constraint::notice`. It used to have a second arm — a harness this build did not drive,
+  with `Constraint::notice`'s sentence, drawn in the interface's language by
+  `i18n::constraint_notice_text`. It used to have a second arm — a harness this build did not drive,
   which was Gemini and only Gemini — and with that harness deleted every variant the enum names is
   driven, so the unestablished constraint is the only refusal left. **The arm was rewritten rather
   than removed**: it is now an exhaustive
@@ -41146,7 +41164,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     below), risk lines (`ddl::Risk`, below), risk heading, *Used by* lines (`used_by::Listing`,
     below), omitted lines (`compare::PlanOmission`, under `compare_view.rs`) and withheld lines
     (`ddl::Withheld`, below) — the modal's whole body but the SQL and the server's words — nor the
-    compare tab's standing notes above its tree.
+    compare tab's standing notes above its tree, nor an agent CLI's grade notice, pre-spawn
+    refusal and failure fallbacks (`schemaic-ai`'s `SpawnRefusal`/`CliFailure`, below), though what
+    the CLI itself said still is, nor Seed rows' unusable reply (`seed::SeedError`, below).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41629,6 +41649,27 @@ Re-introducing the anti-patterns these guard against is a regression:
     in `ai_panel.rs`) are catalogue messages beside them.
     `english_refuses_every_proposal_as_core_does` holds the English equal to the `Display` over
     every variant, each `ExpressionField` and two `TableProblem`s.
+    An agent CLI's refusals came from `schemaic-ai` as finished English, and reached the AI panel,
+    Ctrl+K and the grid's Fill and Seed that way whatever the interface's language. They are values
+    now (under `schemaic-ai`'s `lib.rs`), and four renderers here word them: `spawn_refusal_text`
+    for a `SpawnRefusal` — `ai-oversize` with the unit from `ai-unit-*` and the closing sentence
+    from `ai-levers-*`, and `ai-batch-shim`; `cli_failure_text` for a `CliFailure` —
+    `ai-cli-exited`/`-signalled`, a `Said` passing through untouched; `seed_error_text` for core's
+    `seed::SeedError` (`ai-seed-*`, the JSON parser's text a `$error`); and
+    `constraint_notice_text` for `Constraint::notice`, which kept its plain arguments. **That one
+    re-asks the harness rather than reading a value**: `ai-constraint-sandboxed`,
+    `-workspace-rules`, `-denylist`, `-unrestricted` and `-unknown` are chosen by the same
+    `restricted_means_sandbox`/`restricts_by_workspace_rules`/`seals_by_flag` order `notice` uses,
+    and the first two carry an `$mcp` selector (`isolated`/`shared`) for the sentence `notice`
+    appends where `isolates_mcp_servers` is false — so the dispatch exists twice, and the test is
+    what keeps the two orders one. The figures go in as plain digits, as `Display` writes them.
+    Every call site that shows one takes the renderer — `inline_plan`'s refusal, `run_inline`'s
+    failure, both session models' spawn refusals and their turn- and session-ended errors,
+    `cursor::approve_verdict`, the app's own `spawn_refusal` gate, Settings' grade notice and the
+    Seed rows parse error — and none of these is sent to a model.
+    `english_says_every_agent_refusal_as_schemaic_ai_does` holds the English equal over every
+    `Harness` × `Constraint`, both units × both levers, a shim, every `CliFailure` and every
+    `SeedError`; it was seen red with *also* dropped from the en-GB sandboxed message.
     The editor's diagnostics are the case where one value has two readers in two languages.
     `intel::Diagnostic` held a finished `message: String` and now holds `what`, an
     `intel::DiagMessage` (under `core::intel`), with `Diagnostic::message()` the English byte for
@@ -41762,7 +41803,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     public for the app's run paths, `run_failed_message`, `run_cancelled_message` and
     `not_sent_message`, with core's signatures, and for the app's kill and compare actions,
     `activity_read_only_refusal` and `compare_incomparable`, plain arguments as core's take, and
-    `tunnel_refusal` for its connection lookups.
+    `tunnel_refusal` for its connection lookups, and the four agent renderers above for `ai.rs`,
+    `cursor.rs` and `main.rs`.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.

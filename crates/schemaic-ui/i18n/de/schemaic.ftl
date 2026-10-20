@@ -3237,6 +3237,28 @@ ai-session-ended-badly = Die KI-Sitzung endete unerwartet: { $error }
 ai-session-ended = Die Sitzung von { $cli } ist beendet. Frag erneut, um eine neue zu starten.
 ai-session-restart-failed = Die Sitzung von { $cli } konnte nach dem Anhalten nicht neu gestartet werden ({ $error }), daher ist sie beendet. Frag erneut, um eine neue zu starten.
 ai-session-not-accepting = Die Sitzung von { $cli } nimmt keine Fragen mehr an. Frag erneut, um eine neue zu starten.
+ai-oversize = Der an { $cli } gesendete Kontext ist zu groß für eine Befehlszeile ({ $total } { $unit }; diese Plattform erlaubt etwa { $limit }). { $levers }
+ai-unit-characters = Zeichen
+ai-unit-bytes = Bytes
+ai-levers-schema-and-query = Beschränke Einstellungen → KI → Schemakontext auf die aktive Datenbank (oder „Keiner“) oder kürze die Abfrage im Editor.
+ai-levers-sample = Senke den KI-Datenzugriff dieser Verbindung unter „Daten lesen lassen“, damit keine Beispielzeilen mehr gesendet werden, oder beschränke Einstellungen → KI → Schemakontext.
+ai-batch-shim = { $cli } verweist auf ein Batch-Skript ({ $bin }), dem keine mehrzeilige Eingabe übergeben werden kann — Windows führt eine .cmd über cmd.exe aus, und das verweigert das Argument, bevor { $cli } startet. Setze unter Einstellungen → KI den Pfad zu { $cli } auf die eigentliche ausführbare Datei (bei einer npm-Installation liegt meist eine unter node_modules, neben dem Skript).
+ai-cli-exited = die CLI von { $cli } wurde mit Status { $code } beendet
+ai-cli-signalled = die CLI von { $cli } wurde durch ein Signal beendet
+ai-constraint-sandboxed = { $cli } läuft in einer Sandbox: Seine eigenen Werkzeuge können keine Dateien schreiben und keine Befehle ausführen, diesen Rechner aber weiterhin lesen.{ $mcp ->
+        [isolated] {""}
+       *[shared] {" "}Alle MCP-Server, die du bei ihm registriert hast, stehen auch dieser Sitzung zur Verfügung, und Schemaic kann sie nicht einschränken.
+    }
+ai-constraint-workspace-rules = { $cli } wird durch eine Berechtigungsdatei, die Schemaic für diese Sitzung schreibt, aufs Antworten beschränkt, nicht durch eine Sandbox: Seinen eigenen Werkzeugen ist das Schreiben von Dateien und das Ausführen von Befehlen verwehrt, Dateien auf diesem Rechner können sie aber weiterhin lesen.{ $mcp ->
+        [isolated] {""}
+       *[shared] {" "}MCP-Server, die du bei ihm registriert hast, starten ebenfalls mit dieser Sitzung; ihre Werkzeuge werden verweigert, sofern deine eigenen Einstellungen sie nicht erlauben.
+    }
+ai-constraint-denylist = Diese Version von { $cli } kennt die Option nicht, die ihre eingebauten Werkzeuge leert, daher werden sie stattdessen über eine Sperrliste zurückgehalten — schwächer und nichts, was Schemaic garantieren kann. Ein Update der CLI stellt die volle Abschottung wieder her.
+ai-constraint-unrestricted = Schemaic konnte die eingebauten Werkzeuge von { $cli } für diese Sitzung nicht vollständig einschränken, daher kann es womöglich mehr, als Fragen zu dieser Datenbank zu beantworten.
+ai-constraint-unknown = Schemaic konnte nicht bestätigen, dass dieses Programm von { $cli } die einschränkenden Optionen annimmt, daher ist der Assistent deaktiviert. Prüfe den Pfad unter Einstellungen → KI.
+ai-seed-empty = das Modell hat keinen Inhalt zurückgegeben
+ai-seed-not-json = die Antwort war kein gültiges JSON: { $error }
+ai-seed-not-rows = die Antwort war kein JSON-Array aus Zeilenobjekten
 import-source-not-a-file = { $path } ist keine Datei.
 import-source-too-big = { $path } ist { $size } groß, mehr als die { $most }, die hier gelesen werden.
 import-source-unreadable = { $path } konnte nicht gelesen werden: { $error }

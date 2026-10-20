@@ -976,7 +976,7 @@ pub(crate) fn inline_plan(
     // `schemaic_ai::oversize_reason`. Ctrl+K has an editor and a query; Fill
     // and Seed are grid context menus and have neither, so the levers cannot be
     // written here.
-    levers: &str,
+    levers: schemaic_ai::Levers,
 ) -> Result<InlinePlan, String> {
     let bin = harness_bin(harness, cli_path);
     let p = probe(harness, &bin);
@@ -1028,7 +1028,7 @@ pub(crate) fn inline_plan(
         if let Some(p) = &last_message {
             let _ = std::fs::remove_file(p);
         }
-        return Err(why);
+        return Err(schemaic_ui::i18n::spawn_refusal_text(&why));
     }
     let cwd = match inline_cwd(harness) {
         Ok(c) => c,
@@ -1209,11 +1209,8 @@ pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
-        return Err(schemaic_ai::cli_failure_message(
-            plan.harness,
-            out.status.code(),
-            &stdout,
-            &stderr,
+        return Err(schemaic_ui::i18n::cli_failure_text(
+            &schemaic_ai::cli_failure_message(plan.harness, out.status.code(), &stdout, &stderr),
         ));
     }
     match plan.output {
@@ -1623,7 +1620,7 @@ fn owes_system_after_respawn(harness: Harness, owed: bool, resume: Option<&str>)
 /// about it.
 fn spawn_refusal(harness: Harness, constraint: Constraint) -> Option<String> {
     if !constraint.is_runnable() {
-        return constraint.notice(harness);
+        return schemaic_ui::i18n::constraint_notice_text(constraint, harness);
     }
     // **Exhaustive on purpose, though every arm answers the same today.** This
     // used to turn Gemini away — a harness the pure layer decoded but nothing
@@ -1977,7 +1974,7 @@ pub(crate) fn start_ai_session(
                     schemaic_ai::arg_limit(),
                     schemaic_ai::SCHEMA_AND_QUERY_LEVERS,
                 ) {
-                    pump.fail(why);
+                    pump.fail(schemaic_ui::i18n::spawn_refusal_text(&why));
                     continue;
                 }
                 let mut cmd = Command::new(&launch.program);
@@ -2172,8 +2169,9 @@ pub(crate) fn start_ai_session(
                     } else {
                         let stderr_text = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
                         let joined = raw.join("\n");
-                        let why =
-                            schemaic_ai::cli_failure_message(harness, code, &joined, &stderr_text);
+                        let why = schemaic_ui::i18n::cli_failure_text(
+                            &schemaic_ai::cli_failure_message(harness, code, &joined, &stderr_text),
+                        );
                         pump.fail(tr!("ai-turn-ended", cli = harness.label(), error = why));
                     }
                 }
@@ -2241,6 +2239,7 @@ pub(crate) fn start_ai_session(
         schemaic_ai::arg_limit(),
         schemaic_ai::SCHEMA_AND_QUERY_LEVERS,
     ) {
+        let why = schemaic_ui::i18n::spawn_refusal_text(&why);
         let _ = ai_tx.send(AiStreamMsg {
             segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
             done: true,
@@ -2557,11 +2556,13 @@ pub(crate) fn start_ai_session(
                         let why = match ended_badly {
                             true => tr!(
                                 "ai-session-ended-badly",
-                                error = schemaic_ai::cli_failure_message(
-                                    harness,
-                                    code,
-                                    &raw,
-                                    &stderr_text
+                                error = schemaic_ui::i18n::cli_failure_text(
+                                    &schemaic_ai::cli_failure_message(
+                                        harness,
+                                        code,
+                                        &raw,
+                                        &stderr_text
+                                    )
                                 )
                             ),
                             // A clean exit with nothing to report is still the

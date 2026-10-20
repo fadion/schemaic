@@ -13823,7 +13823,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         Ok(plan) => match ai::run_inline(plan).await {
                             Ok(text) => match schemaic_core::seed::parse_seed_response(&text) {
                                 Ok(rows) => AiSeedResult::Rows(rows),
-                                Err(e) => AiSeedResult::Failed(e.to_string()),
+                                Err(e) => {
+                                    AiSeedResult::Failed(schemaic_ui::i18n::seed_error_text(&e))
+                                }
                             },
                             Err(why) => AiSeedResult::Failed(why),
                         },
@@ -15240,9 +15242,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // subscription a cold key would show nothing until some
                 // unrelated change re-ran the memo.
                 let _ = ai_probe_gen.get();
-                crate::agent_cli::probe_cached(h, &bin)?
-                    .constraint
-                    .notice(h)
+                let constraint = crate::agent_cli::probe_cached(h, &bin)?.constraint;
+                schemaic_ui::i18n::constraint_notice_text(constraint, h)
             }),
         }),
         history: HistoryUi {

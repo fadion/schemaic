@@ -997,6 +997,95 @@ fn unsafe_text(u: &schemaic_core::sql::Unsafe) -> String {
     }
 }
 
+/// What a harness's own tools are kept to this session — `schemaic-ai`'s
+/// `Constraint::notice` in the interface's language, asking the harness the
+/// same questions. `None` where that says nothing.
+pub fn constraint_notice_text(
+    c: schemaic_ai::harness::Constraint,
+    h: schemaic_ai::harness::Harness,
+) -> Option<String> {
+    use schemaic_ai::harness::Constraint;
+    let cli = h.label();
+    let mcp = match h.isolates_mcp_servers() {
+        true => "isolated",
+        false => "shared",
+    };
+    Some(match c {
+        Constraint::Sealed => return None,
+        Constraint::Restricted if h.restricted_means_sandbox() => {
+            tr!("ai-constraint-sandboxed", cli = cli, mcp = mcp)
+        }
+        Constraint::Restricted if h.restricts_by_workspace_rules() => {
+            tr!("ai-constraint-workspace-rules", cli = cli, mcp = mcp)
+        }
+        Constraint::Restricted if h.seals_by_flag() => tr!("ai-constraint-denylist", cli = cli),
+        Constraint::Restricted => tr!("ai-constraint-unrestricted", cli = cli),
+        Constraint::Unknown => tr!("ai-constraint-unknown", cli = cli),
+    })
+}
+
+/// Why an agent CLI was not started — `schemaic-ai`'s `SpawnRefusal` in the
+/// interface's language.
+pub fn spawn_refusal_text(r: &schemaic_ai::SpawnRefusal) -> String {
+    use schemaic_ai::{ArgUnit, Levers, SpawnRefusal};
+    match r {
+        SpawnRefusal::Oversize {
+            harness,
+            total,
+            unit,
+            limit,
+            levers,
+        } => {
+            let unit = match unit {
+                ArgUnit::Characters => tr!("ai-unit-characters"),
+                ArgUnit::Bytes => tr!("ai-unit-bytes"),
+            };
+            let levers = match levers {
+                Levers::SchemaAndQuery => tr!("ai-levers-schema-and-query"),
+                Levers::Sample => tr!("ai-levers-sample"),
+            };
+            // As plain digits, which is how core writes them.
+            let (total, limit) = (total.to_string(), limit.to_string());
+            tr!(
+                "ai-oversize",
+                cli = harness.label(),
+                total = total,
+                unit = unit,
+                limit = limit,
+                levers = levers
+            )
+        }
+        SpawnRefusal::BatchShim { harness, bin } => {
+            tr!("ai-batch-shim", cli = harness.label(), bin = bin.as_str())
+        }
+    }
+}
+
+/// A failed agent CLI's reason — `schemaic-ai`'s `CliFailure` in the
+/// interface's language, what the CLI said passing through as it said it.
+pub fn cli_failure_text(f: &schemaic_ai::CliFailure) -> String {
+    use schemaic_ai::CliFailure;
+    match f {
+        CliFailure::Said(s) => s.clone(),
+        CliFailure::Exited { harness, code } => {
+            let code = code.to_string();
+            tr!("ai-cli-exited", cli = harness.label(), code = code)
+        }
+        CliFailure::Signalled { harness } => tr!("ai-cli-signalled", cli = harness.label()),
+    }
+}
+
+/// Why Seed rows could not use the model's reply — core's `seed::SeedError`
+/// in the interface's language, the JSON parser's own text passing through.
+pub fn seed_error_text(e: &schemaic_core::seed::SeedError) -> String {
+    use schemaic_core::seed::SeedError;
+    match e {
+        SeedError::Empty => tr!("ai-seed-empty"),
+        SeedError::NotJson(why) => tr!("ai-seed-not-json", error = why.as_str()),
+        SeedError::NotArrayOfObjects => tr!("ai-seed-not-rows"),
+    }
+}
+
 /// Load `lang`'s catalogue (with `en-GB` behind it, message by message) into
 /// `loader` and set it up. Split from [`init`] so a test can do it to a loader
 /// of its own rather than to the one every other test reads.
@@ -1088,6 +1177,62 @@ mod tests {
         }
         for r in reasons {
             assert_eq!(guard_reason_text(&r), r.message(), "{r:?}");
+        }
+    }
+
+    /// **Every agent CLI's refusal and failure reads in English exactly as
+    /// `schemaic-ai` says it** — each grade's notice on every harness, an
+    /// oversize context in both units and with both levers, a batch shim, and
+    /// a failure the CLI explained, exited from and was killed in — and each
+    /// way Seed rows could not use the reply.
+    #[test]
+    fn english_says_every_agent_refusal_as_schemaic_ai_does() {
+        use schemaic_ai::harness::{Constraint, Harness};
+        use schemaic_ai::{ArgUnit, CliFailure, Levers, SpawnRefusal};
+        for h in Harness::ALL {
+            for c in [
+                Constraint::Unknown,
+                Constraint::Restricted,
+                Constraint::Sealed,
+            ] {
+                assert_eq!(constraint_notice_text(c, h), c.notice(h), "{h:?} {c:?}");
+            }
+            let mut refusals = vec![SpawnRefusal::BatchShim {
+                harness: h,
+                bin: "opencode.cmd".into(),
+            }];
+            for unit in [ArgUnit::Characters, ArgUnit::Bytes] {
+                for levers in [Levers::SchemaAndQuery, Levers::Sample] {
+                    refusals.push(SpawnRefusal::Oversize {
+                        harness: h,
+                        total: 40_007,
+                        unit,
+                        limit: 30_000,
+                        levers,
+                    });
+                }
+            }
+            for r in refusals {
+                assert_eq!(spawn_refusal_text(&r), r.to_string(), "{r:?}");
+            }
+            for f in [
+                CliFailure::Said("Failed to authenticate".into()),
+                CliFailure::Exited {
+                    harness: h,
+                    code: 2,
+                },
+                CliFailure::Signalled { harness: h },
+            ] {
+                assert_eq!(cli_failure_text(&f), f.to_string(), "{f:?}");
+            }
+        }
+        use schemaic_core::seed::SeedError;
+        for e in [
+            SeedError::Empty,
+            SeedError::NotJson("expected value at line 1 column 1".into()),
+            SeedError::NotArrayOfObjects,
+        ] {
+            assert_eq!(seed_error_text(&e), e.to_string(), "{e:?}");
         }
     }
 

@@ -146,7 +146,10 @@ assertions pin English wording — stays the regression net throughout.
    caption and undrawable note (`chart_view::caption_text`, `chart-too-large`), none of which
    the 2026-10-19 survey had listed, and the editor squiggle's database diagnostic
    (`intel::DiagMessage::Server`'s `shown`, set by `Diagnostic::shown_as` from the run's
-   `ModalError::displayed` and the live check's `db_error_shown`).
+   `ModalError::displayed` and the live check's `db_error_shown`), and `schemaic-ai`'s refusals
+   (`SpawnRefusal`, `CliFailure`, and `Constraint::notice`'s plain arguments;
+   `i18n::spawn_refusal_text`, `cli_failure_text`, `constraint_notice_text`) with Seed rows'
+   `seed::SeedError` (`seed_error_text`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -168,9 +171,6 @@ assertions pin English wording — stays the regression net throughout.
    unchanged today is this phase's list to work from (resurveyed 2026-10-20; no English literal
    or hand-rolled plural is left in the two view crates' own code, so all of it is prose handed
    up from below):
-   - **`schemaic-ai`'s refusals** — `Constraint::notice`, `oversize_reason`/`spawn_refusal`,
-     `cli_failure_message`'s own fallbacks, and `seed::parse_seed_response`'s error, through
-     the AI panel, Ctrl+K and the grid's Fill and Seed.
    - **The grid's own refusals** — `edit::paste_report`, `rowjson::update_changes`,
      `withheld_model_reason` and Copy as SQL's `&'static str` errors, `result_diff::DiffError`,
      and the find bar's `text_ops::find_regex`.
