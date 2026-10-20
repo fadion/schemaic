@@ -211,7 +211,7 @@ const MSSQL_ON_ONLY: &[&str] = &[
 /// `sql`'s statements, each trimmed and without its terminator, if every one
 /// is a setting an init may make on `dialect` — else why the first one that is
 /// not, in words the connection form shows. Empty SQL is no statements.
-pub fn check(sql: &str, dialect: SqlDialect) -> Result<Vec<String>, String> {
+pub fn check(sql: &str, dialect: SqlDialect) -> Result<Vec<String>, InitRefusal> {
     let mut out = Vec::new();
     for (lo, hi) in statement_ranges(sql, dialect) {
         let stmt = sql[lo..hi].trim().trim_end_matches(';').trim();
@@ -219,19 +219,20 @@ pub fn check(sql: &str, dialect: SqlDialect) -> Result<Vec<String>, String> {
         let Some(head) = toks.first() else {
             continue; // a comment alone
         };
-        let shown = crate::history::preview(stmt);
+        let refused = |why| InitRefusal {
+            statement: crate::history::preview(stmt),
+            why,
+        };
         let pragmas = settings_are_pragmas(dialect);
         if !is_word(Some(head), if pragmas { "PRAGMA" } else { "SET" }) {
-            return Err(if pragmas {
-                format!("“{shown}”: only PRAGMA settings can run when connecting")
+            return Err(refused(if pragmas {
+                InitWhy::OnlyPragmas
             } else {
-                format!("“{shown}”: only SET statements can run when connecting")
-            });
+                InitWhy::OnlySets
+            }));
         }
         if toks.contains(&Tok::Punct(b'(')) {
-            return Err(format!(
-                "“{shown}”: a setting cannot call a function when connecting"
-            ));
+            return Err(refused(InitWhy::CallsFunction));
         }
         let rest = &toks[1..];
         let verdict = match dialect {
@@ -240,10 +241,101 @@ pub fn check(sql: &str, dialect: SqlDialect) -> Result<Vec<String>, String> {
             SqlDialect::Postgres => postgres(rest, dialect),
             SqlDialect::MsSql => mssql(rest, dialect),
         };
-        verdict.map_err(|why| format!("“{shown}”: {why}"))?;
+        verdict.map_err(refused)?;
         out.push(stmt.to_string());
     }
     Ok(out)
+}
+
+/// Why [`check`] refused a connection's init SQL: the first statement it
+/// refused, cut to a preview, and why. The connection form words it in the
+/// interface's language; `Display` is the English the connect's error and
+/// the CLI say.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitRefusal {
+    pub statement: String,
+    pub why: InitWhy,
+}
+
+/// Why one init statement was refused ([`InitRefusal`]). The names a
+/// variant carries are lower-cased, as the sentence says them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InitWhy {
+    /// On SQLite, a statement that is not a `PRAGMA`.
+    OnlyPragmas,
+    /// Elsewhere, a statement that is not a `SET`.
+    OnlySets,
+    /// A `(` anywhere: a function call, or a subquery.
+    CallsFunction,
+    /// A setting's name written quoted.
+    QuotedName,
+    /// Nothing where a setting's name goes.
+    NamesNoSetting,
+    /// A setting on no list.
+    NotListed(String),
+    /// A client character set other than UTF-8.
+    NotUtf8,
+    /// More than one value, or anything after it.
+    OneValue,
+    /// A value with no `=` before it.
+    OneValueAfterEquals,
+    /// Transaction characteristics, which the read-only guard sets.
+    Transaction,
+    /// A SQLite `PRAGMA` off the list.
+    Pragma,
+    /// MySQL's `GLOBAL`/`PERSIST`/`PERSIST_ONLY` scope.
+    ServerScope(String),
+    /// A T-SQL variable, which ends with its batch.
+    Variable,
+    /// A T-SQL switch Schemaic relies on, turned off.
+    OnOnly(String),
+}
+
+impl InitWhy {
+    /// The reason in English, after the statement's preview.
+    pub fn message(&self) -> String {
+        match self {
+            InitWhy::OnlyPragmas => "only PRAGMA settings can run when connecting".into(),
+            InitWhy::OnlySets => "only SET statements can run when connecting".into(),
+            InitWhy::CallsFunction => "a setting cannot call a function when connecting".into(),
+            InitWhy::QuotedName => "a setting's name cannot be quoted when connecting".into(),
+            InitWhy::NamesNoSetting => "that names no setting".into(),
+            InitWhy::NotListed(name) => format!(
+                "{name} cannot be set when connecting — it is not one of the session settings \
+                 Schemaic knows leave its guards alone"
+            ),
+            InitWhy::NotUtf8 => "the client character set must stay UTF-8 — Schemaic's \
+                                 read-only check reads every statement as UTF-8"
+                .into(),
+            InitWhy::OneValue => {
+                "a setting takes one value when connecting, and nothing may follow it".into()
+            }
+            InitWhy::OneValueAfterEquals => {
+                "a setting takes one value when connecting, after an =".into()
+            }
+            InitWhy::Transaction => "transaction settings cannot be made when connecting — the \
+                                     read-only guard sets them"
+                .into(),
+            InitWhy::Pragma => "that PRAGMA cannot run when connecting — it changes the file or \
+                                the read-only guard"
+                .into(),
+            InitWhy::ServerScope(scope) => {
+                format!("{scope} settings change the server, not the session")
+            }
+            InitWhy::Variable => {
+                "a variable is not a session setting — it ends with its batch".into()
+            }
+            InitWhy::OnOnly(name) => {
+                format!("{name} can only be turned on when connecting — Schemaic relies on it")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for InitRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "“{}”: {}", self.statement, self.why.message())
+    }
 }
 
 /// Is a session setting on `dialect` a `PRAGMA` rather than a `SET`? SQLite's
@@ -315,28 +407,22 @@ fn is_word(t: Option<&Tok>, w: &str) -> bool {
 
 /// The setting name `t` spells, or why it names none: a quoted name is the
 /// same setting to the server, so it cannot be let past a list of bare ones.
-fn name_of(t: Option<&Tok>) -> Result<&str, String> {
+fn name_of(t: Option<&Tok>) -> Result<&str, InitWhy> {
     match t {
         Some(Tok::Word(w)) => Ok(w),
-        Some(Tok::Quoted) => Err("a setting's name cannot be quoted when connecting".into()),
-        _ => Err("that names no setting".into()),
+        Some(Tok::Quoted) => Err(InitWhy::QuotedName),
+        _ => Err(InitWhy::NamesNoSetting),
     }
 }
 
 /// The refusal for a setting on no list.
-fn not_listed(name: &str) -> String {
-    format!(
-        "{} cannot be set when connecting — it is not one of the session settings Schemaic \
-         knows leave its guards alone",
-        name.to_ascii_lowercase()
-    )
+fn not_listed(name: &str) -> InitWhy {
+    InitWhy::NotListed(name.to_ascii_lowercase())
 }
 
 /// The refusal for a client character set other than UTF-8.
-fn not_utf8() -> String {
-    "the client character set must stay UTF-8 — Schemaic's read-only check reads every \
-     statement as UTF-8"
-        .into()
+fn not_utf8() -> InitWhy {
+    InitWhy::NotUtf8
 }
 
 /// A literal value's text — a bare word or a string.
@@ -356,7 +442,7 @@ fn value_text(t: Option<&Tok>) -> Option<&str> {
 /// ANSI_WARNINGS OFF` on the next line was one statement to [`check`] and two
 /// to the server. MariaDB's `NEXT VALUE FOR s`, read past the same way,
 /// advanced a sequence on every operation.
-fn one_value(v: &[Tok]) -> Result<(), String> {
+fn one_value(v: &[Tok]) -> Result<(), InitWhy> {
     let digits = |w: &str| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit());
     let v = match v {
         [Tok::Punct(b'-' | b'+'), rest @ ..] => rest,
@@ -369,26 +455,22 @@ fn one_value(v: &[Tok]) -> Result<(), String> {
         [Tok::Punct(b'.'), Tok::Word(b)] => digits(b),
         _ => false,
     };
-    if one {
-        Ok(())
-    } else {
-        Err("a setting takes one value when connecting, and nothing may follow it".into())
-    }
+    if one { Ok(()) } else { Err(InitWhy::OneValue) }
 }
 
 /// `v` is `= value` (MySQL's `:=` too) with [`one_value`] after it.
-fn assigned(v: &[Tok]) -> Result<(), String> {
+fn assigned(v: &[Tok]) -> Result<(), InitWhy> {
     match v {
         [Tok::Punct(b'='), value @ ..] | [Tok::Punct(b':'), Tok::Punct(b'='), value @ ..] => {
             one_value(value)
         }
-        _ => Err("a setting takes one value when connecting, after an =".into()),
+        _ => Err(InitWhy::OneValueAfterEquals),
     }
 }
 
 /// `v` is one character-set value `utf8` accepts, optionally followed — where
 /// `collate` — by `COLLATE` and a UTF-8 collation, and nothing else.
-fn charset(v: &[Tok], utf8: fn(&str) -> bool, collate: bool) -> Result<(), String> {
+fn charset(v: &[Tok], utf8: fn(&str) -> bool, collate: bool) -> Result<(), InitWhy> {
     if !value_text(v.first()).is_some_and(utf8) {
         return Err(not_utf8());
     }
@@ -424,7 +506,7 @@ fn postgres_utf8(v: &str) -> bool {
 /// nothing after it ([`one_value`]'s rule), and only where the read-only
 /// guard is a rollback, which an isolation level cannot lift; elsewhere the
 /// transaction characteristics *are* the guard.
-fn transaction(dialect: SqlDialect, after: &[Tok]) -> Result<(), String> {
+fn transaction(dialect: SqlDialect, after: &[Tok]) -> Result<(), InitWhy> {
     let level: Vec<&str> = after
         .iter()
         .skip(2)
@@ -446,31 +528,24 @@ fn transaction(dialect: SqlDialect, after: &[Tok]) -> Result<(), String> {
     {
         Ok(())
     } else {
-        Err(
-            "transaction settings cannot be made when connecting — the read-only guard sets them"
-                .into(),
-        )
+        Err(InitWhy::Transaction)
     }
 }
 
 /// A SQLite `PRAGMA` (after the head): a listed name, unqualified, with an
 /// `=` value or none.
-fn pragma(rest: &[Tok]) -> Result<(), String> {
-    let refused = || {
-        "that PRAGMA cannot run when connecting — it changes the file or the read-only guard"
-            .to_string()
-    };
-    let name = name_of(rest.first()).map_err(|_| refused())?;
+fn pragma(rest: &[Tok]) -> Result<(), InitWhy> {
+    let name = name_of(rest.first()).map_err(|_| InitWhy::Pragma)?;
     if SQLITE_PRAGMAS.contains(&name) && matches!(rest.get(1), None | Some(Tok::Punct(b'='))) {
         Ok(())
     } else {
-        Err(refused())
+        Err(InitWhy::Pragma)
     }
 }
 
 /// A MySQL/MariaDB `SET` (after the head): `SET ROLE …`, or a comma list of
 /// assignments, each checked by [`mysql_assignment`].
-fn mysql(rest: &[Tok], dialect: SqlDialect) -> Result<(), String> {
+fn mysql(rest: &[Tok], dialect: SqlDialect) -> Result<(), InitWhy> {
     if is_word(rest.first(), "ROLE") {
         return Ok(());
     }
@@ -484,7 +559,7 @@ fn mysql(rest: &[Tok], dialect: SqlDialect) -> Result<(), String> {
 /// never `GLOBAL`/`PERSIST`/`PERSIST_ONLY`, and the value one literal
 /// ([`assigned`]): a variable's too, since `NEXT VALUE FOR s` is a value
 /// that writes.
-fn mysql_assignment(p: &[Tok], dialect: SqlDialect) -> Result<(), String> {
+fn mysql_assignment(p: &[Tok], dialect: SqlDialect) -> Result<(), InitWhy> {
     let at = p.iter().take_while(|t| **t == Tok::Punct(b'@')).count();
     if at == 1 {
         return assigned(p.get(2..).unwrap_or_default());
@@ -496,10 +571,7 @@ fn mysql_assignment(p: &[Tok], dialect: SqlDialect) -> Result<(), String> {
         if scoped {
             match scope.as_str() {
                 "GLOBAL" | "PERSIST" | "PERSIST_ONLY" => {
-                    return Err(format!(
-                        "{} settings change the server, not the session",
-                        scope.to_ascii_lowercase()
-                    ));
+                    return Err(InitWhy::ServerScope(scope.to_ascii_lowercase()));
                 }
                 "SESSION" | "LOCAL" => i += if at == 2 { 2 } else { 1 },
                 _ if at == 2 => return Err(not_listed(scope)),
@@ -521,7 +593,7 @@ fn mysql_assignment(p: &[Tok], dialect: SqlDialect) -> Result<(), String> {
 /// A PostgreSQL `SET` (after the head): `[SESSION|LOCAL] name {TO|=} …`, the
 /// name on [`POSTGRES_SETTINGS`] or a planner switch or a custom
 /// `prefix.name`; `TIME ZONE …`; `NAMES`/`client_encoding` with UTF-8 only.
-fn postgres(rest: &[Tok], dialect: SqlDialect) -> Result<(), String> {
+fn postgres(rest: &[Tok], dialect: SqlDialect) -> Result<(), InitWhy> {
     let mut i = 0;
     if (is_word(rest.first(), "SESSION") || is_word(rest.first(), "LOCAL")) && rest.len() > 1 {
         i = 1;
@@ -552,9 +624,9 @@ fn postgres(rest: &[Tok], dialect: SqlDialect) -> Result<(), String> {
 /// ([`MSSQL_VALUE_SETTINGS`]), `TRANSACTION ISOLATION LEVEL …`, or a comma
 /// list of switches and one `ON`/`OFF` for them all — each on
 /// [`MSSQL_SWITCHES`], or on [`MSSQL_ON_ONLY`] and turned on.
-fn mssql(rest: &[Tok], dialect: SqlDialect) -> Result<(), String> {
+fn mssql(rest: &[Tok], dialect: SqlDialect) -> Result<(), InitWhy> {
     if rest.first() == Some(&Tok::Punct(b'@')) {
-        return Err("a variable is not a session setting — it ends with its batch".into());
+        return Err(InitWhy::Variable);
     }
     let name = name_of(rest.first())?;
     if name == "TRANSACTION" {
@@ -582,10 +654,7 @@ fn mssql(rest: &[Tok], dialect: SqlDialect) -> Result<(), String> {
         let n = name_of(Some(t))?;
         if MSSQL_ON_ONLY.contains(&n) {
             if !on {
-                return Err(format!(
-                    "{} can only be turned on when connecting — Schemaic relies on it",
-                    n.to_ascii_lowercase()
-                ));
+                return Err(InitWhy::OnOnly(n.to_ascii_lowercase()));
             }
         } else if !MSSQL_SWITCHES.contains(&n) {
             return Err(not_listed(n));
@@ -695,9 +764,17 @@ mod tests {
     #[test]
     fn the_refusal_names_the_statement() {
         let e = check("SET time_zone = '+00:00';\nSET autocommit = 0", MY).unwrap_err();
-        assert!(
-            e.contains("SET autocommit = 0") && e.contains("autocommit"),
-            "{e}"
+        assert_eq!(
+            e,
+            InitRefusal {
+                statement: "SET autocommit = 0".into(),
+                why: InitWhy::NotListed("autocommit".into()),
+            }
+        );
+        assert_eq!(
+            e.to_string(),
+            "“SET autocommit = 0”: autocommit cannot be set when connecting — it is not one of \
+             the session settings Schemaic knows leave its guards alone"
         );
     }
 

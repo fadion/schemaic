@@ -13184,8 +13184,12 @@ existing prose was left alone.
     every operation** — one connection per operation makes that a run, a listing, a ping, a `KILL` —
     so the gate is an **allowlist** with no `Confirm` arm, the fourth of the refusals strictly
     stronger than `run_verdict` that the write-guard invariant names. `check` answers the
-    statements, each trimmed and without its `;`, or the first refusal in words the connection form
-    shows; empty SQL and a comment alone are no statements (`nothing_is_nothing_to_run`). A
+    statements, each trimmed and without its `;`, or the first refusal as a value: `InitRefusal`,
+    the refused statement's `history::preview` and an `InitWhy` — every reason, a named one
+    carrying the setting or scope lower-cased. The connection form words it in the interface's
+    language; its `Display` is the English the connect's error and the CLI still say, byte for byte
+    the `String` `check` used to return (`the_refusal_names_the_statement`). Empty SQL and a
+    comment alone are no statements (`nothing_is_nothing_to_run`). A
     statement passes only as a `SET` — on SQLite, a `PRAGMA` — with no `(` at code level, since
     `SET @x = f()` on MySQL or SQL Server calls a function and a function can write, and then **only
     if the setting it names is on this engine's list**. Which engine's settings are `PRAGMA`s is the
@@ -26282,8 +26286,8 @@ existing prose was left alone.
     placeholder `SET search_path TO app, public`, and it sits in a `dyn_container` keyed on the
     dialect read off `draft.db_type`, because an `edit_field`'s colouring is fixed when it is built
     — so changing the engine rebuilds it. **Under it is what `init_sql::check` makes of the text as
-    typed**: the refusal in `theme::error`, or else a hint in `text_muted` — *"Optional. SET
-    statements run on every connection Schemaic opens — a search path, a time zone, a role."*, and
+    typed**: the refusal in `theme::error`, worded by `init_refusal_text`, or else a hint in
+    `text_muted` — *"Optional. SET statements run on every connection Schemaic opens — a search path, a time zone, a role."*, and
     on SQLite the `PRAGMA` sentence. The connect refuses the same text, and this line is the only
     place the user hears that before a connect fails; Save does not check it. `DraftSignals::init_sql`
     is threaded through create, load (and so `blank`) and `to_connection`, and the Test result's
@@ -26509,14 +26513,19 @@ existing prose was left alone.
     `tls_floor_words(auth)` (`tls-floor-azure-cli`/`-aws-iam`/`-gcp-iam`/`-other`) for
     `AuthMode::tls_note`, and `connections-read-only-mssql` and `connections-named-instance-port`
     inline for `read_only_caveat` and `named_instance_port_note` — held to core's text wherever
-    core says one by `english_says_every_field_note_as_core_does`. What stays
+    core says one by `english_says_every_field_note_as_core_does`. The Init SQL note's refusal is
+    the same move for a value: it used to show `init_sql::check`'s finished English whatever the
+    interface's language, and `init_refusal_text` now maps each `InitWhy` to its own
+    `connections-init-*` message inside `connections-init-refused`'s `$statement`/`$why` framing,
+    held to `InitRefusal`'s `Display` for every reason by
+    `english_says_every_init_refusal_as_core_does`. The statement's preview and the lower-cased
+    setting names it carries are SQL, and are not translated. What stays
     English: the Type picker's engine names (`DbKind::label`), which are product names and are also
     what is persisted as `Connection::db_type` and read by `default_port`/`is_networked`; the
     samples `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules'
     sentences — `connection`'s `AuthMode::transport_refusal`, which never reaches this form
     (`external_client_refusal`, which never did either, is a `launch::Refusal` the app words now),
-    `ssh_config::describe_route`, `SshTunnel::route`'s error,
-    `init_sql::check`'s refusal (core's prose, phase 4) and `lib.rs`'s `TestLine::text`.
+    `ssh_config::describe_route`, `SshTunnel::route`'s error and `lib.rs`'s `TestLine::text`.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import connections" — it was
     "Import from another client", which misled once the modal read Schemaic's own exports and

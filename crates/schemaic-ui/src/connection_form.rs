@@ -1721,6 +1721,36 @@ fn conn_statement_timeout_label(v: Option<u64>) -> String {
     }
 }
 
+/// Why the init SQL would be refused — core's `init_sql::InitRefusal` in the
+/// interface's language, the statement's preview and the lower-cased setting
+/// names passing through.
+fn init_refusal_text(r: &schemaic_core::init_sql::InitRefusal) -> String {
+    use schemaic_core::init_sql::InitWhy;
+    let why = match &r.why {
+        InitWhy::OnlyPragmas => tr!("connections-init-only-pragmas"),
+        InitWhy::OnlySets => tr!("connections-init-only-sets"),
+        InitWhy::CallsFunction => tr!("connections-init-calls-function"),
+        InitWhy::QuotedName => tr!("connections-init-quoted-name"),
+        InitWhy::NamesNoSetting => tr!("connections-init-names-no-setting"),
+        InitWhy::NotListed(name) => tr!("connections-init-not-listed", name = name.as_str()),
+        InitWhy::NotUtf8 => tr!("connections-init-not-utf8"),
+        InitWhy::OneValue => tr!("connections-init-one-value"),
+        InitWhy::OneValueAfterEquals => tr!("connections-init-one-value-after-equals"),
+        InitWhy::Transaction => tr!("connections-init-transaction"),
+        InitWhy::Pragma => tr!("connections-init-pragma"),
+        InitWhy::ServerScope(scope) => {
+            tr!("connections-init-server-scope", scope = scope.as_str())
+        }
+        InitWhy::Variable => tr!("connections-init-variable"),
+        InitWhy::OnOnly(name) => tr!("connections-init-on-only", name = name.as_str()),
+    };
+    tr!(
+        "connections-init-refused",
+        statement = r.statement.as_str(),
+        why = why
+    )
+}
+
 /// What Windows sign-in presents, named: the account this process runs as,
 /// which is the one SSPI hands the server. From the environment Windows sets
 /// for every process; without it, the sentence says so generically.
@@ -2053,7 +2083,7 @@ fn conn_form(
             draft
                 .init_sql
                 .with(|sql| match schemaic_core::init_sql::check(sql, dialect) {
-                    Err(why) => why,
+                    Err(why) => init_refusal_text(&why),
                     Ok(_) if schemaic_core::init_sql::settings_are_pragmas(dialect) => {
                         tr!("connections-init-sql-pragma-hint")
                     }
@@ -2407,6 +2437,36 @@ mod tests {
         runs_of_delta, splice_real, windows_sign_in_hint_for,
     };
     use floem::views::editor::core::xi_rope::{Interval, Rope, RopeDelta};
+
+    /// **Every init SQL refusal reads in English exactly as core's
+    /// `InitRefusal`** — each reason, a named one with its name.
+    #[test]
+    fn english_says_every_init_refusal_as_core_does() {
+        use schemaic_core::init_sql::{InitRefusal, InitWhy};
+        let n = |s: &str| s.to_string();
+        for why in [
+            InitWhy::OnlyPragmas,
+            InitWhy::OnlySets,
+            InitWhy::CallsFunction,
+            InitWhy::QuotedName,
+            InitWhy::NamesNoSetting,
+            InitWhy::NotListed(n("autocommit")),
+            InitWhy::NotUtf8,
+            InitWhy::OneValue,
+            InitWhy::OneValueAfterEquals,
+            InitWhy::Transaction,
+            InitWhy::Pragma,
+            InitWhy::ServerScope(n("global")),
+            InitWhy::Variable,
+            InitWhy::OnOnly(n("ansi_nulls")),
+        ] {
+            let r = InitRefusal {
+                statement: n("SET autocommit = 0"),
+                why,
+            };
+            assert_eq!(super::init_refusal_text(&r), r.to_string(), "{r:?}");
+        }
+    }
 
     /// **The notes under the form's fields read in English exactly as core's**
     /// wherever core says one: the Verify CA caveat, each sign-in's TLS floor,

@@ -1813,6 +1813,25 @@ connections-init-sql = Init SQL
 # PRAGMA and SET are SQL keywords.
 connections-init-sql-pragma-hint = Optional. PRAGMA settings run on every connection Schemaic opens.
 connections-init-sql-set-hint = Optional. SET statements run on every connection Schemaic opens — a search path, a time zone, a role.
+# Why the init SQL would be refused (core's init_sql::InitRefusal; a test
+# holds the English equal). $statement is the refused statement's preview;
+# $why one of the connections-init-* reasons below. $name and $scope are
+# setting names and scopes as SQL spells them, lower-cased.
+connections-init-refused = “{ $statement }”: { $why }
+connections-init-only-pragmas = only PRAGMA settings can run when connecting
+connections-init-only-sets = only SET statements can run when connecting
+connections-init-calls-function = a setting cannot call a function when connecting
+connections-init-quoted-name = a setting's name cannot be quoted when connecting
+connections-init-names-no-setting = that names no setting
+connections-init-not-listed = { $name } cannot be set when connecting — it is not one of the session settings Schemaic knows leave its guards alone
+connections-init-not-utf8 = the client character set must stay UTF-8 — Schemaic's read-only check reads every statement as UTF-8
+connections-init-one-value = a setting takes one value when connecting, and nothing may follow it
+connections-init-one-value-after-equals = a setting takes one value when connecting, after an =
+connections-init-transaction = transaction settings cannot be made when connecting — the read-only guard sets them
+connections-init-pragma = that PRAGMA cannot run when connecting — it changes the file or the read-only guard
+connections-init-server-scope = { $scope } settings change the server, not the session
+connections-init-variable = a variable is not a session setting — it ends with its batch
+connections-init-on-only = { $name } can only be turned on when connecting — Schemaic relies on it
 connections-host = Host
 connections-port = Port
 # Under Host and Port for a SQL Server named instance (core's
