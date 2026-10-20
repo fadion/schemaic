@@ -5780,8 +5780,9 @@ pub(crate) async fn enforce_session(
 ) -> Result<(), DbError> {
     // The server's words about Schemaic's own set-up statements, not about the
     // user's, which has not been sent: `Connect`, so the bar offers no *AI fix*.
-    let qerr =
-        |e: mysql_async::Error| DbError::Connect(format!("could not prepare the session: {e}"));
+    let qerr = |e: mysql_async::Error| {
+        DbError::ConnectFailed(crate::ConnectFailure::PrepareSession(e.to_string()))
+    };
     let mode: Option<String> = conn
         .query_first("SELECT @@SESSION.sql_mode")
         .await
@@ -6080,7 +6081,7 @@ pub(crate) async fn ping(db: &Db, timeout: std::time::Duration) -> Result<(), Db
     };
     tokio::time::timeout(timeout, check)
         .await
-        .map_err(|_| DbError::Connect("timed out".to_string()))?
+        .map_err(|_| DbError::ConnectFailed(crate::ConnectFailure::TimedOut))?
 }
 
 /// The user databases on this server, system schemas excluded.
@@ -6102,7 +6103,7 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
     };
     tokio::time::timeout(crate::PING_TIMEOUT, listing)
         .await
-        .map_err(|_| DbError::Connect("timed out".to_string()))?
+        .map_err(|_| DbError::ConnectFailed(crate::ConnectFailure::TimedOut))?
 }
 
 /// `SELECT COUNT(*)` — the exact count, killable from a second connection.

@@ -2176,8 +2176,9 @@ fn file_name(path: &str) -> &str {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadFailure {
     /// The tunnel itself would not open — the SSH error (connect, host key,
-    /// key file, agent, authentication).
-    Tunnel(String),
+    /// key file, agent, authentication), in English (`text`) and as the
+    /// window words it (`shown`), as [`LoadFailure::Server`] carries it.
+    Tunnel { text: String, shown: String },
     /// The tunnel opened, but the server behind it failed the load, and the
     /// tunnel was closed with it: the error in English (`text`), and as the
     /// window words it (`shown`) — the refusal the interface says reads the
@@ -2219,7 +2220,10 @@ impl TunnelFailures {
     pub fn refusal_of(&self, conn_id: u64) -> TunnelRefusal<'_> {
         match self.0.get(&conn_id) {
             None => TunnelRefusal::StillOpening,
-            Some(LoadFailure::Tunnel(why)) => TunnelRefusal::Tunnel(why.trim_end_matches('.')),
+            Some(LoadFailure::Tunnel { text, shown }) => TunnelRefusal::Tunnel {
+                why: text.trim_end_matches('.'),
+                shown: shown.trim_end_matches('.'),
+            },
             Some(LoadFailure::Server { text, shown }) => TunnelRefusal::Server {
                 why: text.trim_end_matches('.'),
                 shown: shown.trim_end_matches('.'),
@@ -2233,8 +2237,9 @@ impl TunnelFailures {
 pub enum TunnelRefusal<'a> {
     /// The tunnel is still opening.
     StillOpening,
-    /// The tunnel would not open: the SSH error.
-    Tunnel(&'a str),
+    /// The tunnel would not open: the SSH error, in English and as the window
+    /// words it.
+    Tunnel { why: &'a str, shown: &'a str },
     /// The server behind the tunnel failed the load: its error, in English
     /// and as the window words it.
     Server { why: &'a str, shown: &'a str },
@@ -2246,7 +2251,7 @@ impl TunnelRefusal<'_> {
         const RETRY: &str = "Refresh the schema to try again.";
         match self {
             TunnelRefusal::StillOpening => "SSH tunnel is not established yet".to_string(),
-            TunnelRefusal::Tunnel(why) => {
+            TunnelRefusal::Tunnel { why, .. } => {
                 format!("The SSH tunnel could not be opened: {why}. {RETRY}")
             }
             TunnelRefusal::Server { why, .. } => {
@@ -2265,6 +2270,13 @@ mod tunnel_failure_tests {
     /// A server's failure as an English window would show it.
     fn server(text: &str) -> LoadFailure {
         LoadFailure::Server {
+            text: text.into(),
+            shown: text.into(),
+        }
+    }
+
+    fn tunnel(text: &str) -> LoadFailure {
+        LoadFailure::Tunnel {
             text: text.into(),
             shown: text.into(),
         }
@@ -2300,7 +2312,7 @@ mod tunnel_failure_tests {
     #[test]
     fn a_refused_tunnel_names_the_ssh_error_and_how_to_retry() {
         let mut f = TunnelFailures::default();
-        f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
+        f.record(7, tunnel("SSH authentication failed"));
         let msg = f.refusal(7);
         assert!(msg.contains("SSH authentication failed"), "{msg}");
         assert!(msg.contains("could not be opened"), "{msg}");
@@ -2324,7 +2336,7 @@ mod tunnel_failure_tests {
     #[test]
     fn a_reason_ending_in_a_full_stop_is_not_doubled() {
         let mut f = TunnelFailures::default();
-        f.record(7, LoadFailure::Tunnel("no answer within 20s.".into()));
+        f.record(7, tunnel("no answer within 20s."));
         assert!(!f.refusal(7).contains(".."), "{}", f.refusal(7));
     }
 
@@ -2332,7 +2344,7 @@ mod tunnel_failure_tests {
     #[test]
     fn clearing_returns_to_still_opening() {
         let mut f = TunnelFailures::default();
-        f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
+        f.record(7, tunnel("SSH authentication failed"));
         f.clear(7);
         assert_eq!(f.refusal(7), STILL_OPENING);
     }
@@ -2340,14 +2352,14 @@ mod tunnel_failure_tests {
     #[test]
     fn a_failure_belongs_to_its_own_connection() {
         let mut f = TunnelFailures::default();
-        f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
+        f.record(7, tunnel("SSH authentication failed"));
         assert_eq!(f.refusal(8), STILL_OPENING);
     }
 
     #[test]
     fn the_latest_failure_is_the_one_reported() {
         let mut f = TunnelFailures::default();
-        f.record(7, LoadFailure::Tunnel("SSH authentication failed".into()));
+        f.record(7, tunnel("SSH authentication failed"));
         f.record(7, server("Unknown database 'app'"));
         let msg = f.refusal(7);
         assert!(msg.contains("Unknown database 'app'"), "{msg}");

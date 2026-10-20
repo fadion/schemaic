@@ -497,7 +497,7 @@ pub fn tunnel_refusal(
     use schemaic_core::connection::TunnelRefusal;
     match failures.refusal_of(conn_id) {
         TunnelRefusal::StillOpening => tr!("tunnel-still-opening"),
-        TunnelRefusal::Tunnel(why) => tr!("tunnel-could-not-open", error = why),
+        TunnelRefusal::Tunnel { shown, .. } => tr!("tunnel-could-not-open", error = shown),
         TunnelRefusal::Server { shown, .. } => tr!("tunnel-server-failed", error = shown),
     }
 }
@@ -1164,6 +1164,156 @@ pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
     }
 }
 
+/// Why a connection could not be made — core's `model::ConnectFailure`, what
+/// `DbError::ConnectFailed` carries, in the interface's language and without
+/// *connection failed:* (`db_connection_failed` puts it in front). The
+/// driver's, the SSH library's and the system's own words pass through, and
+/// so do hosts, paths and fingerprints.
+pub fn connect_failure_text(f: &schemaic_core::model::ConnectFailure) -> String {
+    use schemaic_core::model::{ConnectFailure, SshFailure, SshPhase, TlsFailure};
+    let ssh = |f: &SshFailure| -> String {
+        match f {
+            SshFailure::NoAnswer {
+                phase,
+                host_port,
+                secs,
+            } => {
+                let secs = secs.to_string();
+                let host_port = host_port.as_str();
+                match phase {
+                    SshPhase::Connect => {
+                        tr!("db-ssh-connect-no-answer", host = host_port, secs = secs)
+                    }
+                    SshPhase::Authentication => {
+                        tr!("db-ssh-auth-no-answer", host = host_port, secs = secs)
+                    }
+                }
+            }
+            SshFailure::AuthError(e) => tr!("db-ssh-auth-error", error = e.as_str()),
+            SshFailure::AuthFailed => tr!("db-ssh-auth-failed"),
+            SshFailure::KeyLoad(e) => tr!("db-ssh-key-load", error = e.as_str()),
+            SshFailure::KeyAuth(e) => tr!("db-ssh-key-auth", error = e.as_str()),
+            SshFailure::Agent(e) => tr!("db-ssh-agent", error = e.as_str()),
+            SshFailure::AgentEmpty => tr!("db-ssh-agent-empty"),
+            SshFailure::AgentAuth(e) => tr!("db-ssh-agent-auth", error = e.as_str()),
+            SshFailure::NoAgent => tr!("db-ssh-no-agent"),
+            SshFailure::NoAgentSocket(e) => tr!("db-ssh-no-agent-socket", error = e.as_str()),
+            SshFailure::JumpUnreachable { host_port, error } => tr!(
+                "db-ssh-jump-unreachable",
+                host = host_port.as_str(),
+                error = error.as_str()
+            ),
+            SshFailure::ConnectTo { host_port, error } => tr!(
+                "db-ssh-connect-to",
+                host = host_port.as_str(),
+                error = error.as_str()
+            ),
+            SshFailure::Connect(e) => tr!("db-ssh-connect", error = e.as_str()),
+            SshFailure::NoHost => tr!("db-ssh-no-host"),
+            SshFailure::Bind(e) => tr!("db-ssh-bind", error = e.as_str()),
+            SshFailure::NamedInstance { server, instance } => tr!(
+                "db-ssh-named-instance",
+                server = server.as_str(),
+                instance = instance.as_str()
+            ),
+            // A real line break is two messages joined here.
+            SshFailure::HostKeyChanged {
+                host_port,
+                known,
+                offered,
+                store,
+            } => {
+                let known = match known {
+                    Some(k) => k.clone(),
+                    None => tr!("db-ssh-host-key-none"),
+                };
+                [
+                    tr!("db-ssh-host-key-changed", host = host_port.as_str()),
+                    String::new(),
+                    tr!("db-ssh-host-key-expected", key = known),
+                    tr!("db-ssh-host-key-offered", key = offered.as_str()),
+                    String::new(),
+                    tr!("db-ssh-host-key-changed-advice", store = store.as_str()),
+                ]
+                .join("\n")
+            }
+            SshFailure::HostKeyStoreUnreadable {
+                host_port,
+                offered,
+                store,
+            } => [
+                tr!(
+                    "db-ssh-host-key-store",
+                    host = host_port.as_str(),
+                    key = offered.as_str(),
+                    store = store.as_str()
+                ),
+                String::new(),
+                tr!("db-ssh-host-key-store-advice", store = store.as_str()),
+            ]
+            .join("\n"),
+            SshFailure::Route(r) => crate::connection_form::route_note_text(
+                &schemaic_core::ssh_config::RouteNote::Refused(r.clone()),
+            ),
+        }
+    };
+    let tls = |f: &TlsFailure| -> String {
+        match f {
+            TlsFailure::Setup(e) => tr!("db-tls-setup", error = e.as_str()),
+            TlsFailure::ClientCertRejected(e) => tr!("db-tls-client-cert", error = e.as_str()),
+            TlsFailure::TrustStore(e) => tr!("db-tls-trust-store", error = e.as_str()),
+            TlsFailure::BadName { name, error } => tr!(
+                "db-tls-bad-name",
+                name = name.as_str(),
+                error = error.as_str()
+            ),
+            TlsFailure::CaEmpty(path) => tr!("db-tls-ca-empty", path = path.as_str()),
+            TlsFailure::CaUnusable(path) => tr!("db-tls-ca-unusable", path = path.as_str()),
+            TlsFailure::CertUnreadable { path, error } => tr!(
+                "db-tls-cert-unreadable",
+                path = path.as_str(),
+                error = error.as_str()
+            ),
+            TlsFailure::CertNotPem { path, error } => tr!(
+                "db-tls-cert-not-pem",
+                path = path.as_str(),
+                error = error.as_str()
+            ),
+            TlsFailure::CertIsDer(path) => tr!("db-tls-cert-is-der", path = path.as_str()),
+            TlsFailure::KeyUnreadable { path, error } => tr!(
+                "db-tls-key-unreadable",
+                path = path.as_str(),
+                error = error.as_str()
+            ),
+            TlsFailure::KeyEncrypted(path) => tr!("db-tls-key-encrypted", path = path.as_str()),
+            TlsFailure::KeyNotPem { path, error } => tr!(
+                "db-tls-key-not-pem",
+                path = path.as_str(),
+                error = error.as_str()
+            ),
+        }
+    };
+    match f {
+        ConnectFailure::TimedOut => tr!("db-connect-timed-out"),
+        ConnectFailure::InitFailed { statement, error } => tr!(
+            "db-connect-init-failed",
+            statement = statement.as_str(),
+            error = error.as_str()
+        ),
+        ConnectFailure::SessionRetired => tr!("db-connect-session-retired"),
+        ConnectFailure::BeginFailed(e) => tr!("db-connect-begin-failed", error = e.as_str()),
+        ConnectFailure::PrepareSession(e) => {
+            tr!("db-connect-prepare-session", error = e.as_str())
+        }
+        ConnectFailure::ReadOnlySetup(e) => tr!("db-connect-read-only-setup", error = e.as_str()),
+        ConnectFailure::GuardSession(e) => tr!("db-connect-guard-session", error = e.as_str()),
+        ConnectFailure::PlanSetup(e) => tr!("db-connect-plan-setup", error = e.as_str()),
+        ConnectFailure::NoMaintenanceDb => tr!("db-connect-no-maintenance-db"),
+        ConnectFailure::Ssh(f) => ssh(f),
+        ConnectFailure::Tls(f) => tls(f),
+    }
+}
+
 /// Why Seed rows could not use the model's reply — core's `seed::SeedError`
 /// in the interface's language, the JSON parser's own text passing through.
 pub fn seed_error_text(e: &schemaic_core::seed::SeedError) -> String {
@@ -1266,6 +1416,125 @@ mod tests {
         }
         for r in reasons {
             assert_eq!(guard_reason_text(&r), r.message(), "{r:?}");
+        }
+    }
+
+    /// **Every connect failure reads in English exactly as core's
+    /// `ConnectFailure::message`** — each frame, every SSH and TLS failure,
+    /// both timeout phases, a changed host key with a recorded key and none,
+    /// and a route refusal.
+    #[test]
+    fn english_says_every_connect_failure_as_core_does() {
+        use schemaic_core::model::{ConnectFailure, SshFailure, SshPhase, TlsFailure};
+        let s = |t: &str| t.to_string();
+        let e = || s("Connection refused (os error 111)");
+        let mut all = vec![
+            ConnectFailure::TimedOut,
+            ConnectFailure::InitFailed {
+                statement: s("SET ROLE app"),
+                error: e(),
+            },
+            ConnectFailure::SessionRetired,
+            ConnectFailure::BeginFailed(e()),
+            ConnectFailure::PrepareSession(e()),
+            ConnectFailure::ReadOnlySetup(e()),
+            ConnectFailure::GuardSession(e()),
+            ConnectFailure::PlanSetup(e()),
+            ConnectFailure::NoMaintenanceDb,
+        ];
+        let ssh = [
+            SshFailure::NoAnswer {
+                phase: SshPhase::Connect,
+                host_port: s("bastion:22"),
+                secs: 20,
+            },
+            SshFailure::NoAnswer {
+                phase: SshPhase::Authentication,
+                host_port: s("bastion:22"),
+                secs: 60,
+            },
+            SshFailure::AuthError(e()),
+            SshFailure::AuthFailed,
+            SshFailure::KeyLoad(e()),
+            SshFailure::KeyAuth(e()),
+            SshFailure::Agent(e()),
+            SshFailure::AgentEmpty,
+            SshFailure::AgentAuth(e()),
+            SshFailure::NoAgent,
+            SshFailure::NoAgentSocket(e()),
+            SshFailure::JumpUnreachable {
+                host_port: s("inner:22"),
+                error: e(),
+            },
+            SshFailure::ConnectTo {
+                host_port: s("inner:22"),
+                error: e(),
+            },
+            SshFailure::Connect(e()),
+            SshFailure::NoHost,
+            SshFailure::Bind(e()),
+            SshFailure::NamedInstance {
+                server: s("db.corp"),
+                instance: s("SQLEXPRESS"),
+            },
+            SshFailure::HostKeyChanged {
+                host_port: s("jump:22"),
+                known: Some(s("SHA256:old")),
+                offered: s("SHA256:new"),
+                store: s("known_hosts.json"),
+            },
+            SshFailure::HostKeyChanged {
+                host_port: s("jump:22"),
+                known: None,
+                offered: s("SHA256:new"),
+                store: s("known_hosts.json"),
+            },
+            SshFailure::HostKeyStoreUnreadable {
+                host_port: s("jump:22"),
+                offered: s("SHA256:new"),
+                store: s("known_hosts.json"),
+            },
+            SshFailure::Route(
+                schemaic_core::ssh_config::RouteRefusal::ConfigJumpPassword {
+                    host: s("prod"),
+                    jump: s("jump.corp"),
+                },
+            ),
+        ];
+        all.extend(ssh.into_iter().map(ConnectFailure::Ssh));
+        let p = || s("/tmp/client.crt");
+        let tls = [
+            TlsFailure::Setup(e()),
+            TlsFailure::ClientCertRejected(e()),
+            TlsFailure::TrustStore(e()),
+            TlsFailure::BadName {
+                name: s("db"),
+                error: e(),
+            },
+            TlsFailure::CaEmpty(p()),
+            TlsFailure::CaUnusable(p()),
+            TlsFailure::CertUnreadable {
+                path: p(),
+                error: e(),
+            },
+            TlsFailure::CertNotPem {
+                path: p(),
+                error: e(),
+            },
+            TlsFailure::CertIsDer(p()),
+            TlsFailure::KeyUnreadable {
+                path: p(),
+                error: e(),
+            },
+            TlsFailure::KeyEncrypted(p()),
+            TlsFailure::KeyNotPem {
+                path: p(),
+                error: e(),
+            },
+        ];
+        all.extend(tls.into_iter().map(ConnectFailure::Tls));
+        for f in all {
+            assert_eq!(connect_failure_text(&f), f.message(), "{f:?}");
         }
     }
 
@@ -1743,7 +2012,13 @@ mod tests {
     fn english_says_the_tunnel_refusal_as_core_does() {
         use schemaic_core::connection::{LoadFailure, TunnelFailures};
         let mut f = TunnelFailures::default();
-        f.record(1, LoadFailure::Tunnel("Host key mismatch.".into()));
+        f.record(
+            1,
+            LoadFailure::Tunnel {
+                text: "Host key mismatch.".into(),
+                shown: "Host key mismatch.".into(),
+            },
+        );
         let denied = "connection failed: Access denied for user 'u'";
         f.record(
             2,
@@ -1772,6 +2047,22 @@ mod tests {
         );
         assert!(tunnel_refusal(&f, 2).contains("Verbindung fehlgeschlagen: Access denied"));
         assert!(f.refusal(2).contains("connection failed: Access denied"));
+        // And a tunnel that would not open, the same way.
+        f.record(
+            3,
+            LoadFailure::Tunnel {
+                text: "connection failed: SSH authentication failed".into(),
+                shown: "Verbindung fehlgeschlagen: SSH-Anmeldung fehlgeschlagen".into(),
+            },
+        );
+        assert!(
+            tunnel_refusal(&f, 3)
+                .contains("Verbindung fehlgeschlagen: SSH-Anmeldung fehlgeschlagen")
+        );
+        assert!(
+            f.refusal(3)
+                .contains("connection failed: SSH authentication failed")
+        );
     }
 
     /// **A refused kill and an incomparable pair read in English exactly as

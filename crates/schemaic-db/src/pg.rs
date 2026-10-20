@@ -320,7 +320,9 @@ pub(crate) async fn connect_maintenance_avoiding(
             Err((e, false)) => return Err(e),
         }
     }
-    Err(last.unwrap_or_else(|| DbError::Connect("no maintenance database reachable".to_string())))
+    Err(last.unwrap_or(DbError::ConnectFailed(
+        crate::ConnectFailure::NoMaintenanceDb,
+    )))
 }
 
 /// Which databases to try, in order, for server-level work.
@@ -389,7 +391,7 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
     };
     tokio::time::timeout(timeout, check)
         .await
-        .map_err(|_| DbError::Connect("timed out".to_string()))?
+        .map_err(|_| DbError::ConnectFailed(crate::ConnectFailure::TimedOut))?
 }
 
 /// The databases worth putting in the schema tree.
@@ -449,7 +451,7 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
     };
     tokio::time::timeout(crate::PING_TIMEOUT, listing)
         .await
-        .map_err(|_| DbError::Connect("timed out".to_string()))?
+        .map_err(|_| DbError::ConnectFailed(crate::ConnectFailure::TimedOut))?
 }
 
 /// Connect (to `database`, or the maintenance db if unscoped) and run one
@@ -637,10 +639,7 @@ fn placed(message: String, pos: Option<&tokio_postgres::error::ErrorPosition>) -
 /// `Connect`, not [`db_err`]'s `Query`: a `Query` is offered *AI fix* over the
 /// buffer, and there is nothing in it to fix.
 pub(crate) fn read_only_setup_failed(e: &tokio_postgres::Error) -> DbError {
-    DbError::Connect(format!(
-        "could not make the session read-only: {}",
-        db_text(e)
-    ))
+    DbError::ConnectFailed(crate::ConnectFailure::ReadOnlySetup(db_text(e)))
 }
 
 /// [`db_err`]'s text, for the paths that carry a bare `String` rather than a

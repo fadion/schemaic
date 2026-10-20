@@ -65,17 +65,23 @@ pub const TUNNEL_AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 /// `fut`, or the refusal naming the phase that did not answer within `limit`.
 async fn within<T>(
     limit: Duration,
-    phase: &str,
+    phase: crate::SshPhase,
     host_port: &str,
     fut: impl std::future::Future<Output = Result<T, DbError>>,
 ) -> Result<T, DbError> {
     match tokio::time::timeout(limit, fut).await {
         Ok(r) => r,
-        Err(_) => Err(DbError::Connect(format!(
-            "SSH {phase} with {host_port}: no answer within {}s",
-            limit.as_secs()
-        ))),
+        Err(_) => Err(ssh_failed(crate::SshFailure::NoAnswer {
+            phase,
+            host_port: host_port.to_string(),
+            secs: limit.as_secs(),
+        })),
     }
+}
+
+/// `failure` as the connect's error.
+fn ssh_failed(failure: crate::SshFailure) -> DbError {
+    DbError::ConnectFailed(crate::ConnectFailure::Ssh(failure))
 }
 
 /// A live SSH tunnel. Dropping it aborts the accept loop, releasing the local
@@ -109,7 +115,7 @@ struct TunnelClient {
     /// opposite of a mismatch, and the natural remedy for it (clear the trust
     /// record) is exactly what hands the attacker's key a permanent welcome. So
     /// the verdict travels out of band and `open_tunnel` reports *that* instead.
-    refusal: Arc<Mutex<Option<String>>>,
+    refusal: Arc<Mutex<Option<crate::SshFailure>>>,
 }
 
 /// Serialises the known-hosts read-modify-write.
@@ -178,28 +184,20 @@ fn refusal_message(
     host_port: &str,
     known: Option<&str>,
     offered: &str,
-) -> Option<String> {
+) -> Option<crate::SshFailure> {
     match verdict {
         HostKeyVerdict::Accept | HostKeyVerdict::RecordAndAccept => None,
-        HostKeyVerdict::Mismatch => Some(format!(
-            "The SSH host key for {host_port} has CHANGED since Schemaic first trusted it.\n\n\
-             Expected {}\nOffered  {offered}\n\n\
-             This can mean the server was rebuilt or its key rotated — or that something is \
-             intercepting the connection. Nothing was sent to it. Verify the new fingerprint out \
-             of band (on the server's own console, or with whoever administers it) before \
-             trusting it. Once you have, remove this host's entry from {KNOWN_HOSTS_FILE} in \
-             Schemaic's config directory to record the new key.",
-            known.unwrap_or("(no recorded key)")
-        )),
-        HostKeyVerdict::StoreUnreadable => Some(format!(
-            "Schemaic could not read its record of trusted SSH host keys \
-             ({KNOWN_HOSTS_FILE}), so it can't tell whether {host_port}'s key \
-             ({offered}) is the one you trusted before.\n\n\
-             The connection was refused rather than trusting the key on sight. Repair or delete \
-             {KNOWN_HOSTS_FILE} in Schemaic's config directory — deleting it means every SSH host \
-             is trusted afresh on its next connection, so do that only if you can verify the \
-             fingerprints."
-        )),
+        HostKeyVerdict::Mismatch => Some(crate::SshFailure::HostKeyChanged {
+            host_port: host_port.to_string(),
+            known: known.map(str::to_string),
+            offered: offered.to_string(),
+            store: KNOWN_HOSTS_FILE.to_string(),
+        }),
+        HostKeyVerdict::StoreUnreadable => Some(crate::SshFailure::HostKeyStoreUnreadable {
+            host_port: host_port.to_string(),
+            offered: offered.to_string(),
+            store: KNOWN_HOSTS_FILE.to_string(),
+        }),
     }
 }
 
@@ -272,7 +270,7 @@ async fn authenticate(
         SshAuth::Password => session
             .authenticate_password(user.to_string(), ssh.password.clone())
             .await
-            .map_err(|e| DbError::Connect(format!("SSH auth error: {e}")))?
+            .map_err(|e| ssh_failed(crate::SshFailure::AuthError(e.to_string())))?
             .success(),
         SshAuth::KeyPair => authenticate_key(session, ssh, user).await?,
         SshAuth::Agent => authenticate_agent(session, user).await?,
@@ -280,7 +278,7 @@ async fn authenticate(
     if ok {
         Ok(())
     } else {
-        Err(DbError::Connect("SSH authentication failed".to_string()))
+        Err(ssh_failed(crate::SshFailure::AuthFailed))
     }
 }
 
@@ -293,7 +291,7 @@ async fn authenticate_key(
 ) -> Result<bool, DbError> {
     let passphrase = (!ssh.key_passphrase.is_empty()).then_some(ssh.key_passphrase.as_str());
     let key = russh::keys::load_secret_key(&ssh.key_path, passphrase)
-        .map_err(|e| DbError::Connect(format!("SSH key load failed: {e}")))?;
+        .map_err(|e| ssh_failed(crate::SshFailure::KeyLoad(e.to_string())))?;
     let hash_alg = session
         .best_supported_rsa_hash()
         .await
@@ -306,7 +304,7 @@ async fn authenticate_key(
             PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
         )
         .await
-        .map_err(|e| DbError::Connect(format!("SSH key auth error: {e}")))?;
+        .map_err(|e| ssh_failed(crate::SshFailure::KeyAuth(e.to_string())))?;
     Ok(res.success())
 }
 
@@ -325,11 +323,9 @@ where
     let ids = agent
         .request_identities()
         .await
-        .map_err(|e| DbError::Connect(format!("SSH agent error: {e}")))?;
+        .map_err(|e| ssh_failed(crate::SshFailure::Agent(e.to_string())))?;
     if ids.is_empty() {
-        return Err(DbError::Connect(
-            "SSH agent has no identities loaded (run `ssh-add`)".to_string(),
-        ));
+        return Err(ssh_failed(crate::SshFailure::AgentEmpty));
     }
     let hash_alg = session
         .best_supported_rsa_hash()
@@ -342,7 +338,7 @@ where
             let res = session
                 .authenticate_publickey_with(user, key, hash_alg, &mut agent)
                 .await
-                .map_err(|e| DbError::Connect(format!("SSH agent auth error: {e}")))?;
+                .map_err(|e| ssh_failed(crate::SshFailure::AgentAuth(e.to_string())))?;
             if res.success() {
                 return Ok(true);
             }
@@ -365,10 +361,7 @@ async fn authenticate_agent(
     if let Ok(agent) = AgentClient::connect_pageant().await {
         return agent_try(session, user, agent).await;
     }
-    Err(DbError::Connect(
-        "no SSH agent found (start the OpenSSH Authentication Agent service, or run Pageant)"
-            .to_string(),
-    ))
+    Err(ssh_failed(crate::SshFailure::NoAgent))
 }
 
 #[cfg(unix)]
@@ -379,7 +372,7 @@ async fn authenticate_agent(
     use russh::keys::agent::client::AgentClient;
     let agent = AgentClient::connect_env()
         .await
-        .map_err(|e| DbError::Connect(format!("no SSH agent ($SSH_AUTH_SOCK): {e}")))?;
+        .map_err(|e| ssh_failed(crate::SshFailure::NoAgentSocket(e.to_string())))?;
     agent_try(session, user, agent).await
 }
 
@@ -391,13 +384,12 @@ async fn authenticate_agent(
 /// the question cannot be asked through it, and dialled as a name
 /// `server\INSTANCE` resolves to nothing. Refused before the SSH sign-in,
 /// saying how to reach the instance instead.
-pub(crate) fn tunnel_target_refusal(target_host: &str) -> Option<String> {
+pub(crate) fn tunnel_target_refusal(target_host: &str) -> Option<crate::SshFailure> {
     let (server, instance) = schemaic_core::connection::sql_server_instance(target_host)?;
-    Some(format!(
-        "A named instance cannot be reached through an SSH tunnel: SQL Server Browser answers \
-         with its port over UDP, which the tunnel does not carry. Set the host to {server} \
-         without \\{instance} and the port to the one the instance listens on."
-    ))
+    Some(crate::SshFailure::NamedInstance {
+        server: server.to_string(),
+        instance: instance.to_string(),
+    })
 }
 
 /// Open an SSH tunnel to `target_host:target_port` and return a handle carrying
@@ -409,7 +401,7 @@ pub async fn open_tunnel(
     target_port: u16,
 ) -> Result<TunnelHandle, DbError> {
     if let Some(why) = tunnel_target_refusal(target_host) {
-        return Err(DbError::Connect(why));
+        return Err(ssh_failed(why));
     }
     // Keepalives so a dropped SSH session is detected instead of the local port
     // being reused against a dead tunnel forever (review H9).
@@ -436,12 +428,12 @@ pub async fn open_tunnel(
             .as_ref()
             .map(|(text, home)| (text.as_str(), home.as_deref())),
     )
-    .map_err(|why| DbError::Connect(why.to_string()))?;
+    .map_err(|why| ssh_failed(crate::SshFailure::Route(why)))?;
     let ssh = &resolved;
     let mut sessions: Vec<client::Handle<TunnelClient>> = Vec::with_capacity(route.len());
     for hop in &route {
         let host_port = format!("{}:{}", hop.host, hop.port);
-        let refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let refusal: Arc<Mutex<Option<crate::SshFailure>>> = Arc::new(Mutex::new(None));
         let handler = TunnelClient {
             host_port: host_port.clone(),
             refusal: refusal.clone(),
@@ -461,9 +453,10 @@ pub async fn open_tunnel(
                         )
                         .await
                         .map_err(|e| {
-                            DbError::Connect(format!(
-                                "SSH jump host could not reach {host_port}: {e}"
-                            ))
+                            ssh_failed(crate::SshFailure::JumpUnreachable {
+                                host_port: host_port.clone(),
+                                error: e.to_string(),
+                            })
                         })?;
                     client::connect_stream(config, channel.into_stream(), handler).await
                 }
@@ -472,18 +465,25 @@ pub async fn open_tunnel(
                 // A host-key refusal reaches here as russh's generic `UnknownKey`.
                 // Our own verdict is the one worth showing.
                 match refusal.lock().ok().and_then(|g| g.clone()) {
-                    Some(msg) => DbError::Connect(msg),
-                    None if route.len() > 1 => {
-                        DbError::Connect(format!("SSH connect to {host_port} failed: {e}"))
-                    }
-                    None => DbError::Connect(format!("SSH connect failed: {e}")),
+                    Some(why) => ssh_failed(why),
+                    None if route.len() > 1 => ssh_failed(crate::SshFailure::ConnectTo {
+                        host_port: host_port.clone(),
+                        error: e.to_string(),
+                    }),
+                    None => ssh_failed(crate::SshFailure::Connect(e.to_string())),
                 }
             })
         };
-        let mut session = within(TUNNEL_CONNECT_TIMEOUT, "connect", &host_port, connect).await?;
+        let mut session = within(
+            TUNNEL_CONNECT_TIMEOUT,
+            crate::SshPhase::Connect,
+            &host_port,
+            connect,
+        )
+        .await?;
         within(
             TUNNEL_AUTH_TIMEOUT,
-            "authentication",
+            crate::SshPhase::Authentication,
             &host_port,
             authenticate(&mut session, ssh, &hop.user),
         )
@@ -492,14 +492,14 @@ pub async fn open_tunnel(
     }
     let session = sessions
         .pop()
-        .ok_or_else(|| DbError::Connect("SSH tunnel has no host".to_string()))?;
+        .ok_or_else(|| ssh_failed(crate::SshFailure::NoHost))?;
     // The jump hosts' sessions carry the last one's transport, so they live as
     // long as the tunnel does — moved into the accept loop below.
     let jumps = sessions;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
-        .map_err(|e| DbError::Connect(format!("local tunnel bind failed: {e}")))?;
+        .map_err(|e| ssh_failed(crate::SshFailure::Bind(e.to_string())))?;
     let local_port = listener
         .local_addr()
         .map_err(|e| DbError::Connect(e.to_string()))?
@@ -552,7 +552,7 @@ pub async fn open_tunnel(
 #[cfg(test)]
 mod tests {
     use super::{HostKeyVerdict, known_host_decision, refusal_message};
-    use super::{TUNNEL_AUTH_TIMEOUT, TUNNEL_CONNECT_TIMEOUT, within};
+    use super::{TUNNEL_AUTH_TIMEOUT, TUNNEL_CONNECT_TIMEOUT, ssh_failed, within};
     use crate::DbError;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -563,7 +563,8 @@ mod tests {
     /// so the refusal is the one every caller gets, and before any I/O.
     #[tokio::test]
     async fn a_named_instance_is_refused_through_a_tunnel() {
-        let why = super::tunnel_target_refusal("db.corp\\SQLEXPRESS").unwrap();
+        let refused = super::tunnel_target_refusal("db.corp\\SQLEXPRESS").unwrap();
+        let why = refused.to_string();
         assert!(why.contains("UDP") && why.contains("db.corp"), "{why}");
         assert!(super::tunnel_target_refusal("db.corp").is_none());
         let ssh = schemaic_core::connection::SshTunnel {
@@ -571,7 +572,7 @@ mod tests {
             ..Default::default()
         };
         match super::open_tunnel(&ssh, "db.corp\\SQLEXPRESS", 1433).await {
-            Err(DbError::Connect(m)) => assert_eq!(m, why),
+            Err(DbError::ConnectFailed(crate::ConnectFailure::Ssh(f))) => assert_eq!(f, refused),
             Err(e) => panic!("{e}"),
             Ok(_) => panic!("a tunnel opened to a named instance"),
         }
@@ -582,10 +583,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_silent_ssh_server_is_given_up_on_at_the_bound() {
         let silent = std::future::pending::<Result<(), DbError>>();
-        let got = within(TUNNEL_CONNECT_TIMEOUT, "connect", "bastion:22", silent).await;
+        let got = within(
+            TUNNEL_CONNECT_TIMEOUT,
+            crate::SshPhase::Connect,
+            "bastion:22",
+            silent,
+        )
+        .await;
         match got {
-            Err(DbError::Connect(msg)) => {
-                assert_eq!(msg, "SSH connect with bastion:22: no answer within 20s");
+            Err(e @ DbError::ConnectFailed(_)) => {
+                assert_eq!(
+                    e.to_string(),
+                    "connection failed: SSH connect with bastion:22: no answer within 20s"
+                );
             }
             other => panic!("expected a connect refusal, got {other:?}"),
         }
@@ -595,18 +605,28 @@ mod tests {
     /// own error, which must not be replaced by a timeout message.
     #[tokio::test(start_paused = true)]
     async fn an_answer_inside_the_bound_is_passed_through() {
-        let ok = within(TUNNEL_CONNECT_TIMEOUT, "connect", "h:22", async {
-            tokio::time::sleep(Duration::from_secs(19)).await;
-            Ok::<_, DbError>(5)
-        })
+        let ok = within(
+            TUNNEL_CONNECT_TIMEOUT,
+            crate::SshPhase::Connect,
+            "h:22",
+            async {
+                tokio::time::sleep(Duration::from_secs(19)).await;
+                Ok::<_, DbError>(5)
+            },
+        )
         .await;
         assert_eq!(ok.unwrap(), 5);
-        let refused = within(TUNNEL_AUTH_TIMEOUT, "authentication", "h:22", async {
-            Err::<(), _>(DbError::Connect("SSH authentication failed".into()))
-        })
+        let refused = within(
+            TUNNEL_AUTH_TIMEOUT,
+            crate::SshPhase::Authentication,
+            "h:22",
+            async { Err::<(), _>(ssh_failed(crate::SshFailure::AuthFailed)) },
+        )
         .await;
         match refused {
-            Err(DbError::Connect(msg)) => assert_eq!(msg, "SSH authentication failed"),
+            Err(DbError::ConnectFailed(crate::ConnectFailure::Ssh(f))) => {
+                assert_eq!(f.to_string(), "SSH authentication failed")
+            }
             other => panic!("expected the auth refusal itself, got {other:?}"),
         }
     }
@@ -686,7 +706,8 @@ mod tests {
             Some("SHA256:old"),
             "SHA256:new",
         )
-        .expect("a refusal must be explainable");
+        .expect("a refusal must be explainable")
+        .to_string();
         assert!(msg.contains("CHANGED"), "{msg}");
         assert!(msg.contains("jump.example:22"), "{msg}");
         assert!(
@@ -717,7 +738,8 @@ mod tests {
             None,
             "SHA256:new",
         )
-        .expect("a refusal must be explainable");
+        .expect("a refusal must be explainable")
+        .to_string();
         assert!(!msg.contains("CHANGED"), "{msg}");
         assert!(msg.contains(super::KNOWN_HOSTS_FILE), "{msg}");
     }

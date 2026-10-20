@@ -101,12 +101,7 @@ enum Backend {
 
 /// What a [`Backend::Retired`] session answers.
 fn retired_error() -> DbError {
-    DbError::Connect(
-        "this tab's connection was closed after a Stop the server did not acknowledge, \
-         and a new one could not be opened; its transaction was rolled back. Switch the \
-         tab to Auto and back to Manual to open another."
-            .to_string(),
-    )
+    DbError::ConnectFailed(crate::ConnectFailure::SessionRetired)
 }
 
 /// The three transaction statements the session issues itself, spelled per
@@ -181,7 +176,7 @@ fn aborted_commit() -> DbError {
 /// it the server's.
 fn begin_failed(e: DbError) -> DbError {
     match e {
-        DbError::Query(m) => DbError::Connect(format!("could not begin the transaction: {m}")),
+        DbError::Query(m) => DbError::ConnectFailed(crate::ConnectFailure::BeginFailed(m)),
         other => other,
     }
 }

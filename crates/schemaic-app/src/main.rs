@@ -411,6 +411,7 @@ fn db_error_shown(e: &DbError) -> String {
     match e {
         DbError::Query(m) | DbError::QueryAt { message: m, .. } => i18n::db_query_failed(m.clone()),
         DbError::Connect(m) => i18n::db_connection_failed(m.clone()),
+        DbError::ConnectFailed(f) => i18n::db_connection_failed(i18n::connect_failure_text(f)),
         DbError::Cancelled => i18n::db_query_cancelled(),
         DbError::Refused(r) => i18n::db_refusal_text(r),
         DbError::Write(f) => i18n::write_failure_text(f),
@@ -9945,7 +9946,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         {
                             Ok(h) => (Some(h.port()), Some(h)),
                             Err(e) => {
-                                send(Err(LoadFailure::Tunnel(e.to_string())));
+                                send(Err(LoadFailure::Tunnel {
+                                    text: e.to_string(),
+                                    shown: db_error_shown(&e),
+                                }));
                                 return;
                             }
                         },

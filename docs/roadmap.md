@@ -160,7 +160,10 @@ assertions pin English wording — stays the regression net throughout.
    init SQL's refusal (`init_sql::InitRefusal`; `connection_form::init_refusal_text`), and the
    SSH host's note (`ssh_config::RouteNote`, `RouteRefusal` and `connection::JumpHostError`;
    `route_note_text`), and the database layer's own refusals (`model::DbRefusal`, which
-   `DbError::Refused` and `WriteCause::Refused` carry; `i18n::db_refusal_text`).
+   `DbError::Refused` and `WriteCause::Refused` carry; `i18n::db_refusal_text`), and the frames
+   it puts around a driver's text at connect — SSH, TLS, timeouts, the session set-up
+   (`model::ConnectFailure` in `DbError::ConnectFailed`; `i18n::connect_failure_text`, and
+   `LoadFailure::Tunnel`'s `shown`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -182,11 +185,11 @@ assertions pin English wording — stays the regression net throughout.
    unchanged today is this phase's list to work from (resurveyed 2026-10-20; no English literal
    or hand-rolled plural is left in the two view crates' own code, so all of it is prose handed
    up from below):
-   - **`schemaic-db`'s own words inside `DbError::Connect` and `Query`** — the frames it puts
-     around a driver's or the OS's text at connect (SSH, TLS, cloud and Entra sign-in, the
-     connect timeout, the session set-up), the connect's SSH route refusal, and a handful of
-     its own `Query` sentences; found 2026-10-20, when the survey of the view crates could
-     not see them.
+   - **Cloud IAM and Entra sign-in's messages** — `schemaic-db`'s `cloud_iam.rs` and
+     `entra.rs` frames around the CLI's text, and core `cloud_iam`'s and `entra`'s
+     `failure_text`, `parse_token` and argv refusals, still inside a plain `DbError::Connect`.
+   - **`schemaic-db`'s own `Query` sentences** — `lib.rs`'s export, server-settings and
+     import ones, SQL Server's note that a batch runs on past an error, SQLite's lock advice.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).

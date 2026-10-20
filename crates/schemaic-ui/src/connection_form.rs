@@ -337,7 +337,7 @@ fn jump_host_error_text(e: &schemaic_core::connection::JumpHostError) -> String 
 /// The SSH host's note — core's `ssh_config::RouteNote` in the interface's
 /// language. Hosts, users, ports, key paths and jump lists pass through as
 /// the connection and the config spell them.
-fn route_note_text(note: &schemaic_core::ssh_config::RouteNote) -> String {
+pub(crate) fn route_note_text(note: &schemaic_core::ssh_config::RouteNote) -> String {
     use schemaic_core::ssh_config::{RouteHost, RouteNote, RouteRefusal, UnreadRoute};
     let has = |o: &Option<String>| if o.is_some() { "some" } else { "none" };
     let why = match note {

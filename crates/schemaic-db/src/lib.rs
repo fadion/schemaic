@@ -103,11 +103,18 @@ use tokio_util::sync::CancellationToken;
 
 /// [`DbError::Refused`]'s value, where every producer in this crate names it.
 pub use schemaic_core::model::DbRefusal;
+/// [`DbError::ConnectFailed`]'s values.
+pub use schemaic_core::model::{ConnectFailure, SshFailure, SshPhase, TlsFailure};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DbError {
     #[error("connection failed: {0}")]
     Connect(String),
+    /// A [`DbError::Connect`] in Schemaic's words around the driver's
+    /// ([`schemaic_core::model::ConnectFailure`]): displayed the same way, and
+    /// worded by the interface in its own language.
+    #[error("connection failed: {0}")]
+    ConnectFailed(schemaic_core::model::ConnectFailure),
     #[error("query failed: {0}")]
     Query(String),
     /// A [`DbError::Query`] the server **placed**: `at` is its 1-based
@@ -162,7 +169,7 @@ impl DbError {
     pub fn modal_source(&self) -> ErrorSource {
         match self {
             DbError::Query(_) | DbError::QueryAt { .. } => ErrorSource::Statement,
-            DbError::Connect(_) => ErrorSource::Server,
+            DbError::Connect(_) | DbError::ConnectFailed(_) => ErrorSource::Server,
             DbError::Cancelled | DbError::Refused(_) => ErrorSource::App,
             DbError::Write(f) if f.cause.is_statements() => ErrorSource::Statement,
             DbError::Write(_) => ErrorSource::App,
@@ -184,6 +191,7 @@ impl DbError {
             DbError::QueryAt { at, .. } => Some(*at),
             DbError::Query(_)
             | DbError::Connect(_)
+            | DbError::ConnectFailed(_)
             | DbError::Cancelled
             | DbError::Refused(_)
             | DbError::Write(_) => None,
@@ -827,7 +835,10 @@ impl Db {
     /// user asked for (a `SET ROLE` that did not take would run as the
     /// login's own role).
     pub(crate) fn init_failed(stmt: &str, err: impl std::fmt::Display) -> DbError {
-        DbError::Connect(format!("init SQL `{stmt}` failed: {err}"))
+        DbError::ConnectFailed(ConnectFailure::InitFailed {
+            statement: stmt.to_string(),
+            error: err.to_string(),
+        })
     }
 
     /// This endpoint, signing in as `auth` — for the MCP subprocess, which
@@ -1365,7 +1376,7 @@ impl Db {
         };
         tokio::time::timeout(PING_TIMEOUT, fetch)
             .await
-            .map_err(|_| DbError::Connect("timed out".to_string()))?
+            .map_err(|_| DbError::ConnectFailed(ConnectFailure::TimedOut))?
     }
 }
 
@@ -1834,7 +1845,7 @@ impl Db {
                 // share can block in `open` for as long as the OS lets it.
                 return match tokio::time::timeout(timeout, sqlite::ping(self)).await {
                     Ok(r) => r,
-                    Err(_) => Err(DbError::Connect("timed out".to_string())),
+                    Err(_) => Err(DbError::ConnectFailed(ConnectFailure::TimedOut)),
                 };
             }
             // Bounded inside, like its two neighbours — see `mysql::ping`.
@@ -2093,7 +2104,7 @@ impl Db {
         };
         tokio::time::timeout(PING_TIMEOUT, poll)
             .await
-            .map_err(|_| DbError::Connect("timed out".to_string()))?
+            .map_err(|_| DbError::ConnectFailed(ConnectFailure::TimedOut))?
     }
 
     /// The locks this server's sessions hold and wait for — Server Activity's
@@ -2122,7 +2133,7 @@ impl Db {
         };
         let mut list = tokio::time::timeout(PING_TIMEOUT, poll)
             .await
-            .map_err(|_| DbError::Connect("timed out".to_string()))??;
+            .map_err(|_| DbError::ConnectFailed(ConnectFailure::TimedOut))??;
         list.truncated |= activity::prepare_locks(&mut list.locks);
         Ok(list)
     }
@@ -2171,7 +2182,7 @@ impl Db {
         };
         tokio::time::timeout(PING_TIMEOUT, fetch)
             .await
-            .map_err(|_| DbError::Connect("timed out".to_string()))?
+            .map_err(|_| DbError::ConnectFailed(ConnectFailure::TimedOut))?
     }
 
     /// Cancel a statement, or terminate a session outright, by server id.
@@ -2213,7 +2224,7 @@ impl Db {
         };
         tokio::time::timeout(CANCEL_TIMEOUT, kill)
             .await
-            .map_err(|_| DbError::Connect("timed out".to_string()))?
+            .map_err(|_| DbError::ConnectFailed(ConnectFailure::TimedOut))?
     }
 
     /// Every account the server will tell us about.

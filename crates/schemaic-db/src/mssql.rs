@@ -404,7 +404,7 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
     };
     tokio::time::timeout(timeout, check)
         .await
-        .map_err(|_| DbError::Connect("timed out".to_string()))?
+        .map_err(|_| DbError::ConnectFailed(crate::ConnectFailure::TimedOut))?
 }
 
 /// The databases worth putting in the schema tree: online, open to this
@@ -558,7 +558,7 @@ where
     UF: std::future::Future<Output = Result<R, DbError>>,
 {
     let start = tokio::time::Instant::now();
-    let timed_out = || DbError::Connect("timed out".to_string());
+    let timed_out = || DbError::ConnectFailed(crate::ConnectFailure::TimedOut);
     let left = |start: tokio::time::Instant| budget.saturating_sub(start.elapsed());
     let client = tokio::time::timeout(budget, connect)
         .await
@@ -621,7 +621,7 @@ pub(crate) async fn fetch_query(
 /// Schemaic's statement, not the user's, so `Connect` rather than `Query`, as
 /// `pg::read_only_setup_failed` explains.
 fn read_only_setup_failed(e: DbError) -> DbError {
-    DbError::Connect(format!("could not guard the session: {e}"))
+    DbError::ConnectFailed(crate::ConnectFailure::GuardSession(e.to_string()))
 }
 
 /// Run several statements in order on ONE connection, so session state
@@ -3302,7 +3302,7 @@ pub(crate) async fn explain(
     for step in setup {
         drain(&mut client, step)
             .await
-            .map_err(|e| DbError::Connect(format!("could not set up the plan: {e}")))?;
+            .map_err(|e| DbError::ConnectFailed(crate::ConnectFailure::PlanSetup(e.to_string())))?;
     }
     let docs = plan_documents(&mut client, sql, &cancel).await?;
     // Dropped, not committed: a measured statement's work is rolled back.
@@ -5264,6 +5264,7 @@ fn cancelled_import(undone: Rollback) -> DbError {
 fn err_text(e: DbError) -> String {
     match e {
         DbError::Query(m) | DbError::Connect(m) => m,
+        DbError::ConnectFailed(f) => f.to_string(),
         other => other.to_string(),
     }
 }
@@ -7183,7 +7184,13 @@ mod tests {
             || async { panic!("the fallback ran") },
         )
         .await;
-        assert!(matches!(got, Err(DbError::Connect(_))), "{got:?}");
+        assert!(
+            matches!(
+                got,
+                Err(DbError::ConnectFailed(crate::ConnectFailure::TimedOut))
+            ),
+            "{got:?}"
+        );
         assert!(start.elapsed() <= crate::PING_TIMEOUT);
         let got: Result<Vec<String>, _> = listing_within(
             crate::PING_TIMEOUT,

@@ -2104,7 +2104,7 @@ fn fk_violations(conn: &SqliteConn) -> Result<FkViolations, DbError> {
 pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
     match tokio::time::timeout(crate::PING_TIMEOUT, ping(db)).await {
         Ok(r) => r?,
-        Err(_) => return Err(DbError::Connect("timed out".to_string())),
+        Err(_) => return Err(DbError::ConnectFailed(crate::ConnectFailure::TimedOut)),
     }
     Ok(vec![MAIN.to_string()])
 }

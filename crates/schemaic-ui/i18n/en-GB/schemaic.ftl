@@ -535,6 +535,61 @@ db-refused-sqlite-no-column = { $table }.{ $column } is not a column this table 
 db-refused-sqlite-generated = { $column } is a generated column: it has no default to set it back to, and SQLite computes it from the row
 db-refused-sqlite-sizes-too-large = Table sizes are read only for a database up to { $cap }: SQLite measures them by reading every page of the file, and this one is { $file }.
 
+## Why a connection could not be made (core's model::ConnectFailure), after
+## db-connection-failed's prefix; a test holds the English equal. $error is
+## the driver's, the SSH library's or the system's own text; $host a
+## host:port; $path a file; $secs a number of seconds; $key a fingerprint.
+
+db-connect-timed-out = timed out
+db-connect-init-failed = init SQL `{ $statement }` failed: { $error }
+db-connect-session-retired = this tab's connection was closed after a Stop the server did not acknowledge, and a new one could not be opened; its transaction was rolled back. Switch the tab to Auto and back to Manual to open another.
+db-connect-begin-failed = could not begin the transaction: { $error }
+db-connect-prepare-session = could not prepare the session: { $error }
+db-connect-read-only-setup = could not make the session read-only: { $error }
+db-connect-guard-session = could not guard the session: { $error }
+db-connect-plan-setup = could not set up the plan: { $error }
+db-connect-no-maintenance-db = no maintenance database reachable
+db-ssh-connect-no-answer = SSH connect with { $host }: no answer within { $secs }s
+db-ssh-auth-no-answer = SSH authentication with { $host }: no answer within { $secs }s
+db-ssh-auth-error = SSH auth error: { $error }
+db-ssh-auth-failed = SSH authentication failed
+db-ssh-key-load = SSH key load failed: { $error }
+db-ssh-key-auth = SSH key auth error: { $error }
+db-ssh-agent = SSH agent error: { $error }
+db-ssh-agent-empty = SSH agent has no identities loaded (run `ssh-add`)
+db-ssh-agent-auth = SSH agent auth error: { $error }
+db-ssh-no-agent = no SSH agent found (start the OpenSSH Authentication Agent service, or run Pageant)
+db-ssh-no-agent-socket = no SSH agent ($SSH_AUTH_SOCK): { $error }
+db-ssh-jump-unreachable = SSH jump host could not reach { $host }: { $error }
+db-ssh-connect-to = SSH connect to { $host } failed: { $error }
+db-ssh-connect = SSH connect failed: { $error }
+db-ssh-no-host = SSH tunnel has no host
+db-ssh-bind = local tunnel bind failed: { $error }
+# $server and $instance are the two halves of server\instance.
+db-ssh-named-instance = A named instance cannot be reached through an SSH tunnel: SQL Server Browser answers with its port over UDP, which the tunnel does not carry. Set the host to { $server } without \{ $instance } and the port to the one the instance listens on.
+# A changed host key, in three paragraphs: this, the two fingerprints (the
+# second padded to line up with the first), and the advice. $store is the
+# trusted-keys file's name.
+db-ssh-host-key-changed = The SSH host key for { $host } has CHANGED since Schemaic first trusted it.
+db-ssh-host-key-expected = Expected { $key }
+db-ssh-host-key-offered = Offered  { $key }
+db-ssh-host-key-none = (no recorded key)
+db-ssh-host-key-changed-advice = This can mean the server was rebuilt or its key rotated — or that something is intercepting the connection. Nothing was sent to it. Verify the new fingerprint out of band (on the server's own console, or with whoever administers it) before trusting it. Once you have, remove this host's entry from { $store } in Schemaic's config directory to record the new key.
+db-ssh-host-key-store = Schemaic could not read its record of trusted SSH host keys ({ $store }), so it can't tell whether { $host }'s key ({ $key }) is the one you trusted before.
+db-ssh-host-key-store-advice = The connection was refused rather than trusting the key on sight. Repair or delete { $store } in Schemaic's config directory — deleting it means every SSH host is trusted afresh on its next connection, so do that only if you can verify the fingerprints.
+db-tls-setup = TLS setup failed: { $error }
+db-tls-client-cert = client certificate rejected: { $error }
+db-tls-trust-store = TLS trust store is unusable: { $error }
+db-tls-bad-name = { $name } is not a name a certificate can carry: { $error }
+db-tls-ca-empty = CA file { $path } contains no certificates
+db-tls-ca-unusable = CA file { $path } contains a certificate that cannot be used as a trust anchor
+db-tls-cert-unreadable = cannot read certificate file { $path }: { $error }
+db-tls-cert-not-pem = { $path } is not a PEM certificate file: { $error }
+db-tls-cert-is-der = { $path } holds no PEM certificate — a DER file has to be converted first (openssl x509 -inform der -in { $path } -out cert.pem)
+db-tls-key-unreadable = cannot read key file { $path }: { $error }
+db-tls-key-encrypted = { $path } is a passphrase-protected private key, which Schemaic cannot open. Decrypt it first: openssl pkcs8 -in { $path } -out client-key.pem
+db-tls-key-not-pem = { $path } is not a PEM private key: { $error }
+
 ## A DDL plan that failed, in the DDL preview (schemaic-db's DdlError). English
 ## must read exactly as DdlError displays (a test holds it).
 

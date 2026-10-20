@@ -246,6 +246,21 @@ existing prose was left alone.
     what they read before; the interface's wording is held to it by
     `english_says_every_db_refusal_as_core_does` (*The string catalogue*). The names, types and
     values inside are the user's or the server's, and a `SqliteWorker`'s text is the runtime's.
+    **`ConnectFailure` is the same move for the sentences `schemaic-db` composes *around* a
+    driver's, the SSH library's or the operating system's text at connect** — what
+    `DbError::ConnectFailed` carries: `TimedOut`, `InitFailed { statement, error }`,
+    `SessionRetired`, `BeginFailed`, `PrepareSession`, `ReadOnlySetup`, `GuardSession`,
+    `PlanSetup`, `NoMaintenanceDb`, and `Ssh(SshFailure)` and `Tls(TlsFailure)`, a variant for each
+    of `ssh.rs`'s and `tls.rs`'s failures (under `schemaic-db`). `SshFailure::NoAnswer` carries an
+    `SshPhase` — `Connect` or `Authentication` — where `ssh::within` used to splice the word into
+    its string, the two host-key refusals carry the host, the fingerprints and the store's file
+    name rather than the paragraphs, and `Route` holds the `ssh_config::RouteRefusal` itself. Each
+    was a `DbError::Connect(String)` until now, so only the *connection failed:* in front reached
+    the window in the interface's language and the rest of it in English. `message()` is each
+    producer's old English **byte for byte**, without that prefix, and `Display` is it, so the
+    CLI, the MCP server and the logs read what they read before; the driver's error inside, the
+    hosts, paths and fingerprints pass through as they came. The interface's wording is held to it
+    by `english_says_every_connect_failure_as_core_does` (*The string catalogue*).
     **`CellEdit` is what one staged cell holds** — `Null | Text | Bytes | Default` — and it replaced
     the `Option<String>` that had room for exactly two of the first three. `Text` is what was typed
     or pasted, bound as a string parameter and coerced by the server to whatever the column is;
@@ -325,10 +340,10 @@ existing prose was left alone.
     statements' failures as `Query`/`Connect`, so the single run folded a failed lazy `BEGIN` into
     the statement's result and the bar offered *AI fix* over a healthy `SELECT` — while Run All,
     which hard-coded `ModalError::server` for the same failure, did not. Both now take the source
-    `Session::ensure_tx` gives (`Connect` for a refused `BEGIN`), and opening a Manual tab's session
+    `Session::ensure_tx` gives (`ConnectFailed`, `Server`, for a refused `BEGIN`), and opening a Manual tab's session
     carries `Session::open_enforced`'s through `DbError::modal_about_another_statement` rather than
     calling every failure the server's. `DbError::Refused` and the
-    `Connect` rule for set-up failures are under the `DbError` entry. The `App` notes' constructor
+    connect-failure rule for set-up failures are under the `DbError` entry. The `App` notes' constructor
     is a call-site choice the type forces and nothing else pinned — swapping one for `::statement`
     re-offered a fix for "the statement was not sent" with every other test green — so
     `app_tests::a_runs_own_notes_reach_the_bar_as_schemaics` reads `main.rs` for it: every
@@ -12863,19 +12878,22 @@ existing prose was left alone.
     `tracing::error!` and nowhere visible. Every later `db_for` and the terminal's `open_db_cli` then
     answered "SSH tunnel is not established yet", for good, over a tunnel that had in fact been
     refused, the sentence masking the one cause worth reading; it was reported from macOS, where the
-    tunnel evidently never opened. `LoadFailure` says which step failed — `Tunnel` (connect, host key,
-    key file, agent, authentication) or `Server { text, shown }` (the tunnel opened, the server
-    behind it failed the load, and the tunnel closed with it: its `DbError` as `to_string()` and as
-    the app's `db_error_shown`) — and is the error half of the app's `ConnectResult`, which
-    was a `String`. `TunnelFailures` holds each connection's last one, and `refusal` is the sentence:
+    tunnel evidently never opened. `LoadFailure` says which step failed — `Tunnel { text, shown }`
+    (connect, host key, key file, agent, authentication) or `Server { text, shown }` (the tunnel
+    opened, the server behind it failed the load, and the tunnel closed with it), each its
+    `DbError` as `to_string()` and as the app's `db_error_shown` — and is the error half of the
+    app's `ConnectResult`, which was a `String`. `TunnelFailures` holds each connection's last one, and `refusal` is the sentence:
     the old one while nothing is recorded, otherwise the reason and *Refresh the schema to try
     again* — the only retry there is, since nothing re-opens a tunnel on its own. `refusal_of` is
     the same answer as a `TunnelRefusal` (the reason borrowed, its closing full stop off), which the
-    app says through `ui::i18n::tunnel_refusal` (`tunnel-*`); `refusal` is its English. A server's
-    failure is both there too, `TunnelRefusal::Server { why, shown }`: `refusal` reads `why` and
-    `tunnel_refusal` reads `shown`, so the window says the server's failure as it says it everywhere
-    else and core's sentence keeps the English (`a_server_failure_is_refused_in_english_and_shown_as_worded`;
-    `the_tunnel_refusal_says_the_servers_failure_as_shown` in `ui::i18n`). `Server` is kept
+    app says through `ui::i18n::tunnel_refusal` (`tunnel-*`); `refusal` is its English. A
+    failure is both there too, `TunnelRefusal::Tunnel { why, shown }` and `Server { why, shown }`:
+    `refusal` reads `why` and `tunnel_refusal` reads `shown`, so the window says the failure as it
+    says it everywhere else — a tunnel's, an `SshFailure` (under `core::model`), included — and
+    core's sentence keeps the English (`a_server_failure_is_refused_in_english_and_shown_as_worded`;
+    `the_tunnel_refusal_says_the_servers_failure_as_shown` in `ui::i18n`, which reads a `Tunnel`'s
+    `shown` too — the app's tunnel arm of `load_schema` fills it with `db_error_shown(&e)` as the
+    server arm does). `Server` is kept
     apart because calling it a tunnel failure would send the user to fix SSH settings that work
     (`a_server_failure_behind_the_tunnel_is_not_called_a_tunnel_failure`, in `tunnel_failure_tests`).
     The app's bookkeeping is the half the type cannot pin: `load_schema` clears the entry when it is
@@ -13204,9 +13222,10 @@ existing prose was left alone.
     (a `JumpHostError`, with a `From` so `route()?` reads as it did), `Unread { host, unread }`,
     `ConfigJumpPassword { host, jump }` and `JumpOwnProxyJump { host, jump }`, where `RouteHost`
     tells the SSH host (`Ssh`) from the first jump host (`FirstJump`, which the English calls
-    *jump host <alias>*). The connection form words them in the interface's language; each
-    `Display` is the English the connect's error still says, byte for byte the `String` it
-    replaced, and `unread_route_sentence` and `config_jump_password_sentence` survive as that
+    *jump host <alias>*). The connection form words them in the interface's language, and so does
+    the connect's error, which carries one as `SshFailure::Route` (under `core::model`) and is
+    worded through the form's `route_note_text`; each `Display` is the English the CLI and the logs
+    still read, byte for byte the `String` it replaced, and `unread_route_sentence` and `config_jump_password_sentence` survive as that
     English. The tests here read the `Display`.
   - `init_sql.rs` — **a connection's init SQL**: the session settings `Connection::init_sql` runs on
     every connection Schemaic opens for it — a `search_path`, a time zone, a role — and `check(sql,
@@ -19068,8 +19087,8 @@ existing prose was left alone.
   recording which engines carry a separate detail field at all.
   **`DbError::modal_source` answers whose words an error is** (`core::model::ErrorSource`), read off
   the variant, for the editor's error bar and the error modal behind it: `Query` is a statement's
-  failure, with SQL for *AI fix* to rewrite; `Connect` is the server's words about no statement,
-  explained and never fixed; `Cancelled` is the user's Stop or Schemaic's own watchdog and has
+  failure, with SQL for *AI fix* to rewrite; `Connect` — and `ConnectFailed`, below — is the
+  server's words about no statement, explained and never fixed; `Cancelled` is the user's Stop or Schemaic's own watchdog and has
   nothing to explain; `Refused` is **Schemaic's own sentence** and has nothing to explain either.
   `Refused` exists because the variant is the provenance and this crate had been writing its own
   words as `Query`/`Connect`, so the bar and the modal offered *AI fix* or *Explain* on them. It
@@ -19113,12 +19132,32 @@ existing prose was left alone.
   "query failed:" worded by `db_error_shown` and the server's words inside left as they came.
   `modal_source_tests` has no `Write` case; the SQL Server import's live tests
   match the variant (`an_imported_blank_number_is_refused_not_stored_as_zero`).
-  **The server refusing a statement Schemaic sent for itself is `Connect`, not `Query`** — its words, but about SQL the user did not write, and theirs
-  was never sent: `enforce_session`'s "could not prepare the session: …",
-  `pg::read_only_setup_failed` ("could not make the session read-only: …", for `pg::fetch_query`'s
-  enforced path and `Session::open`'s PostgreSQL arm) and `session::begin_failed`, which rewrites a
-  lazy `BEGIN`'s `Query` from `Session::control_on` as "could not begin the transaction: …" and
-  passes anything else through. The `Connect` prefix does come with them, so these read
+  **`ConnectFailed(ConnectFailure)` is a connect failure in Schemaic's words around someone
+  else's** (`core::model::ConnectFailure`, re-exported with `SshFailure`, `SshPhase` and
+  `TlsFailure`). It shares `Connect`'s `#[error("connection failed: {0}")]`, its `modal_source`
+  (`Server`) and its `position` (`None`), so moving a site from one to the other changed nothing a
+  reader of `to_string()` or the modal could see; what changed is that the app can word it
+  (`db_error_shown`, under `app/main.rs`). Its producers are every sentence this crate composed
+  around another's text at connect: the thirteen "timed out" sites, `Db::init_failed`,
+  `session::retired_error` and `begin_failed`, `enforce_session`'s prepare,
+  `pg::read_only_setup_failed` and `connect_maintenance_avoiding`'s *no maintenance database
+  reachable*, SQL Server's session guard and plan set-up, and every `ssh.rs` and `tls.rs` failure
+  but one (their passages, below). **`Connect(String)` stays for a driver's or the system's text
+  alone** — SQLite's `{file}: {e}`, the tunnel listener's `local_addr` — where there is no frame
+  of Schemaic's to word; `cloud_iam.rs`'s and `entra.rs`'s sign-in sentences are the exception
+  still to move, English composed inside a `Connect`. Keeping the driver's text there is
+  load-bearing: `unknown_database`, which decides whether an
+  unopenable configured database is recoverable, reads only a `Connect`'s message, so the
+  driver's own connect error moved to `ConnectFailed` would stop being recognised. SQL Server's
+  `err_text` passes `ConnectFailed`'s `Display`, without the prefix, as it passes a `Connect`'s
+  string.
+  **The server refusing a statement Schemaic sent for itself is a connect failure, not `Query`** — its words, but about SQL the user did not write, and theirs
+  was never sent: `enforce_session`'s "could not prepare the session: …" (`PrepareSession`),
+  `pg::read_only_setup_failed` ("could not make the session read-only: …", `ReadOnlySetup`, for
+  `pg::fetch_query`'s enforced path and `Session::open`'s PostgreSQL arm) and
+  `session::begin_failed`, which rewrites a lazy `BEGIN`'s `Query` from `Session::control_on` as
+  "could not begin the transaction: …" (`BeginFailed`) and passes anything else through — each a
+  `ConnectFailed`. The `Connect` prefix does come with them, so these read
   "connection failed: could not …". **`modal_about_another_statement`** is
   `ModalError::new(to_string(), modal_source()).about_another_statement()`, for an error raised by
   something that is not the editor's statement (a grid Commit, `end_tx`); it is one composition
@@ -21799,6 +21838,22 @@ existing prose was left alone.
   means to a fingerprint store before it has anything to hash. That is a migration on the code that
   decides whether to trust a host, not a version bump, and it is not being done inside a dependency
   sweep.
+  **Every failure `ssh.rs` composes is a `core::model::SshFailure`** inside
+  `DbError::ConnectFailed`, built by the private `ssh_failed` — sign-in, key, agent, jump host,
+  connect, bind, the route, the named instance and the host-key refusals — so the window words the
+  sentence and the SSH library's error inside passes through; the one bare `Connect` left is the
+  listener's `local_addr` failure, the system's text alone. `tunnel_target_refusal` and the
+  host-key `refusal_message` answer `Option<SshFailure>`, and `TunnelClient::refusal` holds one,
+  so the verdict `open_tunnel` reports over russh's `UnknownKey` is that value rather than its
+  paragraphs. Their tests compare the value or its `Display`, which is the old English. In the
+  catalogue the two refusals are a message per paragraph, joined with line breaks by
+  `i18n::connect_failure_text` since a message holds none; the changed key's out-of-band check
+  and the file that re-trusts stay **one** message, `db-ssh-host-key-changed-advice`, so the order
+  `a_mismatch_says_the_key_changed_and_carries_both_fingerprints` pins in English — verify first,
+  then the file — is held inside a message a translator reads whole rather than across two the
+  code joins. **`Offered  { $key }` has two spaces on purpose**, to
+  line the fingerprint up under *Expected*'s, as core's English does; removing one is how
+  `english_says_every_connect_failure_as_core_does` was taken red.
   **`open_tunnel` bounds its own handshake, for every caller**, because russh bounds none of it:
   the default `inactivity_timeout` is `None`, `read_ssh_id` waits for a banner forever, and the
   keepalives above only start once a session exists. So an endpoint that accepts TCP and never
@@ -21808,7 +21863,8 @@ existing prose was left alone.
   and key exchange, while `TUNNEL_AUTH_TIMEOUT` (60 s) is longer because an agent may be waiting on
   a *person* — a 1Password prompt, Pageant's confirmation, a hardware key's touch — and that wait is
   theirs, not the network's. Both go through the private `within`, which turns an elapsed bound into
-  `DbError::Connect("SSH {phase} with {host:port}: no answer within Ns")` and passes the phase's own
+  `SshFailure::NoAnswer { phase, host_port, secs }` — *SSH {phase} with {host:port}: no answer
+  within Ns*, the phase an `SshPhase` the caller passes — and passes the phase's own
   result through untouched otherwise — **its own error included**, so a host-key refusal or a wrong
   key still names itself rather than reading as a timeout
   (`an_answer_inside_the_bound_is_passed_through`, beside
@@ -21861,8 +21917,8 @@ existing prose was left alone.
   before any I/O, a route the file hides in a `ProxyCommand` or a `Match` block for the SSH host
   or its first jump host (whose own `ProxyJump` refuses too), and a password bound for a jump host
   only the file names — all under that entry, and the form's hint says each of them first
-  (`describe_route`). The `RouteRefusal` reaches `DbError::Connect` as its English `Display`:
-  the form words it, the connect's error does not yet. Known-hosts entries
+  (`describe_route`). The `RouteRefusal` reaches the connect's error as `SshFailure::Route`, and
+  the window words it as the form does. Known-hosts entries
   are therefore keyed by the **resolved** `host:port`, not the alias. The connection form keeps the
   alias in its field and says what it became on a line under it (`ssh_config_hint`, under
   `connection_form.rs`) — from its own read of the file, taken when the tunnel's fields are built,
@@ -21908,7 +21964,8 @@ existing prose was left alone.
   runs — `init_sql::check` for this engine, its refusal a `DbError::Refused` reading *Not
   connected — this connection's init SQL was refused: …* — so a refused init runs none of it; the
   three networked engines ask before they dial. A statement the server then refuses is
-  `Db::init_failed`, a `DbError::Connect` naming it (*init SQL `…` failed: …*), and the operation
+  `Db::init_failed`, a `DbError::ConnectFailed` naming it (`ConnectFailure::InitFailed`, *init
+  SQL `…` failed: …*), and the operation
   fails with it. **That is deliberate**: a `SET ROLE` that did not take would run the operation as
   the login's own role, so nothing goes on in a session missing a setting the user asked for, and
   the fix is the connection form. The four sites: **MySQL's is `Db::dial`**, which every `open`
@@ -22009,6 +22066,13 @@ existing prose was left alone.
   the same reason — a DER `.crt` is what Windows' *Export certificate* writes, it came back as
   `Ok(vec![])`, and `preflight` passed it while PostgreSQL rejected the identity and MySQL
   presented it.
+  **Every failure this module composes is a `core::model::TlsFailure`** inside
+  `DbError::ConnectFailed`, built by the private `tls_failed` — the set-up and trust-store
+  failures, a rejected client certificate, a name no certificate can carry, the CA, certificate
+  and key file refusals above — so the window words them and rustls's or the file system's error
+  inside passes through. They were `DbError::Connect` strings, the `openssl` commands included,
+  and reached the window in English; their tests now match `ConnectFailed` and read the same
+  `Display`.
   **How any of this is verified, since none of it can be tested purely:** the unit tests here cover
   the decisions and nothing pure covers a handshake. `db/examples/tls_matrix.rs` walks every mode
   against a live server and prints what each one did, and `scripts/tls-testbed/` is what it is
@@ -41281,8 +41345,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     still are, nor `DbError`'s own *query failed:*, *connection failed:* and *query cancelled*
     wherever the app shows an error through `db_error_shown` (below) — the sites still on
     `to_string()` are listed there — nor `schemaic-db`'s own refusals (`model::DbRefusal`, below),
-    `AuthMode::transport_refusal`'s sentence among them, though the sentences that crate composes
-    around a driver's text inside a `Connect` or `Query` still are, nor the DDL preview's change lines (`ddl::ChangeLine`,
+    `AuthMode::transport_refusal`'s sentence among them, nor the sentences it composes around a
+    driver's, the SSH library's or the system's text at connect (`model::ConnectFailure`, below),
+    though its cloud IAM and Entra sign-in sentences and a few `Query` ones of its own still are,
+    nor the DDL preview's change lines (`ddl::ChangeLine`,
     below), risk lines (`ddl::Risk`, below), risk heading, *Used by* lines (`used_by::Listing`,
     below), omitted lines (`compare::PlanOmission`, under `compare_view.rs`) and withheld lines
     (`ddl::Withheld`, below) — the modal's whole body but the SQL and the server's words — nor the
@@ -41832,7 +41898,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     The app's `db_error_shown` asks it for a `Write`, and words every other `DbError` variant
     itself from the section *A database error's own words* — `Query` and `QueryAt` as
     `db-query-failed` (`i18n::db_query_failed`), `Connect` as `db-connection-failed`, `Cancelled`
-    as `db-query-cancelled` — with the server's or driver's message inside as it came — and a
+    as `db-query-cancelled` — with the server's or driver's message inside as it came — a
+    `ConnectFailed` as `db-connection-failed` around `i18n::connect_failure_text`, which words its
+    `ConnectFailure` from `db-connect-*`, `db-ssh-*` and `db-tls-*` (a route refusal through
+    `connection_form.rs`'s `route_note_text`, now `pub(crate)` for it), and a
     `Refused` through `i18n::db_refusal_text`. That variant is already the whole sentence (under
     `schemaic-db`'s `lib.rs`), so it used to pass through as written, which was English whatever
     the interface's language; it carries a `DbRefusal` now (under `core::model`), and
@@ -41844,7 +41913,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_says_every_db_refusal_as_core_does` holds it equal to `message` over every variant,
     each sign-in's transport, and the blank and code-page refusals with and without a row and
     the code page's lost character with and without one; it was taken red by rewording en-GB's
-    code-page *has no character for* clause. `modal_error_shown` is `modal_about_another_statement` *shown as* that text
+    code-page *has no character for* clause. `english_says_every_connect_failure_as_core_does`
+    does the same for `connect_failure_text` over every variant, both `SshPhase`s, a changed host
+    key with a recorded key and without one, and a route refusal; it was taken red by removing the
+    alignment space in en-GB's `Offered  { $key }` (under `ssh.rs`). `modal_error_shown` is `modal_about_another_statement` *shown as* that text
     (`ModalError::shown_as`), and `db_error_pair` is `(to_string(), db_error_shown)` for a caller
     that raises its error as text. The Commit's `CommitDone::Failed`, a Manual tab's `end_tx`, a
     failed session open, the import's `ImportOutcome::Failed` and the copy's `CopyFailed` take
@@ -41886,9 +41958,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     statements already applied. What stays
     English: the server's or driver's
     words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and the
-    sentences `schemaic-db` composes around a driver's text inside a `Connect` or `Query` — its
-    SSH, TLS, cloud sign-in and timeout messages, "could not prepare the session: …" and the like,
-    where only the prefix is worded. A database-layer refusal inside `Refused` (SQL Server's
+    sentences `schemaic-db` still composes around a driver's text inside a `Connect` or `Query` —
+    cloud IAM's and Microsoft Entra's sign-in messages (`cloud_iam.rs`/`entra.rs`, and core's
+    `cloud_iam::{failure_text, parse_token, token_args}` and `entra::{failure_text,
+    parse_token}`), and a few `Query`
+    sentences of its own: `lib.rs`'s export, settings and import ones, SQL Server's
+    batch-continues note and SQLite's lock advice — where only the prefix is worded. Its SSH, TLS,
+    timeout, init SQL and session set-up sentences are no longer among it: they are a
+    `ConnectFailure`, worded as above. A database-layer refusal inside `Refused` (SQL Server's
     blank-string and code-page refusals) is no longer among it: it is a `DbRefusal`, worded as
     above. And, until the
     roadmap's next step, the one `DbError` still taken as `to_string()`, prefix and all: the
@@ -41939,8 +42016,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `result_diff_view.rs` and `dump_view.rs` share, `skip_reason_shown`, which the import modal
     and the app's paste field share, `read_refusal_text` and `import_error_text` for the app's
     import probe, check and load, `write_failure_text` for the app's Commit, import and copy
-    failures, `db_query_failed`, `db_connection_failed`, `db_query_cancelled` and
-    `db_refusal_text` for the app's `db_error_shown`, the crate holding no `DbError`, the six
+    failures, `db_query_failed`, `db_connection_failed`, `db_query_cancelled`,
+    `connect_failure_text` and `db_refusal_text` for the app's `db_error_shown`, the crate holding no `DbError`, the six
     `ddl_*` for its `ddl_error_shown`, for
     the same reason, and the grid's three filter notices — `staged_requery_note`
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded

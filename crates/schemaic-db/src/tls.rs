@@ -56,10 +56,16 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use schemaic_core::connection::TlsPlan;
+use schemaic_core::model::TlsFailure;
 use tokio_postgres::config::SslMode as PgSslMode;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::DbError;
+
+/// `failure` as the connect's error.
+fn tls_failed(failure: TlsFailure) -> DbError {
+    DbError::ConnectFailed(schemaic_core::model::ConnectFailure::Tls(failure))
+}
 
 /// `mysql_async`'s TLS options for this plan.
 ///
@@ -209,14 +215,14 @@ pub(crate) fn mssql_client_config(plan: Option<&TlsPlan>) -> Result<Arc<ClientCo
             let provider = Arc::new(rustls::crypto::ring::default_provider());
             let cfg = ClientConfig::builder_with_provider(provider.clone())
                 .with_safe_default_protocol_versions()
-                .map_err(|e| DbError::Connect(format!("TLS setup failed: {e}")))?
+                .map_err(|e| tls_failed(TlsFailure::Setup(e.to_string())))?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)));
             let cfg = match plan.and_then(|p| p.client_identity.as_ref()) {
                 None => cfg.with_no_client_auth(),
                 Some((cert, key)) => cfg
                     .with_client_auth_cert(read_certs(cert)?, read_key(key)?)
-                    .map_err(|e| DbError::Connect(format!("client certificate rejected: {e}")))?,
+                    .map_err(|e| tls_failed(TlsFailure::ClientCertRejected(e.to_string())))?,
             };
             Ok(Arc::new(cfg))
         }
@@ -281,7 +287,7 @@ fn client_config(plan: &TlsPlan) -> Result<ClientConfig, DbError> {
 
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .map_err(|e| DbError::Connect(format!("TLS setup failed: {e}")))?;
+        .map_err(|e| tls_failed(TlsFailure::Setup(e.to_string())))?;
 
     let verifier: Arc<dyn ServerCertVerifier> = if plan.accept_invalid_certs {
         Arc::new(NoVerification(provider))
@@ -292,13 +298,16 @@ fn client_config(plan: &TlsPlan) -> Result<ClientConfig, DbError> {
         };
         let webpki = WebPkiServerVerifier::builder_with_provider(roots, provider)
             .build()
-            .map_err(|e| DbError::Connect(format!("TLS trust store is unusable: {e}")))?;
+            .map_err(|e| tls_failed(TlsFailure::TrustStore(e.to_string())))?;
         match (plan.skip_hostname_check, &plan.hostname_override) {
             (true, _) => Arc::new(NameAgnosticVerifier(webpki)),
             (false, Some(name)) => Arc::new(FixedNameVerifier {
                 inner: webpki,
                 name: ServerName::try_from(name.clone()).map_err(|e| {
-                    DbError::Connect(format!("{name} is not a name a certificate can carry: {e}"))
+                    tls_failed(TlsFailure::BadName {
+                        name: name.clone(),
+                        error: e.to_string(),
+                    })
                 })?,
             }),
             (false, None) => webpki,
@@ -315,7 +324,7 @@ fn client_config(plan: &TlsPlan) -> Result<ClientConfig, DbError> {
             let chain = read_certs(cert)?;
             let key = read_key(key)?;
             cfg.with_client_auth_cert(chain, key)
-                .map_err(|e| DbError::Connect(format!("client certificate rejected: {e}")))
+                .map_err(|e| tls_failed(TlsFailure::ClientCertRejected(e.to_string())))
         }
     }
 }
@@ -445,16 +454,12 @@ fn default_roots() -> &'static DefaultRoots {
 fn file_root_store(path: &str) -> Result<RootCertStore, DbError> {
     let certs = read_certs(path)?;
     if certs.is_empty() {
-        return Err(DbError::Connect(format!(
-            "CA file {path} contains no certificates"
-        )));
+        return Err(tls_failed(TlsFailure::CaEmpty(path.to_string())));
     }
     let count = certs.len();
     let (store, kept) = usable_roots(certs);
     if kept.len() != count {
-        return Err(DbError::Connect(format!(
-            "CA file {path} contains a certificate that cannot be used as a trust anchor"
-        )));
+        return Err(tls_failed(TlsFailure::CaUnusable(path.to_string())));
     }
     Ok(store)
 }
@@ -477,8 +482,12 @@ fn file_root_store(path: &str) -> Result<RootCertStore, DbError> {
 /// not. `file_root_store` twenty lines above already had this check; the client
 /// certificate did not.
 fn read_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, DbError> {
-    let pem = std::fs::read(path)
-        .map_err(|e| DbError::Connect(format!("cannot read certificate file {path}: {e}")))?;
+    let pem = std::fs::read(path).map_err(|e| {
+        tls_failed(TlsFailure::CertUnreadable {
+            path: path.to_string(),
+            error: e.to_string(),
+        })
+    })?;
     parse_certs(path, &pem)
 }
 
@@ -488,19 +497,25 @@ fn read_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, DbError> {
 fn parse_certs(path: &str, pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, DbError> {
     let certs = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| DbError::Connect(format!("{path} is not a PEM certificate file: {e}")))?;
+        .map_err(|e| {
+            tls_failed(TlsFailure::CertNotPem {
+                path: path.to_string(),
+                error: e.to_string(),
+            })
+        })?;
     if certs.is_empty() {
-        return Err(DbError::Connect(format!(
-            "{path} holds no PEM certificate — a DER file has to be converted first \
-             (openssl x509 -inform der -in {path} -out cert.pem)"
-        )));
+        return Err(tls_failed(TlsFailure::CertIsDer(path.to_string())));
     }
     Ok(certs)
 }
 
 fn read_key(path: &str) -> Result<PrivateKeyDer<'static>, DbError> {
-    let pem = std::fs::read(path)
-        .map_err(|e| DbError::Connect(format!("cannot read key file {path}: {e}")))?;
+    let pem = std::fs::read(path).map_err(|e| {
+        tls_failed(TlsFailure::KeyUnreadable {
+            path: path.to_string(),
+            error: e.to_string(),
+        })
+    })?;
     parse_key(path, &pem)
 }
 
@@ -515,13 +530,14 @@ fn read_key(path: &str) -> Result<PrivateKeyDer<'static>, DbError> {
 /// `schemaic_core::connection::Tls`) and this says what to do instead.
 fn parse_key(path: &str, pem: &[u8]) -> Result<PrivateKeyDer<'static>, DbError> {
     if std::str::from_utf8(pem).is_ok_and(is_encrypted_key) {
-        return Err(DbError::Connect(format!(
-            "{path} is a passphrase-protected private key, which Schemaic cannot open. \
-             Decrypt it first: openssl pkcs8 -in {path} -out client-key.pem"
-        )));
+        return Err(tls_failed(TlsFailure::KeyEncrypted(path.to_string())));
     }
-    PrivateKeyDer::from_pem_slice(pem)
-        .map_err(|e| DbError::Connect(format!("{path} is not a PEM private key: {e}")))
+    PrivateKeyDer::from_pem_slice(pem).map_err(|e| {
+        tls_failed(TlsFailure::KeyNotPem {
+            path: path.to_string(),
+            error: e.to_string(),
+        })
+    })
 }
 
 /// Does this PEM text hold a key that cannot be read without a passphrase?
@@ -812,9 +828,10 @@ mod tests {
         let der = [0x30u8, 0x82, 0x02, 0x5c, 0x30, 0x82, 0x01, 0xc5, 0xa0, 0x03];
         let err = parse_certs("/tmp/client.crt", &der)
             .expect_err("a DER file must not pass as zero certificates");
-        let DbError::Connect(msg) = err else {
+        let DbError::ConnectFailed(_) = &err else {
             panic!("a connect error is what preflight reports");
         };
+        let msg = err.to_string();
         assert!(msg.contains("/tmp/client.crt"), "{msg}");
         assert!(msg.contains("DER"), "{msg}");
 
@@ -834,9 +851,10 @@ mod tests {
                           -----END ENCRYPTED PRIVATE KEY-----\n";
         let err = parse_key("/tmp/client.key", encrypted)
             .expect_err("an encrypted key cannot be opened here");
-        let DbError::Connect(msg) = err else {
+        let DbError::ConnectFailed(_) = &err else {
             panic!("a connect error is what preflight reports");
         };
+        let msg = err.to_string();
         assert!(msg.contains("passphrase"), "{msg}");
         assert!(msg.contains("openssl pkcs8"), "the way out: {msg}");
         assert!(
@@ -846,7 +864,7 @@ mod tests {
 
         // An ordinary malformed key keeps the old message, which is right for it.
         let err = parse_key("/tmp/client.key", b"hello").expect_err("not a key");
-        assert!(format!("{err:?}").contains("not a PEM private key"));
+        assert!(err.to_string().contains("not a PEM private key"), "{err:?}");
     }
 
     /// **…in both spellings, not just PKCS#8's.** The check above matched the
@@ -879,9 +897,10 @@ mod tests {
         ] {
             let err = parse_key("/tmp/client.key", pem)
                 .expect_err("an encrypted key cannot be opened here");
-            let DbError::Connect(msg) = err else {
+            let DbError::ConnectFailed(_) = &err else {
                 panic!("a connect error is what preflight reports");
             };
+            let msg = err.to_string();
             assert!(msg.contains("passphrase"), "{msg}");
             assert!(msg.contains("openssl pkcs8"), "the way out: {msg}");
             assert!(

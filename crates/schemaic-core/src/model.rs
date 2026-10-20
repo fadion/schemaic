@@ -1677,6 +1677,278 @@ impl std::fmt::Display for DbRefusal {
     }
 }
 
+/// **Why a connection could not be made, in Schemaic's words** around the
+/// driver's, the SSH library's or the operating system's own (`error`, which
+/// passes through) — `schemaic-db`'s `DbError::ConnectFailed`. The interface
+/// words the frame in its language; [`ConnectFailure::message`] is the
+/// English the CLI, the MCP server and the logs say, after *connection
+/// failed:*.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectFailure {
+    /// No connection within the connect timeout.
+    TimedOut,
+    /// The server refused one of the connection's init statements.
+    InitFailed { statement: String, error: String },
+    /// A Manual tab's connection was closed after an unacknowledged Stop and
+    /// could not be reopened.
+    SessionRetired,
+    /// The server refused the session's own `BEGIN`.
+    BeginFailed(String),
+    /// MySQL's session set-up failed.
+    PrepareSession(String),
+    /// PostgreSQL's read-only session set-up failed.
+    ReadOnlySetup(String),
+    /// SQL Server's session guard failed.
+    GuardSession(String),
+    /// SQL Server's plan set-up failed.
+    PlanSetup(String),
+    /// No PostgreSQL maintenance database answered.
+    NoMaintenanceDb,
+    /// An SSH tunnel's failure.
+    Ssh(SshFailure),
+    /// A TLS set-up's failure.
+    Tls(TlsFailure),
+}
+
+/// Which SSH step did not answer in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshPhase {
+    Connect,
+    Authentication,
+}
+
+/// Why an SSH tunnel could not be opened ([`ConnectFailure::Ssh`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshFailure {
+    /// A step that did not answer within `secs`.
+    NoAnswer {
+        phase: SshPhase,
+        host_port: String,
+        secs: u64,
+    },
+    /// Password sign-in errored.
+    AuthError(String),
+    /// The server refused every sign-in tried.
+    AuthFailed,
+    /// The private key could not be loaded.
+    KeyLoad(String),
+    /// Key sign-in errored.
+    KeyAuth(String),
+    /// The SSH agent errored.
+    Agent(String),
+    /// The SSH agent holds no identity.
+    AgentEmpty,
+    /// Agent sign-in errored.
+    AgentAuth(String),
+    /// No SSH agent on Windows.
+    NoAgent,
+    /// No SSH agent at `$SSH_AUTH_SOCK`.
+    NoAgentSocket(String),
+    /// A jump host could not reach the next hop.
+    JumpUnreachable { host_port: String, error: String },
+    /// The SSH connection to a hop of a several-hop route failed.
+    ConnectTo { host_port: String, error: String },
+    /// The SSH connection failed.
+    Connect(String),
+    /// The route had no host.
+    NoHost,
+    /// The local end of the tunnel could not be bound.
+    Bind(String),
+    /// A SQL Server named instance, which a tunnel cannot reach.
+    NamedInstance { server: String, instance: String },
+    /// The host's key changed since it was first trusted.
+    HostKeyChanged {
+        host_port: String,
+        known: Option<String>,
+        offered: String,
+        store: String,
+    },
+    /// The record of trusted host keys could not be read.
+    HostKeyStoreUnreadable {
+        host_port: String,
+        offered: String,
+        store: String,
+    },
+    /// The route `~/.ssh/config` and the connection give cannot be built.
+    Route(crate::ssh_config::RouteRefusal),
+}
+
+/// Why a TLS set-up could not be made ([`ConnectFailure::Tls`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TlsFailure {
+    Setup(String),
+    ClientCertRejected(String),
+    TrustStore(String),
+    BadName { name: String, error: String },
+    CaEmpty(String),
+    CaUnusable(String),
+    CertUnreadable { path: String, error: String },
+    CertNotPem { path: String, error: String },
+    CertIsDer(String),
+    KeyUnreadable { path: String, error: String },
+    KeyEncrypted(String),
+    KeyNotPem { path: String, error: String },
+}
+
+impl ConnectFailure {
+    /// The failure in English, after *connection failed:*.
+    pub fn message(&self) -> String {
+        match self {
+            ConnectFailure::TimedOut => "timed out".to_string(),
+            ConnectFailure::InitFailed { statement, error } => {
+                format!("init SQL `{statement}` failed: {error}")
+            }
+            ConnectFailure::SessionRetired => "this tab's connection was closed after a Stop \
+                                               the server did not acknowledge, and a new one \
+                                               could not be opened; its transaction was rolled \
+                                               back. Switch the tab to Auto and back to Manual \
+                                               to open another."
+                .to_string(),
+            ConnectFailure::BeginFailed(e) => format!("could not begin the transaction: {e}"),
+            ConnectFailure::PrepareSession(e) => format!("could not prepare the session: {e}"),
+            ConnectFailure::ReadOnlySetup(e) => {
+                format!("could not make the session read-only: {e}")
+            }
+            ConnectFailure::GuardSession(e) => format!("could not guard the session: {e}"),
+            ConnectFailure::PlanSetup(e) => format!("could not set up the plan: {e}"),
+            ConnectFailure::NoMaintenanceDb => "no maintenance database reachable".to_string(),
+            ConnectFailure::Ssh(f) => f.message(),
+            ConnectFailure::Tls(f) => f.message(),
+        }
+    }
+}
+
+impl SshFailure {
+    /// The failure in English.
+    pub fn message(&self) -> String {
+        match self {
+            SshFailure::NoAnswer {
+                phase,
+                host_port,
+                secs,
+            } => {
+                let phase = match phase {
+                    SshPhase::Connect => "connect",
+                    SshPhase::Authentication => "authentication",
+                };
+                format!("SSH {phase} with {host_port}: no answer within {secs}s")
+            }
+            SshFailure::AuthError(e) => format!("SSH auth error: {e}"),
+            SshFailure::AuthFailed => "SSH authentication failed".to_string(),
+            SshFailure::KeyLoad(e) => format!("SSH key load failed: {e}"),
+            SshFailure::KeyAuth(e) => format!("SSH key auth error: {e}"),
+            SshFailure::Agent(e) => format!("SSH agent error: {e}"),
+            SshFailure::AgentEmpty => {
+                "SSH agent has no identities loaded (run `ssh-add`)".to_string()
+            }
+            SshFailure::AgentAuth(e) => format!("SSH agent auth error: {e}"),
+            SshFailure::NoAgent => "no SSH agent found (start the OpenSSH Authentication Agent \
+                                    service, or run Pageant)"
+                .to_string(),
+            SshFailure::NoAgentSocket(e) => format!("no SSH agent ($SSH_AUTH_SOCK): {e}"),
+            SshFailure::JumpUnreachable { host_port, error } => {
+                format!("SSH jump host could not reach {host_port}: {error}")
+            }
+            SshFailure::ConnectTo { host_port, error } => {
+                format!("SSH connect to {host_port} failed: {error}")
+            }
+            SshFailure::Connect(e) => format!("SSH connect failed: {e}"),
+            SshFailure::NoHost => "SSH tunnel has no host".to_string(),
+            SshFailure::Bind(e) => format!("local tunnel bind failed: {e}"),
+            SshFailure::NamedInstance { server, instance } => format!(
+                "A named instance cannot be reached through an SSH tunnel: SQL Server Browser \
+                 answers with its port over UDP, which the tunnel does not carry. Set the host \
+                 to {server} without \\{instance} and the port to the one the instance listens \
+                 on."
+            ),
+            SshFailure::HostKeyChanged {
+                host_port,
+                known,
+                offered,
+                store,
+            } => format!(
+                "The SSH host key for {host_port} has CHANGED since Schemaic first trusted \
+                 it.\n\nExpected {}\nOffered  {offered}\n\nThis can mean the server was rebuilt \
+                 or its key rotated — or that something is intercepting the connection. Nothing \
+                 was sent to it. Verify the new fingerprint out of band (on the server's own \
+                 console, or with whoever administers it) before trusting it. Once you have, \
+                 remove this host's entry from {store} in Schemaic's config directory to record \
+                 the new key.",
+                known.as_deref().unwrap_or("(no recorded key)")
+            ),
+            SshFailure::HostKeyStoreUnreadable {
+                host_port,
+                offered,
+                store,
+            } => format!(
+                "Schemaic could not read its record of trusted SSH host keys ({store}), so it \
+                 can't tell whether {host_port}'s key ({offered}) is the one you trusted \
+                 before.\n\nThe connection was refused rather than trusting the key on sight. \
+                 Repair or delete {store} in Schemaic's config directory — deleting it means \
+                 every SSH host is trusted afresh on its next connection, so do that only if you \
+                 can verify the fingerprints."
+            ),
+            SshFailure::Route(r) => r.to_string(),
+        }
+    }
+}
+
+impl TlsFailure {
+    /// The failure in English.
+    pub fn message(&self) -> String {
+        match self {
+            TlsFailure::Setup(e) => format!("TLS setup failed: {e}"),
+            TlsFailure::ClientCertRejected(e) => format!("client certificate rejected: {e}"),
+            TlsFailure::TrustStore(e) => format!("TLS trust store is unusable: {e}"),
+            TlsFailure::BadName { name, error } => {
+                format!("{name} is not a name a certificate can carry: {error}")
+            }
+            TlsFailure::CaEmpty(path) => format!("CA file {path} contains no certificates"),
+            TlsFailure::CaUnusable(path) => format!(
+                "CA file {path} contains a certificate that cannot be used as a trust anchor"
+            ),
+            TlsFailure::CertUnreadable { path, error } => {
+                format!("cannot read certificate file {path}: {error}")
+            }
+            TlsFailure::CertNotPem { path, error } => {
+                format!("{path} is not a PEM certificate file: {error}")
+            }
+            TlsFailure::CertIsDer(path) => format!(
+                "{path} holds no PEM certificate — a DER file has to be converted first (openssl \
+                 x509 -inform der -in {path} -out cert.pem)"
+            ),
+            TlsFailure::KeyUnreadable { path, error } => {
+                format!("cannot read key file {path}: {error}")
+            }
+            TlsFailure::KeyEncrypted(path) => format!(
+                "{path} is a passphrase-protected private key, which Schemaic cannot open. \
+                 Decrypt it first: openssl pkcs8 -in {path} -out client-key.pem"
+            ),
+            TlsFailure::KeyNotPem { path, error } => {
+                format!("{path} is not a PEM private key: {error}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::fmt::Display for SshFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::fmt::Display for TlsFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
 impl WriteCause {
     /// Is this a statement's failure — the server's answer or what a statement
     /// did — rather than the user's own Stop or Schemaic's refusal? The error
