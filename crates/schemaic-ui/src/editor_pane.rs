@@ -1192,7 +1192,7 @@ fn cmdk_popup(
                         // nor depends on. The closure is a tracking scope.
                         label(move || {
                             cmdk.preview.with(|p| {
-                                diff::inline_plan_summary(p.as_ref().and_then(|v| v.plan()))
+                                inline_plan_summary_text(p.as_ref().and_then(|v| v.plan()))
                             })
                         })
                         .style(|s| s.color(theme::text_muted()).font_size(theme::font_body()))
@@ -2576,7 +2576,110 @@ fn quick_info(
     let refs: Vec<(&str, &schemaic_core::schema::DbSchema)> =
         loaded.iter().map(|(d, s)| (d.as_str(), &**s)).collect();
     let hit = schemaic_core::quickinfo::name_at(sql, at, dialect, &refs, active_db)?;
-    schemaic_core::quickinfo::describe(&hit.object, &refs)
+    schemaic_core::quickinfo::info(&hit.object, &refs).map(|i| quick_info_text(&i))
+}
+
+/// What the hover's quick-info says — core's `quickinfo::QuickInfo::message`
+/// in the interface's language, a line each. Names, types, defaults,
+/// signatures and comments are the catalogue's and pass through.
+fn quick_info_text(info: &schemaic_core::quickinfo::QuickInfo) -> String {
+    use schemaic_core::quickinfo::QuickInfo;
+    let mut lines = Vec::new();
+    match info {
+        QuickInfo::Table {
+            view,
+            name,
+            database,
+            columns,
+            comment,
+        } => {
+            let (name, database) = (name.as_str(), database.as_str());
+            lines.push(match view {
+                true => tr!("quickinfo-view", name = name, database = database),
+                false => tr!("quickinfo-table", name = name, database = database),
+            });
+            let n = *columns;
+            let figure = crate::i18n::figure(&n.to_string());
+            lines.push(tr!("quickinfo-columns", count = n, n = figure));
+            lines.extend(comment.clone());
+        }
+        QuickInfo::Column {
+            name,
+            type_name,
+            primary_key,
+            nullable,
+            auto_increment,
+            default,
+            generated,
+            comment,
+        } => {
+            lines.push(format!("{name}  {type_name}"));
+            let mut traits = Vec::new();
+            if *primary_key {
+                traits.push(tr!("quickinfo-primary-key"));
+            }
+            traits.push(match nullable {
+                true => tr!("quickinfo-null"),
+                false => tr!("quickinfo-not-null"),
+            });
+            if *auto_increment {
+                traits.push(tr!("quickinfo-auto-increment"));
+            }
+            if let Some(d) = default {
+                traits.push(tr!("quickinfo-default", value = d.as_str()));
+            }
+            if let Some(g) = generated {
+                traits.push(tr!("quickinfo-generated", expression = g.as_str()));
+            }
+            lines.push(traits.join(" · "));
+            lines.extend(comment.clone());
+        }
+        QuickInfo::Routine {
+            function,
+            name,
+            arguments,
+            returns,
+        } => {
+            let (name, arguments) = (name.as_str(), arguments.as_str());
+            let sig = match (function, returns) {
+                (true, None) => tr!("quickinfo-function", name = name, arguments = arguments),
+                (true, Some(r)) => tr!(
+                    "quickinfo-function-returns",
+                    name = name,
+                    arguments = arguments,
+                    returns = r.as_str()
+                ),
+                (false, None) => tr!("quickinfo-procedure", name = name, arguments = arguments),
+                (false, Some(r)) => tr!(
+                    "quickinfo-procedure-returns",
+                    name = name,
+                    arguments = arguments,
+                    returns = r.as_str()
+                ),
+            };
+            lines.push(sig);
+        }
+    }
+    lines.join("\n")
+}
+
+/// Ctrl+K's diff bar summary — core's `diff::inline_plan_summary` in the
+/// interface's language, the counts core's ungrouped figures in its marks.
+fn inline_plan_summary_text(plan: Option<&schemaic_core::diff::InlinePlan>) -> String {
+    let Some(p) = plan else {
+        return tr!("cmdk-no-changes");
+    };
+    let hunks = p.hunks.len();
+    // Core's figures, ungrouped, in the interface's marks.
+    let figure = |n: usize| crate::i18n::figure(&n.to_string());
+    let (removed, added) = (figure(p.removed), figure(p.added));
+    tr!(
+        "cmdk-diff-summary",
+        hunks = hunks,
+        n = figure(hunks),
+        removed = removed,
+        added = added
+    )
 }
 
 /// What the name at `at` names, against the connection's loaded schemas —
@@ -9994,6 +10097,90 @@ mod geometry_tests {
         );
         for m in all {
             assert_eq!(diag_message_text(&m), m.message(), "{m:?}");
+        }
+    }
+
+    /// **The hover's quick info reads in English exactly as core's
+    /// `QuickInfo::message`** — a table and a view at one column and several,
+    /// with a comment and without, a column with every trait and with none
+    /// optional, and a function and a procedure with and without a return.
+    #[test]
+    fn english_says_every_quick_info_as_core_does() {
+        use schemaic_core::quickinfo::QuickInfo;
+        let s = |t: &str| t.to_string();
+        let mut all = Vec::new();
+        for (view, columns, comment) in [
+            (false, 1, None),
+            (true, 3, Some(s("One row a sale"))),
+            (false, 1_200, None),
+        ] {
+            all.push(QuickInfo::Table {
+                view,
+                name: s("sales.orders"),
+                database: s("shop"),
+                columns,
+                comment,
+            });
+        }
+        for (pk, nullable, auto, extra) in [(true, false, true, true), (false, true, false, false)]
+        {
+            all.push(QuickInfo::Column {
+                name: s("orders.total"),
+                type_name: s("decimal(10,2)"),
+                primary_key: pk,
+                nullable,
+                auto_increment: auto,
+                default: extra.then(|| s("0")),
+                generated: extra.then(|| s("price * qty")),
+                comment: extra.then(|| s("Gross, with tax")),
+            });
+        }
+        for function in [true, false] {
+            for returns in [None, Some(s("decimal"))] {
+                all.push(QuickInfo::Routine {
+                    function,
+                    name: s("tax"),
+                    arguments: s("amount decimal"),
+                    returns,
+                });
+            }
+        }
+        for i in all {
+            assert_eq!(quick_info_text(&i), i.message(), "{i:?}");
+        }
+    }
+
+    /// Ctrl+K's diff bar reads in English exactly as core's
+    /// `inline_plan_summary` — no plan, an empty one, one hunk and several.
+    #[test]
+    fn english_says_the_inline_plan_summary_as_core_does() {
+        use schemaic_core::diff::{InlineHunk, InlinePlan, inline_plan_summary};
+        let hunk = || InlineHunk {
+            del: 0..1,
+            add: vec!["a".to_string()],
+            anchor: 0,
+            before: false,
+        };
+        let plans = [
+            InlinePlan::default(),
+            InlinePlan {
+                hunks: vec![hunk()],
+                added: 1,
+                removed: 1,
+            },
+            InlinePlan {
+                hunks: vec![hunk(), hunk()],
+                added: 1_500,
+                removed: 3,
+            },
+        ];
+        assert_eq!(inline_plan_summary_text(None), inline_plan_summary(None));
+        for p in &plans {
+            assert_eq!(
+                inline_plan_summary_text(Some(p)),
+                inline_plan_summary(Some(p)),
+                "{p:?}"
+            );
         }
     }
 

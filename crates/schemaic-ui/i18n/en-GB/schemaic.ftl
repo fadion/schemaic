@@ -3660,6 +3660,14 @@ cmdk-placeholder = Ask the AI Assistant for help.
 # Keep or drop the suggested edit shown as a diff.
 cmdk-accept = Accept
 cmdk-reject = Reject
+# The diff bar's summary (core's diff::inline_plan_summary; a test holds the
+# English equal). $hunks selects the plural; $n, $removed and $added are
+# figures. − and + are the removed and added line counts.
+cmdk-no-changes = No changes suggested
+cmdk-diff-summary = { $hunks ->
+        [one] { $n } hunk · { $removed } − / { $added } +
+       *[other] { $n } hunks · { $removed } − / { $added } +
+    }
 
 ## The editor's bind-parameter row (editor_pane.rs). The kind chip's own
 ## labels (abc, 123, NULL, SQL) are symbols and stay.
@@ -3721,6 +3729,26 @@ guard-replace-database = CREATE OR REPLACE DATABASE deletes the existing databas
 guard-replace-schema = CREATE OR REPLACE SCHEMA deletes the existing schema and every table in it.
 guard-truncate-partition = TRUNCATE PARTITION removes every row in the partitions it names.
 guard-drop-partition = DROP PARTITION deletes the partition and every row in it.
+# The hover's quick info on a name (core's quickinfo::QuickInfo; a test holds
+# the English equal). $name, $database, $value, $expression, $arguments and
+# $returns are the catalogue's own text; $count selects the plural and $n is
+# it as a figure. A column's traits are joined by a middle dot.
+quickinfo-table = table { $name } · { $database }
+quickinfo-view = view { $name } · { $database }
+quickinfo-columns = { $count ->
+        [one] { $n } column
+       *[other] { $n } columns
+    }
+quickinfo-primary-key = primary key
+quickinfo-null = null
+quickinfo-not-null = not null
+quickinfo-auto-increment = auto increment
+quickinfo-default = default { $value }
+quickinfo-generated = generated as { $expression }
+quickinfo-function = function { $name }({ $arguments })
+quickinfo-function-returns = function { $name }({ $arguments }) returns { $returns }
+quickinfo-procedure = procedure { $name }({ $arguments })
+quickinfo-procedure-returns = procedure { $name }({ $arguments }) returns { $returns }
 # A squiggle's tooltip, under its message: the fix a key would make. $keys is
 # the key (Alt+Enter); $fix is what it does.
 editor-diag-fix = { $keys }: { $fix }
@@ -4231,7 +4259,7 @@ ai-session-not-accepting = The { $cli } session is no longer accepting questions
 ## Why an agent CLI was not started or failed (schemaic-ai's SpawnRefusal and
 ## CliFailure), and what its own tools are kept to (Constraint::notice).
 ## English must read exactly as schemaic-ai's (a test holds it). $total and
-## $limit are plain numbers; $unit is one of ai-unit-*; $levers one of
+## $limit are figures; $unit is one of ai-unit-*; $levers one of
 ## ai-levers-*; $code an exit status; $mcp is "isolated" when the CLI keeps
 ## the user's own MCP servers out of the session, else "shared".
 

@@ -152,7 +152,10 @@ assertions pin English wording — stays the regression net throughout.
    `seed::SeedError` (`seed_error_text`), and the grid's own refusals (`edit::paste_report`'s
    plain arguments, `CopySqlRefusal`, `rowjson::FieldRefusal`; `grid::paste_report_shown`,
    `copy_sql_refusal_text`, `field_refusal_text`), the result diff's `result_diff::DiffError`
-   (`diff_error_text`) and the find bar's `text_ops::PatternError` (`pattern_error_text`).
+   (`diff_error_text`) and the find bar's `text_ops::PatternError` (`pattern_error_text`), and
+   Ctrl+K's diff summary (`diff::inline_plan_summary`'s plain arguments;
+   `editor_pane::inline_plan_summary_text`) and the hover's quick info (`quickinfo::QuickInfo`
+   from `info`; `quick_info_text`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -174,8 +177,6 @@ assertions pin English wording — stays the regression net throughout.
    unchanged today is this phase's list to work from (resurveyed 2026-10-20; no English literal
    or hand-rolled plural is left in the two view crates' own code, so all of it is prose handed
    up from below):
-   - **Ctrl+K's diff summary and the hover's quick info** — `diff::inline_plan_summary`,
-     `quickinfo::describe`.
    - **The connection form's notes** — `ssh_config::describe_route`, `init_sql::check`'s
      refusal.
    - **The completion popup's detail words** — `rank`'s *foreign key*, *expand \**'s column

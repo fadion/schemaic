@@ -3925,12 +3925,17 @@ existing prose was left alone.
     PostgreSQL's quoted `"Name"` and `name` on one table, whichever is listed first answers for
     both, a known gap (R2.1-L8-04). **What no
     loaded schema holds is `None`**, never a nearest guess — the database is the semantic authority,
-    and a guess would open the wrong object. `describe` renders a `NamedObject` as the tip's lines:
-    a table or view with its column count and comment; a column with its type, then *primary key ·
-    not null · auto increment · default … · generated as …*, then its comment; a routine as its
-    signature. **It fetches nothing**: types, constraints and comments are already in the loaded
-    `DbSchema`, so the lazy fetch once planned for this had nothing to do. The module's own tests
-    pin both halves.
+    and a guess would open the wrong object. `info` looks a `NamedObject` up as a `QuickInfo` — a
+    `Table` (or view) with its schema-qualified name, database, column count and comment; a `Column`
+    as `table.column` with its type, its primary key, nullability, auto increment, default and
+    generation expression, and its comment; a `Routine` with its arguments and its return type where
+    it has one — and `QuickInfo::message` is the tip's lines in English: *primary key · not null ·
+    auto increment · default … · generated as …* under a column's type, a routine as its signature.
+    `describe` is `info` then `message`, byte for byte what it rendered before the value existed, so
+    its tests did not move. The value is there because the hover read core's English whatever the
+    interface's language; the editor words it itself (`quick_info_text`, under `editor_pane.rs`).
+    **It fetches nothing**: types, constraints and comments are already in the loaded `DbSchema`, so
+    the lazy fetch once planned for this had nothing to do. The module's own tests pin both halves.
   - `filter.rs` — the header filter/sort bar: a dialect-aware `sqlparser` **AST rewrite** that
     splices a `WHERE`/`ORDER BY` into the `SELECT` that produced the result and hands back SQL to
     re-run — so filtering covers the whole table, not the loaded page. `build_query` rewrites only
@@ -11172,7 +11177,10 @@ existing prose was left alone.
     string inside a `dyn_container` builder, which floem 0.2 does not track, so the counts could
     freeze beside a diff that had moved on — splitting the sentence out is what let the view's half
     be a `label` closure and this half be tested at all (*Floem 0.2 gotchas*, the builder-freeze
-    entry).
+    entry). Its sentence is the English: the bar itself draws `inline_plan_summary_text` (under
+    `editor_pane.rs`), the same argument restated in the interface's language. This function is
+    unchanged and no longer has a caller outside tests: it stays as the English that
+    `english_says_the_inline_plan_summary_as_core_does` holds the bar's wording to.
     **`inline_splice` is one function because the preview and the accept have to agree.** It returns
     both the text that will actually go into `full[start..end]` and the whole buffer that results, so
     `inline_plan` diffs the same string Accept writes. Computed separately, a CRLF buffer plus an LF
@@ -31133,9 +31141,17 @@ existing prose was left alone.
     the text, and boxes the run of word bytes on the line — so a diagnostic on the same word wins.
     It runs on every pointer move and so reads nothing document-sized: the code column comes from
     the rope's line count through `content_x` (below), not from the text. **Resolution waits for the delay** — `quick_info`
-    (`completion::loaded_schemas` → `name_at` → `describe`) runs only when `DIAG_TIP_DELAY` fires,
-    so a pointer crossing a line of words resolves none of them, and a name that names nothing shows
-    no tip rather than an empty one. Being the same `diag_tip`, it keeps everything above — the
+    (`completion::loaded_schemas` → `name_at` → `info` → `quick_info_text`) runs only when
+    `DIAG_TIP_DELAY` fires, so a pointer crossing a line of words resolves none of them, and a name
+    that names nothing shows no tip rather than an empty one. `quick_info_text` words core's
+    `QuickInfo` from `quickinfo-*` — *table*/*view*, a column count as a plural whose `$n` is core's
+    ungrouped figure in the interface's marks (`i18n::figure`), each column trait, *function*/*procedure* with and without *returns* — while names,
+    types, defaults, generation expressions, signatures and comments pass through, and the
+    `name  type` line and the ` · ` between traits stay as core writes them. It used to show
+    `describe`'s English in every language; `english_says_every_quick_info_as_core_does` holds it to
+    `QuickInfo::message` for a table and a view at one column and several, with and without a
+    comment, a column with every trait and with none optional, and both routine kinds with and
+    without a return. Being the same `diag_tip`, it keeps everything above — the
     overlay gate, what retires it, its placement. The `Copy` hover closure reaches the `Editor`
     through a `RwSignal` (`ed_qi`). **Ctrl+click** is the editor's outer `PointerDown`, which runs
     after floem's own click has put the caret under the pointer: the primary button with the
@@ -31293,8 +31309,11 @@ existing prose was left alone.
     change count, read off the *published* plan so there is
     no second diff of the same text — anchored under the added rows. Neither covers the editor any
     more, so the compact↔expanded animation went with the box it was growing.
-    **That count is `diff::inline_plan_summary` drawn by a `label` closure, and the closure is the
-    point.** The footer's container is keyed on `verdict_shape` — `cmdk.open` and whether `inline_ai`
+    **That count is `inline_plan_summary_text` drawn by a `label` closure, and the closure is the
+    point.** The function is `diff::inline_plan_summary` restated in the interface's language —
+    `cmdk-no-changes`, and `cmdk-diff-summary` a plural on the hunk count with every count core's
+    ungrouped figure in the interface's marks (`i18n::figure`) — held to core's English for no plan, an empty one, one hunk and two
+    by `english_says_the_inline_plan_summary_as_core_does`. The footer's container is keyed on `verdict_shape` — `cmdk.open` and whether `inline_ai`
     is `Ready` — which never reads `cmdk.preview`, so the sentence built in the builder's body
     subscribed to nothing and would freeze at whatever the plan said when the bar last became
     `Ready`, while the editor's own phantom rows moved on (`inline_band_runs` is a *key*, so it does
@@ -41191,7 +41210,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `edit::paste_report`, `rowjson::FieldRefusal`, under *Data grid*), nor the result diff's key
     refusals (`result_diff::DiffError`, under `result_diff_view.rs`), nor the find bar's bad
     pattern (`text_ops::PatternError`, under `editor_pane.rs`), though the regex crate's reason
-    inside it still is.
+    inside it still is, nor the hover's quick info (`quickinfo::QuickInfo`, under `editor_pane.rs`),
+    though the schema's own names, types, defaults and comments inside it still are, nor Ctrl+K's
+    diff-bar summary (`inline_plan_summary_text`, under `editor_pane.rs`).
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41687,7 +41708,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     `restricted_means_sandbox`/`restricts_by_workspace_rules`/`seals_by_flag` order `notice` uses,
     and the first two carry an `$mcp` selector (`isolated`/`shared`) for the sentence `notice`
     appends where `isolates_mcp_servers` is false — so the dispatch exists twice, and the test is
-    what keeps the two orders one. The figures go in as plain digits, as `Display` writes them.
+    what keeps the two orders one. The figures go in as `Display` writes them, ungrouped, through `figure` for the interface's marks.
     Every call site that shows one takes the renderer — `inline_plan`'s refusal, `run_inline`'s
     failure, both session models' spawn refusals and their turn- and session-ended errors,
     `cursor::approve_verdict`, the app's own `spawn_refusal` gate, Settings' grade notice and the

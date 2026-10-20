@@ -1044,8 +1044,8 @@ pub fn spawn_refusal_text(r: &schemaic_ai::SpawnRefusal) -> String {
                 Levers::SchemaAndQuery => tr!("ai-levers-schema-and-query"),
                 Levers::Sample => tr!("ai-levers-sample"),
             };
-            // As plain digits, which is how core writes them.
-            let (total, limit) = (total.to_string(), limit.to_string());
+            // Core's figures, ungrouped, in the interface's marks.
+            let (total, limit) = (figure(&total.to_string()), figure(&limit.to_string()));
             tr!(
                 "ai-oversize",
                 cli = harness.label(),

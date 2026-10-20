@@ -2885,6 +2885,11 @@ widgets-spinner-verbs = Abwägen, Ausbrüten, Backen, Basteln, Berechnen, Bummel
 cmdk-placeholder = Bitte den KI-Assistenten um Hilfe.
 cmdk-accept = Übernehmen
 cmdk-reject = Verwerfen
+cmdk-no-changes = Keine Änderungen vorgeschlagen
+cmdk-diff-summary = { $hunks ->
+        [one] { $n } Abschnitt · { $removed } − / { $added } +
+       *[other] { $n } Abschnitte · { $removed } − / { $added } +
+    }
 params-value-placeholder = Wert
 params-kind-tip = Text, Zahl, NULL oder rohes SQL — zum Ändern klicken
 params-missing = Kein Wert für { $names }
@@ -2922,6 +2927,22 @@ guard-truncate-partition = TRUNCATE PARTITION entfernt jede Zeile in den genannt
 guard-drop-partition = DROP PARTITION löscht die Partition und jede Zeile darin.
 editor-diag-fix = { $keys }: { $fix }
 diag-syntax = Syntaxfehler
+quickinfo-table = Tabelle { $name } · { $database }
+quickinfo-view = Sicht { $name } · { $database }
+quickinfo-columns = { $count ->
+        [one] { $n } Spalte
+       *[other] { $n } Spalten
+    }
+quickinfo-primary-key = Primärschlüssel
+quickinfo-null = NULL erlaubt
+quickinfo-not-null = nicht NULL
+quickinfo-auto-increment = Autoinkrement
+quickinfo-default = Standard { $value }
+quickinfo-generated = generiert als { $expression }
+quickinfo-function = Funktion { $name }({ $arguments })
+quickinfo-function-returns = Funktion { $name }({ $arguments }) gibt { $returns } zurück
+quickinfo-procedure = Prozedur { $name }({ $arguments })
+quickinfo-procedure-returns = Prozedur { $name }({ $arguments }) gibt { $returns } zurück
 diag-syntax-detail = Syntaxfehler: { $detail }
 diag-reserved-alias-backticks = `{ $word }` ist ein reserviertes Schlüsselwort und kann nicht als Alias verwendet werden (setze es in Backticks)
 diag-reserved-alias-double-quotes = `{ $word }` ist ein reserviertes Schlüsselwort und kann nicht als Alias verwendet werden (setze es in doppelte Anführungszeichen)

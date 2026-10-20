@@ -102,16 +102,26 @@ pub fn name_at(
     Some(NameHit { span, object })
 }
 
-/// The quick-info for `object`, as lines of plain text: what it is and its
-/// name, then its type and constraints or its signature, then its comment.
+/// The quick-info for `object`, as lines of plain text in English: what it is
+/// and its name, then its type and constraints or its signature, then its
+/// comment ([`QuickInfo::message`] over [`info`]).
 pub fn describe(object: &NamedObject, loaded: &Loaded<'_>) -> Option<String> {
+    info(object, loaded).map(|i| i.message())
+}
+
+/// What the quick-info says about `object`, as a value: the editor's hover
+/// words it in the interface's language, and [`QuickInfo::message`] is the
+/// English. The names, types, defaults, signatures and comments are the
+/// catalogue's own and pass through. `None` where the loaded schemas do not
+/// hold it.
+pub fn info(object: &NamedObject, loaded: &Loaded<'_>) -> Option<QuickInfo> {
     let schema_of = |db: &str| loaded.iter().find(|(d, _)| *d == db).map(|(_, s)| *s);
     let named = |schema: &Option<String>, name: &str| match schema {
         Some(s) => format!("{s}.{name}"),
         None => name.to_string(),
     };
-    let mut lines = Vec::new();
-    match object {
+    let comment = |c: &Option<String>| c.clone().filter(|c| !c.trim().is_empty());
+    Some(match object {
         NamedObject::Table {
             database,
             schema,
@@ -119,11 +129,13 @@ pub fn describe(object: &NamedObject, loaded: &Loaded<'_>) -> Option<String> {
             view,
         } => {
             let t = find_table(schema_of(database)?, schema.as_deref(), table)?;
-            let what = if *view { "view" } else { "table" };
-            lines.push(format!("{what} {} · {database}", named(schema, &t.name)));
-            let n = t.columns.len();
-            lines.push(format!("{n} column{}", if n == 1 { "" } else { "s" }));
-            lines.extend(t.comment.clone().filter(|c| !c.trim().is_empty()));
+            QuickInfo::Table {
+                view: *view,
+                name: named(schema, &t.name),
+                database: database.clone(),
+                columns: t.columns.len(),
+                comment: comment(&t.comment),
+            }
         }
         NamedObject::Column {
             database,
@@ -136,28 +148,16 @@ pub fn describe(object: &NamedObject, loaded: &Loaded<'_>) -> Option<String> {
                 .columns
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(column))?;
-            lines.push(format!(
-                "{}.{}  {}",
-                named(schema, &t.name),
-                c.name,
-                c.type_name
-            ));
-            let mut traits = Vec::new();
-            if c.primary_key {
-                traits.push("primary key".to_string());
+            QuickInfo::Column {
+                name: format!("{}.{}", named(schema, &t.name), c.name),
+                type_name: c.type_name.clone(),
+                primary_key: c.primary_key,
+                nullable: c.nullable,
+                auto_increment: c.auto_increment,
+                default: c.default.clone(),
+                generated: c.generated.clone(),
+                comment: comment(&c.comment),
             }
-            traits.push(if c.nullable { "null" } else { "not null" }.to_string());
-            if c.auto_increment {
-                traits.push("auto increment".to_string());
-            }
-            if let Some(d) = &c.default {
-                traits.push(format!("default {d}"));
-            }
-            if let Some(g) = &c.generated {
-                traits.push(format!("generated as {g}"));
-            }
-            lines.push(traits.join(" · "));
-            lines.extend(c.comment.clone().filter(|c| !c.trim().is_empty()));
         }
         NamedObject::Routine {
             database,
@@ -169,18 +169,110 @@ pub fn describe(object: &NamedObject, loaded: &Loaded<'_>) -> Option<String> {
                 r.name.eq_ignore_ascii_case(name)
                     && (schema.is_none() || r.schema.as_deref() == schema.as_deref())
             })?;
-            let kind = match r.kind {
-                RoutineKind::Function => "function",
-                RoutineKind::Procedure => "procedure",
-            };
-            let mut sig = format!("{kind} {}({})", named(&r.schema, &r.name), r.arguments);
-            if !r.returns.trim().is_empty() {
-                sig.push_str(&format!(" returns {}", r.returns));
+            QuickInfo::Routine {
+                function: matches!(r.kind, RoutineKind::Function),
+                name: named(&r.schema, &r.name),
+                arguments: r.arguments.clone(),
+                returns: (!r.returns.trim().is_empty()).then(|| r.returns.clone()),
             }
-            lines.push(sig);
         }
+    })
+}
+
+/// What the quick-info says ([`info`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuickInfo {
+    /// A table or a view: its (schema-qualified) name, its database, its
+    /// column count and its comment.
+    Table {
+        view: bool,
+        name: String,
+        database: String,
+        columns: usize,
+        comment: Option<String>,
+    },
+    /// A column: `table.column`, its type, its constraints and its comment.
+    Column {
+        name: String,
+        type_name: String,
+        primary_key: bool,
+        nullable: bool,
+        auto_increment: bool,
+        default: Option<String>,
+        generated: Option<String>,
+        comment: Option<String>,
+    },
+    /// A function or procedure and its signature.
+    Routine {
+        function: bool,
+        name: String,
+        arguments: String,
+        returns: Option<String>,
+    },
+}
+
+impl QuickInfo {
+    /// The quick-info in English, a line each.
+    pub fn message(&self) -> String {
+        let mut lines = Vec::new();
+        match self {
+            QuickInfo::Table {
+                view,
+                name,
+                database,
+                columns,
+                comment,
+            } => {
+                let what = if *view { "view" } else { "table" };
+                lines.push(format!("{what} {name} · {database}"));
+                let n = *columns;
+                lines.push(format!("{n} column{}", if n == 1 { "" } else { "s" }));
+                lines.extend(comment.clone());
+            }
+            QuickInfo::Column {
+                name,
+                type_name,
+                primary_key,
+                nullable,
+                auto_increment,
+                default,
+                generated,
+                comment,
+            } => {
+                lines.push(format!("{name}  {type_name}"));
+                let mut traits = Vec::new();
+                if *primary_key {
+                    traits.push("primary key".to_string());
+                }
+                traits.push(if *nullable { "null" } else { "not null" }.to_string());
+                if *auto_increment {
+                    traits.push("auto increment".to_string());
+                }
+                if let Some(d) = default {
+                    traits.push(format!("default {d}"));
+                }
+                if let Some(g) = generated {
+                    traits.push(format!("generated as {g}"));
+                }
+                lines.push(traits.join(" · "));
+                lines.extend(comment.clone());
+            }
+            QuickInfo::Routine {
+                function,
+                name,
+                arguments,
+                returns,
+            } => {
+                let kind = if *function { "function" } else { "procedure" };
+                let mut sig = format!("{kind} {name}({arguments})");
+                if let Some(r) = returns {
+                    sig.push_str(&format!(" returns {r}"));
+                }
+                lines.push(sig);
+            }
+        }
+        lines.join("\n")
     }
-    Some(lines.join("\n"))
 }
 
 /// A table by name in one schema, the exact spelling first and then any case;
