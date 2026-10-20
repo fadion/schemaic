@@ -773,6 +773,30 @@ ddl-risk-star-refresh = Aktualisiert jede Sicht und Inline-Funktion in dieser Da
 ddl-risk-piecewise = SQL Server erstellt, ändert oder löscht ein nativ kompiliertes Modul nicht innerhalb einer Transaktion; dieser Plan läuft daher Anweisung für Anweisung und lässt sich nicht anhalten: Schlägt eine Anweisung fehl, bleiben die vorherigen angewendet.
 ddl-risk-drop-sequence-table = Löscht die Sequenz: Der erreichte Wert geht verloren, und alles, was noch aus ihr zieht, schlägt fehl.
 ddl-risk-drop-scale = Laut den Statistiken des Schemabaums sind das { $rows } Zeilen.
+propose-wrong-table = der Vorschlag gilt für die Tabelle `{ $proposed }`, aber `{ $actual }` ist geöffnet
+propose-no-ops = der Vorschlag verlangt keine Änderungen
+propose-no-such-column = `{ $table }` hat keine Spalte namens `{ $name }`
+propose-column-exists = `{ $table }` hat bereits eine Spalte namens `{ $name }`
+propose-no-such-index = `{ $table }` hat keinen Index namens `{ $name }`
+propose-index-exists = `{ $table }` hat bereits einen Index namens `{ $name }`
+propose-no-such-foreign-key = `{ $table }` hat keinen Fremdschlüssel namens `{ $name }`
+propose-no-such-check = `{ $table }` hat keinen Check namens `{ $name }`
+propose-key-width-mismatch = ein Fremdschlüssel braucht so viele referenzierte wie referenzierende Spalten
+propose-empty-index = ein Index braucht mindestens eine Spalte
+propose-invalid = die vorgeschlagene Tabelle wäre nicht gültig: { $problem }
+propose-not-a-table = `{ $name }` ist eine Sicht — ein Vorschlag kann nur eine Tabelle ändern
+propose-no-such-table = keine Tabelle namens `{ $name }` — rufe list_schema auf, um zu sehen, was existiert
+propose-not-an-expression = { $field ->
+        [default] der Standardwert `{ $text }` ist kein einzelner SQL-Ausdruck
+        [generated] der Generierungsausdruck `{ $text }` ist kein einzelner SQL-Ausdruck
+       *[check] der Check-Ausdruck `{ $text }` ist kein einzelner SQL-Ausdruck
+    }
+propose-not-a-type = `{ $text }` ist kein Spaltentyp — gib nur den Typ an, ohne Standardwert, ohne NOT NULL und ohne etwas danach
+propose-unknown-action = `{ $text }` ist keine Fremdschlüssel-Aktion
+propose-not-loaded = { $table } ist in { $database } gerade nicht geladen — öffne die Datenbank im Schemabaum oder warte, bis eine Aktualisierung fertig ist, und versuche es erneut.
+propose-nothing-to-change = { $subject } sieht bereits so aus — es gibt nichts zu ändern.
+propose-no-database = Für diesen Tab ist keine Datenbank ausgewählt, eine von hier angewendete Schemaänderung hätte also kein Ziel. Wähle zuerst eine für diese Verbindung — sind alle Datenbanken ausgeblendet, holt das SCHEMA-Auge eine zurück.
+propose-other-connection = Diese Änderung betrifft einen Tab einer anderen Verbindung — wechsle zu ihm oder wähle seine Verbindung im Baum, bevor du eine Schemaänderung anwendest.
 ddl-used-by-count-view = { $count ->
     [one] { $count } Sicht
    *[other] { $count } Sichten

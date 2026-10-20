@@ -2543,6 +2543,38 @@ ddl-risk-piecewise = SQL Server will not create, alter or drop a natively compil
 ddl-risk-drop-sequence-table = Drops the sequence: the value it has reached is lost, and anything that still draws from it fails.
 # $rows is the figure as the properties panel prints it (~4.2m, 12).
 ddl-risk-drop-scale = By the schema tree's statistics, that is { $rows } rows.
+## An AI proposal the preview cannot open, on the proposal's card (core's
+## propose::ProposeError). English must read exactly as its Display (a test
+## holds it). Backticked names are the table's and the model's own.
+propose-wrong-table = the proposal is for table `{ $proposed }`, but `{ $actual }` is open
+propose-no-ops = the proposal asks for no changes
+propose-no-such-column = `{ $table }` has no column named `{ $name }`
+propose-column-exists = `{ $table }` already has a column named `{ $name }`
+propose-no-such-index = `{ $table }` has no index named `{ $name }`
+propose-index-exists = `{ $table }` already has an index named `{ $name }`
+propose-no-such-foreign-key = `{ $table }` has no foreign key named `{ $name }`
+propose-no-such-check = `{ $table }` has no check constraint named `{ $name }`
+propose-key-width-mismatch = a foreign key needs as many referenced columns as referencing ones
+propose-empty-index = an index needs at least one column
+# $problem is what stops the table design (table-problem-*).
+propose-invalid = the proposed table wouldn't be valid: { $problem }
+propose-not-a-table = `{ $name }` is a view — a proposal can only change a table
+# list_schema is a tool name: never translated.
+propose-no-such-table = no table called `{ $name }` — call list_schema to see what exists
+# $field is default, generated or check; $text is the model's SQL.
+propose-not-an-expression = { $field ->
+        [default] the default `{ $text }` isn't a single SQL expression
+        [generated] the generated expression `{ $text }` isn't a single SQL expression
+       *[check] the check expression `{ $text }` isn't a single SQL expression
+    }
+propose-not-a-type = `{ $text }` isn't a column type — give the type alone, with no default, no NOT NULL, and nothing after it
+propose-unknown-action = `{ $text }` isn't a foreign-key action
+# The card's own refusals, before core is asked.
+propose-not-loaded = { $table } isn't loaded in { $database } right now — open the database in the schema tree, or wait for a refresh to finish, and try again.
+propose-nothing-to-change = { $subject } already looks like that — there is nothing to change.
+propose-no-database = This tab has no database selected, so a schema change applied from here would have nowhere to go. Pick one for this connection first — if every database is hidden, the SCHEMA eye is where to bring one back.
+propose-other-connection = This change is about a tab on a different connection — switch to it, or select its connection in the tree, before applying a schema change.
+
 ## The Used by lines: what in the loaded schema still names something the plan
 ## renames, drops or retypes (core's used_by::UsedByNote and Listing). English
 ## must read exactly as core's change_warning and drop_warning (a test holds it).

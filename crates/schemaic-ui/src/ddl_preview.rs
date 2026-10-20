@@ -608,24 +608,24 @@ pub(crate) fn preview_proposal(
 ) -> Result<(), String> {
     let ctx = crate::table_designer::edit_ctx(conn);
     let Some(loaded) = crate::table_designer::loaded_schema(schema, database) else {
-        return Err(format!(
-            "{} isn't loaded in {database} right now — open the database in the schema tree, or \
-             wait for a refresh to finish, and try again.",
-            proposal.table
+        return Err(tr!(
+            "propose-not-loaded",
+            table = proposal.table.as_str(),
+            database = database
         ));
     };
     // **The same resolver `propose_table_change` uses.** The tool tells the
     // model its change is valid against one table; this is what the user is
     // offered, and the two reading the JSON by different rules is how those
     // could be different tables.
-    let info =
-        schemaic_core::propose::resolve_target(&loaded, proposal).map_err(|e| e.to_string())?;
+    let info = schemaic_core::propose::resolve_target(&loaded, proposal)
+        .map_err(|e| propose_error_text(&e))?;
     // The table as the *server* spells it, not as the proposal wrote it: the
     // resolver accepts `sales.orders` and an explicit `schema`, so the subject
     // has to come off what was found.
     let subject = schemaic_core::schema::display_name(info.schema.as_deref(), &info.name);
-    let draft =
-        schemaic_core::propose::apply(info, proposal, ctx.dialect).map_err(|e| e.to_string())?;
+    let draft = schemaic_core::propose::apply(info, proposal, ctx.dialect)
+        .map_err(|e| propose_error_text(&e))?;
     // The flavour the schema was actually introspected with — see `db_flavour`.
     // The MySQL emitter's `ALTER TABLE` path reads it, so taking the dialect
     // alone would give this path a different plan than the designer's for the
@@ -636,9 +636,7 @@ pub(crate) fn preview_proposal(
     );
     let cs = schemaic_core::ddl::diff(info, &draft, target);
     if cs.is_empty() {
-        return Err(format!(
-            "{subject} already looks like that — there is nothing to change."
-        ));
+        return Err(tr!("propose-nothing-to-change", subject = subject.as_str()));
     }
     open_preview(
         ddl,
@@ -2301,6 +2299,70 @@ pub(crate) fn plan_risk_text(risk: &schemaic_core::compare::PlanRisk) -> String 
     }
 }
 
+/// Why an AI proposal cannot be previewed, on its card — core's
+/// `ProposeError` `Display` in the interface's language; the names and the
+/// model's own SQL stay as they came.
+pub(crate) fn propose_error_text(e: &schemaic_core::propose::ProposeError) -> String {
+    use schemaic_core::propose::{ExpressionField, ProposeError as E};
+    match e {
+        E::WrongTable { proposed, actual } => tr!(
+            "propose-wrong-table",
+            proposed = proposed.as_str(),
+            actual = actual.as_str()
+        ),
+        E::NoOps => tr!("propose-no-ops"),
+        E::NoSuchColumn(t, n) => tr!(
+            "propose-no-such-column",
+            table = t.as_str(),
+            name = n.as_str()
+        ),
+        E::ColumnExists(t, n) => tr!(
+            "propose-column-exists",
+            table = t.as_str(),
+            name = n.as_str()
+        ),
+        E::NoSuchIndex(t, n) => tr!(
+            "propose-no-such-index",
+            table = t.as_str(),
+            name = n.as_str()
+        ),
+        E::IndexExists(t, n) => tr!(
+            "propose-index-exists",
+            table = t.as_str(),
+            name = n.as_str()
+        ),
+        E::NoSuchForeignKey(t, n) => tr!(
+            "propose-no-such-foreign-key",
+            table = t.as_str(),
+            name = n.as_str()
+        ),
+        E::NoSuchCheck(t, n) => tr!(
+            "propose-no-such-check",
+            table = t.as_str(),
+            name = n.as_str()
+        ),
+        E::KeyWidthMismatch => tr!("propose-key-width-mismatch"),
+        E::EmptyIndex => tr!("propose-empty-index"),
+        E::Invalid(p) => tr!(
+            "propose-invalid",
+            problem = crate::table_designer::table_problem_text(p)
+        ),
+        E::NotATable(n) => tr!("propose-not-a-table", name = n.as_str()),
+        E::NoSuchTable(n) => tr!("propose-no-such-table", name = n.as_str()),
+        E::NotAnExpression { what, text } => tr!(
+            "propose-not-an-expression",
+            field = match what {
+                ExpressionField::Default => "default",
+                ExpressionField::Generated => "generated",
+                ExpressionField::Check => "check",
+            },
+            text = text.as_str()
+        ),
+        E::NotAType { text } => tr!("propose-not-a-type", text = text.as_str()),
+        E::UnknownAction(a) => tr!("propose-unknown-action", text = a.as_str()),
+    }
+}
+
 /// The dependents a *Used by* line names — core's `used_by::Listing` in the
 /// interface's language.
 fn listing_text(l: &schemaic_core::used_by::Listing) -> String {
@@ -3059,6 +3121,52 @@ mod tests {
         }
         for risk in &plan {
             assert_eq!(plan_risk_text(risk), risk.message(), "{risk:?}");
+        }
+    }
+
+    /// **Every proposal refusal reads in English exactly as core's
+    /// `ProposeError` displays it** — the card shows the one, the MCP tool
+    /// hands the model the other.
+    #[test]
+    fn english_refuses_every_proposal_as_core_does() {
+        use schemaic_core::ddl::TableProblem;
+        use schemaic_core::propose::{ExpressionField, ProposeError as E};
+        let t = || ("orders".to_string(), "qty".to_string());
+        let mut errors = vec![
+            E::WrongTable {
+                proposed: "orders".into(),
+                actual: "customers".into(),
+            },
+            E::NoOps,
+            E::NoSuchColumn(t().0, t().1),
+            E::ColumnExists(t().0, t().1),
+            E::NoSuchIndex(t().0, "ix".into()),
+            E::IndexExists(t().0, "ix".into()),
+            E::NoSuchForeignKey(t().0, "fk".into()),
+            E::NoSuchCheck(t().0, "ck".into()),
+            E::KeyWidthMismatch,
+            E::EmptyIndex,
+            E::Invalid(TableProblem::NoColumns),
+            E::Invalid(TableProblem::ColumnTwice { name: "qty".into() }),
+            E::NotATable("v_orders".into()),
+            E::NoSuchTable("nope".into()),
+            E::NotAType {
+                text: "int not null".into(),
+            },
+            E::UnknownAction("EXPLODE".into()),
+        ];
+        for what in [
+            ExpressionField::Default,
+            ExpressionField::Generated,
+            ExpressionField::Check,
+        ] {
+            errors.push(E::NotAnExpression {
+                what,
+                text: "1; DROP TABLE t".into(),
+            });
+        }
+        for e in &errors {
+            assert_eq!(propose_error_text(e), e.to_string(), "{e:?}");
         }
     }
 

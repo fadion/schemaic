@@ -188,14 +188,14 @@ pub enum ProposeError {
     KeyWidthMismatch,
     #[error("an index needs at least one column")]
     EmptyIndex,
-    #[error("the proposed table wouldn't be valid: {0}")]
-    Invalid(String),
+    #[error("the proposed table wouldn't be valid: {}", .0.message())]
+    Invalid(crate::ddl::TableProblem),
     #[error("`{0}` is a view — a proposal can only change a table")]
     NotATable(String),
     #[error("no table called `{0}` — call list_schema to see what exists")]
     NoSuchTable(String),
-    #[error("the {what} `{text}` isn't a single SQL expression")]
-    NotAnExpression { what: String, text: String },
+    #[error("the {} `{text}` isn't a single SQL expression", .what.label())]
+    NotAnExpression { what: ExpressionField, text: String },
     /// A `type` field that is not a bare column type.
     ///
     /// Separate from [`ProposeError::NotAnExpression`] because a type is not an
@@ -207,6 +207,26 @@ pub enum ProposeError {
     NotAType { text: String },
     #[error("`{0}` isn't a foreign-key action")]
     UnknownAction(String),
+}
+
+/// Which free-SQL field of a proposal was not a single expression
+/// ([`ProposeError::NotAnExpression`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpressionField {
+    Default,
+    Generated,
+    Check,
+}
+
+impl ExpressionField {
+    /// What the field is called in the English message.
+    pub fn label(self) -> &'static str {
+        match self {
+            ExpressionField::Default => "default",
+            ExpressionField::Generated => "generated expression",
+            ExpressionField::Check => "check expression",
+        }
+    }
 }
 
 /// Is `action` a referential action a foreign key may state on `dialect`?
@@ -250,11 +270,11 @@ fn is_fk_action(action: &str, dialect: SqlDialect) -> bool {
 /// hole of the same shape, so a new one on `NewColumn` or `ColumnPatch` belongs
 /// here before it belongs in the emitter.
 fn check_free_sql(op: &ProposedOp, dialect: SqlDialect) -> Result<(), ProposeError> {
-    let expr = |what: &str, text: &Option<String>| -> Result<(), ProposeError> {
+    let expr = |what: ExpressionField, text: &Option<String>| -> Result<(), ProposeError> {
         match text {
             Some(t) if !crate::intel::is_single_expression(t, dialect) => {
                 Err(ProposeError::NotAnExpression {
-                    what: what.to_string(),
+                    what,
                     text: t.clone(),
                 })
             }
@@ -279,17 +299,17 @@ fn check_free_sql(op: &ProposedOp, dialect: SqlDialect) -> Result<(), ProposeErr
     match op {
         ProposedOp::AddColumn(c) => {
             column_type(&c.type_name)?;
-            expr("default", &c.default)?;
-            expr("generated expression", &c.generated)?;
+            expr(ExpressionField::Default, &c.default)?;
+            expr(ExpressionField::Generated, &c.generated)?;
         }
         ProposedOp::AlterColumn(p) => {
             if let Some(t) = &p.type_name {
                 column_type(t)?;
             }
-            expr("default", &p.default)?;
+            expr(ExpressionField::Default, &p.default)?;
         }
         ProposedOp::AddCheck(ck) => {
-            expr("check expression", &Some(ck.expression.clone()))?;
+            expr(ExpressionField::Check, &Some(ck.expression.clone()))?;
         }
         ProposedOp::AddForeignKey(fk) => {
             action(&fk.on_delete)?;
@@ -427,9 +447,8 @@ pub fn apply(
         apply_op(&mut draft, op, dialect)?;
     }
 
-    let problems = draft.validate(dialect);
-    if let Some(first) = problems.first() {
-        return Err(ProposeError::Invalid(first.clone()));
+    if let Some(first) = draft.problems(dialect).into_iter().next() {
+        return Err(ProposeError::Invalid(first));
     }
     Ok(draft)
 }

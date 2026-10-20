@@ -206,21 +206,10 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 let db = match schemaic_core::tabsel::tab_scope(tab, conn) {
                     schemaic_core::tabsel::TabScope::Bound(db) => db,
                     schemaic_core::tabsel::TabScope::NoDatabase => {
-                        return Err(
-                            "This tab has no database selected, so a schema change applied \
-                             from here would have nowhere to go. Pick one for this \
-                             connection first — if every database is hidden, the SCHEMA eye \
-                             is where to bring one back."
-                                .to_string(),
-                        );
+                        return Err(tr!("propose-no-database"));
                     }
                     schemaic_core::tabsel::TabScope::OtherConnection => {
-                        return Err(
-                            "This change is about a tab on a different connection — switch \
-                             to it, or select its connection in the tree, before applying a \
-                             schema change."
-                                .to_string(),
-                        );
+                        return Err(tr!("propose-other-connection"));
                     }
                 };
                 crate::ddl_preview::preview_proposal(ui.conn, ui.schema, ui.ddl, &db, &proposal)

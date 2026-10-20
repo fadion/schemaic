@@ -2564,7 +2564,7 @@ fn swap_selected(d: DdlUi, delta: isize) {
 
 /// What stops the draft being emitted — core's `TableProblem::message` in the
 /// interface's language. Names are the draft's; the SQL in them stays.
-fn table_problem_text(p: &ddl::TableProblem) -> String {
+pub(crate) fn table_problem_text(p: &ddl::TableProblem) -> String {
     use ddl::TableProblem as P;
     fn s(v: &str) -> &str {
         v

@@ -15179,8 +15179,9 @@ existing prose was left alone.
       downstream able to tell either from an intended change. What a patch doesn't name, it doesn't
       touch. Ops compose through the draft's own mutators (`rename_column`, `remove_column`), so a
       rename carries its indexes and keys and a drop cascades to them; the result is run through
-      `TableDraft::validate` before it is returned, so the designer's rules stand between the model
-      and the preview. Column lookups match case-insensitively — a model routinely writes `Email`
+      `TableDraft::problems(dialect)` before it is returned, the first refusal coming back as
+      `ProposeError::Invalid(TableProblem)`, so the designer's rules stand between the model and the
+      preview. Column lookups match case-insensitively — a model routinely writes `Email`
       for `email` — and keep the server's spelling. A foreign key's action is a closed vocabulary,
       since `ddl` writes it straight after `ON DELETE `, and **it is the designer's own list**:
       `is_fk_action` asks `ddl::fk_actions(dialect)`, its `None` entry read as `NO ACTION`. It used
@@ -25413,7 +25414,8 @@ existing prose was left alone.
     `text::plural`), *Review change…* (`card_button` takes a `String`) and the unreadable line
     (`$error`). The model's own text — the reply, the proposal's summary — is never translated;
     the unreadable line's `$error` is serde's, and the error `CodeActions::propose` hands back is
-    shown as it comes. `the_proposal_card_reads_as_it_did_in_english` pins the card's lines.
+    shown as it comes — already worded, by `ddl_preview::propose_error_text` or the panel's own
+    `propose-no-database`/`propose-other-connection`. `the_proposal_card_reads_as_it_did_in_english` pins the card's lines.
   - `i18n.rs` — **the interface's string catalogue**: Fluent, through `i18n-embed` (feature
     `fluent-system`) and `i18n-embed-fl`, over the language `core::locale` chose. The catalogues
     are `crates/schemaic-ui/i18n/<tag>/schemaic.ftl` — `en-GB` the source, `de` machine-drafted and
@@ -28775,8 +28777,9 @@ existing prose was left alone.
     risk heading and the *Used by* lines have left that list, worded from `ChangeLine`,
     `Risk`/`PlanRisk` and `used_by::Listing`/`UsedByNote` (`risk_text`, `plan_risk_text`,
     `used_by_drop_text`, `used_by_note_text`, all under *The string catalogue*) and from the bool
-    above; and `preview_proposal`'s two `Err` sentences, which go back
-    through the AI panel's propose path, whose sibling error in `ai_panel.rs` is English too.
+    above, and so has every `Err` `preview_proposal` hands the card — its own two refusals
+    (`propose-not-loaded`, `propose-nothing-to-change`) and each `ProposeError` that
+    `resolve_target` or `apply` returns, through `propose_error_text`.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
     tree's column and key right-clicks (`Edit column`, and `Edit index` / `Edit foreign key` /
@@ -28824,7 +28827,8 @@ existing prose was left alone.
     hint is worded here, `index_hint_text` over the `IndexHint` and its `subject`
     (`designer-hint-*`, `english_says_every_index_hint_as_core_does`), and so are the draft's
     refusals: the footer and Preview's readiness read `TableDraft::problems`, never `validate`, and
-    `table_problem_text` words each `TableProblem` from `table-problem-*` (under `i18n.rs`).
+    `table_problem_text` words each `TableProblem` from `table-problem-*` (under `i18n.rs`) — and,
+    being `pub(crate)`, the AI proposal card's `ProposeError::Invalid` too.
   - `view_editor.rs` — the **view** modal (tree "Edit" on a view, "Create view" on a database/
     schema node *and* on the editor's right-click when the statement under the caret can be a
     view body — `ddl::can_be_view_body`, which seeds the draft with it), over `core::ddl`'s
@@ -41421,6 +41425,20 @@ Re-introducing the anti-patterns these guard against is a regression:
     consequence. What stays core's English in the modal: the withheld lines (`unsupported`, which
     still reads `Change::summary` for a refused change), the omitted notes and the after-commit
     refresh note (`ddl::elsewhere_report`).
+    An AI proposal's refusal is the same two-reader case, its readers on either side of the chat.
+    `ProposeError` held two pieces it had already worded in English: `Invalid` carried
+    `validate`'s first sentence, and `NotAnExpression`'s `what` the field's name as a `String`.
+    `Invalid` now carries the `ddl::TableProblem` itself — the first of `TableDraft::problems` —
+    and `what` is an `ExpressionField` (`Default`, `Generated`, `Check`) whose `label()` is the name
+    the English gives it; the `Display` is unchanged, and it is what `propose_table_change` hands
+    the model, so the model reads English whatever the interface's language. The card reads
+    `propose_error_text` (under `ddl_preview.rs`), which words every variant from `propose-*`, the
+    `Invalid` problem through the designer's `table_problem_text` — `pub(crate)` for it — and the
+    field as a `$field` selector whose every arm is a whole sentence; `preview_proposal`'s own two
+    refusals and the panel's two scope refusals (`propose-no-database`, `propose-other-connection`,
+    in `ai_panel.rs`) are catalogue messages beside them.
+    `english_refuses_every_proposal_as_core_does` holds the English equal to the `Display` over
+    every variant, each `ExpressionField` and two `TableProblem`s.
     The editor's diagnostics are the case where one value has two readers in two languages.
     `intel::Diagnostic` held a finished `message: String` and now holds `what`, an
     `intel::DiagMessage` (under `core::intel`), with `Diagnostic::message()` the English byte for
