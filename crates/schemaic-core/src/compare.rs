@@ -1618,11 +1618,13 @@ impl SchemaPlan {
     /// What a preview's risk block calls itself — the stronger of its sets'
     /// answers, since one irreversible statement makes the whole plan one.
     pub fn risk_heading(&self) -> &'static str {
-        if self.sets.iter().all(ChangeSet::risk_reversible) && !self.cycles {
-            "Before you apply"
-        } else {
-            "This can't be undone"
-        }
+        ddl::risk_heading_for(self.risk_reversible())
+    }
+
+    /// Is every consequence in this plan reversible — every set's, and no
+    /// foreign-key cycle? What [`SchemaPlan::risk_heading`] reads.
+    pub fn risk_reversible(&self) -> bool {
+        self.sets.iter().all(ChangeSet::risk_reversible) && !self.cycles
     }
 
     /// Does the plan run **whole or not at all**? Every set's answer

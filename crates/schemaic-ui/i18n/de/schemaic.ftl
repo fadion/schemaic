@@ -1982,6 +1982,8 @@ preview-changes = { $count ->
     [one] { $count } Änderung
    *[other] { $count } Änderungen
 }
+preview-risk-reversible = Bevor du anwendest
+preview-risk-irreversible = Das lässt sich nicht rückgängig machen
 preview-used-by = Verwendet von
 preview-withheld = Diese Engine kann einen Teil dieses Plans nicht ausdrücken
 preview-withheld-hint = Nichts wird angewendet, solange dies aufgeführt ist.

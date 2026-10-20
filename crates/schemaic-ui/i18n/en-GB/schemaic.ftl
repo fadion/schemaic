@@ -2155,8 +2155,13 @@ diff-no-added = No added rows.
 diff-no-removed = No removed rows.
 
 ## The DDL preview — the plan a schema editor or a comparison applies (ddl_preview.rs)
-## The risk heading and its lines, and the Used by, withheld and omitted lines
-## are core's words and stay as they are for now.
+## The risk lines, and the Used by, withheld and omitted lines are core's words
+## and stay as they are for now.
+
+# The heading over what the plan destroys: every consequence listed can be
+# reversed, or not. English must read exactly as core's ddl::risk_heading_for.
+preview-risk-reversible = Before you apply
+preview-risk-irreversible = This can't be undone
 
 ## The change list: one line per change (core's ddl::ChangeLine). English must
 ## read exactly as core's Change::summary (a test holds it). Names, types, SQL

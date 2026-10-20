@@ -263,7 +263,7 @@ pub(crate) fn preview_of(
             .map(|c| change_line_text(&c.line()))
             .collect(),
         destructive: cs.destructive(),
-        risk_heading: cs.risk_heading(),
+        risk_heading: risk_heading_text(cs.risk_reversible()),
         used_by: Vec::new(),
         then: None,
         withheld: cs.unsupported(),
@@ -352,7 +352,7 @@ pub(crate) fn preview_of_plan(
             .map(|(subject, line)| plan_line_text(subject, line))
             .collect(),
         destructive: plan.destructive(),
-        risk_heading: plan.risk_heading(),
+        risk_heading: risk_heading_text(plan.risk_reversible()),
         used_by: Vec::new(),
         then: None,
         // The same refusal a single set gets: non-empty disables Apply and is
@@ -667,7 +667,7 @@ fn change_line(label: String) -> impl IntoView {
 
 /// The destructive block. Present ⇒ this plan takes something away, and the
 /// wording says what rather than "are you sure".
-fn risk_block(heading: &'static str, risks: Vec<String>) -> impl IntoView {
+fn risk_block(heading: String, risks: Vec<String>) -> impl IntoView {
     let empty_block = risks.is_empty();
     v_stack((
         h_stack((
@@ -1121,7 +1121,7 @@ pub(crate) fn ddl_preview_overlay(
                     form_section_owned(tr!("preview-changes", count = n)),
                     v_stack_from_iter(p.changes.iter().cloned().map(change_line))
                         .style(|s| s.flex_col().width_full()),
-                    risk_block(p.risk_heading, p.destructive.clone())
+                    risk_block(p.risk_heading.clone(), p.destructive.clone())
                         .style(|s| s.margin_top(theme::scaled(14.0))),
                     used_by_block(p.used_by.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
                     withheld_block(p.withheld.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
@@ -1961,6 +1961,16 @@ pub(crate) fn change_line_text(line: &schemaic_core::ddl::ChangeLine) -> String 
     }
 }
 
+/// What the risk block calls itself — core's `ddl::risk_heading_for` in the
+/// interface's language.
+pub(crate) fn risk_heading_text(reversible: bool) -> String {
+    if reversible {
+        tr!("preview-risk-reversible")
+    } else {
+        tr!("preview-risk-irreversible")
+    }
+}
+
 /// A comparison's line: `line` worded, about `subject` — core's
 /// `SchemaPlan::summaries` in the interface's language.
 pub(crate) fn plan_line_text(subject: &str, line: &schemaic_core::ddl::ChangeLine) -> String {
@@ -2403,6 +2413,18 @@ mod tests {
         for storage in IndexStorage::ALL {
             let line = index(false, Some(storage), None, &["a"], false);
             assert_eq!(change_line_text(&line), line.message(), "{storage:?}");
+        }
+    }
+
+    /// **The risk block's heading reads in English exactly as core's.**
+    #[test]
+    fn english_heads_the_risk_block_as_core_does() {
+        for reversible in [false, true] {
+            assert_eq!(
+                risk_heading_text(reversible),
+                schemaic_core::ddl::risk_heading_for(reversible),
+                "{reversible}"
+            );
         }
     }
 

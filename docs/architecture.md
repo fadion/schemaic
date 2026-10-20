@@ -9217,7 +9217,10 @@ existing prose was left alone.
     an account change in a plan should inherit it instead of having to notice the prose.
     `risk_heading` takes the **stronger** of its sets' answers by asking `ChangeSet::risk_reversible`
     — extracted `pub` for this caller rather than having the aggregate compare headings as strings,
-    which would agree with every set the day one is reworded. It only titles a non-empty
+    which would agree with every set the day one is reworded. That answer is itself `pub` now, as
+    `risk_reversible()` (every set's, and no foreign-key cycle), because the preview words the
+    heading from the bool rather than taking core's English; `risk_heading` is
+    `ddl::risk_heading_for` over it, the one place both headings' English lives. It only titles a non-empty
     `destructive()` list, so a create-only plan's heading is never read at all, and since
     `Change::risk_is_reversible` is true of the four account changes alone, a compare plan with a
     risk block to head always reads "This can't be undone".
@@ -28675,8 +28678,9 @@ existing prose was left alone.
     and it inherited the qualifier as a side effect, so `CREATE USER 'app'@'%'` — server-wide on
     both engines — was titled `shop.app@%`, which reads as scoped and is not. `preview_title` is a
     free function so that sentence has a test; it was a `match` inside a `dyn_container` child.
-    `risk_heading` rides on the preview beside it, from `ChangeSet::risk_heading` — a heading that
-    contradicts the sentence beneath it costs the sentence its weight. A multi-object plan is
+    `risk_heading` rides on the preview beside it, a `String` worded by `risk_heading_text` from
+    `ChangeSet::risk_reversible` (`SchemaPlan::risk_reversible` in `preview_of_plan`) — a heading
+    that contradicts the sentence beneath it costs the sentence its weight. A multi-object plan is
     `qualified`'s one exception to being derived at all — the entry below says why.
     **`preview_of_plan` is `preview_of`'s multi-object counterpart**, for a schema comparison's
     `compare::SchemaPlan`, and `DdlPreview` needed **nothing added** to carry one: every field it
@@ -28732,7 +28736,9 @@ existing prose was left alone.
     `preview_title`, one whole message `preview-title` (`$connection`, `$subject`) whose subject is
     `database.subject` when `qualified` and the bare subject otherwise, so its tests pass unchanged;
     the change-list heading `preview-changes`, a plural on `$count` that replaced `text::plural`;
-    the Used by, withheld and omitted headings and the latter two's closing lines; Copy, Open in
+    the risk heading, `preview-risk-reversible` or `preview-risk-irreversible` through
+    `risk_heading_text`, which `english_heads_the_risk_block_as_core_does` holds equal to
+    `ddl::risk_heading_for`; the Used by, withheld and omitted headings and the latter two's closing lines; Copy, Open in
     editor, Back (`preview-back`) and Apply/Applying…; and the applied view's `preview-applied`
     (plural, `$count`, `$subject`) and *The schema has been refreshed.* Stop, Cancel and Close are
     the shared `dialog-stop`, `dialog-cancel` and `dialog-close`, and the note beside the disabled
@@ -28740,9 +28746,9 @@ existing prose was left alone.
     footers share is now one message rather than two literals that modal's source gate held equal.
     `the_counted_lines_read_as_they_did_in_english` pins both plurals. English stays: the SQL box
     (`sql_box_text`, its `-- After the plan commits…` comment included, being generated SQL) and the
-    *SQL* heading; `ChangeSet::risk_heading` and the risk, used-by, withheld and omitted lines,
-    core's prose, phase 4 — the change lines have left that list, worded from `ChangeLine` (under
-    *The string catalogue*); and `preview_proposal`'s two `Err` sentences, which go back
+    *SQL* heading; the risk, used-by, withheld and omitted lines, core's prose, phase 4 — the
+    change lines and the risk heading have left that list, worded from `ChangeLine` (under
+    *The string catalogue*) and from the bool above; and `preview_proposal`'s two `Err` sentences, which go back
     through the AI panel's propose path, whose sibling error in `ai_panel.rs` is English too.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
@@ -41018,7 +41024,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     still are, nor `DbError`'s own *query failed:*, *connection failed:* and *query cancelled*
     wherever the app shows an error through `db_error_shown` (below) — the sites still on
     `to_string()` are listed there — nor the DDL preview's change lines (`ddl::ChangeLine`,
-    below), though its risk heading and risk lines, withheld, *Used by* and omitted lines still are.
+    below) and risk heading, though its risk lines, withheld, *Used by* and omitted lines still are.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -41352,8 +41358,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     `message()` over every variant — optional parts present and absent, counts one and many, lists
     empty, single and several, every `IndexStorage`, every object and principal kind — and
     `plan_line_text` equal to `SchemaPlan::summaries`' line. What stays core's English in the
-    modal: the risk heading and risk lines (`ChangeSet::risk_heading`, `Change::risks`,
-    `destructive`), the withheld lines (`unsupported`, which still reads `Change::summary` for a
+    modal: the risk lines (`Change::risks`, `destructive`), the withheld lines (`unsupported`, which still reads `Change::summary` for a
     refused change), the *Used by* warnings and the omitted notes.
     The editor's diagnostics are the case where one value has two readers in two languages.
     `intel::Diagnostic` held a finished `message: String` and now holds `what`, an

@@ -7796,6 +7796,17 @@ impl ChangeSet {
     }
 }
 
+/// What a preview's risk block calls itself, in English, given whether every
+/// consequence under it is reversible — [`ChangeSet::risk_heading`]'s and
+/// [`crate::compare::SchemaPlan::risk_heading`]'s one answer.
+pub fn risk_heading_for(reversible: bool) -> &'static str {
+    if reversible {
+        "Before you apply"
+    } else {
+        "This can't be undone"
+    }
+}
+
 /// [`ChangeSet::editor_script`]'s "INCOMPLETE" preamble, over any list of
 /// withheld items — empty when nothing was withheld.
 ///
@@ -7873,11 +7884,7 @@ impl ChangeSet {
     /// there because it is a claim about the changes, and because a heading that
     /// contradicts the sentence beneath it costs the sentence its weight.
     pub fn risk_heading(&self) -> &'static str {
-        if self.risk_reversible() {
-            "Before you apply"
-        } else {
-            "This can't be undone"
-        }
+        risk_heading_for(self.risk_reversible())
     }
 
     /// Is every consequence in this set reversible? What

@@ -1303,10 +1303,11 @@ pub struct DdlPreview {
     /// before the Apply button, in the error colour.
     pub destructive: Vec<String>,
     /// What that block calls itself — see
-    /// [`schemaic_core::ddl::ChangeSet::risk_heading`]. Off the change set, so a
+    /// [`schemaic_core::ddl::ChangeSet::risk_heading`], in the interface's
+    /// language (`ddl_preview::risk_heading_text`). Off the change set, so a
     /// consequence that *is* undone does not appear under "This can't be undone"
     /// two entries away from `DROP USER`.
-    pub risk_heading: &'static str,
+    pub risk_heading: String,
     /// What uses a name the plan renames, drops or retypes — one sentence per
     /// touched name, from `schemaic_core::used_by::change_warning`, filled in
     /// by the editor that opened the preview (`ddl_preview::with_used_by`),

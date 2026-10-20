@@ -147,12 +147,12 @@ assertions pin English wording — stays the regression net throughout.
    keys) and AI prompts keep core's English. What the converted views and the app pass through
    unchanged today is this phase's list to work from (surveyed 2026-10-19; it once claimed only
    the number formatting was left, which was never true):
-   - **The rest of the DDL preview modal's body** — `risk_heading`, `destructive` (each
-     change's `risks`), `unsupported`, `used_by::change_warnings`/`drop_warning`, the
-     compare plan's `omitted` (`compare::omission_note`), `ddl::elsewhere_report` and the
-     AI proposal errors (`propose::resolve_target`/`apply`). The change list is done
-     (`ddl::ChangeLine`, `ddl_preview::change_line_text`). A test in `ddl_preview.rs`
-     matches `"gone — "` on the English.
+   - **The rest of the DDL preview modal's body** — `destructive` (each change's `risks`),
+     `unsupported`, `used_by::change_warnings`/`drop_warning`, the compare plan's `omitted`
+     (`compare::omission_note`), `ddl::elsewhere_report` and the AI proposal errors
+     (`propose::resolve_target`/`apply`). The change list and the risk heading are done
+     (`ddl::ChangeLine`, `ddl_preview::change_line_text`; `ddl::risk_heading_for`,
+     `risk_heading_text`). A test in `ddl_preview.rs` matches `"gone — "` on the English.
    - **The drop's warning** — `stats::drop_warning`, which goes with the risks; its line is
      a `ChangeLine` now (`stats::drop_summary`).
    - **Number formatting**, waiting on phase 7: `format_bytes`, `history::format_duration`,
