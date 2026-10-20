@@ -45,7 +45,7 @@ pub fn field_value_text(value: &Value) -> String {
 pub fn update_changes(
     cols: &[ColSpec],
     state: &[(usize, Option<String>)],
-) -> Result<Vec<(usize, Option<String>)>, String> {
+) -> Result<Vec<(usize, Option<String>)>, FieldRefusal> {
     let mut changes = Vec::new();
     for (ci, new) in state {
         let Some(c) = cols.get(*ci) else { continue };
@@ -54,14 +54,33 @@ pub fn update_changes(
             continue;
         }
         if !c.editable {
-            return Err(format!("Column `{}` is not editable.", c.name));
+            return Err(FieldRefusal::NotEditable(c.name.clone()));
         }
         if new.is_none() && !c.nullable {
-            return Err(format!("Column `{}` cannot be NULL.", c.name));
+            return Err(FieldRefusal::NotNullable(c.name.clone()));
         }
         changes.push((*ci, new.clone()));
     }
     Ok(changes)
+}
+
+/// Why [`update_changes`] refused a field, naming its column: the row panel
+/// words it in the interface's language, and `Display` is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldRefusal {
+    /// An edit to a read-only column.
+    NotEditable(String),
+    /// NULL staged into a NOT NULL column.
+    NotNullable(String),
+}
+
+impl std::fmt::Display for FieldRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldRefusal::NotEditable(c) => write!(f, "Column `{c}` is not editable."),
+            FieldRefusal::NotNullable(c) => write!(f, "Column `{c}` cannot be NULL."),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -119,7 +138,8 @@ mod tests {
         assert_eq!(update_changes(&cols, &[(2, None)]), Ok(vec![(2, None)]));
         // NOT-NULL name → NULL is rejected.
         let err = update_changes(&cols, &[(1, None)]).unwrap_err();
-        assert!(err.contains("`name`") && err.contains("NULL"), "{err}");
+        assert_eq!(err, FieldRefusal::NotNullable("name".into()));
+        assert_eq!(err.to_string(), "Column `name` cannot be NULL.");
     }
 
     #[test]
@@ -127,10 +147,8 @@ mod tests {
         let cols = sample();
         // id is read-only; a changed value is rejected (widget should've blocked it).
         let err = update_changes(&cols, &[(0, Some("2".into()))]).unwrap_err();
-        assert!(
-            err.contains("`id`") && err.contains("not editable"),
-            "{err}"
-        );
+        assert_eq!(err, FieldRefusal::NotEditable("id".into()));
+        assert_eq!(err.to_string(), "Column `id` is not editable.");
         // But an unchanged read-only field is a no-op, not an error.
         assert_eq!(update_changes(&cols, &[(0, Some("1".into()))]), Ok(vec![]));
     }

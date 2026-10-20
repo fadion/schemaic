@@ -4416,9 +4416,16 @@ existing prose was left alone.
     Server has no tuple `IN` — each row once, in display order
     (`copy_as_where_in_ors_a_composite_key`); it refuses an implicit key (non-empty `confirm_cols`,
     SQLite's `rowid`), a rowid alone being no identity a pasted predicate should rest on and, with
-    its confirming values, no longer a key list. Both refuse with `COPY_NEEDS_ONE_KEYED_TABLE`
+    its confirming values, no longer a key list. Both refuse with `CopySqlRefusal::NoKeyedTable`
     unless `EditModel::insert_target()` names one table — the gate Duplicate and Delete row ask —
-    and the refusal is the `Err` sentence the grid puts on the bar instead of copying. One rule,
+    and the refusal is the `Err` the grid puts on the bar instead of copying. **It is a value, not
+    a sentence**: `CopySqlRefusal` is every reason either copy gives — `NoKeyedTable`,
+    `KeyTooLarge` (`key_aimable`), `UpdateColumnsTooLarge` and `UpdateNothingWritable`
+    (`updates_at`), `WhereInNoKey`, `NewRowHasNoKey` (`saved_rows`), and the `Pinned` and
+    `ReadOnly` that `withheld_model_reason` answers — with `message()` the English and `Display`
+    it. They were a `COPY_NEEDS_ONE_KEYED_TABLE` const and `&'static str` errors, which reached
+    the bar in English whatever the interface's language; the grid words the value
+    (`copy_sql_refusal_text`, under *Data grid*). One rule,
     because this resolution kept going out one source short where nothing could test it:
     `attached_rows` first read `rs.cell` and never `dirty`, so a green uncommitted edit was on
     screen while the pre-edit value went to the model, and the fix for *that* left the rule in
@@ -14840,7 +14847,9 @@ existing prose was left alone.
     `field_value_text` renders a cell into its editable text and `update_changes` diffs the panel's
     per-field state back into the changed *editable* columns for an `UPDATE` (rejecting a read-only
     edit or a NOT-NULL→null, and treating an untouched field as a no-op via normalized-text
-    compare). Validation here covers NULL and read-only rules only — **type-correctness stays the
+    compare). The rejection is a `FieldRefusal` naming the column — `NotEditable` or
+    `NotNullable`, its `Display` the English — rather than the `String` it was, which the panel
+    could only show in English; the grid words it (`field_refusal_text`). Validation here covers NULL and read-only rules only — **type-correctness stays the
     DB's job**, and its error surfaces in the panel. Pure + unit-tested.
   - `jsontree.rs` — the editable JSON tree the row panel uses for a `json`/`jsonb` column.
     `JsonNode::parse` walks the document as `RawValue`s rather than going through
@@ -15457,7 +15466,12 @@ existing prose was left alone.
     `Not a valid pattern: …`, from the last line of the crate's message, which otherwise draws a
     caret under the pattern over several (`a_pattern_that_does_not_compile_says_so_in_one_line`) —
     and walks `find_at` over `hay[..hi]`, so `\b` and `^` at the scope's start see the text before
-    it (`a_scope_confines_both_modes_and_keeps_offsets_absolute`). An empty match is skipped, there
+    it (`a_scope_confines_both_modes_and_keeps_offsets_absolute`). **That line is a value, not the
+    sentence**: `find_hits` and `replace_hits` err with `PatternError(Option<String>)`, the crate's
+    own one-line reason or `None` when it gave none, whose `Display` is the sentence above. The
+    sentence itself used to reach the bar, so it read *Not a valid pattern* in English in every
+    language; the bar now words the frame and passes the crate's English through (`pattern_error_text`, under
+    `editor_pane.rs`). An empty match is skipped, there
     being nothing to select or replace (`an_empty_regex_match_is_not_a_hit`), and whole word asks
     `word_bounded`, the same test `hit_at` now calls, so the two modes cannot end a word in
     different places (`whole_word_bounds_a_regex_hit_by_the_dialects_names`). Both modes stop at
@@ -27774,7 +27788,10 @@ existing prose was left alone.
     `diff-capped`. `the_composed_lines_read_as_they_did_in_english` pins them and the card lines in
     English. The footer's headline is `diff_summary_text`, core's `ResultDiff::summary` worded part
     by part (`diff-summary-*`, joined by ` · `; `english_says_the_diff_summary_as_core_does`).
-    English stays: the A/B letters; `RowChange::label`'s CHANGED/ADDED/REMOVED, core's
+    Why a key cannot match rows is `diff_error_text`, which `compute` maps core's `DiffError`
+    through — `diff-missing-key` and `diff-binary-key`, the column a `$column` — where the
+    outcome's `Err` used to be the `DiffError`'s English
+    (`english_says_every_key_refusal_as_core_does`). English stays: the A/B letters; `RowChange::label`'s CHANGED/ADDED/REMOVED, core's
     word, which the export file writes too and which sizes the *Change* column; the export menu's `ExportFormat::label`s; the suggested file
     name `comparison`; and the arrow.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
@@ -31754,7 +31771,10 @@ existing prose was left alone.
     the first two, and to 389 with all four. `Sel` is not an `opt_toggle`, the scope not being a
     `FindOptions` field: pressing it takes the editor's non-empty selection, and pressing it again
     drops the scope. A pattern that does not compile shows **Invalid** in `theme::error()` in the
-    count's place, with `find_error`'s sentence as its tooltip. None of them has a key.
+    count's place, with `find_error`'s sentence as its tooltip — `pattern_error_text` of core's
+    `text_ops::PatternError`, `find-bad-pattern` or `find-bad-pattern-why` with the regex crate's
+    reason passing through as `$why`, held to core's `Display` in English by
+    `english_says_a_bad_pattern_as_core_does`. None of them has a key.
     **Replace All honours `edit_untyped`'s refusal before it touches `find_hits`**, which is the
     guard `replace_one` beside it already had. `replace_all_cb` wrote the new hit list unconditionally
     and it was computed from `new_text` — text that, when the editor is frozen, was never written. For
@@ -41166,7 +41186,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     (`ddl::Withheld`, below) — the modal's whole body but the SQL and the server's words — nor the
     compare tab's standing notes above its tree, nor an agent CLI's grade notice, pre-spawn
     refusal and failure fallbacks (`schemaic-ai`'s `SpawnRefusal`/`CliFailure`, below), though what
-    the CLI itself said still is, nor Seed rows' unusable reply (`seed::SeedError`, below).
+    the CLI itself said still is, nor Seed rows' unusable reply (`seed::SeedError`, below), nor
+    the grid's Copy as SQL refusals, paste reports and row-panel refusals (`edit::CopySqlRefusal`,
+    `edit::paste_report`, `rowjson::FieldRefusal`, under *Data grid*), nor the result diff's key
+    refusals (`result_diff::DiffError`, under `result_diff_view.rs`), nor the find bar's bad
+    pattern (`text_ops::PatternError`, under `editor_pane.rs`), though the regex crate's reason
+    inside it still is.
   - **Four checks read the catalogue where the compiler cannot reach it.**
     `widgets-spinner-verbs` is a comma-separated list each language writes for itself, as many
     verbs as it likes, and `the_reserved_loader_width_fits_every_verb_and_dot_state` measures every
@@ -44848,7 +44873,16 @@ this bundle's.
   a `Notice` — an ordinary success with a caveat, on the ordinary chrome — while a paste that
   landed *nothing* is a `Failed` and earns the red fill. Both were errors, so "Pasted 5 cells,
   skipping 1 in read-only columns." was rendered indistinguishably from a write-back that failed.
-  The counts are snapshotted through `PastePlan::counts` **before** staging drains the cell list,
+  **The view does not show `paste_report`'s words, only follows its decision**: core's sentence is
+  English, so `paste_selection` asks `paste_report_shown(counts, skipped_deleted, staged)`, which
+  restates the same decision over the same arguments in the interface's language — the
+  `grid-paste-*` clauses in core's order, joined with `", "`, the figures through `i18n::count` in
+  the interface's marks, and `grid-paste-partial` a plural on the raw `staged`. So the decision
+  exists twice, and the test is what keeps the two one: `english_says_every_paste_report_as_core_does`
+  (`refusal_wording_tests`) holds it equal to `paste_report` over each skipped kind alone and all
+  together, at one and 1,500, against 0, 1 and 2,000 deleted and 0, 1, 3 and 12,345 staged; it
+  was seen red with the hyphen of *-cell* dropped. `paste_report` itself is unchanged, its
+  arguments plain counts. The counts are snapshotted through `PastePlan::counts` **before** staging drains the cell list,
   which is what stops the report claiming every paste landed nothing. **What landed is counted by
   the caller, after staging**, and handed over as `paste_report`'s `staged`: it used to be derived as
   `planned - skipped_deleted`, which is what the plan *intended*, and staging drops entries the plan
@@ -45139,9 +45173,13 @@ this bundle's.
   the bar). *SQL UPDATE* and *SQL WHERE IN* close it — `copy_keyed_sql` →
   `edit::GridCells::updates_at`/`where_in_at`, keyed by the write-back's own `row_key` (`core::edit`'s
   entry has the statement shapes and the refusals) — behind `row_gestures_are_safe`, as Delete and
-  Duplicate row are, and a refusal goes on `commit_note` with the clipboard left as it was. On a
+  Duplicate row are, and a refusal goes on `commit_note` with the clipboard left as it was —
+  core's `edit::CopySqlRefusal`, worded by `copy_sql_refusal_text` (`grid-copy-sql-*`,
+  `grid-copy-update-*`, `grid-copy-where-in-no-key`, `grid-copy-new-row-no-key`) and held to its
+  `message()` in English by `english_says_every_copy_and_row_refusal_as_core_does`. On a
   read-only connection or a pinned result the two keyed copies refuse with **that** reason
-  (`edit::withheld_model_reason`, held in `GridState::model_withheld` by the edit-model effect):
+  (`edit::withheld_model_reason`, held in `GridState::model_withheld` by the edit-model effect as
+  the `Option<CopySqlRefusal>` itself, so it is worded where it is shown):
   the model is emptied there on purpose, and its own refusal blamed a keyed table for having no
   key. The submenu is `copy_as_menu(gs, pos, sel)`, and **the cell menu carries it too**, after
   *Copy* / *Copy formatted*, with the cell's display row as `pos`: the gesture is the highlighted
@@ -45190,8 +45228,10 @@ this bundle's.
   and it keeps a **red outline** on the box meanwhile: the bar says what, the outline says *which
   field* — which is also why that editor still owns the error signal it mirrors into the bar (and
   takes back only its own message). The bar's **View** is offered per `ModalError::worth_viewing`,
-  and both of this panel's own refusals — a value `rowjson::update_changes` can't read, the JSON
-  tree's parse error — are `ModalError::app`, for which that comes down to `text::hides_detail`:
+  and both of this panel's own refusals — a value `rowjson::update_changes` can't read (a
+  `FieldRefusal`, which `commit_row_update` words through `field_refusal_text`,
+  `grid-row-not-editable`/`-nullable`, held to its `Display` by the same test as the copies), the
+  JSON tree's parse error — are `ModalError::app`, for which that comes down to `text::hides_detail`:
   only when one-lining actually hid something; a parse error repeated verbatim in a modal is a
   button that does nothing. A save the server refused is its `Server` words and gets **View** for
   the modal's *Explain*. The panel is capped at **70% of the results area**

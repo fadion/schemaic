@@ -2684,8 +2684,18 @@ fn tip_message(
     }
 }
 
+/// Why the find bar's pattern does not compile — core's
+/// `text_ops::PatternError` in the interface's language, the regex crate's
+/// own reason passing through.
+fn pattern_error_text(e: &schemaic_core::text_ops::PatternError) -> String {
+    match &e.0 {
+        None => tr!("find-bad-pattern"),
+        Some(why) => tr!("find-bad-pattern-why", why = why.as_str()),
+    }
+}
+
 /// What a diagnostic says — core's `intel::DiagMessage::message` in the
-/// interface's language. The parser's detail and the server's error pass
+/// interface's language. The parser's detail and the server's own words pass
 /// through as they came; the names and SQL inside stay as the statement spelt
 /// them.
 fn diag_message_text(m: &schemaic_core::intel::DiagMessage) -> String {
@@ -8003,7 +8013,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     hits
                 }
                 Err(why) => {
-                    find_error.set(Some(why));
+                    find_error.set(Some(pattern_error_text(&why)));
                     Vec::new()
                 }
             }
@@ -9984,6 +9994,19 @@ mod geometry_tests {
         );
         for m in all {
             assert_eq!(diag_message_text(&m), m.message(), "{m:?}");
+        }
+    }
+
+    /// The find bar's complaint about a pattern reads in English exactly as
+    /// core's `PatternError` says it, with the regex crate's reason and without.
+    #[test]
+    fn english_says_a_bad_pattern_as_core_does() {
+        use schemaic_core::text_ops::PatternError;
+        for e in [
+            PatternError(None),
+            PatternError(Some("unclosed group".into())),
+        ] {
+            assert_eq!(pattern_error_text(&e), e.to_string(), "{e:?}");
         }
     }
 

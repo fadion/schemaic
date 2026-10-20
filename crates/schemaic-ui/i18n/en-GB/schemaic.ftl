@@ -2190,6 +2190,10 @@ diff-side-facts = { $count ->
 # comma-separated list of column names.
 diff-only-in = Only in { $side }: { $columns }
 diff-uncompared = Binary, not compared: { $columns }
+# Why the chosen key cannot match rows (core's result_diff::DiffError);
+# $column is a column name.
+diff-missing-key = both results need a column named { $column } to match rows by
+diff-binary-key = { $column } holds binary values, which are not compared, so it cannot match rows
 # The footer's headline (core's ResultDiff::summary), its parts joined by a
 # middle dot: each kind with rows, then the unchanged count, then any binary
 # column left out ($columns, comma-separated names).
@@ -3385,6 +3389,22 @@ copy-sql-left-out = { $n ->
 }
 
 grid-fill-nothing = Nothing to fill: the selected columns can't be written, or the cell to copy is a new row's unset value or a staged DEFAULT.
+# What a paste skipped (core's edit::paste_report; a test holds the English
+# equal). Each grid-paste-* part is one clause; $notes is them joined with
+# ", ". $n, $cap and $cells are figures as the app writes them, $count the
+# raw number of cells pasted.
+grid-paste-outside = { $n } outside the grid
+grid-paste-read-only = { $n } in read-only columns
+grid-paste-capped = { $n } over the { $cap }-cell paste limit
+grid-paste-deleted = { $n } in rows marked for deletion
+grid-paste-nothing = Nothing pasted: { $notes }.
+grid-paste-partial = { $count ->
+        [one] Pasted { $cells } cell, skipping { $notes }.
+       *[other] Pasted { $cells } cells, skipping { $notes }.
+    }
+# The row panel's refusals (core's rowjson::FieldRefusal); $column is a name.
+grid-row-not-editable = Column `{ $column }` is not editable.
+grid-row-not-nullable = Column `{ $column }` cannot be NULL.
 # $filled and $skipped are counts written out (1,204); $count is $filled as a
 # number, for the plural.
 grid-fill-skipped = { $count ->
@@ -3411,6 +3431,16 @@ grid-attach-summary-from = { $rows ->
 grid-attach-summary-capped = { $summary } (the first { $taken } of { $total } selected)
 grid-copy-sql-unset = Nothing to copy as SQL — the selected cells of the new row have no value yet, and take the server's default.
 grid-copy-sql-joined = Nothing to copy as SQL: these rows come from a query over more than one table.
+# Copy as SQL UPDATE / WHERE IN's other refusals (core's edit::CopySqlRefusal).
+# English must read exactly as core's (a test holds it).
+grid-copy-sql-no-keyed-table = Nothing to copy as SQL: the rows need to come from one table with a key.
+grid-copy-sql-key-too-large = Nothing to copy as SQL: the key was too large for this result to hold whole, so some rows cannot be named by it.
+grid-copy-sql-pinned = Nothing to copy as SQL: this result is pinned, so its rows are a snapshot.
+grid-copy-sql-read-only = Nothing to copy as SQL: this connection is read-only.
+grid-copy-update-too-large = Nothing to copy as UPDATE: the selected columns were too large for this result to hold whole, and some of their cells show blank.
+grid-copy-update-nothing-writable = Nothing to copy as UPDATE: none of the selected columns can be written.
+grid-copy-where-in-no-key = Nothing to copy as WHERE IN: this table has no primary or unique key to name its rows by.
+grid-copy-new-row-no-key = Nothing to copy: a new row has no key until it is saved.
 # The export menu's scope for the rows already read; $count is written out.
 grid-export-fetched-rows = Fetched rows ({ $count })
 # The Save dialog's title.
@@ -3801,6 +3831,10 @@ editor-run-everything = Run Everything
 find-placeholder = Find
 # In place of the match count while the pattern is not a valid regex.
 find-invalid = Invalid
+# Why a regular expression does not compile (core's text_ops::PatternError);
+# $why is the regex library's own one-line reason.
+find-bad-pattern = Not a valid pattern
+find-bad-pattern-why = Not a valid pattern: { $why }
 find-match-case = Match case
 find-whole-word = Whole word
 find-regex = Regular expression

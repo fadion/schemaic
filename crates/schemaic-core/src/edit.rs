@@ -619,10 +619,69 @@ pub enum Fill {
     Up,
 }
 
-/// What Copy as ▸ SQL UPDATE / WHERE IN say for a result with no single keyed
-/// table — the [`EditModel::insert_target`] refusal.
-const COPY_NEEDS_ONE_KEYED_TABLE: &str =
-    "Nothing to copy as SQL: the rows need to come from one table with a key.";
+/// Why Copy as ▸ SQL UPDATE / WHERE IN copied nothing, as a value: the grid
+/// words it in the interface's language, and [`CopySqlRefusal::message`] is
+/// the English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopySqlRefusal {
+    /// The result has no single keyed table — the
+    /// [`EditModel::insert_target`] refusal.
+    NoKeyedTable,
+    /// A key column sits past the result's arena ceiling ([`key_aimable`]).
+    KeyTooLarge,
+    /// The result is pinned, so its rows are a snapshot
+    /// ([`withheld_model_reason`]).
+    Pinned,
+    /// The connection is read-only ([`withheld_model_reason`]).
+    ReadOnly,
+    /// Every selected column for an `UPDATE` was blanked by the arena ceiling.
+    UpdateColumnsTooLarge,
+    /// None of the selected columns can be written.
+    UpdateNothingWritable,
+    /// `WHERE IN` over a table with no primary or unique key.
+    WhereInNoKey,
+    /// The selection holds a new row, which has no key until it is saved.
+    NewRowHasNoKey,
+}
+
+impl CopySqlRefusal {
+    /// The refusal in English.
+    pub fn message(self) -> &'static str {
+        match self {
+            CopySqlRefusal::NoKeyedTable => {
+                "Nothing to copy as SQL: the rows need to come from one table with a key."
+            }
+            CopySqlRefusal::KeyTooLarge => {
+                "Nothing to copy as SQL: the key was too large for this result to hold whole, so \
+                 some rows cannot be named by it."
+            }
+            CopySqlRefusal::Pinned => {
+                "Nothing to copy as SQL: this result is pinned, so its rows are a snapshot."
+            }
+            CopySqlRefusal::ReadOnly => "Nothing to copy as SQL: this connection is read-only.",
+            CopySqlRefusal::UpdateColumnsTooLarge => {
+                "Nothing to copy as UPDATE: the selected columns were too large for this result to \
+                 hold whole, and some of their cells show blank."
+            }
+            CopySqlRefusal::UpdateNothingWritable => {
+                "Nothing to copy as UPDATE: none of the selected columns can be written."
+            }
+            CopySqlRefusal::WhereInNoKey => {
+                "Nothing to copy as WHERE IN: this table has no primary or unique key to name its \
+                 rows by."
+            }
+            CopySqlRefusal::NewRowHasNoKey => {
+                "Nothing to copy: a new row has no key until it is saved."
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for CopySqlRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
 
 /// [`row_key`] as **SQL text** the user reads and runs: `a = 1 AND b = 'x'`,
 /// with `IS NULL` for a NULL — `=` never matches one, and an implicit key's
@@ -650,17 +709,14 @@ fn key_match(rs: &ResultSet, tbl: &EditTable, di: usize, dialect: SqlDialect) ->
 /// `Err` when a column [`key_match`] would name a row by sits past the
 /// result's arena ceiling ([`ResultSet::capped_columns`]): its later cells read
 /// blank, and `WHERE k = ''` aims at another row or none.
-fn key_aimable(rs: &ResultSet, tbl: &EditTable) -> Result<(), &'static str> {
+fn key_aimable(rs: &ResultSet, tbl: &EditTable) -> Result<(), CopySqlRefusal> {
     let blanked = tbl
         .key_cols
         .iter()
         .chain(tbl.confirm_cols.iter())
         .any(|ci| rs.capped_columns.contains(ci));
     if blanked {
-        return Err(
-            "Nothing to copy as SQL: the key was too large for this result to hold whole, so some \
-             rows cannot be named by it.",
-        );
+        return Err(CopySqlRefusal::KeyTooLarge);
     }
     Ok(())
 }
@@ -1205,11 +1261,11 @@ pub fn toolbar_copy_block(
 /// the result for having no keyed table when the table had one. A pinned
 /// result's reason wins, being the stronger: unpinning would not help a
 /// read-only connection, but neither would it be the first thing to try.
-pub fn withheld_model_reason(read_only: bool, pinned: bool) -> Option<&'static str> {
+pub fn withheld_model_reason(read_only: bool, pinned: bool) -> Option<CopySqlRefusal> {
     if pinned {
-        Some("Nothing to copy as SQL: this result is pinned, so its rows are a snapshot.")
+        Some(CopySqlRefusal::Pinned)
     } else if read_only {
-        Some("Nothing to copy as SQL: this connection is read-only.")
+        Some(CopySqlRefusal::ReadOnly)
     } else {
         None
     }
@@ -1781,8 +1837,8 @@ impl GridCells<'_> {
         pos: usize,
         layout: impl Into<ColLayout>,
         dialect: SqlDialect,
-    ) -> Result<String, &'static str> {
-        let tbl = model.insert_target().ok_or(COPY_NEEDS_ONE_KEYED_TABLE)?;
+    ) -> Result<String, CopySqlRefusal> {
+        let tbl = model.insert_target().ok_or(CopySqlRefusal::NoKeyedTable)?;
         key_aimable(self.rs, tbl)?;
         let (rows, cols) = self.gesture_at(selection, pos, &layout.into());
         let (out, order) = self.exported();
@@ -1792,13 +1848,10 @@ impl GridCells<'_> {
             .filter(|&ci| model.text_editable(ci) && !tbl.key_cols.contains(&ci))
             .partition(|ci| !self.rs.capped_columns.contains(ci));
         if sets.is_empty() && !blanked.is_empty() {
-            return Err(
-                "Nothing to copy as UPDATE: the selected columns were too large for this result to \
-                 hold whole, and some of their cells show blank.",
-            );
+            return Err(CopySqlRefusal::UpdateColumnsTooLarge);
         }
         if sets.is_empty() {
-            return Err("Nothing to copy as UPDATE: none of the selected columns can be written.");
+            return Err(CopySqlRefusal::UpdateNothingWritable);
         }
         let target = crate::export::qualified_row_target(
             &tbl.database,
@@ -1854,14 +1907,11 @@ impl GridCells<'_> {
         pos: usize,
         layout: impl Into<ColLayout>,
         dialect: SqlDialect,
-    ) -> Result<String, &'static str> {
-        let tbl = model.insert_target().ok_or(COPY_NEEDS_ONE_KEYED_TABLE)?;
+    ) -> Result<String, CopySqlRefusal> {
+        let tbl = model.insert_target().ok_or(CopySqlRefusal::NoKeyedTable)?;
         key_aimable(self.rs, tbl)?;
         if !tbl.confirm_cols.is_empty() {
-            return Err(
-                "Nothing to copy as WHERE IN: this table has no primary or unique key to name its \
-                 rows by.",
-            );
+            return Err(CopySqlRefusal::WhereInNoKey);
         }
         let (rows, _) = self.gesture_at(selection, pos, &layout.into());
         let (_, order) = self.exported();
@@ -1902,14 +1952,14 @@ impl GridCells<'_> {
         &self,
         order: &[usize],
         rows: std::ops::RangeInclusive<usize>,
-    ) -> Result<Vec<usize>, &'static str> {
+    ) -> Result<Vec<usize>, CopySqlRefusal> {
         let nreal = self.rs.row_count();
         let saved: Vec<usize> = pick(order, rows)
             .into_iter()
             .filter(|&di| di < nreal)
             .collect();
         if saved.is_empty() {
-            return Err("Nothing to copy: a new row has no key until it is saved.");
+            return Err(CopySqlRefusal::NewRowHasNoKey);
         }
         Ok(saved)
     }
@@ -4860,21 +4910,20 @@ mod tests {
     #[test]
     fn a_withheld_model_says_why() {
         assert_eq!(withheld_model_reason(false, false), None);
-        assert!(
-            withheld_model_reason(true, false)
-                .unwrap()
-                .contains("read-only")
+        assert_eq!(
+            withheld_model_reason(true, false),
+            Some(CopySqlRefusal::ReadOnly)
         );
-        assert!(
-            withheld_model_reason(false, true)
-                .unwrap()
-                .contains("pinned")
+        assert_eq!(
+            withheld_model_reason(false, true),
+            Some(CopySqlRefusal::Pinned)
         );
-        assert!(
-            withheld_model_reason(true, true)
-                .unwrap()
-                .contains("pinned")
+        assert_eq!(
+            withheld_model_reason(true, true),
+            Some(CopySqlRefusal::Pinned)
         );
+        assert!(CopySqlRefusal::ReadOnly.message().contains("read-only"));
+        assert!(CopySqlRefusal::Pinned.message().contains("pinned"));
     }
 
     // ── what the surfaces that *read* the grid see ───────────────────────────
@@ -5246,11 +5295,7 @@ mod tests {
         let c = cells(&r, &order, &formats, &dirty, &new);
         assert!(c.updates_at(&m, None, 3, None, SqlDialect::MySql).is_err());
         let only_key = c.updates_at(&m, Some((0, 0, 2, 0)), 0, None, SqlDialect::MySql);
-        assert!(
-            only_key
-                .unwrap_err()
-                .contains("none of the selected columns")
-        );
+        assert_eq!(only_key, Err(CopySqlRefusal::UpdateNothingWritable));
         let no_model = EditModel::default();
         assert!(
             c.updates_at(&no_model, None, 0, None, SqlDialect::MySql)
@@ -5292,7 +5337,7 @@ mod tests {
         let only = c
             .updates_at(&m, Some((0, 2, 0, 2)), 0, None, SqlDialect::MySql)
             .unwrap_err();
-        assert!(only.contains("too large"), "{only}");
+        assert_eq!(only, CopySqlRefusal::UpdateColumnsTooLarge);
     }
 
     /// A key column blanked by the arena ceiling cannot name its rows: a

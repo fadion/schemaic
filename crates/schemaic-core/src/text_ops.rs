@@ -830,8 +830,8 @@ fn word_bounded(hay: &str, off: usize, end: usize, opts: FindOptions) -> bool {
 /// The find bar's pattern, compiled — case-insensitive unless match case says
 /// otherwise, `^`/`$` at line ends, a `\r\n` one included (`crlf`: a paste
 /// from the Windows clipboard keeps its `\r`, and `.` must not swallow it) —
-/// or the one-line sentence the bar shows.
-fn find_regex(needle: &str, opts: FindOptions) -> Result<regex::Regex, String> {
+/// or why not, in the one line the bar shows ([`PatternError`]).
+fn find_regex(needle: &str, opts: FindOptions) -> Result<regex::Regex, PatternError> {
     regex::RegexBuilder::new(needle)
         .case_insensitive(!opts.match_case)
         .multi_line(true)
@@ -850,12 +850,23 @@ fn find_regex(needle: &str, opts: FindOptions) -> Result<regex::Regex, String> {
                 .trim_start_matches("error:")
                 .trim()
                 .to_string();
-            if last.is_empty() {
-                "Not a valid pattern".to_string()
-            } else {
-                format!("Not a valid pattern: {last}")
-            }
+            PatternError((!last.is_empty()).then_some(last))
         })
+}
+
+/// A find pattern that does not compile, with the regex crate's one-line
+/// reason when it gave one — its own English, which passes through. The bar
+/// words the frame in the interface's language; `Display` is the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatternError(pub Option<String>);
+
+impl std::fmt::Display for PatternError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            None => f.write_str("Not a valid pattern"),
+            Some(why) => write!(f, "Not a valid pattern: {why}"),
+        }
+    }
 }
 
 /// Every non-empty match of `re` lying wholly in `hay[lo..hi]` that whole
@@ -937,8 +948,8 @@ pub const FIND_HIT_CAP: usize = 100_000;
 
 /// Every hit of `needle` in `hay` under `opts`, in order and non-overlapping —
 /// within `scope` (`(start, end)`, a selection the search is confined to) when
-/// there is one. `Err` carries the sentence the bar shows for a pattern that
-/// does not compile; plain text never fails.
+/// there is one. `Err` says why a pattern does not compile ([`PatternError`]);
+/// plain text never fails.
 ///
 /// A regex hit that matches nothing (`a*` between two letters) is not a hit:
 /// there is nothing to select or replace.
@@ -947,7 +958,7 @@ pub fn find_hits(
     needle: &str,
     opts: FindOptions,
     scope: Option<(usize, usize)>,
-) -> Result<Vec<Hit>, String> {
+) -> Result<Vec<Hit>, PatternError> {
     let Some((lo, hi)) = scope_bounds(hay, scope) else {
         return Ok(Vec::new());
     };
@@ -1060,7 +1071,7 @@ pub fn replace_hits(
     replacement: &str,
     opts: FindOptions,
     scope: Option<(usize, usize)>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize), PatternError> {
     let hits = find_hits(hay, needle, opts, scope)?;
     if hits.is_empty() {
         return Ok((hay.to_string(), 0));
@@ -3346,7 +3357,7 @@ mod tests {
 
     #[test]
     fn a_pattern_that_does_not_compile_says_so_in_one_line() {
-        let err = find_hits("abc", "a(b", re(), None).unwrap_err();
+        let err = find_hits("abc", "a(b", re(), None).unwrap_err().to_string();
         assert!(!err.contains('\n'), "{err:?}");
         assert!(err.starts_with("Not a valid pattern"), "{err:?}");
     }

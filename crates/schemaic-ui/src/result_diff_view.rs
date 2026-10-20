@@ -212,7 +212,7 @@ fn compute(t: &DiffTarget, swapped: bool, key: Option<String>, generation: u64) 
                 },
             }
         })
-        .map_err(|e| e.to_string());
+        .map_err(|e| diff_error_text(&e));
     Computed {
         generation,
         swapped,
@@ -223,6 +223,16 @@ fn compute(t: &DiffTarget, swapped: bool, key: Option<String>, generation: u64) 
 /// How many table rows' cells are built to size the columns: a column's width
 /// is the longest of these, so a longer value further down ends in `…`.
 const WIDTH_SAMPLE: usize = 2_000;
+
+/// Why the chosen key cannot match rows — core's `result_diff::DiffError` in
+/// the interface's language.
+fn diff_error_text(e: &schemaic_core::result_diff::DiffError) -> String {
+    use schemaic_core::result_diff::DiffError;
+    match e {
+        DiffError::MissingKey(c) => tr!("diff-missing-key", column = c.as_str()),
+        DiffError::BinaryKey(c) => tr!("diff-binary-key", column = c.as_str()),
+    }
+}
 
 /// Each column wide enough for its header and its longest values, between
 /// [`min_col_w`] and [`max_col_w`]. Only the few values longest by characters
@@ -1106,6 +1116,19 @@ mod tests {
     use super::{diff_notes, diff_summary_text};
     use crate::i18n::tr;
     use schemaic_core::result_diff::ResultDiff;
+
+    /// Why a key cannot match rows reads in English exactly as core's
+    /// `DiffError` says it.
+    #[test]
+    fn english_says_every_key_refusal_as_core_does() {
+        use schemaic_core::result_diff::DiffError;
+        for e in [
+            DiffError::MissingKey("id".into()),
+            DiffError::BinaryKey("blob".into()),
+        ] {
+            assert_eq!(super::diff_error_text(&e), e.to_string(), "{e:?}");
+        }
+    }
 
     /// The footer's headline reads in English exactly as core's `summary` —
     /// identical (one row and several), each kind alone and together, and

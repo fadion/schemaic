@@ -2259,6 +2259,8 @@ diff-side-facts = { $count ->
 }
 diff-only-in = Nur in { $side }: { $columns }
 diff-uncompared = Binär, nicht verglichen: { $columns }
+diff-missing-key = beide Ergebnisse brauchen eine Spalte namens { $column }, um Zeilen zuzuordnen
+diff-binary-key = { $column } enthält Binärwerte, die nicht verglichen werden, und kann daher keine Zeilen zuordnen
 diff-summary-identical = { $n ->
         [one] Keine Unterschiede · { $n } Zeile unverändert
        *[other] Keine Unterschiede · { $n } Zeilen unverändert
@@ -2722,6 +2724,17 @@ copy-sql-left-out = { $n ->
    *[other] In die Zwischenablage kopiert — { $cols } enthalten Bytes, die SQL-Text nicht tragen kann: diese Werte sind ausgelassen
 }
 grid-fill-nothing = Nichts auszufüllen: Die ausgewählten Spalten sind nicht beschreibbar, oder die zu kopierende Zelle ist der nicht gesetzte Wert einer neuen Zeile oder ein vorgemerktes DEFAULT.
+grid-paste-outside = { $n } außerhalb des Rasters
+grid-paste-read-only = { $n } in schreibgeschützten Spalten
+grid-paste-capped = { $n } über der Einfügegrenze von { $cap } Zellen
+grid-paste-deleted = { $n } in zum Löschen markierten Zeilen
+grid-paste-nothing = Nichts eingefügt: { $notes }.
+grid-paste-partial = { $count ->
+        [one] { $cells } Zelle eingefügt, übersprungen: { $notes }.
+       *[other] { $cells } Zellen eingefügt, übersprungen: { $notes }.
+    }
+grid-row-not-editable = Die Spalte `{ $column }` ist nicht bearbeitbar.
+grid-row-not-nullable = Die Spalte `{ $column }` darf nicht NULL sein.
 grid-fill-skipped = { $count ->
     [one] { $filled } Zelle ausgefüllt, { $skipped } in zum Löschen markierten Zeilen übersprungen.
    *[other] { $filled } Zellen ausgefüllt, { $skipped } in zum Löschen markierten Zeilen übersprungen.
@@ -2743,6 +2756,14 @@ grid-attach-summary-from = { $rows ->
 grid-attach-summary-capped = { $summary } (die ersten { $taken } von { $total } ausgewählten)
 grid-copy-sql-unset = Nichts als SQL zu kopieren — die ausgewählten Zellen der neuen Zeile haben noch keinen Wert und erhalten den Standardwert des Servers.
 grid-copy-sql-joined = Nichts als SQL zu kopieren: Diese Zeilen stammen aus einer Abfrage über mehr als eine Tabelle.
+grid-copy-sql-no-keyed-table = Nichts als SQL zu kopieren: Die Zeilen müssen aus einer Tabelle mit Schlüssel stammen.
+grid-copy-sql-key-too-large = Nichts als SQL zu kopieren: Der Schlüssel war zu groß, um in diesem Ergebnis vollständig gehalten zu werden, daher lassen sich manche Zeilen nicht über ihn benennen.
+grid-copy-sql-pinned = Nichts als SQL zu kopieren: Dieses Ergebnis ist angeheftet, seine Zeilen sind also eine Momentaufnahme.
+grid-copy-sql-read-only = Nichts als SQL zu kopieren: Diese Verbindung ist schreibgeschützt.
+grid-copy-update-too-large = Nichts als UPDATE zu kopieren: Die ausgewählten Spalten waren zu groß, um in diesem Ergebnis vollständig gehalten zu werden, und manche ihrer Zellen erscheinen leer.
+grid-copy-update-nothing-writable = Nichts als UPDATE zu kopieren: Keine der ausgewählten Spalten kann geschrieben werden.
+grid-copy-where-in-no-key = Nichts als WHERE IN zu kopieren: Diese Tabelle hat keinen Primär- oder eindeutigen Schlüssel, über den sich ihre Zeilen benennen lassen.
+grid-copy-new-row-no-key = Nichts zu kopieren: Eine neue Zeile hat bis zum Speichern keinen Schlüssel.
 grid-export-fetched-rows = Abgerufene Zeilen ({ $count })
 grid-export-dialog-title = Ergebnisse exportieren
 grid-export-already-running = Es läuft bereits ein Export — es wurde nichts geschrieben.
@@ -2978,6 +2999,8 @@ editor-run-current = Aktuelle ausführen
 editor-run-everything = Alle ausführen
 find-placeholder = Suchen
 find-invalid = Ungültig
+find-bad-pattern = Kein gültiges Muster
+find-bad-pattern-why = Kein gültiges Muster: { $why }
 find-match-case = Groß-/Kleinschreibung beachten
 find-whole-word = Ganzes Wort
 find-regex = Regulärer Ausdruck

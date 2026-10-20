@@ -328,7 +328,7 @@ struct GridState {
     /// Why [`GridState::edit_model`] is empty on purpose — a read-only
     /// connection or a pinned result — for a surface that would otherwise
     /// blame the result's shape (`edit::withheld_model_reason`).
-    model_withheld: RwSignal<Option<&'static str>>,
+    model_withheld: RwSignal<Option<schemaic_core::edit::CopySqlRefusal>>,
     /// Which **control** each result column's values are edited with — a boolean
     /// track, an enum menu, a `SET`'s chips, a calendar, or plain text. Resolved
     /// from the column's *declared* type (see `column_editors`) and kept in a
@@ -2713,10 +2713,63 @@ fn paste_selection(gs: GridState) {
     // earns the red fill. Both used to be errors, so "Pasted 5 cells, skipping
     // 1 in read-only columns." was rendered indistinguishably from a write-back
     // that failed.
-    match schemaic_core::edit::paste_report(counts, skipped_deleted, staged) {
+    match paste_report_shown(counts, skipped_deleted, staged) {
         schemaic_core::edit::PasteReport::Clean => {}
         schemaic_core::edit::PasteReport::Notice(m) => gs.commit_note.set(Some(m)),
         schemaic_core::edit::PasteReport::Failed(m) => gs.commit_err.set(Some(ModalError::app(m))),
+    }
+}
+
+/// What a paste says it did — core's `edit::paste_report` in the interface's
+/// language, deciding the surface as it does and taking the same counts. The
+/// figures take the interface's marks.
+fn paste_report_shown(
+    counts: schemaic_core::edit::PasteCounts,
+    skipped_deleted: usize,
+    staged: usize,
+) -> schemaic_core::edit::PasteReport {
+    use schemaic_core::edit::{PASTE_CELL_CAP, PasteReport};
+    let n = crate::i18n::count;
+    let mut notes = Vec::new();
+    if counts.dropped > 0 {
+        notes.push(tr!("grid-paste-outside", n = n(counts.dropped)));
+    }
+    if counts.read_only > 0 {
+        notes.push(tr!("grid-paste-read-only", n = n(counts.read_only)));
+    }
+    if counts.capped > 0 {
+        notes.push(tr!(
+            "grid-paste-capped",
+            n = n(counts.capped),
+            cap = n(PASTE_CELL_CAP)
+        ));
+    }
+    if skipped_deleted > 0 {
+        notes.push(tr!("grid-paste-deleted", n = n(skipped_deleted)));
+    }
+    if notes.is_empty() {
+        return PasteReport::Clean;
+    }
+    let notes = notes.join(", ");
+    if staged == 0 {
+        PasteReport::Failed(tr!("grid-paste-nothing", notes = notes))
+    } else {
+        PasteReport::Notice(tr!(
+            "grid-paste-partial",
+            count = staged,
+            cells = n(staged),
+            notes = notes
+        ))
+    }
+}
+
+/// Why the row panel refused a field — core's `rowjson::FieldRefusal` in the
+/// interface's language.
+fn field_refusal_text(r: &schemaic_core::rowjson::FieldRefusal) -> String {
+    use schemaic_core::rowjson::FieldRefusal;
+    match r {
+        FieldRefusal::NotEditable(c) => tr!("grid-row-not-editable", column = c.as_str()),
+        FieldRefusal::NotNullable(c) => tr!("grid-row-not-nullable", column = c.as_str()),
     }
 }
 
@@ -3255,7 +3308,7 @@ enum KeyedCopy {
 /// them through has to stay clear of every write gate, and is not this.
 fn copy_keyed_sql(gs: GridState, pos: usize, sel: Block, what: KeyedCopy) -> String {
     let result = if let Some(why) = gs.model_withheld.get_untracked() {
-        Err(why.to_string())
+        Err(copy_sql_refusal_text(why))
     } else if gs.row_gestures_are_safe() {
         let model = gs.edit_model.get_untracked();
         let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
@@ -3267,7 +3320,7 @@ fn copy_keyed_sql(gs: GridState, pos: usize, sel: Block, what: KeyedCopy) -> Str
             KeyedCopy::Update => cells.updates_at(&model, sel, pos, layout, gs.dialect),
             KeyedCopy::WhereIn => cells.where_in_at(&model, sel, pos, layout, gs.dialect),
         }
-        .map_err(|why| why.to_string())
+        .map_err(copy_sql_refusal_text)
     } else {
         Err(tr!("grid-copy-sql-joined"))
     };
@@ -3275,6 +3328,22 @@ fn copy_keyed_sql(gs: GridState, pos: usize, sel: Block, what: KeyedCopy) -> Str
         gs.commit_note.set(Some(why));
         String::new()
     })
+}
+
+/// Why Copy as ▸ SQL copied nothing — core's `edit::CopySqlRefusal` in the
+/// interface's language.
+fn copy_sql_refusal_text(r: schemaic_core::edit::CopySqlRefusal) -> String {
+    use schemaic_core::edit::CopySqlRefusal;
+    match r {
+        CopySqlRefusal::NoKeyedTable => tr!("grid-copy-sql-no-keyed-table"),
+        CopySqlRefusal::KeyTooLarge => tr!("grid-copy-sql-key-too-large"),
+        CopySqlRefusal::Pinned => tr!("grid-copy-sql-pinned"),
+        CopySqlRefusal::ReadOnly => tr!("grid-copy-sql-read-only"),
+        CopySqlRefusal::UpdateColumnsTooLarge => tr!("grid-copy-update-too-large"),
+        CopySqlRefusal::UpdateNothingWritable => tr!("grid-copy-update-nothing-writable"),
+        CopySqlRefusal::WhereInNoKey => tr!("grid-copy-where-in-no-key"),
+        CopySqlRefusal::NewRowHasNoKey => tr!("grid-copy-new-row-no-key"),
+    }
 }
 
 /// The *Copy as* submenu, shared by the gutter's menu and the cell's: the
@@ -6470,9 +6539,10 @@ fn commit_row_update(
     }
     let changes = match rowjson::update_changes(cols, &state) {
         Ok(c) => c,
-        Err(msg) => {
+        Err(why) => {
             // A value the row panel could not read — nothing reached a server.
-            gs.commit_err.set(Some(ModalError::app(msg)));
+            gs.commit_err
+                .set(Some(ModalError::app(field_refusal_text(&why))));
             return;
         }
     };
@@ -13374,6 +13444,68 @@ mod clipboard_gate {
             src[at..body_end].contains("copy_split_note"),
             "copy_selection must report the cells the TSV format split"
         );
+    }
+}
+
+#[cfg(test)]
+mod refusal_wording_tests {
+    use schemaic_core::edit::{CopySqlRefusal, PasteCounts, paste_report};
+    use schemaic_core::rowjson::FieldRefusal;
+
+    /// **Every paste report reads in English exactly as core's
+    /// `edit::paste_report`** — each skipped kind alone and all together, at
+    /// one and several, with nothing staged and with one and many cells.
+    #[test]
+    fn english_says_every_paste_report_as_core_does() {
+        let counts = |dropped, read_only, capped| PasteCounts {
+            dropped,
+            read_only,
+            capped,
+        };
+        let mut cases = vec![counts(0, 0, 0)];
+        for n in [1, 1_500] {
+            cases.extend([
+                counts(n, 0, 0),
+                counts(0, n, 0),
+                counts(0, 0, n),
+                counts(n, n, n),
+            ]);
+        }
+        for c in cases {
+            for skipped_deleted in [0, 1, 2_000] {
+                for staged in [0, 1, 3, 12_345] {
+                    assert_eq!(
+                        super::paste_report_shown(c, skipped_deleted, staged),
+                        paste_report(c, skipped_deleted, staged),
+                        "{c:?} {skipped_deleted} {staged}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Every Copy as SQL refusal and row-panel refusal reads in English
+    /// exactly as core's.**
+    #[test]
+    fn english_says_every_copy_and_row_refusal_as_core_does() {
+        for r in [
+            CopySqlRefusal::NoKeyedTable,
+            CopySqlRefusal::KeyTooLarge,
+            CopySqlRefusal::Pinned,
+            CopySqlRefusal::ReadOnly,
+            CopySqlRefusal::UpdateColumnsTooLarge,
+            CopySqlRefusal::UpdateNothingWritable,
+            CopySqlRefusal::WhereInNoKey,
+            CopySqlRefusal::NewRowHasNoKey,
+        ] {
+            assert_eq!(super::copy_sql_refusal_text(r), r.message(), "{r:?}");
+        }
+        for r in [
+            FieldRefusal::NotEditable("id".into()),
+            FieldRefusal::NotNullable("name".into()),
+        ] {
+            assert_eq!(super::field_refusal_text(&r), r.to_string(), "{r:?}");
+        }
     }
 }
 
