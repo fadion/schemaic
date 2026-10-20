@@ -1802,7 +1802,7 @@ fn conn_statement_timeout_label(v: Option<u64>) -> String {
 /// Why the init SQL would be refused — core's `init_sql::InitRefusal` in the
 /// interface's language, the statement's preview and the lower-cased setting
 /// names passing through.
-fn init_refusal_text(r: &schemaic_core::init_sql::InitRefusal) -> String {
+pub(crate) fn init_refusal_text(r: &schemaic_core::init_sql::InitRefusal) -> String {
     use schemaic_core::init_sql::InitWhy;
     let why = match &r.why {
         InitWhy::OnlyPragmas => tr!("connections-init-only-pragmas"),

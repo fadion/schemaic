@@ -70,8 +70,8 @@ pub(crate) type MsClient = tiberius::Client<Compat<TcpStream>>;
 /// connection already carries the raised plan (`Connection::tls_plan`); this
 /// is for one assembled from parts.
 async fn config(db: &Db, database: Option<&str>) -> Result<tiberius::Config, DbError> {
-    if let Some(why) = db.auth.transport_refusal(db.tls_plan()) {
-        return Err(DbError::Refused(why.to_string()));
+    if db.auth.transport_refusal(db.tls_plan()).is_some() {
+        return Err(DbError::Refused(crate::DbRefusal::Transport(db.auth)));
     }
     let mut cfg = tiberius::Config::new();
     let address = schemaic_core::connection::sql_server_address(&db.host);
@@ -177,17 +177,15 @@ async fn auth_method(db: &Db) -> Result<tiberius::AuthMethod, DbError> {
         #[cfg(windows)]
         AuthMode::Windows => Ok(tiberius::AuthMethod::Integrated),
         #[cfg(not(windows))]
-        AuthMode::Windows => Err(DbError::Refused(
-            "Windows sign-in is available only in the Windows build of Schemaic.".to_string(),
-        )),
+        AuthMode::Windows => Err(DbError::Refused(crate::DbRefusal::WindowsBuildOnly)),
         AuthMode::AzureCli => Ok(tiberius::AuthMethod::aad_token(
             crate::entra::sql_token().await?,
         )),
         // PostgreSQL's and the MySQL family's, never in force here
         // (`AuthMode::offered`) — refused should a hand-made `Db` carry one.
-        AuthMode::AwsIam | AuthMode::GcpIam => Err(DbError::Refused(
-            "Cloud IAM sign-in is for PostgreSQL and MySQL connections.".to_string(),
-        )),
+        AuthMode::AwsIam | AuthMode::GcpIam => {
+            Err(DbError::Refused(crate::DbRefusal::CloudIamEngine))
+        }
     }
 }
 
@@ -3338,7 +3336,8 @@ fn explain_setup(
         return Ok(&["SET SHOWPLAN_XML ON"]);
     }
     if read_only {
-        schemaic_core::sql::read_only_reason(sql, MS).map_err(DbError::Refused)?;
+        schemaic_core::sql::read_only_refusal(sql, MS)
+            .map_err(|r| DbError::Refused(crate::DbRefusal::ReadOnly(r.reason)))?;
     }
     Ok(&["BEGIN TRANSACTION", "SET STATISTICS XML ON"])
 }
@@ -3858,11 +3857,7 @@ pub(crate) async fn kill_session(
     kind: schemaic_core::activity::KillKind,
 ) -> Result<(), DbError> {
     if !schemaic_core::activity::supports_kill_kind(MS, kind) {
-        return Err(DbError::Refused(
-            "SQL Server cannot cancel another session's statement without ending the \
-             session — use Kill session."
-                .to_string(),
-        ));
+        return Err(DbError::Refused(crate::DbRefusal::MsSqlCancelNeedsKill));
     }
     let mut client = connect(db, None).await?;
     // An integer the panel read from `session_id`, formatted as one: there is
@@ -4542,29 +4537,19 @@ fn code_page_fit(code_page: u32, text: &str) -> Fit {
 /// cannot hold, and the values only the server can judge.
 #[derive(Debug, Default)]
 struct CodePageCheck<'a> {
-    refusal: Option<String>,
+    refusal: Option<crate::DbRefusal>,
     /// Each value with its column and, for an import, the file's row.
     ask_server: Vec<(Option<u64>, &'a ColumnFacts, &'a str)>,
 }
 
 /// The sentence for a value `col` cannot hold. `row` names an import's row.
-fn code_page_refusal(row: Option<u64>, f: &ColumnFacts, lost: Option<char>) -> String {
-    let what = match lost {
-        Some(c) => format!(
-            "`{c}`, which code page {} has no character for",
-            f.code_page
-        ),
-        None => "a character its code page has no character for".to_string(),
-    };
-    let head = match row {
-        Some(r) => format!("Row {r} has a value for {} ({})", f.name, f.base_type),
-        None => format!("A value for {} ({})", f.name, f.base_type),
-    };
-    format!(
-        "{head} holds {what}: SQL Server would store it as `?` or a look-alike rather \
-         than refuse it. \
-         Store the column as nvarchar, or remove the character."
-    )
+fn code_page_refusal(row: Option<u64>, f: &ColumnFacts, lost: Option<char>) -> crate::DbRefusal {
+    crate::DbRefusal::CodePage {
+        row,
+        column: f.name.clone(),
+        base_type: f.base_type.clone(),
+        lost: lost.map(|c| (c, f.code_page)),
+    }
 }
 
 /// [`blank_refusal`]'s twin for the other silent conversion: text written to
@@ -4631,7 +4616,7 @@ fn import_code_page_check<'a>(
 async fn server_code_page_refusal(
     client: &mut MsClient,
     values: &[(Option<u64>, &ColumnFacts, &str)],
-) -> Result<Option<String>, DbError> {
+) -> Result<Option<crate::DbRefusal>, DbError> {
     let plain =
         |c: &&str| !c.is_empty() && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
     let mut collations: Vec<&str> = Vec::new();
@@ -4739,7 +4724,7 @@ fn fact<'a>(facts: &'a [ColumnFacts], col: &str) -> Option<&'a ColumnFacts> {
 /// engine alone clearing a quantity would store zero and report success. Asked
 /// before anything runs, so nothing is written; a column the catalogue does not
 /// name is left to the server.
-fn blank_refusal(write: &GridWrite, facts: &[ColumnFacts]) -> Option<String> {
+fn blank_refusal(write: &GridWrite, facts: &[ColumnFacts]) -> Option<crate::DbRefusal> {
     let staged = write
         .updates
         .iter()
@@ -4751,11 +4736,11 @@ fn blank_refusal(write: &GridWrite, facts: &[ColumnFacts]) -> Option<String> {
             continue;
         }
         if let Some(f) = fact(facts, col).filter(|f| !holds_text(&f.base_type)) {
-            return Some(format!(
-                "An empty or blank value can't be written to {} ({}): SQL Server would store it as \
-                 0 or 1900-01-01 rather than refuse it. Set the cell to NULL, or type a value.",
-                col, f.base_type
-            ));
+            return Some(crate::DbRefusal::BlankValue {
+                row: None,
+                column: col.clone(),
+                base_type: f.base_type.clone(),
+            });
         }
     }
     None
@@ -4784,7 +4769,7 @@ fn import_blank_refusal(
     facts: &[ColumnFacts],
     batch: &[Vec<Value>],
     first_row: u64,
-) -> Option<String> {
+) -> Option<crate::DbRefusal> {
     for (i, row) in batch.iter().enumerate() {
         for (col, v) in columns.iter().zip(row) {
             let Value::Str(s) = v else { continue };
@@ -4792,13 +4777,11 @@ fn import_blank_refusal(
                 continue;
             }
             if let Some(f) = fact(facts, col).filter(|f| !holds_text(&f.base_type)) {
-                return Some(format!(
-                    "Row {} has an empty or blank value for {} ({}): SQL Server would store it as 0 or \
-                     1900-01-01 rather than refuse it. Import empty fields as NULL, or fill them in.",
-                    first_row + i as u64 + 1,
-                    col,
-                    f.base_type
-                ));
+                return Some(crate::DbRefusal::BlankValue {
+                    row: Some(first_row + i as u64 + 1),
+                    column: col.clone(),
+                    base_type: f.base_type.clone(),
+                });
             }
         }
     }
@@ -5280,7 +5263,7 @@ fn cancelled_import(undone: Rollback) -> DbError {
 /// wrapping it again with a rollback note does not say that twice.
 fn err_text(e: DbError) -> String {
     match e {
-        DbError::Query(m) | DbError::Connect(m) | DbError::Refused(m) => m,
+        DbError::Query(m) | DbError::Connect(m) => m,
         other => other.to_string(),
     }
 }
@@ -5967,7 +5950,9 @@ mod write_tests {
             )],
             ..Default::default()
         };
-        let msg = blank_refusal(&blank("qty"), &f).expect("an int refuses ''");
+        let msg = blank_refusal(&blank("qty"), &f)
+            .expect("an int refuses ''")
+            .to_string();
         assert!(msg.contains("qty") && msg.contains("int"), "{msg}");
         assert!(blank_refusal(&blank("shipped"), &f).is_some());
         // Case-insensitive, as SQL Server's own names usually are.
@@ -6085,7 +6070,10 @@ mod write_tests {
             ..Default::default()
         };
         let greek = set("v", "Ωμέγα");
-        let msg = code_page_check(&greek, &f).refusal.expect("refused");
+        let msg = code_page_check(&greek, &f)
+            .refusal
+            .expect("refused")
+            .to_string();
         assert!(
             msg.contains('v') && msg.contains('Ω') && msg.contains("1252"),
             "{msg}"
@@ -6106,7 +6094,8 @@ mod write_tests {
         ];
         let msg = import_code_page_check(&cols, &f, &batch, 10)
             .refusal
-            .expect("refused");
+            .expect("refused")
+            .to_string();
         assert!(msg.starts_with("Row 12 ") && msg.contains('日'), "{msg}");
     }
 
@@ -6139,7 +6128,9 @@ mod write_tests {
         let ok = [row("", Value::Null), row("x", Value::Str("3".into()))];
         assert_eq!(import_blank_refusal(&cols, &f, &ok, 0), None);
         let bad = [row("a", Value::Int(1)), row("b", Value::Str(String::new()))];
-        let msg = import_blank_refusal(&cols, &f, &bad, 500).expect("refused");
+        let msg = import_blank_refusal(&cols, &f, &bad, 500)
+            .expect("refused")
+            .to_string();
         assert!(msg.contains("qty") && msg.starts_with("Row 502 "), "{msg}");
         // A column the catalogue does not know is the server's to judge.
         let unknown = ["other".to_string()];
@@ -6964,7 +6955,9 @@ mod tests {
             SslMode::VerifyCa,
         ] {
             match config(&entra(mode), None).await {
-                Err(DbError::Refused(why)) => assert!(why.contains("Verify full"), "{why}"),
+                Err(DbError::Refused(why)) => {
+                    assert!(why.to_string().contains("Verify full"), "{why}")
+                }
                 other => panic!("{mode:?}: expected a refusal, got {:?}", other.map(|_| ())),
             }
         }

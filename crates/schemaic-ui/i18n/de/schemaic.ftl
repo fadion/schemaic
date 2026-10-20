@@ -440,6 +440,40 @@ error-modal-explain = Erklären
 db-query-failed = Abfrage fehlgeschlagen: { $error }
 db-connection-failed = Verbindung fehlgeschlagen: { $error }
 db-query-cancelled = Abfrage abgebrochen
+db-refused-init-sql = Nicht verbunden — das Init-SQL dieser Verbindung wurde abgelehnt: { $why }
+db-refused-transport-entra = Die Anmeldung mit Microsoft Entra braucht SSL / TLS mit „Vollständig prüfen“: Ihr Token öffnet jede Azure-SQL-Datenbank, die das Konto erreicht, daher muss der Server seinen Namen nachweisen, bevor er eines erhält.
+db-refused-transport-aws = Die Anmeldung mit AWS IAM braucht SSL / TLS mindestens mit „Erforderlich“: Ihr Token ist ein Passwort für diesen Server und darf nicht unverschlüsselt durchs Netz gehen.
+db-refused-transport-gcp = Die Anmeldung mit Google Cloud IAM braucht SSL / TLS mit „CA prüfen“ und der Server-CA der Instanz als Stamm-CA: Ihr Token öffnet jede Cloud-SQL-Instanz, die das Konto erreicht.
+db-refused-transport = Diese Anmeldung braucht einen stärkeren SSL-/TLS-Modus als den der Verbindung.
+db-refused-backup-in-terminal = Eine Serverdatenbank wird mit ihren eigenen Werkzeugen gesichert, im Terminal.
+db-refused-commit-aborted = die Transaktion war bereits abgebrochen — eine Anweisung darin ist fehlgeschlagen oder wurde angehalten, ein Commit würde die Arbeit also verwerfen statt sie zu speichern. Es wurde nichts übernommen.
+db-refused-sqlite-no-manual = SQLite-Verbindungen unterstützen den manuellen Transaktionsmodus noch nicht — Anweisungen laufen und werden übernommen, sobald sie gesendet sind
+db-refused-mssql-read-only-auto = Eine schreibgeschützte SQL-Server-Verbindung läuft im Auto-Modus: SQL Server hat keine schreibgeschützte Transaktion, in der ein manueller Tab gehalten werden könnte, und jede Anweisung im Auto-Modus wird zurückgerollt
+db-refused-client-charset = abgelehnt: Der Client-Zeichensatz der Sitzung ({ $charset }) kann ein Anführungszeichen in einem Zeichen verstecken, daher kann die Anweisungsprüfung sie nicht so lesen wie der Server
+db-refused-sql-mode = abgelehnt: Der sql_mode des Servers ({ $mode }) liest Anführungszeichen anders als die Anweisungsprüfung und ließ sich für diese Sitzung nicht ändern
+db-refused-writing-plan = Pläne laufen hier in einer schreibgeschützten Transaktion, und MySQL und MariaDB planen darin keine schreibende Anweisung. Plane stattdessen die SELECT-Form der Anweisung.
+db-refused-writing-plan-function = Pläne laufen hier in einer schreibgeschützten Transaktion, und MySQL und MariaDB planen darin keine schreibende Anweisung. Eine Funktion, die sie aufruft, schreibt, und das darf ein Plan hier nicht.
+db-refused-windows-build-only = Die Windows-Anmeldung gibt es nur in der Windows-Version von Schemaic.
+db-refused-cloud-iam-engine = Die Cloud-IAM-Anmeldung ist für PostgreSQL- und MySQL-Verbindungen.
+db-refused-mssql-cancel-needs-kill = SQL Server kann die Anweisung einer anderen Sitzung nicht abbrechen, ohne die Sitzung zu beenden — verwende „Sitzung beenden“.
+db-refused-blank-value = { $has_row ->
+        [some] Zeile { $row } hat einen leeren Wert für { $column } ({ $sql_type }): SQL Server würde ihn als 0 oder 1900-01-01 speichern, statt ihn abzulehnen. Importiere leere Felder als NULL oder fülle sie aus.
+       *[none] Ein leerer Wert kann nicht in { $column } ({ $sql_type }) geschrieben werden: SQL Server würde ihn als 0 oder 1900-01-01 speichern, statt ihn abzulehnen. Setze die Zelle auf NULL oder gib einen Wert ein.
+    }
+db-refused-code-page = { $has_row ->
+        [some] Zeile { $row } hat einen Wert für { $column } ({ $sql_type }), der
+       *[none] Ein Wert für { $column } ({ $sql_type }) enthält
+    } { $has_lost ->
+        [some] `{ $character }` enthält, für das Codepage { $code_page } kein Zeichen hat
+       *[none] ein Zeichen, für das seine Codepage kein Zeichen hat
+    }: SQL Server würde es als `?` oder ein ähnliches Zeichen speichern, statt es abzulehnen. Speichere die Spalte als nvarchar oder entferne das Zeichen.
+db-refused-sqlite-no-file = keine Datenbankdatei festgelegt
+db-refused-sqlite-memory = :memory: ist keine Datenbankdatei — SQLite hält eine In-Memory-Datenbank nur so lange, wie die Verbindung besteht, die sie angelegt hat, und diese App öffnet für jeden Vorgang eine neue Verbindung, sodass jeder Schreibvorgang als gespeichert gemeldet und dann verworfen würde. Gib den Pfad zu einer Datei an.
+db-refused-sqlite-uri = { $file }: Das ist eine URI, keine Datenbankdatei — SQLite würde den Teil nach `?` als Öffnungsoptionen lesen, und `?mode=memory` öffnet eine Wegwerfdatenbank, die jeden Schreibvorgang annimmt und keinen behält. Gib den Pfad zur Datei selbst an.
+db-refused-sqlite-worker = der SQLite-Worker ist fehlgeschlagen: { $error }
+db-refused-sqlite-no-column = { $table }.{ $column } ist keine Spalte dieser Tabelle und hat daher keinen Standardwert, der geschrieben werden könnte
+db-refused-sqlite-generated = { $column } ist eine generierte Spalte: Sie hat keinen Standardwert, auf den sie zurückgesetzt werden könnte, und SQLite berechnet sie aus der Zeile
+db-refused-sqlite-sizes-too-large = Tabellengrößen werden nur für eine Datenbank bis { $cap } gelesen: SQLite misst sie, indem es jede Seite der Datei liest, und diese hat { $file }.
 ddl-statement-failed = Anweisung { $n } fehlgeschlagen: { $error }
 ddl-already-applied = { $n ->
     [one] { $failed } — { $n } vorherige Anweisung ist bereits angewendet und lässt sich nicht zurückrollen

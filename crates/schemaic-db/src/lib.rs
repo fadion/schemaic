@@ -101,6 +101,9 @@ use schemaic_core::stats::{SchemaStats, count_rows_sql};
 use schemaic_core::users::{self, Grants, Principal};
 use tokio_util::sync::CancellationToken;
 
+/// [`DbError::Refused`]'s value, where every producer in this crate names it.
+pub use schemaic_core::model::DbRefusal;
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DbError {
     #[error("connection failed: {0}")]
@@ -122,8 +125,8 @@ pub enum DbError {
     /// **Schemaic's own sentence**, not the server's — a refusal written before
     /// anything was sent (`sqlite::open_target`, the SQLite manual-mode
     /// backstop, an `sql_mode` that would not pin), or this crate's account of
-    /// what an operation did (a Stop that could not undo everything, a Commit
-    /// that found the block aborted). Rendered as written: it is already the
+    /// what an operation did (a Commit that found the block aborted). Rendered
+    /// as written: it is already the
     /// whole sentence, and "query failed:" in front of "Commit cancelled — …"
     /// named a failure that was the user's own act.
     ///
@@ -132,8 +135,11 @@ pub enum DbError {
     /// offered *AI fix* on a `SELECT 1` whose session set-up had refused, and
     /// the modal *Explain* on a Stop. The producer is the one place that knows
     /// whose words these are, so it says so here.
+    ///
+    /// A value ([`schemaic_core::model::DbRefusal`]), so the interface says it
+    /// in its own language; `Display` is the English.
     #[error("{0}")]
-    Refused(String),
+    Refused(schemaic_core::model::DbRefusal),
     /// A write path failed — the grid's write-back, an import, a copy — and
     /// here is what its rollback achieved, as a value the interface can say in
     /// its own language. Displayed as the `Query` or `Refused` it replaced
@@ -201,7 +207,7 @@ impl DbError {
 
 #[cfg(test)]
 mod modal_source_tests {
-    use super::DbError;
+    use super::{DbError, DbRefusal};
     use schemaic_core::model::ErrorSource;
 
     #[test]
@@ -216,7 +222,7 @@ mod modal_source_tests {
         );
         assert_eq!(DbError::Cancelled.modal_source(), ErrorSource::App);
         assert_eq!(
-            DbError::Refused("x".into()).modal_source(),
+            DbError::Refused(DbRefusal::CommitAborted).modal_source(),
             ErrorSource::App
         );
         // A write path's failure is the statement's when its cause is, and
@@ -235,7 +241,10 @@ mod modal_source_tests {
             ),
             (WriteCause::CommitCancelled, ErrorSource::App),
             (WriteCause::ImportCancelled, ErrorSource::App),
-            (WriteCause::Refused("x".into()), ErrorSource::App),
+            (
+                WriteCause::Refused(DbRefusal::CommitAborted),
+                ErrorSource::App,
+            ),
         ] {
             let e = DbError::write(cause, Some(Rollback::Unknown));
             assert_eq!(e.modal_source(), source, "{e}");
@@ -250,15 +259,18 @@ mod modal_source_tests {
         assert_eq!(src(DbError::Query("x".into())), ErrorSource::Server);
         assert_eq!(src(DbError::Connect("x".into())), ErrorSource::Server);
         assert_eq!(src(DbError::Cancelled), ErrorSource::App);
-        assert_eq!(src(DbError::Refused("x".into())), ErrorSource::App);
+        assert_eq!(
+            src(DbError::Refused(DbRefusal::CommitAborted)),
+            ErrorSource::App
+        );
     }
 
     /// A refusal is already the whole sentence; nothing is prefixed to it.
     #[test]
     fn a_refusal_renders_as_written() {
         assert_eq!(
-            DbError::Refused("Commit cancelled — x".into()).to_string(),
-            "Commit cancelled — x"
+            DbError::Refused(DbRefusal::BackupInTerminal).to_string(),
+            "A server database is backed up by its own tools, in the terminal."
         );
     }
 }
@@ -806,11 +818,8 @@ impl Db {
     /// engine — or the refusal, as the connect's error. Asked by every
     /// engine's connect function before it runs any of them.
     pub(crate) fn init_statements(&self) -> Result<Vec<String>, DbError> {
-        schemaic_core::init_sql::check(&self.init_sql, self.engine.dialect()).map_err(|why| {
-            DbError::Refused(format!(
-                "Not connected — this connection's init SQL was refused: {why}"
-            ))
-        })
+        schemaic_core::init_sql::check(&self.init_sql, self.engine.dialect())
+            .map_err(|why| DbError::Refused(DbRefusal::InitSql(why)))
     }
 
     /// A server's refusal of one of the init statements, as the connect's
@@ -851,8 +860,8 @@ impl Db {
         let Some(cloud) = self.auth.cloud() else {
             return Ok(self.pass.clone());
         };
-        if let Some(why) = self.auth.transport_refusal(self.tls.as_ref()) {
-            return Err(DbError::Refused(why.to_string()));
+        if self.auth.transport_refusal(self.tls.as_ref()).is_some() {
+            return Err(DbError::Refused(DbRefusal::Transport(self.auth)));
         }
         let (host, port) = self.signing_target();
         cloud_iam::token(cloud, host, port, &self.user).await
@@ -1808,9 +1817,9 @@ impl Db {
     pub async fn backup_to_file(&self, target: &str) -> Result<(), DbError> {
         match self.engine {
             Engine::Sqlite => sqlite::backup_to(self, target.to_string()).await,
-            Engine::MySql | Engine::Postgres | Engine::MsSql => Err(DbError::Refused(
-                "A server database is backed up by its own tools, in the terminal.".to_string(),
-            )),
+            Engine::MySql | Engine::Postgres | Engine::MsSql => {
+                Err(DbError::Refused(DbRefusal::BackupInTerminal))
+            }
         }
     }
 

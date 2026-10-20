@@ -402,7 +402,7 @@ fn main() -> std::process::ExitCode {
 /// `e` as the window shows it: `DbError`'s own words — *query failed:*,
 /// *connection failed:*, *query cancelled*, a write path's failure — in the
 /// interface's language, the server's words inside as they came, and a
-/// refusal (already the catalogue's, or this crate's English) as written.
+/// refusal of the database layer's own (`DbRefusal`) worded too.
 /// **For the eye only**: the log, the write log, the CLI and anything sent to
 /// a model keep `to_string()`, which is English; a `ModalError` carries this
 /// as its `shown` beside that `text` ([`modal_error_shown`]).
@@ -412,7 +412,7 @@ fn db_error_shown(e: &DbError) -> String {
         DbError::Query(m) | DbError::QueryAt { message: m, .. } => i18n::db_query_failed(m.clone()),
         DbError::Connect(m) => i18n::db_connection_failed(m.clone()),
         DbError::Cancelled => i18n::db_query_cancelled(),
-        DbError::Refused(m) => m.clone(),
+        DbError::Refused(r) => i18n::db_refusal_text(r),
         DbError::Write(f) => i18n::write_failure_text(f),
     }
 }
@@ -16060,7 +16060,7 @@ mod app_tests {
                 at: 8,
             },
             DbError::Cancelled,
-            DbError::Refused("Read-only connection.".into()),
+            DbError::Refused(schemaic_db::DbRefusal::BackupInTerminal),
             DbError::Write(WriteFailure {
                 cause: WriteCause::Server("Duplicate entry".into()),
                 undone: Some(Rollback::Complete),

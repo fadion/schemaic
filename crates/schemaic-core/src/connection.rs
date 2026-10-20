@@ -1115,7 +1115,14 @@ impl AuthMode {
                     || (floor.verifies_hostname() && p.skip_hostname_check)
             }
         };
-        short.then_some(match self {
+        short.then_some(self.transport_sentence())
+    }
+
+    /// Why this sign-in refuses a transport too weak for it, in English —
+    /// [`AuthMode::transport_refusal`]'s sentence, asked whether or not the
+    /// plan is short.
+    pub fn transport_sentence(self) -> &'static str {
+        match self {
             AuthMode::AzureCli => {
                 "Microsoft Entra sign-in needs SSL / TLS at Verify full: its token opens every \
                  Azure SQL database the account can reach, so the server must prove its name \
@@ -1132,7 +1139,7 @@ impl AuthMode {
             AuthMode::Password | AuthMode::Windows => {
                 "This sign-in needs a stronger SSL / TLS mode than the connection's."
             }
-        })
+        }
     }
 
     /// The line under the form's TLS picker when this sign-in connects at a

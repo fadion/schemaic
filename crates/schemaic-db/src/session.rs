@@ -170,12 +170,7 @@ pub struct Session {
 /// What [`Session::commit`] answers when the block was already aborted, so the
 /// `COMMIT` would have been a `ROLLBACK`.
 fn aborted_commit() -> DbError {
-    DbError::Refused(
-        "the transaction was already aborted — a statement in it failed \
-         or was stopped, so committing discards the work rather than \
-         saving it. Nothing was committed."
-            .to_string(),
-    )
+    DbError::Refused(crate::DbRefusal::CommitAborted)
 }
 
 /// A lazy `BEGIN` the server refused — its words, about Schemaic's statement
@@ -282,11 +277,7 @@ impl Session {
             // offer the mode for a SQLite connection, and this is the backstop for
             // any path that reaches it anyway.
             Engine::Sqlite => {
-                return Err(DbError::Refused(
-                    "SQLite connections don't support manual transaction mode yet — \
-                     statements run and commit as they are sent"
-                        .to_string(),
-                ));
+                return Err(DbError::Refused(crate::DbRefusal::SqliteNoManual));
             }
             // **SQL Server holds no read-only transaction**, so a read-only
             // connection is refused a pinned session rather than given an
@@ -298,12 +289,7 @@ impl Session {
             // every statement is rolled back, loses it nothing.
             Engine::MsSql => {
                 if enforce == Some(crate::Enforce::ReadOnly) {
-                    return Err(DbError::Refused(
-                        "A read-only SQL Server connection runs in Auto mode: SQL Server \
-                         has no read-only transaction to hold a Manual tab in, and each \
-                         statement Auto mode runs is rolled back"
-                            .to_string(),
-                    ));
+                    return Err(DbError::Refused(crate::DbRefusal::MsSqlReadOnlyAuto));
                 }
                 // `AsJudged` needs nothing, for the reason `mssql::fetch_query`
                 // gives. `XACT_ABORT` is left at its default, off: a failed

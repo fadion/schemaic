@@ -492,6 +492,49 @@ db-query-failed = query failed: { $error }
 db-connection-failed = connection failed: { $error }
 db-query-cancelled = query cancelled
 
+## The database layer's own refusals (core's model::DbRefusal; a test holds
+## the English equal). Names, types, values and the runtime's own words are
+## as they came; $has_row and $has_lost are "some" or "none" for an optional
+## file row ($row) and lost character ($character in code page $code_page);
+## $sql_type is the column's type as the server names it;
+## $cap and $file are sizes as the app writes them.
+
+# $why is a connections-init-refused sentence.
+db-refused-init-sql = Not connected — this connection's init SQL was refused: { $why }
+db-refused-transport-entra = Microsoft Entra sign-in needs SSL / TLS at Verify full: its token opens every Azure SQL database the account can reach, so the server must prove its name before it is handed one.
+db-refused-transport-aws = AWS IAM sign-in needs SSL / TLS of at least Require: its token is a password for this server, and must not cross the network in the clear.
+db-refused-transport-gcp = Google Cloud IAM sign-in needs SSL / TLS at Verify CA, with the instance's server CA as Root CA: its token opens every Cloud SQL instance the account can reach.
+db-refused-transport = This sign-in needs a stronger SSL / TLS mode than the connection's.
+db-refused-backup-in-terminal = A server database is backed up by its own tools, in the terminal.
+db-refused-commit-aborted = the transaction was already aborted — a statement in it failed or was stopped, so committing discards the work rather than saving it. Nothing was committed.
+db-refused-sqlite-no-manual = SQLite connections don't support manual transaction mode yet — statements run and commit as they are sent
+db-refused-mssql-read-only-auto = A read-only SQL Server connection runs in Auto mode: SQL Server has no read-only transaction to hold a Manual tab in, and each statement Auto mode runs is rolled back
+db-refused-client-charset = refused: the session's client character set ({ $charset }) can hide a quote inside a character, so the statement check cannot read it the way the server would
+db-refused-sql-mode = refused: the server's sql_mode ({ $mode }) reads quotes differently from the statement check, and could not be changed for this session
+db-refused-writing-plan = Plans here run in a read-only transaction, and MySQL and MariaDB will not plan a statement that writes inside one. Plan the statement's SELECT form instead.
+db-refused-writing-plan-function = Plans here run in a read-only transaction, and MySQL and MariaDB will not plan a statement that writes inside one. A function it calls writes, which a plan here is not allowed to do.
+db-refused-windows-build-only = Windows sign-in is available only in the Windows build of Schemaic.
+db-refused-cloud-iam-engine = Cloud IAM sign-in is for PostgreSQL and MySQL connections.
+db-refused-mssql-cancel-needs-kill = SQL Server cannot cancel another session's statement without ending the session — use Kill session.
+db-refused-blank-value = { $has_row ->
+        [some] Row { $row } has an empty or blank value for { $column } ({ $sql_type }): SQL Server would store it as 0 or 1900-01-01 rather than refuse it. Import empty fields as NULL, or fill them in.
+       *[none] An empty or blank value can't be written to { $column } ({ $sql_type }): SQL Server would store it as 0 or 1900-01-01 rather than refuse it. Set the cell to NULL, or type a value.
+    }
+db-refused-code-page = { $has_row ->
+        [some] Row { $row } has a value for { $column } ({ $sql_type })
+       *[none] A value for { $column } ({ $sql_type })
+    } holds { $has_lost ->
+        [some] `{ $character }`, which code page { $code_page } has no character for
+       *[none] a character its code page has no character for
+    }: SQL Server would store it as `?` or a look-alike rather than refuse it. Store the column as nvarchar, or remove the character.
+db-refused-sqlite-no-file = no database file is set
+db-refused-sqlite-memory = :memory: is not a database file — SQLite keeps an in-memory database only for as long as the connection that made it, and this app opens a new connection per operation, so every write would be reported as saved and then discarded. Give the path to a file.
+db-refused-sqlite-uri = { $file }: this is a URI, not a database file — SQLite would read the part after `?` as open options, and `?mode=memory` opens a scratch database that accepts every write and keeps none. Give the path to the file itself.
+db-refused-sqlite-worker = the SQLite worker failed: { $error }
+db-refused-sqlite-no-column = { $table }.{ $column } is not a column this table has, so it has no default to write
+db-refused-sqlite-generated = { $column } is a generated column: it has no default to set it back to, and SQLite computes it from the row
+db-refused-sqlite-sizes-too-large = Table sizes are read only for a database up to { $cap }: SQLite measures them by reading every page of the file, and this one is { $file }.
+
 ## A DDL plan that failed, in the DDL preview (schemaic-db's DdlError). English
 ## must read exactly as DdlError displays (a test holds it).
 

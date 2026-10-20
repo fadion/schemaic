@@ -914,7 +914,8 @@ pub fn ddl_rollback_failed(cause: String, rollback: String) -> String {
 pub fn write_failure_text(f: &schemaic_core::model::WriteFailure) -> String {
     use schemaic_core::model::{Rollback, WriteAction, WriteCause};
     let cause = match &f.cause {
-        WriteCause::Server(m) | WriteCause::Refused(m) => m.clone(),
+        WriteCause::Server(m) => m.clone(),
+        WriteCause::Refused(r) => db_refusal_text(r),
         WriteCause::Row(e) => row_error_text(e),
         WriteCause::OneRow(miss) => {
             let (table, affected) = (miss.table.as_str(), miss.affected);
@@ -1075,6 +1076,94 @@ pub fn cli_failure_text(f: &schemaic_ai::CliFailure) -> String {
     }
 }
 
+/// The database layer's own refusal — core's `model::DbRefusal`, what
+/// `DbError::Refused` and a write's `WriteCause::Refused` carry, in the
+/// interface's language. Names, values and the runtime's words inside pass
+/// through; sizes take the interface's marks.
+pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
+    use schemaic_core::connection::AuthMode;
+    use schemaic_core::model::DbRefusal;
+    let opt_row = |row: &Option<u64>| row.map(|r| r.to_string()).unwrap_or_default();
+    let has_row = |row: &Option<u64>| if row.is_some() { "some" } else { "none" };
+    match r {
+        DbRefusal::InitSql(why) => tr!(
+            "db-refused-init-sql",
+            why = crate::connection_form::init_refusal_text(why)
+        ),
+        DbRefusal::Transport(auth) => match auth {
+            AuthMode::AzureCli => tr!("db-refused-transport-entra"),
+            AuthMode::AwsIam => tr!("db-refused-transport-aws"),
+            AuthMode::GcpIam => tr!("db-refused-transport-gcp"),
+            AuthMode::Password | AuthMode::Windows => tr!("db-refused-transport"),
+        },
+        DbRefusal::BackupInTerminal => tr!("db-refused-backup-in-terminal"),
+        DbRefusal::CommitAborted => tr!("db-refused-commit-aborted"),
+        DbRefusal::SqliteNoManual => tr!("db-refused-sqlite-no-manual"),
+        DbRefusal::MsSqlReadOnlyAuto => tr!("db-refused-mssql-read-only-auto"),
+        DbRefusal::ClientCharset(charset) => {
+            tr!("db-refused-client-charset", charset = charset.as_str())
+        }
+        DbRefusal::SqlMode(mode) => tr!("db-refused-sql-mode", mode = mode.as_str()),
+        DbRefusal::WritingPlan { function } => match function {
+            true => tr!("db-refused-writing-plan-function"),
+            false => tr!("db-refused-writing-plan"),
+        },
+        DbRefusal::WindowsBuildOnly => tr!("db-refused-windows-build-only"),
+        DbRefusal::CloudIamEngine => tr!("db-refused-cloud-iam-engine"),
+        DbRefusal::ReadOnly(reason) => read_only_reason_text(reason),
+        DbRefusal::MsSqlCancelNeedsKill => tr!("db-refused-mssql-cancel-needs-kill"),
+        DbRefusal::BlankValue {
+            row,
+            column,
+            base_type,
+        } => tr!(
+            "db-refused-blank-value",
+            has_row = has_row(row),
+            row = opt_row(row),
+            column = column.as_str(),
+            sql_type = base_type.as_str()
+        ),
+        DbRefusal::CodePage {
+            row,
+            column,
+            base_type,
+            lost,
+        } => {
+            let (has_lost, character, code_page) = match lost {
+                Some((c, page)) => ("some", c.to_string(), page.to_string()),
+                None => ("none", String::new(), String::new()),
+            };
+            tr!(
+                "db-refused-code-page",
+                has_row = has_row(row),
+                row = opt_row(row),
+                column = column.as_str(),
+                sql_type = base_type.as_str(),
+                has_lost = has_lost,
+                character = character,
+                code_page = code_page
+            )
+        }
+        DbRefusal::SqliteNoFile => tr!("db-refused-sqlite-no-file"),
+        DbRefusal::SqliteMemory => tr!("db-refused-sqlite-memory"),
+        DbRefusal::SqliteUri(file) => tr!("db-refused-sqlite-uri", file = file.as_str()),
+        DbRefusal::SqliteWorker(e) => tr!("db-refused-sqlite-worker", error = e.as_str()),
+        DbRefusal::SqliteNoColumn { table, column } => tr!(
+            "db-refused-sqlite-no-column",
+            table = table.as_str(),
+            column = column.as_str()
+        ),
+        DbRefusal::SqliteGenerated(column) => {
+            tr!("db-refused-sqlite-generated", column = column.as_str())
+        }
+        DbRefusal::SqliteSizesTooLarge { cap, file } => tr!(
+            "db-refused-sqlite-sizes-too-large",
+            cap = bytes(*cap),
+            file = bytes(*file)
+        ),
+    }
+}
+
 /// Why Seed rows could not use the model's reply — core's `seed::SeedError`
 /// in the interface's language, the JSON parser's own text passing through.
 pub fn seed_error_text(e: &schemaic_core::seed::SeedError) -> String {
@@ -1180,6 +1269,76 @@ mod tests {
         }
     }
 
+    /// **Every refusal of the database layer's own reads in English exactly as
+    /// core's `DbRefusal::message`** — each variant, a named one with and
+    /// without its optional row and lost character, every sign-in's transport.
+    #[test]
+    fn english_says_every_db_refusal_as_core_does() {
+        use schemaic_core::connection::AuthMode;
+        use schemaic_core::init_sql::{InitRefusal, InitWhy};
+        use schemaic_core::model::DbRefusal;
+        use schemaic_core::sql::ReadOnlyReason;
+        let s = |t: &str| t.to_string();
+        let mut all = vec![
+            DbRefusal::InitSql(InitRefusal {
+                statement: s("SET autocommit = 0"),
+                why: InitWhy::NotListed(s("autocommit")),
+            }),
+            DbRefusal::BackupInTerminal,
+            DbRefusal::CommitAborted,
+            DbRefusal::SqliteNoManual,
+            DbRefusal::MsSqlReadOnlyAuto,
+            DbRefusal::ClientCharset(s("gbk")),
+            DbRefusal::SqlMode(s("ANSI_QUOTES")),
+            DbRefusal::WritingPlan { function: false },
+            DbRefusal::WritingPlan { function: true },
+            DbRefusal::WindowsBuildOnly,
+            DbRefusal::CloudIamEngine,
+            DbRefusal::ReadOnly(ReadOnlyReason::Several),
+            DbRefusal::MsSqlCancelNeedsKill,
+            DbRefusal::SqliteNoFile,
+            DbRefusal::SqliteMemory,
+            DbRefusal::SqliteUri(s("file:x?mode=memory")),
+            DbRefusal::SqliteWorker(s("task 7 panicked")),
+            DbRefusal::SqliteNoColumn {
+                table: s("orders"),
+                column: s("total"),
+            },
+            DbRefusal::SqliteGenerated(s("total")),
+            DbRefusal::SqliteSizesTooLarge {
+                cap: 4096,
+                file: 3 * 1024 * 1024 * 1024,
+            },
+        ];
+        for auth in [
+            AuthMode::Password,
+            AuthMode::Windows,
+            AuthMode::AzureCli,
+            AuthMode::AwsIam,
+            AuthMode::GcpIam,
+        ] {
+            all.push(DbRefusal::Transport(auth));
+        }
+        for row in [None, Some(502)] {
+            all.push(DbRefusal::BlankValue {
+                row,
+                column: s("qty"),
+                base_type: s("int"),
+            });
+            for lost in [None, Some(('Ω', 1252))] {
+                all.push(DbRefusal::CodePage {
+                    row,
+                    column: s("v"),
+                    base_type: s("varchar"),
+                    lost,
+                });
+            }
+        }
+        for r in all {
+            assert_eq!(db_refusal_text(&r), r.message(), "{r:?}");
+        }
+    }
+
     /// **Every agent CLI's refusal and failure reads in English exactly as
     /// `schemaic-ai` says it** — each grade's notice on every harness, an
     /// oversize context in both units and with both levers, a batch shim, and
@@ -1247,7 +1406,11 @@ mod tests {
             WriteCause::Server("Duplicate entry '1' for key 'PRIMARY'".into()),
             WriteCause::CommitCancelled,
             WriteCause::ImportCancelled,
-            WriteCause::Refused("Column `name` cannot hold an empty string".into()),
+            WriteCause::Refused(schemaic_core::model::DbRefusal::BlankValue {
+                row: Some(3),
+                column: "qty".into(),
+                base_type: "int".into(),
+            }),
         ];
         for action in [
             WriteAction::Delete,

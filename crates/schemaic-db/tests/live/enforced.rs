@@ -245,7 +245,8 @@ pub async fn a_read_only_plan_refuses_a_write_its_planner_makes(target: &'static
         _ => {
             assert!(
                 matches!(&write, Err(schemaic_db::DbError::Refused(m))
-                    if m.contains("read-only") && m.contains("SELECT form")),
+                    if m.to_string().contains("read-only")
+                        && m.to_string().contains("SELECT form")),
                 "{}: {write:?}",
                 target.name
             );
@@ -253,7 +254,8 @@ pub async fn a_read_only_plan_refuses_a_write_its_planner_makes(target: &'static
             // than to plan the SELECT form it already is.
             assert!(
                 matches!(&got, Err(schemaic_db::DbError::Refused(m))
-                    if !m.contains("SELECT form") && m.contains("function")),
+                    if !m.to_string().contains("SELECT form")
+                        && m.to_string().contains("function")),
                 "{}: {got:?}",
                 target.name
             );

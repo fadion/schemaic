@@ -267,22 +267,14 @@ fn open(db: &Db) -> Result<SqliteConn, DbError> {
 /// `cfg` block so that both answers are reachable from a test.
 fn open_target(file: &str, allow_uri: bool) -> Result<&str, DbError> {
     if file.trim().is_empty() {
-        return Err(DbError::Refused("no database file is set".to_string()));
+        return Err(DbError::Refused(crate::DbRefusal::SqliteNoFile));
     }
     if file == ":memory:" {
-        return Err(DbError::Refused(
-            ":memory: is not a database file — SQLite keeps an in-memory database only for as \
-             long as the connection that made it, and this app opens a new connection per \
-             operation, so every write would be reported as saved and then discarded. Give the \
-             path to a file."
-                .to_string(),
-        ));
+        return Err(DbError::Refused(crate::DbRefusal::SqliteMemory));
     }
     if !allow_uri && rejects_uri_filename(file) {
-        return Err(DbError::Refused(format!(
-            "{file}: this is a URI, not a database file — SQLite would read the part after `?` \
-             as open options, and `?mode=memory` opens a scratch database that accepts every \
-             write and keeps none. Give the path to the file itself."
+        return Err(DbError::Refused(crate::DbRefusal::SqliteUri(
+            file.to_string(),
         )));
     }
     Ok(file)
@@ -339,7 +331,7 @@ where
         f(&mut conn)
     })
     .await
-    .map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?
+    .map_err(|e| DbError::Refused(crate::DbRefusal::SqliteWorker(e.to_string())))?
 }
 
 /// One reachability probe at a time, per file.
@@ -905,7 +897,7 @@ pub(crate) async fn fetch_query(
     // own result is, so it is simply awaited.
     let interrupt = rx.await.ok();
     let outcome = tokio::select! {
-        r = work => Some(r.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?),
+        r = work => Some(r.map_err(|e| DbError::Refused(crate::DbRefusal::SqliteWorker(e.to_string())))?),
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt {
                 h.interrupt();
@@ -1221,7 +1213,7 @@ pub(crate) async fn commit_writes(
 
     let interrupt = rx.await.ok();
     tokio::select! {
-        r = work => r.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?,
+        r = work => r.map_err(|e| DbError::Refused(crate::DbRefusal::SqliteWorker(e.to_string())))?,
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt { h.interrupt(); }
             Err(DbError::Cancelled)
@@ -1284,15 +1276,14 @@ fn staged_defaults(conn: &SqliteConn, write: &GridWrite) -> Result<StagedDefault
                 })?;
             let sql = match found {
                 None => {
-                    return Err(DbError::Refused(format!(
-                        "{}.{} is not a column this table has, so it has no default to write",
-                        u.table, col
-                    )));
+                    return Err(DbError::Refused(crate::DbRefusal::SqliteNoColumn {
+                        table: u.table.clone(),
+                        column: col.to_string(),
+                    }));
                 }
                 Some((_, 2 | 3)) => {
-                    return Err(DbError::Refused(format!(
-                        "{col} is a generated column: it has no default to set it back to, \
-                         and SQLite computes it from the row"
+                    return Err(DbError::Refused(crate::DbRefusal::SqliteGenerated(
+                        col.to_string(),
                     )));
                 }
                 Some((Some(expr), _)) => default_operand(&expr),
@@ -1480,7 +1471,7 @@ pub(crate) async fn fetch_blob(
 
     let interrupt = rx.await.ok();
     tokio::select! {
-        res = work => res.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?,
+        res = work => res.map_err(|e| DbError::Refused(crate::DbRefusal::SqliteWorker(e.to_string())))?,
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt { h.interrupt(); }
             Err(DbError::Cancelled)
@@ -1553,7 +1544,7 @@ pub(crate) async fn refetch_rows(
 
     let interrupt = rx.await.ok();
     tokio::select! {
-        r = work => r.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?,
+        r = work => r.map_err(|e| DbError::Refused(crate::DbRefusal::SqliteWorker(e.to_string())))?,
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt { h.interrupt(); }
             Err(DbError::Cancelled)
@@ -2424,7 +2415,7 @@ pub(crate) async fn count_rows(
     });
     let interrupt = rx.await.ok();
     tokio::select! {
-        r = work => r.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?,
+        r = work => r.map_err(|e| DbError::Refused(crate::DbRefusal::SqliteWorker(e.to_string())))?,
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt { h.interrupt(); }
             Err(DbError::Cancelled)
@@ -2463,7 +2454,7 @@ pub(crate) async fn fetch_table_stats(
 /// other key's automatic index is listed as `PRIMARY`, as the other engines
 /// print theirs. A virtual table has no b-tree under its own name, so no size.
 fn table_stats(conn: &SqliteConn, cap: u64) -> Result<schemaic_core::stats::SchemaStats, DbError> {
-    use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats, format_bytes};
+    use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats};
     let pragma = |name: &str| -> Result<u64, DbError> {
         conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
             .map(|n| n.max(0) as u64)
@@ -2471,12 +2462,10 @@ fn table_stats(conn: &SqliteConn, cap: u64) -> Result<schemaic_core::stats::Sche
     };
     let file = pragma("page_count")? * pragma("page_size")?;
     if file > cap {
-        return Err(DbError::Refused(format!(
-            "Table sizes are read only for a database up to {}: SQLite measures them by \
-             reading every page of the file, and this one is {}.",
-            format_bytes(cap),
-            format_bytes(file)
-        )));
+        return Err(DbError::Refused(crate::DbRefusal::SqliteSizesTooLarge {
+            cap,
+            file,
+        }));
     }
     let mut sizes: HashMap<String, u64> = HashMap::new();
     {
@@ -5460,7 +5449,7 @@ mod tests {
             ..Default::default()
         };
         match commit_writes(&db, &write, CancellationToken::new()).await {
-            Err(DbError::Refused(m)) => assert!(m.contains("generated"), "{m}"),
+            Err(DbError::Refused(m)) => assert!(m.to_string().contains("generated"), "{m}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
@@ -6331,7 +6320,7 @@ mod tests {
         )
         .unwrap();
         match table_stats(&conn, 4096) {
-            Err(DbError::Refused(m)) => assert!(m.contains("4 KiB"), "{m}"),
+            Err(DbError::Refused(m)) => assert!(m.to_string().contains("4 KiB"), "{m}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(table_stats(&conn, 1 << 30).is_ok());

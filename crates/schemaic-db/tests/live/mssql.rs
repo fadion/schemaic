@@ -9694,7 +9694,7 @@ async fn a_read_only_connection_is_refused_a_manual_session() {
         schemaic_db::session::Session::open_enforced(&s.db, Some(&s.name), Some(Enforce::ReadOnly))
             .await;
     assert!(
-        matches!(refused, Err(DbError::Refused(ref m)) if m.contains("Auto mode")),
+        matches!(refused, Err(DbError::Refused(ref m)) if m.to_string().contains("Auto mode")),
         "{:?}",
         refused.err()
     );

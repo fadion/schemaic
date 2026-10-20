@@ -223,7 +223,7 @@ existing prose was left alone.
     unquoted `table` and the count), `Batch { rows, wrote, affected }` (an import batch that wrote
     another number, `affected` where the engine counts what a statement affected rather than what
     it inserted), `CommitCancelled`, `ImportCancelled`, and `Refused` (a refusal of the database
-    layer's own, made before a batch was sent); `undone` is the `Rollback`, `None` where the path
+    layer's own, made before a batch was sent — a `DbRefusal`, below); `undone` is the `Rollback`, `None` where the path
     reports the cause alone. `message()` is the English the errors displayed before it existed,
     byte for byte: the cause, then `Rollback::note` — unchanged, still the English clause with
     its own leading separator — and `query failed: ` in front exactly when
@@ -233,6 +233,19 @@ existing prose was left alone.
     `a_write_failure_says_what_its_error_used_to` and
     `the_note_reads_as_one_sentence_with_the_verdict` pin the English; the interface's wording is
     held to it by `english_says_every_write_failure_as_core_does` (*The string catalogue*).
+    **`DbRefusal` is `schemaic-db`'s own sentence as a value** — what `DbError::Refused` and
+    `WriteCause::Refused` carry, one variant per thing that crate refuses or will not do: the init
+    SQL's `InitSql(InitRefusal)`, a sign-in's `Transport(AuthMode)`, SQL Server's `BlankValue` and
+    `CodePage` (each with the file's `row` where an import names one, and `CodePage` the `lost`
+    character and its code page where it is known), SQLite's `open_target` refusals and worker
+    failure, MySQL's quote-safety and read-only plan refusals, and the rest under `schemaic-db`'s
+    `DbError` entry. Both carried a finished English `String` until now, so every one of them reached
+    the window in English whatever the interface's language — the app's `db_error_shown` passed
+    `Refused(m)` through as written. `message()` is each producer's old English **byte for byte**,
+    and `Display` is it, so the CLI, the MCP server and the logs, which keep `to_string()`, read
+    what they read before; the interface's wording is held to it by
+    `english_says_every_db_refusal_as_core_does` (*The string catalogue*). The names, types and
+    values inside are the user's or the server's, and a `SqliteWorker`'s text is the runtime's.
     **`CellEdit` is what one staged cell holds** — `Null | Text | Bytes | Default` — and it replaced
     the `Option<String>` that had room for exactly two of the first three. `Text` is what was typed
     or pasted, bound as a string parameter and coerced by the server to whatever the column is;
@@ -12763,9 +12776,12 @@ existing prose was left alone.
     `Environment::badge_label` is asked by the top bar only for *whether* there is a badge. So,
     now, are the notes this module writes under the form's fields — `SslMode::caveat`,
     `AuthMode::tls_note`, `read_only_caveat`, `named_instance_port_note`: the form keeps the
-    decision here and words the answer itself (under `connection_form.rs`). One refusal still
-    reaches the user as it is, English: `AuthMode::transport_refusal`, which arrives as a database
-    error from `schemaic-db`. `external_client_refusal` says nothing itself any more — it answers
+    decision here and words the answer itself (under `connection_form.rs`). So, now, is
+    `AuthMode::transport_refusal`, which arrives as a database error from `schemaic-db`: it used to
+    reach the user as it was, English, and is `short.then_some(self.transport_sentence())` now —
+    `transport_sentence` holding the four sentences, one per cloud sign-in and one for the rest —
+    while `schemaic-db` carries the refusal as `DbRefusal::Transport(AuthMode)` and the window words
+    it from the mode (`i18n::db_refusal_text`). `external_client_refusal` says nothing itself any more — it answers
     `launch::Refusal::CloudToken`, one of `launch::*`'s own refusals, which the app words (under
     `launch.rs`).
     **`statement_timeout_secs` is this connection's statement timeout over the app's** (*Settings →
@@ -19056,16 +19072,25 @@ existing prose was left alone.
   explained and never fixed; `Cancelled` is the user's Stop or Schemaic's own watchdog and has
   nothing to explain; `Refused` is **Schemaic's own sentence** and has nothing to explain either.
   `Refused` exists because the variant is the provenance and this crate had been writing its own
-  words as `Query`/`Connect`, so the bar and the modal offered *AI fix* or *Explain* on them. Its
-  producers are `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …" (a
-  `Query` once), `Session::open`'s SQLite manual-mode backstop (a `Connect` once) and
+  words as `Query`/`Connect`, so the bar and the modal offered *AI fix* or *Explain* on them. It
+  carries a `core::model::DbRefusal` (re-exported as `schemaic_db::DbRefusal`), not a `String`,
+  and every producer names its variant: `Db::init_statements` (`InitSql`), `sign_in_secret` and
+  `mssql::config` (`Transport`, from `AuthMode::transport_refusal`), `backup_to_file`'s server
+  arm, `session::aborted_commit`, which `Session::commit` answers over a block that was already
+  aborted, `Session::open`'s SQLite manual-mode backstop (a `Connect` once) and
   `Session::open_enforced`'s refusal of a read-only SQL Server connection (under `mssql.rs`),
-  `mysql::unpinnable_mode` — `enforce_session`'s refusal when the server puts a quote-moving
-  `sql_mode` back — and its refusal of a client character set that can hide a quote,
-  and `session::aborted_commit`, which `Session::commit` answers over a block that was
-  already aborted. It renders **as written**, `#[error("{0}")]` with no prefix:
-  each is already the whole sentence, and "query failed:" in front of "Commit cancelled — …" named
-  a failure that was the user's own act.
+  `mysql::enforce_session`'s refusal of a client character set that can hide a quote and
+  `unpinnable_mode` — its refusal when the server puts a quote-moving `sql_mode` back — and
+  `read_only_plan_refusal`, SQL Server's Windows and cloud IAM sign-in arms, `explain_setup`'s
+  read-only gate (`read_only_refusal(..).reason`), `kill_session`'s cancel, the blank-string and
+  code-page checks, `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …"
+  (a `Query` once) at each of its six sites, its default-reset refusals and `table_stats`' size
+  cap. It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
+  English: each is already the whole sentence, and "query failed:" in front of "Commit cancelled
+  — …" named a failure that was the user's own act. The window words it instead
+  (`i18n::db_refusal_text`, from `db_error_shown`); the CLI, the MCP server and the logs keep
+  `to_string()`. SQL Server's `err_text` no longer names `Refused` in its pass-through, its
+  `Display` being the same text.
   **`Write(WriteFailure)` is a write path's failure carrying what its rollback achieved**
   (`core::model::WriteFailure`), built by the crate-private `DbError::write(cause, undone)` at
   every exit that used to append `Rollback::note` to a `Query` or `Refused` string: MySQL's
@@ -26548,9 +26573,12 @@ existing prose was left alone.
     English: the Type picker's engine names (`DbKind::label`), which are product names and are also
     what is persisted as `Connection::db_type` and read by `default_port`/`is_networked`; the
     samples `user@bastion:22, inner` and `SET search_path TO app, public`; and other modules'
-    sentences — `connection`'s `AuthMode::transport_refusal`, which never reaches this form
-    (`external_client_refusal`, which never did either, is a `launch::Refusal` the app words now),
-    and `lib.rs`'s `TestLine::text`. `SshTunnel::route`'s `JumpHostError` is worded by
+    sentences — `lib.rs`'s `TestLine::text`. `connection`'s `AuthMode::transport_refusal` never
+    reaches this form, and is worded where it does arrive, as a `DbRefusal` (`i18n::db_refusal_text`);
+    `external_client_refusal`, which never did either, is a `launch::Refusal` the app words now.
+    `init_refusal_text` is `pub(crate)` for that same function, which words a connect's init SQL
+    refusal (`DbRefusal::InitSql`) through it, so the field's note and the refused connect say it
+    alike. `SshTunnel::route`'s `JumpHostError` is worded by
     `jump_host_error_text`, under the Jump hosts field and inside the SSH host's note alike.
   - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
     app's `conn_sources`. Raised from the Manage Connections list ("Import connections" — it was
@@ -41233,8 +41261,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines; and
     the prose core and `schemaic-cli` return, which is phase 4 of the roadmap's *Interface
-    translation* — among it `AuthMode::transport_refusal`, which reaches the
-    user as a database error from `schemaic-db` and goes with the error messages. A figure is not
+    translation*. A figure is not
     among it: core prints it in English and the view writes it in the language's marks (*Figures
     in the interface's marks*, below). The notes under
     the connection form's fields are no longer among it (`connection_form.rs`), nor are
@@ -41253,7 +41280,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     write path's failure (`model::WriteFailure`, below), though the server's words inside it
     still are, nor `DbError`'s own *query failed:*, *connection failed:* and *query cancelled*
     wherever the app shows an error through `db_error_shown` (below) — the sites still on
-    `to_string()` are listed there — nor the DDL preview's change lines (`ddl::ChangeLine`,
+    `to_string()` are listed there — nor `schemaic-db`'s own refusals (`model::DbRefusal`, below),
+    `AuthMode::transport_refusal`'s sentence among them, though the sentences that crate composes
+    around a driver's text inside a `Connect` or `Query` still are, nor the DDL preview's change lines (`ddl::ChangeLine`,
     below), risk lines (`ddl::Risk`, below), risk heading, *Used by* lines (`used_by::Listing`,
     below), omitted lines (`compare::PlanOmission`, under `compare_view.rs`) and withheld lines
     (`ddl::Withheld`, below) — the modal's whole body but the SQL and the server's words — nor the
@@ -41803,9 +41832,19 @@ Re-introducing the anti-patterns these guard against is a regression:
     The app's `db_error_shown` asks it for a `Write`, and words every other `DbError` variant
     itself from the section *A database error's own words* — `Query` and `QueryAt` as
     `db-query-failed` (`i18n::db_query_failed`), `Connect` as `db-connection-failed`, `Cancelled`
-    as `db-query-cancelled` — with the server's or driver's message inside as it came, and a
-    `Refused` as written, since that variant is already the whole sentence (under `schemaic-db`'s
-    `lib.rs`). `modal_error_shown` is `modal_about_another_statement` *shown as* that text
+    as `db-query-cancelled` — with the server's or driver's message inside as it came — and a
+    `Refused` through `i18n::db_refusal_text`. That variant is already the whole sentence (under
+    `schemaic-db`'s `lib.rs`), so it used to pass through as written, which was English whatever
+    the interface's language; it carries a `DbRefusal` now (under `core::model`), and
+    `db_refusal_text` words each variant from `db-refused-*` — `Transport` a message per cloud
+    sign-in and `db-refused-transport` for the rest, `InitSql` through `connection_form.rs`'s
+    `init_refusal_text`, `ReadOnly` through `read_only_reason_text`, the SQLite size cap's two
+    sizes through `bytes`, so in the interface's marks — with the names, types and values inside
+    passing through. `write_failure_text` words a `WriteCause::Refused` with the same function.
+    `english_says_every_db_refusal_as_core_does` holds it equal to `message` over every variant,
+    each sign-in's transport, and the blank and code-page refusals with and without a row and
+    the code page's lost character with and without one; it was taken red by rewording en-GB's
+    code-page *has no character for* clause. `modal_error_shown` is `modal_about_another_statement` *shown as* that text
     (`ModalError::shown_as`), and `db_error_pair` is `(to_string(), db_error_shown)` for a caller
     that raises its error as text. The Commit's `CommitDone::Failed`, a Manual tab's `end_tx`, a
     failed session open, the import's `ImportOutcome::Failed` and the copy's `CopyFailed` take
@@ -41846,9 +41885,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     `Display` for every cause, bare and inside a `RollbackFailed`, with none, one and several
     statements already applied. What stays
     English: the server's or driver's
-    words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and a
-    database-layer refusal's own text inside `Refused` (SQL
-    Server's blank-string and code-page refusals — the note after it is worded). And, until the
+    words inside `Server`, the CSV parser's or a copy's read's inside `RowError::Read`, and the
+    sentences `schemaic-db` composes around a driver's text inside a `Connect` or `Query` — its
+    SSH, TLS, cloud sign-in and timeout messages, "could not prepare the session: …" and the like,
+    where only the prefix is worded. A database-layer refusal inside `Refused` (SQL Server's
+    blank-string and code-page refusals) is no longer among it: it is a `DbRefusal`, worded as
+    above. And, until the
     roadmap's next step, the one `DbError` still taken as `to_string()`, prefix and all: the
     squiggle's diagnostic
     (`intel::db_error_diagnostic`), whose text the AI fix prompt reads. The run paths' own `App`
@@ -41897,8 +41939,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `result_diff_view.rs` and `dump_view.rs` share, `skip_reason_shown`, which the import modal
     and the app's paste field share, `read_refusal_text` and `import_error_text` for the app's
     import probe, check and load, `write_failure_text` for the app's Commit, import and copy
-    failures, `db_query_failed`, `db_connection_failed` and `db_query_cancelled` for the app's
-    `db_error_shown`, the crate holding no `DbError`, the six `ddl_*` for its `ddl_error_shown`, for
+    failures, `db_query_failed`, `db_connection_failed`, `db_query_cancelled` and
+    `db_refusal_text` for the app's `db_error_shown`, the crate holding no `DbError`, the six
+    `ddl_*` for its `ddl_error_shown`, for
     the same reason, and the grid's three filter notices — `staged_requery_note`
     for `grid.rs`, `staged_landing_note` and `reread_without_filter_note` for the app — worded
     from `filter`'s constants, `requery` refusing with the value `filter::HoldsStagedWork` — and,

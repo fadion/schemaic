@@ -1477,8 +1477,204 @@ pub enum WriteCause {
     /// The user stopped an import.
     ImportCancelled,
     /// A refusal of the database layer's own, made before a batch was sent
-    /// (SQL Server's blank-string and code-page checks), in its English.
-    Refused(String),
+    /// (SQL Server's blank-string and code-page checks).
+    Refused(DbRefusal),
+}
+
+/// **Schemaic's own sentence about a database operation** — a refusal the
+/// database layer makes before anything is sent, or its account of what it
+/// would not do — as a value: `schemaic-db`'s `DbError::Refused` and
+/// [`WriteCause::Refused`] carry it, the interface words it in its language,
+/// and [`DbRefusal::message`] is the English the CLI, the MCP server and the
+/// logs say. The names and values inside are the user's or the server's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DbRefusal {
+    /// The connection's init SQL failed [`crate::init_sql::check`].
+    InitSql(crate::init_sql::InitRefusal),
+    /// This sign-in needs a stronger transport than the connection's
+    /// ([`crate::connection::AuthMode::transport_refusal`]).
+    Transport(crate::connection::AuthMode),
+    /// A server database is backed up by its own tools, not here.
+    BackupInTerminal,
+    /// `COMMIT` on a block the server had already aborted.
+    CommitAborted,
+    /// SQLite has no Manual transaction mode.
+    SqliteNoManual,
+    /// A read-only SQL Server connection has no Manual mode.
+    MsSqlReadOnlyAuto,
+    /// MySQL's session client character set can hide a quote.
+    ClientCharset(String),
+    /// MySQL's `sql_mode` moved quotes and could not be pinned.
+    SqlMode(String),
+    /// MySQL will not plan a writing statement in a read-only transaction;
+    /// `function` where the statement is a read whose function writes.
+    WritingPlan { function: bool },
+    /// Windows sign-in, outside the Windows build.
+    WindowsBuildOnly,
+    /// Cloud IAM sign-in on SQL Server.
+    CloudIamEngine,
+    /// SQL Server's EXPLAIN ANALYZE on a read-only connection, refused by the
+    /// read-only gate.
+    ReadOnly(crate::sql::ReadOnlyReason),
+    /// SQL Server cannot cancel another session's statement alone.
+    MsSqlCancelNeedsKill,
+    /// SQL Server would store `''` as `0` or `1900-01-01`: in the grid
+    /// (`row` none) or an import's file row.
+    BlankValue {
+        row: Option<u64>,
+        column: String,
+        base_type: String,
+    },
+    /// SQL Server's code page cannot hold a character of the value, the one
+    /// named where it is known.
+    CodePage {
+        row: Option<u64>,
+        column: String,
+        base_type: String,
+        lost: Option<(char, u32)>,
+    },
+    /// A SQLite connection with no file.
+    SqliteNoFile,
+    /// `:memory:` as a SQLite file.
+    SqliteMemory,
+    /// A SQLite URI where a file is wanted.
+    SqliteUri(String),
+    /// SQLite's worker thread failed, with the runtime's own words.
+    SqliteWorker(String),
+    /// A column SQLite's table does not have, set to its default.
+    SqliteNoColumn { table: String, column: String },
+    /// A generated SQLite column set to its default.
+    SqliteGenerated(String),
+    /// SQLite's table sizes are read only for files up to `cap` bytes.
+    SqliteSizesTooLarge { cap: u64, file: u64 },
+}
+
+impl DbRefusal {
+    /// The refusal in English.
+    pub fn message(&self) -> String {
+        match self {
+            DbRefusal::InitSql(r) => {
+                format!("Not connected — this connection's init SQL was refused: {r}")
+            }
+            DbRefusal::Transport(auth) => auth.transport_sentence().to_string(),
+            DbRefusal::BackupInTerminal => {
+                "A server database is backed up by its own tools, in the terminal.".to_string()
+            }
+            DbRefusal::CommitAborted => "the transaction was already aborted — a statement in \
+                                         it failed or was stopped, so committing discards the \
+                                         work rather than saving it. Nothing was committed."
+                .to_string(),
+            DbRefusal::SqliteNoManual => "SQLite connections don't support manual transaction \
+                                          mode yet — statements run and commit as they are sent"
+                .to_string(),
+            DbRefusal::MsSqlReadOnlyAuto => "A read-only SQL Server connection runs in Auto \
+                                             mode: SQL Server has no read-only transaction to \
+                                             hold a Manual tab in, and each statement Auto mode \
+                                             runs is rolled back"
+                .to_string(),
+            DbRefusal::ClientCharset(charset) => format!(
+                "refused: the session's client character set ({charset}) can hide a quote \
+                 inside a character, so the statement check cannot read it the way the server \
+                 would"
+            ),
+            DbRefusal::SqlMode(back) => format!(
+                "refused: the server's sql_mode ({back}) reads quotes differently from the \
+                 statement check, and could not be changed for this session"
+            ),
+            DbRefusal::WritingPlan { function } => format!(
+                "Plans here run in a read-only transaction, and MySQL and MariaDB will not plan \
+                 a statement that writes inside one. {}",
+                if *function {
+                    "A function it calls writes, which a plan here is not allowed to do."
+                } else {
+                    "Plan the statement's SELECT form instead."
+                }
+            ),
+            DbRefusal::WindowsBuildOnly => {
+                "Windows sign-in is available only in the Windows build of Schemaic.".to_string()
+            }
+            DbRefusal::CloudIamEngine => {
+                "Cloud IAM sign-in is for PostgreSQL and MySQL connections.".to_string()
+            }
+            DbRefusal::ReadOnly(reason) => reason.message(),
+            DbRefusal::MsSqlCancelNeedsKill => "SQL Server cannot cancel another session's \
+                                                statement without ending the session — use Kill \
+                                                session."
+                .to_string(),
+            DbRefusal::BlankValue {
+                row: None,
+                column,
+                base_type,
+            } => format!(
+                "An empty or blank value can't be written to {column} ({base_type}): SQL Server \
+                 would store it as 0 or 1900-01-01 rather than refuse it. Set the cell to NULL, \
+                 or type a value."
+            ),
+            DbRefusal::BlankValue {
+                row: Some(row),
+                column,
+                base_type,
+            } => format!(
+                "Row {row} has an empty or blank value for {column} ({base_type}): SQL Server \
+                 would store it as 0 or 1900-01-01 rather than refuse it. Import empty fields as \
+                 NULL, or fill them in."
+            ),
+            DbRefusal::CodePage {
+                row,
+                column,
+                base_type,
+                lost,
+            } => {
+                let what = match lost {
+                    Some((c, code_page)) => {
+                        format!("`{c}`, which code page {code_page} has no character for")
+                    }
+                    None => "a character its code page has no character for".to_string(),
+                };
+                let head = match row {
+                    Some(r) => format!("Row {r} has a value for {column} ({base_type})"),
+                    None => format!("A value for {column} ({base_type})"),
+                };
+                format!(
+                    "{head} holds {what}: SQL Server would store it as `?` or a look-alike \
+                     rather than refuse it. Store the column as nvarchar, or remove the \
+                     character."
+                )
+            }
+            DbRefusal::SqliteNoFile => "no database file is set".to_string(),
+            DbRefusal::SqliteMemory => ":memory: is not a database file — SQLite keeps an \
+                                       in-memory database only for as long as the connection \
+                                       that made it, and this app opens a new connection per \
+                                       operation, so every write would be reported as saved and \
+                                       then discarded. Give the path to a file."
+                .to_string(),
+            DbRefusal::SqliteUri(file) => format!(
+                "{file}: this is a URI, not a database file — SQLite would read the part after \
+                 `?` as open options, and `?mode=memory` opens a scratch database that accepts \
+                 every write and keeps none. Give the path to the file itself."
+            ),
+            DbRefusal::SqliteWorker(e) => format!("the SQLite worker failed: {e}"),
+            DbRefusal::SqliteNoColumn { table, column } => format!(
+                "{table}.{column} is not a column this table has, so it has no default to write"
+            ),
+            DbRefusal::SqliteGenerated(column) => format!(
+                "{column} is a generated column: it has no default to set it back to, and SQLite \
+                 computes it from the row"
+            ),
+            DbRefusal::SqliteSizesTooLarge { cap, file } => format!(
+                "Table sizes are read only for a database up to {}: SQLite measures them by \
+                 reading every page of the file, and this one is {}.",
+                crate::stats::format_bytes(*cap),
+                crate::stats::format_bytes(*file)
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for DbRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
 }
 
 impl WriteCause {
@@ -1498,7 +1694,8 @@ impl WriteFailure {
     /// The failure in English, as the error says it whole.
     pub fn message(&self) -> String {
         let cause = match &self.cause {
-            WriteCause::Server(m) | WriteCause::Refused(m) => m.clone(),
+            WriteCause::Server(m) => m.clone(),
+            WriteCause::Refused(r) => r.message(),
             WriteCause::Row(e) => e.message(),
             WriteCause::OneRow(miss) => miss.message(),
             &WriteCause::Batch {

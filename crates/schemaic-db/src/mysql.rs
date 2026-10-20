@@ -5809,10 +5809,7 @@ pub(crate) async fn enforce_session(
         .map_err(qerr)?;
     let charset = charset.unwrap_or_default();
     if !schemaic_core::sql::mysql_charset_is_lexed_like_the_gate(&charset) {
-        return Err(DbError::Refused(format!(
-            "refused: the session's client character set ({charset}) can hide a quote inside \
-             a character, so the statement check cannot read it the way the server would"
-        )));
+        return Err(DbError::Refused(crate::DbRefusal::ClientCharset(charset)));
     }
     if enforce == crate::Enforce::ReadOnly {
         conn.query_drop("SET SESSION TRANSACTION READ ONLY")
@@ -5824,10 +5821,7 @@ pub(crate) async fn enforce_session(
 
 /// [`enforce_session`]'s refusal when the server put a quote-moving mode back.
 fn unpinnable_mode(back: &str) -> DbError {
-    DbError::Refused(format!(
-        "refused: the server's sql_mode ({back}) reads quotes differently from the \
-         statement check, and could not be changed for this session"
-    ))
+    DbError::Refused(crate::DbRefusal::SqlMode(back.to_string()))
 }
 
 /// Run `stmts` in order on **one** connection, reporting each result as it lands.
@@ -5991,15 +5985,9 @@ pub(crate) async fn explain(
 fn read_only_plan_refusal(e: DbError, sql: &str) -> DbError {
     match e {
         DbError::Query(m) if server_error_code(&m) == Some(1792) => {
-            let advice = if schemaic_core::sql::contains_write(sql, SqlDialect::MySql) {
-                "Plan the statement's SELECT form instead."
-            } else {
-                "A function it calls writes, which a plan here is not allowed to do."
-            };
-            DbError::Refused(format!(
-                "Plans here run in a read-only transaction, and MySQL and MariaDB will not plan \
-                 a statement that writes inside one. {advice}"
-            ))
+            DbError::Refused(crate::DbRefusal::WritingPlan {
+                function: !schemaic_core::sql::contains_write(sql, SqlDialect::MySql),
+            })
         }
         other => other,
     }
@@ -6376,8 +6364,8 @@ mod explain_tests {
         };
         let refused = super::read_only_plan_refusal(e1792(), "DELETE FROM t WHERE id = 1");
         assert!(
-            matches!(&refused, DbError::Refused(m) if m.contains("read-only")
-                && m.contains("SELECT form")),
+            matches!(&refused, DbError::Refused(m) if m.to_string().contains("read-only")
+                && m.to_string().contains("SELECT form")),
             "{refused:?}"
         );
         // The statement is already a SELECT: a function it calls writes, and
@@ -6388,6 +6376,7 @@ mod explain_tests {
         let DbError::Refused(m) = &refused else {
             panic!("{refused:?}")
         };
+        let m = m.to_string();
         assert!(!m.contains("SELECT form"), "{m}");
         assert!(!m.contains("connection is read-only"), "{m}");
         assert!(m.contains("function"), "{m}");

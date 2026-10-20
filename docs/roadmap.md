@@ -159,7 +159,8 @@ assertions pin English wording — stays the regression net throughout.
    `Suggestion::words`; `completion::shown_words`), *CTE* staying the SQL term it is, and the
    init SQL's refusal (`init_sql::InitRefusal`; `connection_form::init_refusal_text`), and the
    SSH host's note (`ssh_config::RouteNote`, `RouteRefusal` and `connection::JumpHostError`;
-   `route_note_text`).
+   `route_note_text`), and the database layer's own refusals (`model::DbRefusal`, which
+   `DbError::Refused` and `WriteCause::Refused` carry; `i18n::db_refusal_text`).
    **A word that is a property of a typed value needs none of that and goes early**: the
    interface draws its own (`i18n::object_kind`, `object_kind_group` for `ObjectKind`), core
    keeps its English for the CLI, MCP and AI, and a test holds the two equal in English. Done for
@@ -181,10 +182,11 @@ assertions pin English wording — stays the regression net throughout.
    unchanged today is this phase's list to work from (resurveyed 2026-10-20; no English literal
    or hand-rolled plural is left in the two view crates' own code, so all of it is prose handed
    up from below):
-   - **`schemaic-db`'s own sentences** — `DbError::Refused`'s roughly twenty-five producers
-     (SQLite's file and worker refusals, the SQL Server and MySQL sign-in and read-only
-     refusals, `session`'s), and the connect's SSH route refusal inside `DbError::Connect`;
-     found 2026-10-20, when the survey of the view crates could not see them.
+   - **`schemaic-db`'s own words inside `DbError::Connect` and `Query`** — the frames it puts
+     around a driver's or the OS's text at connect (SSH, TLS, cloud and Entra sign-in, the
+     connect timeout, the session set-up), the connect's SSH route refusal, and a handful of
+     its own `Query` sentences; found 2026-10-20, when the survey of the view crates could
+     not see them.
 5. **Plurals and assembled sentences** — a few hundred sites using `plural(` or `== 1 { "" }`,
    folded into whole Fluent messages as their phase-4 file is converted rather than as a pass of
    their own (the views' own were folded as they were converted).
