@@ -190,8 +190,9 @@ sed -e "s|__BASE_URL__|${BASE_URL}|g" \
     "${HERE}/index.html.in" > "${OUT}/index.html"
 
 # Pages runs Jekyll over a branch source and would drop directories beginning
-# with an underscore; the Actions deployment does not, but the file costs
-# nothing and removes the question.
+# with an underscore; the Actions deployment does not. upload-pages-artifact
+# v5 leaves hidden files out, so this never reaches the site — it is kept for
+# a local preview or a branch-source fallback, where it still matters.
 touch "${OUT}/.nojekyll"
 
 echo

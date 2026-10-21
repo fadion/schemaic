@@ -32,7 +32,11 @@ bash "${HERE}/stage-payload.sh" "$VERSION" "$BINARY" "${STAGE}/SOURCES/payload"
 # CI runner and a developer's machine behave the same way.
 mkdir -p "${STAGE}"/{BUILD,BUILDROOT,RPMS,SRPMS,SPECS}
 
+# `_rpmformat 4`: rpm 6 defaults to v6 packages, which rpm 4 clients (RHEL 8–10,
+# older Fedora) install without being able to verify the signature. rpm 4
+# ignores the macro.
 rpmbuild -bb "${HERE}/schemaic.spec" \
+    --define "_rpmformat 4" \
     --define "_topdir ${STAGE}" \
     --define "_sourcedir ${STAGE}/SOURCES" \
     --define "schemaic_version ${VERSION}" \

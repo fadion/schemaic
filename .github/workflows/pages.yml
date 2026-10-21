@@ -50,7 +50,9 @@ concurrency:
 jobs:
   publish:
     name: Build and publish the package repositories
-    runs-on: ubuntu-latest
+    # Pinned: rpm 6 (Ubuntu 26.04) signs into a header tag rpm 4 clients and
+    # build-rpm-repo.sh's signature check do not read.
+    runs-on: ubuntu-24.04
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -225,12 +227,12 @@ jobs:
       - name: Verify the built repositories
         run: bash packaging/repo/verify-site.sh site
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - name: Deploy to Pages
         id: deploy
         if: github.event_name != 'workflow_dispatch' || inputs.publish
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
