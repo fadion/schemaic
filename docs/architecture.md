@@ -18222,7 +18222,10 @@ existing prose was left alone.
       the stats line shows `human_count` through `i18n::count`, in the interface's marks, and
       `goto_row_index` takes the same `NumberMarks` — German's box reads `1,25k` as 1250 and
       `1.250` as 1250 grouped (`goto_row_reads_the_interface_language_s_marks`,
-      `every_remarked_count_reads_back_in_german`). `NumberMarks`, `group_digits`, `group_number`
+      `every_remarked_count_reads_back_in_german`). The group mark counts only where grouping can
+      be, after a digit of the integer part with exactly three digits following. It was dropped
+      anywhere once, so German read the English-written `1.25k` as `125k` and jumped a hundred times
+      too far; now that is a miss (`a_group_mark_where_no_grouping_can_be_is_a_miss`). `NumberMarks`, `group_digits`, `group_number`
       and `remark` live here too (*Figures in the interface's marks*, under *UI conventions*).
       The property was stated in `human_count`'s doc and tested by nothing until
       `model::tests::every_count_human_count_prints_reads_back`, which reads back every printed
@@ -27805,7 +27808,10 @@ existing prose was left alone.
       `Freshness`, `props-index-unused` for `unused_note` and `row_caption_text` for the row
       tile's `row_caption` (`english_says_every_stats_note_as_core_does`), their figures in the
       interface's marks — sizes through `i18n::bytes` (imported here as `format_bytes`), counts
-      as `RowCount::label` prints them through `i18n::figure` — and `format_age`, whole units with
+      as `RowCount::label` prints them through `i18n::figure` — and the index line's three
+      (size, cardinality, scans) through `index_fact_in`, which `text::remark`s each in the marks
+      it is given. The cardinality arrives already printed (`~1.25k`), and passed through raw it
+      was the one figure on the line a German reader took for ~125k. And `format_age`, whole units with
       no mark to move, as core prints it. The copied
       Markdown stays core's English.
   - `used_by_view.rs` — the **Used by** modal (`used_by_overlay`), over `core::used_by`, opened by
@@ -41678,8 +41684,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     **The gate is `every_core_figure_a_view_shows_takes_the_interface_s_marks`** (`i18n.rs`): in
     both view crates' production code outside `i18n.rs`, a `::human_count`, `format_bytes`,
     `human_bytes`, `contrasting_bytes`, `group_digits`, `format_duration` or `elapsed_text` path
-    segment — called, or passed as a function — must share its line with `figure(` or
-    `number_marks()` unless it is `i18n::`'s, and none may be imported by a `use schemaic_core…`.
+    segment — called, or passed as a function — must share its line with `figure(`,
+    `number_marks()` or `remark(` (marks a caller passed in, as the Properties index line's
+    `index_fact_in` takes them) unless it is `i18n::`'s, and none may be imported by a `use schemaic_core…`.
     It first missed `.map(stats::format_bytes)`, a printer passed rather than called, and was seen
     red on it once it matched whole path segments. A `figure(` ending the line above also counts,
     as `cargo fmt` splits one there (it did, on the AI panel's timer, which now calls

@@ -2767,7 +2767,8 @@ mod tests {
     /// printers write English's marks for the CLI, MCP and the clipboard; a
     /// view calling one directly showed `1.5 KiB` to a German reader. So
     /// outside this file every call to one in the two view crates sits on a
-    /// line that hands it to [`figure`] or is given [`number_marks`] — or goes
+    /// line that hands it to [`figure`], is given [`number_marks`] or is
+    /// `text::remark`ed in marks a caller passed — or goes
     /// through [`count`], [`bytes`], [`elapsed`] and [`contrasting_bytes`],
     /// which do. A `figure(` ending the line above counts, as `cargo fmt`
     /// splits one there; a call split further, or a printer imported under
@@ -2808,7 +2809,11 @@ mod tests {
                         continue;
                     }
                     seen += 1;
-                    let marked = |l: &str| l.contains("figure(") || l.contains("number_marks()");
+                    let marked = |l: &str| {
+                        l.contains("figure(")
+                            || l.contains("number_marks()")
+                            || l.contains("remark(")
+                    };
                     if !(marked(line) || above.trim_end().ends_with("figure(")) {
                         offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
                     }

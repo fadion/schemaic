@@ -2335,6 +2335,10 @@ pub fn drop_committed(staged: &mut StagedEdits, committed: &HashSet<(usize, usiz
 /// - digit-group separators (`148,203`, `148 203`, `148_203`), which the app
 ///   itself never writes — the stats line is compact, the gutter and the find
 ///   readout unformatted — but which come in from anywhere a count is copied.
+///   The language's group mark counts only where grouping can be, after a
+///   digit of the integer part with exactly three digits following: anywhere
+///   else it is a miss, so a count written in the other language's marks
+///   (`1.25k` in German) is refused rather than read a hundred times too big.
 ///
 /// Nothing else is stripped: a stray letter is still a miss rather than being
 /// quietly filtered into a number the user never asked for.
@@ -2347,10 +2351,25 @@ pub fn goto_row_index(input: &str, total: usize, marks: NumberMarks) -> Option<u
         return None;
     }
     let mut s = String::with_capacity(input.len());
-    for c in input.trim().chars() {
+    let chars: Vec<char> = input.trim().chars().collect();
+    for (k, &c) in chars.iter().enumerate() {
         match c {
             c if c == marks.decimal => s.push('.'),
-            c if c == marks.group => continue,
+            // **The language's group mark only where grouping can be**: after a
+            // digit of the integer part, with exactly three digits after it.
+            // Dropped anywhere, German read the English-written `1.25k` as
+            // `125k` — a row a hundred times further down, with nothing said.
+            c if c == marks.group => {
+                let digit = |i: usize| chars.get(i).is_some_and(char::is_ascii_digit);
+                let grouping = k > 0
+                    && digit(k - 1)
+                    && !s.contains('.')
+                    && (k + 1..k + 4).all(digit)
+                    && !digit(k + 4);
+                if !grouping {
+                    return None;
+                }
+            }
             '_' | ' ' | '\u{202f}' | '\u{a0}' => continue,
             _ => s.push(c.to_ascii_lowercase()),
         }
@@ -2894,6 +2913,26 @@ mod tests {
             super::goto_target("1,5k", 2_000, (0, 2), GERMAN).map(|t| t.anchor.0),
             Some(1_499)
         );
+    }
+
+    /// **A group mark only where grouping can be**: between digits, with three
+    /// after it. Dropped anywhere, German read the English-written `1.25k` as
+    /// `125k` and jumped a hundred times too far with nothing said; English
+    /// did the same to `1,25k`. Both are misses now, as `1,250` in German and
+    /// `1.250` in English already were.
+    #[test]
+    fn a_group_mark_where_no_grouping_can_be_is_a_miss() {
+        assert_eq!(super::goto_row_index("1.25k", 200_000, GERMAN), None);
+        assert_eq!(goto_row_index("1,25k", 200_000), None);
+        assert_eq!(goto_row_index("1,2345", 200_000), None);
+        assert_eq!(goto_row_index(",250", 200_000), None);
+        assert_eq!(goto_row_index("250,", 200_000), None);
+        assert_eq!(goto_row_index("1.5,000k", 200_000), None);
+        // Real grouping still reads.
+        assert_eq!(super::goto_row_index("1.250", 200_000, GERMAN), Some(1_249));
+        assert_eq!(goto_row_index("148,203", 200_000), Some(148_202));
+        assert_eq!(goto_row_index("1,234,567", usize::MAX), Some(1_234_566));
+        assert_eq!(goto_row_index("1,250k", usize::MAX), Some(1_249_999));
     }
 
     /// Every count `human_count` prints, remarked for German as the stats line

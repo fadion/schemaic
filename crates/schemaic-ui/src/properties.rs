@@ -843,14 +843,25 @@ fn freshness_text(f: &stats::Freshness) -> Option<String> {
 ///
 /// [`IndexFact::message`]: schemaic_core::stats::IndexFact::message
 fn index_fact_text(fact: stats::IndexFact) -> String {
+    index_fact_in(fact, crate::i18n::number_marks())
+}
+
+/// [`index_fact_text`] in the given marks, so a test can ask for German's.
+/// **Every one of the three figures is remarked**: the cardinality arrives
+/// already printed in English (`~1.25k`), and passed through raw it was the
+/// one figure on the line a German reader took for ~125k.
+fn index_fact_in(fact: stats::IndexFact, marks: schemaic_core::text::NumberMarks) -> String {
+    use schemaic_core::text::remark;
     use stats::IndexFact;
     match fact {
-        IndexFact::Size(b) => format_bytes(b),
-        IndexFact::Cardinality(c) => tr!("props-index-cardinality", cardinality = c),
+        IndexFact::Size(b) => remark(&stats::format_bytes(b), marks),
+        IndexFact::Cardinality(c) => {
+            tr!("props-index-cardinality", cardinality = remark(&c, marks))
+        }
         IndexFact::Scans(n) => tr!(
             "props-index-scans",
             n = n,
-            shown = figure(&RowCount::Exact(n).label())
+            shown = remark(&RowCount::Exact(n).label(), marks)
         ),
         IndexFact::NotCounted => tr!("props-index-not-counted"),
     }
@@ -1026,6 +1037,22 @@ mod tests {
                 .collect();
             assert_eq!(ours, stats::index_facts(&ix), "{scans:?}");
         }
+        // **Every figure on an index's line is in the interface's marks**,
+        // the cardinality as well as the size and the scans.
+        let german = schemaic_core::text::NumberMarks {
+            decimal: ',',
+            group: '.',
+        };
+        let card = stats::index_fact_list(&IndexStats {
+            name: "ix".into(),
+            cardinality: Some(1_250),
+            ..IndexStats::default()
+        })
+        .into_iter()
+        .find(|f| matches!(f, stats::IndexFact::Cardinality(_)))
+        .expect("a cardinality fact");
+        let shown = index_fact_in(card, german);
+        assert!(shown.contains("1,25k"), "{shown}");
         assert_eq!(tr!("props-index-unused"), stats::unused_note());
         for (rows, exact_rows) in [(None, None), (Some(40), None), (Some(40), Some(42))] {
             let t = TableStats {
