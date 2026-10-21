@@ -2773,11 +2773,14 @@ impl ModalError {
     /// a grid filter/sort re-run, whose SQL Schemaic built. A statement's
     /// failure becomes the server's words about no statement the user can
     /// rewrite, so it is explained but never "fixed" into the buffer; the other
-    /// sources already say that.
+    /// sources already say that. **The server's position goes with it**: it
+    /// indexes the SQL Schemaic built, not the buffer. What the error is shown
+    /// as stays.
     pub fn about_another_statement(self) -> Self {
         match self.source {
             ErrorSource::Statement => Self {
                 source: ErrorSource::Server,
+                at: None,
                 ..self
             },
             ErrorSource::Server | ErrorSource::App => self,
@@ -3106,6 +3109,17 @@ mod tests {
             ModalError::app("no tunnel").about_another_statement(),
             ModalError::app("no tunnel")
         );
+        // **The server's position goes; what it is shown as stays.** The
+        // position indexes SQL Schemaic built, not the editor's buffer, so
+        // nothing may place a squiggle by it — the squiggle's own `Statement`
+        // gate is not the only thing standing between them.
+        let e = ModalError::statement("syntax error")
+            .shown_as("Syntaxfehler")
+            .at(Some(12))
+            .about_another_statement();
+        assert_eq!(e.at, None);
+        assert_eq!(e.source, ErrorSource::Server);
+        assert_eq!(e.displayed(), "Syntaxfehler");
     }
 
     #[test]

@@ -415,7 +415,10 @@ existing prose was left alone.
     wording went into `text` — so under a non-English interface *Explain* sent the model a
     translation. A producer with a wording sets it with `shown_as`, which leaves `text` alone;
     `about_another_statement` changes the source and keeps `shown`
-    (`the_actions_act_on_the_english_whatever_is_shown`). The editor's run paths had the same fault
+    (`the_actions_act_on_the_english_whatever_is_shown`), and drops `at`, the server's position,
+    which indexes SQL Schemaic built rather than the buffer
+    (`about_another_statement_keeps_the_words_and_drops_the_fix`). It carried `at` along once,
+    and only the squiggle's own `Statement` gate stood between that position and the editor. The editor's run paths had the same fault
     over their transaction notes and their own not-sent, timeout and Stop notices, and keep the
     two apart the same way now (under `core::tx`).
   - `access.rs` — **what a dump's replay drops besides the objects, and the statements that put it
