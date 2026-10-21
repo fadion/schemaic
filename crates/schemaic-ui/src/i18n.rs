@@ -1326,6 +1326,22 @@ pub fn connect_failure_text(f: &schemaic_core::model::ConnectFailure) -> String 
         ConnectFailure::Ssh(f) => ssh(f),
         ConnectFailure::Tls(f) => tls(f),
         ConnectFailure::SignIn(f) => sign_in_failure_text(f),
+        ConnectFailure::BrowserSilent { server, instance } => tr!(
+            "db-connect-browser-silent",
+            server = server.as_str(),
+            instance = instance.as_str()
+        ),
+        ConnectFailure::BrowserWithoutTcp { server, instance } => tr!(
+            "db-connect-browser-without-tcp",
+            server = server.as_str(),
+            instance = instance.as_str()
+        ),
+        ConnectFailure::AzureTimedOut { secs } => {
+            tr!("db-connect-azure-timed-out", secs = secs.to_string())
+        }
+        ConnectFailure::AzureUnavailable(server) => {
+            tr!("db-connect-azure-unavailable", server = server.as_str())
+        }
     }
 }
 
@@ -1602,6 +1618,18 @@ mod tests {
             ConnectFailure::GuardSession(e()),
             ConnectFailure::PlanSetup(e()),
             ConnectFailure::NoMaintenanceDb,
+            ConnectFailure::BrowserSilent {
+                server: s("db.corp"),
+                instance: s("SQLEXPRESS"),
+            },
+            ConnectFailure::BrowserWithoutTcp {
+                server: s("db.corp"),
+                instance: s("SQLEXPRESS"),
+            },
+            ConnectFailure::AzureTimedOut { secs: 60 },
+            ConnectFailure::AzureUnavailable(s(
+                "Database 'd' is not currently available. (Msg 40613)",
+            )),
         ];
         let ssh = [
             SshFailure::NoAnswer {

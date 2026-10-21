@@ -558,6 +558,14 @@ db-connect-read-only-setup = could not make the session read-only: { $error }
 db-connect-guard-session = could not guard the session: { $error }
 db-connect-plan-setup = could not set up the plan: { $error }
 db-connect-no-maintenance-db = no maintenance database reachable
+# SQL Server Browser on $server gave no port for the named $instance. The
+# backslash before $instance is the host's spelling (server\instance).
+db-connect-browser-silent = SQL Server Browser on { $server } gave no port for the instance { $instance }: the Browser service is not running, UDP port 1434 is blocked on the way, or no instance there has that name. If the instance listens on a fixed port, set the host to { $server } without \{ $instance } and the port to that one.
+db-connect-browser-without-tcp = SQL Server Browser on { $server } answered for the instance { $instance } but gave no TCP port: the instance does not listen on TCP. Enable TCP/IP for it in SQL Server Configuration Manager and restart it.
+# A paused Azure SQL serverless database; $secs is how long the sign-in waited.
+db-connect-azure-timed-out = Azure SQL did not finish signing in within { $secs } seconds. A serverless database that has paused takes about a minute to resume, and this attempt has woken it — connect again shortly.
+# $server is the server's own Msg 40613 sentence, which comes first.
+db-connect-azure-unavailable = { $server } A serverless database that has paused takes about a minute to resume, and this attempt has woken it — connect again shortly.
 db-ssh-connect-no-answer = SSH connect with { $host }: no answer within { $secs }s
 db-ssh-auth-no-answer = SSH authentication with { $host }: no answer within { $secs }s
 db-ssh-auth-error = SSH auth error: { $error }

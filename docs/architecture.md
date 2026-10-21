@@ -19196,7 +19196,10 @@ existing prose was left alone.
   around another's text at connect: the thirteen "timed out" sites, `Db::init_failed`,
   `session::retired_error` and `begin_failed`, `enforce_session`'s prepare,
   `pg::read_only_setup_failed` and `connect_maintenance_avoiding`'s *no maintenance database
-  reachable*, SQL Server's session guard and plan set-up, every `ssh.rs` and `tls.rs` failure
+  reachable*, SQL Server's session guard and plan set-up, its two SQL Server Browser sentences and
+  its two for a waking Azure SQL database (`BrowserSilent`, `BrowserWithoutTcp`, `AzureTimedOut`,
+  `AzureUnavailable`, which were `Connect(String)`s of English until the review after v0.35.0
+  found them), every `ssh.rs` and `tls.rs` failure
   but one (their passages, below), and every failure `cloud_iam.rs` and `entra.rs` meet asking a
   CLI for a token, through each one's private `sign_in_failed`. **`Connect(String)` stays for a
   driver's or the system's text alone** — SQLite's `{file}: {e}`, the tunnel listener's
@@ -20779,12 +20782,13 @@ existing prose was left alone.
   serverless database that has paused holds the login at the gateway while it resumes**: measured
   on a free-offer database in Sweden Central (auto-pause after an hour), the first login after an
   idle spell outlasted fifteen seconds and failed with a bare handshake timeout, and a retry a
-  minute later went straight through. A timeout there is reported as `azure_timeout_text` — the
+  minute later went straight through. A timeout there is reported as `azure_timeout` (the
+  `ConnectFailure::AzureTimedOut` the interface words) — the
   likely reason, and that this attempt has woken the database, so connect again shortly — rather
   than as an I/O error that names neither. **A waking database has a second answer**, seen on the
   same database minutes later: the gateway refuses at once with Msg 40613, *Database … is not
   currently available*, rather than holding the login — so that code on an Azure host keeps the
-  server's words and gains the same sentence (`azure_unavailable_text`). The bound is on the whole
+  server's words and gains the same sentence (`azure_unavailable`, `AzureUnavailable`). The bound is on the whole
   config, so the one routing redirect inherits it.
   **A named instance is reached through SQL Server Browser**, as the Microsoft drivers reach one: a
   host written `server\INSTANCE` (`connection::sql_server_instance`) is asked of the Browser on UDP
@@ -20809,7 +20813,7 @@ existing prose was left alone.
   measured — there is no Windows named instance to try it on — so a password sign-in working
   without the line is no evidence it can go. A routed reconnect (Azure's gateway) passes
   `named = false`, the redirect naming a host and a port of its own. **The Browser's silence is
-  told in words that say what it means** (`browser_silent_text`): tiberius gives up on it after a
+  told in words that say what it means** (`browser_silent`, `ConnectFailure::BrowserSilent`): tiberius gives up on it after a
   second with an `Error::Conversion` mentioning the browser, and the Browser answers nothing
   alike whether the service is not running, UDP 1434 is blocked on the way, or no instance there
   has that name — so the text names all three, and the way round them: the bare host and the port
@@ -20821,7 +20825,7 @@ existing prose was left alone.
   but an **answer without a TCP port**: a reply carries `tcp;<port>` only while the instance
   listens on TCP (MS-SQLR), so an instance with TCP/IP off, SQL Express's install default, was
   reported as a Browser not running, UDP blocked or a wrong name, all three false (S5-L1-01). That
-  answer is `is_browser_without_tcp` now, told by `browser_without_tcp_text`: the Browser answered,
+  answer is `is_browser_without_tcp` now, told by `browser_without_tcp` (`BrowserWithoutTcp`): the Browser answered,
   the instance does not listen on TCP, enable TCP/IP for it in SQL Server Configuration Manager
   (`a_browser_answer_without_a_tcp_port_is_not_its_silence`). **On Windows the silence arrives as a reset, not a
   timeout**: with nothing listening on UDP 1434 the host answers the query with an ICMP

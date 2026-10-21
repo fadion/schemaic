@@ -36,9 +36,9 @@ use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::export::language_safe_datetime;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
-    CellEdit, Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
-    ResultBuilder, ResultSet, Rollback, RowInsert, Value, WriteCause, WriteStep, binary_display,
-    one_row_verdict, type_is_binary,
+    CellEdit, Column, ColumnFlags, ColumnOrigin, ConnectFailure, GridWrite, RefetchRow,
+    RefetchTemplate, ResultBuilder, ResultSet, Rollback, RowInsert, Value, WriteCause, WriteStep,
+    binary_display, one_row_verdict, type_is_binary,
 };
 use schemaic_core::schema::{DbSchema, ListedDatabase, TableInfo};
 use tiberius::{ColumnData, ColumnType, QueryItem};
@@ -136,16 +136,13 @@ fn is_azure_sql(host: &str) -> bool {
     .any(|s| h.ends_with(s))
 }
 
-/// The sentence for a login that timed out on an Azure SQL server: the
-/// likely reason, and what to do — the attempt itself is what wakes a paused
-/// database.
-fn azure_timeout_text() -> String {
-    format!(
-        "Azure SQL did not finish signing in within {} seconds. A serverless database that has \
-         paused takes about a minute to resume, and this attempt has woken it — connect again \
-         shortly.",
-        AZURE_HANDSHAKE.as_secs()
-    )
+/// A login that timed out on an Azure SQL server: the likely reason, and what
+/// to do — the attempt itself is what wakes a paused database. A value, so the
+/// interface says it in its own language.
+fn azure_timeout() -> ConnectFailure {
+    ConnectFailure::AzureTimedOut {
+        secs: AZURE_HANDSHAKE.as_secs(),
+    }
 }
 
 /// Azure SQL's *database is not currently available* — what a paused
@@ -153,13 +150,10 @@ fn azure_timeout_text() -> String {
 /// instead (both were seen, minutes apart, on the same free-offer database).
 const AZURE_UNAVAILABLE: u32 = 40613;
 
-/// [`azure_timeout_text`]'s sibling for Msg 40613: the server's own words,
-/// then what they usually mean and what to do.
-fn azure_unavailable_text(server: &str) -> String {
-    format!(
-        "{server} A serverless database that has paused takes about a minute to resume, and this \
-         attempt has woken it — connect again shortly."
-    )
+/// [`azure_timeout`]'s sibling for Msg 40613: the server's own words, then
+/// what they usually mean and what to do.
+fn azure_unavailable(server: &str) -> ConnectFailure {
+    ConnectFailure::AzureUnavailable(server.to_string())
 }
 
 /// How the login packet signs in, per [`Db::auth`]:
@@ -247,10 +241,12 @@ async fn login(db: &Db, database: Option<&str>) -> Result<MsClient, DbError> {
     // three, and the way round it, rather than the driver's.
     if let (Some((server, instance)), Err(e)) = (named, &result) {
         if is_browser_silence(e) {
-            return Err(DbError::Connect(browser_silent_text(server, instance)));
+            return Err(DbError::ConnectFailed(browser_silent(server, instance)));
         }
         if is_browser_without_tcp(e) {
-            return Err(DbError::Connect(browser_without_tcp_text(server, instance)));
+            return Err(DbError::ConnectFailed(browser_without_tcp(
+                server, instance,
+            )));
         }
     }
     if db.auth == schemaic_core::connection::AuthMode::AzureCli
@@ -263,12 +259,12 @@ async fn login(db: &Db, database: Option<&str>) -> Result<MsClient, DbError> {
             Err(tiberius::error::Error::Io { kind, .. })
                 if *kind == std::io::ErrorKind::TimedOut =>
             {
-                return Err(DbError::Connect(azure_timeout_text()));
+                return Err(DbError::ConnectFailed(azure_timeout()));
             }
             // The other way a waking database answers: at once, with Msg 40613
             // "not currently available", rather than by holding the login.
             Err(e @ tiberius::error::Error::Server(t)) if t.code() == AZURE_UNAVAILABLE => {
-                return Err(DbError::Connect(azure_unavailable_text(&ms_text(e))));
+                return Err(DbError::ConnectFailed(azure_unavailable(&ms_text(e))));
             }
             _ => {}
         }
@@ -344,24 +340,21 @@ fn is_browser_without_tcp(e: &tiberius::error::Error) -> bool {
 
 /// What a connect to a named instance says when SQL Server Browser answered
 /// without a TCP port.
-fn browser_without_tcp_text(server: &str, instance: &str) -> String {
-    format!(
-        "SQL Server Browser on {server} answered for the instance {instance} but gave no TCP \
-         port: the instance does not listen on TCP. Enable TCP/IP for it in SQL Server \
-         Configuration Manager and restart it."
-    )
+fn browser_without_tcp(server: &str, instance: &str) -> ConnectFailure {
+    ConnectFailure::BrowserWithoutTcp {
+        server: server.to_string(),
+        instance: instance.to_string(),
+    }
 }
 
 /// What a connect to a named instance says when SQL Server Browser gave no
 /// port: the three reasons it stays silent, and the way to reach the instance
 /// without it.
-fn browser_silent_text(server: &str, instance: &str) -> String {
-    format!(
-        "SQL Server Browser on {server} gave no port for the instance {instance}: the Browser \
-         service is not running, UDP port 1434 is blocked on the way, or no instance there has \
-         that name. If the instance listens on a fixed port, set the host to {server} without \
-         \\{instance} and the port to that one."
-    )
+fn browser_silent(server: &str, instance: &str) -> ConnectFailure {
+    ConnectFailure::BrowserSilent {
+        server: server.to_string(),
+        instance: instance.to_string(),
+    }
 }
 
 /// A failed connect, in the server's words when it gave any — a wrong
@@ -6680,7 +6673,7 @@ mod tests {
     /// reasons and the way round them, naming the server and the instance.
     #[test]
     fn a_silent_browser_names_the_instance_and_the_way_round() {
-        let t = browser_silent_text("db.corp", "SQLEXPRESS");
+        let t = browser_silent("db.corp", "SQLEXPRESS").message();
         assert!(t.contains("db.corp") && t.contains("SQLEXPRESS"), "{t}");
         assert!(
             t.contains("UDP port 1434") && t.contains("fixed port"),
@@ -6734,7 +6727,7 @@ mod tests {
         assert!(is_browser_without_tcp(&answered));
         let timeout = Error::Conversion("SQL browser timeout during resolving instance X".into());
         assert!(!is_browser_without_tcp(&timeout));
-        let text = browser_without_tcp_text("db", "SQLEXPRESS");
+        let text = browser_without_tcp("db", "SQLEXPRESS").message();
         assert!(
             text.contains("TCP/IP") && !text.contains("not running"),
             "{text}"
@@ -6997,8 +6990,8 @@ mod tests {
         ] {
             assert!(!is_azure_sql(h), "{h}");
         }
-        assert!(azure_timeout_text().contains("60 seconds"));
-        let t = azure_unavailable_text("Database 'd' is not currently available. (Msg 40613)");
+        assert!(azure_timeout().message().contains("60 seconds"));
+        let t = azure_unavailable("Database 'd' is not currently available. (Msg 40613)").message();
         assert!(
             t.starts_with("Database 'd'") && t.contains("connect again shortly"),
             "{t}"

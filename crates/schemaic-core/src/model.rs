@@ -1710,6 +1710,18 @@ pub enum ConnectFailure {
     Tls(TlsFailure),
     /// A cloud IAM or Entra sign-in's failure to get a token.
     SignIn(SignInFailure),
+    /// SQL Server Browser on `server` gave no port for the named `instance`:
+    /// it is not running, UDP 1434 is blocked, or no instance has that name.
+    BrowserSilent { server: String, instance: String },
+    /// SQL Server Browser answered for `instance` but with no TCP port: the
+    /// instance does not listen on TCP.
+    BrowserWithoutTcp { server: String, instance: String },
+    /// Azure SQL did not finish signing in within `secs` — a paused
+    /// serverless database, which the attempt has woken.
+    AzureTimedOut { secs: u64 },
+    /// Azure SQL's Msg 40613 *not currently available*, in the server's own
+    /// words — the other way a waking serverless database answers.
+    AzureUnavailable(String),
 }
 
 /// **A query's failure in Schemaic's words** — `schemaic-db`'s
@@ -2040,6 +2052,26 @@ impl ConnectFailure {
             ConnectFailure::Ssh(f) => f.message(),
             ConnectFailure::Tls(f) => f.message(),
             ConnectFailure::SignIn(f) => f.message(),
+            ConnectFailure::BrowserSilent { server, instance } => format!(
+                "SQL Server Browser on {server} gave no port for the instance {instance}: the \
+                 Browser service is not running, UDP port 1434 is blocked on the way, or no \
+                 instance there has that name. If the instance listens on a fixed port, set the \
+                 host to {server} without \\{instance} and the port to that one."
+            ),
+            ConnectFailure::BrowserWithoutTcp { server, instance } => format!(
+                "SQL Server Browser on {server} answered for the instance {instance} but gave no \
+                 TCP port: the instance does not listen on TCP. Enable TCP/IP for it in SQL \
+                 Server Configuration Manager and restart it."
+            ),
+            ConnectFailure::AzureTimedOut { secs } => format!(
+                "Azure SQL did not finish signing in within {secs} seconds. A serverless \
+                 database that has paused takes about a minute to resume, and this attempt has \
+                 woken it — connect again shortly."
+            ),
+            ConnectFailure::AzureUnavailable(server) => format!(
+                "{server} A serverless database that has paused takes about a minute to resume, \
+                 and this attempt has woken it — connect again shortly."
+            ),
         }
     }
 }
