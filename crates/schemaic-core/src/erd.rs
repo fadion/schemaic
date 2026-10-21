@@ -1214,12 +1214,34 @@ impl Matches {
 /// inside a single table is already unambiguous, and the diagram will have panned
 /// to it.
 pub fn match_label(matches: &[NodeMatch]) -> String {
-    let hits = total_hits(matches);
-    match (hits, matches.len()) {
-        (0, _) => "No matches".to_string(),
-        (1, _) => "1 match".to_string(),
-        (h, 1) => format!("{h} matches"),
-        (h, t) => format!("{h} matches in {t} tables"),
+    match_count(matches).message()
+}
+
+/// What [`match_label`] says, as a value the interface words in its own
+/// language: the hits, and how many tables they are in.
+pub fn match_count(matches: &[NodeMatch]) -> MatchCount {
+    MatchCount {
+        hits: total_hits(matches),
+        tables: matches.len(),
+    }
+}
+
+/// The find bar's count ([`match_count`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatchCount {
+    pub hits: usize,
+    pub tables: usize,
+}
+
+impl MatchCount {
+    /// The readout in English. The tables are named only past one.
+    pub fn message(self) -> String {
+        match (self.hits, self.tables) {
+            (0, _) => "No matches".to_string(),
+            (1, _) => "1 match".to_string(),
+            (h, 1) => format!("{h} matches"),
+            (h, t) => format!("{h} matches in {t} tables"),
+        }
     }
 }
 

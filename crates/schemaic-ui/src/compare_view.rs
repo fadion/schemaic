@@ -1430,7 +1430,7 @@ fn open_plan_preview(ctx: &CompareCtx, close: Rc<dyn Fn()>) {
         // Named for the database it lands in, not just the connection: the
         // left-hand side is what these statements change, and this modal is the
         // last thing the user sees before they run.
-        plan.subject_in(&t.left.database),
+        plan_subject_text(plan.len(), &t.left.database),
         &plan,
         read_only,
     );
@@ -1447,9 +1447,42 @@ fn selection_note_text(planned: usize) -> String {
     tr!("compare-selected", n = planned)
 }
 
+/// The preview's subject for a plan of `n` objects landing in `database` —
+/// core's `SchemaPlan::subject_in` in the interface's language. It titles the
+/// preview and is repeated in its success line.
+fn plan_subject_text(n: usize, database: &str) -> String {
+    tr!("compare-plan-subject", n = n, database = database)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compare_kind_group, compare_kind_word, selection_note_text};
+    use super::{compare_kind_group, compare_kind_word, plan_subject_text, selection_note_text};
+
+    /// **The plan's subject reads in English exactly as core's** — the count,
+    /// for one object and for several, and the database it lands in.
+    #[test]
+    fn english_names_the_plan_s_subject_as_core_does() {
+        use schemaic_core::compare::SchemaPlan;
+        use schemaic_core::ddl::{Change, ChangeSet};
+        let set = || ChangeSet {
+            table: "t".into(),
+            schema: None,
+            dialect: Default::default(),
+            flavour: Default::default(),
+            changes: vec![Change::DropTrigger {
+                name: "tr".into(),
+                natively_compiled: false,
+            }],
+        };
+        for n in [0usize, 1, 2, 12] {
+            let plan = SchemaPlan {
+                sets: (0..n).map(|_| set()).collect(),
+                ..Default::default()
+            };
+            assert_eq!(plan.len(), n);
+            assert_eq!(plan_subject_text(n, "shop"), plan.subject_in("shop"), "{n}");
+        }
+    }
 
     /// **The two notes the comparison draws read in English as the literals
     /// they replaced** — the foreign-key cycle's warning and the line under a

@@ -5768,42 +5768,83 @@ impl ObjectItem {
     }
 }
 
+/// One row of what the properties panel says about a table's partitioning
+/// ([`TableInfo::partition_facts`]) — a value, so the interface words its
+/// labels and its count in its own language; [`PartitionLine::english`] is
+/// the English.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartitionLine {
+    /// The table this one is a partition of, as displayed.
+    Of(String),
+    /// This partition's bound, as the server writes it.
+    Bound(String),
+    /// The partitioned table's key, as the server writes it.
+    By(String),
+    /// One partition, by displayed name, with its bound — `None` for one
+    /// the server gave no bound for.
+    Part { name: String, bound: Option<String> },
+    /// How many partitions past the cap went unlisted.
+    More(usize),
+}
+
+impl PartitionLine {
+    /// The row in English, as `(label, value)`.
+    pub fn english(&self) -> (String, String) {
+        match self {
+            PartitionLine::Of(t) => ("Partition of".to_string(), t.clone()),
+            PartitionLine::Bound(b) => ("Bound".to_string(), b.clone()),
+            PartitionLine::By(k) => ("Partitioned by".to_string(), k.clone()),
+            PartitionLine::Part { name, bound } => (
+                name.clone(),
+                bound.clone().unwrap_or_else(|| "—".to_string()),
+            ),
+            PartitionLine::More(n) => (
+                String::new(),
+                format!(
+                    "and {n} more {}",
+                    crate::text::plural(*n, "partition", "partitions")
+                ),
+            ),
+        }
+    }
+}
+
 impl TableInfo {
-    /// What the properties panel says about this table's partitioning, as
-    /// `(label, value)` rows: its key and each partition with its bound, at
-    /// most `cap` of them and then how many more; or the table it is a
-    /// partition of and its bound. Empty for a table that is neither.
-    pub fn partition_lines(&self, cap: usize) -> Vec<(String, String)> {
+    /// What the properties panel says about this table's partitioning: its
+    /// key and each partition with its bound, at most `cap` of them and then
+    /// how many more; or the table it is a partition of and its bound. Empty
+    /// for a table that is neither.
+    pub fn partition_facts(&self, cap: usize) -> Vec<PartitionLine> {
         let mut out = Vec::new();
         if let Some(of) = &self.partition_of {
-            out.push((
-                "Partition of".to_string(),
-                display_name(of.schema.as_deref(), &of.parent),
-            ));
-            out.push(("Bound".to_string(), of.bound.clone()));
+            out.push(PartitionLine::Of(display_name(
+                of.schema.as_deref(),
+                &of.parent,
+            )));
+            out.push(PartitionLine::Bound(of.bound.clone()));
         }
         if let Some(p) = &self.partitioning {
-            out.push(("Partitioned by".to_string(), p.key.clone()));
+            out.push(PartitionLine::By(p.key.clone()));
             for part in p.partitions.iter().take(cap) {
-                let bound = if part.bound.is_empty() {
-                    "—".to_string()
-                } else {
-                    part.bound.clone()
-                };
-                out.push((display_name(part.schema.as_deref(), &part.name), bound));
+                out.push(PartitionLine::Part {
+                    name: display_name(part.schema.as_deref(), &part.name),
+                    bound: (!part.bound.is_empty()).then(|| part.bound.clone()),
+                });
             }
             let more = p.partitions.len().saturating_sub(cap);
             if more > 0 {
-                out.push((
-                    String::new(),
-                    format!(
-                        "and {more} more {}",
-                        if more == 1 { "partition" } else { "partitions" }
-                    ),
-                ));
+                out.push(PartitionLine::More(more));
             }
         }
         out
+    }
+
+    /// [`Self::partition_facts`] in English, as `(label, value)` rows.
+    pub fn partition_lines(&self, cap: usize) -> Vec<(String, String)> {
+        self.partition_facts(cap)
+            .iter()
+            .map(PartitionLine::english)
+            .collect()
     }
 
     /// Is this table a partition of `parent` ([`TableInfo::partition_of`])?

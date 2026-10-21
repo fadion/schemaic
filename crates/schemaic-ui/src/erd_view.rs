@@ -290,6 +290,16 @@ fn press_missed_the_field(pos: Point, field: Size, pad: (f64, f64)) -> bool {
     !on_field
 }
 
+/// The find bar's readout — core's `erd::MatchCount::message` in the
+/// interface's language; the tables are named only past one.
+fn match_count_text(c: erd::MatchCount) -> String {
+    match (c.hits, c.tables) {
+        (0, _) => tr!("erd-find-none"),
+        (h, t) if h > 1 && t > 1 => tr!("erd-find-matches-in-tables", hits = h, tables = t),
+        (h, _) => tr!("erd-find-matches", hits = h),
+    }
+}
+
 /// The find popup: the editor's and grid's bar, in the diagram's top-right corner.
 ///
 /// 10px in from the canvas's top and right edges — the canvas starts below the
@@ -336,7 +346,7 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
                 move || {
                     find.query
                         .with(|q| !q.trim().is_empty())
-                        .then(|| matches.with(|m| erd::match_label(m.hits())))
+                        .then(|| matches.with(|m| match_count_text(erd::match_count(m.hits()))))
                 },
                 move |label| match label {
                     Some(label) => text(label)
@@ -3019,6 +3029,16 @@ fn modal_frame(
 mod tests {
     use super::*;
     use schemaic_core::erd::{Cardinality, DiagramEdge, DiagramGraph, DiagramNode, NodeKind};
+
+    /// **The find readout reads in English exactly as core's** — none, one,
+    /// several in one table and several across tables.
+    #[test]
+    fn english_says_the_find_readout_as_core_does() {
+        for (hits, tables) in [(0, 0), (1, 1), (2, 1), (2, 2), (7, 3)] {
+            let c = erd::MatchCount { hits, tables };
+            assert_eq!(match_count_text(c), c.message(), "{c:?}");
+        }
+    }
 
     /// The toolbar's counts and the export notices read as they did in English
     /// before the catalogue — counts unpluralised, as they always were.

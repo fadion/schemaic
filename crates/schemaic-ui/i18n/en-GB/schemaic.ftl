@@ -873,6 +873,16 @@ activity-locks-undrawn = { $n } more { $n ->
 }
 # The fetch stopped at its cap, so the list is not the whole server's.
 activity-list-capped = list capped
+# The Locks header's counts (core's activity::LocksTally). $shown is the count
+# as shown, with a + when the cap may have cut it; $n the number itself.
+activity-locks-total = { $n ->
+    [one] { $shown } lock
+   *[other] { $shown } locks
+}
+activity-locks-waiting = { $n ->
+    [one] { $shown } waiting
+   *[other] { $shown } waiting
+}
 # A session's state on its row — also what the search box matches (core's
 # SessionState; English must read exactly as its label).
 activity-state-blocked = Blocked
@@ -1070,6 +1080,15 @@ props-created = Created
 props-updated = Updated
 props-comment = Comment
 props-section-partitioning = Partitioning
+# Its row labels (core's schema::PartitionLine); a partition's own row is
+# labelled by its name. The last counts the partitions past those listed.
+props-partition-of = Partition of
+props-partition-bound = Bound
+props-partitioned-by = Partitioned by
+props-partitions-more = { $n ->
+    [one] and { $n } more partition
+   *[other] and { $n } more partitions
+}
 props-section-indexes = Indexes
 # An index's facts after its name, joined by " · " (core's stats::IndexFact).
 # $cardinality and $shown arrive formatted (~1.2k, 12,345).
@@ -1144,6 +1163,9 @@ dialog-stop = Stop
 
 # $table is the source table's display name.
 copy-table-title = Copy { $table }
+# The preview's line for the rows, beside the CREATE TABLE's (core's
+# copy_table::rows_change); the rows are streamed, not run from the script.
+copy-table-rows-line = Then copy every row of { $table } into it (not shown as SQL)
 copy-table-into = Copy into
 copy-table-schema = Schema
 copy-table-name = Name
@@ -1324,6 +1346,13 @@ compare-note-binding = Alias type { $alias }: { $bound ->
 compare-hint-blocked = body must be re-read before this can be applied
 compare-hint-uncertain = an index this model reads only in part — a match here isn't certain
 compare-preview-migration = Preview migration
+# The migration preview's subject: how many objects the plan holds, and the
+# database they land in (core's compare::SchemaPlan::subject_in). It titles the
+# preview and ends its success line.
+compare-plan-subject = { $n ->
+    [one] { $n } object in { $database }
+   *[other] { $n } objects in { $database }
+}
 # Beside Preview migration: how many objects the plan holds (core's
 # compare::selection_note). Only the empty one ends in a full stop.
 compare-selected = { $n ->
@@ -3184,6 +3213,17 @@ erd-chip-tables = { $count } tables
 erd-chip-relationships = { $count } relationships
 erd-chip-hidden = { $count } unrelated hidden
 erd-find-placeholder = Find table or column
+# Its readout (core's erd::MatchCount): $hits found, in $tables tables (named
+# only past one).
+erd-find-none = No matches
+erd-find-matches = { $hits ->
+    [one] { $hits } match
+   *[other] { $hits } matches
+}
+erd-find-matches-in-tables = { $hits ->
+    [one] { $hits } match in { $tables } tables
+   *[other] { $hits } matches in { $tables } tables
+}
 # A collapsed table's row for the columns it is not showing; also drawn in an
 # exported picture.
 erd-more-columns = +{ $count } more
@@ -3515,6 +3555,12 @@ grid-menu-hide-column = Hide column
 grid-menu-show-hidden-columns = Show hidden columns ({ $count })
 grid-menu-show-all = Show all
 grid-menu-format-as = Format as
+# Its entries (core's format::ColumnFormat::label); None clears the format.
+grid-format-none = None
+grid-format-timestamp = Timestamp
+grid-format-grouped = Number grouping
+grid-format-bytes = File size
+grid-format-bool = Boolean
 grid-menu-copy-name = Copy name
 grid-menu-copy-qualified-name = Copy qualified name
 grid-menu-copy-values = Copy values

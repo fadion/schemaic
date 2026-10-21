@@ -1625,10 +1625,31 @@ impl LockInfo {
 /// The *Locks* view's tally ([`locks_tally`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocksTally {
+    /// How many locks the list holds.
+    pub total: usize,
+    /// Whether the cap cut the list — the total wears a `+`.
+    pub capped: bool,
+    /// How many of them wait.
+    pub waiting: usize,
+    /// Whether the waits could have been cut — the waiting count wears a `+`.
+    pub waits_capped: bool,
+}
+
+impl LocksTally {
     /// "12 locks", or "500+ locks" when the cap cut the list.
-    pub total: String,
+    pub fn total_text(&self) -> String {
+        let more = if self.capped { "+" } else { "" };
+        let noun = crate::text::plural(self.total, "lock", "locks");
+        format!("{}{more} {noun}", self.total)
+    }
+
     /// "3 waiting", or `None` when nothing waits.
-    pub waiting: Option<String>,
+    pub fn waiting_text(&self) -> Option<String> {
+        (self.waiting > 0).then(|| {
+            let more = if self.waits_capped { "+" } else { "" };
+            format!("{}{more} waiting", self.waiting)
+        })
+    }
 }
 
 /// The header figures over one *Locks* poll.
@@ -1642,12 +1663,11 @@ pub struct LocksTally {
 pub fn locks_tally(list: &LockList) -> LocksTally {
     let n = list.locks.len();
     let waiting = list.locks.iter().filter(|l| !l.granted).count();
-    let more = if list.truncated { "+" } else { "" };
-    let waits_cut = list.truncated && waiting == n;
     LocksTally {
-        total: format!("{n}{more} {}", if n == 1 { "lock" } else { "locks" }),
-        waiting: (waiting > 0)
-            .then(|| format!("{waiting}{} waiting", if waits_cut { "+" } else { "" })),
+        total: n,
+        capped: list.truncated,
+        waiting,
+        waits_capped: list.truncated && waiting == n,
     }
 }
 
@@ -3169,8 +3189,8 @@ mod tests {
             contended_only: false,
         };
         let t = locks_tally(&list);
-        assert_eq!(t.total, "500+ locks");
-        assert_eq!(t.waiting.as_deref(), Some("3 waiting"));
+        assert_eq!(t.total_text(), "500+ locks");
+        assert_eq!(t.waiting_text().as_deref(), Some("3 waiting"));
 
         for l in &mut locks {
             l.granted = false;
@@ -3181,7 +3201,7 @@ mod tests {
             contended_only: false,
         };
         assert_eq!(
-            locks_tally(&all_waits).waiting.as_deref(),
+            locks_tally(&all_waits).waiting_text().as_deref(),
             Some("500+ waiting")
         );
 
@@ -3191,9 +3211,9 @@ mod tests {
             contended_only: false,
         };
         let t = locks_tally(&one);
-        assert_eq!(t.total, "1 lock");
-        assert_eq!(t.waiting, None);
-        assert_eq!(locks_tally(&LockList::default()).total, "0 locks");
+        assert_eq!(t.total_text(), "1 lock");
+        assert_eq!(t.waiting_text(), None);
+        assert_eq!(locks_tally(&LockList::default()).total_text(), "0 locks");
     }
 
     /// MySQL 5.7 has `INNODB_LOCKS` and not `data_locks`, as MariaDB does; only

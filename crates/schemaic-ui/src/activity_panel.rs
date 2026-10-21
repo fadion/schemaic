@@ -949,6 +949,30 @@ fn session_row(
         .into_any()
 }
 
+/// The lock count over the *Locks* list — core's `LocksTally::total_text` in
+/// the interface's language, `+` where the cap cut the list.
+fn locks_total_text(t: &activity::LocksTally) -> String {
+    let more = if t.capped { "+" } else { "" };
+    tr!(
+        "activity-locks-total",
+        n = t.total,
+        shown = format!("{}{more}", t.total)
+    )
+}
+
+/// How many of them wait — core's `LocksTally::waiting_text` in the
+/// interface's language; `None` when nothing waits.
+fn locks_waiting_text(t: &activity::LocksTally) -> Option<String> {
+    (t.waiting > 0).then(|| {
+        let more = if t.waits_capped { "+" } else { "" };
+        tr!(
+            "activity-locks-waiting",
+            n = t.waiting,
+            shown = format!("{}{more}", t.waiting)
+        )
+    })
+}
+
 /// The *Locks* view's tally, from the whole snapshot as the sessions' is: how
 /// many, how many waiting (in the blocked colour, left out at zero), the cap
 /// as a caveat — and, where the engine shows only contended locks, that a
@@ -956,11 +980,11 @@ fn session_row(
 fn locks_header(list: &activity::LockList) -> floem::AnyView {
     let tally = activity::locks_tally(list);
     let mut parts: Vec<floem::AnyView> = vec![
-        text(tally.total)
+        text(locks_total_text(&tally))
             .style(|s| s.font_size(font_label()).color(theme::text_muted()))
             .into_any(),
     ];
-    if let Some(waiting) = tally.waiting {
+    if let Some(waiting) = locks_waiting_text(&tally) {
         parts.push(
             text(waiting)
                 .style(|s| s.font_size(font_label()).color(theme::error()))
@@ -1231,6 +1255,29 @@ fn lock_menu(
 mod tests {
     use crate::i18n::tr;
     use schemaic_core::activity::KillKind;
+
+    /// **The Locks header's counts read in English exactly as core's**,
+    /// capped and not, for one and for several, and none waiting.
+    #[test]
+    fn english_counts_the_locks_as_core_does() {
+        use schemaic_core::activity::LocksTally;
+        for (total, capped, waiting, waits_capped) in [
+            (0, false, 0, false),
+            (1, false, 1, false),
+            (12, false, 3, false),
+            (500, true, 3, false),
+            (500, true, 500, true),
+        ] {
+            let t = LocksTally {
+                total,
+                capped,
+                waiting,
+                waits_capped,
+            };
+            assert_eq!(super::locks_total_text(&t), t.total_text(), "{t:?}");
+            assert_eq!(super::locks_waiting_text(&t), t.waiting_text(), "{t:?}");
+        }
+    }
     use schemaic_core::text::plural;
 
     /// The Locks view's note for a server that lists only contended locks

@@ -418,7 +418,7 @@ fn modal(ctx: CopyCtx, src: CopySource) -> impl IntoView {
             // The rows are no statement in the script, so the change list
             // carries them as a line of their own — without it, the preview
             // read as a structure-only copy.
-            p.changes.push(copy_table::rows_change(&info));
+            p.changes.push(rows_line_text(&info));
             let (copy_rows, d) = (ctx.copy_rows.clone(), ctx.ddl);
             p.then = Some(Rc::new(move || {
                 // The table is there; the preview has nothing more to say,
@@ -637,9 +637,37 @@ fn copy_refusal_text(why: copy_table::CopyRefusal) -> String {
     }
 }
 
+/// The preview's change-list line for the rows half — core's
+/// `copy_table::rows_change` in the interface's language.
+fn rows_line_text(src: &schemaic_core::schema::TableInfo) -> String {
+    tr!(
+        "copy-table-rows-line",
+        table = schemaic_core::schema::display_name(src.schema.as_deref(), &src.name)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The rows line reads in English exactly as core's**, with and
+    /// without a namespace.
+    #[test]
+    fn english_says_the_rows_line_as_core_does() {
+        use schemaic_core::schema::TableInfo;
+        for schema in [None, Some("sales")] {
+            let t = TableInfo {
+                name: "orders".into(),
+                schema: schema.map(Into::into),
+                ..TableInfo::default()
+            };
+            assert_eq!(
+                rows_line_text(&t),
+                copy_table::rows_change(&t),
+                "{schema:?}"
+            );
+        }
+    }
 
     /// **Every refusal reads in English exactly as core's `message`.**
     #[test]

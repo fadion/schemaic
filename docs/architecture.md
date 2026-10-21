@@ -9584,7 +9584,8 @@ existing prose was left alone.
     button that built an empty plan and returned. `selection_note(planned)` is the footer's sentence
     and `subject()` the preview's, both "N objects", replacing two hand-rolled plurals a hundred lines
     apart beside `preview_title` — which was extracted precisely so a modal's words could be tested
-    (`a_plans_subject_and_the_footers_count_agree_and_read_as_english`).
+    (`a_plans_subject_and_the_footers_count_agree_and_read_as_english`). Both are now the English of
+    what the window shows, `compare_view`'s `selection_note_text` and `plan_subject_text` wording it.
     **Display order is a second order, and it is deliberately not the plan's.** `rows(filter,
     expanded)` is what a tree renders: groups in `CompareKind`'s own order, objects **alphabetical by
     `label` within a group**, because a tree is read by looking a name up — while the order the
@@ -10024,7 +10025,8 @@ existing prose was left alone.
     (`a_copy_refusal_says_what_it_used_to`). It is a *stop* because `CopyRefusal` was taken: that
     is `refusal`'s answer, the modal's own refusals before anything runs (*Name the copy.*), this a
     value met mid-write, which reaches the interface inside `import::RowError::Copy`.
-    `rows_change(src)` is the preview's change-list line for the rows — *"Then copy every row of
+    `rows_change(src)` is the English of the preview's change-list line for the rows, which the
+    modal words itself (`rows_line_text`, under `copy_table_view.rs`) — *"Then copy every row of
     `<source>` into it (not shown as SQL)"*, the source through `schema::display_name`, so bare
     where it has no schema. The rows are no statement in the plan: `Db::copy_rows` streams them once
     the `CREATE` has committed, so the preview listed only the `CREATE`'s own line and read as a
@@ -10129,7 +10131,9 @@ existing prose was left alone.
     hand-rolled `to_lowercase().contains` (see the one-predicate invariant); an empty or
     whitespace-only term finds nothing, which is that predicate's rule. A `NodeKind::Stub` answers
     on its name alone, having no columns to search. `hits()` counts the name as one plus one per
-    matched column, `total_hits`/`match_label` are the bar's readout, and `sole_node` — the
+    matched column, `total_hits` and `match_count` — a `MatchCount { hits, tables }`, `match_label`
+    its English — are the bar's readout, worded by `erd_view::match_count_text` from `erd-find-*`
+    (`english_says_the_find_readout_as_core_does`), and `sole_node` — the
     pan-and-flash trigger — asks about **cards, not hits**: three matches inside `orders` still name
     one place to go, while two cards leave the choice to the user and moving the canvas would only
     be guessing which was meant. The stated limitation is that a collapsed card shows only its key
@@ -10534,7 +10538,9 @@ existing prose was left alone.
     (`5,9`). The pins are `waiting_locks_lead_and_their_blockers_are_distinct` and
     `a_lock_is_found_by_what_its_row_says`; they arrived with the functions they test, so there was
     no unfixed tree for them to be watched failing against. `locks_tally` is the view's header
-    figures — `N locks` and `M waiting`, the first wearing `+` on a capped list and the second
+    figures, a `LocksTally { total, capped, waiting, waits_capped }` whose `total_text()` and
+    `waiting_text()` are the English the panel words (under `activity_panel.rs`) — `N locks` and
+    `M waiting`, the first wearing `+` on a capped list and the second
     **only when every row kept is a wait**, since each engine sorts the waits ahead of its limit and
     `prepare_locks` again before it cuts, so a capped list of 500 with three waits holds all three;
     "3+ waiting" there suggested stuck sessions the list did not show
@@ -13645,10 +13651,12 @@ existing prose was left alone.
     `listed_as(t)` the topmost ancestor held — the table a sub-partition is drawn as — its walk
     bounded by the table count, since a catalogue cannot hold a cycle but a model built by hand
     could (`a_partition_is_listed_under_the_parent_this_schema_holds`).
-    `TableInfo::partition_lines(cap)` is what the properties panel says about either end, as
-    `(label, value)` rows: *Partition of* and *Bound*, or *Partitioned by* and each partition with
-    its bound (`—` where it has none) up to `cap`, then *and N more partitions*
-    (`partition_lines_name_the_key_the_partitions_and_the_parent`).
+    `TableInfo::partition_facts(cap)` is what the properties panel says about either end, as
+    `PartitionLine`s: `Of` and `Bound`, or `By` and a `Part` per partition with its bound (`None`
+    where it has none, drawn `—`) up to `cap`, then `More(n)`. `partition_lines` is their English
+    as `(label, value)` rows — *Partition of*, *Bound*, *Partitioned by*, *and N more partitions*
+    (`partition_lines_name_the_key_the_partitions_and_the_parent`) — and the panel words them
+    itself (under `properties.rs`).
     `create_ddl`'s PostgreSQL arm restates both ends: a partitioned table's `CREATE TABLE` closes
     `) PARTITION BY <key>;`, and a partition is `CREATE TABLE q PARTITION OF parent [(own column
     options, own key, own checks)] <bound> [PARTITION BY <key>];` — no column list, which it takes
@@ -27663,7 +27671,8 @@ existing prose was left alone.
     for the other list, `Idle`/`Loaded(Rc<LockList>)`/`Failed` — in three functions. `locks_header`
     is the tally, from the whole snapshot as the sessions' counts are: `activity::locks_tally`'s
     `N locks`, then `M waiting` in the error colour and left out at zero (the `+` on the waits only
-    when they could have been cut), then
+    when they could have been cut), worded by `locks_total_text`/`locks_waiting_text` from
+    `activity-locks-total`/`-waiting` (`english_counts_the_locks_as_core_does`), then
     "list capped" — and on `contended_only` a line saying the server lists only locks waited for or
     holding up a wait, so MariaDB's short list does not read as a lock-free server. `locks_list`
     filters by `lock_matches_with` and the rows' own `activity-lock-waits-for`, draws `render_slice`'s front for the sessions list's reason and counts
@@ -27811,9 +27820,11 @@ existing prose was left alone.
       `options_section` is reached from two arms, not only the full `Loaded` one, and its own
       emptiness guard is what keeps it silent on an engine that publishes nothing.
     - **A *Partitioning* section follows *Options*** (`partition_section`), from the same two arms:
-      `TableInfo::partition_lines(PARTITIONS_LISTED)` — the key and up to 24 partitions with their
+      `TableInfo::partition_facts(PARTITIONS_LISTED)` — the key and up to 24 partitions with their
       bounds, then how many more — or, on a partition, the table it is a partition of and its bound
-      (under `schema.rs`). It reads the in-memory `TableInfo`, not the statistics, and its own
+      (under `schema.rs`), each row worded by `partition_line_text` from `props-partition-of`/
+      `-bound`, `props-partitioned-by` and the plural `props-partitions-more`
+      (`english_says_every_partition_line_as_core_does`). It reads the in-memory `TableInfo`, not the statistics, and its own
       emptiness check leaves it out for a table that is neither.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
@@ -29115,7 +29126,8 @@ existing prose was left alone.
     build `None`. It is not `after_commit`, which is SQL the app runs after the plan and the box
     shows; `then` is UI work, and the box shows nothing for it. So **`changes` is not always one
     line per `Change`**: what `then` will write has to be said by its caller in the change list —
-    *Copy to* pushes `copy_table::rows_change` there — or the preview promises less than Apply does.
+    *Copy to* pushes `copy_table::rows_change` there, worded (`copy_table_view::rows_line_text`) —
+    or the preview promises less than Apply does.
     **`ddl_preview::close_peers` is the one editor-target list**, called by every editor's `open`
     before it sets its own and by `close_editors` after an Apply. Each of those `open`s used to
     keep its own copy and they had **drifted**: the table designer cleared the view editor and
@@ -29207,7 +29219,8 @@ existing prose was left alone.
     `editor_script()` byte for byte for a comparison, which produces no account change, but the rule
     is enforced by *calling* the scrubbing function rather than by a comment observing there is
     nothing to scrub today. `subject` names the plan and the database it lands in
-    (`SchemaPlan::subject_in` — "12 objects in shop") rather than an object, there being no single
+    (`SchemaPlan::subject_in` — "12 objects in shop" — worded by `compare_view::plan_subject_text`
+    for the title and the success line alike) rather than an object, there being no single
     object to name, and the post-apply `refresh_db` already re-introspects a
     whole database, which is the right refresh for a plan that touched many of its objects.
     **`preview_account` takes a `PlanTarget` captured where the plan was raised**, not the
@@ -33446,8 +33459,9 @@ existing prose was left alone.
     here: the user restarts the sequence, recreates the repartitioned table, or creates the
     partition function, scheme and table, on the target and compares again.
     **Preview never applies.** `open_plan_preview` builds the `SchemaPlan`, reads the left
-    connection's `read_only` off the connection list, names it through `SchemaPlan::subject_in` —
-    the count and the database it lands in, both from the plan rather than hand-rolled here — and hands it to
+    connection's `read_only` off the connection list, names it through `plan_subject_text` —
+    `SchemaPlan::subject_in`'s count and the database it lands in, worded from the plural
+    `compare-plan-subject` (`english_names_the_plan_s_subject_as_core_does`) — and hands it to
     `ddl_preview::preview_of_plan` — the same modal, the same Apply and the same `Db::run_ddl` a
     one-table designer edit takes. The comparison closes on the way there, so the plan is a snapshot
     rather than a selection the preview no longer reflects.
@@ -33513,7 +33527,8 @@ existing prose was left alone.
     `table_designer::loaded_table` — refusing with *"expand it in the tree"* while the database's
     schema is not loaded — asks `copy_table::refusal`, builds `copy_table::plan`, and opens it with
     `ddl_preview::preview_of` on the **target** connection and database, with the target's
-    `read_only`. With **Copy data** on it pushes `copy_table::rows_change` onto the preview's
+    `read_only`. With **Copy data** on it pushes `rows_line_text` — `copy_table::rows_change` worded
+    from `copy-table-rows-line` (`english_says_the_rows_line_as_core_does`) — onto the preview's
     `changes`, so the heading counts the rows as a change of their own — they are no statement in
     the script, and without the line the preview read as a structure-only copy while Apply went on
     to write every row — and sets a `then` (`DdlPreview::then`, under `ddl_preview.rs`) carrying a
@@ -41534,7 +41549,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     indent lands on the pixel the glyphs it aligns under actually occupy — at 80% those differ by one.
 - **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
   value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). **Every file of
-  `schemaic-ui` and `schemaic-app` now draws what a user reads from the catalogue**, so a new word
+  `schemaic-ui` and `schemaic-app` now draws what a user reads from the catalogue** — but for
+  `activity::interval_label`'s *Off* and `30s` in Server Activity's poll menu, still core's
+  English (under `overlays.rs`, with `ExportFormat::label`, whose names are English on purpose) —
+  so a new word
   a user reads goes in through `tr!` as well, with its German in the same change — a literal is
   the odd one out now, and the pseudo-locale (below) is what shows one left plain. The app reaches
   the one loader through its own `tr!` (the `schemaic-app` entry says why it cannot borrow the UI
@@ -41741,7 +41759,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `connection::Environment::label` and `AiData::label`/`hint` (in `i18n.rs` because the form, the
     top bar's badge and Settings' `ai_data_line` all call them), and `connection_form`'s
     `ssl_mode_label`/`ssl_mode_description`, `ssh_auth_label` and `auth_mode_label` for
-    `SslMode::label`/`description`, `SshAuth::label` and `AuthMode::label`, and — the one from
+    `SslMode::label`/`description`, `SshAuth::label` and `AuthMode::label`, and
+    `grid::column_format_label` for `format::ColumnFormat::label`, the *Format as* menu, and — the
+    one from
     `schemaic-ai` rather
     than core — `settings::agent_label` for `harness::Agent::label`, whose harnesses keep their
     product names and only *Disabled* is drawn —
@@ -41756,6 +41776,7 @@ Re-introducing the anti-patterns these guard against is a regression:
     `english_names_every_formatting_choice_as_core_does`,
     `english_names_every_environment_and_data_level_as_core_does`,
     `english_names_every_picker_choice_as_core_does`,
+    `english_names_every_column_format_as_core_does`, which walks `ColumnFormat::MENU`,
     `english_names_every_agent_as_the_ai_crate_does`).
     Where the word is a phrase core composes rather than a label, core answers with a value or
     keeps the composition and lets the caller word the part that is language: `history::ago` hands
@@ -41807,6 +41828,20 @@ Re-introducing the anti-patterns these guard against is a regression:
     (*Figures in the interface's marks*, above); `rows_read_clause`,
     `attach_scope_label` and `duplicate_prompt` remain only as the English wrappers core's tests
     read.
+    Three counts a view drew as core's English are values now, the English kept beside them:
+    `erd::MatchCount` (`match_count`, `match_label` its `message()`), worded by `erd_view`'s
+    `match_count_text`; `activity::LocksTally`, by `activity_panel`'s `locks_total_text` and
+    `locks_waiting_text`, which select on `$n` and carry the `+` in `$shown` as
+    `ActivitySummary::figure`'s count does; and `schema::PartitionLine` (`partition_facts`,
+    `partition_lines` its English), by `properties::partition_line_text`, whose
+    `props-partitions-more` replaced a hand-rolled `if more == 1`. Two plain-arguments lines went
+    beside them — `compare_view::plan_subject_text` for `SchemaPlan::subject_in` and
+    `copy_table_view::rows_line_text` for `copy_table::rows_change`, both in the DDL preview. The
+    review after v0.35.0 found all five still drawing English under the claim, above, that every
+    file had left it. `english_says_the_find_readout_as_core_does`,
+    `english_counts_the_locks_as_core_does`, `english_says_every_partition_line_as_core_does`,
+    `english_names_the_plan_s_subject_as_core_does` and `english_says_the_rows_line_as_core_does`
+    hold the English.
     *Restore from file*'s refusal is the first that joins a list: `script::RestoreRefusal` keeps
     its named switches as `DatabaseSwitch` values rather than text, and the app's
     `restore_refusal_text` words each from `restore-switch`/`-unnamed` — `$how` being the SQL that

@@ -10804,14 +10804,26 @@ fn format_submenu(gs: GridState, ci: usize) -> Vec<MenuEntry> {
         .map(|&fmt| {
             if fmt == cur {
                 // Selected: tint the label (no checkmark).
-                MenuEntry::action_colored(fmt.label(), theme::chip_active, move || {
+                MenuEntry::action_colored(column_format_label(fmt), theme::chip_active, move || {
                     set_format(gs, ci, fmt)
                 })
             } else {
-                MenuEntry::action(fmt.label(), move || set_format(gs, ci, fmt))
+                MenuEntry::action(column_format_label(fmt), move || set_format(gs, ci, fmt))
             }
         })
         .collect()
+}
+
+/// A column format's menu label — core's `ColumnFormat::label` in the
+/// interface's language.
+fn column_format_label(fmt: ColumnFormat) -> String {
+    match fmt {
+        ColumnFormat::None => tr!("grid-format-none"),
+        ColumnFormat::Timestamp => tr!("grid-format-timestamp"),
+        ColumnFormat::Grouped => tr!("grid-format-grouped"),
+        ColumnFormat::Bytes => tr!("grid-format-bytes"),
+        ColumnFormat::Bool => tr!("grid-format-bool"),
+    }
 }
 
 /// Whether display column `ci`'s header draws a chevron, and which way it
@@ -13460,6 +13472,19 @@ mod clipboard_gate {
             src[at..body_end].contains("copy_split_note"),
             "copy_selection must report the cells the TSV format split"
         );
+    }
+}
+
+#[cfg(test)]
+mod column_format_label_tests {
+    /// **Every entry of the *Format as* menu reads in English exactly as
+    /// core's label** — walked over `ColumnFormat::MENU`, so a format added
+    /// there is held too.
+    #[test]
+    fn english_names_every_column_format_as_core_does() {
+        for fmt in schemaic_core::format::ColumnFormat::MENU {
+            assert_eq!(super::column_format_label(fmt), fmt.label(), "{fmt:?}");
+        }
     }
 }
 

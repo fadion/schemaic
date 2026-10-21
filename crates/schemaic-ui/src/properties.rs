@@ -687,18 +687,38 @@ fn options_section(stats: &TableStats, info: Option<&TableInfo>) -> Option<AnyVi
 }
 
 /// How the table is partitioned, or which table it is a partition of
-/// ([`TableInfo::partition_lines`]). `None` for a table that is neither.
+/// ([`TableInfo::partition_facts`]). `None` for a table that is neither.
 fn partition_section(info: Option<&TableInfo>) -> Option<AnyView> {
-    let lines = info?.partition_lines(PARTITIONS_LISTED);
+    let lines = info?.partition_facts(PARTITIONS_LISTED);
     if lines.is_empty() {
         return None;
     }
-    // Labels are partition names here, so not `detail`'s `&'static str`.
     let rows = lines
-        .into_iter()
+        .iter()
+        .map(partition_line_text)
         .map(|(label, value)| crate::widgets::fact_row(label, value, label_w))
         .collect();
     Some(section(tr!("props-section-partitioning"), rows))
+}
+
+/// One partitioning row, `(label, value)` — core's
+/// `schema::PartitionLine::english` in the interface's language. A
+/// partition's own row is labelled by its name, which is data.
+fn partition_line_text(line: &schemaic_core::schema::PartitionLine) -> (String, String) {
+    use schemaic_core::schema::PartitionLine as L;
+    match line {
+        L::Of(t) => (tr!("props-partition-of"), t.clone()),
+        L::Bound(b) => (tr!("props-partition-bound"), b.clone()),
+        L::By(k) => (tr!("props-partitioned-by"), k.clone()),
+        L::Part { name, bound } => (
+            name.clone(),
+            bound.clone().unwrap_or_else(|| "—".to_string()),
+        ),
+        L::More(n) => {
+            let n = *n;
+            (String::new(), tr!("props-partitions-more", n = n))
+        }
+    }
 }
 
 /// How many partitions the panel names before it says how many more there are.
@@ -1007,6 +1027,30 @@ const COUNT_TAB: u32 = 10;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every partitioning row reads in English exactly as core's**, the
+    /// count of the unlisted ones for one and for several.
+    #[test]
+    fn english_says_every_partition_line_as_core_does() {
+        use schemaic_core::schema::PartitionLine as L;
+        for line in [
+            L::Of("public.measurements".into()),
+            L::Bound("FOR VALUES FROM (1) TO (2)".into()),
+            L::By("RANGE (at)".into()),
+            L::Part {
+                name: "m_2024".into(),
+                bound: Some("FOR VALUES IN (1)".into()),
+            },
+            L::Part {
+                name: "m_default".into(),
+                bound: None,
+            },
+            L::More(1),
+            L::More(3),
+        ] {
+            assert_eq!(partition_line_text(&line), line.english(), "{line:?}");
+        }
+    }
 
     /// **The staleness caveat, an index's facts and its unused flag read in
     /// English exactly as core says them.**
