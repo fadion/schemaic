@@ -136,13 +136,13 @@ settings-format-commas-trailing = End of line
 settings-format-commas-leading = Start of line
 settings-format-gap-one = One blank line
 settings-format-gap-none = No blank line
-settings-format-keyword-case-hint = How Format Code writes keywords such as SELECT and FROM. Names, strings and comments keep their case.
+settings-format-keyword-case-hint = How Format code writes keywords such as SELECT and FROM. Names, strings and comments keep their case.
 settings-format-function-case = Function case
-settings-format-function-case-hint = How Format Code writes the engine's own functions, such as COUNT and COALESCE, where they are called. Your own functions keep their case.
+settings-format-function-case-hint = How Format code writes the engine's own functions, such as COUNT and COALESCE, where they are called. Your own functions keep their case.
 settings-format-type-case = Type case
-settings-format-type-case-hint = How Format Code writes the engine's own data types, such as INT and VARCHAR. Types you created keep their case.
+settings-format-type-case-hint = How Format code writes the engine's own data types, such as INT and VARCHAR. Types you created keep their case.
 settings-format-commas = Commas
-settings-format-commas-hint = Where Format Code puts the comma of a list it breaks across lines. Lists kept on one line, like a function's arguments, are left alone unless the wrap width breaks them.
+settings-format-commas-hint = Where Format code puts the comma of a list it breaks across lines. Lists kept on one line, like a function's arguments, are left alone unless the wrap width breaks them.
 settings-format-statement-gap = Between statements
 settings-format-statement-gap-hint = The blank lines Format Code leaves between two statements. As typed keeps a blank line wherever there was one.
 settings-format-wrap = Wrap width
@@ -219,7 +219,7 @@ shortcuts-group-er-diagram = ER diagram
 
 ## Shortcuts modal › rows (the keys beside them are never translated)
 
-shortcuts-find-anywhere = Find Anywhere
+shortcuts-find-anywhere = Find anywhere
 shortcuts-command-palette = Command palette
 shortcuts-new-tab = New query tab
 shortcuts-close-tab = Close query tab
@@ -247,7 +247,7 @@ shortcuts-toggle-case = Toggle case
 shortcuts-join-lines = Join lines
 shortcuts-duplicate = Duplicate line / selection
 shortcuts-cut = Cut line / selection
-# Also the editor menu's entry, and named like the palette's "Format Code".
+# Also the editor menu's entry, and named like the palette's "Format code".
 shortcuts-format-code = Format code
 shortcuts-format-statement = Format statement
 shortcuts-single-line = Make single line
@@ -297,67 +297,67 @@ key-space = Space
 ## fine, "Verlauf" before "Verlauf leeren" is not. The English names match in
 ## every language as well.
 
-palette-toggle-panel = Toggle Panel
+palette-toggle-panel = Toggle panel
 palette-toggle-panel-hint = schema · ai · terminal · query history · server activity
 palette-panel-schema = Schema
 palette-panel-ai = AI
 palette-panel-terminal = Terminal
-palette-panel-history = Query History
-palette-panel-activity = Server Activity
-palette-new-tab = New Tab
-palette-export-settings = Export Settings
-palette-import-settings = Import Settings
-palette-duplicate-tab = Duplicate Tab
-palette-close-tab = Close Tab
-palette-reopen-closed-tab = Reopen Closed Tab
+palette-panel-history = Query history
+palette-panel-activity = Server activity
+palette-new-tab = New tab
+palette-export-settings = Export settings
+palette-import-settings = Import settings
+palette-duplicate-tab = Duplicate tab
+palette-close-tab = Close tab
+palette-reopen-closed-tab = Reopen closed tab
 palette-reopen-closed-tab-hint = <tab>
-palette-open-file = Open File
+palette-open-file = Open file
 palette-open-file-hint = a .sql script
-palette-save-file = Save File
-palette-save-file-as = Save File As
-palette-next-tab = Next Tab
-palette-previous-tab = Previous Tab
+palette-save-file = Save file
+palette-save-file-as = Save file as
+palette-next-tab = Next tab
+palette-previous-tab = Previous tab
 # Named like the editor menu's and the shortcut sheet's "Format code".
-palette-format-code = Format Code
-palette-format-statement = Format Statement
+palette-format-code = Format code
+palette-format-statement = Format statement
 palette-format-statement-hint = the statement at the caret
-palette-make-single-line = Make Single Line
+palette-make-single-line = Make single line
 palette-make-single-line-hint = the selection or statement, on one line
 palette-run = Run
 palette-run-hint = run all statements
-palette-go-to-line = Go to Line
+palette-go-to-line = Go to line
 palette-go-to-line-hint = <number>
-palette-go-to-statement = Go to Statement
+palette-go-to-statement = Go to statement
 palette-search-hint = <search>
 palette-history = History
-palette-clear-history = Clear History
+palette-clear-history = Clear history
 palette-clear-history-hint = current connection
 palette-ask-ai = Ask AI
 palette-ask-ai-hint = <prompt>
 palette-ask-ai-empty = Type a prompt…
 palette-terminal = Terminal
 palette-terminal-hint = <command>
-palette-run-in-terminal = Run in Terminal
+palette-run-in-terminal = Run in terminal
 palette-terminal-empty = Type a command…
-palette-ui-theme = UI Theme
+palette-ui-theme = UI theme
 palette-ui-theme-hint = light · dark
-palette-editor-theme = Editor Theme
+palette-editor-theme = Editor theme
 palette-editor-theme-hint = <theme>
-palette-font-size = Font Size
-palette-increase-font-size = Increase Font Size
-palette-decrease-font-size = Decrease Font Size
-palette-indent-style = Indent Style
+palette-font-size = Font size
+palette-increase-font-size = Increase font size
+palette-decrease-font-size = Decrease font size
+palette-indent-style = Indent style
 palette-indent-style-hint = tabs · spaces
 palette-indent-spaces = Spaces
 palette-indent-tabs = Tabs
-palette-indent-width = Indent Width
-palette-toggle-word-wrap = Toggle Word Wrap
-palette-toggle-whitespace = Toggle Whitespace
+palette-indent-width = Indent width
+palette-toggle-word-wrap = Toggle word wrap
+palette-toggle-whitespace = Toggle whitespace
 palette-toggle-whitespace-hint = show spaces and tabs
-palette-toggle-indent-guides = Toggle Indent Guides
-palette-switch-connection = Switch Connection
+palette-toggle-indent-guides = Toggle indent guides
+palette-switch-connection = Switch connection
 palette-switch-connection-hint = <connection>
-palette-server-variables = Server Variables
+palette-server-variables = Server variables
 palette-server-variables-hint = the active connection's settings
 palette-enter-number = Enter a number
 palette-nothing-found = Nothing found
@@ -453,7 +453,7 @@ tree-show-table-sizes = Show table sizes
 
 ## Connection switcher
 
-conn-menu-manage = Manage Connections
+conn-menu-manage = Manage connections
 
 ## Shared dialog buttons
 
@@ -1942,7 +1942,7 @@ designer-check-enforced-hint = Off records the constraint without applying it �
 ## The engine names in the Type picker (MySQL, PostgreSQL, SQLite, SQL Server)
 ## are product names and persisted: never translated.
 
-connections-title = Manage Connections
+connections-title = Manage connections
 connections-new = New connection
 connections-import = Import connections
 connections-export = Export connections
@@ -3017,7 +3017,7 @@ preview-refreshed = The schema has been refreshed.
 ## Why an entry was skipped, and what is wrong with a pasted URL, are core's
 ## words and stay as they are for now.
 
-conn-import-title = Import Connections
+conn-import-title = Import connections
 conn-import-url = Connection URL
 # The button inside the URL field.
 conn-import-add = Add
@@ -3820,7 +3820,7 @@ lib-cursor-underline = Underline
 header-no-connection = No connection
 header-new-connection = New connection
 # $keys is the shortcut (Ctrl+P), in the keyboard's own legends.
-header-find-anywhere-tip = Find Anywhere ({ $keys })
+header-find-anywhere-tip = Find anywhere ({ $keys })
 header-shortcuts-tip = Keyboard shortcuts
 header-settings-tip = Settings
 header-disconnected = Disconnected
@@ -4086,8 +4086,8 @@ editor-several-carets = Several carets and nothing selected: select what to run,
 
 ## The editor's run menu (Ctrl+Enter with several statements; editor_pane.rs).
 
-editor-run-current = Run Current
-editor-run-everything = Run Everything
+editor-run-current = Run current
+editor-run-everything = Run everything
 
 ## The editor's find / replace bar and go to line (editor_pane.rs). The option
 ## glyphs Aa, W and .* stay as they are.

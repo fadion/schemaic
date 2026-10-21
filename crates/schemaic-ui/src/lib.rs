@@ -15456,7 +15456,7 @@ mod catalogue_tests {
         );
         assert_eq!(
             tr!("header-find-anywhere-tip", keys = "Ctrl+P"),
-            "Find Anywhere (Ctrl+P)"
+            "Find anywhere (Ctrl+P)"
         );
     }
 

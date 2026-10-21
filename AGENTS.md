@@ -280,6 +280,11 @@ start with a failing test, then the code that makes it pass.
   odd one out, which is why it kept having to be corrected after the fact.
   `source_gate::no_menu_label_ends_in_an_ellipsis` now fails on a literal label that carries one;
   a label built at run time it cannot see.
+- **Sentence case for every label, title and command name** — *Manage connections*, *Toggle
+  word wrap*, *Find anywhere*, never Title Case. Only a proper noun or an acronym keeps its
+  capitals (*AI*, *UI*, *SQL*, *Microsoft Entra*, *Azure CLI*), and an engine's own term keeps its
+  spelling (*Verify CA*). The palette and the modal titles were in Title Case while every menu
+  was not, and the mix was reported as inconsistent.
 - **British spelling in everything a user reads** — labels, menus, hints, notices, prompts the app
   sends as the user's message, README: *colour*, *favourite*, *optimise*, *summarise*, *analysed*,
   *licence* (the noun). Mixed spelling was reported as confusing. Three things keep the US form on
