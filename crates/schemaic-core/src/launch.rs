@@ -765,7 +765,9 @@ fn is_windows_path(p: &str) -> bool {
 /// **A letter in any script is kept** because a translated message is made of
 /// them — German's `für` printed `f r` — and no shell gives one a meaning. It
 /// was once dropped for the console's codepage, but the panel's console is a
-/// pseudo-console, which takes `cmd`'s UTF-16 and hands back UTF-8.
+/// pseudo-console, which takes `cmd`'s UTF-16 and hands back UTF-8. **So is a
+/// combining mark on a kept letter** — an NFD `für`, a Devanagari virama —
+/// which is part of the letter it sits on; one with no letter before it goes.
 ///
 /// **The backslash is on the list**, so a Windows path in a message stays a
 /// path: `cmd` gives it no meaning, `sh` none inside single quotes, and the
@@ -775,7 +777,16 @@ fn is_windows_path(p: &str) -> bool {
 pub fn shell_message_text(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     for ch in msg.chars() {
-        let keep = ch.is_alphanumeric() || " .,:;!?-_/()[]+=@#\\".contains(ch);
+        // A combining mark only on a kept letter (or on a mark already kept on
+        // one): it is part of that letter, and neither shell reads one as
+        // syntax. With nothing to attach to — after a stripped character, or
+        // first — it goes like any other non-ASCII symbol.
+        let on_letter = out.chars().last().is_some_and(|p| {
+            p.is_alphanumeric() || unicode_normalization::char::is_combining_mark(p)
+        });
+        let keep = ch.is_alphanumeric()
+            || (on_letter && unicode_normalization::char::is_combining_mark(ch))
+            || " .,:;!?-_/()[]+=@#\\".contains(ch);
         let ch = if keep { ch } else { ' ' };
         if ch == ' ' && out.ends_with(' ') {
             continue;
@@ -1488,6 +1499,13 @@ mod tests {
             "Kein Client für mysql öffne"
         );
         assert_eq!(shell_message_text("a\u{202E}b \u{FF06} c"), "a b c");
+        // **A combining mark on a kept letter is part of it**: an NFD `für`
+        // (`u` + U+0308) printed `fu r`, and a Hindi OS error was cut apart at
+        // every virama. A mark with no letter before it still goes, so one
+        // cannot ride in on its own after a stripped character.
+        assert_eq!(shell_message_text("fu\u{0308}r"), "fu\u{0308}r");
+        assert_eq!(shell_message_text("स्ट"), "स्ट");
+        assert_eq!(shell_message_text("\u{0308}a & \u{0308}b"), "a b");
         assert_eq!(shell_message_text("   "), "");
         assert_eq!(shell_message_text(""), "");
         // **A Windows path stays legible**: a backslash is no syntax to `cmd`,
