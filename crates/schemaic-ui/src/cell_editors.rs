@@ -436,9 +436,11 @@ pub(crate) fn set_control(
 // ── Date / datetime ─────────────────────────────────────────────────────────
 
 /// Width of one day cell in the calendar — seven of them plus the panel's
-/// padding is the panel's width.
+/// padding is the panel's width. 33 rather than the 30 it was, so the month
+/// and year above the grid have room for a language whose month names run
+/// longer than English's.
 fn day_w() -> f64 {
-    theme::scaled(30.0)
+    theme::scaled(33.0)
 }
 
 /// Height of one day cell.
@@ -1092,12 +1094,14 @@ mod tests {
     }
 
     /// And Normal is the exact identity, written out rather than derived — the
-    /// numbers the app laid out with before the scale setting existed. Comparing
-    /// against the formula would pass even if every term moved together.
+    /// numbers the app laid out with before the scale setting existed, 21px
+    /// wider since the day cell went from 30 to 33 for longer month names.
+    /// Comparing against the formula would pass even if every term moved
+    /// together.
     #[test]
     fn the_calendar_at_normal_is_the_box_the_app_shipped_with() {
         crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
-        assert_eq!(calendar_size(), (228.0, 234.0));
+        assert_eq!(calendar_size(), (249.0, 234.0));
     }
 
     const SIZE: (f64, f64) = (230.0, 220.0);
