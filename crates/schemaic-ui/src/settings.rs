@@ -2473,7 +2473,8 @@ pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
                     .background(theme::bg_panel())
                     // Room for German, whose rows and chords both run longer;
                     // a row that still does not fit wraps (`shortcut_row`).
-                    .width(crate::widgets::modal_w(460.0))
+                    // A fifth wider than the 460 it was, so fewer do.
+                    .width(crate::widgets::modal_w(552.0))
             });
 
             let esc = close.clone();

@@ -26209,7 +26209,8 @@ existing prose was left alone.
     a second line instead of pushing the pill past the panel's edge, and the pill `flex_shrink(0)`,
     so a chord like `Strg+Umschalt+C / Strg+Umschalt+V` stays whole; a 12px gap replaced the
     spacer between them. The panel widened from `modal_w(420)` to `modal_w(460)` for German's
-    longer rows and chords as well — the wrap is for the row that still does not fit.
+    longer rows and chords as well, and later by a fifth again to `modal_w(552)`, at the user's
+    request — the wrap is for the row that still does not fit.
     **Every word the modal writes itself comes from the catalogue** — the first file converted to
     it: labels, hints, placeholders, section names and the Settings and Shortcuts titles
     are `tr!` over `settings-*`/`shortcuts-*` messages (`ui/i18n.rs`), with German beside them, and
