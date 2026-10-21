@@ -25383,8 +25383,12 @@ existing prose was left alone.
     It is `ellipsized_text` in `error` at `font_label`. **`ellipsized_text(t, style)` is the
     general form** — one line with `min_width(0)`/`flex_shrink(1)`/`text_ellipsis` and the full
     text as a tooltip — for any status, hint or label beside controls that must not give way; the
-    `min_width(0)` is the half that is easy to forget, and the parent row still needs a definite
-    width for any of it to bite. **`menu_row_face(icon, icon_px, label, font_size, color)`** is the
+    `min_width(0)` is the half that is easy to forget, and it goes **twice**: on the text, and again
+    with `flex_shrink(1)` on the `.tooltip()` wrapper after it, since the wrapper is the row's flex
+    item (*`.tooltip()`'s wrapper is the flex item* under *Floem 0.2 gotchas*). The first cut
+    (`2cdfbd64`) had only the first, and Manage Connections' *New*/*Import*/*Export* rows and the
+    Properties *Count rows* hint still overflowed under the pseudo-locale (fixed in `32a2cafb`). The
+    parent row still needs a definite width for any of it to bite. **`menu_row_face(icon, icon_px, label, font_size, color)`** is the
     icon-plus-label face of a full-width action row under a list — Manage Connections' *New
     connection*/*Import*/*Export* and Users' *New account* — the icon at its size and the label
     ellipsizing to the column; both lists had hand-rolled it, and a label longer than English ran
@@ -32871,7 +32875,9 @@ existing prose was left alone.
     yet*, in `Tone::Calm`, like any other (`a_binary_column_is_said_by_the_icon_not_the_line`).
     Paused or stopped is the
     title's badge, not this line. The line ends in an ellipsis and its tooltip carries the whole of
-    it, since a poll error can outrun the footer. `capped` is
+    it, since a poll error can outrun the footer — which takes `min_width(0)`/`flex_shrink(1)` on
+    the `.tooltip()` wrapper as well as `min_width(0)` on the label, or the line clips without its
+    `…` (*`.tooltip()`'s wrapper is the flex item* under *Floem 0.2 gotchas*). `capped` is
     `overlay.monitor_dropped > 0`, accumulated from `monitor::trim_log`'s return, **not** the log's
     length: at exactly `LOG_CAP` nothing has been dropped yet, and the caveat used to be printed
     there anyway. An export failure that lands after the modal has closed goes to the shared error
@@ -43354,6 +43360,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   `tip_when` returns the `.tooltip()` wrapper itself, so the row is still styled before the call
   and the `width_full()` chained after it still lands on the wrapper. This is the only menu in the
   app whose rows carry a tooltip, which is why it is the only one that had it.
+- **`.tooltip()`'s wrapper is the flex item, so an ellipsizing text under it needs `min_width(0)`
+  twice.** The same re-parenting as the bullet above, read for shrinking rather than styling:
+  `Tooltip` (floem-0.2.0, `src/views/tooltip.rs:45`) is a view of its own, and it is *that* view a
+  row lays out — with taffy's automatic minimum, its content's width. So
+  `text(…).style(|s| s.min_width(0.0).text_ellipsis()).tooltip(…)` relaxes the minimum on a node
+  the row never measures: the wrapper keeps the text's full width, the text is never handed a
+  narrower box to end a line in, and the line **clips without its `…`** — which reads as an
+  ellipsis that silently did nothing rather than as a layout bug. The fix is a second
+  `.style(|s| s.min_width(0.0).flex_shrink(1.0))` chained *after* `.tooltip(…)`, keeping the
+  text's own `min_width(0)` and `text_ellipsis` before it. `widgets::ellipsized_text` shipped
+  without the second half in `2cdfbd64`, and Manage Connections' *New*/*Import*/*Export* rows and
+  the Properties *Count rows* hint still overflowed in the sandboxed app under
+  `SCHEMAIC_LOCALE=pseudo-en`; `32a2cafb` added it there and on the Live Monitor's status line
+  (`monitor_view.rs`, inside `h_stack((icon, line))`). Prefer `ellipsized_text` to spelling the
+  pair by hand.
 - **A `VirtualItemSize::Fixed` is a promise about the child's height, and the child has to keep it.**
   `virtual_stack` places child `i` at `i * item_size` and derives the range it builds from the same
   arithmetic, so a row whose real height is *assembled* — padding plus a parent `gap` — drifts
