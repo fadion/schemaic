@@ -2569,12 +2569,17 @@ mod tests {
         }
     }
 
-    /// Without `init` (every test), every choice draws English — so none of
-    /// them needs a restart, and the system entry says it is English.
+    /// Without `init` (every test) English is on screen and the system has no
+    /// languages, so the system entry and English need no restart and every
+    /// other shipped language does — and the system entry says it is English.
     #[test]
     fn a_choice_that_draws_what_is_on_screen_needs_no_restart() {
         for o in LanguageChoice::options() {
-            assert!(!o.needs_restart(), "{o:?}");
+            let draws_english = matches!(
+                o,
+                LanguageChoice::System | LanguageChoice::Fixed(UiLanguage::EnGb)
+            );
+            assert_eq!(o.needs_restart(), !draws_english, "{o:?}");
         }
         assert_eq!(LanguageChoice::System.label(), "System (English)");
         assert_eq!(LanguageChoice::Fixed(UiLanguage::EnGb).label(), "English");

@@ -14,14 +14,14 @@ file rather than ticked off.
 Translate the GUI into languages other than English. The catalogue, the loader and every view's
 own words are in place (`docs/architecture.md`, *The string catalogue*), with eight complete,
 machine-drafted catalogues — German, Albanian, Italian, Dutch, French, Spanish, Romanian and
-Bulgarian — reached through `SCHEMAIC_LOCALE=<tag>` (`de`, `sq`, `it`, `nl`, `fr`, `es`, `ro`,
-`bg`), and figures follow the language's marks (*Figures in the
+Bulgarian — all shipped (`locale::SHIPPED`): offered in Settings and drawn for a system set to
+the language. Figures follow the language's marks (*Figures in the
 interface's marks* there). The prose built below the views — in `schemaic-core`, `schemaic-db`
 and `schemaic-ai` — is a typed value the window words, and its plurals are whole messages (the
 same section, *A typed message*), and the layout makes room for text longer than English's —
 found with a doubled-English pseudo-locale, since removed (*Layout for longer text* there).
-Every phase has landed; what is left is the decision to ship the catalogues
-(`locale::SHIPPED`), and the right-to-left and CJK questions below.
+Every phase has landed and every catalogue ships; what is left is proofreading, the
+right-to-left and CJK questions, and the data-in-any-script items below.
 
 ### Decided
 
@@ -59,8 +59,9 @@ Every phase has landed; what is left is the decision to ship the catalogues
   dependency for a setting changed once. Changing it says so where the user changed it:
   *The language change takes effect the next time Schemaic starts.*
 - **Settings offers a language only once its catalogue is complete** (`locale::SHIPPED`), and
-  so does the OS: a German system gets English until German ships, never a half-German
-  interface. While a catalogue is being written it is reached with `SCHEMAIC_LOCALE=de`.
+  so does the OS: a system set to a language still being written gets English, never a
+  half-translated interface. Meanwhile the catalogue is reached with `SCHEMAIC_LOCALE=<tag>`.
+  All nine catalogues ship today; this governs a language added later.
 
 ### Never translated
 

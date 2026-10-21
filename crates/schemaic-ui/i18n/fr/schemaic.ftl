@@ -1,8 +1,8 @@
 # Schemaic — French catalogue.
 #
 # Machine-drafted and unreviewed (docs/roadmap.md); a message missing here
-# falls back to the en-GB catalogue. Not offered in Settings until it ships
-# (locale::SHIPPED) — reach it with SCHEMAIC_LOCALE=fr.
+# falls back to the en-GB catalogue. Shipped (locale::SHIPPED): offered in
+# Settings, and drawn for a system set to French.
 
 ## Settings › Appearance › Language
 

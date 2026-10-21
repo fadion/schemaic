@@ -1,8 +1,8 @@
 # Schemaic — Romanian catalogue.
 #
 # Machine-drafted and unreviewed (docs/roadmap.md); a message missing here
-# falls back to the en-GB catalogue. Not offered in Settings until it ships
-# (locale::SHIPPED) — reach it with SCHEMAIC_LOCALE=ro.
+# falls back to the en-GB catalogue. Shipped (locale::SHIPPED): offered in
+# Settings, and drawn for a system set to Romanian.
 
 ## Settings › Appearance › Language
 

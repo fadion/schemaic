@@ -8,8 +8,8 @@
 //!
 //! **Three sources, in order:** the `SCHEMAIC_LOCALE` environment variable, the
 //! *Language* setting, and the operating system's preferred languages. The
-//! variable is for development — it reaches a catalogue that is not shipped yet —
-//! so it is honoured whatever it names. The setting and
+//! variable is for development — it reaches a catalogue that is not shipped yet,
+//! when there is one — so it is honoured whatever it names. The setting and
 //! the OS reach only [`SHIPPED`] catalogues: a language whose catalogue is half
 //! written would draw a half-translated interface for everyone whose system is
 //! set to it, which is worse than English.
@@ -44,8 +44,19 @@ pub enum UiLanguage {
 }
 
 /// The catalogues a user may choose, or be given by their OS. A language joins
-/// this list when its catalogue is complete, not when it is started.
-pub const SHIPPED: &[UiLanguage] = &[UiLanguage::EnGb];
+/// this list when its catalogue is complete, not when it is started. English
+/// first, since Settings lists them in this order.
+pub const SHIPPED: &[UiLanguage] = &[
+    UiLanguage::EnGb,
+    UiLanguage::De,
+    UiLanguage::Sq,
+    UiLanguage::It,
+    UiLanguage::Nl,
+    UiLanguage::Fr,
+    UiLanguage::Es,
+    UiLanguage::Ro,
+    UiLanguage::Bg,
+];
 
 /// The setting's value meaning "follow the operating system".
 pub const SYSTEM_KEY: &str = "system";
@@ -156,7 +167,7 @@ pub fn resolve(env: Option<&str>, setting: &str, os: &[String]) -> UiLanguage {
 }
 
 /// [`resolve`] against a given shipped list, so the order can be tested with
-/// more than the one catalogue that ships today.
+/// a list other than the one that ships today.
 fn resolve_in(
     env: Option<&str>,
     setting: &str,
@@ -273,8 +284,8 @@ mod tests {
         assert_eq!(UiLanguage::from_key(SYSTEM_KEY), None);
     }
 
-    /// The variable is a developer's, so it reaches what Settings cannot: a
-    /// catalogue not shipped yet.
+    /// The variable is a developer's, so it overrides the setting and the
+    /// system, and would reach a catalogue not shipped yet.
     #[test]
     fn the_environment_wins_and_reaches_unshipped_catalogues() {
         assert_eq!(
@@ -292,23 +303,45 @@ mod tests {
         );
     }
 
-    /// **The OS reaches only shipped catalogues.** German's is being written;
-    /// a German system must not get a half-German interface meanwhile.
+    /// **Every catalogue ships** — all nine are complete, and shipping them
+    /// was the user's call (2026-10-21). A language added later starts off
+    /// this list: drop it from the expectation here until its catalogue is
+    /// complete.
+    #[test]
+    fn every_catalogue_ships() {
+        for lang in UiLanguage::ALL {
+            assert!(SHIPPED.contains(lang), "{lang:?}");
+        }
+        assert_eq!(SHIPPED.len(), UiLanguage::ALL.len());
+        assert_eq!(SHIPPED[0], UiLanguage::EnGb, "English heads the picker");
+    }
+
+    /// **The OS reaches only shipped catalogues.** A catalogue still being
+    /// written must not give a system set to its language a half-translated
+    /// interface — nor may the setting.
     #[test]
     fn the_system_never_reaches_an_unshipped_catalogue() {
-        assert!(
-            !SHIPPED.contains(&UiLanguage::De),
-            "update this test when German ships"
-        );
+        let english = [UiLanguage::EnGb];
         assert_eq!(
-            resolve(None, SYSTEM_KEY, &os(&["de-DE", "en-US"])),
+            resolve_in(None, SYSTEM_KEY, &os(&["de-DE", "en-US"]), &english),
             UiLanguage::EnGb
         );
         assert_eq!(
-            resolve(None, "de", &os(&["de-DE"])),
+            resolve_in(None, "de", &os(&["de-DE"]), &english),
             UiLanguage::EnGb,
             "nor the setting"
         );
+    }
+
+    /// With every catalogue shipped, the public `resolve` takes the system's
+    /// language and the setting's.
+    #[test]
+    fn a_system_set_to_a_shipped_language_gets_it() {
+        assert_eq!(
+            resolve(None, SYSTEM_KEY, &os(&["fr-CA", "en-US"])),
+            UiLanguage::Fr
+        );
+        assert_eq!(resolve(None, "bg", &os(&["en-GB"])), UiLanguage::Bg);
     }
 
     #[test]
@@ -351,8 +384,8 @@ mod tests {
         assert_eq!(pick(&[]), UiLanguage::EnGb);
     }
 
-    /// Once German ships, the setting reaches it even on an English system,
-    /// and English on a German one.
+    /// A shipped setting reaches its language even on an English system, and
+    /// English on a German one.
     #[test]
     fn a_shipped_setting_overrides_the_system_either_way() {
         let both = [UiLanguage::EnGb, UiLanguage::De];
