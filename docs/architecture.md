@@ -11465,24 +11465,26 @@ existing prose was left alone.
     a question only the GUI asks: the CLI, the MCP server and everything sent to an AI harness stay
     English, because scripts parse the first and a model reads the second, so nothing in core
     renders through it (`ui/i18n.rs` is the half that does; the conventions are under *UI
-    conventions*, *The string catalogue*). `UiLanguage` is `EnGb`, `De`, `Pseudo` and `PseudoEn`
-    (the doubled pseudo-locale, key `pseudo-en`), with `key()` the persisted spelling and what
-    `SCHEMAIC_LOCALE` takes, `catalogue()` the directory its `.ftl` lives in — both pseudo-locales
-    answer `en-GB`'s, being the English catalogue transformed — and
+    conventions*, *The string catalogue*). `UiLanguage` has one variant per catalogue, `EnGb` the
+    source, and `UiLanguage::ALL` lists every variant — pinned by `all_names_every_language_once`,
+    whose exhaustive `match` makes a new variant a compile error until it joins the list, so the
+    tests that iterate `ALL` cannot quietly skip one. `catalogue()` is the directory its `.ftl`
+    lives in and `key()` — the persisted spelling and what `SCHEMAIC_LOCALE` takes — is simply
+    `catalogue()`, every language having a catalogue of its own; and
     `endonym()` the language's name **in itself**, which is deliberately not in any catalogue: a
     picker lists each language the same way in every language, so a reader lost in the wrong one
     can still find their own. `from_key` reads the primary subtag case-insensitively, so `de-AT`,
     `de_AT` and POSIX's `de_AT.UTF-8` are all German and `en-US` is the one English there is
-    (`keys_round_trip_and_tolerate_case_and_region`). **`pseudo-en` is matched whole before that
-    split** — `pseudo-en` and `pseudo_en`, case-insensitively — because the split would otherwise
-    read it as `pseudo` in a region and draw the accented locale instead (the same test).
-    `number_marks()` is the language's decimal and grouping marks, a table rather than CLDR, both
-    pseudo-locales keeping English's
-    (`german_swaps_both_marks_and_the_pseudo_locale_keeps_english_s`; *Figures in the interface's
+    (`keys_round_trip_and_tolerate_case_and_region`). The two pseudo-locales that once stood
+    beside the real ones — `pseudo` and the doubled `pseudo-en`, English transformed to find boxes
+    too narrow for longer text — were removed once real translations could do that job, and
+    `from_key` now reads either key as one it does not know.
+    `number_marks()` is the language's decimal and grouping marks, a table rather than CLDR
+    (`german_swaps_both_marks_and_english_keeps_core_s`; *Figures in the interface's
     marks*, under *UI conventions*).
     **`resolve(env, setting, os)` takes three sources in order, and only the first is
     unconditional.** `SCHEMAIC_LOCALE` is a developer's, so it reaches whatever it names — a
-    catalogue still being written, and the pseudo-locale — and one it does not know falls through
+    catalogue still being written — and one it does not know falls through
     rather than failing the launch (`the_environment_wins_and_reaches_unshipped_catalogues`). The
     *Language* setting and then the OS's preferred languages, in preference order with an unknown
     one passed over, reach only **`SHIPPED`** catalogues, and nothing matching is `EnGb`: a language
@@ -11490,9 +11492,10 @@ existing prose was left alone.
     whose system is set to it, which is worse than English. `SHIPPED` is `[EnGb]` today — a language
     joins it when its catalogue is complete, not when it is started — and
     `the_system_never_reaches_an_unshipped_catalogue` asserts German is *not* on it, with *update
-    this test when German ships* as its message, so shipping German fails that test on purpose. The
-    pseudo-locales are never reached from the setting either, a hand-edited settings file not being a
-    way into a developer tool (`the_pseudo_locale_is_the_environment_s_alone`). The private
+    this test when German ships* as its message, so shipping German fails that test on purpose. A
+    settings file that still names a retired pseudo-locale reads as the system's choice, and the
+    variable naming one falls through like any other unknown key
+    (`a_retired_pseudo_locale_key_is_the_system_s_choice`). The private
     `resolve_in` takes the shipped list as a parameter so the ordering can be tested with German
     counted as shipped (`the_system_is_read_in_preference_order`,
     `a_shipped_setting_overrides_the_system_either_way`) while it is not. `SYSTEM_KEY` (`system`) is
@@ -25297,7 +25300,7 @@ existing prose was left alone.
     `section_title` — a panel's title, and **the part of its header that gives way**. The headers
     are `h_stack((section_title, buttons))`, and a title without `min_width(0)` kept its text's
     width, so a narrowing panel pushed its buttons out until they clipped (found under the doubled
-    pseudo-locale, `SCHEMAIC_LOCALE=pseudo-en`). It now carries `min_width(0)`/`flex_shrink(1)`/
+    pseudo-locale, every label said twice, since removed). It now carries `min_width(0)`/`flex_shrink(1)`/
     `text_ellipsis`, and `toolbar_icon`'s container `flex_shrink(0)` as well as its glyph, so the
     title ends in a `…` and the buttons never give up a pixel — the rule `modal_footer_split` and
     the results strip follow, a control clipped in half not being a control —
@@ -25445,7 +25448,7 @@ existing prose was left alone.
     `status.style(|s| s.min_width(0.0))` themselves; the other nine were not — a helper whose
     contract only holds if the caller repeats half of it is one that will keep being called wrong.
     **Every status these footers carry now ends in a `…` rather than wrapping or clipping** — an
-    audit under the pseudo-locale found the rest still overflowing. Only Chart's and Result diff's
+    audit under text twice English's length found the rest still overflowing. Only Chart's and Result diff's
     export notices, the first validation problem of the object, view, trigger, database and
     account editors and the table designer, and the designer's index hint go through
     `footer_error` or `ellipsized_text` (both below), so only those can be read whole on hover —
@@ -25483,8 +25486,8 @@ existing prose was left alone.
     `max_width(460)` as a *wrap hint*, on the reasoning that `modal_footer_split` would shrink the
     box and the text would wrap earlier; but wrapping is the failure, not the fallback, in a row
     whose height is fixed — a second line ran behind the buttons or out of the modal, which is what
-    the account editor's *"Pick a level, name what it applies to…"* did under the doubled
-    pseudo-locale (`SCHEMAIC_LOCALE=pseudo-en`). Since `modal_footer_split` already ends the status
+    the account editor's *"Pick a level, name what it applies to…"* did under text twice
+    English's length. Since `modal_footer_split` already ends the status
     where the actions begin, the line needs no bound of its own, and one helper serves every modal
     width. Its callers grew past the six schema editors with that fix: the account form's blocker
     line and the grant form's *needs a role / privileges* line (hand-rolled before, one capped at
@@ -25512,7 +25515,7 @@ existing prose was left alone.
     again with `flex_shrink(1)` on the `.tooltip()` wrapper after it, since the wrapper is the
     row's flex item (*`.tooltip()`'s wrapper is the flex item* under *Floem 0.2 gotchas*). The first cut
     (`2cdfbd64`) had only the first, and Manage Connections' *New*/*Import*/*Export* rows and the
-    Properties *Count rows* hint still overflowed under the pseudo-locale (fixed in `32a2cafb`). The
+    Properties *Count rows* hint still overflowed under doubled text (fixed in `32a2cafb`). The
     parent row still needs a definite width for any of it to bite. **`menu_row_face(icon, icon_px, label, font_size, color)`** is the
     icon-plus-label face of a full-width action row under a list — Manage Connections' *New
     connection*/*Import*/*Export* and Users' *New account* — the icon at its size and the label
@@ -25551,7 +25554,7 @@ existing prose was left alone.
     `widgets::fact_label_w` over every label it can show, in the interface's language — one column
     still, so the values line up, at least the old 132 (Properties) or 124 (Users) and at most
     under half the panel (Properties) or 240 (Users). Fixed, a longer language wrapped every label
-    onto a second line (*Next auto-increment* did, under `SCHEMAIC_LOCALE=pseudo-en`); a label
+    onto a second line (*Next auto-increment* did, under doubled text); a label
     past the cap still wraps.
     `fact_section_owned` is `fact_section` under a heading built at run time — the *Used by* modal's
     *"Views (3)"*, where the count is the heading — and `fact_section` delegates to it, so there is
@@ -25905,22 +25908,11 @@ existing prose was left alone.
     `System (\u{2068}English\u{2069})` before the call. What it gives up is that protection, for
     right-to-left data put into a message as much as for a right-to-left language; there is no
     right-to-left interface in this phase (`docs/roadmap.md`).
-    **The pseudo-locale is `en-GB` with a transform** (`bundle.set_transform`), `pseudo`:
-    `fluent-pseudo`'s accented and lengthened text, then bracketed, so a box that cuts either end
-    shows which end it cut. Fluent applies it to a message's text pieces and never to the values put
-    into it, which are data rather than the interface's words, so a string still left as a literal is
-    the one that reads plain (`the_pseudo_locale_marks_the_words_and_spares_the_values`).
-    **The doubled pseudo-locale (`PseudoEn`) is the same `en-GB` with a second transform**,
-    `doubled`, chosen beside `pseudo` in `configure`: each text piece's words, from its first letter
-    to its last, said twice, with the spacing and punctuation outside them kept where they were —
-    *Manage connections* reads *Manage connections Manage connections*, and *System (* reads
-    *System System (*, so the parenthesis still opens on the value after it — and a piece with no
-    letter (`)`, ` — `) left alone (`doubled_repeats_the_words_inside_their_punctuation`). It exists
-    because the accented one is the wrong tool for layout: roughly 30–40% longer, it reads as nearly
-    English and is too short to stress a box. Doubled is twice the length, past German, and still
-    readable, so a box too narrow shows *which* label it cut. Values are spared here too, and for a
-    second reason: a message wrapped in another would otherwise double again at each level
-    (`the_doubled_locale_repeats_the_words_and_spares_the_values`).
+    `configure_from` does nothing else: the two pseudo-locales' transforms (`bundle.set_transform`
+    — `fluent-pseudo`'s accented text, and a `doubled` one that said each word twice) were deleted
+    with the locales and the `fluent-pseudo` dependency, their job of finding boxes too narrow for
+    longer text being done since by the real catalogues (*Layout for longer text*, under *UI
+    conventions*).
     **Three catalogue tests stand in for what `fl!` cannot see.** At run time a malformed `.ftl` is
     only logged and its broken messages fall back to English, unseen, so
     `every_catalogue_parses_cleanly` parses every embedded file strictly with `fluent-syntax` (a
@@ -25933,12 +25925,14 @@ existing prose was left alone.
     error: it falls back to English **message by message**, which is `load_languages` appending
     `en-GB` behind the tag in `configure_from`, and `a_message_german_lacks_reads_in_english`
     holds it over a fixture whose `de` has one message. A language with **no** catalogue folder is
-    not skipped: i18n-embed panics on it, so `every_language_s_catalogue_is_embedded` walks every
-    `UiLanguage`, with a `match` that makes a new variant a compile error there. Keeping an
+    not skipped: i18n-embed panics on it, so `every_language_s_catalogue_is_embedded` walks
+    `UiLanguage::ALL`, which core's `all_names_every_language_once` holds to every variant with
+    the `match` that makes a new one a compile error. Keeping an
     incomplete catalogue out of users' hands is `SHIPPED`'s job.
     **`LanguageChoice` is the setting as Settings offers it** — `System` or `Fixed(UiLanguage)`,
-    `options()` being `System` then `SHIPPED`, never either pseudo-locale. `from_key` reads a key it
-    does not offer (a newer build's, a hand edit, an unshipped catalogue) as `System`, which is also
+    `options()` being `System` then `SHIPPED`. `from_key` reads a key it does not offer (a newer
+    build's, a hand edit, an unshipped catalogue, a retired pseudo-locale's) as `System`, which is
+    also
     what `resolve` makes of it (`the_language_setting_offers_only_what_ships`). `label()` names a
     language by its endonym and the system entry as `System (English)` —
     `settings-language-system` over the endonym the system would resolve to. `needs_restart()` is
@@ -26015,7 +26009,7 @@ existing prose was left alone.
     section's page on the right, `SECTION_PAGE_W` 500 wide — the single-column modal's 420, which
     every hint in it was written to wrap within, and 80 more since a row with buttons beside its
     text (*Settings file*'s Export/Import, *Log file*'s Open folder) squeezed that text into a tall
-    sliver under `SCHEMAIC_LOCALE=pseudo-en`; *Settings file*'s two buttons also stack, one above
+    sliver under doubled text; *Settings file*'s two buttons also stack, one above
     the other at one width (`bundle_row`). The panel is `modal_w(SECTION_LIST_W +
     SECTION_PAGE_W)` at a **fixed** `height(modal_h(560))`, so switching sections never resizes it;
     the old `max_height(modal_body_h(560))` cap went with the column. **Both panes scroll**: the
@@ -26949,7 +26943,7 @@ existing prose was left alone.
     for (GitHub #18); once *Docker containers* made a third source, one lit button among three read
     as the odd one out rather than the obvious one, so it went `Quiet` with the others. Their row
     (`row_of_buttons`) **wraps**: three side by side fit English and little else, and under
-    `SCHEMAIC_LOCALE=pseudo-en` the third was cut in half at the modal's edge. The footer's
+    doubled text the third was cut in half at the modal's edge. The footer's
     Import is now the dialog's one `Primary`. Opening does **not** scan: the walk reads the user's home
     directory, and a dialog that goes through it because it was opened is doing something nobody
     asked for. The four sources all append through the app's one `add_import_result`, so a scan
@@ -41662,7 +41656,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic-ui` and `schemaic-app` now draws what a user reads from the catalogue** — but for
   `ExportFormat::label`, whose names are English on purpose (under `overlays.rs`) — so a new word
   a user reads goes in through `tr!` as well, with its German in the same change — a literal is
-  the odd one out now, and the pseudo-locale (below) is what shows one left plain. The app reaches
+  the odd one out now, and under a translated catalogue (`SCHEMAIC_LOCALE=de`, below) it is the
+  one that still reads English. The app reaches
   the one loader through its own `tr!` (the `schemaic-app` entry says why it cannot borrow the UI
   crate's), and the app's messages live in the same two `.ftl` files. Only the GUI is translated:
   CLI, MCP and AI text stays English, as do SQL, persisted names and key names.
@@ -41794,10 +41789,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     MCP server, the AI's prompts, the clipboard's Markdown (`to_markdown`), a selection figure's
     copy (`Figure::copy`) and every pinned English test read the bytes they read before; the view
     marks what it shows. `text::NumberMarks { decimal, group }` is the pair, `NumberMarks::ENGLISH`
-    core's own, and `locale::UiLanguage::number_marks` answers it per language — `Pseudo` keeping
-    English's, its catalogue being English's, and `PseudoEn` likewise.
+    core's own, and `locale::UiLanguage::number_marks` answers it per language.
     **A table, not CLDR (decided 2026-10-20).** The need is two characters per shipped language,
-    which a table answers and `german_swaps_both_marks_and_the_pseudo_locale_keeps_english_s` pins.
+    which a table answers and `german_swaps_both_marks_and_english_keeps_core_s` pins.
     CLDR data would move byte-pinned English under a `cargo update` — French's grouping space
     changed from U+00A0 to U+202F between CLDR releases — and the shortcut through the catalogue
     does not exist: fluent-rs's `NUMBER()` ignores the locale, and a `FluentNumber` renders
@@ -42516,19 +42510,17 @@ Re-introducing the anti-patterns these guard against is a regression:
     runs; nothing takes a reactive dependency on it, which spares every label one for a setting
     changed once. The setting says so where it is changed.
   - **`SCHEMAIC_LOCALE` reaches what Settings cannot**: `SCHEMAIC_LOCALE=de` for a catalogue still
-    being written, `SCHEMAIC_LOCALE=pseudo` for the pseudo-locale, whose accented, lengthened and
-    bracketed text shows every box too narrow for a longer language and every string nobody moved
-    into the catalogue (the one left plain); `SCHEMAIC_LOCALE=pseudo-en` for the doubled one, every
-    label said twice, which is the stronger test of layout — twice as long and still readable, so a
-    clipped box shows which label it cut. The setting and the OS reach only `locale::SHIPPED`,
-    which a language joins when its catalogue is complete.
+    being written — which is also how a box is checked against longer text, and a string nobody
+    moved into the catalogue shows, reading English among the German. The setting and the OS reach
+    only `locale::SHIPPED`, which a language joins when its catalogue is complete. The two
+    pseudo-locales that once did the layout job (`pseudo`, `pseudo-en`) are removed, and the
+    variable now reads either as a key it does not know.
   - **Layout for longer text** — phase 6 of *Interface translation*, landed. A summary that points
-    at the passages holding the detail, not a restatement of them. **The tool is the doubled
-    pseudo-locale**, `SCHEMAIC_LOCALE=pseudo-en` (`UiLanguage::PseudoEn`, the `doubled` transform
-    under `i18n.rs`): twice English's length and still readable, where the accented `pseudo` is
-    only 30–40% longer and too short to stress a box. A string that reads *once* among doubled
-    ones did not come through the catalogue. **The rule: a box beside text either measures its
-    text or ellipsizes it — nothing fixed-width just clips.** The pieces, each recorded where it
+    at the passages holding the detail, not a restatement of them. The phase was worked under a
+    doubled pseudo-locale, every label said twice, since removed; **layout is now checked under
+    the real, longer catalogues** — German running longest — with `SCHEMAIC_LOCALE=de`. **The
+    rule: a box beside text either measures its text or ellipsizes it — nothing fixed-width just
+    clips.** The pieces, each recorded where it
     lives:
     `widgets::ellipsized_text` (under `widgets.rs`) — `min_width(0)` on the text *and* on the
     tooltip wrapper (*`.tooltip()`'s wrapper is the flex item* under *Floem 0.2 gotchas*), the
@@ -43701,7 +43693,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   text's own `min_width(0)` and `text_ellipsis` before it. `widgets::ellipsized_text` shipped
   without the second half in `2cdfbd64`, and Manage Connections' *New*/*Import*/*Export* rows and
   the Properties *Count rows* hint still overflowed in the sandboxed app under
-  `SCHEMAIC_LOCALE=pseudo-en`; `32a2cafb` added it there and on the Live Monitor's status line
+  doubled text; `32a2cafb` added it there and on the Live Monitor's status line
   (`monitor_view.rs`, inside `h_stack((icon, line))`). Prefer `ellipsized_text` to spelling the
   pair by hand. The table designer's index hint and the editor's guard-bar message were two more
   bare spellings, and are now `ellipsized_text`. The guard bar's message also lacked the
@@ -44462,7 +44454,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   constant 170 was right while the labels were English; longer ones drew the panel wider than the
   170 the placement had made room for, and near the editor's right edge it was cut off again — the
   same bug through the other half of the metric, seen in the sandboxed app under
-  `SCHEMAIC_LOCALE=pseudo-en` and gone there after.
+  doubled text and gone there after.
 - **The floem editor owns its document once mounted, and the sync is one-way — writing the `query`
   signal from outside is not merely invisible, it is lost.** Every edit runs
   `query.set(doc.text())` from the editor's `.update` callback (`editor_pane.rs`) — **the one copy

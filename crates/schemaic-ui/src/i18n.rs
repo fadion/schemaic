@@ -19,7 +19,6 @@
 //! the literal it replaced — which several hundred assertions pin, and which
 //! the user would copy out of a message with two invisible characters in it.
 
-use std::borrow::Cow;
 use std::sync::{LazyLock, OnceLock};
 
 use i18n_embed::LanguageLoader;
@@ -214,8 +213,8 @@ pub(crate) fn would_draw(key: &str) -> UiLanguage {
 }
 
 /// The *Language* setting as Settings offers it: follow the system, or one of
-/// the shipped languages. Never the pseudo-locale, and never a language whose
-/// catalogue is not complete (`locale::SHIPPED`).
+/// the shipped languages. Never a language whose catalogue is not complete
+/// (`locale::SHIPPED`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanguageChoice {
     System,
@@ -1537,48 +1536,9 @@ fn configure_from(
     loader
         .load_languages(assets, &[tag])
         .expect("every language's catalogue is embedded");
-    // After the load, not before: a load swaps in fresh bundles, and these are
-    // settings of the bundles.
+    // After the load, not before: a load swaps in fresh bundles, and this is a
+    // setting of the bundles.
     loader.set_use_isolating(false);
-    let transform: Option<fn(&str) -> Cow<'_, str>> = match lang {
-        UiLanguage::Pseudo => Some(pseudo),
-        UiLanguage::PseudoEn => Some(doubled),
-        UiLanguage::EnGb | UiLanguage::De => None,
-    };
-    if let Some(transform) = transform {
-        loader.with_bundles_mut(|bundle| bundle.set_transform(Some(transform)));
-    }
-}
-
-/// The pseudo-locale's transform, applied to every text piece of a message —
-/// never to the values put into it. Accented and lengthened by
-/// `fluent-pseudo` (doubled vowels, roughly 30–40% longer, which is the length
-/// German and Finnish run to), then bracketed, so a box that cuts either end
-/// shows which end it cut.
-fn pseudo(s: &str) -> Cow<'_, str> {
-    if s.trim().is_empty() {
-        return Cow::Borrowed(s);
-    }
-    Cow::Owned(format!("[{}]", fluent_pseudo::transform(s, false, true)))
-}
-
-/// The doubled pseudo-locale's transform: a text piece's words, from its first
-/// letter to its last, said twice — `System (` becomes `System System (`, so
-/// the parenthesis still opens on the value after it. A piece with no letter
-/// (`)`, ` — `) is left alone. Values are never doubled: Fluent hands this the
-/// text pieces only, and a message wrapped in another would otherwise double
-/// again at each level.
-fn doubled(s: &str) -> Cow<'_, str> {
-    let Some(start) = s.find(char::is_alphabetic) else {
-        return Cow::Borrowed(s);
-    };
-    let (end, last) = s
-        .char_indices()
-        .rfind(|(_, c)| c.is_alphabetic())
-        .expect("a piece with a first letter has a last one");
-    let end = end + last.len_utf8();
-    let words = &s[start..end];
-    Cow::Owned(format!("{}{words} {words}{}", &s[..start], &s[end..]))
 }
 
 #[cfg(test)]
@@ -2506,20 +2466,11 @@ mod tests {
 
     /// **Every language's catalogue folder is embedded.** i18n-embed panics on
     /// a language with none, so a `UiLanguage` added ahead of its folder would
-    /// fail at launch. The `match` makes a new variant a compile error here
-    /// until it joins the list.
+    /// fail at launch. [`UiLanguage::ALL`] is every variant, which core's
+    /// `all_names_every_language_once` holds to.
     #[test]
     fn every_language_s_catalogue_is_embedded() {
-        let all = [
-            UiLanguage::EnGb,
-            UiLanguage::De,
-            UiLanguage::Pseudo,
-            UiLanguage::PseudoEn,
-        ];
-        for lang in all {
-            match lang {
-                UiLanguage::EnGb | UiLanguage::De | UiLanguage::Pseudo | UiLanguage::PseudoEn => {}
-            }
+        for &lang in UiLanguage::ALL {
             let file = format!("{}/schemaic.ftl", lang.catalogue());
             assert!(Catalogues::get(&file).is_some(), "{lang:?}: no {file}");
         }
@@ -2543,56 +2494,30 @@ mod tests {
         }
     }
 
-    /// The pseudo-locale changes every text piece — so a string left as a
-    /// literal is the one that reads plain — and leaves the values put into a
-    /// message alone, since those are data and not the interface's words.
-    #[test]
-    fn the_pseudo_locale_marks_the_words_and_spares_the_values() {
-        let l = loader(UiLanguage::Pseudo);
-        let word = l.get("settings-language");
-        assert!(word.starts_with('[') && word.ends_with(']'), "{word}");
-        assert_ne!(word, "Language");
-        assert!(
-            word.chars().count() > "Language".chars().count() + 2,
-            "longer: {word}"
-        );
-        assert!(
-            system(&l, "English").contains("English"),
-            "the value is spared"
-        );
-        assert!(
-            !system(&l, "English").contains("System"),
-            "the words are not"
-        );
-    }
-
     /// Settings offers the system and the shipped catalogues, and reads a key
-    /// it does not offer as the system — never as the pseudo-locale, and never
-    /// as a catalogue still being written.
+    /// it does not offer as the system — never as a catalogue still being
+    /// written, nor as a retired pseudo-locale's.
     #[test]
     fn the_language_setting_offers_only_what_ships() {
         let options = LanguageChoice::options();
         assert_eq!(options[0], LanguageChoice::System);
         assert!(options.contains(&LanguageChoice::Fixed(UiLanguage::EnGb)));
-        assert!(!options.contains(&LanguageChoice::Fixed(UiLanguage::Pseudo)));
-        assert!(!options.contains(&LanguageChoice::Fixed(UiLanguage::PseudoEn)));
         for o in &options {
             assert_eq!(LanguageChoice::from_key(o.key()), *o);
         }
         assert_eq!(LanguageChoice::from_key("pseudo"), LanguageChoice::System);
-        assert_eq!(
-            LanguageChoice::from_key("pseudo-en"),
-            LanguageChoice::System
-        );
         assert_eq!(LanguageChoice::from_key("xx"), LanguageChoice::System);
-        assert_eq!(
-            LanguageChoice::from_key("de"),
-            if locale::SHIPPED.contains(&UiLanguage::De) {
-                LanguageChoice::Fixed(UiLanguage::De)
-            } else {
-                LanguageChoice::System
-            }
-        );
+        for &lang in UiLanguage::ALL {
+            assert_eq!(
+                LanguageChoice::from_key(lang.key()),
+                if locale::SHIPPED.contains(&lang) {
+                    LanguageChoice::Fixed(lang)
+                } else {
+                    LanguageChoice::System
+                },
+                "{lang:?}"
+            );
+        }
     }
 
     /// Without `init` (every test), every choice draws English — so none of
@@ -2919,38 +2844,6 @@ mod tests {
                 )
             );
         }
-    }
-
-    #[test]
-    fn pseudo_leaves_whitespace_alone() {
-        assert_eq!(pseudo(" "), " ");
-        assert_eq!(pseudo(""), "");
-    }
-
-    /// The doubled locale is still English, twice: the words repeat, and the
-    /// punctuation and spacing around them stay where a placeable expects them.
-    #[test]
-    fn doubled_repeats_the_words_inside_their_punctuation() {
-        assert_eq!(
-            doubled("Manage connections"),
-            "Manage connections Manage connections"
-        );
-        assert_eq!(doubled("System ("), "System System (");
-        assert_eq!(doubled(" rows in "), " rows in rows in ");
-        assert_eq!(doubled("Saved. Restart?"), "Saved. Restart Saved. Restart?");
-        assert_eq!(doubled(")"), ")");
-        assert_eq!(doubled(" — "), " — ");
-        assert_eq!(doubled(""), "");
-    }
-
-    /// Through the loader: every message reads twice, and a value put into one
-    /// reads once — it is data, and doubling it would double again each time
-    /// one message is wrapped in another.
-    #[test]
-    fn the_doubled_locale_repeats_the_words_and_spares_the_values() {
-        let l = loader(UiLanguage::PseudoEn);
-        assert_eq!(l.get("settings-language"), "Language Language");
-        assert_eq!(system(&l, "English"), "System System (English)");
     }
 
     /// **[`tr_static!`] is the message, read once per site** — the English a

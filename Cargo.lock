@@ -2110,16 +2110,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fluent-pseudo"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f1b5259b7f28e4f6a03e826c8305e15309cd90fc3a786447407c001786bf2e"
-dependencies = [
- "once_cell",
- "regex",
-]
-
-[[package]]
 name = "fluent-syntax"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5489,7 +5479,6 @@ version = "0.35.0"
 dependencies = [
  "floem",
  "floem_renderer",
- "fluent-pseudo",
  "fluent-syntax",
  "getrandom 0.3.4",
  "i18n-embed",

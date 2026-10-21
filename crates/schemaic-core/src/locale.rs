@@ -8,8 +8,8 @@
 //!
 //! **Three sources, in order:** the `SCHEMAIC_LOCALE` environment variable, the
 //! *Language* setting, and the operating system's preferred languages. The
-//! variable is for development — it reaches a catalogue that is not shipped yet,
-//! and the pseudo-locale — so it is honoured whatever it names. The setting and
+//! variable is for development — it reaches a catalogue that is not shipped yet —
+//! so it is honoured whatever it names. The setting and
 //! the OS reach only [`SHIPPED`] catalogues: a language whose catalogue is half
 //! written would draw a half-translated interface for everyone whose system is
 //! set to it, which is worse than English.
@@ -26,16 +26,6 @@ pub enum UiLanguage {
     EnGb,
     /// German.
     De,
-    /// The pseudo-locale: the English catalogue with every letter accented,
-    /// ~40% longer and bracketed, so one run shows every box too narrow for a
-    /// longer language and every string nobody moved into the catalogue (it is
-    /// the one left plain). A development tool, never offered in Settings.
-    Pseudo,
-    /// The doubled pseudo-locale: the English catalogue with every message's
-    /// words said twice — *Manage connections Manage connections*. Twice the
-    /// length, past even German's, and still readable, so a box too narrow
-    /// shows which label it cut. A development tool, never offered in Settings.
-    PseudoEn,
 }
 
 /// The catalogues a user may choose, or be given by their OS. A language joins
@@ -46,22 +36,19 @@ pub const SHIPPED: &[UiLanguage] = &[UiLanguage::EnGb];
 pub const SYSTEM_KEY: &str = "system";
 
 impl UiLanguage {
-    /// The persisted key — also what `SCHEMAIC_LOCALE` takes.
+    /// Every language, shipped or not.
+    pub const ALL: &'static [UiLanguage] = &[UiLanguage::EnGb, UiLanguage::De];
+
+    /// The persisted key — also what `SCHEMAIC_LOCALE` takes. The catalogue's
+    /// tag, every language having a catalogue of its own.
     pub fn key(self) -> &'static str {
-        match self {
-            UiLanguage::EnGb => "en-GB",
-            UiLanguage::De => "de",
-            UiLanguage::Pseudo => "pseudo",
-            UiLanguage::PseudoEn => "pseudo-en",
-        }
+        self.catalogue()
     }
 
-    /// The catalogue's language tag — the directory its `.ftl` lives in. The
-    /// pseudo-locales are the English catalogue transformed, so they have none
-    /// of their own.
+    /// The catalogue's language tag — the directory its `.ftl` lives in.
     pub fn catalogue(self) -> &'static str {
         match self {
-            UiLanguage::EnGb | UiLanguage::Pseudo | UiLanguage::PseudoEn => "en-GB",
+            UiLanguage::EnGb => "en-GB",
             UiLanguage::De => "de",
         }
     }
@@ -73,18 +60,13 @@ impl UiLanguage {
         match self {
             UiLanguage::EnGb => "English",
             UiLanguage::De => "Deutsch",
-            UiLanguage::Pseudo => "Pseudo",
-            UiLanguage::PseudoEn => "Pseudo English",
         }
     }
 
-    /// The marks the language writes a figure with. The pseudo-locales keep
-    /// English's: they test the words' length, and their catalogue is English's.
+    /// The marks the language writes a figure with.
     pub fn number_marks(self) -> crate::text::NumberMarks {
         match self {
-            UiLanguage::EnGb | UiLanguage::Pseudo | UiLanguage::PseudoEn => {
-                crate::text::NumberMarks::ENGLISH
-            }
+            UiLanguage::EnGb => crate::text::NumberMarks::ENGLISH,
             UiLanguage::De => crate::text::NumberMarks {
                 decimal: ',',
                 group: '.',
@@ -96,16 +78,11 @@ impl UiLanguage {
     /// region on a language the app has only one of is ignored (`de-AT` is
     /// German; `en-US` is the English there is).
     pub fn from_key(key: &str) -> Option<Self> {
-        // Before the region is dropped: `pseudo-en` is not `pseudo` in a region.
-        if key.replace('_', "-").eq_ignore_ascii_case("pseudo-en") {
-            return Some(UiLanguage::PseudoEn);
-        }
         // The primary subtag: `de-AT`, `de_AT` and POSIX's `de_AT.UTF-8` alike.
         let primary = key.split(['-', '_', '.', '@']).next().unwrap_or("");
         match primary.to_ascii_lowercase().as_str() {
             "en" => Some(UiLanguage::EnGb),
             "de" => Some(UiLanguage::De),
-            "pseudo" => Some(UiLanguage::Pseudo),
             _ => None,
         }
     }
@@ -150,11 +127,9 @@ mod tests {
     }
 
     #[test]
-    fn german_swaps_both_marks_and_the_pseudo_locale_keeps_english_s() {
+    fn german_swaps_both_marks_and_english_keeps_core_s() {
         use crate::text::NumberMarks;
         assert_eq!(UiLanguage::EnGb.number_marks(), NumberMarks::ENGLISH);
-        assert_eq!(UiLanguage::Pseudo.number_marks(), NumberMarks::ENGLISH);
-        assert_eq!(UiLanguage::PseudoEn.number_marks(), NumberMarks::ENGLISH);
         assert_eq!(
             UiLanguage::De.number_marks(),
             NumberMarks {
@@ -164,42 +139,46 @@ mod tests {
         );
     }
 
+    /// [`UiLanguage::ALL`] is every variant: the `match` makes a new one a
+    /// compile error here until it joins the list.
+    #[test]
+    fn all_names_every_language_once() {
+        for lang in UiLanguage::ALL {
+            match lang {
+                UiLanguage::EnGb | UiLanguage::De => {}
+            }
+            let once = UiLanguage::ALL.iter().filter(|l| *l == lang).count();
+            assert_eq!(once, 1, "{lang:?}");
+        }
+        assert_eq!(UiLanguage::ALL.len(), 2);
+    }
+
     #[test]
     fn keys_round_trip_and_tolerate_case_and_region() {
-        for lang in [
-            UiLanguage::EnGb,
-            UiLanguage::De,
-            UiLanguage::Pseudo,
-            UiLanguage::PseudoEn,
-        ] {
+        for &lang in UiLanguage::ALL {
             assert_eq!(UiLanguage::from_key(lang.key()), Some(lang));
         }
         assert_eq!(UiLanguage::from_key("EN-gb"), Some(UiLanguage::EnGb));
         assert_eq!(UiLanguage::from_key("en-US"), Some(UiLanguage::EnGb));
         assert_eq!(UiLanguage::from_key("en_US.UTF-8"), Some(UiLanguage::EnGb));
         assert_eq!(UiLanguage::from_key("de-AT"), Some(UiLanguage::De));
-        assert_eq!(UiLanguage::from_key("Pseudo"), Some(UiLanguage::Pseudo));
-        // The region is not ignored here: `pseudo-en` is a locale of its own,
-        // not the accented one with a region on it.
-        assert_eq!(
-            UiLanguage::from_key("Pseudo-EN"),
-            Some(UiLanguage::PseudoEn)
-        );
-        assert_eq!(
-            UiLanguage::from_key("pseudo_en"),
-            Some(UiLanguage::PseudoEn)
-        );
-        assert_eq!(UiLanguage::from_key("fr-FR"), None);
+        // The pseudo-locales are gone; a setting or variable naming one is
+        // a language the app does not know.
+        assert_eq!(UiLanguage::from_key("pseudo"), None);
+        assert_eq!(UiLanguage::from_key("pseudo-en"), None);
+        assert_eq!(UiLanguage::from_key("ja-JP"), None);
         assert_eq!(UiLanguage::from_key(""), None);
         assert_eq!(UiLanguage::from_key(SYSTEM_KEY), None);
     }
 
     /// The variable is a developer's, so it reaches what Settings cannot: a
-    /// catalogue not shipped yet, and the pseudo-locale.
+    /// catalogue not shipped yet.
     #[test]
     fn the_environment_wins_and_reaches_unshipped_catalogues() {
-        let de = os(&["de-DE"]);
-        assert_eq!(resolve(Some("pseudo"), "en-GB", &de), UiLanguage::Pseudo);
+        assert_eq!(
+            resolve(Some("de"), "en-GB", &os(&["en-GB"])),
+            UiLanguage::De
+        );
         assert_eq!(
             resolve(Some("de"), "en-GB", &os(&["en-GB"])),
             UiLanguage::De
@@ -237,18 +216,14 @@ mod tests {
         assert_eq!(resolve(None, "xx", &os(&["en-GB"])), UiLanguage::EnGb);
     }
 
-    /// Never offered, so never honoured from the setting: a hand-edited
-    /// settings file is not a way into a developer tool.
+    /// A settings file a pseudo-locale build wrote reads as the system's
+    /// choice, and so does the variable naming one.
     #[test]
-    fn the_pseudo_locale_is_the_environment_s_alone() {
+    fn a_retired_pseudo_locale_key_is_the_system_s_choice() {
         assert_eq!(resolve(None, "pseudo", &os(&["en-GB"])), UiLanguage::EnGb);
         assert_eq!(
-            resolve(None, "pseudo-en", &os(&["en-GB"])),
-            UiLanguage::EnGb
-        );
-        assert_eq!(
             resolve(Some("pseudo-en"), "en-GB", &os(&["en-GB"])),
-            UiLanguage::PseudoEn
+            UiLanguage::EnGb
         );
     }
 
@@ -261,11 +236,16 @@ mod tests {
         assert_eq!(pick(&["de-DE", "en-US"]), UiLanguage::De);
         assert_eq!(pick(&["en-US", "de-DE"]), UiLanguage::EnGb);
         assert_eq!(
-            pick(&["fr-FR", "de-CH"]),
+            pick(&["ja-JP", "de-CH"]),
             UiLanguage::De,
             "an unknown one is passed over"
         );
-        assert_eq!(pick(&["fr-FR"]), UiLanguage::EnGb);
+        assert_eq!(pick(&["ja-JP"]), UiLanguage::EnGb);
+        assert_eq!(
+            pick(&["fr-FR"]),
+            UiLanguage::EnGb,
+            "nor is a known one that has not shipped"
+        );
         assert_eq!(pick(&[]), UiLanguage::EnGb);
     }
 

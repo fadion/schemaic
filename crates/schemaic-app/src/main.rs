@@ -2168,8 +2168,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // **The interface language, before any view is built** — a label is built
     // with its text and never re-reads it, so a language chosen after the first
     // view would leave that view in English. Read once: the setting applies on
-    // the next start. The environment variable is a developer's way into the
-    // pseudo-locale and unshipped catalogues (`schemaic_core::locale`).
+    // the next start. The environment variable is a developer's way into
+    // unshipped catalogues (`schemaic_core::locale`).
     let ui_language_at_launch = schemaic_ui::i18n::init(
         std::env::var("SCHEMAIC_LOCALE").ok(),
         sys_locale::get_locales().collect(),

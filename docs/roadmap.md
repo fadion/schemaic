@@ -17,8 +17,7 @@ reached through `SCHEMAIC_LOCALE=de`, and figures follow the language's marks (*
 interface's marks* there). The prose built below the views — in `schemaic-core`, `schemaic-db`
 and `schemaic-ai` — is a typed value the window words, and its plurals are whole messages (the
 same section, *A typed message*), and the layout makes room for text longer than English's —
-found with the doubled pseudo-locale, `SCHEMAIC_LOCALE=pseudo-en` (*Layout for longer text*
-there). Every phase has landed; what is left is the decision to ship German (`locale::SHIPPED`),
+found with a doubled-English pseudo-locale, since removed (*Layout for longer text* there). Every phase has landed; what is left is the decision to ship German (`locale::SHIPPED`),
 and the right-to-left and CJK questions below.
 
 ### Decided
@@ -56,8 +55,7 @@ and the right-to-left and CJK questions below.
   *The language change takes effect the next time Schemaic starts.*
 - **Settings offers a language only once its catalogue is complete** (`locale::SHIPPED`), and
   so does the OS: a German system gets English until German ships, never a half-German
-  interface. While a catalogue is being written it is reached with `SCHEMAIC_LOCALE=de`, as the
-  pseudo-locale is with `SCHEMAIC_LOCALE=pseudo`.
+  interface. While a catalogue is being written it is reached with `SCHEMAIC_LOCALE=de`.
 
 ### Never translated
 
