@@ -630,7 +630,7 @@ pub fn matches_query_with<'w>(
     }
     contains_ignore_ascii_case(&s.id.to_string(), q)
         || contains_ignore_ascii_case(&s.who(), q)
-        || contains_ignore_ascii_case(state_word(s.state), q)
+        || word_contains(state_word(s.state), q)
         || s.database
             .as_deref()
             .is_some_and(|d| contains_ignore_ascii_case(d, q))
@@ -1307,16 +1307,32 @@ pub fn prepare_locks(locks: &mut Vec<LockInfo>) -> bool {
 }
 
 /// Does the view's search find this lock? By what the row shows — the
-/// session, the object, the kind and the mode — and `waiting` for a lock not
-/// yet granted.
+/// session, the object, the kind and the mode — and, for a lock not yet
+/// granted, the verb its row reads: "waits for" in English. It matched
+/// `waiting` once, a word no row shows, so typing what the row said hid it.
 pub fn lock_matches(l: &LockInfo, query: &str) -> bool {
+    lock_matches_with(l, query, "waits for")
+}
+
+/// [`lock_matches`] against the verb a waiting lock's row shows —
+/// `waits_word` is the interface's, folded as a word in any script is
+/// ([`word_contains`]).
+pub fn lock_matches_with(l: &LockInfo, query: &str, waits_word: &str) -> bool {
     let q = query.trim();
     q.is_empty()
         || contains_ignore_ascii_case(&l.session.to_string(), q)
         || contains_ignore_ascii_case(&l.object, q)
         || contains_ignore_ascii_case(&l.kind, q)
         || contains_ignore_ascii_case(&l.mode, q)
-        || (!l.granted && contains_ignore_ascii_case("waiting", q))
+        || (!l.granted && word_contains(waits_word, q))
+}
+
+/// Does `word` — the interface's, so possibly not ASCII — contain `q`,
+/// ignoring case in any script? `LÄUFT` finds `Läuft`, which ASCII folding
+/// compared byte for byte and missed. A server's own text (a name, a mode)
+/// keeps ASCII folding; this is for the words the interface draws.
+fn word_contains(word: &str, q: &str) -> bool {
+    crate::text_ops::fold_for_search(word).contains(&crate::text_ops::fold_for_search(q))
 }
 
 /// Which of the two things "kill" can mean.
@@ -2106,6 +2122,17 @@ mod tests {
         assert!(matches_query_with(&s, "läuft", german));
         assert!(!matches_query_with(&s, "running", german));
         assert!(matches_query(&s, "running"));
+    }
+
+    /// **And folds its case as a word in any script does**: `LÄUFT` finds
+    /// `Läuft`. ASCII folding compared `Ä` with `ä` byte for byte, and the
+    /// lower-case search above passed only because `L` is ASCII.
+    #[test]
+    fn a_state_word_is_found_in_any_case() {
+        let s = sess(7, SessionState::Running, 0.0);
+        let german = |_: SessionState| "Läuft";
+        assert!(matches_query_with(&s, "LÄUFT", german));
+        assert!(matches_query_with(&s, "läUFT", german));
     }
 
     /// **The quiet poll asks nothing.** A wait graph has a waiter in it only
@@ -3252,15 +3279,30 @@ mod tests {
     }
 
     /// The search reads what the row shows: the session, the object, the
-    /// lock's kind and mode, and whether it waits.
+    /// lock's kind and mode, and the verb a waiting lock's row says. That
+    /// verb is "waits for"; the search matched `waiting`, which no row shows,
+    /// so typing what the row said hid it.
     #[test]
     fn a_lock_is_found_by_what_its_row_says() {
         let l = lock(42, "shop.orders (PRIMARY) 7", false, &[5]);
-        for q in ["42", "ORDERS", "primary", "record", "x", "waiting", ""] {
+        for q in [
+            "42",
+            "ORDERS",
+            "primary",
+            "record",
+            "x",
+            "waits",
+            "Waits for",
+            "",
+        ] {
             assert!(lock_matches(&l, q), "{q}");
         }
         assert!(!lock_matches(&l, "items"));
-        assert!(!lock_matches(&lock(1, "t", true, &[]), "waiting"));
+        assert!(!lock_matches(&l, "waiting"), "a word no row shows");
+        assert!(!lock_matches(&lock(1, "t", true, &[]), "waits"));
+        // The interface's verb, in any case.
+        assert!(lock_matches_with(&l, "WARTET", "wartet auf"));
+        assert!(!lock_matches_with(&l, "waits", "wartet auf"));
         assert_eq!(parse_id_list("5,9, 12"), [5, 9, 12]);
         assert_eq!(parse_id_list("{5,9}"), [5, 9]);
         assert!(parse_id_list("").is_empty());

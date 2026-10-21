@@ -10521,8 +10521,12 @@ existing prose was left alone.
     not spend the cap; and a cut at `MAX_LOCKS` whose `bool` is said
     rather than hidden. The cap matters more here than
     for sessions, since an `UPDATE` of a million rows holds a record lock on each on MySQL.
-    `lock_matches` searches what the row shows — session, object, kind and mode — and the word
-    `waiting` for a lock not yet granted. `parse_id_list` is `parse_pid_array` under the name a lock
+    `lock_matches` searches what the row shows — session, object, kind and mode — and, for a lock
+    not yet granted, the verb its row reads. `lock_matches_with` takes that verb, so the view
+    passes `activity-lock-waits-for` ("waits for", German *wartet auf*). It matched `waiting` once,
+    a word no row shows, so typing what the row said hid it. The verb and the sessions' state word
+    are folded as words in any script (`word_contains`, over `text_ops::fold_for_search`), so
+    `LÄUFT` finds *Läuft*. A server's own text keeps ASCII folding. `parse_id_list` is `parse_pid_array` under the name a lock
     caller asks for, reading both PostgreSQL's array literal (`{5,9}`) and MySQL's `GROUP_CONCAT`
     (`5,9`). The pins are `waiting_locks_lead_and_their_blockers_are_distinct` and
     `a_lock_is_found_by_what_its_row_says`; they arrived with the functions they test, so there was
@@ -27655,7 +27659,7 @@ existing prose was left alone.
     when they could have been cut), then
     "list capped" — and on `contended_only` a line saying the server lists only locks waited for or
     holding up a wait, so MariaDB's short list does not read as a lock-free server. `locks_list`
-    filters by `lock_matches`, draws `render_slice`'s front for the sessions list's reason and counts
+    filters by `lock_matches_with` and the rows' own `activity-lock-waits-for`, draws `render_slice`'s front for the sessions list's reason and counts
     the rest, and says which kind of empty it is: no match, no lock waits (where only contended
     locks are listed), or no other session holding a lock. A connection that could not be reached
     at all fails `refresh_activity` before it asks for either list; it reports on the *sessions*

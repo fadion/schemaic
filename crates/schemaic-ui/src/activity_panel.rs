@@ -1002,7 +1002,7 @@ fn locks_header(list: &activity::LockList) -> floem::AnyView {
         .into_any()
 }
 
-/// The *Locks* list: the locks [`activity::lock_matches`] the search, the
+/// The *Locks* list: the locks [`activity::lock_matches_with`] the search, the
 /// front [`activity::RENDER_CAP`] of them as rows for the sessions list's
 /// reason, the rest counted.
 fn locks_list(
@@ -1014,10 +1014,12 @@ fn locks_list(
     read_only: floem::reactive::Memo<bool>,
     dialect: floem::reactive::Memo<schemaic_core::intel::SqlDialect>,
 ) -> floem::AnyView {
+    // Matched against the verb the rows draw, in the interface's language.
+    let waits = tr!("activity-lock-waits-for");
     let matched: Vec<&activity::LockInfo> = list
         .locks
         .iter()
-        .filter(|l| activity::lock_matches(l, q))
+        .filter(|l| activity::lock_matches_with(l, q, &waits))
         .collect();
     if matched.is_empty() {
         return list_message(
