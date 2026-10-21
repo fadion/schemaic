@@ -5721,13 +5721,14 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         cells.push(
                             highlighted_primary(&item.primary, &item.match_term, live).into_any(),
                         );
+                        // Ellipsized like the primary: a long secondary — Toggle
+                        // Panel's list of panels — ran off the row's right edge.
                         cells.push(
-                            text(item.secondary.clone())
-                                .style(move |s| {
-                                    s.color(fade(theme::text_muted()))
-                                        .font_size(theme::scaled_font(14.0))
-                                })
-                                .into_any(),
+                            crate::widgets::ellipsized_text(item.secondary.clone(), move |s| {
+                                s.color(fade(theme::text_muted()))
+                                    .font_size(theme::scaled_font(14.0))
+                            })
+                            .into_any(),
                         );
                         // Trailing keycap and history marker, pushed to the far
                         // right by a single spacer — two spacers would split the
