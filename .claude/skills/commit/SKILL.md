@@ -78,10 +78,12 @@ broken work "so it isn't lost" — that's what the working tree is already for.
 A docs-only or comment-only change may skip the bar. Say that you skipped it and
 why, rather than silently reporting a commit as verified.
 
-**One docs file is not exempt: `docs/architecture.md`.** `core/tests/doc_coverage.rs`
-asserts that every `crates/schemaic-core/src/*.rs` module is named somewhere in it, so
-an edit that drops or renames a module's mention turns the suite red — the one case
-where a change with no `.rs` in it can. Run the bar for any edit to that file.
+**One set of docs files is not exempt: the architecture document** — `docs/architecture.md`
+and everything under `docs/architecture/`. `core/tests/doc_coverage.rs` asserts that every
+`src/*.rs` module in the workspace is named somewhere in them, and that the index links every
+file under `docs/architecture/`, so an edit that drops or renames a module's mention, or adds a
+file without its link, turns the suite red — the one case where a change with no `.rs` in it
+can. Run the bar for any edit to those files.
 
 ## Reviewing on request
 
@@ -133,8 +135,8 @@ this brief:
 > Review the commits in `<range>` as one pass — no slicing, no ledger. Read
 > `git diff <range>` in full, plus enough surrounding code to judge it. Focus on
 > three things, in order: **correctness bugs** (wrong conditions, missing guards,
-> broken callers, disposal and focus hazards), **`docs/architecture.md`'s architecture
-> invariants** for the surfaces the range touched, and **data safety** (writes,
+> broken callers, disposal and focus hazards), **the architecture
+> invariants** (`docs/architecture/invariants.md`) for the surfaces the range touched, and **data safety** (writes,
 > DDL, secrets, quoting) where it touches them. Report findings inline, most
 > severe first, each with the concrete scenario in which the code misbehaves.
 > Don't fix anything.

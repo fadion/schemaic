@@ -1,6 +1,8 @@
-//! Guard: every source module is named somewhere in `docs/architecture.md`.
+//! Guard: every source module is named somewhere in the architecture document —
+//! the index `docs/architecture.md` and the files under `docs/architecture/` it
+//! links — and the index links every one of those files.
 //!
-//! That file is this project's architecture document — every contributor and
+//! That is this project's architecture document — every contributor and
 //! every AI session reads it as the map. A review found 19 modules missing from
 //! it, ~12% of the codebase, including the whole ER-diagram subsystem: an
 //! undocumented module is where the invariants quietly stop applying, which is
@@ -85,29 +87,64 @@ fn repo_root() -> PathBuf {
         .expect("workspace root")
 }
 
-/// Every `.rs` file under `dir`, recursively.
-fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Every file with extension `ext` under `dir`, recursively.
+fn files_with(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            sources(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
+            files_with(&path, ext, out);
+        } else if path.extension().is_some_and(|e| e == ext) {
             out.push(path);
         }
     }
 }
 
+/// Every `.rs` file under `dir`, recursively.
+fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    files_with(dir, "rs", out);
+}
+
+/// The files under `docs/architecture/`, as the index links them —
+/// `architecture/core/ddl.md`, forward slashes on every platform.
+fn architecture_files(docs: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    files_with(&docs.join("architecture"), "md", &mut files);
+    let mut rel: Vec<String> = files
+        .iter()
+        .filter_map(|p| p.strip_prefix(docs).ok())
+        .map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    rel.sort_unstable();
+    rel
+}
+
+/// Does the index link `rel` (`architecture/core/ddl.md`) as a Markdown target?
+fn links(index: &str, rel: &str) -> bool {
+    index.contains(&format!("]({rel})"))
+}
+
 #[test]
 fn every_module_is_named_in_the_architecture_doc() {
     let root = repo_root();
-    let Ok(doc) = fs::read_to_string(root.join("docs").join("architecture.md")) else {
+    let docs = root.join("docs");
+    let Ok(mut doc) = fs::read_to_string(docs.join("architecture.md")) else {
         // Checked out without the doc (or built from a package) — nothing to
         // guard, and failing here would be about the checkout, not the code.
         return;
     };
+    // The index names little itself; the entries are in the files it links.
+    for rel in architecture_files(&docs) {
+        doc.push('\n');
+        doc.push_str(&fs::read_to_string(docs.join(&rel)).expect("architecture file"));
+    }
 
     // `src/` only — a test file documents itself, and the map is about the
     // shipped modules. `(crate short name, basename)` rather than the basename
@@ -157,10 +194,42 @@ fn every_module_is_named_in_the_architecture_doc() {
 
     assert!(
         missing.is_empty(),
-        "these modules are not named anywhere in docs/architecture.md — add them \
-         to its Crates section at the same altitude as their peers: {}",
+        "these modules are not named anywhere in docs/architecture.md or \
+         docs/architecture/ — give each its own docs/architecture/<crate>/<module>.md, \
+         linked from the index beside its nearest relative: {}",
         missing.join(", ")
     );
+}
+
+/// **The index cannot fall behind the directory.** A file under
+/// `docs/architecture/` that `docs/architecture.md` does not link is one nobody
+/// reading the index will open — the same failure as an unnamed module, one
+/// level up.
+#[test]
+fn every_architecture_file_is_linked_from_the_index() {
+    let docs = repo_root().join("docs");
+    let Ok(index) = fs::read_to_string(docs.join("architecture.md")) else {
+        return;
+    };
+    let files = architecture_files(&docs);
+    assert!(!files.is_empty(), "found nothing under docs/architecture/");
+    let unlinked: Vec<&String> = files.iter().filter(|rel| !links(&index, rel)).collect();
+    assert!(
+        unlinked.is_empty(),
+        "docs/architecture.md does not link these files — add each to its crate's \
+         line or the cross-cutting table: {unlinked:?}"
+    );
+}
+
+#[test]
+fn a_link_is_a_markdown_target_not_a_mention() {
+    let index = "- **`schemaic-core`** — [ddl](architecture/core/ddl.md) · see `architecture/core/intel.md`";
+    assert!(links(index, "architecture/core/ddl.md"));
+    assert!(
+        !links(index, "architecture/core/intel.md"),
+        "a path in prose is not a link"
+    );
+    assert!(!links(index, "architecture/ddl.md"));
 }
 
 /// **The check's own decision, asserted without the filesystem.** The guard

@@ -84,7 +84,7 @@ You are running pass <ID> of an in-progress codebase review of Schemaic. Read th
   §4 the per-pass protocol, §5 the ledger format and its integrity rules. Follow them exactly.
 - .claude/skills/codebase-review/SKILL.md — "Project-specific notes for reviewers". The
   deliberate-conservatism traps listed there are the most common source of wrong findings.
-- docs/architecture.md — the architecture invariants and Floem gotchas. L2 is the highest-yield lens here.
+- docs/architecture/invariants.md and docs/architecture/floem-gotchas.md — the architecture invariants and Floem gotchas (docs/architecture.md indexes the rest). L2 is the highest-yield lens here.
 - review/index.md — every finding raised so far, one line each, plus the rejected candidates.
   Check it before writing anything: if your candidate is already there, it's a duplicate (say so
   in your report instead of re-raising it) or already rejected (don't re-raise it at all).

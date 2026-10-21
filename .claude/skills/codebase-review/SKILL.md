@@ -15,7 +15,7 @@ gate, the ledger format and its integrity rules, the orchestration contract. **R
 Phase 2.** Both skills follow it, so it's the one place the method lives.
 
 **This skill is Schemaic-specific.** The parts below that name cargo commands, the invariants in
-`docs/architecture.md`, this repo's traps and its scope decisions are the highest-yield content in
+`docs/architecture/invariants.md`, this repo's traps and its scope decisions are the highest-yield content in
 it — a generic reviewer misses all of it. Copying this to another project means copying the whole
 `.claude/skills/codebase-review*` pair and rewriting those sections for that repo; `reference.md`
 transfers unchanged.
@@ -90,7 +90,7 @@ the gap as covered.
 ## Phase 1 — generate the plan
 
 Inventory first: crates, line counts per file, test counts per file, and
-`docs/architecture.md`'s architecture notes. Then cut slices.
+the architecture index (`docs/architecture.md`, linking `docs/architecture/`). Then cut slices.
 
 **Slicing heuristics** — the part that makes or breaks the review:
 
@@ -168,7 +168,7 @@ Standard shapes in reference §2. What makes each concrete here:
 
 | # | Sweep | This codebase |
 | --- | --- | --- |
-| **A1** | Invariant conformance | Walk `docs/architecture.md`'s *Architecture invariants* and *Floem 0.2 gotchas* one at a time, enumerating **every** site each governs: (a) every SQL scan → through `sql::skip_noncode`, with the right `SqlDialect`? (b) every `Db::` method + `Session` use → one-connection-per-op except manual-tx; do read-only side channels stay off the pinned connection? (c) every secret read/write → through `core::secrets` + the keyring store, never `persist::save_connections` directly? (d) every `ALTER`/`CREATE`/`DROP` string → originates in `ddl::emit`, terminates at `ddl_preview`? (e) every `create_child()`/`dispose()` → deferred? (f) every `Color` captured by value into a `.style(` closure. (g) `>= 0x80` word-byte handling in every identifier scanner. |
+| **A1** | Invariant conformance | Walk `docs/architecture/invariants.md` and `docs/architecture/floem-gotchas.md` one at a time, enumerating **every** site each governs: (a) every SQL scan → through `sql::skip_noncode`, with the right `SqlDialect`? (b) every `Db::` method + `Session` use → one-connection-per-op except manual-tx; do read-only side channels stay off the pinned connection? (c) every secret read/write → through `core::secrets` + the keyring store, never `persist::save_connections` directly? (d) every `ALTER`/`CREATE`/`DROP` string → originates in `ddl::emit`, terminates at `ddl_preview`? (e) every `create_child()`/`dispose()` → deferred? (f) every `Color` captured by value into a `.style(` closure. (g) `>= 0x80` word-byte handling in every identifier scanner. |
 | **A2** | Architecture & boundaries | Crate dep graph; what leaks from `schemaic-db` up into `schemaic-ui`; the `Ui` bundles vs. what closures actually capture; the god modules (`intel.rs`, `grid.rs`, `ui/lib.rs`, `main.rs`) — still cohesive, or landfills? Are `SqlDialect` / `SecretStore` / `RowSource` / `Catalog` real seams, or is dialect logic still scattered? |
 | **A3** | Security & data safety | Secrets end to end (keyring ↔ JSON ↔ memory ↔ subprocess env ↔ logs); every identifier/literal reaching SQL text — is anything bypassing `export::ident_sql`/`sql_literal`? the MCP and AI read-only gates; the write-back 1-row net and `TxScope` SAVEPOINT nesting; `run_ddl` atomicity honesty per engine; SSH TOFU; import/export path handling; panic messages carrying data. |
 | **A4** | Performance map | Per-keystroke (diagnostics / completion / highlight), per-frame (grid render, the `ColWindow` memo), per-scroll, per-result-set (fetch → model → widths), import/export streaming. Output: ranked ≤8 paths worth deep L4 attention. |
@@ -182,8 +182,8 @@ delegate like any other pass. Run them one at a time, appending to the ledger, a
 These go into every subagent's brief. They are the difference between a review of this codebase and
 a generic one.
 
-- **The invariants are the point.** `docs/architecture.md`'s *Architecture invariants* and *Floem
-  0.2 gotchas* each encode a bug already paid for — five drifting SQL lexers, plaintext credentials,
+- **The invariants are the point.** `docs/architecture/invariants.md` and
+  `docs/architecture/floem-gotchas.md` each encode a bug already paid for — five drifting SQL lexers, plaintext credentials,
   disposed-signal panics, silent `MODIFY COLUMN` data loss. **L2 outranks everything else here.**
 - **This codebase is deliberately conservative in specific places**, and each is a trap for a
   plausible-but-wrong finding: `intel::colres` treats an unenumerable source as *open* so

@@ -284,8 +284,8 @@ jobs:
       # a self-updating .AppImage on Linux, and the packages each installed app
       # polls this same Release for.
       #
-      # **These are unsigned, deliberately** — see the packaging prose under
-      # `update.rs` in docs/architecture.md. A self-signed certificate would
+      # **These are unsigned, deliberately** — see the packaging prose in
+      # docs/architecture/app/update.md. A self-signed certificate would
       # buy nothing here (it chains to no trusted root, so SmartScreen still
       # says "Unknown publisher" and no reputation accrues), so this ships
       # honestly unsigned until a real cert exists. Adding one later is a

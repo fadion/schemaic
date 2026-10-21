@@ -12,12 +12,13 @@ Three subagents do the reading `AGENTS.md` describes, each in its own window:
 
 - **`scout`** — "where is X wired", "how does feature Y flow across the crates", "what does the
   architecture doc say about Z". Read-only; returns `file:line` citations and a conclusion, never a
-  transcript. **Use this instead of reading `docs/architecture.md` yourself**; page in a section by
-  hand only when you are about to edit it, or when the citation isn't enough.
+  transcript. **Use this instead of reading `docs/architecture/` yourself**; page in a file's range
+  by hand only when you are about to edit it, or when the citation isn't enough.
 - **`locate`** — a pinpoint symbol lookup when you want only the locations.
-- **`arch-scribe`** — makes the `docs/architecture.md` edits a finished change requires, in the
+- **`arch-scribe`** — makes the architecture-doc edits a finished change requires (the index
+  `docs/architecture.md` and the files under `docs/architecture/`), in the
   document's own voice. Give it what changed and why. It checks the brief against the code before
   writing and reports where the two disagree, so read its closing notes rather than treating them
-  as a formality. **Route the `docs/architecture.md` write through it when a change lands.**
+  as a formality. **Route the architecture write through it when a change lands.**
 
 Editing a module you are actively designing in still belongs in the main loop.

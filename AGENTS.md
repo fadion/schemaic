@@ -57,9 +57,13 @@ for all three engines today
 (`supports_view_editing`, `supports_trigger_editing`, `supports_table_design`) *compute* that answer
 from `supports_change` rather than returning `true`.
 
-**`docs/architecture.md` is the reference document** — the module map (one entry per source file),
+**The architecture document is the reference** — the module map (one entry per source file),
 the architecture invariants, the UI conventions, the Floem hazards, and the data grid end to end.
-This file holds only the working rules. Keep the two disjoint: a fact about the system goes there,
+`docs/architecture.md` is its index; the document itself is split under `docs/architecture/`, one
+file per module entry (`docs/architecture/<crate>/<module>.md`) and one per cross-cutting section
+(`invariants.md`, `ui-conventions.md`, `floem-gotchas.md`, `popup-menus.md`, `results-strip.md`,
+`data-grid.md`). Open only the file you need. A source comment citing a section of
+`docs/architecture.md` by name means the file of that name. This file holds only the working rules. Keep the two disjoint: a fact about the system goes there,
 an instruction about how to work goes here.
 
 **Keep it honest as you work, not afterwards.** It is the map every contributor and every session
@@ -72,19 +76,20 @@ later pass.
 decisions already taken, its non-goals, its phases and the traps worth knowing before starting.
 Read a feature's entry before working on it, and follow what it has decided rather than
 re-deciding it; a decision that turns out wrong is changed there, with the user, not worked around
-in the code. When a phase lands, its facts move into `docs/architecture.md` in the same change and
+in the code. When a phase lands, its facts move into the architecture files in the same change and
 the phase is deleted from the roadmap rather than ticked off. Keep the three disjoint: a fact about
-the system goes in `docs/architecture.md`, an instruction about how to work goes in this file,
+the system goes in `docs/architecture/`, an instruction about how to work goes in this file,
 planned work goes in `docs/roadmap.md`.
 
 ## Delegate the reading
 
-`docs/architecture.md` runs to several thousand lines, and so do the crate's largest modules
+The largest architecture files (`invariants.md`, `floem-gotchas.md`, `data-grid.md`,
+`core/ddl.md`, `core/intel.md`) run to thousands of lines, and so do the crate's largest modules
 (`ui/grid.rs`, `ui/lib.rs`, `app/main.rs`), so paging them into the main context is what runs a
 session out of room. **No figures here on purpose** — they were 40–70% under the real ones by the
 time anyone checked, and the rule they support does not depend on the value. If your tool can
 farm a search out to a sub-agent with its own context window, do that for any multi-file discovery
-and for consulting `docs/architecture.md`, and take back a conclusion with `file:line` citations
+and for consulting `docs/architecture/`, and take back a conclusion with `file:line` citations
 rather than a transcript. Read a section by hand only when you are about to edit it, or when the
 citation isn't enough.
 
@@ -92,8 +97,7 @@ Editing a module you are actively designing in still belongs in the main loop.
 
 ## The invariants — don't regress these
 
-Each is stated in full, with the bug that motivated it, under *Architecture invariants* in
-`docs/architecture.md`. This index exists so you know a rule is there to be read; it is **not** a
+Each is stated in full, with the bug that motivated it, in `docs/architecture/invariants.md`. This index exists so you know a rule is there to be read; it is **not** a
 substitute for the statement, and none of these is a style preference.
 
 - **The write guard lives on the run action**, not in a caller of it — every path executing user
@@ -186,8 +190,8 @@ substitute for the statement, and none of these is a style preference.
 - **Splitting `lib.rs`/`main.rs`** has its own procedure; read it before starting one.
 
 Two further sections are load-bearing and easy to regress by not knowing they exist: **Floem 0.2
-gotchas** (focus and Tab handling, scroll-sync, overlays, transitions, `with` vs `get`) and **Data
-grid**. Consult them before touching either area — most entries are there because the obvious
+gotchas** (`docs/architecture/floem-gotchas.md` — focus and Tab handling, scroll-sync, overlays,
+transitions, `with` vs `get`) and **Data grid** (`docs/architecture/data-grid.md`). Consult them before touching either area — most entries are there because the obvious
 spelling shipped a bug.
 
 ## Testing (TDD is the default)
@@ -226,12 +230,13 @@ start with a failing test, then the code that makes it pass.
   where several connections must reach one database, as the write paths do — a plain `:memory:` is
   private to one connection, and a temp file would break the rule for real. **Exactly one function
   is sanctioned to break it** — `export::export_xlsx_chunks`, with the user's say-so; why, and what
-  it costs, is in `docs/architecture.md`. Read it as *the* one case, not as licence for a second:
+  it costs, is in `docs/architecture/core/export.md`. Read it as *the* one case, not as licence for a second:
   anything else wanting a real file still models it at the boundary. Don't commit with failing
   or `#[ignore]`d tests unless the user asks. **Reading the repository's own source is the one
   exempt kind of filesystem access**, because there the thing under test *is* a file:
-  `core/tests/doc_coverage.rs` asserts every `src/*.rs` module is named somewhere in
-  `docs/architecture.md` (a new module fails it until it's on the map there), and the
+  `core/tests/doc_coverage.rs` asserts every `src/*.rs` module is named somewhere in the
+  architecture files and that the index links every one of them (a new module fails it until it
+  has its file, linked from `docs/architecture.md`), and the
   `ui::source_gate` family scans `.rs` files for a pattern an invariant forbids. That is a whole
   family, not one test — this line said "the single exception is `doc_coverage.rs`" while a
   couple of dozen source files were already doing it.
