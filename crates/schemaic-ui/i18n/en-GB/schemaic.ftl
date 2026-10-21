@@ -847,6 +847,8 @@ activity-sessions-undrawn = { $n } more { $n ->
 activity-locks-no-match = No matching locks.
 activity-locks-no-waits = No lock waits on this server.
 activity-locks-none = No other session holds a lock.
+# Under the Locks view on a server whose lock list holds only contended locks.
+activity-locks-contended-only = This server lists only locks that are waited for, or that hold up a wait — not every lock a session has.
 activity-locks-undrawn = { $n } more { $n ->
     [one] lock matches — narrow the search to see it.
    *[other] locks match — narrow the search to see them.
@@ -1256,6 +1258,9 @@ compare-source-of-truth = source of truth
 compare-idle = Choose a database to compare against.
 compare-loading = Reading both schemas
 compare-select-object = Select an object to see both sides.
+compare-fk-cycle-note = These tables' foreign keys form a cycle — no creation order satisfies all of them, so a generated migration may be refused partway.
+# Under a row compared as identical whose stored statement text still differs.
+compare-same-but-stored-differently = These agree structurally — the difference below is in how the engine stores the statement, and there is nothing to migrate.
 compare-summary = { $differ } differ · { $only_here } only here · { $only_there } only there · { $same } identical
 compare-summary-uncertain = { $n } { $n ->
     [one] match
@@ -1474,6 +1479,32 @@ users-no-match = No account matches “{ $needle }”.
 users-pick-account = Pick an account to see what it may do.
 users-section-attributes = Attributes
 users-section-privileges = Privileges
+# The Attributes section's labels — what the server says about an account.
+users-attr-authentication = Authentication
+users-attr-locked = Locked
+users-attr-password-expired = Password expired
+users-attr-superuser = Superuser
+users-attr-create-role = Create role
+users-attr-create-database = Create database
+users-attr-replication = Replication
+users-attr-bypass-rls = Bypass RLS
+users-attr-inherit = Inherit
+users-attr-connection-limit = Connection limit
+users-attr-valid-until = Valid until
+users-attr-type = Type
+users-attr-disabled = Disabled
+users-attr-default-database = Default database
+users-attr-server-roles = Server roles
+users-attr-login = Login
+users-attr-default-schema = Default schema
+users-attr-member-of = Member of
+# An attribute's value when it is a yes-or-no fact.
+users-attr-yes = Yes
+users-attr-no = No
+# A SQL Server login's type, as the Type attribute's value.
+users-login-type-sql = SQL login
+users-login-type-windows = Windows login
+users-login-type-windows-group = Windows group
 # PrincipalKind's words, as core's label names them.
 users-kind-user = User
 users-kind-role = Role

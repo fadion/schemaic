@@ -981,16 +981,13 @@ fn locks_header(list: &activity::LockList) -> floem::AnyView {
             .gap(theme::scaled(12.0))
     });
     let note = list.contended_only.then(|| {
-        text(
-            "This server lists only locks that are waited for, or that hold up a wait — \
-             not every lock a session has.",
-        )
-        .style(|s| {
-            s.font_size(font_label())
-                .color(theme::text_faint())
-                .width_full()
-        })
-        .into_any()
+        text(tr!("activity-locks-contended-only"))
+            .style(|s| {
+                s.font_size(font_label())
+                    .color(theme::text_faint())
+                    .width_full()
+            })
+            .into_any()
     });
     let mut rows = vec![tally.into_any()];
     rows.extend(note);
@@ -1233,6 +1230,17 @@ mod tests {
     use crate::i18n::tr;
     use schemaic_core::activity::KillKind;
     use schemaic_core::text::plural;
+
+    /// The Locks view's note for a server that lists only contended locks
+    /// reads in English as the literal it replaced.
+    #[test]
+    fn english_says_the_contended_only_note_as_before() {
+        assert_eq!(
+            crate::i18n::LOADER.get("activity-locks-contended-only"),
+            "This server lists only locks that are waited for, or that hold up a wait — \
+             not every lock a session has."
+        );
+    }
 
     /// **The rows' state words and the counts line read in English exactly as
     /// core's** — every state, every tally, the total's singular and plural,

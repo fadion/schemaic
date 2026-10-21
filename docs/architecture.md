@@ -10652,6 +10652,18 @@ existing prose was left alone.
     user/role split, and it is the only split PostgreSQL makes; `from_pg_rows` lists only the
     attributes that are *set*, since a role with nine "No" rows is where `Superuser` stops standing
     out.
+    **`attributes` is a `Vec<AccountAttribute>`, not text.** It was `(label, value)` pairs of
+    finished English, which the browser could only show in English whatever the interface's
+    language. A variant is one kind of fact (`Locked(bool)`, `Superuser`, `ConnectionLimit(i32)`,
+    `LoginType(LoginType)`, …) and carries the server's own text where the fact has one — a
+    plugin, `rolvaliduntil` as rendered, a default database or schema, a login, a role list as the
+    catalogue query joined it, a login-type letter `LoginType::Other` has no word for — which is
+    data and passes through. `label()`/`value()` are the English pair it replaced, and
+    `every_account_attribute_reads_as_the_pair_it_replaced` holds them to the old strings; the
+    three folds push them in the order they pushed the pairs. A PostgreSQL flag listed only when
+    set carries no value, its presence being the *Yes*, and `NoInherit` reads *Inherit — No*, the
+    state that is notable. No CLI or MCP surface reads `attributes`, so the type changed nothing
+    but what the window shows (under `users_view.rs`).
     **SQL Server splits an account in two, and the browser lists both halves, linked** — the model
     chosen over listing either half alone. A server **login** (`sys.server_principals`) holds the
     password and signs in; a database **user** (`sys.database_principals`, one database's) is what
@@ -27616,7 +27628,9 @@ existing prose was left alone.
     kills are dimmed on a read-only connection and on a lock a server process holds
     (`LockInfo::killable`).
     **The panel's own words are the catalogue's** (`activity-*`), SQLite's
-    no-sessions note included — `sqlite_has_no_sessions()`, a constant before it. The two kill
+    no-sessions note included — `sqlite_has_no_sessions()`, a constant before it — and so is the
+    Locks view's contended-only line, `activity-locks-contended-only`, a literal before it, with
+    `english_says_the_contended_only_note_as_before` holding the English to the old sentence. The two kill
     entries are `kill_label(KillKind)`, `KillKind::label`'s words drawn here (the core-words rule
     under *UI conventions*), and the line under a session's state is `session_note_text` over
     `SessionInfo::note_kind`'s `SessionNote` (`activity-waiting-on`, `activity-blocks`, the ids
@@ -28299,7 +28313,15 @@ existing prose was left alone.
     Database, role and securable-class names go in as the server spells them, the classes joined
     with `", "` in code. `english_says_every_users_note_as_core_does` holds every one equal to
     `message()` — every `MsListed`/`short` pair that has a note, and PostgreSQL's scope with a
-    database and without under each implicit holding. The fetch errors stay English: the server's text.
+    database and without under each implicit holding. An account's *Attributes* are core's
+    `AccountAttribute` values, worded by `attribute_text` from `users-attr-*` — `users-attr-yes`/
+    `-no` for a flag, `users-login-type-sql`/`-windows`/`-windows-group` for SQL Server's login
+    types — with the server's text inside each (a plugin, a date, a login, a schema, a role list, a
+    type letter it has no word for) passed through as it came, and a connection limit ungrouped as
+    core prints it, a limit being a setting rather than a figure.
+    `english_words_every_account_attribute_as_core_does` holds the pair equal to `label`/`value`
+    over every variant, both values of a flag that carries one and every login type. The fetch
+    errors stay English: the server's text.
     - The two requests are tracked apart — `UsersState` for the list, `GrantsState` for one
       account's privileges — for the reason the properties modal's exact `COUNT(*)` is tracked apart
       from its statistics: a failure to read one account's grants must not replace a list of accounts
@@ -28541,7 +28563,10 @@ existing prose was left alone.
     sentences unchanged. `script_view` has no tests of its own, so
     `i18n::tests::the_script_import_sentences_read_as_they_did` holds
     every composed sentence to the `format!` it replaced, for one statement and for three. The
-    system file dialog's file-type name stays English: `FileSpec::name` is a `&'static str`.
+    system file dialog's file-type name was a hard-coded English *SQL script*, because
+    `FileSpec::name` is a `&'static str`; it is now `file-sql-filter`, the message the app's own SQL
+    dialogs name the type with, made `&'static` by the UI crate's `tr_static!` (*The string
+    catalogue*).
   - `dump_view.rs` — the **schema + data dump** modal, **Export** to the user, over `core::dump`.
     Three entry points and one modal: a database's schema context menu and a PostgreSQL namespace's,
     where it is the middle of **`Import → Export ▸ → Create ▸`** — the three entries about the node
@@ -33185,7 +33210,10 @@ existing prose was left alone.
     — the first listing the kinds by hand, there being no `CompareKind::ALL`, so a new kind is
     caught by `compare_kind_word`'s exhaustive `match` instead). The rest of the modal's words are
     `compare-*` messages; the tally is one message with all four counts, which
-    `the_summary_reads_as_it_did` holds to the `format!` it replaced.
+    `the_summary_reads_as_it_did` holds to the `format!` it replaced. The foreign-key cycle's
+    banner (`compare-fk-cycle-note`) and the line under a `Same` row whose stored text differs
+    (`compare-same-but-stored-differently`) were the last two literals the modal drew, and
+    `english_says_the_cycle_and_storage_notes_as_before` holds them to the sentences they replaced.
     **What the comparison noted is shown above the tree**, one line each, under the banner a
     foreign-key cycle takes: `SchemaComparison::remarks` — an alias type's bound rule or default the
     target lacks, a source object a case-insensitive target cannot hold beside another — reached the
@@ -41436,9 +41464,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     becomes an enum with a `label()` (`shortcuts::Group`), and the text a `fn() -> String`
     non-capturing closure over `tr!` (`shortcuts::Describe`, `CONN_COLOR_PRESETS`' names), so the
     table stays `const` and the id is still checked at compile time. **An API that takes only
-    `&'static str`** — floem's `FileSpec::name`, a file dialog's type filter — gets the app's
-    `tr_static!` (top of `main.rs`): a `OnceLock` per use site, filled once, which is sound only
-    because the language is fixed at launch, and leaks nothing per dialog opened. A word core gives
+    `&'static str`** — floem's `FileSpec::name`, a file dialog's type filter — gets `tr_static!`:
+    a `OnceLock` per use site, filled once, which is sound only because the language is fixed at
+    launch, and leaks nothing per dialog opened. There are two, the same macro each over its own
+    crate's `tr!` — the app's at the top of `main.rs`, and `schemaic-ui`'s in `ui/i18n.rs`, which
+    `script_view.rs`'s *Run a SQL script* dialog uses and `tr_static_reads_the_message_once_per_site`
+    holds to the message. A word core gives
     as a property of a typed value is drawn UI-side (below), and so is a message core gives as a
     typed *why*; prose core hands over as a finished `String` is not the view's to translate and
     stays as it comes.
@@ -41477,7 +41508,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     run guard's reasons (`sql::GuardReason`, below), the
     read-only gate's `ReadOnlyReason` inside one included, nor the filter field's two refusals
     (`filter::FilterError`, below), though `sqlparser`'s text in a `BadCondition` still is, nor the
-    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below), nor any object editor's
+    account browser's notes (`users::PrincipalsNote`/`GrantsNote`, below) and attributes
+    (`users::AccountAttribute`, below), nor any object editor's
     refusals (`ddl::DatabaseProblem`/`ViewProblem`/`EventProblem`/`ObjectProblem`/
     `RoutineProblem`/`TriggerProblem`/`TableProblem`, below), though every draft's `validate`
     still answers core's English, nor the editor's diagnostics (`intel::DiagMessage`, below),
@@ -41818,6 +41850,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     `core::users`), with `message()` the English and no `Display`. `users_view.rs` words them from
     `users-note-*`, joining sentences with a space in code as core does, held by
     `english_says_every_users_note_as_core_does`; the live tests read `message()`.
+    Its attributes are the case of a value that was already a pair of English strings rather than
+    a sentence: `Principal::attributes` held `(label, value)` text from all three folds and now
+    holds `users::AccountAttribute`s, `label()`/`value()` the old pair. `users_view.rs`'s
+    `attribute_text` words both halves from `users-attr-*` and `users-login-type-*`, the server's
+    text inside passing through, held by `english_words_every_account_attribute_as_core_does`.
     The object editors' refusals are the case where core's English has more readers than the
     interface does, and every editor — database, view, event, object, routine, trigger and the
     table designer — now takes the shape below. A draft's `validate` stays core's English — still

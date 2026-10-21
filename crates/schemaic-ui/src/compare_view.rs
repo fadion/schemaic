@@ -652,11 +652,7 @@ fn ready_body(c: Rc<SchemaComparison>, o: OverlayUi, ring: FocusRing) -> impl In
         h_stack((
             crate::icons::icon(crate::icons::TRIANGLE_ALERT, 12.0)
                 .style(|s| s.color(theme::plan_warn())),
-            text(
-                "These tables' foreign keys form a cycle — no creation order satisfies \
-                 all of them, so a generated migration may be refused partway.",
-            )
-            .style(|s| {
+            text(tr!("compare-fk-cycle-note")).style(|s| {
                 s.font_size(theme::font_hint())
                     .color(theme::text_dim())
                     .min_width(0.0)
@@ -1285,18 +1281,15 @@ fn diff_pane(e: &CompareEntry) -> impl IntoView {
     // those draws as a change under a row labelled identical. Nothing is hidden:
     // the difference is real and worth seeing. What was missing is the reading.
     let note: AnyView = if e.text_differs_though_same() {
-        text(
-            "These agree structurally — the difference below is in how the engine \
-             stores the statement, and there is nothing to migrate.",
-        )
-        .style(|s| {
-            s.font_size(theme::font_hint())
-                .color(theme::text_muted())
-                .width_full()
-                .padding_horiz(theme::scaled(8.0))
-                .padding_bottom(theme::scaled(6.0))
-        })
-        .into_any()
+        text(tr!("compare-same-but-stored-differently"))
+            .style(|s| {
+                s.font_size(theme::font_hint())
+                    .color(theme::text_muted())
+                    .width_full()
+                    .padding_horiz(theme::scaled(8.0))
+                    .padding_bottom(theme::scaled(6.0))
+            })
+            .into_any()
     } else {
         empty().into_any()
     };
@@ -1457,6 +1450,25 @@ fn selection_note_text(planned: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{compare_kind_group, compare_kind_word, selection_note_text};
+
+    /// **The two notes the comparison draws read in English as the literals
+    /// they replaced** — the foreign-key cycle's warning and the line under a
+    /// `Same` row whose stored text differs. Read through the loader by id, so
+    /// a missing message is a failure here rather than only at `fl!`'s check.
+    #[test]
+    fn english_says_the_cycle_and_storage_notes_as_before() {
+        let l = &crate::i18n::LOADER;
+        assert_eq!(
+            l.get("compare-fk-cycle-note"),
+            "These tables' foreign keys form a cycle — no creation order satisfies \
+             all of them, so a generated migration may be refused partway."
+        );
+        assert_eq!(
+            l.get("compare-same-but-stored-differently"),
+            "These agree structurally — the difference below is in how the engine \
+             stores the statement, and there is nothing to migrate."
+        );
+    }
 
     /// The selection line reads in English exactly as core's.
     #[test]

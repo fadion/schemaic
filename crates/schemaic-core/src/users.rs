@@ -135,12 +135,14 @@ pub struct Principal {
     /// real question — but sorted last and dimmed, so the handful of accounts
     /// someone actually administers are the ones at the top of the list.
     pub system: bool,
-    /// What the engine says about the account, in display order, already
-    /// rendered as text. Per-engine by construction — MariaDB has no
-    /// `account_locked` and MySQL 8 has no `is_role`, so a shared struct of
-    /// `Option` fields would be mostly holes and every reader would have to know
-    /// which engine filled which.
-    pub attributes: Vec<(String, String)>,
+    /// What the engine says about the account, in display order. Per-engine
+    /// by construction — MariaDB has no `account_locked` and MySQL 8 has no
+    /// `is_role`, so a shared struct of `Option` fields would be mostly holes
+    /// and every reader would have to know which engine filled which. Typed
+    /// rather than rendered, so the interface words each one
+    /// ([`AccountAttribute::label`]/[`value`](AccountAttribute::value) are the
+    /// English).
+    pub attributes: Vec<AccountAttribute>,
     /// **Could this row be a role that the server does not label as one?**
     ///
     /// `false` wherever the catalogue answers role-ness outright — MariaDB's
@@ -392,19 +394,15 @@ pub fn from_mysql_rows(rows: &[MyUserRow]) -> Vec<Principal> {
             };
             let mut attributes = Vec::new();
             if let Some(p) = r.plugin.as_deref().filter(|p| !p.is_empty()) {
-                attributes.push(("Authentication".to_string(), p.to_string()));
+                attributes.push(AccountAttribute::Authentication(p.to_string()));
             }
             if r.account_locked.is_some() {
-                attributes.push((
-                    "Locked".to_string(),
-                    yes_no(my_flag(&r.account_locked)).to_string(),
-                ));
+                attributes.push(AccountAttribute::Locked(my_flag(&r.account_locked)));
             }
             if r.password_expired.is_some() {
-                attributes.push((
-                    "Password expired".to_string(),
-                    yes_no(my_flag(&r.password_expired)).to_string(),
-                ));
+                attributes.push(AccountAttribute::PasswordExpired(my_flag(
+                    &r.password_expired,
+                )));
             }
             Principal {
                 name: r.user.clone(),
@@ -444,6 +442,124 @@ pub fn from_mysql_rows(rows: &[MyUserRow]) -> Vec<Principal> {
 
 fn yes_no(b: bool) -> &'static str {
     if b { "Yes" } else { "No" }
+}
+
+/// One line of an account's *Attributes* — what kind of fact it is, carrying
+/// the server's own text where the fact has one (a plugin name, a date, a
+/// login, a schema, a role list), which is data and passes through as it came.
+/// A flag that is listed only when set (PostgreSQL's) carries no value: its
+/// presence is the *Yes*.
+///
+/// [`label`](Self::label) and [`value`](Self::value) are the English; the
+/// interface words the same variants from its catalogue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccountAttribute {
+    /// MySQL/MariaDB's `plugin`; a SQL Server user's
+    /// `authentication_type_desc`.
+    Authentication(String),
+    /// MySQL 8's `account_locked`.
+    Locked(bool),
+    /// MySQL/MariaDB's `password_expired`.
+    PasswordExpired(bool),
+    /// PostgreSQL's `rolsuper`, listed only when set.
+    Superuser,
+    /// PostgreSQL's `rolcreaterole`, listed only when set.
+    CreateRole,
+    /// PostgreSQL's `rolcreatedb`, listed only when set.
+    CreateDatabase,
+    /// PostgreSQL's `rolreplication`, listed only when set.
+    Replication,
+    /// PostgreSQL's `rolbypassrls`, listed only when set.
+    BypassRls,
+    /// PostgreSQL's `rolinherit` *off* — on is the default, so its absence is
+    /// the notable state.
+    NoInherit,
+    /// PostgreSQL's `rolconnlimit`, when there is one.
+    ConnectionLimit(i32),
+    /// PostgreSQL's `rolvaliduntil`, as the server rendered it.
+    ValidUntil(String),
+    /// A SQL Server login's type.
+    LoginType(LoginType),
+    /// A SQL Server login that is disabled.
+    Disabled,
+    /// A SQL Server login's default database.
+    DefaultDatabase(String),
+    /// A SQL Server login's server roles, as the catalogue query joined them.
+    ServerRoles(String),
+    /// The login a SQL Server database user maps to.
+    Login(String),
+    /// A SQL Server database user's default schema.
+    DefaultSchema(String),
+    /// The roles a SQL Server database principal is a member of, as joined.
+    MemberOf(String),
+}
+
+/// What kind of SQL Server login a row is, from `sys.server_principals.type`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoginType {
+    /// `S`.
+    Sql,
+    /// `U`.
+    Windows,
+    /// `G`.
+    WindowsGroup,
+    /// Any other letter, as the server sent it.
+    Other(String),
+}
+
+impl AccountAttribute {
+    /// The attribute's name, in English.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Authentication(_) => "Authentication",
+            Self::Locked(_) => "Locked",
+            Self::PasswordExpired(_) => "Password expired",
+            Self::Superuser => "Superuser",
+            Self::CreateRole => "Create role",
+            Self::CreateDatabase => "Create database",
+            Self::Replication => "Replication",
+            Self::BypassRls => "Bypass RLS",
+            Self::NoInherit => "Inherit",
+            Self::ConnectionLimit(_) => "Connection limit",
+            Self::ValidUntil(_) => "Valid until",
+            Self::LoginType(_) => "Type",
+            Self::Disabled => "Disabled",
+            Self::DefaultDatabase(_) => "Default database",
+            Self::ServerRoles(_) => "Server roles",
+            Self::Login(_) => "Login",
+            Self::DefaultSchema(_) => "Default schema",
+            Self::MemberOf(_) => "Member of",
+        }
+    }
+
+    /// The attribute's value, in English — the server's text where it has
+    /// one.
+    pub fn value(&self) -> String {
+        match self {
+            Self::Authentication(s)
+            | Self::ValidUntil(s)
+            | Self::DefaultDatabase(s)
+            | Self::ServerRoles(s)
+            | Self::Login(s)
+            | Self::DefaultSchema(s)
+            | Self::MemberOf(s) => s.clone(),
+            Self::Locked(b) | Self::PasswordExpired(b) => yes_no(*b).to_string(),
+            Self::Superuser
+            | Self::CreateRole
+            | Self::CreateDatabase
+            | Self::Replication
+            | Self::BypassRls
+            | Self::Disabled => yes_no(true).to_string(),
+            Self::NoInherit => yes_no(false).to_string(),
+            Self::ConnectionLimit(n) => n.to_string(),
+            Self::LoginType(t) => match t {
+                LoginType::Sql => "SQL login".to_string(),
+                LoginType::Windows => "Windows login".to_string(),
+                LoginType::WindowsGroup => "Windows group".to_string(),
+                LoginType::Other(s) => s.clone(),
+            },
+        }
+    }
 }
 
 /// The accounts the server ships and maintains itself.
@@ -583,25 +699,25 @@ pub fn from_pg_rows(rows: &[PgRoleRow]) -> Vec<Principal> {
         .iter()
         .map(|r| {
             let mut attributes = Vec::new();
-            let mut flag = |on: bool, label: &str| {
+            let mut flag = |on: bool, attribute: AccountAttribute| {
                 if on {
-                    attributes.push((label.to_string(), "Yes".to_string()));
+                    attributes.push(attribute);
                 }
             };
-            flag(r.superuser, "Superuser");
-            flag(r.createrole, "Create role");
-            flag(r.createdb, "Create database");
-            flag(r.replication, "Replication");
-            flag(r.bypassrls, "Bypass RLS");
+            flag(r.superuser, AccountAttribute::Superuser);
+            flag(r.createrole, AccountAttribute::CreateRole);
+            flag(r.createdb, AccountAttribute::CreateDatabase);
+            flag(r.replication, AccountAttribute::Replication);
+            flag(r.bypassrls, AccountAttribute::BypassRls);
             // Inherit is on by default, so its *absence* is the notable state.
             if !r.inherit {
-                attributes.push(("Inherit".to_string(), "No".to_string()));
+                attributes.push(AccountAttribute::NoInherit);
             }
             if r.connlimit >= 0 {
-                attributes.push(("Connection limit".to_string(), r.connlimit.to_string()));
+                attributes.push(AccountAttribute::ConnectionLimit(r.connlimit));
             }
             if let Some(v) = r.valid_until.as_deref().filter(|v| !v.is_empty()) {
-                attributes.push(("Valid until".to_string(), v.to_string()));
+                attributes.push(AccountAttribute::ValidUntil(v.to_string()));
             }
             Principal {
                 name: r.name.clone(),
@@ -2939,23 +3055,22 @@ pub fn from_mssql_rows(logins: &[MsLoginRow], users: &[MsUserRow]) -> Vec<Princi
         p.system = is_mssql_system_login(&l.name);
         p.external_sign_in = matches!(l.kind.trim(), "U" | "G");
         let kind = match l.kind.trim() {
-            "S" => "SQL login",
-            "U" => "Windows login",
-            "G" => "Windows group",
-            other => other,
+            "S" => LoginType::Sql,
+            "U" => LoginType::Windows,
+            "G" => LoginType::WindowsGroup,
+            other => LoginType::Other(other.to_string()),
         };
-        p.attributes.push(("Type".into(), kind.to_string()));
+        p.attributes.push(AccountAttribute::LoginType(kind));
         if l.disabled {
-            p.attributes
-                .push(("Disabled".into(), yes_no(true).to_string()));
+            p.attributes.push(AccountAttribute::Disabled);
         }
         if let Some(db) = l.default_database.as_deref().filter(|s| !s.is_empty()) {
             p.attributes
-                .push(("Default database".into(), db.to_string()));
+                .push(AccountAttribute::DefaultDatabase(db.to_string()));
         }
         if let Some(roles) = l.server_roles.as_deref().filter(|s| !s.is_empty()) {
             p.attributes
-                .push(("Server roles".into(), roles.to_string()));
+                .push(AccountAttribute::ServerRoles(roles.to_string()));
         }
         out.push(p);
     }
@@ -2976,16 +3091,18 @@ pub fn from_mssql_rows(logins: &[MsLoginRow], users: &[MsUserRow]) -> Vec<Princi
                 .as_deref()
                 .is_some_and(|a| a.trim().eq_ignore_ascii_case("DATABASE"));
         if let Some(l) = &p.login {
-            p.attributes.push(("Login".into(), l.clone()));
+            p.attributes.push(AccountAttribute::Login(l.clone()));
         }
         if let Some(a) = u.authentication.as_deref().filter(|s| !s.is_empty()) {
-            p.attributes.push(("Authentication".into(), a.to_string()));
+            p.attributes
+                .push(AccountAttribute::Authentication(a.to_string()));
         }
         if let Some(s) = u.default_schema.as_deref().filter(|s| !s.is_empty()) {
-            p.attributes.push(("Default schema".into(), s.to_string()));
+            p.attributes
+                .push(AccountAttribute::DefaultSchema(s.to_string()));
         }
         if let Some(m) = u.member_of.as_deref().filter(|s| !s.is_empty()) {
-            p.attributes.push(("Member of".into(), m.to_string()));
+            p.attributes.push(AccountAttribute::MemberOf(m.to_string()));
         }
         out.push(p);
     }
@@ -3233,7 +3350,7 @@ mod tests {
         }];
         let out = from_mysql_rows(&rows);
         assert_eq!(out[0].kind, PrincipalKind::User);
-        assert!(out[0].attributes.contains(&("Locked".into(), "Yes".into())));
+        assert!(out[0].attributes.contains(&AccountAttribute::Locked(true)));
     }
 
     /// An absent column is "this server does not publish it", so the attribute
@@ -3241,12 +3358,91 @@ mod tests {
     #[test]
     fn a_column_the_server_lacks_produces_no_attribute() {
         let out = from_mysql_rows(&[my("app", "%")]);
-        assert!(out[0].attributes.iter().all(|(k, _)| k != "Locked"));
         assert!(
-            out[0]
-                .attributes
-                .iter()
-                .all(|(k, _)| k != "Password expired")
+            out[0].attributes.iter().all(|a| !matches!(
+                a,
+                AccountAttribute::Locked(_) | AccountAttribute::PasswordExpired(_)
+            )),
+            "{:?}",
+            out[0].attributes
+        );
+    }
+
+    /// **Each attribute reads in English as the pair it replaced** — label and
+    /// value, every variant, the server's own text passed through. The
+    /// interface's renderer is held to these by its own test; this holds them
+    /// to what the list showed before the pairs were typed.
+    #[test]
+    fn every_account_attribute_reads_as_the_pair_it_replaced() {
+        use AccountAttribute as A;
+        let cases: Vec<(A, &str, &str)> = vec![
+            (
+                A::Authentication("caching_sha2_password".into()),
+                "Authentication",
+                "caching_sha2_password",
+            ),
+            (A::Locked(true), "Locked", "Yes"),
+            (A::Locked(false), "Locked", "No"),
+            (A::PasswordExpired(true), "Password expired", "Yes"),
+            (A::PasswordExpired(false), "Password expired", "No"),
+            (A::Superuser, "Superuser", "Yes"),
+            (A::CreateRole, "Create role", "Yes"),
+            (A::CreateDatabase, "Create database", "Yes"),
+            (A::Replication, "Replication", "Yes"),
+            (A::BypassRls, "Bypass RLS", "Yes"),
+            (A::NoInherit, "Inherit", "No"),
+            (A::ConnectionLimit(0), "Connection limit", "0"),
+            (A::ConnectionLimit(25), "Connection limit", "25"),
+            (
+                A::ValidUntil("2027-01-01 00:00:00+00".into()),
+                "Valid until",
+                "2027-01-01 00:00:00+00",
+            ),
+            (A::LoginType(LoginType::Sql), "Type", "SQL login"),
+            (A::LoginType(LoginType::Windows), "Type", "Windows login"),
+            (
+                A::LoginType(LoginType::WindowsGroup),
+                "Type",
+                "Windows group",
+            ),
+            (A::LoginType(LoginType::Other("C".into())), "Type", "C"),
+            (A::Disabled, "Disabled", "Yes"),
+            (
+                A::DefaultDatabase("master".into()),
+                "Default database",
+                "master",
+            ),
+            (
+                A::ServerRoles("sysadmin".into()),
+                "Server roles",
+                "sysadmin",
+            ),
+            (A::Login("app".into()), "Login", "app"),
+            (A::DefaultSchema("dbo".into()), "Default schema", "dbo"),
+            (A::MemberOf("db_owner".into()), "Member of", "db_owner"),
+        ];
+        for (a, label, value) in cases {
+            assert_eq!((a.label(), a.value().as_str()), (label, value), "{a:?}");
+        }
+    }
+
+    /// A MySQL row's attributes come in the order the list has always shown:
+    /// the plugin, then *locked*, then *password expired*.
+    #[test]
+    fn a_mysql_account_lists_its_attributes_in_display_order() {
+        let out = from_mysql_rows(&[MyUserRow {
+            plugin: Some("mysql_native_password".into()),
+            account_locked: Some("N".into()),
+            password_expired: Some("Y".into()),
+            ..my("app", "%")
+        }]);
+        assert_eq!(
+            out[0].attributes,
+            [
+                AccountAttribute::Authentication("mysql_native_password".into()),
+                AccountAttribute::Locked(false),
+                AccountAttribute::PasswordExpired(true),
+            ]
         );
     }
 
@@ -3389,11 +3585,40 @@ mod tests {
             superuser: true,
             ..pg("postgres", true)
         }]);
-        let keys: Vec<&str> = out[0].attributes.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(keys.contains(&"Superuser"));
-        assert!(!keys.contains(&"Create role"));
-        // -1 is "no limit" and says nothing worth a row.
-        assert!(!keys.contains(&"Connection limit"));
+        // Only `Superuser`: no other flag is set, and -1 is "no limit", which
+        // says nothing worth a row.
+        assert_eq!(out[0].attributes, [AccountAttribute::Superuser]);
+    }
+
+    /// Every PostgreSQL attribute that is set, in the order the list has
+    /// always shown them.
+    #[test]
+    fn a_postgres_role_lists_its_attributes_in_display_order() {
+        let out = from_pg_rows(&[PgRoleRow {
+            superuser: true,
+            createrole: true,
+            createdb: true,
+            replication: true,
+            bypassrls: true,
+            inherit: false,
+            connlimit: 5,
+            valid_until: Some("infinity".into()),
+            ..pg("app", true)
+        }]);
+        use AccountAttribute as A;
+        assert_eq!(
+            out[0].attributes,
+            [
+                A::Superuser,
+                A::CreateRole,
+                A::CreateDatabase,
+                A::Replication,
+                A::BypassRls,
+                A::NoInherit,
+                A::ConnectionLimit(5),
+                A::ValidUntil("infinity".into()),
+            ]
+        );
     }
 
     #[test]
@@ -3402,7 +3627,7 @@ mod tests {
             inherit: false,
             ..pg("app", true)
         }]);
-        assert!(out[0].attributes.contains(&("Inherit".into(), "No".into())));
+        assert!(out[0].attributes.contains(&AccountAttribute::NoInherit));
     }
 
     #[test]
@@ -5931,6 +6156,32 @@ mod mssql_tests {
         );
     }
 
+    /// A disabled login says so after its type, and a type letter this list
+    /// has no word for passes through as the server sent it.
+    #[test]
+    fn a_disabled_login_lists_its_type_then_disabled() {
+        let login = |kind: &str, disabled| MsLoginRow {
+            name: format!("l_{kind}"),
+            kind: kind.into(),
+            disabled,
+            default_database: None,
+            server_roles: None,
+        };
+        let list = from_mssql_rows(&[login("G", true), login("C", false)], &[]);
+        let attrs = |n: &str| &list.iter().find(|p| p.name == n).expect(n).attributes;
+        assert_eq!(
+            attrs("l_G"),
+            &[
+                AccountAttribute::LoginType(LoginType::WindowsGroup),
+                AccountAttribute::Disabled,
+            ]
+        );
+        assert_eq!(
+            attrs("l_C"),
+            &[AccountAttribute::LoginType(LoginType::Other("C".into()))]
+        );
+    }
+
     /// The two catalogues folded into one list: every login, then the
     /// database's users and roles, each user carrying the login it maps to;
     /// the server's own principals kept but marked system.
@@ -5985,13 +6236,23 @@ mod mssql_tests {
         let find = |n: &str, k| list.iter().find(|p| p.name == n && p.kind == k).expect(n);
         let l = find("app", PrincipalKind::Login);
         assert!(!l.system);
-        assert!(
-            l.attributes
-                .contains(&("Server roles".into(), "dbcreator".into())),
-            "{:?}",
-            l.attributes
+        use AccountAttribute as A;
+        assert_eq!(
+            l.attributes,
+            [
+                A::LoginType(LoginType::Sql),
+                A::DefaultDatabase("shop".into()),
+                A::ServerRoles("dbcreator".into()),
+            ]
         );
         assert!(find("NT AUTHORITY\\SYSTEM", PrincipalKind::Login).system);
+        assert_eq!(
+            find("NT AUTHORITY\\SYSTEM", PrincipalKind::Login).attributes,
+            [
+                A::LoginType(LoginType::Windows),
+                A::DefaultDatabase("master".into()),
+            ]
+        );
         let u = find("app_u", PrincipalKind::User);
         assert_eq!(u.login.as_deref(), Some("app"));
         assert_eq!(u.display(), "app_u ← app");
@@ -6000,10 +6261,14 @@ mod mssql_tests {
             "a search for the login finds it"
         );
         assert_eq!(find("app", PrincipalKind::Login).display(), "app");
-        assert!(u.attributes.contains(&("Login".into(), "app".into())));
-        assert!(
-            u.attributes
-                .contains(&("Member of".into(), "db_datareader".into()))
+        assert_eq!(
+            u.attributes,
+            [
+                A::Login("app".into()),
+                A::Authentication("INSTANCE".into()),
+                A::DefaultSchema("dbo".into()),
+                A::MemberOf("db_datareader".into()),
+            ]
         );
         assert!(
             find("db_datareader", PrincipalKind::Role).system,

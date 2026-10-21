@@ -187,9 +187,9 @@ fn pick_file(ctx: &ScriptCtx) {
     let dialog = FileDialogOptions::new()
         .title(tr!("script-dialog-title"))
         .allowed_types(vec![FileSpec {
-            // `FileSpec` holds a `&'static str`, so the file type's name in
-            // the system dialog stays English.
-            name: "SQL script",
+            // `FileSpec` holds a `&'static str`, which `tr_static!` makes of
+            // the message once — the app's own SQL dialogs' type name.
+            name: crate::i18n::tr_static!("file-sql-filter"),
             extensions: &["sql"],
         }]);
     let probe = ctx.probe.clone();

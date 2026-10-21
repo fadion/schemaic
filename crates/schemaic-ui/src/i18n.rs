@@ -53,6 +53,19 @@ macro_rules! tr {
 }
 pub(crate) use tr;
 
+/// [`tr!`] as a `&'static str`, for the API that takes nothing else — floem's
+/// `FileSpec::name`, a file dialog's type filter. Each use site keeps its own
+/// cell and fills it once: the language is fixed at launch, so the first answer
+/// is every answer, and nothing is leaked per dialog opened. The app crate's
+/// `tr_static!` is the same macro over its own `tr!`.
+macro_rules! tr_static {
+    ($id:literal) => {{
+        static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| $crate::i18n::tr!($id)).as_str()
+    }};
+}
+pub(crate) use tr_static;
+
 /// What [`init`] was told at launch, so Settings can ask what a choice
 /// *would* draw without asking the OS again.
 struct Launch {
@@ -2693,6 +2706,16 @@ mod tests {
         let l = loader(UiLanguage::PseudoEn);
         assert_eq!(l.get("settings-language"), "Language Language");
         assert_eq!(system(&l, "English"), "System System (English)");
+    }
+
+    /// **[`tr_static!`] is the message, read once per site** — the English a
+    /// literal `FileSpec::name` said, and the same `&'static str` every time
+    /// the site runs, so nothing is leaked per dialog opened.
+    #[test]
+    fn tr_static_reads_the_message_once_per_site() {
+        let site = || tr_static!("file-sql-filter");
+        assert_eq!(site(), "SQL script");
+        assert!(std::ptr::eq(site(), site()), "one cell per site");
     }
 
     /// The catalogues, as embedded, parsed **strictly**. At run time a parse

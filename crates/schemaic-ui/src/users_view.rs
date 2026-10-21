@@ -615,7 +615,10 @@ fn detail_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: Focu
                         tr!("users-section-attributes"),
                         p.attributes
                             .iter()
-                            .map(|(k, v)| detail(k.clone(), v.clone()))
+                            .map(|a| {
+                                let (k, v) = attribute_text(a);
+                                detail(k, v)
+                            })
                             .collect(),
                     ));
                 }
@@ -708,6 +711,51 @@ fn pg_implicit_text(i: &schemaic_core::users::PgImplicit) -> String {
             }
             out.join(" ")
         }
+    }
+}
+
+/// One line of the account's *Attributes* — core's `AccountAttribute::label`
+/// and `value` in the interface's language, the server's own text (a plugin, a
+/// date, a login, a schema, a role list, a type letter it has no word for)
+/// passed through as it came. `english_words_every_account_attribute_as_core_does`
+/// holds the English equal.
+fn attribute_text(a: &schemaic_core::users::AccountAttribute) -> (String, String) {
+    use schemaic_core::users::{AccountAttribute as A, LoginType};
+    let yes_no = |b: bool| {
+        if b {
+            tr!("users-attr-yes")
+        } else {
+            tr!("users-attr-no")
+        }
+    };
+    match a {
+        A::Authentication(s) => (tr!("users-attr-authentication"), s.clone()),
+        A::Locked(b) => (tr!("users-attr-locked"), yes_no(*b)),
+        A::PasswordExpired(b) => (tr!("users-attr-password-expired"), yes_no(*b)),
+        A::Superuser => (tr!("users-attr-superuser"), yes_no(true)),
+        A::CreateRole => (tr!("users-attr-create-role"), yes_no(true)),
+        A::CreateDatabase => (tr!("users-attr-create-database"), yes_no(true)),
+        A::Replication => (tr!("users-attr-replication"), yes_no(true)),
+        A::BypassRls => (tr!("users-attr-bypass-rls"), yes_no(true)),
+        A::NoInherit => (tr!("users-attr-inherit"), yes_no(false)),
+        // Ungrouped, as core prints it: a limit is a setting, not a figure.
+        A::ConnectionLimit(n) => (tr!("users-attr-connection-limit"), n.to_string()),
+        A::ValidUntil(s) => (tr!("users-attr-valid-until"), s.clone()),
+        A::LoginType(t) => (
+            tr!("users-attr-type"),
+            match t {
+                LoginType::Sql => tr!("users-login-type-sql"),
+                LoginType::Windows => tr!("users-login-type-windows"),
+                LoginType::WindowsGroup => tr!("users-login-type-windows-group"),
+                LoginType::Other(s) => s.clone(),
+            },
+        ),
+        A::Disabled => (tr!("users-attr-disabled"), yes_no(true)),
+        A::DefaultDatabase(s) => (tr!("users-attr-default-database"), s.clone()),
+        A::ServerRoles(s) => (tr!("users-attr-server-roles"), s.clone()),
+        A::Login(s) => (tr!("users-attr-login"), s.clone()),
+        A::DefaultSchema(s) => (tr!("users-attr-default-schema"), s.clone()),
+        A::MemberOf(s) => (tr!("users-attr-member-of"), s.clone()),
     }
 }
 
@@ -1400,6 +1448,47 @@ mod tests {
         }
         for n in grants {
             assert_eq!(grants_note_text(&n), n.message(), "{n:?}");
+        }
+    }
+
+    /// **Every account attribute reads in English exactly as core's
+    /// `label`/`value`** — each variant, both values of a flag that carries
+    /// one, and every login type, the server's text passed through.
+    #[test]
+    fn english_words_every_account_attribute_as_core_does() {
+        use schemaic_core::users::{AccountAttribute as A, LoginType};
+        let all = [
+            A::Authentication("caching_sha2_password".into()),
+            A::Locked(true),
+            A::Locked(false),
+            A::PasswordExpired(true),
+            A::PasswordExpired(false),
+            A::Superuser,
+            A::CreateRole,
+            A::CreateDatabase,
+            A::Replication,
+            A::BypassRls,
+            A::NoInherit,
+            A::ConnectionLimit(0),
+            A::ConnectionLimit(1500),
+            A::ValidUntil("2027-01-01 00:00:00+00".into()),
+            A::LoginType(LoginType::Sql),
+            A::LoginType(LoginType::Windows),
+            A::LoginType(LoginType::WindowsGroup),
+            A::LoginType(LoginType::Other("C".into())),
+            A::Disabled,
+            A::DefaultDatabase("master".into()),
+            A::ServerRoles("sysadmin, dbcreator".into()),
+            A::Login("app".into()),
+            A::DefaultSchema("dbo".into()),
+            A::MemberOf("db_owner".into()),
+        ];
+        for a in all {
+            assert_eq!(
+                super::attribute_text(&a),
+                (a.label().to_string(), a.value()),
+                "{a:?}"
+            );
         }
     }
 
