@@ -1,6 +1,6 @@
 # Schemaic — German catalogue.
 #
-# Machine-drafted and unreviewed (docs/roadmap.md); a message missing here
+# Machine-drafted and unreviewed (docs/architecture.md, The string catalogue); a message missing here
 # falls back to the en-GB catalogue. Shipped (locale::SHIPPED): offered in
 # Settings, and drawn for a system set to German.
 

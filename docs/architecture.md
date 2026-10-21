@@ -25921,7 +25921,7 @@ existing prose was left alone.
     `a_message_with_an_argument_carries_no_isolation_marks` pins it, and was seen red with
     `System (\u{2068}English\u{2069})` before the call. What it gives up is that protection, for
     right-to-left data put into a message as much as for a right-to-left language; there is no
-    right-to-left interface in this phase (`docs/roadmap.md`).
+    right-to-left interface, and one is not a goal (*The string catalogue*, under *UI conventions*).
     `configure_from` does nothing else: the two pseudo-locales' transforms (`bundle.set_transform`
     — `fluent-pseudo`'s accented text, and a `doubled` one that said each word twice) were deleted
     with the locales and the `fluent-pseudo` dependency, their job of finding boxes too narrow for
@@ -27831,8 +27831,8 @@ existing prose was left alone.
     `modal_title_borderless`), the Analyze toggle's hint and the line that replaces the toggle for
     a write (`plan-analyze-unavailable`, which keeps the word *Analyze*), *Explaining* under the
     loading dots, *Potential issues* and *Ask AI*. The toggle's own **Analyze** label stays a
-    literal — it is `EXPLAIN ANALYZE`'s keyword, which AGENTS.md's spelling rule and the roadmap's
-    never-translated list both name — as do the server's plan columns and rows and the prompt
+    literal — it is `EXPLAIN ANALYZE`'s keyword, which AGENTS.md's spelling rule and *The string
+    catalogue*'s translation conventions both name — as do the server's plan columns and rows and the prompt
     `ask_ai` sends the AI panel, English as all AI text is. **SQL Server's table is the
     catalogue's as far as Schemaic wrote it**: `plan_table` measures and draws what the private
     `shown_table` hands it — the plan's headers and cells as read where `QueryPlan::wording` is
@@ -28656,8 +28656,8 @@ existing prose was left alone.
     `import-missing-required` (`$columns`), `import-engine-not-transactional` (`$engine`), the
     plurals `import-problems` and `import-done`, and each problem's line through `issue_line` —
     `import-problem-at-line` or `import-problem-at-column`, a message per shape rather than a place
-    spliced in. What is wrong with a field is core's word drawn here, early, as the roadmap's rule
-    for a property of a typed value has it: `i18n::issue_kind_message` stands in for
+    spliced in. What is wrong with a field is core's word drawn here, early, as *The string
+    catalogue*'s rule for a property of a typed value has it: `i18n::issue_kind_message` stands in for
     `IssueKind::message` (`import-issue-*`), core keeping its English for the CLI — in `i18n.rs`
     rather than here, `pub(crate)`, because the load's backstop says it too (*The string
     catalogue*) — and `english_words_every_issue_kind_as_core_does`, still in this file, holds the
@@ -41692,7 +41692,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   the one loader through its own `tr!` (the `schemaic-app` entry says why it cannot borrow the UI
   crate's), and the app's messages live in the same two `.ftl` files. Only the GUI is translated:
   CLI, MCP and AI text stays English, as do SQL and persisted names; key names follow the
-  language's keyboard legends through the `key-*` messages.
+  language's keyboard legends through the `key-*` messages. **Text the GUI shares with one of
+  those surfaces — the export and compare notes — is split at that seam, never translated
+  through it**: a typed value each side words, so a `schemaic exec` report a script parses stays
+  English. **A server's or driver's error stays in the server's language**, so a translated
+  sentence wrapped round an English (or German, or whatever the server is set to) error is
+  expected, not a defect.
   - **How a file draws from it** — the shape the whole conversion settled on, file by file, and
     the one a new view follows. A helper taking `&'static str` widens to `impl Into<String>`, so
     every literal caller still compiles and a `tr!` result passes too (`section_title`,
@@ -41730,7 +41735,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **What stays English on purpose**, so a sweep for capitalised literals does not "fix" it: SQL
     and its sentinels (`WHERE`, `<null>`, `<default>`, `SQL VALUES`/`UPDATE`/`WHERE IN`, the
     parameter chip's `abc`/`123`/`NULL`/`SQL`); the export formats' names; persisted keys and file
-    names; font names; the terminal's escape sequences; the find options' glyphs `Aa`, `W` and
+    names; font names; `pg_builtins.rs` and `mssql_builtins.rs`, which quote the servers' own
+    text; the terminal's escape sequences; the find options' glyphs `Aa`, `W` and
     `.*`; product names (the agents', *Microsoft Entra*, *AWS IAM*, *Google Cloud IAM* and the CLIs
     the sign-in picker names); **everything sent to an AI model** — the
     Explain prompt, the Optimise intent (whose box label `cmdk-optimise-label` *is* translated and
@@ -41808,9 +41814,13 @@ Re-introducing the anti-patterns these guard against is a regression:
     source, in British spelling, and a new message goes there first, since `fl!` checks ids and
     argument names against that file alone. Ids are kebab-case and start with the area they belong
     to (`settings-language-restart`). A translation lives beside it at `i18n/<tag>/schemaic.ftl` and falls back to `en-GB` message
-    by message.
+    by message. British English is the base on purpose — the spelling rule in `AGENTS.md` is the
+    source catalogue's — and an `en-US` catalogue is possible but not planned.
     **The translations' conventions** — all eight machine-drafted and unreviewed, each header
-    saying so: the address is German
+    saying so. They shipped that way, and proofreading waits until the project has users who can
+    contribute corrections: accepted, not a blocker. German was drafted first, being a large
+    developer market and the longest-running of the common interface languages, which made it the
+    layout stress test (*Layout for longer text*, below). The address is German
     *du*, Italian *tu*, Spanish *tú*, Romanian *tu*, Dutch *je*, French *vous*, Bulgarian *вие*
     and Albanian *ju*; quotation marks are the language's own — French `« »` with no-break spaces
     inside, Italian and Spanish `« »`, Dutch `‘ ’`, Romanian `„ ”`, Bulgarian `„ “`, Albanian
@@ -42554,7 +42564,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **Isolation marks are off**, set after every catalogue load, because Fluent's default
     U+2068/U+2069 around each placeable made an English message with an argument differ from the
     literal it replaced (`a_message_with_an_argument_carries_no_isolation_marks`). Converting a
-    label must leave English output byte-identical: the roadmap's every phase promises it, because
+    label must leave English output byte-identical: every phase of the conversion promised it, because
     the suite's assertions on English wording are the regression net for the whole conversion.
   - **The language is read once, at launch**, before any view, and never changes while the app
     runs; nothing takes a reactive dependency on it, which spares every label one for a setting
@@ -42587,6 +42597,21 @@ Re-introducing the anti-patterns these guard against is a regression:
     a time (`core::erd::fit_toolbar`); Settings' page at 500 with *Settings file*'s buttons stacked
     (`settings.rs`); Connection import's source buttons wrapping; and the calendar's day cell at 33
     (`day_w`, for longer month names).
+  - **No right-to-left interface, and no Chinese, Japanese or Korean one — standing decisions,
+    not pending work.** A right-to-left interface means mirroring, and nothing underneath can:
+    Floem 0.2 has no layout direction, no start/end insets and no `text-align`, taffy 0.4 does
+    not mirror, and the UI hard-codes left and right in a few hundred style calls, so it would be
+    a project of its own. A CJK interface cannot be romanised — pinyin without characters is
+    ambiguous, and a romaji or romanised-Korean interface is essentially unseen — so it is a
+    proper translation or none, and a proper one would wait on the fonts below. Neither is a goal.
+    **Data in those scripts is another matter**, and is shown whatever the interface's language.
+    Right-to-left cell data shapes and reorders through cosmic-text but always sits left-aligned;
+    aligning a cell by its first strong character would be cheap, and is not planned. Only IBM
+    Plex is bundled (`fonts.rs` — Latin, Cyrillic, Greek), so CJK, Arabic and Hebrew on screen
+    rely on cosmic-text falling back to the system's fonts, which is unverified on macOS and
+    Linux; the diagram PNG has a fallback of its own (`export_options`, under `erd_raster.rs`).
+    With the isolation marks off (above), a right-to-left value placed in a message is not
+    protected from reordering the sentence round it either.
   - **Three tests guard what the compiler cannot**: `every_catalogue_parses_cleanly`, because a
     malformed translation is only logged at run time and falls back to English unseen;
     `no_translation_outlives_its_english_message`, for a renamed or deleted English id; and

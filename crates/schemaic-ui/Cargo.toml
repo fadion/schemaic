@@ -57,7 +57,7 @@ unicode-width = "0.2"
 # `fl!` checks a message id and its argument names against the `en-GB`
 # catalogue at compile time, so a missing key is a build error rather than a
 # blank label. The catalogues are embedded (`rust-embed`). GUI only — see
-# `docs/roadmap.md`.
+# *The string catalogue* in `docs/architecture.md`.
 i18n-embed = { version = "0.16", features = ["fluent-system"] }
 i18n-embed-fl = "0.10"
 rust-embed = "8"

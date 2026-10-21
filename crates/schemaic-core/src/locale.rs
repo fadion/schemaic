@@ -2,8 +2,8 @@
 //!
 //! The GUI is translated; nothing else is. The CLI, the MCP server and
 //! everything sent to an AI harness stay English, because scripts parse the
-//! first and a model reads the second (`docs/roadmap.md`, *Interface
-//! translation*). So this module answers a question only the GUI asks, and
+//! first and a model reads the second (`docs/architecture.md`, *The string
+//! catalogue*). So this module answers a question only the GUI asks, and
 //! nothing in core renders through it.
 //!
 //! **Three sources, in order:** the `SCHEMAIC_LOCALE` environment variable, the
