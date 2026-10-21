@@ -404,8 +404,19 @@ existing prose was left alone.
     Schemaic's own ("Not connected — the commit was not attempted") and only the producer knows
     which; `settle_after_switch` passes it through untouched, source and all
     (`a_failure_survives_a_switch_unchanged` checks both).
-    **A `ModalError`'s `text` is always English; a translation goes in `shown`**, which is for the
-    eye alone. `displayed()` — the wording, else the text — is what the editor's error bar and the
+    **A `ModalError`'s `text` is English wherever it can reach a model or a log; a translation goes
+    in `shown`**, which is for the eye alone. That is every `Statement` and `Server` source, and
+    every run path's `App` note — the not-sent, timeout and Stop notes that `ran_of` records, held
+    to `ModalError::app(en).shown_as(m)` by `a_runs_own_notes_reach_the_bar_as_schemaics` (under
+    `app/main.rs`). It is *not* every `ModalError`: an `App` notice that is only ever shown — the
+    recovery report (`report_recoveries`, under `ui/lib.rs`) and the keyring's save notice, both
+    through `i18n::notice_text`; the AI panel's two run refusals; the connection gate's
+    connection-changed, not-connected and tab-moved-on notes in `app/main.rs`; the grid's
+    nothing-to-fill and staged re-query notes — is built as `ModalError::app(tr!(…))` (or an
+    `i18n::` wording) with the wording in `text`. That is harmless only because `App` offers
+    neither *Explain* nor *AI fix* and none of them is a `QueryState::Failed` the write log reads;
+    one moved onto a path that logs or reaches a model has to move to `shown_as` with it, since no
+    test would notice. `displayed()` — the wording, else the text — is what the editor's error bar and the
     grid's bottom bar draw and what `worth_viewing` measures, and `resolve_kept` hands it on as
     `ErrorModalContent::shown`, while `explain` and `fix` go on carrying `text`. Everything that
     *acts* on the error reads `text`: *Explain* and *AI fix* send it to the model, the statement
@@ -1305,9 +1316,11 @@ existing prose was left alone.
     `Denied { word }`, `AdvancesSequence`, `UnlistedCall { name }`, `Locks { clause }`, each field
     SQL the statement spelt — and `ReadOnlyReason::message` is the English, byte for byte the
     sentences it used to return. `read_only_reason` still answers `Result<(), String>` with that
-    English, for the callers that say or test it as text (`filter.rs`, `write_log.rs`, `mssql.rs`'s
-    `DbError::Refused`); `cli::query::gate` says `message()`, the CLI and the MCP server staying
-    English. No decision moved with the type: every arm, its order and the statements it fires on
+    English, but no production caller reads the text any more: `filter.rs`, `write_log.rs` and the
+    MCP server (`cli/mcp.rs`) ask it only `is_ok()`/`is_err()`, as the live legs do, and only
+    `sql.rs`'s own tests hold its `Err` as text. `db::mssql` refuses through
+    `read_only_refusal` and carries the typed `DbRefusal::ReadOnly(reason)`; `cli::query::gate`
+    says `message()`, the CLI and the MCP server staying English. No decision moved with the type: every arm, its order and the statements it fires on
     are as described above.
     **Both halves judge the statement an executing prefix runs, not the prefix.** `EXPLAIN ANALYZE`
     (with `VERBOSE`/`FORMAT=…`), PostgreSQL's `EXPLAIN (… ANALYZE …)` option list and MariaDB's bare
@@ -5118,7 +5131,10 @@ existing prose was left alone.
     every text format writes NULL, and re-importing it writes empty over the blobs.
     Gating the clause on `streaming` looks like the fix and is not, which is the part worth knowing
     before touching it: **every production caller that writes a file passes `true`** — the grid's,
-    the dump's and `files_note` alike (only the grid's clipboard copy passes `false`, having no
+    the dump's and the folder export's alike (the last through `dump_view::files_done_note`'s
+    `export_said(…, true)`; core's `files_note` passes `true` too, but is now only the English
+    `english_says_every_folder_outcome_as_core_does` holds that wording to; only the grid's
+    clipboard copy passes `false`, having no
     modal to confirm it), because the grid export reports into a modal that stays up until it is
     dismissed and a confirmation saying nothing about a clean save would be a dialog reporting
     silence. So the flag no longer means "no grid was mounted", and a clause hung on it would read
@@ -17387,8 +17403,12 @@ existing prose was left alone.
     `failure` is `entra`'s: a signed-out CLI says to run `aws configure` or `aws sso login`, or
     `gcloud auth login`, and anything else keeps the CLI's own first stderr line
     (`a_signed_out_cli_says_how_to_sign_in`). Every refusal here — `token_args`', `token_argv`'s,
-    `parse_token`'s and `failure`'s — is a `model::SignInFailure` naming the CLI through
-    `From<Cloud> for TokenCli`, as `entra`'s are. `identity_files` names what the token cache keys
+    `parse_token`'s and `failure`'s — is a `model::SignInFailure`, as `entra`'s are, but not every
+    one names a CLI: `failure`'s `SignedOut`/`NoTokenFrom` (and `db::cloud_iam`'s `NotFound`) take
+    it through `From<Cloud> for TokenCli`; `token_argv`'s `Shim` spells `TokenCli::Aws`/`Gcloud`
+    directly; `parse_token`'s `NoToken`/`MoreThanToken` and `token_args`' `BadValue` (from
+    `launch::cli_flag_value`, naming the field) carry no CLI. `identity_files` names what the token
+    cache keys
     on, as `azure_cli_profile` does for Entra: AWS's `~/.aws/credentials` and `~/.aws/config`, or the
     files `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` name; gcloud's `active_config`,
     the **active** configuration's own `configurations/config_<name>` and `credentials.db` under
@@ -19175,7 +19195,8 @@ existing prose was left alone.
   `mssql::config` (`Transport`, from `AuthMode::transport_refusal`), `backup_to_file`'s server
   arm, `session::aborted_commit`, which `Session::commit` answers over a block that was already
   aborted, `Session::open`'s SQLite manual-mode backstop (a `Connect` once) and
-  `Session::open_enforced`'s refusal of a read-only SQL Server connection (under `mssql.rs`),
+  `Session::open_enforced`'s refusal of a read-only SQL Server connection (`MsSqlReadOnlyAuto`,
+  under `mssql.rs`),
   `mysql::enforce_session`'s refusal of a client character set that can hide a quote and
   `unpinnable_mode` — its refusal when the server puts a quote-moving `sql_mode` back — and
   `read_only_plan_refusal`, SQL Server's Windows and cloud IAM sign-in arms, `explain_setup`'s
@@ -19208,15 +19229,18 @@ existing prose was left alone.
   `db_err`, is still a `Query`, as is one under SQL Server's savepoint, which carries no note
   (`WriteScope::failure`, under `mssql.rs`), and both reach the window as any `Query` does, its
   "query failed:" worded by `db_error_shown` and the server's words inside left as they came.
-  `modal_source_tests` has no `Write` case; the SQL Server import's live tests
-  match the variant (`an_imported_blank_number_is_refused_not_stored_as_zero`).
+  `modal_source_tests`' `only_a_statements_failure_is_offered_a_fix` holds five `Write` cases to
+  that predicate — a server error and a batch count `Statement`, the two cancels and a refusal
+  `App`; the SQL Server import's live tests match the variant
+  (`an_imported_blank_number_is_refused_not_stored_as_zero`).
   **`ConnectFailed(ConnectFailure)` is a connect failure in Schemaic's words around someone
   else's** (`core::model::ConnectFailure`, re-exported with `SshFailure`, `SshPhase` and
   `TlsFailure`). It shares `Connect`'s `#[error("connection failed: {0}")]`, its `modal_source`
   (`Server`) and its `position` (`None`), so moving a site from one to the other changed nothing a
   reader of `to_string()` or the modal could see; what changed is that the app can word it
   (`db_error_shown`, under `app/main.rs`). Its producers are every sentence this crate composed
-  around another's text at connect: the thirteen "timed out" sites, `Db::init_failed`,
+  around another's text at connect: every "timed out" site (`ConnectFailure::TimedOut`, fourteen
+  spellings across `lib.rs` and the four engines' modules), `Db::init_failed`,
   `session::retired_error` and `begin_failed`, `enforce_session`'s prepare,
   `pg::read_only_setup_failed` and `connect_maintenance_avoiding`'s *no maintenance database
   reachable*, SQL Server's session guard and plan set-up, its two SQL Server Browser sentences and
@@ -25401,12 +25425,16 @@ existing prose was left alone.
     `status.style(|s| s.min_width(0.0))` themselves; the other nine were not — a helper whose
     contract only holds if the caller repeats half of it is one that will keep being called wrong.
     **Every status these footers carry now ends in a `…` rather than wrapping or clipping** — an
-    audit under the pseudo-locale found the rest still overflowing, and each now goes through
-    `footer_error` or `ellipsized_text` (both below): Users' and Server Variables' counts, Compare's
-    selection note, Export's and Run script's progress lines, Chart's and Result diff's
-    export notices, Result diff's `summary_line` (which also lacked the `min_width(0)` above), and
-    the *N changes* and *reading source* lines of the object, event, routine, view and trigger
-    editors and the table designer.
+    audit under the pseudo-locale found the rest still overflowing. Only Chart's and Result diff's
+    export notices, the first validation problem of the object, view, trigger, database and
+    account editors and the table designer, and the designer's index hint go through
+    `footer_error` or `ellipsized_text` (both below), so only those can be read whole on hover —
+    Export's and Run script's outcomes left this row for `modal_footer_noted`. The rest are a bare
+    `text`/`label` styled `min_width(0)` and `text_ellipsis`, and carry **no tooltip** — a cut
+    line there is cut for good: Users' and Server Variables' counts, Compare's selection note,
+    Export's and Run script's progress lines, Result diff's `summary_line` (which also lacked the
+    `min_width(0)` above), the *N changes* lines of the object, event, routine, view and trigger
+    editors and the table designer, and the event and routine editors' *reading source* lines.
     **`modal_footer_noted` is for a sentence too long to end in a `…` beside the buttons**: the note
     gets a full-width row of its own above them, wrapping at the modal's width, with the actions
     right-aligned below and never shrinking. **Never spell that as a `v_stack` handed to
@@ -27177,7 +27205,8 @@ existing prose was left alone.
     the title goes to `widgets::modal_title`, which takes `impl Into<String>` — this was its last
     caller with a `&'static str`. A refusal's text is the private `refusal_message`'s, a `tr!` arm
     per `AliasRenameRefusal` variant (`Conflict` with the trimmed `$name`), held to core's
-    `message` in English by `english_refuses_every_alias_rename_as_core_does` (under `i18n.rs`).
+    `message` in English by `english_refuses_every_alias_rename_as_core_does`, in this file's own
+    tests.
   - `usages_view.rs` — the SQL editor's *Find usages* list (`usages_overlay`, raised by
     `OverlayUi::usages` with a `UsagesRequest`, which `lib.rs` re-exports for the app): a modal
     titled *N usages of name* (*usage* for one), whose rows are a line number and that line's text
@@ -28910,7 +28939,9 @@ existing prose was left alone.
     short arrives typed**, a `dump::ExportFailure`, and `export_failure_text` words it — the
     existing `export-failed` and `export-worker-died`, then `export-not-published`,
     `export-not-renamed`, `export-nothing-matched` and `export-stopped`, adding no prefix since
-    every variant already says it failed — while `Worded`, a refusal the app wrote before the run
+    each variant's sentence is already whole — the four failures say they failed, and
+    `NothingMatched` and `Cancelled` say what happened instead — while `Worded`, a refusal the app
+    wrote before the run
     began, passes through as it stands. The result goes into `i18n::export_failure_note` for a dump
     and `files_failure_note` for a folder, and `english_says_every_export_failure_as_core_does`
     holds every variant equal to core's `Display`, which the CLI prints. The two replay toggles'
@@ -28919,8 +28950,10 @@ existing prose was left alone.
     held by `english_hints_every_replay_toggle_as_core_does`. The grid export's outcome
     lines in the progress box are the
     grid's, worded the same way (*Data grid*). What stays English: the format names
-    (`ExportFormat::label`, a `$format` placeable); and the save dialog's file-type name `SQL`
-    (`FileSpec::name` is a `&'static str`).
+    (`ExportFormat::label`, a `$format` placeable). The save dialog's file-type name was an English
+    `SQL` once, reasoned as `FileSpec::name` being a `&'static str`; it is `file-sql-filter` through
+    `tr_static!` now, the message `script_view.rs`'s open dialog uses, so both SQL dialogs name the
+    type alike.
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
     designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
@@ -31557,8 +31590,9 @@ existing prose was left alone.
     types, defaults, generation expressions, signatures and comments pass through, and the
     `name  type` line and the ` · ` between traits stay as core writes them. It used to show
     `describe`'s English in every language; `english_says_every_quick_info_as_core_does` holds it to
-    `QuickInfo::message` for a table and a view at one column and several, with and without a
-    comment, a column with every trait and with none optional, and both routine kinds with and
+    `QuickInfo::message` for three tables — a table at one column and at 1,200, neither with a
+    comment, and a view at three columns with one (no view at one column, and none without a
+    comment) — a column with every trait and with none optional, and both routine kinds with and
     without a return. Being the same `diag_tip`, it keeps everything above — the
     overlay gate, what retires it, its placement. The `Copy` hover closure reaches the `Editor`
     through a `RwSignal` (`ed_qi`). **Ctrl+click** is the editor's outer `PointerDown`, which runs
@@ -41612,7 +41646,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     a `OnceLock` per use site, filled once, which is sound only because the language is fixed at
     launch, and leaks nothing per dialog opened. There are two, the same macro each over its own
     crate's `tr!` — the app's at the top of `main.rs`, and `schemaic-ui`'s in `ui/i18n.rs`, which
-    `script_view.rs`'s *Run a SQL script* dialog uses and `tr_static_reads_the_message_once_per_site`
+    `script_view.rs`'s *Run a SQL script* dialog and `dump_view.rs`'s save dialog use (both for
+    `file-sql-filter`) and `tr_static_reads_the_message_once_per_site`
     holds to the message. A word core gives
     as a property of a typed value is drawn UI-side (below), and so is a message core gives as a
     typed *why*; prose core hands over as a finished `String` is not the view's to translate and
@@ -41846,7 +41881,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     `$names`, the `:a, :b` list joined UI-side as core's `Display` joins it, and
     `params-not-a-number` with `$name` and `$text` — for the app's run guard (`guarded_run`,
     `guarded_run_all`), in place of `e.to_string()`. `english_refuses_every_alias_rename_as_core_does`
-    and `english_says_every_parameter_error_as_core_does` hold the English equal byte for byte.
+    (in `alias_rename.rs`) and `english_says_every_parameter_error_as_core_does` (in `i18n.rs`)
+    hold the English equal byte for byte.
     The third is `cli_install`, whose `Refusal`, `Report` and `RowHint` the app's
     `install_cli::refusal`/`report` word from `install-refuse-*`/`install-report-*` and
     `settings::cli_hint` from `install-hint-*`, held by `english_refuses_every_install_as_core_does`,
@@ -41911,9 +41947,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     `export-cancelled-partial`/`-nothing`), and the grid words `SqlCopy::said` by `sql_copy_words`
     (`copy-sql-*`). The grid's destinations *the clipboard* and *the file*, a `$name` in those
     sentences, are `export-dest-clipboard`/`-file`. `english_says_every_export_note_as_core_does`
-    (four row counts, all eight combinations of the three losses, one and two columns),
-    `english_says_every_failed_or_cancelled_export_as_core_does` and
-    `english_says_every_sql_copy_note_as_core_does` (`core_words_tests`) hold the English. As with
+    (four row counts, all eight combinations of the three losses, one and two columns) and
+    `english_says_every_failed_or_cancelled_export_as_core_does`, both under `ui/i18n.rs`, and
+    `english_says_every_sql_copy_note_as_core_does` (`grid.rs`'s `core_words_tests`) hold the
+    English. As with
     *Restore from file*, the separator is the code's.
     The Export modal's dump and folder notes are the same plain-arguments case, and their
     renderers sit beside their one caller rather than in `i18n.rs`: `dump_view.rs`'s
@@ -41963,8 +42000,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     `conn-import-reason-*`/`conn-import-url-*` (in `i18n.rs`, since the import modal and the
     app's paste field both say one). Since a parser's text inside a reason may be a
     password, the worded sentence goes through `conn_import::redact_shown` whole, as core's
-    `message` does its English; `english_says_every_import_refusal_as_core_does` holds the two
-    equal and fails without the redaction (under `connection_import.rs`).
+    `message` does its English (under `connection_import.rs`);
+    `english_says_every_import_refusal_as_core_does`, in `i18n.rs`'s tests, holds the two equal
+    and fails without the redaction.
     The file import's refusals are the case where a library's text and Schemaic's share one
     channel. `ImportError::Read(String)` held both, and now holds only the library's — every
     sentence Schemaic writes itself is `ImportError::Refused(ReadRefusal)` (under `core/import.rs`).
@@ -42409,7 +42447,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     `not_sent_message`, with core's signatures, and for the app's kill and compare actions,
     `activity_read_only_refusal` and `compare_incomparable`, plain arguments as core's take, and
     `tunnel_refusal` for its connection lookups, and the four agent renderers above for `ai.rs`,
-    `cursor.rs` and `main.rs`.
+    `cursor.rs` and `main.rs` — and three more the list missed until the review after v0.35.0:
+    `notice_text`, which `lib.rs`'s startup recovery report and the app's keyring save notice
+    share; `elsewhere_note_text`, for the app's DDL apply, whose note `lib.rs`'s `DdlOutcome`
+    carries; and `issue_kind_message`, which `import_view.rs` calls and `i18n.rs`'s own
+    `row_error_text` builds on.
     Core's own stays English for the CLI, the
     MCP server and the AI prompts, and so does every use of it that is a key or a prompt: the
     tree's persisted `objgrp:`/`obj:` expansion keys, the *AI explain* prompts.

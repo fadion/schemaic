@@ -285,7 +285,9 @@ fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
         .title(tr!("dump-sql-dialog"))
         .default_name(format!("{}.sql", target.database))
         .allowed_types(vec![FileSpec {
-            name: "SQL",
+            // The app's SQL dialogs' one type name, as `script_view`'s — a
+            // `&'static str` that `tr_static!` makes of the message once.
+            name: crate::i18n::tr_static!("file-sql-filter"),
             extensions: &["sql"],
         }]);
     let run = ctx.run.clone();

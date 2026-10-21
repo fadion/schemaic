@@ -10108,8 +10108,8 @@ mod geometry_tests {
     }
 
     /// **The hover's quick info reads in English exactly as core's
-    /// `QuickInfo::message`** — a table and a view at one column and several,
-    /// with a comment and without, a column with every trait and with none
+    /// `QuickInfo::message`** — a table at one column and at many, without a
+    /// comment, and a view with one, a column with every trait and with none
     /// optional, and a function and a procedure with and without a return.
     #[test]
     fn english_says_every_quick_info_as_core_does() {
