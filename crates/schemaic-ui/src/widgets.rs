@@ -2761,6 +2761,12 @@ pub(crate) fn menu_row_face(
 /// that must not give way. `min_width(0)` is the part that is easy to forget:
 /// a flex item's minimum is its content otherwise, and the text clips rather
 /// than shrinks. The parent row needs a definite width for it to bite.
+///
+/// **And on the tooltip too.** `.tooltip()` wraps its view in a `Tooltip`
+/// view of its own, so *that* is the row's flex item; with the text's
+/// `min_width(0)` alone the wrapper kept the text's width and the line
+/// clipped without its `…` — the first cut of this helper shipped so, and the
+/// sandboxed app showed it.
 pub(crate) fn ellipsized_text(
     t: String,
     style: impl Fn(floem::style::Style) -> floem::style::Style + 'static,
@@ -2769,6 +2775,7 @@ pub(crate) fn ellipsized_text(
     text(t)
         .style(move |s| style(s).min_width(0.0).flex_shrink(1.0_f32).text_ellipsis())
         .tooltip(move || text(tip.clone()).style(tooltip_style))
+        .style(|s| s.min_width(0.0).flex_shrink(1.0_f32))
 }
 
 pub(crate) fn menu_item_style(s: floem::style::Style) -> floem::style::Style {

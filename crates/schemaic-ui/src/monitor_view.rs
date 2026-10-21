@@ -779,7 +779,10 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                 // A poll error can outrun the footer; the whole of it is here.
                 .tooltip(move || {
                     text(line.with(|(msg, _)| msg.clone())).style(crate::widgets::tooltip_style)
-                });
+                })
+                // The tooltip's wrapper is the row's flex item, so it shrinks
+                // too, or the line clips without its `…`.
+                .style(|s| s.min_width(0.0).flex_shrink(1.0_f32));
             // Binary columns: a warning icon ahead of the line, the columns
             // named in its tooltip, and absent for a table without one.
             let length_note = create_memo(move |_| length_only.with(|c| length_only_note(c)));
