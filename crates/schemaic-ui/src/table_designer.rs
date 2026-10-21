@@ -2809,11 +2809,14 @@ pub(crate) fn table_designer_overlay(
                         // Preview button gives by lighting up, at the other end of
                         // the footer where the count lives.
                         .style(move |s| {
-                            s.font_size(theme::font_label()).color(if n == 0 {
-                                theme::text_faint()
-                            } else {
-                                theme::change_count()
-                            })
+                            s.font_size(theme::font_label())
+                                .color(if n == 0 {
+                                    theme::text_faint()
+                                } else {
+                                    theme::change_count()
+                                })
+                                .min_width(0.0)
+                                .text_ellipsis()
                         });
                     // **Advice, after the count and never instead of it**: an
                     // index hint does not block Preview (`ddl::index_hints` is

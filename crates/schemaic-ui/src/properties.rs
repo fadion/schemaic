@@ -472,6 +472,7 @@ fn count_row(
         ))
         .style(|s| {
             s.items_center()
+                .flex_shrink(0.0_f32)
                 .gap(theme::scaled(7.0))
                 .padding_horiz(theme::scaled(8.0))
                 .padding_vert(theme::scaled(4.0))
@@ -492,17 +493,21 @@ fn count_row(
         ))
     };
 
+    // One line beside the button, ellipsized where the modal is narrow, the
+    // whole of it in the tooltip — it clipped mid-word before.
     let hint: Option<AnyView> = match hint_kind {
         Some(stats::CountHint::Error) => Some(
-            text(count_err.clone().unwrap_or_default())
-                .style(|s| s.font_size(font_body()).color(theme::error()))
-                .into_any(),
+            crate::widgets::ellipsized_text(count_err.clone().unwrap_or_default(), |s| {
+                s.font_size(font_body()).color(theme::error())
+            })
+            .into_any(),
         ),
         // The warning belongs *before* the press, not after.
         Some(stats::CountHint::Slow) => Some(
-            text(tr!("props-count-slow"))
-                .style(|s| s.font_size(font_body()).color(theme::text_faint()))
-                .into_any(),
+            crate::widgets::ellipsized_text(tr!("props-count-slow"), |s| {
+                s.font_size(font_body()).color(theme::text_faint())
+            })
+            .into_any(),
         ),
         // Counted: nothing left to say. The caption under the headline already
         // reads "rows (counted)", so a second line asserting the same thing is

@@ -1372,8 +1372,12 @@ fn footer(ctx: CompareCtx, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoVie
             .with(|sel| c.differences().filter(|e| is_planned(e, sel)).count())
     });
 
-    let status = label(move || selection_note_text(planned.get()))
-        .style(|s| s.font_size(theme::font_hint()).color(theme::text_muted()));
+    let status = label(move || selection_note_text(planned.get())).style(|s| {
+        s.font_size(theme::font_hint())
+            .color(theme::text_muted())
+            .min_width(0.0)
+            .text_ellipsis()
+    });
 
     let preview = {
         let ctx = ctx.clone();

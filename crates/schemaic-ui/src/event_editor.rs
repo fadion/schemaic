@@ -975,7 +975,12 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                     // body rather than the event as written.
                     if pending {
                         return text(tr!("event-editor-reading-source"))
-                            .style(|s| s.color(theme::text_faint()).font_size(theme::font_label()))
+                            .style(|s| {
+                                s.color(theme::text_faint())
+                                    .font_size(theme::font_label())
+                                    .min_width(0.0)
+                                    .text_ellipsis()
+                            })
                             .into_any();
                     }
                     if stale {
@@ -991,11 +996,14 @@ pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView 
                     let n = change_set(&status_target, &draft).len();
                     text(tr!("editor-change-count", n = n))
                         .style(move |s| {
-                            s.font_size(theme::font_label()).color(if n == 0 {
-                                theme::text_faint()
-                            } else {
-                                theme::change_count()
-                            })
+                            s.font_size(theme::font_label())
+                                .color(if n == 0 {
+                                    theme::text_faint()
+                                } else {
+                                    theme::change_count()
+                                })
+                                .min_width(0.0)
+                                .text_ellipsis()
                         })
                         .into_any()
                 },

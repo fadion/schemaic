@@ -923,6 +923,7 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                                     s.color(theme::text_muted())
                                         .font_size(theme::font_label())
                                         .min_width(0.0)
+                                        .text_ellipsis()
                                 })
                                 .into_any(),
                                 // Before the first table there is nothing to count
@@ -939,24 +940,15 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                         )
                         .into_any()
                     } else if let Some(e) = error {
-                        text(e)
-                            .style(|s| {
-                                s.color(theme::error())
-                                    .font_size(theme::font_label())
-                                    .min_width(0.0)
-                            })
-                            .into_any()
+                        crate::widgets::footer_error(e)
                     } else if let Some(msg) = done {
                         // Built at the callback, where the file's name was still
                         // in scope — `export_note` names the file and every column
                         // the export could not carry, in the grid's own wording.
-                        text(msg)
-                            .style(|s| {
-                                s.color(theme::status_ok())
-                                    .font_size(theme::font_label())
-                                    .min_width(0.0)
-                            })
-                            .into_any()
+                        crate::widgets::ellipsized_text(msg, |s| {
+                            s.color(theme::status_ok()).font_size(theme::font_label())
+                        })
+                        .into_any()
                     } else {
                         empty().into_any()
                     };

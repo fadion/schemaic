@@ -526,9 +526,10 @@ pub(crate) fn result_diff_overlay(
                 move |n| match n {
                     None => summary_line(computed).into_any(),
                     Some((msg, true)) => crate::widgets::footer_error(msg),
-                    Some((msg, false)) => text(msg)
-                        .style(|s| s.color(theme::text_dim()).font_size(theme::font_label()))
-                        .into_any(),
+                    Some((msg, false)) => crate::widgets::ellipsized_text(msg, |s| {
+                        s.color(theme::text_dim()).font_size(theme::font_label())
+                    })
+                    .into_any(),
                 },
             )
             .style(|s| s.min_width(0.0).flex_shrink(1.0_f32));
@@ -707,6 +708,7 @@ fn summary_line(computed: RwSignal<Rc<Computed>>) -> impl IntoView {
     .style(|s| {
         s.color(theme::text_dim())
             .font_size(theme::font_label())
+            .min_width(0.0)
             .text_ellipsis()
     })
 }

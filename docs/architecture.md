@@ -25345,6 +25345,13 @@ existing prose was left alone.
     everything right. Eight of the seventeen call sites had noticed and were spelling
     `status.style(|s| s.min_width(0.0))` themselves; the other nine were not — a helper whose
     contract only holds if the caller repeats half of it is one that will keep being called wrong.
+    **Every status these footers carry now ends in a `…` rather than wrapping or clipping** — an
+    audit under the pseudo-locale found the rest still overflowing, and each now goes through
+    `footer_error` or `ellipsized_text` (both below): Users' and Server Variables' counts, Compare's
+    selection note, Export's and Run script's progress and done lines, Chart's and Result diff's
+    export notices, Result diff's `summary_line` (which also lacked the `min_width(0)` above), and
+    the *N changes* and *reading source* lines of the object, event, routine, view and trigger
+    editors and the table designer.
     **`modal_footer_noted` is for a sentence too long to end in a `…` beside the buttons**: the note
     gets a full-width row of its own above them, wrapping at the modal's width, with the actions
     right-aligned below and never shrinking. **Never spell that as a `v_stack` handed to
@@ -25361,11 +25368,31 @@ existing prose was left alone.
     `view_editor`, `event_editor`, `routine_editor`; `object_editor` differed only in the number) and
     each freezing its box at `max_width(460.0)` while the `font_size` beside it scaled, so at
     **Huge** the longest messages these render wrapped to two or three lines inside a footer whose
-    height is fixed (see the size invariant). The width is a **wrap hint rather than a demand**:
-    `modal_footer_split` lets the status shrink to nothing and never shrinks the actions, so a modal
-    too narrow for the bound simply wraps earlier — which is why one number serves the 700-wide
-    object editor and the 900-wide rest, and why `object_editor`'s 420 was over-specification rather
-    than a second decision.
+    height is fixed (see the size invariant). **It is one line, ending in a `…`, with the whole
+    message in its tooltip — and no `max_width` at all.** The first version kept a scaled
+    `max_width(460)` as a *wrap hint*, on the reasoning that `modal_footer_split` would shrink the
+    box and the text would wrap earlier; but wrapping is the failure, not the fallback, in a row
+    whose height is fixed — a second line ran behind the buttons or out of the modal, which is what
+    the account editor's *"Pick a level, name what it applies to…"* did under the doubled
+    pseudo-locale (`SCHEMAIC_LOCALE=pseudo-en`). Since `modal_footer_split` already ends the status
+    where the actions begin, the line needs no bound of its own, and one helper serves every modal
+    width. Its callers grew past the six schema editors with that fix: the account form's blocker
+    line and the grant form's *needs a role / privileges* line (hand-rolled before, one capped at
+    340), `database_editor`'s status (capped at 320), `dump_view`'s and `script_view`'s error, and
+    the export error in `chart_view` and `result_diff_view`.
+    It is `ellipsized_text` in `error` at `font_label`. **`ellipsized_text(t, style)` is the
+    general form** — one line with `min_width(0)`/`flex_shrink(1)`/`text_ellipsis` and the full
+    text as a tooltip — for any status, hint or label beside controls that must not give way; the
+    `min_width(0)` is the half that is easy to forget, and the parent row still needs a definite
+    width for any of it to bite. **`menu_row_face(icon, icon_px, label, font_size, color)`** is the
+    icon-plus-label face of a full-width action row under a list — Manage Connections' *New
+    connection*/*Import*/*Export* and Users' *New account* — the icon at its size and the label
+    ellipsizing to the column; both lists had hand-rolled it, and a label longer than English ran
+    past the column's edge (Manage Connections' is a fixed `scaled(210)`). The caller still wraps it
+    in its `menu_item_style` container and `in_ring_button`, **whose wrapper carries `min_width(0)`
+    beside its `flex_shrink(0)`** for exactly these rows: in a column the wrapper's automatic
+    minimum was its content, so the label inside could never narrow; in a row `flex_shrink(0)`
+    still holds a button at its content, so nothing else moved.
     **`noted_if_empty` is applied inside `open_picker`, so nothing to choose from is an answer
     rather than silence.** `popup_menu_overlay` builds a panel for any `Some`, and for an empty list
     its height sums to the padding and border alone while its measured width is zero — so it clamps
@@ -25943,9 +25970,11 @@ existing prose was left alone.
     centred on the column, slid down to sit beside the message instead of the label. So the row is
     a `v_stack` of an `h_stack` (label column and buttons, `items_center`) and the outcome, at a
     gap of 6. **Both outcomes are a local `outcome_line`, not `widgets::footer_error`**: that one's
-    `max_width(scaled(460))` is a wrap hint which relies on `modal_footer_split` to shrink it, and
-    in the Settings modal's `modal_w(420)` nothing did, so a long error was laid out past the
-    modal's edge and clipped. `outcome_line` is `width_full().min_width(0)`, so it wraps at the
+    `max_width(scaled(460))` was then a wrap hint which relied on `modal_footer_split` to shrink it,
+    and in the Settings modal's `modal_w(420)` nothing did, so a long error was laid out past the
+    modal's edge and clipped. (`footer_error` is now one ellipsized line with no bound, which is
+    still not this row's shape: the outcome wraps.)
+    `outcome_line` is `width_full().min_width(0)`, so it wraps at the
     page's width (`SECTION_PAGE_W`, the 420 the modal then was). All of it arrives as one
     `Ui::cli_command: CliCommand { install, remove, state, installed, status }` — two actions, the
     one `RwSignal<InstallState>` they share, the `RwSignal<bool>` behind Remove and the
@@ -26735,7 +26764,8 @@ existing prose was left alone.
     the list behind it, so closing returns to it. Its own term in `modal_backdrop_up`, like
     `manage_open`'s, because it is a loose child of the layer and can outlive the modal that raised
     it. **"Export connections" sits under that row and is not part of this modal**: the same dim
-    `in_ring_button` (`icons::UPLOAD` beside Import's `DOWNLOAD`, ring index `NAV_TAB + 3`), calling
+    `in_ring_button` (`icons::UPLOAD` beside Import's `DOWNLOAD`, ring index `NAV_TAB + 3`; all
+    three rows' faces are `widgets::menu_row_face`, so a label ellipsizes to the `scaled(210)` column), calling
     `ConnActions::export_connections`, which goes straight to a save dialog — the app's closure,
     titled *Export connections*, defaulting to `schemaic-connections.json`. A typed name without
     `conn_import::EXPORT_FILE_SUFFIX` gets it appended (`conn_import::ExportPath::of`), after any
@@ -27689,7 +27719,9 @@ existing prose was left alone.
       appear, so a count error raised elsewhere and then followed by a failed re-fetch was
       swallowed. The decision itself already had a core test
       (`the_count_row_disappears_only_when_it_has_nothing_to_say`); the gap was the view's
-      composition with it, which no test here can reach.
+      composition with it, which no test here can reach. The slow warning or the error beside the
+      button is one `widgets::ellipsized_text` line with the whole of it in a tooltip, and the
+      button's face is `flex_shrink(0)`: in a narrow modal the hint clipped mid-word before.
     - **A MySQL view reached the full `Loaded` arm on a creation timestamp alone**, printing two
       em-dashes under a staleness caveat about figures the server never publishes. The fix is in
       `stats::TableStats::has_any`, so the panel and the Markdown copy move together — see
@@ -28127,7 +28159,9 @@ existing prose was left alone.
     Inside it the search box is full width (placeholder `Search accounts`), the list sits 10px below it
     with 5px between rows — Manage Connections' figure, two lists of names in one app spaced the
     same — and `+ New account` is an `in_ring_button` row pinned at the foot: `CIRCLE_PLUS` plus accent
-    text at `menu_item_style`'s 12px inset, the shape and the place `New connection` has.
+    text at `menu_item_style`'s 12px inset, the shape and the place `New connection` has — and the
+    same face, `widgets::menu_row_face`, so the label ends in a `…` at the column's `list_w()`
+    (`scaled(260)`) rather than running past it.
     **The list is keyed on `(state, filter)` and deliberately not on the selection** — picking a row
     would otherwise throw the whole list away to change one row's background, and take the scroll
     position under the pointer with it — so the selected row's background is a *reactive style* over

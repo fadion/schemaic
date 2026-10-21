@@ -714,7 +714,14 @@ pub(crate) fn in_ring_button<V: IntoView + 'static>(
     // Built for both states, so enabling a button doesn't change its box: a
     // disabled action keeps its place in the footer (see [`action_button`]), and
     // it would not if one state had a flex item the other lacked.
-    let wrapper = container(view).style(move |s| button_focus_ring(s, radius).flex_shrink(0.0_f32));
+    // `min_width(0)` for a button in a *column* — Manage connections' New /
+    // Import / Export — whose label ellipsizes to the column's width; in a
+    // row `flex_shrink(0)` still holds it at its content.
+    let wrapper = container(view).style(move |s| {
+        button_focus_ring(s, radius)
+            .flex_shrink(0.0_f32)
+            .min_width(0.0)
+    });
     if !enabled {
         return wrapper.into_any();
     }
@@ -2710,19 +2717,58 @@ fn footer_bar(s: floem::style::Style) -> floem::style::Style {
 /// ~1.6× wider and were given the same 460px, so a one-line error wrapped to
 /// two or three inside a footer whose height is fixed.
 ///
-/// The width is a wrap hint rather than a demand: [`modal_footer_split`] lets
-/// the status shrink to nothing and never shrinks the actions, so a modal too
-/// narrow for this bound simply wraps earlier. That is why one number serves the
-/// 700-wide object editor and the 900-wide rest, and why `object_editor`'s 420
-/// was over-specification rather than a second decision.
+/// **One line, ellipsized, the whole message in the tooltip.** It wrapped once,
+/// under a `max_width` meant as a wrap hint; but a footer's height is fixed,
+/// and a message wrapped to two lines there ran behind the buttons or out of
+/// the modal (the account editor's *"Pick a level, name what it applies to…"*
+/// did). [`modal_footer_split`] shrinks the status and never the actions, so
+/// the line simply ends where the buttons begin. The account editor's
+/// validation lines go through it too.
 pub(crate) fn footer_error(msg: String) -> AnyView {
-    text(msg)
-        .style(|s| {
-            s.color(theme::error())
-                .font_size(theme::font_label())
-                .max_width(theme::scaled(460.0))
-        })
-        .into_any()
+    ellipsized_text(msg, |s| {
+        s.color(theme::error()).font_size(theme::font_label())
+    })
+    .into_any()
+}
+
+/// An icon and a label for a full-width action row under a list — Manage
+/// connections' *New connection* / *Import* / *Export*, Users' *New account*.
+/// The icon keeps its size and the label ellipsizes to the column, which is
+/// fixed-width; a long label ran past its edge before. The caller wraps it in
+/// its `menu_item_style` container and [`in_ring_button`].
+pub(crate) fn menu_row_face(
+    icon: &'static str,
+    icon_px: f32,
+    label: String,
+    font_size: fn() -> f32,
+    color: fn() -> floem::peniko::Color,
+) -> impl IntoView {
+    h_stack((
+        icons::icon(icon, icon_px).style(|s| s.flex_shrink(0.0_f32)),
+        ellipsized_text(label, move |s| s.font_size(font_size())),
+    ))
+    .style(move |s| {
+        s.flex_row()
+            .items_center()
+            .min_width(0.0)
+            .gap(theme::scaled(8.0))
+            .color(color())
+    })
+}
+
+/// One line of text that ends in `…` where its row runs out of room, with the
+/// whole of it in a tooltip — for a status, a hint or a label beside controls
+/// that must not give way. `min_width(0)` is the part that is easy to forget:
+/// a flex item's minimum is its content otherwise, and the text clips rather
+/// than shrinks. The parent row needs a definite width for it to bite.
+pub(crate) fn ellipsized_text(
+    t: String,
+    style: impl Fn(floem::style::Style) -> floem::style::Style + 'static,
+) -> impl IntoView {
+    let tip = t.clone();
+    text(t)
+        .style(move |s| style(s).min_width(0.0).flex_shrink(1.0_f32).text_ellipsis())
+        .tooltip(move || text(tip.clone()).style(tooltip_style))
 }
 
 pub(crate) fn menu_item_style(s: floem::style::Style) -> floem::style::Style {

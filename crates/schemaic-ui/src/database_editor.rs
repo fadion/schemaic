@@ -615,13 +615,7 @@ pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl Into
             let status = dyn_container(
                 move || d.database_draft.get(),
                 move |draft| match draft.problems().pop() {
-                    Some(first) => text(database_problem_text(first))
-                        .style(|s| {
-                            s.color(theme::error())
-                                .font_size(theme::font_label())
-                                .max_width(theme::scaled(320.0))
-                        })
-                        .into_any(),
+                    Some(first) => crate::widgets::footer_error(database_problem_text(first)),
                     None => crate::widgets::nothing().into_any(),
                 },
             );

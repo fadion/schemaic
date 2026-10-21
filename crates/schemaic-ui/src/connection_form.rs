@@ -1099,18 +1099,13 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
 
             let new_c = new_conn.clone();
             let add = in_ring_button(
-                container(
-                    h_stack((
-                        icons::icon(icons::CIRCLE_PLUS, 16.0),
-                        text(tr!("connections-new")).style(|s| s.font_size(theme::font_body())),
-                    ))
-                    .style(|s| {
-                        s.flex_row()
-                            .items_center()
-                            .gap(theme::scaled(8.0))
-                            .color(theme::accent())
-                    }),
-                )
+                container(crate::widgets::menu_row_face(
+                    icons::CIRCLE_PLUS,
+                    16.0,
+                    tr!("connections-new"),
+                    theme::font_body,
+                    theme::accent,
+                ))
                 .on_click_stop({
                     let new_c = new_c.clone();
                     move |_| (new_c)()
@@ -1134,20 +1129,15 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
             // to add a connection on every day after the first.
             let import_c = open_import.clone();
             let import = in_ring_button(
-                container(
-                    h_stack((
-                        icons::icon(icons::DOWNLOAD, 15.0),
-                        // Not "from another client": the modal reads Schemaic's
-                        // own exports and Docker's containers as well.
-                        text(tr!("connections-import")).style(|s| s.font_size(theme::font_label())),
-                    ))
-                    .style(|s| {
-                        s.flex_row()
-                            .items_center()
-                            .gap(theme::scaled(8.0))
-                            .color(theme::text_dim())
-                    }),
-                )
+                // Not "from another client": the modal reads Schemaic's own
+                // exports and Docker's containers as well.
+                container(crate::widgets::menu_row_face(
+                    icons::DOWNLOAD,
+                    15.0,
+                    tr!("connections-import"),
+                    theme::font_label,
+                    theme::text_dim,
+                ))
                 .on_click_stop({
                     let import_c = import_c.clone();
                     move |_| (import_c)()
@@ -1163,18 +1153,13 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
             // share, without its secrets — the file Import reads back.
             let export_c = export_connections.clone();
             let export = in_ring_button(
-                container(
-                    h_stack((
-                        icons::icon(icons::UPLOAD, 15.0),
-                        text(tr!("connections-export")).style(|s| s.font_size(theme::font_label())),
-                    ))
-                    .style(|s| {
-                        s.flex_row()
-                            .items_center()
-                            .gap(theme::scaled(8.0))
-                            .color(theme::text_dim())
-                    }),
-                )
+                container(crate::widgets::menu_row_face(
+                    icons::UPLOAD,
+                    15.0,
+                    tr!("connections-export"),
+                    theme::font_label,
+                    theme::text_dim,
+                ))
                 .on_click_stop({
                     let export_c = export_c.clone();
                     move |_| (export_c)()

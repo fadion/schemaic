@@ -669,6 +669,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                                     st.color(theme::text_muted())
                                         .font_size(theme::font_label())
                                         .min_width(0.0)
+                                        .text_ellipsis()
                                 })
                                 .into_any(),
                                 Some(p) => text(tr!(
@@ -679,6 +680,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                                     st.color(theme::text_muted())
                                         .font_size(theme::font_label())
                                         .min_width(0.0)
+                                        .text_ellipsis()
                                 })
                                 .into_any(),
                                 None => crate::widgets::loading_dots(
@@ -691,21 +693,12 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                         )
                         .into_any()
                     } else if let Some(e) = error {
-                        text(e)
-                            .style(|st| {
-                                st.color(theme::error())
-                                    .font_size(theme::font_label())
-                                    .min_width(0.0)
-                            })
-                            .into_any()
+                        crate::widgets::footer_error(e)
                     } else if let Some(msg) = done {
-                        text(msg)
-                            .style(|st| {
-                                st.color(theme::status_ok())
-                                    .font_size(theme::font_label())
-                                    .min_width(0.0)
-                            })
-                            .into_any()
+                        crate::widgets::ellipsized_text(msg, |st| {
+                            st.color(theme::status_ok()).font_size(theme::font_label())
+                        })
+                        .into_any()
                     } else {
                         empty().into_any()
                     };

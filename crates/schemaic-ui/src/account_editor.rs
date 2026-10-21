@@ -969,9 +969,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                     })
                 },
                 move |missing| match missing {
-                    Some(why) => text(account_blocker_text(why))
-                        .style(|s| s.color(theme::error()).font_size(theme::font_label()))
-                        .into_any(),
+                    Some(why) => crate::widgets::footer_error(account_blocker_text(why)),
                     None => crate::widgets::nothing().into_any(),
                 },
             );
@@ -1440,16 +1438,10 @@ pub(crate) fn grant_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoVie
                     if draft.is_ready(&status_who) {
                         crate::widgets::nothing().into_any()
                     } else {
-                        text(match draft.subject {
+                        crate::widgets::footer_error(match draft.subject {
                             GrantSubject::Role => tr!("account-editor-needs-role"),
                             GrantSubject::Privileges => tr!("account-editor-needs-privileges"),
                         })
-                        .style(|s| {
-                            s.color(theme::error())
-                                .font_size(theme::font_label())
-                                .max_width(theme::scaled(340.0))
-                        })
-                        .into_any()
                     }
                 },
             );

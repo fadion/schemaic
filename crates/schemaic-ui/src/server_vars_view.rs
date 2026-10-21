@@ -390,7 +390,12 @@ fn footer(
         }
         _ => String::new(),
     })
-    .style(|s| s.font_size(font_hint()).color(theme::text_faint()));
+    .style(|s| {
+        s.font_size(font_hint())
+            .color(theme::text_faint())
+            .min_width(0.0)
+            .text_ellipsis()
+    });
 
     modal_footer_split(
         status,

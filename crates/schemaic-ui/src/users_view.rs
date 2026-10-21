@@ -995,24 +995,19 @@ fn new_account_row(
     };
     let open_click = open.clone();
     in_ring_button(
-        container(
-            h_stack((
-                icons::icon(icons::CIRCLE_PLUS, 16.0),
-                text(tr!("users-new-account")).style(|s| s.font_size(font_body())),
-            ))
-            .style(move |s| {
-                s.flex_row()
-                    .items_center()
-                    .gap(theme::scaled(8.0))
-                    // Dimmed rather than absent while the connection is
-                    // read-only or has no database selected — see [`WriteGate`].
-                    .color(if enabled {
-                        theme::accent()
-                    } else {
-                        theme::text_faint()
-                    })
-            }),
-        )
+        container(crate::widgets::menu_row_face(
+            icons::CIRCLE_PLUS,
+            16.0,
+            tr!("users-new-account"),
+            theme::font_body,
+            // Dimmed rather than absent while the connection is read-only or
+            // has no database selected — see [`WriteGate`].
+            if enabled {
+                theme::accent
+            } else {
+                theme::text_faint
+            },
+        ))
         .on_click_stop(move |_| {
             if enabled {
                 (open_click)();
@@ -1294,7 +1289,12 @@ fn footer(
         }
         _ => String::new(),
     })
-    .style(|s| s.font_size(font_hint()).color(theme::text_faint()));
+    .style(|s| {
+        s.font_size(font_hint())
+            .color(theme::text_faint())
+            .min_width(0.0)
+            .text_ellipsis()
+    });
 
     // Copy takes the statements the pane is showing — the redacted ones, since
     // redaction happens at the fetch. There is nothing here that could put a
