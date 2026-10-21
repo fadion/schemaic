@@ -6316,6 +6316,22 @@ fn start_edit(gs: GridState, i: usize, ci: usize) {
     gs.edit_cell.set(Some((i, ci)));
 }
 
+/// Whether an in-cell editor opens as a multiline field: **always**, whatever
+/// its seed.
+///
+/// A database cell is the one field in the app where a line break is data, and
+/// a single-line field strips breaks from its document and writes the stripped
+/// text back. Deciding from the seed covered only the first cell opened. A
+/// Tab/Enter hop seeds the shared `edit_buf` *before* `edit_cell` moves, so the
+/// field being left reads the next cell's value through its own sync first; a
+/// single-line one joined its lines, and the destination opened on (and the
+/// next hop or Commit staged) a value nobody typed. A paste of two lines into a
+/// one-line value lost its break the same way. The bare field is one line tall
+/// and unwrapped either way, and `enter_never_breaks` keeps Enter staging.
+fn cell_field_multiline(_seed: &str) -> bool {
+    true
+}
+
 /// Start the clock on a write that has just been handed to the app: if it is
 /// still in flight [`WRITE_WAIT_MS`] from now, say so — and name what of the
 /// user's own might be holding it up.
@@ -11727,13 +11743,10 @@ fn data_cell(
                         // rather than a nested input.
                         bare: true,
                         autofocus: true,
-                        // **A value that already holds a line break is edited as
-                        // one.** A single-line field strips breaks from its
-                        // document and writes the stripped text back, which would
-                        // rewrite a multi-line value on the first keystroke.
-                        // Unwrapped and one line tall either way, and Enter still
-                        // stages rather than breaking the line.
-                        multiline: gs.edit_buf.with_untracked(|b| b.contains(['\n', '\r'])),
+                        // **Every cell is edited multiline**, so no field bound to
+                        // `edit_buf` ever strips a break — see
+                        // [`cell_field_multiline`].
+                        multiline: gs.edit_buf.with_untracked(|b| cell_field_multiline(b)),
                         no_wrap: true,
                         enter_never_breaks: true,
                         on_submit: Some(enter),
@@ -13446,6 +13459,39 @@ mod clipboard_gate {
         assert!(
             src[at..body_end].contains("copy_split_note"),
             "copy_selection must report the cells the TSV format split"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cell_field_tests {
+    use super::cell_field_multiline;
+    use crate::single_line_sync;
+
+    /// **A hop onto a multi-line cell keeps its lines.** Tab off `name = "x"`:
+    /// `start_edit` seeds the shared `edit_buf` with the next cell's
+    /// `"a\nb"` while `name`'s field is still mounted, so that field's own
+    /// sync reads the new seed first — and it was built for *its* seed. When
+    /// that build was single-line, the sync joined the lines and the
+    /// destination opened on (and staged) `"ab"`.
+    #[test]
+    fn a_hop_from_a_one_line_cell_onto_a_multi_line_one_keeps_its_breaks() {
+        let source_was_built = cell_field_multiline("x");
+        assert_eq!(
+            single_line_sync("x", "a\nb", source_was_built),
+            Some("a\nb".into())
+        );
+    }
+
+    /// **A paste carries its breaks into a cell.** A database cell is the one
+    /// field where a line break is data, so a two-line clipboard pasted into
+    /// a one-line value is staged with both lines.
+    #[test]
+    fn a_two_line_paste_into_a_one_line_cell_keeps_the_break() {
+        let built = cell_field_multiline("12 High St");
+        assert_eq!(
+            single_line_sync("12 High St", "12 High St\nLondon", built),
+            Some("12 High St\nLondon".into())
         );
     }
 }

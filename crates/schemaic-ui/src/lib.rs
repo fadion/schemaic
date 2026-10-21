@@ -11437,7 +11437,7 @@ pub(crate) fn tab_action(
 /// Returning `Some` with an equal value is not a no-op here, and that is the
 /// mechanism: a floem signal never dedups, so the set still notifies, the
 /// reconcile runs, finds `want != have`, and rewrites the document.
-fn single_line_sync(current: &str, doc: &str, multiline: bool) -> Option<String> {
+pub(crate) fn single_line_sync(current: &str, doc: &str, multiline: bool) -> Option<String> {
     let stripped = !multiline && (doc.contains('\n') || doc.contains('\r'));
     let t = if stripped {
         doc.replace(['\n', '\r'], "")
@@ -11968,7 +11968,10 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 })
                 .background(floem::peniko::Color::TRANSPARENT)
                 .class(Handle, move |s| {
-                    if multiline {
+                    // A bare field is one line tall whatever `multiline` says
+                    // (the grid's cell editor is multiline only to keep a
+                    // value's breaks), so a bar would sit over the text.
+                    if multiline && !bare {
                         // The chat box shows a thin bar past the row cap. Faded
                         // out while idle rather than hidden: alpha is what a
                         // style class can reach, and it transitions.

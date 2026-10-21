@@ -34514,7 +34514,8 @@ existing prose was left alone.
     floem's `text_input` (*Data grid* has why). `FieldCfg::bare` draws in place inside a box that
     already exists — no border, padding, background or rounding, and exactly one line tall for the parent
     to centre, not `height_full`, since the editor fills its box and a full-height one would set the
-    line at the top. `FieldCfg::inset_left` is the box's left padding read reactively, for a numeric
+    line at the top — and with no scrollbar even when `multiline`, which the grid always sets to keep
+    a value's line breaks. `FieldCfg::inset_left` is the box's left padding read reactively, for a numeric
     cell's right-alignment; padding the editor itself is a no-op, it being a scroll view. Both feed
     one `pad_left` closure, which the placeholder, the `suggest` ghost and the click-in-chrome
     mapping read too, so nothing laid over the text drifts from it. `FieldCfg::on_shift_tab` is
@@ -45827,10 +45828,18 @@ this bundle's.
   it is not a blur, which is why it asks `gs.alive()` (a switched tab has disposed the grid by then)
   and that `edit_cell` still is this cell (a Tab/Enter hop has already repointed it, and the blur
   must not clobber that), and it takes the keyboard back only when `reclaim_keyboard` finds the
-  pointer over the grid — Floem 0.2 gotchas has why the pointer decides. **A value that already
-  holds a `\n` or `\r` is edited `multiline`** (`no_wrap`, `enter_never_breaks`, one line tall
-  either way): a single-line field strips line breaks from its document and writes the stripped text
-  back, which would rewrite a multi-line value on its first keystroke. A numeric cell right-aligns
+  pointer over the grid — Floem 0.2 gotchas has why the pointer decides. **Every cell is edited
+  `multiline`, whatever its value** (`cell_field_multiline`; `no_wrap`, `enter_never_breaks`, one
+  line tall either way): a database cell is the one field where a line break is data, and a
+  single-line field strips breaks from its document and writes the stripped text back
+  (`single_line_sync`). Deciding it from the seed — multiline only when the value held a `\n` or
+  `\r` — covered only the first cell opened. `start_edit` seeds the shared `edit_buf` *before*
+  `edit_cell` moves, so on a Tab/Shift+Tab/Enter hop the field being left is still mounted and its
+  sync reads the next cell's value first; a single-line one joined its lines, the destination opened
+  on the joined text, and the next hop or Commit staged a value nobody typed. Two lines pasted into a
+  one-line value lost the break the same way (`cell_field_tests`). A bare field shows no scrollbar
+  for being multiline — the `Handle` class draws the fading bar only for `multiline && !bare`, since
+  one line tall it would sit over the text. A numeric cell right-aligns
   through `FieldCfg::inset_left` (*No `text-align` in Floem 0.2*, under the gotchas), and a date
   cell's calendar has its own blur guard (*Dates keep the text input*, below).
   **What the commit's landing clears is addressed by position and by key, and ✗ Discard is live
