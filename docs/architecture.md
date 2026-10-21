@@ -10446,7 +10446,7 @@ existing prose was left alone.
     the wait worth a banner and write its sentence — deliberately `None` when the holder isn't in
     the snapshot, since a banner offering to kill a session that isn't there is worse than no
     banner. The sentence's decisions are `lock_wait_said`, which answers a `LockWait` — both ids and
-    `who()`s, the holder's state, `waited`/`held` as `format_age` prints them (`None` where the
+    `who()`s, the holder's state, `waited`/`held` as `Age`s (`None` where the
     server withheld the age) and `others`, the other holders — whose `Display` is the English
     `lock_wait_text` wraps, so the panel can word it (`activity_panel.rs`). It is not called
     `lock_wait` because that name is the picker's.
@@ -10503,8 +10503,8 @@ existing prose was left alone.
     `state_change`, `query_start` and `backend_start` for a backend the role may not inspect, so
     its age arrives NULL; folded to `0.0` it drew as **"0s"**, and a connection open for three
     hours claimed to have just arrived on the list a person scans for what has been sitting there.
-    Every reader has an answer for the unknown rather than a substitute: `format_age` takes the
-    `Option` and draws an em dash, both sorts put `None` last (`None < Some`, which is also what
+    Every reader has an answer for the unknown rather than a substitute: `age` takes the
+    `Option` and hands the `None` back, which the panel draws as an em dash, both sorts put `None` last (`None < Some`, which is also what
     the query's `NULLS LAST` does), and `lock_wait_text` drops the duration from its sentence
     instead of inventing one. `KillKind` is an enum and not a bool because both engines offer both and the
     consequences differ in kind: cancelling leaves the session and its transaction alive, while
@@ -10517,9 +10517,13 @@ existing prose was left alone.
     gone exactly as under a terminate. Telling a PostgreSQL user their transaction "stays open" is
     true and useless. `supports_activity` is the capability (**false for SQLite, which is a library in this
     process and has no other session to see**) and `supports_kill` is *computed* from it rather than
-    spelling out a second `!= Sqlite`. `format_age` prints whole seconds under a minute because
+    spelling out a second `!= Sqlite`. `age` keeps whole seconds under a minute because
     MySQL's `PROCESSLIST.TIME` has nothing finer, and steps the unit up rather than running the
-    count on. The **poll interval is stored per connection** (`IntervalRule`, keyed by `conn_id`
+    count on. It answers a value, `Age` — the unit and its two counts — rather than a string,
+    because the units are words, not marks (`d` is not German): the panel words one through
+    `i18n::session_age`, and `Age`'s `Display` is the English (`4m 12s`, `2d 07h`) that
+    `LockWait`'s `Display` and core's tests read. It replaced `format_age`, which returned the
+    English string and left the interface nothing to translate. The **poll interval is stored per connection** (`IntervalRule`, keyed by `conn_id`
     like the colour and favourite rules, in `ui_state.json`): it is not a taste but how hard you
     are willing to lean on a particular server, and one global number would carry a laptop's two
     seconds onto a production replica on the next switch. `interval_for` clamps on the way out and
@@ -18303,7 +18307,8 @@ existing prose was left alone.
       lived as `result_diff`'s private `table_value` and, before that, as the monitor view's own
       `cell`/`is_line_break` — two copies of one promise, now one.
     - `stats.rs` — table statistics: `TableStats`/`IndexStats`/`SchemaStats`, `format_bytes`
-      (1024-based, IEC units), `format_age`, and the honesty types. Every figure is an `Option`
+      (1024-based, IEC units), `format_age` — `span(secs)`'s English, the `Span` (one whole unit)
+      the Properties panel words through `i18n::staleness_age` — and the honesty types. Every figure is an `Option`
       because the engines publish different facts — SQLite's sizes are exact, read from `dbstat`,
       and it has no row figure at all (under `schemaic-db`'s entry). **There is no
       `supports_table_stats` any more**: it was `false` for SQLite while nothing read SQLite's sizes,
@@ -25864,6 +25869,13 @@ existing prose was left alone.
     language's `NumberMarks`, and `figure`, `count`, `bytes` and `contrasting_bytes` write core's
     English figures in them — the view's half of *Figures in the interface's marks*, with
     `every_core_figure_a_view_shows_takes_the_interface_s_marks` the gate that keeps a view on it.
+    Units are the other half, and they are words rather than marks: `session_age`,
+    `staleness_age` and `poll_interval` word `activity::Age`, `stats::Span` and a poll interval
+    from `activity-age-*`, `props-age-*` and `activity-interval*` (German `4 min 02 s`, `3 Tg.`,
+    `Aus`), `session_age` padding the second figure to two digits as core does so a column of
+    ages lines up. Each has a private `_in(&FluentLanguageLoader, …)` sibling so
+    `ages_and_poll_intervals_read_in_the_interfaces_units` can ask German as well as hold the
+    English equal to core's `Display`.
     **`configure` loads a catalogue and *then* calls `set_use_isolating(false)`, and the order is
     load-bearing**: a load swaps in fresh bundles and the flag is a setting of the bundles, so set
     first it is silently undone. Fluent wraps every placeable in U+2068/U+2069 by default, so a
@@ -27764,7 +27776,8 @@ existing prose was left alone.
     which words `activity::lock_wait_said`'s `LockWait` as the one message
     `activity-lock-wait-sentence` (under *The string catalogue*), held to core's `Display` by
     `english_says_every_lock_wait_as_core_does` across every holder state, each age present or
-    withheld, and none, one or three other holders — 48 sentences.
+    withheld, and none, one or three other holders — 48 sentences. Its ages and the session row's
+    are `activity::Age`s worded by `i18n::session_age`, the row's withheld age an em dash.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
     read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
@@ -27885,8 +27898,10 @@ existing prose was left alone.
       as `RowCount::label` prints them through `i18n::figure` — and the index line's three
       (size, cardinality, scans) through `index_fact_in`, which `text::remark`s each in the marks
       it is given. The cardinality arrives already printed (`~1.25k`), and passed through raw it
-      was the one figure on the line a German reader took for ~125k. And `format_age`, whole units with
-      no mark to move, as core prints it. The copied
+      was the one figure on the line a German reader took for ~125k. The staleness window's age is
+      worded too, through `i18n::staleness_age(stats::span(secs))` (`props-age-*`): it used to be
+      `format_age` as core prints it, on the reasoning that whole units have no mark to move — but
+      the units are language, not marks, and `d` is not German (`3 Tg.`). The copied
       Markdown stays core's English.
   - `used_by_view.rs` — the **Used by** modal (`used_by_overlay`), over `core::used_by`, opened by
     setting `overlay.used_by` to a `UsedByTarget { database, schema, name, column, routine }`
@@ -30496,8 +30511,11 @@ existing prose was left alone.
     (`the_transaction_prompt_is_one_sentence_with_its_count` pins the English). The `{kind}` inside
     *Create {kind}* and *Edit {kind}* — and `CreateKind::label`'s fallback for an object kind — is
     `i18n::object_kind`, the catalogue's `kind-*` rather than `ObjectKind::label()`. Some words
-    reaching these popups are still another module's English: `ExportFormat::label` and
-    `activity::interval_label`; `stats::truncate_prompt`'s question is `i18n::truncate_prompt`'s
+    reaching these popups were another module's English, and one still is: `ExportFormat::label`,
+    whose names are English on purpose. `activity::interval_label` is gone — Server Activity's poll
+    menu, the `dyn_container` over `activity::POLL_INTERVALS`, draws its entries through
+    `i18n::poll_interval` (`activity-interval-off`, `activity-interval` with `$secs`);
+    `stats::truncate_prompt`'s question is `i18n::truncate_prompt`'s
     now (`tree-truncate-rows`, `-every-row`, over core's `confirm_figure`; the first selects on
     `$n`, the figure's own number, so an exact count of one asks "Delete the 1 row", as core's
     English does). The colour presets' names
@@ -41618,9 +41636,7 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **The string catalogue: a translated label is spelled `tr!("id")`**, or `tr!("id", name =
   value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). **Every file of
   `schemaic-ui` and `schemaic-app` now draws what a user reads from the catalogue** — but for
-  `activity::interval_label`'s *Off* and `30s` in Server Activity's poll menu, still core's
-  English (under `overlays.rs`, with `ExportFormat::label`, whose names are English on purpose) —
-  so a new word
+  `ExportFormat::label`, whose names are English on purpose (under `overlays.rs`) — so a new word
   a user reads goes in through `tr!` as well, with its German in the same change — a literal is
   the odd one out now, and the pseudo-locale (below) is what shows one left plain. The app reaches
   the one loader through its own `tr!` (the `schemaic-app` entry says why it cannot borrow the UI

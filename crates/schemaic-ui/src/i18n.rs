@@ -127,6 +127,53 @@ pub fn elapsed(ms: u64) -> String {
     figure(&schemaic_core::transcript::elapsed_text(ms))
 }
 
+/// How long a session has been in its state — `activity::Age` in the
+/// interface's units: `4m 12s`, German `4 min 12 s`.
+pub fn session_age(age: schemaic_core::activity::Age) -> String {
+    session_age_in(&LOADER, age)
+}
+
+fn session_age_in(l: &FluentLanguageLoader, age: schemaic_core::activity::Age) -> String {
+    use schemaic_core::activity::Age;
+    // The second unit keeps its two digits, as core's English does, so ages
+    // stacked down the list line up.
+    let pad = |n: u64| format!("{n:02}");
+    match age {
+        Age::Seconds(s) => i18n_embed_fl::fl!(l, "activity-age-seconds", s = s),
+        Age::Minutes(m, s) => i18n_embed_fl::fl!(l, "activity-age-minutes", m = m, s = pad(s)),
+        Age::Hours(h, m) => i18n_embed_fl::fl!(l, "activity-age-hours", h = h, m = pad(m)),
+        Age::Days(d, h) => i18n_embed_fl::fl!(l, "activity-age-days", d = d, h = pad(h)),
+    }
+}
+
+/// A staleness window — `stats::Span` in the interface's units: `24h`,
+/// German `24 h`.
+pub fn staleness_age(span: schemaic_core::stats::Span) -> String {
+    staleness_age_in(&LOADER, span)
+}
+
+fn staleness_age_in(l: &FluentLanguageLoader, span: schemaic_core::stats::Span) -> String {
+    use schemaic_core::stats::Span;
+    match span {
+        Span::Seconds(n) => i18n_embed_fl::fl!(l, "props-age-seconds", n = n),
+        Span::Minutes(n) => i18n_embed_fl::fl!(l, "props-age-minutes", n = n),
+        Span::Hours(n) => i18n_embed_fl::fl!(l, "props-age-hours", n = n),
+        Span::Days(n) => i18n_embed_fl::fl!(l, "props-age-days", n = n),
+    }
+}
+
+/// An entry of Server Activity's auto-refresh menu: `Off`, or `5s`.
+pub fn poll_interval(secs: u64) -> String {
+    poll_interval_in(&LOADER, secs)
+}
+
+fn poll_interval_in(l: &FluentLanguageLoader, secs: u64) -> String {
+    match secs {
+        0 => i18n_embed_fl::fl!(l, "activity-interval-off"),
+        secs => i18n_embed_fl::fl!(l, "activity-interval", secs = secs),
+    }
+}
+
 /// `format::contrasting_bytes` in the interface's marks — two sizes told
 /// apart, for a refusal whose point is that they differ.
 pub fn contrasting_bytes(a: u64, b: u64) -> (String, String) {
@@ -2614,6 +2661,37 @@ mod tests {
         let de = loader(UiLanguage::De);
         let args = HashMap::from([("name", "t2")]);
         assert!(de.get_args("alias-rename-conflict", args).contains("„t2“"));
+    }
+
+    /// **Ages and the poll menu read in English exactly as core's**, every
+    /// unit, the padded second figure included — and in German's own units,
+    /// where they were core's `4m 12s`, `1d 02h` and *Off* in any language.
+    #[test]
+    fn ages_and_poll_intervals_read_in_the_interfaces_units() {
+        use schemaic_core::activity::{Age, age};
+        use schemaic_core::stats::{Span, span};
+        for secs in [0.0, 12.0, 252.0, 3_600.0, 86_399.0, 200_000.0] {
+            let a = age(Some(secs)).unwrap();
+            assert_eq!(session_age(a), a.to_string(), "{a:?}");
+        }
+        for secs in [30, 300, 3_600, 86_400, 172_800] {
+            let s = span(secs);
+            assert_eq!(staleness_age(s), s.to_string(), "{s:?}");
+        }
+        assert_eq!(poll_interval(0), "Off");
+        assert_eq!(poll_interval(30), "30s");
+
+        let de = loader(UiLanguage::De);
+        assert_eq!(session_age_in(&de, Age::Seconds(12)), "12 s");
+        assert_eq!(session_age_in(&de, Age::Minutes(4, 2)), "4 min 02 s");
+        assert_eq!(session_age_in(&de, Age::Hours(1, 0)), "1 h 00 min");
+        assert_eq!(session_age_in(&de, Age::Days(2, 7)), "2 Tg. 07 h");
+        assert_eq!(staleness_age_in(&de, Span::Seconds(30)), "30 s");
+        assert_eq!(staleness_age_in(&de, Span::Minutes(5)), "5 min");
+        assert_eq!(staleness_age_in(&de, Span::Hours(24)), "24 h");
+        assert_eq!(staleness_age_in(&de, Span::Days(3)), "3 Tg.");
+        assert_eq!(poll_interval_in(&de, 0), "Aus");
+        assert_eq!(poll_interval_in(&de, 5), "5 s");
     }
 
     /// **A typed message reads in English exactly as core's own rendering**

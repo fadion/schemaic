@@ -108,15 +108,6 @@ pub const POLL_INTERVALS: [u64; 5] = [0, 2, 5, 10, 30];
 /// slow enough that watching it is not itself a load worth noticing.
 pub const DEFAULT_POLL_SECS: u64 = 5;
 
-/// Menu label for a poll interval.
-pub fn interval_label(secs: u64) -> String {
-    if secs == 0 {
-        "Off".to_string()
-    } else {
-        format!("{secs}s")
-    }
-}
-
 /// Clamp a persisted interval to one the picker can actually show, so a
 /// hand-edited or future-version config can't leave the menu with nothing
 /// highlighted (or the timer spinning at 1ms).
@@ -257,7 +248,8 @@ pub struct SessionInfo {
     /// arrives NULL; folded to `0.0` it drew as **"0s"**, and a connection open
     /// for three hours claimed to have just arrived on the list a person scans
     /// for what has been sitting there. Everything that reads this has an
-    /// answer for the unknown: [`format_age`] draws an em dash, both sorts put
+    /// answer for the unknown: [`age`] is `None` and the panel draws an em
+    /// dash, both sorts put
     /// it last (`None < Some`, which is also what the query's `NULLS LAST`
     /// does), and [`lock_wait_text`] drops the duration from its sentence
     /// rather than inventing one.
@@ -696,19 +688,19 @@ pub fn lock_wait_text(waiter: &SessionInfo, holder: &SessionInfo) -> String {
 }
 
 /// What [`lock_wait_text`] says, as values: the two sessions, the holder's
-/// state, both ages as [`format_age`] prints them, and how many other holders
+/// state, both ages as [`age`] measures them, and how many other holders
 /// there are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockWait {
     pub waiter: i64,
     pub waiter_who: String,
     /// How long the waiter has waited; `None` where the server withheld it.
-    pub waited: Option<String>,
+    pub waited: Option<Age>,
     pub holder: i64,
     pub holder_who: String,
     pub holder_state: SessionState,
     /// How long the holder has held it; `None` where the server withheld it.
-    pub held: Option<String>,
+    pub held: Option<Age>,
     /// Other sessions holding a lock the waiter needs.
     pub others: usize,
 }
@@ -751,15 +743,14 @@ pub fn lock_wait_said(waiter: &SessionInfo, holder: &SessionInfo) -> LockWait {
     // **An age the server withheld is left out of the sentence, not drawn as a
     // number.** Either side can be masked (`SessionInfo::seconds`), and "has
     // been waiting 0s for a lock" was a claim nothing had made.
-    let age = |s: &SessionInfo| s.seconds.map(|_| format_age(s.seconds));
     LockWait {
         waiter: waiter.id,
         waiter_who: waiter.who(),
-        waited: age(waiter),
+        waited: age(waiter.seconds),
         holder: holder.id,
         holder_who: holder.who(),
         holder_state: holder.state,
-        held: age(holder),
+        held: age(holder.seconds),
         others: waiter.blocked_by.len().saturating_sub(1),
     }
 }
@@ -937,7 +928,7 @@ pub fn from_mysql_rows(
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
                 // `TIME` is signed and goes negative when the system clock steps
-                // back under a live thread; `format_age` floors it, but the sort
+                // back under a live thread; `age` floors it, but the sort
                 // key must not hoist such a row to the top of its group.
                 // MySQL's `PROCESSLIST.TIME` is a plain integer the server
                 // always fills, so the age is never unknown on this engine.
@@ -1721,29 +1712,48 @@ fn cancel_transaction_note(dialect: SqlDialect) -> &'static str {
 /// Separate from [`crate::history::format_duration`], which formats a *query's*
 /// millisecond runtime and has no arm past minutes — a connection open since
 /// yesterday would render there as `1873m 04s`.
-/// An age the server withheld is `None` and draws as an em dash. It used to
-/// fall to `0.0` and draw "0s", which reads as a fact rather than as a blank —
-/// see [`SessionInfo::seconds`].
-pub fn format_age(secs: Option<f64>) -> String {
-    let Some(secs) = secs else {
-        return "—".to_string();
-    };
-    let secs = if secs.is_finite() && secs > 0.0 {
-        secs
+///
+/// A value — the unit chosen and the two counts — rather than a string, so
+/// the interface words it in its own units; [`Age`]'s `Display` is the
+/// English. An age the server withheld is `None`, which the panel draws as an
+/// em dash. It used to fall to `0.0` and draw "0s", which reads as a fact
+/// rather than as a blank — see [`SessionInfo::seconds`].
+pub fn age(secs: Option<f64>) -> Option<Age> {
+    let secs = secs?;
+    let t = if secs.is_finite() && secs > 0.0 {
+        secs as u64
     } else {
-        0.0
+        0
     };
-    if secs < 60.0 {
-        format!("{}s", secs as u64)
-    } else if secs < 3600.0 {
-        let t = secs as u64;
-        format!("{}m {:02}s", t / 60, t % 60)
-    } else if secs < 86_400.0 {
-        let t = secs as u64;
-        format!("{}h {:02}m", t / 3600, (t % 3600) / 60)
+    Some(if t < 60 {
+        Age::Seconds(t)
+    } else if t < 3600 {
+        Age::Minutes(t / 60, t % 60)
+    } else if t < 86_400 {
+        Age::Hours(t / 3600, (t % 3600) / 60)
     } else {
-        let t = secs as u64;
-        format!("{}d {:02}h", t / 86_400, (t % 86_400) / 3600)
+        Age::Days(t / 86_400, (t % 86_400) / 3600)
+    })
+}
+
+/// An age in its largest unit and the next one down: `Minutes(4, 12)` is four
+/// minutes and twelve seconds. See [`age`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Age {
+    Seconds(u64),
+    Minutes(u64, u64),
+    Hours(u64, u64),
+    Days(u64, u64),
+}
+
+impl std::fmt::Display for Age {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Age::Seconds(s) => write!(f, "{s}s"),
+            Age::Minutes(m, s) => write!(f, "{m}m {s:02}s"),
+            Age::Hours(h, m) => write!(f, "{h}h {m:02}m"),
+            Age::Days(d, h) => write!(f, "{d}d {h:02}h"),
+        }
     }
 }
 
@@ -2568,7 +2578,7 @@ mod tests {
         masked.age = None;
         let out = from_pg_rows(&[masked]);
         assert_eq!(out[0].seconds, None);
-        assert_eq!(format_age(out[0].seconds), "—");
+        assert_eq!(age(out[0].seconds), None);
         // A real zero still reads as a real zero.
         assert_eq!(format_age(Some(0.0)), "0s");
     }
@@ -3010,6 +3020,11 @@ mod tests {
         assert_eq!(strip_port(""), "");
     }
 
+    /// An age as its English `Display` prints it.
+    fn format_age(secs: Option<f64>) -> String {
+        age(secs).expect("an age the server gave").to_string()
+    }
+
     #[test]
     fn format_age_scales_from_seconds_to_days() {
         assert_eq!(format_age(Some(0.0)), "0s");
@@ -3083,8 +3098,6 @@ mod tests {
 
     #[test]
     fn the_interval_picker_covers_every_persisted_value() {
-        assert_eq!(interval_label(0), "Off");
-        assert_eq!(interval_label(30), "30s");
         assert!(POLL_INTERVALS.contains(&DEFAULT_POLL_SECS));
         for secs in POLL_INTERVALS {
             assert_eq!(sane_interval(secs), secs);

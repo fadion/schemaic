@@ -1156,6 +1156,12 @@ activity-title = SERVERAKTIVITÄT
 activity-refresh-tip = Jetzt aktualisieren
 activity-auto-refresh-off = Automatische Aktualisierung aus
 activity-auto-refresh-every = Automatisch alle { $secs } s aktualisieren
+activity-interval-off = Aus
+activity-interval = { $secs } s
+activity-age-seconds = { $s } s
+activity-age-minutes = { $m } min { $s } s
+activity-age-hours = { $h } h { $m } min
+activity-age-days = { $d } Tg. { $h } h
 activity-view-sessions = Sitzungen
 activity-view-locks = Sperren
 activity-search-sessions = Sitzungen durchsuchen…
@@ -1352,6 +1358,10 @@ props-never-analysed = Diese Tabelle wurde nie analysiert, daher hat der Server 
 props-analysed-at = Geschätzt zum Stand des letzten ANALYZE, { $when }.
 props-read-live = Live gelesen — dieser Server hat information_schema_stats_expiry = 0.
 props-cached-up-to = Vom Server zwischengespeichert: diese Werte können bis zu { $age } alt sein (information_schema_stats_expiry = { $secs }).
+props-age-seconds = { $n } s
+props-age-minutes = { $n } min
+props-age-hours = { $n } h
+props-age-days = { $n } Tg.
 props-vacuum-note = { $pct } % der Zeilenversionen dieser Tabelle sind tot und noch nicht freigegeben. Ein VACUUM würde diesen Platz zurückgeben.
 props-copy = Kopieren
 

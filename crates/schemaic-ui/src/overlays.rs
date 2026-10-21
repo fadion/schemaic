@@ -1256,7 +1256,7 @@ pub(crate) fn activity_menu_overlay(
                 .iter()
                 .map(|&secs| {
                     let set = set_interval.clone();
-                    text(schemaic_core::activity::interval_label(secs))
+                    text(crate::i18n::poll_interval(secs))
                         .on_click_stop(move |_| {
                             (set)(secs);
                             open.set(false);

@@ -839,8 +839,8 @@ fn freshness_note(stats: &TableStats) -> Option<AnyView> {
         .map(|n| note_line(icons::CIRCLE_QUESTION, theme::text_faint, n))
 }
 
-/// [`Freshness::note`]'s words. The timestamp is the server's own text and
-/// the age `stats::format_age`'s, both as core prints them.
+/// [`Freshness::note`]'s words. The timestamp is the server's own text, as
+/// core prints it; the age is `stats::span` in the interface's units.
 ///
 /// [`Freshness::note`]: schemaic_core::stats::Freshness::note
 fn freshness_text(f: &stats::Freshness) -> Option<String> {
@@ -852,7 +852,7 @@ fn freshness_text(f: &stats::Freshness) -> Option<String> {
         Freshness::CachedUpTo(0) => Some(tr!("props-read-live")),
         &Freshness::CachedUpTo(secs) => Some(tr!(
             "props-cached-up-to",
-            age = stats::format_age(secs),
+            age = crate::i18n::staleness_age(stats::span(secs)),
             secs = secs.to_string()
         )),
     }

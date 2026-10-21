@@ -1164,15 +1164,42 @@ fn drop_scale(rows: Option<RowCount>, shape: TableShape) -> Option<crate::ddl::R
 
 /// A duration in seconds as the shortest sensible unit: `30s`, `5m`, `1h`,
 /// `24h`, `2d`. For naming a staleness window, not for precision.
+///
+/// The English of [`span`]: the interface words that value itself.
 pub fn format_age(secs: u64) -> String {
+    span(secs).to_string()
+}
+
+/// [`format_age`]'s rules as a value — the one unit chosen and its count —
+/// so the interface can word it in its own units.
+pub fn span(secs: u64) -> Span {
     match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3_600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3_600),
+        s if s < 60 => Span::Seconds(s),
+        s if s < 3_600 => Span::Minutes(s / 60),
         // A day is still spoken of in hours (MySQL's default expiry *is* 24h and
         // reads wrong as "1d"); past two, days.
-        s if s < 172_800 => format!("{}h", s / 3_600),
-        s => format!("{}d", s / 86_400),
+        s if s < 172_800 => Span::Hours(s / 3_600),
+        s => Span::Days(s / 86_400),
+    }
+}
+
+/// A staleness window in one whole unit. See [`span`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Span {
+    Seconds(u64),
+    Minutes(u64),
+    Hours(u64),
+    Days(u64),
+}
+
+impl std::fmt::Display for Span {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Span::Seconds(n) => write!(f, "{n}s"),
+            Span::Minutes(n) => write!(f, "{n}m"),
+            Span::Hours(n) => write!(f, "{n}h"),
+            Span::Days(n) => write!(f, "{n}d"),
+        }
     }
 }
 

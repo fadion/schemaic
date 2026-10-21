@@ -849,6 +849,16 @@ activity-refresh-tip = Refresh now
 activity-auto-refresh-off = Auto-refresh off
 # $secs is the poll interval in seconds.
 activity-auto-refresh-every = Auto-refresh every { $secs }s
+# The auto-refresh menu's entries: off, or an interval in seconds.
+activity-interval-off = Off
+activity-interval = { $secs }s
+# How long a session has been in its state, in its largest unit and the next
+# one down (core's activity::Age; English must read exactly as its Display).
+# The second figure arrives already padded to two digits.
+activity-age-seconds = { $s }s
+activity-age-minutes = { $m }m { $s }s
+activity-age-hours = { $h }h { $m }m
+activity-age-days = { $d }d { $h }h
 activity-view-sessions = Sessions
 activity-view-locks = Locks
 activity-search-sessions = Search sessions…
@@ -1108,6 +1118,12 @@ props-never-analysed = This table has never been analysed, so the server has no 
 props-analysed-at = Estimated as of the last ANALYZE, { $when }.
 props-read-live = Read live — this server has information_schema_stats_expiry = 0.
 props-cached-up-to = Server-cached: these figures may be up to { $age } old (information_schema_stats_expiry = { $secs }).
+# That $age, in one whole unit (core's stats::Span; English must read exactly
+# as its Display).
+props-age-seconds = { $n }s
+props-age-minutes = { $n }m
+props-age-hours = { $n }h
+props-age-days = { $n }d
 # $pct is a whole-number percentage. VACUUM is a SQL keyword.
 props-vacuum-note = { $pct }% of this table's row versions are dead and not yet reclaimed. A VACUUM would return that space.
 props-copy = Copy

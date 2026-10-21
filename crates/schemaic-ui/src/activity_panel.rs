@@ -512,8 +512,11 @@ impl StateWords {
 
 /// The lock-wait card's sentence — `activity::lock_wait_text` in the
 /// interface's language, one whole message with a selector for each part that
-/// may be absent. A withheld age is passed as `none`, which no age reads as.
+/// may be absent. A withheld age is passed as `none`, which no age reads as;
+/// a known one in the interface's units.
 fn lock_wait_sentence(w: &activity::LockWait) -> String {
+    let age =
+        |a: Option<activity::Age>| a.map_or_else(|| "none".to_string(), crate::i18n::session_age);
     let doing = match w.holder_state {
         SessionState::IdleInTx => "idle-in-tx",
         SessionState::Blocked => "blocked",
@@ -524,11 +527,11 @@ fn lock_wait_sentence(w: &activity::LockWait) -> String {
         "activity-lock-wait-sentence",
         waiter = w.waiter,
         waiter_who = w.waiter_who.as_str(),
-        waited = w.waited.as_deref().unwrap_or("none"),
+        waited = age(w.waited),
         holder = w.holder,
         holder_who = w.holder_who.as_str(),
         doing = doing,
-        held = w.held.as_deref().unwrap_or("none"),
+        held = age(w.held),
         others = w.others
     )
 }
@@ -830,11 +833,12 @@ fn session_row(
 
     let heading = h_stack((
         identity,
-        text(activity::format_age(s.seconds)).style(|s| {
-            s.font_size(font_label())
-                .color(theme::text_faint())
-                .flex_shrink(0.0_f32)
-        }),
+        text(activity::age(s.seconds).map_or_else(|| "—".to_string(), crate::i18n::session_age))
+            .style(|s| {
+                s.font_size(font_label())
+                    .color(theme::text_faint())
+                    .flex_shrink(0.0_f32)
+            }),
     ))
     .style(|s| {
         s.items_center()
@@ -1335,7 +1339,7 @@ mod tests {
     /// other holders.
     #[test]
     fn english_says_every_lock_wait_as_core_does() {
-        use schemaic_core::activity::{LockWait, SessionState};
+        use schemaic_core::activity::{Age, LockWait, SessionState};
         for holder_state in [
             SessionState::IdleInTx,
             SessionState::Blocked,
@@ -1343,20 +1347,20 @@ mod tests {
             SessionState::Idle,
         ] {
             for (waited, held) in [
-                (Some("4m 12s"), Some("1h 2m")),
-                (None, Some("30s")),
-                (Some("12s"), None),
+                (Some(Age::Minutes(4, 12)), Some(Age::Hours(1, 2))),
+                (None, Some(Age::Days(3, 0))),
+                (Some(Age::Seconds(12)), None),
                 (None, None),
             ] {
                 for others in [0, 1, 3] {
                     let w = LockWait {
                         waiter: 41,
                         waiter_who: "app@10.0.0.1".into(),
-                        waited: waited.map(str::to_string),
+                        waited,
                         holder: -7,
                         holder_who: "batch".into(),
                         holder_state,
-                        held: held.map(str::to_string),
+                        held,
                         others,
                     };
                     assert_eq!(super::lock_wait_sentence(&w), w.to_string(), "{w:?}");
