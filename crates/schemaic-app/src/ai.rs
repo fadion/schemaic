@@ -1915,10 +1915,17 @@ pub(crate) fn start_ai_session(
                 let approved =
                     tokio::task::spawn_blocking(move || crate::cursor::approve(&launch, &ws))
                         .await
-                        .unwrap_or_else(|e| Err(e.to_string()));
+                        .unwrap_or_else(|e| Err(crate::cursor::ApproveFailure::Io(e.to_string())));
                 if let Err(e) = approved {
-                    tracing::warn!("could not approve the Schemaic MCP server with Cursor: {e}");
-                    degraded = Some(no_tools_note(&tr!("ai-cursor-not-approved", error = e)));
+                    // English to the log, the interface's words to the panel.
+                    tracing::warn!(
+                        "could not approve the Schemaic MCP server with Cursor: {}",
+                        e.english()
+                    );
+                    degraded = Some(no_tools_note(&tr!(
+                        "ai-cursor-not-approved",
+                        error = e.shown()
+                    )));
                 }
             }
             if let Some(why) = degraded {

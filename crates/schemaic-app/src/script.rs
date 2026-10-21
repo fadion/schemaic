@@ -56,7 +56,7 @@ pub(crate) async fn run(
     let read_end = reader.await.unwrap_or_else(|e| {
         // A panicked or aborted reader is a failure of ours, not of the file's,
         // and saying so beats reporting a clean end of stream.
-        ReadEnd::Failed(tr!("script-reader-stopped", error = e.to_string()))
+        ReadEnd::ReaderStopped(e.to_string())
     });
     run_outcome(read_end, exec_end, ran)
 }
@@ -89,7 +89,7 @@ fn read(
         stamp,
         schemaic_core::script::FileStamp::of(&file),
     ) {
-        return ReadEnd::Failed(tr!("script-changed-since-read"));
+        return ReadEnd::Changed;
     }
     // Best-effort: a file whose length cannot be read still loads, it just has
     // no denominator to report against.
@@ -265,10 +265,7 @@ mod tests {
             .await
             .expect("the reader finishes")
         });
-        match &end {
-            ReadEnd::Failed(why) => assert!(why.contains("changed on disk"), "{why}"),
-            other => panic!("the swapped file was read: {other:?}"),
-        }
+        assert_eq!(end, ReadEnd::Changed, "the swapped file was read");
         // And nothing reached the executor — a refusal that still queued the
         // first statement would be the bug with a message on top.
         assert!(rx.try_recv().is_err(), "a statement was handed over anyway");

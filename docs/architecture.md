@@ -35232,7 +35232,11 @@ existing prose was left alone.
   cannot find it. A transaction `save_conn` asks about ends through `end_tx`, which logs its own.
   `script_run` logs a `.sql` file whole — `Source::Script`, its detail
   `file <path>, N statements ran`, and as `sql` the failing statement when `RunOutcome::Failed`'s
-  `at` names one; the statements that succeeded are not lines of their own. `commit_edits` logs
+  `at` names one; the statements that succeeded are not lines of their own. Its error is
+  `ScriptFailure::message`, English: the failure is a value (`Said`, `Changed`, `ReaderStopped`,
+  `NoTerminator`) that `script_view` words for the modal, since the reader's own two sentences
+  once reached this persisted record in the interface's language
+  (`english_says_every_script_failure_as_core_does`). `commit_edits` logs
   `grid_sql` of the staged batch with `commit_writes`' count, through a `log_commit` ext action
   called right after the write and before the re-fetch, which is a read. The DDL preview's run
   logs the plan's statements joined by `;\n` — an account's password masked by the log whatever
@@ -36580,7 +36584,11 @@ existing prose was left alone.
     the message `cli_failure_message` is called to show. After the exit the output is waited for
     two seconds at most, since the `.cmd` fallback's node can still hold a write end. What it
     reports is `approve_verdict`, pure over how the run ended
-    (`a_failed_approval_carries_the_clis_own_words`). The record it writes is keyed by
+    (`a_failed_approval_carries_the_clis_own_words`). It answers an `ApproveFailure` (`Unfinished`,
+    `Cli(CliFailure)`, `Io`), not a string, because the one failure has two readers:
+    `schemaic.log` takes its `english()`, and the panel's note takes its `shown()`. One worded
+    string served both, and the log line a bug report attaches carried the interface's clause
+    (`english_says_every_approval_failure_as_the_log_does`). The record it writes is keyed by
     a hash of the config's contents — changing the endpoint path read *"needs approval"* again — so it
     is asked again every session. **`--approve-mcps` is the lever that looks like the answer and is
     never passed**: it approves every server in reach, a user's plugins' among them, where this

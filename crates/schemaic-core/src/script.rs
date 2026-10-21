@@ -1129,14 +1129,56 @@ pub enum ReadEnd {
     /// The user stopped it.
     Cancelled,
     /// The file could not be read: a disk error, a revoked permission, a
-    /// vanished network mount.
+    /// vanished network mount — the system's own words.
     Failed(String),
+    /// The file is not the one the probe read: it changed on disk between the
+    /// two opens (`probe_still_describes`).
+    Changed,
+    /// The reader itself panicked or was aborted — a failure of ours, not of
+    /// the file's; the runtime's words.
+    ReaderStopped(String),
     /// One statement grew past [`MAX_PENDING_BYTES`] — a file with no statement
     /// terminator in it at all, rather than a script with a long statement.
     NoTerminator,
     /// The executor stopped consuming, so reading stopped too. **Carries no
     /// cause on purpose**: the executor has the real one.
     Stopped,
+}
+
+/// Why a run failed ([`RunOutcome::Failed`]) — a value, because it goes to two
+/// readers: the write log, a persisted record that stays English
+/// ([`ScriptFailure::message`]), and the run modal, in the interface's
+/// language. One worded string served both, and the log took the interface's
+/// sentence for a changed file or a stopped reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptFailure {
+    /// The server's, the driver's or the system's own words.
+    Said(String),
+    /// [`ReadEnd::Changed`].
+    Changed,
+    /// [`ReadEnd::ReaderStopped`], with the runtime's words.
+    ReaderStopped(String),
+    /// [`ReadEnd::NoTerminator`].
+    NoTerminator,
+}
+
+impl ScriptFailure {
+    /// The failure in English.
+    pub fn message(&self) -> String {
+        match self {
+            ScriptFailure::Said(s) => s.clone(),
+            ScriptFailure::Changed => "This file changed on disk after it was read, so the \
+                                       summary above is not what would run. Choose it again."
+                .to_string(),
+            ScriptFailure::ReaderStopped(e) => {
+                format!("the file reader stopped unexpectedly: {e}")
+            }
+            ScriptFailure::NoTerminator => "This file holds no statement terminator, so it is \
+                                            not a SQL script Schemaic can run. Check that you \
+                                            picked the file you meant."
+                .to_string(),
+        }
+    }
 }
 
 /// How the executing half of a run ended — the server side.
@@ -1170,7 +1212,7 @@ pub enum RunOutcome {
         ran: usize,
     },
     Failed {
-        message: String,
+        failure: ScriptFailure,
         ran: usize,
         /// The statement the server refused and the line it began on. `None`
         /// when the failure was not a statement's — a file that could not be
@@ -1197,21 +1239,20 @@ pub enum RunOutcome {
 /// holds the true cause describes it.
 pub fn run_outcome(read: ReadEnd, exec: ExecEnd, ran: usize) -> RunOutcome {
     let failed =
-        |message: String, at: Option<(String, u64)>| RunOutcome::Failed { message, ran, at };
+        |failure: ScriptFailure, at: Option<(String, u64)>| RunOutcome::Failed { failure, ran, at };
     match (read, exec) {
         // Either half may witness the stop; neither is a finished run.
         (ReadEnd::Cancelled, _) | (_, ExecEnd::Cancelled) => RunOutcome::Cancelled { ran },
         // The reader's own failures outrank the server error they cause — see
         // the doc above, and `a_read_failure_outranks_the_server_error_it_caused`.
-        (ReadEnd::Failed(e), _) => failed(e, None),
-        (ReadEnd::NoTerminator, _) => failed(
-            "This file holds no statement terminator, so it is not a SQL script \
-             Schemaic can run. Check that you picked the file you meant."
-                .to_string(),
-            None,
-        ),
-        (_, ExecEnd::Connect(e)) => failed(e, None),
-        (_, ExecEnd::Failed { message, sql, line }) => failed(message, Some((sql, line))),
+        (ReadEnd::Failed(e), _) => failed(ScriptFailure::Said(e), None),
+        (ReadEnd::Changed, _) => failed(ScriptFailure::Changed, None),
+        (ReadEnd::ReaderStopped(e), _) => failed(ScriptFailure::ReaderStopped(e), None),
+        (ReadEnd::NoTerminator, _) => failed(ScriptFailure::NoTerminator, None),
+        (_, ExecEnd::Connect(e)) => failed(ScriptFailure::Said(e), None),
+        (_, ExecEnd::Failed { message, sql, line }) => {
+            failed(ScriptFailure::Said(message), Some((sql, line)))
+        }
         (ReadEnd::Eof, ExecEnd::Done) => RunOutcome::Done { ran },
         // The reader stopped because the executor did, and the executor says it
         // finished: the statements it was given all ran. Reachable when the
@@ -3045,7 +3086,8 @@ mod tests {
             ExecEnd::Done,
             120,
         ) {
-            RunOutcome::Failed { message, ran, at } => {
+            RunOutcome::Failed { failure, ran, at } => {
+                let message = failure.message();
                 assert!(message.contains("device is not ready"), "{message}");
                 assert_eq!(ran, 120);
                 assert_eq!(at, None, "a disk error names no statement");
@@ -3065,7 +3107,8 @@ mod tests {
             refused(),
             9,
         ) {
-            RunOutcome::Failed { message, .. } => {
+            RunOutcome::Failed { failure, .. } => {
+                let message = failure.message();
                 assert!(message.contains("device is not ready"), "{message}");
             }
             other => panic!("expected a failure, got {other:?}"),
@@ -3078,7 +3121,8 @@ mod tests {
     #[test]
     fn a_file_with_no_statement_terminator_says_so() {
         match run_outcome(ReadEnd::NoTerminator, ExecEnd::Done, 0) {
-            RunOutcome::Failed { message, at, .. } => {
+            RunOutcome::Failed { failure, at, .. } => {
+                let message = failure.message();
                 assert!(
                     message.to_lowercase().contains("terminator")
                         || message.to_lowercase().contains(";"),
@@ -3096,7 +3140,8 @@ mod tests {
     #[test]
     fn a_refused_statement_is_reported_with_its_line() {
         match run_outcome(ReadEnd::Stopped, refused(), 411) {
-            RunOutcome::Failed { message, ran, at } => {
+            RunOutcome::Failed { failure, ran, at } => {
+                let message = failure.message();
                 assert!(message.contains("syntax error"), "{message}");
                 assert_eq!(ran, 411);
                 assert_eq!(at, Some(("INSERT INTO t VALUE (1)".into(), 412)));

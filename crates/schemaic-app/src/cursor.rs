@@ -148,14 +148,17 @@ const APPROVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Blocking; the caller runs it off the async workers. `Err` carries what the
 /// CLI said, and the session then runs with no database tools and says so,
 /// Antigravity's shape for a registration that failed.
-pub(crate) fn approve(launch: &crate::agent_cli::Launch, workspace: &Path) -> Result<(), String> {
+pub(crate) fn approve(
+    launch: &crate::agent_cli::Launch,
+    workspace: &Path,
+) -> Result<(), ApproveFailure> {
     let mut c = launch.std_command();
     c.args(["mcp", "enable", MCP_SERVER])
         .current_dir(workspace)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let mut child = c.spawn().map_err(|e| ApproveFailure::Io(e.to_string()))?;
     // **Both pipes drained while it runs**, each on its own thread. A child
     // writes into a pipe only as far as the OS buffer, then blocks until
     // someone reads — and this loop used to read nothing until the child had
@@ -185,7 +188,7 @@ pub(crate) fn approve(launch: &crate::agent_cli::Launch, workspace: &Path) -> Re
                 break None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(ApproveFailure::Io(e.to_string())),
         }
     };
     // After the exit, so both reach end-of-file — unless a grandchild (the
@@ -212,18 +215,50 @@ fn approve_verdict(
     ended: Option<(bool, Option<i32>)>,
     stdout: &str,
     stderr: &str,
-) -> Result<(), String> {
+) -> Result<(), ApproveFailure> {
     match ended {
-        None => Err(tr!("ai-cursor-enable-unfinished")),
+        None => Err(ApproveFailure::Unfinished),
         Some((true, _)) => Ok(()),
-        Some((false, code)) => Err(schemaic_ui::i18n::cli_failure_text(
-            &schemaic_ai::cli_failure_message(
-                schemaic_ai::harness::Harness::Cursor,
-                code,
-                stdout,
-                stderr,
-            ),
-        )),
+        Some((false, code)) => Err(ApproveFailure::Cli(schemaic_ai::cli_failure_message(
+            schemaic_ai::harness::Harness::Cursor,
+            code,
+            stdout,
+            stderr,
+        ))),
+    }
+}
+
+/// Why [`approve`] failed — a value, because the one failure goes to two
+/// readers: `schemaic.log`, which stays English, and the panel's note, in the
+/// interface's language. One worded string served both, and the log line a
+/// bug report attaches carried the interface's clause inside an English one.
+#[derive(Debug)]
+pub(crate) enum ApproveFailure {
+    /// `mcp enable` was killed at [`APPROVE_TIMEOUT`].
+    Unfinished,
+    /// It ran and failed; what the CLI said, or how it ended.
+    Cli(schemaic_ai::CliFailure),
+    /// It could not be run or waited on: the system's own words.
+    Io(String),
+}
+
+impl ApproveFailure {
+    /// The failure in English, for the log.
+    pub(crate) fn english(&self) -> String {
+        match self {
+            ApproveFailure::Unfinished => "`mcp enable` did not finish".to_string(),
+            ApproveFailure::Cli(f) => f.to_string(),
+            ApproveFailure::Io(e) => e.clone(),
+        }
+    }
+
+    /// The failure in the interface's language, for the panel.
+    pub(crate) fn shown(&self) -> String {
+        match self {
+            ApproveFailure::Unfinished => tr!("ai-cursor-enable-unfinished"),
+            ApproveFailure::Cli(f) => schemaic_ui::i18n::cli_failure_text(f),
+            ApproveFailure::Io(e) => e.clone(),
+        }
     }
 }
 
@@ -448,12 +483,35 @@ mod tests {
     fn a_failed_approval_carries_the_clis_own_words() {
         let e = approve_verdict(Some((false, Some(1))), "", "Error: no such server")
             .expect_err("a failed exit");
-        assert!(e.contains("no such server"), "{e}");
+        assert!(e.english().contains("no such server"), "{e:?}");
+        assert!(e.shown().contains("no such server"), "{e:?}");
         assert_eq!(
-            approve_verdict(None, "", "").unwrap_err(),
+            approve_verdict(None, "", "").unwrap_err().english(),
             "`mcp enable` did not finish"
         );
         assert!(approve_verdict(Some((true, Some(0))), "chatter", "warn").is_ok());
+    }
+
+    /// **The log is English and the note is the interface's, and in English
+    /// the two agree** — for every way the approval fails.
+    #[test]
+    fn english_says_every_approval_failure_as_the_log_does() {
+        use schemaic_ai::CliFailure;
+        use schemaic_ai::harness::Harness;
+        for f in [
+            ApproveFailure::Unfinished,
+            ApproveFailure::Cli(CliFailure::Said("Error: no such server".into())),
+            ApproveFailure::Cli(CliFailure::Exited {
+                harness: Harness::Cursor,
+                code: 2,
+            }),
+            ApproveFailure::Cli(CliFailure::Signalled {
+                harness: Harness::Cursor,
+            }),
+            ApproveFailure::Io("Access is denied. (os error 5)".into()),
+        ] {
+            assert_eq!(f.shown(), f.english(), "{f:?}");
+        }
     }
 
     #[test]

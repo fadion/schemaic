@@ -5816,7 +5816,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // statement it never reached.
                     Err(e) => {
                         return (done)(RunOutcome::Failed {
-                            message: e,
+                            failure: schemaic_core::script::ScriptFailure::Said(e),
                             ran: 0,
                             at: None,
                         });
@@ -5853,7 +5853,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 entry.with_detail(ran(n)).ended_as(Outcome::Cancelled, None)
                             }
                             RunOutcome::Failed {
-                                message,
+                                failure,
                                 ran: n,
                                 at,
                             } => {
@@ -5861,7 +5861,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 if let Some((sql, _)) = at {
                                     e.sql = sql.clone();
                                 }
-                                e.ended(Err(message.clone()))
+                                // English: the write log is a persisted record.
+                                e.ended(Err(failure.message()))
                             }
                         };
                         (log_write)(conn_id, dialect, logged);

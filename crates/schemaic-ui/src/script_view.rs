@@ -329,9 +329,10 @@ fn run_script(ctx: &ScriptCtx) {
                     tr!("script-stopped", n = ran),
                     durability_sentence(s.probe.get_untracked().as_ref(), &name, ran),
                 ))),
-                RunOutcome::Failed { message, ran, at } => {
+                RunOutcome::Failed { failure, ran, at } => {
                     // The server's message rides inside as it came: server
                     // and driver errors stay in the server's language.
+                    let message = script_failure_text(&failure);
                     let failed = match at {
                         // The line, because this is a file too big to open in
                         // the editor — "statement 30,000" would be no answer.
@@ -352,6 +353,19 @@ fn run_script(ctx: &ScriptCtx) {
             }
         }),
     );
+}
+
+/// Why a run failed — core's `script::ScriptFailure::message` in the
+/// interface's language. The server's, driver's or system's own words pass
+/// through as they came.
+fn script_failure_text(f: &schemaic_core::script::ScriptFailure) -> String {
+    use schemaic_core::script::ScriptFailure;
+    match f {
+        ScriptFailure::Said(s) => s.clone(),
+        ScriptFailure::Changed => tr!("script-changed-since-read"),
+        ScriptFailure::ReaderStopped(e) => tr!("script-reader-stopped", error = e.as_str()),
+        ScriptFailure::NoTerminator => tr!("script-no-terminator"),
+    }
 }
 
 /// What a part-way stop left behind, in one sentence both stopping arms use.
@@ -821,4 +835,25 @@ fn watch_connection(s: ScriptUi, conn: ConnUi) {
             s.target.set(None);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::script_failure_text;
+
+    /// **Every way a run fails reads in English exactly as core's message**,
+    /// which is what the write log records — so the modal and the log say
+    /// the same thing in English, and only the modal is translated.
+    #[test]
+    fn english_says_every_script_failure_as_core_does() {
+        use schemaic_core::script::ScriptFailure as F;
+        for f in [
+            F::Said("Duplicate entry '1' for key 'PRIMARY'".into()),
+            F::Changed,
+            F::ReaderStopped("task 7 panicked".into()),
+            F::NoTerminator,
+        ] {
+            assert_eq!(script_failure_text(&f), f.message(), "{f:?}");
+        }
+    }
 }

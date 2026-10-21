@@ -4642,5 +4642,7 @@ docker-exited = Docker exited with { $status }.
 # $error is the system's own text.
 script-reader-stopped = the file reader stopped unexpectedly: { $error }
 script-changed-since-read = This file changed on disk after it was read, so the summary above is not what would run. Choose it again.
+# A file with no statement terminator in it (core's script::ScriptFailure).
+script-no-terminator = This file holds no statement terminator, so it is not a SQL script Schemaic can run. Check that you picked the file you meant.
 # mcp enable is the Cursor CLI command; never translated.
 ai-cursor-enable-unfinished = `mcp enable` did not finish
