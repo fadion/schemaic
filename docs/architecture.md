@@ -28873,8 +28873,9 @@ existing prose was left alone.
     removing the selected row leaves `selected` unchanged over a different item).
     The footer status is validation first, since it blocks; then the change count; then — only when
     nothing fails validation, and **after** the count, never instead of it — the first of
-    `ddl::index_hints` in `theme::plan_warn()`, cut with an ellipsis at 420px with the whole sentence
-    on hover. The rest ride the list rows' faint detail (`hints_of`, on the designer's own dialect):
+    `ddl::index_hints` in `theme::plan_warn()`, an `ellipsized_text` capped at 420px with the whole
+    sentence on hover. It gives way before the count (`flex_shrink(1000)`). A bare `.tooltip()`
+    over it once kept its full width, clipped it without its `…`, and squeezed the count out first. The rest ride the list rows' faint detail (`hints_of`, on the designer's own dialect):
     an Indexes row reads *redundant* (a unique one still reads *unique*, and is never flagged), a
     Foreign keys row *→ t · no index*. None of it touches Preview.
     It also owns three things the other editors reuse: `list_pane` — the list-plus-action-bar that
@@ -43485,7 +43486,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   the Properties *Count rows* hint still overflowed in the sandboxed app under
   `SCHEMAIC_LOCALE=pseudo-en`; `32a2cafb` added it there and on the Live Monitor's status line
   (`monitor_view.rs`, inside `h_stack((icon, line))`). Prefer `ellipsized_text` to spelling the
-  pair by hand.
+  pair by hand. The table designer's index hint and the editor's guard-bar message were two more
+  bare spellings, and are now `ellipsized_text`. The guard bar's message also lacked the
+  `min_width(0)` the error bar's has, so a long or translated warning pushed *Run anyway*, the
+  held run's one mouse release, off the bar; that text is `flex_shrink(0)` now. The same holds for
+  a **hide**: the Live Monitor's binary-column icon was hidden inside its `.tooltip()`, so the
+  zero-sized wrapper still took the row's `gap` (next entry). The hide goes after `.tooltip(…)`.
 - **A `VirtualItemSize::Fixed` is a promise about the child's height, and the child has to keep it.**
   `virtual_stack` places child `i` at `i * item_size` and derives the range it builds from the same
   arithmetic, so a row whose real height is *assembled* — padding plus a parent `gap` — drifts

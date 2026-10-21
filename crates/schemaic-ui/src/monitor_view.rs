@@ -787,13 +787,17 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
             // named in its tooltip, and absent for a table without one.
             let length_note = create_memo(move |_| length_only.with(|c| length_only_note(c)));
             let length_icon = crate::icons::icon(crate::icons::TRIANGLE_ALERT, 12.0)
-                .style(move |s| {
-                    s.color(theme::plan_warn())
-                        .flex_shrink(0.0_f32)
-                        .apply_if(length_note.with(Option::is_none), |s| s.hide())
-                })
+                .style(move |s| s.color(theme::plan_warn()).flex_shrink(0.0_f32))
                 .tooltip(move || {
                     text(length_note.get().unwrap_or_default()).style(crate::widgets::tooltip_style)
+                })
+                // Hidden on the tooltip's wrapper, which is the row's flex item:
+                // taffy skips a `display:none` child when it hands out `gap` but
+                // counts a zero-sized one, so hiding the icon inside it left the
+                // line indented by a gap with nothing in front of it.
+                .style(move |s| {
+                    s.flex_shrink(0.0_f32)
+                        .apply_if(length_note.with(Option::is_none), |s| s.hide())
                 });
             let status = h_stack((length_icon, status_line))
                 .style(|s| s.items_center().min_width(0.0).gap(theme::scaled(6.0)));

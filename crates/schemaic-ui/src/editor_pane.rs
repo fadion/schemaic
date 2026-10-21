@@ -7058,19 +7058,26 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             s.color(theme::err_fix_btn())
                                 .font_size(theme::font_body())
                                 .margin_right(theme::scaled(8.0))
+                                // The one mouse release of the held run: the
+                                // message gives way, this never does.
+                                .flex_shrink(0.0_f32)
                         })
                         .into_any()
                 } else {
                     empty().into_any()
                 };
                 h_stack((
-                    text(g.message).style(|s| {
+                    // `ellipsized_text` for the error bar's reason: a message
+                    // without `min_width(0)` refuses to shrink below its
+                    // content and pushes "Run anyway" off the bar, which a
+                    // long or translated warning did. Cut, it is whole on hover.
+                    // The cap is on the wrapper, which is the row's flex item.
+                    crate::widgets::ellipsized_text(g.message, |s| {
                         s.color(theme::reject_text())
                             .font_size(theme::font_body())
-                            .max_width_pct(70.0)
-                            .text_ellipsis()
                             .margin_left(theme::scaled(8.0))
-                    }),
+                    })
+                    .style(|s| s.max_width_pct(70.0)),
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     action,
                 ))

@@ -2827,26 +2827,23 @@ pub(crate) fn table_designer_overlay(
                         .map(|h| index_hint_text(h, &draft));
                     match hint {
                         None => count.into_any(),
-                        Some(m) => {
-                            let tip = m.clone();
-                            h_stack((
-                                count,
-                                text(m)
-                                    .style(|s| {
-                                        s.font_size(theme::font_label())
-                                            .color(theme::plan_warn())
-                                            .text_ellipsis()
-                                            .min_width(0.0)
-                                            .max_width(theme::scaled(420.0))
-                                            .margin_left(theme::scaled(12.0))
-                                    })
-                                    .tooltip(move || {
-                                        text(tip.clone()).style(crate::widgets::tooltip_style)
-                                    }),
-                            ))
-                            .style(|s| s.items_center().min_width(0.0))
-                            .into_any()
-                        }
+                        // `ellipsized_text`, because a bare `.tooltip()` over
+                        // an ellipsizing text is the flex item that never
+                        // shrinks: the hint clipped with no `…` and the count
+                        // gave way first. The hint gives way first now
+                        // (`flex_shrink(1000)`), so the count stays readable.
+                        Some(m) => h_stack((
+                            count,
+                            crate::widgets::ellipsized_text(m, |s| {
+                                s.font_size(theme::font_label())
+                                    .color(theme::plan_warn())
+                                    .max_width(theme::scaled(420.0))
+                                    .margin_left(theme::scaled(12.0))
+                            })
+                            .style(|s| s.flex_shrink(1000.0_f32)),
+                        ))
+                        .style(|s| s.items_center().min_width(0.0))
+                        .into_any(),
                     }
                 },
             );
