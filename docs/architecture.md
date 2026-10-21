@@ -25394,10 +25394,25 @@ existing prose was left alone.
     the export error in `chart_view` and `result_diff_view`.
     It is `ellipsized_text` in `error` at `font_label`. **`ellipsized_text(t, style)` is the
     general form** — one line with `min_width(0)`/`flex_shrink(1)`/`text_ellipsis` and the full
-    text as a tooltip — for any status, hint or label beside controls that must not give way; the
-    `min_width(0)` is the half that is easy to forget, and it goes **twice**: on the text, and again
-    with `flex_shrink(1)` on the `.tooltip()` wrapper after it, since the wrapper is the row's flex
-    item (*`.tooltip()`'s wrapper is the flex item* under *Floem 0.2 gotchas*). The first cut
+    text as a tooltip **only when the line is actually cut** — for any status, hint or label beside
+    controls that must not give way. Every line it drew used to carry a tooltip repeating it, cut
+    or not; now `on_resize` keeps the text's laid-out width in a signal and the wrap is `tip_when`,
+    whose closure — read at hover — compares `measure_text_px_at(full, font)` against that width
+    plus a pixel of slack (measuring and laying out round differently). The rule is the user's — a
+    tooltip only on truncated text, as the tab titles and the ERD header already behaved. The font
+    it measures at is read off the caller's own `style` closure
+    (`style(Style::new()).get(FontSize)`, `font_body` when it sets none), so a caller that sizes
+    its text by inheriting from a parent is measured at `font_body`. Two callers pair two lines and
+    set `flex_shrink(1000)` on the one that should give way first: the grid row panel's
+    `field_label`, whose type (once `flex_shrink(0)` beside a shrinking name) squeezed the column's
+    name to nothing in the fixed `scaled(150)` label column — `SMALLINT UNSIGNED` did it on a wide
+    screen — and the palette row's secondary, which at equal shrink shared the cut with the
+    command's own name (`overlays.rs`). The import modal's `mapping_row` puts the file's header
+    name in one, in its own fixed `scaled(150)` column, where a bare `text_ellipsis` gave no way to
+    read a long header at all.
+    The `min_width(0)` is the half that is easy to forget, and it goes **twice**: on the text, and
+    again with `flex_shrink(1)` on the `.tooltip()` wrapper after it, since the wrapper is the
+    row's flex item (*`.tooltip()`'s wrapper is the flex item* under *Floem 0.2 gotchas*). The first cut
     (`2cdfbd64`) had only the first, and Manage Connections' *New*/*Import*/*Export* rows and the
     Properties *Count rows* hint still overflowed under the pseudo-locale (fixed in `32a2cafb`). The
     parent row still needs a definite width for any of it to bite. **`menu_row_face(icon, icon_px, label, font_size, color)`** is the
@@ -31209,7 +31224,10 @@ existing prose was left alone.
     smaller than its own contents*, which does not clip but overflows the background and the border,
     and makes the edge flip an under-estimate at the same time. The border is the one term that stays
     a `const`, being a hairline at every scale — the same distinction `menu_panel_height` draws, and
-    `calendar_size` had it backwards, scaling its boxes and treating its air as the hairline. Its
+    `calendar_size` had it backwards, scaling its boxes and treating its air as the hairline.
+    `day_w` is 33, not the 30 it shipped at, so the month and year above the grid have room for a
+    language whose month names run longer than English's — 249px wide at Normal rather than 228,
+    which `the_calendar_at_normal_is_the_box_the_app_shipped_with` pins. Its
     `DatePick::anchor` carries **both** vertical edges of the control, unlike
     `PopupAnchor::BelowBox`'s three numbers, because it flips through `widgets::box_menu_inset`:
     down from the control's bottom, up from its **top**. The row panel is a strip at the bottom of
@@ -41239,7 +41257,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   it always adds the overlay, and an empty tip is a small empty box because `AnchoredTooltip`
   applies `tooltip_style`'s chrome to whatever root it is handed.
   The two older conditional tips (a truncated ERD header, a tab's path) decide **once, at build**,
-  and an `AnyView` branch is right for them. A condition that changes while the app runs — a window
+  and an `AnyView` branch is right for them. `widgets::ellipsized_text` cannot: whether its line is
+  cut depends on the width it was laid out at, so it decides at hover through `tip_when` (under
+  `widgets.rs`). A condition that changes while the app runs — a window
   width — cannot use that shape, and does not need to: `AnchoredTooltip::update` calls the tip
   closure at the moment the delay fires, so a signal read there is read fresh on every hover with no rebuild underneath. What
   it returns when there is nothing to say is a `display: none` root, which the chrome cannot
@@ -44168,7 +44188,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   not enough: an anchor already past the fold (a caret scrolled out to the right) flips to somewhere
   still past it. `run_menu_w()` is one metric for the panel's `min_width` and the placement's
   arithmetic — comparing an unscrolled anchor against a width the panel wasn't drawn at is what cut
-  the menu off at the editor's right edge on a long line.
+  the menu off at the editor's right edge on a long line. **And that metric is measured, with
+  `scaled(170)` as its floor**: the widest of the two labels at `font_title`, plus
+  `menu_item_style`'s `widgets::MENU_ROW_PAD_H` on both sides and the panel's 2px of border. A
+  constant 170 was right while the labels were English; longer ones drew the panel wider than the
+  170 the placement had made room for, and near the editor's right edge it was cut off again — the
+  same bug through the other half of the metric, seen in the sandboxed app under
+  `SCHEMAIC_LOCALE=pseudo-en` and gone there after.
 - **The floem editor owns its document once mounted, and the sync is one-way — writing the `query`
   signal from outside is not merely invisible, it is lost.** Every edit runs
   `query.set(doc.text())` from the editor's `.update` callback (`editor_pane.rs`) — **the one copy

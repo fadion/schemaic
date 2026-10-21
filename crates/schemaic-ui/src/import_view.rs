@@ -648,13 +648,12 @@ fn mapping_row(i: ImportUi, fi: usize, file_col: String, ring: FocusRing) -> imp
     };
     let table = info.table;
 
-    let name = text(file_col).style(|s| {
-        s.width(theme::scaled(150.0))
-            .font_size(theme::font_body())
-            .color(theme::text())
-            .text_ellipsis()
-            .flex_shrink(0.0_f32)
-    });
+    // A fixed column, ellipsized, with the whole header in a tooltip when —
+    // and only when — it is cut: a file's header names can run long.
+    let name = crate::widgets::ellipsized_text(file_col, |s| {
+        s.font_size(theme::font_body()).color(theme::text())
+    })
+    .style(|s| s.width(theme::scaled(150.0)).flex_shrink(0.0_f32));
 
     // `Skip` first, so "don't import this" is always in the same place.
     let options: Vec<Target> = std::iter::once(Target::Skip)

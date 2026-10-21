@@ -2781,15 +2781,36 @@ pub(crate) fn menu_row_face(
 /// `min_width(0)` alone the wrapper kept the text's width and the line
 /// clipped without its `…` — the first cut of this helper shipped so, and the
 /// sandboxed app showed it.
+///
+/// **The tooltip only when the text is cut.** The text's laid-out width is
+/// kept from `on_resize`, and the tip ([`tip_when`]) compares it, at hover, with
+/// the text's measured width at the font size `style` sets — so a line that fits
+/// raises no tooltip repeating it, as the tab titles and the ERD header already
+/// behave.
 pub(crate) fn ellipsized_text(
     t: String,
     style: impl Fn(floem::style::Style) -> floem::style::Style + 'static,
 ) -> impl IntoView {
-    let tip = t.clone();
-    text(t)
-        .style(move |s| style(s).min_width(0.0).flex_shrink(1.0_f32).text_ellipsis())
-        .tooltip(move || text(tip.clone()).style(tooltip_style))
-        .style(|s| s.min_width(0.0).flex_shrink(1.0_f32))
+    let style = Rc::new(style);
+    let laid_out = RwSignal::new(f64::INFINITY);
+    let full = t.clone();
+    let text_style = style.clone();
+    let view = text(t)
+        .style(move |s| {
+            text_style(s)
+                .min_width(0.0)
+                .flex_shrink(1.0_f32)
+                .text_ellipsis()
+        })
+        .on_resize(move |r| laid_out.set(r.width()));
+    tip_when(view, move || {
+        let font = style(floem::style::Style::new())
+            .get(floem::style::FontSize)
+            .unwrap_or_else(theme::font_body);
+        // A pixel of slack: measuring and laying out round differently.
+        (measure_text_px_at(&full, font) > laid_out.get_untracked() + 1.0).then(|| full.clone())
+    })
+    .style(|s| s.min_width(0.0).flex_shrink(1.0_f32))
 }
 
 pub(crate) fn menu_item_style(s: floem::style::Style) -> floem::style::Style {
@@ -4201,7 +4222,7 @@ pub(crate) fn menu_panel_width(entries: &[MenuEntry]) -> f64 {
 
 /// A row's horizontal padding at 100%, **and the one `menu_item_style` draws
 /// with** — the same single-statement rule [`MENU_ROW_PAD`] follows vertically.
-const MENU_ROW_PAD_H: f64 = 12.0;
+pub(crate) const MENU_ROW_PAD_H: f64 = 12.0;
 /// The gap `menu_item_style` puts between a row's kids (icon → label → chevron).
 const MENU_KID_GAP: f64 = 8.0;
 /// A row icon's **base** size — what `menu_row` hands [`crate::icons::icon`],

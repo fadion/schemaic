@@ -7339,21 +7339,24 @@ fn field_state(sigs: &[FieldSig]) -> Vec<(usize, Option<String>)> {
 }
 
 /// The left-hand column label in a field row: name + dim type.
+///
+/// **The name has the room; the type gives way.** The type was `flex_shrink(0)`
+/// beside a shrinking name, so a long type — `SMALLINT UNSIGNED` — squeezed the
+/// column's name down to nothing, which is the one thing the row exists to say.
+/// Now the type shrinks first (its weight against the name's) and ends in `…`
+/// with the whole of it in a tooltip, and the name only shrinks once the type
+/// is gone.
 fn field_label(name: String, type_name: String) -> impl IntoView {
     h_stack((
-        text(name).style(|s| {
-            s.font_size(theme::scaled_font(13.0))
-                .color(theme::text())
-                .text_ellipsis()
-                .min_width(0.0)
-                .flex_grow(1.0_f32)
+        crate::widgets::ellipsized_text(name, |s| {
+            s.font_size(theme::scaled_font(13.0)).color(theme::text())
         }),
-        text(type_name).style(|s| {
+        crate::widgets::ellipsized_text(type_name, |s| {
             s.font_size(theme::scaled_font(13.0))
                 .color(theme::text_faint())
                 .margin_left(theme::scaled(6.0))
-                .flex_shrink(0.0_f32)
-        }),
+        })
+        .style(|s| s.flex_shrink(1000.0_f32)),
     ))
     .style(|s| {
         s.items_center()
