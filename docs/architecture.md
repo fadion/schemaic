@@ -30429,8 +30429,11 @@ existing prose was left alone.
     statement**, so a leading `-- note` is neither the label nor where the jump lands
     (`each_statement_is_listed_at_its_code`). The pick sets `Tab::jump_offset`, the request
     *Go to Line* uses. A long script's `CREATE`s, temp tables and `WITH`s are found by typing part
-    of what they say; the options filter also matches the value, the offset, so a typed number can
-    match a statement by its byte position as well as its line.
+    of what they say. The options filter matches the label alone here: the value is a byte offset,
+    and matching it once kept the statement *at offset* 40 ahead of line 40's for
+    `>go to statement 40`, so Enter jumped to the wrong one. A `CmdArg::Options` says whether its
+    values are words worth typing (`keyed`), and `option_kept` is the one filter
+    (`overlays::option_filter_tests`).
     **A label that long is why the palette truncates.** A row's text either side of the match
     shrinks to a `…` while the match itself does not (`highlighted_primary`; shrinking all three
     alike collapsed a hit deep in a statement to `c…`), and the field's grey completion ghost is
@@ -30460,7 +30463,10 @@ existing prose was left alone.
     so typing all of *Verlauf leeren* would resolve to it with `leeren` as the argument, which is
     why German's *Clear History* is *Abfrageverlauf leeren*. Toggle Panel's and Indent Style's
     option labels are translated while their values stay English, and the options filter matches
-    values too, so `>toggle panel ai` still works in German.
+    a `keyed` list's values too, so `>toggle panel ai` still works in German. The themes are
+    keyed the same way. *Go to statement*, *Reopen closed tab* and *Switch connection* are not:
+    their values are an offset, a ring index and a connection id, which a typed number would
+    match by accident.
     **The error modal wears `modal_title("Error", …)` and its ✕**, where it used to have neither a
     title row nor a close button and only click-away and Escape closed it. All three exits run the
     one `close`, which is also what clears `error_modal_text` so the editor bar's next *View* falls

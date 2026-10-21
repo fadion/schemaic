@@ -4013,6 +4013,12 @@ type LiveFn = Rc<dyn Fn(&str) -> bool>;
 /// `arg -> rows` — a free-text command's live results.
 type ItemsFn = Rc<dyn Fn(&str) -> Vec<PaletteItem>>;
 
+/// Does an option row stand for the typed argument `a` (already lowercased)?
+/// Its label always counts, and its value only when the list is `keyed`.
+fn option_kept(value: &str, label: &str, a: &str, keyed: bool) -> bool {
+    a.is_empty() || label.to_lowercase().contains(a) || (keyed && value.to_lowercase().contains(a))
+}
+
 /// How a command consumes its argument. Every `run`/action closure already closes
 /// the overlay, so `build_items` doesn't add that itself.
 enum CmdArg {
@@ -4025,10 +4031,18 @@ enum CmdArg {
     /// command but Toggle Panel. A `false` row is dimmed and skipped rather than
     /// dropped; see `PaletteItem::enabled` for why this is not the same as
     /// leaving the option out of `list` in the first place.
+    ///
+    /// `keyed` says whether a value is a **word worth typing** — an English
+    /// config key (`ai`, `tabs`, `one-dark-pro`), matched beside the label so
+    /// `>toggle panel ai` works in every language — or an opaque id (a byte
+    /// offset, a ring index, a connection id) that only the label may match.
+    /// Matching an id let `>go to statement 40` keep the statement at byte
+    /// offset 40 first, and Enter jumped there; see [`option_kept`].
     Options {
         list: OptionsFn,
         run: Rc<dyn Fn(String)>,
         live: Option<LiveFn>,
+        keyed: bool,
     },
     /// A number clamped to `[min, max]`; `run(n)`. `empty` handles a missing arg.
     Number {
@@ -4192,6 +4206,8 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: tr!("palette-toggle-panel"),
             hint: tr!("palette-toggle-panel-hint"),
             arg: CmdArg::Options {
+                // Panel keys (`ai`, `schema`) are English words.
+                keyed: true,
                 // **The window is too narrow for that panel right now.** Dimmed
                 // and skipped rather than dropped: this state changes as the user
                 // drags a window edge, and a list whose *length* jitters mid-drag
@@ -4327,6 +4343,8 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             hint: tr!("palette-reopen-closed-tab-hint"),
             arg: CmdArg::Options {
                 live: None,
+                // Ring indices.
+                keyed: false,
                 list: ui.tab_actions.closed_tabs_list.clone(),
                 run: {
                     let close = close.clone();
@@ -4519,6 +4537,8 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: tr!("palette-go-to-statement"),
             hint: tr!("palette-search-hint"),
             arg: CmdArg::Options {
+                // Byte offsets.
+                keyed: false,
                 list: Rc::new(move || {
                     let Some(t) = active_tab() else {
                         return Vec::new();
@@ -4673,6 +4693,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             hint: tr!("palette-ui-theme-hint"),
             arg: CmdArg::Options {
                 live: None,
+                keyed: true,
                 list: Rc::new(|| {
                     theme::UiThemeKind::ALL
                         .into_iter()
@@ -4694,6 +4715,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             hint: tr!("palette-editor-theme-hint"),
             arg: CmdArg::Options {
                 live: None,
+                keyed: true,
                 list: Rc::new(|| {
                     theme::EditorThemeKind::ALL
                         .into_iter()
@@ -4750,6 +4772,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             hint: tr!("palette-indent-style-hint"),
             arg: CmdArg::Options {
                 live: None,
+                keyed: true,
                 list: Rc::new(|| {
                     vec![
                         ("spaces".to_string(), tr!("palette-indent-spaces")),
@@ -4809,6 +4832,8 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             hint: tr!("palette-switch-connection-hint"),
             arg: CmdArg::Options {
                 live: None,
+                // Connection ids.
+                keyed: false,
                 list: Rc::new(move || {
                     connections.with(|cs| {
                         cs.iter()
@@ -5325,15 +5350,16 @@ fn build_items(
                     right_icon: None,
                     keys: crate::shortcuts::command_keys(c.id),
                 }],
-                CmdArg::Options { list, run, live } => {
+                CmdArg::Options {
+                    list,
+                    run,
+                    live,
+                    keyed,
+                } => {
                     let a = arg.trim().to_lowercase();
                     list()
                         .into_iter()
-                        .filter(|(v, l)| {
-                            a.is_empty()
-                                || l.to_lowercase().contains(&a)
-                                || v.to_lowercase().contains(&a)
-                        })
+                        .filter(|(v, l)| option_kept(v, l, &a, *keyed))
                         .map(|(v, l)| {
                             let run = run.clone();
                             let v2 = v.clone();
@@ -7995,6 +8021,43 @@ mod find_tests {
             }
             assert_eq!(object_names(q), tree, "the two surfaces disagree on {q:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod option_filter_tests {
+    use super::option_kept;
+
+    fn kept<'a>(rows: &[(&'a str, &'a str)], a: &str, keyed: bool) -> Vec<&'a str> {
+        rows.iter()
+            .filter(|(v, l)| option_kept(v, l, a, keyed))
+            .map(|(_, l)| *l)
+            .collect()
+    }
+
+    /// **A typed number finds the row it names, not the one whose hidden id
+    /// contains it.** Go to statement's values are byte offsets, so the
+    /// statement *at offset* 40 came first and Enter jumped to line 5.
+    #[test]
+    fn an_opaque_value_is_not_matched() {
+        let rows = [("40", "5: SELECT 1"), ("390", "40: SELECT 1")];
+        assert_eq!(kept(&rows, "40", false), ["40: SELECT 1"]);
+    }
+
+    /// **A key still is**, which is what lets `>toggle panel ai` work under a
+    /// translated label.
+    #[test]
+    fn a_keyed_value_is_matched_beside_its_label() {
+        let rows = [("ai", "KI-Assistent"), ("schema", "Schema")];
+        assert_eq!(kept(&rows, "ai", true), ["KI-Assistent"]);
+        assert_eq!(kept(&rows, "ki", true), ["KI-Assistent"]);
+    }
+
+    /// An empty argument keeps every row, keyed or not.
+    #[test]
+    fn an_empty_argument_keeps_everything() {
+        let rows = [("1", "prod"), ("12", "db1")];
+        assert_eq!(kept(&rows, "", false), ["prod", "db1"]);
     }
 }
 
