@@ -444,17 +444,15 @@ fn controls(
             if histogram {
                 return empty().into_any();
             }
-            let lookup = lookup.clone();
-            let picked_none = row_number.clone();
-            let field = crate::table_designer::focusable_owned_dropdown(
-                // A fn item, not a captured `String`: the picker wants a
-                // `Copy` closure.
-                move || label.get().map(name_of).unwrap_or_else(self::row_number),
+            // Told apart by position, not by text: a column named exactly
+            // like *Row number* is still that column.
+            let field = crate::table_designer::focusable_indexed_dropdown(
+                move || label.get().map_or(0, |c| c + 1),
                 label_options.clone(),
                 col_w,
                 label_ring.clone(),
                 30,
-                move |picked| label.set(lookup(&picked).filter(|_| picked != picked_none)),
+                move |picked| label.set(crate::table_designer::after_none_row(picked)),
             );
             v_stack((caption(tr!("chart-caption-labels")), field))
                 .style(|s| s.flex_col().gap(theme::scaled(6.0)))

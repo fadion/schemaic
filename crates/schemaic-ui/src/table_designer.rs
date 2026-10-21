@@ -977,6 +977,62 @@ pub(crate) fn focusable_owned_dropdown(
     .style(move |s| s.width(width()))
 }
 
+/// [`focusable_owned_dropdown`] that hands back the picked row's **index**,
+/// and is told the held one by index too.
+///
+/// For a list that mixes a "none" row of its own wording with data — the
+/// result diff's *Whole row* ahead of the shared columns, the chart's *Row
+/// number* ahead of the result's. Matching the pick back by its text made a
+/// column named exactly like that row unpickable, and which name collided
+/// moved with the interface's language. [`after_none_row`] reads the index.
+pub(crate) fn focusable_indexed_dropdown(
+    current: impl Fn() -> usize + Copy + 'static,
+    options: Vec<String>,
+    width: fn() -> f64,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+    on_pick: impl Fn(usize) + 'static,
+) -> impl IntoView {
+    let on_pick = Rc::new(on_pick);
+    let shown = options.clone();
+    let entries = move || {
+        options
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let on_pick = on_pick.clone();
+                let pick = move || (on_pick)(i);
+                match current() == i {
+                    true => MenuEntry::action_colored(item.clone(), theme::accent, pick),
+                    false => MenuEntry::action(item.clone(), pick),
+                }
+            })
+            .collect()
+    };
+    let box_content = crate::settings::picker_box_content(move || {
+        shown
+            .get(current())
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "—".to_string())
+    });
+    container(crate::settings::in_ring_picker(
+        box_content,
+        entries,
+        ring,
+        tabindex,
+    ))
+    .style(move |s| s.width(width()))
+}
+
+/// In a [`focusable_indexed_dropdown`] whose row 0 is its "none" row, the
+/// data item a picked row stands for: `None` for row 0, and item `i - 1`
+/// otherwise — decided by position, so a datum spelt like the none row is
+/// still that datum.
+pub(crate) fn after_none_row(picked: usize) -> Option<usize> {
+    picked.checked_sub(1)
+}
+
 /// A toggle row bound to the draft, same shape as the settings modals'.
 fn bound_toggle(
     draft: RwSignal<TableDraft>,

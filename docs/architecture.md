@@ -27851,7 +27851,9 @@ existing prose was left alone.
     **Three pickers**: *Chart* — the kind, a `settings::focusable_dropdown`, tab 10; *Values* — the
     numeric columns only (`chart::numeric_columns`, read once per open), a
     `table_designer::focusable_owned_dropdown`, tab 20, starting on the **last** numeric column; and
-    *Labels* — *Row number* or any column, tab 30, starting on the first column that is not the
+    *Labels* — *Row number* or any column, a `table_designer::focusable_indexed_dropdown` told the
+    pick by position (`after_none_row`), so a column named like the interface's *Row number* is
+    still that column; tab 30, starting on the first column that is not the
     value, and not built at all for a histogram, whose labels are its bins — a `dyn_container` on the
     kind rather than `s.hide()`, since a hidden picker would still be a Tab stop. A picked name maps
     back to its column by name, so the names are `chart::picker_labels`' — distinct, a repeated
@@ -27988,7 +27990,7 @@ existing prose was left alone.
     (`SWAP_TAB` 5), Enter or Space picking. On the right **one picker, *Match rows by*** — *Whole
     row* or any column `result_diff::key_columns` offers, which leaves out a binary one since its
     every cell reads `<n bytes>` and would match nothing apart — a
-    `table_designer::focusable_owned_dropdown`, `PICKER_TAB` 10, then the export icon
+    `table_designer::focusable_indexed_dropdown`, `PICKER_TAB` 10, then the export icon
     (`EXPORT_TAB` 11), Close (`ACTION_TAB`) and the title's ✕; it starts on
     `result_diff::suggested_key`. The label and
     picker are an `h_stack` of their own with a 10px gap, not a `margin_right` on the label: with
@@ -28094,9 +28096,10 @@ existing prose was left alone.
     title, the saved notice's fallback file name (`diff-unnamed-file`), the cards' `diff-ran-at`
     (`$time`) and `diff-side-facts` (a plural on `$count`, with `$ms`), the *Change* header and the
     four empty-table notes; Close is the shared `dialog-close`. The key picker's *Whole row* is
-    `diff-whole-row`, which replaced the `WHOLE_ROW` const: the picker hands back the text it shows,
-    so the pick is matched against that same message, and the current-value closure draws it with
-    `tr!` itself rather than capturing it, since that closure has to be `Copy`. The notes are whole
+    `diff-whole-row`, which replaced the `WHOLE_ROW` const. The pick is read **by position**
+    (`key_of_pick`: row 0 is no key, row `i` is shared column `i - 1`). It was matched against that
+    same text once, so a column named exactly like it, in whatever language, could never key the
+    diff (`a_column_named_like_the_whole_row_entry_is_still_a_key`). The notes are whole
     messages built by `diff_notes(diff, swapped, capped)`, still joined by `"  ·  "` in `notes`:
     `diff-only-in` (`$side`, the letter, and `$columns`), `diff-uncompared`, the plural
     `diff-repeated-keys` — which replaced a sentence spliced from two `plural` calls — and
@@ -28880,7 +28883,9 @@ existing prose was left alone.
     Foreign keys row *→ t · no index*. None of it touches Preview.
     It also owns three things the other editors reuse: `list_pane` — the list-plus-action-bar that
     is **one** Tab stop with Up/Down inside it (over `widgets::list_step`) —
-    `focusable_owned_dropdown`, the picker for a value that isn't `Copy`, and `suggest_field`, the
+    `focusable_owned_dropdown`, the picker for a value that isn't `Copy` (with
+    `focusable_indexed_dropdown`, its sibling that hands back an index, for a list whose row 0 is a
+    "none" row of its own wording — read by `after_none_row` rather than by matching text), and `suggest_field`, the
     **one** builder of a free-text field with a `suggest_chevron` beside it. One options closure
     feeds both the menu and the field's inline ghost (`FieldCfg::suggest`, under `lib.rs`), so the
     ghost cannot offer what the menu does not hold; the field takes `tabindex` and the chevron

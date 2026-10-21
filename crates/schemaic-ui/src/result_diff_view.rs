@@ -234,6 +234,13 @@ fn diff_error_text(e: &schemaic_core::result_diff::DiffError) -> String {
     }
 }
 
+/// The key a pick in the key picker stands for: its row 0 is *Whole row*
+/// (`None`), and row `i` is shared column `i - 1`.
+/// Decided by position: a column spelt like that row is still a column.
+fn key_of_pick(picked: usize, shared: &[String]) -> Option<String> {
+    crate::table_designer::after_none_row(picked).and_then(|i| shared.get(i).cloned())
+}
+
 /// Each column wide enough for its header and its longest values, between
 /// [`min_col_w`] and [`max_col_w`]. Only the few values longest by characters
 /// are measured — shaping every cell of a large result would stall the open.
@@ -322,20 +329,28 @@ pub(crate) fn result_diff_overlay(
                 });
             }
 
-            // The key picker's entry for "no key — the whole row". The picker
-            // hands back the text it shows, so the pick is matched against
-            // this same string. Drawn in the closure rather than captured: the
-            // current-value closure has to be `Copy`.
-            let whole_row = tr!("diff-whole-row");
-            let mut options = vec![whole_row.clone()];
+            // The key picker: "no key — the whole row" first, then the shared
+            // columns, told apart by position (`key_of_pick`).
+            let mut options = vec![tr!("diff-whole-row")];
             options.extend(shared.iter().cloned());
-            let picker = crate::table_designer::focusable_owned_dropdown(
-                move || key.get().unwrap_or_else(|| tr!("diff-whole-row")),
+            // In a signal, which is `Copy`, because the picker's face is a
+            // `Copy` closure.
+            let shared_sig = RwSignal::new(shared.to_vec());
+            let picker = crate::table_designer::focusable_indexed_dropdown(
+                move || {
+                    key.with(|k| {
+                        shared_sig.with(|s| {
+                            k.as_ref()
+                                .and_then(|k| s.iter().position(|c| c == k))
+                                .map_or(0, |i| i + 1)
+                        })
+                    })
+                },
                 options,
                 || theme::scaled(200.0),
                 ring.clone(),
                 PICKER_TAB,
-                move |picked| key.set((picked != whole_row).then_some(picked)),
+                move |picked| key.set(shared_sig.with(|s| key_of_pick(picked, s))),
             );
 
             // ── Export ───────────────────────────────────────────────────
@@ -1115,9 +1130,21 @@ fn table_row(change: RowChange, row_cells: &[DiffCell], widths: &Widths) -> impl
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_notes, diff_summary_text};
+    use super::{diff_notes, diff_summary_text, key_of_pick};
     use crate::i18n::tr;
     use schemaic_core::result_diff::ResultDiff;
+
+    /// **A column named like the "none" row can still be the key.** The pick
+    /// was matched back by its text, so `SELECT id AS "Whole row"` on both
+    /// sides could never key the diff — and which name collided moved with
+    /// the interface's language.
+    #[test]
+    fn a_column_named_like_the_whole_row_entry_is_still_a_key() {
+        let shared = vec!["id".to_string(), tr!("diff-whole-row")];
+        assert_eq!(key_of_pick(0, &shared), None);
+        assert_eq!(key_of_pick(1, &shared), Some("id".to_string()));
+        assert_eq!(key_of_pick(2, &shared), Some(tr!("diff-whole-row")));
+    }
 
     /// Why a key cannot match rows reads in English exactly as core's
     /// `DiffError` says it.
