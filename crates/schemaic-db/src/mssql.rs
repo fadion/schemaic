@@ -654,12 +654,12 @@ pub(crate) async fn run_batch(
     let mut client = match opened {
         Ok(c) => c,
         Err(e) => {
-            let msg = e.to_string();
+            // The error as the connect typed it, as `pg::run_batch` keeps it.
             for i in 0..stmts.len() {
                 on_result(
                     i,
                     if i == 0 {
-                        Err(DbError::Connect(msg.clone()))
+                        Err(e.clone())
                     } else {
                         Err(DbError::Cancelled)
                     },

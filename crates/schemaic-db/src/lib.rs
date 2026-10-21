@@ -3805,6 +3805,40 @@ mod tests {
         assert_eq!(db().sign_in_secret().await.unwrap(), "secret");
     }
 
+    /// **Run All reports a failed connect as the connect reported it**, on
+    /// every networked engine. PostgreSQL and SQL Server re-wrapped the
+    /// error's Display in a fresh `Connect`, so statement 1 read "connection
+    /// failed: connection failed: …" and a typed refusal — here an init SQL
+    /// `init_sql::check` refuses, which every engine answers before any I/O —
+    /// became a server failure offering *Explain*.
+    #[tokio::test]
+    async fn run_all_keeps_a_refused_connect_typed_on_every_networked_engine() {
+        for engine in [Engine::MySql, Engine::Postgres, Engine::MsSql] {
+            let db = Db::from_parts(engine, "h".into(), 1, "u".into(), "p".into(), String::new())
+                .with_init_sql("DELETE FROM t");
+            let mut got = Vec::new();
+            db.run_batch(
+                None,
+                &["SELECT 1".to_string(), "SELECT 2".to_string()],
+                10,
+                CancellationToken::new(),
+                |i, r| got.push((i, r)),
+            )
+            .await;
+            assert_eq!(got.len(), 2, "{engine:?}");
+            let first = got[0].1.as_ref().expect_err("the connect was refused");
+            assert!(matches!(first, DbError::Refused(_)), "{engine:?}: {first}");
+            assert!(
+                !first.to_string().contains("connection failed"),
+                "{engine:?}: {first}"
+            );
+            assert!(
+                matches!(got[1].1, Err(DbError::Cancelled)),
+                "{engine:?}: the rest is cancelled"
+            );
+        }
+    }
+
     // ── The server-level DDL runner ───────────────────────────────────────
 
     /// The runner for the two most destructive statements this app emits had

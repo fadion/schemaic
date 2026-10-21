@@ -527,12 +527,14 @@ pub(crate) async fn run_batch(
         Ok(c) => c,
         Err(e) => {
             // Couldn't even connect: fail the first statement, cancel the rest.
-            let msg = e.to_string();
+            // The error as the connect typed it — re-wrapping its Display in a
+            // `Connect` doubled the prefix and turned a refusal into a server
+            // failure.
             for i in 0..stmts.len() {
                 on_result(
                     i,
                     if i == 0 {
-                        Err(DbError::Connect(msg.clone()))
+                        Err(e.clone())
                     } else {
                         Err(DbError::Cancelled)
                     },
