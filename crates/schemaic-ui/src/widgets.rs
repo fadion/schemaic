@@ -1718,13 +1718,27 @@ pub(crate) fn form_label_style(s: floem::style::Style) -> floem::style::Style {
 /// `text_faint`, not `text_muted` at 60% — the latter composites to 1.70:1,
 /// under even the `Recessive` floor of 2.0, which no other foreground in
 /// `UI_PAIRINGS` misses.
+///
+/// **Every hint in the app is painted by this**, the hand-rolled `text_muted`
+/// ones included once they were found to read a shade apart from their
+/// neighbours. `width_full` is part of it because a text sizes to its content
+/// otherwise and a long hint runs off the form rather than wrapping (the jump
+/// hosts' hint did, in a `dyn_container`).
 pub(crate) fn form_hint_style(s: floem::style::Style) -> floem::style::Style {
-    s.color(theme::text_faint()).font_size(theme::font_hint())
+    s.color(theme::text_faint())
+        .font_size(theme::font_hint())
+        .width_full()
 }
 
 /// A form hint as a view — the common case, where the text is a literal.
 pub(crate) fn form_hint(hint: impl Into<String>) -> impl IntoView {
     text(hint.into()).style(form_hint_style)
+}
+
+/// A form hint whose text follows a signal — [`form_hint`] for the hints that
+/// change with the choice above them.
+pub(crate) fn form_hint_label(hint: impl Fn() -> String + 'static) -> impl IntoView {
+    floem::views::label(hint).style(form_hint_style)
 }
 
 /// A long form's section heading over a group of fields: [`form_section`] in

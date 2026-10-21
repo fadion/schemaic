@@ -1321,11 +1321,7 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             150,
         ))
         .style(|s| s.width(theme::scaled(200.0))),
-        label(move || ssl_mode_description(mode.get())).style(|s| {
-            s.width_full()
-                .font_size(theme::font_hint())
-                .color(theme::text_muted())
-        }),
+        crate::widgets::form_hint_label(move || ssl_mode_description(mode.get())),
         // **What this engine does that the line above does not say.** Today
         // that is one thing: on MySQL/MariaDB `Verify CA` also checks the host
         // name, so the picker's two verifying rungs are one there. Said here
@@ -1338,10 +1334,7 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 .unwrap_or_default()
         })
         .style(move |s| {
-            let s = s
-                .width_full()
-                .font_size(theme::font_hint())
-                .color(theme::text_dim());
+            let s = crate::widgets::form_hint_style(s);
             // **Hidden when there is no caveat, not merely empty.** An empty
             // `label` is still a flex child *and* still has a line box, so on
             // every mode that has nothing to add — which is most of them, and
@@ -1362,10 +1355,7 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         // the picker: an effect cannot tell a pick from a load, and raising
         // on a load would edit a saved connection by opening it.
         label(move || tls_floor_note(draft).unwrap_or_default()).style(move |s| {
-            let s = s
-                .width_full()
-                .font_size(theme::font_hint())
-                .color(theme::text_dim());
+            let s = crate::widgets::form_hint_style(s);
             if tls_floor_note(draft).is_none() {
                 s.hide()
             } else {
@@ -1427,16 +1417,6 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 )
                 .into_any(),
             );
-            rows.push(
-                path_field(
-                    tr!("connections-client-key"),
-                    draft.tls_client_key_path,
-                    tr!("connections-client-key-dialog"),
-                    ring.clone(),
-                    155,
-                )
-                .into_any(),
-            );
             // **There was a "Client key passphrase" row here.** It was
             // collected, masked and written to the keyring, and nothing ever
             // read it: `TlsPlan` carries no passphrase, so an encrypted key
@@ -1445,8 +1425,24 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             // row — see `connection::Tls` for the decision, and
             // `db::tls::preflight`, which now refuses an encrypted key by name
             // and says how to decrypt it.
-            let _ = ring;
-            rows.push(form_hint(tr!("connections-client-identity-hint")).into_any());
+            //
+            // The hint is about both client rows but sits with the key, as
+            // the CA's sits with its field: as a row of its own it took the
+            // group's 20px gap and read as a stray paragraph.
+            rows.push(
+                v_stack((
+                    path_field(
+                        tr!("connections-client-key"),
+                        draft.tls_client_key_path,
+                        tr!("connections-client-key-dialog"),
+                        ring,
+                        155,
+                    ),
+                    form_hint(tr!("connections-client-identity-hint")),
+                ))
+                .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
+                .into_any(),
+            );
 
             v_stack_from_iter(rows)
                 // Grouped like the SSH block: outlined rather than tinted, since a
@@ -1706,10 +1702,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             .map(|_| tr!("connections-named-instance-port"))
     };
     let instance_note = label(move || port_note().unwrap_or_default()).style(move |s| {
-        let s = s
-            .width_full()
-            .font_size(theme::font_hint())
-            .color(theme::text_dim());
+        let s = crate::widgets::form_hint_style(s);
         if port_note().is_none() { s.hide() } else { s }
     });
 
@@ -2096,11 +2089,7 @@ fn conn_form(
             35,
         ))
         .style(|s| s.width(theme::scaled(200.0))),
-        label(move || crate::i18n::ai_data_hint(draft.ai_data.get())).style(|s| {
-            s.width_full()
-                .font_size(theme::font_hint())
-                .color(theme::text_muted())
-        }),
+        crate::widgets::form_hint_label(move || crate::i18n::ai_data_hint(draft.ai_data.get())),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
@@ -2118,11 +2107,7 @@ fn conn_form(
             37,
         ))
         .style(|s| s.width(theme::scaled(200.0))),
-        text(tr!("connections-statement-timeout-hint")).style(|s| {
-            s.width_full()
-                .font_size(theme::font_hint())
-                .color(theme::text_muted())
-        }),
+        form_hint(tr!("connections-statement-timeout-hint")),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
@@ -2173,10 +2158,7 @@ fn conn_form(
                 schemaic_core::init_sql::check(sql, SqlDialect::from_db_type(&draft.db_type.get()))
                     .is_err()
             });
-            s.width_full()
-                .font_size(theme::font_hint())
-                .apply_if(bad, |s| s.color(theme::error()))
-                .apply_if(!bad, |s| s.color(theme::text_muted()))
+            crate::widgets::form_hint_style(s).apply_if(bad, |s| s.color(theme::error()))
         }),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
@@ -2271,11 +2253,7 @@ fn conn_form(
             ring.clone(),
             17,
         ),
-        text(tr!("connections-folder-hint")).style(|s| {
-            s.width_full()
-                .font_size(theme::font_hint())
-                .color(theme::text_muted())
-        }),
+        form_hint(tr!("connections-folder-hint")),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
@@ -2289,14 +2267,11 @@ fn conn_form(
                 .unwrap_or_default()
         })
         .style(move |s| {
-            s.width_full()
-                .font_size(theme::font_hint())
-                .color(theme::text_muted())
-                .apply_if(
-                    schemaic_core::connection::read_only_caveat(&draft.db_type.get()).is_none()
-                        || !draft.read_only.get(),
-                    |s| s.hide(),
-                )
+            crate::widgets::form_hint_style(s).apply_if(
+                schemaic_core::connection::read_only_caveat(&draft.db_type.get()).is_none()
+                    || !draft.read_only.get(),
+                |s| s.hide(),
+            )
         }),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());

@@ -25268,6 +25268,15 @@ existing prose was left alone.
     with lines, and the colour sets a heading off with nothing added. Settings' version caption
     used to copy the margin, so the air under it matched the air under `General`; it moved to the
     foot of the section list and copies nothing now (under `settings.rs`).
+    **Every hint under a control is `form_hint_style`** — `text_faint` at `font_hint`, `width_full`
+    — through `form_hint` for a literal, `form_hint_label` for text that follows a signal, or the
+    style itself where a hint needs one thing more (the init-SQL line's `error` when the text is
+    refused). The Settings AI page and the connection form had hand-rolled theirs in `text_muted`
+    or `text_dim`, and the user saw hints a shade apart on the same page; `text_faint` is the colour
+    they chose for all of them. `text_muted` at 60% was not an option: it composites to 1.70:1,
+    under the `Recessive` floor of 2.0. `width_full` is in the style because a text sizes to its
+    content otherwise, and a long hint runs off the form instead of wrapping — the Jump hosts hint,
+    inside a `dyn_container`, did.
     **`pill_tab_style(s, on)` is a modal's section-tab look**, lifted out of
     `table_designer::tab_strip`: body size, `scaled(12)`/`scaled(7)` padding, radius 6, filled in
     `pill_active_bg`/`pill_active_text` when `on`, `text_dim` with a `pill_hover_bg` hover when not.
@@ -26445,8 +26454,8 @@ existing prose was left alone.
     placeholder `SET search_path TO app, public`, and it sits in a `dyn_container` keyed on the
     dialect read off `draft.db_type`, because an `edit_field`'s colouring is fixed when it is built
     — so changing the engine rebuilds it. **Under it is what `init_sql::check` makes of the text as
-    typed**: the refusal in `theme::error`, worded by `init_refusal_text`, or else a hint in
-    `text_muted` — *"Optional. SET statements run on every connection Schemaic opens — a search path, a time zone, a role."*, and
+    typed**: the refusal in `theme::error`, worded by `init_refusal_text`, or else a hint — both
+    `widgets::form_hint_style`, the refusal recoloured — *"Optional. SET statements run on every connection Schemaic opens — a search path, a time zone, a role."*, and
     on SQLite the `PRAGMA` sentence. The connect refuses the same text, and this line is the only
     place the user hears that before a connect fails; Save does not check it. `DraftSignals::init_sql`
     is threaded through create, load (and so `blank`) and `to_connection`, and the Test result's
@@ -26594,6 +26603,9 @@ existing prose was left alone.
     `negotiates_tls`, so a sixth level would not need this view found and edited. An *empty* CA
     path under a verifying mode means **whatever the operating system trusts** (`db/tls.rs`), and
     the hint says so, because a blank required-looking field otherwise reads as unfinished.
+    That hint shares a 6px `v_stack` with the CA field, and the client-identity hint — about both
+    client rows — shares one with the Client key field in the same way: as a row of its own it took
+    the group's 20px gap and read as a stray paragraph.
     **Under Entra sign-in with anything short of Verify full picked, a hint says the picker is not
     what connects** (`tls_floor_note` → `AuthMode::tls_note` of the mode in force, hidden when it
     is `None`): *"Microsoft Entra sign-in connects at Verify full

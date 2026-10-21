@@ -846,14 +846,9 @@ fn password_row(d: crate::DdlUi, ring: FocusRing, dialect: SqlDialect) -> AnyVie
         // The one field in the app whose value can reach a screenshot, so it
         // says so where it is typed — and per engine, since on PostgreSQL the
         // preview shows a hash instead (`users::password_hint`).
-        text(password_hint_text(
+        crate::widgets::form_hint(password_hint_text(
             schemaic_core::users::password_hint_kind(dialect),
-        ))
-        .style(|s| {
-            s.font_size(theme::font_hint())
-                .color(theme::text_faint())
-                .width_full()
-        }),
+        )),
     ))
     .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()

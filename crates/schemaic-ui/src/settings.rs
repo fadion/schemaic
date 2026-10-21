@@ -13,8 +13,8 @@ use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::i18n::tr;
 use crate::widgets::{
     ActionKind, FocusRing, MenuEntry, action_button, action_button_dyn, action_gap, autohide,
-    focus_root_with_ring, form_hint, form_hint_style, form_label_style, form_section_header,
-    modal_title_owned, nothing, panel_style,
+    focus_root_with_ring, form_hint, form_hint_label, form_hint_style, form_label_style,
+    form_section_header, modal_title_owned, nothing, panel_style,
 };
 use crate::{
     AiActions, AiEffort, AiUi, ConnUi, FieldCfg, LayoutUi, SchemaScope, TermActions, TermCursor,
@@ -932,10 +932,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
     // control, so hiding it is safe for the ring (§ Floem: a `.hide()`n
     // control is still in the Tab order).
     let off_hint = text(tr!("settings-ai-off-hint")).style(move |s| {
-        let s = s
-            .width_full()
-            .font_size(theme::font_hint())
-            .color(theme::text_muted());
+        let s = form_hint_style(s);
         if enabled.get() {
             s.display(floem::style::Display::None)
         } else {
@@ -1124,14 +1121,9 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
             // reads as a bug in the modal rather than a note about the
             // field. Two whole messages rather than a sentence appended, so a
             // translation is never two fragments joined in English order.
-            label(move || match harness.get().suggested_models().is_empty() {
+            form_hint_label(move || match harness.get().suggested_models().is_empty() {
                 true => tr!("settings-ai-model-hint"),
                 false => tr!("settings-ai-model-hint-with-chips"),
-            })
-            .style(|s| {
-                s.width_full()
-                    .font_size(theme::font_hint())
-                    .color(theme::text_muted())
             }),
         ))
         .style(group);
@@ -1212,11 +1204,7 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         let scope_section = v_stack((
             settings_group_label(tr!("settings-ai-schema-context")),
             scope_dd,
-            text(tr!("settings-ai-schema-context-hint")).style(|s| {
-                s.width_full()
-                    .font_size(theme::font_hint())
-                    .color(theme::text_muted())
-            }),
+            form_hint(tr!("settings-ai-schema-context-hint")),
         ))
         .style(group);
         // Data access is *not* settable here: it belongs to the connection,
@@ -1228,20 +1216,11 @@ fn ai_section(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>, ring: FocusRing) -
         // setting".
         let data_section = v_stack((
             settings_group_label(tr!("settings-ai-data-access")),
-            label(move || {
+            form_hint_label(move || {
                 let (name, lvl) = active_ai_data.get();
                 ai_data_line(&name, lvl)
-            })
-            .style(|s| {
-                s.width_full()
-                    .font_size(theme::font_hint())
-                    .color(theme::text_muted())
             }),
-            text(tr!("settings-ai-data-access-where")).style(|s| {
-                s.width_full()
-                    .font_size(theme::font_hint())
-                    .color(theme::text_muted())
-            }),
+            form_hint(tr!("settings-ai-data-access-where")),
         ))
         .style(group);
         // Presentation, and the only setting here that is: it changes
