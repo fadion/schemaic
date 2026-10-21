@@ -2186,12 +2186,11 @@ impl WriteCause {
             WriteCause::CommitCancelled | WriteCause::ImportCancelled | WriteCause::Refused(_)
         )
     }
-}
 
-impl WriteFailure {
-    /// The failure in English, as the error says it whole.
+    /// The cause alone in English, with neither the *query failed:* frame
+    /// nor a rollback note — for a caller that puts it in a frame of its own.
     pub fn message(&self) -> String {
-        let cause = match &self.cause {
+        match self {
             WriteCause::Server(m) => m.clone(),
             WriteCause::Refused(r) => r.message(),
             WriteCause::Row(e) => e.message(),
@@ -2206,7 +2205,14 @@ impl WriteFailure {
             ),
             WriteCause::CommitCancelled => "Commit cancelled".to_string(),
             WriteCause::ImportCancelled => "Import cancelled".to_string(),
-        };
+        }
+    }
+}
+
+impl WriteFailure {
+    /// The failure in English, as the error says it whole.
+    pub fn message(&self) -> String {
+        let cause = self.cause.message();
         let note = self.undone.map_or("", Rollback::note);
         if self.cause.is_statements() {
             format!("query failed: {cause}{note}")

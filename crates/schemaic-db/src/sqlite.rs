@@ -1627,21 +1627,41 @@ pub(crate) async fn import_rows(
                 Ok(total)
             }
             Err(e) => {
-                // Reported only if the rollback itself fails — the original error
-                // is the one worth surfacing.
-                let undo = conn.execute_batch("ROLLBACK");
-                match undo {
-                    Ok(()) => Err(e),
-                    Err(u) => Err(DbError::QueryFailed(
-                        crate::QueryFailure::RollbackFailedToo {
-                            error: e.to_string(),
-                            rollback: u.to_string(),
-                        },
-                    )),
-                }
+                let undo = conn.execute_batch("ROLLBACK").map_err(|u| u.to_string());
+                Err(import_failure(e, undo, conn.is_autocommit()))
             }
         }
     })
+}
+
+/// An import's error once its `ROLLBACK` has run: `undo` is what the rollback
+/// answered, and `no_transaction` whether the connection is out of a
+/// transaction after it.
+///
+/// - **A rollback that worked leaves the error as it was.** That is the error
+///   worth surfacing.
+/// - **So does one SQLite had already done.** After `SQLITE_FULL`, `IOERR`,
+///   `BUSY` or `NOMEM` SQLite may roll the transaction back itself, and the
+///   explicit `ROLLBACK` then fails with "no transaction is active". Nothing
+///   was committed, so the error's own rollback note is true.
+/// - **A rollback that really failed puts the cause's own words in the frame**,
+///   never its Display, which already reads "query failed:". A write's
+///   `Complete` note was attached before the rollback ran, so it is dropped:
+///   saying "rolled back all changes" beside "the rollback failed too" claims
+///   more than the engine delivered.
+fn import_failure(e: DbError, undo: Result<(), String>, no_transaction: bool) -> DbError {
+    let rollback = match undo {
+        Ok(()) => return e,
+        Err(_) if no_transaction => return e,
+        Err(u) => u,
+    };
+    let error = match e {
+        DbError::Query(m) | DbError::QueryAt { message: m, .. } => m,
+        DbError::QueryFailed(q) => q.message(),
+        DbError::Write(w) => w.cause.message(),
+        other => other.to_string(),
+    };
+    DbError::QueryFailed(crate::QueryFailure::RollbackFailedToo { error, rollback })
 }
 
 /// SQLite's arm of [`crate::Db::run_script`]. See there for why nothing is
@@ -5142,6 +5162,78 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("user_version");
         assert_eq!(v, 0, "part of a refused init SQL ran");
+    }
+
+    /// **An import whose `ROLLBACK` fails says "query failed:" once.** The
+    /// cause's own words go inside the frame, not its Display, which already
+    /// carries the prefix.
+    #[test]
+    fn a_failed_import_rollback_says_query_failed_once() {
+        let err = super::import_failure(
+            DbError::Query("database or disk is full".into()),
+            Err("disk I/O error".into()),
+            false,
+        );
+        let shown = err.to_string();
+        assert_eq!(shown.matches("query failed:").count(), 1, "{shown}");
+        assert!(shown.contains("database or disk is full"), "{shown}");
+        assert!(shown.contains("disk I/O error"), "{shown}");
+    }
+
+    /// **And it never claims a rollback it then says failed.** The batch
+    /// check attaches `Complete` before the rollback runs; when the rollback
+    /// fails, that clause is not true any more and must not be said.
+    #[test]
+    fn a_failed_import_rollback_does_not_also_say_everything_was_rolled_back() {
+        use schemaic_core::model::{Rollback, WriteCause};
+        let err = super::import_failure(
+            DbError::write(
+                WriteCause::Batch {
+                    rows: 3,
+                    wrote: 2,
+                    affected: true,
+                },
+                Some(Rollback::Complete),
+            ),
+            Err("disk I/O error".into()),
+            false,
+        );
+        let shown = err.to_string();
+        assert!(!shown.contains("rolled back all changes"), "{shown}");
+        assert!(shown.contains("a batch of 3 rows affected 2"), "{shown}");
+        assert_eq!(shown.matches("query failed:").count(), 1, "{shown}");
+    }
+
+    /// **A rollback SQLite already did is a rollback.** After `SQLITE_FULL`,
+    /// `IOERR`, `BUSY` or `NOMEM` SQLite may roll the transaction back itself,
+    /// and the import's own `ROLLBACK` then answers "no transaction is
+    /// active". Nothing was committed, so the error stands as it was —
+    /// "the rollback failed too" would send the user to audit a file that is
+    /// exactly as they left it.
+    #[test]
+    fn a_rollback_sqlite_already_did_reports_the_error_alone() {
+        use schemaic_core::model::{Rollback, WriteCause};
+        let e = DbError::write(
+            WriteCause::Batch {
+                rows: 3,
+                wrote: 2,
+                affected: true,
+            },
+            Some(Rollback::Complete),
+        );
+        let err = super::import_failure(
+            e.clone(),
+            Err("cannot rollback - no transaction is active".into()),
+            true,
+        );
+        assert_eq!(err.to_string(), e.to_string());
+        // The premise, on a real connection: a ROLLBACK with no transaction
+        // open fails, and the connection reads as in autocommit.
+        let conn = SqliteConn::open_in_memory().expect("open");
+        conn.execute_batch("BEGIN; ROLLBACK;")
+            .expect("one rollback");
+        assert!(conn.execute_batch("ROLLBACK").is_err());
+        assert!(conn.is_autocommit());
     }
 
     /// **The session refuses a write the text gate let through.** The gate is

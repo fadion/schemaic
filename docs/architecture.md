@@ -42210,8 +42210,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     timeout, init SQL and session set-up sentences are no longer among it, nor cloud IAM's and
     Microsoft Entra's sign-in messages: they are a `ConnectFailure`, worded as above. A database-layer refusal inside `Refused` (SQL Server's
     blank-string and code-page refusals) is no longer among it: it is a `DbRefusal`, worded as
-    above. The inner error of a SQLite import's `RollbackFailedToo` still is, prefix and all: its
-    `error` is the failure's whole `to_string()`, carried as text. The squiggle's
+    above. The inner error of a SQLite import's `RollbackFailedToo` still is English carried as
+    text, but no longer with its prefix: `sqlite::import_failure` carries the cause's own words
+    (a write's `WriteCause::message`, without the `Complete` note attached before the rollback
+    ran), and a `ROLLBACK` that fails on a connection SQLite has already rolled back (it reads as
+    autocommit) leaves the error as it was. The squiggle's
     diagnostic (`intel::db_error_diagnostic`) still takes `to_string()`, prefix and all, as the
     `text` the AI fix prompt reads, its hover showing `db_error_shown` (`Diagnostic::shown_as`,
     above). The run paths' own `App`
