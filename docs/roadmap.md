@@ -16,7 +16,10 @@ own words are in place (`docs/architecture.md`, *The string catalogue*), with a 
 reached through `SCHEMAIC_LOCALE=de`, and figures follow the language's marks (*Figures in the
 interface's marks* there). The prose built below the views — in `schemaic-core`, `schemaic-db`
 and `schemaic-ai` — is a typed value the window words, and its plurals are whole messages (the
-same section, *A typed message*). What is left is the layout for longer text.
+same section, *A typed message*), and the layout makes room for text longer than English's —
+found with the doubled pseudo-locale, `SCHEMAIC_LOCALE=pseudo-en` (*Layout for longer text*
+there). Every phase has landed; what is left is the decision to ship German (`locale::SHIPPED`),
+and the right-to-left and CJK questions below.
 
 ### Decided
 
@@ -65,18 +68,6 @@ as above. Key names in shortcut labels follow the language's keyboard legends ra
 English — German reads `Strg`, `Umschalt`, `Entf`, `Eingabe`, `Pos1` — through the catalogue's
 `key-*` messages, which `shortcuts::keys_label` reads key by key; a key printed the same
 everywhere (letters, arrows, `Tab`, `Esc`, `F6`) and macOS's `Cmd` have no message.
-
-### Phases
-
-Each phase leaves English output byte-identical, so the existing suite — several hundred
-assertions pin English wording — stays the regression net throughout.
-
-6. **Layout for longer text.** German, Finnish and Russian run 30–100% longer than English.
-   Roughly sixty fixed-width boxes sit beside text — the connection form, the import and compare
-   panes, the find bar, `widgets::fact_row`'s fixed label column — and each either measures its
-   text or ellipsises. The doubled pseudo-locale (`SCHEMAIC_LOCALE=pseudo-en`, every label's
-   words said twice) finds them and still reads as English; the accented one
-   (`SCHEMAIC_LOCALE=pseudo`) is only 30–40% longer.
 
 ### Data in any script — in scope regardless of locale
 

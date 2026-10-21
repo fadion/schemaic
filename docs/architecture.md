@@ -26829,7 +26829,9 @@ existing prose was left alone.
     app (GitHub #19). **All three source buttons wear the `Quiet` fill.** *Scan installed clients*
     wore `Primary` while it stood beside *Choose a file…* alone, since it is what most people come
     for (GitHub #18); once *Docker containers* made a third source, one lit button among three read
-    as the odd one out rather than the obvious one, so it went `Quiet` with the others. The footer's
+    as the odd one out rather than the obvious one, so it went `Quiet` with the others. Their row
+    (`row_of_buttons`) **wraps**: three side by side fit English and little else, and under
+    `SCHEMAIC_LOCALE=pseudo-en` the third was cut in half at the modal's edge. The footer's
     Import is now the dialog's one `Primary`. Opening does **not** scan: the walk reads the user's home
     directory, and a dialog that goes through it because it was opened is doing something nobody
     asked for. The four sources all append through the app's one `add_import_result`, so a scan
@@ -42281,6 +42283,27 @@ Re-introducing the anti-patterns these guard against is a regression:
     label said twice, which is the stronger test of layout — twice as long and still readable, so a
     clipped box shows which label it cut. The setting and the OS reach only `locale::SHIPPED`,
     which a language joins when its catalogue is complete.
+  - **Layout for longer text** — phase 6 of *Interface translation*, landed. A summary that points
+    at the passages holding the detail, not a restatement of them. **The tool is the doubled
+    pseudo-locale**, `SCHEMAIC_LOCALE=pseudo-en` (`UiLanguage::PseudoEn`, the `doubled` transform
+    under `i18n.rs`): twice English's length and still readable, where the accented `pseudo` is
+    only 30–40% longer and too short to stress a box. A string that reads *once* among doubled
+    ones did not come through the catalogue. **The rule: a box beside text either measures its
+    text or ellipsizes it — nothing fixed-width just clips.** The pieces, each recorded where it
+    lives:
+    `widgets::ellipsized_text` (under `widgets.rs`) — `min_width(0)` on the text *and* on the
+    tooltip wrapper (*`.tooltip()`'s wrapper is the flex item* under *Floem 0.2 gotchas*), the
+    tooltip only when the line is actually cut — behind `footer_error`'s modal statuses,
+    `menu_row_face`'s action rows under Manage connections' and Users' lists, the Properties
+    *Count rows* hint, the palette row's secondary, the grid row panel's name and type, and Import's
+    mapping header names; `flex_shrink(1000)` on the half that gives way first (the row panel's
+    type, the palette's hint); `form_hint_style`'s `width_full`, so a hint wraps; `section_title`
+    and `panel_group_header` ellipsizing so a header's buttons and count never go; the fact panels'
+    label column measured (`widgets::fact_label_w`); the Ctrl+Enter run menu's width measured
+    (`consts::run_menu_w`, under *Floem 0.2 gotchas*); the ER diagram's count pills dropping one at
+    a time (`core::erd::fit_toolbar`); Settings' page at 500 with *Settings file*'s buttons stacked
+    (`settings.rs`); Connection import's source buttons wrapping; and the calendar's day cell at 33
+    (`day_w`, for longer month names).
   - **Two tests guard what the compiler cannot**: `every_catalogue_parses_cleanly`, because a
     malformed translation is only logged at run time and falls back to English unseen; and
     `no_translation_outlives_its_english_message`, for a renamed or deleted English id. A message
