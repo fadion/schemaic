@@ -939,62 +939,75 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                             },
                         )
                         .into_any()
-                    } else if let Some(e) = error {
-                        crate::widgets::footer_error(e)
-                    } else if let Some(msg) = done {
-                        // Built at the callback, where the file's name was still
-                        // in scope — `export_note` names the file and every column
-                        // the export could not carry, in the grid's own wording.
-                        crate::widgets::ellipsized_text(msg, |s| {
-                            s.color(theme::status_ok()).font_size(theme::font_label())
-                        })
-                        .into_any()
                     } else {
                         empty().into_any()
                     };
-                    modal_footer_split(
-                        left,
-                        h_stack((
-                            // **The dismissive slot becomes Stop while it runs,
-                            // and turns red.** It is the modal's one fixed
-                            // position, which is what the export needs a stop to
-                            // be — the alternative, a button beside the progress
-                            // text, moved with the row count under the cursor.
-                            // Red because it is an action rather than a way out:
-                            // in `Neutral` it reads as the same dismissive button
-                            // with a different word on it, which is precisely what
-                            // it is not. `exit` routes it, so Escape and the ✕
-                            // stop the export too and no exit can disagree with
-                            // another.
-                            action_button(
-                                if running {
-                                    tr!("dialog-stop")
-                                } else {
-                                    tr!("dialog-close")
-                                },
-                                if running {
-                                    ActionKind::Danger
-                                } else {
-                                    ActionKind::Neutral
-                                },
-                                true,
-                                ring.clone(),
-                                ACTION_TAB,
-                                move || (exit)(),
-                            ),
-                            action_button(
-                                tr!("dump-export"),
-                                ActionKind::Primary,
-                                !running && !none_chosen && !no_content,
-                                ring,
-                                ACTION_TAB + 10,
-                                move || run_export(&run_ctx),
-                            ),
-                        ))
-                        .style(|s| s.items_center().gap(theme::scaled(8.0)))
+                    // **The outcome gets a row of its own, wrapping.** A done
+                    // note names the ticked tables that were not found and the
+                    // objects left out of the file, and a failure names the
+                    // `.part` path and the OS error: ellipsized beside the
+                    // buttons, a partial backup read as a green success with the
+                    // rest on hover. The progress line stays one line above.
+                    //
+                    // The done note is built at the callback, where the file's
+                    // name was still in scope — `export_note` names the file and
+                    // every column the export could not carry, in the grid's own
+                    // wording.
+                    let outcome: Option<(String, fn() -> floem::peniko::Color)> = if running {
+                        None
+                    } else if let Some(e) = error {
+                        Some((e, theme::error))
+                    } else {
+                        done.map(|msg| (msg, theme::status_ok as fn() -> floem::peniko::Color))
+                    };
+                    let actions = h_stack((
+                        // **The dismissive slot becomes Stop while it runs,
+                        // and turns red.** It is the modal's one fixed
+                        // position, which is what the export needs a stop to
+                        // be — the alternative, a button beside the progress
+                        // text, moved with the row count under the cursor.
+                        // Red because it is an action rather than a way out:
+                        // in `Neutral` it reads as the same dismissive button
+                        // with a different word on it, which is precisely what
+                        // it is not. `exit` routes it, so Escape and the ✕
+                        // stop the export too and no exit can disagree with
+                        // another.
+                        action_button(
+                            if running {
+                                tr!("dialog-stop")
+                            } else {
+                                tr!("dialog-close")
+                            },
+                            if running {
+                                ActionKind::Danger
+                            } else {
+                                ActionKind::Neutral
+                            },
+                            true,
+                            ring.clone(),
+                            ACTION_TAB,
+                            move || (exit)(),
+                        ),
+                        action_button(
+                            tr!("dump-export"),
+                            ActionKind::Primary,
+                            !running && !none_chosen && !no_content,
+                            ring,
+                            ACTION_TAB + 10,
+                            move || run_export(&run_ctx),
+                        ),
+                    ))
+                    .style(|s| s.items_center().gap(theme::scaled(8.0)))
+                    .into_any();
+                    match outcome {
+                        Some((msg, color)) => crate::widgets::modal_footer_noted(
+                            text(msg)
+                                .style(move |s| s.color(color()).font_size(theme::font_label())),
+                            actions,
+                        )
                         .into_any(),
-                    )
-                    .into_any()
+                        None => modal_footer_split(left, actions).into_any(),
+                    }
                 },
             )
             .style(|s| s.width_full());

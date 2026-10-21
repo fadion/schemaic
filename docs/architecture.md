@@ -25365,7 +25365,7 @@ existing prose was left alone.
     **Every status these footers carry now ends in a `…` rather than wrapping or clipping** — an
     audit under the pseudo-locale found the rest still overflowing, and each now goes through
     `footer_error` or `ellipsized_text` (both below): Users' and Server Variables' counts, Compare's
-    selection note, Export's and Run script's progress and done lines, Chart's and Result diff's
+    selection note, Export's and Run script's progress lines, Chart's and Result diff's
     export notices, Result diff's `summary_line` (which also lacked the `min_width(0)` above), and
     the *N changes* and *reading source* lines of the object, event, routine, view and trigger
     editors and the table designer.
@@ -25377,7 +25377,14 @@ existing prose was left alone.
     one line at its natural length: Import Connections' "Added N connections." line took Close and
     Import past the modal's right edge exactly that way. Here the note is a direct child of the bar,
     whose width is the modal's. A caller whose note is sometimes absent hides it with
-    `Display::None` rather than leaving it empty, or the empty row still takes the column's gap. The
+    `Display::None` rather than leaving it empty, or the empty row still takes the column's gap.
+    **Export's and Run script's outcomes are its other callers**: their done, stopped and failed
+    notes went through the one-line footer once, and that made the point of each line hover-only
+    — the tables a dump did not find, the objects it left out, the `.part` path, a script's count
+    of statements that ran and whether they are still applied. A partial backup read as a green
+    success. Both footers switch to `modal_footer_split` only while the progress line is ticking,
+    and each modal's body is a `flex_grow` scroll with `min_height(0)`, so a wrapped note takes its
+    room from the body. The
     bar's own styling — full width, the modal's side padding, the top rule — is the private
     `footer_bar`, which `modal_footer_split` and `modal_footer_noted` both call.
     **`footer_error` is that row's left half when a draft doesn't validate**, and it exists because

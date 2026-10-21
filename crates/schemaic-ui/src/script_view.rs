@@ -692,57 +692,66 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                             },
                         )
                         .into_any()
-                    } else if let Some(e) = error {
-                        crate::widgets::footer_error(e)
-                    } else if let Some(msg) = done {
-                        crate::widgets::ellipsized_text(msg, |st| {
-                            st.color(theme::status_ok()).font_size(theme::font_label())
-                        })
-                        .into_any()
                     } else {
                         empty().into_any()
                     };
-                    modal_footer_split(
-                        left,
-                        h_stack((
-                            action_button(
-                                if running {
-                                    tr!("dialog-stop")
-                                } else {
-                                    tr!("dialog-close")
-                                },
-                                if running {
-                                    ActionKind::Danger
-                                } else {
-                                    ActionKind::Neutral
-                                },
-                                true,
-                                ring.clone(),
-                                ACTION_TAB,
-                                move || (exit)(),
-                            ),
-                            // **`Primary`, the same as the table import's own
-                            // button.** It was `Danger` on the argument that
-                            // this runs someone else's DDL with no undo — but
-                            // that made the one modal reachable by two menu
-                            // entries wear two different confirming colours,
-                            // which reads as two different features rather than
-                            // as a warning. What the file will do is said in
-                            // words, in the panel, where it can be specific;
-                            // the button is the same button.
-                            action_button(
-                                tr!("script-run"),
-                                ActionKind::Primary,
-                                !running && ready,
-                                ring,
-                                ACTION_TAB + 10,
-                                move || run_script(&run_ctx),
-                            ),
-                        ))
-                        .style(|st| st.items_center().gap(theme::scaled(8.0)))
+                    // **The outcome gets a row of its own, wrapping.** A failed
+                    // or stopped run says how many statements ran before it and
+                    // whether they are still applied — the point of the line —
+                    // and ellipsized beside the buttons that was hover-only.
+                    let outcome: Option<(String, fn() -> floem::peniko::Color)> = if running {
+                        None
+                    } else if let Some(e) = error {
+                        Some((e, theme::error))
+                    } else {
+                        done.map(|msg| (msg, theme::status_ok as fn() -> floem::peniko::Color))
+                    };
+                    let actions = h_stack((
+                        action_button(
+                            if running {
+                                tr!("dialog-stop")
+                            } else {
+                                tr!("dialog-close")
+                            },
+                            if running {
+                                ActionKind::Danger
+                            } else {
+                                ActionKind::Neutral
+                            },
+                            true,
+                            ring.clone(),
+                            ACTION_TAB,
+                            move || (exit)(),
+                        ),
+                        // **`Primary`, the same as the table import's own
+                        // button.** It was `Danger` on the argument that
+                        // this runs someone else's DDL with no undo — but
+                        // that made the one modal reachable by two menu
+                        // entries wear two different confirming colours,
+                        // which reads as two different features rather than
+                        // as a warning. What the file will do is said in
+                        // words, in the panel, where it can be specific;
+                        // the button is the same button.
+                        action_button(
+                            tr!("script-run"),
+                            ActionKind::Primary,
+                            !running && ready,
+                            ring,
+                            ACTION_TAB + 10,
+                            move || run_script(&run_ctx),
+                        ),
+                    ))
+                    .style(|st| st.items_center().gap(theme::scaled(8.0)))
+                    .into_any();
+                    match outcome {
+                        Some((msg, color)) => crate::widgets::modal_footer_noted(
+                            text(msg)
+                                .style(move |st| st.color(color()).font_size(theme::font_label())),
+                            actions,
+                        )
                         .into_any(),
-                    )
-                    .into_any()
+                        None => modal_footer_split(left, actions).into_any(),
+                    }
                 },
             )
             .style(|st| st.width_full());
