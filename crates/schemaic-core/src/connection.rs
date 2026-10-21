@@ -754,7 +754,7 @@ impl SslMode {
     /// `db::tls`'s `the_driver_still_reads_the_verifier_error_by_its_words`
     /// fails when the drivers fix this, which is when the caveat comes out.
     pub fn caveat(self, db_type: &str) -> Option<&'static str> {
-        (self == SslMode::VerifyCa && !is_postgres(db_type) && !is_sqlite(db_type)).then_some(
+        (self == SslMode::VerifyCa && verify_ca_checks_host_name(db_type)).then_some(
             "On MySQL and MariaDB this also checks the host name, so it behaves as Verify full \
              — a driver limitation, not a setting.",
         )
@@ -786,6 +786,24 @@ impl SslMode {
     /// and fails only this one.
     pub fn verifies_hostname(self) -> bool {
         matches!(self, SslMode::VerifyFull)
+    }
+}
+
+/// Does `Verify CA` on this engine also reject a host-name mismatch — the
+/// `mysql_async` defect [`SslMode::caveat`] names?
+///
+/// A **driver** capability, so it is answered per engine by an exhaustive
+/// match: only the engines `mysql_async` connects have it. PostgreSQL's
+/// driver and SQL Server's (Schemaic's own rustls configuration, whose
+/// `NameAgnosticVerifier` skips the name) do what the mode says, and SQLite
+/// has no TLS. A new engine has to decide here rather than fall onto
+/// whichever side a negated comparison left it.
+pub fn verify_ca_checks_host_name(db_type: &str) -> bool {
+    match crate::intel::SqlDialect::from_db_type(db_type) {
+        crate::intel::SqlDialect::MySql => true,
+        crate::intel::SqlDialect::Postgres
+        | crate::intel::SqlDialect::Sqlite
+        | crate::intel::SqlDialect::MsSql => false,
     }
 }
 
@@ -4852,6 +4870,12 @@ mod tls_tests {
         assert!(SslMode::VerifyCa.caveat("MariaDB").is_some());
         assert!(SslMode::VerifyCa.caveat("PostgreSQL").is_none());
         assert!(SslMode::VerifyCa.caveat("SQLite").is_none());
+        // SQL Server's TLS is Schemaic's own rustls configuration, whose
+        // `NameAgnosticVerifier` really does skip the name under Verify CA —
+        // so telling its user the mode "behaves as Verify full" claims a
+        // protection the connection does not have.
+        assert!(SslMode::VerifyCa.caveat("SQL Server").is_none());
+        assert!(SslMode::VerifyCa.caveat("mssql").is_none());
         for m in SslMode::ALL {
             if m == SslMode::VerifyCa {
                 continue;

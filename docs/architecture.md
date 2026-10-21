@@ -20170,8 +20170,11 @@ existing prose was left alone.
     `a_server_less_engine_reaches_no_server_by_any_route` fails if a site goes back to deciding for
     itself, and `a_networked_engine_still_reaches_its_server` is its floor, so the predicate cannot
     pass by refusing everything. `SslMode::caveat` is deliberately **not** among them: its
-    `!is_postgres && !is_sqlite` asks which engine *family* this is, for a MySQL/MariaDB driver
-    defect, not whether there is a server to reach. **The driver is blocking**, so every call runs in
+    `verify_ca_checks_host_name` asks which *driver* this engine runs on, for a `mysql_async`
+    defect, not whether there is a server to reach. That predicate is an exhaustive match over the
+    dialect because its first spelling, `!is_postgres && !is_sqlite`, sorted SQL Server onto
+    MySQL's side when it arrived. The form then told a SQL Server user that Verify CA "behaves as
+    Verify full", while that engine's `NameAgnosticVerifier` really skips the name. **The driver is blocking**, so every call runs in
   `spawn_blocking` and opens its own connection there — which is not a compromise but exactly the
   one-connection-per-operation invariant, at microsecond cost on a local file; cancellation goes
   through `Connection::get_interrupt_handle`, the analogue of `KILL QUERY` that needs no second
@@ -22106,7 +22109,9 @@ existing prose was left alone.
   `verify-ca` on MySQL/MariaDB also rejects a host-name mismatch: `mysql_async` 0.37 implements its
   skip-domain-validation toggle by matching `"NotValidForName"` in the verifier's error *text*, and
   rustls 0.23 raises `NotValidForNameContext`, whose `Display` has no such substring — so the two
-  verifying rungs are one mode there. `SslMode::caveat` puts that under the picker, and
+  verifying rungs are one mode there. `SslMode::caveat` puts that under the picker on those two
+  engines alone (`verify_ca_checks_host_name`; SQL Server's own rustls configuration does skip
+  the name), and
   `the_driver_still_reads_the_verifier_error_by_its_words` pins what is true **now**, so it turns
   red the day the drivers agree again. And a **passphrase-protected client key** is refused by name
   (`parse_key`), with the `openssl pkcs8` command to fix it: the form used to collect a passphrase
