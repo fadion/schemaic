@@ -293,8 +293,22 @@ pub(crate) fn completion_annot_size() -> f32 {
 /// `run_menu_pos` finds room for — one metric, because a placement computed
 /// against a different width than the panel draws at is how the menu came to be
 /// cut off at the editor's right edge in the first place.
+///
+/// **Measured, with 170 as its floor.** A constant was right while the labels
+/// were English and fit it; a longer language widened the panel past the 170
+/// the placement had made room for, and the menu was cut at the pane's edge
+/// again — the same bug, by the other half of the metric.
 pub(crate) fn run_menu_w() -> f64 {
-    scaled(170.0)
+    let label = [
+        crate::i18n::tr!("editor-run-current"),
+        crate::i18n::tr!("editor-run-everything"),
+    ]
+    .iter()
+    .map(|l| crate::widgets::measure_text_px_at(l, theme::font_title()))
+    .fold(0.0, f64::max);
+    // The rows' `menu_item_style` inset both sides, and the panel's border.
+    let row = label + scaled(crate::widgets::MENU_ROW_PAD_H) * 2.0 + 2.0;
+    scaled(170.0).max(row.ceil())
 }
 /// One run-menu row: `theme::font_title()`'s line box plus its `padding_vert(8)`.
 pub(crate) fn run_menu_row_h() -> f64 {
