@@ -1615,15 +1615,25 @@ fn trigger_list(
 }
 
 fn preview_from(target: &TriggerTarget, cs: &ddl::ChangeSet) -> DdlPreview {
-    ddl_preview::preview_of(
+    let mut preview = ddl_preview::preview_of(
         target.conn_id,
         &target.database,
         // The subject is the table: a plan here can touch several triggers, so
         // heading it with one of their names would misdescribe it.
-        tr!("trigger-editor-preview-subject", table = target.display()),
+        tr!(
+            "trigger-editor-preview-subject",
+            table = format!("{}.{}", target.database, target.display())
+        ),
         cs,
         target.read_only,
-    )
+    );
+    // **The table is qualified inside the phrase, so the phrase is not.** The
+    // title writes `database.subject` for a subject that names an object, and
+    // this one is a phrase: it read "shop.triggers on orders", as if `shop`
+    // held an object called that. The compare plan's count is unqualified for
+    // the same reason.
+    preview.qualified = false;
+    preview
 }
 
 /// The trigger editor. Absolutely positioned over the workspace when
@@ -1936,6 +1946,38 @@ mod one_answer_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The preview's title qualifies the table, not the phrase.** The
+    /// subject is a phrase ("triggers on orders"), and qualifying it the way
+    /// an object name is qualified titled the preview "shop.triggers on
+    /// orders", as if `shop` held an object called that.
+    #[test]
+    fn the_preview_title_qualifies_the_table_inside_the_phrase() {
+        let target = TriggerTarget {
+            conn_id: 1,
+            database: "shop".into(),
+            schema: None,
+            table: "orders".into(),
+            dialect: SqlDialect::MySql,
+            is_view: false,
+            current: Vec::new(),
+            sibling_triggers: Vec::new(),
+            read_only: false,
+        };
+        let cs = ddl::ChangeSet {
+            table: "orders".into(),
+            schema: None,
+            dialect: SqlDialect::MySql,
+            flavour: Default::default(),
+            changes: vec![ddl::Change::DropTrigger {
+                name: "t1".into(),
+                natively_compiled: false,
+            }],
+        };
+        let title = crate::ddl_preview::preview_title("Local", &preview_from(&target, &cs));
+        assert!(!title.contains("shop.triggers"), "{title}");
+        assert!(title.contains("triggers on shop.orders"), "{title}");
+    }
 
     /// **Every problem reads in English exactly as core's
     /// `TriggerProblem::message`** — each engine's own, the shared ones under

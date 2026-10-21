@@ -29159,7 +29159,11 @@ existing prose was left alone.
     `risk_heading` rides on the preview beside it, a `String` worded by `risk_heading_text` from
     `ChangeSet::risk_reversible` (`SchemaPlan::risk_reversible` in `preview_of_plan`) — a heading
     that contradicts the sentence beneath it costs the sentence its weight. A multi-object plan is
-    `qualified`'s one exception to being derived at all — the entry below says why.
+    one of `qualified`'s two exceptions to being derived at all — the entry below says why. The
+    other is the trigger editor's `preview_from`, whose subject is a phrase (`triggers on
+    shop.orders`, the table qualified inside it): derived, the title read `shop.triggers on orders`,
+    as if `shop` held an object called that
+    (`the_preview_title_qualifies_the_table_inside_the_phrase`).
     **`preview_of_plan` is `preview_of`'s multi-object counterpart**, for a schema comparison's
     `compare::SchemaPlan`, and `DdlPreview` needed **nothing added** to carry one: every field it
     holds was already flat text, and a plan answers each of them — the statements as its sets'

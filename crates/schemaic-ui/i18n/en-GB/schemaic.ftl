@@ -1626,6 +1626,7 @@ trigger-problem-last-clash = { $n ->
    *[other] Only one trigger can fire last on { $event } — { $names } and { $last } are all set to.
 }
 # The DDL preview's subject: a plan can touch several of a table's triggers.
+# $table is qualified with its database (shop.orders, shop.public.orders).
 trigger-editor-preview-subject = triggers on { $table }
 trigger-editor-none-selected = No trigger selected.
 trigger-editor-readonly-constraint = This is a constraint trigger. Schemaic doesn't model the deferral settings one carries, so it can be removed here but not edited — change it in SQL instead.
