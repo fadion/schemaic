@@ -936,22 +936,6 @@ pub(crate) fn calendar_insets(
     (x, box_menu_inset(top, bottom, h, wh, 4.0))
 }
 
-/// **Every control that stands in for a text field owes the keyboard the same
-/// contract that field had.** A signature scan, in the style of
-/// `widgets::menu_trigger_gate`, because what went wrong was not a wrong
-/// calculation — it was two parameters that were never passed.
-///
-/// `typed_editor` hands the row panel's `autofocus` and its panel-closing Escape
-/// to whichever control the column's type asks for. Two of the four ignored both,
-/// and the result was a column that could not be set without a mouse: nothing
-/// took the keyboard when the panel opened on an `ENUM`, and Tab walked past the
-/// control as though it were a label.
-///
-/// **What it can and can't see.** It reads the parameter lists, so it catches a
-/// fifth control added without them and it catches either being dropped from an
-/// existing one — which is exactly how this arrived. It cannot see that the
-/// control *uses* them; that half is `focus_on_mount` and the `escape` helper,
-/// which exist so there is one implementation to read rather than four.
 /// A month's name in the calendar's header — `date::MONTH_NAMES`' word, drawn
 /// here so it can be translated; core keeps its English. `month` is 1–12, and
 /// anything else is blank, as `date::month_name` answers.
@@ -987,6 +971,22 @@ fn weekday_initials(day: usize) -> String {
     }
 }
 
+/// **Every control that stands in for a text field owes the keyboard the same
+/// contract that field had.** A signature scan, in the style of
+/// `widgets::menu_trigger_gate`, because what went wrong was not a wrong
+/// calculation — it was two parameters that were never passed.
+///
+/// `typed_editor` hands the row panel's `autofocus` and its panel-closing Escape
+/// to whichever control the column's type asks for. Two of the four ignored both,
+/// and the result was a column that could not be set without a mouse: nothing
+/// took the keyboard when the panel opened on an `ENUM`, and Tab walked past the
+/// control as though it were a label.
+///
+/// **What it can and can't see.** It reads the parameter lists, so it catches a
+/// fifth control added without them and it catches either being dropped from an
+/// existing one — which is exactly how this arrived. It cannot see that the
+/// control *uses* them; that half is `focus_on_mount` and the `escape` helper,
+/// which exist so there is one implementation to read rather than four.
 #[cfg(test)]
 mod row_panel_focus_gate {
     /// The controls `grid::typed_editor` can build. `CellEditor::Text` is not

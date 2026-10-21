@@ -225,8 +225,10 @@ pub fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
 /// count through one and the go-to-row box parses what the user retypes from it,
 /// so a suffix translated on the printing side alone would print counts the box
 /// then refuses. One table is what keeps the two sides from being changed
-/// apart. The decimal point between them is the same question — localising it
-/// has to move both sides at once (`docs/roadmap.md`, locale formatting).
+/// apart. The decimal point between them is the same question, and it moves on
+/// both sides at once: the stats line prints through the interface language's
+/// [`crate::text::NumberMarks`], and `goto_row_index` reads back with the same
+/// marks.
 pub const COUNT_UNITS: [(char, u32); 3] = [('k', 3), ('m', 6), ('b', 9)];
 
 /// Compact row-count label: `1000 → 1k`, `1250 → 1.25k`, `1_000_000 → 1m`.

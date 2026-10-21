@@ -25782,7 +25782,9 @@ existing prose was left alone.
     **`tr!` is `fl!` against `LOADER`**, so a message
     id and its argument names are checked against the `en-GB` file at compile time and a missing key
     is a build error rather than a blank label — but *only* against `en-GB`, which is why the tests
-    below read the other files. `LOADER` is a `LazyLock<FluentLanguageLoader>` holding `en-GB` until
+    below read the other files. The crate's `build.rs` prints `cargo:rerun-if-changed=i18n`,
+    because the non-test build otherwise records no dependency on the catalogues: an id renamed in
+    the `.ftl` alone left a stale build that still passed the check. `LOADER` is a `LazyLock<FluentLanguageLoader>` holding `en-GB` until
     `init` says otherwise, and in every test, so English output never depends on the machine running
     the suite (`the_global_loader_is_english_until_init`).
     **`init(env, os, setting)` runs once, before any view is built**, and a second call is ignored

@@ -13417,6 +13417,17 @@ mod cell_preview_tests {
 
 #[cfg(test)]
 mod clipboard_gate {
+    #[test]
+    fn english_says_the_copy_split_note_as_core_does() {
+        for n in [0, 1, 2, 40] {
+            assert_eq!(
+                super::copy_split_note_text(n),
+                schemaic_core::edit::copy_split_note(n),
+                "{n}"
+            );
+        }
+    }
+
     /// **The gate.** A copy whose cells hold a tab or a newline has to say so,
     /// because the clipboard format cannot carry them and nothing downstream
     /// can tell afterwards.
@@ -13435,17 +13446,6 @@ mod clipboard_gate {
     /// place that both knows and can speak. A unit test on `copy_split_note`
     /// guards nothing without this: the sentence was right the moment it was
     /// written, and the whole defect was that nobody asked for it.
-    #[test]
-    fn english_says_the_copy_split_note_as_core_does() {
-        for n in [0, 1, 2, 40] {
-            assert_eq!(
-                super::copy_split_note_text(n),
-                schemaic_core::edit::copy_split_note(n),
-                "{n}"
-            );
-        }
-    }
-
     #[test]
     fn a_copy_that_the_clipboard_format_cannot_carry_says_so() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
