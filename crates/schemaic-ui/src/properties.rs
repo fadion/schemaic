@@ -112,11 +112,26 @@ impl PropertiesCtx {
 fn panel_w() -> f64 {
     modal_w(640.0)
 }
-/// The label column of the detail list. Fixed rather than measured so the values
-/// line up down the panel — a ragged left edge on a list of eight facts reads as
-/// eight unrelated lines.
+/// The label column of the detail list. One column so the values line up down
+/// the panel — a ragged left edge on a list of eight facts reads as eight
+/// unrelated lines — but as wide as the longest label this panel can show, in
+/// the interface's language, up to under half the panel
+/// ([`crate::widgets::fact_label_w`]).
 fn label_w() -> f64 {
-    theme::scaled(132.0)
+    let labels = [
+        tr!("props-columns"),
+        tr!("props-indexes"),
+        tr!("props-foreign-keys"),
+        tr!("props-type"),
+        tr!("props-engine"),
+        tr!("props-row-format"),
+        tr!("props-collation"),
+        tr!("props-next-auto-increment"),
+        tr!("props-created"),
+        tr!("props-updated"),
+        tr!("props-comment"),
+    ];
+    crate::widgets::fact_label_w(&labels, theme::scaled(132.0), panel_w() * 0.45)
 }
 /// Height of the storage-breakdown bar.
 fn bar_h() -> f64 {

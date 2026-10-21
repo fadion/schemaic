@@ -25434,6 +25434,12 @@ existing prose was left alone.
     `users_view::section`/`detail`/`note`) for the label column and row gap that legitimately differ
     between the two panels. The gap and the label width are `fn() -> f64` and not numbers, for the
     reason every other length here is: one resolved at build freezes at the scale it was built at.
+    **The label column is measured, not a constant**: each panel's `label_w` is
+    `widgets::fact_label_w` over every label it can show, in the interface's language — one column
+    still, so the values line up, at least the old 132 (Properties) or 124 (Users) and at most
+    under half the panel (Properties) or 240 (Users). Fixed, a longer language wrapped every label
+    onto a second line (*Next auto-increment* did, under `SCHEMAIC_LOCALE=pseudo-en`); a label
+    past the cap still wraps.
     `fact_section_owned` is `fact_section` under a heading built at run time — the *Used by* modal's
     *"Views (3)"*, where the count is the heading — and `fact_section` delegates to it, so there is
     still one section view; its title is `impl Into<String>`, for the properties panel's `tr!` headings.

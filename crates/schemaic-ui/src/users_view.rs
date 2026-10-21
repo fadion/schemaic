@@ -88,10 +88,32 @@ fn row_inset() -> f64 {
     theme::scaled(12.0)
 }
 
-/// The label column of the attributes list, fixed so the values line up — a
-/// ragged left edge on a column of facts reads as unrelated lines.
+/// The label column of the attributes list, one column so the values line up
+/// — a ragged left edge on a column of facts reads as unrelated lines — but as
+/// wide as the longest label in the interface's language
+/// ([`crate::widgets::fact_label_w`]).
 fn label_w() -> f64 {
-    theme::scaled(124.0)
+    let labels = [
+        tr!("users-attr-authentication"),
+        tr!("users-attr-locked"),
+        tr!("users-attr-password-expired"),
+        tr!("users-attr-superuser"),
+        tr!("users-attr-create-role"),
+        tr!("users-attr-create-database"),
+        tr!("users-attr-replication"),
+        tr!("users-attr-bypass-rls"),
+        tr!("users-attr-inherit"),
+        tr!("users-attr-connection-limit"),
+        tr!("users-attr-valid-until"),
+        tr!("users-attr-type"),
+        tr!("users-attr-disabled"),
+        tr!("users-attr-default-database"),
+        tr!("users-attr-server-roles"),
+        tr!("users-attr-login"),
+        tr!("users-attr-default-schema"),
+        tr!("users-attr-member-of"),
+    ];
+    crate::widgets::fact_label_w(&labels, theme::scaled(124.0), theme::scaled(240.0))
 }
 
 // ── what the browser reads ───────────────────────────────────────────────────

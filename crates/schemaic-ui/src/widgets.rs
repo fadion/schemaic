@@ -2014,7 +2014,7 @@ pub(crate) fn fact_section_owned(title: String, rows: Vec<AnyView>, gap: fn() ->
 /// `dividers::scaled_arg_gate`, where the same shape was two visible bugs). It
 /// is a parameter rather than a constant because the two panels that use this
 /// have differently sized label columns, and a shared column would leave one of
-/// them ragged.
+/// them ragged. Each panel sizes its column with [`fact_label_w`].
 pub(crate) fn fact_row(label: String, value: String, label_w: fn() -> f64) -> AnyView {
     h_stack((
         text(label).style(move |s| {
@@ -2030,6 +2030,20 @@ pub(crate) fn fact_row(label: String, value: String, label_w: fn() -> f64) -> An
     ))
     .style(|s| s.items_start().gap(theme::scaled(10.0)).width_full())
     .into_any()
+}
+
+/// A [`fact_row`] label column wide enough for the longest of `labels`, at
+/// least `floor` and at most `cap` — still one column, so the values line up,
+/// but measured, so a language that runs longer than English does not wrap
+/// every label onto a second line (*Next auto-increment* did, doubled). A
+/// label past the cap wraps, as before.
+pub(crate) fn fact_label_w(labels: &[String], floor: f64, cap: f64) -> f64 {
+    labels
+        .iter()
+        .map(|l| measure_text_px_at(l, theme::font_body()))
+        .fold(floor, f64::max)
+        .min(cap)
+        .ceil()
 }
 
 /// The style a **container** wants when the thing inside it may render nothing:
