@@ -25195,7 +25195,14 @@ existing prose was left alone.
     list — links rather than footer buttons, because they adjust the list the user is reading
     instead of answering the modal, and `in_ring_button`-wrapped because the only other way to
     change a selection is clicking every row, which is not a thing a keyboard can do —
-    `section_title`/`centered_msg`/`toggle_icon` (whose `enabled` is **not optional**: every panel
+    `section_title` — a panel's title, and **the part of its header that gives way**. The headers
+    are `h_stack((section_title, buttons))`, and a title without `min_width(0)` kept its text's
+    width, so a narrowing panel pushed its buttons out until they clipped (found under the doubled
+    pseudo-locale, `SCHEMAIC_LOCALE=pseudo-en`). It now carries `min_width(0)`/`flex_shrink(1)`/
+    `text_ellipsis`, and `toolbar_icon`'s container `flex_shrink(0)` as well as its glyph, so the
+    title ends in a `…` and the buttons never give up a pixel — the rule `modal_footer_split` and
+    the results strip follow, a control clipped in half not being a control —
+    `centered_msg`/`toggle_icon` (whose `enabled` is **not optional**: every panel
     toggle in the footer needs it, so the ungated shims that passed `|| true` were only hiding the
     fact — see *The footer's panel toggles* below), `tip_when`, `measure_text_px` (and
     `measure_field_text_px`, text as an `edit_field` draws it — in `MONO_FAMILY` when the field is
@@ -25389,7 +25396,9 @@ existing prose was left alone.
     still one section view; its title is `impl Into<String>`, for the properties panel's `tr!` headings.
     Also the right-hand panels' shared list chrome — `panel_search` (its *Search…* is
     `panel-search-placeholder`, through `FieldCfg::placeholder_of`), `panel_group_header` (a band's
-    title and count; its colour and border rulings are on the function) and **`banded_list`, which
+    title and count; its colour and border rulings are on the function — the title ellipsizes and
+    the count is `flex_shrink(0)`, so a narrow band still ends in its count where it used to clip
+    the title mid-word) and **`banded_list`, which
     makes those bands sticky**: the band under the top edge keeps its header pinned while its rows
     scroll, and the next header pushes it out as it arrives. It takes `(title, count, rows)` per
     band and the enclosing scroll's visible rect, which `autohide_tracking` publishes from the

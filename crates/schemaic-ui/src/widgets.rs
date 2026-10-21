@@ -2899,7 +2899,10 @@ pub(crate) fn toolbar_icon(
     .on_event_cont(EventListener::PointerEnter, move |_| hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| hov.set(false))
     .style(move |s| {
+        // Never squeezed: a panel header's title truncates before its buttons
+        // give up a pixel (`section_title`).
         s.items_center()
+            .flex_shrink(0.0_f32)
             .margin_top(mt)
             .margin_right(mr)
             .padding_horiz(theme::scaled(5.0))
@@ -5625,6 +5628,13 @@ pub(crate) fn control_surface(s: floem::style::Style) -> floem::style::Style {
         .border_radius(CONTROL_RADIUS)
 }
 
+/// A panel's title — `QUERY HISTORY`, `SNIPPET LIBRARY`, `AI`, `TERMINAL`.
+///
+/// **It is the part of its header that gives way.** The headers are
+/// `h_stack((section_title, buttons))`, the buttons `flex_shrink(0)`; a title
+/// without `min_width(0)` keeps its text's width, so a narrowing panel pushed
+/// the buttons out and clipped them. Now it shrinks to what the buttons leave
+/// and ends in an ellipsis, and the buttons never go.
 pub(crate) fn section_title(t: impl Into<String>) -> impl IntoView {
     text(t.into()).style(|s| {
         s.font_size(theme::font_title())
@@ -5632,6 +5642,9 @@ pub(crate) fn section_title(t: impl Into<String>) -> impl IntoView {
             .color(theme::text_muted())
             .padding_horiz(theme::scaled(12.0))
             .padding_vert(theme::scaled(8.0))
+            .min_width(0.0)
+            .flex_shrink(1.0_f32)
+            .text_ellipsis()
     })
 }
 
@@ -5692,11 +5705,16 @@ pub(crate) fn panel_search(filter: RwSignal<String>) -> impl IntoView {
 ///   own top rule. Every other follows a row that already ends in the same 1px
 ///   border, and two stacked is a 2px seam at every group boundary but the
 ///   first — floem does not collapse adjacent borders.
+/// * The title ellipsizes and the count does not: in a narrow panel the band
+///   still ends in its count, rather than clipping both mid-word.
 pub(crate) fn panel_group_header(title: String, count: usize, first: bool) -> AnyView {
     let label = text(title).style(|s| {
         s.font_size(theme::font_label())
             .font_bold()
             .color(theme::accent())
+            .min_width(0.0)
+            .flex_shrink(1.0_f32)
+            .text_ellipsis()
     });
     let n = text(count.to_string()).style(|s| {
         s.font_size(theme::font_label())
