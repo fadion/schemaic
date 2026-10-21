@@ -764,22 +764,36 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                         // What was actually dropped, not what the length implies:
                         // a log resting *at* the cap has lost nothing yet.
                         dropped.get() > 0,
-                        &length_only.get(),
                         l.len(),
                         l.first().map(|e| e.at.as_str()),
                     )
                 })
             });
-            let status = label(move || line.with(|(msg, _)| msg.clone()))
+            let status_line = label(move || line.with(|(msg, _)| msg.clone()))
                 .style(move |s| {
                     s.color(line.with(|(_, tone)| tone.color())())
                         .font_size(font_label())
+                        .min_width(0.0)
                         .text_ellipsis()
                 })
                 // A poll error can outrun the footer; the whole of it is here.
                 .tooltip(move || {
                     text(line.with(|(msg, _)| msg.clone())).style(crate::widgets::tooltip_style)
                 });
+            // Binary columns: a warning icon ahead of the line, the columns
+            // named in its tooltip, and absent for a table without one.
+            let length_note = create_memo(move |_| length_only.with(|c| length_only_note(c)));
+            let length_icon = crate::icons::icon(crate::icons::TRIANGLE_ALERT, 12.0)
+                .style(move |s| {
+                    s.color(theme::plan_warn())
+                        .flex_shrink(0.0_f32)
+                        .apply_if(length_note.with(Option::is_none), |s| s.hide())
+                })
+                .tooltip(move || {
+                    text(length_note.get().unwrap_or_default()).style(crate::widgets::tooltip_style)
+                });
+            let status = h_stack((length_icon, status_line))
+                .style(|s| s.items_center().min_width(0.0).gap(theme::scaled(6.0)));
             let done = close.clone();
             let footer = modal_footer_split(
                 status,
@@ -1147,15 +1161,16 @@ impl Tone {
 /// *co-occur* and each one is a different reason the log isn't the whole story.
 /// `partial` and `capped` are the two silent truncations — rows the poll can't
 /// see, and changes the log has already dropped — and the second only became
-/// load-bearing when the log became exportable. `length_only` is the third:
-/// binary columns, whose changes a poll sees only when their length moves.
-/// Whether the poll is paused or stopped is the title's badge, not this line.
+/// load-bearing when the log became exportable. Binary columns, whose changes
+/// a poll sees only when their length moves, are not a caveat of this line:
+/// they are a property of the table, said by the icon beside it
+/// ([`length_only_note`]). Whether the poll is paused or stopped is the
+/// title's badge, not this line.
 fn footer_line(
     export_err: Option<String>,
     poll_err: Option<String>,
     partial: bool,
     capped: bool,
-    length_only: &[String],
     events: usize,
     since: Option<&str>,
 ) -> (String, Tone) {
@@ -1175,15 +1190,6 @@ fn footer_line(
     if capped {
         parts.push(tr!("monitor-capped", cap = schemaic_core::monitor::LOG_CAP));
     }
-    // A blob's cell is `<n bytes>`: rewritten at the same length, it is no
-    // change to the poll.
-    if !length_only.is_empty() {
-        parts.push(tr!(
-            "monitor-length-only",
-            count = length_only.len(),
-            columns = length_only.join(", ")
-        ));
-    }
     if parts.len() > 1 {
         return (parts.join(" · "), Tone::Warn);
     }
@@ -1191,6 +1197,19 @@ fn footer_line(
         parts.push(tr!("monitor-newest-at-bottom"));
     }
     (parts.join(" · "), Tone::Calm)
+}
+
+/// The tooltip of the footer's warning icon, naming the table's binary
+/// columns — or `None`, and no icon, for a table without one. A blob's cell
+/// is `<n bytes>`: rewritten at the same length, it is no change to the poll.
+fn length_only_note(length_only: &[String]) -> Option<String> {
+    (!length_only.is_empty()).then(|| {
+        tr!(
+            "monitor-length-only",
+            count = length_only.len(),
+            columns = length_only.join(", ")
+        )
+    })
 }
 
 /// Write the change log to a file the user picks, in `format`.
@@ -1371,7 +1390,7 @@ mod tests {
     /// `footer_line` with no error, 200 events since 11:48:12 — the two
     /// truncation flags are what most of these vary.
     fn line(partial: bool, capped: bool) -> (String, Tone) {
-        footer_line(None, None, partial, capped, &[], 200, Some("11:48:12"))
+        footer_line(None, None, partial, capped, 200, Some("11:48:12"))
     }
 
     /// A stopped loop is not waiting for anything: its badge says so, ahead of
@@ -1388,33 +1407,24 @@ mod tests {
         }
     }
 
-    /// Binary columns are seen by length only, and the footer says which.
+    /// Binary columns are seen by length only — said by the warning icon's
+    /// tooltip, which names them, and never by the line: a table with a blob
+    /// column is a normal table, and an amber caveat on every one of them read
+    /// as something wrong with it.
     #[test]
-    fn a_binary_column_is_said_to_be_watched_by_length_only() {
-        let (msg, tone) = footer_line(
-            None,
-            None,
-            false,
-            false,
-            &["photo".to_string()],
-            3,
-            Some("10:00:00"),
+    fn a_binary_column_is_said_by_the_icon_not_the_line() {
+        assert_eq!(
+            length_only_note(&["photo".to_string()]).as_deref(),
+            Some("photo is binary, so its changes are seen by length only")
         );
-        assert_eq!(tone, Tone::Warn);
-        assert!(
-            msg.ends_with("photo is binary, so its changes are seen by length only"),
-            "{msg}"
-        );
-        let (two, _) = footer_line(
-            None,
-            None,
-            false,
-            false,
-            &["a".to_string(), "b".to_string()],
-            0,
-            None,
-        );
+        let two = length_only_note(&["a".to_string(), "b".to_string()]).unwrap();
         assert!(two.contains("a, b are binary"), "{two}");
+        assert_eq!(length_only_note(&[]), None, "no binary column, no icon");
+        // The line of a table with one is any table's line.
+        assert_eq!(
+            footer_line(None, None, false, false, 0, None),
+            ("No changes yet".to_string(), Tone::Calm)
+        );
     }
 
     #[test]
@@ -1426,14 +1436,14 @@ mod tests {
                 Tone::Calm
             )
         );
-        let (one, _) = footer_line(None, None, false, false, &[], 1, Some("09:00:00"));
+        let (one, _) = footer_line(None, None, false, false, 1, Some("09:00:00"));
         assert_eq!(one, "1 event since 09:00:00 · newest at the bottom");
     }
 
     #[test]
     fn an_empty_log_says_nothing_has_changed() {
         assert_eq!(
-            footer_line(None, None, false, false, &[], 0, None),
+            footer_line(None, None, false, false, 0, None),
             ("No changes yet".to_string(), Tone::Calm)
         );
     }
@@ -1454,7 +1464,6 @@ mod tests {
             Some("connection lost".into()),
             true,
             true,
-            &[],
             5,
             Some("10:00:00"),
         );
@@ -1474,7 +1483,6 @@ mod tests {
             Some("connection lost".into()),
             true,
             true,
-            &[],
             5,
             Some("10:00:00"),
         );

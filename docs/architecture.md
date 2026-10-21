@@ -10204,8 +10204,8 @@ existing prose was left alone.
     **A snapshot sees a binary column's change by its length only**: its cells are the result's
     text, and a blob's text is `<n bytes>`, so a blob rewritten at the same length is no change to
     `diff_snapshots`. `length_only_columns(rs)` names those columns — binary by type or by
-    `ResultSet::binary_columns`, as `result_diff` decides — so the modal's footer can say so rather
-    than let the log read as complete (`a_binary_column_is_watched_by_length_only`). It is a
+    `ResultSet::binary_columns`, as `result_diff` decides — so the modal's footer can say so, by a
+    warning icon beside its status line, rather than let the log read as complete (`a_binary_column_is_watched_by_length_only`). It is a
     caveat, not a fix: the
     bytes are not in the result to compare. `merge_length_only(prev, rs)` is that list grown by a
     poll — `None` where the poll adds no column — since SQLite marks a column binary as blobs
@@ -32793,20 +32793,27 @@ existing prose was left alone.
     holds it now is the absence of any control bound to this run, which is exactly what
     `stoppable: false` says. Compare results' export (`result_diff_view.rs`) is built on this one —
     the same glyph in the ring, the same popup, the same request — and inherits both reasons.
-    `footer_line(export_err, poll_err, partial, capped, length_only, events, since)` decides what the footer
+    `footer_line(export_err, poll_err, partial, capped, events, since)` decides what the footer
     says: an error takes the line outright in `Tone::Error`, worst-to-mislead first (a failed export
     beats a poll error, because the user believes they have a file and doesn't). Otherwise it is
     *"200 events since 11:48:12 · newest at the bottom"* in `Tone::Calm`, `since` being the oldest
     entry the log still holds, or *No changes yet* for an empty log; with a caveat the tail is
     replaced by **every** caveat that applies, joined, in `Tone::Warn`. `partial` (only the first
-    `ROW_CAP` rows are watched) and `capped` co-occur and neither replaces the other. `length_only`
-    is the third (S6.1-L1-05): the watched columns `monitor::length_only_columns` names on the
-    baseline poll, and each later poll adds to (`monitor::merge_length_only` — SQLite marks a
-    column binary only as blobs arrive), held in `overlay.monitor_length_only` (`MonitorCtx::length_only`, reset by
-    `open_monitor`), said as *"photo is binary, so its changes are seen by length only"* — plural
-    *are … their* for several (`a_binary_column_is_said_to_be_watched_by_length_only`). A blob's
+    `ROW_CAP` rows are watched) and `capped` co-occur and neither replaces the other. **Binary
+    columns are not a caveat of this line**, though they were its third (S6.1-L1-05): the watched
+    columns `monitor::length_only_columns` names on the baseline poll, and each later poll adds to
+    (`monitor::merge_length_only` — SQLite marks a column binary only as blobs arrive), held in
+    `overlay.monitor_length_only` (`MonitorCtx::length_only`, reset by `open_monitor`). A blob's
     snapshot cell is `<n bytes>`, so a blob rewritten at the same length is no change to the poll,
-    and a log that said nothing would read as complete. Paused or stopped is the
+    and a log that said nothing would read as complete — but appended to the line, the sentence
+    turned every table with a blob amber, and the user read that as something wrong with a table
+    that is perfectly normal. It is a property of the table, not of the log, so it is said beside
+    the line instead: the footer's left side is `h_stack((icon, line))`, a `TRIANGLE_ALERT` in
+    `plan_warn` that is hidden when the list is empty and whose tooltip is `length_only_note` —
+    *"photo is binary, so its changes are seen by length only"*, plural *are … their* for several,
+    `None` (and no icon) for none. A table with a binary column therefore reads plain *No changes
+    yet*, in `Tone::Calm`, like any other (`a_binary_column_is_said_by_the_icon_not_the_line`).
+    Paused or stopped is the
     title's badge, not this line. The line ends in an ellipsis and its tooltip carries the whole of
     it, since a poll error can outrun the footer. `capped` is
     `overlay.monitor_dropped > 0`, accumulated from `monitor::trim_log`'s return, **not** the log's
@@ -32831,9 +32838,9 @@ existing prose was left alone.
     notes, the Stopped./Paused./Waiting faces and the export dialog's window title; Close is the
     shared `dialog-close`. `footer_line`'s parts are whole messages, still joined by ` · `:
     `monitor-events-since` (plural, `$count`, `$since`), `monitor-no-changes`, `monitor-partial`
-    and `monitor-capped` (`$cap`, `monitor::ROW_CAP`/`LOG_CAP`), `monitor-length-only` (plural on
-    `$count`, `$columns`) — which replaced the assembled *is … its*/*are … their* pair — and
-    `monitor-newest-at-bottom`. The footer's tests pin the English and pass unchanged;
+    and `monitor-capped` (`$cap`, `monitor::ROW_CAP`/`LOG_CAP`), and `monitor-newest-at-bottom`;
+    `monitor-length-only` (plural on `$count`, `$columns`) — which replaced the assembled
+    *is … its*/*are … their* pair — is now the icon's tooltip, built by `length_only_note`. The footer's tests pin the English and pass unchanged;
     `the_clear_prompt_and_the_intervals_read_as_they_did_in_english` pins the rest. English stays:
     `monitor::action_label`'s INSERT/UPDATE/DELETE (SQL keywords, and what the export writes), the
     export menu's `ExportFormat::label`s, the `old → new` arrow, the file name's `-monitor`
