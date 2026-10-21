@@ -92,28 +92,45 @@ fn row_inset() -> f64 {
 /// — a ragged left edge on a column of facts reads as unrelated lines — but as
 /// wide as the longest label in the interface's language
 /// ([`crate::widgets::fact_label_w`]).
+///
+/// **The labels are `attribute_text`'s own**, over [`every_attribute`], so
+/// the column measures exactly what the rows draw. It once re-listed the
+/// eighteen messages by hand, and a variant added to one list and not the
+/// other would have wrapped its label.
 fn label_w() -> f64 {
-    let labels = [
-        tr!("users-attr-authentication"),
-        tr!("users-attr-locked"),
-        tr!("users-attr-password-expired"),
-        tr!("users-attr-superuser"),
-        tr!("users-attr-create-role"),
-        tr!("users-attr-create-database"),
-        tr!("users-attr-replication"),
-        tr!("users-attr-bypass-rls"),
-        tr!("users-attr-inherit"),
-        tr!("users-attr-connection-limit"),
-        tr!("users-attr-valid-until"),
-        tr!("users-attr-type"),
-        tr!("users-attr-disabled"),
-        tr!("users-attr-default-database"),
-        tr!("users-attr-server-roles"),
-        tr!("users-attr-login"),
-        tr!("users-attr-default-schema"),
-        tr!("users-attr-member-of"),
-    ];
+    let labels: Vec<String> = every_attribute()
+        .iter()
+        .map(|a| attribute_text(a).0)
+        .collect();
     crate::widgets::fact_label_w(&labels, theme::scaled(124.0), theme::scaled(240.0))
+}
+
+/// One of every [`schemaic_core::users::AccountAttribute`], for measuring
+/// their labels — the values are placeholders. `attribute_variant` and its
+/// test hold the list complete.
+fn every_attribute() -> Vec<schemaic_core::users::AccountAttribute> {
+    use schemaic_core::users::{AccountAttribute as A, LoginType};
+    let s = String::new;
+    vec![
+        A::Authentication(s()),
+        A::Locked(false),
+        A::PasswordExpired(false),
+        A::Superuser,
+        A::CreateRole,
+        A::CreateDatabase,
+        A::Replication,
+        A::BypassRls,
+        A::NoInherit,
+        A::ConnectionLimit(0),
+        A::ValidUntil(s()),
+        A::LoginType(LoginType::Sql),
+        A::Disabled,
+        A::DefaultDatabase(s()),
+        A::ServerRoles(s()),
+        A::Login(s()),
+        A::DefaultSchema(s()),
+        A::MemberOf(s()),
+    ]
 }
 
 // ── what the browser reads ───────────────────────────────────────────────────
@@ -1413,6 +1430,49 @@ fn footer(
 
 #[cfg(test)]
 mod tests {
+    /// Which variant an attribute is, as a number. **An exhaustive `match`**,
+    /// so a variant added to core does not compile here until it is counted —
+    /// and the test below then fails until `every_attribute` lists it.
+    fn attribute_variant(a: &schemaic_core::users::AccountAttribute) -> usize {
+        use schemaic_core::users::AccountAttribute as A;
+        match a {
+            A::Authentication(_) => 0,
+            A::Locked(_) => 1,
+            A::PasswordExpired(_) => 2,
+            A::Superuser => 3,
+            A::CreateRole => 4,
+            A::CreateDatabase => 5,
+            A::Replication => 6,
+            A::BypassRls => 7,
+            A::NoInherit => 8,
+            A::ConnectionLimit(_) => 9,
+            A::ValidUntil(_) => 10,
+            A::LoginType(_) => 11,
+            A::Disabled => 12,
+            A::DefaultDatabase(_) => 13,
+            A::ServerRoles(_) => 14,
+            A::Login(_) => 15,
+            A::DefaultSchema(_) => 16,
+            A::MemberOf(_) => 17,
+        }
+    }
+
+    /// **The label column measures every label the rows can draw**: the
+    /// list it measures holds each attribute once.
+    #[test]
+    fn the_label_column_measures_every_attribute() {
+        let seen: std::collections::BTreeSet<usize> = super::every_attribute()
+            .iter()
+            .map(attribute_variant)
+            .collect();
+        assert_eq!(
+            seen,
+            (0..18).collect(),
+            "an attribute the column never measures"
+        );
+        assert_eq!(super::every_attribute().len(), 18, "one of each");
+    }
+
     /// **Every note under the account list and the privilege list reads in
     /// English exactly as core's `message`** — MySQL's, PostgreSQL's over a
     /// database and none with each thing a role may hold implicitly, and SQL
