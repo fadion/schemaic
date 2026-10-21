@@ -15398,8 +15398,22 @@ existing prose was left alone.
       `ddl_preview::preview_proposal` turns it into a plan, and the user clicks Apply. Every step
       before that last one is read-only.
     - `transcript.rs` — the rendered shape of one AI turn (`ChatMessage`/`Seg::{Text,Tool}`/
-      `TurnStats`), kept here rather than in `schemaic-ai` so the UI crate needn't depend on the
-      CLI-integration crate. `ChatMessage::prose` is what copy *and* conversation replay use.
+      `TurnNotes`/`TurnStats`), kept here rather than in `schemaic-ai` so the UI crate needn't depend
+      on the CLI-integration crate. `ChatMessage::prose` is what conversation replay uses, and copy
+      takes it with the turn's notes around it.
+      **Schemaic's own words in a turn are `TurnNotes`, never a `Seg::Text`** — a `lead` drawn above
+      the segments (the no-database-tools note) and a `tail` below them (a spawn refusal, a launch
+      that failed, a turn that ended badly, a session refused before it started, the app's
+      no-database refusal). They were text segments, so `prose()` returned them and `render_history`
+      replayed them into a later session's prompt as `Assistant: …` — the interface's sentences, in
+      its language, sent to the model as things it had said. `prose()` does not read `notes`, and
+      `history_replay_leaves_out_schemaics_own_notes` (in `app/ai.rs`) pins that with German notes
+      around an English answer. **A field and not a new `Seg` variant, on purpose**: `chats.json`
+      persists `segs` with no parsing shim, so a variant an older build does not know fails its
+      read of the whole file, while a struct field it does not know is skipped — the field is
+      `#[serde(default, skip_serializing_if = "TurnNotes::is_empty")]` for the same reader.
+      `fingerprint` mixes in both notes' lengths, since a turn gains a lead at its start and a tail
+      when it fails without any segment changing.
       **`ToolCall::bare_name` is the one `mcp__schemaic__run_query` → `run_query` derivation**, and
       `short_name` is it asked of a call that already exists. It lives here, below `schemaic-ai`,
       because both answers have to name the same tool: this expression produces the chip label the
@@ -15509,7 +15523,8 @@ existing prose was left alone.
       switching connections and back mid-session still shows that session's own results.
       `persistable` drops a still-streaming turn and its unanswered question before capping. A
       restored conversation is transcript, not memory: prose is replayed into a fresh agent-CLI
-      session's system prompt, tool calls never are. That session need not be the harness that
+      session's system prompt, tool calls never are, and neither are Schemaic's own `TurnNotes`
+      (above). That session need not be the harness that
       produced the transcript — each message carries its own `harness`, so a conversation restored
       after a switch keeps naming whoever answered each turn while the *next* turn runs on the CLI
       selected now.
@@ -24739,7 +24754,8 @@ existing prose was left alone.
     until the text lands.
     **`streams_deltas` is a record, not a lever, and its doc now says so.** Nothing in the app calls
     it: it claimed the panel used it to decide whether a first token means "it has started", and the
-    panel decides that from `m.pending && m.segs.is_empty()` — the better rule, since it answers
+    panel decides that from `m.pending && m.segs.is_empty() && m.notes.is_empty()` — the better
+    rule, since it answers
     correctly for the harness that streams nothing. It is kept with `#[allow(dead_code)]` rather
     than deleted because it is a measured fact about six CLIs that this parser's whole design rests
     on, and deleting a measurement to satisfy a warning is how a measurement gets taken twice.
@@ -35543,14 +35559,24 @@ existing prose was left alone.
   refactored onto it rather than left alongside: it briefly had its own copy, and two copies drift
   on exactly the details a user notices — whether a half-finished turn renders, whether stats reach
   the footer, whether the accumulator is reset at the boundary.
-  **`fail()` *appends* its reason to what streamed in rather than replacing it**, and sending the
-  reason alone is not a smaller version of that: the consumer assigns `last.segs = msg.segs`
-  wholesale, so a one-segment message threw away every word already on screen. That was invisible on
+  **`fail()` *appends* its reason to what streamed in rather than replacing it** — as the turn's
+  `TurnNotes` tail, through `end(segs, tail)`, not as one more segment (*`transcript.rs`*) — and
+  sending the reason alone is not a smaller version of that: the consumer assigns
+  `last.segs = msg.segs` (and `last.notes = msg.notes`) wholesale, so a one-segment message threw
+  away every word already on screen. That was invisible on
   Claude, whose `result` event carries the accumulated turn so the final snapshot is complete, and
   wrong wherever a turn ends by the process *exiting* — press Stop on a long Codex or OpenCode
   answer, or on an Antigravity one, whose Stop kills the child because there is no interrupt to send
   it, and the prose you were reading vanished, replaced by "Stopped.". The consumer's
   own comment already promised the opposite, which is what made the two halves look consistent.
+  **`note()` is the pump's `lead`, held on the pump rather than sent as a `TextDelta`**: it rides
+  every snapshot of the turn it was put on and is cleared when that turn ends, because a snapshot
+  of its own would be erased by the next real one, the notes being assigned wholesale too. As a
+  delta it became the turn's prose and was replayed to the model as its own words. The senders
+  that answer with a refusal and nothing else — `refuse_every_turn`, `spawn_refusal`, `no_cwd`,
+  the isolation refusal, a session that failed to launch — send `segs: Vec::new()` with
+  `TurnNotes::tail(why)`, for the same reason. The session tests read a snapshot two ways,
+  `shown_of` (what the panel draws, notes included) and `text_of` (what a replay would read).
   **The per-turn child is released before it is waited on, and the wait is bounded.** After a decoded
   `TurnDone` the loop breaks and the child is reaped — but the loop owns the read half of stdout, and
   a child that keeps writing past its terminal event fills the pipe and blocks in `wait()` forever.
@@ -41607,7 +41633,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     the sign-in picker names); **everything sent to an AI model** — the
     Explain prompt, the Optimise intent (whose box label `cmdk-optimise-label` *is* translated and
     compared against the box, so the English intent still goes out), the AI fill and seed system
-    prompts, every prompt `ai.rs` and `antigravity.rs` send; `--mcp-serve`'s errors to an agent's
+    prompts, every prompt `ai.rs` and `antigravity.rs` send — and the converse holds: Schemaic's
+    own words in a turn *are* worded, so they are `transcript::TurnNotes`, which the replay into
+    a later prompt never reads, rather than prose that it does; `--mcp-serve`'s errors to an agent's
     stderr; what the app writes to the write log, a persisted record; log and `tracing` lines;
     the prose core and `schemaic-cli` return wherever the CLI, the MCP server, a log or a model
     reads it — where the window shows it, it is a typed value the window words (*A typed

@@ -1208,11 +1208,18 @@ fn message_bubble(
         // segments — with a footer underneath (a live elapsed timer while the turn
         // runs, swapped for the final cost/token summary + actions once it finishes).
         // Prose only — tool chips are the assistant *using* tools, not content.
-        let copy_text = m.prose();
-        let content: AnyView = if m.pending && m.segs.is_empty() {
+        // Copy takes what the bubble shows, Schemaic's notes included — unlike
+        // a replay to the model, for which `prose()` leaves them out.
+        let copy_text = [m.notes.lead.clone(), Some(m.prose()), m.notes.tail.clone()]
+            .into_iter()
+            .flatten()
+            .filter(|t| !t.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let content: AnyView = if m.pending && m.segs.is_empty() && m.notes.is_empty() {
             verb_spinner(theme::text_muted, || theme::scaled_font(14.0)).into_any()
         } else {
-            render_segments(m.segs, m.role, actions, !m.pending).into_any()
+            render_segments(m.segs, m.notes, m.role, actions, !m.pending).into_any()
         };
         let footer = assistant_footer(
             m.pending, m.stats, elapsed_ms, copy_text, is_last, regenerate, enabled,
@@ -1314,9 +1321,11 @@ fn message_bubble(
 }
 
 // Render an assistant turn: prose segments as markdown, tool segments as chips,
-// then a dim cost footer if the turn reported one.
+// then a dim cost footer if the turn reported one. Schemaic's own notes sit at
+// the head and the tail, drawn as the prose around them is.
 fn render_segments(
     segs: Vec<Seg>,
+    notes: schemaic_core::transcript::TurnNotes,
     role: Role,
     actions: CodeActions,
     settled: bool,
@@ -1325,7 +1334,15 @@ fn render_segments(
     // answer to format — see `Role::carries_an_answer`, which is the same
     // question the decoders answer at the other end.
     let error_color = !role.carries_an_answer();
-    v_stack_from_iter(segs.into_iter().map(move |seg| match seg {
+    // Drawn as text segments — only the transcript keeps them apart, so a
+    // replay to the model never reads them as its own.
+    let all = notes
+        .lead
+        .map(Seg::Text)
+        .into_iter()
+        .chain(segs)
+        .chain(notes.tail.map(Seg::Text));
+    v_stack_from_iter(all.map(move |seg| match seg {
         Seg::Text(t) => {
             if error_color {
                 text(t)

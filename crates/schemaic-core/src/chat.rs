@@ -183,6 +183,7 @@ mod tests {
             pending: false,
             attachment: None,
             harness: None,
+            notes: Default::default(),
         }
     }
 

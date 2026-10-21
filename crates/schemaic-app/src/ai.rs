@@ -1238,6 +1238,9 @@ pub(crate) enum SessionMsg {
 #[derive(Clone)]
 pub(crate) struct AiStreamMsg {
     pub(crate) segs: Vec<schemaic_core::transcript::Seg>,
+    /// Schemaic's own words around the segments — set wholesale on the turn,
+    /// as `segs` is, and never replayed to a model (`TurnNotes`).
+    pub(crate) notes: schemaic_core::transcript::TurnNotes,
     pub(crate) done: bool,
     pub(crate) is_error: bool,
     /// Cost/usage summary; only populated on the final (done) snapshot.
@@ -1375,6 +1378,9 @@ struct TurnPump {
     /// snapshot from the session it is showing from one belonging to a session
     /// the user has left. See [`AiStreamMsg::session`].
     session: u64,
+    /// [`Self::note`]'s line, riding every snapshot of the turn it was put
+    /// on and cleared with it.
+    lead: Option<String>,
 }
 
 impl TurnPump {
@@ -1383,6 +1389,15 @@ impl TurnPump {
             turn: schemaic_ai::TurnState::default(),
             ai_tx,
             session,
+            lead: None,
+        }
+    }
+
+    /// The turn's notes so far, with `tail` as its last word when it has one.
+    fn notes(&self, tail: Option<String>) -> schemaic_core::transcript::TurnNotes {
+        schemaic_core::transcript::TurnNotes {
+            lead: self.lead.clone(),
+            tail,
         }
     }
 
@@ -1410,18 +1425,21 @@ impl TurnPump {
             Some((is_error, stats)) => {
                 let _ = self.ai_tx.send(AiStreamMsg {
                     segs: self.turn.segments(),
+                    notes: self.notes(None),
                     done: true,
                     is_error,
                     stats: (!stats.is_empty()).then_some(stats),
                     session: self.session,
                 });
                 self.turn = schemaic_ai::TurnState::default();
+                self.lead = None;
                 true
             }
             None => {
                 if changed {
                     let _ = self.ai_tx.send(AiStreamMsg {
                         segs: self.turn.segments(),
+                        notes: self.notes(None),
                         done: false,
                         is_error: false,
                         stats: None,
@@ -1436,23 +1454,29 @@ impl TurnPump {
     /// Put a line of Schemaic's own at the **top** of the turn being
     /// accumulated, without ending it.
     ///
-    /// **The channel a degraded session did not have.** There are three ways to
-    /// start a session with no database tools — the endpoint file could not be
-    /// written, `agy mcp add` failed, the settings grant was declined — and all
-    /// three were silent, one of them without even a `tracing::warn!`, while the
+    /// **The channel a degraded session did not have.** A session can start
+    /// with no database tools — the endpoint file could not be written, `agy
+    /// mcp add` failed, the settings grant was declined, Cursor's approval
+    /// failed — and the first three were silent, one of them without even a `tracing::warn!`, while the
     /// system prompt went on telling the model it has `list_schema`,
     /// `describe_table` and `run_query`. The user watched the assistant refuse
     /// to look anything up and had nothing to tell them why.
     ///
     /// Not a `fail`, because the session works — it just cannot reach the
     /// database — and not a snapshot of its own, because the panel's consumer
-    /// assigns `last.segs` wholesale and the next real snapshot would erase it.
-    /// Held in the accumulator, it rides every snapshot of that turn.
+    /// assigns the turn's notes wholesale and the next real snapshot would
+    /// erase it. Held on the pump, it rides every snapshot of that turn.
+    ///
+    /// **A [`TurnNotes`] lead, not a text delta.** It was one, and so became
+    /// part of the turn's prose — which a later session's prompt replays as the
+    /// assistant's own words, in the interface's language.
+    ///
+    /// [`TurnNotes`]: schemaic_core::transcript::TurnNotes
     fn note(&mut self, text: String) {
-        self.turn
-            .apply(&schemaic_ai::StreamEvent::TextDelta(format!("{text}\n\n")));
+        self.lead = Some(text);
         let _ = self.ai_tx.send(AiStreamMsg {
             segs: self.turn.segments(),
+            notes: self.notes(None),
             done: false,
             is_error: false,
             stats: None,
@@ -1472,10 +1496,11 @@ impl TurnPump {
     /// you were reading vanished, replaced by "Stopped.". The consumer's own
     /// comment already promised the opposite ("keeping whatever partial answer
     /// had streamed in").
+    /// The reason is a [`schemaic_core::transcript::TurnNotes`] tail, not a
+    /// segment, so it is never replayed to a model as something it said.
     fn fail(&mut self, why: String) {
-        let mut segs = self.turn.segments();
-        segs.push(schemaic_core::transcript::Seg::Text(why));
-        self.end(segs);
+        let segs = self.turn.segments();
+        self.end(segs, Some(why));
     }
 
     /// End the turn with only what streamed in, adding nothing.
@@ -1488,19 +1513,22 @@ impl TurnPump {
     /// second of which is the one the panel actually owns.
     fn stop(&mut self) {
         let segs = self.turn.segments();
-        self.end(segs);
+        self.end(segs, None);
     }
 
-    /// Send a final snapshot and reset for the next turn.
-    fn end(&mut self, segs: Vec<schemaic_core::transcript::Seg>) {
+    /// Send a final snapshot, with `tail` as Schemaic's last word on the turn,
+    /// and reset for the next turn.
+    fn end(&mut self, segs: Vec<schemaic_core::transcript::Seg>, tail: Option<String>) {
         let _ = self.ai_tx.send(AiStreamMsg {
             segs,
+            notes: self.notes(tail),
             done: true,
             is_error: true,
             stats: None,
             session: self.session,
         });
         self.turn = schemaic_ai::TurnState::default();
+        self.lead = None;
     }
 }
 
@@ -1532,7 +1560,8 @@ fn refuse_every_turn(
                 continue;
             }
             let _ = ai_tx.send(AiStreamMsg {
-                segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+                segs: Vec::new(),
+                notes: schemaic_core::transcript::TurnNotes::tail(why.clone()),
                 done: true,
                 is_error: true,
                 stats: None,
@@ -1687,7 +1716,8 @@ pub(crate) fn start_ai_session(
     let checked = probe(harness, &bin);
     if let Some(why) = spawn_refusal(harness, checked.constraint) {
         let _ = ai_tx.send(AiStreamMsg {
-            segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+            segs: Vec::new(),
+            notes: schemaic_core::transcript::TurnNotes::tail(why.clone()),
             done: true,
             is_error: true,
             stats: None,
@@ -1711,7 +1741,8 @@ pub(crate) fn start_ai_session(
     let Some(cwd) = session_cwd() else {
         let why = no_cwd();
         let _ = ai_tx.send(AiStreamMsg {
-            segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+            segs: Vec::new(),
+            notes: schemaic_core::transcript::TurnNotes::tail(why.clone()),
             done: true,
             is_error: true,
             stats: None,
@@ -1856,7 +1887,8 @@ pub(crate) fn start_ai_session(
         let refused = isolation_refusal(harness, wrote);
         if let Some(why) = refused {
             let _ = ai_tx.send(AiStreamMsg {
-                segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+                segs: Vec::new(),
+                notes: schemaic_core::transcript::TurnNotes::tail(why.clone()),
                 done: true,
                 is_error: true,
                 stats: None,
@@ -2248,7 +2280,8 @@ pub(crate) fn start_ai_session(
     ) {
         let why = schemaic_ui::i18n::spawn_refusal_text(&why);
         let _ = ai_tx.send(AiStreamMsg {
-            segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+            segs: Vec::new(),
+            notes: schemaic_core::transcript::TurnNotes::tail(why.clone()),
             done: true,
             is_error: true,
             stats: None,
@@ -2334,12 +2367,13 @@ pub(crate) fn start_ai_session(
             Ok(c) => c,
             Err(e) => {
                 let _ = ai_tx.send(AiStreamMsg {
-                    segs: vec![schemaic_core::transcript::Seg::Text(tr!(
+                    segs: Vec::new(),
+                    notes: schemaic_core::transcript::TurnNotes::tail(tr!(
                         "ai-launch-failed-session",
                         bin = harness.bin(),
                         error = e.to_string(),
                         cli = harness.label()
-                    ))],
+                    )),
                     done: true,
                     is_error: true,
                     stats: None,
@@ -3649,6 +3683,17 @@ mod session_tests {
             .collect()
     }
 
+    /// What the panel draws of a snapshot: the lead note, the segments' text,
+    /// the tail note — where [`text_of`] is what a later prompt replays.
+    fn shown_of(m: &AiStreamMsg) -> String {
+        [
+            m.notes.lead.clone().unwrap_or_default(),
+            text_of(m),
+            m.notes.tail.clone().unwrap_or_default(),
+        ]
+        .concat()
+    }
+
     /// **`TurnPump` folds every harness's events into a turn and had no tests at
     /// all** — including for the append-not-replace `fail` this range shipped.
     /// It needs nothing but a channel and a `Vec<StreamEvent>`, which is the
@@ -3693,7 +3738,9 @@ mod session_tests {
             "{last:?}",
             last = text_of(&last)
         );
-        assert!(text_of(&last).contains("the CLI died"));
+        assert!(shown_of(&last).contains("the CLI died"));
+        // Drawn, and not part of the prose a later prompt replays.
+        assert!(!text_of(&last).contains("the CLI died"));
 
         // `stop` adds nothing of its own: `mark_stopped` already appends the
         // `(stopped)` marker, and a `fail("Stopped.")` here as well left the
@@ -3733,9 +3780,19 @@ mod session_tests {
             "I cannot look that up.".into(),
         )]);
         let last = rx.try_iter().last().expect("a snapshot");
-        let t = text_of(&last);
+        let t = shown_of(&last);
         assert!(t.contains("no database tools"), "{t}");
         assert!(t.contains("I cannot look that up."), "{t}");
+        // Drawn, and not replayed later as something the model said.
+        assert_eq!(text_of(&last), "I cannot look that up.");
+        // And it goes with its turn.
+        p.push(vec![StreamEvent::TurnDone {
+            is_error: false,
+            stats: TurnStats::default(),
+        }]);
+        p.push(vec![StreamEvent::TextDelta("next".into())]);
+        let next = rx.try_iter().last().expect("a snapshot");
+        assert!(next.notes.is_empty(), "{:?}", next.notes);
         // One wording for all three paths that reach this state — they used to
         // say nothing, a log line, and nothing again.
         assert!(no_tools_note("x").contains("no database tools"));
@@ -3823,7 +3880,8 @@ mod session_tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("an answer per question");
             assert!(m.done && m.is_error);
-            assert_eq!(text_of(&m), "the reason");
+            assert_eq!(shown_of(&m), "the reason");
+            assert_eq!(text_of(&m), "", "a refusal is no prose to replay");
             answered += 1;
         }
         // The interrupt produced nothing of its own.
@@ -5519,6 +5577,7 @@ mod tests {
                 // These tests are about recap and history text, which the
                 // speaker label plays no part in.
                 harness: None,
+                notes: Default::default(),
             },
         }
     }
@@ -5600,6 +5659,31 @@ mod tests {
         assert!(out.contains("Assistant: 1,204"));
         // The model is told these turns aren't in its own context.
         assert!(out.contains("did not see"));
+    }
+
+    /// **Schemaic's own words in a turn are not replayed as the model's.** A
+    /// session's no-tools note and a turn's failure are the interface's
+    /// sentences, in its language, and a later prompt read them back as
+    /// `Assistant:` lines the model never wrote.
+    #[test]
+    fn history_replay_leaves_out_schemaics_own_notes() {
+        use schemaic_core::transcript::TurnNotes;
+        let noted = ChatMessage {
+            notes: TurnNotes {
+                lead: Some("Keine Datenbankwerkzeuge".into()),
+                tail: Some("Die CLI ist abgestürzt".into()),
+            },
+            ..msg(Role::Assistant, "1,204")
+        };
+        let refused = ChatMessage {
+            notes: TurnNotes::tail("Keine Datenbank ausgewählt".into()),
+            ..msg(Role::Error, "")
+        };
+        let out = render_history(&[noted, refused], 10, AiData::Full, "claude");
+        assert!(out.contains("Assistant: 1,204"), "{out}");
+        for note in ["Datenbankwerkzeuge", "abgestürzt", "ausgewählt"] {
+            assert!(!out.contains(note), "{note} replayed: {out}");
+        }
     }
 
     #[test]

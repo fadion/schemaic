@@ -13022,6 +13022,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 ai_messages.update(|v| {
                     if let Some(last) = v.last_mut() {
                         last.segs = msg.segs;
+                        last.notes = msg.notes;
                         last.stats = msg.stats;
                         last.pending = !msg.done;
                         // `Role::settled` is the middle link of the chain the
@@ -13225,15 +13226,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         v.push(ChatMessage {
                             role: Role::Error,
                             text: String::new(),
-                            segs: vec![schemaic_core::transcript::Seg::Text(tr!(
-                                "ai-chat-no-database"
-                            ))],
+                            segs: Vec::new(),
                             stats: None,
                             pending: false,
                             attachment: None,
                             // Schemaic's own refusal, not an agent's answer — no
                             // CLI was reached, so none is named over it.
                             harness: None,
+                            // A note, not a segment: never replayed to a model
+                            // as something it said (`TurnNotes`).
+                            notes: schemaic_core::transcript::TurnNotes::tail(tr!(
+                                "ai-chat-no-database"
+                            )),
                         });
                     });
                     return;

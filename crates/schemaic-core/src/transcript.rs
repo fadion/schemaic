@@ -142,6 +142,46 @@ pub struct ChatMessage {
     /// guessed — `serde(default)` is what lets those keep loading.
     #[serde(default)]
     pub harness: Option<String>,
+    /// Schemaic's own words in this turn ([`TurnNotes`]), kept apart from
+    /// `segs` so they are never replayed to a model as something it said.
+    #[serde(default, skip_serializing_if = "TurnNotes::is_empty")]
+    pub notes: TurnNotes,
+}
+
+/// **Schemaic's own words in an assistant turn** — a note at its head (a
+/// session with no database tools, and why) and a reason at its tail (a spawn
+/// that failed, a turn that ended badly, a refusal). The panel draws them
+/// around the turn's segments, in the interface's language.
+///
+/// **Not a [`Seg`]**, for two reasons. [`ChatMessage::prose`] is what a fresh
+/// session's prompt replays as the assistant's own words, and these are not
+/// the model's — they were the interface's translation, sent back to the model
+/// as if it had written them. And `chats.json` persists `segs` with no parsing
+/// shim, so a new `Seg` variant would fail an older build's read of the whole
+/// file; a struct field it does not know is skipped.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TurnNotes {
+    /// Drawn above the segments.
+    #[serde(default)]
+    pub lead: Option<String>,
+    /// Drawn below them.
+    #[serde(default)]
+    pub tail: Option<String>,
+}
+
+impl TurnNotes {
+    /// Nothing to draw.
+    pub fn is_empty(&self) -> bool {
+        self.lead.is_none() && self.tail.is_none()
+    }
+
+    /// A turn that ended with `why` of Schemaic's own.
+    pub fn tail(why: String) -> TurnNotes {
+        TurnNotes {
+            lead: None,
+            tail: Some(why),
+        }
+    }
 }
 
 impl ChatMessage {
@@ -155,6 +195,7 @@ impl ChatMessage {
             attachment: None,
             // The user's own turn has no author to record.
             harness: None,
+            notes: TurnNotes::default(),
         }
     }
 
@@ -181,13 +222,15 @@ impl ChatMessage {
             pending: true,
             attachment: None,
             harness,
+            notes: TurnNotes::default(),
         }
     }
 
     /// The message's prose: the user's own text, or the assistant's text
     /// segments joined (tool calls are the assistant *using* tools, not
     /// content). Used for the copy action and for replaying a restored
-    /// conversation into a fresh session's prompt.
+    /// conversation into a fresh session's prompt — which is why Schemaic's
+    /// own [`TurnNotes`] are not in it.
     pub fn prose(&self) -> String {
         if self.role == Role::User {
             return self.text.trim().to_string();
@@ -271,6 +314,11 @@ impl ChatMessage {
                 mix(a.summary.len() as u64);
                 mix(a.rows.len() as u64);
             }
+        }
+        // Schemaic's own notes, which a turn gains (a lead at its start, a tail
+        // when it fails) without a segment changing.
+        for note in [&self.notes.lead, &self.notes.tail] {
+            mix(note.as_ref().map_or(ABSENT, |s| s.len() as u64));
         }
         // The harness, which the speaker label above the bubble is drawn from.
         // It is stamped once when the turn is created and never mutated, so by
@@ -659,6 +707,7 @@ mod tests {
             pending: false,
             attachment: None,
             harness: None,
+            notes: Default::default(),
         }
     }
 
