@@ -314,7 +314,15 @@ fn row_of_buttons(
             },
         ),
     ))
-    .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
+    // Wraps: three sources side by side fit English and little else, and in a
+    // longer language the third button ran past the modal's edge and was cut
+    // in half. On a second line it stays whole.
+    .style(|s| {
+        s.items_center()
+            .width_full()
+            .flex_wrap(floem::style::FlexWrap::Wrap)
+            .gap(theme::scaled(8.0))
+    })
 }
 
 /// The review list — **built only once there is something to review.**
