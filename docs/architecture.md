@@ -25879,8 +25879,11 @@ existing prose was left alone.
     **The main modal is Manage connections' two panes, not one long column.** It had been five
     headed groups in a single scroll; it is now a section list on the left (`section_list`, a
     `SECTION_LIST_W` 170 column with a `border_right` and `padding_vert` 6) and the chosen
-    section's page on the right, `SECTION_PAGE_W` 420 wide — the single-column modal's width, which
-    every hint in it was written to wrap within. The panel is `modal_w(SECTION_LIST_W +
+    section's page on the right, `SECTION_PAGE_W` 500 wide — the single-column modal's 420, which
+    every hint in it was written to wrap within, and 80 more since a row with buttons beside its
+    text (*Settings file*'s Export/Import, *Log file*'s Open folder) squeezed that text into a tall
+    sliver under `SCHEMAIC_LOCALE=pseudo-en`; *Settings file*'s two buttons also stack, one above
+    the other at one width (`bundle_row`). The panel is `modal_w(SECTION_LIST_W +
     SECTION_PAGE_W)` at a **fixed** `height(modal_h(560))`, so switching sections never resizes it;
     the old `max_height(modal_body_h(560))` cap went with the column. **Both panes scroll**: the
     page in its own `autohide(scroll)`, and the list's rows in theirs (`flex_grow`, `min_height(0)`)

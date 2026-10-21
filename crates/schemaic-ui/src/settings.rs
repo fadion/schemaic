@@ -1574,22 +1574,28 @@ fn bundle_row(
                 .flex_grow(1.0_f32)
                 .min_width(0.0)
         }),
-        action_button(
-            tr!("settings-bundle-export"),
-            ActionKind::Quiet,
-            true,
-            ring.clone(),
-            tabindex,
-            move || export(),
-        ),
-        action_button(
-            tr!("settings-bundle-import"),
-            ActionKind::Quiet,
-            true,
-            ring,
-            tabindex + 1,
-            move || import(),
-        ),
+        // One above the other, at one width: side by side the pair took so
+        // much of the row that the description beside it wrapped to eight
+        // lines.
+        v_stack((
+            action_button(
+                tr!("settings-bundle-export"),
+                ActionKind::Quiet,
+                true,
+                ring.clone(),
+                tabindex,
+                move || export(),
+            ),
+            action_button(
+                tr!("settings-bundle-import"),
+                ActionKind::Quiet,
+                true,
+                ring,
+                tabindex + 1,
+                move || import(),
+            ),
+        ))
+        .style(|s| s.flex_col().gap(theme::scaled(6.0)).flex_shrink(0.0_f32)),
     ))
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
@@ -1806,9 +1812,11 @@ pub(crate) fn open_settings_at(layout: LayoutUi, section: SettingsSection) {
 /// the single-column modal had.
 const SECTION_LIST_W: f64 = 170.0;
 
-/// The page's width — the single-column modal's, which every setting's hint
-/// was written to wrap within.
-const SECTION_PAGE_W: f64 = 420.0;
+/// The page's width. It was the single-column modal's 420, which every
+/// setting's hint was written to wrap within; 80 more since, because a row
+/// with a button or two beside its text squeezed the text into a tall sliver
+/// in a longer language.
+const SECTION_PAGE_W: f64 = 500.0;
 
 /// Everything the Settings modal reaches out of the root bundle, one field per
 /// domain its sections edit.
