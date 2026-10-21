@@ -11466,7 +11466,8 @@ existing prose was left alone.
     English, because scripts parse the first and a model reads the second, so nothing in core
     renders through it (`ui/i18n.rs` is the half that does; the conventions are under *UI
     conventions*, *The string catalogue*). `UiLanguage` has one variant per catalogue, `EnGb` the
-    source, and `UiLanguage::ALL` lists every variant — pinned by `all_names_every_language_once`,
+    source, then `De`, `Sq`, `It`, `Nl`, `Fr`, `Es`, `Ro` and `Bg` — every one complete, none yet
+    on `SHIPPED` (below) — and `UiLanguage::ALL` lists every variant — pinned by `all_names_every_language_once`,
     whose exhaustive `match` makes a new variant a compile error until it joins the list, so the
     tests that iterate `ALL` cannot quietly skip one. `catalogue()` is the directory its `.ftl`
     lives in and `key()` — the persisted spelling and what `SCHEMAIC_LOCALE` takes — is simply
@@ -11474,14 +11475,17 @@ existing prose was left alone.
     `endonym()` the language's name **in itself**, which is deliberately not in any catalogue: a
     picker lists each language the same way in every language, so a reader lost in the wrong one
     can still find their own. `from_key` reads the primary subtag case-insensitively, so `de-AT`,
-    `de_AT` and POSIX's `de_AT.UTF-8` are all German and `en-US` is the one English there is
-    (`keys_round_trip_and_tolerate_case_and_region`). The two pseudo-locales that once stood
+    `de_AT` and POSIX's `de_AT.UTF-8` are all German, `fr_CA.UTF-8` is French, `es-MX` Spanish
+    and `ro-MD` Romanian — one catalogue a language, the region dropped — and `en-US` is the one
+    English there is (`keys_round_trip_and_tolerate_case_and_region`; the tests' language nobody
+    knows is `ja-JP`, which was `fr-FR` until French had a catalogue). The two pseudo-locales that once stood
     beside the real ones — `pseudo` and the doubled `pseudo-en`, English transformed to find boxes
     too narrow for longer text — were removed once real translations could do that job, and
     `from_key` now reads either key as one it does not know.
     `number_marks()` is the language's decimal and grouping marks, a table rather than CLDR
-    (`german_swaps_both_marks_and_english_keeps_core_s`; *Figures in the interface's
-    marks*, under *UI conventions*).
+    (`german_swaps_both_marks_and_english_keeps_core_s`,
+    `each_translation_writes_its_own_group_mark_after_a_decimal_comma`; *Figures in the
+    interface's marks*, under *UI conventions*, has the table).
     **`resolve(env, setting, os)` takes three sources in order, and only the first is
     unconditional.** `SCHEMAIC_LOCALE` is a developer's, so it reaches whatever it names — a
     catalogue still being written — and one it does not know falls through
@@ -11490,7 +11494,9 @@ existing prose was left alone.
     one passed over, reach only **`SHIPPED`** catalogues, and nothing matching is `EnGb`: a language
     whose catalogue is half written would otherwise draw a half-translated interface for everyone
     whose system is set to it, which is worse than English. `SHIPPED` is `[EnGb]` today — a language
-    joins it when its catalogue is complete, not when it is started — and
+    joins it when its catalogue is complete, not when it is started, and complete is not enough on
+    its own: all eight translations are complete and none is on it, shipping each being the
+    user's call — and
     `the_system_never_reaches_an_unshipped_catalogue` asserts German is *not* on it, with *update
     this test when German ships* as its message, so shipping German fails that test on purpose. A
     settings file that still names a retired pseudo-locale reads as the system's choice, and the
@@ -25860,8 +25866,9 @@ existing prose was left alone.
     `the_proposal_card_reads_as_it_did_in_english` pins the card's lines.
   - `i18n.rs` — **the interface's string catalogue**: Fluent, through `i18n-embed` (feature
     `fluent-system`) and `i18n-embed-fl`, over the language `core::locale` chose. The catalogues
-    are `crates/schemaic-ui/i18n/<tag>/schemaic.ftl` — `en-GB` the source, `de` machine-drafted and
-    unreviewed — embedded in the binary by `rust-embed`, and `crates/schemaic-ui/i18n.toml` names
+    are `crates/schemaic-ui/i18n/<tag>/schemaic.ftl` — `en-GB` the source, and `de`, `sq`, `it`,
+    `nl`, `fr`, `es`, `ro` and `bg` each complete but machine-drafted and unreviewed, as its header
+    says — embedded in the binary by `rust-embed`, and `crates/schemaic-ui/i18n.toml` names
     `en-GB` the fallback and the Fluent domain `schemaic`, after the app rather than the crate, so
     that every crate drawing the interface can share the one catalogue. `schemaic-app` is the
     second to read it: `LOADER` is `pub`, but `tr!` stays this crate's, because `fl!` checks a
@@ -25929,6 +25936,18 @@ existing prose was left alone.
     `UiLanguage::ALL`, which core's `all_names_every_language_once` holds to every variant with
     the `match` that makes a new one a compile error. Keeping an
     incomplete catalogue out of users' hands is `SHIPPED`'s job.
+    **Three more read the translations language by language.**
+    `every_translation_reads_its_own_catalogue` asks each translation after German for
+    `settings-language`, since a catalogue that failed to load would answer English's *Language*
+    there and look like a fallback rather than a fault. `romanian_counts_in_its_three_plural_forms`
+    is the check that `ro` is the tag the bundle was built under: Fluent takes the CLDR plural
+    rules from the catalogue's tag, and only Romanian's reach `[few]` (2–19) and the *de* of
+    twenty or more (`20 de potriviri`). `each_translation_names_keys_by_its_keyboard_legends` pins
+    the `key-*` words to what the keyboard prints: Italian, French and Spanish keyboards carry their
+    own legends (*Maiusc*/*Invio*/*Canc*, *Maj*/*Entrée*/*Suppr*, *Mayús*/*Intro*/*Supr*, and
+    *Origine* and *Inicio* for Home), so those are translated, while Bulgarian, Romanian, Albanian
+    and Dutch keyboards print English's and only the space bar is named in the language — the test
+    covers Bulgarian of those four.
     **`LanguageChoice` is the setting as Settings offers it** — `System` or `Fixed(UiLanguage)`,
     `options()` being `System` then `SHIPPED`. `from_key` reads a key it does not offer (a newer
     build's, a hand edit, an unshipped catalogue, a retired pseudo-locale's) as `System`, which is
@@ -41655,12 +41674,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   value)`, never a literal (`ui/i18n.rs`; which language is `core/locale.rs`). **Every file of
   `schemaic-ui` and `schemaic-app` now draws what a user reads from the catalogue** — but for
   `ExportFormat::label`, whose names are English on purpose (under `overlays.rs`) — so a new word
-  a user reads goes in through `tr!` as well, with its German in the same change — a literal is
+  a user reads goes in through `tr!` as well, with every translation's words in the same change —
+  eight catalogues beside `en-GB` now, not one; a message a translation lacks falls back to
+  English, so this is a convention no test enforces — a literal is
   the odd one out now, and under a translated catalogue (`SCHEMAIC_LOCALE=de`, below) it is the
   one that still reads English. The app reaches
   the one loader through its own `tr!` (the `schemaic-app` entry says why it cannot borrow the UI
   crate's), and the app's messages live in the same two `.ftl` files. Only the GUI is translated:
-  CLI, MCP and AI text stays English, as do SQL, persisted names and key names.
+  CLI, MCP and AI text stays English, as do SQL and persisted names; key names follow the
+  language's keyboard legends through the `key-*` messages.
   - **How a file draws from it** — the shape the whole conversion settled on, file by file, and
     the one a new view follows. A helper taking `&'static str` widens to `impl Into<String>`, so
     every literal caller still compiles and a `tr!` result passes too (`section_title`,
@@ -41776,7 +41798,20 @@ Re-introducing the anti-patterns these guard against is a regression:
     source, in British spelling, and a new message goes there first, since `fl!` checks ids and
     argument names against that file alone. Ids are kebab-case and start with the area they belong
     to (`settings-language-restart`). A translation lives beside it at `i18n/<tag>/schemaic.ftl` and falls back to `en-GB` message
-    by message. **Pass `tr!` an owned value, never a dereference**: `fl!` pastes each argument
+    by message.
+    **The translations' conventions** — all eight machine-drafted and unreviewed, each header
+    saying so: the address is German
+    *du*, Italian *tu*, Spanish *tú*, Romanian *tu*, Dutch *je*, French *vous*, Bulgarian *вие*
+    and Albanian *ju*; quotation marks are the language's own — French `« »` with no-break spaces
+    inside, Italian and Spanish `« »`, Dutch `‘ ’`, Romanian `„ ”`, Bulgarian `„ “`, Albanian
+    `“ ”`; *AI* becomes *KI*, *IA* or *ИИ* where the language says so (German; Italian, French and
+    Spanish; Bulgarian) and stays *AI* in Dutch, Romanian and Albanian. What stays English is what
+    stays English in every language (above), plus *Verify CA*/*Verify full*, the plan modal's
+    *Analyze* and the Generate submenu's `CREATE`/`INSERT`/`UPDATE`/`DELETE`, which name SQL. A
+    translation may select on a plural English does not — the `erd-chip-*` counts are bare
+    `{ $count } tables` in English and a `[one]`/`*[other]` select in every translation —
+    which `a_translation_reads_only_the_variables_english_is_given` permits, since the select reads
+    no variable English is not given. **Pass `tr!` an owned value, never a dereference**: `fl!` pastes each argument
     expression in front of `.into()`, so `n = *n` parses as `*(n.into())` and fails as E0282,
     "type annotations needed", pointing into `i18n.rs` rather than at the call. Bind the field by
     value in the `match` instead, as `rows_read_text` does. **Write a variant's leading space as
@@ -41791,9 +41826,14 @@ Re-introducing the anti-patterns these guard against is a regression:
     marks what it shows. `text::NumberMarks { decimal, group }` is the pair, `NumberMarks::ENGLISH`
     core's own, and `locale::UiLanguage::number_marks` answers it per language.
     **A table, not CLDR (decided 2026-10-20).** The need is two characters per shipped language,
-    which a table answers and `german_swaps_both_marks_and_english_keeps_core_s` pins.
+    which a table answers and `german_swaps_both_marks_and_english_keeps_core_s` pins. Every
+    translation writes a decimal comma and they part on the group mark: `.` for German, Italian,
+    Dutch, Spanish and Romanian, U+202F (the narrow no-break space) for French, and U+00A0 for
+    Bulgarian and Albanian — a space either way that never breaks a figure across lines
+    (`each_translation_writes_its_own_group_mark_after_a_decimal_comma`).
     CLDR data would move byte-pinned English under a `cargo update` — French's grouping space
-    changed from U+00A0 to U+202F between CLDR releases — and the shortcut through the catalogue
+    changed from U+00A0 to U+202F between CLDR releases, and the table takes the current one as a
+    fixed choice that a release cannot move — and the shortcut through the catalogue
     does not exist: fluent-rs's `NUMBER()` ignores the locale, and a `FluentNumber` renders
     `f64::to_string`, with no grouping and always `.`. icu4x would also add a second
     locale-identifier stack beside `unic-langid`. What would reopen it: locale dates, collation, or
@@ -42509,10 +42549,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **The language is read once, at launch**, before any view, and never changes while the app
     runs; nothing takes a reactive dependency on it, which spares every label one for a setting
     changed once. The setting says so where it is changed.
-  - **`SCHEMAIC_LOCALE` reaches what Settings cannot**: `SCHEMAIC_LOCALE=de` for a catalogue still
-    being written — which is also how a box is checked against longer text, and a string nobody
-    moved into the catalogue shows, reading English among the German. The setting and the OS reach
-    only `locale::SHIPPED`, which a language joins when its catalogue is complete. The two
+  - **`SCHEMAIC_LOCALE` reaches what Settings cannot**: `SCHEMAIC_LOCALE=de` (or `sq`, `it`, `nl`,
+    `fr`, `es`, `ro`, `bg`) for a catalogue not yet shipped — which is also how a box is checked
+    against longer text, and a string nobody moved into the catalogue shows, reading English among
+    the German. The setting and the OS reach only `locale::SHIPPED`, which a language joins when
+    its catalogue is complete and the user decides to ship it. The two
     pseudo-locales that once did the layout job (`pseudo`, `pseudo-en`) are removed, and the
     variable now reads either as a key it does not know.
   - **Layout for longer text** — phase 6 of *Interface translation*, landed. A summary that points

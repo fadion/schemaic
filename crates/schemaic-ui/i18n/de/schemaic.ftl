@@ -1,8 +1,8 @@
 # Schemaic — German catalogue.
 #
 # Machine-drafted and unreviewed (docs/roadmap.md); a message missing here
-# falls back to the en-GB catalogue. Not offered in Settings until complete —
-# reach it with SCHEMAIC_LOCALE=de.
+# falls back to the en-GB catalogue. Not offered in Settings until it ships
+# (locale::SHIPPED) — reach it with SCHEMAIC_LOCALE=de.
 
 ## Settings › Appearance › Language
 

@@ -2433,6 +2433,55 @@ mod tests {
         assert_eq!(loader(UiLanguage::De).get("settings-language"), "Sprache");
     }
 
+    /// Every language after German draws from its own folder, not English's
+    /// fallback — a catalogue that failed to parse or load would read
+    /// *Language* here.
+    #[test]
+    fn every_translation_reads_its_own_catalogue() {
+        for (lang, word) in [
+            (UiLanguage::Sq, "Gjuha"),
+            (UiLanguage::It, "Lingua"),
+            (UiLanguage::Nl, "Taal"),
+            (UiLanguage::Fr, "Langue"),
+            (UiLanguage::Es, "Idioma"),
+            (UiLanguage::Ro, "Limbă"),
+            (UiLanguage::Bg, "Език"),
+        ] {
+            assert_eq!(loader(lang).get("settings-language"), word, "{lang:?}");
+        }
+    }
+
+    /// Italian, French and Spanish keyboards print their own legends; the
+    /// others print English's and name only the space bar.
+    #[test]
+    fn each_translation_names_keys_by_its_keyboard_legends() {
+        for (lang, shift, enter, del, space) in [
+            (UiLanguage::It, "Maiusc", "Invio", "Canc", "Spazio"),
+            (UiLanguage::Fr, "Maj", "Entrée", "Suppr", "Espace"),
+            (UiLanguage::Es, "Mayús", "Intro", "Supr", "Espacio"),
+            (UiLanguage::Bg, "Shift", "Enter", "Del", "Интервал"),
+        ] {
+            let l = loader(lang);
+            assert_eq!(l.get("key-shift"), shift, "{lang:?}");
+            assert_eq!(l.get("key-enter"), enter, "{lang:?}");
+            assert_eq!(l.get("key-del"), del, "{lang:?}");
+            assert_eq!(l.get("key-space"), space, "{lang:?}");
+        }
+    }
+
+    /// **Romanian counts in three forms**, which only its CLDR rules reach:
+    /// one, a few (2–19), and twenty or more with *de*. The bundle takes them
+    /// from the catalogue's tag, so this is the check that `ro` is the tag.
+    #[test]
+    fn romanian_counts_in_its_three_plural_forms() {
+        let ro = loader(UiLanguage::Ro);
+        let matches = |n: i64| ro.get_args("erd-find-matches", HashMap::from([("hits", n)]));
+        assert_eq!(matches(1), "1 potrivire");
+        assert_eq!(matches(2), "2 potriviri");
+        assert_eq!(matches(19), "19 potriviri");
+        assert_eq!(matches(20), "20 de potriviri");
+    }
+
     /// The real catalogues, except that German holds one message only — the
     /// partly translated catalogue every language is on its way to complete.
     struct OneGermanMessage;

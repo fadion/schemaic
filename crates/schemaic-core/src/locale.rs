@@ -26,6 +26,21 @@ pub enum UiLanguage {
     EnGb,
     /// German.
     De,
+    /// Albanian.
+    Sq,
+    /// Italian.
+    It,
+    /// Dutch.
+    Nl,
+    /// French.
+    Fr,
+    /// Spanish.
+    Es,
+    /// Romanian.
+    Ro,
+    /// Bulgarian — the one catalogue in Cyrillic, which the bundled IBM Plex
+    /// covers.
+    Bg,
 }
 
 /// The catalogues a user may choose, or be given by their OS. A language joins
@@ -37,7 +52,17 @@ pub const SYSTEM_KEY: &str = "system";
 
 impl UiLanguage {
     /// Every language, shipped or not.
-    pub const ALL: &'static [UiLanguage] = &[UiLanguage::EnGb, UiLanguage::De];
+    pub const ALL: &'static [UiLanguage] = &[
+        UiLanguage::EnGb,
+        UiLanguage::De,
+        UiLanguage::Sq,
+        UiLanguage::It,
+        UiLanguage::Nl,
+        UiLanguage::Fr,
+        UiLanguage::Es,
+        UiLanguage::Ro,
+        UiLanguage::Bg,
+    ];
 
     /// The persisted key — also what `SCHEMAIC_LOCALE` takes. The catalogue's
     /// tag, every language having a catalogue of its own.
@@ -50,6 +75,13 @@ impl UiLanguage {
         match self {
             UiLanguage::EnGb => "en-GB",
             UiLanguage::De => "de",
+            UiLanguage::Sq => "sq",
+            UiLanguage::It => "it",
+            UiLanguage::Nl => "nl",
+            UiLanguage::Fr => "fr",
+            UiLanguage::Es => "es",
+            UiLanguage::Ro => "ro",
+            UiLanguage::Bg => "bg",
         }
     }
 
@@ -60,6 +92,13 @@ impl UiLanguage {
         match self {
             UiLanguage::EnGb => "English",
             UiLanguage::De => "Deutsch",
+            UiLanguage::Sq => "Shqip",
+            UiLanguage::It => "Italiano",
+            UiLanguage::Nl => "Nederlands",
+            UiLanguage::Fr => "Français",
+            UiLanguage::Es => "Español",
+            UiLanguage::Ro => "Română",
+            UiLanguage::Bg => "Български",
         }
     }
 
@@ -67,9 +106,21 @@ impl UiLanguage {
     pub fn number_marks(self) -> crate::text::NumberMarks {
         match self {
             UiLanguage::EnGb => crate::text::NumberMarks::ENGLISH,
-            UiLanguage::De => crate::text::NumberMarks {
+            UiLanguage::De | UiLanguage::It | UiLanguage::Nl | UiLanguage::Es | UiLanguage::Ro => {
+                crate::text::NumberMarks {
+                    decimal: ',',
+                    group: '.',
+                }
+            }
+            // A space between groups, one that never breaks a figure across
+            // lines — French's narrow one, as CLDR now has it.
+            UiLanguage::Fr => crate::text::NumberMarks {
                 decimal: ',',
-                group: '.',
+                group: '\u{202F}',
+            },
+            UiLanguage::Bg | UiLanguage::Sq => crate::text::NumberMarks {
+                decimal: ',',
+                group: '\u{A0}',
             },
         }
     }
@@ -83,6 +134,13 @@ impl UiLanguage {
         match primary.to_ascii_lowercase().as_str() {
             "en" => Some(UiLanguage::EnGb),
             "de" => Some(UiLanguage::De),
+            "sq" => Some(UiLanguage::Sq),
+            "it" => Some(UiLanguage::It),
+            "nl" => Some(UiLanguage::Nl),
+            "fr" => Some(UiLanguage::Fr),
+            "es" => Some(UiLanguage::Es),
+            "ro" => Some(UiLanguage::Ro),
+            "bg" => Some(UiLanguage::Bg),
             _ => None,
         }
     }
@@ -139,24 +197,68 @@ mod tests {
         );
     }
 
+    /// Every translation after German writes a decimal comma; they part on the
+    /// group mark — a dot, or the space French, Bulgarian and Albanian set
+    /// between groups, which must not break (French's CLDR one, U+202F).
+    #[test]
+    fn each_translation_writes_its_own_group_mark_after_a_decimal_comma() {
+        use crate::text::NumberMarks;
+        let comma = |group| NumberMarks {
+            decimal: ',',
+            group,
+        };
+        for (lang, marks) in [
+            (UiLanguage::It, comma('.')),
+            (UiLanguage::Nl, comma('.')),
+            (UiLanguage::Es, comma('.')),
+            (UiLanguage::Ro, comma('.')),
+            (UiLanguage::Fr, comma('\u{202F}')),
+            (UiLanguage::Bg, comma('\u{A0}')),
+            (UiLanguage::Sq, comma('\u{A0}')),
+        ] {
+            assert_eq!(lang.number_marks(), marks, "{lang:?}");
+        }
+    }
+
     /// [`UiLanguage::ALL`] is every variant: the `match` makes a new one a
     /// compile error here until it joins the list.
     #[test]
     fn all_names_every_language_once() {
         for lang in UiLanguage::ALL {
             match lang {
-                UiLanguage::EnGb | UiLanguage::De => {}
+                UiLanguage::EnGb
+                | UiLanguage::De
+                | UiLanguage::Sq
+                | UiLanguage::It
+                | UiLanguage::Nl
+                | UiLanguage::Fr
+                | UiLanguage::Es
+                | UiLanguage::Ro
+                | UiLanguage::Bg => {}
             }
             let once = UiLanguage::ALL.iter().filter(|l| *l == lang).count();
             assert_eq!(once, 1, "{lang:?}");
         }
-        assert_eq!(UiLanguage::ALL.len(), 2);
+        assert_eq!(UiLanguage::ALL.len(), 9);
     }
 
     #[test]
     fn keys_round_trip_and_tolerate_case_and_region() {
         for &lang in UiLanguage::ALL {
             assert_eq!(UiLanguage::from_key(lang.key()), Some(lang));
+        }
+        for (tag, lang) in [
+            ("sq-AL", UiLanguage::Sq),
+            ("sq_XK", UiLanguage::Sq),
+            ("it-CH", UiLanguage::It),
+            ("nl-BE", UiLanguage::Nl),
+            ("fr-FR", UiLanguage::Fr),
+            ("fr_CA.UTF-8", UiLanguage::Fr),
+            ("es-MX", UiLanguage::Es),
+            ("ro-MD", UiLanguage::Ro),
+            ("bg-BG", UiLanguage::Bg),
+        ] {
+            assert_eq!(UiLanguage::from_key(tag), Some(lang), "{tag}");
         }
         assert_eq!(UiLanguage::from_key("EN-gb"), Some(UiLanguage::EnGb));
         assert_eq!(UiLanguage::from_key("en-US"), Some(UiLanguage::EnGb));
@@ -176,8 +278,8 @@ mod tests {
     #[test]
     fn the_environment_wins_and_reaches_unshipped_catalogues() {
         assert_eq!(
-            resolve(Some("de"), "en-GB", &os(&["en-GB"])),
-            UiLanguage::De
+            resolve(Some("bg"), "en-GB", &os(&["de-DE"])),
+            UiLanguage::Bg
         );
         assert_eq!(
             resolve(Some("de"), "en-GB", &os(&["en-GB"])),

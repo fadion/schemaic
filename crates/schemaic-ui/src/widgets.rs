@@ -7799,6 +7799,13 @@ mod measure_tests {
         [
             ("en-GB", include_str!("../i18n/en-GB/schemaic.ftl")),
             ("de", include_str!("../i18n/de/schemaic.ftl")),
+            ("sq", include_str!("../i18n/sq/schemaic.ftl")),
+            ("it", include_str!("../i18n/it/schemaic.ftl")),
+            ("nl", include_str!("../i18n/nl/schemaic.ftl")),
+            ("fr", include_str!("../i18n/fr/schemaic.ftl")),
+            ("es", include_str!("../i18n/es/schemaic.ftl")),
+            ("ro", include_str!("../i18n/ro/schemaic.ftl")),
+            ("bg", include_str!("../i18n/bg/schemaic.ftl")),
         ]
         .into_iter()
         .map(|(lang, ftl)| {

@@ -12,13 +12,16 @@ file rather than ticked off.
 ## Interface translation
 
 Translate the GUI into languages other than English. The catalogue, the loader and every view's
-own words are in place (`docs/architecture.md`, *The string catalogue*), with a German catalogue
-reached through `SCHEMAIC_LOCALE=de`, and figures follow the language's marks (*Figures in the
+own words are in place (`docs/architecture.md`, *The string catalogue*), with eight complete,
+machine-drafted catalogues — German, Albanian, Italian, Dutch, French, Spanish, Romanian and
+Bulgarian — reached through `SCHEMAIC_LOCALE=<tag>` (`de`, `sq`, `it`, `nl`, `fr`, `es`, `ro`,
+`bg`), and figures follow the language's marks (*Figures in the
 interface's marks* there). The prose built below the views — in `schemaic-core`, `schemaic-db`
 and `schemaic-ai` — is a typed value the window words, and its plurals are whole messages (the
 same section, *A typed message*), and the layout makes room for text longer than English's —
-found with a doubled-English pseudo-locale, since removed (*Layout for longer text* there). Every phase has landed; what is left is the decision to ship German (`locale::SHIPPED`),
-and the right-to-left and CJK questions below.
+found with a doubled-English pseudo-locale, since removed (*Layout for longer text* there).
+Every phase has landed; what is left is the decision to ship the catalogues
+(`locale::SHIPPED`), and the right-to-left and CJK questions below.
 
 ### Decided
 
@@ -48,7 +51,9 @@ and the right-to-left and CJK questions below.
 - **German first.** It is a large developer market and runs longer than any other common
   interface language, so it is also the layout stress test phase 6 needs. The first catalogue is
   machine-drafted and ships unreviewed; proofreading waits until the project has users, who can
-  then contribute corrections. Treat that as accepted, not as a blocker.
+  then contribute corrections. Treat that as accepted, not as a blocker. The seven after it
+  (Albanian, Italian, Dutch, French, Spanish, Romanian, Bulgarian) were drafted the same way and
+  wait on the same proofreading.
 - **A language change applies on the next start.** The Settings override is read once, at launch;
   no label re-renders when it changes, which spares two to three thousand call sites a reactive
   dependency for a setting changed once. Changing it says so where the user changed it:
