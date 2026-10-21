@@ -912,20 +912,16 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
                                 // The table name and the running count are the
                                 // difference between an export that looks stuck
                                 // and one visibly grinding through a large table.
-                                Some(p) => text(tr!(
-                                    "dump-progress",
-                                    table = p.table.clone(),
-                                    index = p.index,
-                                    total = p.total,
-                                    rows = crate::i18n::count(p.rows as usize),
-                                ))
-                                .style(|s| {
-                                    s.color(theme::text_muted())
-                                        .font_size(theme::font_label())
-                                        .min_width(0.0)
-                                        .text_ellipsis()
-                                })
-                                .into_any(),
+                                Some(p) => {
+                                    text(dump_progress_text(&p.table, p.index, p.total, p.rows))
+                                        .style(|s| {
+                                            s.color(theme::text_muted())
+                                                .font_size(theme::font_label())
+                                                .min_width(0.0)
+                                                .text_ellipsis()
+                                        })
+                                        .into_any()
+                                }
                                 // Before the first table there is nothing to count
                                 // yet, and the schema read is the slow part on a
                                 // large database — animated, because a static
@@ -1085,17 +1081,41 @@ fn dump_title(database: &str, schema: Option<&str>, format: ExportFormat) -> Str
 fn export_count_line(rows: u64, total: Option<u64>, approx: bool) -> String {
     let shown = crate::i18n::count(rows as usize);
     match total {
-        Some(total) => {
-            let total = crate::i18n::count(total as usize);
+        // The total decides the plural (`count`); the figures are what is shown.
+        Some(count) => {
+            let total = crate::i18n::count(count as usize);
             if approx {
-                tr!("export-progress-of-about", rows = shown, total = total)
+                tr!(
+                    "export-progress-of-about",
+                    count = count,
+                    rows = shown,
+                    total = total
+                )
             } else {
-                tr!("export-progress-of", rows = shown, total = total)
+                tr!(
+                    "export-progress-of",
+                    count = count,
+                    rows = shown,
+                    total = total
+                )
             }
         }
         // The count decides the plural; the abbreviated figure is what is shown.
         None => tr!("export-progress-rows", count = rows, rows = shown),
     }
+}
+
+/// A dump's progress line: which table, which of how many, and the rows
+/// written before it — `count`, the raw number, deciding the plural.
+fn dump_progress_text(table: &str, index: usize, total: usize, rows: u64) -> String {
+    tr!(
+        "dump-progress",
+        table = table,
+        index = index,
+        total = total,
+        count = rows,
+        rows = crate::i18n::count(rows as usize),
+    )
 }
 
 /// The grid export's progress modal — raised by **every** grid export, both
@@ -1655,7 +1675,7 @@ mod core_words_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{dump_title, export_count_line};
+    use super::{dump_progress_text, dump_title, export_count_line};
     use crate::i18n::tr;
     use schemaic_core::export::ExportFormat;
     use schemaic_core::text::human_count;
@@ -1679,13 +1699,7 @@ mod tests {
             "3 of 12 selected"
         );
         assert_eq!(
-            tr!(
-                "dump-progress",
-                table = "orders",
-                index = 3,
-                total = 12,
-                rows = human_count(9_400)
-            ),
+            dump_progress_text("orders", 3, 12, 9_400),
             format!(
                 "Writing orders — 3 of 12, {} rows so far",
                 human_count(9_400)
@@ -1700,6 +1714,15 @@ mod tests {
             format!("{} of {} rows", human_count(9_400), human_count(180_000))
         );
         assert_eq!(export_count_line(1, None, false), "1 row");
+        // **The total decides the plural**, so a one-row export does not read
+        // "1 of 1 rows" — and a language whose plural depends on the number
+        // has it to select on, which a pre-formatted figure never matches.
+        assert_eq!(export_count_line(1, Some(1), false), "1 of 1 row");
+        assert_eq!(export_count_line(0, Some(1), true), "0 of ~1 row");
+        assert_eq!(
+            dump_progress_text("orders", 1, 1, 1),
+            "Writing orders — 1 of 1, 1 row so far"
+        );
         assert_eq!(
             export_count_line(16_000, None, false),
             format!("{} rows", human_count(16_000))

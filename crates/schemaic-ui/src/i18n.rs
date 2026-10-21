@@ -492,6 +492,7 @@ pub(crate) fn truncate_prompt(label: &str, rows: Option<schemaic_core::stats::Ro
     match schemaic_core::stats::confirm_figure(rows) {
         Some(r) => tr!(
             "tree-truncate-rows",
+            n = r.value(),
             rows = figure(&r.label()),
             table = label
         ),

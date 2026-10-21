@@ -396,7 +396,10 @@ tree-triggers-count = Trigger ({ $n })
 tree-refresh-view = Sicht aktualisieren
 tree-truncate = Leeren
 tree-truncate-title = Tabelle leeren
-tree-truncate-rows = Alle { $rows } Zeilen in { $table } löschen? Das lässt sich nicht rückgängig machen.
+tree-truncate-rows = { $n ->
+    [one] Die { $rows } Zeile in { $table } löschen? Das lässt sich nicht rückgängig machen.
+   *[other] Alle { $rows } Zeilen in { $table } löschen? Das lässt sich nicht rückgängig machen.
+}
 tree-truncate-every-row = Jede Zeile in { $table } löschen? Das lässt sich nicht rückgängig machen.
 tree-drop = Löschen
 tree-drop-index = Index löschen
@@ -2320,7 +2323,10 @@ dump-fk-hint = Für die Dauer des Ladens aus, damit die Reihenfolge, in der Zeil
 dump-fk-hint-drops = Für die Dauer des Ladens aus, damit die Reihenfolge, in der Zeilen ankommen, sie nicht abweisen kann. Eine Datei, die Tabellen löscht, schaltet sie ohnehin aus: Ein Löschen bei eingeschalteten Prüfungen löscht über ihre ON-DELETE-Aktionen die Zeilen von Tabellen außerhalb der Datei.
 dump-no-fk-guard-hint = Diese Engine hat keinen Sitzungsschalter für Fremdschlüsselprüfungen; die Datei fügt die Constraints stattdessen nach den Daten hinzu.
 dump-export = Exportieren
-dump-progress = Schreibe { $table } – { $index } von { $total }, bisher { $rows } Zeilen
+dump-progress = { $count ->
+    [one] Schreibe { $table } – { $index } von { $total }, bisher { $rows } Zeile
+   *[other] Schreibe { $table } – { $index } von { $total }, bisher { $rows } Zeilen
+}
 dump-reading-schema = Schema wird gelesen
 dump-replace-files = Dateien ersetzen
 dump-replace-prompt = { $n ->
@@ -2372,8 +2378,14 @@ files-missing = { $n ->
     [one] { $n } ausgewählte Tabelle wurde nicht gefunden und ergab keine Datei: { $names }.
    *[other] { $n } ausgewählte Tabellen wurden nicht gefunden und ergaben keine Datei: { $names }.
 }
-export-progress-of-about = { $rows } von ~{ $total } Zeilen
-export-progress-of = { $rows } von { $total } Zeilen
+export-progress-of-about = { $count ->
+    [one] { $rows } von ~{ $total } Zeile
+   *[other] { $rows } von ~{ $total } Zeilen
+}
+export-progress-of = { $count ->
+    [one] { $rows } von { $total } Zeile
+   *[other] { $rows } von { $total } Zeilen
+}
 export-progress-rows = { $count ->
     [one] { $rows } Zeile
    *[other] { $rows } Zeilen
@@ -2545,8 +2557,24 @@ blob-pane-hex = Hex
 blob-reading = Wird gelesen…
 blob-empty = Diese Zelle ist NULL, oder ihre Zeile existiert nicht mehr.
 blob-preview-too-large = Dieses Bild ist { $width } × { $height } groß – zu groß für eine Vorschau hier. Die Bytes sind unversehrt: lies sie als Hex oder speichere sie in eine Datei.
-blob-preview-truncated = Nur die ersten { $shown } dieses Werts ({ $kind }) wurden gelesen, daher lässt er sich nicht darstellen. Lies die Bytes als Hex.
-blob-preview-unreadable = Diese Bytes beginnen wie ein Wert vom Typ { $kind }, lassen sich aber nicht so lesen. Lies sie als Hex oder speichere sie in eine Datei.
+blob-preview-truncated = Nur die ersten { $shown } dieses Werts ({ $key ->
+    [png] PNG-Bild
+    [jpeg] JPEG-Bild
+    [gif] GIF-Bild
+    [bmp] BMP-Bild
+    [webp] WebP-Bild
+    [ico] Symbol
+   *[other] Binärdaten
+}) wurden gelesen, daher lässt er sich nicht darstellen. Lies die Bytes als Hex.
+blob-preview-unreadable = Diese Bytes beginnen wie ein Wert vom Typ { $key ->
+    [png] PNG-Bild
+    [jpeg] JPEG-Bild
+    [gif] GIF-Bild
+    [bmp] BMP-Bild
+    [webp] WebP-Bild
+    [ico] Symbol
+   *[other] Binärdaten
+}, lassen sich aber nicht so lesen. Lies sie als Hex oder speichere sie in eine Datei.
 blob-save-truncated = Nur die ersten { $shown } von { $size } konnten gelesen werden, dies würde also nur den Anfang des Werts speichern.
 blob-load = Aus Datei laden
 blob-save = In Datei speichern

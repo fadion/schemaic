@@ -488,6 +488,35 @@ fn blob_kind_label(kind: BlobKind) -> String {
     }
 }
 
+/// A kind as a key a message can select on — the noun a sentence needs is not
+/// the capitalised label over the value ("like a Icon"), so a sentence that
+/// names the kind picks its own words by this.
+fn blob_kind_key(kind: BlobKind) -> &'static str {
+    match kind {
+        BlobKind::Png => "png",
+        BlobKind::Jpeg => "jpeg",
+        BlobKind::Gif => "gif",
+        BlobKind::Bmp => "bmp",
+        BlobKind::Webp => "webp",
+        BlobKind::Ico => "ico",
+        BlobKind::Opaque => "opaque",
+    }
+}
+
+/// Only the front of an image was read, so it cannot be drawn.
+fn truncated_text(shown: &str, kind: BlobKind) -> String {
+    tr!(
+        "blob-preview-truncated",
+        shown = shown,
+        key = blob_kind_key(kind)
+    )
+}
+
+/// The bytes look like an image the decoder cannot measure.
+fn unreadable_text(kind: BlobKind) -> String {
+    tr!("blob-preview-unreadable", key = blob_kind_key(kind))
+}
+
 /// Whether **Save to file** is offered, and the sentence that says why it is
 /// not — one answer, because the button and the line beside it are about the
 /// same fact and had two spellings of it.
@@ -648,19 +677,11 @@ fn preview_view(value: Arc<BlobValue>, kind: BlobKind) -> impl IntoView {
         )
         .into_any(),
         PreviewVerdict::Truncated => note_view(
-            tr!(
-                "blob-preview-truncated",
-                shown = human_bytes(value.bytes.len() as i64),
-                kind = blob_kind_label(kind)
-            ),
+            truncated_text(&human_bytes(value.bytes.len() as i64), kind),
             false,
         )
         .into_any(),
-        PreviewVerdict::Unmeasurable => note_view(
-            tr!("blob-preview-unreadable", kind = blob_kind_label(kind)),
-            false,
-        )
-        .into_any(),
+        PreviewVerdict::Unmeasurable => note_view(unreadable_text(kind), false).into_any(),
     };
     container(body).style(move |s| s.size_full().background(theme::bg_editor()))
 }
@@ -1088,14 +1109,27 @@ mod tests {
              read them as Hex, or save them to a file."
         );
         assert_eq!(
-            tr!("blob-preview-truncated", shown = "16 B", kind = "PNG image"),
+            truncated_text("16 B", BlobKind::Png),
             "Only the first 16 B of this PNG image was read, so it cannot be drawn. Read the \
              bytes as Hex."
         );
         assert_eq!(
-            tr!("blob-preview-unreadable", kind = "GIF image"),
+            unreadable_text(BlobKind::Gif),
             "These bytes begin like a GIF image but cannot be read as one. Read them as Hex, \
              or save them to a file."
+        );
+        // **A kind in a sentence is a noun in that sentence**, not the
+        // capitalised label over the value: "like a Icon" was the label pasted
+        // in.
+        assert_eq!(
+            unreadable_text(BlobKind::Ico),
+            "These bytes begin like an icon but cannot be read as one. Read them as Hex, \
+             or save them to a file."
+        );
+        assert_eq!(
+            truncated_text("16 MiB", BlobKind::Ico),
+            "Only the first 16 MiB of this icon was read, so it cannot be drawn. Read the \
+             bytes as Hex."
         );
         assert_eq!(
             tr!("blob-file-too-large", got = "64.0 KB", most = "63.9 KB"),

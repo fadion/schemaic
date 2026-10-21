@@ -3,7 +3,10 @@
 # Every other language's catalogue falls back to this one message by message.
 # Ids are kebab-case and start with the area they belong to. Spelling is
 # British throughout (AGENTS.md); SQL keywords and persisted names are never
-# put here, and a key name only as the `key-*` legends at the end.
+# put here. Shortcut labels take their key names from the `key-*` legends
+# (after the Shortcuts modal's rows); a key named inside a sentence is part of that
+# sentence, and a translation writes its keyboards' own legend there too
+# (Strg, not Ctrl). Such sentences carry a note saying so.
 
 ## Settings › Appearance › Language
 
@@ -110,6 +113,8 @@ settings-restore-tabs-hint = Reopen the query tabs from your last session when t
 
 settings-editor-font-size = Font size
 settings-editor-predictions = Inline predictions
+# Ctrl, ⌘ and Escape are named in the sentence: write your keyboards' own
+# legends (key-ctrl's word; Esc is Escape here).
 settings-editor-predictions-hint = Show the likely next words after the caret — the partner of a keyword, a join's foreign key, the columns to group by or insert. Tab, or → at the end of a line, takes them whole, Ctrl+→ (⌘→ on macOS) a word at a time, and Escape turns them down.
 settings-editor-remembered = Predictions from past statements
 settings-editor-remembered-hint = Also offer the rest of a line from a statement you ran, wrote in another tab or saved as a snippet. Switch off to keep past statements off the screen.
@@ -293,7 +298,7 @@ key-space = Space
 ## Command palette › commands
 ## A command's label is also what is typed to pick it, lowercased (Tab types
 ## the label into the box), so no argument-taking command's label may be the
-## first words of another command's: "History" before "Clear History" is
+## first words of another command's: "History" before "Clear history" is
 ## fine, "Verlauf" before "Verlauf leeren" is not. The English names match in
 ## every language as well.
 
@@ -438,8 +443,12 @@ tree-refresh-view = Refresh view
 tree-truncate = Truncate
 tree-truncate-title = Truncate table
 # The Truncate confirmation (core's stats::truncate_prompt). $table is the
-# table's shown name; $rows a figure worth naming, formatted (4,213,551 or ~4.2m).
-tree-truncate-rows = Delete all { $rows } rows in { $table }? This can't be undone.
+# table's shown name; $rows a figure worth naming, formatted (4,213,551 or ~4.2m),
+# and $n the number itself, which decides the plural.
+tree-truncate-rows = { $n ->
+    [one] Delete the { $rows } row in { $table }? This can't be undone.
+   *[other] Delete all { $rows } rows in { $table }? This can't be undone.
+}
 tree-truncate-every-row = Delete every row in { $table }? This can't be undone.
 tree-drop = Drop
 tree-drop-index = Drop index
@@ -676,7 +685,8 @@ ddl-elsewhere-list = { $items }{ $more ->
 ddl-rollback-failed = { $error } — and the rollback failed too: { $rollback }
 
 ## A write path's failure — the grid's Commit, an import, a copy (core's
-## model::WriteFailure). The server's words in $error stay the server's.
+## model::WriteFailure). A server's own words reach the line as they are, not
+## through a message here.
 
 # The 1-row safety net: a statement that changed $affected rows rather than
 # one. $table is db.table or db.schema.table, as written.
@@ -2256,8 +2266,12 @@ dump-fk-hint = Off for the duration of the load, so the order rows arrive in can
 dump-fk-hint-drops = Off for the duration of the load, so the order rows arrive in can't refuse them. A file that drops tables turns them off anyway: a drop with them on deletes the rows of tables outside the file through their ON DELETE actions.
 dump-no-fk-guard-hint = This engine has no session switch for foreign-key checks; the file adds the constraints after the data instead.
 dump-export = Export
-# The progress line; $rows is an abbreviated count (9.4k).
-dump-progress = Writing { $table } — { $index } of { $total }, { $rows } rows so far
+# The progress line; $rows is an abbreviated count (9.4k), and $count the
+# number itself, which decides the plural.
+dump-progress = { $count ->
+    [one] Writing { $table } — { $index } of { $total }, { $rows } row so far
+   *[other] Writing { $table } — { $index } of { $total }, { $rows } rows so far
+}
 # Animated with trailing dots while it lasts.
 dump-reading-schema = Reading the schema
 # The title of the prompt asking whether to overwrite files already in the folder.
@@ -2325,10 +2339,17 @@ files-missing = { $n ->
 }
 
 ## Grid export's progress box (dump_view.rs)
-## $rows and $total are abbreviated counts (9.4k, ~180k).
+## $rows and $total are abbreviated counts (9.4k, ~180k); $count is the total
+## itself, which decides the plural.
 
-export-progress-of-about = { $rows } of ~{ $total } rows
-export-progress-of = { $rows } of { $total } rows
+export-progress-of-about = { $count ->
+    [one] { $rows } of ~{ $total } row
+   *[other] { $rows } of ~{ $total } rows
+}
+export-progress-of = { $count ->
+    [one] { $rows } of { $total } row
+   *[other] { $rows } of { $total } rows
+}
 # $count is the exact number, which decides the plural; $rows is how it is shown.
 export-progress-rows = { $count ->
     [one] { $rows } row
@@ -3107,8 +3128,28 @@ blob-reading = Reading…
 # NULL is the SQL keyword.
 blob-empty = This cell is NULL, or its row is no longer there.
 blob-preview-too-large = This image is { $width } × { $height } — too large to preview here. The bytes are intact: read them as Hex, or save them to a file.
-blob-preview-truncated = Only the first { $shown } of this { $kind } was read, so it cannot be drawn. Read the bytes as Hex.
-blob-preview-unreadable = These bytes begin like a { $kind } but cannot be read as one. Read them as Hex, or save them to a file.
+# The next two name the kind inside the sentence. $key is the kind (png, jpeg,
+# gif, bmp, webp, ico, opaque), to select the noun the sentence needs with its
+# own article and case. The blob-kind-* labels above are capitalised for
+# standing alone, and pasted in they read "like a Icon".
+blob-preview-truncated = Only the first { $shown } of this { $key ->
+    [png] PNG image
+    [jpeg] JPEG image
+    [gif] GIF image
+    [bmp] BMP image
+    [webp] WebP image
+    [ico] icon
+   *[other] value
+} was read, so it cannot be drawn. Read the bytes as Hex.
+blob-preview-unreadable = These bytes begin like { $key ->
+    [png] a PNG image
+    [jpeg] a JPEG image
+    [gif] a GIF image
+    [bmp] a BMP image
+    [webp] a WebP image
+    [ico] an icon
+   *[other] an image
+} but cannot be read as one. Read them as Hex, or save them to a file.
 blob-save-truncated = Only the first { $shown } of { $size } could be read, so this would save the front of the value.
 blob-load = Load from file
 blob-save = Save to file
@@ -4240,6 +4281,7 @@ backup-failed = The backup failed: { $error }
 # The open dialog's title, and the question asked before a restore runs.
 restore-title = Restore from file
 # $database is the database restored into; $connection the connection's name.
+# Ctrl+C is named in the sentence: write your keyboards' legend (key-ctrl's word).
 restore-confirm = Run { $path } into { $database } on { $connection }? What it creates or replaces cannot be undone. It runs in the terminal, where Ctrl+C stops it.
 restore-read-only = This connection is read-only in Schemaic, so nothing is restored into it.
 restore-engine-not-here = This engine's backups are not restored from here.

@@ -28849,10 +28849,12 @@ existing prose was left alone.
     (`dump-sql-dialog`, `dump-folder-dialog` with `$format`), the folder hint, the picker's count
     (`dump-all-selected`, `dump-some-selected`), its Select all/None and its three notes, the two
     sections' toggles and the hints this file owns, the no-FK-guard hint, Export, the progress line
-    `dump-progress` (`$table`, `$index`, `$total`, and `$rows`, `human_count`'s abbreviated figure),
+    `dump-progress` through `dump_progress_text` (`$table`, `$index`, `$total`, `$rows`,
+    `human_count`'s abbreviated figure, and `$count`, the raw number the plural selects on),
     *Reading the schema* and the *Replace files* confirm's title. The progress box's: its count
-    through `export_count_line` — `export-progress-of-about` for the `~` case, `export-progress-of`,
-    and the plural `export-progress-rows`, whose `$count` is the exact number Fluent chooses the
+    through `export_count_line` — `export-progress-of-about` for the `~` case, `export-progress-of`
+    (both selecting on `$count`, the total, so a one-row export reads "1 of 1 row" rather than
+    "rows"), and the plural `export-progress-rows`, whose `$count` is the exact number Fluent chooses the
     plural by and `$rows` the abbreviated one shown, since a `9.4k` is no number to choose one with
     (`script_view`'s two-argument count, above) — *Starting*, and the destination line,
     `export-progress-file` or `export-progress-writing` (`$name`). Stop and Close in both footers
@@ -30423,7 +30425,9 @@ existing prose was left alone.
     `i18n::object_kind`, the catalogue's `kind-*` rather than `ObjectKind::label()`. Some words
     reaching these popups are still another module's English: `ExportFormat::label` and
     `activity::interval_label`; `stats::truncate_prompt`'s question is `i18n::truncate_prompt`'s
-    now (`tree-truncate-rows`, `-every-row`, over core's `confirm_figure`). The colour presets' names
+    now (`tree-truncate-rows`, `-every-row`, over core's `confirm_figure`; the first selects on
+    `$n`, the figure's own number, so an exact count of one asks "Delete the 1 row", as core's
+    English does). The colour presets' names
     (`lib.rs`'s `CONN_COLOR_PRESETS`) were the fourth until `lib.rs` drew them from `colour-*`.
     **A PostgreSQL foreign table is offered what its server takes** (`object_entries` over
     `TableShape::ForeignTable`): its Drop, which `object_drop_change` makes `DROP FOREIGN TABLE`;
@@ -33231,7 +33235,9 @@ existing prose was left alone.
     **Its words are the catalogue's** (`blob-*`) — the pane switch's labels
     (`pane_label` returns `String`), the Reading…/NULL-cell notes, the preview's three refusals
     (`blob-preview-too-large` with `$width`/`$height`, `blob-preview-truncated`,
-    `blob-preview-unreadable`), `save_offer`'s refusal (`blob-save-truncated`), Load from file and
+    `blob-preview-unreadable` — the last two selecting the kind's noun on `$key`, `blob_kind_key`'s
+    word, since the capitalised `blob-kind-*` label pasted into the sentence read "like a Icon"),
+    `save_offer`'s refusal (`blob-save-truncated`), Load from file and
     Save to file and their dialogs' window titles, and `BlobUi`'s status lines — `saved_at`'s
     `blob-saved-to` (`$path`), and `loaded_file`'s `blob-loaded-file`, `blob-not-writable`,
     `blob-file-too-large` (`$got`, `$most`) and `blob-not-accepting`; Close is the shared

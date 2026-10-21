@@ -1058,6 +1058,10 @@ pub fn confirm_figure(rows: Option<RowCount>) -> Option<RowCount> {
 /// goes when a row figure worth naming is already in hand.
 pub fn truncate_prompt(label: &str, rows: Option<RowCount>) -> String {
     match confirm_figure(rows) {
+        Some(r) if r.value() == 1 => format!(
+            "Delete the {} row in {label}? This can't be undone.",
+            r.label()
+        ),
         Some(r) => format!(
             "Delete all {} rows in {label}? This can't be undone.",
             r.label()
@@ -2296,6 +2300,11 @@ mod tests {
         assert_eq!(
             truncate_prompt("orders", Some(RowCount::Exact(12))),
             "Delete all 12 rows in orders? This can't be undone."
+        );
+        // One row is one row, not "all 1 rows".
+        assert_eq!(
+            truncate_prompt("orders", Some(RowCount::Exact(1))),
+            "Delete the 1 row in orders? This can't be undone."
         );
     }
 
