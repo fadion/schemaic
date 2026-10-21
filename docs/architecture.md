@@ -25827,14 +25827,21 @@ existing prose was left alone.
     readable, so a box too narrow shows *which* label it cut. Values are spared here too, and for a
     second reason: a message wrapped in another would otherwise double again at each level
     (`the_doubled_locale_repeats_the_words_and_spares_the_values`).
-    **Two catalogue tests stand in for what `fl!` cannot see.** At run time a malformed `.ftl` is
+    **Three catalogue tests stand in for what `fl!` cannot see.** At run time a malformed `.ftl` is
     only logged and its broken messages fall back to English, unseen, so
     `every_catalogue_parses_cleanly` parses every embedded file strictly with `fluent-syntax` (a
     dev-dependency) and requires at least two of them; and
     `no_translation_outlives_its_english_message` fails on an id a translation has and `en-GB` has
-    not — dead weight that reads as live, and usually a renamed id whose new name is untranslated.
-    Nothing tests the other direction: a message missing from a translation falls back to English by
-    design, and keeping an incomplete catalogue out of users' hands is `SHIPPED`'s job.
+    not — dead weight that reads as live, and usually a renamed id whose new name is untranslated;
+    and `a_translation_reads_only_the_variables_english_is_given` walks both ASTs, since `fl!`
+    checks a call's argument names against `en-GB` alone and a German `{ $nmae }` would draw a
+    placeholder unseen (seen red by renaming one). A message missing from a translation is not an
+    error: it falls back to English **message by message**, which is `load_languages` appending
+    `en-GB` behind the tag in `configure_from`, and `a_message_german_lacks_reads_in_english`
+    holds it over a fixture whose `de` has one message. A language with **no** catalogue folder is
+    not skipped: i18n-embed panics on it, so `every_language_s_catalogue_is_embedded` walks every
+    `UiLanguage`, with a `match` that makes a new variant a compile error there. Keeping an
+    incomplete catalogue out of users' hands is `SHIPPED`'s job.
     **`LanguageChoice` is the setting as Settings offers it** — `System` or `Fixed(UiLanguage)`,
     `options()` being `System` then `SHIPPED`, never either pseudo-locale. `from_key` reads a key it
     does not offer (a newer build's, a hand edit, an unshipped catalogue) as `System`, which is also
@@ -41691,6 +41698,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     red on it once it matched whole path segments. A `figure(` ending the line above also counts,
     as `cargo fmt` splits one there (it did, on the AI panel's timer, which now calls
     `i18n::elapsed`); a call split further, or a printer under another name, is not seen.
+    **Its floor is a fixture, not a count of offenders**:
+    `the_figure_gate_s_matcher_sees_a_bare_printer_and_passes_a_marked_one` runs the matcher
+    (`unmarked_printer_calls`) over a few lines with known answers, and the gate itself only
+    requires that it read the tree. The `seen >= 5` it replaced sat exactly on the number of
+    printer calls the tree held, so moving one onto `i18n::bytes`, which is the remedy the gate's
+    own message recommends, failed it as "gone blind".
   - **A word core gives as a property of a typed value is drawn UI-side**, not translated from
     core's text — `i18n::object_kind`/`object_kind_group` for `ObjectKind::label`/`group_label`,
     `history_panel::bucket_title` for `history::Bucket::label`, `activity_panel::kill_label`
@@ -41728,7 +41741,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     back an `Ago` that `i18n::relative_time` says from `ago-*` (the history and snippet rows, the
     palette's history rows, a result chip's tooltip), and `history::outcome_line_with` keeps which
     facts and where the separators go while `i18n::outcome_line` supplies `outcome-rows`/
-    `outcome-rows-capped` — `english_says_ago_and_rows_as_core_does` holding both to core's English.
+    `outcome-rows-capped` — `english_says_ago_and_rows_as_core_does` holding both to core's English,
+    the outcome half by comparing `i18n::outcome_line` with `history::outcome_line` over 0, 1, 100
+    and capped rows, a failure, no duration and an unknown outcome. It once compared the messages
+    with a copy of core's row words written in the test, which stayed green while core changed.
     **A typed message** — phases 4 and 5 of *Interface translation*, landed, the shape settled on
     review (2026-10-19). Prose composed below the views — in `schemaic-core`, `schemaic-db` and
     `schemaic-ai` — becomes a typed value, an enum per area whose fields are the message's
@@ -42341,10 +42357,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     a time (`core::erd::fit_toolbar`); Settings' page at 500 with *Settings file*'s buttons stacked
     (`settings.rs`); Connection import's source buttons wrapping; and the calendar's day cell at 33
     (`day_w`, for longer month names).
-  - **Two tests guard what the compiler cannot**: `every_catalogue_parses_cleanly`, because a
-    malformed translation is only logged at run time and falls back to English unseen; and
-    `no_translation_outlives_its_english_message`, for a renamed or deleted English id. A message
-    a translation lacks is not caught, by design.
+  - **Three tests guard what the compiler cannot**: `every_catalogue_parses_cleanly`, because a
+    malformed translation is only logged at run time and falls back to English unseen;
+    `no_translation_outlives_its_english_message`, for a renamed or deleted English id; and
+    `a_translation_reads_only_the_variables_english_is_given`. A message a translation lacks is
+    not caught, by design: it reads in English (`a_message_german_lacks_reads_in_english`).
 - **Reactive text**: use `dyn_container` (no `floem::views::label`).
 - **There is no accessibility tree, and there is nothing in this repository that can add one.**
   Floem 0.2.0 ships no AccessKit integration and no a11y surface of any kind — grepping the crate

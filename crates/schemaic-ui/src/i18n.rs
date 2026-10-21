@@ -1423,15 +1423,33 @@ pub fn seed_error_text(e: &schemaic_core::seed::SeedError) -> String {
 /// `loader` and set it up. Split from [`init`] so a test can do it to a loader
 /// of its own rather than to the one every other test reads.
 fn configure(loader: &FluentLanguageLoader, lang: UiLanguage) {
+    configure_from(loader, &Catalogues, lang);
+}
+
+/// [`configure`] over the catalogues `assets` holds, so a test can hand it a
+/// language missing a message.
+///
+/// **Per-message fallback is `load_languages`' doing**: given `[tag]`, it
+/// appends `en-GB` behind it, and a lookup walks both bundles, so a message
+/// German lacks reads in English (`a_message_german_lacks_reads_in_english`).
+/// A `select_languages` here would load German alone and show the id instead.
+fn configure_from(
+    loader: &FluentLanguageLoader,
+    assets: &dyn i18n_embed::I18nAssets,
+    lang: UiLanguage,
+) {
     let tag: LanguageIdentifier = lang
         .catalogue()
         .parse()
         .expect("a catalogue tag is a valid language identifier");
-    // Only the fallback can fail to load (a missing language is skipped), and
-    // it is embedded: a failure here is a broken build, not a broken machine.
+    // **A language with no catalogue folder is not skipped**: i18n-embed loads
+    // it as an empty set of bundles and panics on it. Every `UiLanguage`'s
+    // folder is embedded (`every_language_s_catalogue_is_embedded`), so the
+    // panic is a broken build, not a broken machine — and so is a failure of
+    // the fallback, which is embedded too.
     loader
-        .load_languages(&Catalogues, &[tag])
-        .expect("the en-GB catalogue is embedded");
+        .load_languages(assets, &[tag])
+        .expect("every language's catalogue is embedded");
     // After the load, not before: a load swaps in fresh bundles, and these are
     // settings of the bundles.
     loader.set_use_isolating(false);
@@ -2356,6 +2374,58 @@ mod tests {
         assert_eq!(loader(UiLanguage::De).get("settings-language"), "Sprache");
     }
 
+    /// The real catalogues, except that German holds one message only — the
+    /// partly translated catalogue every language is on its way to complete.
+    struct OneGermanMessage;
+
+    impl i18n_embed::I18nAssets for OneGermanMessage {
+        fn get_files(&self, file_path: &str) -> Vec<std::borrow::Cow<'_, [u8]>> {
+            if file_path.starts_with("de/") {
+                return vec![std::borrow::Cow::Borrowed(b"settings-language = Sprache\n")];
+            }
+            i18n_embed::I18nAssets::get_files(&Catalogues, file_path)
+        }
+
+        fn filenames_iter(&self) -> Box<dyn Iterator<Item = String> + '_> {
+            i18n_embed::I18nAssets::filenames_iter(&Catalogues)
+        }
+    }
+
+    /// **A message German lacks reads in English**, not as its id. Nothing
+    /// exercised this while `de` defined every id, and it is what makes a
+    /// partly translated catalogue safe to ship.
+    #[test]
+    fn a_message_german_lacks_reads_in_english() {
+        let l = fluent_language_loader!();
+        configure_from(&l, &OneGermanMessage, UiLanguage::De);
+        assert_eq!(l.get("settings-language"), "Sprache");
+        assert_eq!(
+            l.get("dialog-close"),
+            loader(UiLanguage::EnGb).get("dialog-close")
+        );
+    }
+
+    /// **Every language's catalogue folder is embedded.** i18n-embed panics on
+    /// a language with none, so a `UiLanguage` added ahead of its folder would
+    /// fail at launch. The `match` makes a new variant a compile error here
+    /// until it joins the list.
+    #[test]
+    fn every_language_s_catalogue_is_embedded() {
+        let all = [
+            UiLanguage::EnGb,
+            UiLanguage::De,
+            UiLanguage::Pseudo,
+            UiLanguage::PseudoEn,
+        ];
+        for lang in all {
+            match lang {
+                UiLanguage::EnGb | UiLanguage::De | UiLanguage::Pseudo | UiLanguage::PseudoEn => {}
+            }
+            let file = format!("{}/schemaic.ftl", lang.catalogue());
+            assert!(Catalogues::get(&file).is_some(), "{lang:?}: no {file}");
+        }
+    }
+
     /// German shortcut labels use the German keyboard's legends — the ones
     /// `shortcuts`' tests take as their German namer.
     #[test]
@@ -2596,24 +2666,37 @@ mod tests {
                 schemaic_core::history::relative_time(now - back, now)
             );
         }
-        // The count words, through the same composition core's English uses.
-        let words = |n: u64, capped: bool| {
-            if capped {
-                tr!("outcome-rows-capped", n = n)
-            } else {
-                tr!("outcome-rows", n = n)
-            }
+        // The outcome line, the interface's against core's own — not against a
+        // copy of core's row words written here, which stayed green while core
+        // changed its English.
+        use schemaic_core::history::{HistoryEntry, Outcome};
+        let entry = |rows: Option<u64>, capped: bool, ms: Option<u64>, outcome| HistoryEntry {
+            conn_id: 1,
+            database: None,
+            sql: "SELECT 1".into(),
+            ts: 0,
+            tab_name: None,
+            run_id: 1,
+            duration_ms: ms,
+            rows,
+            rows_capped: capped,
+            outcome,
         };
-        for (n, capped) in [(0u64, false), (1, false), (100, false), (200_000, true)] {
-            let english = if capped {
-                format!("{n}+ rows")
-            } else {
-                format!(
-                    "{n} {}",
-                    schemaic_core::text::plural(n as usize, "row", "rows")
-                )
-            };
-            assert_eq!(words(n, capped), english);
+        for e in [
+            entry(Some(0), false, Some(12), Outcome::Ok),
+            entry(Some(1), false, Some(1_500), Outcome::Ok),
+            entry(Some(100), false, Some(90_000), Outcome::Ok),
+            entry(Some(200_000), true, Some(4_200), Outcome::Ok),
+            entry(Some(3), false, Some(40), Outcome::Failed),
+            entry(Some(7), false, None, Outcome::Ok),
+            entry(None, false, None, Outcome::Ok),
+            entry(Some(7), false, Some(5), Outcome::Unknown),
+        ] {
+            assert_eq!(
+                outcome_line(&e),
+                schemaic_core::history::outcome_line(&e),
+                "{e:?}"
+            );
         }
     }
 
@@ -2735,6 +2818,96 @@ mod tests {
         assert!(seen >= 2, "found only {seen} catalogues");
     }
 
+    /// Every `$variable` a catalogue's messages read, by message id — in the
+    /// value, every attribute, every select arm and every call's arguments.
+    fn variables(path: &str) -> HashMap<String, std::collections::BTreeSet<String>> {
+        use fluent_syntax::ast::{Expression, InlineExpression, Pattern, PatternElement};
+        type Vars = std::collections::BTreeSet<String>;
+        fn pattern(p: &Pattern<String>, out: &mut Vars) {
+            for el in &p.elements {
+                if let PatternElement::Placeable { expression } = el {
+                    expr(expression, out);
+                }
+            }
+        }
+        fn expr(e: &Expression<String>, out: &mut Vars) {
+            match e {
+                Expression::Select { selector, variants } => {
+                    inline(selector, out);
+                    for v in variants {
+                        pattern(&v.value, out);
+                    }
+                }
+                Expression::Inline(i) => inline(i, out),
+            }
+        }
+        fn inline(e: &InlineExpression<String>, out: &mut Vars) {
+            let args = |a: &fluent_syntax::ast::CallArguments<String>, out: &mut Vars| {
+                for p in &a.positional {
+                    inline(p, out);
+                }
+                for n in &a.named {
+                    inline(&n.value, out);
+                }
+            };
+            match e {
+                InlineExpression::VariableReference { id } => {
+                    out.insert(id.name.clone());
+                }
+                InlineExpression::FunctionReference { arguments, .. } => args(arguments, out),
+                InlineExpression::TermReference {
+                    arguments: Some(a), ..
+                } => args(a, out),
+                InlineExpression::Placeable { expression } => expr(expression, out),
+                _ => {}
+            }
+        }
+        let file = Catalogues::get(path).expect(path);
+        let text = std::str::from_utf8(&file.data).expect("utf-8").to_string();
+        let res = fluent_syntax::parser::parse(text).expect("parses");
+        res.body
+            .iter()
+            .filter_map(|e| match e {
+                fluent_syntax::ast::Entry::Message(m) => {
+                    let mut vars = Vars::new();
+                    if let Some(v) = &m.value {
+                        pattern(v, &mut vars);
+                    }
+                    for a in &m.attributes {
+                        pattern(&a.value, &mut vars);
+                    }
+                    Some((m.id.name.clone(), vars))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **A translation reads only the variables its English message is
+    /// given.** `fl!` checks a call's argument names against `en-GB` alone, so
+    /// a German `{ $nmae }`, or a select on a variable the code never passes,
+    /// would draw a placeholder or the default arm with no test failing.
+    #[test]
+    fn a_translation_reads_only_the_variables_english_is_given() {
+        let english = variables("en-GB/schemaic.ftl");
+        assert!(
+            english.values().any(|v| !v.is_empty()),
+            "no variable found in en-GB; the walk has gone blind"
+        );
+        for path in Catalogues::iter().filter(|p| !p.starts_with("en-GB/")) {
+            for (id, vars) in variables(&path) {
+                let Some(given) = english.get(&id) else {
+                    continue; // `no_translation_outlives_its_english_message`
+                };
+                let extra: Vec<&String> = vars.difference(given).collect();
+                assert!(
+                    extra.is_empty(),
+                    "{path} `{id}` reads {extra:?}, which English is not given"
+                );
+            }
+        }
+    }
+
     fn ids(path: &str) -> Vec<String> {
         let file = Catalogues::get(path).expect(path);
         let text = std::str::from_utf8(&file.data).expect("utf-8").to_string();
@@ -2773,8 +2946,9 @@ mod tests {
     /// which do. A `figure(` ending the line above counts, as `cargo fmt`
     /// splits one there; a call split further, or a printer imported under
     /// another name, is not seen.
-    #[test]
-    fn every_core_figure_a_view_shows_takes_the_interface_s_marks() {
+    /// The figure gate's matcher over one file: how many core printer calls it
+    /// saw, and the ones shown without the interface's marks.
+    fn unmarked_printer_calls(name: &str, code: &str) -> (usize, Vec<String>) {
         const PRINTERS: [&str; 7] = [
             "human_count",
             "format_bytes",
@@ -2793,41 +2967,73 @@ mod tests {
                 !next.is_some_and(|c| c.is_alphanumeric() || c == '_')
             })
         };
-        let files = crate::source_gate::crate_sources();
         let mut seen = 0usize;
         let mut offenders = Vec::new();
-        for (name, code) in files.iter().filter(|(n, _)| n != "i18n.rs") {
-            let lines: Vec<&str> = code.lines().collect();
-            for (i, &line) in lines.iter().enumerate() {
-                // `cargo fmt` breaks `figure(` + the call over two lines.
-                let above = i.checked_sub(1).map_or("", |j| lines[j]);
-                let imports = line.trim_start().starts_with("use schemaic_core");
-                for p in PRINTERS {
-                    // Core's, by its path; a view's own wrapper is unqualified,
-                    // and this file's are `i18n::`.
-                    if imports || !names(line, "::", p) || names(line, "i18n::", p) {
-                        continue;
-                    }
-                    seen += 1;
-                    let marked = |l: &str| {
-                        l.contains("figure(")
-                            || l.contains("number_marks()")
-                            || l.contains("remark(")
-                    };
-                    if !(marked(line) || above.trim_end().ends_with("figure(")) {
-                        offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
-                    }
+        let lines: Vec<&str> = code.lines().collect();
+        for (i, &line) in lines.iter().enumerate() {
+            // `cargo fmt` breaks `figure(` + the call over two lines.
+            let above = i.checked_sub(1).map_or("", |j| lines[j]);
+            let imports = line.trim_start().starts_with("use schemaic_core");
+            for p in PRINTERS {
+                // Core's, by its path; a view's own wrapper is unqualified,
+                // and this file's are `i18n::`.
+                if imports || !names(line, "::", p) || names(line, "i18n::", p) {
+                    continue;
                 }
-                let imported = PRINTERS.iter().any(|p| names(line, "", p));
-                if imports && imported {
+                seen += 1;
+                let marked = |l: &str| {
+                    l.contains("figure(") || l.contains("number_marks()") || l.contains("remark(")
+                };
+                if !(marked(line) || above.trim_end().ends_with("figure(")) {
                     offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
                 }
             }
+            let imported = PRINTERS.iter().any(|p| names(line, "", p));
+            if imports && imported {
+                offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
+            }
         }
-        assert!(
-            seen >= 5,
-            "only {seen} core printer calls found; this gate has gone blind"
+        (seen, offenders)
+    }
+
+    /// **The matcher still sees, checked on a fixture** rather than by how
+    /// many unmarked calls the tree happens to hold. The floor it replaced,
+    /// `seen >= 5`, sat exactly on today's count, so moving one call onto
+    /// `i18n::bytes` — the remedy the gate itself recommends — failed it as
+    /// "gone blind".
+    #[test]
+    fn the_figure_gate_s_matcher_sees_a_bare_printer_and_passes_a_marked_one() {
+        let code = "let a = stats::format_bytes(n);\n\
+                    let b = figure(&stats::format_bytes(n));\n\
+                    let c = rows.map(text::human_count);\n\
+                    let d = figure(\n    &text::human_count(n),\n);\n\
+                    let e = i18n::bytes(n);\n\
+                    use schemaic_core::stats::format_bytes;\n";
+        let (seen, offenders) = unmarked_printer_calls("fixture.rs", code);
+        assert_eq!(seen, 4, "{offenders:?}");
+        assert_eq!(
+            offenders,
+            [
+                "fixture.rs:1: let a = stats::format_bytes(n);",
+                "fixture.rs:3: let c = rows.map(text::human_count);",
+                "fixture.rs:8: use schemaic_core::stats::format_bytes;",
+            ]
         );
+    }
+
+    #[test]
+    fn every_core_figure_a_view_shows_takes_the_interface_s_marks() {
+        let files = crate::source_gate::crate_sources();
+        // The tree is read at all: both view crates, dozens of files.
+        assert!(
+            files.len() >= 20,
+            "only {} source files read; this gate has gone blind",
+            files.len()
+        );
+        let mut offenders = Vec::new();
+        for (name, code) in files.iter().filter(|(n, _)| n != "i18n.rs") {
+            offenders.extend(unmarked_printer_calls(name, code).1);
+        }
         assert!(
             offenders.is_empty(),
             "a figure core printed in English, shown without the interface's \
