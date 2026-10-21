@@ -489,6 +489,10 @@ db-connect-read-only-setup = die Sitzung konnte nicht schreibgeschützt werden: 
 db-connect-guard-session = die Sitzung konnte nicht abgesichert werden: { $error }
 db-connect-plan-setup = der Plan konnte nicht vorbereitet werden: { $error }
 db-connect-no-maintenance-db = keine Wartungsdatenbank erreichbar
+db-connect-browser-silent = Der SQL Server Browser auf { $server } nannte keinen Port für die Instanz { $instance }: Der Browser-Dienst läuft nicht, UDP-Port 1434 wird unterwegs blockiert, oder dort heißt keine Instanz so. Lauscht die Instanz auf einem festen Port, setze den Host auf { $server } ohne \{ $instance } und den Port auf diesen.
+db-connect-browser-without-tcp = Der SQL Server Browser auf { $server } antwortete für die Instanz { $instance }, nannte aber keinen TCP-Port: Die Instanz lauscht nicht auf TCP. Aktiviere TCP/IP für sie im SQL Server-Konfigurations-Manager und starte sie neu.
+db-connect-azure-timed-out = Azure SQL hat die Anmeldung nicht innerhalb von { $secs } Sekunden abgeschlossen. Eine pausierte serverlose Datenbank braucht etwa eine Minute zum Fortsetzen, und dieser Versuch hat sie geweckt – verbinde dich gleich noch einmal.
+db-connect-azure-unavailable = { $server } Eine pausierte serverlose Datenbank braucht etwa eine Minute zum Fortsetzen, und dieser Versuch hat sie geweckt – verbinde dich gleich noch einmal.
 db-ssh-connect-no-answer = SSH-Verbindung mit { $host }: keine Antwort innerhalb von { $secs } s
 db-ssh-auth-no-answer = SSH-Anmeldung bei { $host }: keine Antwort innerhalb von { $secs } s
 db-ssh-auth-error = SSH-Anmeldefehler: { $error }
@@ -1186,6 +1190,14 @@ activity-locks-undrawn = { $n ->
    *[other] { $n } weitere passende Sperren – Suche eingrenzen, um sie zu sehen.
 }
 activity-list-capped = Liste gekürzt
+activity-locks-total = { $n ->
+    [one] { $shown } Sperre
+   *[other] { $shown } Sperren
+}
+activity-locks-waiting = { $n ->
+    [one] { $shown } wartet
+   *[other] { $shown } warten
+}
 activity-state-blocked = Blockiert
 activity-state-idle-in-tx = Leerlauf in Txn
 activity-state-running = Läuft
@@ -1349,6 +1361,13 @@ props-created = Erstellt
 props-updated = Aktualisiert
 props-comment = Kommentar
 props-section-partitioning = Partitionierung
+props-partition-of = Partition von
+props-partition-bound = Grenze
+props-partitioned-by = Partitioniert nach
+props-partitions-more = { $n ->
+    [one] und { $n } weitere Partition
+   *[other] und { $n } weitere Partitionen
+}
 props-section-indexes = Indizes
 props-index-cardinality = Kardinalität { $cardinality }
 props-index-scans = { $n ->
@@ -1422,6 +1441,7 @@ dialog-stop = Anhalten
 ## Copy table modal
 
 copy-table-title = { $table } kopieren
+copy-table-rows-line = Danach jede Zeile von { $table } hineinkopieren (nicht als SQL gezeigt)
 copy-table-into = Kopieren nach
 copy-table-schema = Schema
 copy-table-name = Name
@@ -1566,6 +1586,10 @@ compare-note-binding = Aliastyp { $alias }: { $bound ->
 compare-hint-blocked = der Rumpf muss neu gelesen werden, bevor dies angewendet werden kann
 compare-hint-uncertain = ein Index, den dieses Modell nur teilweise liest – eine Übereinstimmung hier ist nicht sicher
 compare-preview-migration = Migrationsvorschau
+compare-plan-subject = { $n ->
+    [one] { $n } Objekt in { $database }
+   *[other] { $n } Objekte in { $database }
+}
 compare-selected = { $n ->
         [0] Nichts ausgewählt.
         [one] { $n } Objekt ausgewählt
@@ -2610,6 +2634,15 @@ erd-chip-relationships = { $count ->
 }
 erd-chip-hidden = { $count } unverbundene ausgeblendet
 erd-find-placeholder = Tabelle oder Spalte suchen
+erd-find-none = Keine Treffer
+erd-find-matches = { $hits ->
+    [one] { $hits } Treffer
+   *[other] { $hits } Treffer
+}
+erd-find-matches-in-tables = { $hits ->
+    [one] { $hits } Treffer in { $tables } Tabellen
+   *[other] { $hits } Treffer in { $tables } Tabellen
+}
 erd-more-columns = +{ $count } weitere
 erd-show-less = weniger anzeigen
 erd-not-loaded = Das Schema dieser Datenbank ist noch nicht geladen.
@@ -2841,6 +2874,11 @@ grid-menu-hide-column = Spalte ausblenden
 grid-menu-show-hidden-columns = Ausgeblendete Spalten anzeigen ({ $count })
 grid-menu-show-all = Alle anzeigen
 grid-menu-format-as = Formatieren als
+grid-format-none = Keine
+grid-format-timestamp = Zeitstempel
+grid-format-grouped = Zifferngruppierung
+grid-format-bytes = Dateigröße
+grid-format-bool = Boolesch
 grid-menu-copy-name = Namen kopieren
 grid-menu-copy-qualified-name = Qualifizierten Namen kopieren
 grid-menu-copy-values = Werte kopieren
@@ -3540,4 +3578,5 @@ docker-answered = Docker hat geantwortet: { $error }
 docker-exited = Docker wurde mit { $status } beendet.
 script-reader-stopped = Das Lesen der Datei brach unerwartet ab: { $error }
 script-changed-since-read = Diese Datei wurde nach dem Lesen auf der Festplatte geändert, daher ist die Zusammenfassung oben nicht das, was laufen würde. Wähle sie erneut.
+script-no-terminator = Diese Datei enthält kein Anweisungsende, ist also kein SQL-Skript, das Schemaic ausführen kann. Prüfe, ob du die gemeinte Datei gewählt hast.
 ai-cursor-enable-unfinished = `mcp enable` wurde nicht abgeschlossen
