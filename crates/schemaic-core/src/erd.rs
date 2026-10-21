@@ -1232,8 +1232,10 @@ pub fn match_label(matches: &[NodeMatch]) -> String {
 /// the zoom stepper they have no pointer equivalent (scroll-to-zoom does).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolbarFit {
-    /// The `N tables` / `N relationships` count pills.
-    pub counts: bool,
+    /// How many of the `N tables` / `N relationships` / `N hidden` count
+    /// pills are shown, counted from the left — they go one at a time, the
+    /// rightmost first.
+    pub counts: usize,
     /// The `− 33% +` zoom stepper.
     pub zoom: bool,
     /// The export (download) button.
@@ -1241,19 +1243,24 @@ pub struct ToolbarFit {
 }
 
 impl ToolbarFit {
-    /// Everything shown — the answer for a toolbar with room, and for one that
-    /// has not been measured yet.
-    pub const ALL: ToolbarFit = ToolbarFit {
-        counts: true,
-        zoom: true,
-        export: true,
-    };
+    /// Everything shown, `chips` pills included — the answer for a toolbar
+    /// with room, and for one that has not been measured yet.
+    pub fn all(chips: usize) -> ToolbarFit {
+        ToolbarFit {
+            counts: chips,
+            zoom: true,
+            export: true,
+        }
+    }
 }
 
 /// Drop the toolbar's optional groups, **in priority order**, until what is left
 /// fits `avail`.
 ///
-/// The order is counts → zoom → export, least useful first: the pills restate
+/// The order is counts → zoom → export, least useful first, and the counts go
+/// **one chip at a time from the right** (`chips` holds each one's cost, left
+/// to right) — all three vanishing together on one pixel of narrowing read
+/// worse than losing them one by one. The pills restate
 /// something the diagram itself shows, the zoom stepper duplicates scroll-to-zoom
 /// and the percentage is only a readout, and the export button is the one of the
 /// three with no other way to reach it. Everything not named here is fixed and is
@@ -1267,25 +1274,31 @@ impl ToolbarFit {
 /// first frame and putting it back on the second is worse than one frame of
 /// overflow in a panel that opens at 80% of the window and is nearly always wide
 /// enough.
-pub fn fit_toolbar(avail: f64, fixed: f64, counts: f64, zoom: f64, export: f64) -> ToolbarFit {
-    if avail <= 1.0 || fixed + counts + zoom + export <= avail {
-        return ToolbarFit::ALL;
+pub fn fit_toolbar(avail: f64, fixed: f64, chips: &[f64], zoom: f64, export: f64) -> ToolbarFit {
+    if avail <= 1.0 {
+        return ToolbarFit::all(chips.len());
     }
-    if fixed + zoom + export <= avail {
+    // The most chips, from the left, that fit beside both other groups.
+    let with = |n: usize| fixed + chips[..n].iter().sum::<f64>() + zoom + export;
+    let mut counts = chips.len();
+    while counts > 0 && with(counts) > avail {
+        counts -= 1;
+    }
+    if with(counts) <= avail {
         return ToolbarFit {
-            counts: false,
-            ..ToolbarFit::ALL
+            counts,
+            ..ToolbarFit::all(0)
         };
     }
     if fixed + export <= avail {
         return ToolbarFit {
-            counts: false,
+            counts: 0,
             zoom: false,
             export: true,
         };
     }
     ToolbarFit {
-        counts: false,
+        counts: 0,
         zoom: false,
         export: false,
     }
@@ -1295,66 +1308,61 @@ pub fn fit_toolbar(avail: f64, fixed: f64, counts: f64, zoom: f64, export: f64) 
 mod toolbar_fit_tests {
     use super::*;
 
+    /// Three chips — tables, relationships, hidden — summing to 150.
+    const CHIPS: [f64; 3] = [60.0, 50.0, 40.0];
+
+    fn fit(counts: usize, zoom: bool, export: bool) -> ToolbarFit {
+        ToolbarFit {
+            counts,
+            zoom,
+            export,
+        }
+    }
+
     /// Room for everything.
     #[test]
     fn a_wide_toolbar_keeps_every_group() {
         assert_eq!(
-            fit_toolbar(1000.0, 200.0, 150.0, 120.0, 40.0),
-            ToolbarFit::ALL
+            fit_toolbar(1000.0, 200.0, &CHIPS, 120.0, 40.0),
+            ToolbarFit::all(3)
         );
         // Exactly enough is enough.
         assert_eq!(
-            fit_toolbar(510.0, 200.0, 150.0, 120.0, 40.0),
-            ToolbarFit::ALL
+            fit_toolbar(510.0, 200.0, &CHIPS, 120.0, 40.0),
+            ToolbarFit::all(3)
         );
     }
 
     /// **The order is the whole of it**, so it is walked one step at a time:
-    /// counts, then zoom, then export, and each step keeps what is left.
+    /// the chips one by one from the right, then zoom, then export, and each
+    /// step keeps what is left.
     #[test]
     fn groups_drop_in_priority_order() {
-        let (fixed, counts, zoom, export) = (200.0, 150.0, 120.0, 40.0);
-        let at = |avail| fit_toolbar(avail, fixed, counts, zoom, export);
+        let (fixed, zoom, export) = (200.0, 120.0, 40.0);
+        let at = |avail| fit_toolbar(avail, fixed, &CHIPS, zoom, export);
 
-        // 509: one pixel short of everything — the pills go, and only the pills.
-        assert_eq!(
-            at(509.0),
-            ToolbarFit {
-                counts: false,
-                zoom: true,
-                export: true
-            }
-        );
+        // 509: one pixel short of everything — the last chip goes, and only it.
+        assert_eq!(at(509.0), fit(2, true, true));
+        // 469: short of the first two chips — the middle one goes too.
+        assert_eq!(at(469.0), fit(1, true, true));
+        // 419: short of even the first chip — every chip is gone.
+        assert_eq!(at(419.0), fit(0, true, true));
         // 359: short of fixed + zoom + export — the zoom goes too.
-        assert_eq!(
-            at(359.0),
-            ToolbarFit {
-                counts: false,
-                zoom: false,
-                export: true
-            }
-        );
+        assert_eq!(at(359.0), fit(0, false, true));
         // 239: short of fixed + export — everything optional is gone.
-        assert_eq!(
-            at(239.0),
-            ToolbarFit {
-                counts: false,
-                zoom: false,
-                export: false
-            }
-        );
+        assert_eq!(at(239.0), fit(0, false, false));
     }
 
     /// A group never comes back while a lower-priority one is hidden: the result
     /// is always a **prefix** of the drop order, never a hole in the middle.
     #[test]
     fn the_result_is_always_a_prefix_of_the_drop_order() {
-        let (fixed, counts, zoom, export) = (200.0, 150.0, 120.0, 40.0);
+        let (fixed, zoom, export) = (200.0, 120.0, 40.0);
         for avail in (0..1200).map(|n| n as f64) {
-            let f = fit_toolbar(avail, fixed, counts, zoom, export);
+            let f = fit_toolbar(avail, fixed, &CHIPS, zoom, export);
             assert!(
-                !(f.counts && !f.zoom),
-                "{avail}: counts shown while zoom is hidden"
+                !(f.counts > 0 && !f.zoom),
+                "{avail}: a chip shown while zoom is hidden"
             );
             assert!(
                 !(f.zoom && !f.export),
@@ -1367,12 +1375,12 @@ mod toolbar_fit_tests {
     /// group in and out as the window is dragged.
     #[test]
     fn widening_the_toolbar_never_hides_a_group() {
-        let (fixed, counts, zoom, export) = (200.0, 150.0, 120.0, 40.0);
-        let shown = |f: ToolbarFit| f.counts as u8 + f.zoom as u8 + f.export as u8;
+        let (fixed, zoom, export) = (200.0, 120.0, 40.0);
+        let shown = |f: ToolbarFit| f.counts + f.zoom as usize + f.export as usize;
         // From 2 up, so the unmeasured arm below isn't mistaken for a step down.
         let mut last = 0;
         for avail in (2..1200).map(|n| n as f64) {
-            let n = shown(fit_toolbar(avail, fixed, counts, zoom, export));
+            let n = shown(fit_toolbar(avail, fixed, &CHIPS, zoom, export));
             assert!(n >= last, "{avail}: went from {last} groups to {n}");
             last = n;
         }
@@ -1382,10 +1390,27 @@ mod toolbar_fit_tests {
     /// bar on the frame before the first layout lands.
     #[test]
     fn an_unmeasured_toolbar_shows_everything() {
-        assert_eq!(fit_toolbar(0.0, 200.0, 150.0, 120.0, 40.0), ToolbarFit::ALL);
         assert_eq!(
-            fit_toolbar(1.0, 999.0, 999.0, 999.0, 999.0),
-            ToolbarFit::ALL
+            fit_toolbar(0.0, 200.0, &CHIPS, 120.0, 40.0),
+            ToolbarFit::all(3)
+        );
+        assert_eq!(
+            fit_toolbar(1.0, 999.0, &[999.0, 999.0], 999.0, 999.0),
+            ToolbarFit::all(2)
+        );
+    }
+
+    /// No chips at all — a diagram with nothing to count — is not a toolbar
+    /// that cannot fit them.
+    #[test]
+    fn a_toolbar_without_chips_still_drops_zoom_then_export() {
+        assert_eq!(
+            fit_toolbar(400.0, 200.0, &[], 120.0, 40.0),
+            ToolbarFit::all(0)
+        );
+        assert_eq!(
+            fit_toolbar(300.0, 200.0, &[], 120.0, 40.0),
+            fit(0, false, true)
         );
     }
 
@@ -1395,12 +1420,8 @@ mod toolbar_fit_tests {
     #[test]
     fn a_toolbar_narrower_than_its_fixed_part_drops_everything() {
         assert_eq!(
-            fit_toolbar(50.0, 200.0, 150.0, 120.0, 40.0),
-            ToolbarFit {
-                counts: false,
-                zoom: false,
-                export: false
-            }
+            fit_toolbar(50.0, 200.0, &CHIPS, 120.0, 40.0),
+            fit(0, false, false)
         );
     }
 }

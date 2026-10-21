@@ -2764,8 +2764,9 @@ struct Controls {
     export: AnyView,
 }
 
-/// The toolbar's width accounting, as the four numbers
-/// [`schemaic_core::erd::fit_toolbar`] takes: `(fixed, counts, zoom, export)`.
+/// The toolbar's width accounting, as the four values
+/// [`schemaic_core::erd::fit_toolbar`] takes: `(fixed, counts, zoom, export)`,
+/// `counts` holding each chip's cost left to right, since they go one by one.
 ///
 /// `fixed` is what the bar pays whatever it hides — the two paddings, the
 /// toolbar's own two gaps, the scope group, and, when the controls are drawn,
@@ -2780,15 +2781,24 @@ struct Controls {
 /// captures four locals and returns an `Rc<dyn Fn()>` no test can reach: this
 /// is where every way the toolbar can be wrong lives, so the sum the app draws
 /// has to be the sum a test reads.
-fn toolbar_metrics(scope: &str, labels: &[String], has_controls: bool) -> (f64, f64, f64, f64) {
-    let counts_w = match labels.is_empty() {
-        true => 0.0,
-        false => {
-            labels.iter().map(|l| chip_w(l)).sum::<f64>()
-                + theme::scaled(CHIP_GAP) * (labels.len() - 1) as f64
-                + theme::scaled(TOOLBAR_GAP)
-        }
-    };
+fn toolbar_metrics(
+    scope: &str,
+    labels: &[String],
+    has_controls: bool,
+) -> (f64, Vec<f64>, f64, f64) {
+    // The first chip takes the gap between the group and the scope with it,
+    // every later one the gap between it and the chip before.
+    let counts_w = labels
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            chip_w(l)
+                + match i {
+                    0 => theme::scaled(TOOLBAR_GAP),
+                    _ => theme::scaled(CHIP_GAP),
+                }
+        })
+        .collect();
     let scope_w = crate::widgets::measure_text_px_at(&tr!("erd-scope"), toolbar_font())
         + theme::scaled(SCOPE_GAP)
         + crate::widgets::measure_text_px_at(scope, toolbar_font());
@@ -2839,14 +2849,20 @@ fn modal_frame(
     let fit: Rc<dyn Fn() -> erd::ToolbarFit> = Rc::new(move || {
         let (fixed, counts_w, zoom_w, export_w) =
             toolbar_metrics(&scope_text, &count_labels, has_controls);
-        erd::fit_toolbar(avail.get(), fixed, counts_w, zoom_w, export_w)
+        erd::fit_toolbar(avail.get(), fixed, &counts_w, zoom_w, export_w)
     });
 
-    let count_pills = h_stack_from_iter(counts.into_iter().map(count_chip)).style({
+    // Each pill hides on its own, the rightmost first; the group goes with
+    // its last pill so its leading gap goes too.
+    let count_pills = h_stack_from_iter(counts.into_iter().enumerate().map(|(i, label)| {
+        let fit = fit.clone();
+        count_chip(label).style(move |s| s.apply_if(i >= fit().counts, |s| s.hide()))
+    }))
+    .style({
         let fit = fit.clone();
         move |s| {
             let s = s.items_center().gap(theme::scaled(CHIP_GAP));
-            s.apply_if(!fit().counts, |s| s.hide())
+            s.apply_if(fit().counts == 0, |s| s.hide())
         }
     });
     let control_row = match controls {
@@ -3603,11 +3619,11 @@ mod toolbar_width_tests {
             // that over-counts has to be able to fail this.
             let (fixed, counts, zoom, export) =
                 toolbar_metrics("employees.employees", &labels, true);
-            let got = erd::fit_toolbar(avail, fixed, counts, zoom, export);
+            let got = erd::fit_toolbar(avail, fixed, &counts, zoom, export);
             crate::theme::set_ui_scale(UiScale::Normal);
             assert_eq!(
                 got,
-                erd::ToolbarFit::ALL,
+                erd::ToolbarFit::all(labels.len()),
                 "{scale:?} at {win_w}px: the toolbar stripped itself on a window \
                  with room"
             );
@@ -3641,12 +3657,16 @@ mod toolbar_width_tests {
                 + gap,
             "the fixed width is not the sum of the parts the bar always draws"
         );
-        // Two chips, the gap between them, and the gap that separates the group
-        // from the scope.
+        // Each chip with the gap that goes when it does: the first, the gap
+        // that separates the group from the scope; the second, the one between
+        // the chips.
         assert_eq!(
             counts,
-            chip_w("5 tables") + chip_w("4 relationships") + theme::scaled(CHIP_GAP) + gap,
-            "the count group does not carry its own leading gap"
+            vec![
+                chip_w("5 tables") + gap,
+                chip_w("4 relationships") + theme::scaled(CHIP_GAP)
+            ],
+            "a chip does not carry the gap that goes with it"
         );
         assert_eq!(zoom, zoom_unit_w() + gap, "the zoom unit lost its gap");
         assert_eq!(export, icon_button_w() + gap, "Export lost its gap");
@@ -3670,7 +3690,10 @@ mod toolbar_width_tests {
             icon_button_w() * 2.0 + theme::scaled(TOOLBAR_GAP),
             "the Fit/Reset pair and its gap are the whole difference"
         );
-        assert_eq!(counts, chip_w("5 tables") + theme::scaled(TOOLBAR_GAP));
+        assert_eq!(
+            counts,
+            vec![chip_w("5 tables") + theme::scaled(TOOLBAR_GAP)]
+        );
     }
 
     /// Hiding the pills gives back the gap that went with them, not just the
@@ -3683,14 +3706,15 @@ mod toolbar_width_tests {
         let (fixed, counts, ..) = toolbar_metrics("app.orders", &labels, true);
         let (bare_fixed, bare_counts, ..) = toolbar_metrics("app.orders", &[], true);
 
-        assert_eq!(bare_counts, 0.0, "no labels should cost nothing");
+        assert!(bare_counts.is_empty(), "no labels should cost nothing");
         assert_eq!(
             bare_fixed, fixed,
             "the pills are not part of the fixed width"
         );
+        let total: f64 = counts.iter().sum();
         assert!(
-            counts > chip_w("5 tables") + chip_w("4 relationships") + theme::scaled(CHIP_GAP),
-            "dropping the group must give back its leading gap as well: {counts}"
+            total > chip_w("5 tables") + chip_w("4 relationships") + theme::scaled(CHIP_GAP),
+            "dropping the group must give back its leading gap as well: {total}"
         );
     }
 }

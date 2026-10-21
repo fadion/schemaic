@@ -10079,7 +10079,13 @@ existing prose was left alone.
     `fit_toolbar` is the diagram **toolbar's responsive rule**, and it is here rather than in the
     view because it is arithmetic over widths: given the room available and what each optional
     group costs, it drops them in a fixed priority order — the count pills, then the zoom stepper,
-    then the export button — and returns a `ToolbarFit`. The order is least-useful-first: the pills
+    then the export button — and returns a `ToolbarFit`. **The pills go one at a time, rightmost
+    first**: `chips` is each pill's cost left to right, `ToolbarFit::counts` is how many are shown
+    from the left, and the most that fit beside zoom and export are kept before zoom is touched.
+    It was a `bool` once, and the three vanishing together on one pixel of narrowing read worse to
+    the user than losing them one by one (`groups_drop_in_priority_order` walks each step; a
+    diagram with no pills still drops zoom then export —
+    `a_toolbar_without_chips_still_drops_zoom_then_export`). The order is least-useful-first: the pills
     restate what the diagram already shows, the zoom stepper duplicates Ctrl+wheel and its
     percentage is only a readout, and export is the one of the three with no other way to reach it.
     The scope breadcrumb and the Fit/Reset pair never drop — those two are the *recovery* controls,
@@ -32349,6 +32355,12 @@ existing prose was left alone.
     `width_full`, so its width does not depend on the children being hidden and there is no
     measure-hide-measure loop. The scope breadcrumb is the one variable-length item and so the one
     that ellipsizes, and it does so only after every optional group has already gone.
+    `toolbar_metrics` hands the fit one cost per pill, and **which gap each cost carries is the
+    load-bearing part**: the first pill's includes `TOOLBAR_GAP`, the group's own leading gap, and
+    each later one `CHIP_GAP`, the gap before it. That is only true because `modal_frame` hides the
+    whole pill group once `fit().counts` is 0, not just each pill (`i >= fit().counts`) — an empty
+    `h_stack` is still a flex child and would keep the leading gap the first pill's cost claimed to
+    give back. `the_toolbar_pays_for_every_gap_it_draws` writes the per-pill sum out by hand.
     A table carrying a `db_color` identity colour has its card **header** tinted with it: `header_bg`
     composites the colour over `theme::erd_node_header` at `HEADER_TINT_ALPHA` (0.22) and is called
     *inside* the header's style closure, so the themable half follows a live theme switch while the
