@@ -1396,8 +1396,9 @@ fn assistant_footer(
 
     // Left: summary (done) or the live timer (pending).
     let left: AnyView = if let Some(st) = stats.filter(|s| !s.is_empty()) {
-        // Only figures, arrows and a middle dot: the marks are all it needs.
-        text(crate::i18n::figure(&st.summary()))
+        // Figures, arrows, a middle dot and the duration's unit: core composes
+        // it, in the interface's marks, with the duration worded here.
+        text(st.summary_with(crate::i18n::number_marks(), crate::i18n::took))
             .style(style)
             .into_any()
     } else if pending {

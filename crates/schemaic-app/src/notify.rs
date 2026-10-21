@@ -24,7 +24,7 @@ use schemaic_core::history::Finished;
 
 /// The notification's title and body — `history::finished_note` in the
 /// interface's language: what ended and how, then how long it took (the
-/// duration as `history::format_duration` writes it).
+/// duration `history::took`'s, worded by `i18n::took`).
 pub(crate) fn finished_note(what: Finished, failed: bool, took_ms: u64) -> (String, String) {
     let title = match (what, failed) {
         (Finished::Query, false) => tr!("notify-query-finished"),
@@ -36,7 +36,7 @@ pub(crate) fn finished_note(what: Finished, failed: bool, took_ms: u64) -> (Stri
         (Finished::Dump, false) => tr!("notify-dump-finished"),
         (Finished::Dump, true) => tr!("notify-dump-failed"),
     };
-    let took = schemaic_ui::i18n::figure(&schemaic_core::history::format_duration(took_ms));
+    let took = schemaic_ui::i18n::took(schemaic_core::history::took(took_ms));
     (title, tr!("notify-took", duration = took))
 }
 

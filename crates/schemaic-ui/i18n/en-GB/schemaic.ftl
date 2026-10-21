@@ -198,6 +198,14 @@ notify-export-failed = Export failed
 notify-dump-finished = Dump finished
 notify-dump-failed = Dump failed
 notify-took = Took { $duration }.
+# How long a run or an AI turn took, in the unit that suits it (core's
+# history::Took; English must read exactly as its Display) — the notification's
+# $duration, the history row's and the AI panel's. $s in took-seconds arrives
+# with one decimal in the interface's marks; in took-minutes it is padded to
+# two digits.
+took-millis = { $ms }ms
+took-seconds = { $s }s
+took-minutes = { $m }m { $s }s
 settings-query-write-log = Keep values in the write log
 # write_log.jsonl and "schemaic exec" are a file name and a command: never translated.
 settings-query-write-log-hint = Every write Schemaic or schemaic exec runs is appended to write_log.jsonl in the settings folder, and never cleared. Values in its SQL are masked unless this is on; a password is masked either way.

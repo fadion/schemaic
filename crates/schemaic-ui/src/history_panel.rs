@@ -454,7 +454,7 @@ fn history_row(
     // of the line would then be a guess.
     let outcome_row: Option<floem::AnyView> = {
         // The composition is `history::outcome_line`'s, in core beside the
-        // `format_duration` it calls and under test; this only paints it.
+        // `took` it calls and under test; this only paints it.
         let failed = entry.outcome == history::Outcome::Failed;
         crate::i18n::outcome_line(&entry).map(|lead| {
             let row = h_stack((

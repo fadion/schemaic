@@ -493,13 +493,53 @@ pub fn group_by_recency(entries: Vec<HistoryEntry>, now: u64) -> Vec<(Bucket, Ve
 /// Sub-second runs keep whole milliseconds (the difference between 8 and 80 is
 /// the whole point at that scale), seconds get one decimal, and past a minute it
 /// reads as minutes and seconds — `93.4s` makes the reader do arithmetic.
-pub fn format_duration(ms: u64) -> String {
+///
+/// The English of [`took`]: the interface words that value itself, so this
+/// is the crate's own (the notification's English, the tests').
+pub(crate) fn format_duration(ms: u64) -> String {
+    took(ms).to_string()
+}
+
+/// [`format_duration`]'s rules as a value — the unit chosen and its counts —
+/// so the interface can word a duration in its own units.
+pub fn took(ms: u64) -> Took {
     if ms < 1_000 {
-        format!("{ms}ms")
+        Took::Millis(ms)
     } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
+        Took::Seconds(ms)
     } else {
-        format!("{}m {:02}s", ms / 60_000, (ms % 60_000) / 1_000)
+        Took::Minutes(ms / 60_000, (ms % 60_000) / 1_000)
+    }
+}
+
+/// How long a run took, in the unit that suits it. See [`took`], and
+/// `transcript::elapsed`, which never steps up to minutes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Took {
+    /// Under a second, in whole milliseconds.
+    Millis(u64),
+    /// Under a minute — still the milliseconds, written as seconds to one
+    /// decimal ([`Took::seconds_text`]).
+    Seconds(u64),
+    /// Minutes and the seconds past them.
+    Minutes(u64, u64),
+}
+
+impl Took {
+    /// A [`Took::Seconds`]' figure in English marks, `12.3` — the interface
+    /// remarks it rather than rounding a second time.
+    pub fn seconds_text(ms: u64) -> String {
+        format!("{:.1}", ms as f64 / 1_000.0)
+    }
+}
+
+impl std::fmt::Display for Took {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Took::Millis(ms) => write!(f, "{ms}ms"),
+            Took::Seconds(ms) => write!(f, "{}s", Took::seconds_text(ms)),
+            Took::Minutes(m, s) => write!(f, "{m}m {s:02}s"),
+        }
     }
 }
 
@@ -761,32 +801,36 @@ pub fn matches_query(entry: &HistoryEntry, query: &str) -> bool {
 /// The trailing separator belongs to the facts, so a row with none of them
 /// doesn't open with a stray `· `.
 ///
-/// In core rather than in the view builder, beside the `format_duration` it
-/// calls: it is composition decisions (which facts, whether the count is marked
+/// In core rather than in the view builder, beside the [`took`] it calls: it
+/// is composition decisions (which facts, whether the count is marked
 /// capped, where the separator goes) and each has a wrong answer that reads as a
 /// number the query never produced. The `+` that marks a capped count is the
 /// count's *wording*, so a caller of [`outcome_line_with`] supplies it.
 pub fn outcome_line(entry: &HistoryEntry) -> Option<String> {
-    outcome_line_with(entry, crate::text::NumberMarks::ENGLISH, |n, capped| {
-        // `200000+ rows` when the fetch stopped at the cap: that number is what
-        // came back, not what the query returned, and only the `+` says so once
-        // the grid is gone. Always plural there — the count means "at least this
-        // many", so it is never one.
-        if capped {
-            format!("{n}+ rows")
-        } else {
-            format!("{n} {}", crate::text::plural(n as usize, "row", "rows"))
-        }
-    })
+    outcome_line_with(
+        entry,
+        |t| t.to_string(),
+        |n, capped| {
+            // `200000+ rows` when the fetch stopped at the cap: that number is what
+            // came back, not what the query returned, and only the `+` says so once
+            // the grid is gone. Always plural there — the count means "at least this
+            // many", so it is never one.
+            if capped {
+                format!("{n}+ rows")
+            } else {
+                format!("{n} {}", crate::text::plural(n as usize, "row", "rows"))
+            }
+        },
+    )
 }
 
-/// [`outcome_line`] with the row count worded by `rows(count, capped)` — the
-/// composition (which facts, where the separator goes, nothing counted on a
-/// failure) stays here, and the interface supplies the words in its language
-/// and the `marks` the duration is written in.
+/// [`outcome_line`] with the duration worded by `took` and the row count by
+/// `rows(count, capped)` — the composition (which facts, where the separator
+/// goes, nothing counted on a failure) stays here, and the interface supplies
+/// the words, in its language and its marks.
 pub fn outcome_line_with(
     entry: &HistoryEntry,
-    marks: crate::text::NumberMarks,
+    took: impl Fn(Took) -> String,
     rows: impl Fn(u64, bool) -> String,
 ) -> Option<String> {
     if entry.outcome == Outcome::Unknown {
@@ -797,7 +841,7 @@ pub fn outcome_line_with(
     // exclusive: a run that failed produced nothing to count.
     let mut facts: Vec<String> = Vec::new();
     if let Some(ms) = entry.duration_ms {
-        facts.push(crate::text::remark(&format_duration(ms), marks));
+        facts.push(took(self::took(ms)));
     }
     if let Some(n) = entry.rows.filter(|_| !failed) {
         facts.push(rows(n, entry.rows_capped));
@@ -2023,7 +2067,7 @@ mod tests {
     #[test]
     fn outcome_line_takes_its_row_words_from_the_caller() {
         let words = |n: u64, capped: bool| format!("{n}{} Zeilen", if capped { "+" } else { "" });
-        let en = crate::text::NumberMarks::ENGLISH;
+        let en = |t: Took| t.to_string();
         assert_eq!(
             outcome_line_with(&finished(Some(100), false, true), en, words).as_deref(),
             Some("5ms · 100 Zeilen")
@@ -2039,20 +2083,20 @@ mod tests {
         );
     }
 
-    /// The duration is written in the caller's marks: `1.2s` is `1,2s` in
-    /// German, and the composition around it does not change.
+    /// The duration is the caller's to word: it is handed the run's `Took`,
+    /// and the composition around its words does not change.
     #[test]
-    fn outcome_line_writes_its_duration_in_the_caller_s_marks() {
-        let de = crate::text::NumberMarks {
-            decimal: ',',
-            group: '.',
-        };
+    fn outcome_line_takes_its_duration_words_from_the_caller() {
         let mut e = finished(Some(3), false, true);
         e.duration_ms = Some(1_234);
+        let took = |t: Took| {
+            assert_eq!(t, Took::Seconds(1_234));
+            "1,2 s".to_string()
+        };
         let words = |n: u64, _| format!("{n} Zeilen");
         assert_eq!(
-            outcome_line_with(&e, de, words).as_deref(),
-            Some("1,2s · 3 Zeilen")
+            outcome_line_with(&e, took, words).as_deref(),
+            Some("1,2 s · 3 Zeilen")
         );
     }
 

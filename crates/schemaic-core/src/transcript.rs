@@ -537,7 +537,10 @@ pub struct TurnStats {
     pub output_tokens: Option<u64>,
 }
 
-/// A duration for a turn footer: `450ms` under a second, `1.2s` above.
+/// A duration for a turn footer: `450ms` under a second, `1.2s` above — never
+/// minutes, which a run's [`crate::history::took`] steps up to and a turn does
+/// not. A value, so the interface words it in its own units; `Took`'s
+/// `Display` is the English.
 ///
 /// Shared by [`TurnStats::summary`] (the finished turn) and the AI panel's live
 /// counter (the turn in progress), which had its own copy — with a doc comment
@@ -545,11 +548,12 @@ pub struct TurnStats {
 /// promise nothing enforced. The two sit next to each other on screen, one
 /// replacing the other when the turn ends, so a drift between them would show
 /// as the number changing format at the moment it stops moving.
-pub fn elapsed_text(ms: u64) -> String {
+pub fn elapsed(ms: u64) -> crate::history::Took {
+    use crate::history::Took;
     if ms >= 1000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
+        Took::Seconds(ms)
     } else {
-        format!("{ms}ms")
+        Took::Millis(ms)
     }
 }
 
@@ -561,14 +565,26 @@ impl TurnStats {
 
     /// A compact one-line footer, e.g. `1.2s · ↑1.2k ↓340`.
     pub fn summary(&self) -> String {
+        self.summary_with(crate::text::NumberMarks::ENGLISH, |t| t.to_string())
+    }
+
+    /// [`summary`](Self::summary) with the duration worded by `took` and the
+    /// token counts written in `marks` — the composition stays here, the
+    /// interface supplies its units and its marks.
+    pub fn summary_with(
+        &self,
+        marks: crate::text::NumberMarks,
+        took: impl Fn(crate::history::Took) -> String,
+    ) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(ms) = self.duration_ms {
-            parts.push(elapsed_text(ms));
+            parts.push(took(elapsed(ms)));
         }
+        let count = |n: u64| crate::text::remark(&human_count(n), marks);
         let tok = match (self.input_tokens, self.output_tokens) {
-            (Some(i), Some(o)) => Some(format!("↑{} ↓{}", human_count(i), human_count(o))),
-            (Some(i), None) => Some(format!("↑{}", human_count(i))),
-            (None, Some(o)) => Some(format!("↓{}", human_count(o))),
+            (Some(i), Some(o)) => Some(format!("↑{} ↓{}", count(i), count(o))),
+            (Some(i), None) => Some(format!("↑{}", count(i))),
+            (None, Some(o)) => Some(format!("↓{}", count(o))),
             (None, None) => None,
         };
         if let Some(t) = tok {

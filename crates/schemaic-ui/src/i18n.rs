@@ -122,9 +122,32 @@ pub fn bytes(n: u64) -> String {
     figure(&schemaic_core::stats::format_bytes(n))
 }
 
-/// `transcript::elapsed_text` in the interface's marks: `1.2s`, German `1,2s`.
+/// An AI turn's running time — `transcript::elapsed` in the interface's units
+/// and marks: `1.2s`, German `1,2 s`.
 pub fn elapsed(ms: u64) -> String {
-    figure(&schemaic_core::transcript::elapsed_text(ms))
+    took(schemaic_core::transcript::elapsed(ms))
+}
+
+/// How long a run took — `history::Took` in the interface's units and marks:
+/// `850ms`, `12.3s`, `2m 05s`; German `850 ms`, `12,3 s`, `2 min 05 s`.
+pub fn took(t: schemaic_core::history::Took) -> String {
+    took_in(&LOADER, number_marks(), t)
+}
+
+fn took_in(
+    l: &FluentLanguageLoader,
+    marks: NumberMarks,
+    t: schemaic_core::history::Took,
+) -> String {
+    use schemaic_core::history::Took;
+    match t {
+        Took::Millis(ms) => i18n_embed_fl::fl!(l, "took-millis", ms = ms),
+        Took::Seconds(ms) => {
+            let s = text::remark(&Took::seconds_text(ms), marks);
+            i18n_embed_fl::fl!(l, "took-seconds", s = s)
+        }
+        Took::Minutes(m, s) => i18n_embed_fl::fl!(l, "took-minutes", m = m, s = format!("{s:02}")),
+    }
 }
 
 /// How long a session has been in its state — `activity::Age` in the
@@ -301,9 +324,9 @@ pub(crate) fn relative_time(ts: u64, now: u64) -> String {
 }
 
 /// A history row's outcome line — `history::outcome_line`'s composition, with
-/// the row count worded here.
+/// the duration and the row count worded here.
 pub(crate) fn outcome_line(entry: &schemaic_core::history::HistoryEntry) -> Option<String> {
-    schemaic_core::history::outcome_line_with(entry, number_marks(), |n, capped| {
+    schemaic_core::history::outcome_line_with(entry, took, |n, capped| {
         if capped {
             tr!("outcome-rows-capped", n = n)
         } else {
@@ -2694,6 +2717,38 @@ mod tests {
         assert_eq!(poll_interval_in(&de, 5), "5 s");
     }
 
+    /// **Run times read in English exactly as core's**, every unit — and in
+    /// German's units and marks, where they were core's `850ms`, `1,2s` and
+    /// `2m 05s`. The AI footer composes around the same words, so its live
+    /// counter and its finished line cannot drift apart.
+    #[test]
+    fn run_times_read_in_the_interfaces_units_and_marks() {
+        use schemaic_core::history::{Took, took as took_of};
+        use schemaic_core::transcript::TurnStats;
+        for ms in [0, 850, 1_000, 1_240, 59_900, 60_000, 3_723_000] {
+            let t = took_of(ms);
+            assert_eq!(took(t), t.to_string(), "{t:?}");
+        }
+        assert_eq!(elapsed(850), "850ms");
+        assert_eq!(elapsed(75_300), "75.3s", "a turn never steps up to minutes");
+        let st = TurnStats {
+            duration_ms: Some(1_240),
+            input_tokens: Some(1_234),
+            output_tokens: Some(340),
+        };
+        assert_eq!(st.summary_with(number_marks(), took), st.summary());
+
+        let de = loader(UiLanguage::De);
+        let marks = UiLanguage::De.number_marks();
+        assert_eq!(took_in(&de, marks, Took::Millis(850)), "850 ms");
+        assert_eq!(took_in(&de, marks, Took::Seconds(1_240)), "1,2 s");
+        assert_eq!(took_in(&de, marks, Took::Minutes(2, 5)), "2 min 05 s");
+        assert_eq!(
+            st.summary_with(marks, |t| took_in(&de, marks, t)),
+            "1,2 s  ·  ↑1,2k ↓340"
+        );
+    }
+
     /// **A typed message reads in English exactly as core's own rendering**
     /// (phase 4). The names list is joined here (`:a, :b`), as core's
     /// `Display` joins it, and handed in whole.
@@ -3043,27 +3098,15 @@ mod tests {
         }
     }
 
-    /// **No view shows a figure core printed in English unmarked.** Core's
-    /// printers write English's marks for the CLI, MCP and the clipboard; a
-    /// view calling one directly showed `1.5 KiB` to a German reader. So
-    /// outside this file every call to one in the two view crates sits on a
-    /// line that hands it to [`figure`], is given [`number_marks`] or is
-    /// `text::remark`ed in marks a caller passed — or goes
-    /// through [`count`], [`bytes`], [`elapsed`] and [`contrasting_bytes`],
-    /// which do. A `figure(` ending the line above counts, as `cargo fmt`
-    /// splits one there; a call split further, or a printer imported under
-    /// another name, is not seen.
     /// The figure gate's matcher over one file: how many core printer calls it
     /// saw, and the ones shown without the interface's marks.
     fn unmarked_printer_calls(name: &str, code: &str) -> (usize, Vec<String>) {
-        const PRINTERS: [&str; 7] = [
+        const PRINTERS: [&str; 5] = [
             "human_count",
             "format_bytes",
             "human_bytes",
             "contrasting_bytes",
             "group_digits",
-            "format_duration",
-            "elapsed_text",
         ];
         // `::name` as a whole path segment — called, or passed as a function
         // (`.map(stats::format_bytes)`), which is how one was missed.
@@ -3128,6 +3171,19 @@ mod tests {
         );
     }
 
+    /// **No view shows a figure core printed in English unmarked.** Core's
+    /// printers write English's marks for the CLI, MCP and the clipboard; a
+    /// view calling one directly showed `1.5 KiB` to a German reader. So
+    /// outside this file every call to one in the two view crates sits on a
+    /// line that hands it to [`figure`], is given [`number_marks`] or is
+    /// `text::remark`ed in marks a caller passed — or goes
+    /// through [`count`], [`bytes`] and [`contrasting_bytes`], which do. A
+    /// `figure(` ending the line above counts, as `cargo fmt` splits one
+    /// there; a call split further, or a printer imported under another name,
+    /// is not seen. Durations are not on the list: their units are words as
+    /// well as marks, so core's English printer (`history::format_duration`)
+    /// is private to it, and a view words a `Took` through [`took`] or
+    /// [`elapsed`].
     #[test]
     fn every_core_figure_a_view_shows_takes_the_interface_s_marks() {
         let files = crate::source_gate::crate_sources();

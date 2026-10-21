@@ -11602,10 +11602,17 @@ existing prose was left alone.
     `failed` own the rows-vs-`affected` choice and the `rows_capped` rule, and `outcome_line` the
     facts line's composition, so both are in core rather than in a view builder: a wrong
     `rows_capped` writes a number into a log read long after the grid it came from. That
-    composition is `outcome_line_with(entry, marks, rows)` — which facts, the separators, nothing
+    composition is `outcome_line_with(entry, took, rows)` — which facts, the separators, nothing
     counted on a failure — with the row count worded by the caller's `rows(count, capped)` and the
-    duration written in the caller's `marks` (`outcome_line_writes_its_duration_in_the_caller_s_marks`);
-    `outcome_line` is it with English words and marks (`outcome_line_takes_its_row_words_from_the_caller`). `preview`
+    duration by the caller's `took(Took)` (`outcome_line_takes_its_duration_words_from_the_caller`);
+    `outcome_line` is it with English words and marks (`outcome_line_takes_its_row_words_from_the_caller`).
+    **A duration is a value, `took(ms) -> Took`** — `Millis` under a second, `Seconds` (still the
+    milliseconds, written to one decimal by `Took::seconds_text`) under a minute, `Minutes(m, s)`
+    past one — and `Took`'s `Display` is the English, `48ms`, `1.2s`, `2m 05s`. It is a value
+    rather than a string because units are words as well as marks: German writes `12,3 s` and
+    `2 min 05 s`, where remarking core's string gave the interface `1,2s` and `2m 05s`. So
+    `format_duration`, which is `took(ms).to_string()`, is `pub(crate)` — core's own English, for
+    `finished_note` and the tests — and no view can reach it to show unremarked. `preview`
     clamps at `PREVIEW_MAX` while `matches_query` searches the unclamped text, through
     `text_ops::contains_collapsed_ignore_ascii_case` so the collapse the panel draws happens during
     the comparison rather than into a `String` first — `max_height` and
@@ -11656,7 +11663,7 @@ existing prose was left alone.
     follow it — *Query finished* / *Script failed* and so on over `Took 12.3s.` through
     `format_duration` (`a_finished_note_names_what_ended_and_how_long_it_took`) — the English;
     what the notification shows is the app's `notify::finished_note`, which words the same
-    arguments from the catalogue. **It never
+    arguments from the catalogue, its duration through `i18n::took`. **It never
     carries the statement**, for this module's credential reason one step further out: a
     notification outlives the run in the system's notification history, readable by anyone at the
     machine, and the SQL may carry the very values it wrote. `Finished` is four kinds — `Query`
@@ -15421,6 +15428,14 @@ existing prose was left alone.
       `TurnNotes`/`TurnStats`), kept here rather than in `schemaic-ai` so the UI crate needn't depend
       on the CLI-integration crate. `ChatMessage::prose` is what conversation replay uses, and copy
       takes it with the turn's notes around it.
+      **`elapsed(ms)` is the one turn duration**, a `history::Took` that is `Millis` under a second
+      and `Seconds` above and never steps up to `Minutes` as a run's does — shared by
+      `TurnStats::summary` (the finished turn's footer) and the AI panel's live counter, which had
+      its own copy with a comment promising it formatted "like `TurnStats::summary`'s time part" and
+      nothing holding it to that; the two sit in the same place, one replacing the other as the turn
+      ends, so a drift would show as the number changing format the moment it stops moving.
+      `summary_with(marks, took)` is the composition with the duration worded by the caller and the
+      token counts written in `marks`; `summary()` is it with English marks and `Took`'s `Display`.
       **Schemaic's own words in a turn are `TurnNotes`, never a `Seg::Text`** — a `lead` drawn above
       the segments (the no-database-tools note) and a `tail` below them (a spawn refusal, a launch
       that failed, a turn that ended badly, a session refused before it started, the app's
@@ -25875,7 +25890,11 @@ existing prose was left alone.
     `Aus`), `session_age` padding the second figure to two digits as core does so a column of
     ages lines up. Each has a private `_in(&FluentLanguageLoader, …)` sibling so
     `ages_and_poll_intervals_read_in_the_interfaces_units` can ask German as well as hold the
-    English equal to core's `Display`.
+    English equal to core's `Display`. Run times are the same shape: `took` words `history::Took`
+    from `took-*` (`850 ms`, `12,3 s`, `2 min 05 s`) for a history row's outcome line and the
+    desktop notification, and `elapsed(ms)` is `took(transcript::elapsed(ms))` for the AI panel's
+    live counter — with `took_in` the sibling, and
+    `run_times_read_in_the_interfaces_units_and_marks` the test.
     **`configure` loads a catalogue and *then* calls `set_use_isolating(false)`, and the order is
     load-bearing**: a load swaps in fresh bundles and the flag is a setting of the bundles, so set
     first it is silently undone. Fluent wraps every placeable in U+2068/U+2069 by default, so a
@@ -30450,6 +30469,10 @@ existing prose was left alone.
     is not the panel's to translate: the agents' product names and `harness::speaker_label`'s, every
     prompt sent to the agent. The off note is `lib.rs`'s `ai_off_note()` (`lib-ai-off-note`), once
     the `AI_OFF_NOTE` const, translated there for the panel and the app's AI refusals alike.
+    The turn's figures are worded too: the finished footer is
+    `TurnStats::summary_with(i18n::number_marks(), i18n::took)` and the live counter
+    `i18n::elapsed`, both through `took-*`, so German reads `1,2 s` in each rather than the `1,2s`
+    a remarked English summary gave.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, the date picker's calendar (`date_pick_overlay`, whose panel is
     `cell_editors::calendar_panel` — up here because the field it drops from sits inside a scrolling
@@ -37062,7 +37085,8 @@ existing prose was left alone.
     `history::wants_attention` has said yes and only with *Notify when a run finishes in the
     background* on. The words are `finished_note`'s: `history::finished_note`'s arguments worded
     from `notify-{query,script,export,dump}-{finished,failed}` and `notify-took`, whose `$duration`
-    is core's `format_duration` through `i18n::figure`, in the interface's marks, and
+    is `i18n::took(history::took(ms))`, in the interface's units and marks (German `12,3 s`,
+    where remarking core's `format_duration` had given `12,3s`), and
     `english_says_every_finished_run_as_core_does` holds the English equal to core's for every kind,
     outcome and width of duration. Through `notify-rust` 4.18 — a
     WinRT toast on Windows (`tauri-winrt-notification`, over the `windows` 0.62 already in the
@@ -41794,16 +41818,24 @@ Re-introducing the anti-patterns these guard against is a regression:
     through whole (`remark_leaves_punctuation_that_is_not_between_digits`). A prose sentence
     should not — its words are the catalogue's, with the figure an argument.
     **The view's side is `ui::i18n`**: `number_marks()` (English's until `init`, and in every
-    test), `figure(&str)` over `remark`, and `count(n)`, `bytes(n)`, `elapsed(ms)` and
-    `contrasting_bytes(a, b)` — `human_count`, `stats::format_bytes`, `transcript::elapsed_text`
-    and `format::contrasting_bytes` through it. **A figure
+    test), `figure(&str)` over `remark`, and `count(n)`, `bytes(n)` and
+    `contrasting_bytes(a, b)` — `human_count`, `stats::format_bytes` and
+    `format::contrasting_bytes` through it. **A duration is not a figure to remark**, because its
+    units are words: `i18n::took(Took)` words `history::Took` from `took-millis`/`took-seconds`/
+    `took-minutes` — `850 ms`, `12,3 s`, `2 min 05 s` in German, where remarking core's string had
+    shown `1,2s` and `2m 05s` — with the seconds' `$s` arriving remarked and the minutes' zero-padded,
+    and `i18n::elapsed(ms)` is `took(transcript::elapsed(ms))`
+    (`run_times_read_in_the_interfaces_units_and_marks`, which holds English to `Took`'s `Display`
+    for every unit). **A figure
     handed to `tr!` goes as a pre-formatted string while the raw number selects the plural**, the
     catalogue's existing `$n`/`$rows` split. A plain integer `{ $n }` in a message stays ungrouped,
     as core's English has it — an ungrouped integer is valid German too.
     **Where core composes the figure itself, it takes the marks** rather than having its output
     re-marked: `model::goto_row_index(input, total, marks)` and `goto_target(…, marks)` (the go-to
     box, which has to read back what the stats line prints — under `text.rs` and *Data grid*),
-    `history::outcome_line_with(entry, marks, rows)` for the duration, `chart_draw::layout(…,
+    `transcript::TurnStats::summary_with(marks, took)` for the AI footer's token counts (its
+    duration worded by `took`, as `history::outcome_line_with(entry, took, rows)` words a history
+    row's), `chart_draw::layout(…,
     figures, measure)` for the tick labels and a histogram's bin edges under the axis — never a
     series' labels, which are the label column's data (`only_a_histogram_s_edges_take_the_marks`)
     — and `format::apply(fmt, v, marks)`, *Grouped* and *Bytes* being how a value is shown. The
@@ -41816,10 +41848,13 @@ Re-introducing the anti-patterns these guard against is a regression:
     (`an_attachment_writes_its_figures_in_english_whatever_the_grid_shows`).
     **The gate is `every_core_figure_a_view_shows_takes_the_interface_s_marks`** (`i18n.rs`): in
     both view crates' production code outside `i18n.rs`, a `::human_count`, `format_bytes`,
-    `human_bytes`, `contrasting_bytes`, `group_digits`, `format_duration` or `elapsed_text` path
+    `human_bytes`, `contrasting_bytes` or `group_digits` path
     segment — called, or passed as a function — must share its line with `figure(`,
     `number_marks()` or `remark(` (marks a caller passed in, as the Properties index line's
     `index_fact_in` takes them) unless it is `i18n::`'s, and none may be imported by a `use schemaic_core…`.
+    Durations left the list (`format_duration`, and `elapsed_text`, now deleted) when they stopped
+    being a marks question: a remarked one is still in English's units, and core's printer is
+    `pub(crate)`, so the compiler refuses a view the call the gate would have looked for.
     It first missed `.map(stats::format_bytes)`, a printer passed rather than called, and was seen
     red on it once it matched whole path segments. A `figure(` ending the line above also counts,
     as `cargo fmt` splits one there (it did, on the AI panel's timer, which now calls
@@ -41870,7 +41905,8 @@ Re-introducing the anti-patterns these guard against is a regression:
     back an `Ago` that `i18n::relative_time` says from `ago-*` (the history and snippet rows, the
     palette's history rows, a result chip's tooltip), and `history::outcome_line_with` keeps which
     facts and where the separators go while `i18n::outcome_line` supplies `outcome-rows`/
-    `outcome-rows-capped` — `english_says_ago_and_rows_as_core_does` holding both to core's English,
+    `outcome-rows-capped` and words the duration through `i18n::took` —
+    `english_says_ago_and_rows_as_core_does` holding both to core's English,
     the outcome half by comparing `i18n::outcome_line` with `history::outcome_line` over 0, 1, 100
     and capped rows, a failure, no duration and an unknown outcome. It once compared the messages
     with a copy of core's row words written in the test, which stayed green while core changed.
