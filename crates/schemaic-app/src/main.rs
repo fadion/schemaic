@@ -2958,14 +2958,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // the UI thread. The effect re-warms when the setting changes, for the same
     // reason — and now on the **harness** too, which is a second key into the
     // same cache and a second way to warm an entry nobody reads.
-    create_effect(move |_| {
+    //
+    // **Once per key, not once per run.** A Floem `set` notifies even when the
+    // value is unchanged, and the harness-switch effect below writes
+    // `ai_cli_path` back on its first run — so this effect ran twice at every
+    // launch, both before the first probe had filled the cache, and started two
+    // `claude --help`s. It returns the key it warmed and skips a run that would
+    // warm the same one again.
+    create_effect(move |warmed: Option<Option<(Harness, String)>>| {
         let h = ai_harness.get();
         let path = ai_cli_path.get();
         // **Not while the assistant is off.** This runs at every launch, and the
         // probe spawns the CLI: off has to mean no agent process at all, not
         // only no question sent. Tracked, so turning it on warms the cache then.
         if !ai_enabled.get() {
-            return;
+            return None;
+        }
+        let key = (h, harness_bin(h, &path));
+        if warmed.flatten().as_ref() == Some(&key) {
+            return Some(key);
         }
         // **The settings notice reads the cache and never fills it**, so this
         // has to tell it when an answer lands, or a harness switch leaves the
@@ -2976,13 +2987,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let bump = create_ext_action(Scope::current(), move |()| {
             ai_probe_gen.update(|n| *n += 1);
         });
-        agent_cli::warm_probe_cache(h, harness_bin(h, &path), move || bump(()));
+        agent_cli::warm_probe_cache(h, key.1.clone(), move || bump(()));
         // **One key now covers every AI entry point.** The one-shot generators
         // used to run Claude whatever was selected, so they read a second key —
         // `(Claude, <claude bin>)` — that this effect did not fill, and each
         // Ctrl+K paid a blocking, timeout-free `claude --help` on the Floem UI
         // thread. They build their own harness's argv now (`ai::inline_plan`),
         // which is the same key as the line above.
+        Some(key)
     });
     // Antigravity is the one harness Schemaic configures by writing into the
     // *user's* files, so a session that never ran its cleanup leaves an MCP

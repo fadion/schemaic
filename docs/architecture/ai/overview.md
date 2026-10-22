@@ -279,7 +279,11 @@ used — and the effect reads the **harness** signal as well, since that is the 
 key and a second way to warm an entry nobody reads. **It returns early while the assistant is
 off**, because the probe *is* a spawn of the CLI and runs at every launch: off has to mean no agent
 process at all, not only no question sent. It reads `ai_enabled` tracked, so turning the assistant
-on is what warms the cache.
+on is what warms the cache. **It warms once per key, not once per run**: it returns the
+`(Harness, resolved bin)` it warmed and skips a run that would warm the same one. A Floem `set`
+notifies even for an unchanged value, and the harness-switch effect writes `ai_cli_path` back on
+its first run, so this effect ran twice at every launch, both times before the first probe had
+filled the cache, and started two `claude --help`s (*Floem 0.2 gotchas*).
 **One key now covers every AI entry point, and it took two goes to get there.** Ctrl+K, AI Fill and
 AI Seed used to probe `(Claude, <claude bin>)` whatever was selected, which is a different key from
 `(selected harness, its bin)` whenever the selection is not Claude — so with Codex, Antigravity or

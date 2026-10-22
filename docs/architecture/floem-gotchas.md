@@ -551,6 +551,13 @@
   selection and a different signal entirely, and admits a write only when that line or the one above
   it carries `active.get_untracked() !=` (rustfmt puts the `if` there). It also asserts it still
   finds at least two guarded writes, so a rename cannot make it pass by seeing nothing.
+  **An effect that starts a process pays for a same-value write in processes.** `main.rs`'s
+  `warm_probe_cache` effect reads `ai_cli_path`, and the harness-switch effect writes it back on its
+  own first run, so at every launch it ran twice — both before the first probe had filled the cache
+  — and spawned two `claude --help`s. The guard there is the effect's own return value rather than
+  a check at the writer: it returns the `(Harness, resolved bin)` key it warmed and skips a run whose
+  key matches, because what must not repeat is the spawn, whoever writes. No test reaches it — the
+  effect is a closure in `main.rs`.
   **A `dyn_container` key re-runs on notification, not on change**, which is the same fact where it
   costs most. The view has no equality check of its own — `create_updater` calls `on_change` on every
   re-run and `swap_val` then disposes the child scope and rebuilds it unconditionally — so a key
