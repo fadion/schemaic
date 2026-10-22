@@ -204,7 +204,7 @@ a generic one.
 ## Scope decisions
 
 Carried across rounds unless the user changes them: `THIRD-PARTY-NOTICES.md`, CI workflow files,
-the `release` skill, packaging (TODO.md owns that track), `build.rs`, and
+the `release` skill, packaging, `build.rs`, and
 `crates/schemaic-core/examples/result_footprint.rs` (a throwaway measurement harness) are out of
 scope. Round-specific additions go in `plan.md`.
 
