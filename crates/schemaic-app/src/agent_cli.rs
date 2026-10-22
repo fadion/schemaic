@@ -245,9 +245,29 @@ impl Launch {
     /// follow.
     pub(crate) fn std_command(&self) -> std::process::Command {
         let mut c = std::process::Command::new(&self.program);
+        hide_console_window(&mut c);
         c.args(&self.prefix);
         c
     }
+}
+
+/// Start `c` without a console window of its own.
+///
+/// Schemaic is a `windows`-subsystem binary with no console to share, so every
+/// agent CLI it starts — all console programs — would otherwise get a fresh
+/// window: the startup probe's `--help` flashed one on every launch. The child
+/// still gets a console, only an invisible one, which is what its own children
+/// (`reg.exe`, `node`) then inherit. A no-op elsewhere; a tokio `Command` passes
+/// `as_std_mut()`.
+pub(crate) fn hide_console_window(c: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = c;
 }
 
 /// Resolve `bin` into what is actually started.
@@ -764,6 +784,34 @@ mod tests {
             help_command(Harness::Claude, "zz-bin").get_program(),
             std::ffi::OsStr::new("zz-bin")
         );
+    }
+
+    /// **Every agent spawn hides its console.** Schemaic is a `windows`-subsystem
+    /// binary, so a console program it starts gets a console window of its own
+    /// unless the spawn says otherwise — and the startup probe's
+    /// `claude --help` flashed one on every launch. Counted per file, in the
+    /// idiom of `ai.rs`'s spawn checks: a new spawn without the call shows up as
+    /// an imbalance. `std_command` is where this file's spawns get it.
+    #[test]
+    fn every_agent_spawn_hides_its_console_window() {
+        for file in ["ai.rs", "antigravity.rs", "agent_cli.rs"] {
+            let src = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join(file),
+            )
+            .expect("the crate's own source");
+            let body = schemaic_ui::source_gate::production_code(&src);
+            // Split so this assertion is not itself a match.
+            let hides = format!("hide_console{}(", "_window");
+            let defines = format!("fn {hides}");
+            assert_eq!(
+                body.matches("Command::new(").count(),
+                body.matches(&hides).count() - body.matches(&defines).count(),
+                "{file}: a `Command` spawns without `hide_console_window`, so \
+                 it flashes a console window on Windows"
+            );
+        }
     }
 
     #[test]

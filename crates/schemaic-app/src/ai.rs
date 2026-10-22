@@ -1140,6 +1140,7 @@ fn inline_reply_path() -> Option<PathBuf> {
 /// Run one inline generation to completion and hand back the reply text.
 pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
     let mut cmd = Command::new(&plan.bin);
+    crate::agent_cli::hide_console_window(cmd.as_std_mut());
     cmd.args(&plan.args)
         // **Null unless the prompt travels on it.** A CLI that waits on a stdin
         // nobody will write costs seconds, which is why this was unconditional;
@@ -2017,6 +2018,7 @@ pub(crate) fn start_ai_session(
                     continue;
                 }
                 let mut cmd = Command::new(&launch.program);
+                crate::agent_cli::hide_console_window(cmd.as_std_mut());
                 cmd.args(&args);
                 // **Clear before set.** A child inherits our environment, so
                 // `OPENCODE_CONFIG` exported in the user's shell merges their
@@ -2352,6 +2354,7 @@ pub(crate) fn start_ai_session(
         };
         let spawn_child = |args: Vec<String>| {
             let mut cmd = Command::new(&bin);
+            crate::agent_cli::hide_console_window(cmd.as_std_mut());
             cmd.args(args);
             cmd.current_dir(&cwd);
             cmd.stdin(Stdio::piped())

@@ -470,8 +470,9 @@ fn release(mine: Option<Claim>) {
 /// no database tools, which the panel already reports through the tool call that
 /// then fails. Failing the whole session over a config write would be worse.
 fn agy_mcp(bin: &str, args: &[&str]) -> bool {
-    std::process::Command::new(bin)
-        .arg("mcp")
+    let mut c = std::process::Command::new(bin);
+    crate::agent_cli::hide_console_window(&mut c);
+    c.arg("mcp")
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

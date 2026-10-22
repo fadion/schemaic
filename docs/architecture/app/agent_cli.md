@@ -63,6 +63,19 @@ the one-shot, `cursor::approve` and `help_command` all go through it — the las
 the `.cmd` would answer for the chain rather than for the node the session will start. **The
 persistent branch does not**: it spawns `bin` directly, which is right only because `launch`
 answers `direct` for Claude and Antigravity, the two harnesses that reach it.
+**Every agent spawn hides its console, through `hide_console_window`.** The release build is a
+`windows_subsystem = "windows"` binary with no console to share, so each console program it starts
+gets a window of its own unless the spawn sets `CREATE_NO_WINDOW` — and none of the agent spawns
+did, so the startup probe's `claude --help` flashed a console window on every launch, as every AI
+turn, inline generation, Cursor `mcp enable` and `agy mcp` call would have. `Launch::std_command`
+calls it, which covers `probe` and `cursor::approve`; the three tokio spawns in `ai.rs` (the
+one-shot, the per-turn loop, the persistent branch) pass `cmd.as_std_mut()`; and
+`antigravity::agy_mcp` calls it on its own `Command`. The child still gets a console, only an
+invisible one, which is what its own children (`reg.exe`, `node`) inherit. The other crates' spawns
+— `db::entra`, `db::cloud_iam`, `conn_sources`, `term::shell`, `main.rs`'s `open_url` — already set
+the flag inline. `every_agent_spawn_hides_its_console_window` counts `Command::new(` against the
+call in `ai.rs`, `antigravity.rs` and this file, so a new spawn without it shows up as an
+imbalance; it is a count, so it cannot tell *which* spawn lacks the call, only that one does.
 `harness_bin(h, override)` and `harness_reachable(h, path)` are the former
 `claude_bin`/`claude_reachable` with the harness passed in rather than assumed — the first
 resolves what to spawn, the second answers the settings modal's "is this reachable".
