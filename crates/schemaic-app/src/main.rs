@@ -15434,6 +15434,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // observable, though — `WindowHandle::destroy` fires `WindowClosed` before it
     // disposes the scope — which is enough to make the debounced save's 600 ms
     // window stop mattering. See `flush_session`.
+    //
+    // **Then the process ends, on macOS too.** Floem exits the event loop once
+    // the last window is gone everywhere *except* macOS, where nothing does: the
+    // window went, the process stayed in the menu bar, and *Restart to update*
+    // — which waits for this process to exit before applying — waited until the
+    // user found *Quit*. The app is single-window, so there is nothing to reopen
+    // from the Dock. `quit_app` comes after the flushes, which are synchronous,
+    // so it cuts nothing short; elsewhere the loop is already exiting and the
+    // extra request is harmless.
     {
         use floem::views::Decorators;
         schemaic_ui::workspace(ui, window).on_event_cont(
@@ -15442,6 +15451,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 flush_session();
                 flush_filter();
                 flush_closed();
+                floem::quit_app();
             },
         )
     }

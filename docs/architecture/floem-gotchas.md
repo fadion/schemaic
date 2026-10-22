@@ -75,6 +75,11 @@
   the guard, `conn::secrets`'s `zbus_is_not_on_its_tokio_backend`, reads `Cargo.lock` rather than a
   manifest (the keyring there is the other zbus user — see `schemaic-conn` — and `app::notify`'s
   `notify-rust` a third, on zbus 5 beside the other two's zbus 4).
+- **Floem does not exit on macOS when the last window closes.** `AppHandle::close_window` calls
+  `event_loop.exit()` on an empty window list under `#[cfg(not(target_os = "macos"))]` only, so on
+  a Mac the process outlived its one window and *Restart to update* waited on it. The app's
+  `WindowClosed` listener calls `floem::quit_app()` after its flushes (*app/main.rs*); don't drop
+  it as redundant because the platform you test on exits without it.
 - **One `on_scroll` per scroll** — setting it twice clobbers. `autohide` sets its own; a scroll
   needing custom `on_scroll` must inline `autohide_state()` (results grid + AI convo).
   `autohide_tracking` is `autohide` plus publishing the visible rect into a signal, from the same

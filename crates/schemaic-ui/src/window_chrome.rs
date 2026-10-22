@@ -200,8 +200,9 @@ impl WindowChrome {
         // `WindowHandle::destroy`, and that is what fires `WindowClosed` — which
         // is the event the app hangs `flush_session` off, the one write that
         // saves open tabs on the way out. `quit_app` exits the event loop
-        // straight away and would drop the session. Floem exits on its own once
-        // the last window is gone.
+        // straight away and would drop the session. The app's `WindowClosed`
+        // listener calls `quit_app` itself once the flushes have run, because
+        // on macOS Floem does not exit when the last window goes.
         let close = control_button(
             icons::icon(icons::WINDOW_CLOSE, GLYPH).into_any(),
             theme::caption_close_hover,

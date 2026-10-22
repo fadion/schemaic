@@ -47,7 +47,11 @@ until the window actually goes.
 skip the `WindowClosed` handler `flush_session` hangs off and lose up to one debounce interval of
 unsaved tab text — the same reasoning the caption bar's close button carries in
 `ui::window_chrome`. Closing the window runs the normal shutdown, and the updater we just handed
-off to is already sitting there waiting for this process to go away.
+off to is already sitting there waiting for this process to go away. **That shutdown ends in the
+`WindowClosed` listener's own `floem::quit_app()`, not in Floem**, which exits once the last
+window is gone everywhere but macOS: there the window went, the process stayed in the menu bar,
+and *Restart to update* waited for an exit only the menu bar's *Quit* produced (*app/main.rs*,
+the `WindowClosed` flush).
 **`FORCE_UPDATE_BADGE` is a development switch and shipping it `true` is a real hazard**, which
 is why a test now holds it down. It pins the state at `UpdateState::Ready` and skips the real
 check — the only way to look at the "Restart to update" chip while working on it, since every

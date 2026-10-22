@@ -14,7 +14,9 @@ starting an OS move loop on press can eat the second press before `DoubleClick` 
 close calls `close_window`, **not `quit_app`**, because only the former runs
 `WindowHandle::destroy` → `WindowClosed` → `flush_session`, the write that saves open tabs — the
 same reason the auto-updater hands over with `close_window` rather than Velopack's
-`apply_updates_and_restart` (`app/update.rs`).
+`apply_updates_and_restart` (`app/update.rs`). `quit_app` still ends the process, but from the
+app's `WindowClosed` listener, after the flushes: on macOS Floem does not exit once the last
+window is gone (*Floem 0.2 gotchas*), so a close that relied on it left the process running.
 The eight zones are spread into the stack that wraps the app root as **loose siblings** —
 never under a full-window parent, which would swallow every press in the app (see *Floem 0.2
 gotchas*, "a full-window sibling ends the pointer walk"); they wrap the root rather than
