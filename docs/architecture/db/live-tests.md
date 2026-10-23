@@ -700,6 +700,14 @@ the lift then `SELECT purge_all()`, the multi-statement query MariaDB's lift rea
 `a_read_only_pinned_session_cannot_be_lifted_across_a_commit` (the lift inside one `ensure_tx`
 transaction, a commit, then a `DELETE` in the next). The pinned case leaves whether the lift itself
 is refused to the server; each asserts the three rows are still there.
+`a_read_only_session_reads_the_catalog_before_a_users_functions` is PostgreSQL's alone, and asks
+which function a bare name reaches rather than whether a write lands: it creates a
+`public.version()` answering `'shadowed'`, gives the connection the init SQL `SET search_path TO
+public, pg_catalog`, and has plain `fetch_query` return `'shadowed'` — the premise, so a fixture
+that fails to shadow fails here — before `fetch_query_enforced` with `Enforce::ReadOnly` must
+return the builtin's `PostgreSQL …`. It was red on PostgreSQL 16 before
+`pg::READ_ONLY_SESSION_SQL` put `pg_catalog` first, by its author's report; the other three paths
+that run that setup have no case of their own.
 `a_read_only_plan_refuses_a_write_its_planner_makes` is the plain `EXPLAIN`'s case, for the
 editor's Plan and the MCP server's `explain` at once, and its statement is the planner's rather
 than the executor's: an `IMMUTABLE` plpgsql function that `PERFORM`s `purge_all()` on

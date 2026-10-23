@@ -454,6 +454,22 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
         .map_err(|_| DbError::ConnectFailed(crate::ConnectFailure::TimedOut))?
 }
 
+/// What a read-only PostgreSQL session is set up with: the read-only
+/// default, and **`pg_catalog` first on the search path** (security review
+/// S24).
+///
+/// The read-only gates allowlist builtin functions by their bare names
+/// (`sql::read_only_refusal`), which is an answer about the builtin only
+/// while `pg_catalog` is searched first — PostgreSQL's default, unless a path
+/// names it after a schema of the user's. Init SQL may set one, and so may a
+/// role's default on the server, so `search_path TO public, pg_catalog` let a
+/// `public.version()` stand in for the builtin on a read-only connection.
+/// Putting `pg_catalog` in front changes nothing for any other path: it is
+/// where PostgreSQL searches it anyway when the path leaves it out.
+pub(crate) const READ_ONLY_SESSION_SQL: &str = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY; \
+     SELECT set_config('search_path', CASE WHEN current_setting('search_path') = '' \
+     THEN 'pg_catalog' ELSE 'pg_catalog, ' || current_setting('search_path') END, false)";
+
 /// Connect (to `database`, or the maintenance db if unscoped) and run one
 /// statement.
 pub(crate) async fn fetch_query(
@@ -479,7 +495,7 @@ pub(crate) async fn fetch_query(
     // transaction has taken its snapshot, which a `SELECT` has.
     if enforce == Some(crate::Enforce::ReadOnly) {
         client
-            .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            .batch_execute(READ_ONLY_SESSION_SQL)
             .await
             .map_err(|e| read_only_setup_failed(&e))?;
     }
@@ -517,7 +533,7 @@ pub(crate) async fn run_batch(
     // issues — is then a read-only one.
     let client = match client {
         Ok(c) if enforce == Some(crate::Enforce::ReadOnly) => c
-            .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            .batch_execute(READ_ONLY_SESSION_SQL)
             .await
             .map(|_| c)
             .map_err(|e| db_err(&e)),
@@ -777,6 +793,14 @@ pub(crate) async fn explain(
         None => connect_maintenance(db).await?,
     };
     // `BEGIN` isn't a preparable statement, so it goes through `batch_execute`.
+    // A read-only measurement reads `pg_catalog` first, as every read-only
+    // session does (`READ_ONLY_SESSION_SQL`).
+    if read_only {
+        client
+            .batch_execute(READ_ONLY_SESSION_SQL)
+            .await
+            .map_err(|e| read_only_setup_failed(&e))?;
+    }
     client
         .batch_execute(if read_only {
             "BEGIN READ ONLY"

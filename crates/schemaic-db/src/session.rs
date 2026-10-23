@@ -262,7 +262,7 @@ impl Session {
                 // every connection's startup packet.
                 if enforce == Some(crate::Enforce::ReadOnly) {
                     client
-                        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                        .batch_execute(pg::READ_ONLY_SESSION_SQL)
                         .await
                         // The server's words about Schemaic's `SET`, not about
                         // anything the user wrote: `Connect`, so no *AI fix*.

@@ -1033,7 +1033,21 @@ that reads text sees a view's body or a trigger. So the session refuses writes �
 ONLY` on PostgreSQL, `SET SESSION TRANSACTION READ ONLY` on MySQL/MariaDB, `PRAGMA query_only = ON`
 on SQLite. On PostgreSQL it is the session default rather than a `BEGIN READ ONLY`, so the
 statement's own implicit transaction is the read-only one and there is no transaction of ours for
-it to sit inside. None of the three can be lifted by the statement it guards: PostgreSQL refuses
+it to sit inside. **And on PostgreSQL the same setup puts `pg_catalog` first on the search path**
+— both are `pg::READ_ONLY_SESSION_SQL`, the one string every read-only PostgreSQL session is made
+with: `fetch_query`'s enforced path, `run_batch`'s setup, `Session::open_enforced` and the
+read-only `EXPLAIN ANALYZE` ahead of its `BEGIN READ ONLY` (security review S24). The read-only
+gates allowlist builtin functions by bare name, and a bare name is the builtin only while
+`pg_catalog` is searched first. That is PostgreSQL's default, but a path may name it after a
+schema of the user's — init SQL may set `search_path`, and so may a role's default on the server
+— and under `search_path TO public, pg_catalog` a `public.version()` stood in for the builtin on
+a read-only connection. So the setup reads the session's path and sets it to `pg_catalog, ` ahead
+of it (`set_config(…, false)`, for the session), or to `pg_catalog` alone when it is empty.
+Prepending changes nothing for a path that leaves `pg_catalog` out, since PostgreSQL searches it
+first then anyway. The live `a_read_only_session_reads_the_catalog_before_a_users_functions`
+pins it, on `fetch_query_enforced` alone — red on PostgreSQL 16 before the change, by its
+author's report. `run_batch`'s re-assertion before each statement (below) is the transaction
+characteristics only; the path is set once. None of the three can be lifted by the statement it guards: PostgreSQL refuses
 `transaction_read_only` once a transaction has taken its snapshot, which a `SELECT` has; a MySQL
 transaction's access mode cannot change while it runs, so a stored function cannot undo it from
 inside; and a `SELECT` cannot set a pragma. **But a statement can lift it for the statements
@@ -1114,8 +1128,8 @@ mechanism.** `Db::stream_query_enforced` is `stream_query` with an `Enforce` dow
 `run_to` — `stream_query` is it with `None` — for the *All rows* export, which re-runs the tab's
 statement. `Db::run_batch_enforced` is `run_batch` (which passes `None`) for the auto-commit Run
 All, with its one connection put in the state before the first statement: `enforce_session` after
-the open on MySQL/MariaDB, `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` after the
-connect on PostgreSQL, `PRAGMA query_only = ON` on SQLite. A connection that cannot be put in it
+the open on MySQL/MariaDB, `READ_ONLY_SESSION_SQL` (the read-only default and `pg_catalog`
+first, above) after the connect on PostgreSQL, `PRAGMA query_only = ON` on SQLite. A connection that cannot be put in it
 fails the first statement and cancels the rest, exactly as one that cannot connect does. **On the
 two servers the read-only default is then re-asserted before every statement** — `SET SESSION
 CHARACTERISTICS AS TRANSACTION READ ONLY` / `SET SESSION TRANSACTION READ ONLY` — because the
@@ -1125,8 +1139,8 @@ that statement and cancels the rest. SQLite's `query_only` is set once, a `SELEC
 to set a pragma.
 `Session::open_enforced(db, database, enforce)` is `Session::open` (which passes `None`)
 with the pinned connection put in the state **before any `BEGIN`**: `mysql::enforce_session`, now
-`pub(crate)` for it, on MySQL/MariaDB — a failure disconnects and fails the open — and `SET SESSION
-CHARACTERISTICS AS TRANSACTION READ ONLY` on PostgreSQL. **That default is not what the session
+`pub(crate)` for it, on MySQL/MariaDB — a failure disconnects and fails the open — and
+`pg::READ_ONLY_SESSION_SQL` on PostgreSQL. **That default is not what the session
 rests on**, since a lift inside one of the tab's transactions would reach the next: the session
 keeps a `read_only` flag from the open, and `ensure_tx` opens `Ctl::BeginReadOnly` — `BEGIN READ
 ONLY` on PostgreSQL, `START TRANSACTION READ ONLY` on MySQL/MariaDB (whose `BEGIN` takes no
@@ -1140,7 +1154,8 @@ ANALYZE` *executes* the statement inside a transaction it always rolls back, and
 not the guarantee it looks like: it undoes an InnoDB write but not a MyISAM or Aria one, and on
 PostgreSQL `setval`/`nextval` are never rolled back, so a measured `SELECT setval(…)` moved the
 sequence for good. With the flag, `mysql::explain_in_rolled_back_tx` opens `START TRANSACTION READ
-ONLY` and `pg::explain` opens `BEGIN READ ONLY`, which refuse both. **Plain `EXPLAIN` takes the
+ONLY` and `pg::explain` opens `BEGIN READ ONLY`, which refuse both — after `READ_ONLY_SESSION_SQL`,
+so the measured statement reads `pg_catalog` first as every read-only session does. **Plain `EXPLAIN` takes the
 flag too, because planning is not inert**, and this entry used to say it was untouched: MySQL and
 MariaDB run a stored function to materialise a derived table or fold a constant while planning,
 and PostgreSQL evaluates an `IMMUTABLE` function's call at plan time, which may call a volatile

@@ -444,3 +444,65 @@ pub async fn a_read_only_pinned_session_cannot_be_lifted_across_a_commit(target:
     assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
     scratch.teardown().await;
 }
+
+/// **A read-only PostgreSQL session reads `pg_catalog` first** (security
+/// review S24). The read-only gates allowlist builtin functions by their
+/// bare names, which is only an answer about the builtin while `pg_catalog`
+/// is searched first — PostgreSQL's default, unless a path names it after a
+/// schema of the user's. Init SQL may set `search_path`, and so may a role's
+/// server-side default, so `SET search_path TO public, pg_catalog` let a
+/// `public.version()` stand in for the builtin. The unenforced read shows the
+/// shadow is real; the read-only one reads the builtin. PostgreSQL only.
+pub async fn a_read_only_session_reads_the_catalog_before_a_users_functions(
+    target: &'static Target,
+) {
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    let scratch = Scratch::create(target, "enforce_catalog_first").await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.version() RETURNS text LANGUAGE sql \
+             AS $$ SELECT 'shadowed'::text $$",
+        )
+        .await;
+    let db = scratch
+        .db
+        .clone()
+        .with_init_sql("SET search_path TO public, pg_catalog");
+    let read = |enforce: Option<Enforce>| {
+        let (db, database) = (db.clone(), scratch.database.clone());
+        async move {
+            let rs = match enforce {
+                Some(e) => {
+                    db.fetch_query_enforced(
+                        Some(&database),
+                        "SELECT version()",
+                        1,
+                        CancellationToken::new(),
+                        e,
+                    )
+                    .await
+                }
+                None => {
+                    db.fetch_query(
+                        Some(&database),
+                        "SELECT version()",
+                        1,
+                        CancellationToken::new(),
+                    )
+                    .await
+                }
+            }
+            .unwrap_or_else(|e| panic!("SELECT version(): {e}"));
+            rs.cell(0, 0).expect("a value").display().to_string()
+        }
+    };
+    assert_eq!(read(None).await, "shadowed", "the fixture does not shadow");
+    let enforced = read(Some(Enforce::ReadOnly)).await;
+    assert!(
+        enforced.starts_with("PostgreSQL"),
+        "a read-only session called the user's function: {enforced}"
+    );
+    scratch.teardown().await;
+}
