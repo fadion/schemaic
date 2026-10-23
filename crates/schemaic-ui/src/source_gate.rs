@@ -693,8 +693,15 @@ mod headless_read_session_gate {
                         }
                     }
                     let args = &body[open..end];
+                    // `Generated` is the read-only session for a statement
+                    // the app wrote (a dump's, a sample's), which no gate read.
+                    // **Never for `query.rs`**: every read there is the gated
+                    // text, and `Generated` drops the checks that keep the
+                    // gate's judgement true (release review S1-L1-02).
+                    let generated_ok = file != "schemaic-cli/query.rs";
                     assert!(
-                        args.contains("Enforce::ReadOnly"),
+                        args.contains("Enforce::ReadOnly")
+                            || (generated_ok && args.contains("Enforce::Generated")),
                         "{file}: a headless read runs on a session that is not read-only — \
                      the text gate passes `SELECT setval(…)`, so only the session stops \
                      it writing:\n{args}"

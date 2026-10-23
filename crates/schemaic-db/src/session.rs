@@ -260,11 +260,11 @@ impl Session {
                 // `AsJudged` needs nothing here, for the reason `pg`'s own
                 // enforced path gives: the one quote-moving setting is pinned on
                 // every connection's startup packet.
-                if enforce == Some(crate::Enforce::ReadOnly) {
+                if let Some(e) = enforce.filter(|e| e.refuses_writes()) {
                     // The server's words about Schemaic's `SET` come back as
                     // `Connect`, not about anything the user wrote, so no *AI
                     // fix*; a path that shadows a builtin as a refusal.
-                    pg::set_up_read_only(&client).await?;
+                    pg::set_up_read_only(&client, e.was_gated()).await?;
                 }
                 // Best effort — a session whose pid we failed to learn still
                 // works, it just can't be recognised as ours later.
@@ -299,7 +299,7 @@ impl Session {
             // read-only connection has nothing to commit, so Auto mode, where
             // every statement is rolled back, loses it nothing.
             Engine::MsSql => {
-                if enforce == Some(crate::Enforce::ReadOnly) {
+                if enforce.is_some_and(crate::Enforce::refuses_writes) {
                     return Err(DbError::Refused(crate::DbRefusal::MsSqlReadOnlyAuto));
                 }
                 // `AsJudged` needs nothing, for the reason `mssql::fetch_query`
@@ -324,7 +324,7 @@ impl Session {
             server_id: std::sync::Mutex::new(server_id),
             inner: Mutex::new(backend),
             in_tx: AtomicBool::new(false),
-            read_only: enforce == Some(crate::Enforce::ReadOnly),
+            read_only: enforce.is_some_and(crate::Enforce::refuses_writes),
         }))
     }
 

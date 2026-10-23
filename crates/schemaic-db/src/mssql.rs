@@ -603,7 +603,7 @@ pub(crate) async fn fetch_query(
     enforce: Option<crate::Enforce>,
 ) -> Result<ResultSet, DbError> {
     let mut client = connect(db, database).await?;
-    if enforce == Some(crate::Enforce::ReadOnly) {
+    if enforce.is_some_and(crate::Enforce::refuses_writes) {
         drain(&mut client, "BEGIN TRANSACTION")
             .await
             .map_err(read_only_setup_failed)?;
@@ -639,7 +639,7 @@ pub(crate) async fn run_batch(
     enforce: Option<crate::Enforce>,
 ) {
     let opened = match connect(db, database).await {
-        Ok(mut c) if enforce == Some(crate::Enforce::ReadOnly) => {
+        Ok(mut c) if enforce.is_some_and(crate::Enforce::refuses_writes) => {
             match drain(&mut c, "BEGIN TRANSACTION").await {
                 Ok(()) => Ok(c),
                 Err(e) => Err(read_only_setup_failed(e)),
@@ -3277,7 +3277,7 @@ pub(crate) async fn fetch_table(
         &sql,
         limit,
         cancel,
-        crate::Enforce::ReadOnly,
+        crate::Enforce::Generated,
     )
     .await
 }

@@ -147,9 +147,11 @@
   `SELECT * … LIMIT 20` the user never ran is a read of their data whether or not it is sent —
   and the builder drops it as well so the decision cannot be lost between the two. When they do
   fetch it, it is on a read-only session whatever the connection (`fetch_query_enforced(…,
-  Enforce::ReadOnly)`): the `SELECT` is generated, so no text gate reads it, and the source may be
+  Enforce::Generated)`): the `SELECT` is generated, so no text gate reads it, and the source may be
   a view whose body writes (security review S8; the write-guard invariant, and
-  `the_ai_sample_reads_run_on_a_read_only_session` in `main.rs`).
+  `the_ai_sample_reads_run_on_a_read_only_session` in `main.rs`, which requires `Generated`).
+  On `Enforce::ReadOnly` a PostgreSQL path holding an ordinary `public.round(double precision,
+  integer)` refused the session and the sample went silently empty (release review S1-L1-02).
   `schema_section` is the other: `ddl` is an `Option`, `None` at `SchemaScope::None`
   (`main.rs`'s `ai_ddl_for`), where Fill and Seed had been handing the vendor's CLI every column
   name, type, nullability, default and comment of a table whose structure the user had just asked

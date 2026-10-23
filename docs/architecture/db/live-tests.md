@@ -710,9 +710,12 @@ return the builtin's `PostgreSQL …`. It was red on PostgreSQL 16 before the re
 answer: `version` is a name the read-only gate allows, so the setup's shadow check refuses the
 session with `DbRefusal::ShadowedBuiltin` naming `public`/`version` before the statement is sent.
 That check has four cases of its own, registered beside it, each over the private
-`read_only_entries` — a read, a batch, a plan and a pinned session, every one opened enforced, so
-the four paths that run `pg::set_up_read_only` are asked together where this case asks only the
-first. `a_read_only_session_refuses_a_path_that_shadows_a_builtin` plants `public.lower(varchar)`
+`read_only_entries` — a read, a batch, a plan, an Analyze and a pinned session, every one opened
+enforced, so the five ways into `pg::set_up_read_only` are asked together where this case asks
+only the first. **The Analyze is release review S1-L6-05's**: the read-only `EXPLAIN ANALYZE` calls
+`set_up_read_only` itself, apart from the `fetch_query` the plain plan returns through, so the plan
+entry never reached it; with that call disabled the function and operator shadow cases both failed
+on `analyze`, by the fix author's report. `a_read_only_session_refuses_a_path_that_shadows_a_builtin` plants `public.lower(varchar)`
 and first has an unenforced `SELECT lower('A'::varchar)` answer `'shadowed'` on a `pg_catalog,
 public` path — the premise, that the catalogue first is not enough — then requires each entry to
 refuse with the variant naming `public`, `lower`, not an operator.
@@ -731,6 +734,18 @@ database. It is skipped, saying so, without `citext` or without the right to cre
 was red before the check asked who owns a member ("read: a read-only session trusted the owner's
 addition"), by its author's report. The four have no unenforced control beyond the first's premise; the refusal's
 variant and its fields are what tell it from a session that refuses everything.
+`a_generated_read_runs_beside_a_shadowed_builtin`, PostgreSQL's alone and registered beside them,
+is the check's other edge (release review S1-L1-02): a read the app wrote is not asked it
+(`Enforce::Generated`, under `schemaic-db`). It plants `public.round(double precision, integer)` —
+the ordinary add-on that took `schemaic dump` and the monitor away from a writable database — then
+requires the Live Monitor's `fetch_table` and a `Generated` `stream_query_enforced` (the dump's and
+the copy's read) on the writable scratch connection to return the three rows, **and** every
+`read_only_entries` entry still to refuse with `ShadowedBuiltin`, so a fix that dropped the check
+for everyone fails it. It was red before the fix — the monitor's read refused with the shadow's
+text — by the fix author's report. That the `Generated` session still refuses a write is asked on
+every leg by `a_read_only_stream_refuses_a_write_a_select_hides`, which streams the hidden write
+under `Generated` as well as `ReadOnly`; nothing here asks MySQL's half, that `Generated` skips the
+`sql_mode` pin, for the reason given below.
 `introspection_calls_no_function_the_database_planted`, in `namespaces.rs`, is the catalogue
 reads' case (`pg::connect_catalogue`, under `schemaic-db`): it plants `public.obj_description(oid,
 text)`, `public.format_type(oid, integer)`, a `public.=` on `oid` and a `public.!~~` on `(name,

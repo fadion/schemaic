@@ -1218,6 +1218,35 @@ pub enum Enforce {
     /// [`Enforce::AsJudged`], and the session refuses every write: a read-only
     /// transaction on the two servers, `PRAGMA query_only` on SQLite.
     ReadOnly,
+    /// [`Enforce::ReadOnly`]'s session for a read **the app wrote itself** —
+    /// a table's rows for a dump, a folder export, the Live Monitor, a copy, an
+    /// AI sample — on any connection, writable or not. The session refuses
+    /// every write as `ReadOnly`'s does, because the *object* is not the app's:
+    /// a view can call a function that writes. What it is not asked is a check
+    /// that exists only to make a text gate's judgement hold: PostgreSQL's
+    /// refusal of a path where a builtin's name is shadowed
+    /// (`pg::set_up_read_only`) keeps the gate's allowlist about the builtin,
+    /// and a generated `SELECT *` passed no gate and names no function. Asked
+    /// of these reads, it took `schemaic dump` and the monitor away from every
+    /// writable database with a `public.round(double precision, integer)` add-on
+    /// (release review S1-L1-02).
+    Generated,
+}
+
+impl Enforce {
+    /// Whether the session refuses every write — [`Enforce::ReadOnly`] and
+    /// [`Enforce::Generated`]. **Ask this, never `== ReadOnly`**: a comparison
+    /// with one variant sorts `Generated` onto the writable side and compiles.
+    pub fn refuses_writes(self) -> bool {
+        matches!(self, Enforce::ReadOnly | Enforce::Generated)
+    }
+
+    /// Whether a text gate judged the statement, so a check that keeps the
+    /// gate's judgement true is asked as well ([`Enforce::Generated`] says why
+    /// one read is not).
+    pub fn was_gated(self) -> bool {
+        !matches!(self, Enforce::Generated)
+    }
 }
 
 impl Db {
@@ -1386,7 +1415,7 @@ impl Db {
     /// is logged as *inserted*. Pass the row-identity key; `None` only when the
     /// table has none, where the monitor can't track changes anyway.
     ///
-    /// **Read-only on every connection** (`Enforce::ReadOnly`), writable or
+    /// **Read-only on every connection** (`Enforce::Generated`), writable or
     /// not: the monitor only reads, and the name it polls may be a view whose
     /// body calls a function that writes, which on an ordinary session would
     /// write every two seconds — on a read-only connection too, since this
@@ -1429,7 +1458,7 @@ impl Db {
                         limit
                     );
                     return self
-                        .fetch_query_enforced(None, &sql, limit, cancel, Enforce::ReadOnly)
+                        .fetch_query_enforced(None, &sql, limit, cancel, Enforce::Generated)
                         .await;
                 }
                 Engine::MySql => {
@@ -3206,9 +3235,9 @@ impl Db {
 
     /// **Copy the rows `select` reads here into `target` on `to`** — the data
     /// half of *Copy to* (`core::copy_table`), after the preview created the
-    /// table. The read streams on a read-only session (`Enforce::ReadOnly`: the
-    /// `SELECT` is generated, but a copy writes nothing on its source by any
-    /// route); the write is [`Db::import_rows`], one transaction with every
+    /// table. The read streams on a read-only session (`Enforce::Generated`:
+    /// the `SELECT` is generated, but a copy writes nothing on its source by
+    /// any route); the write is [`Db::import_rows`], one transaction with every
     /// batch's count checked, so a copy that stops part-way leaves the target
     /// table empty rather than holding the first rows as if they were all.
     ///
@@ -3258,7 +3287,7 @@ impl Db {
                     COPY_CHUNK_ROWS,
                     read_cancel,
                     tx,
-                    Some(Enforce::ReadOnly),
+                    Some(Enforce::Generated),
                 )
                 .await
             })

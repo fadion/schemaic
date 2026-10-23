@@ -160,9 +160,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   server, so the editor's runs stepped around the missing-`WHERE` net and `confirm_writes` while
   `schemaic exec` already pinned the lexer. **The cost, stated**: on a server whose global mode
   holds `ANSI_QUOTES`, the editor's session now runs without it, as `exec`'s did — `"x"` is a
-  string there, not a name. `run_plan` derives its `read_only` as `== Some(Enforce::ReadOnly)`;
-  `.is_some()`, its spelling while `None` meant writable, would now call every known connection
-  read-only. Five
+  string there, not a name. `run_plan` derives its `read_only` as
+  `.is_some_and(Enforce::refuses_writes)`; `.is_some()`, its spelling while `None` meant writable,
+  would now call every known connection read-only, and `== Some(Enforce::ReadOnly)`, its spelling
+  until `Enforce::Generated` existed, is the comparison with one variant that enum's doc forbids. Five
   closures ask it: `run_query_core`'s auto-commit arm takes `Db::fetch_query_enforced` — which
   carries every `apply_view` re-run with it (filter/sort and a page, the capped notice's read-more, the
   post-commit re-fetch) and `open_table_filtered`, since they all end there; `run_all`'s auto-commit
@@ -325,12 +326,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   build a `SELECT` the app wrote, which no gate reads — and the name it reads may be a view whose
   body calls a function that writes, so on an ordinary session every one of them ran that write,
   the monitor every two seconds, **on a read-only connection too**. All of them now read on
-  `Enforce::ReadOnly` on **every** connection, writable or not, since none of them is meant to
-  write anything (on SQL Server, the always-rolled-back transaction); `Db::copy_rows`' source read
-  already did, for the same reason. The dump's reads are in
-  `every_headless_read_runs_on_a_read_only_session`'s file list, and the AI samples have their own
-  source gate in `main.rs`, `the_ai_sample_reads_run_on_a_read_only_session`; `fetch_table`'s four
-  arms have none (`schemaic-db`'s entry). **`read_only_reason` has no minted
+  `Enforce::Generated` on **every** connection, writable or not, since none of them is meant to
+  write anything (on SQL Server, the always-rolled-back transaction) — as do `Db::copy_rows`'
+  source read and the MCP server's `sample_rows`, for the same reason. **`Generated`, not
+  `ReadOnly`, because `ReadOnly` is the session for a statement a gate judged** (release review
+  S1-L1-02): it also asks the checks that keep that judgement true — PostgreSQL's refusal of a path
+  where a builtin's name is shadowed, MySQL's `sql_mode` pin and character-set read-back — and
+  S8 first moved these reads onto `ReadOnly`, so a writable PostgreSQL database with an ordinary
+  `public.round(double precision, integer)` could no longer be dumped or monitored and its AI
+  samples went silently empty. `Generated` refuses writes exactly as `ReadOnly` does and skips
+  only those checks, which guard a judgement these reads never had. **Ask
+  `Enforce::refuses_writes`, never `== Enforce::ReadOnly`**: the comparison compiles and sorts a
+  generated read onto the writable side. And **don't hand `Generated` to a gated read**: the
+  dump's reads are in `every_headless_read_runs_on_a_read_only_session`'s file list, which accepts
+  either variant in `dump.rs` and `mcp.rs` but only `ReadOnly` in `query.rs`, so `read_only_query`
+  moved onto `Generated` fails it, and the AI samples have their own
+  source gate in `main.rs`, `the_ai_sample_reads_run_on_a_read_only_session`, which requires
+  `Generated`; `fetch_table`'s four arms have none (`schemaic-db`'s entry). **`read_only_reason` has no minted
   request**: it is enforced inside `read_only_query`, `read_only_export` and `read_only_explain`
   themselves, and the
   refusals and the requests are two separate lists. `schemaic query`, `schemaic explain` and

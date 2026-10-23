@@ -4195,7 +4195,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
             let read_only = connections
                 .with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()))
-                == Some(schemaic_db::Enforce::ReadOnly);
+                .is_some_and(schemaic_db::Enforce::refuses_writes);
             handle.spawn(async move {
                 let watchdog = RunTimeout::arm(&token, timeout.secs);
                 let res = db
@@ -14079,7 +14079,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 &sql,
                                 20,
                                 token,
-                                schemaic_db::Enforce::ReadOnly,
+                                schemaic_db::Enforce::Generated,
                             )
                             .await
                         {
@@ -14193,7 +14193,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 &sql,
                                 20,
                                 token,
-                                schemaic_db::Enforce::ReadOnly,
+                                schemaic_db::Enforce::Generated,
                             )
                             .await
                         {
@@ -16866,7 +16866,7 @@ mod app_tests {
         for (at, _) in body.match_indices("sample_sql(db.engine(), &source, &pk_cols)") {
             let read = &body[at..at + 600];
             assert!(
-                read.contains("fetch_query_enforced(") && read.contains("Enforce::ReadOnly"),
+                read.contains("fetch_query_enforced(") && read.contains("Enforce::Generated"),
                 "an AI sample read runs on an ordinary session:\n{read}"
             );
         }

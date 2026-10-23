@@ -223,9 +223,13 @@ which made this a silent per-engine divergence in a refusal path as well. `None`
 the **caller words it**, because they do not all mean the same thing: a timed-out `run_query` is an
 error the model must see, while a timed-out sample degrades to the same "(unavailable: …)" line an
 unselectable view already produces, with the table's DDL and keys still returned.
-**The sample runs on a read-only session too** (`fetch_query_enforced` with `Enforce::ReadOnly`,
-as `run_query`'s read does): the statement is `filter::table_query`'s own, but the object it names
-is not, and a view can call a function that writes. It is one function, `sample(db, database,
+**The sample runs on a read-only session too** (`fetch_query_enforced` with `Enforce::Generated`,
+which refuses writes as `run_query`'s `ReadOnly` does): the statement is `filter::table_query`'s
+own, but the object it names is not, and a view can call a function that writes. **Not
+`ReadOnly`**, which it was until release review S1-L1-02: that also refuses a PostgreSQL path where
+a builtin's name is shadowed, a check that keeps the text gate's allowlist honest and means
+nothing to a `SELECT *` no gate read — on it, a database with an ordinary
+`public.round(double precision, integer)` had no samples to give. It is one function, `sample(db, database,
 info, n)`, shared by `describe_table`'s five rows and `sample_rows`' whole answer; `Err` is
 the reason, which
 `describe_table` words as "(unavailable: …)" and `sample_rows` returns as its error.

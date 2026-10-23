@@ -5797,7 +5797,7 @@ pub(crate) async fn fetch_query(
     // statement after it (measured, `tests/live/enforced.rs`). A running
     // transaction's access mode cannot change. Never committed: the connection
     // is closed below, which rolls it back.
-    if enforce == Some(crate::Enforce::ReadOnly)
+    if enforce.is_some_and(crate::Enforce::refuses_writes)
         && let Err(e) = conn.query_drop("START TRANSACTION READ ONLY").await
     {
         let _ = conn.disconnect().await;
@@ -5841,6 +5841,28 @@ pub(crate) async fn enforce_session(
     let qerr = |e: mysql_async::Error| {
         DbError::ConnectFailed(crate::ConnectFailure::PrepareSession(e.to_string()))
     };
+    // A read the app wrote passed no gate, so nothing rests on the server
+    // lexing it as one did: its identifiers are backticked, where neither the
+    // mode nor the character set moves a quote. Pinning and refusing here only
+    // took a dump and the monitor away from a server with a `gbk` client set
+    // (release review S1-L1-02, `Enforce::Generated`).
+    if enforce.was_gated() {
+        pin_gate_lexing(conn).await?;
+    }
+    if enforce.refuses_writes() {
+        conn.query_drop("SET SESSION TRANSACTION READ ONLY")
+            .await
+            .map_err(qerr)?;
+    }
+    Ok(())
+}
+
+/// [`enforce_session`]'s half for a gated statement: the server made to read
+/// quotes as the gate did, or a refusal saying why it cannot be.
+async fn pin_gate_lexing(conn: &mut Conn) -> Result<(), DbError> {
+    let qerr = |e: mysql_async::Error| {
+        DbError::ConnectFailed(crate::ConnectFailure::PrepareSession(e.to_string()))
+    };
     let mode: Option<String> = conn
         .query_first("SELECT @@SESSION.sql_mode")
         .await
@@ -5869,11 +5891,6 @@ pub(crate) async fn enforce_session(
     let charset = charset.unwrap_or_default();
     if !schemaic_core::sql::mysql_charset_is_lexed_like_the_gate(&charset) {
         return Err(DbError::Refused(crate::DbRefusal::ClientCharset(charset)));
-    }
-    if enforce == crate::Enforce::ReadOnly {
-        conn.query_drop("SET SESSION TRANSACTION READ ONLY")
-            .await
-            .map_err(qerr)?;
     }
     Ok(())
 }
@@ -5948,7 +5965,7 @@ pub(crate) async fn run_batch(
         // honours for every statement after it on this connection (measured,
         // `tests/live/enforced.rs`). A statement cannot change the access mode
         // of its own transaction, so re-asserting it here holds the next one.
-        if enforce == Some(crate::Enforce::ReadOnly)
+        if enforce.is_some_and(crate::Enforce::refuses_writes)
             && let Err(e) = conn.query_drop("SET SESSION TRANSACTION READ ONLY").await
         {
             stopped = true;
@@ -6250,7 +6267,7 @@ pub(crate) async fn fetch_table(
         &sql,
         limit,
         cancel,
-        crate::Enforce::ReadOnly,
+        crate::Enforce::Generated,
     )
     .await
 }

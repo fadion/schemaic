@@ -212,6 +212,8 @@ pub async fn run(
                 }
                 // Read-only whatever the connection: a dump only reads, and a
                 // view's body may call a function that writes (security review S8).
+                // `Generated`: the `SELECT` is ours and passed no gate, so the
+                // checks that keep a gate's judgement true are not asked.
                 match db
                     .stream_query_enforced(
                         Some(&database),
@@ -219,7 +221,7 @@ pub async fn run(
                         chunk_rows,
                         token.clone(),
                         row_tx,
-                        Some(schemaic_db::Enforce::ReadOnly),
+                        Some(schemaic_db::Enforce::Generated),
                     )
                     .await
                 {
@@ -447,7 +449,7 @@ pub async fn run_files(
                 chunk_rows,
                 token.clone(),
                 row_tx,
-                Some(schemaic_db::Enforce::ReadOnly),
+                Some(schemaic_db::Enforce::Generated),
             )
             .await;
         let written = writer.await;

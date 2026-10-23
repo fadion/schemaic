@@ -294,6 +294,13 @@ pub async fn a_read_only_stream_refuses_a_write_a_select_hides(target: &'static 
         "{}: a read-only stream ran a function that deletes",
         target.name
     );
+    // A dump's, a copy's: the app's own `SELECT`, still on a session that
+    // refuses what the object it reads does (release review S1-L1-02).
+    assert!(
+        stream(Some(Enforce::Generated)).await.is_err(),
+        "{}: a generated read's stream ran a function that deletes",
+        target.name
+    );
     assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
     stream(None)
         .await
@@ -565,7 +572,7 @@ pub async fn a_read_only_session_calls_no_users_function_while_setting_itself_up
 }
 
 /// What each way into a read-only PostgreSQL session answers for one
-/// database: a plain read, a batch, a plan and a pinned session, each opened
+/// database: a plain read, a batch, a plan, an Analyze and a pinned session, each opened
 /// enforced. `Ok(())` where it ran, and the error where it did not.
 async fn read_only_entries(scratch: &Scratch) -> Vec<(&'static str, Result<(), DbError>)> {
     use schemaic_db::Session;
@@ -602,6 +609,14 @@ async fn read_only_entries(scratch: &Scratch) -> Vec<(&'static str, Result<(), D
         .await
         .map(|_| ());
     out.push(("plan", plan));
+    // The read-only Analyze sets its session up apart from `fetch_query`, which
+    // the plain plan above returns through (release review S1-L6-05).
+    let analyze = scratch
+        .db
+        .explain(database, "SELECT 1", true, true, CancellationToken::new())
+        .await
+        .map(|_| ());
+    out.push(("analyze", analyze));
     let pinned = match Session::open_enforced(&scratch.db, database, Some(Enforce::ReadOnly)).await
     {
         Ok(s) => {
@@ -665,6 +680,69 @@ pub async fn a_read_only_session_refuses_a_path_that_shadows_a_builtin(target: &
             Ok(()) => panic!("{entry}: a read-only session ran on a shadowing path"),
             Err(e) => panic!("{entry}: refused, but not for the shadow: {e}"),
         }
+    }
+    scratch.teardown().await;
+}
+
+/// **A read the app wrote runs beside a shadowed builtin** (release review
+/// S1-L1-02). The shadow refusal exists so that the text gate's allowlist
+/// means the builtin; a dump's, the Live Monitor's or a sample's `SELECT *`
+/// has no gate and calls no function by name, and refusing it took `schemaic
+/// dump` and the monitor away from every PostgreSQL database with the common
+/// `public.round(double precision, integer)` add-on. Its session still
+/// refuses a write, on every engine. PostgreSQL's half only.
+pub async fn a_generated_read_runs_beside_a_shadowed_builtin(target: &'static Target) {
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    let (scratch, _t) = seeded(target, "enforce_generated_shadow").await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.round(double precision, integer) RETURNS numeric \
+             LANGUAGE sql AS $$ SELECT pg_catalog.round($1::numeric, $2) $$",
+        )
+        .await;
+    let ns = scratch.namespace_ref();
+    let monitored = scratch
+        .db
+        .fetch_table(
+            &scratch.database,
+            ns.schema.as_deref(),
+            "keep",
+            None,
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the monitor's read was refused: {e}"));
+    assert_eq!(monitored.row_count(), 3);
+    // The dump's and the copy's read.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let streamed = scratch
+        .db
+        .stream_query_enforced(
+            Some(&scratch.database),
+            &format!("SELECT * FROM {}", scratch.qualified("keep")),
+            100,
+            CancellationToken::new(),
+            tx,
+            Some(Enforce::Generated),
+        )
+        .await;
+    let _ = drain.await;
+    assert_eq!(
+        streamed.unwrap_or_else(|e| panic!("the dump's read was refused: {e}")),
+        3
+    );
+    for (entry, got) in read_only_entries(&scratch).await {
+        assert!(
+            matches!(
+                got,
+                Err(DbError::Refused(DbRefusal::ShadowedBuiltin { .. }))
+            ),
+            "{entry}: the gated paths keep the refusal: {got:?}"
+        );
     }
     scratch.teardown().await;
 }

@@ -484,9 +484,14 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
 /// `lower(a_varchar)` wherever the catalogue sits, and the gate's yes to
 /// `lower` was about a function the database's owner wrote. Asked here, the
 /// one function every `Enforce::ReadOnly` PostgreSQL connection passes
-/// through, so it covers the reads, the batch, the plan, a pinned session and
-/// the MCP server's `sample_rows`, which has no text gate in front.
-pub(crate) async fn set_up_read_only(client: &Client) -> Result<(), DbError> {
+/// through, so it covers the reads, the batch, the plan, the read-only Analyze
+/// (which calls it apart) and a pinned session. **Not for a read the app
+/// wrote** (`Enforce::Generated`, `shadow_check` false — the dump, the monitor,
+/// the samples, a copy; the read-only default and `pg_catalog` first still
+/// apply): no gate judged it, its
+/// `SELECT *` names no function, and the refusal there only took a writable
+/// database's dump away from it (release review S1-L1-02).
+pub(crate) async fn set_up_read_only(client: &Client, shadow_check: bool) -> Result<(), DbError> {
     client
         .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
         .await
@@ -494,6 +499,9 @@ pub(crate) async fn set_up_read_only(client: &Client) -> Result<(), DbError> {
     put_catalog_first(client)
         .await
         .map_err(|e| read_only_setup_failed(&e))?;
+    if !shadow_check {
+        return Ok(());
+    }
     let rows = query_all(
         client,
         &shadowed_builtin_sql(schemaic_core::sql::pg_read_functions()),
@@ -690,8 +698,8 @@ pub(crate) async fn fetch_query(
     // ours for it to be inside — `in_tx` stays false below. A statement cannot
     // undo it for itself: `transaction_read_only` is refused once the
     // transaction has taken its snapshot, which a `SELECT` has.
-    if enforce == Some(crate::Enforce::ReadOnly) {
-        set_up_read_only(&client).await?;
+    if let Some(e) = enforce.filter(|e| e.refuses_writes()) {
+        set_up_read_only(&client, e.was_gated()).await?;
     }
     // A connection of its own, opened three lines up: no transaction to fence.
     run_statement(
@@ -726,7 +734,10 @@ pub(crate) async fn run_batch(
     // statement's implicit transaction — and any `BEGIN` the batch itself
     // issues — is then a read-only one.
     let client = match client {
-        Ok(c) if enforce == Some(crate::Enforce::ReadOnly) => set_up_read_only(&c).await.map(|_| c),
+        Ok(c) if enforce.is_some_and(crate::Enforce::refuses_writes) => {
+            let gated = enforce.is_some_and(crate::Enforce::was_gated);
+            set_up_read_only(&c, gated).await.map(|_| c)
+        }
         other => other,
     };
     let client = match client {
@@ -761,7 +772,7 @@ pub(crate) async fn run_batch(
         // 'off', false)` passes for a read and leaves every later statement on
         // this connection read-write. A statement cannot lift its own
         // transaction, so re-asserting it here is what holds the next one.
-        if enforce == Some(crate::Enforce::ReadOnly)
+        if enforce.is_some_and(crate::Enforce::refuses_writes)
             && let Err(e) = client
                 .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
                 .await
@@ -932,7 +943,7 @@ pub(crate) async fn fetch_table(
         &sql,
         &mut crate::RowDest::Capped(limit),
         cancel,
-        Some(crate::Enforce::ReadOnly),
+        Some(crate::Enforce::Generated),
     )
     .await
 }
@@ -986,7 +997,7 @@ pub(crate) async fn explain(
     // A read-only measurement reads `pg_catalog` first, as every read-only
     // session does (`set_up_read_only`).
     if read_only {
-        set_up_read_only(&client).await?;
+        set_up_read_only(&client, true).await?;
     }
     client
         .batch_execute(if read_only {

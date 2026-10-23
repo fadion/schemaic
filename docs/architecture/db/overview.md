@@ -226,7 +226,7 @@ as `kill_session` is, for being the call made when somebody is looking at a serv
 when a dark one is likeliest, and a modal sitting on *Loading…* for the OS connect timeout is
 the failure the deadline exists to bound.
 **`fetch_table` also reads on a read-only session, on every connection, writable or not** —
-`Enforce::ReadOnly` in all four arms: `pg::fetch_table` passes it down `pg::fetch_query`,
+`Enforce::Generated` in all four arms: `pg::fetch_table` passes it down `pg::fetch_query`,
 `mysql::fetch_table`, `mssql::fetch_table` and SQLite's arm take `fetch_query_enforced`, and on
 SQL Server that is the always-rolled-back transaction (`fetch_query_enforced`, below). Its
 `SELECT * … LIMIT n` is generated, so no text gate ever reads it, and the name the monitor polls
@@ -234,7 +234,12 @@ may be a view whose body calls a function that writes: on an ordinary session th
 every tick, every two seconds for as long as the modal was open — on a read-only connection too,
 which is the hole this closes (security review S8). On a writable connection it is a change of
 behaviour as well as a guard, and a deliberate one: a monitored view whose body writes no longer
-writes because somebody is watching it. Nothing pins the four arms' `Enforce` —
+writes because somebody is watching it. **It was meant to be the only change there, and on
+`Enforce::ReadOnly` it was not** (release review S1-L1-02): that session also refused a
+PostgreSQL path with a shadowed builtin's name on it, so a writable database with an ordinary
+`public.round(double precision, integer)` could no longer be monitored at all, and on MySQL it
+brought `enforce_session`'s `sql_mode` and character-set refusals with it. `Generated` is the same
+write refusal without those gate-only checks (below, beside the shadow check). Nothing pins the four arms' `Enforce` —
 `every_reachability_path_is_bounded_by_a_timeout` reads this method for its deadline, not its
 session — so the `Read-only on every connection` comments at each arm are the only marker.
 **`Db::fetch_locks` is Server Activity's *Locks* view**, gated on `supports_activity` like
@@ -1038,7 +1043,8 @@ the session made to agree with the judgement** — the headless paths, where nob
 keyboard to notice the gate was wrong, and the editor's runs on a read-only connection, whose
 `run_verdict` is a text gate too. It takes an `Enforce` down the same `run_to` dispatch, whose
 `None` is what every other caller passes, and each variant answers one thing a gate that reads
-text cannot know. **`Enforce::ReadOnly` is the effect the text does not show**: `SELECT setval(…)`,
+text cannot know — except `Enforce::Generated`, the read-only session for a `SELECT` the app wrote
+and no gate read (beside the shadow check, below). **`Enforce::ReadOnly` is the effect the text does not show**: `SELECT setval(…)`,
 `SELECT lo_unlink(…)`, PostgreSQL's `SELECT 1 INTO newtable` and a `SELECT` of a function whose body
 deletes all passed `sql::read_only_reason` and all wrote through the headless read path (see
 `core::sql`). PostgreSQL's function allowlist now refuses the three that are calls there, but
@@ -1105,9 +1111,34 @@ arriving as `export::sql_literal` strings (`the_shadow_check_names_nothing_bare`
 connect failure — while a `SET` or `SHOW` that fails is still `ConnectFailure::ReadOnlySetup`;
 `run_batch` passes the setup's error on as typed, as the other callers already did, where it used
 to re-wrap it through `db_err`. Asked in the one function every `Enforce::ReadOnly` PostgreSQL
-connection is made with, it covers the enforced read and stream, the batch, the read-only plan, a
-pinned read-only session and the MCP server's `sample_rows`, whose generated `SELECT` has no text
-gate in front of it. **The trade is that it judges the path, not the statement**: an owner's
+connection is made with, it covers the enforced read and stream, the batch, the read-only plan
+and the read-only Analyze (which sets its session up apart from `fetch_query`), and a pinned
+read-only session. **It is not asked of a read the app wrote — `Enforce::Generated`** (release
+review S1-L1-02): the Live Monitor's `fetch_table`, `Db::copy_rows`' reader, `schemaic dump`'s
+and the folder export's reads, the MCP server's `sample_rows` and the AI panel's Fill and Seed
+samples. Security review S8 had put those on `ReadOnly` on every connection, writable or not, so
+that a view whose body writes could not write through them; this check then made every
+`ReadOnly` PostgreSQL connection run it, and the two together refused a writable database's dump
+and monitor whenever its path held an ordinary `public.round(double precision, integer)`, any
+user operator, or an extension member a non-superuser owns — and an AI sample went silently
+empty. The check exists so that the text gate's yes to a name means the builtin; a generated
+`SELECT *` passed no gate and calls no function by name, so on it the check guarded nothing and
+refused everything. `Generated` is `ReadOnly`'s session otherwise: `set_up_read_only(client,
+shadow_check)` takes `e.was_gated()`, so the read-only default and `pg_catalog` first still go
+on, and only the shadow query is skipped; on MySQL `enforce_session` skips its `sql_mode` pin and
+character-set read-back (`pin_gate_lexing`, below); SQLite and SQL Server treat it as `ReadOnly`.
+**The session half is kept because the object is not the app's** — a view can call a function
+that writes — and the live `a_read_only_stream_refuses_a_write_a_select_hides` holds a
+`Generated` stream to refusing the hidden write on every leg. Two methods decide it, and **every
+site asks one of them rather than comparing with a variant**: `Enforce::refuses_writes` (`ReadOnly`
+or `Generated`) for whether the session refuses writes, `Enforce::was_gated` (anything but
+`Generated`) for whether the gate's own checks are asked. An `== Some(Enforce::ReadOnly)` compiles
+and sorts `Generated` onto the writable side — every former one in the engines, `session.rs` and
+the app's Plan was changed for that reason. The choice of variant at a call site is pinned where it
+matters most by `every_headless_read_runs_on_a_read_only_session`, which accepts only `ReadOnly` in
+`cli/query.rs` — every read there is the gated text — and either in `dump.rs` and `mcp.rs`; the
+live shadow tests could not see it, since `read_only_entries` asks the `Db` methods with
+`ReadOnly` directly. **The trade is that it judges the path, not the statement**: an owner's
 `lower(integer)`, which no call on a `varchar` would pick, refuses every read-only read on that
 path all the same — the safe direction, and the refusal names the schema and the object so the
 user can take the schema off the path. What it still cannot see is under `core::sql`'s entry.
@@ -1207,7 +1238,9 @@ to the server, and the `DELETE` runs, because `mysql_async` sends multi-statemen
 caller wants it or not — `CLIENT_MULTI_STATEMENTS` is hard-coded in 0.37's
 `Opts::get_capabilities`, with no toggle. Shown end to end on a throwaway MariaDB 11.8 with the
 global mode set: plain `fetch_query` deleted a row, and both `Enforce` modes deleted nothing.
-`mysql::enforce_session` runs on **both** variants: it reads `@@SESSION.sql_mode`, strips it
+`mysql::enforce_session` runs this on both gated variants, `AsJudged` and `ReadOnly` — not on
+`Generated`, whose backticked identifiers neither the mode nor the character set moves, so the half
+below is `pin_gate_lexing`, called only where `was_gated()`: it reads `@@SESSION.sql_mode`, strips it
 through `core::sql::mysql_mode_lexed_like_the_gate`, sets the result as a **bound parameter** so
 nothing the server listed is spliced into SQL text, and **reads it back** through
 `mysql_mode_is_lexed_like_the_gate` rather than trusting the `SET` — a combination mode the list
@@ -1217,7 +1250,7 @@ does not know must fail the statement, not run it under a lexer the gate did not
 of a character, so the gate's `\'` is the server's closing quote. The handshake asks for
 `utf8mb4`, but a server's `init_connect` or a skipped handshake can say otherwise, and `SET NAMES
 gbk` as a connection's init SQL had MCP `run_query` delete rows until the init list refused it.
-Only then does `ReadOnly` add its `SET SESSION TRANSACTION READ ONLY`. PostgreSQL's `AsJudged` asks nothing,
+Only then does `ReadOnly` — or `Generated`, with nothing before it — add its `SET SESSION TRANSACTION READ ONLY`. PostgreSQL's `AsJudged` asks nothing,
 because the one setting that moves a quote there, `standard_conforming_strings`, is already pinned
 on the startup packet by `connect_probe` (above) — the same hazard, closed earlier — and SQLite's
 asks nothing because it has no backslash escape to disagree about. SQL Server's asks nothing

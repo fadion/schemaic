@@ -98,7 +98,7 @@ after itself. That half is a deletion and no test can be made to fail on it, whi
 and in the commit rather than left to look like coverage.
 **`Db::copy_rows(database, select, to, ImportTarget, cancel, progress)` is `import_rows` with a
 database for its file** — the data half of *Copy to* (`core::copy_table`), run once the preview
-has created the table. The read is `stream_query_enforced(…, Some(Enforce::ReadOnly))` on `self`
+has created the table. The read is `stream_query_enforced(…, Some(Enforce::Generated))` on `self`
 in `COPY_CHUNK_ROWS` (2,000) chunks: the `SELECT` is generated, but a copy writes nothing on its
 source by any route. **Both ends run on `Db::for_rows`** — the connection's init SQL, then
 `export::rows_session_sql` (MySQL's `SET time_zone = '+00:00'`, last so an init's own zone does

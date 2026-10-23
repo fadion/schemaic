@@ -863,7 +863,7 @@ pub(crate) async fn fetch_query(
     // setting that would give it one. `ReadOnly` is `query_only`, which refuses
     // every change to a database file for the life of the connection — and a
     // `SELECT` cannot set a pragma, so the statement cannot lift it.
-    let read_only = enforce == Some(crate::Enforce::ReadOnly);
+    let read_only = enforce.is_some_and(crate::Enforce::refuses_writes);
 
     // The row loop is the blocking half, so the destination travels *with* it and
     // comes back: a stream's `sent` is written inside that loop, and the caller
@@ -947,7 +947,7 @@ pub(crate) async fn run_batch(
     enforce: Option<crate::Enforce>,
 ) {
     // `query_only`, as `fetch_query`'s enforced path sets it.
-    let read_only = enforce == Some(crate::Enforce::ReadOnly);
+    let read_only = enforce.is_some_and(crate::Enforce::refuses_writes);
     let n = stmts.len();
     let owned: Vec<String> = stmts.to_vec();
     let db = db.clone();

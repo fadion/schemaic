@@ -58,15 +58,23 @@ shape the server no longer has is a backup that restores the wrong table. That r
 run's own token (`Db::fetch_schema`'s entry has why), so the `Err(DbError::Cancelled)` arm ahead
 of the plan is reached rather than being the dead code it was while Stop could not touch the
 longest phase of a large dump. **Its row reads run on a read-only session, whatever the
-connection** — both `stream_query_enforced(…, Some(Enforce::ReadOnly))`, the `.sql` dump's and
+connection** — both `stream_query_enforced(…, Some(Enforce::Generated))`, the `.sql` dump's and
 `run_files`' — because the `SELECT`s are generated, so no text gate reads them, and a name they
 read may be a view whose body calls a function that writes: `core::dump::file_plan` reads every
 chosen view's rows, so a folder export on an ordinary session ran that write, on a read-only
 connection too (security review S8). The `.sql` dump streams base tables only (a view is structure
-and no rows there) and takes the same session regardless, since a dump only reads and on a
-writable connection the session costs nothing it was meant to do. That half is pinned in source:
+and no rows there) and takes the same session regardless, since a dump only reads. **`Generated`,
+not `ReadOnly`, and the difference is what lets a writable database be dumped at all** (release
+review S1-L1-02): the two refuse writes alike, but `ReadOnly` also asks the checks that keep a text
+gate's judgement true, and they refused reads no gate had judged. On `ReadOnly`, PostgreSQL's
+shadow check (`pg::set_up_read_only`) refused the session on any database with an ordinary
+`public.round(double precision, integer)`, any user operator on the path, or an extension member a
+non-superuser owns — so such a database, writable or not, could not be dumped — and MySQL's
+`enforce_session` brought its `sql_mode` and client-character-set refusals to a read whose
+identifiers are backticked. `schemaic-db`'s `Enforce::Generated` has the rest. That half is pinned in source:
 `ui/source_gate.rs`'s `every_headless_read_runs_on_a_read_only_session` reads this file beside
-`query.rs` and `mcp.rs`, and was seen red against the plain `stream_query` it replaced. The two counts in the
+`query.rs` and `mcp.rs`, and was seen red against the plain `stream_query` it replaced; it accepts
+either variant here, and only `ReadOnly` in `query.rs`, whose reads are all gated. The two counts in the
 report are deliberately different figures and must not be made to agree — progress counts the
 `DumpStep::Rows` steps (`DumpPlan::streamed_tables`), since a view has no rows of its own and a
 structure-only dump streams nothing at all, so counting tables would promise a "12 of 12" that

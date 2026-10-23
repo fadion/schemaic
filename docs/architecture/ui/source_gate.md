@@ -255,13 +255,17 @@ used to walk the whole census to keep one entry, every crate's source read and c
 **`headless_read_session_gate` is the same arrangement for the other half of the headless read
 guard.** `every_headless_read_runs_on_a_read_only_session` asserts that every
 `.fetch_query_enforced(` and `.stream_query_enforced(` in `schemaic-cli/query.rs`,
-`schemaic-cli/mcp.rs` and `schemaic-cli/dump.rs` carries `Enforce::ReadOnly` within its own
-argument list — cut at the matching `)`, so an `Enforce::ReadOnly` elsewhere in the file cannot
-answer for a call without one — and that no such file calls plain `.fetch_query(` or
+`schemaic-cli/mcp.rs` and `schemaic-cli/dump.rs` carries `Enforce::ReadOnly` or
+`Enforce::Generated` within its own argument list — cut at the matching `)`, so one elsewhere in
+the file cannot answer for a call without one — and that no such file calls plain `.fetch_query(` or
 `.stream_query(`, with a floor of one call per file so a needle that stops matching fails.
 `dump.rs` joined the list with security review S8: its `SELECT`s are generated, so no text gate
 reads them, and a view's body can call a function that writes (`cli/dump.md`); the gate was seen
-red against the plain `stream_query` it had. It is a source gate because nothing else could be red: changing
+red against the plain `stream_query` it had. **It takes either variant in `dump.rs` and `mcp.rs`,
+and only `ReadOnly` in `query.rs`**: `Generated` (the dump's reads, `mcp.rs`'s `sample_rows`, since
+release review S1-L1-02) refuses writes as `ReadOnly` does but skips the checks a text gate's
+judgement rests on, and every read in `query.rs` is the gated text, so one moved onto it fails
+here. `mcp.rs`'s `run_query` is not told apart from its `sample_rows` this way. It is a source gate because nothing else could be red: changing
 `read_only_query`'s `Enforce::ReadOnly` to `Enforce::None` passed the whole suite, since
 in-memory SQLite has no statement that passes its text gate and writes. The editor's twin is
 `every_editor_sql_path_runs_on_a_session_enforcing_read_only`.

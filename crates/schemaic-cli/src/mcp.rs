@@ -1694,14 +1694,16 @@ async fn sample(db: &Db, database: &str, info: &TableInfo, n: usize) -> Result<R
     // never answered.
     //
     // A read-only session, like `run_query`'s: the statement is ours, but the
-    // object is not — a view can call a function that writes.
+    // object is not — a view can call a function that writes. `Generated`,
+    // since the statement is ours: it names no function a shadow could stand
+    // in for.
     match with_deadline(
         db.fetch_query_enforced(
             Some(database),
             &sql,
             n,
             token.clone(),
-            schemaic_db::Enforce::ReadOnly,
+            schemaic_db::Enforce::Generated,
         ),
         token,
     )
