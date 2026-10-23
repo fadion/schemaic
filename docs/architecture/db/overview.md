@@ -1271,6 +1271,16 @@ other (`main.rs`'s `session_enforce`), as `schemaic exec` already did — it use
 on a writable one, so its run was plain `fetch_query` and the smuggle above reached the server past
 the missing-`WHERE` net and `confirm_writes` (security review S6). On a server whose global mode
 holds `ANSI_QUOTES` the editor's session therefore runs without it, and `"x"` is a string there.
+**And on a server whose session client character set is one a backslash can hide inside —
+`sjis`, `cp932`, `gbk`, `big5`, `gb18030`, or an empty answer — every editor run is refused,
+writable connection or not** (`DbRefusal::ClientCharset`; release review S3-L1-02, a cost
+f15d0855 brought to writable connections without saying so). Kept deliberately, with the user:
+under such a set `SELECT 'a\'; DELETE …` is one read to the gate and a `DELETE` to the server, so
+running there would step round the missing-`WHERE` net and `confirm_writes` the session pin
+exists to keep. The usual causes are a non-SUPER user's `init_connect='SET NAMES sjis'` or
+`skip-character-set-client-handshake` with such a server default; the connection's own init SQL
+cannot set one back (`init_sql::check`), so the remedy is the server's — a utf8mb4 client set for
+that account. The app's generated reads do not meet it (`Enforce::Generated`, above).
 **A connection's init SQL runs before all of this**, inside the connect and before the
 caller sees the connection, so every enforcement statement here — and SQL Server's `BEGIN
 TRANSACTION` — is issued after it and overrides whatever it set; that ordering is why it cannot
