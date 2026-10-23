@@ -576,7 +576,12 @@ of a number only that call could have sent, bounded by `CANCEL_TIMEOUT` — whic
 trip per Stop. Out of step, **the pinned connection is replaced** — the one place a `Session`
 swaps its own connection: nothing more is sent on the old one, and dropping it closes the socket, so
 the server rolls the transaction back and releases its locks; a fresh `connect` takes its place,
-`server_id` (behind a `std::sync::Mutex` now, for this one change) becomes the new `@@SPID` so
+**which runs the connection's init SQL again, as every `connect` does, and nothing else**: a `SET`
+the user typed in the tab — `SET LANGUAGE`, `SET DATEFORMAT`, `SET LOCK_TIMEOUT` — was the old
+connection's session state and is gone with it, and the replacement runs under the init SQL and
+the server's defaults alone. The tab is told about its transaction (the `tx-lost-*` notices), not
+that its settings went too, so the same statement can answer differently either side of the
+replacement. `server_id` (behind a `std::sync::Mutex` now, for this one change) becomes the new `@@SPID` so
 Server Activity still recognises the tab, `in_tx` and the scope reset, and the operation reports
 `StmtOutcome::ConnectionLost` — the transaction is gone and the tab has to hear it. If no
 connection can be opened the backend becomes `Backend::Retired`, whose statements, writes and
