@@ -72,10 +72,15 @@ A review list, not a form: a row is a *proposal* with a tick box, its name, wher
 (`row_target`, mono — `user@host:port/db`, or the file's name on SQLite; pure and tested, and
 deliberately **not** a `scheme://` URL, since this project has no URL builder on purpose and
 one written to fill a label is what the next reader copies for something that matters), and
-capsules for the engine and the source. Every `ImportNote` it carries is joined into a third
-line shown only when there is one — a row can be both already-saved and password-less, and
-showing only the first hides the one that decides whether to tick it. Rows that repeat a saved
-connection arrive unticked. The tick box is `widgets::check_box` — the app's one checkbox, which
+capsules for the engine and the source. A tunnel is part of where a row points, so its SSH server
+follows the target as `via user@host:port` (`a_tunnelled_target_names_its_ssh_server`); how it
+signs in and init SQL reach the screen as notes (`SignsInAs`, `ThroughSsh`, `RunsInitSql`, under
+`core::conn_import`'s entry), not as more of the target. Every `ImportNote`
+it carries is joined into a third line shown only when there is one — a row can be both
+already-saved and password-less, and showing only the first hides the one that decides whether
+to tick it. That line is in `status_warn` when it holds `AlreadySaved` or a `SignsInAs`, and
+`text_muted` otherwise. Rows that repeat a saved connection arrive unticked, and so do rows that
+sign in with the user's own identity. The tick box is `widgets::check_box` — the app's one checkbox, which
 was written here first and moved to `widgets` once the dump picker adopted it — and it changes
 **by style, never a rebuild**; the
 selection is a `HashSet` of indices so a row's read is O(1) — the two rules `dump_view`'s table
@@ -143,7 +148,8 @@ with `$count` otherwise; Close is the shared `dialog-close`. `skipped_sentence` 
 messages, `conn-import-skipped` and `conn-import-skipped-more` (plurals on `$count`, with
 `$names` and `$rest`), where an opening clause used to be spliced into a `format!`. A row's
 notes are core's word drawn UI-side: `import_note_label(ImportNote)` replaces
-`ImportNote::label` (`conn-import-note-*`), and
+`ImportNote::label` (`conn-import-note-*`, one `conn-import-note-signs-in-*` key per
+`AuthMode`), and
 `english_words_every_import_note_as_core_does` holds its English equal to core's. The
 `import_label`, `empty_message` and `skipped_sentence` tests pass unchanged. Why an entry was
 left out is worded in `i18n.rs`, phase 4's shape, since the app's paste field says it too:

@@ -41,8 +41,8 @@
 //! four string comparisons libpq already specifies.
 
 use crate::connection::{
-    Connection, Environment, SshAuth, SshTunnel, SslMode, Tls, default_port, is_networked,
-    is_postgres, is_sqlite, same_engine,
+    AuthMode, Connection, Environment, SshAuth, SshTunnel, SslMode, Tls, default_port,
+    is_networked, is_postgres, is_sqlite, same_engine,
 };
 // Every source here is a file somebody else's tool wrote, on a platform where
 // the editors write a BOM. Each parser strips one at its own door, so calling a
@@ -146,12 +146,34 @@ pub enum ImportNote {
     /// `AuthMode::AzureCli` instead. Read from an ADO.NET string and a JDBC
     /// URL alike (`MssqlSignIn`).
     ExternalLogin,
+    /// The row signs in with **the user's own identity** rather than a
+    /// password typed for it — Windows sign-in's NTLM exchange, a Microsoft
+    /// Entra or cloud token minted from their account — and it goes to the
+    /// host the source named. Left unticked: for a pasted string or a file
+    /// somebody sent, that host is nobody's promise, and Entra's and Google's
+    /// tokens open every database the account can reach. Never
+    /// [`AuthMode::Password`].
+    SignsInAs(AuthMode),
+    /// The row connects through an SSH tunnel, whose host the review row's
+    /// target line names after the server.
+    ThroughSsh,
+    /// The row carries init SQL, which runs on every connect.
+    RunsInitSql,
 }
 
 impl ImportNote {
     /// The one line shown beside the row.
     pub fn label(self) -> &'static str {
         match self {
+            ImportNote::SignsInAs(mode) => match mode {
+                AuthMode::Windows => "Signs in with your Windows login",
+                AuthMode::AzureCli => "Signs in with your Microsoft Entra account",
+                AuthMode::AwsIam => "Signs in with your AWS identity",
+                AuthMode::GcpIam => "Signs in with your Google Cloud account",
+                AuthMode::Password => "Signs in with a password",
+            },
+            ImportNote::ThroughSsh => "Connects through SSH",
+            ImportNote::RunsInitSql => "Runs its own SQL on every connect",
             ImportNote::NoPassword => "No password in the source",
             ImportNote::AlreadySaved => "Already saved",
             ImportNote::UnexpandedPath => "Path contains an unexpanded macro",
@@ -190,9 +212,16 @@ impl Imported {
     /// missing password is not a reason to skip a row — the user is about to
     /// type it — but re-adding a server they already have, or sending one of
     /// their credentials to a server named by a file somebody sent them, are
-    /// the two outcomes nobody wants by accident.
+    /// the two outcomes nobody wants by accident — and a row that would sign
+    /// in to the host it names with the user's own identity
+    /// ([`ImportNote::SignsInAs`]) is the same outcome by another route.
     pub fn preselected(&self) -> bool {
-        !self.has(ImportNote::AlreadySaved) && !self.has(ImportNote::PasswordFromPgpass)
+        !self.has(ImportNote::AlreadySaved)
+            && !self.has(ImportNote::PasswordFromPgpass)
+            && !self
+                .notes
+                .iter()
+                .any(|n| matches!(n, ImportNote::SignsInAs(_)))
     }
 
     fn note(&mut self, note: ImportNote) {
@@ -931,19 +960,50 @@ pub fn scan(files: &[SourceFile], existing: &[Connection]) -> ImportScan {
         out.merge(one);
     }
 
-    // `OwnClients`: the only `.pgpass` entries here are ones that came in
-    // `files` alongside the rows they complete, so both halves have the same
-    // author. A hand-picked file is completed by the *caller*, from this
-    // machine's `~/.pgpass`, and that call passes `PickedFile`.
-    fill_missing_passwords(&mut out.found, &pgpass, PgpassScope::OwnClients);
+    // The `.pgpass` entries here came in `files` alongside the rows they
+    // complete — but the rows need not have the same author. A tool's own
+    // configuration is the user's (`OwnClients`); a project's file arrived
+    // with its checkout, so it is a file the user was sent (`PickedFile`,
+    // `is_project_file`). A hand-picked file is completed by the *caller*,
+    // from this machine's `~/.pgpass`, and that call passes `PickedFile`.
+    fill_missing_passwords_by(&mut out.found, &pgpass, |imp| {
+        if is_project_file(imp.source, &imp.origin) {
+            PgpassScope::PickedFile
+        } else {
+            PgpassScope::OwnClients
+        }
+    });
     out.found = dedupe(out.found);
     mark_existing(&mut out.found, existing);
     for imp in &mut out.found {
         if imp.connection.password.is_empty() && needs_password(&imp.connection) {
             imp.note(ImportNote::NoPassword);
         }
+        note_what_the_target_hides(imp);
     }
     out
+}
+
+/// Note what a row will do that its `user@host:port/db` line does not say —
+/// how it signs in, a tunnel, init SQL. Asked of every row whatever its
+/// source, since a Schemaic export carries all three as written, and a
+/// hand-written one carries whatever its author chose.
+fn note_what_the_target_hides(imp: &mut Imported) {
+    let c = &imp.connection;
+    let (auth, ssh, init) = (
+        c.auth,
+        c.ssh.enabled && is_networked(&c.db_type),
+        !c.init_sql.trim().is_empty(),
+    );
+    if auth != AuthMode::Password {
+        imp.note(ImportNote::SignsInAs(auth));
+    }
+    if ssh {
+        imp.note(ImportNote::ThroughSsh);
+    }
+    if init {
+        imp.note(ImportNote::RunsInitSql);
+    }
 }
 
 /// Would a missing password actually stop this connection?
@@ -2380,11 +2440,13 @@ fn overlay(dst: &mut String, v: Option<String>) {
 /// A narrow element scan rather than a real XML parse, and that is a decision
 /// with a cost: it reads exactly `<data-source>`'s `name` and `uuid` attributes and its
 /// `<jdbc-url>`, `<user-name>` and `<driver-ref>` children, and would be
-/// defeated by either of those inside a comment or a CDATA section. The
-/// alternative is a new dependency in `schemaic-core` — which has none for
-/// parsing at all — for one file whose shape JetBrains has written the same way
-/// for a decade. If that shape ever moves, this reports zero connections rather
-/// than wrong ones, which is the failure mode to prefer.
+/// defeated by either of those inside a comment or a CDATA section. It was
+/// written when the alternative was a new XML dependency in `schemaic-core`,
+/// for one file whose shape JetBrains has written the same way for a decade;
+/// `quick-xml` has since arrived for SQL Server's query plans (`plan.rs`), and
+/// this reader has not been moved onto it. If that shape ever moves, this
+/// reports zero connections rather than wrong ones, which is the failure mode
+/// to prefer.
 ///
 /// Passwords are in the OS credential store, not here.
 pub fn parse_datagrip(xml: &str) -> ImportScan {
@@ -3121,6 +3183,32 @@ pub fn parse_pgpass(text: &str) -> ImportScan {
 /// **`scope` is not a preference; it is who wrote the rows.** See
 /// [`PgpassScope`].
 pub fn fill_missing_passwords(found: &mut [Imported], entries: &[PgpassEntry], scope: PgpassScope) {
+    fill_missing_passwords_by(found, entries, |_| scope);
+}
+
+/// Was `path` a **project's** file rather than the tool's own configuration —
+/// something that arrives with a checkout?
+///
+/// A JetBrains `.idea/dataSources.xml`: many repositories commit it, and
+/// *Scan installed clients* finds it through the IDE's recent-projects list
+/// and `~/DataGripProjects`. The IDE's `options/dataSources.xml` is the
+/// user's own. DBeaver's project files live inside DBeaver's own workspace
+/// directory, so they count as its configuration. Either separator, since
+/// the path is the platform's.
+pub fn is_project_file(source: ImportSource, path: &str) -> bool {
+    let mut parts = path.rsplit(['/', '\\']);
+    source == ImportSource::DataGrip
+        && parts.next() == Some("dataSources.xml")
+        && parts.next() == Some(".idea")
+}
+
+/// [`fill_missing_passwords`], with each row's [`PgpassScope`] decided by
+/// `scope_of` — [`scan`]'s, where one scan holds rows of both kinds.
+fn fill_missing_passwords_by(
+    found: &mut [Imported],
+    entries: &[PgpassEntry],
+    scope_of: impl Fn(&Imported) -> PgpassScope,
+) {
     // Every host the file names outright. A `*` line may complete a row only if
     // the row's server is one of these — see `PgpassScope::PickedFile`.
     let known: Vec<&str> = entries
@@ -3135,6 +3223,7 @@ pub fn fill_missing_passwords(found: &mut [Imported], entries: &[PgpassEntry], s
         let Some(e) = entries.iter().find(|e| e.matches(&imp.connection)) else {
             continue;
         };
+        let scope = scope_of(imp);
         if scope == PgpassScope::PickedFile
             && e.host == "*"
             && !known
@@ -3157,9 +3246,12 @@ pub fn fill_missing_passwords(found: &mut [Imported], entries: &[PgpassEntry], s
 /// Who wrote the rows a `.pgpass` is being asked to complete.
 ///
 /// **The rows and the password file need not come from the same place, and that
-/// is the whole problem.** *Scan installed clients* reads both off this machine:
-/// every row is a server the user already had configured, so completing one
-/// from their own file moves a credential nowhere. *Choose a file…* takes a
+/// is the whole problem.** *Scan installed clients* reads both off this machine,
+/// and a row from a tool's own configuration is a server the user already had
+/// configured, so completing one from their own file moves a credential
+/// nowhere — but the scan also reads every project's `.idea/dataSources.xml`,
+/// which arrived with a checkout, and [`scan`] treats those rows as picked
+/// ([`is_project_file`]). *Choose a file…* takes a
 /// file the user was **sent** — a `dataSources.xml` from a colleague, a
 /// `.env`-shaped list — and completing *those* rows from `~/.pgpass` sends the
 /// user's real password to whatever server the file named.
@@ -6760,6 +6852,135 @@ mod tests {
         assert_eq!(row.source, ImportSource::DataGrip);
         assert_eq!(row.origin, "/x/dataSources.xml");
         assert!(!row.has(ImportNote::NoPassword));
+    }
+
+    /// **A row that signs in with the user's own identity arrives unticked and
+    /// says so.** Windows sign-in sends an NTLM exchange, Entra and the cloud
+    /// modes a token minted from the user's account — to whichever host the
+    /// source named, which for a pasted string or a file somebody sent is
+    /// nobody's promise. The review row showed `user@host:port/db` and
+    /// nothing about how it would sign in.
+    #[test]
+    fn a_row_that_signs_in_with_the_users_identity_is_named_and_unticked() {
+        let ado = |auth: &str| {
+            file(
+                ImportSource::Url,
+                "",
+                &format!("Server=tcp:sql.attacker.example,1433;Database=app;{auth}"),
+            )
+        };
+        for (text, mode) in [
+            (ado("Integrated Security=SSPI"), AuthMode::Windows),
+            (
+                ado("Authentication=Active Directory Default"),
+                AuthMode::AzureCli,
+            ),
+        ] {
+            let scan = scan(&[text], &[]);
+            let row = scan.found.first().expect("a row");
+            if row.connection.auth != mode {
+                // A build with no Windows identity reads it as `ExternalLogin`.
+                assert!(row.has(ImportNote::ExternalLogin), "{:?}", row.notes);
+                continue;
+            }
+            assert!(
+                row.has(ImportNote::SignsInAs(mode)),
+                "{mode:?}: {:?}",
+                row.notes
+            );
+            assert!(!row.preselected(), "{mode:?}");
+        }
+        // A password row is noted for nothing of the kind.
+        let scan = scan(&[ado("User ID=app;Password=pw")], &[]);
+        assert!(scan.found[0].preselected());
+        assert!(
+            !scan.found[0]
+                .notes
+                .iter()
+                .any(|n| matches!(n, ImportNote::SignsInAs(_)))
+        );
+    }
+
+    /// **A Schemaic export carries what the review row did not show** — an SSH
+    /// tunnel, init SQL, a sign-in mode — and a hand-written one carries
+    /// whatever its author put there, whatever `shareable` would have cleared.
+    /// Each is named on the row.
+    #[test]
+    fn an_export_row_names_its_tunnel_init_sql_and_sign_in() {
+        let mut c = blank(POSTGRES);
+        c.host = "db.example".into();
+        c.port = 5432;
+        c.user = "app".into();
+        c.ssh.enabled = true;
+        c.ssh.host = "bastion.attacker.example".into();
+        c.ssh.port = 22;
+        c.init_sql = "SET search_path TO evil, public".into();
+        c.auth = AuthMode::GcpIam;
+        let text = export_connections(&[c]);
+        let scan = scan(&[file(ImportSource::Schemaic, "/x/c.json", &text)], &[]);
+        let row = scan.found.first().expect("a row");
+        assert!(row.has(ImportNote::ThroughSsh), "{:?}", row.notes);
+        assert!(row.has(ImportNote::RunsInitSql), "{:?}", row.notes);
+        assert!(
+            row.has(ImportNote::SignsInAs(AuthMode::GcpIam)),
+            "{:?}",
+            row.notes
+        );
+        assert!(!row.preselected());
+    }
+
+    /// **A project's `.idea/dataSources.xml` is a file the user was sent**,
+    /// however it reached the disk: it arrives with every clone of a repository
+    /// that commits it, and *Scan installed clients* reads it off the IDE's
+    /// recent-projects list. So a wildcard `.pgpass` line must not complete a
+    /// row it names for a host the `.pgpass` never lists — the first connect
+    /// would send the password there. The IDE's own `options/` file is the
+    /// user's, and stays unnarrowed.
+    #[test]
+    fn scan_treats_a_projects_data_sources_as_a_picked_file() {
+        let source = |host: &str| {
+            format!(
+                r#"<data-source name="{host}"><jdbc-url>jdbc:postgresql://{host}:5432/app</jdbc-url></data-source>"#
+            )
+        };
+        let pgpass = file(
+            ImportSource::Pgpass,
+            "/home/me/.pgpass",
+            "*:*:*:bob:hunter2\n",
+        );
+        for path in [
+            "/home/me/code/repo/.idea/dataSources.xml",
+            r"C:\Users\me\code\repo\.idea\dataSources.xml",
+        ] {
+            let files = [
+                file(ImportSource::DataGrip, path, &source("db.mallory.example")),
+                pgpass.clone(),
+            ];
+            let row = scan(&files, &[])
+                .found
+                .into_iter()
+                .find(|r| r.connection.host == "db.mallory.example")
+                .expect("the project's row");
+            assert!(
+                row.connection.password.is_empty(),
+                "{path}: a project file's row took the wildcard password"
+            );
+        }
+        let files = [
+            file(
+                ImportSource::DataGrip,
+                "/home/me/.config/JetBrains/DataGrip2025.2/options/dataSources.xml",
+                &source("pg.example"),
+            ),
+            pgpass,
+        ];
+        let row = scan(&files, &[])
+            .found
+            .into_iter()
+            .find(|r| r.connection.host == "pg.example")
+            .expect("the global row");
+        assert_eq!(row.connection.password, "hunter2", "the IDE's own file");
+        assert!(row.preselected());
     }
 
     #[test]

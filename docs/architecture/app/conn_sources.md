@@ -26,7 +26,9 @@ never itself a source — through `conn_import::recent_project_dirs`, and
 `~/DataGripProjects/*` one level deep, DataGrip's default project location on every platform,
 for a project that has fallen off the recent list. The only paths that come from outside a known
 layout are ones the IDE itself recorded, and only that one fixed file inside each is opened.
-Globals are listed before projects, so where both describe one server `scan` keeps the global
+**A project's file is still not the user's configuration**: it arrives with a checkout, so
+`conn_import::scan` lets `~/.pgpass` complete its rows only as it would a hand-picked file's
+(`is_project_file`, `PgpassScope::PickedFile`, under that entry). Globals are listed before projects, so where both describe one server `scan` keeps the global
 row; a project reached twice (the recent list and `DataGripProjects`, or two products' lists) is
 one file to `discover`'s resolved-path check. **A JetBrains file is read as a pair**, whichever
 half is named: `jetbrains_pair` keeps the named half's own spelling and spells only the *other*

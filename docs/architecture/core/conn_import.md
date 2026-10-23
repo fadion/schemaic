@@ -12,7 +12,8 @@ proposal, and the app assigns the real id and uniquifies the name only when the 
 row. Nothing here touches the keyring.
 `scan` is the one entry point, and its **order is the design**: `.pgpass` passwords are applied
 (`fill_missing_passwords`) after every source has parsed, so a `*:*:*:me:secret` line can
-complete the twelve server-only rows DataGrip just handed over; `dedupe` collapses repeats
+complete the twelve server-only rows DataGrip's own configuration just handed over — not a
+project's, which is a file the user was sent (`PgpassScope`, below); `dedupe` collapses repeats
 *after* that, keeping the **first** description of a server, so the survivor is the one that
 already has the name a human chose — and **merging rather than discarding**, through `absorb`,
 which takes from the dropped row whatever the survivor lacks — an empty password, and the TLS
@@ -20,7 +21,8 @@ material below — and nothing else. There is deliberately **no `ssh` arm**: a t
 field a source can merely be missing, it decides *which* machine `db.internal:5432` is, so two
 rows differing in it are two connections and `same_endpoint` says so; moving one across gave the
 survivor an SSH session to a jump host the user never configured for it, on every connect, with
-no SSH column in the review list to show it. It only discarded, on the strength of
+no SSH column in the review list to show it (the review row now names the tunnel's server after
+the target, `… via user@host:port`, beside an `ImportNote::ThroughSsh`). It only discarded, on the strength of
 `fill_missing_passwords` having run first, and that function's only matcher opens with
 `is_postgres`: there is no `~/.my.cnf` analogue, so on MySQL the source order did the *opposite*
 of the rationale `conn_sources::discover` states for it — a DBeaver row, whose passwords this
@@ -101,6 +103,41 @@ bound. `fill_missing_passwords` **retracts
 `ImportNote::NoPassword`** when it fills — the order inside `scan` would do on its own, but a
 caller completing an already-scanned row (a hand-picked file, whose passwords arrive
 afterwards) would otherwise show "No password in the source" on a row that has one.
+**Who wrote the rows decides what a `.pgpass` may complete, and `scan` asks it per row**
+(`PgpassScope`). `OwnClients` lets a wildcard line complete any row with nothing noted;
+`PickedFile` — what the app passes for *Choose a file…* — lets one complete a row only where the
+same `.pgpass` names that host outright, and notes `ImportNote::PasswordFromPgpass` on each row
+it fills, which `Imported::preselected` leaves unticked. `scan` used to hold `OwnClients` for
+everything it read, on the reasoning that a scanned row was a server the user already had
+configured — but project discovery (`recent_project_dirs`, and `conn_sources`'s
+`~/DataGripProjects`) reads every JetBrains project's `.idea/dataSources.xml`, and that file
+arrives with any cloned repository: a wildcard `*:*:*:bob:hunter2` handed its password to
+whatever host the repository named, the row ticked and unnoted. `is_project_file` is the test —
+a DataGrip row whose origin ends `.idea/dataSources.xml`, either separator — and those rows take
+`PickedFile` through the private `fill_missing_passwords_by`, of which `fill_missing_passwords`
+is now the one-scope form. The IDE's own `options/dataSources.xml` stays `OwnClients`, and so do
+DBeaver's files, which live inside DBeaver's own workspace directory rather than in a project
+(`scan_treats_a_projects_data_sources_as_a_picked_file`).
+**The last notes `scan` adds are about what the review row's target line does not say.** That
+line was `user@host:port/db` and nothing more (`row_target`, in `connection_import.rs`, which now
+appends a tunnel's `via user@host:port`), so a row that signs in with the user's own identity,
+tunnels, or runs SQL of its own read exactly like one that types a password at a server. `note_what_the_target_hides` runs on every row from every
+source — a Schemaic export carries its sign-in, its tunnel and its init SQL as written, and a
+hand-written one carries whatever its author put there — and adds `ImportNote::SignsInAs(mode)`
+for any mode but `Password` (Windows sign-in's NTLM exchange with the named host; a Microsoft
+Entra, AWS IAM or GCP IAM token minted from the user's own account), `ThroughSsh` for an enabled
+tunnel on a networked engine, and `RunsInitSql` for init SQL that is not blank. **`SignsInAs`
+unticks the row** (`Imported::preselected`): a pasted string's or a sent file's host is nobody's
+promise, and an Entra or Google token opens every database the account can reach — the
+`PasswordFromPgpass` outcome by another route. The other two are said and leave the tick alone
+(`a_row_that_signs_in_with_the_users_identity_is_named_and_unticked`,
+`an_export_row_names_its_tunnel_init_sql_and_sign_in`). Three answers were decided against.
+`shareable` does **not** reset `auth` on export: a note on the importing side covers a
+hand-written file too, which an export-side reset cannot, and it keeps a team's sharing of Entra
+connections working. There is no host-suffix allowlist for an Entra token, since SQL Server 2022
+on-premises signs in with Entra under any host name. And there is no TLS floor under a Windows
+row, because SQL Server encrypts the login packet, which carries the SSPI exchange, even under
+`Disable`.
 **Every row starts at `SslMode::Prefer`, not at `Tls::default()`.** `blank` is written out field
 by field so that a field added to `Connection` makes *it* fail to compile and an import has to
 decide what the new field is — which is exactly the decision the TLS mode never got. Each parser
@@ -390,8 +427,10 @@ folder arrives as one heading spelled however DBeaver writes its path in the key
 no nesting to put it in — and trimming is left to `Connection::sanitized` on save. The
 DataGrip reader is a narrow element scan
 (`<data-source>`'s `name` and `uuid`, `<jdbc-url>`, `<user-name>`, `<driver-ref>`) rather than a
-real XML parse — `schemaic-core` has no XML dependency, and if JetBrains ever moves that shape
-this reports zero connections rather than wrong ones. **A project's file is only half of each
+real XML parse, and if JetBrains ever moves that shape this reports zero connections rather than
+wrong ones. It was written so while `schemaic-core` had no XML dependency; it has one now —
+`quick-xml`, for SQL Server's query plans (`plan.rs`) — and this reader has not moved onto it,
+so it is still defeated by one of those elements inside a comment or a CDATA section. **A project's file is only half of each
 data source**: `.idea/dataSources.xml` is the part meant for version control — name, driver,
 URL — and the user name is per-person, so it lives in the `dataSources.local.xml` beside it
 under the same `uuid`. Reading only the first imported every project connection with a blank

@@ -3128,6 +3128,13 @@ conn-import-note-unexpanded-path = Path contains an unexpanded macro
 conn-import-note-pgpass = Password taken from your own .pgpass
 conn-import-note-port-assumed = The source named no port; this is the default
 conn-import-note-external-login = Signs in a way Schemaic can't: set a SQL login
+conn-import-note-signs-in-windows = Signs in with your Windows login
+conn-import-note-signs-in-entra = Signs in with your Microsoft Entra account
+conn-import-note-signs-in-aws = Signs in with your AWS identity
+conn-import-note-signs-in-gcp = Signs in with your Google Cloud account
+conn-import-note-signs-in-password = Signs in with a password
+conn-import-note-through-ssh = Connects through SSH
+conn-import-note-init-sql = Runs its own SQL on every connect
 # $names is up to three entries, each "name (why)", joined by commas.
 conn-import-skipped = { $count ->
     [one] { $count } entry was not imported: { $names }.

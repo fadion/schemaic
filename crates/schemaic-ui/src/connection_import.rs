@@ -24,6 +24,7 @@ use std::rc::Rc;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use schemaic_core::conn_import::{ImportNote, Imported, Skipped};
+use schemaic_core::connection::AuthMode;
 
 use crate::i18n::tr;
 use crate::widgets::{
@@ -434,7 +435,11 @@ fn import_row(chosen: RwSignal<HashSet<usize>>, index: usize, imp: Imported) -> 
         .map(|&n| import_note_label(n))
         .collect::<Vec<_>>()
         .join(" · ");
-    let alarming = imp.has(ImportNote::AlreadySaved);
+    let alarming = imp.has(ImportNote::AlreadySaved)
+        || imp
+            .notes
+            .iter()
+            .any(|n| matches!(n, ImportNote::SignsInAs(_)));
 
     let detail = v_stack((
         text(imp.connection.name.clone()).style(|s| {
@@ -517,6 +522,16 @@ fn row_target(c: &schemaic_core::connection::Connection) -> String {
     if !c.database.trim().is_empty() {
         out.push('/');
         out.push_str(c.database.trim());
+    }
+    // A tunnel is part of where the row points: its SSH server is who sees
+    // the traffic first, and an imported one is a host the user never typed.
+    if c.ssh.enabled && schemaic_core::connection::is_networked(&c.db_type) {
+        out.push_str(" via ");
+        if !c.ssh.user.trim().is_empty() {
+            out.push_str(c.ssh.user.trim());
+            out.push('@');
+        }
+        out.push_str(&format!("{}:{}", c.ssh.host.trim(), c.ssh.port));
     }
     out
 }
@@ -710,6 +725,15 @@ fn import_note_label(note: ImportNote) -> String {
         ImportNote::PasswordFromPgpass => tr!("conn-import-note-pgpass"),
         ImportNote::PortAssumed => tr!("conn-import-note-port-assumed"),
         ImportNote::ExternalLogin => tr!("conn-import-note-external-login"),
+        ImportNote::SignsInAs(mode) => match mode {
+            AuthMode::Windows => tr!("conn-import-note-signs-in-windows"),
+            AuthMode::AzureCli => tr!("conn-import-note-signs-in-entra"),
+            AuthMode::AwsIam => tr!("conn-import-note-signs-in-aws"),
+            AuthMode::GcpIam => tr!("conn-import-note-signs-in-gcp"),
+            AuthMode::Password => tr!("conn-import-note-signs-in-password"),
+        },
+        ImportNote::ThroughSsh => tr!("conn-import-note-through-ssh"),
+        ImportNote::RunsInitSql => tr!("conn-import-note-init-sql"),
     }
 }
 
@@ -767,6 +791,13 @@ mod tests {
             ImportNote::PasswordFromPgpass,
             ImportNote::PortAssumed,
             ImportNote::ExternalLogin,
+            ImportNote::SignsInAs(AuthMode::Windows),
+            ImportNote::SignsInAs(AuthMode::AzureCli),
+            ImportNote::SignsInAs(AuthMode::AwsIam),
+            ImportNote::SignsInAs(AuthMode::GcpIam),
+            ImportNote::SignsInAs(AuthMode::Password),
+            ImportNote::ThroughSsh,
+            ImportNote::RunsInitSql,
         ] {
             assert_eq!(import_note_label(note), note.label(), "{note:?}");
         }
@@ -859,6 +890,30 @@ mod tests {
             row_target(&conn("", "db.example", 3306, "")),
             "db.example:3306"
         );
+    }
+
+    /// **A tunnel is part of where a row points**, so its SSH server is named
+    /// on the same line: an imported row routed through somebody else's
+    /// bastion read exactly like a direct one.
+    #[test]
+    fn a_tunnelled_target_names_its_ssh_server() {
+        let mut c = conn("app", "db.example", 3306, "shop");
+        c.ssh.enabled = true;
+        c.ssh.user = "ops".into();
+        c.ssh.host = "bastion.example".into();
+        c.ssh.port = 2222;
+        assert_eq!(
+            row_target(&c),
+            "app@db.example:3306/shop via ops@bastion.example:2222"
+        );
+        c.ssh.user.clear();
+        c.ssh.port = 22;
+        assert_eq!(
+            row_target(&c),
+            "app@db.example:3306/shop via bastion.example:22"
+        );
+        c.ssh.enabled = false;
+        assert_eq!(row_target(&c), "app@db.example:3306/shop");
     }
 
     #[test]
