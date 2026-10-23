@@ -5838,15 +5838,23 @@ mod tests {
     /// runner: quadrupling the input quadruples a linear cost and multiplies a
     /// quadratic one by sixteen. Measured against the unfixed decoder, the
     /// ratio was 15.5; the fixed one is ~4.
+    ///
+    /// Each size is the **fastest of five** runs. One sample each failed a
+    /// macOS runner at 9.5x on the fixed decoder: a stall during the big run
+    /// only ever adds time, so the minimum is the run nothing interrupted.
     #[test]
     fn the_entity_decoder_is_linear_in_the_number_of_ampersands() {
         let time = |n: usize| {
             let hostile = "&".repeat(n);
-            let start = std::time::Instant::now();
-            let out = xml_unescape(&hostile);
-            let took = start.elapsed();
-            assert_eq!(out.len(), n, "nothing decodes, so nothing is lost");
-            took.as_secs_f64()
+            (0..5)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let out = xml_unescape(&hostile);
+                    let took = start.elapsed();
+                    assert_eq!(out.len(), n, "nothing decodes, so nothing is lost");
+                    took.as_secs_f64()
+                })
+                .fold(f64::INFINITY, f64::min)
         };
         // Warm the allocator so the first call is not the slow one.
         time(10_000);
