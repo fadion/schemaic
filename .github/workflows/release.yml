@@ -59,7 +59,7 @@ jobs:
             target: macos-arm64
             channel: osx-arm64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # A channel name is app identity, like `--packId`: an installed app polls
       # the manifest of the channel it was packed from, so renaming one orphans
@@ -151,8 +151,10 @@ jobs:
           # rpmbuild, which packaging/linux/build-rpm.sh drives; the spec compiles
           # nothing, so a Debian-hosted rpmbuild is enough.
           sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config rpm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Linux: build against an older glibc (2.31 = Ubuntu 20.04 / Debian 11) with
       # cargo-zigbuild, so the binary runs on distros older than the CI runner
@@ -160,7 +162,7 @@ jobs:
       # against the runner's glibc would fail on older systems.
       - name: Install Zig (Linux)
         if: runner.os == 'Linux'
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.13.0
       - name: Install cargo-zigbuild (Linux)
@@ -293,12 +295,12 @@ jobs:
       #
       # Pinned rather than relying on whatever SDK the runner image ships, since
       # `vpk` is a .NET global tool and the runner's default has moved before.
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
           dotnet-version: "8.0.x"
 
       - name: Install the Velopack CLI
-        run: dotnet tool install -g vpk
+        run: dotnet tool install -g vpk --version 1.2.161
 
       # Still fetched even though `--delta None` means nothing is diffed against
       # it: `vpk pack` reads the previous release to carry its entry forward into
@@ -449,7 +451,7 @@ jobs:
       # is the mistake worth catching here.
       - name: Publish to the GitHub Release
         if: github.ref_type == 'tag' && runner.os != 'macOS'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: schemaic-${{ github.ref_name }}-${{ matrix.target }}.*
 
@@ -470,7 +472,7 @@ jobs:
       # both beats two nearly identical OS-gated ones.
       - name: Publish the Velopack artifacts
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             Releases/Schemaic-${{ matrix.channel }}-Setup.exe
@@ -487,7 +489,7 @@ jobs:
       # the Velopack one.
       - name: Publish the distribution packages
         if: github.ref_type == 'tag' && runner.os == 'Linux'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             dist-packages/*.deb

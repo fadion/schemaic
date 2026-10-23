@@ -57,7 +57,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # Bounded and retried for the same reason release.yml is: an apt mirror
       # that stalls never fails on its own, and a job left to itself runs for
@@ -227,12 +227,12 @@ jobs:
       - name: Verify the built repositories
         run: bash packaging/repo/verify-site.sh site
 
-      - uses: actions/configure-pages@v6
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: site
 
       - name: Deploy to Pages
         id: deploy
         if: github.event_name != 'workflow_dispatch' || inputs.publish
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

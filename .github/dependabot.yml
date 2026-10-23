@@ -1,0 +1,13 @@
+# The workflows pin every action to a commit SHA, with the tag it was taken
+# from in a trailing comment: a tag can be moved to other code, and the
+# release job holds `contents: write` and the package-signing key. This keeps
+# those pins current — Dependabot rewrites the SHA and the comment together.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

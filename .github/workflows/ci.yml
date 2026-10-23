@@ -21,7 +21,7 @@ jobs:
     name: Lint (fmt + clippy + deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # `apt-get update` has hung on GitHub's runners twice now — an hour on the
       # v0.16.0 release build, forty minutes on a v0.16.2 CI run — while other
       # jobs in the *same run* sailed through the identical step. A stalled mirror
@@ -48,10 +48,11 @@ jobs:
             sleep 5
           done
           sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Formatting
         run: cargo fmt --all -- --check
       # `--features schemaic-db/live-tests` is what compiles the live engine
@@ -77,7 +78,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - name: License / advisory policy
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
   test:
     name: Build & test (${{ matrix.os }})
@@ -94,7 +95,7 @@ jobs:
         # cancelling the legs that do have someone watching them.
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # Bounded and retried for the reason spelled out on the lint job's copy of
       # this step above.
       - name: Install Linux GUI build dependencies
@@ -110,10 +111,11 @@ jobs:
             sleep 5
           done
           sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # The lint job runs on Linux, where `#[cfg(windows)]` and
       # `#[cfg(target_os = "macos")]` code is never compiled — so clippy had
       # never seen it: Windows-only code was linted only when someone happened
@@ -221,11 +223,13 @@ jobs:
           --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Schemaic_2026 -C -Q 'SELECT 1'"
           --health-interval=10s --health-timeout=10s --health-retries=24
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # No GUI packages: this builds `schemaic-db` and `schemaic-core` only,
       # neither of which pulls in floem.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # **Contained database authentication on**, so SQL Server's contained-user
       # round trip runs rather than reporting itself skipped. It is a server-wide
       # setting, which is why the test only reads it and this step — on a
