@@ -1017,10 +1017,32 @@ impl Session {
     /// Did a Stop leave the pinned connection out of step, so that it was
     /// replaced and the operation's outcome is
     /// [`StmtOutcome::ConnectionLost`]? Asked of every operation on the
-    /// connection, in one place rather than four: only a cancelled result can
-    /// have left it so, and only SQL Server's connection is asked
-    /// ([`Session::resync_after_stop`]).
+    /// connection, in one place rather than four: only a Stop can have left it
+    /// so — a cancelled result, which only SQL Server's connection is asked
+    /// about ([`Session::resync_after_stop`]), or MySQL's unacknowledged kill
+    /// (`mysql::cancel_awaited`), which retires the connection.
     async fn lost_after_stop<T>(&self, guard: &mut Backend, result: &Result<T, DbError>) -> bool {
+        // **MySQL's Stop that the server never acknowledged** gives up its
+        // connection (`mysql::cancel_awaited`): the killed statement's reply
+        // is still owed, so the stream is out of step and must not be read
+        // again. Closing it is what the server rolls back on.
+        if matches!(guard, Backend::MySql { .. })
+            && matches!(
+                result,
+                Err(DbError::ConnectFailed(
+                    crate::ConnectFailure::SessionRetired
+                ))
+            )
+        {
+            *guard = Backend::Retired;
+            self.in_tx.store(false, Ordering::SeqCst);
+            // The thread id may be another session's by now, as SQL Server's
+            // `replace_pinned` says of its spid.
+            if let Ok(mut id) = self.server_id.lock() {
+                *id = None;
+            }
+            return true;
+        }
         matches!(result, Err(DbError::Cancelled)) && self.resync_after_stop(guard).await
     }
 

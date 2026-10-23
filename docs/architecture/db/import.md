@@ -60,7 +60,23 @@ long `SELECT` cancelled, and then pressed **Commit**. MySQL 8.4.11 returned `Ok(
 a success report. MariaDB 10.11.14 returned `ERROR 1317` (*"Query execution was interrupted"*),
 the app reported failure, and the row **was** committed — Rollback offered over durable data. One
 desynchronisation read through two servers' different replies, which is why neither of them looked
-like a protocol fault. The gate is `session::pg_cancel_gate`'s second test,
+like a protocol fault.
+**The await is bounded only when the kill went unanswered** (security review S22). A server that
+cannot be reached to `KILL` will not answer the statement either, and awaiting it without bound
+held the `Session`'s lock — so the tab's Rollback and close queued behind it for ever. So
+`mysql::kill_query` returns whether the `KILL QUERY` ran, and the body is
+`cancel_awaited_with(fut, kill, cancel, grace)`, pure over its kill and its grace: a kill the
+server took is awaited in full as before, however long the statement's own rollback takes, since
+there the reply is coming and reading it is what keeps the stream in step; an unanswered one gives
+the statement `UNKILLED_GRACE` (10 s) and past that returns
+`Err(ConnectFailed(ConnectFailure::SessionRetired))`. Returning there leaves the stream out of step
+by construction, so the connection must never be read again: `Session::lost_after_stop`, which all
+four `Session` operations already pass through, turns that error on a `Backend::MySql` into
+`Backend::Retired` with `in_tx` cleared and reports the operation lost, and dropping the
+connection is what the server rolls back on. The pins are
+`an_unanswered_kill_retires_the_connection_after_the_grace` and
+`an_answered_kill_or_a_reply_in_the_grace_is_only_a_cancel`, on paused tokio time, so the grace
+costs the suite nothing. The gate is `session::pg_cancel_gate`'s second test,
 `every_mysql_cancel_on_the_pinned_connection_awaits_the_statement_it_killed`, spelled as
 "`kill_query` is not called from `session.rs`" rather than as "no `select!`" — the PostgreSQL arms
 in that file race quite correctly, `Client` being a handle onto a connection task that drains

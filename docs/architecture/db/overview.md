@@ -121,8 +121,9 @@ deliberately two functions.** `mysql::kill_session` had been writing `KILL QUERY
 capability, takes the `i64` the server reported, returns an error the panel shows, and opens
 `db.open(None, ..)`. `mysql::kill_query` is the *cancel* path — reached because a statement this
 app is itself waiting on has to stop, taking the `u32` the driver reported for its own connection,
-ignoring failure because the caller's `select!` has given up on the statement either way, and
-opening `Db::open_serverless`, since a `KILL` names no object and a connection that first has to
+reporting a failure to nobody — it answers only whether the `KILL QUERY` ran, a `bool`
+`cancel_awaited` reads to decide how long to wait for the statement it killed (under
+`Db::import_rows`) — and opening `Db::open_serverless`, since a `KILL` names no object and a connection that first has to
 open the user's database is one more thing that can hang on a server already misbehaving. Merging
 them would have to flatten all four of those differences; sitting next to each other is what lets
 the next reader see they are the same sentence to the server.

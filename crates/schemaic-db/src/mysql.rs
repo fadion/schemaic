@@ -747,8 +747,9 @@ pub(crate) async fn run_init(conn: &mut Conn, init: &[String]) -> Result<(), DbE
 /// and it hands back an error the panel shows. This one is the *cancel* path —
 /// it is reached because a statement this app is itself waiting on has to stop,
 /// it takes the `u32` the driver reported for its own connection, and a failure
-/// is nothing to report, because the caller's `select!` has already given up on
-/// the statement either way. They sat in two files until the extraction
+/// is reported to nobody — it answers only whether the `KILL QUERY` ran, which
+/// [`cancel_awaited`] reads to decide how long to wait for the statement it
+/// killed. They sat in two files until the extraction
 /// finished; sitting in one is what lets the next reader see they are the same
 /// sentence to the server.
 ///
@@ -763,20 +764,32 @@ pub(crate) async fn run_init(conn: &mut Conn, init: &[String]) -> Result<(), DbE
 /// connect — to a host that may be gone. Unbounded, a Stop against a dead server
 /// hangs inside a modal whose every exit maps to that same Stop, and the only
 /// way out is killing the process.
-pub(crate) async fn kill_query(db: &Db, conn_id: u32) {
+pub(crate) async fn kill_query(db: &Db, conn_id: u32) -> bool {
     let kill = async {
-        if let Ok(mut killer) = db.open_serverless(false).await {
-            let _ = killer.query_drop(format!("KILL QUERY {conn_id}")).await;
-            let _ = killer.disconnect().await;
+        match db.open_serverless(false).await {
+            Ok(mut killer) => {
+                let killed = killer
+                    .query_drop(format!("KILL QUERY {conn_id}"))
+                    .await
+                    .is_ok();
+                let _ = killer.disconnect().await;
+                killed
+            }
+            Err(_) => false,
         }
     };
-    if tokio::time::timeout(crate::CANCEL_TIMEOUT, kill)
-        .await
-        .is_err()
-    {
-        tracing::debug!("kill query timed out after {:?}", crate::CANCEL_TIMEOUT);
+    match tokio::time::timeout(crate::CANCEL_TIMEOUT, kill).await {
+        Ok(killed) => killed,
+        Err(_) => {
+            tracing::debug!("kill query timed out after {:?}", crate::CANCEL_TIMEOUT);
+            false
+        }
     }
 }
+
+/// How long [`cancel_awaited`] waits for a statement whose `KILL QUERY` the
+/// server never acknowledged before giving its connection up.
+const UNKILLED_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Race `fut` against `cancel`, and on a cancel **kill the statement at the
 /// server and then await the future** rather than dropping it.
@@ -811,11 +824,33 @@ pub(crate) async fn kill_query(db: &Db, conn_id: u32) {
 /// reply, and awaiting it is precisely what leaves the stream aligned. A body
 /// that runs several statements propagates that error with `?` and stops, which
 /// is why [`refetch_on`]'s loop needs nothing of its own.
+///
+/// **Unless the kill itself went unanswered** (security review S22): a server
+/// that cannot be reached to `KILL` will not answer the statement either, and
+/// awaiting it without bound held the session's lock — so the tab's Rollback
+/// and close queued behind it for ever. Then the statement gets
+/// [`UNKILLED_GRACE`], and past that the connection is given up as
+/// [`ConnectFailure::SessionRetired`](crate::ConnectFailure::SessionRetired):
+/// its stream is out of step and must not be read again, which the session
+/// answers by retiring it (`Session::lost_after_stop`). A kill the server did
+/// take is still awaited in full, however long the statement's own rollback
+/// takes: there the reply is coming.
 pub(crate) async fn cancel_awaited<T>(
     fut: impl Future<Output = Result<T, DbError>>,
     db: &Db,
     conn_id: u32,
     cancel: &CancellationToken,
+) -> Result<T, DbError> {
+    cancel_awaited_with(fut, kill_query(db, conn_id), cancel, UNKILLED_GRACE).await
+}
+
+/// [`cancel_awaited`] over its kill and its grace, so the composition has a
+/// test that needs no server.
+async fn cancel_awaited_with<T>(
+    fut: impl Future<Output = Result<T, DbError>>,
+    kill: impl Future<Output = bool>,
+    cancel: &CancellationToken,
+    grace: std::time::Duration,
 ) -> Result<T, DbError> {
     let mut fut = std::pin::pin!(fut);
     let raced = tokio::select! {
@@ -825,9 +860,16 @@ pub(crate) async fn cancel_awaited<T>(
     match raced {
         Some(r) => r,
         None => {
-            kill_query(db, conn_id).await;
-            let _ = fut.await;
-            Err(DbError::Cancelled)
+            if kill.await {
+                let _ = fut.await;
+                return Err(DbError::Cancelled);
+            }
+            match tokio::time::timeout(grace, fut).await {
+                Ok(_) => Err(DbError::Cancelled),
+                Err(_) => Err(DbError::ConnectFailed(
+                    crate::ConnectFailure::SessionRetired,
+                )),
+            }
         }
     }
 }
@@ -8430,5 +8472,64 @@ mod replay_access_tests {
         assert_eq!(out[1].privileges, ["Grant"]);
         assert!(out[2].privileges.is_empty());
         assert_eq!((out[0].user.as_str(), out[0].host.as_str()), ("app", "%"));
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::{DbError, cancel_awaited_with};
+    use tokio_util::sync::CancellationToken;
+
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn cancelled() -> CancellationToken {
+        let t = CancellationToken::new();
+        t.cancel();
+        t
+    }
+
+    /// **An unanswered kill gives the connection up after the grace**
+    /// (security review S22). Awaiting the killed statement without bound
+    /// held the pinned session's lock, so on a server gone dark the tab's
+    /// Rollback and close queued behind it for ever. On paused time, so the
+    /// grace costs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_kill_retires_the_connection_after_the_grace() {
+        let out = cancel_awaited_with(
+            std::future::pending::<Result<(), DbError>>(),
+            async { false },
+            &cancelled(),
+            GRACE,
+        )
+        .await;
+        assert!(
+            matches!(
+                out,
+                Err(DbError::ConnectFailed(
+                    crate::ConnectFailure::SessionRetired
+                ))
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// A kill the server took is awaited in full — its reply is coming, and
+    /// reading it is what keeps the stream in step — and a statement that
+    /// answers inside the grace after an unanswered kill is only cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_kill_or_a_reply_in_the_grace_is_only_a_cancel() {
+        let slow = async {
+            tokio::time::sleep(GRACE * 5).await;
+            Ok::<(), DbError>(())
+        };
+        let out = cancel_awaited_with(slow, async { true }, &cancelled(), GRACE).await;
+        assert!(matches!(out, Err(DbError::Cancelled)), "{out:?}");
+
+        let prompt = async {
+            tokio::time::sleep(GRACE / 2).await;
+            Ok::<(), DbError>(())
+        };
+        let out = cancel_awaited_with(prompt, async { false }, &cancelled(), GRACE).await;
+        assert!(matches!(out, Err(DbError::Cancelled)), "{out:?}");
     }
 }

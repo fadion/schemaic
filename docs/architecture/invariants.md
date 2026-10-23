@@ -860,7 +860,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `COMMIT` read the previous statement's reply, reported as success over **0 committed rows** on
   MySQL 8.4.11 and as failure over a row that *was* committed on MariaDB 10.11.14.
   `session::pg_cancel_gate` holds the shape for both engines — see `schemaic-db` for what each gate
-  can and cannot see. SQL Server's arm keeps the rule by the attention and its acknowledgement,
+  can and cannot see. The await is unbounded only behind a kill the server answered: one that went
+  unanswered gives the statement a grace and then retires the connection (`Backend::Retired`)
+  rather than read it again, since awaiting a server gone dark held the session's lock and queued
+  the tab's Rollback behind it for ever (security review S22, under `Db::import_rows`).
+  SQL Server's arm keeps the rule by the attention and its acknowledgement,
   and a connection that no longer answers its own requests after a Stop is not trusted but
   replaced, the tab told `ConnectionLost` (`Session::resync_after_stop`, under `mssql.rs`).
   **The second exception is `Db::run_script`**, and it is a genuine one rather than a long call:
