@@ -5983,9 +5983,18 @@ pub(crate) async fn explain(
                 )
                 .await
                 .map_err(|e| read_only_plan_refusal(e, sql)),
+            // Lexed as the gate lexed it, as every editor statement is: under
+            // a server's `NO_BACKSLASH_ESCAPES` the text after `EXPLAIN` can be
+            // a second statement the gate never saw.
             false => {
-                db.fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel)
-                    .await
+                db.fetch_query_enforced(
+                    database,
+                    &primary,
+                    EXPLAIN_ROW_CAP,
+                    cancel,
+                    crate::Enforce::AsJudged,
+                )
+                .await
             }
         };
     }
@@ -6050,6 +6059,12 @@ async fn explain_in_rolled_back_tx(
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     let mut conn = db.open(database, false).await?;
+    // The server reads the statement's quotes as the gate did (`AsJudged`);
+    // the read-only half is the transaction below.
+    if let Err(e) = enforce_session(&mut conn, crate::Enforce::AsJudged).await {
+        let _ = conn.disconnect().await;
+        return Err(e);
+    }
     let conn_id = conn.id();
     let begin = if read_only {
         "START TRANSACTION READ ONLY"

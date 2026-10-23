@@ -3,7 +3,11 @@
 `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
 via `TabsActions::run_plan` → `Db::explain`. On a read-only connection the plain plan runs on a
 read-only session too, so on MySQL/MariaDB the plan of a write is refused, in
-`mysql::read_only_plan_refusal`'s sentence, rather than drawn (`schemaic-db`'s entry). SQL Server's plan needed no change here: it
+`mysql::read_only_plan_refusal`'s sentence, rather than drawn (`schemaic-db`'s entry). **Hiding
+the Analyze toggle for a write is the view, not the guard**: the app's `run_plan` refuses
+`analyze` of a statement `contains_write` calls a write itself, failing the modal with the same
+`plan-analyze-unavailable`, and the rolled-back transaction is the backstop behind both (the
+write-guard invariant). SQL Server's plan needed no change here: it
 arrives as the same tabular `QueryPlan` (under `core::plan`), and the two warning kinds only
 it produces, `MissingIndex` and `ServerWarning`, take the warning colour through the `_ =>`
 arm that keeps `theme::error` for `FullScan` alone.

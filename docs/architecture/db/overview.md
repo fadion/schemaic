@@ -1080,9 +1080,12 @@ asks nothing because it has no backslash escape to disagree about. SQL Server's 
 either: the gate reads `"…"` as a name, and T-SQL under either `QUOTED_IDENTIFIER` setting ends
 that span where the gate does. **Failing to put the session in
 the asked-for state fails the statement**: it never runs on a session that was only *meant* to be
-guarded. The editor asks for `ReadOnly` on a read-only connection and for nothing otherwise
-(`main.rs`'s `session_enforce`), so a writable connection's run is plain `fetch_query` as it always
-was. **A connection's init SQL runs before all of this**, inside the connect and before the
+guarded. The editor asks for `ReadOnly` on a read-only connection and for `AsJudged` on every
+other (`main.rs`'s `session_enforce`), as `schemaic exec` already did — it used to ask for nothing
+on a writable one, so its run was plain `fetch_query` and the smuggle above reached the server past
+the missing-`WHERE` net and `confirm_writes` (security review S6). On a server whose global mode
+holds `ANSI_QUOTES` the editor's session therefore runs without it, and `"x"` is a string there.
+**A connection's init SQL runs before all of this**, inside the connect and before the
 caller sees the connection, so every enforcement statement here — and SQL Server's `BEGIN
 TRANSACTION` — is issued after it and overrides whatever it set; that ordering is why it cannot
 lift the transaction guard (the init SQL paragraph below, and the live tier's
@@ -1151,6 +1154,12 @@ points at the `SELECT` form only for a statement `sql::contains_write` calls a w
 refused here is one whose function writes, and is told so (the live
 `a_read_only_plan_refuses_a_write_its_planner_makes` asserts both sentences). PostgreSQL still plans a
 write in a read-only transaction, `EXPLAIN` alone never reaching the executor's read-only check.
+**Without the flag MySQL/MariaDB still lex as the gate did**: the plain form runs through
+`fetch_query_enforced(…, Enforce::AsJudged)` rather than `fetch_query`, and
+`explain_in_rolled_back_tx` calls `enforce_session(…, AsJudged)` before its `BEGIN` or `START
+TRANSACTION READ ONLY`, on either flag, a failure disconnecting and failing the plan — under a server's
+`NO_BACKSLASH_ESCAPES` the text after `EXPLAIN` can be a second statement the gate never saw
+(security review S6, the editor's `AsJudged` above).
 SQLite's `EXPLAIN QUERY PLAN` takes `Enforce::ReadOnly` as well, for uniformity rather than
 need — nothing executes there; `a_read_only_plan_runs_on_a_query_only_connection` holds that the
 plan still comes back, and in `id|parent|notused|detail`. SQL Server has

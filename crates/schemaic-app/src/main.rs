@@ -1215,9 +1215,24 @@ fn stop_grid_ai_jobs(slot: &RefCell<GridAiJobs>) {
 /// (auto-commit and a Manual tab's pinned `Session`), EXPLAIN ANALYZE, and the
 /// *All rows* export that re-runs the tab's statement. The text gate stays in
 /// front, for what a read-only session still allows.
+///
+/// **A writable connection still gets [`Enforce::AsJudged`]**: the server must
+/// read quotes as the gate did, or a statement the gate counted as one read
+/// is several to a MySQL server whose global `sql_mode` holds
+/// `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES`, and the missing-`WHERE` net and
+/// `confirm_writes` judged the wrong text. `schemaic exec` pinned it already;
+/// the other engines need nothing for it. `None` only for an id no connection
+/// has.
+///
+/// [`Enforce::AsJudged`]: schemaic_db::Enforce::AsJudged
 fn session_enforce(connections: &[Connection], conn_id: u64) -> Option<schemaic_db::Enforce> {
-    schemaic_core::connection::read_only_of(connections, conn_id)
-        .then_some(schemaic_db::Enforce::ReadOnly)
+    let known = connections.iter().any(|c| c.id == conn_id);
+    let read_only = schemaic_core::connection::read_only_of(connections, conn_id);
+    known.then_some(if read_only {
+        schemaic_db::Enforce::ReadOnly
+    } else {
+        schemaic_db::Enforce::AsJudged
+    })
 }
 
 /// Does a refused health check still let the action through?
@@ -4025,6 +4040,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             };
             let database = tab.database.get_untracked();
+            // **Analyze executes the statement, so a write is refused here**,
+            // on the action, and not only by the modal hiding its toggle: the
+            // transaction it is rolled back in undoes neither a MyISAM write
+            // nor a sequence.
+            if analyze && schemaic_core::sql::contains_write(&sql, db.engine().dialect()) {
+                plan_state.set(PlanState::Failed(tr!("plan-analyze-unavailable")));
+                return;
+            }
 
             // Cancel any in-flight EXPLAIN (e.g. the Analyze toggle re-firing).
             if let Some(old) = plan_token.borrow_mut().take() {
@@ -4061,7 +4084,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
             let read_only = connections
                 .with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()))
-                .is_some();
+                == Some(schemaic_db::Enforce::ReadOnly);
             handle.spawn(async move {
                 let watchdog = RunTimeout::arm(&token, timeout.secs);
                 let res = db
@@ -6189,8 +6212,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 else {
                     return;
                 };
+                // **The read-only guard lives on this action**, not only in the
+                // edit model that offers no editable grid on such a connection:
+                // a guard by derivation is one a future path to here does not
+                // inherit. Asked when the commit runs, as every other
+                // destructive launch asks it.
+                let conn_id = tab.conn_id.get_untracked();
+                if connections
+                    .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id))
+                {
+                    (done)(CommitDone::Failed(ModalError::app(tr!("dialog-read-only"))));
+                    return;
+                }
                 // Both refusals below are Schemaic's own — nothing was sent yet.
-                let db = match db_for(tab.conn_id.get_untracked()) {
+                let db = match db_for(conn_id) {
                     Ok(db) => db,
                     Err(e) => {
                         (done)(CommitDone::Failed(ModalError::app(e)));
@@ -16491,9 +16526,73 @@ mod app_tests {
         );
     }
 
-    /// A read-only connection's session refuses writes; any other's is left
-    /// alone — and an id no connection has is not read-only, as
-    /// `read_only_of` answers it.
+    /// **A grid commit refuses a read-only connection at the commit**
+    /// (security review S7). The protection was the edit model's: a read-only
+    /// connection yields no editable grid, so nothing reached `commit_edits`.
+    /// That is a guard by derivation — the shape the write-guard invariant
+    /// names as insufficient — and every other destructive launch (kill,
+    /// restore, copy, DDL apply, import) re-reads `read_only_of` when it runs.
+    #[test]
+    fn a_grid_commit_refuses_a_read_only_connection_at_the_commit() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let head = "let commit_edits: schemaic_ui::CommitFn = {";
+        let at = body
+            .find(head)
+            .expect("`commit_edits` — this gate is stale");
+        let end = at
+            + body[at..]
+                .find("\n    };")
+                .expect("the end of `commit_edits`");
+        let region = &body[at..end];
+        let asks = region
+            .find("read_only_of(cs, conn_id)")
+            .expect("`commit_edits` no longer asks whether its connection is read-only");
+        let writes = region
+            .find(".commit_writes(")
+            .expect("`commit_edits` no longer commits — this gate is stale");
+        assert!(asks < writes, "the question comes after the write");
+    }
+
+    /// **EXPLAIN ANALYZE refuses a writing statement at the run** (security
+    /// review S9). Analyze executes the statement, and the only thing keeping a
+    /// write away from it was the plan modal hiding its toggle; the rolled-back
+    /// transaction behind it is the backstop, not the guard.
+    #[test]
+    fn explain_analyze_refuses_a_write_at_the_run() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let head = "let run_plan: Rc<dyn Fn(String, bool)> = {";
+        let at = body.find(head).expect("`run_plan` — this gate is stale");
+        let end = at + body[at..].find("\n    };").expect("the end of `run_plan`");
+        let region = &body[at..end];
+        let asks = region
+            .find("analyze && schemaic_core::sql::contains_write(")
+            .expect("`run_plan` no longer refuses to Analyze a write");
+        let runs = region
+            .find(".explain(")
+            .expect("`run_plan` — this gate is stale");
+        assert!(asks < runs, "the refusal comes after the run");
+    }
+
+    /// A read-only connection's session refuses writes; any other's still
+    /// **reads quotes as the gate did** (`AsJudged`, security review S6). On a
+    /// MySQL server whose global `sql_mode` holds `NO_BACKSLASH_ESCAPES` or
+    /// `ANSI_QUOTES`, `SELECT 'a\'; DELETE FROM t; -- '` is one read to the gate
+    /// and a `DELETE` with no `WHERE` to the server, so the missing-`WHERE`
+    /// net and `confirm_writes` were stepped around on every writable
+    /// connection's editor run. `schemaic exec` already ran `AsJudged`. An id
+    /// no connection has asks for nothing.
     #[test]
     fn only_a_read_only_connection_asks_for_a_read_only_session() {
         use super::session_enforce;
@@ -16507,7 +16606,10 @@ mod app_tests {
             session_enforce(&cs, 1),
             Some(schemaic_db::Enforce::ReadOnly)
         );
-        assert_eq!(session_enforce(&cs, 2), None);
+        assert_eq!(
+            session_enforce(&cs, 2),
+            Some(schemaic_db::Enforce::AsJudged)
+        );
         assert_eq!(session_enforce(&cs, 9), None);
     }
 

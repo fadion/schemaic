@@ -102,7 +102,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   "Run anyway". **Don't add a run path that takes the raw action, and don't re-implement the
   verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
   un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
-  `EXPLAIN ANALYZE` may run a statement for its timings.) **What the verdict carries is a reason,
+  `EXPLAIN ANALYZE` may run a statement for its timings. **That decision is made on the action
+  too**, not only by the modal hiding its toggle: `run_plan` refuses `analyze` of a statement
+  `contains_write` calls a write, with `plan-analyze-unavailable`, before it reaches `.explain(` —
+  security review S9 found the hidden toggle the only thing between a write and Analyze, which
+  *executes* it, and the transaction it is rolled back in undoes neither a MyISAM write nor a
+  sequence. That transaction stays, as the backstop rather than the guard
+  (`explain_analyze_refuses_a_write_at_the_run` pins the order).) **What the verdict carries is a reason,
   not a sentence** — `sql::GuardReason`, which the editor words from the catalogue and the CLI
   says in core's English (under `core::sql`). Making it a value changed no decision: which arm,
   in which order, for which statements, is as stated here; only how the reason travels moved.
@@ -146,8 +152,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   same blind spot on the same engine — a bare `DELETE` below a scoped one borrowed its `WHERE` —
   and reads each statement of the range now (`sql::tsql_statements`, under `core::sql`).
   `main.rs`'s `session_enforce(connections, conn_id)` answers `Enforce::ReadOnly` for a read-only
-  connection and `None` otherwise, an id no connection has counting as writable, as
-  `read_only_of` answers it (`only_a_read_only_connection_asks_for_a_read_only_session`). Five
+  connection, `Enforce::AsJudged` for any other connection, and `None` only for an id no
+  connection has (`only_a_read_only_connection_asks_for_a_read_only_session`). **It used to answer
+  `None` for every writable connection, and that was a hole on the writable side** (security review
+  S6): under a MySQL/MariaDB server-wide `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES`,
+  `SELECT 'a\'; DELETE FROM t; -- '` is one read to the gate and a `WHERE`-less `DELETE` to the
+  server, so the editor's runs stepped around the missing-`WHERE` net and `confirm_writes` while
+  `schemaic exec` already pinned the lexer. **The cost, stated**: on a server whose global mode
+  holds `ANSI_QUOTES`, the editor's session now runs without it, as `exec`'s did — `"x"` is a
+  string there, not a name. `run_plan` derives its `read_only` as `== Some(Enforce::ReadOnly)`;
+  `.is_some()`, its spelling while `None` meant writable, would now call every known connection
+  read-only. Five
   closures ask it: `run_query_core`'s auto-commit arm takes `Db::fetch_query_enforced` — which
   carries every `apply_view` re-run with it (filter/sort and a page, the capped notice's read-more, the
   post-commit re-fetch) and `open_table_filtered`, since they all end there; `run_all`'s auto-commit
@@ -1355,7 +1370,14 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Write-back is transactional with a 1-row safety net — and the *report* never claims more than
   the engine delivered.** `commit_writes` runs a `GridWrite`
   (DELETEs → UPDATEs → INSERTs) in one transaction, each statement required to affect exactly 1 row
-  (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. On SQLite
+  (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. **A
+  read-only connection is refused at the commit, not only by derivation.** Until security review
+  S7 the protection was the edit model's — a read-only connection yields no editable grid, so
+  nothing reached `commit_edits` — which is a guard a future path to the commit does not inherit.
+  `commit_edits` now re-reads `connection::read_only_of` for the tab's `conn_id` when it runs,
+  before it opens anything, and fails with `dialog-read-only`;
+  `a_grid_commit_refuses_a_read_only_connection_at_the_commit` pins that the question precedes
+  `.commit_writes(`. On SQLite
   the *analysis* is the part that has to be conservative, and it now reads the driver's per-column
   provenance rather than deriving attribution from the statement — see `db::sqlite`. What the
   statement still decides is whether that provenance may be trusted at all
