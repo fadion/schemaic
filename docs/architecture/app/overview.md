@@ -598,7 +598,13 @@ says whether they stayed. **So a transaction Schemaic drops rather than ends get
 `resettle_sessions` releasing a session under `OpenSession::Dropped`, and `delete_conn_now`, log
 `write_log::abandoned` — a `ROLLBACK` whose detail says the connection was edited or deleted — for
 each tab whose transaction was open; without it those writes stood in the log as `ok` with no
-end. `delete_conn_now` resolves the dialect from the saved connection, and logs nothing if it
+end. **And so does a write whose session was re-pinned under it** (release review S3-L2-06): a
+tab whose first statement is still in flight reads as having nothing open, so the re-pin logged
+nothing, its queued `ROLLBACK` ended the statement's transaction, and the landed write was logged
+`ok` with no end. Both runs ask `dropped_write_owes_an_end(wrote, ran_pinned, still_pinned)` where
+they ask `still_pinned` for the fold, and log an `abandoned` line saying so
+(`only_a_write_on_a_replaced_session_owes_the_log_an_end`; the wiring is pinned in
+`a_run_folds_its_outcome_only_into_the_session_it_ran_on`). `delete_conn_now` resolves the dialect from the saved connection, and logs nothing if it
 cannot find it. A transaction `save_conn` asks about ends through `end_tx`, which logs its own.
 `script_run` logs a `.sql` file whole — `Source::Script`, its detail
 `file <path>, N statements ran`, and as `sql` the failing statement when `RunOutcome::Failed`'s

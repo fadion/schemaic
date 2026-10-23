@@ -2195,6 +2195,18 @@ fn still_pinned(
     }
 }
 
+/// Does a landed run owe the write log an `abandoned` end? When it **wrote**
+/// on a pinned session (`ran_pinned`) the tab **no longer holds**: the re-pin
+/// that replaced it queued a `ROLLBACK` behind the statement, which undid it,
+/// while the log wrote the statement as `ok` — a write inside a Manual
+/// transaction with no end after it, the shape `write_log::abandoned` exists to
+/// close (release review S3-L2-06). `resettle_sessions` logs one only for a tab
+/// whose transaction it saw open, and a first statement still in flight is
+/// not.
+fn dropped_write_owes_an_end(wrote: bool, ran_pinned: bool, still_pinned: bool) -> bool {
+    wrote && ran_pinned && !still_pinned
+}
+
 /// Re-pin a Manual tab whose stale session was kept for the transaction it
 /// held (`PinnedFate::RepinWhenTxEnds`, `owed` by tab id) — once that
 /// transaction has ended, by Commit, Roll back, or a statement typed in the
@@ -3789,10 +3801,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 )| {
                     // Logged before the supersede check, as the history is:
                     // the write happened whichever run the tab now shows.
+                    let wrote = write_entry.is_some() && matches!(state, QueryState::Loaded(_));
                     if let Some(entry) = write_entry {
                         // Read before the fold below moves it on.
                         let aborted = matches!(tab.tx.get_untracked(), TxState::Poisoned { .. });
                         log_landed(&log_write, conn_id, dialect, entry, &state, aborted);
+                    }
+                    if dropped_write_owes_an_end(
+                        wrote,
+                        ran_on.is_some(),
+                        still_pinned(&sessions_now.borrow(), id, ran_on.as_ref()),
+                    ) {
+                        (log_write)(
+                            conn_id,
+                            dialect,
+                            schemaic_core::write_log::abandoned(
+                                ran_on.as_ref().and_then(|s| s.database()),
+                                "the session was re-pinned while the statement ran, and the \
+                                 rollback queued behind it ended its transaction",
+                            ),
+                        );
                     }
                     // Fold the transaction state first, whatever run the tab now
                     // shows: it tracks the *connection*, so it stays true even when
@@ -4494,15 +4522,30 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         engine,
                         &steps,
                     );
+                    let mut wrote = false;
                     for (i, (entry, state)) in write_entries.iter().zip(&states).enumerate() {
                         if let (Some(entry), true) = (entry, logged[i]) {
                             let before = aborted.get(i).copied().unwrap_or(false);
+                            wrote |= matches!(state, QueryState::Loaded(_));
                             log_landed(&log_write, conn_id, dialect, entry.clone(), state, before);
                         }
                     }
                     // Only while the tab still holds the connection they ran
                     // on (`still_pinned`).
                     let pinned = still_pinned(&sessions_now.borrow(), id, ran_on.as_ref());
+                    // And an end for the log when it does not, as the single
+                    // run's (`dropped_write_owes_an_end`).
+                    if dropped_write_owes_an_end(wrote, ran_on.is_some(), pinned) {
+                        (log_write)(
+                            conn_id,
+                            dialect,
+                            schemaic_core::write_log::abandoned(
+                                ran_on.as_ref().and_then(|s| s.database()),
+                                "the session was re-pinned while the batch ran, and the \
+                                 rollback queued behind it ended its transaction",
+                            ),
+                        );
+                    }
                     for (sql, stmt) in tx_stmts.iter().zip(&outcomes) {
                         if let Some(stmt) = stmt
                             && pinned
@@ -16942,7 +16985,30 @@ mod app_tests {
                 .unwrap_or_else(|| panic!("`{head}` folds without asking `still_pinned`"));
             let fold = region.find(".on_statement(").expect("the fold — stale");
             assert!(guard < fold, "`{head}`: the guard comes after the fold");
+            // And the dropped fold's write gets an end in the log (release
+            // review S3-L2-06).
+            assert!(
+                region.contains("if dropped_write_owes_an_end(")
+                    && region.contains("write_log::abandoned("),
+                "`{head}` logs a write its re-pin rolled back as `ok` with no end"
+            );
         }
+    }
+
+    /// **A write whose session was re-pinned under it owes the log an end**
+    /// (release review S3-L2-06) — and only that: an auto-commit run has no
+    /// session to lose, a read nothing to end, and a session still held its
+    /// own transaction.
+    #[test]
+    fn only_a_write_on_a_replaced_session_owes_the_log_an_end() {
+        use super::dropped_write_owes_an_end as owes;
+        assert!(owes(true, true, false));
+        assert!(
+            !owes(true, true, true),
+            "still pinned: the tab's transaction"
+        );
+        assert!(!owes(true, false, true), "auto-commit");
+        assert!(!owes(false, true, false), "a read");
     }
 
     /// **The AI fill and seed samples read on a read-only session** (security
