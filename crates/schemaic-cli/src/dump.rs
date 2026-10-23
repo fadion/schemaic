@@ -563,7 +563,7 @@ fn write_one(
     use std::io::Write as _;
 
     // The create is the one failure that leaves nothing behind — see `WriteFail`.
-    let mut w = match std::fs::File::create(part) {
+    let mut w = match schemaic_core::persist::create_part(part, path) {
         Ok(f) => std::io::BufWriter::new(f),
         Err(e) => {
             return Err(WriteFail {
@@ -626,7 +626,7 @@ fn write(
     use std::io::Write as _;
 
     // The create is the one failure that leaves nothing behind — see `WriteFail`.
-    let mut w = match std::fs::File::create(part) {
+    let mut w = match schemaic_core::persist::create_part(part, path) {
         Ok(f) => std::io::BufWriter::new(f),
         Err(e) => {
             return Err(WriteFail {

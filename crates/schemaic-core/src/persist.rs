@@ -1042,6 +1042,42 @@ pub fn create_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_mode(path, bytes, true)
 }
 
+/// Open the staging sibling `part` an export writes before renaming it over
+/// `target` (security review S31).
+///
+/// **Created, never opened**: whatever already sits at `part` is removed
+/// first — a fragment a failed export left, which a fresh one replaces
+/// anyway, or a symlink planted there, which `File::create` would have
+/// followed and truncated — and the file is then made with `create_new`, so a
+/// path re-planted in between is refused rather than written through.
+/// **Owner-only on Unix** (`0600`): result rows and whole-database dumps took
+/// the default `0644` and landed readable by every account on a shared host.
+/// Replacing a file that exists keeps *its* mode, so one the user shared on
+/// purpose stays shared. Windows has no mode to set; the file inherits the
+/// directory's ACL, as every other file there does.
+pub fn create_part(part: &Path, target: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(part) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(part)?;
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(target) {
+        let _ = f.set_permissions(meta.permissions());
+    }
+    #[cfg(not(unix))]
+    let _ = target;
+    Ok(f)
+}
+
 fn write_mode(path: &Path, bytes: &[u8], exclusive: bool) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();

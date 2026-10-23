@@ -5104,8 +5104,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // on the one path where the fragment is the only copy of the
                 // rows.
                 let part_of = dump::part_of;
-                let create = |path: &std::path::Path| {
-                    std::fs::File::create(path).map(std::io::BufWriter::new)
+                // Created owner-only and never through a planted link, keeping
+                // a replaced file's own mode (`persist::create_part`).
+                let create = |part: &std::path::Path, target: &std::path::Path| {
+                    persist::create_part(part, target).map(std::io::BufWriter::new)
                 };
                 // Rename the finished sibling over the destination. Failing *here*
                 // is the one case where the export wrote everything and the user
@@ -5243,7 +5245,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             let write =
                                 || -> std::io::Result<schemaic_core::export::ExportTally> {
                                     use std::io::Write as _;
-                                    let mut w = create(&part)?;
+                                    let mut w = create(&part, &path)?;
                                     // One hook, both jobs, asked at one instant —
                                     // see `SliceChunks::watching`. `false` ends
                                     // the render as an *error*, which is the only
@@ -5469,7 +5471,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // after the write — both ask the same question at
                             // two different moments.
                             let src_token = w_token.clone();
-                            let mut w = create(&part).map_err(|e| e.to_string())?;
+                            let mut w = create(&part, &path).map_err(|e| e.to_string())?;
                             // Rows handed to the renderer so far. Counted here
                             // rather than at the reader because the channel
                             // between them is bounded and would run two blocks

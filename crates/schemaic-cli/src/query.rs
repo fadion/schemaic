@@ -195,11 +195,12 @@ pub async fn read_only_export(
     let part = schemaic_core::export::part_file(path);
     let dialect = db.engine().dialect();
     let writer = {
-        let (part, token) = (part.clone(), token.clone());
+        let (part, token, target) = (part.clone(), token.clone(), path.to_path_buf());
         tokio::task::spawn_blocking(
             move || -> std::io::Result<schemaic_core::export::ExportTally> {
                 use std::io::Write as _;
-                let mut w = std::io::BufWriter::new(std::fs::File::create(&part)?);
+                let mut w =
+                    std::io::BufWriter::new(schemaic_core::persist::create_part(&part, &target)?);
                 let mut src =
                     schemaic_core::export::PullChunks::new(move || match rx.blocking_recv() {
                         None if token.is_cancelled() => {

@@ -370,7 +370,10 @@ name, a path with no file name coming back unchanged for the create to refuse �
 `dump::part_of`, then the app's, so that `schemaic export`, a crate with no access to the app,
 builds its file under the same spelling the app does; `part_of` (now `cli/dump.rs`'s) delegates
 to it
-(`a_file_is_built_beside_itself_under_part`). `ExportFormat::from_name` and `for_path` are the
+(`a_file_is_built_beside_itself_under_part`). The name is this module's and the *create* is
+not: every writer opens the sibling through `persist::create_part`, never `File::create`, which
+followed a planted symlink and left rows and dumps world-readable on Unix — the policy, and why,
+is under *core/persist.rs*. `ExportFormat::from_name` and `for_path` are the
 other half of that command's needs: a format named by any of its `extensions()` or its
 `label()`, case-insensitively and with a leading dot ignored — so `excel` and `htm` both resolve
 — and the one an output path's extension names, `None` for either when nothing matches

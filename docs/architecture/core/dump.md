@@ -601,8 +601,9 @@ field on three arms that could only report. `colliding_files(plan, exists)` is t
 `exists` is an `exists` **predicate** rather than a filesystem, so it is unit-tested without
 one, and the order follows the plan because that is the order the files would be replaced in;
 **each planned file's `.part` sibling is censused with it**, because the export destroys that too
-and this is the only guard in front of it: `write_one` opens the fragment with `File::create`,
-which truncates, and the failure path removes it — so a fragment left by an earlier failed export,
+and this is the only guard in front of it: `write_one` opens the fragment through
+`persist::create_part`, which removes whatever is there before it creates, and the failure path
+removes it — so a fragment left by an earlier failed export,
 the one file in that directory this app teaches the user to care about (`export_failure_note`
 having just said *"the rows that were written are in `orders.csv.part`"*), was replaced by a retry
 and swept by its cancel with no prompt naming it. The suffix comes from `export::part_path`, the

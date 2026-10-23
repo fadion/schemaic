@@ -412,3 +412,27 @@ other *processes* and is not, on its own, ordered after the data blocks with res
 loss, and this path has no `.bak` to fall back on. **What it does not pretend to keep** is a
 second hard link — the new inode is a new inode, and there is no way to have both that and a
 one-step replacement; atomicity wins, because the file being protected is often the only copy.
+**`create_part(part, target)` is the staging rule for a data export, and it is a different
+policy from the script's on purpose** (security review S31). Every export that writes a `.part`
+sibling and renames it over the destination opens that sibling here — the app's result/grid
+export (its `create` closure, both scopes), `cli/dump.rs`'s two writers behind `schemaic dump`
+and the schema tree's folder export, and `schemaic export -o` in `cli/query.rs`. All five used
+`File::create`, which is wrong twice over: it follows a symlink and truncates its target, so
+another local account planting `orders.csv.part` as a link redirected the export's write at
+whatever the link named, at the victim's privileges; and it creates at `0o666 & !umask`, 0644
+under the usual one, so result rows and whole-database dumps landed readable by every account on
+a shared host while the owner-only helpers above covered only the config directory, the log and
+the AI files — nothing documented a mode for data exports at all. So it **removes whatever sits
+at `part` first** — a fragment a failed export left, which a fresh export replaced anyway, or a
+planted link, which `remove_file` unlinks rather than follows — then creates with `create_new`,
+so a path re-planted in that window is refused rather than written through; **0600 on Unix**;
+and, when `target` already exists, copies *its* permissions onto the new file, because the
+rename swaps the inode and a file the user shared on purpose should stay shared — the same
+reasoning `stage_beside` gives for a `chmod 600 seed.sql`, from the other direction. The
+difference from `write_file_atomic` is only the *new* file: a script saved for the first time
+takes the default mode, since it "narrows no permissions", where an export's new destination is
+owner-only. Windows sets no mode — the file inherits the directory's ACL, as before. **No test
+pins any of it**: every property is about a real file, and the workspace's no-filesystem rule
+admits exactly one exception, `export::export_xlsx_chunks`. Not covered either:
+`write_file_atomic`'s own fallback when the rename is refused, a direct `fs::write` of the
+user-chosen target path itself, which S31 left as it was.

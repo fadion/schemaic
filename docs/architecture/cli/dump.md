@@ -179,7 +179,7 @@ also the **only** disclosure that a folder export destroys anything, wrong in th
 sends a user looking for a backup they do not need. **`attempted` is the third argument because a
 `.part` dies at the *start* of a table's attempt, not at its end**: the rename that publishes
 `orders.csv` consumes `orders.csv.part`, so publishing is one way to destroy it — but the writer
-truncates the fragment with `File::create` before it writes a byte, and both the cancel and the
+replaces the fragment (`persist::create_part`) before it writes a byte, and both the cancel and the
 failure arms then sweep it. A table whose retry was stopped or failed therefore destroyed the
 fragment an earlier run had left, and nothing named it, `published` holding only the tables that
 finished — so the one file `export_failure_note` had just taught the user to care about was the
