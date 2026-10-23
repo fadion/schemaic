@@ -393,3 +393,14 @@ refusal is passed on** rather than the file being removed first — so picking a
 the save dialog ends in "The backup failed: …" in the terminal panel. The test copies into a
 second shared in-memory database, opened first as an empty one, which `VACUUM INTO` accepts as a
 target (`a_backup_copies_the_database_whole`), so the suite touches no file.
+**The live check never compiles a `PRAGMA`** (`prepare_check`, security review S11). Live
+validation prepares whatever the user is typing, and a prepare is not inert here: SQLite runs some
+pragmas while *preparing* them rather than when stepping, and a few of those set process-wide state
+— `temp_store_directory`, Windows' `data_store_directory` — in the app's own process, keystroke by
+keystroke. A pragma that sets a per-connection flag was already harmless, `with_conn` opening a
+fresh connection for every call. So a statement whose leading words (`sql::leading_words(sql, 4,
+Sqlite)`) are `PRAGMA`, `EXPLAIN PRAGMA` or `EXPLAIN QUERY PLAN PRAGMA` answers `Ok(())` without
+being compiled. What that gives up is a squiggle on a malformed pragma: it goes unchecked, and the
+run is what reports its error. The pin, `the_live_check_does_not_compile_a_pragma`, proves the
+skip with malformed pragmas (`PRAGMA ((` would be a syntax error if it were compiled) and keeps
+`SELECT ((` and a missing table failing, so the skip cannot pass by checking nothing.

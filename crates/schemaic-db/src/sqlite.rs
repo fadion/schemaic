@@ -2164,7 +2164,21 @@ pub(crate) async fn backup_to(db: &Db, target: String) -> Result<(), DbError> {
 /// `prepare` compiles the statement and reports a syntax error or an unknown
 /// table/column, which is the same tier the other two engines' non-executing
 /// `PREPARE` provides. Dropping the prepared statement runs nothing.
+///
+/// **Except a `PRAGMA`, which is not compiled at all** (security review S11):
+/// SQLite runs some pragmas while preparing them rather than when stepping,
+/// and a few of those set process-wide state — `temp_store_directory`,
+/// Windows' `data_store_directory` — in the app's own process, as the user
+/// types. A pragma goes unchecked instead; the run reports its errors.
 pub(crate) async fn prepare_check(db: &Db, sql: &str) -> Result<(), DbError> {
+    let words = schemaic_core::sql::leading_words(sql, 4, schemaic_core::intel::SqlDialect::Sqlite);
+    let compiles_a_pragma = matches!(
+        words.iter().map(String::as_str).collect::<Vec<_>>()[..],
+        ["PRAGMA", ..] | ["EXPLAIN", "PRAGMA", ..] | ["EXPLAIN", "QUERY", "PLAN", "PRAGMA"]
+    );
+    if compiles_a_pragma {
+        return Ok(());
+    }
     let sql = sql.to_string();
     with_conn(db, move |conn| {
         conn.prepare(&sql).map(|_| ()).map_err(query_err)
@@ -4721,6 +4735,27 @@ mod tests {
     /// bare *column* name but accepted as a table's, and `IF` is the reverse. A
     /// first draft of this test put each one on the side it tolerates and passed
     /// with the fix reverted.
+    /// **The live check never compiles a `PRAGMA`** (security review S11).
+    /// SQLite runs some pragmas while it *prepares* them, and a few of those
+    /// set process-wide state (`temp_store_directory`, Windows'
+    /// `data_store_directory`) — in the app's process, as the user types. A
+    /// malformed one shows that it is not compiled: it would be a syntax error
+    /// if it were. Everything else is still checked.
+    #[tokio::test]
+    async fn the_live_check_does_not_compile_a_pragma() {
+        let (_keeper, db) = shared_memory("prepare_check_pragma");
+        for sql in [
+            "PRAGMA ((",
+            "  pragma temp_store_directory = '/tmp/elsewhere'",
+            "EXPLAIN PRAGMA ((",
+            "EXPLAIN QUERY PLAN PRAGMA ((",
+        ] {
+            assert!(prepare_check(&db, sql).await.is_ok(), "{sql}");
+        }
+        assert!(prepare_check(&db, "SELECT ((").await.is_err());
+        assert!(prepare_check(&db, "SELECT * FROM nowhere").await.is_err());
+    }
+
     #[tokio::test]
     async fn a_table_named_for_a_keyword_still_opens() {
         let (keeper, db) = shared_memory("kw_named_table");
