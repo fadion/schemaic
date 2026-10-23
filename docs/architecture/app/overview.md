@@ -306,6 +306,19 @@ through `end_tx`, which logs its own end, and the tab is re-pinned in Manual thr
 re-pin** (`repin_owed`), which `repin_if_owed` pays when the transaction ends — in `end_tx` and in
 both run folds, so a typed `COMMIT` counts. It used to keep the stale session for the tab's life:
 the old role, the old `search_path`, or writes on a connection since made read-only (S3.1-L5-01).
+**Ticking read-only never reaches that Cancel**: owing the re-pin still left a writable session
+writing, until its transaction ended, on a connection the whole UI called read-only (security
+review S20). So when an edit `Connection::ticks_read_only`, both routes ask first, through
+`settle_before_read_only(id, proceed, cancelled)`, which chains `guard_tx` over every Manual tab
+on the connection with an open transaction *before* anything applies, and runs `cancelled` —
+asking nothing further — on the first Cancel. `toggle_read_only`'s Cancel leaves the connection
+writable and unchanged; once all are settled the flip applies and `resettle_sessions` re-pins the
+now idle sessions read-only at once. The form's `save_conn` is thin for this: it reads `id`,
+`previous` and the drafted `conn`, and either calls `save_conn_now` — the save as it was — or
+settles first, its Cancel saving the rest of the edit with `read_only = false` and setting the
+draft's `read_only` back, so the read-only change alone is not saved. Unticking goes straight
+through, as before. `the_read_only_toggle_resettles_pinned_sessions` pins both routes' asking
+`ticks_read_only` and going through the settle, and the form's `writable.read_only = false`.
 `open_session` is built after the run actions that ask, so it is reached through `repin_late`, a
 `LateAction`. `tx_prompt` holds one question, so the prompts are chained one tab at a time, the
 way `run_ddl` chains its blockers. The AI session is on the same list

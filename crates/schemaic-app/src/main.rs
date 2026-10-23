@@ -11500,27 +11500,77 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // Settle every open Manual transaction on connection `id` **before** an
+    // edit that makes it read-only, then `proceed`; a Cancel on any of them
+    // runs `cancelled` instead and asks nothing further
+    // (`Connection::ticks_read_only`). Asked after, as other stale-session
+    // edits are, a Cancel kept the writable session for the rest of its
+    // transaction on a connection the whole UI called read-only.
+    let settle_before_read_only: Rc<dyn Fn(u64, Rc<dyn Fn()>, Rc<dyn Fn()>)> = {
+        let guard_tx = guard_tx.clone();
+        Rc::new(
+            move |id: u64, proceed: Rc<dyn Fn()>, cancelled: Rc<dyn Fn()>| {
+                let open: Vec<usize> = tabs.with_untracked(|v| {
+                    v.iter()
+                        .filter(|t| {
+                            t.conn_id.get_untracked() == id
+                                && t.tx_mode.get_untracked() == TxMode::Manual
+                                && t.tx.get_untracked().is_open()
+                        })
+                        .map(|t| t.id)
+                        .collect()
+                });
+                // One prompt at a time, chained as `resettle_sessions` chains its.
+                let mut next: Rc<dyn Fn()> = proceed;
+                for tab_id in open.into_iter().rev() {
+                    let (guard_tx, then, cancelled) = (guard_tx.clone(), next, cancelled.clone());
+                    next =
+                        Rc::new(move || (guard_tx)(tab_id, then.clone(), Some(cancelled.clone())));
+                }
+                next();
+            },
+        )
+    };
+
     // Flip a connection's read-only flag and persist (the status-bar shortcut).
     // The `read_only` memo reads this reactively, so write-gating updates at once
     // — and a Manual tab's pinned session, whose enforcement was fixed when it
     // opened, is resettled as a saved edit's is: ticking read-only is
-    // `OpenSession::AskFirst` (R1-L2-01).
+    // `OpenSession::AskFirst` (R1-L2-01). **Ticking it settles the open
+    // transactions first** (`settle_before_read_only`), and a Cancel leaves the
+    // connection writable.
     let toggle_read_only: Rc<dyn Fn(u64)> = {
         let resettle_sessions = resettle_sessions.clone();
+        let settle_before_read_only = settle_before_read_only.clone();
         Rc::new(move |id: u64| {
-            let mut fate = OpenSession::Kept;
-            connections.update(|cs| {
-                if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
-                    let before = c.clone();
-                    c.read_only = !c.read_only;
-                    fate = before.open_session_after(c);
-                }
+            let resettle_sessions = resettle_sessions.clone();
+            let apply: Rc<dyn Fn()> = Rc::new(move || {
+                let mut fate = OpenSession::Kept;
+                connections.update(|cs| {
+                    if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
+                        let before = c.clone();
+                        c.read_only = !c.read_only;
+                        fate = before.open_session_after(c);
+                    }
+                });
+                persist_conns(
+                    Some(active_conn.get_untracked()),
+                    persist::Saving::Replacing,
+                );
+                resettle_sessions(id, fate);
             });
-            persist_conns(
-                Some(active_conn.get_untracked()),
-                persist::Saving::Replacing,
-            );
-            resettle_sessions(id, fate);
+            let ticks = connections.with_untracked(|cs| {
+                cs.iter().find(|c| c.id == id).is_some_and(|c| {
+                    let mut after = c.clone();
+                    after.read_only = !c.read_only;
+                    c.ticks_read_only(&after)
+                })
+            });
+            if ticks {
+                settle_before_read_only(id, apply, Rc::new(|| {}));
+            } else {
+                apply();
+            }
         })
     };
 
@@ -12463,13 +12513,146 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     };
 
     // Save the form (create or update); reload schema if the active conn changed.
-    let save_conn: Rc<dyn Fn()> = {
+    let save_conn_now: Rc<dyn Fn(u64, Option<Connection>, Connection)> = {
         let load_schema = load_schema.clone();
         let check_conn = check_conn.clone();
         let tunnels = tunnels.clone();
         let reset_activity = reset_activity.clone();
         let ai_session = ai_session.clone();
         let resettle_sessions = resettle_sessions.clone();
+        Rc::new(
+            move |id: u64, previous: Option<Connection>, conn: Connection| {
+                connections.update(|cs| {
+                    if let Some(existing) = cs.iter_mut().find(|c| c.id == id) {
+                        *existing = conn.clone();
+                    } else {
+                        cs.push(conn.clone());
+                    }
+                });
+                draft.id.set(Some(id));
+                persist_conns(
+                    Some(active_conn.get_untracked()),
+                    persist::Saving::Replacing,
+                );
+                // **Did this edit move the connection to a different server?** Asked
+                // through `targets_same_server`, the predicate that already answers it
+                // for the schema tree, rather than a second reading of the same
+                // fields. Everything below is invalid exactly when the answer is yes.
+                //
+                // It used to be asked of nothing at all: the tunnel was dropped on
+                // *every* save (review H9, "the edit may have changed the host / SSH
+                // settings"). True of an edit that moved something, and quietly
+                // destructive of one that didn't — tearing the listener down takes the
+                // forwarded connections with it, so changing a connection's **colour**
+                // killed the socket under a pinned Manual transaction and rolled back
+                // uncommitted work, while the tab went on offering Commit and
+                // Rollback. Unconditional was the cheap answer in the wrong place:
+                // cheap is right for throwing a *snapshot* away, and wrong for
+                // throwing a *transaction* away.
+                let repointed = previous
+                    .as_ref()
+                    .is_some_and(|p| !p.targets_same_server(&conn));
+                // **A wider question than "which server", asked separately.** The
+                // transport is not part of `targets_same_server` — nor should it be,
+                // since the schema tree's question really is only about which server
+                // — but it *is* part of "is anything I have already opened still
+                // valid". Change a connection's TLS mode and every one of its
+                // fields is unchanged, so the block below was skipped and a pinned
+                // Manual session went on running, and committing, over the plaintext
+                // socket it was opened on, while the form and the status bar reported
+                // TLS. See `Connection::invalidates_open_connections`.
+                let fate = previous
+                    .as_ref()
+                    .map_or(OpenSession::Kept, |p| p.open_session_after(&conn));
+                let invalidated = fate != OpenSession::Kept;
+                if repointed {
+                    // The cached tunnel reaches the old server — drop it (its listener
+                    // is torn down) so `load_schema` establishes a fresh one. **On the
+                    // server question, not the wider one:** a TLS change needs no new
+                    // listener, and tearing one down takes the forwarded connections
+                    // with it.
+                    tunnels.borrow_mut().remove(&id);
+                }
+                if invalidated {
+                    // Every pinned Manual session on this connection is stale — on a
+                    // server the user has left, a transport or guard they have just
+                    // changed, or the old init SQL — and is resettled, asking first
+                    // wherever its transaction is still alive (`resettle_sessions`).
+                    (resettle_sessions)(id, fate);
+                    // And the AI session, whose MCP subprocess holds a `Db` built at
+                    // spawn from the old target and the old tunnel port. `needs_respawn`
+                    // cannot see this: it compares the conn id, which did not move, and
+                    // the `AiSettings`, none of which name a host. Left alone, the
+                    // assistant's tools went on reading the previous server while the
+                    // whole UI said otherwise — or, tunnelled, reached a local port
+                    // that no longer answers. Dropping it costs nothing: `ai_send`
+                    // replays the conversation into the prompt of the session it
+                    // spawns next.
+                    let ours = ai_session
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|s| s.conn_id == id);
+                    if ours {
+                        ai_session.borrow_mut().take();
+                        // **Taking the session settles the panel.** Nothing else
+                        // will: the drop closes `stdin_tx`, the session task breaks
+                        // to `child.kill()`, and whether a further snapshot is
+                        // emitted at all is a race — so leaving `ai_busy` true here
+                        // left "Thinking…" spinning with its timer, the send box a
+                        // Stop button, and `ai_send` returning early for the rest of
+                        // the session. The stream consumer's `Settle` arm is the
+                        // other half of this, for the snapshot that does arrive.
+                        ai_stopping.set(false);
+                        if ai_busy.get_untracked() {
+                            mark_stopped(ai_messages);
+                            ai_busy.set(false);
+                        }
+                    }
+                }
+                if active_conn.get_untracked() == id {
+                    // Same reasoning as the tunnel above, for the other thing that
+                    // was taken against wherever this connection pointed *before* the
+                    // edit: the Server Activity snapshot. See `reset_activity` — the
+                    // effect that clears it cannot see an in-place edit, because the
+                    // id it keys on doesn't move.
+                    //
+                    // **After `load_schema`, not before.** When the edit repointed the
+                    // connection, `load_schema` is what re-opens the tunnel dropped
+                    // above, and the reset wants to refetch. Ordered the other way the
+                    // refetch is not merely at risk of finding no tunnel — it is
+                    // *guaranteed* to, the removal being a few lines up with the
+                    // re-open not yet asked for. Unconditional, unlike the block
+                    // above: a rename moves no server but the snapshot is cheap, and
+                    // `reset_activity` skips its own refetch when nothing is
+                    // reachable.
+                    //
+                    // **And the header's verdict, the third thing taken against the
+                    // old settings.** A save used to leave it alone, so "Disconnected
+                    // · Retry" from a wrong password stood beside a tree the corrected
+                    // one had just filled, until the poll — backed off by every
+                    // failure that password earned — came round. The edit forgets
+                    // that backoff and retires any ping still out with the old
+                    // settings (`note_evidence`), and the check runs now rather than
+                    // at the next tick; the verdict stands until it (or the load's
+                    // listing) answers. Unconditional for the reason above: an edit the predicates
+                    // call harmless can still be the password, which neither compares.
+                    note_health(health::Evidence::Edited);
+                    load_schema(conn);
+                    check_conn();
+                    (reset_activity)();
+                }
+            },
+        )
+    };
+
+    // The form's Save. **An edit that ticks read-only settles the open Manual
+    // transactions first** (`settle_before_read_only`), as the status-bar
+    // toggle does; a Cancel saves the rest of the edit with the connection
+    // still writable, rather than keeping a writable session on a read-only
+    // one until its transaction ends.
+    let save_conn: Rc<dyn Fn()> = {
+        let save_conn_now = save_conn_now.clone();
+        let settle_before_read_only = settle_before_read_only.clone();
         Rc::new(move || {
             let id = draft.id.get_untracked().unwrap_or_else(|| {
                 connections.with_untracked(|cs| {
@@ -12481,125 +12664,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // nothing yet to invalidate.
             let previous = connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned());
             let conn = draft.to_connection(id);
-            connections.update(|cs| {
-                if let Some(existing) = cs.iter_mut().find(|c| c.id == id) {
-                    *existing = conn.clone();
-                } else {
-                    cs.push(conn.clone());
-                }
-            });
-            draft.id.set(Some(id));
-            persist_conns(
-                Some(active_conn.get_untracked()),
-                persist::Saving::Replacing,
+            if !previous.as_ref().is_some_and(|p| p.ticks_read_only(&conn)) {
+                save_conn_now(id, previous, conn);
+                return;
+            }
+            let mut writable = conn.clone();
+            writable.read_only = false;
+            let (as_edited, kept) = (save_conn_now.clone(), save_conn_now.clone());
+            let previous_too = previous.clone();
+            settle_before_read_only(
+                id,
+                Rc::new(move || as_edited(id, previous.clone(), conn.clone())),
+                Rc::new(move || {
+                    draft.read_only.set(false);
+                    kept(id, previous_too.clone(), writable.clone())
+                }),
             );
-            // **Did this edit move the connection to a different server?** Asked
-            // through `targets_same_server`, the predicate that already answers it
-            // for the schema tree, rather than a second reading of the same
-            // fields. Everything below is invalid exactly when the answer is yes.
-            //
-            // It used to be asked of nothing at all: the tunnel was dropped on
-            // *every* save (review H9, "the edit may have changed the host / SSH
-            // settings"). True of an edit that moved something, and quietly
-            // destructive of one that didn't — tearing the listener down takes the
-            // forwarded connections with it, so changing a connection's **colour**
-            // killed the socket under a pinned Manual transaction and rolled back
-            // uncommitted work, while the tab went on offering Commit and
-            // Rollback. Unconditional was the cheap answer in the wrong place:
-            // cheap is right for throwing a *snapshot* away, and wrong for
-            // throwing a *transaction* away.
-            let repointed = previous
-                .as_ref()
-                .is_some_and(|p| !p.targets_same_server(&conn));
-            // **A wider question than "which server", asked separately.** The
-            // transport is not part of `targets_same_server` — nor should it be,
-            // since the schema tree's question really is only about which server
-            // — but it *is* part of "is anything I have already opened still
-            // valid". Change a connection's TLS mode and every one of its
-            // fields is unchanged, so the block below was skipped and a pinned
-            // Manual session went on running, and committing, over the plaintext
-            // socket it was opened on, while the form and the status bar reported
-            // TLS. See `Connection::invalidates_open_connections`.
-            let fate = previous
-                .as_ref()
-                .map_or(OpenSession::Kept, |p| p.open_session_after(&conn));
-            let invalidated = fate != OpenSession::Kept;
-            if repointed {
-                // The cached tunnel reaches the old server — drop it (its listener
-                // is torn down) so `load_schema` establishes a fresh one. **On the
-                // server question, not the wider one:** a TLS change needs no new
-                // listener, and tearing one down takes the forwarded connections
-                // with it.
-                tunnels.borrow_mut().remove(&id);
-            }
-            if invalidated {
-                // Every pinned Manual session on this connection is stale — on a
-                // server the user has left, a transport or guard they have just
-                // changed, or the old init SQL — and is resettled, asking first
-                // wherever its transaction is still alive (`resettle_sessions`).
-                (resettle_sessions)(id, fate);
-                // And the AI session, whose MCP subprocess holds a `Db` built at
-                // spawn from the old target and the old tunnel port. `needs_respawn`
-                // cannot see this: it compares the conn id, which did not move, and
-                // the `AiSettings`, none of which name a host. Left alone, the
-                // assistant's tools went on reading the previous server while the
-                // whole UI said otherwise — or, tunnelled, reached a local port
-                // that no longer answers. Dropping it costs nothing: `ai_send`
-                // replays the conversation into the prompt of the session it
-                // spawns next.
-                let ours = ai_session
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|s| s.conn_id == id);
-                if ours {
-                    ai_session.borrow_mut().take();
-                    // **Taking the session settles the panel.** Nothing else
-                    // will: the drop closes `stdin_tx`, the session task breaks
-                    // to `child.kill()`, and whether a further snapshot is
-                    // emitted at all is a race — so leaving `ai_busy` true here
-                    // left "Thinking…" spinning with its timer, the send box a
-                    // Stop button, and `ai_send` returning early for the rest of
-                    // the session. The stream consumer's `Settle` arm is the
-                    // other half of this, for the snapshot that does arrive.
-                    ai_stopping.set(false);
-                    if ai_busy.get_untracked() {
-                        mark_stopped(ai_messages);
-                        ai_busy.set(false);
-                    }
-                }
-            }
-            if active_conn.get_untracked() == id {
-                // Same reasoning as the tunnel above, for the other thing that
-                // was taken against wherever this connection pointed *before* the
-                // edit: the Server Activity snapshot. See `reset_activity` — the
-                // effect that clears it cannot see an in-place edit, because the
-                // id it keys on doesn't move.
-                //
-                // **After `load_schema`, not before.** When the edit repointed the
-                // connection, `load_schema` is what re-opens the tunnel dropped
-                // above, and the reset wants to refetch. Ordered the other way the
-                // refetch is not merely at risk of finding no tunnel — it is
-                // *guaranteed* to, the removal being a few lines up with the
-                // re-open not yet asked for. Unconditional, unlike the block
-                // above: a rename moves no server but the snapshot is cheap, and
-                // `reset_activity` skips its own refetch when nothing is
-                // reachable.
-                //
-                // **And the header's verdict, the third thing taken against the
-                // old settings.** A save used to leave it alone, so "Disconnected
-                // · Retry" from a wrong password stood beside a tree the corrected
-                // one had just filled, until the poll — backed off by every
-                // failure that password earned — came round. The edit forgets
-                // that backoff and retires any ping still out with the old
-                // settings (`note_evidence`), and the check runs now rather than
-                // at the next tick; the verdict stands until it (or the load's
-                // listing) answers. Unconditional for the reason above: an edit the predicates
-                // call harmless can still be the password, which neither compares.
-                note_health(health::Evidence::Edited);
-                load_schema(conn);
-                check_conn();
-                (reset_activity)();
-            }
         })
     };
 
@@ -16518,8 +16598,21 @@ mod app_tests {
         let toggle = region("let toggle_read_only: Rc<dyn Fn(u64)> = {");
         assert!(toggle.contains(".open_session_after("), "{toggle}");
         assert!(toggle.contains("resettle_sessions(id, fate)"), "{toggle}");
-        let save = region("let save_conn: Rc<dyn Fn()> = {");
+        let save = region("let save_conn_now: Rc<dyn Fn(u64, Option<Connection>, Connection)> = {");
         assert!(save.contains("(resettle_sessions)(id, fate)"));
+        // **Ticking read-only is asked before it applies** (security review
+        // S20): both routes check `ticks_read_only` and go through the settle,
+        // so a Cancel leaves the connection writable instead of keeping a
+        // writable session on a read-only one.
+        assert!(toggle.contains("ticks_read_only("), "{toggle}");
+        assert!(
+            toggle.contains("settle_before_read_only(id, apply"),
+            "{toggle}"
+        );
+        let form = region("let save_conn: Rc<dyn Fn()> = {");
+        assert!(form.contains("ticks_read_only("), "{form}");
+        assert!(form.contains("settle_before_read_only("), "{form}");
+        assert!(form.contains("writable.read_only = false"), "{form}");
         let resettle = region("let resettle_sessions: Rc<dyn Fn(u64, OpenSession)> = {");
         assert!(resettle.contains("pinned_fate(TxAsked::Cancelled)"));
         assert!(resettle.contains("pinned_fate(TxAsked::Settled)"));

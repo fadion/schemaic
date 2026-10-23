@@ -161,7 +161,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   the unenforced spelling is gone. The verdict still stands in front and still decides:
   it refuses a plain `DELETE` before a connection is opened, with a sentence, where the session
   would answer with a server error. The flag is read when each closure runs, so a Manual tab's
-  pinned session keeps the state it was opened in.
+  pinned session keeps the state it was opened in until a flip of the flag re-pins it
+  (`resettle_sessions`); ticking it settles any open transaction first, so no writable session
+  outlives the tick (`Connection::ticks_read_only`).
   **The re-run affordances answer to the guard too, through a refusal strictly stronger than
   it.** `ExportScope::AllRows` re-executes the tab's captured statement through
   `Db::stream_query_enforced`;
@@ -1584,9 +1586,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   **Import** entry, disabled on a `read_only` snapshot taken where the menu is built; there is no
   palette, shortcut, toolbar, menu-bar, MCP or drag-and-drop route to it, and
   `conn_actions.open_import` is a *different feature* — importing connections from another client,
-  `connection_import.rs` — rather than a second door. The only writer of an existing connection's
-  `read_only` is `main.rs`'s `toggle_read_only`, wired to the status bar's `ro_seg` click and to
-  nothing else: no shortcut, and nothing server- or background-driven (`db::session`'s read-only
+  `connection_import.rs` — rather than a second door. The only writers of an existing connection's
+  `read_only` are `main.rs`'s `toggle_read_only`, wired to the status bar's `ro_seg` click, and
+  the connection form's `save_conn`, behind Manage connections: no shortcut, and nothing server-
+  or background-driven (`db::session`'s read-only
   *transaction* detection is a different, session-scoped fact that shares the words). A modal
   backdrop covers the whole window, so neither that segment nor Manage Connections is reachable
   while Import is up. What is left is the pre-open race — a context menu whose snapshot went stale

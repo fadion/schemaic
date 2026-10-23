@@ -1417,7 +1417,9 @@ pub enum PinnedFate {
     /// Replaced now by one opened under the connection as saved; the tab stays
     /// in Manual.
     Repin,
-    /// Kept for the transaction it holds, and replaced when that ends.
+    /// Kept for the transaction it holds, and replaced when that ends. Never
+    /// for an edit that ticks read-only, which is asked before it applies
+    /// ([`Connection::ticks_read_only`]).
     RepinWhenTxEnds,
     /// Dropped; the tab falls back to Auto-commit.
     Release,
@@ -1445,6 +1447,20 @@ impl OpenSession {
 }
 
 impl Connection {
+    /// Does going from `self` to `after` **make the connection read-only**?
+    ///
+    /// The one edit whose question is asked *before* it applies. A Manual
+    /// tab's pinned session is enforced from the moment it opens, so a tab
+    /// still holding a writable one with an open transaction would go on
+    /// writing on a connection marked read-only. That window is what Cancel
+    /// used to keep open until the transaction ended
+    /// ([`PinnedFate::RepinWhenTxEnds`]). Asked first, Cancel leaves the
+    /// connection writable instead, and every session on a read-only
+    /// connection is enforced with no exception.
+    pub fn ticks_read_only(&self, after: &Connection) -> bool {
+        !self.read_only && after.read_only
+    }
+
     /// `host:port`, shown in the UI — or, on SQLite, the file's **name**.
     ///
     /// There is deliberately no `mysql://user:pass@host/db` URL builder: the DB
@@ -4230,6 +4246,24 @@ mod tests {
         assert_eq!(conn().open_session_after(&ro), OpenSession::AskFirst);
         assert_eq!(ro.open_session_after(&conn()), OpenSession::AskFirst);
         assert_eq!(ro.open_session_after(&ro), OpenSession::Kept);
+    }
+
+    /// **Ticking read-only asks before it applies**, not after: the
+    /// connection only becomes read-only once every open Manual transaction on
+    /// it is settled, and Cancel leaves it writable. So no writable session is
+    /// ever kept on a read-only connection, which is what `RepinWhenTxEnds`
+    /// did for a cancelled question. Lifting read-only, or any other edit,
+    /// is not this question.
+    #[test]
+    fn only_ticking_read_only_asks_before_it_applies() {
+        let mut ro = conn();
+        ro.read_only = true;
+        assert!(conn().ticks_read_only(&ro));
+        assert!(!ro.ticks_read_only(&conn()), "lifting it");
+        assert!(!ro.ticks_read_only(&ro), "unchanged");
+        let mut role = conn();
+        role.init_sql = "SET ROLE reporting".into();
+        assert!(!conn().ticks_read_only(&role), "another stale-session edit");
     }
 
     /// **What becomes of each pinned session**, once its transaction was

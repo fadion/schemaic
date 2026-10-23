@@ -303,6 +303,15 @@ Manual on a session opened under the connection as saved, at once with nothing o
 Commit / Roll back — or, after Cancel, `RepinWhenTxEnds`: the work is kept, the stale session
 only until the transaction ends (`a_cancelled_question_repins_when_the_transaction_ends`; it
 used to stay for the tab's life, S3.1-L5-01).
+**`ticks_read_only(after)` is the one edit asked *before* it applies, so `RepinWhenTxEnds` is
+never its answer.** Asked after, as every other stale-session edit still is, a Cancel kept the
+old **writable** session for the rest of its transaction on a connection the whole UI called
+read-only, with nothing but `run_verdict`'s text gate in front of it (security review S20). The
+app now settles every open Manual transaction on the connection first and applies the flag only
+once all are settled, and a Cancel leaves the connection writable — so every session on a
+read-only connection is server-enforced, with no window. It is `!self.read_only &&
+after.read_only` and nothing wider: lifting the flag, or an `init_sql` edit, is not this question
+(`only_ticking_read_only_asks_before_it_applies`).
 **`Tls` and `SslMode` are the transport half**, and they live here rather than in
 `schemaic-db` for the reason the module exists: this is the saved connection, and the mode is a
 saved field. Five rungs — `Disable` / `Prefer` / `Require` / `VerifyCa` / `VerifyFull` — asked
