@@ -182,17 +182,7 @@ pub fn load_connections() -> ConnectionsFile {
 /// a value read here and never delivered is invisible to a save, which is what
 /// keeps a save between the two from reading the empty field as a clear.
 pub fn secret(id: u64, kind: SecretKind) -> Result<Option<String>, StoreError> {
-    if let Some(known) = hydration().known(id, kind) {
-        return Ok(known.map(str::to_string));
-    }
-    let _reading = read_lock().lock().unwrap_or_else(|e| e.into_inner());
-    // Asked again under the read lock: another worker may have just read it.
-    if let Some(known) = hydration().known(id, kind) {
-        return Ok(known.map(str::to_string));
-    }
-    let answer = KeyringStore.get(&secrets::account(id, kind));
-    hydration().record(id, kind, &answer);
-    answer
+    keyring_reader().secret(id, kind)
 }
 
 /// [`secret`] for a read **nobody asked for** — the health ping's, on a timer:
@@ -200,13 +190,70 @@ pub fn secret(id: u64, kind: SecretKind) -> Result<Option<String>, StoreError> {
 /// again, or a locked keyring or a declined keychain prompt would be raised
 /// anew on every tick. The next read the user makes happen asks again.
 pub fn secret_unprompted(id: u64, kind: SecretKind) -> Result<Option<String>, StoreError> {
-    {
-        let h = hydration();
-        if h.is_unreadable(id, kind) {
-            return Err(StoreError(h.error.clone().unwrap_or_default()));
-        }
+    keyring_reader().secret_unprompted(id, kind)
+}
+
+/// The lazy reads' state and store, apart so their decisions can be tested
+/// against a store that counts its calls (release review S2-L6-05): the real
+/// one is the process's [`last_hydration`] and [`read_lock`] over the OS
+/// keyring, which no test may touch.
+struct Reader<'a> {
+    store: &'a dyn SecretStore,
+    hydration: &'a Mutex<Hydration>,
+    lock: &'a Mutex<()>,
+}
+
+fn keyring_reader() -> Reader<'static> {
+    Reader {
+        store: &KeyringStore,
+        hydration: last_hydration(),
+        lock: read_lock(),
     }
-    secret(id, kind)
+}
+
+impl Reader<'_> {
+    /// Poison-safe, as [`hydration`] is and for its reason.
+    fn hydration(&self) -> std::sync::MutexGuard<'_, Hydration> {
+        self.hydration.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn secret(&self, id: u64, kind: SecretKind) -> Result<Option<String>, StoreError> {
+        if let Some(known) = self.hydration().known(id, kind) {
+            return Ok(known.map(str::to_string));
+        }
+        let _reading = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Asked again under the read lock: another worker may have just read it.
+        if let Some(known) = self.hydration().known(id, kind) {
+            return Ok(known.map(str::to_string));
+        }
+        let answer = self.store.get(&secrets::account(id, kind));
+        self.hydration().record(id, kind, &answer);
+        answer
+    }
+
+    fn secret_unprompted(&self, id: u64, kind: SecretKind) -> Result<Option<String>, StoreError> {
+        {
+            let h = self.hydration();
+            if h.is_unreadable(id, kind) {
+                return Err(StoreError(h.error.clone().unwrap_or_default()));
+            }
+        }
+        self.secret(id, kind)
+    }
+
+    fn fill(&self, conn: &mut Connection, kinds: &[SecretKind]) -> Result<(), StoreError> {
+        for &kind in kinds {
+            let slot = match kind {
+                SecretKind::DbPassword => &mut conn.password,
+                SecretKind::SshPassword => &mut conn.ssh.password,
+                SecretKind::SshPassphrase => &mut conn.ssh.key_passphrase,
+            };
+            if slot.is_empty() {
+                *slot = self.secret(conn.id, kind)?.unwrap_or_default();
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What this process already knows of a secret, without asking the keyring:
@@ -223,17 +270,7 @@ pub fn known(id: u64, kind: SecretKind) -> Option<Option<String>> {
 /// [`deliver`]'s). Stops at the first secret the keyring would not give, and
 /// returns its error.
 pub fn fill(conn: &mut Connection, kinds: &[SecretKind]) -> Result<(), StoreError> {
-    for &kind in kinds {
-        let slot = match kind {
-            SecretKind::DbPassword => &mut conn.password,
-            SecretKind::SshPassword => &mut conn.ssh.password,
-            SecretKind::SshPassphrase => &mut conn.ssh.key_passphrase,
-        };
-        if slot.is_empty() {
-            *slot = secret(conn.id, kind)?.unwrap_or_default();
-        }
-    }
-    Ok(())
+    keyring_reader().fill(conn, kinds)
 }
 
 /// Hand what has been read of `conn`'s secrets of `kinds` to `conn` — **the one
@@ -496,5 +533,161 @@ mod tests {
         assert!(!classify_delete(Err(keyring::Error::PlatformFailure(
             Box::new(std::io::Error::other("down"))
         ))));
+    }
+
+    /// A store that counts its reads and answers what it is set to.
+    struct Counting {
+        gets: std::sync::atomic::AtomicUsize,
+        answer: std::sync::Mutex<Result<Option<String>, StoreError>>,
+    }
+
+    impl Counting {
+        fn answering(answer: Result<Option<String>, StoreError>) -> Self {
+            Counting {
+                gets: Default::default(),
+                answer: std::sync::Mutex::new(answer),
+            }
+        }
+        fn gets(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SecretStore for Counting {
+        fn get(&self, _: &str) -> Result<Option<String>, StoreError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Long enough for a second reader to arrive while this one is out.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            self.answer.lock().unwrap().clone()
+        }
+        fn set(&self, _: &str, _: &str) -> bool {
+            true
+        }
+        fn delete(&self, _: &str) -> bool {
+            true
+        }
+    }
+
+    use super::{Hydration, Reader, SecretKind, SecretStore, StoreError};
+    use schemaic_core::connection::{AuthMode, Connection, Environment, SshTunnel, Tls};
+    use std::sync::Mutex;
+
+    fn conn(id: u64) -> Connection {
+        Connection {
+            id,
+            name: "c".to_string(),
+            db_type: "MySQL".to_string(),
+            host: "db".to_string(),
+            port: 3306,
+            user: "u".to_string(),
+            password: String::new(),
+            file: String::new(),
+            database: String::new(),
+            ssh: SshTunnel::default(),
+            tls: Tls::default(),
+            color: None,
+            prominent_color: false,
+            read_only: false,
+            cli_access: false,
+            environment: Environment::None,
+            ai_data: None,
+            folder: String::new(),
+            auth: AuthMode::Password,
+            statement_timeout_secs: None,
+            init_sql: String::new(),
+        }
+    }
+
+    fn reader<'a>(store: &'a Counting, h: &'a Mutex<Hydration>, lock: &'a Mutex<()>) -> Reader<'a> {
+        Reader {
+            store,
+            hydration: h,
+            lock,
+        }
+    }
+
+    /// **Two readers of one secret raise one keyring read** (release review
+    /// S2-L6-05): the second finds the first's answer under the read lock,
+    /// rather than putting a second keychain prompt behind the first. And
+    /// what was read is cached for every later use.
+    #[test]
+    fn two_readers_of_one_secret_ask_the_keyring_once() {
+        let store = Counting::answering(Ok(Some("pw".into())));
+        let (h, lock) = (Mutex::new(Hydration::default()), Mutex::new(()));
+        std::thread::scope(|s| {
+            let a = s.spawn(|| reader(&store, &h, &lock).secret(7, SecretKind::DbPassword));
+            let b = s.spawn(|| reader(&store, &h, &lock).secret(7, SecretKind::DbPassword));
+            assert_eq!(a.join().unwrap(), Ok(Some("pw".into())));
+            assert_eq!(b.join().unwrap(), Ok(Some("pw".into())));
+        });
+        assert_eq!(store.gets(), 1);
+        let r = reader(&store, &h, &lock);
+        assert_eq!(r.secret(7, SecretKind::DbPassword), Ok(Some("pw".into())));
+        assert_eq!(store.gets(), 1, "a read secret is cached");
+        // Read, but not delivered: nothing marks a saved field as read.
+        let mut saved = conn(7);
+        h.lock().unwrap().deliver(&mut saved, &[]);
+        assert!(saved.password.is_empty());
+    }
+
+    /// **An unreadable secret is asked for again by the next use**, which may
+    /// come after the keyring was unlocked — but **not by the health ping**,
+    /// whose timer would otherwise raise a refused prompt on every tick.
+    #[test]
+    fn a_refused_read_is_retried_by_a_user_and_not_by_the_ping() {
+        let store = Counting::answering(Err(StoreError("locked".into())));
+        let (h, lock) = (Mutex::new(Hydration::default()), Mutex::new(()));
+        let r = reader(&store, &h, &lock);
+        assert!(r.secret(3, SecretKind::SshPassword).is_err());
+        assert_eq!(store.gets(), 1);
+        assert_eq!(
+            r.secret_unprompted(3, SecretKind::SshPassword),
+            Err(StoreError("locked".into()))
+        );
+        assert_eq!(store.gets(), 1, "the ping asked a refusing keyring again");
+        *store.answer.lock().unwrap() = Ok(Some("open".into()));
+        assert_eq!(
+            r.secret(3, SecretKind::SshPassword),
+            Ok(Some("open".into()))
+        );
+        assert_eq!(store.gets(), 2, "an error was cached");
+        // A secret never refused is the ping's to read.
+        assert_eq!(
+            r.secret_unprompted(3, SecretKind::DbPassword),
+            Ok(Some("open".into()))
+        );
+    }
+
+    /// **`fill` fills only empty fields, and stops at the first secret the
+    /// keyring will not give**, with its error, leaving the rest unread.
+    #[test]
+    fn fill_stops_at_the_first_unreadable_secret() {
+        let store = Counting::answering(Ok(Some("pw".into())));
+        let (h, lock) = (Mutex::new(Hydration::default()), Mutex::new(()));
+        let r = reader(&store, &h, &lock);
+        let mut copy = Connection {
+            password: "typed".into(),
+            ..conn(5)
+        };
+        r.fill(
+            &mut copy,
+            &[SecretKind::DbPassword, SecretKind::SshPassword],
+        )
+        .unwrap();
+        assert_eq!(copy.password, "typed", "a filled field is the caller's");
+        assert_eq!(copy.ssh.password, "pw");
+        assert_eq!(store.gets(), 1);
+
+        *store.answer.lock().unwrap() = Err(StoreError("locked".into()));
+        let mut copy = conn(6);
+        assert_eq!(
+            r.fill(
+                &mut copy,
+                &[SecretKind::DbPassword, SecretKind::SshPassword]
+            ),
+            Err(StoreError("locked".into()))
+        );
+        assert_eq!(store.gets(), 2, "a kind after the refusal was asked too");
+        assert!(copy.password.is_empty() && copy.ssh.password.is_empty());
     }
 }
