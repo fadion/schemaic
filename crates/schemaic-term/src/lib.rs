@@ -145,7 +145,17 @@ impl Terminal {
             })
             .map_err(to_io)?;
 
-        let mut cmd = CommandBuilder::new(&shell.program);
+        // **A bare name is spawned as the path `shell::which` resolves it to**,
+        // so portable-pty's own `PATH` search, which joins a relative entry
+        // against the working directory, never runs, and the launcher that
+        // judged the resolved file (`launch::direct_spawn_verdict`) is
+        // answered about the file that starts. A name `which` cannot find is
+        // passed on as it was, for the spawn's own error.
+        let program = match shell::which(&shell.program) {
+            Some(path) if !shell.program.contains(['/', '\\']) => path.into_os_string(),
+            _ => shell.program.clone().into(),
+        };
+        let mut cmd = CommandBuilder::new(program);
         cmd.args(&shell.args);
         cmd.env("TERM", "xterm-256color");
         for (k, v) in &shell.env {

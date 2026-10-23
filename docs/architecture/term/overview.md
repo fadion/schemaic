@@ -38,3 +38,18 @@ state is in the grid and the pending notify only says there is a new one. **Exit
 coalesced** — `read_loop`'s final notify after `exited.store` must arrive whatever the flag says,
 or a shell that exits with its last output already read leaves the panel showing a live prompt
 for a process that is gone.
+**`shell::which` searches only absolute `PATH` entries** (security review S25). It joined every
+entry as written, and a relative one — a `.`, or the empty entry a trailing `;` makes on Windows
+— is resolved against the app's working directory, so a `mysql`, `sqlcmd`, `docker` or `pwsh`
+planted there ran in place of the real one. The search is now the pure
+`which_in(program, path: &OsStr)`, which `which` calls with the process `PATH` and which drops
+every entry that is not absolute; `a_relative_or_empty_path_entry_is_not_searched` takes this
+crate's own `Cargo.toml`, sitting in the test's working directory, as the planted file and was
+red without the filter. It has a module of its own, `which_tests`, outside the Windows-only WSL
+tests, so every CI leg runs it. **And `Terminal::spawn` starts the path `which` found, not the name**: a
+bare program name (no `/` or `\`) is handed to portable-pty's `CommandBuilder` as the absolute
+path `shell::which` returns, so portable-pty's own `PATH` search — which resolved the name a
+second time, relative entries included — never runs, and `launch::direct_spawn_verdict`, which
+the app's `resolve_cli`/`resolve_native_cli` ask of the file `which` resolved, is answered about
+the file that actually starts. A name `which` cannot find is passed on as given, so the spawn's
+own error still says why; a program already written as a path is never searched at all.

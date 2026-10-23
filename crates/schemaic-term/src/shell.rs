@@ -191,8 +191,16 @@ impl Default for TerminalSettings {
 
 /// Resolve `program` against `PATH` (honoring `PATHEXT` on Windows).
 pub fn which(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    which_in(program, &std::env::var_os("PATH")?)
+}
+
+/// [`which`] over `path`, so the search is testable without an environment.
+///
+/// **Only absolute entries are searched.** A relative or empty one — a `.`, a
+/// trailing `;` — is resolved against the app's working directory, which is
+/// how a client planted there would have run in place of the real one.
+pub fn which_in(program: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path).filter(|d| d.is_absolute()) {
         let direct = dir.join(program);
         if direct.is_file() {
             return Some(direct);
@@ -547,5 +555,34 @@ mod tests {
         let mut bytes = utf16le("Ubuntu");
         bytes.push(0x00); // incomplete final code unit
         assert_eq!(parse_wsl_list(&bytes), vec!["Ubuntu"]);
+    }
+}
+
+/// [`which_in`] on every platform, unlike the WSL tests above.
+#[cfg(test)]
+mod which_tests {
+    use super::which_in;
+
+    /// **A relative or empty `PATH` entry is no directory to search**
+    /// (security review S25). Joined as written it is resolved against the
+    /// app's working directory — a trailing `;` on Windows is one — so a
+    /// `mysql`, `sqlcmd` or `pwsh` planted there was run in place of the real
+    /// one. This crate's own `Cargo.toml` sits in the test's working
+    /// directory, which makes it the planted file.
+    #[test]
+    fn a_relative_or_empty_path_entry_is_not_searched() {
+        for path in [".", "", ";", "./"] {
+            assert_eq!(
+                which_in("Cargo.toml", std::ffi::OsStr::new(path)),
+                None,
+                "{path:?}"
+            );
+        }
+        let here = std::env::current_dir().expect("the test's directory");
+        assert_eq!(
+            which_in("Cargo.toml", here.as_os_str()),
+            Some(here.join("Cargo.toml")),
+            "an absolute entry is still searched"
+        );
     }
 }

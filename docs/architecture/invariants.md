@@ -693,7 +693,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   whole shape being that the refusal is about *this candidate*, and the message is kept as the answer
   of last resort so a box whose **only** client is a shim still gets that specific line rather than
   the generic one. `resolve_cli_with(progs, resolve)` takes the resolver, so the search is testable
-  without a `PATH`.
+  without a `PATH`. **The verdict is about the file `schemaic_term::shell::which` resolved, so that
+  is the file the terminal starts** (security review S25): `Terminal::spawn` used to hand
+  portable-pty the bare name, which searched `PATH` again on its own, relative entries included,
+  and could start a different file from the one judged. It spawns `which`'s absolute path now, and
+  `which` itself skips a relative or empty entry — `schemaic-term`'s entry.
   **What the search reaches is a value, not a sentence.** `resolve_cli`, `resolve_cli_with` and
   `resolve_native_cli` answer `Err(Unreached::Absent)` or `Err(Unreached::Refused(why))` — `why`
   a `launch::Refusal`, which `said` words through `refusal_text` — and each
