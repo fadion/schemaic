@@ -167,6 +167,12 @@ pub struct Session {
     /// transaction [`Session::ensure_tx`] opens says `READ ONLY` itself — see
     /// [`Session::open_enforced`] for why the session default is not enough.
     read_only: bool,
+    /// Opened with a gated `Enforce` that refuses writes: on PostgreSQL every
+    /// statement first asks whether the path now shadows a builtin
+    /// ([`pg::refuse_a_shadowed_path`], release review S1-L5-03), since the
+    /// gate's yes to a call was about the builtin and the path can change
+    /// while the tab stays open.
+    shadow_check: bool,
 }
 
 /// What [`Session::commit`] answers when the block was already aborted, so the
@@ -325,6 +331,7 @@ impl Session {
             inner: Mutex::new(backend),
             in_tx: AtomicBool::new(false),
             read_only: enforce.is_some_and(crate::Enforce::refuses_writes),
+            shadow_check: enforce.is_some_and(|e| e.refuses_writes() && e.was_gated()),
         }))
     }
 
@@ -708,6 +715,18 @@ impl Session {
         if cancel.is_cancelled() {
             return Outcome {
                 result: Err(DbError::Cancelled),
+                stmt: StmtOutcome::NotSent,
+            };
+        }
+        // **The path asked again before every statement** (release review
+        // S1-L5-03): checked only at open, a builtin's name planted on it while
+        // the tab stayed open answered the next call the gate had passed.
+        if self.shadow_check
+            && let Backend::Postgres { client } = &*guard
+            && let Err(e) = pg::refuse_a_shadowed_path(client).await
+        {
+            return Outcome {
+                result: Err(e),
                 stmt: StmtOutcome::NotSent,
             };
         }
@@ -1637,6 +1656,7 @@ mod tests {
             inner: Mutex::new(Backend::Retired),
             in_tx: AtomicBool::new(true),
             read_only: false,
+            shadow_check: false,
         }
     }
 

@@ -728,6 +728,99 @@ pub async fn a_read_only_session_refuses_a_path_that_shadows_a_builtin(target: &
     scratch.teardown().await;
 }
 
+/// **A pinned read-only session asks about the path before every statement**
+/// (release review S1-L5-03). The shadow check ran when the session opened,
+/// so a `public.lower(varchar)` planted while a Manual tab stayed open
+/// answered the tab's next `lower(…)` — which the gate passes, `lower` being
+/// listed — inside the read-only transaction it was already in. PostgreSQL
+/// only.
+pub async fn a_pinned_read_only_session_refuses_a_shadow_planted_after_it_opened(
+    target: &'static Target,
+) {
+    use schemaic_db::Session;
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    let scratch = Scratch::create(target, "enforce_late_shadow").await;
+    let database = Some(scratch.database.as_str());
+    let s = Session::open_enforced(&scratch.db, database, Some(Enforce::ReadOnly))
+        .await
+        .unwrap_or_else(|e| panic!("opening on a clean path: {e}"));
+    s.ensure_tx().await.expect("BEGIN READ ONLY");
+    let ask = || s.fetch_query("SELECT lower('A'::varchar)", 1, CancellationToken::new());
+    let before = ask()
+        .await
+        .result
+        .unwrap_or_else(|e| panic!("the clean read: {e}"));
+    assert_eq!(
+        before.cell(0, 0).expect("a value").display().to_string(),
+        "a"
+    );
+    scratch
+        .exec(
+            "CREATE FUNCTION public.lower(varchar) RETURNS text LANGUAGE sql \
+             AS $$ SELECT 'shadowed'::text $$",
+        )
+        .await;
+    // The tab's next transaction, where the backend takes in the catalogue
+    // change (within the one already open, its cached lookup still answered
+    // the builtin — measured on 16).
+    s.commit().await.expect("COMMIT");
+    s.ensure_tx().await.expect("BEGIN READ ONLY");
+    match ask().await.result {
+        Err(DbError::Refused(DbRefusal::ShadowedBuiltin { schema, name, .. })) => {
+            assert_eq!((schema.as_str(), name.as_str()), ("public", "lower"))
+        }
+        Ok(rs) => panic!(
+            "the pinned session ran on a path shadowed since it opened: {}",
+            rs.cell(0, 0).expect("a value").display()
+        ),
+        Err(e) => panic!("refused, but not for the shadow: {e}"),
+    }
+    s.close().await;
+
+    // Run All on a fresh connection: one set-up, then statement after
+    // statement, each its own transaction — a window as long as the batch.
+    scratch.exec("DROP FUNCTION public.lower(varchar)").await;
+    let mut results = Vec::new();
+    let stmts = [
+        "SELECT pg_sleep(0.6)".to_string(),
+        "SELECT lower('A'::varchar)".to_string(),
+    ];
+    let batch = scratch.db.run_batch_enforced(
+        database,
+        &stmts,
+        1,
+        CancellationToken::new(),
+        |_, r| results.push(r),
+        Some(Enforce::ReadOnly),
+    );
+    let plant = async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        scratch
+            .exec(
+                "CREATE FUNCTION public.lower(varchar) RETURNS text LANGUAGE sql \
+                 AS $$ SELECT 'shadowed'::text $$",
+            )
+            .await;
+    };
+    tokio::join!(batch, plant);
+    assert!(
+        results[0].is_ok(),
+        "the clean first statement: {:?}",
+        results[0]
+    );
+    match &results[1] {
+        Err(DbError::Refused(DbRefusal::ShadowedBuiltin { name, .. })) => assert_eq!(name, "lower"),
+        Ok(rs) => panic!(
+            "Run All ran on a path shadowed since it began: {}",
+            rs.cell(0, 0).expect("a value").display()
+        ),
+        Err(e) => panic!("refused, but not for the shadow: {e}"),
+    }
+    scratch.teardown().await;
+}
+
 /// **A read the app wrote runs beside a shadowed builtin** (release review
 /// S1-L1-02). The shadow refusal exists so that the text gate's allowlist
 /// means the builtin; a dump's, the Live Monitor's or a sample's `SELECT *`

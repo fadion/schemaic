@@ -142,6 +142,7 @@ live_suite!(
         a_read_only_session_calls_no_users_function_while_setting_itself_up,
         a_read_only_session_refuses_a_path_that_shadows_a_builtin,
         a_generated_read_runs_beside_a_shadowed_builtin,
+        a_pinned_read_only_session_refuses_a_shadow_planted_after_it_opened,
         counting_a_view_runs_no_write_its_body_makes,
         a_read_only_session_refuses_a_path_with_a_users_operator,
         a_read_only_session_runs_beside_an_extensions_functions,

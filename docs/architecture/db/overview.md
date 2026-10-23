@@ -1113,7 +1113,15 @@ connect failure — while a `SET` or `SHOW` that fails is still `ConnectFailure:
 to re-wrap it through `db_err`. Asked in the one function every `Enforce::ReadOnly` PostgreSQL
 connection is made with, it covers the enforced read and stream, the batch, the read-only plan
 and the read-only Analyze (which sets its session up apart from `fetch_query`), and a pinned
-read-only session. **It is not asked of a read the app wrote — `Enforce::Generated`** (release
+read-only session. **And it is asked again before each later statement** where a connection
+outlives one (release review S1-L5-03): `pg::refuse_a_shadowed_path` is the refusal on its own,
+which `Session::fetch_query` calls on a gated read-only session (`Session::shadow_check`) and
+`run_batch` before every statement after the first. Asked only at set-up, a builtin's name
+planted while a Manual tab stayed open answered its next transaction's call, and a long Run All's
+later statements likewise — each new transaction takes in the catalogue change, while within one
+the backend's cached lookup still answers the builtin (measured on 16,
+`a_pinned_read_only_session_refuses_a_shadow_planted_after_it_opened`, red for both halves before
+it). One catalogue read per statement, on those two paths only. **It is not asked of a read the app wrote — `Enforce::Generated`** (release
 review S1-L1-02): the Live Monitor's `fetch_table`, `Db::copy_rows`' reader, `schemaic dump`'s
 and the folder export's reads, the MCP server's `sample_rows` and the AI panel's Fill and Seed
 samples. Security review S8 had put those on `ReadOnly` on every connection, writable or not, so

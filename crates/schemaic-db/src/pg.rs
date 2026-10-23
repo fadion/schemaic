@@ -502,6 +502,19 @@ pub(crate) async fn set_up_read_only(client: &Client, shadow_check: bool) -> Res
     if !shadow_check {
         return Ok(());
     }
+    refuse_a_shadowed_path(client).await
+}
+
+/// [`set_up_read_only`]'s refusal on its own: `Err(Refused(ShadowedBuiltin))`
+/// when [`shadowed_builtin_sql`] finds anything on the session's path.
+///
+/// Apart because **a pinned read-only session asks it again before every
+/// statement** (release review S1-L5-03, `Session::fetch_query`): asked only
+/// when the session opened, a function planted on the path afterwards — by
+/// the owner, or by any login on PostgreSQL ≤ 14 — answered the next
+/// `lower(name)` the gate had passed, for as long as the tab stayed open. One
+/// catalogue read per statement, on a Manual tab of a read-only connection.
+pub(crate) async fn refuse_a_shadowed_path(client: &Client) -> Result<(), DbError> {
     let rows = query_all(
         client,
         &shadowed_builtin_sql(schemaic_core::sql::pg_read_functions()),
@@ -779,6 +792,18 @@ pub(crate) async fn run_batch(
         {
             stopped = true;
             on_result(i, Err(read_only_setup_failed(&e)));
+            continue;
+        }
+        // And the path, for the reason `Session::fetch_query` asks it before
+        // each statement (release review S1-L5-03): a long Run All is a window
+        // as long as itself, and each statement's own transaction takes in a
+        // function planted since the last. The first was asked at set-up.
+        if i > 0
+            && enforce.is_some_and(|e| e.refuses_writes() && e.was_gated())
+            && let Err(e) = refuse_a_shadowed_path(&client).await
+        {
+            stopped = true;
+            on_result(i, Err(e));
             continue;
         }
         let outcome = run_statement(
