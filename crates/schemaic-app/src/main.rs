@@ -6775,6 +6775,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                         None => tab.tx.set(TxState::closed()),
                     }
+                    // A prompt raised about this tab while the end was in
+                    // flight — the tab still read as open — asks about a
+                    // transaction that is gone now. Answered here, before `then`
+                    // can put its own prompt in the one slot.
+                    if let Some(stale) = tx_prompt.get_untracked().filter(|p| p.tab_id == tab_id) {
+                        (stale.resolve)(TxChoice::Settled);
+                    }
                     settle();
                     // Its stale session was kept for this transaction alone.
                     repin_if_owed(tab, &repin_owed, &repin_late);
@@ -6826,6 +6833,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         match choice {
                             TxChoice::Commit => (end_tx)(tab_id, true, Some(proceed.clone())),
                             TxChoice::Rollback => (end_tx)(tab_id, false, Some(proceed.clone())),
+                            TxChoice::Settled => proceed(),
                             TxChoice::Cancel => {
                                 if let Some(cancel) = on_cancel.clone() {
                                     cancel();
@@ -17217,6 +17225,54 @@ mod app_tests {
         let resettle = region("let resettle_sessions: Rc<dyn Fn(u64, OpenSession)> = {");
         assert!(resettle.contains("pinned_fate(TxAsked::Cancelled)"));
         assert!(resettle.contains("pinned_fate(TxAsked::Settled)"));
+    }
+
+    /// **A prompt raised while its transaction's end was in flight closes when
+    /// that end lands.** The tab reads as open until the COMMIT or ROLLBACK
+    /// answers, so a second read-only click inside a slow COMMIT (or a tab
+    /// close, a mode switch) asked about a transaction that was gone by the
+    /// time anyone read the question — found driving f38640ac's hand checks.
+    /// The landing now answers that prompt itself, and the action behind it
+    /// goes ahead. Pinned by its text: both halves are closures no core test
+    /// reaches.
+    #[test]
+    fn a_prompt_about_a_transaction_that_ended_meanwhile_answers_itself() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let region = |head: &str| {
+            let at = body
+                .find(head)
+                .unwrap_or_else(|| panic!("`{head}` — this gate is stale"));
+            let end = at + body[at..].find("\n    };").expect("the end of the closure");
+            &body[at..end]
+        };
+        let end_tx = region("let end_tx: EndTxFn = {");
+        let closed = end_tx
+            .find("None => tab.tx.set(TxState::closed()),")
+            .expect("end_tx's landing");
+        let answered = end_tx
+            .find("(stale.resolve)(TxChoice::Settled)")
+            .expect("end_tx no longer answers a prompt its landing made stale");
+        assert!(closed < answered, "{end_tx}");
+        // Before `settle()` and `then`: `tx_prompt` is one slot, and `then`
+        // raising its own prompt first would overwrite the stale one and lose
+        // its continuation.
+        let landing = &end_tx[closed..];
+        let answered = answered - closed;
+        for later in ["settle();", "then();"] {
+            let at = landing.find(later).expect("the landing's continuation");
+            assert!(
+                answered < at,
+                "`{later}` runs before the stale prompt is answered"
+            );
+        }
+        let guard = region("let guard_tx: GuardTxFn = {");
+        assert!(guard.contains("TxChoice::Settled => proceed()"), "{guard}");
     }
 
     /// **The note that a commit's re-read dropped the filter reaches the

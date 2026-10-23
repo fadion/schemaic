@@ -2664,6 +2664,10 @@ pub enum TxChoice {
     Rollback,
     /// Back out — the action that raised the prompt doesn't happen either.
     Cancel,
+    /// Not the user's: the transaction ended while the prompt was up (it was
+    /// raised while an earlier answer's COMMIT or ROLLBACK was still in
+    /// flight), so the question is answered and the action goes ahead.
+    Settled,
 }
 
 /// A pending "this would strand your open transaction" question.

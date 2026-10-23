@@ -362,7 +362,18 @@ while `draft.id` is still this one. Unticking goes straight through, as before.
 `the_read_only_toggle_resettles_pinned_sessions` pins both routes' asking `ticks_read_only` and
 going through the settle, the form's `writable.read_only = false`, `save_conn_now` touching no
 `draft.`, the Cancel arm's guard, the flip's `c.read_only = target`, and the settle's re-scan
-before `proceed`. **A session open landing after a later one is closed, not filed**: `open_session`
+before `proceed`. **A prompt raised while an end is in flight answers itself when the end lands.**
+A tab reads as open until its COMMIT or ROLLBACK answers, so clicking the read-only segment again
+during a slow COMMIT (6 s, against a PostgreSQL table whose deferred constraint trigger calls
+`pg_sleep`) raised a second "Open transaction" prompt for the same tab, and it stayed up after the
+COMMIT landed, asking about a transaction that no longer existed; any guarded action — tab close,
+mode switch, database switch — raised in that window did the same. `end_tx`'s landing, once it has
+set `TxState::closed()`, resolves a `tx_prompt` whose `tab_id` is this tab with
+`TxChoice::Settled`, which `guard_tx` treats as `proceed()`. **It does so before `settle()` and
+before `then`**: `tx_prompt` is one slot, and `then` raising its own prompt first would overwrite
+the stale one and lose its continuation. `a_prompt_about_a_transaction_that_ended_meanwhile_answers_itself`
+pins the resolve after the landing's `closed()` and before its `settle()` and `then`, and the
+`Settled => proceed()` arm. **A session open landing after a later one is closed, not filed**: `open_session`
 keeps each tab's newest open generation, and `tx::session_still_wanted(mode, launched, newest)`
 keeps only the newest — a writable open still connecting when the read-only tick re-pinned the
 tab landed second and replaced the read-only session (release review S3-L2-04,
