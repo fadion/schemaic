@@ -11,7 +11,7 @@ reports instead of repairing.** The app's load self-heals — a `connections.jso
 legacy plaintext is migrated into the keyring and the on-disk copy rewritten blanked — which a
 one-shot `schemaic query` must not do as a side effect while the GUI may be running and about to
 save its own copy — nor the AI panel's `--mcp-serve` subprocess, which runs *while* the GUI is,
-and reads its connection's password this way (`app::ai::keyring_password`). So it reads through `persist::read_connections_unrecovered` (for that
+and reads its whole connection this way (`app::ai::keyring_connection`). So it reads through `persist::read_connections_unrecovered` (for that
 function's own reasons) and hands back the `ConnectionsFile` **unhydrated** — `list` shows no
 secret — and `hydrate_for_cli(conn, supplied)` fills in only the one connection a command runs
 against, and only the secrets it will use, through `core::secrets::hydrate_connection`, returning the strings the caller puts on

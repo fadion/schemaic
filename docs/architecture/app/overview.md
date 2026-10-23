@@ -980,9 +980,9 @@ its server is registered *globally* with `agy mcp add`, so the command line hold
 `--endpoint-file <path>` is written into that CLI's own config rather than passed per invocation —
 still the path and never the endpoint, and `write_endpoint_file` puts the file in the same
 directory, with the same prefix, as the Claude config so `sweep_stale_mcp_configs` already
-collects it. It holds the same secret and must not outlive its session any longer. **OpenCode is on
+collects it. It held the same secret and must not outlive its session any longer. **OpenCode is on
 that route for a third reason**: it is configured by a file, like Claude, but by a *reused* one, so
-the `--endpoint-file <path>` in its `opencode.json` is what keeps the credential out of a directory
+the `--endpoint-file <path>` in its `opencode.json` is what keeps the endpoint out of a directory
 that outlives the session (`crate::opencode`). **Copilot is on it for OpenCode's reason**: its MCP
 config *is* a file, but it lives in a `COPILOT_HOME` reused across sessions, so it carries the
 path, and the endpoint file is what this session owns (`crate::copilot`). The two differ where the
@@ -1045,10 +1045,14 @@ through: an unreadable `--endpoint-file` dropped to `None`, fell back to `$SCHEM
 `SchemaScope::None` started answering with sample rows and a full catalogue listing from whatever
 local MySQL or MariaDB was listening — both access gates re-opened against a database nobody
 authorised, and the trigger was not hypothetical, because the age-based sweep below could delete a
-live session's endpoint file. **A missing field inside a blob that *did* parse still defaults, and
-must**: those defaults are what every endpoint written before a given field existed relies on
-(`an_old_blob_still_gets_its_back_compat_defaults`), so failing closed is about the blob being
-absent or unreadable and not about it being old. `mcp.rs` is untouched by this — it destructured
+live session's endpoint file. **A missing field inside a blob that *did* parse still defaults** —
+those defaults are what every endpoint written before a given field existed relies on, so failing
+closed is about the blob being absent or unreadable and not about it being old — **except the two
+data levels, which now default *off*** (security review S5): absent `samples` and `schema` used to
+mean both on, so a rewritten blob could widen what the assistant reads. The app writes both on
+every spawn, so a blob without them is either a rewritten one or a session spawned before an
+update, and the cost is that such a session goes without sample rows until its next spawn
+(`missing_data_flags_default_closed`, `an_old_blob_gets_closed_data_levels`). `mcp.rs` is untouched by this — it destructured
 the defaulted endpoint and started answering, so the fix belongs upstream of it — and `main.rs`'s
 `--mcp-serve` arm prints the reason to **stderr**, because stdout is the JSON-RPC stream, then
 exits 2 so the launching CLI surfaces the server as failed
@@ -1056,36 +1060,53 @@ exits 2 so the launching CLI surfaces the server as failed
 does *not* fall through to the environment, and `a_blob_that_is_not_a_json_object_refuses`).
 **The endpoint names its connection and never its password.** `endpoint_json(db, conn_id, …)`
 writes `"conn_id"` — the saved connection the `Db` was built from, which `StartAiParams::conn_id`
-carries from `main.rs`'s active connection — and no `"pass"`; the subprocess puts the password
-back itself, `mcp_endpoint_from_env` calling `resolve_password(&mut blob, keyring_password)`
-before `endpoint_from_value`. It used to write the password, and owner-private was the whole of
+carries from `main.rs`'s active connection — and no `"pass"`; the subprocess builds its `Db` from
+that saved connection itself, `mcp_endpoint_from_env` calling `saved_db(&blob, keyring_connection)`
+and putting the result in place of the `Db` `endpoint_from_value` parsed. It used to write the password, and owner-private was the whole of
 its protection — which guards against other accounts and not against the agent, which runs *as*
 the user. The harnesses whose built-in readers stay live could be steered to read the file and put
 the plaintext DB password into the conversation, at every AI data level: Cursor's `Grep`, with
 the path sitting in `.cursor/mcp.json` inside the model's own working directory; Codex's read-only
 sandbox; Antigravity's `view_file`. The keyring is out of a file reader's reach, and since the
-same blob rides Claude's config `env` map, that no longer holds the password either. **The
-sign-in mode crosses as `"auth"`, and an Entra or cloud IAM token does not cross at all**: `endpoint_from_value`
-hands the mode to `Db::with_auth`, an absent one being a password as every blob written before
-the field meant (`the_endpoint_handoff_carries_the_sign_in_mode`), and the subprocess asks the
-CLI for its own token through its own process's cache (`db/entra.rs`, `db/cloud_iam.rs`). **The connection's
-init SQL crosses as `"init_sql"`**, written from `Db::init_sql()` and handed back to
-`Db::with_init_sql`, so the assistant's queries run under the `search_path` or role the user's
-own do; an absent one is none, which is what every blob written before the field meant
-(`the_endpoint_handoff_carries_the_init_sql`). The subprocess's connects check it again, as
-every connect does (`schemaic-db`'s init SQL paragraph).
-`resolve_password` is pure with the lookup injected; `keyring_password(id)` is the real one —
+same blob rides Claude's config `env` map, that no longer holds the password either.
+**And nothing the password travels with is the blob's either** (security review S5). Moving the
+password to the keyring left everything around it in the blob — host, port, user, engine, TLS
+plan, sign-in mode, init SQL, signing target — so whatever could rewrite the endpoint file, or set
+`$SCHEMAIC_MCP_ENDPOINT`, could have the subprocess fetch the saved password from the keyring and
+send it to a host of its own with TLS off, attach init SQL of its own to the session, or (with the
+data levels above) widen what it reads. `saved_db(v, lookup) -> Result<Option<Db>, String>` now
+answers a blob that carries a `conn_id` with `Db::connect(&saved, tunnel)` — exactly how `main.rs`
+builds the app's own `Db` — so all of those are the saved connection's. The blob supplies only what
+the saved connection cannot know, the local port of the app's SSH tunnel, and only when
+`saved.uses_tunnel()`; a tunnelled connection whose blob has no port is refused, and the blob's
+`host` is never read, because `Db::connect` writes `127.0.0.1` for a tunnel itself. What stays the
+blob's is the session's choice rather than the connection's: the selected `database`, `samples`,
+`schema` and `hidden` (`the_subprocess_connects_where_the_saved_connection_points`, which hands it
+a forged host, port, user, engine and init SQL and gets the saved ones back). **The residual**: the
+tunnel port is still the blob's, so a same-user process that rewrites it can point the subprocess
+at a loopback listener of its own. **The sign-in mode is the saved connection's, and an Entra or
+cloud IAM token does not cross at all**: the subprocess asks the CLI for its own token through its
+own process's cache (`db/entra.rs`, `db/cloud_iam.rs`). So is the **init SQL**, so the assistant's
+queries run under the `search_path` or role the user's own do, and the subprocess's connects check
+it again, as every connect does (`schemaic-db`'s init SQL paragraph). `endpoint_json` still writes
+`"auth"`, `"init_sql"`, `"signing_target"` and the rest, and `endpoint_from_value` still parses them
+— an absent one meaning what every blob written before the field meant
+(`the_endpoint_handoff_carries_the_sign_in_mode`, `the_endpoint_handoff_carries_the_init_sql`) —
+but for a blob that names its connection that parse is discarded; it is what a blob with no
+`conn_id` gets.
+`saved_db` is pure with the lookup injected; `keyring_connection(id)` is the real one —
 `conn::secrets::load_connections_readonly`, **never** the app's self-healing load, which may
 rewrite `connections.json` under the running app; the connection found by id; `hydrate_for_cli`,
-whose notices go to stderr because stdout is the JSON-RPC stream. Host and port are still the
-app's own SSH tunnel, so no SSH secret is needed on this side. An unreadable connections file or
+whose notices go to stderr because stdout is the JSON-RPC stream. It hydrates the DB secrets only:
+the tunnel is the app's, so the SSH password and passphrase are passed as `supplied` and never read
+into this process. An unreadable connections file or
 an id not among the saved connections is an `Err`, and so the same stderr-and-exit-2 refusal as
 above — an empty password would come back as the server's *Access denied*, which names the wrong
 cause. A keyring that will not answer is **not** one of those: `hydrate_for_cli` reports it as a
 notice and leaves the field empty, so that case still reaches the server with an empty password
-and the reason is on stderr only. A blob with no `conn_id` is left alone, so an older blob's
-`pass` still parses (`the_endpoint_names_the_connection_and_never_its_password`,
-`the_subprocess_reads_the_password_by_the_connection_id`). **What this does not cover**: a
+and the reason is on stderr only. A blob with no `conn_id` is left alone — it carries no keyring
+secret to protect — so an older blob's `pass` still parses
+(`the_endpoint_names_the_connection_and_never_its_password`). **What this does not cover**: a
 harness that can *execute* commands as the user can still reach the keyring — Windows Credential
 Manager answers any process of the user — so this closes the file-reader path and not that one;
 and on a machine with no working keyring the password is in `connections.json` as plaintext

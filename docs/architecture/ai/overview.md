@@ -175,8 +175,15 @@ own measurements record a turn running `list_dir` and `view_file` unprompted. A 
 column comment, an imported dump or a row value is text the user did not write, and
 `../connections.json` was one relative path away. The credentials the AI paths *write* moved the
 other way in the same change, out of the temp dir and into `ai::mcp_dir()` — see the `ai.rs` entry.
-`session_cwd` answers `Option<PathBuf>`, and `None` means the caller spawns with **no**
-`current_dir` at all rather than falling back to a shared one. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
+`session_cwd` answers `Option<PathBuf>`, trying the temp dir and then
+`persist::private_dir("ai-run")` — owner-only by construction, and a private subdirectory rather
+than the config dir beside `connections.json` that the paragraph above forbids — and `None`, when
+neither yields a fresh exclusive directory, is a **refusal of the turn** (`no_cwd`, one wording for
+every spawn path), not a spawn with no `current_dir`. That is what it used to be, and it is not
+neutral: a child given no `current_dir` inherits Schemaic's own, which is where a CLI resolves
+`.claude/settings.json` and `AGENTS.md` — the very thing the directory exists to keep away from it.
+`no_agent_spawn_sets_its_working_directory_conditionally` scans `ai.rs` for the `if let Some`
+spelling the three spawn sites used to have. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
 otherwise swallow a later flag's name as a tool name, and both
 `the_session_loads_no_mcp_server_and_no_config_dir_of_its_own_finding` and the test above pin that
 order. **They did not prompt — they ran.** Driving the old flag set with

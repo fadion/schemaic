@@ -931,7 +931,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   directory every account on the machine can list, `O_EXCL` plus a random name was the whole of the
   defence. **They no longer hold it at all** — owner-private stops another account, not the agent,
   which runs as the user and whose file readers can be pointed at the file — so the endpoint names
-  its saved connection and `ai::resolve_password` reads the password from the keyring (the `ai.rs`
+  its saved connection and `ai::saved_db` reads the password from the keyring (the `ai.rs`
   entry has the whole of it, including the executing harness it does not stop). And a subprocess that cannot read the file it was pointed at **refuses** rather than
   defaulting — `ai::mcp_endpoint_from_env` returns `Err`, because the fallback was a
   `127.0.0.1:3306` endpoint with every access gate back on. Don't add new plaintext-secret surfaces.
@@ -996,7 +996,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   through `conn::secrets::{load,save}_connections`/`forget_connection` (which wrap
   `persist::{load,save}_connections`) — never call `persist::save_connections` directly from a front
   end, or you reintroduce plaintext. **Nor does the AI panel's MCP endpoint carry one** — it
-  names the saved connection (`conn_id`) and its subprocess reads the password from the keyring (`ai::resolve_password`), because an owner-private file is still one the
+  names the saved connection (`conn_id`) and its subprocess reads the password from the keyring (`ai::saved_db`), because an owner-private file is still one the
   agent's own file readers can open. Plaintext in the JSON is a *fallback only* for a machine with no
   working keyring — **and the app now says so when it happens**, rather than letting a stated
   invariant be quietly false on someone's machine: `Sanitized::notice` names the file the passwords

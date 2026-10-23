@@ -275,20 +275,25 @@ pub(crate) type McpEndpoint = schemaic_cli::mcp::Endpoint;
 /// A missing field inside a blob that *did* parse still defaults, and must: those
 /// defaults are what every endpoint written before a given field existed relies
 /// on. Failing closed is about the blob being absent or unreadable, not about it
-/// being old.
+/// being old — except the two data levels, which default off
+/// ([`endpoint_from_value`]).
 pub(crate) fn mcp_endpoint_from_env() -> Result<McpEndpoint, String> {
     // A harness whose MCP config is a *file* we write puts the endpoint in that
     // file's `env` map. Codex's only lever is `-c` overrides, which are argv —
     // world-readable — so it gets a path instead and the endpoint stays in a
     // file of its own. Neither holds the password any more: the blob names the
-    // saved connection, and `resolve_password` reads it from the keyring.
+    // saved connection, and `saved_db` builds the `Db` from it, keyring and all.
     let mut v = endpoint_blob(
         endpoint_file_arg(&std::env::args().collect::<Vec<_>>()).as_deref(),
         |p| std::fs::read_to_string(p).map_err(|e| e.to_string()),
         std::env::var("SCHEMAIC_MCP_ENDPOINT").ok().as_deref(),
     )?;
-    resolve_password(&mut v, keyring_password)?;
-    Ok(endpoint_from_value(&v))
+    let saved = saved_db(&v, keyring_connection)?;
+    let mut endpoint = endpoint_from_value(&v);
+    if let Some(db) = saved {
+        endpoint.db = db;
+    }
+    Ok(endpoint)
 }
 
 /// Resolve the endpoint blob, with the filesystem and the environment as
@@ -325,37 +330,55 @@ fn endpoint_blob(
     Ok(v)
 }
 
-/// Put the connection's password into the endpoint blob `v`, read by the id it
-/// names through `lookup` — the OS keyring, for the real subprocess.
+/// The `Db` for the saved connection the endpoint blob `v` names by its
+/// `conn_id`, read through `lookup` — the saved connections hydrated from the
+/// OS keyring, for the real subprocess — or `None` for a blob that names none.
 ///
-/// **The blob never carries it** ([`endpoint_json`]): the file it rides is
-/// owner-private, which guards against other accounts and not against the
-/// agent, which runs as the user and whose built-in readers — Cursor's `Grep`,
-/// Codex's read-only sandbox, Antigravity's `view_file` — read a file whose
-/// path the model has been given. The keyring is out of their reach, and this
-/// process is the app's own binary, so it reads the secret the way
+/// **The blob never carries the password** ([`endpoint_json`]): the file it
+/// rides is owner-private, which guards against other accounts and not against
+/// the agent, which runs as the user and whose built-in readers — Cursor's
+/// `Grep`, Codex's read-only sandbox, Antigravity's `view_file` — read a file
+/// whose path the model has been given. The keyring is out of their reach, and
+/// this process is the app's own binary, so it reads the secret the way
 /// `schemaic mcp` does. A failed lookup is a refusal: an empty password would
 /// come back from the server as *Access denied*, a cause that is not the one.
 ///
-/// A blob with no `conn_id` names nothing to look up and is left as it is.
-fn resolve_password(
-    v: &mut serde_json::Value,
-    lookup: impl Fn(u64) -> Result<String, String>,
-) -> Result<(), String> {
+/// **And nothing the password travels with is the blob's either** (security
+/// review S5). The host, port, user, engine, TLS plan, sign-in and init SQL
+/// used to be read from the blob while the password came from the keyring, so
+/// whatever could rewrite the file, or set `$SCHEMAIC_MCP_ENDPOINT`, could send
+/// the saved password to a host of its own with TLS off. The `Db` is now
+/// [`Db::connect`] of the saved connection itself, as the app builds it; the
+/// blob supplies only what the saved connection cannot know, the local port of
+/// the app's SSH tunnel — always on loopback, since `Db::connect` writes
+/// `127.0.0.1` itself.
+fn saved_db(
+    v: &serde_json::Value,
+    lookup: impl Fn(u64) -> Result<schemaic_core::connection::Connection, String>,
+) -> Result<Option<Db>, String> {
     let Some(id) = v.get("conn_id").and_then(|x| x.as_u64()) else {
-        return Ok(());
+        return Ok(None);
     };
-    let pass = lookup(id)?;
-    v["pass"] = serde_json::Value::String(pass);
-    Ok(())
+    let saved = lookup(id)?;
+    let tunnel = if saved.uses_tunnel() {
+        let port = v
+            .get("port")
+            .and_then(|x| x.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            .ok_or("the database endpoint names no tunnel port for an SSH connection")?;
+        Some(port)
+    } else {
+        None
+    };
+    Ok(Some(Db::connect(&saved, tunnel)))
 }
 
-/// [`resolve_password`]'s real lookup: the saved connection `id`, hydrated from
+/// [`saved_db`]'s real lookup: the saved connection `id`, hydrated from
 /// the keyring **read-only** — never the app's self-healing load, which may
 /// rewrite `connections.json` under the running app — and only its own
 /// secrets. What the hydration has to say goes to stderr, stdout being the
 /// JSON-RPC stream.
-fn keyring_password(id: u64) -> Result<String, String> {
+fn keyring_connection(id: u64) -> Result<schemaic_core::connection::Connection, String> {
     let file = schemaic_conn::secrets::load_connections_readonly()
         .map_err(|e| format!("the saved connections could not be read: {e}"))?;
     let mut conn = file
@@ -370,7 +393,7 @@ fn keyring_password(id: u64) -> Result<String, String> {
     for note in schemaic_conn::secrets::hydrate_for_cli(&mut conn, &skip) {
         eprintln!("schemaic --mcp-serve: {note}");
     }
-    Ok(conn.password)
+    Ok(conn)
 }
 
 /// The path given as `--endpoint-file <path>`, if any.
@@ -386,7 +409,10 @@ fn endpoint_file_arg(args: &[String]) -> Option<String> {
 
 /// Parse a DB endpoint from the MCP-config JSON value: host defaults to
 /// `127.0.0.1`, port to `3306`, user/pass to empty, database optional, samples
-/// on. Pure so the defaulting is unit-tested without touching the environment.
+/// and schema off. Pure so the defaulting is unit-tested without touching the
+/// environment. For a blob naming a saved connection the `Db` parsed here is
+/// replaced by that connection's own ([`saved_db`]); what stays the blob's is
+/// the selected database and the data levels.
 fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
     let host = v
         .get("host")
@@ -460,12 +486,11 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
             .with_init_sql(init_sql)
             .with_signing_target(signing),
         database,
-        // Absent → on, matching the endpoint blobs written before the flag
-        // existed (which also predate any tool that reads rows from schema).
-        samples: v.get("samples").and_then(|x| x.as_bool()).unwrap_or(true),
-        // Absent → on, matching every blob written before the field existed —
-        // where the schema tools were always offered.
-        schema: v.get("schema").and_then(|x| x.as_bool()).unwrap_or(true),
+        // Absent → **off**: the app writes both on every spawn, so a blob
+        // without them is either from before an update or rewritten, and
+        // neither may widen what the assistant reads (security review S5).
+        samples: v.get("samples").and_then(|x| x.as_bool()).unwrap_or(false),
+        schema: v.get("schema").and_then(|x| x.as_bool()).unwrap_or(false),
         // Absent → nothing hidden, which is what every blob written before the
         // field existed meant.
         hidden: v
@@ -495,7 +520,8 @@ fn endpoint_json(
     hidden: &HashSet<String>,
 ) -> String {
     // **Every part but the password**, which the subprocess reads from the OS
-    // keyring by `conn_id` — see `resolve_password`. Host and port are the
+    // keyring by `conn_id` — see `saved_db`, which also takes everything else
+    // but the tunnel port from the saved connection. Host and port are the
     // app's own tunnel for an SSH connection, so no SSH secret is needed there.
     let (host, port, user, _, file) = db.parts();
     // Sorted, so the blob is stable for a given set rather than reshuffling with
@@ -533,8 +559,9 @@ const MCP_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 *
 
 /// Where the per-session files carrying the database endpoint live.
 ///
-/// **Ours, not the shared temp directory.** These hold the DB host, user and
-/// **plaintext password**, and putting them in a directory every account on the
+/// **Ours, not the shared temp directory.** These hold the DB host and user —
+/// the password they once held now stays in the keyring ([`saved_db`]) — and
+/// putting them in a directory every account on the
 /// machine can list meant the only thing between them and another user was
 /// `O_EXCL` plus a random name. `persist::private_dir` is `0o700` on Unix and
 /// ACL-scoped to the profile on Windows, which is the permission a credential
@@ -587,7 +614,8 @@ fn drain_stderr(child: &mut tokio::process::Child, buf: &std::sync::Arc<std::syn
 }
 
 /// Write the `claude` MCP config to a per-session temp file and return its path.
-/// The DB endpoint (with credentials) rides in the config's `env`, so it never
+/// The DB endpoint (never the password, which stays in the keyring) rides in
+/// the config's `env`, so it never
 /// appears on a command line where another same-user process could read it
 /// (review C6). Owner-only, removed when the session drops. Returns `None` if the
 /// file couldn't be written (caller then skips MCP).
@@ -4502,28 +4530,74 @@ mod tests {
         assert_eq!(v["conn_id"], 42);
     }
 
-    /// The subprocess's half: the password comes back by the connection id,
-    /// and a failed lookup is a refusal rather than an empty password — which
-    /// would read to the user as the server's *Access denied*.
+    /// **The keyring password goes where the saved connection points, and
+    /// nowhere else** (security review S5). The blob names the connection by
+    /// id and the password is read by that id, but host, port, user, engine,
+    /// TLS, sign-in and init SQL were all taken from the blob. Anything that
+    /// could rewrite the endpoint file, or set the environment variable, could
+    /// send the saved password to its own host with TLS off. Now the `Db` is
+    /// the saved connection's own (`Db::connect`), and the blob supplies only
+    /// the tunnel's local port.
     #[test]
-    fn the_subprocess_reads_the_password_by_the_connection_id() {
-        let mut v = serde_json::json!({ "host": "h", "conn_id": 42 });
-        resolve_password(&mut v, |id| match id {
-            42 => Ok("s3cret".to_string()),
-            _ => Err("no such connection".to_string()),
-        })
-        .unwrap();
-        assert_eq!(v["pass"], "s3cret");
-        assert_eq!(endpoint_from_value(&v).db.parts().3, "s3cret");
+    fn the_subprocess_connects_where_the_saved_connection_points() {
+        let mut saved: schemaic_core::connection::Connection =
+            serde_json::from_value(serde_json::json!({
+                "id": 42, "name": "app", "db_type": "PostgreSQL", "host": "db.example",
+                "port": 5432, "user": "app", "password": "",
+                "ssh": { "enabled": false, "host": "", "port": 22, "user": "", "password": "" },
+            }))
+            .expect("a saved connection");
+        saved.password = "s3cret".into();
+        saved.init_sql = "SET search_path TO app".into();
+        let lookup = |s: schemaic_core::connection::Connection| {
+            move |id: u64| match id {
+                42 => Ok(s.clone()),
+                _ => Err("no such connection".to_string()),
+            }
+        };
+        let forged = serde_json::json!({
+            "conn_id": 42, "host": "evil.example", "port": 1, "user": "root",
+            "engine": "mysql", "tls": null, "init_sql": "", "auth": "Password",
+        });
+        let db = saved_db(&forged, lookup(saved.clone())).unwrap().unwrap();
+        let (host, port, user, pass, _) = db.parts();
+        assert_eq!(
+            (host, port, user, pass),
+            ("db.example", 5432, "app", "s3cret")
+        );
+        assert_eq!(db.engine(), schemaic_db::Engine::Postgres);
+        assert_eq!(db.init_sql(), "SET search_path TO app");
 
-        let mut v = serde_json::json!({ "host": "h", "conn_id": 9 });
-        assert!(resolve_password(&mut v, |_| Err("no such connection".into())).is_err());
+        // Tunnelled: the blob's port is the app's tunnel, on loopback.
+        saved.ssh.enabled = true;
+        saved.ssh.host = "bastion.example".into();
+        let tunnelled = serde_json::json!({ "conn_id": 42, "host": "evil.example", "port": 40123 });
+        let db = saved_db(&tunnelled, lookup(saved.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.parts().0, "127.0.0.1");
+        assert_eq!(db.parts().1, 40123);
+        assert!(saved_db(&serde_json::json!({ "conn_id": 42 }), lookup(saved)).is_err());
 
-        // A blob that names no connection has nothing to look up: an older
-        // blob that still carries its password keeps it.
-        let mut v = serde_json::json!({ "host": "h", "pass": "old" });
-        resolve_password(&mut v, |_| panic!("looked up without an id")).unwrap();
-        assert_eq!(v["pass"], "old");
+        // A failed lookup is a refusal, and a blob naming no connection has
+        // nothing to look up.
+        let none = |_: u64| Err("no such connection".to_string());
+        assert!(saved_db(&serde_json::json!({ "conn_id": 9 }), none).is_err());
+        assert!(
+            saved_db(&serde_json::json!({ "host": "h" }), |_| panic!("looked up"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// **The data levels default closed.** A blob missing `samples` or
+    /// `schema` used to switch both on, so a rewritten file could widen what
+    /// the assistant may read.
+    #[test]
+    fn missing_data_flags_default_closed() {
+        let e = endpoint_from_value(&serde_json::json!({ "host": "h" }));
+        assert!(!e.samples);
+        assert!(!e.schema);
     }
 
     #[test]
@@ -4539,9 +4613,12 @@ mod tests {
         let json = endpoint_json(&db, 7, Some("shop"), false, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!endpoint_from_value(&v).samples);
-        // An older blob with no flag → samples on (nothing then read rows).
-        let v = serde_json::json!({ "host": "h" });
+        let json = endpoint_json(&db, 7, Some("shop"), true, true, &HashSet::new());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(endpoint_from_value(&v).samples);
+        // A blob with no flag → samples off (`missing_data_flags_default_closed`).
+        let v = serde_json::json!({ "host": "h" });
+        assert!(!endpoint_from_value(&v).samples);
     }
 
     #[test]
@@ -4631,7 +4708,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
         // Everything but the password, which the subprocess reads from the
-        // keyring (`resolve_password`).
+        // keyring (`saved_db`).
         assert_eq!(parsed.db.parts(), ("host", 3306, "user", "", ""));
         assert_eq!(parsed.db.engine(), schemaic_db::Engine::Postgres);
         assert_eq!(parsed.database.as_deref(), Some("db1"));
@@ -4959,10 +5036,10 @@ mod tests {
         .expect_err("fell through to the environment");
         assert!(err.contains("/gone.json"), "{err}");
 
-        // The shape the default would have had, so this test names what it is
-        // preventing rather than only that something was refused.
+        // And were a null blob ever parsed, its data levels are closed now
+        // (`missing_data_flags_default_closed`), where they used to open both.
         let defaulted = endpoint_from_value(&serde_json::Value::Null);
-        assert!(defaulted.samples && defaulted.schema);
+        assert!(!defaulted.samples && !defaulted.schema);
     }
 
     #[test]
@@ -4976,17 +5053,18 @@ mod tests {
         assert!(endpoint_blob(None, read, None).is_err());
     }
 
-    /// A field missing from a blob that *did* parse still defaults, and must:
-    /// those defaults are what every endpoint written before a given field
-    /// existed relies on. Failing closed is about the blob being unreadable, not
-    /// about it being old.
+    /// A field missing from a blob that *did* parse still defaults — but the
+    /// two data levels default **closed** (security review S5): a blob is
+    /// written per session by the running app, so one missing them is either
+    /// a session spawned before an update, which loses sample rows until its
+    /// next spawn, or a rewritten file, which must not widen them.
     #[test]
-    fn an_old_blob_still_gets_its_back_compat_defaults() {
+    fn an_old_blob_gets_closed_data_levels() {
         let read = |_: &str| Ok(r#"{"host":"h","port":3307}"#.to_string());
         let v = endpoint_blob(Some("/e.json"), read, None).expect("a parseable blob");
         let e = endpoint_from_value(&v);
-        assert!(e.samples, "a blob predating `samples` lost its default");
-        assert!(e.schema, "a blob predating `schema` lost its default");
+        assert!(!e.samples, "a blob predating `samples` opened it");
+        assert!(!e.schema, "a blob predating `schema` opened it");
         // …and the Claude path, whose blob arrives in the environment, is
         // untouched by any of this.
         let v = endpoint_blob(None, |_| Ok(String::new()), Some(r#"{"host":"h"}"#))

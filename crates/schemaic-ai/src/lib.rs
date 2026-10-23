@@ -208,7 +208,8 @@ fn seal_args(seal: CliSeal) -> Vec<String> {
 ///
 /// **A path, and that is load-bearing.** The Claude CLI accepts inline JSON
 /// there too, and the config Schemaic hands it carries the already-tunnelled
-/// database endpoint — password included. `app/ai.rs` writes it to an
+/// database endpoint — no longer the password, which the MCP subprocess reads
+/// from the keyring, but the host, user and data levels. `app/ai.rs` writes it to an
 /// owner-only private file and passes the file name for exactly that reason,
 /// stated at its own call site: "written to a temp file so the credentials
 /// never appear on a command line". Nothing in *this* crate said so — the

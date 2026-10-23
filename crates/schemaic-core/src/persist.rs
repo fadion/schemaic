@@ -971,8 +971,9 @@ fn connections_path() -> Option<PathBuf> {
 ///
 /// Pure, and separate from [`private_dir`], because the *choice* is the part
 /// worth pinning and the failure it exists for is silent. Its consumer is
-/// `ai::mcp_dir`, which holds the per-session files carrying the database host,
-/// user and **plaintext password**: those lived in `std::env::temp_dir()`, which
+/// `ai::mcp_dir`, which holds the per-session files carrying the database host
+/// and user (they once carried the **plaintext password** too, which now stays
+/// in the keyring): those lived in `std::env::temp_dir()`, which
 /// every account on the machine can list, and the whole of the defence was
 /// `O_EXCL` plus a random name.
 ///
